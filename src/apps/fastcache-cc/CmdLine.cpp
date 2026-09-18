@@ -200,8 +200,16 @@ namespace
     /// silent under an ordinary build, and a hard preprocess failure under one
     /// that also builds with /WX, which takes the cache out of every compile
     /// with no build failure to notice it by (#688).
-    constexpr std::array<std::string_view, 6> MsvcDrop {
-        "/c", "-c", "/showIncludes", "/showIncludes:user", "-showIncludes", "-showIncludes:user",
+    ///
+    /// And the GNU dependency switches in clang-cl's pass-through spelling, for the
+    /// reason GnuDrop names its own: CMake's Ninja generator asks clang-cl for a GNU
+    /// depfile (`deps = gcc`) as `-clang:-MD -clang:-MT<obj> -clang:-MF<dep>` rather
+    /// than for `/showIncludes` (#1531), and a probe line that kept `-clang:-MD` would
+    /// write, and so overwrite, the build's real depfile. The `-MT`/`-MF` halves are
+    /// dropped by role, as PathValues rows.
+    constexpr std::array<std::string_view, 12> MsvcDrop {
+        "/c",         "-c",         "/showIncludes", "/showIncludes:user", "-showIncludes", "-showIncludes:user",
+        "/clang:-MD", "-clang:-MD", "/clang:-MMD",   "-clang:-MMD",        "/clang:-MP",    "-clang:-MP",
     };
     constexpr std::array<std::string_view, 4> GnuDrop { "-c", "-MD", "-MMD", "-MP" };
 
@@ -398,7 +406,7 @@ namespace
     // the producing machine's object path into every Windows key and two checkouts
     // at different roots could never share an entry.
 
-    constexpr std::array<PathValueFlag, 13> PathValues { {
+    constexpr std::array<PathValueFlag, 19> PathValues { {
         // The prefix-map row first, being the longest spelling. GNU-only: `cl` has
         // no path-map switch at all, and clang-cl accepts `-ffile-prefix-map`
         // while ignoring it for the records that matter -- measured, an object
@@ -423,6 +431,19 @@ namespace
           .valueTailSeparator = '=' },
         { .spelling = "/external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
         { .spelling = "-external:I", .role = PathValueRole::IncludeDir, .families = DriverFamily::Msvc },
+        // clang-cl's pass-through spellings of the GNU dependency flags, which is how
+        // CMake's Ninja generator asks clang-cl for a depfile (#1531). Unrecognised,
+        // the launcher never learned the depfile's path: a miss wrote one as a side
+        // effect of the real compile, a HIT wrote none, and Ninja -- reading a
+        // `deps = gcc` depfile that is not there -- recorded NO dependencies and said
+        // nothing, so a later header edit left the object stale. `cl` never takes
+        // these, and the rows cost it nothing. Fused only: see `joinedOnly`.
+        { .spelling = "/clang:-MF", .role = PathValueRole::DepFile, .families = DriverFamily::Msvc, .joinedOnly = true },
+        { .spelling = "-clang:-MF", .role = PathValueRole::DepFile, .families = DriverFamily::Msvc, .joinedOnly = true },
+        { .spelling = "/clang:-MT", .role = PathValueRole::DepTarget, .families = DriverFamily::Msvc, .joinedOnly = true },
+        { .spelling = "-clang:-MT", .role = PathValueRole::DepTarget, .families = DriverFamily::Msvc, .joinedOnly = true },
+        { .spelling = "/clang:-MQ", .role = PathValueRole::DepTarget, .families = DriverFamily::Msvc, .joinedOnly = true },
+        { .spelling = "-clang:-MQ", .role = PathValueRole::DepTarget, .families = DriverFamily::Msvc, .joinedOnly = true },
         { .spelling = "/Fo", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Msvc },
         { .spelling = "-Fo", .role = PathValueRole::ObjectOutput, .families = DriverFamily::Msvc },
         { .spelling = "/Fd", .role = PathValueRole::DebugOutput, .families = DriverFamily::Msvc },
@@ -1203,6 +1224,13 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
         // `/Fo`, used to be.
         if (auto const match = MatchPathValueFlag(a, IntroducersOf(driver.family), driver.family))
         {
+            // A pass-through spelling with its value in the next argument: that value
+            // is wrapped in a pass-through of its own, so it is refused, not read.
+            if (match->flag.joinedOnly && match->value.empty())
+            {
+                out.separatedPassThrough = true;
+                continue;
+            }
             auto const destination = DestinationFor(match->flag.role);
             // An include directory or a dependency target goes nowhere, and its
             // separated value is deliberately left to be scanned rather than
@@ -1266,7 +1294,8 @@ ParsedCommand ParseCommand(std::span<std::string const> argv)
     if (auto const language = LanguageOfSource(out.source); language.has_value() && !UncacheableBecause(*language).empty())
         out.sideArtefact = true;
 
-    out.parsedOk = !out.source.empty() && !out.objPath.empty() && sawCompileOnly && !preprocessOnly && !out.sideArtefact;
+    out.parsedOk = !out.source.empty() && !out.objPath.empty() && sawCompileOnly && !preprocessOnly && !out.sideArtefact
+                   && !out.separatedPassThrough;
     return out;
 }
 

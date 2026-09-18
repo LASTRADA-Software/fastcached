@@ -255,6 +255,14 @@ struct PathValueFlag
     /// contains one, and it costs a MISS rather than a mis-serve -- the head the
     /// launcher isolates lies under no root, so the argument comes back verbatim.
     char valueTailSeparator { '\0' };
+
+    /// True for a spelling whose value must be FUSED to it: clang-cl's `/clang:` and
+    /// `-clang:` pass-through, which hands one argument to the GNU driver inside it.
+    /// Its separated form (`-clang:-MF -clang:dep.d`) carries a value wrapped in a
+    /// pass-through of its own, which no consumer of this table unwraps -- so the
+    /// parser refuses the bare spelling as uncacheable rather than reading
+    /// `-clang:dep.d` as a path. CMake's Ninja generator emits the fused form (#1531).
+    bool joinedOnly { false };
 };
 
 /// Every flag whose value is a filesystem path, in one table.
@@ -625,6 +633,11 @@ struct ParsedCommand
     /// launcher can say WHY it stepped aside: a link step and a module interface
     /// unit are both passed through, and only one of them looks like a defect.
     bool sideArtefact { false };
+    /// True when a pass-through dependency flag (`-clang:-MF`) arrived with its value
+    /// in a SEPARATE argument, which the launcher cannot read. Uncacheable rather than
+    /// guessed at: a hit writes the depfile the build named, and a misread name is a
+    /// build whose headers stop triggering rebuilds (#1531). See `PathValueFlag::joinedOnly`.
+    bool separatedPassThrough { false };
     bool parsedOk { false }; ///< False if the line is not a cacheable compile.
 };
 

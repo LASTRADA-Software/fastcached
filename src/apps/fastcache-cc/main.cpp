@@ -1156,12 +1156,10 @@ void ReportVerification(InvocationRecord const& record, Cc::HitComparison const&
     return PathCanon::Grammar::ShowIncludes;
 }
 
-/// Index of the depfile inside a stored value's text regions.
-///
-/// Regions are positional: 0 = stdout, 1 = stderr, 2 = the GNU depfile. A value
-/// stored before depfile support simply has no region 2, so it decodes and
-/// replays exactly as before — the addition is backward compatible.
-constexpr std::size_t DepFileRegionIndex = 2;
+// `DepFileRegionIndex` is in CacheDecision.hpp, beside `ReproducesDepFile`, which is the
+// rule that reads it: a value with no depfile region is NOT served to a compile that
+// names a depfile (#1531).
+using Cc::DepFileRegionIndex;
 
 /// Number of captured streams replayed to our own stdout/stderr. Regions beyond
 /// these are files, not streams, and must never be replayed.
@@ -1624,6 +1622,16 @@ struct MaterializedHit
     auto assertions = std::span<TextRegion const> { localized };
     if (cmd.depPath.empty() && assertions.size() > DepFileRegionIndex)
         assertions = assertions.first(DepFileRegionIndex);
+
+    // Asked before anything is written: a hit that would leave the build's depfile absent
+    // is a stale object waiting for the next header edit, not a hit (#1531).
+    if (!Cc::ReproducesDepFile(!cmd.depPath.empty(), localized.size()))
+    {
+        Note(record.verbose,
+             std::format("STALE HIT (the build names the depfile {} and the cached value carries none); recompiling",
+                         cmd.depPath));
+        return NotMaterialized(HitDisposition::Stale);
+    }
 
     if (auto const missing = Cc::MissingReplayedDependency(assertions, layout, workingDirectory); missing.has_value())
     {
@@ -3172,6 +3180,10 @@ int main(int argc, char** argv)
             Note(record.verbose,
                  "the compile writes a second artefact (a BMI or a precompiled header) "
                  "that a cache hit cannot reproduce; not cached");
+        if (cmd.separatedPassThrough)
+            Note(record.verbose,
+                 "a clang-cl pass-through dependency flag (-clang:-MF) carries its value in a separate "
+                 "argument, which the launcher cannot read; spell it fused (-clang:-MF<path>) to cache this compile");
         return RunPassthrough(std::span<std::string const> { args });
     }
 

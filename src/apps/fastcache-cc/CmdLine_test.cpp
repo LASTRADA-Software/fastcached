@@ -128,6 +128,103 @@ TEST_CASE("ParseCommand captures the depfile path from -MF, joined or separate")
     CHECK(Parse({ "clang++", "-c", "a.cpp", "-o", "a.o", "-MD", "-MFdep/a.d" }).depPath == "dep/a.d");
 }
 
+TEST_CASE("ParseCommand captures clang-cl's depfile from CMake's -clang:-MF pass-through (#1531)")
+{
+    // Unrecognised, `depPath` stayed empty: a miss wrote the depfile as a side effect of the
+    // real compile, a HIT wrote none, and Ninja recorded no dependencies at all -- so a
+    // header edit after a cache hit rebuilt nothing. `cl` is unaffected because CMake gives
+    // it /showIncludes and `deps = msvc`.
+    // CMake 4's Ninja generator for CMAKE_CXX_COMPILER=clang-cl, as measured on #1531: it asks
+    // for a GNU depfile (`deps = gcc`) through the pass-through, never for /showIncludes.
+    std::vector<std::string> const argv {
+        R"(C:\LLVM\bin\clang-cl.exe)",
+        "/nologo",
+        "-TP",
+        R"(-IC:\src\include)",
+        "/EHsc",
+        "-MDd",
+        "-Zi",
+        "-clang:-MD",
+        R"(-clang:-MTCMakeFiles\r.dir\main.cpp.obj)",
+        R"(-clang:-MFCMakeFiles\r.dir\main.cpp.obj.d)",
+        R"(/FoCMakeFiles\r.dir\main.cpp.obj)",
+        R"(/FdCMakeFiles\r.dir\r.pdb)",
+        "-c",
+        "--",
+        R"(C:\src\main.cpp)",
+    };
+    auto const p = Parse(argv);
+    CHECK(p.parsedOk);
+    CHECK(p.flavor == Flavor::ClangCl);
+    CHECK(p.depPath == R"(CMakeFiles\r.dir\main.cpp.obj.d)");
+    CHECK(p.objPath == R"(CMakeFiles\r.dir\main.cpp.obj)");
+    CHECK_FALSE(p.wantShowIncludes);
+
+    // The slash spelling of the same pass-through, which clang-cl accepts alike.
+    CHECK(Parse({ "clang-cl.exe", "/c", "/clang:-MD", "/clang:-MFdep/a.d", "/Foa.obj", "a.cpp" }).depPath == "dep/a.d");
+}
+
+TEST_CASE("A pass-through dependency flag with a separated value is refused, not misread (#1531)")
+{
+    // `-clang:-MF -clang:dep.d` wraps the VALUE in a pass-through of its own, and nothing
+    // here unwraps it. Read as the next argument, the depfile would be named
+    // `-clang:dep.d`, and a hit would write that file while the build waits on another.
+    auto const p = Parse({ "clang-cl.exe", "/c", "-clang:-MD", "-clang:-MF", "-clang:dep.d", "/Foa.obj", "a.cpp" });
+    CHECK(p.separatedPassThrough);
+    CHECK_FALSE(p.parsedOk);
+    CHECK(p.depPath.empty());
+
+    // The control: the fused spelling on the same line is cacheable.
+    auto const fused = Parse({ "clang-cl.exe", "/c", "-clang:-MD", "-clang:-MFdep.d", "/Foa.obj", "a.cpp" });
+    CHECK_FALSE(fused.separatedPassThrough);
+    CHECK(fused.parsedOk);
+}
+
+TEST_CASE("The key probe and the dispatched line drop clang-cl's pass-through dependency flags (#1531)")
+{
+    // A probe line that kept them would write, and so overwrite, the build's real depfile;
+    // a worker that kept them would write one on the WORKER, where nothing reads it. On a
+    // dispatched compile the launcher renders the depfile itself.
+    // CMake 4's Ninja generator for CMAKE_CXX_COMPILER=clang-cl, as measured on #1531: it asks
+    // for a GNU depfile (`deps = gcc`) through the pass-through, never for /showIncludes.
+    std::vector<std::string> const argv {
+        R"(C:\LLVM\bin\clang-cl.exe)",
+        "/nologo",
+        "-TP",
+        R"(-IC:\src\include)",
+        "/EHsc",
+        "-MDd",
+        // /Z7, not the -Zi CMake writes by default: CompileCache.cmake forces /Z7 whenever a
+        // launcher is active, and -Zi is refused for dispatch on its own grounds (a shared PDB).
+        "-Z7",
+        "-clang:-MD",
+        R"(-clang:-MTCMakeFiles\r.dir\main.cpp.obj)",
+        R"(-clang:-MFCMakeFiles\r.dir\main.cpp.obj.d)",
+        R"(/FoCMakeFiles\r.dir\main.cpp.obj)",
+        R"(/FdCMakeFiles\r.dir\r.pdb)",
+        "-c",
+        "--",
+        R"(C:\src\main.cpp)",
+    };
+    auto const cmd = Parse(argv);
+    REQUIRE(cmd.parsedOk);
+
+    auto const pp = PreprocessCommand(cmd, argv);
+    auto const remote = RemoteCompileArgs(cmd, argv, {});
+    INFO("refused: " << remote.error_or(""));
+    REQUIRE(remote.has_value());
+    for (auto const* dropped:
+         { "-clang:-MD", R"(-clang:-MTCMakeFiles\r.dir\main.cpp.obj)", R"(-clang:-MFCMakeFiles\r.dir\main.cpp.obj.d)" })
+    {
+        INFO("flag " << dropped);
+        CHECK_FALSE(std::ranges::contains(pp, dropped));
+        CHECK_FALSE(std::ranges::contains(*remote, dropped));
+    }
+    // The control: a code-generating flag on the same line survives both.
+    CHECK(std::ranges::contains(pp, "/EHsc"));
+    CHECK(std::ranges::contains(*remote, "/EHsc"));
+}
+
 TEST_CASE("ParseCommand does not treat an absolute path as an option for GNU drivers")
 {
     // A GNU driver only introduces options with '-', so /usr/src/a.cpp is a

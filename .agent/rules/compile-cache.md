@@ -744,6 +744,23 @@ same on both — the same defect with no MSVC anywhere near it.
     `/showIncludes` is covered alongside the depfile because Ninja reads it as `deps = msvc`;
     `MsvcDiagnostics` is not, because a diagnostic quotes a path rather than declaring a
     dependency on it.
+  - **A hit reproduces BOTH artefacts or is not a hit** (#1531). A value with no depfile region
+    is not served to a compile that names a depfile (`Cc::ReproducesDepFile`, asked before
+    anything is written): it is `Stale`, so the real compile runs and its STORE repairs the
+    entry. Served anyway, the object is correct and the depfile the build named is simply
+    ABSENT -- and Ninja reading a `deps = gcc` depfile that is not there records no
+    dependencies and says nothing, so every later header edit leaves the object stale. That is
+    also what retired #1531's poisoned values without an `objkey-v*` bump: their key does not
+    move, they fail this once each, and are replaced -- where a bump would have cost every
+    platform a cold rebuild to retire entries one driver wrote.
+  - **clang-cl under CMake's Ninja generator asks for a GNU DEPFILE, not `/showIncludes`**:
+    `deps = gcc` and `-clang:-MD -clang:-MT<obj> -clang:-MF<dep>`, through the pass-through that
+    hands one argument to the GNU driver inside clang-cl. Measured on CMake 4.2 (#1531). `cl`
+    gets `/showIncludes` and `deps = msvc`, which is why only clang-cl broke. The pass-through
+    spellings are `PathValueFlags()` rows (`joinedOnly`) and `MsvcDrop` rows, so every consumer
+    of that table -- the parser, the key probe, the dispatched line, the key -- reads them as the
+    flags they wrap. A separated `-clang:-MF -clang:<path>` wraps its VALUE too, which nothing
+    unwraps, so it is refused as uncacheable rather than read as a path named `-clang:<path>`.
   - **The residual, recorded deliberately:** two machines whose compilers print the *same*
     `--version` banner from *different* install prefixes still share a key and can still
     replay each other's toolchain paths. Closing that would mean hashing those absolute

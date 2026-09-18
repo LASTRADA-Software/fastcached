@@ -81,6 +81,18 @@ TEST_CASE("a stale hit repairs its own key", "[cache-decision]")
     CHECK(DecideCacheAction(FetchObservation::HitStale) == CacheAction::CompileAndStore);
 }
 
+TEST_CASE("a value with no depfile is not served to a compile that names one (#1531)", "[cache-decision]")
+{
+    // The two stored-region counts a value can have, against the two things a compile can
+    // ask for. Serving the object without the depfile is the #1531 shape: Ninja reads a
+    // depfile that is not there, records no dependencies, and says nothing.
+    CHECK_FALSE(ReproducesDepFile(/*depFileRequested=*/true, /*regionCount=*/DepFileRegionIndex));
+    CHECK(ReproducesDepFile(/*depFileRequested=*/true, /*regionCount=*/DepFileRegionIndex + 1));
+    // The control: a compile that names no depfile is served whatever the value carries.
+    CHECK(ReproducesDepFile(/*depFileRequested=*/false, /*regionCount=*/DepFileRegionIndex));
+    CHECK(ReproducesDepFile(/*depFileRequested=*/false, /*regionCount=*/DepFileRegionIndex + 1));
+}
+
 TEST_CASE("a miss and a daemon that never answered both store", "[cache-decision]")
 {
     CHECK(DecideCacheAction(FetchObservation::Miss) == CacheAction::CompileAndStore);

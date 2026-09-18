@@ -431,7 +431,12 @@ RAM where compression cannot help).
 
 A hit reproduces two things: the object file, and the build system's dependency
 record — a GNU depfile, or the `/showIncludes` notes Ninja reads as
-`deps = msvc`. Suppressing line markers keeps every path out of the hashed text,
+`deps = msvc`. A cached value that cannot reproduce the depfile a compile names is
+not served: it is recompiled and stored again. Note that **clang-cl under CMake's
+Ninja generator asks for a GNU depfile** (`-clang:-MD -clang:-MF<file>`,
+`deps = gcc`), not for `/showIncludes`; the launcher reads that spelling, and a
+separated `-clang:-MF -clang:<file>` is compiled uncached, since its value cannot
+be read. Suppressing line markers keeps every path out of the hashed text,
 which is what makes a key portable across checkouts, and equally what once made
 it identical after a header **moved**: same bytes, new path, so the object was
 still correct and still served while the recorded paths were not. Replaying

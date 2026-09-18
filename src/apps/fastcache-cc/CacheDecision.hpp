@@ -173,6 +173,35 @@ static_assert(RowsInEnumeratorOrder(CacheDecisionTable, &CacheDecisionRow::obser
     return action == CacheAction::CompileAndStore;
 }
 
+/// Index of the depfile inside a stored value's text regions.
+///
+/// Regions are positional: 0 = stdout, 1 = stderr, 2 = the GNU depfile. A value
+/// stored by a compile that wrote no depfile has no region 2.
+inline constexpr std::size_t DepFileRegionIndex = 2;
+
+/// Whether a stored value can reproduce the dependency record this compile asks for.
+///
+/// A hit reproduces TWO artefacts, the object and the build system's dependency record,
+/// and serving the first without the second is worse than a miss: the build succeeds,
+/// the depfile the build named is simply absent, and Ninja reading a `deps = gcc`
+/// depfile that is not there records NO dependencies and says nothing -- every later
+/// header edit leaves the object stale (#1531). So a value with no depfile region is
+/// not served to a compile that names a depfile; the caller recompiles and RE-STORES,
+/// which is what repairs the entry.
+///
+/// That is also what retires the values #1531 left behind without re-keying the whole
+/// cache: clang-cl's `-clang:-MF` was not recognised, so every value stored for such a
+/// compile lacks region 2 under a key the fix does not move. They fail this once each
+/// and are replaced, where an `objkey-v*` bump would have cost every platform a cold
+/// rebuild to retire entries only one driver wrote.
+/// @param depFileRequested Whether this compile names a depfile.
+/// @param regionCount How many text regions the stored value carries.
+/// @return False exactly when a depfile is asked for and the value has none.
+[[nodiscard]] constexpr bool ReproducesDepFile(bool depFileRequested, std::size_t regionCount) noexcept
+{
+    return !depFileRequested || regionCount > DepFileRegionIndex;
+}
+
 /// What became of a cache hit we tried to honour.
 ///
 /// Three outcomes rather than a bool, because the two failures want opposite
