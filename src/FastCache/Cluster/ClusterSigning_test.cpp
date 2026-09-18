@@ -38,17 +38,18 @@ TEST_CASE("Each domain's label is the byte string on the wire", "[cluster][signi
     // changing one retires every outstanding tag in that domain, and that should
     // be a deliberate act with a test to update rather than a silent edit.
     //
-    // That the two are non-empty and distinct is `SigningLabelsSeparateDomains`,
+    // That every label is non-empty and distinct is `SigningLabelsSeparateDomains`,
     // `static_assert`ed three lines below its own definition -- a runtime `CHECK`
     // of a `consteval` predicate cannot fail in a translation unit that compiled,
     // so it would read as a guarantee while asserting nothing.
-    CHECK(DescribeSigningDomain(SigningDomain::DiscoveryProof).label == "fastcache-discovery-v1");
     CHECK(DescribeSigningDomain(SigningDomain::NodeProof).label == "fastcache-node-proof-v1");
 
-    // And a RETIRED label stays retired (#178): the discovery proof moved to each node's own key,
-    // and a row spelled `fastcache-discovery-v1` again would accept every tag an older build
-    // minted under it. Asserted by label, so a row re-added under any enumerator name is caught.
+    // And a RETIRED label stays retired (#178): the discovery proof and the lease moved to each
+    // node's own key, and a row spelled `fastcache-discovery-v1` or `fastcache-lease-v1` again
+    // would accept every tag an older build minted under it. Asserted by label, so a row re-added
+    // under any enumerator name is caught.
     for (auto const retired: { std::string_view { "fastcache-discovery-v1" },
+                               std::string_view { "fastcache-lease-v1" },
                                std::string_view { "fastcache-raft-dial-v1" },
                                std::string_view { "fastcache-raft-verdict-v1" },
                                std::string_view { "fastcache-raft-frame-v1" } })
@@ -62,21 +63,26 @@ TEST_CASE("One field list signs differently in each domain", "[cluster][signing]
     // own. Safety used to be a fact about the PAIR: a discovery proof was four
     // fields beginning with a cluster id, a lease tag two beginning with a literal,
     // so no byte string was a valid message under both. That is a coincidence, and
-    // it survives exactly as long as nobody adds a field to discovery. Here the
-    // SAME fields are signed in two domains and must not produce the same tag.
+    // it survives exactly as long as nobody adds a field to discovery.
+    //
+    // One domain is left (#178 moved discovery and the lease to each node's own key), so the
+    // domain that matters beside it is a RETIRED one: an older build still mints tags under
+    // `fastcache-lease-v1` and `fastcache-discovery-v1` with this very key, and retiring a row
+    // must not leave its tags valid in the row that remained. The SAME fields, signed under each
+    // retired label the long way, must not produce the node proof's tag.
     auto const key = Key();
     auto const fields = std::array<std::span<std::byte const>, 2> { Bytes("node-a"), Bytes("10.0.0.7:6675") };
 
-    auto const asProof = SignFields(key, SigningDomain::DiscoveryProof, fields);
     auto const asNodeProof = SignFields(key, SigningDomain::NodeProof, fields);
+    for (auto const retired: { std::string_view { "fastcache-lease-v1" }, std::string_view { "fastcache-discovery-v1" } })
+    {
+        auto const asRetired = HmacSha256(key, WireFields::Encode({ WireFields::AsBytes(retired), fields[0], fields[1] }));
+        CHECK_FALSE(ConstantTimeEquals(asRetired, asNodeProof));
+        CHECK_FALSE(VerifyFields(key, SigningDomain::NodeProof, fields, asRetired));
+    }
 
-    CHECK_FALSE(ConstantTimeEquals(asProof, asNodeProof));
-    CHECK_FALSE(VerifyFields(key, SigningDomain::NodeProof, fields, asProof));
-    CHECK_FALSE(VerifyFields(key, SigningDomain::DiscoveryProof, fields, asNodeProof));
-
-    // And each still authenticates in its own domain, or the separation would be
+    // And it still authenticates in its own domain, or the separation would be
     // indistinguishable from nothing working at all.
-    CHECK(VerifyFields(key, SigningDomain::DiscoveryProof, fields, asProof));
     CHECK(VerifyFields(key, SigningDomain::NodeProof, fields, asNodeProof));
 
     // And every pair of domains, not only the first two: the Raft peer wire added three
@@ -94,14 +100,17 @@ TEST_CASE("One field list signs differently in each domain", "[cluster][signing]
 TEST_CASE("An empty field list is still a signed statement of its domain", "[cluster][signing]")
 {
     // Not a degenerate case to skip. A message with no fields still carries the
-    // label, so the two domains disagree even with nothing to say -- which is the
-    // whole failure mode in miniature: under an unlabelled construction, signing
-    // nothing yields one tag that is valid in every domain.
+    // label, so it disagrees with a retired label's statement even with nothing to say -- which is
+    // the whole failure mode in miniature: under an unlabelled construction, signing nothing
+    // yields one tag that is valid in every domain.
     auto const key = Key();
     auto const none = WireFields::FieldList {};
 
-    CHECK_FALSE(ConstantTimeEquals(SignFields(key, SigningDomain::DiscoveryProof, none),
-                                   SignFields(key, SigningDomain::NodeProof, none)));
+    auto const asNodeProof = SignFields(key, SigningDomain::NodeProof, none);
+    CHECK_FALSE(ConstantTimeEquals(
+        asNodeProof,
+        HmacSha256(key, WireFields::Encode({ WireFields::AsBytes(std::string_view { "fastcache-lease-v1" }) }))));
+    CHECK_FALSE(ConstantTimeEquals(asNodeProof, HmacSha256(key, WireFields::Encode(none))));
 }
 
 TEST_CASE("The signed message is the label, then the fields, all length-prefixed", "[cluster][signing]")
