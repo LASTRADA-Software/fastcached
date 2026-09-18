@@ -140,7 +140,8 @@ struct PresenceFixture
                                .capacity = capacity,
                                .endpoint = ThisMachine,
                                .logger = logger,
-                               .conditions = conditions };
+                               .conditions = conditions,
+                               .roster = nullptr };
     }
 
     /// Announce once through @p dialer.
@@ -257,7 +258,8 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
                                                               .capacity = capacity,
                                                               .endpoint = ThisMachine,
                                                               .logger = logger,
-                                                              .conditions = conditions },
+                                                              .conditions = conditions,
+                                                              .roster = nullptr },
                                               link,
                                               dialer);
 
@@ -277,7 +279,7 @@ TEST_CASE("A machine announces its condition rows, as they stand when the round 
     // what carries the rows to the leader's page. Read when the ROUND runs rather than when the
     // presence tier was built: a live row that cleared between two rounds must arrive cleared.
     PresenceFixture fixture;
-    fixture.conditions.Raise(NodeCondition::UnsignedLeaseGrants, "no key");
+    fixture.conditions.Raise(NodeCondition::ScratchRootUnmappable, "a space in the root");
     fixture.conditions.Raise(NodeCondition::EnrollmentWindowOpen, "the window is open");
 
     Testing::ScriptedDialer first { { Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {}) } };
@@ -297,5 +299,5 @@ TEST_CASE("A machine announces its condition rows, as they stand when the round 
         return row->state;
     };
     CHECK(stateOf(NodeCondition::EnrollmentWindowOpen) == "clear");
-    CHECK(stateOf(NodeCondition::UnsignedLeaseGrants) == "raised");
+    CHECK(stateOf(NodeCondition::ScratchRootUnmappable) == "raised");
 }

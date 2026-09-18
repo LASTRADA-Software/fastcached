@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Cluster/ClusterSigning.hpp>
 #include <FastCache/Core/Base64.hpp>
-#include <FastCache/Core/Sha256.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/WireFields.hpp>
+#include <FastCache/Distributed/LeaseSigner.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
-#include <FastCache/Distributed/NodeProof.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -19,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -35,15 +35,9 @@ namespace
 /// let a verifier ship without looking (#322).
 inline constexpr std::string_view TestCluster = "fleet-alpha";
 
-/// A second fleet, provisioned from the SAME key -- which is what copying a working
-/// configuration to another site produces, and the whole scenario #322 is about.
+/// A second fleet whose roster names the SAME voter -- which is what copying a working
+/// state directory to another site produces, and the whole scenario #322 is about.
 inline constexpr std::string_view OtherCluster = "fleet-beta";
-
-/// The cluster's key, as a file holding thirty-two bytes would supply it.
-[[nodiscard]] std::vector<std::byte> Key(unsigned char fill = 0x5A)
-{
-    return std::vector<std::byte>(32, static_cast<std::byte>(fill));
-}
 
 /// A fixed instant, so nothing here reads a real clock.
 [[nodiscard]] std::chrono::system_clock::time_point Noon()
@@ -64,7 +58,8 @@ inline constexpr std::string_view OtherCluster = "fleet-beta";
                          .key = std::string { key },
                          .expiresAt = Noon() + 10min,
                          .clusterId = std::string { cluster },
-                         .epoch = epoch };
+                         .epoch = epoch,
+                         .signer = {} };
 }
 
 /// What the worker at the granted endpoint expects to see.
@@ -139,6 +134,28 @@ constexpr std::size_t SerialByteOffset = VersionByteOffset + 1 + sizeof(std::uin
     return Base64Encode(AsBytes(decoded));
 }
 
+/// Where the LAST byte of one packed claim sits in the decoded envelope of @p token.
+///
+/// Found by splitting the envelope rather than by arithmetic on a layout, so it names the
+/// field the case means whatever precedes or follows it.
+/// @param token The token.
+/// @param field Which claim, in `PackClaims`' order.
+/// @return The offset, from the front of the decoded envelope.
+[[nodiscard]] std::size_t ClaimEndOffset(std::string const& token, std::size_t field)
+{
+    auto const raw = Base64Decode(token);
+    REQUIRE(raw.has_value());
+    auto const bytes = AsBytes(Unwrap(raw));
+    auto const outer = WireFields::SplitExactly(bytes, 2);
+    REQUIRE(outer.has_value());
+    auto const claims = WireFields::SplitAll(Unwrap(outer)[0]);
+    REQUIRE(claims.has_value());
+    REQUIRE(Unwrap(claims).size() > field);
+    auto const target = Unwrap(claims)[field];
+    REQUIRE_FALSE(target.empty());
+    return static_cast<std::size_t>(target.data() - bytes.data()) + target.size() - 1;
+}
+
 /// How many bytes the decoded envelope of @p token holds.
 /// @param token The token.
 /// @return The decoded size.
@@ -152,8 +169,9 @@ constexpr std::size_t SerialByteOffset = VersionByteOffset + 1 + sizeof(std::uin
 
 TEST_CASE("A signed lease round-trips and carries every claim back", "[distributed][lease][token]")
 {
-    auto const key = Key();
-    auto const token = MintLeaseToken(key, Grant());
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const token = MintLeaseToken(signer, Grant());
 
     // Base64 rather than raw bytes is a property the fleet depends on, not a
     // presentation choice: this string ends up in launcher output and in worker
@@ -161,7 +179,7 @@ TEST_CASE("A signed lease round-trips and carries every claim back", "[distribut
     // everybody. Asserted here so a future encoder change cannot quietly drop it.
     CHECK(std::ranges::all_of(token, [](char c) { return static_cast<unsigned char>(c) < 0x80; }));
 
-    auto const verified = VerifyLeaseToken(key, token, Worker(), Noon());
+    auto const verified = VerifyLeaseToken(roster, token, Worker(), Noon());
     REQUIRE(verified.has_value());
     CHECK(verified->serial == "17");
     CHECK(verified->endpoint == "10.0.0.7:6675");
@@ -172,14 +190,15 @@ TEST_CASE("A signed lease round-trips and carries every claim back", "[distribut
 
 TEST_CASE("A forged or tampered lease is refused and tells the forger nothing", "[distributed][lease][token]")
 {
-    auto const key = Key();
-    auto const token = MintLeaseToken(key, Grant());
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const token = MintLeaseToken(signer, Grant());
 
-    SECTION("a flipped tag byte")
+    SECTION("a flipped signature byte")
     {
-        // The tag is the last thing in the envelope, so the last byte is inside it.
+        // The signature is the last thing in the envelope, so the last byte is inside it.
         auto const damaged = FlipByteAt(token, EnvelopeSize(token) - 1);
-        auto const refusal = VerifyLeaseToken(key, damaged, Worker(), Noon());
+        auto const refusal = VerifyLeaseToken(roster, damaged, Worker(), Noon());
         REQUIRE_FALSE(refusal.has_value());
         CHECK(refusal.error().reason == LeaseRefusalReason::Unauthorized);
 
@@ -189,19 +208,19 @@ TEST_CASE("A forged or tampered lease is refused and tells the forger nothing", 
         CHECK(refusal.error().detail.empty());
     }
 
-    SECTION("a tampered claim, which the MAC covers")
+    SECTION("a tampered claim, which the signature covers")
     {
-        // The serial, which is a CLAIM rather than the tag. The MAC is recomputed
-        // over the claim bytes as received, so this is `Unauthorized` and not a
+        // The serial, which is a CLAIM rather than the signature. The signature is
+        // verified over the claim bytes as received, so this is `Unauthorized` and not a
         // successful decode of different claims.
-        auto const refusal = VerifyLeaseToken(key, FlipByteAt(token, SerialByteOffset), Worker(), Noon());
+        auto const refusal = VerifyLeaseToken(roster, FlipByteAt(token, SerialByteOffset), Worker(), Noon());
         REQUIRE_FALSE(refusal.has_value());
         CHECK(refusal.error().reason == LeaseRefusalReason::Unauthorized);
     }
 
-    SECTION("a different cluster's key")
+    SECTION("a signer this worker's roster does not name")
     {
-        auto const refusal = VerifyLeaseToken(Key(0x11), token, Worker(), Noon());
+        auto const refusal = VerifyLeaseToken(Testing::FixedLeaseRoster { { "other" } }, token, Worker(), Noon());
         REQUIRE_FALSE(refusal.has_value());
         CHECK(refusal.error().reason == LeaseRefusalReason::Unauthorized);
     }
@@ -211,7 +230,7 @@ TEST_CASE("A forged or tampered lease is refused and tells the forger nothing", 
         // What an old launcher presents: the bare serial the scheduler used to hand
         // out. Refused by name, so the client compiles locally rather than being
         // dropped -- a close is indistinguishable from a network fault.
-        auto const refusal = VerifyLeaseToken(key, "17", Worker(), Noon());
+        auto const refusal = VerifyLeaseToken(roster, "17", Worker(), Noon());
         REQUIRE_FALSE(refusal.has_value());
         CHECK(refusal.error().reason == LeaseRefusalReason::Malformed);
 
@@ -225,59 +244,62 @@ TEST_CASE("A forged or tampered lease is refused and tells the forger nothing", 
 
 TEST_CASE("A lease minted for one worker does not authorize another", "[distributed][lease][token]")
 {
-    auto const key = Key();
-    auto const token = MintLeaseToken(key, Grant("10.0.0.7:6675"));
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const token = MintLeaseToken(signer, Grant("10.0.0.7:6675"));
 
-    // The replay the endpoint is inside the MAC for: a token captured on the way to
-    // one machine, presented to another that trusts the same key.
-    auto const refusal = VerifyLeaseToken(key, token, Worker("10.0.0.8:6675"), Noon());
+    // The replay the endpoint is inside the signature for: a token captured on the way to
+    // one machine, presented to another that trusts the same roster.
+    auto const refusal = VerifyLeaseToken(roster, token, Worker("10.0.0.8:6675"), Noon());
     REQUIRE_FALSE(refusal.has_value());
     CHECK(refusal.error().reason == LeaseRefusalReason::EndpointMismatch);
 
     // Named, and it NAMES BOTH -- because the overwhelmingly common cause is not a
     // replay but a worker registered under an address clients do not dial. Reported
-    // only because the MAC already verified, which is what keeps it a diagnostic
+    // only because the signature already verified, which is what keeps it a diagnostic
     // rather than an oracle.
     CHECK(refusal.error().detail.contains("10.0.0.7:6675"));
     CHECK(refusal.error().detail.contains("10.0.0.8:6675"));
     CHECK(DescribeLeaseRefusal(refusal.error().reason).code == CompileCacheWire::ErrorCode::LeaseEndpointMismatch);
 }
 
-TEST_CASE("The endpoint is inside the MAC, not merely beside it", "[distributed][lease][token]")
+TEST_CASE("The endpoint is inside the signature, not merely beside it", "[distributed][lease][token]")
 {
     // The test that actually pins the design, and the one the obvious
     // wrong-endpoint case does NOT: that one is answered by comparing the
     // cleartext endpoint, so it passes just as happily with the endpoint left out
-    // of the MAC entirely. This one rewrites the endpoint to the attacker's own
-    // worker -- the exact replay a captured grant enables -- and requires the tag
-    // to fail. Drop `claims.endpoint` from the packed claims and only this case
-    // goes red.
-    auto const key = Key();
-    auto const token = MintLeaseToken(key, Grant("10.0.0.7:6675"));
+    // of the signed claims entirely. This one rewrites the endpoint to the attacker's
+    // own worker -- the exact replay a captured grant enables -- and requires the
+    // signature to fail. Drop `claims.endpoint` from the packed claims and only this
+    // case goes red.
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const token = MintLeaseToken(signer, Grant("10.0.0.7:6675"));
     auto const rewritten = Substitute(token, "10.0.0.7:6675", "10.0.0.8:6675");
 
-    auto const refusal = VerifyLeaseToken(key, rewritten, Worker("10.0.0.8:6675"), Noon());
+    auto const refusal = VerifyLeaseToken(roster, rewritten, Worker("10.0.0.8:6675"), Noon());
     REQUIRE_FALSE(refusal.has_value());
     CHECK(refusal.error().reason == LeaseRefusalReason::Unauthorized);
 }
 
-TEST_CASE("The key and the expiry are inside the MAC too", "[distributed][lease][token]")
+TEST_CASE("The key and the expiry are inside the signature too", "[distributed][lease][token]")
 {
     // Same argument, for the two fields nothing else here would notice. A worker
     // checks the endpoint and the fingerprint against itself; it has no
     // independent opinion about which object key a grant covers, so if the key
-    // left the MAC a single lease would authorize compiling anything at all.
-    auto const key = Key();
-    auto const token = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc"));
+    // left the signed claims a single lease would authorize compiling anything at all.
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const token = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc"));
 
-    auto const otherKey = VerifyLeaseToken(key, Substitute(token, "obj-abc", "obj-xyz"), Worker(), Noon());
+    auto const otherKey = VerifyLeaseToken(roster, Substitute(token, "obj-abc", "obj-xyz"), Worker(), Noon());
     REQUIRE_FALSE(otherKey.has_value());
     CHECK(otherKey.error().reason == LeaseRefusalReason::Unauthorized);
 
-    // And the expiry, whose last byte is the one just before the tag's length
-    // prefix: an attacker who could move it would hold a grant that never lapses.
-    auto const moved = FlipByteAt(token, EnvelopeSize(token) - Sha256::DigestSize - sizeof(std::uint32_t) - 1);
-    auto const extended = VerifyLeaseToken(key, moved, Worker(), Noon());
+    // And the expiry: an attacker who could move it would hold a grant that never lapses.
+    // Its last byte, found by splitting the envelope -- the claims no longer END with it.
+    auto const moved = FlipByteAt(token, ClaimEndOffset(token, 5));
+    auto const extended = VerifyLeaseToken(roster, moved, Worker(), Noon());
     REQUIRE_FALSE(extended.has_value());
     CHECK(extended.error().reason == LeaseRefusalReason::Unauthorized);
 }
@@ -289,10 +311,11 @@ TEST_CASE("A lease names the toolchain it was granted against", "[distributed][l
     // could perform that check, because the lease named no toolchain. The only
     // fingerprint a worker saw was the one the client stated about itself in the
     // same frame it stated the token in.
-    auto const key = Key();
-    auto const token = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64"));
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const token = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64"));
 
-    auto const refusal = VerifyLeaseToken(key, token, Worker("10.0.0.7:6675", "gcc-14-x86_64"), Noon());
+    auto const refusal = VerifyLeaseToken(roster, token, Worker("10.0.0.7:6675", "gcc-14-x86_64"), Noon());
     REQUIRE_FALSE(refusal.has_value());
     CHECK(refusal.error().reason == LeaseRefusalReason::FingerprintMismatch);
     CHECK(DescribeLeaseRefusal(refusal.error().reason).code == CompileCacheWire::ErrorCode::FingerprintMismatch);
@@ -300,13 +323,14 @@ TEST_CASE("A lease names the toolchain it was granted against", "[distributed][l
 
 TEST_CASE("A lease expires, with slack for a fleet whose clocks disagree", "[distributed][lease][token]")
 {
-    auto const key = Key();
-    auto const token = MintLeaseToken(key, Grant());
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const token = MintLeaseToken(signer, Grant());
     auto const expiry = Noon() + 10min;
 
     SECTION("before the expiry")
     {
-        CHECK(VerifyLeaseToken(key, token, Worker(), expiry - 1s).has_value());
+        CHECK(VerifyLeaseToken(roster, token, Worker(), expiry - 1s).has_value());
     }
 
     SECTION("inside the slack a skewed clock needs")
@@ -315,12 +339,12 @@ TEST_CASE("A lease expires, with slack for a fleet whose clocks disagree", "[dis
         // exists for, and it is the ordinary state of a fleet where not every host
         // is NTP-managed. Refusing here would refuse legitimate compiles on exactly
         // the machines nobody is watching.
-        CHECK(VerifyLeaseToken(key, token, Worker(), expiry + LeaseTokenClockSkewSlack - 1s).has_value());
+        CHECK(VerifyLeaseToken(roster, token, Worker(), expiry + LeaseTokenClockSkewSlack - 1s).has_value());
     }
 
     SECTION("past the expiry and the slack")
     {
-        auto const refusal = VerifyLeaseToken(key, token, Worker(), expiry + LeaseTokenClockSkewSlack + 1s);
+        auto const refusal = VerifyLeaseToken(roster, token, Worker(), expiry + LeaseTokenClockSkewSlack + 1s);
         REQUIRE_FALSE(refusal.has_value());
         CHECK(refusal.error().reason == LeaseRefusalReason::Expired);
         CHECK(DescribeLeaseRefusal(refusal.error().reason).code == CompileCacheWire::ErrorCode::LeaseExpired);
@@ -332,7 +356,7 @@ TEST_CASE("A lease expires, with slack for a fleet whose clocks disagree", "[dis
 
     SECTION("the slack is a parameter, so a caller may tighten it")
     {
-        CHECK_FALSE(VerifyLeaseToken(key, token, Worker(), expiry + 1s, 0s).has_value());
+        CHECK_FALSE(VerifyLeaseToken(roster, token, Worker(), expiry + 1s, 0s).has_value());
     }
 
     SECTION("a verifier whose own clock reads before the epoch does not overflow")
@@ -347,37 +371,40 @@ TEST_CASE("A lease expires, with slack for a fleet whose clocks disagree", "[dis
         // the correct one -- a clock this far behind has not reached any expiry.
         auto const farFuture =
             std::chrono::system_clock::time_point { std::chrono::milliseconds { Detail::MaxExpiryMillis } };
-        auto const distant = MintLeaseToken(key,
+        auto const distant = MintLeaseToken(signer,
                                             LeaseClaims { .serial = "17",
                                                           .endpoint = "10.0.0.7:6675",
                                                           .fingerprint = "clang-19-x86_64",
                                                           .key = "obj-abc",
                                                           .expiresAt = farFuture,
-                                                          .clusterId = std::string { TestCluster } });
+                                                          .clusterId = std::string { TestCluster },
+                                                          .epoch = 0,
+                                                          .signer = {} });
 
         auto const preEpoch = std::chrono::system_clock::time_point {} - 24h;
-        CHECK(VerifyLeaseToken(key, distant, Worker(), preEpoch).has_value());
+        CHECK(VerifyLeaseToken(roster, distant, Worker(), preEpoch).has_value());
     }
 }
 
-TEST_CASE("A grant from another fleet sharing the key is refused", "[distributed][lease][token]")
+TEST_CASE("A grant from another fleet sharing a voter is refused", "[distributed][lease][token]")
 {
-    // #322's whole scenario, and the reason it is not exotic: two clusters
-    // provisioned from the same `--cluster-key-file` is what copying a working
-    // configuration to a second site produces, or cloning staging from production.
-    // The MAC verifies, the endpoint matches, the fingerprint matches and the expiry
-    // is in the future -- so before the cluster id went inside the MAC, cluster B's
-    // worker compiled work leased by a scheduler that was not its own.
-    auto const key = Key();
-    auto const foreign = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", OtherCluster));
+    // #322's whole scenario, and the reason it is not exotic: two clusters whose rosters
+    // name the same voter is what copying a working state directory to a second site
+    // produces, or cloning staging from production. The signature verifies, the
+    // endpoint matches, the fingerprint matches and the expiry is in the future -- so
+    // without the cluster id inside the signed claims, cluster B's worker would compile
+    // work leased by a scheduler that was not its own.
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const foreign = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", OtherCluster));
 
-    auto const refusal = VerifyLeaseToken(key, foreign, Worker(), Noon());
+    auto const refusal = VerifyLeaseToken(roster, foreign, Worker(), Noon());
     REQUIRE_FALSE(refusal.has_value());
     CHECK(refusal.error().reason == LeaseRefusalReason::ClusterMismatch);
 
     // Both fleets named, because the operator action is to look at two configurations
-    // and find out which one is wrong. This is reported only AFTER the MAC verified,
-    // so it tells a forger nothing it did not already hand over.
+    // and find out which one is wrong. This is reported only AFTER the signature
+    // verified, so it tells a forger nothing it did not already hand over.
     CHECK(refusal.error().detail.contains(OtherCluster));
     CHECK(refusal.error().detail.contains(TestCluster));
 }
@@ -388,10 +415,11 @@ TEST_CASE("Two nodes that name no cluster still agree", "[distributed][lease][to
     // EQUALITY rather than for presence, so "neither named one" is a match -- a rule
     // spelled as "the grant must name a cluster" would refuse every node that never
     // configured one.
-    auto const key = Key();
-    auto const grant = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", ""));
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const grant = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", ""));
 
-    CHECK(VerifyLeaseToken(key, grant, Worker("10.0.0.7:6675", "clang-19-x86_64", ""), Noon()).has_value());
+    CHECK(VerifyLeaseToken(roster, grant, Worker("10.0.0.7:6675", "clang-19-x86_64", ""), Noon()).has_value());
 }
 
 TEST_CASE("A legitimate scheduler reset is adopted rather than refused", "[distributed][lease][token][epoch]")
@@ -402,15 +430,16 @@ TEST_CASE("A legitimate scheduler reset is adopted rather than refused", "[distr
     // the right scheduler -- authenticity was never the issue -- and until #614 a
     // monotonic maximum had no way to express it, so every worker that had learned a
     // higher term refused every grant until its process was restarted.
-    auto const key = Key();
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
 
     KnownSchedulerTerm term;
     REQUIRE(term.Learn(7).transition == TermTransition::Advanced);
 
-    // A scheduler that has genuinely reset mints at term 0. `StandaloneSchedulerTerm`
-    // is literally 0, so this is also exactly what turning consensus OFF produces.
-    auto const afterReset = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 0));
-    CHECK(VerifyLeaseToken(key, afterReset, Worker(), Noon()).has_value());
+    // A scheduler that has genuinely reset mints at term 0 -- the term a fresh cluster's
+    // first leader has not yet left.
+    auto const afterReset = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 0));
+    CHECK(VerifyLeaseToken(roster, afterReset, Worker(), Noon()).has_value());
 
     // And the worker ADOPTS it, so the fleet keeps working with no restart anywhere.
     // The transition is reported to the caller that performed it, which is what makes
@@ -435,13 +464,14 @@ TEST_CASE("The term check that used to stand here was exactly inverted across a 
     // Pinned as the pair, because either half alone reads as an ordinary policy choice
     // and only together do they show the inversion. Both are now decided by
     // `SpentLeases`, which answers the question the term was standing in for.
-    auto const key = Key();
-    auto const fresh = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 0));
-    auto const captured = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 7));
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const fresh = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 0));
+    auto const captured = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 7));
 
     // Both authenticate; the term decides nothing here any more.
-    CHECK(VerifyLeaseToken(key, fresh, Worker(), Noon()).has_value());
-    CHECK(VerifyLeaseToken(key, captured, Worker(), Noon()).has_value());
+    CHECK(VerifyLeaseToken(roster, fresh, Worker(), Noon()).has_value());
+    CHECK(VerifyLeaseToken(roster, captured, Worker(), Noon()).has_value());
 
     // What separates them now is whether they have been spent, and that is a property
     // of the token rather than of the era it was minted in.
@@ -460,9 +490,10 @@ TEST_CASE("A grant is spendable exactly once", "[distributed][lease][token][repl
     // nothing said so, which meant a captured grant was replayable at its worker until
     // it expired.
     SpentLeases spent;
-    auto const key = Key();
-    auto const grant = MintLeaseToken(key, Grant());
-    auto const other = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-def"));
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const grant = MintLeaseToken(signer, Grant());
+    auto const other = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-def"));
 
     CHECK(spent.Spend(grant, Noon() + 10min, Noon()));
     CHECK_FALSE(spent.Spend(grant, Noon() + 10min, Noon()));
@@ -488,8 +519,9 @@ TEST_CASE("A spent grant stays spent for as long as it stays acceptable", "[dist
     //
     // Found reviewing the first version of this file, which pruned on `expiresAt` alone.
     SpentLeases spent;
-    auto const key = Key();
-    auto const grant = MintLeaseToken(key, Grant());
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const grant = MintLeaseToken(signer, Grant());
     auto const expiry = Noon() + 10min;
 
     REQUIRE(spent.Spend(grant, expiry, Noon()));
@@ -497,17 +529,17 @@ TEST_CASE("A spent grant stays spent for as long as it stays acceptable", "[dist
     // Past the expiry and inside the slack: the verifier still accepts it, so the spend
     // must still hold. Both halves asserted -- without the first, this would pass
     // against a verifier that had stopped accepting it, which is a different fix.
-    REQUIRE(VerifyLeaseToken(key, grant, Worker(), expiry + 1min).has_value());
+    REQUIRE(VerifyLeaseToken(roster, grant, Worker(), expiry + 1min).has_value());
     CHECK_FALSE(spent.Spend(grant, expiry, expiry + 1min));
 
     // At the far edge, where `age > slack` is still false.
-    REQUIRE(VerifyLeaseToken(key, grant, Worker(), expiry + LeaseTokenClockSkewSlack).has_value());
+    REQUIRE(VerifyLeaseToken(roster, grant, Worker(), expiry + LeaseTokenClockSkewSlack).has_value());
     CHECK_FALSE(spent.Spend(grant, expiry, expiry + LeaseTokenClockSkewSlack));
 
     // One second past it the verifier refuses the token outright, so the entry has no
     // work left to do and is dropped. That is the BOUND rather than a hole, and
     // asserting it is what stops the fix above from becoming "keep everything forever".
-    REQUIRE_FALSE(VerifyLeaseToken(key, grant, Worker(), expiry + LeaseTokenClockSkewSlack + 1s).has_value());
+    REQUIRE_FALSE(VerifyLeaseToken(roster, grant, Worker(), expiry + LeaseTokenClockSkewSlack + 1s).has_value());
     CHECK(spent.Spend(grant, expiry, expiry + LeaseTokenClockSkewSlack + 1s));
 }
 
@@ -518,13 +550,14 @@ TEST_CASE("The spent set is bounded by the grants' own expiry", "[distributed][l
     // `Spend` rather than kept. A worker with no traffic has nothing to prune, and one
     // with traffic prunes as it goes.
     SpentLeases spent;
-    auto const key = Key();
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
 
     for (auto const index: std::views::iota(0, 8))
     {
         auto claims = Grant();
         claims.serial = std::format("l{}", index);
-        CHECK(spent.Spend(MintLeaseToken(key, claims), Noon() + 10min, Noon()));
+        CHECK(spent.Spend(MintLeaseToken(signer, claims), Noon() + 10min, Noon()));
     }
     CHECK(spent.Size() == 8);
 
@@ -532,7 +565,7 @@ TEST_CASE("The spent set is bounded by the grants' own expiry", "[distributed][l
     auto later = Grant();
     later.serial = "l99";
     later.expiresAt = Noon() + 1h;
-    CHECK(spent.Spend(MintLeaseToken(key, later), Noon() + 1h, Noon() + 30min));
+    CHECK(spent.Spend(MintLeaseToken(signer, later), Noon() + 1h, Noon() + 30min));
     CHECK(spent.Size() == 1);
 }
 
@@ -598,60 +631,63 @@ TEST_CASE("A worker adopts the term of the last authentic grant, in either direc
 TEST_CASE("A verifier accepts a grant from any term", "[distributed][lease][token]")
 {
     // The term decides nothing at verification since #614. It is carried, it is inside
-    // the MAC, and it is adopted -- but a worker never refuses on it, because a lower
+    // the signature, and it is adopted -- but a worker never refuses on it, because a lower
     // term is a scheduler that was legitimately reset and nothing in a token can tell
     // that from a replay. What tells them apart is whether the grant has been spent.
     //
     // Pinned across the whole range rather than at one value, because the defect this
     // replaces was a COMPARISON (`claimed >= expected`) and a comparison mistake lives
     // at a boundary.
-    auto const key = Key();
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
     for (auto const epoch: { std::uint64_t { 0 }, std::uint64_t { 1 }, std::uint64_t { 9'999 } })
     {
         INFO("epoch " << epoch);
-        auto const grant = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, epoch));
-        CHECK(VerifyLeaseToken(key, grant, Worker(), Noon()).has_value());
+        auto const grant = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, epoch));
+        CHECK(VerifyLeaseToken(roster, grant, Worker(), Noon()).has_value());
     }
 }
 
-TEST_CASE("The cluster and the epoch are inside the MAC, not beside it", "[distributed][lease][token]")
+TEST_CASE("The cluster and the epoch are inside the signature, not beside it", "[distributed][lease][token]")
 {
     // The property the whole ticket rests on: an attacker holding a token cannot edit
     // either field, because both are covered. Asserted by MINTING two grants that
-    // differ only in those fields and checking the tags differ -- a field that were
-    // merely carried would produce the same tag twice, which is what "beside it" would
-    // look like and would pass every functional case above.
-    auto const key = Key();
-    auto const base = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 7));
-    auto const otherCluster = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", OtherCluster, 7));
-    auto const otherEpoch = MintLeaseToken(key, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 8));
+    // differ only in those fields and checking the tokens differ -- a field that were
+    // merely carried would produce the same signature twice, which is what "beside it"
+    // would look like and would pass every functional case above.
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const base = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 7));
+    auto const otherCluster = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", OtherCluster, 7));
+    auto const otherEpoch = MintLeaseToken(signer, Grant("10.0.0.7:6675", "clang-19-x86_64", "obj-abc", TestCluster, 8));
 
     CHECK(base != otherCluster);
     CHECK(base != otherEpoch);
     CHECK(otherCluster != otherEpoch);
 }
 
-TEST_CASE("A version-1 token no longer authenticates", "[distributed][lease][token]")
+TEST_CASE("A version-2 token no longer authenticates", "[distributed][lease][token]")
 {
-    // The cost of covering two more fields, stated rather than discovered. Every
-    // outstanding grant minted by an older build stops verifying, which is exactly why
-    // #322 argued for doing this while the format is new: after a fleet is deployed it
-    // is a flag day, and nothing is deployed.
+    // The cost of moving the signature from the cluster key to the issuing voter's own key
+    // (#178), stated rather than discovered: every outstanding grant minted by an older build
+    // stops verifying. Nothing is deployed that it matters to, and the version is what makes
+    // the refusal say so.
     //
-    // Refused as `Malformed` rather than `Unauthorized`, which is the version field
-    // doing its job: the arity differs, so without it the fields would decode as
-    // *something* and the refusal would name the wrong problem.
-    CHECK(LeaseTokenVersion == 2);
+    // Refused as `Malformed` rather than `Unauthorized`, which is the version field doing its
+    // job -- and asked BEFORE the signature, so a version-2 token carrying a genuine version-3
+    // signature over its own bytes is refused for its version and nothing else.
+    CHECK(LeaseTokenVersion == 3);
 
-    auto const key = Key();
-    auto const claims = Grant();
-    auto const packedV1 = Detail::PackClaims(1, claims);
-    auto const tag =
-        Cluster::SignFields(key, Cluster::SigningDomain::LeaseToken, { std::span<std::byte const> { packedV1 } });
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto claims = Grant();
+    claims.signer = std::string { signer.SignerId() };
+    auto const packedV2 = Detail::PackClaims(2, claims);
+    auto const signature = signer.Sign(Detail::SignedLeaseMessage(packedV2));
     auto const envelope =
-        WireFields::Encode({ std::span<std::byte const> { packedV1 }, std::span<std::byte const> { tag } });
+        WireFields::Encode({ std::span<std::byte const> { packedV2 }, std::span<std::byte const> { signature } });
 
-    auto const refusal = AuthenticateLeaseToken(key, Base64Encode(envelope));
+    auto const refusal = AuthenticateLeaseToken(roster, Base64Encode(envelope));
     REQUIRE_FALSE(refusal.has_value());
     CHECK(refusal.error() == LeaseRefusalReason::Malformed);
 }
@@ -740,72 +776,77 @@ TEST_CASE("The claim fields are framed, not joined", "[distributed][lease][token
     // value. Joined by one, `{endpoint="a", key="b:1"}` and `{endpoint="a:b",
     // key="1"}` would authenticate identically -- so a lease for one worker would
     // be a valid lease for another, which is the exact failure the endpoint is in
-    // the MAC to prevent.
-    auto const key = Key();
-    auto const left = MintLeaseToken(key, Grant("a", "f", "b:1"));
-    auto const right = MintLeaseToken(key, Grant("a:b", "f", "1"));
+    // the signature to prevent.
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const left = MintLeaseToken(signer, Grant("a", "f", "b:1"));
+    auto const right = MintLeaseToken(signer, Grant("a:b", "f", "1"));
     CHECK(left != right);
 
     // And neither authenticates as the other, which is the property that matters
     // rather than the strings differing.
-    CHECK_FALSE(VerifyLeaseToken(key, left, Worker("a:b", "f"), Noon()).has_value());
-    CHECK_FALSE(VerifyLeaseToken(key, right, Worker("a", "f"), Noon()).has_value());
+    CHECK_FALSE(VerifyLeaseToken(roster, left, Worker("a:b", "f"), Noon()).has_value());
+    CHECK_FALSE(VerifyLeaseToken(roster, right, Worker("a", "f"), Noon()).has_value());
 }
 
-TEST_CASE("A node proof is not a lease, under the same key", "[distributed][lease][token]")
+TEST_CASE("A signature over the claims without the lease's label is not a lease", "[distributed][lease][token]")
 {
-    // The cluster's pre-shared key also MACs a node's proof on the `0xFC` surface (#1428).
-    // One key serving two constructions is how a tag produced for one purpose comes to be
-    // accepted for the other, so every lease message is prefixed with its own domain label.
-    // (This case paired the lease with the DISCOVERY proof until #178 moved that proof to each
-    // node's own key; the node proof is the construction still sharing the lease's key.)
-    auto const key = Key();
-    auto const challenge = std::array<std::byte, 16> {};
-    auto const proof = MintNodeProof(key, challenge, "n1");
+    // A node's identity key signs more than grants: every Raft handshake transcript and every
+    // roster endorsement too (#178). One key serving several constructions is how a signature
+    // produced for one comes to be accepted for another, so a grant's message starts with its
+    // own label. A signature over the bare packed claims -- what a construction with no label,
+    // or another's, would produce -- verifies under the right key and is still no grant.
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto claims = Grant();
+    claims.signer = std::string { signer.SignerId() };
+    auto const packed = Detail::PackClaims(LeaseTokenVersion, claims);
 
-    // The tag alone, and the tag inside something shaped like an envelope, are both
-    // refused -- the first as malformed, the second because the label is not in it.
-    auto const bare = Base64Encode(std::span<std::byte const> { proof });
-    CHECK_FALSE(VerifyLeaseToken(key, bare, Worker(), Noon()).has_value());
+    auto const envelopeOver = [&packed](std::span<std::byte const> message, Ed25519KeyPair const& key) {
+        auto const signature = key.Sign(message);
+        return Base64Encode(
+            WireFields::Encode({ std::span<std::byte const> { packed }, std::span<std::byte const> { signature } }));
+    };
 
-    // The seam-level property -- one field list, two domains, two tags -- is
-    // `ClusterSigning_test.cpp`'s and is deliberately not restated here. This case
-    // asserts the protocol-level consequence with a real proof and a real token,
-    // which is the part `LeaseToken` owns.
+    auto const unlabelled = AuthenticateLeaseToken(roster, envelopeOver(packed, Testing::TestKeyPair("scheduler")));
+    REQUIRE_FALSE(unlabelled.has_value());
+    CHECK(unlabelled.error() == LeaseRefusalReason::Unauthorized);
+
+    // The control, built the same way with the label: accepted, so the refusal above is the
+    // label's and not the helper's.
+    CHECK(AuthenticateLeaseToken(roster, envelopeOver(Detail::SignedLeaseMessage(packed), Testing::TestKeyPair("scheduler")))
+              .has_value());
 }
 
-TEST_CASE("Moving the lease onto the shared seam changed none of its bytes", "[distributed][lease][token]")
+TEST_CASE("A grant's signature is Ed25519 over the lease label and the claims as packed", "[distributed][lease][token]")
 {
-    // The one thing a consolidation must be able to say for itself. The lease
-    // already carried `fastcache-lease-v1` ahead of its packed claims, so routing
-    // it through `Cluster::SignFields` had to reproduce that message exactly --
-    // and "the tests still pass" cannot show it, because the tests moved with the
-    // code. The pre-seam construction is therefore written out here as a literal:
-    // `HmacSha256` over `Encode({ "fastcache-lease-v1", packedClaims })`, with the
-    // label spelled rather than read from the table it now lives in.
-    auto const key = Key();
-    auto const token = MintLeaseToken(key, Grant());
+    // The construction, written out with the label SPELLED rather than read from the constant
+    // it lives in: a change to either is a change to what every worker verifies, and the tests
+    // moving with the code cannot show that. Verified under the signer's own public key, which
+    // is what a worker's roster holds for it.
+    auto const signer = Testing::TestLeaseSigner();
+    auto const token = MintLeaseToken(signer, Grant());
 
     auto const decoded = Unwrap(Base64Decode(token));
     auto const outer = Unwrap(WireFields::SplitExactly(AsBytes(decoded), 2));
     auto const packed = outer[0];
-    auto const tag = outer[1];
+    auto const presented = outer[1];
 
-    auto const preSeam = HmacSha256(key, WireFields::Encode({ AsBytes(std::string_view { "fastcache-lease-v1" }), packed }));
-
-    REQUIRE(tag.size() == Sha256::DigestSize);
-    Sha256::Digest presented {};
-    std::ranges::copy(tag, presented.begin());
-    CHECK(ConstantTimeEquals(preSeam, presented));
+    REQUIRE(presented.size() == Ed25519SignatureBytes);
+    Ed25519Signature signature {};
+    std::ranges::copy(presented, signature.begin());
+    auto const message = WireFields::Encode({ AsBytes(std::string_view { "fastcache-lease-v3" }), packed });
+    CHECK(Ed25519Verify(signer.PublicKey(), message, signature));
 }
 
 TEST_CASE("A malformed token is refused rather than partly believed", "[distributed][lease][token]")
 {
-    auto const key = Key();
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
 
     /// Assert that @p token is refused as malformed.
     auto const refusedAsMalformed = [&](std::string_view token) {
-        auto const refusal = VerifyLeaseToken(key, token, Worker(), Noon());
+        auto const refusal = VerifyLeaseToken(roster, token, Worker(), Noon());
         REQUIRE_FALSE(refusal.has_value());
         CHECK(refusal.error().reason == LeaseRefusalReason::Malformed);
     };
@@ -830,7 +871,7 @@ TEST_CASE("A malformed token is refused rather than partly believed", "[distribu
         // The version is a field of its own precisely so this is a refusal by name
         // rather than a mis-parse: the fields are length-prefixed, so a different
         // arity would otherwise decode as *something*.
-        refusedAsMalformed(Overwrite(MintLeaseToken(key, Grant()), VersionByteOffset, LeaseTokenVersion + 1));
+        refusedAsMalformed(Overwrite(MintLeaseToken(signer, Grant()), VersionByteOffset, LeaseTokenVersion + 1));
     }
 }
 
@@ -839,31 +880,65 @@ TEST_CASE("Authentication alone answers the scheduler's question", "[distributed
     // What `SchedulerService::Release` needs: the scheduler is not a worker, so the
     // endpoint and fingerprint a grant names are not facts about it -- but the
     // serial inside is what resolves the lease.
-    auto const key = Key();
-    auto const token = MintLeaseToken(key, Grant());
+    auto const signer = Testing::TestLeaseSigner();
+    Testing::FixedLeaseRoster const roster;
+    auto const token = MintLeaseToken(signer, Grant());
 
-    auto const authentic = AuthenticateLeaseToken(key, token);
+    auto const authentic = AuthenticateLeaseToken(roster, token);
     REQUIRE(authentic.has_value());
     CHECK(authentic->serial == "17");
 
-    auto const wrongKey = AuthenticateLeaseToken(Key(0x11), token);
+    auto const wrongKey = AuthenticateLeaseToken(Testing::FixedLeaseRoster { { "other" } }, token);
     REQUIRE_FALSE(wrongKey.has_value());
     CHECK(wrongKey.error() == LeaseRefusalReason::Unauthorized);
 }
 
-TEST_CASE("An empty key authenticates nothing", "[distributed][lease][token]")
+TEST_CASE("A grant signed by a key the cluster revoked is refused by name", "[distributed][lease][token][roster]")
 {
-    // An empty HMAC key is a perfectly valid HMAC key, which is the trap: without a
-    // guard, two nodes that both failed to load their key file would verify each
-    // other's tokens and call it authentication. A caller that legitimately runs
-    // without a key decides in the open that it is not checking; it does not get
-    // there by passing nothing.
-    auto const unsignedToken = MintLeaseToken({}, Grant());
-    auto const refusal = AuthenticateLeaseToken({}, unsignedToken);
-    REQUIRE_FALSE(refusal.has_value());
-    CHECK(refusal.error() == LeaseRefusalReason::Unauthorized);
+    // The removed machine itself, still minting (#178). Its signature verifies -- it still
+    // holds its key -- so this is not a forgery, and the refusal says so: `SignerRevoked`,
+    // on `LeaseUnauthorized`'s wire code because the client's answer is the same, and on a
+    // counter of its own because the operator's is not.
+    auto const signer = Testing::TestLeaseSigner("n1");
+    Testing::FixedLeaseRoster roster { { "n1" } };
+    auto const token = MintLeaseToken(signer, Grant());
+    REQUIRE(AuthenticateLeaseToken(roster, token).has_value());
 
-    // And a real key does not accept it either, so nothing minted without a secret
-    // is ever good anywhere.
-    CHECK_FALSE(AuthenticateLeaseToken(Key(), unsignedToken).has_value());
+    roster.Revoke("n1");
+    auto const refusal = VerifyLeaseToken(roster, token, Worker(), Noon());
+    REQUIRE_FALSE(refusal.has_value());
+    CHECK(refusal.error().reason == LeaseRefusalReason::SignerRevoked);
+    CHECK(DescribeLeaseRefusal(LeaseRefusalReason::SignerRevoked).code
+          == DescribeLeaseRefusal(LeaseRefusalReason::Unauthorized).code);
+    CHECK(DescribeLeaseRefusal(LeaseRefusalReason::SignerRevoked).workerCounter
+          != DescribeLeaseRefusal(LeaseRefusalReason::Unauthorized).workerCounter);
+
+    // Named whatever id the grant CLAIMS: the id only selects a key, and a revocation's id
+    // is a label, so the revoked key signing as a member in good standing is still named.
+    auto const impostor = KeyPairLeaseSigner { "n2", Testing::TestKeyPair("n1") };
+    Testing::FixedLeaseRoster withN2 { { "n2" }, { "n1" } };
+    auto const disguised = AuthenticateLeaseToken(withN2, MintLeaseToken(impostor, Grant()));
+    REQUIRE_FALSE(disguised.has_value());
+    CHECK(disguised.error() == LeaseRefusalReason::SignerRevoked);
+}
+
+TEST_CASE("A grant is signed by a voter, and names it", "[distributed][lease][token][roster]")
+{
+    // The signer claim is inside the signature: rewritten to another voter's id of the same
+    // length, the grant verifies under neither. And a machine the roster names but does not
+    // count as a voter -- or does not name at all -- signs nothing a worker accepts.
+    auto const signer = Testing::TestLeaseSigner("scheduler");
+    auto const token = MintLeaseToken(signer, Grant());
+    auto const authentic = AuthenticateLeaseToken(Testing::FixedLeaseRoster { { "scheduler" } }, token);
+    REQUIRE(authentic.has_value());
+    CHECK(authentic->signer == "scheduler");
+
+    Testing::FixedLeaseRoster const both { { "scheduler", "schedulex" } };
+    auto const renamed = AuthenticateLeaseToken(both, Substitute(token, "scheduler", "schedulex"));
+    REQUIRE_FALSE(renamed.has_value());
+    CHECK(renamed.error() == LeaseRefusalReason::Unauthorized);
+
+    auto const stranger = AuthenticateLeaseToken(Testing::FixedLeaseRoster { { "n1" } }, token);
+    REQUIRE_FALSE(stranger.has_value());
+    CHECK(stranger.error() == LeaseRefusalReason::Unauthorized);
 }

@@ -180,6 +180,10 @@ admin_port="$(free_port)"
 # second `worker_port` here for the dedicated compile listener, which no longer
 # exists.
 sched_port="$(free_port)"
+# A scheduler is a consensus member even alone (#178): it signs every lease with its
+# identity key, so it keeps one in a state directory and runs a cluster of one. Its
+# consensus port is bound to loopback, where nothing else dials it.
+raft_port="$(free_port)"
 readonly TOKEN="dashboard-e2e-secret-token"
 printf '%s\n' "$TOKEN" > "${workdir}/token"
 
@@ -206,6 +210,9 @@ tls_args=()
     --advertise "127.0.0.1:${sched_port}" \
     --serve-scheduler \
     --listen-node "127.0.0.1:${sched_port}" \
+    --listen-raft "127.0.0.1:${raft_port}" \
+    --raft-self 127.0.0.1 \
+    --cluster-dir "${workdir}/state" \
     --fleet-open \
     --cluster-key-file "$cluster_key" \
     --admin-listen "$admin_port" \
@@ -232,6 +239,11 @@ node_pid=$!
 # below fails loudly if it lands early: an unanswered request is an empty body,
 # not a wrong one.
 wait_for_node_ready 127.0.0.1 "$admin_port" "$node_pid" "the node's admin surface" "${workdir}/node.log"
+
+# And LEADING. A scheduler is a cluster of one since #178, and the page is the leader's:
+# until that one-member election completes, /fleet answers 503 naming no leader, which the
+# assertions below would read as a broken page. Waited for as the fact, never as a delay.
+wait_for_log "consensus: this node is now the leader" "$node_pid" "the node" "${workdir}/node.log"
 
 # ---------------------------------------------------------------- 2. /metrics
 # First, because it is the assertion that protects every existing deployment: the
@@ -356,6 +368,16 @@ for auth in "Bearer ${TOKEN}" "Basic ${basic_value}"; do
 done
 
 # ------------------------------------------------------- 1, 4, 5. the document
+# The charts are drawn from the leader's own samples, taken once a minute WHILE it leads
+# (`FleetSampler`). A scheduler running no consensus led from its first instant and so
+# sampled at startup; since #178 it wins a one-member election first, and its first sample
+# lands up to a minute later -- which the page itself says, in as many words. So the page
+# is waited for until it has something to draw, bounded, rather than read once.
+page_has_charts() {
+    page="$(dash_get "$admin_port" /fleet "Bearer ${TOKEN}")"
+    [[ "$page" == *'/fleet/chart/dispatched.svg?range=24h'* ]]
+}
+wait_until page_has_charts "the leader's first fleet sample to reach /fleet"     "$node_pid" "${workdir}/node.log" 150
 page="$(dash_get "$admin_port" /fleet "Bearer ${TOKEN}")"
 [[ "$page" == *Content-Type:\ text/html* ]] || fail "/fleet did not answer HTML"
 [[ "$page" == *'<!doctype html>'* ]] || fail "/fleet answered HTML without a doctype"

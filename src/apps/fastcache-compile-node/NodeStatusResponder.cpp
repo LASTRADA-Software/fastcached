@@ -507,6 +507,21 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     if (_sources.conditions != nullptr)
         fields.runtime.conditions = _sources.conditions->Snapshot();
 
+    // The roster, when this node holds one (#178). Its lapse travels as an INSTANT rather than a
+    // countdown, so a reader far from this node renders it against its own clock and a copy
+    // taken a minute ago still says when it lapses rather than how long it had then.
+    if (auto const summary = _sources.roster != nullptr ? _sources.roster->Summary() : std::nullopt)
+        fields.runtime.roster = CompileCacheWire::NodeRosterFields {
+            .version = summary->version,
+            .voters = summary->voters,
+            .principals = summary->principals,
+            .revoked = summary->revoked,
+            .certifiedUntilMillis = summary->certifiedUntil.transform([](std::chrono::system_clock::time_point until) {
+                return static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(until.time_since_epoch()).count());
+            }),
+        };
+
     for (auto const& mapping: mappings)
     {
         // **A surface the configuration does not resolve is ABSENT, never a zero port.**

@@ -179,6 +179,11 @@ if (-not $SelfTest -and $BasePort -eq 0) { $BasePort = Get-FreePortBlock $PortsN
 $cachePort    = $BasePort
 $dispatchPort = $BasePort + 1
 $workerPort   = $BasePort + 2
+# Each scheduler's consensus port (#178): a scheduler is a cluster of one, bound to
+# loopback where nothing dials it. +6 and +7 were free since the dedicated compile port
+# went.
+$schedRaftPort = $BasePort + 6
+$isoRaftPort   = $BasePort + 7
 
 $procs = @()
 
@@ -276,6 +281,19 @@ function Wait-ForLine([string]$path, [string]$pattern, [int]$seconds, [string]$w
     }
     Write-Host (Read-LiveText $path)
     throw "$what never reported /$pattern/"
+}
+
+# The public key a scheduler will sign its leases with, minted into its state directory
+# before it starts (#178): `--print-identity` over the same consensus flags, whose
+# `public-key` line is what a worker's --voter-key takes. The start that follows reads
+# the same files back rather than minting a second identity.
+function Get-SchedulerKey([string]$stateDir, [int]$raftPort, [string]$clusterKey) {
+    $identity = & $Node --print-identity "--cluster-key-file=$clusterKey" "--listen-raft=127.0.0.1:$raftPort" `
+                        "--raft-self=127.0.0.1" "--cluster-dir=$stateDir"
+    if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint a scheduler identity in $stateDir (exit $LASTEXITCODE)" }
+    $line = @($identity) | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
+    if (-not $line) { throw "--print-identity printed no public-key line: $identity" }
+    return $line.Substring('public-key '.Length)
 }
 
 # The readiness markers, as a TABLE (#1213).
@@ -956,13 +974,12 @@ try {
         if (Test-Path $scratch) { Remove-Item -Recurse -Force $scratch }
         New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
-        # The cluster key every node here shares, and what makes this fixture's
-        # dispatch path the SIGNED one: without it the scheduler hands out bare
-        # serials and every worker runs the unchecked validator, so a run that
-        # dispatches this many compiles would exercise none of the lease check
-        # (#282). The shell twin does the same, with the same fixed text -- nothing
-        # here turns on the value, and a per-run secret would make a failure look
-        # like a flake.
+        # The cluster key every node here shares: a scheduler runs consensus, which
+        # needs it (#178). It no longer makes the dispatch path the SIGNED one -- every
+        # scheduler signs with its own identity key, and a worker CHECKS the signature
+        # when it is given that key with --voter-key, as each worker below is. The
+        # shell twin does the same, with the same fixed text -- nothing here turns on
+        # the value, and a per-run secret would make a failure look like a flake.
         $clusterKey = Join-Path $scratch "cluster.key"
         Set-Content -Path $clusterKey -Value "e2e-fixture-cluster-key-not-a-secret" -NoNewline
 
@@ -1002,11 +1019,22 @@ try {
         # One port: since #290 stage 3 the compile verbs arrive on --listen-node
         # beside the cache and scheduler verbs, so this node's worker half answers on
         # $dispatchPort too and --advertise names that. The dedicated compile port it
-        # used to open, and the $BasePort + 6 it used to take, are both gone.
+        # used to open, and the $BasePort + 6 it used to take, are both gone -- that
+        # offset is the scheduler's consensus port now.
+        #
+        # And it runs consensus, a cluster of one (#178): a scheduler signs every lease with
+        # an identity key kept in its state directory, and holds the roster its workers
+        # check those signatures against. Each worker is given its key with --voter-key,
+        # which is what puts this fixture's dispatches on the CHECKED path: a loopback
+        # worker told no voter checks no lease at all.
         $schedLog = Join-Path $scratch "scheduler.log"
+        $schedState = Join-Path $scratch "scheduler.state"
+        $schedKey = Get-SchedulerKey $schedState $schedRaftPort $clusterKey
         $scheduler = Start-Background $Node @(
             $NoLocalCache, "--cluster-key-file=$clusterKey",
             "--serve-scheduler", "--listen-node=127.0.0.1:$dispatchPort", "--fleet-open",
+            "--listen-raft=127.0.0.1:$schedRaftPort", "--raft-self=127.0.0.1",
+            "--cluster-dir=$schedState",
             "--advertise=127.0.0.1:$dispatchPort",
             "--slots=0",
             "--log-level=debug") $schedLog
@@ -1043,12 +1071,16 @@ try {
 
         $workerLog = Join-Path $scratch "worker.log"
         $worker = Start-Background $Node @(
-            $NoLocalCache, "--cluster-key-file=$clusterKey",
+            $NoLocalCache, "--cluster-key-file=$clusterKey", "--voter-key=$schedKey",
             "--scheduler=127.0.0.1:$dispatchPort", "--listen-node=127.0.0.1:$workerPort",
             "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=$workerSlots",
             "--log-level=debug") $workerLog
         $procs += $worker
         Wait-ForReady Node $workerPort $worker "worker" $workerLog
+        # A lease reaching a worker before it holds a roster is refused `roster-expired`
+        # and compiled locally, which every case below would report as a dispatch that
+        # never happened -- so nothing is dispatched until it holds one.
+        Wait-ForLine $workerLog "roster: adopted roster version" 60 "worker" | Out-Null
         $workerText = Wait-ForLine $workerLog "toolchain\(s\) registered" 120 "worker"
 
         # The worker computed its own fingerprint from a bare --toolchain. If it
@@ -1243,9 +1275,13 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         # registered with it -- and it runs no worker (`--slots=0`, #206), or it would
         # BE a matching worker and the case would pass without testing anything.
         $isoSchedLog = Join-Path $scratch "iso-scheduler.log"
+        $isoSchedState = Join-Path $scratch "iso-scheduler.state"
+        $isoSchedKey = Get-SchedulerKey $isoSchedState $isoRaftPort $clusterKey
         $isoScheduler = Start-Background $Node @(
             $NoLocalCache, "--cluster-key-file=$clusterKey",
             "--serve-scheduler", "--listen-node=127.0.0.1:$isoDispatch", "--fleet-open",
+            "--listen-raft=127.0.0.1:$isoRaftPort", "--raft-self=127.0.0.1",
+            "--cluster-dir=$isoSchedState",
             "--advertise=127.0.0.1:$isoDispatch",
             "--slots=0", "--log-level=debug") $isoSchedLog
         $procs += $isoScheduler
@@ -1253,13 +1289,14 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
 
         $isoWorkerLog = Join-Path $scratch "iso-worker.log"
         $isoNode = Start-Background $Node @(
-            $NoLocalCache, "--cluster-key-file=$clusterKey",
+            $NoLocalCache, "--cluster-key-file=$clusterKey", "--voter-key=$isoSchedKey",
             "--scheduler=127.0.0.1:$isoDispatch", "--listen-node=127.0.0.1:$isoWorker",
             "--advertise=127.0.0.1:$isoWorker",
             "--toolchain=not-the-compiler-this-client-uses=$ccPath", "--slots=2",
             "--log-level=debug") $isoWorkerLog
         $procs += $isoNode
         Wait-ForReady Node $isoWorker $isoNode "isolation worker" $isoWorkerLog
+        Wait-ForLine $isoWorkerLog "roster: adopted roster version" 60 "isolation worker" | Out-Null
         Wait-ForLine $isoWorkerLog "toolchain\(s\) registered" 120 "isolation worker" | Out-Null
 
         $isoRoot = Join-Path $scratch "iso-proj"

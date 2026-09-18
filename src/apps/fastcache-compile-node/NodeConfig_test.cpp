@@ -43,6 +43,7 @@
 #include <vector>
 
 #include <tests/PathFlagCoverage.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -117,6 +118,27 @@ constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
     // authors ever seeing it.
     cfg.advertiseExplicit = true;
     return cfg;
+}
+
+/// A voter's identity key, as `--voter-key` names it (#178): what a worker that runs no
+/// consensus, and that another machine can reach, checks that machine's grants against until
+/// it holds a roster of its own.
+/// @return The key.
+[[nodiscard]] Ed25519PublicKey AVoterKey()
+{
+    return Testing::TestKeyPair("scheduler-01.internal").PublicKey();
+}
+
+/// Make @p cfg a consensus member of a cluster of one, which is what a scheduler is since #178
+/// (`SchedulerNeedsConsensusRefusal`): the port, where a peer would dial it, the key consensus
+/// needs, and the state directory an installed one keeps its log and identity in.
+/// @param cfg The configuration to complete.
+void RunConsensusAlone(NodeConfig& cfg)
+{
+    cfg.raftListen = "6680";
+    cfg.raftSelf = "scheduler-01.internal";
+    cfg.clusterKeyFile = "cluster.key";
+    cfg.clusterDir = "cluster";
 }
 
 /// The member a `--raft-peer` token names, for a config built without a parser.
@@ -400,6 +422,9 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     // A configuration in which no field holds its default, so every emitter fires.
     NodeConfig cfg;
     cfg.schedulers = { "cache.internal:6675" };
+    // Beside consensus below, which a running node would refuse -- this case asserts nothing
+    // about coherence, only that every emitter fires.
+    cfg.voterKeys = { AVoterKey() };
     cfg.advertise = "worker-01.internal:6674";
     cfg.nodeListen = "0.0.0.0:6674";
     cfg.toolchains = { "/usr/bin/g++", "abc123=/usr/bin/clang++" };
@@ -1676,9 +1701,9 @@ TEST_CASE("NodeConfig: a listen flag that is absent, defaulted or valid is accep
     auto configured = Installable();
     configured.serveScheduler = true;
     configured.fleetOpen = true;
-    // `--fleet-open` admits every machine there is, so this node has to be able to
-    // check the grants they present (#282).
-    configured.clusterKeyFile = "cluster.key";
+    // A scheduler runs consensus since #178, which is also what lets this node check the
+    // grants every machine `--fleet-open` admits presents (#282): against its own state.
+    RunConsensusAlone(configured);
     configured.adminListen = "127.0.0.1:6677";
     // The v6 WILDCARD, not `[::1]`. This node admits every machine there is, so a
     // loopback bind behind its routable --advertise is refused since #290 stage 3 --
@@ -1711,7 +1736,7 @@ TEST_CASE("NodeConfig: a listen flag with a port and no host is refused, not wid
     bare.adminListen = "6677";
     bare.serveScheduler = true;
     bare.fleetOpen = true;
-    bare.clusterKeyFile = "cluster.key"; // --fleet-open admits other machines (#282)
+    RunConsensusAlone(bare); // a scheduler is a consensus member (#178)
     CHECK_FALSE(StartupPolicyRejection(bare).has_value());
 }
 
@@ -1931,19 +1956,22 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
     // operator is watching, rather than leaving to be discovered as a fleet that
     // mysteriously never distributes anything.
 
-    SECTION("a listener with no policy at all")
+    SECTION("a scheduler that runs no consensus")
     {
-        // An empty member set refusing everybody is the right *default* -- it is what
-        // stops a misconfigured node becoming an open scheduler -- but it is not a
-        // working configuration, and the two are told apart here rather than at
-        // runtime by an operator reading counters.
+        // This section asserted a refusal naming `--fleet-member` and `--fleet-open`: an
+        // empty member set on a node that was not clustered. Since #178 a scheduler IS
+        // clustered -- it signs every grant with its identity key and hands its workers a
+        // roster its voters certify, so it holds replicated state even alone -- and the
+        // node that row asked about is refused before it, by name. Consensus supplies the
+        // member set, as it always did for a clustered scheduler (#262), and its replicated
+        // client list (`--cluster-admit-client`) is a route to admission no startup rule can
+        // read.
         NodeConfig cfg;
         cfg.serveScheduler = true;
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).contains("--fleet-member"));
-        CHECK(Unwrap(refusal).contains("--fleet-open"));
+        CHECK(Unwrap(refusal) == SchedulerNeedsConsensusRefusal);
     }
 
     SECTION("the two policies contradicting each other")
@@ -2071,11 +2099,11 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig reachable = wildcard;
         reachable.advertise = "worker-01.internal:6674";
         reachable.nodeListen = "0.0.0.0:6674";
-        // And a key, because widening the bind is what makes the compile verbs face
-        // the network -- so the unrelated row that wants one for remote peers fires
-        // too. Naming it here keeps this assertion about the three reachability rows
-        // rather than about whichever rule happens to answer first.
-        reachable.clusterKeyFile = "cluster.key";
+        // And the voters' keys, because widening the bind is what makes the compile verbs
+        // face the network -- so the unrelated row that wants a roster root for remote
+        // peers fires too (#178). Naming them here keeps this assertion about the three
+        // reachability rows rather than about whichever rule happens to answer first.
+        reachable.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(reachable).has_value());
 
         // **The single-machine fleet: loopback bind, loopback advertise, peers
@@ -2128,7 +2156,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // nobody's ticket yet.
         NodeConfig cacheOnly;
         cacheOnly.fleetMembers = { "10.0.0.1:6676" };
-        cacheOnly.clusterKeyFile = "cluster.key"; // it admits another machine (#282)
+        cacheOnly.voterKeys = { AVoterKey() }; // it admits another machine (#282, #178)
         auto const cacheOnlyRefusal = StartupPolicyRejection(cacheOnly);
         REQUIRE(cacheOnlyRefusal.has_value());
         CHECK(Unwrap(cacheOnlyRefusal).contains("--scheduler"));
@@ -2142,7 +2170,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         worker.nodeListen = "0.0.0.0:6674";
         worker.advertise = "worker-01.internal:6674";
         worker.fleetOpen = true;
-        worker.clusterKeyFile = "cluster.key";
+        worker.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(worker).has_value());
     }
 
@@ -2202,7 +2230,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig wide = bare;
         wide.nodeListen = "0.0.0.0:6674";
         wide.advertise = "127.0.0.1:6674"; // a loopback advertise over a NETWORK bind
-        wide.clusterKeyFile = "cluster.key";
+        wide.voterKeys = { AVoterKey() };
         auto const wideRefusal = StartupPolicyRejection(wide);
         REQUIRE(wideRefusal.has_value());
         CHECK(Unwrap(wideRefusal) != Unwrap(refusal));
@@ -2254,7 +2282,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig fixed = bare;
         fixed.nodeListen = "0.0.0.0:6674";
         fixed.advertise = "worker-01.internal:6674";
-        fixed.clusterKeyFile = "cluster.key";
+        fixed.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(fixed).has_value());
     }
 
@@ -2293,9 +2321,9 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
 
     SECTION("the working shapes are accepted")
     {
-        // Each carries `--cluster-key-file`, which every shape admitting another
-        // machine now needs: the scheduler signs a grant and the worker checks it,
-        // and neither is possible without the key (#282).
+        // Each can check a grant from another machine, which every shape admitting one
+        // needs (#282): a scheduler runs consensus and checks against its own state, and
+        // a worker names the voters whose roster it checks against (#178).
         // Each also names `--scheduler`, which every node needs to start at all -- a
         // scheduler included, and it names itself. These fixtures did not, so the
         // shapes they called "accepted" were shapes the binary refuses; the rule was an
@@ -2304,14 +2332,14 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         listed.serveScheduler = true;
         listed.schedulers = { std::string { SelfScheduler } };
         listed.fleetMembers = { "10.0.0.1:6676" };
-        listed.clusterKeyFile = "cluster.key";
+        RunConsensusAlone(listed);
         CHECK_FALSE(StartupPolicyRejection(listed).has_value());
 
         NodeConfig open;
         open.serveScheduler = true;
         open.schedulers = { std::string { SelfScheduler } };
         open.fleetOpen = true;
-        open.clusterKeyFile = "cluster.key";
+        RunConsensusAlone(open);
         CHECK_FALSE(StartupPolicyRejection(open).has_value());
 
         // A joiner names itself and the cluster it is asking to join: under
@@ -2364,7 +2392,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         listedWorker.nodeListen = "0.0.0.0:6674";
         listedWorker.advertise = "worker-01.internal:6674";
         listedWorker.fleetMembers = { "10.0.0.1:6674" };
-        listedWorker.clusterKeyFile = "cluster.key";
+        listedWorker.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(listedWorker).has_value());
 
         NodeConfig openWorker;
@@ -2372,7 +2400,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         openWorker.nodeListen = "0.0.0.0:6674";
         openWorker.advertise = "worker-01.internal:6674";
         openWorker.fleetOpen = true;
-        openWorker.clusterKeyFile = "cluster.key";
+        openWorker.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(openWorker).has_value());
     }
 }
@@ -2733,10 +2761,10 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
         cfg.serveScheduler = true;
         cfg.schedulers = { std::string { SelfScheduler } };
         cfg.fleetOpen = true;
-        // `--fleet-open` admits other machines, and a node that admits them has to
-        // be able to check the grants they present (#282). Present here so that only
-        // the dashboard rule under test can fire.
-        cfg.clusterKeyFile = "cluster.key";
+        // A scheduler runs consensus (#178), which is also how a node that admits other
+        // machines checks the grants they present (#282). Present here so that only the
+        // dashboard rule under test can fire.
+        RunConsensusAlone(cfg);
         cfg.adminListen = "6677"; // a bare port, so loopback
         cfg.dashboard = true;
         return cfg;
@@ -3316,10 +3344,12 @@ TEST_CASE("NodeConfig: a cluster key is never refused for having no reader", "[n
     // resolve to on the machine, which is not a fact this table can see.
     SECTION("a scheduler alone")
     {
+        // A cluster of one since #178, and consensus names the key itself.
         auto cfg = Installable();
         cfg.serveScheduler = true;
         cfg.fleetOpen = true;
-        cfg.clusterKeyFile = "cluster.key";
+        RunConsensusAlone(cfg);
+        REQUIRE(cfg.clusterKeyFile == "cluster.key");
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
     }
 
@@ -3328,9 +3358,14 @@ TEST_CASE("NodeConfig: a cluster key is never refused for having no reader", "[n
         // No scheduler, no discovery, no consensus. This is the shape the previous
         // rule rejected and the shape the lease rule below makes mandatory for any
         // worker admitting a peer on another machine.
+        //
+        // The lease rule asks for the voters' keys since #178 rather than for this file, so
+        // they are named too -- the subject is that the FILE is never refused for having no
+        // reader, and it is here with every rule it could meet satisfied.
         auto cfg = Installable();
         cfg.fleetMembers = { "10.0.0.1:6676" };
         cfg.clusterKeyFile = "cluster.key";
+        cfg.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
     }
 
@@ -3352,14 +3387,14 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // never had to see before. A rule that refused one of them would turn a working
     // install into a service that registers cleanly and refuses at every boot.
     //
-    // Asserted rather than reasoned about. The lease rule reads `clusterKeyFile`,
+    // Asserted rather than reasoned about. The lease rule reads `voterKeys`,
     // `nodeListen` and the membership fields and none of the cache ones, so by
     // inspection it cannot refuse these -- but "by inspection" is what this file
     // exists to replace, and the next rule added to either table gets this case for
     // free.
     auto cfg = Installable();
     cfg.fleetMembers = { "10.0.0.1:6676" };
-    cfg.clusterKeyFile = "cluster.key"; // the lease rule's own requirement (#282)
+    cfg.voterKeys = { AVoterKey() }; // the lease rule's own requirement (#282, #178)
 
     // Both provenance-bearing flags typed at exactly their defaults, which is the
     // whole point of `explicitBit`: the value says nothing, the fact that it was
@@ -3412,13 +3447,16 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     CHECK((*reparsed).cacheMemoryExplicit);
 }
 
-TEST_CASE("NodeConfig: a worker that admits other machines needs a key to check their grants", "[node][policy][lease]")
+TEST_CASE("NodeConfig: a worker that admits other machines needs a roster to check their grants", "[node][policy][lease]")
 {
-    // The scheduler signs a grant; a worker with no key cannot check the signature,
-    // so its compile port serves whoever reaches it (#282). A STARTUP refusal rather
-    // than a per-request fallback, because "no key, so no check" decided per request
-    // leaves the port open with every refusal counter at zero -- a fleet that looks
-    // healthy from both ends.
+    // The scheduler signs a grant with its identity key; a worker with no roster cannot
+    // tell whether that key is one of the cluster's voters, so its compile port serves
+    // whoever reaches it (#282, #178). A STARTUP refusal rather than a per-request
+    // fallback, because "no roster, so no check" decided per request leaves the port open
+    // with every refusal counter at zero -- a fleet that looks healthy from both ends.
+    //
+    // Asserted as the refusal's whole text: it names `--voter-key`, and a row answering in
+    // its place would too.
     SECTION("a listed peer on another machine")
     {
         auto cfg = Installable();
@@ -3426,7 +3464,7 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a key to check 
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).contains("--cluster-key-file"));
+        CHECK(Unwrap(refusal) == RosterlessWorkerRefusal);
     }
 
     SECTION("--fleet-open, which admits every machine there is")
@@ -3436,7 +3474,7 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a key to check 
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).contains("--cluster-key-file"));
+        CHECK(Unwrap(refusal) == RosterlessWorkerRefusal);
     }
 
     SECTION("consensus, whose member set grows to machines nobody typed")
@@ -3509,12 +3547,35 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a key to check 
         CHECK_FALSE(StartupPolicyRejection(loopback).has_value());
     }
 
-    SECTION("and a key is all it takes")
+    SECTION("and the voters' keys are all it takes")
     {
         auto cfg = Installable();
         cfg.fleetMembers = { "10.0.0.1:6676" };
-        cfg.clusterKeyFile = "cluster.key";
+        cfg.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("a state directory is asked at startup, where its answer is")
+    {
+        // It may hold a roster an earlier run adopted, which no configuration can see --
+        // so the table lets it through and `NodeRoster::Build` asks the directory itself.
+        auto cfg = Installable();
+        cfg.fleetMembers = { "10.0.0.1:6676" };
+        cfg.clusterDir = "cluster";
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+
+    SECTION("the cluster key is not what it takes any more")
+    {
+        // The control for the move: the file this rule used to ask for, alone, satisfies
+        // it no longer -- a grant is signed by a voter's own key, which the pre-shared key
+        // cannot vouch for.
+        auto cfg = Installable();
+        cfg.fleetMembers = { "10.0.0.1:6676" };
+        cfg.clusterKeyFile = "cluster.key";
+        auto const refusal = StartupPolicyRejection(cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal) == RosterlessWorkerRefusal);
     }
 }
 
@@ -4826,8 +4887,11 @@ TEST_CASE("A clustered scheduler needs no --fleet-member", "[node-config]")
         CHECK_FALSE(refusal.has_value());
     }
 
-    SECTION("a STANDALONE scheduler with no member list is still refused")
+    SECTION("a STANDALONE scheduler is refused, member list or none")
     {
+        // The node the rule was written for no longer exists: since #178 a scheduler runs
+        // consensus even alone, so one without is refused for THAT, by name -- with or
+        // without a member list, which is what the row before it asked about.
         auto cfg = Installable();
         cfg.serveScheduler = true;
         cfg.fleetMembers.clear();
@@ -4835,7 +4899,12 @@ TEST_CASE("A clustered scheduler needs no --fleet-member", "[node-config]")
         cfg.raftListen.clear();
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).contains("--serve-scheduler needs --fleet-member"));
+        CHECK(Unwrap(refusal) == SchedulerNeedsConsensusRefusal);
+
+        cfg.fleetOpen = true;
+        auto const open = StartupPolicyRejection(cfg);
+        REQUIRE(open.has_value());
+        CHECK(Unwrap(open) == SchedulerNeedsConsensusRefusal);
     }
 }
 
@@ -5040,8 +5109,8 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
 
         // Admitting a peer on ANOTHER machine turns on two rules that have nothing to
         // do with `--fleet-member`'s spelling: the three advertise rows, because such
-        // a node has told peers to dial it, and the cluster-key rule, because it will
-        // have to check the lease signature of a client it did not vouch for. Both are
+        // a node has told peers to dial it, and the lease rule, because it will have to
+        // check the lease signature of a client it did not vouch for (#178). Both are
         // satisfied here rather than worked around -- a fixture that tripped either
         // would report a red for a row this case is not about, which is the trap
         // `SelfScheduler`'s own comment records one fixture up.
@@ -5050,7 +5119,7 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
         cfg.nodeListenExplicit = true;
         cfg.advertise = "worker-99.internal:6674";
         cfg.advertiseExplicit = true;
-        cfg.clusterKeyFile = "/etc/fastcached/cluster.key";
+        cfg.voterKeys = { AVoterKey() };
         cfg.fleetMembers = { value };
 
         auto const refusal = StartupPolicyRejection(cfg);
@@ -5323,11 +5392,11 @@ TEST_CASE("A reload may not advertise what the startup rules refuse", "[node][co
     previous.schedulers = { std::string { SchedulerEndpoint } };
     // A member list is what makes the advertised endpoint TRAVEL, and therefore what
     // scopes the wildcard rule: a node admitting nobody is reached at `--listen-node`
-    // and needs no advertise at all. The key file comes with it because admitting peers
-    // without one is refused by a DIFFERENT startup rule -- which is the refusal the
-    // control below would otherwise be reporting.
+    // and needs no advertise at all. The voters' keys come with it because admitting
+    // peers without a roster root is refused by a DIFFERENT startup rule (#178) -- which
+    // is the refusal the control below would otherwise be reporting.
     previous.fleetMembers = { "10.0.0.7" };
-    previous.clusterKeyFile = "/etc/fastcached/cluster.key";
+    previous.voterKeys = { AVoterKey() };
     // And a listener peers could actually reach, because the table ALSO refuses an
     // advertise that names a dialable address while `--listen-node` binds loopback --
     // a rule this change does not relax and deliberately re-asks: a reload cannot
@@ -5823,6 +5892,8 @@ namespace
     cfg.serveScheduler = true;
     cfg.nodeListen = "0.0.0.0:6674";
     cfg.fleetMembers = { "10.0.0.2" };
+    // A scheduler is a consensus member, alone or not (#178).
+    RunConsensusAlone(cfg);
     return cfg;
 }
 
@@ -5851,6 +5922,9 @@ constexpr auto WorkerSettingSamples = std::to_array<WorkerSettingSample>({
     // provenance case below.
     { .flag = "--drain-timeout", .value = "45s" },
     { .flag = "--reserve-cores", .value = "2" },
+    // RFC 8037 A.1's public key: any well-formed key, since a node running no worker is
+    // refused it before anything asks whose it is.
+    { .flag = "--voter-key", .value = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo" },
 });
 
 /// @p flag spelled on a command line, with its sample value when it takes one.
@@ -6029,6 +6103,8 @@ TEST_CASE("NodeConfig: a node running nothing at all is refused", "[node][config
 {
     auto nothing = SchedulerOnly();
     nothing.serveScheduler = false;
+    nothing.raftListen.clear(); // consensus is a component too, and the scheduler's (#178)
+    nothing.raftSelf.clear();
     nothing.fleetMembers.clear();
     nothing.cacheMemoryBytes = 0;
     auto const refusal = StartupPolicyRejection(nothing);

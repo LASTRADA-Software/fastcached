@@ -3,6 +3,7 @@
 
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeRoster.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Core/Clock.hpp>
@@ -111,6 +112,11 @@ struct NodeScrapeSources
     /// present answer is a different fact entirely — a node that runs consensus and
     /// holds no configuration — and renders, which is the whole of #435.
     std::function<ConsensusStatus()> consensus;
+
+    /// The roster this node verifies lease grants against (#178), or **null** where nothing was
+    /// wired. A node whose roster has no certificate reports no lapse through it, which is the
+    /// one spelling of that absence: `NodeRoster::ExpiresInSeconds` decides it.
+    NodeRoster const* roster {};
 };
 
 /// Build the provider that answers each `/metrics` scrape.

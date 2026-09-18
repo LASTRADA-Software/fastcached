@@ -2407,7 +2407,7 @@ namespace
 /// A node that raises one LATCHED row and one LIVE row, with a third row clear.
 [[nodiscard]] std::vector<Cc::NodeConditionFields> LatchedAndLiveRaised()
 {
-    return { ConditionRow("unsigned-lease-grants", "latched", "warning", "raised"),
+    return { ConditionRow("scratch-root-unmappable", "latched", "warning", "raised"),
              ConditionRow("enrollment-window-open", "live", "alert", "raised"),
              ConditionRow("counter-table-skew", "latched", "warning", "clear") };
 }
@@ -2415,7 +2415,7 @@ namespace
 /// A node that sent every row and raised none.
 [[nodiscard]] std::vector<Cc::NodeConditionFields> NoneRaisedRows()
 {
-    return { ConditionRow("unsigned-lease-grants", "latched", "warning", "clear"),
+    return { ConditionRow("scratch-root-unmappable", "latched", "warning", "clear"),
              ConditionRow("enrollment-window-open", "live", "alert", "not-evaluated") };
 }
 
@@ -2447,7 +2447,7 @@ TEST_CASE("`node` names each raised condition with its persistence, says none, a
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Affirmative);
         CHECK(RequiredCell(answer, "conditions").lexical
-              == "raised: unsigned-lease-grants (latched), enrollment-window-open (live)");
+              == "raised: scratch-root-unmappable (latched), enrollment-window-open (live)");
     }
     SECTION("none raised is SAID")
     {
@@ -2496,7 +2496,7 @@ TEST_CASE("`node-conditions` lists every row, exits by whether any asks, and ref
         auto const persistence = ColumnOf(answer, "persistence");
         auto const state = ColumnOf(answer, "state");
         auto const remedy = ColumnOf(answer, "remedy");
-        CHECK(rows[0][id].lexical == "unsigned-lease-grants");
+        CHECK(rows[0][id].lexical == "scratch-root-unmappable");
         CHECK(rows[0][persistence].lexical == "latched");
         CHECK(rows[1][id].lexical == "enrollment-window-open");
         CHECK(rows[1][persistence].lexical == "live");
@@ -2538,7 +2538,7 @@ TEST_CASE("`fleet conditions` carries the leader's rows, latched and live apart 
         return report;
     };
     snapshot.nodes = {
-        machine("10.0.0.2:7100", std::vector { ConditionRow("unsigned-lease-grants", "latched", "warning", "raised") }),
+        machine("10.0.0.2:7100", std::vector { ConditionRow("scratch-root-unmappable", "latched", "warning", "raised") }),
         machine("10.0.0.3:7100", std::vector { ConditionRow("enrollment-window-open", "live", "alert", "raised") }),
         machine("10.0.0.4:7100", NoneRaisedRows()),
         machine("10.0.0.5:7100", std::nullopt)

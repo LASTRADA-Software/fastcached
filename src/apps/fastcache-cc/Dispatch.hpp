@@ -507,6 +507,11 @@ inline constexpr std::array DeclineCauseTable {
     // retry can clear.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeProofUnchallenged, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeProofRejected, .cause = DeclineCause::NotPermitted },
+    // A worker that can verify nobody's grant (#178): ONE machine declining the job it was
+    // handed, and the machine is where the cause is -- cut off from the leader whose roster
+    // it would need, or only reaching an ex-leader that withholds it. Not `NotPermitted`,
+    // which points at this client's configuration, which is fine.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::RosterExpired, .cause = DeclineCause::WorkerRefused },
 };
 
 /// Whether every refusal this build's wire header knows carries a classification.

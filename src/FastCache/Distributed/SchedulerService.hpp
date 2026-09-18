@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/FleetSample.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -36,13 +37,14 @@ namespace FastCache::Distributed
 /// algorithm thinks, this one what the *scheduler* is allowed to do, and a node
 /// that leads but has not yet caught up on its own log is the case where the two
 /// answers differ.
-/// The scheduler term a node leading alone is in.
+/// Scheduler term zero: a term no Raft election produces, since terms start at one.
 ///
-/// Zero, and it is an answer rather than a placeholder: a node with no `--node-id`
-/// runs no consensus, so there is no election and no term to be in. Named so that no
-/// caller spells a bare `0` for it -- the term goes inside every lease grant (#322),
-/// and a literal at a call site is exactly how somebody later reads it as "unknown"
-/// and starts treating it as one.
+/// No production node is in it any more (#178): every scheduler runs consensus -- a lone one
+/// is a cluster of one -- and takes its term from the consensus tier's role. It is kept, and
+/// named, for a component driven WITHOUT consensus: a test that sets a role and asserts
+/// nothing about terms, and `Testing::FleetHarness`, whose leadership is a role flip. Named
+/// rather than a bare `0` because the term goes inside every lease grant (#322), and a literal
+/// at a call site is exactly how somebody later reads it as "unknown".
 inline constexpr std::uint64_t StandaloneSchedulerTerm = 0;
 
 enum class SchedulerRole : std::uint8_t
@@ -395,21 +397,19 @@ class SchedulerService
     /// @param metrics Counts the outcomes below; must outlive the service.
     /// @param logger Where the one observation this service reports goes; must
     ///        outlive the service. `NullLogger` where a caller does not want it.
-    /// @param signingKey The cluster's pre-shared key, copied. **Empty is legal and
-    ///        means unsigned grants** -- the boundary this surface had before signed
-    ///        leases existed, which a single machine with no `--cluster-key-file`
-    ///        still runs. It is not silent: the first unsigned grant says so in the
-    ///        log, once.
+    /// @param signer Who signs every grant: this node's identity, which a worker verifies
+    ///        against the key its roster holds for this node (#178). **Required**: every
+    ///        scheduler runs consensus and holds a key, so there is no unsigned grant left
+    ///        to hand out. Must outlive the service.
     /// @param clusterId Which fleet this scheduler leads, copied. Goes inside every
-    ///        grant's MAC, so a worker refuses a grant from a fleet that is not its
-    ///        own even when both trust the same key (#322). **Empty is legal** and
-    ///        means a node with no `--cluster-id`, which is the one-machine
-    ///        deployment: a verifier that names none expects none.
+    ///        grant's signature, so a worker refuses a grant from a fleet that is not its
+    ///        own (#322). **Empty is legal** and means a node with no `--cluster-id`: a
+    ///        verifier that names none expects none.
     SchedulerService(IClock& clock,
                      WallClockRef wallClock,
                      IMetricsSink& metrics,
                      ILogger& logger,
-                     std::span<std::byte const> signingKey,
+                     ILeaseSigner const& signer,
                      std::string_view clusterId);
 
     /// Where a node's handed-over history goes, or null to discard it.
@@ -501,10 +501,44 @@ class SchedulerService
     /// @param history Closed buckets it is handing over, oldest first, filed under the same
     ///        endpoint a worker's batch would be -- history belongs to the MACHINE, never to a
     ///        worker id, and this is the verb that makes that true where there is no worker.
-    /// @return `Ok`, or a refusal.
+    ///
+    /// **And the roster travels on it (#178).** A voter's announcement carries its endorsement
+    /// of the roster it applied, taken here through `AcceptEndorsement`; the `Ok` carries the
+    /// roster a strict majority of the current voters endorse, unexpired -- or nothing until
+    /// they have, since a worker refuses anything less and a half-certified roster would only
+    /// be counted as refused.
+    /// @return `Ok` carrying the certified roster or nothing, or a refusal.
     [[nodiscard]] SchedulerReply AnnounceNode(CallerContext const& caller,
                                               NodePresence const& presence,
                                               std::span<FleetBucket const> history = {});
+
+    /// What taking one endorsement did.
+    ///
+    /// **PRIVATE: persisted and transmitted nowhere.**
+    enum class EndorsementOutcome : std::uint8_t
+    {
+        Accepted, ///< A voter's endorsement of the current roster, kept.
+        Stale,    ///< Of a roster other than the one this state holds: ordinary during a change.
+        Refused,  ///< Not a voter's, or its signature does not verify; counted.
+        NoState,  ///< This node administers no cluster, so it certifies nothing.
+    };
+
+    /// Take one voter's endorsement of the roster.
+    ///
+    /// The door a node's OWN endorsement comes through as well as every one NODE-ANNOUNCE
+    /// carries -- a lone scheduler certifies its roster without dialling itself. The endorser
+    /// must be a voter in this node's applied state with a key, the signature must verify under
+    /// that key, and it must name this fleet and the roster this state holds.
+    /// @param endorsement The endorsement.
+    /// @return What it did.
+    EndorsementOutcome AcceptEndorsement(Cluster::RosterEndorsement const& endorsement);
+
+    /// The roster this node would hand a worker now.
+    /// @param now This machine's wall clock.
+    /// @return It, with every unexpired endorsement of it, or nothing until a strict majority
+    ///         of the current voters has endorsed it -- or when this node runs no cluster.
+    [[nodiscard]] std::optional<Cluster::CertifiedRoster> CertifiedRosterNow(
+        std::chrono::system_clock::time_point now) const;
 
     /// Retire one registration at the worker's own request.
     ///
@@ -946,7 +980,7 @@ class SchedulerService
 
     /// Whether the "this cluster's lease-lifetime does not parse" line has been written.
     ///
-    /// Once for the life of the process, like `_warnedUnsigned`: the fact is about
+    /// Once for the life of the process: the fact is about
     /// replicated state that changes rarely, and a line per dispatched compile would
     /// bury it under itself on the first parallel build.
     ///
@@ -956,27 +990,13 @@ class SchedulerService
     /// than an operator error, so it names the value and what is being used instead.
     mutable std::atomic<bool> _warnedLeaseLifetime { false };
 
-    /// Whether the "these grants are unsigned" line has already been written.
-    ///
-    /// One line for the life of the process, not one per grant: the fact is about
-    /// the configuration and does not change, and a per-grant line would bury it
-    /// under itself on the first parallel build. Atomic for the reason
-    /// `_mismatchLines` is -- defensively, against a second thread ever answering
-    /// this surface.
-    std::atomic<bool> _warnedUnsigned { false };
-
-    /// The cluster's pre-shared key, or empty for unsigned grants.
-    ///
-    /// Copied rather than a `std::span` at the caller's buffer: the key is read from
-    /// a file by a tier that has no reason to outlive this service, and a signing key
-    /// that quietly becomes a dangling view is the kind of defect that authenticates
-    /// nothing while every test passes.
-    SecureByteBuffer _signingKey;
+    /// Who signs every grant: this node's identity (#178). Borrowed; it holds the key, and
+    /// this service holds no secret.
+    ILeaseSigner const& _signer;
 
     /// Which fleet this scheduler leads; empty when the operator named none.
     ///
-    /// Copied for the reason the key is: it is read from a configuration that has no
-    /// reason to outlive this service.
+    /// Copied: it is read from a configuration that has no reason to outlive this service.
     std::string _clusterId;
 
     WorkerRegistry _workers;
@@ -1010,6 +1030,15 @@ class SchedulerService
 
     /// The cluster, when this node runs one. Null is a legitimate state.
     IClusterAdmin* _admin { nullptr };
+
+    /// The latest endorsement each voter sent, by endorser (#178).
+    ///
+    /// Bounded by the voters: only a verified voter's endorsement is kept, one per voter. One of
+    /// an older roster is replaced as soon as that voter endorses the current one, and is never
+    /// served meanwhile: `CertifiedRosterNow` serves only endorsements of the roster this state
+    /// holds.
+    mutable std::mutex _endorsementsMutex;
+    std::map<std::string, Cluster::RosterEndorsement, std::less<>> _endorsements; ///< Guarded by `_endorsementsMutex`.
 };
 
 } // namespace FastCache::Distributed

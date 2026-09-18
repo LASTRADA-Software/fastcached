@@ -128,6 +128,13 @@ src/FastCache/
                 peer port". `Apply` is total because it runs after commitment, when
                 refusing is no longer an option; `Validate` is where a change can be
                 refused, and it runs on the proposer.
+                Roster + RosterCertificate (#178): the roster a lease is checked
+                against -- voters, principals and revoked keys, projected from the
+                state at a version `Apply` derives -- and a voter's endorsement of
+                it, `[cluster, version, SHA-256(roster), notAfter]` signed with that
+                voter's identity key. `CertifyRoster` is the one majority rule: a
+                roster is adopted only if a strict majority of the voters the
+                ADOPTER already trusts endorse it, never of the voters it names.
   Distributed/  WorkerRegistry (the worker set: exact-fingerprint grouping,
                 most-free-slots pick tie-broken by utilization, heartbeat
                 expiry over IClock) and
@@ -157,6 +164,12 @@ src/FastCache/
                 FleetChart derives every series from those buckets -- a rate is a
                 delta between adjacent buckets that can both ANSWER for it -- and
                 renders them as standalone SVG.
+                RosterTrust is what a worker that runs no consensus checks a lease
+                against (#178): the certified roster it holds, rooted in its
+                `--voter-key` anchors until the first adoption and in the roster
+                itself after, with RosterStore keeping it in `--cluster-dir` over
+                the durable-file seam the Raft store uses. A consensus member uses
+                StateLeaseRoster instead -- its applied state IS the roster.
   Protocol/     IProtocolHandler, ProtocolAutodetect,
                 Framing/ByteReader (line and length-prefixed), MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,

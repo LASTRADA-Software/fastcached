@@ -35,6 +35,7 @@
 #include <vector>
 
 #include <tests/FleetHistoryFakes.hpp>
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedHostFacts.hpp>
 #include <tests/Unwrap.hpp>
@@ -560,7 +561,8 @@ TEST_CASE("The fleet routes answer on their own paths and gate on the credential
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 
     auto const routes =
@@ -633,7 +635,8 @@ TEST_CASE("A node that does not lead answers the dashboard with 503 and names th
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676", Distributed::StandaloneSchedulerTerm);
 
     auto const routes =
@@ -670,7 +673,8 @@ TEST_CASE("An endpoint with no credential serves the dashboard to anyone who rea
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 
     auto const routes =
@@ -769,7 +773,8 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     Node::NodeConditions conditions;
     ManualClock clock;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 
     // Bind a probe, take its port, release it: `Start` refuses port 0, and a fixed
@@ -987,7 +992,8 @@ TEST_CASE("The sampler records only while this node leads", "[node][admin][fleet
     NullLogger logger;
     SystemWallClock const wall;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
     FleetSampler sampler { sources, metrics, NodeFacts(), wall, {}, logger };
@@ -1021,7 +1027,8 @@ TEST_CASE("A sampler with a path writes its history and reads it back", "[node][
     NullLogger logger;
     SystemWallClock const wall;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
@@ -1056,7 +1063,8 @@ TEST_CASE("What the other machines handed over survives a leader restart", "[nod
     NullLogger logger;
     SystemWallClock const wall;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
@@ -1210,7 +1218,8 @@ struct ChartFixture
     /// the fixture rather than to whichever clock the newest assertion needed.
     Testing::PlacedWallClock wall;
 
-    Distributed::SchedulerService scheduler { clock, wall, metrics, logger, {}, {} };
+    Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wall, metrics, logger, signer, {} };
     std::unique_ptr<FleetSampler> sampler;
     std::vector<AdminRoute> routes;
 
@@ -1693,7 +1702,8 @@ TEST_CASE("A history a newer build wrote stops the sampler promising durability"
     // and the scheduler's lines are not the ones it is asserting about.
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
@@ -1745,7 +1755,8 @@ TEST_CASE("A follower still records itself", "[node][admin][fleethistory]")
     NullLogger logger;
     SystemWallClock const wall;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
 
     for ([[maybe_unused]] auto const hit: std::views::iota(0, 70))
@@ -1787,7 +1798,8 @@ TEST_CASE("The fleet 401 is a page a phone can read, and says what the challenge
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 
     auto const routes =
@@ -1833,7 +1845,8 @@ TEST_CASE("Both pages this binary serves open with the one document prologue", "
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 
     auto const routes =

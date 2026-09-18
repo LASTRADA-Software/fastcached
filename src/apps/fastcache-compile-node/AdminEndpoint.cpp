@@ -73,6 +73,9 @@ AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sou
             // empty member set, because a node that RUNS consensus and holds no
             // configuration is the #388 state and has to be visible, not silent.
             .consensus = sources.consensus ? std::optional { sources.consensus() } : std::nullopt,
+            // Sampled per scrape, for the consensus reading's reason: a countdown captured once
+            // is a number that stops counting.
+            .rosterExpiresInSeconds = sources.roster != nullptr ? sources.roster->ExpiresInSeconds() : std::nullopt,
             .uptime =
                 Uptime { std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - startedAt) },
         };

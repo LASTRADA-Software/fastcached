@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/MembershipFakes.hpp>
 
 using namespace FastCache::Distributed;
@@ -372,7 +373,8 @@ TEST_CASE("A scheduler refuses a non-member through the oracle", "[distributed][
     FastCache::AtomicMetricsSink metrics;
     FastCache::NullLogger schedulerLogger;
     FastCache::ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    auto const signer = FastCache::Testing::TestLeaseSigner();
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
     service.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
 
     auto const ask = [&](std::string_view peer) {

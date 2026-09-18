@@ -355,7 +355,7 @@ version                        0.2.0-125-g6ba32b30
 node-id                        -
 uptime-seconds                 15
 components                     cache-tier, worker
-conditions                     raised: unsigned-lease-grants (latched), enrollment-window-open (live)
+conditions                     raised: scratch-root-unmappable (latched), enrollment-window-open (live)
 toolchains                     surveying
 toolchains-served              0
 toolchains-discovered          3
@@ -430,12 +430,19 @@ Beside them, what that worker is offering and whether anyone knows about it:
   configuration names others and not it). A learner and a following voter report the
   same `scheduler-role`, and only one of them stands for election when the leader
   goes. A node running no consensus reports no such field.
+- **`roster-version`, `roster-voters`, `roster-principals`, `roster-revoked`,
+  `roster-certified-until`** — the roster this node checks lease grants against
+  ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)): which one, how
+  many voters sign it, how many machines it admits by key, how many keys the cluster
+  revoked, and until when a majority of its voters vouch for it, in UTC. A node that
+  checks no grant reports none of them rather than a roster of nobody, and a consensus
+  member reports `roster-certified-until` as absent: its roster is the state it applies
+  and never lapses.
 
 **`conditions`** is what this node has detected that an operator must act on — each
 condition it raised, by its stable id, with **`latched`** or **`live`** beside it:
 
-- **`latched`** — decided once, for the life of the process: an unsigned grant, an
-  unmappable scratch root, a counter table this build cannot carry. Only a restart on a
+- **`latched`** — decided once, for the life of the process: an unmappable scratch root, a counter table this build cannot carry. Only a restart on a
   different build or configuration clears it, so waiting for it to clear is waiting for
   nothing.
 - **`live`** — it can clear while the process runs: an open enrollment window, a
@@ -459,9 +466,9 @@ still printed, so a loop over machines can test it:
 $ fastcache-cli node-conditions --addr=10.0.0.7:6674 --format=csv
 id,persistence,severity,state,detail,remedy
 counter-table-skew,latched,warning,clear,,...
-unsigned-lease-grants,latched,warning,raised,"no --cluster-key-file is configured, ...",...
+scratch-root-unmappable,latched,warning,raised,"the scratch root /tmp/fc work cannot be written into a debug-prefix-map rule",...
 ...
-fastcache-cli: 1 of 6 condition(s) raised
+fastcache-cli: 1 of 5 condition(s) raised
 ```
 
 A node too old to carry conditions exits `protocol`, naming itself, rather than printing

@@ -266,14 +266,21 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
         [&logger = parts.logger](std::string_view line) { logger.Logf(LogLevel::Warn, "{}", line); } });
 
     // The whole trust decision is one call, made and announced where a test can reach
-    // it: a grant carries an HMAC over this worker's endpoint, the toolchain, the key
-    // and an expiry, so the check is local and costs the job nothing. A WALL clock,
-    // because the expiry was stamped on another machine.
+    // it: a grant carries its issuing voter's signature over this worker's endpoint, the
+    // toolchain and an expiry, checked against the roster this node holds (#178), so the check
+    // is local and costs the job nothing. A WALL clock, because the expiry was stamped on
+    // another machine.
     //
     // It borrows `main`'s one `AnnouncedEndpoint` -- see `WorkerTierParts::announced` for why
     // there is exactly one per process rather than one per component that needs an address.
-    auto validator = MakeWorkerLeaseValidator(
-        parts.cfg, parts.announced, parts.activation, DefaultSystemWallClock(), *leaseState, parts.metrics, parts.logger);
+    auto validator = MakeWorkerLeaseValidator(parts.cfg,
+                                              parts.leaseRoster,
+                                              parts.announced,
+                                              parts.activation,
+                                              DefaultSystemWallClock(),
+                                              *leaseState,
+                                              parts.metrics,
+                                              parts.logger);
     if (!validator.has_value())
         return std::unexpected { std::move(validator).error() };
 

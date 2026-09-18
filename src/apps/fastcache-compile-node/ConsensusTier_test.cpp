@@ -2,10 +2,13 @@
 #include "ConsensusTier.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeMembership.hpp"
+#include "NodeRoster.hpp"
 #include "SchedulerTier.hpp"
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/Roster.hpp>
+#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
@@ -30,6 +33,7 @@
 #include <format>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -208,6 +212,11 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
     AtomicMetricsSink metrics;
     std::unique_ptr<SchedulerTier> const noScheduler;
 
+    // Never reached by either case: one returns before consensus exists, the other is
+    // refused before anything is wired. A roster for a node that holds none.
+    auto const roster = NodeRoster::Build(NodeConfig {}, DefaultSystemWallClock(), metrics, logger);
+    REQUIRE(roster.has_value());
+
     SECTION("--node-id with no --listen-raft builds no tier")
     {
         NodeConfig cfg;
@@ -215,8 +224,15 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.1:6680")) };
         NodeMembership membership { cfg, membershipLog };
 
-        auto const tier =
-            StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", std::nullopt, membership, metrics, logger);
+        auto const tier = StartConsensusOrExplain(cfg,
+                                                  noScheduler,
+                                                  "127.0.0.1:6674",
+                                                  std::nullopt,
+                                                  membership,
+                                                  *Unwrap(roster),
+                                                  DefaultSystemWallClock(),
+                                                  metrics,
+                                                  logger);
         REQUIRE(tier.has_value());
         CHECK(*tier == nullptr);
     }
@@ -230,8 +246,15 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         // Refused, and refused by NAME: a null tier here would mean the gate is still
         // reading the id, and any other refusal would mean it got somewhere this test
         // does not intend to reach.
-        auto const tier =
-            StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", std::nullopt, membership, metrics, logger);
+        auto const tier = StartConsensusOrExplain(cfg,
+                                                  noScheduler,
+                                                  "127.0.0.1:6674",
+                                                  std::nullopt,
+                                                  membership,
+                                                  *Unwrap(roster),
+                                                  DefaultSystemWallClock(),
+                                                  metrics,
+                                                  logger);
         REQUIRE_FALSE(tier.has_value());
         CHECK(tier.error() == ConsensusNamesNoSelfPeerRefusal);
     }
@@ -258,8 +281,18 @@ TEST_CASE("A consensus tier refuses to start without an identity key", "[node][c
     cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.1:6680")) };
     cfg.clusterKeyFile = "cluster.key";
     NodeMembership membership { cfg, membershipLog };
+    auto const roster = NodeRoster::Build(NodeConfig {}, DefaultSystemWallClock(), metrics, logger);
+    REQUIRE(roster.has_value());
 
-    auto const tier = StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", std::nullopt, membership, metrics, logger);
+    auto const tier = StartConsensusOrExplain(cfg,
+                                              noScheduler,
+                                              "127.0.0.1:6674",
+                                              std::nullopt,
+                                              membership,
+                                              *Unwrap(roster),
+                                              DefaultSystemWallClock(),
+                                              metrics,
+                                              logger);
     REQUIRE_FALSE(tier.has_value());
     CHECK(tier.error() == ConsensusNeedsIdentityKeyRefusal);
 }
@@ -388,6 +421,8 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
         Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
+        DefaultSystemWallClock(),
+        {},
         metrics,
         logger);
     REQUIRE(started.has_value());
@@ -435,6 +470,115 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
         [&tier] { return std::format("commit index {}", tier->Status().commitIndex.value); }));
     CHECK(tier->Status().commitIndex.value == before.value + 1);
     CHECK(records(tier->ClusterState(), self));
+}
+
+TEST_CASE("A lone voter endorses the roster it applied, under its own key, and re-signs when it changes",
+          "[node][consensus][roster]")
+{
+    // #178, owner decision 3: a lone scheduler runs a one-member consensus, and so it is the
+    // one voter whose endorsement certifies the roster its workers adopt. A real tier -- real
+    // listener, state directory and a driver that elected itself -- because an endorsement
+    // produced by a function nothing calls is the bug it was written to fix.
+    NullLogger logger;
+    AtomicMetricsSink metrics;
+
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->BoundPort();
+    probe.reset();
+
+    auto const scratch = Testing::UniqueScratchPath("consensus-endorse");
+    std::filesystem::create_directories(scratch);
+    {
+        auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
+        key << std::string(32, 'k');
+    }
+
+    NodeConfig cfg;
+    cfg.nodeId = "n1";
+    cfg.clusterId = "fleet";
+    cfg.raftListen = std::format("127.0.0.1:{}", port);
+    cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec(std::format("n1=127.0.0.1:{}", port))) };
+    cfg.clusterKeyFile = scratch / "cluster.key";
+    cfg.clusterDir = scratch / "state";
+
+    // Collected off the reconciler thread, read on this one.
+    struct Seen
+    {
+        std::mutex lock;
+        std::vector<Cluster::RosterEndorsement> endorsements;
+    };
+    auto const seen = std::make_shared<Seen>();
+    auto started = ConsensusTier::Start(
+        cfg,
+        {},
+        Testing::TestKeyPair("n1"),
+        [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
+        [](Cluster::ClusterState const&) {},
+        DefaultSystemWallClock(),
+        [seen](Cluster::RosterEndorsement const& endorsement) {
+            std::scoped_lock const guard { seen->lock };
+            seen->endorsements.push_back(endorsement);
+        },
+        metrics,
+        logger);
+    REQUIRE(started.has_value());
+    auto const& tier = *started;
+
+    auto const latest = [&seen] {
+        std::scoped_lock const guard { seen->lock };
+        return seen->endorsements.empty() ? std::optional<Cluster::RosterEndorsement> {}
+                                          : std::optional { seen->endorsements.back() };
+    };
+    auto const count = [&seen] {
+        std::scoped_lock const guard { seen->lock };
+        return seen->endorsements.size();
+    };
+
+    REQUIRE(Testing::WaitUntil(
+        "the lone voter to endorse the roster recording itself",
+        [&tier, &latest] {
+            auto const endorsement = latest();
+            return endorsement.has_value() && endorsement->version == tier->ClusterState().rosterVersion;
+        },
+        [&tier, &count] {
+            return std::format("{} endorsement(s), roster version {}", count(), tier->ClusterState().rosterVersion);
+        }));
+
+    // What a worker checks, and what distinguishes an endorsement of THIS roster from one of
+    // any: the fleet, the digest of the applied state's roster, a lapse one lifetime ahead,
+    // and a signature under this node's own key -- not under another machine's.
+    auto const first = Unwrap(latest());
+    auto const state = tier->ClusterState();
+    CHECK(first.clusterId == "fleet");
+    CHECK(first.endorser == "n1");
+    CHECK(first.rosterDigest == Cluster::DigestOfRoster(Cluster::ProjectRoster(state)));
+    CHECK(Cluster::VerifyEndorsement(first, Testing::TestKeyPair("n1").PublicKey()));
+    CHECK_FALSE(Cluster::VerifyEndorsement(first, Testing::TestKeyPair("n2").PublicKey()));
+    auto const now = std::chrono::system_clock::now();
+    CHECK(first.notAfter > now + Cluster::RosterEndorsementLifetime - std::chrono::minutes { 5 });
+    CHECK(first.notAfter <= now + Cluster::RosterEndorsementLifetime);
+
+    // An unchanged roster is NOT re-signed every pass: the next endorsement is due a refresh
+    // from now. A changed one is re-signed at once -- admitting a principal moves the roster.
+    auto const before = count();
+    REQUIRE(tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::AdmitPrincipal,
+                                                      .key = "w1",
+                                                      .value = {},
+                                                      .schedulerEndpoint = {},
+                                                      .publicKey = Testing::TestKeyPair("w1").PublicKey(),
+                                                      .role = Cluster::PrincipalRole::Worker })
+                .has_value());
+    REQUIRE(Testing::WaitUntil(
+        "the lone voter to endorse the roster that admits w1",
+        [&latest, &first] {
+            auto const endorsement = latest();
+            return endorsement.has_value() && endorsement->version > first.version;
+        },
+        [&count] { return std::format("{} endorsement(s)", count()); }));
+    CHECK(count() == before + 1);
+    CHECK(Unwrap(latest()).rosterDigest != first.rosterDigest);
 }
 
 namespace
@@ -543,6 +687,8 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
             Testing::TestKeyPair("n1"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [published](Cluster::ClusterState const&) { published->fetch_add(1); },
+            DefaultSystemWallClock(),
+            {},
             metrics,
             logger);
     };
@@ -575,7 +721,7 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         CHECK(refusal.contains(directory.string()));
         CHECK(refusal.contains("the snapshot as of log entry 3"));
         CHECK(refusal.contains(std::format("cluster state encoding version {}", Testing::PreviousClusterStateVersion)));
-        CHECK(refusal.contains("reads 6"));
+        CHECK(refusal.contains("reads 7"));
         CHECK(refusal.contains("it is intact, and there is no conversion"));
         CHECK(refusal.contains(Consensus::UnreadableStateRemedy));
         CHECK(published->load() == 0);

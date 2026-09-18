@@ -539,6 +539,21 @@ std::string RenderPrometheus(StatsReading const& reading)
     if (snapshot.consensus.has_value())
         AppendConsensusMetrics(out, *snapshot.consensus);
 
+    // And how long the roster this node verifies grants against stays certified, where it has
+    // a certificate to lapse (#178). Absent on a consensus member and on a node holding none:
+    // a `0` there would read as a roster that has lapsed, which is the alert this exists for.
+    if (snapshot.rosterExpiresInSeconds.has_value())
+        Append(out,
+               Metric { .name = "fastcache_node_roster_expires_in_seconds",
+                        .help = "Seconds until the roster this node verifies lease grants against stops being certified "
+                                "by a majority of the cluster's voters; 0 once it has, after which (and the clock-skew "
+                                "slack) every grant is refused roster-expired. A healthy fleet re-endorses every 15 "
+                                "minutes, so this stays above 45 minutes; falling towards 0 means this node has not "
+                                "heard a certified roster from the leader. Absent on a consensus member, whose roster "
+                                "is the state it applies, and on a node that verifies no grant.",
+                        .type = MetricType::Gauge,
+                        .value = *snapshot.rosterExpiresInSeconds });
+
     // Every counter the sink knows, without exception. Exporting the *table*
     // rather than a hand-picked subset is the whole point: seven of the nine
     // live counters used to be absent here, including all five the distributed-

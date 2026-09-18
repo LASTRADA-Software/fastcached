@@ -1402,6 +1402,19 @@ class IMetricsSink
         /// A proven Raft dial this node ended because the cluster no longer holds the acceptor's key. (#178)
         RaftPeerDialsEndedKeyWithdrawn,
 
+        /// A grant refused because this worker holds no roster its trust anchors certify. (#178)
+        WorkerJobsRefusedLeaseNoRoster,
+        /// A grant refused because this worker's roster has not been re-certified in time. (#178)
+        WorkerJobsRefusedLeaseRosterExpired,
+        /// A grant whose signature verifies under a key the cluster revoked. (#178)
+        WorkerJobsRefusedLeaseSignerRevoked,
+        /// A roster offered to this worker that a majority of its voters did not endorse. (#178)
+        WorkerRostersRefusedUncertified,
+        /// A roster offered to this worker whose majority of endorsements had already lapsed. (#178)
+        WorkerRostersRefusedExpired,
+        /// A roster endorsement the leader refused: not a voter's, or not signed by one. (#178)
+        SchedulerRosterEndorsementsRefused,
+
         Last,
     };
 

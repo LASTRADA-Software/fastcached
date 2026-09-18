@@ -11,15 +11,17 @@
 #include "SchedulerTier.hpp"
 
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <fstream>
+#include <optional>
 #include <string>
 
-#include <tests/ScratchPath.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 
@@ -44,7 +46,9 @@ struct TierFixture
     ManualWallClock wallClock;
     AtomicMetricsSink metrics;
     NullLogger logger;
-    NodeConditions conditions;
+
+    /// This node's identity key, as its start resolved it out of the state directory (#178).
+    std::optional<Ed25519KeyPair> identity { Testing::TestKeyPair("n1") };
 };
 
 /// A node that runs consensus: a Raft port, which is what turns it on (#1022).
@@ -60,16 +64,7 @@ struct TierFixture
     cfg.serveScheduler = true;
     cfg.nodeId = "n1";
     cfg.raftListen = "127.0.0.1:6680";
-    return cfg;
-}
-
-/// A node that runs no consensus at all: no `--listen-raft`.
-/// @return The config.
-[[nodiscard]] NodeConfig LoneNode()
-{
-    NodeConfig cfg;
-    cfg.schedulers = { "127.0.0.1:6675" };
-    cfg.serveScheduler = true;
+    cfg.clusterKeyFile = "cluster.key";
     return cfg;
 }
 
@@ -93,7 +88,7 @@ TEST_CASE("A clustered scheduler does not claim leadership before consensus repo
     NodeMembership membership { cfg, membershipLog };
 
     auto tier =
-        SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
+        SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.identity);
     REQUIRE(tier.has_value());
 
     // `Undecided` is the state this already has a name and a refusal for: `Gate()`
@@ -113,111 +108,55 @@ TEST_CASE("Consensus reporting leadership is what makes a clustered scheduler le
     NodeMembership membership { cfg, membershipLog };
 
     auto tier =
-        SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
+        SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.identity);
     REQUIRE(tier.has_value());
 
     (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
     CHECK((*tier)->Service().Role() == Distributed::SchedulerRole::Leader);
 }
 
-TEST_CASE("A node leading alone still leads from the moment it starts", "[node][scheduler]")
+TEST_CASE("A scheduler that runs no consensus is refused before it could lead alone", "[node][scheduler]")
 {
-    // **The control, and the reason the fix is conditional rather than a deletion.**
-    // A node with no `--node-id` runs no consensus, so nothing will ever call
-    // `SetRole` -- leaving it `Undecided` would refuse every verb forever on the
-    // deployment most people run. The constructor's own comment says a node that
-    // refused until an election completed would be worse than what it replaces "at
-    // exactly the moment somebody is watching it start"; that argument is right for
-    // this node and does not transfer to a clustered one, where an election really is
-    // coming.
+    // #178, owner decision 3. A scheduler signs every grant with its identity key and hands its
+    // workers a roster its cluster's voters certify, so it holds replicated state -- which is
+    // consensus, even on one machine. The standalone leadership a node with no `--listen-raft`
+    // used to take at term 0 is gone, and the configuration that asked for it is refused BY
+    // NAME at startup rather than run as a scheduler nothing could ever elect.
+    //
+    // WHAT DISTINGUISHES: the same node given `--listen-raft` (and the key consensus needs) is
+    // accepted, so the rule is about consensus and not about scheduling.
+    NodeConfig lone;
+    lone.schedulers = { "127.0.0.1:6675" };
+    lone.serveScheduler = true;
+    CHECK(Testing::Unwrap(StartupPolicyRejection(lone)) == SchedulerNeedsConsensusRefusal);
+
+    auto clustered = lone;
+    clustered.raftListen = "127.0.0.1:6680";
+    clustered.clusterKeyFile = "cluster.key";
+    CHECK(StartupPolicyRejection(clustered)
+          != std::optional<std::string> { std::string { SchedulerNeedsConsensusRefusal } });
+
+    // And the refusal says how to run one machine: a cluster of one.
+    CHECK(SchedulerNeedsConsensusRefusal.contains("--listen-raft"));
+    CHECK(SchedulerNeedsConsensusRefusal.contains("cluster of one"));
+}
+
+TEST_CASE("A scheduler holding no identity key is refused, never run unsigned", "[node][scheduler][lease]")
+{
+    // #178. Every grant is signed by the issuing voter's own key; there is no unsigned grant
+    // left to fall back to, so a tier handed no key refuses to exist rather than minting
+    // grants no worker could verify. Unreachable from a configuration -- a scheduler runs
+    // consensus and a consensus node always holds a key -- which is why this is the answer
+    // to a CALLER, and the control beside it is the ordinary start.
     TierFixture fix;
-    auto const cfg = LoneNode();
+    auto const cfg = ClusteredNode();
     NodeMembership membership { cfg, membershipLog };
 
-    auto tier =
-        SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
-    REQUIRE(tier.has_value());
+    auto const refused =
+        SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, std::nullopt);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == SchedulerNeedsIdentityKeyRefusal);
 
-    CHECK((*tier)->Service().Role() == Distributed::SchedulerRole::Leader);
-}
-
-TEST_CASE("The scheduler tier follows the consensus switch, not the node id", "[node][scheduler]")
-{
-    // #1022 moved the switch from `--node-id` to `--listen-raft`, and this tier is one
-    // of the two that has to agree about it. #613 was those two authoring one rule; a
-    // moved rule is exactly when a second author reappears, and a tier that had
-    // re-spelled `cfg.nodeId.empty()` would compile, pass every case above -- both of
-    // which give BOTH flags -- and be wrong the day the identity gains a default.
-    //
-    // The two cases are the ones the old reading answers oppositely, which is what
-    // makes them a test rather than two more happy paths.
-    TierFixture fix;
-
-    SECTION("--listen-raft with no --node-id does not claim leadership")
-    {
-        // A node whose id is derived rather than typed still runs consensus, so a role
-        // IS coming and claiming term 0 in the meantime is #613 again.
-        NodeConfig cfg;
-        cfg.schedulers = { "127.0.0.1:6675" };
-        cfg.serveScheduler = true;
-        cfg.raftListen = "127.0.0.1:6680";
-        NodeMembership membership { cfg, membershipLog };
-
-        auto tier = SchedulerTier::Start(
-            cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
-        REQUIRE(tier.has_value());
-        CHECK((*tier)->Service().Role() != Distributed::SchedulerRole::Leader);
-    }
-
-    SECTION("--node-id with no --listen-raft leads alone")
-    {
-        // The mirror: an id nothing turns into a cluster is a node leading itself, and
-        // refusing every verb until an election that will never happen is the failure
-        // the control above exists to prevent.
-        NodeConfig cfg;
-        cfg.schedulers = { "127.0.0.1:6675" };
-        cfg.serveScheduler = true;
-        cfg.nodeId = "n1";
-        NodeMembership membership { cfg, membershipLog };
-
-        auto tier = SchedulerTier::Start(
-            cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
-        REQUIRE(tier.has_value());
-        CHECK((*tier)->Service().Role() == Distributed::SchedulerRole::Leader);
-    }
-}
-
-TEST_CASE("A scheduler says whether it signs its grants, as a latched condition", "[node][scheduler][conditions]")
-{
-    // #1364. Unsigned grants were one Warn at the first grant (#303); the tier now answers the
-    // condition as it starts, from the key it read -- the one fact that decides it. WHAT
-    // DISTINGUISHES: no key and a key give opposite answers, so a tier that raised it always, or
-    // never, fails one section.
-    namespace Wire = CompileCacheWire;
-    TierFixture fix;
-    auto cfg = LoneNode();
-
-    SECTION("no --cluster-key-file raises it")
-    {
-        NodeMembership membership { cfg, membershipLog };
-        auto tier = SchedulerTier::Start(
-            cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
-        REQUIRE(tier.has_value());
-        CHECK(fix.conditions.StateOf(NodeCondition::UnsignedLeaseGrants) == Wire::ConditionState::Raised);
-    }
-
-    SECTION("a key clears it")
-    {
-        FastCache::Testing::ScratchDirectory keys { "scheduler-conditions" };
-        cfg.clusterKeyFile = keys / "cluster.key";
-        {
-            std::ofstream out { cfg.clusterKeyFile, std::ios::binary };
-            out << std::string(32, 'k');
-        }
-        NodeMembership membership { cfg, membershipLog };
-        auto tier = SchedulerTier::Start(
-            cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
-        REQUIRE(tier.has_value());
-        CHECK(fix.conditions.StateOf(NodeCondition::UnsignedLeaseGrants) == Wire::ConditionState::Clear);
-    }
+    CHECK(SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.identity)
+              .has_value());
 }

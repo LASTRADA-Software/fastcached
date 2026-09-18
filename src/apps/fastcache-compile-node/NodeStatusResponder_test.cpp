@@ -29,6 +29,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -668,7 +669,8 @@ TEST_CASE("A node running no scheduler reports NO role, which is not `undecided`
     Fixture const none { {}, clock, { .worker = true } };
     CHECK_FALSE(none.status.Describe().runtime.schedulerRole.has_value());
 
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     Fixture const electing { {}, clock, { .scheduler = true }, std::nullopt, DirectSources { .scheduler = &scheduler } };
     CHECK(electing.status.Describe().runtime.schedulerRole == std::optional { Wire::WireSchedulerRole::Undecided });
 }
@@ -683,7 +685,8 @@ TEST_CASE("Each scheduler role crosses the wire as its own tag, with the leader 
     AtomicMetricsSink metrics;
     NullLogger logger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     Fixture const fixture { {}, clock, { .scheduler = true }, std::nullopt, DirectSources { .scheduler = &scheduler } };
 
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);

@@ -56,14 +56,18 @@ src/FastCache/
                 command line's, then the replicated state's), PeerDirectory,
                 ClusterState + ClusterStateMachine,
                 MembershipPolicy — who is a member, WHERE they answer, and the
-                settings every member must agree on
+                settings every member must agree on; Roster + RosterCertificate
+                (the voters a lease is checked against, and a majority of them
+                endorsing it)
   Distributed/  WorkerRegistry, LeaseTable and SchedulerService — the fleet's
                 capacity decisions, all pure with respect to I/O; FleetSample
                 (the slot vocabulary and IFleetHistorySink, so the scheduler's
                 header carries no file format), FleetHistory (three rings, eight
                 views, one file envelope) and FleetNodeHistories (what every other
                 machine handed over); plus FleetView and FleetChart, which render
-                what the leader can see as a page, as SVG and as JSON
+                what the leader can see as a page, as SVG and as JSON; RosterTrust
+                and RosterStore (the certified roster a worker that runs no
+                consensus holds, and keeps)
   Protocol/     IProtocolHandler, ProtocolAutodetect, Framing/ByteReader,
                 MemcachedText, MemcachedMeta, MemcachedBinary, RedisResp,
                 CompileCacheHandler (the 0xFC executor), CompileCacheWire
@@ -322,18 +326,19 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   Container-agnostic is not SUFFICIENT — SSO keeps a short secret where no allocator is called,
   which makes **macOS the platform to write the failing test against**. Secret STRINGS need an
   inline wipe too. Holders are found by NAME, so a row that has stopped matching is a refusal.
-- A lease token is a credential, and its MAC covers the granted **endpoint**. Fields
+- A lease token is a credential, and its signature covers the granted **endpoint**. Fields
   length-prefixed, never joined.
 - The PSK signs through ONE seam and the domain is a required PARAMETER, never a string a caller
-  remembers: `Cluster/ClusterSigning.hpp`'s `SigningDomain` and its `SigningDomainTable`. The lease
-  and the node proof each own rows, and every verifier goes through `VerifyFields`. The Raft peer
-  wire's rows and discovery's LEFT at #178 and their labels are retired, never reused.
+  remembers: `Cluster/ClusterSigning.hpp`'s `SigningDomain` and its `SigningDomainTable`. The node
+  proof owns the one row left, and every verifier goes through `VerifyFields`. The Raft peer
+  wire's rows, discovery's and the lease's LEFT at #178, for each node's own key, and their labels
+  are retired, never reused.
 - #402 moved the discovery proof's MAC *input* and **`DiscoveryWire::CurrentVersion` deliberately
   did not move** — the datagram grammar was unchanged. "We changed the MAC, so bump the version"
   is the tempting correction, and it is wrong. It DID move at #178 (1→2), and `RaftWire`'s for #1308
   and #178, because a key and a signature where a MAC was, a handshake and a tag trailer are
   GRAMMAR: the question is always which of the two changed.
-- The MAC is checked before any other claim is reported on, or a named refusal is an oracle. The
+- The signature is checked before any other claim is reported on, or a named refusal is an oracle. The
   expiry bounds how long a *captured* token is useful and is **not** a capacity bound.
 - A grant is spendable **once**, at the worker it names. The spend runs LAST, so a grant refused
   on a reading of its claims is not consumed, and every refusal a client RETRIES is decided above
@@ -347,8 +352,13 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   grant delivered across a leadership change arrives as one too. Report what is OBSERVED, name
   both causes, and say that the RATE separates them. **A confident wrong signal is worse than a
   vague right one.**
-- No key means the SCHEDULER signs nothing: unsigned grants and one bounded warning, never a
-  silent fallback. Its startup refusal is still open (#303) and must take the worker's shape above.
+- A scheduler IS a consensus member, alone or not, so every grant is signed -- by the ISSUING
+  voter's own identity key. One without `--listen-raft` is refused (`SchedulerNeedsConsensusRefusal`).
+- A worker checks that signature against a ROSTER: the applied state on a consensus member, a
+  certified roster anywhere else. It adopts a newer one only if a STRICT MAJORITY of the voters in
+  the roster it HOLDS endorse it -- never of the offer's own voters -- and `--voter-key` roots only
+  the first. Past `notAfter` plus slack every grant is `RosterExpired`; the version is DERIVED in
+  `Apply`, never bumped per verb.
 - An OUTBOUND credential is read where it is PRESENTED, through one seam
   (`Node::ICredentialSource`), never captured at construction — which is what lets `--requirepass`
   on the worker be `Reloadable::Yes` at all. A rotation reaching two of three sites is WORSE than
@@ -1106,8 +1116,8 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - A SECOND carve-out: a row no writer in this PROCESS could move is absent, never zero. Which
   surface writes each catalogue row is `CounterSoleWriterTable`, complete and
   `static_assert`ed (**the count is not repeated here**, for the reason the loop ratchet's is
-  not: the table owns it) — a scan for `Increment(Counter::X)` finds 39 of them, because the rest are
-  written through a table. Its `size()` counts (counter, surface) PAIRS and is not a count of
+  not: the table owns it) — a scan for `Increment(Counter::X)` finds only the minority written
+  directly, because the rest are written through a table. Its `size()` counts (counter, surface) PAIRS and is not a count of
   counters; `AttributedCounterCount()` is. **Err unattributed**, and narrow a BINARY's set only
   from the flags that decide whether the component is CONSTRUCTED — `ServedSurfaces{}` means
   *not narrowed* and therefore every surface. `ctest -R counter-attribution`.

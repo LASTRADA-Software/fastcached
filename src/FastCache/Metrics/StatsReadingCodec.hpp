@@ -57,7 +57,8 @@ namespace FastCache
 /// ```
 /// u64 layout digest
 /// counter presence bitmap, ceil(rows/8) bytes; then u64 per present counter, in row order
-/// u8 presence: bit0 storage, bit1 host, bit2 upstreamConfigured, bit3 consensus, bit4 hostLoad
+/// u8 presence: bit0 storage, bit1 host, bit2 upstreamConfigured, bit3 consensus, bit4 hostLoad,
+///             bit5 rosterExpiresInSeconds
 /// storage (if present): u64 per StorageStatsWireFields row
 /// tier presence bitmap, ceil(tiers/8) bytes; then StorageStatsWireFields per present tier
 /// host (if present): u64 per HostCapacityWireFields row
@@ -66,6 +67,7 @@ namespace FastCache
 /// upstreamConfigured (if present): u8, 0 or 1
 /// consensus (if present): u32 member count, then per member u32 length + bytes;
 ///                         u8 leader present, then u32 length + bytes; u64 term; u64 commitIndex; u8 role
+/// rosterExpiresInSeconds (if present): u64
 /// u64 uptime seconds
 /// u32 length + bytes: the version of the build that captured the reading
 /// ```
@@ -169,11 +171,14 @@ namespace StatsReadingWire
                                                       std::string_view { "role" } };
 
     /// See `ConsensusFieldNames`.
-    inline constexpr std::array SnapshotFieldNames {
-        std::string_view { "storage" },  std::string_view { "storageTiers" },       std::string_view { "host" },
-        std::string_view { "hostLoad" }, std::string_view { "upstreamConfigured" }, std::string_view { "consensus" },
-        std::string_view { "uptime" }
-    };
+    inline constexpr std::array SnapshotFieldNames { std::string_view { "storage" },
+                                                     std::string_view { "storageTiers" },
+                                                     std::string_view { "host" },
+                                                     std::string_view { "hostLoad" },
+                                                     std::string_view { "upstreamConfigured" },
+                                                     std::string_view { "consensus" },
+                                                     std::string_view { "rosterExpiresInSeconds" },
+                                                     std::string_view { "uptime" } };
 
     /// The fields of `StatsReading` itself, by name, in the order they travel. Held to the struct by the
     /// encoder's structured binding, as `SnapshotFieldNames` is.
@@ -186,7 +191,8 @@ namespace StatsReadingWire
     /// shape without a table changing.
     ///
     /// 5: the consensus block's one member list became two, voters then learners (#1449).
-    inline constexpr std::string_view Grammar = "stats-reading-grammar-5";
+    /// 6: a presence bit and a `u64` after the consensus block, for the roster's lapse (#178).
+    inline constexpr std::string_view Grammar = "stats-reading-grammar-6";
 
     /// 64-bit FNV-1a over @p text, continuing from @p hash.
     /// @param hash The running digest.

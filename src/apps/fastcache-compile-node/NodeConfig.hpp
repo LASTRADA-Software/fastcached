@@ -156,6 +156,16 @@ struct NodeConfig
     /// them in one round until one answers, and a `NotLeader` from any of them is
     /// followed to the endpoint it names without consulting this list.
     std::vector<std::string> schedulers;
+
+    /// The identity keys of the cluster's voters, as a worker that runs no consensus is
+    /// told them: `--voter-key`, repeatable (#178).
+    ///
+    /// Its trust ROOT and nothing more: the first roster it adopts must be endorsed by a
+    /// strict majority of these, and from then on the roster it holds certifies its successor
+    /// and these are never read again -- as the replicated state wins over the keys
+    /// `--raft-peer` typed. Keys and not addresses, because `--scheduler` may be a name that
+    /// fronts several machines, and a key belongs to exactly one.
+    std::vector<Ed25519PublicKey> voterKeys;
     std::string advertise; ///< host:port clients should reach this worker on.
 
     /// fingerprint=compilerPath, repeatable. An OVERRIDE: naming any pins this
@@ -1400,9 +1410,39 @@ inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
 /// worker's lease rule (#282) takes one surface over.
 inline constexpr std::string_view ConsensusNeedsClusterKeyRefusal =
     "--listen-raft turns consensus on, and consensus needs --cluster-key-file: the cluster's pre-shared key no "
-    "longer proves anything between members, which each member's own identity key does, but it still signs the "
-    "scheduler's leases and proves a member on the node port. Give every member the same key file -- generate one "
-    "with `head -c 32 /dev/urandom | base64` -- or drop --listen-raft to run one machine alone";
+    "longer proves anything between members, which each member's own identity key does, nor signs a lease, which "
+    "the leader's does, but it still proves a member on the node port. Give every member the same key file -- "
+    "generate one with `head -c 32 /dev/urandom | base64`";
+
+/// Why a scheduler that runs no consensus is refused (#178).
+///
+/// A scheduler signs every grant with its identity key and hands every worker a roster a
+/// majority of its cluster's voters certify -- so it holds replicated state, which is
+/// consensus, even alone (owner decision 3). Refused rather than run portless: a mode rides
+/// on the PORT (`RunsConsensus`), and a scheduler quietly running a consensus nothing can
+/// join would make the flag's absence carry a mode.
+inline constexpr std::string_view SchedulerNeedsConsensusRefusal =
+    "--serve-scheduler needs --listen-raft: a scheduler signs every lease with its identity key and hands its "
+    "workers a roster its cluster's voters certify, so it is a consensus member -- one machine alone is a cluster "
+    "of one. Add --listen-raft=<port> and --raft-self=<host>, the address another member would dial it at "
+    "(127.0.0.1 when none ever will)";
+
+/// Why a worker that could verify no lease is refused, when other machines can reach it (#178).
+///
+/// Shared by the configuration table and the startup check of the state directory, which ask
+/// the one question at the two moments its answer can be known.
+inline constexpr std::string_view RosterlessWorkerRefusal =
+    "a node that admits peers on other machines checks the lease a client presents to its worker, against a roster "
+    "its cluster's voters certify -- and this node runs no consensus, names no --voter-key and holds no roster, so "
+    "it could verify nothing: it would compile for anybody who can reach its port, and report nothing wrong while "
+    "doing it. Name the voters' keys with --voter-key (each voter's --print-identity prints its key). A node "
+    "admitting only its own machine needs none, because a process on this host already has this host's compiler";
+
+/// Why `--voter-key` on a consensus node is refused (#178).
+inline constexpr std::string_view VoterKeyOnConsensusNodeRefusal =
+    "--voter-key names the voters a worker that runs NO consensus trusts before it holds a roster; this node runs "
+    "consensus (--listen-raft), so it verifies every grant against the state it applies and would never read "
+    "these keys. Drop --voter-key";
 
 /// Why a node with no worker, no scheduler, no consensus and no cache tier is refused.
 inline constexpr std::string_view NodeRunsNothingRefusal =
@@ -1437,7 +1477,9 @@ inline constexpr std::string_view NodeRunsNothingRefusal =
 /// The disagreement is not hypothetical: the scheduler assumed nobody would, published
 /// standalone leadership at term 0, and then consensus published a real term over the
 /// top of it -- leaving a window in which the surface answered `Lease` as a leader that
-/// had not been elected.
+/// had not been elected. Since #178 there is no standalone leadership at all -- a
+/// scheduler without consensus is refused at startup -- and this predicate is what that
+/// refusal asks.
 ///
 /// **The switch is `--listen-raft`, and it moved off `--node-id` at
 /// [#1022](https://github.com/LASTRADA-Software/fastcached/issues/1022).** While the
@@ -1608,6 +1650,18 @@ enum class ConsensusDialGap : std::uint8_t
 [[nodiscard]] std::string WorkerReadinessPhrase(NodeConfig const& cfg,
                                                 std::optional<std::uint32_t> workerSlots,
                                                 std::size_t toolchains);
+
+/// Whether a machine that is not this one could reach this node's compile verbs, as the
+/// configuration says: a door onto them answers somewhere but loopback, and the admission
+/// policy lets a remote peer through it.
+///
+/// **The one question that decides whether a lease must be checked** (#282, #178), asked by
+/// the startup table of a configuration and by `NodeRoster::Build` of a state directory -- two
+/// moments, one predicate. It reads `--bind`, so under socket activation it describes nothing,
+/// and `MakeWorkerLeaseValidator` keeps the backstop for that case.
+/// @param cfg The parsed configuration.
+/// @return True when another machine could present a lease here.
+[[nodiscard]] bool CompileVerbsReachOtherMachines(NodeConfig const& cfg);
 
 /// One path-valued worker flag whose file holds a secret.
 ///

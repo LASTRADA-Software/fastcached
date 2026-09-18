@@ -75,6 +75,10 @@ TEST_CASE("The wire constants have their specified byte values")
     // no reply body for this verb, and drops the one string the change exists to put on
     // the screen. A missing string does not announce itself as missing, so leaving the
     // floor at 7 would manufacture a quiet failure inside the fix for one.
+    //
+    // Version 12 (#178) gives NODE-ANNOUNCE a fourth field -- a voter's roster endorsement --
+    // and its `Ok` a body, the certified roster. The arity is exact, so an older peer cannot
+    // read the request at all, and both move for that reason.
     CHECK(CurrentVersion == 12);
     CHECK(MinSupportedVersion == 12);
     CHECK(RequestHeaderSize == 7);
@@ -2602,7 +2606,7 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
     sent.consensusEndpoint = "10.0.0.4:6680";
     sent.forgottenClients = 2;
     sent.consensusStanding = WireConsensusStanding::Learner;
-    sent.conditions = std::vector { NodeConditionFields { .id = "unsigned-lease-grants",
+    sent.conditions = std::vector { NodeConditionFields { .id = "scratch-root-unmappable",
                                                           .persistence = "latched",
                                                           .severity = "warning",
                                                           .state = "raised",
@@ -2610,17 +2614,19 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
                                                           .remedy = "name one" } };
     sent.identityPublicKey.emplace();
     sent.identityPublicKey->fill(std::byte { 0xA5 });
+    sent.roster = NodeRosterFields { .version = 9, .voters = 3, .principals = 4, .revoked = 1, .certifiedUntilMillis = 42 };
     // Kept in a local: `SplitAll` hands back spans INTO it.
     auto const emitted = EncodeNodeRuntime(sent);
     auto const parts = WireFields::SplitAll(emitted);
     REQUIRE(parts.has_value());
-    // Eighteen: thirteen that predate #1328, the endpoint it added, #1471's applied-tombstone
-    // count, #1449's consensus standing, #1364's condition list and #178's identity key. Pinned,
-    // since every cut below is counted from it and a record that grew would move what "older"
-    // means -- which is how this case caught #1471's append, then #1449's, #1364's and #178's,
-    // rather than letting any of them shift the cuts silently. #1364 and #178 each appended
-    // behind the standing on their own; the integration orders them, the conditions first.
-    REQUIRE(Unwrap(parts).size() == 18);
+    // Nineteen: thirteen that predate #1328, the endpoint it added, #1471's applied-tombstone
+    // count, #1449's consensus standing, #1364's condition list, #178's identity key and the
+    // roster #178 certifies. Pinned, since every cut below is counted from it and a record that
+    // grew would move what "older" means -- which is how this case caught #1471's append, then
+    // #1449's, #1364's and both of #178's, rather than letting any of them shift the cuts
+    // silently. #1364 and #178 each appended behind the standing on their own; the integration
+    // orders them, the conditions first.
+    REQUIRE(Unwrap(parts).size() == 19);
 
     SECTION("thirteen fields, as a build before #1328 emits: both disengaged, and the cordon still read")
     {
@@ -2696,7 +2702,18 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(Unwrap(back).conditions == sent.conditions);
     }
 
-    SECTION("eighteen fields, this build: every fact engaged")
+    SECTION("eighteen fields, as a build after the key and before the roster emits: the roster is absent")
+    {
+        // A node holding no roster answers exactly so, and a record from before the field must
+        // read the same: absent, never a roster of nobody.
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 18 };
+        auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
+        REQUIRE(back.has_value());
+        CHECK_FALSE(Unwrap(back).roster.has_value());
+        CHECK(Unwrap(back).identityPublicKey == sent.identityPublicKey);
+    }
+
+    SECTION("nineteen fields, this build: every fact engaged")
     {
         auto const current = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { current }));
@@ -2708,9 +2725,10 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
         CHECK(runtime.conditions == sent.conditions);
         CHECK(runtime.identityPublicKey == sent.identityPublicKey);
+        CHECK(runtime.roster == sent.roster);
     }
 
-    SECTION("nineteen fields, from a build ahead of this one: the surplus is skipped")
+    SECTION("twenty fields, from a build ahead of this one: the surplus is skipped")
     {
         auto ahead = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const extra = AsBytes(std::string_view { "a fact from the future" });
@@ -2724,6 +2742,7 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
         CHECK(runtime.conditions == sent.conditions);
         CHECK(runtime.identityPublicKey == sent.identityPublicKey);
+        CHECK(runtime.roster == sent.roster);
     }
 }
 
@@ -2748,12 +2767,12 @@ TEST_CASE("An identity key travels as its 32 bytes, absent as nothing, and any o
     // A PREFIX of a key is another key, so a short field is refused rather than padded, and a
     // long one rather than truncated: either would print a string an operator compares against
     // a machine that holds no such key. The key is the eighteenth field, behind #1364's
-    // conditions.
+    // conditions and ahead of the roster.
     for (auto const width: { std::size_t { 31 }, std::size_t { 33 } })
     {
         auto emitted = EncodeNodeRuntime(NodeRuntimeFields {});
         auto parts = Unwrap(WireFields::SplitAll(emitted));
-        REQUIRE(parts.size() == 18);
+        REQUIRE(parts.size() == 19);
         auto const wrong = std::vector<std::byte>(width, std::byte { 0x11 });
         parts[17] = wrong;
         CHECK_FALSE(DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts })).has_value());
@@ -2788,10 +2807,10 @@ TEST_CASE("A consensus standing travels as its pinned byte, and one this build c
     sent.forgottenClients = 3;
     auto emitted = EncodeNodeRuntime(sent);
     auto parts = Unwrap(WireFields::SplitAll(emitted));
-    // Eighteen since #1364 and #178 appended the condition list and the identity key behind the
-    // standing; the standing is still the sixteenth field, so the byte replaced below is still
-    // the one under test.
-    REQUIRE(parts.size() == 18);
+    // Nineteen since #1364 and #178 appended the condition list, the identity key and the roster
+    // behind the standing; the standing is still the sixteenth field, so the byte replaced below
+    // is still the one under test.
+    REQUIRE(parts.size() == 19);
     auto const unknown = std::array { std::byte { 0x7F } };
     parts[15] = unknown;
     auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts }));
@@ -3167,4 +3186,70 @@ TEST_CASE("A condition list this build cannot read is refused, never read short"
 
     // Refused means refused: nothing was written into the caller's list on the way out.
     CHECK_FALSE(out.has_value());
+}
+
+TEST_CASE("NODE-ANNOUNCE carries a voter's endorsement as its fourth field, empty when there is none", "[wire][roster]")
+{
+    // #178. The endorsement is opaque here -- the scheduler decodes and verifies it -- and the
+    // arity is exact whether or not there is one: absent is a zero-length FOURTH field, never a
+    // three-field payload an older reader would have accepted.
+    CHECK(OpFieldCount(Op::NodeAnnounce) == 4);
+    auto const endorsement = std::vector<std::byte> { std::byte { 0x01 }, std::byte { 0x02 }, std::byte { 0x03 } };
+
+    for (auto const& carried: { std::span<std::byte const> {}, std::span<std::byte const> { endorsement } })
+    {
+        auto const frame = EncodeNodeAnnounce(
+            NodeAnnounceRequest { .endpoint = "10.0.0.2:6674", .capacity = {}, .load = {}, .endorsement = carried });
+        REQUIRE(frame.size() > RequestHeaderSize);
+        CHECK(std::to_integer<unsigned>(frame[1]) == 12);
+        auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
+        REQUIRE(WireFields::SplitExactly(payload, 4).has_value());
+
+        auto const decoded = DecodeNodeAnnouncePayload(payload);
+        REQUIRE(decoded.has_value());
+        CHECK(std::ranges::equal(Unwrap(decoded).endorsement, carried));
+    }
+}
+
+TEST_CASE("roster-expired is its own wire code, pinned as a byte", "[wire][roster]")
+{
+    // #178: a worker whose roster is absent or has lapsed refuses every grant with it. A client
+    // reads it as any refused compile -- compile locally -- and an operator reads the worker's
+    // counters for which of the two it was.
+    CHECK(static_cast<std::uint8_t>(ErrorCode::RosterExpired) == 0x28);
+    auto const* const row = Describe(ErrorCode::RosterExpired);
+    REQUIRE(row != nullptr);
+    CHECK(row->name == "roster-expired");
+}
+
+TEST_CASE("A node's roster travels in its runtime record, absent when it holds none", "[wire][roster]")
+{
+    // Field 18 of the nested record (#178). Absent and a roster of nobody are different
+    // answers, and a consensus member's roster has no lapse to report -- absent at the field.
+    auto runtime = NodeRuntimeFields {};
+    SECTION("absent")
+    {
+        auto const decoded = DecodeNodeRuntime(EncodeNodeRuntime(runtime));
+        REQUIRE(decoded.has_value());
+        CHECK_FALSE(Unwrap(decoded).roster.has_value());
+    }
+    SECTION("a worker's, certified until an instant")
+    {
+        runtime.roster = NodeRosterFields {
+            .version = 7, .voters = 3, .principals = 2, .revoked = 1, .certifiedUntilMillis = 1'767'225'600'000ULL
+        };
+        auto const decoded = DecodeNodeRuntime(EncodeNodeRuntime(runtime));
+        REQUIRE(decoded.has_value());
+        CHECK(Unwrap(decoded).roster == runtime.roster);
+    }
+    SECTION("a consensus member's, with no lapse")
+    {
+        runtime.roster = NodeRosterFields {
+            .version = 7, .voters = 3, .principals = 0, .revoked = 0, .certifiedUntilMillis = std::nullopt
+        };
+        auto const decoded = DecodeNodeRuntime(EncodeNodeRuntime(runtime));
+        REQUIRE(decoded.has_value());
+        REQUIRE(Unwrap(decoded).roster.has_value());
+        CHECK_FALSE(Unwrap(Unwrap(decoded).roster).certifiedUntilMillis.has_value());
+    }
 }

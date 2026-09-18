@@ -200,6 +200,7 @@ The scheduler is a **compile node**, not the cache. Pick one machine and give it
 ```sh
 fastcache-compile-node \
     --serve-scheduler --listen-node=0.0.0.0:6675 \
+    --listen-raft=6680 --raft-self=scheduler.internal \
     --fleet-member=worker-01.internal \
     --fleet-member=worker-02.internal \
     --fleet-member=dev-01.internal \
@@ -208,12 +209,25 @@ fastcache-compile-node \
     --cluster-key-file=/etc/fastcached/cluster.key
 ```
 
-`--cluster-key-file` names one pre-shared key the whole fleet holds, and a node
-another machine can dial **will not start** without it — so provision it before you
-start anything, not after the first refusal. It is one file, made once per fleet and
-copied around; the recipe is
+**A scheduler is a cluster, even of one**
+([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). It signs every
+lease with its own identity key, and it hands its workers a *roster* — the cluster's
+voters and their keys — that a majority of those voters certify, so it holds
+replicated state and runs consensus to keep it: `--listen-raft` turns consensus on,
+and `--raft-self` states the host another member would dial it at (`127.0.0.1` when
+none ever will). One started without `--listen-raft` is refused, by name. Its identity
+is minted into its state directory on first start, and the same command line with
+`--print-identity` added prints it without serving — the `public-key` line is what
+every worker's `--voter-key` names.
+
+`--cluster-key-file` names one pre-shared key every consensus member holds, and
+consensus **will not start** without it — so provision it before you start anything,
+not after the first refusal. It is one file, made once per fleet and copied around;
+the recipe is
 [on the node's page](../tools/fastcache-compile-node.md#finding-peers-instead-of-typing-them),
-and what it buys is under [Security](#security).
+and what it buys is under [Security](#security). It no longer signs leases — each
+scheduler's own key does — but it still proves a member on the node port and is what
+an enrollment window hands a joiner.
 
 It used to be `fastcached --listen-dispatch=...`, and that flag is **gone** rather
 than deprecated. The two jobs have opposite deployment shapes: a cache is shared
@@ -250,10 +264,9 @@ Such a machine shows among the cluster's **members** when it runs consensus, and
 not among the fleet page's **machines**, which are built from worker registrations;
 its own history is not handed to a leader either ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
 
-Once several nodes run, exactly one of them must schedule at a time, which is
-what consensus decides — `--node-id`, `--listen-raft` and `--raft-peer`, with the
-same `--cluster-key-file` on every member, because each connection between them
-proves it. See
+Once several nodes schedule, exactly one of them may at a time, which is what the
+same consensus decides once it has more than one member — `--raft-peer` naming each
+of them, with the same `--cluster-key-file` on every member. See
 [a cluster, and who leads it](../tools/fastcache-compile-node.md#a-cluster-and-who-leads-it).
 
 #### Who may use the fleet
@@ -266,10 +279,12 @@ is not on it is refused a lease and compiles locally. List the machines that
 *ask* as well as the machines that *answer*.
 
 `--fleet-open` admits everybody, for one machine or a network that is already
-your boundary. One of the two is **required** — a scheduler with no member list
-refuses every caller, which is the right default and not a working configuration,
-so it is refused at startup rather than left to be discovered as a fleet that
-silently distributes nothing.
+your boundary. Give one of them — or admit each client machine with
+`--cluster-admit-client`, which the cluster replicates: a scheduler with none of the
+three refuses every caller but its own machine, which is the right default and not a
+working configuration. The startup rules cannot see the third route, so they no
+longer refuse a scheduler naming neither flag; its `/metrics` shows the refusals
+instead.
 
 Membership gates **two** of a node's surfaces — its scheduler and its compile port
 — and this machine is always a member of its own fleet whatever the list says.
@@ -299,8 +314,27 @@ fastcache-compile-node \
     --listen-node=0.0.0.0:6674 \
     --advertise=worker-01.internal:6674 \
     --fleet-open \
+    --voter-key=<scheduler-public-key> \
     --cluster-key-file=/etc/fastcached/cluster.key
 ```
+
+**`--voter-key` is how a worker knows whose leases to honour**
+([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). Every lease is
+signed by the scheduler that issued it, with that machine's own identity key, and the
+worker checks the signature against a *roster*: the cluster's voters and their keys,
+endorsed by a strict majority of those voters, re-endorsed every 15 minutes and good
+for an hour at a time. `--voter-key` names the voters it trusts before it holds one —
+paste each voter's `public-key` line from `--print-identity`, one flag per voter. The
+first roster a majority of them endorses is adopted from the scheduler's reply, and
+from then on only the roster held certifies its successor, so a key typed here never
+outvotes the cluster's own revocation. With `--cluster-dir` the roster is kept across
+restarts. A worker another machine can reach **will not start** with no way to check a
+lease; one reachable only from its own machine needs none.
+
+A worker cut off from the leader goes on honouring grants for as long as its roster
+stays certified, and then refuses every one `roster-expired`: that is the bound on how
+long a scheduler the cluster has since removed can go on leasing it out.
+`fastcache_node_roster_expires_in_seconds` says how long is left.
 
 **`--listen-node` is not optional on a worker that serves a fleet.** It defaults to
 **loopback**, which is right for the single-machine install and unreachable for
@@ -343,7 +377,7 @@ port for an endpoint to be compared against.
     runtime](../tools/fastcache-compile-node.md#membership-at-runtime). A cluster
     member is a peer; a client machine is not and never will be, so
     `--fleet-member` stays the way to admit a laptop or a CI runner on a clustered
-    fleet just as on a standalone node. `--fleet-open` remains the answer where the
+    fleet just as on a node running no consensus. `--fleet-open` remains the answer where the
     build network is already your boundary.
 
 The worker then surveys the machine at startup and serves every compiler it
@@ -580,11 +614,14 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_envelope_unsupported_codec_total` | A client compressed with a codec this worker was not built with. A packaging difference between two honest machines; each one cost a local compile. |
 | `fastcache_worker_jobs_refused_envelope_malformed_total` | A payload envelope that did not parse: a version skew, or something on the port that is not this protocol. |
 | `fastcache_worker_jobs_refused_envelope_corrupt_total` | Bytes that parsed and then did not expand to their declared size. The one refusal here that implicates the **transport**. |
-| `fastcache_worker_jobs_refused_lease_unauthorized_total` | The lease presented was not signed by this cluster. The one counter here that is unambiguously a **security** signal rather than a capacity or configuration one — or a launcher predating signed leases, which is told apart by whether the rise tracks a rollout. |
-| `fastcache_worker_jobs_refused_lease_wrong_cluster_total` | An **authentic** lease was signed by a different fleet. Never sum it with `..._unauthorized_total` beside it: that one is a bad signature, this one is a good signature from somebody else. A rise here is a provisioning mistake — two sites built from one copied `--cluster-key-file` — and the fix is a second key, not a firewall. |
+| `fastcache_worker_jobs_refused_lease_unauthorized_total` | The lease presented was not signed by any voter the worker's roster names. The one counter here that is unambiguously a **security** signal rather than a capacity or configuration one — or a launcher predating this lease format, which is told apart by whether the rise tracks a rollout. |
+| `fastcache_worker_jobs_refused_lease_signer_revoked_total` | The lease verifies — under a key the cluster has **revoked**. The removed machine itself, still leasing out work: it should read zero forever, and a rise names a machine somebody removed and nobody stopped. |
+| `fastcache_worker_jobs_refused_lease_wrong_cluster_total` | An **authentic** lease was signed by a different fleet. Never sum it with `..._unauthorized_total` beside it: that one is a bad signature, this one is a good signature from somebody else. A rise here is a provisioning mistake — one identity key voting in two clusters, which is what copying a `--cluster-dir` to a second site produces — and the fix is a fresh state directory on one of them, not a firewall. |
 | `fastcache_worker_jobs_refused_lease_replayed_total` | An **authentic**, unexpired lease that this worker had **already run**. A lease authorizes exactly one compile — one grant per lease, presented once, with no retry — so nothing honest produces this and it should read zero forever. Any rise is somebody presenting a captured grant a second time. Do not sum it with `..._wrong_cluster_total` either: they share a wire code and nothing else, and they send you to opposite places. |
 | `fastcache_worker_jobs_refused_lease_endpoint_mismatch_total` | An **authentic** lease named a different worker. Almost never a replay and almost always a worker registered under an address clients do not dial — a NAT, or a hostname where clients resolve an address. |
 | `fastcache_worker_jobs_refused_lease_expired_total` | An **authentic** lease had expired. A rise on one machine and nowhere else is that machine's clock, not the fleet's leases — which is why the check carries skew slack and why this is worth seeing per node. |
+| `fastcache_worker_jobs_refused_lease_no_roster_total` | The worker holds **no roster** to check any lease against yet: none its `--voter-key` voters endorse has arrived. A few at startup are ordinary; a rise that does not stop means no leader it reaches is endorsed by the keys it was given. |
+| `fastcache_worker_jobs_refused_lease_roster_expired_total` | The worker's roster was not re-certified within its lifetime, so it can no longer tell a live voter from a revoked one. It is cut off from the leader, or reaches only an ex-leader withholding newer rosters — `fastcache_node_roster_expires_in_seconds` reached 0 first. |
 | `fastcache_worker_scratch_roots_reclaimed_total` | This worker took over a scratch root left behind by a node that exited without cleaning up. The work itself is correct — a root is only reclaimed once its previous owner's exclusive claim is free, which the OS releases however that process died. A rise means nodes are **dying rather than stopping**, which is worth knowing and is visible nowhere else. |
 | `fastcache_worker_bytes_received_total` / `..._returned_total` | Link volume, counted at the socket. |
 
@@ -605,23 +642,27 @@ fixes, and one number covering both tells you neither.
 > is impossible looks exactly like one reading zero because the event has not happened,
 > and only one of those means your fleet is healthy.
 
-The five `..._lease_*` counters move only on a node that holds
-`--cluster-key-file`. Without one a worker cannot check a signature, and it says so
-at startup rather than leaving these at zero and looking healthy — a node that
-another machine could dial is refused outright without the key
-([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)).
+The `..._lease_*` counters move only on a worker that checks leases: a consensus
+member, against the state it applies, or a worker holding a roster its `--voter-key`
+voters certified. A worker that checks nothing says so at startup rather than leaving
+these at zero and looking healthy — and one another machine could dial is refused
+outright ([#282](https://github.com/LASTRADA-Software/fastcached/issues/282),
+[#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
 
-**Three** of them — `..._unauthorized_total`, `..._wrong_cluster_total` and
-`..._replayed_total` — share the wire code `lease-unauthorized`, because a client's
-answer to all three is the same, compile it locally, and a code it does not recognise
-would be worse than one it does. **Your** answer is different for each, which is why
-they are three series rather than one: a bad signature is a security question, a good
-signature from another fleet is a provisioning one, and a grant presented twice is
-somebody replaying a credential.
+**Four** of them — `..._unauthorized_total`, `..._signer_revoked_total`,
+`..._wrong_cluster_total` and `..._replayed_total` — share the wire code
+`lease-unauthorized`, because a client's answer to all four is the same, compile it
+locally, and a code it does not recognise would be worse than one it does. **Your**
+answer is different for each, which is why they are four series rather than one: a bad
+signature is a security question, a revoked signer is a machine somebody removed and
+nobody stopped, a good signature from another fleet is a provisioning one, and a grant
+presented twice is somebody replaying a credential.
 
-The other two carry codes of their own — `..._endpoint_mismatch_total` answers
-`lease-endpoint-mismatch` and `..._expired_total` answers `lease-expired` — so an alert
-written against `lease-unauthorized` will not see them. That is deliberate and it is
+The rest carry codes of their own — `..._endpoint_mismatch_total` answers
+`lease-endpoint-mismatch`, `..._expired_total` answers `lease-expired`, and
+`..._no_roster_total` and `..._roster_expired_total` both answer `roster-expired`,
+which says the *worker* can check nobody's lease right now rather than that this one is
+bad — so an alert written against `lease-unauthorized` will not see them. That is deliberate and it is
 `LeaseRefusalTable` in `LeaseToken.hpp` that decides it: a client can act differently
 on those two, and a code it can act on is worth minting.
 
@@ -873,34 +914,38 @@ compiled, and the tier is exactly that. A cache several machines share is a
 
 Membership alone was never enough, because *admitted to the fleet* is not *granted
 this compile*: an admitted machine could spend any worker's CPU without ever asking
-the scheduler for a slot. So a lease grant is a **signed capability**. With
-`--cluster-key-file` set, the scheduler MACs the granted worker's endpoint, the
-toolchain, the object key and an expiry under the cluster's pre-shared key, and the
-worker checks that MAC before it decompresses anything
+the scheduler for a slot. So a lease grant is a **signed capability**. The scheduler
+signs the granted worker's endpoint, the toolchain, the object key and an expiry with
+its own Ed25519 identity key, and the worker checks that signature — against the
+cluster's roster of voters, unrevoked — before it decompresses anything
 ([#281](https://github.com/LASTRADA-Software/fastcached/issues/281),
-[#282](https://github.com/LASTRADA-Software/fastcached/issues/282)). The endpoint is
-inside the MAC, so a token captured on the way to one machine cannot be replayed
-against the rest of the fleet.
+[#282](https://github.com/LASTRADA-Software/fastcached/issues/282),
+[#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). The endpoint is
+inside the signature, so a token captured on the way to one machine cannot be
+replayed against the rest of the fleet; and a signature is one machine's, so a
+scheduler the cluster removes stops being able to lease anything out the moment its
+workers hold the roster that revokes it — or, if one withholds that roster, once the
+roster they hold lapses.
 
-!!! warning "Set `--cluster-key-file` on every node, and set it first"
+!!! warning "Give every worker `--voter-key`, and every consensus member `--cluster-key-file`"
 
-    A node that another machine could dial — anything with `--fleet-member` or
-    `--fleet-open` on a bind that is not loopback — **will not start** without it,
-    and neither will any node running consensus, whatever it binds: every connection
-    between members proves the key before a message is read. Both refusals are
-    deliberate and both are startup ones, not per-request fallbacks: a worker that quietly skipped the check would serve
-    whoever reached its port while every refusal counter read zero, which is a fleet
-    that looks healthy from both ends.
+    A worker that another machine could dial — anything with `--fleet-member` or
+    `--fleet-open` on a bind that is not loopback — **will not start** with no way to
+    check a lease: it runs consensus, or names the voters with `--voter-key`, or keeps
+    a roster in its `--cluster-dir`. And no node running consensus starts without
+    `--cluster-key-file`, whatever it binds. Both refusals are deliberate and both are
+    startup ones, not per-request fallbacks: a worker that quietly skipped the check
+    would serve whoever reached its port while every refusal counter read zero, which
+    is a fleet that looks healthy from both ends.
 
-    A node nothing else can dial — the ordinary one-machine install — needs no key
+    A node nothing else can dial — the ordinary one-machine install — needs neither
     and logs a warning saying the check is off. A process on that host already has
     that host's compiler.
 
-    **Provision the key everywhere before rolling the binary.** A worker that holds
-    the key and a scheduler that does not is a worker refusing every grant that
-    scheduler hands out. And upgrade a cluster's consensus members **together**: a
-    build with the authenticated consensus wire and one from before it cannot talk to
-    each other at all.
+    **Upgrade the fleet together.** A lease format and a roster are new in the same
+    release, and a worker and a scheduler from either side of it cannot agree on
+    either; nor can consensus members from either side of the authenticated
+    consensus wire.
 
 --8<-- "node-credential-gap.md"
 

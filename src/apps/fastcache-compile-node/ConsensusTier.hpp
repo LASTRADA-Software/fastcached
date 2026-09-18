@@ -5,18 +5,21 @@
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
+#include "NodeRoster.hpp"
 #include "SchedulerTier.hpp"
 
 #include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/ClusterStateMachine.hpp>
 #include <FastCache/Cluster/MembershipPolicy.hpp>
+#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Cluster/RosterKeys.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
@@ -319,6 +322,16 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// forget. One commit, one call, both facts.
     using MembersObserver = std::function<void(Cluster::ClusterState const& state)>;
 
+    /// Told every endorsement this node signs of the roster it applied (#178).
+    ///
+    /// Pushed, as the member set is, because it has two readers that must not wait for each
+    /// other: this node's own scheduler takes it directly -- which is how a lone scheduler
+    /// certifies its roster without dialling itself -- and the presence loop carries the latest
+    /// one to whoever leads. Called on the reconciler thread, only when an endorsement is
+    /// signed: when the roster changes, and every `Cluster::RosterEndorsementRefresh` while it
+    /// does not.
+    using EndorsementObserver = std::function<void(Cluster::RosterEndorsement const& endorsement)>;
+
     /// Start consensus, or explain why the node must not start.
     /// @param cfg The parsed configuration.
     /// @param schedulerBound What this node's scheduler surface bound, empty when
@@ -330,6 +343,9 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     ///        refused (`ConsensusNeedsIdentityKeyRefusal`).
     /// @param onRole Told this node's role; must outlive the tier.
     /// @param onMembers Told the member set; must outlive the tier.
+    /// @param wallClock What an endorsement's `notAfter` is read from: a WALL clock, since a
+    ///        worker on another machine compares it with its own. Must outlive the tier.
+    /// @param onEndorsement Told every endorsement this node signs; may be empty.
     /// @param metrics Where a refused peer connection is counted; must outlive the tier.
     /// @param logger Where progress and refusals are reported.
     /// @param conditions Where this tier answers its node conditions; null when nobody
@@ -341,6 +357,8 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
         std::optional<Ed25519KeyPair> const& identityKey,
         RoleObserver onRole,
         MembersObserver onMembers,
+        WallClockRef wallClock,
+        EndorsementObserver onEndorsement,
         IMetricsSink& metrics,
         ILogger& logger,
         NodeConditions* conditions = nullptr);
@@ -450,6 +468,9 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
                   std::string boundEndpoint,
                   RoleObserver onRole,
                   MembersObserver onMembers,
+                  WallClockRef wallClock,
+                  std::string clusterId,
+                  EndorsementObserver onEndorsement,
                   IMetricsSink& metrics,
                   ILogger& logger,
                   NodeConditions* conditions);
@@ -513,6 +534,18 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// `RaftDriver::RoleObserver` says in as many words that an observer must not
     /// block, being on the path that still has to send the next heartbeat.
     void Reconcile();
+
+    /// Endorse the roster @p state holds, when this node is a voter and one is due (#178).
+    ///
+    /// On EVERY node rather than only the leader, for `LearnMembers`' reason: a roster is
+    /// certified by a majority of the voters, and a leader cannot endorse on anybody's behalf.
+    /// Signed when the roster moved since the last endorsement and every
+    /// `Cluster::RosterEndorsementRefresh` while it has not, each lasting
+    /// `Cluster::RosterEndorsementLifetime` -- and never by a learner, or by a voter the state
+    /// records under a key other than the one this node holds, whose endorsement would verify
+    /// nowhere.
+    /// @param state What this node applied.
+    void Endorse(Cluster::ClusterState const& state);
 
     /// Teach the transport where every member of the cluster answers.
     ///
@@ -649,6 +682,19 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// Where this tier answers `unreadable-leader-snapshot`; null when nobody reads it.
     NodeConditions* _conditions;
 
+    /// What an endorsement's lapse is read from.
+    WallClockRef _wallClock;
+
+    /// The fleet every endorsement names: `--cluster-id`.
+    std::string _clusterId;
+
+    /// Told every endorsement this node signs; may be empty.
+    EndorsementObserver _onEndorsement;
+
+    /// The last endorsement this node signed, so an unchanged roster is re-signed only when a
+    /// refresh is due. Reconciler thread only.
+    std::optional<Cluster::RosterEndorsement> _endorsement;
+
     /// What consensus last said, so a state change can be re-read against it.
     ///
     /// The term is carried for the log line rather than for any decision: a role
@@ -773,31 +819,6 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     std::jthread _reconcileThread;
 };
 
-/// Start consensus when the operator configured a cluster, wiring it to the node.
-///
-/// A function rather than four lines in `WorkerBody`, for the reason
-/// `StartCacheTierOrExplain` is one: it is a coherent decision with one answer, it
-/// pushed `WorkerBody` past clang-tidy's cognitive-complexity limit inline, and
-/// `main.cpp` is in no test target. What it encodes is which of this node's parts
-/// consensus drives -- the scheduler's role and the fleet's membership -- and that
-/// list is the thing worth reading in one place.
-///
-/// A null result is success: it means no `--node-id` was given, so this node runs
-/// alone and the scheduler tier's standalone leadership stands. That is the ordinary
-/// single-machine deployment, not a degraded one.
-/// @param cfg The parsed configuration.
-/// @param schedulerTier Told this node's role; may be null when it serves none.
-/// @param identityKey This node's identity key, as the start resolved it; see
-///        `ConsensusTier::Start`.
-/// @param membership Told the replicated member set; must outlive the tier.
-/// @param metrics Where a refused peer connection is counted; must outlive the tier.
-/// @param logger Where progress and refusals are reported.
-/// @return The tier, a null tier meaning "no cluster configured", or the fatal reason.
-/// @param schedulerBound What the node's `0xFC` listener bound, or empty when there
-///        is none. Passed in rather than read off the scheduler tier, which stopped
-///        owning a listener when the surfaces merged (#290) -- and it is what a leader
-///        advertises, so it must be what was BOUND: `--listen-node=0` means "pick a
-///        port", and an endpoint echoing `:0` back names nothing a client could dial.
 /// The consensus reader a `/metrics` scrape uses, disengaged when this node runs none.
 ///
 /// A function rather than a ternary in `WorkerBody`, for the reason
@@ -814,12 +835,44 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
 /// @return A reader of that tier's status, or an empty function when there is none.
 [[nodiscard]] std::function<ConsensusStatus()> ConsensusScrapeSource(ConsensusTier const* tier);
 
+/// Start consensus when the operator configured a cluster, wiring it to the node.
+///
+/// A function rather than four lines in `WorkerBody`, for the reason
+/// `StartCacheTierOrExplain` is one: it is a coherent decision with one answer, it
+/// pushed `WorkerBody` past clang-tidy's cognitive-complexity limit inline, and
+/// `main.cpp` is in no test target. What it encodes is which of this node's parts
+/// consensus drives -- the scheduler's role and its endorsements, the fleet's membership,
+/// and the roster every grant is verified against -- and that list is the thing worth
+/// reading in one place.
+///
+/// A null result is success: it means no `--listen-raft`, so this node runs no consensus --
+/// and therefore no scheduler, since #178 makes every scheduler a consensus member. That is the
+/// ordinary shape of a pure worker, not a degraded one.
+/// @param cfg The parsed configuration.
+/// @param schedulerTier Told this node's role and every endorsement it signs; may be null when
+///        it serves none.
+/// @param schedulerBound What the node's `0xFC` listener bound, or empty when there
+///        is none. Passed in rather than read off the scheduler tier, which stopped
+///        owning a listener when the surfaces merged (#290) -- and it is what a leader
+///        advertises, so it must be what was BOUND: `--listen-node=0` means "pick a
+///        port", and an endpoint echoing `:0` back names nothing a client could dial.
+/// @param identityKey This node's identity key, as the start resolved it; see
+///        `ConsensusTier::Start`.
+/// @param membership Told the replicated member set; must outlive the tier.
+/// @param roster Told every applied state and every endorsement this node signs (#178); must
+///        outlive the tier.
+/// @param wallClock What an endorsement's lapse is read from; must outlive the tier.
+/// @param metrics Where a refused peer connection is counted; must outlive the tier.
+/// @param logger Where progress and refusals are reported.
+/// @return The tier, a null tier meaning "no cluster configured", or the fatal reason.
 [[nodiscard]] std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExplain(
     NodeConfig const& cfg,
     std::unique_ptr<SchedulerTier> const& schedulerTier,
     std::string_view schedulerBound,
     std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
+    NodeRoster& roster,
+    WallClockRef wallClock,
     IMetricsSink& metrics,
     ILogger& logger,
     NodeConditions* conditions = nullptr);

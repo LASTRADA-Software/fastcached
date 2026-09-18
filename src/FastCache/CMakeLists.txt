@@ -74,6 +74,7 @@ target_sources(FastCache
         Distributed/LeaseTable.cpp
         Distributed/WorkerRegistry.cpp
         Distributed/RosterStore.cpp
+        Distributed/RosterTrust.cpp
         Distributed/SchedulerService.cpp
         Distributed/SchedulerProtocol.cpp
         Distributed/FleetHistory.cpp

@@ -126,6 +126,9 @@ struct WorkerTierFixture
                                                    // No cluster key: every case here is about the worker tier itself, and a
                                                    // worker with none is the ordinary single-machine shape.
                                                    .proofKey = nullptr,
+                                                   // No roster either, for the same reason: a worker no other
+                                                   // machine reaches checks no grant (#178).
+                                                   .leaseRoster = nullptr,
                                                    .metrics = metrics,
                                                    .logger = logger,
                                                    .conditions = conditions },

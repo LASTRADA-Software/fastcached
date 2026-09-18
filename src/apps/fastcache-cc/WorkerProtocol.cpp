@@ -127,9 +127,23 @@ namespace
     static_assert(std::ranges::none_of(
                       RefusedVerbs, [](Wire::Op op) { return op == Wire::Op::Compile; }, &Wire::RefusedVerb::op),
                   "a refusal row for COMPILE is dead: the lookup never reaches it");
+
+    /// What a worker whose roster lapsed says about when it did.
+    /// @param reading The roster's standing, `Expired`.
+    /// @param now This machine's clock.
+    /// @return The detail.
+    [[nodiscard]] std::string RosterLapsedDetail(Distributed::RosterReading const& reading,
+                                                 std::chrono::system_clock::time_point now)
+    {
+        if (!reading.certifiedUntil.has_value() || now <= *reading.certifiedUntil)
+            return "this worker's roster is not certified by a majority of its voters, so it can verify no grant";
+        return std::format("this worker's roster lost its certification {} seconds ago and no leader it reaches has "
+                           "re-certified it, so it can verify no grant",
+                           std::chrono::duration_cast<std::chrono::seconds>(now - *reading.certifiedUntil).count());
+    }
 } // namespace
 
-LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
+LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
                                     IAdvertisedEndpointSource const& advertisedEndpoint,
                                     WallClockRef clock,
                                     Distributed::WorkerLeaseState& lease,
@@ -144,7 +158,7 @@ LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
     // The endpoint is the one capture that is a REFERENCE on purpose: it is read per
     // request, so what is captured is where to ask rather than the answer (#1279). It
     // outlives this validator by contract, exactly as `lease` does.
-    return [key = std::move(signingKey), endpoint = &advertisedEndpoint, clock, &lease, &metrics, slack](
+    return [signers = &roster, endpoint = &advertisedEndpoint, clock, &lease, &metrics, slack](
                std::string_view token, std::string_view fingerprint) -> LeaseDecision {
         // The fingerprint is the one the REQUEST names, and this runs BEFORE anything
         // has checked that this worker serves it -- `CompileJobRunner::Run` answers
@@ -166,6 +180,23 @@ LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
         // verification could straddle that and check a MAC against one address while
         // naming another in the refusal.
         auto const advertised = endpoint->Current();
+
+        // The roster FIRST, because nothing below means anything without it (#178): a grant
+        // is verified against the keys the roster holds, and a roster nobody re-certified in
+        // time may still name a voter the cluster has since revoked. A fact about THIS WORKER,
+        // like `Unregistered` below, so answering it before the signature is no oracle.
+        auto const reading = signers->Read(now);
+        if (reading.standing == Distributed::RosterStanding::Absent)
+            return LeaseDecision { .refusal =
+                                       Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::NoRoster,
+                                                                   .detail = "this worker holds no roster its trust anchors "
+                                                                             "certify, so it can verify no grant yet" },
+                                   .remaining = std::nullopt };
+        if (reading.standing == Distributed::RosterStanding::Expired)
+            return LeaseDecision { .refusal =
+                                       Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::RosterExpired,
+                                                                   .detail = RosterLapsedDetail(reading, now) },
+                                   .remaining = std::nullopt };
 
         // The fleet is READ per request rather than captured at construction, because
         // this validator is built at startup and the identity arrives later, in the
@@ -195,7 +226,7 @@ LeaseValidator SignedLeaseValidator(SecureByteBuffer signingKey,
         // verifying grant has at least `slack` of budget by construction, so the
         // refusal the caller draws from `remaining` would be unreachable and untested.
         auto verified = Distributed::VerifyLeaseToken(
-            key,
+            *signers,
             token,
             Distributed::LeaseExpectation { .endpoint = advertised, .fingerprint = fingerprint, .clusterId = *cluster },
             now,
@@ -648,18 +679,19 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(ISocket& schedule
     return {};
 }
 
-std::expected<void, AnnounceRefusal> AnnounceNodePresence(ISocket& scheduler,
-                                                          CredentialNotice& notice,
-                                                          std::string_view endpoint,
-                                                          Wire::CapacityFields const& capacity,
-                                                          Wire::LoadFields const& load,
-                                                          Credential const& credential)
+std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(ISocket& scheduler,
+                                                                            CredentialNotice& notice,
+                                                                            std::string_view endpoint,
+                                                                            Wire::CapacityFields const& capacity,
+                                                                            Wire::LoadFields const& load,
+                                                                            std::span<std::byte const> endorsement,
+                                                                            Credential const& credential)
 {
-    auto const frame =
-        Wire::EncodeNodeAnnounce(Wire::NodeAnnounceRequest { .endpoint = endpoint, .capacity = capacity, .load = load });
-    auto const outcome = SyncRun(ExchangeFramed(&scheduler, &notice, frame, credential));
+    auto const frame = Wire::EncodeNodeAnnounce(
+        Wire::NodeAnnounceRequest { .endpoint = endpoint, .capacity = capacity, .load = load, .endorsement = endorsement });
+    auto outcome = SyncRun(ExchangeFramed(&scheduler, &notice, frame, credential));
     if (outcome.IsHit())
-        return {};
+        return std::move(outcome.value);
 
     // No `UnknownLease` arm, and its absence is the point rather than an omission: there is no
     // id to forget. A registrar clears its worker id on that refusal so the caller's retry

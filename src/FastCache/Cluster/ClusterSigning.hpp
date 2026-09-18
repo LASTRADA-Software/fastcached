@@ -77,15 +77,6 @@ namespace FastCache::Cluster
 /// nowhere.
 enum class SigningDomain : std::uint8_t
 {
-    /// The scheduler's signed grant. See `Distributed/LeaseToken`.
-    ///
-    /// The LAN discovery proof was a row here until #178, when it moved to a signature by each
-    /// node's OWN key (`DiscoveryWire::ProofSignatureLabel`) and this key stopped proving
-    /// anything on the segment. Its label, `fastcache-discovery-v1`, is retired and never
-    /// reused: a new row spelled that way would accept every tag an older build ever minted
-    /// under it.
-    LeaseToken = 0,
-
     /// A caller's proof, on the `0xFC` surface, that it holds the cluster key. See
     /// `Distributed/NodeProof`.
     ///
@@ -101,6 +92,16 @@ enum class SigningDomain : std::uint8_t
     /// retired, never reused: a new row spelled `fastcache-raft-dial-v1`,
     /// `fastcache-raft-verdict-v1` or `fastcache-raft-frame-v1` would accept every tag an older
     /// build ever minted under it.
+    ///
+    /// The lease had a row here too, until #178 signed a grant with the issuing voter's OWN
+    /// key (`Distributed/LeaseToken`), so a worker can tell which member issued it and refuse
+    /// one whose key the cluster revoked. `fastcache-lease-v1` is retired on the same terms.
+    ///
+    /// The LAN discovery proof was a row here until #178, when it moved to a signature by each
+    /// node's OWN key (`DiscoveryWire::ProofSignatureLabel`) and this key stopped proving
+    /// anything on the segment. Its label, `fastcache-discovery-v1`, is retired and never
+    /// reused: a new row spelled that way would accept every tag an older build ever minted
+    /// under it.
     NodeProof,
 
     Last, ///< Not a domain, and has no row: the length of a table keyed by one.
@@ -122,14 +123,12 @@ struct SigningDomainDescriptor
 /// retires every outstanding tag in that domain -- which is a deliberate, stated
 /// act rather than something to discover.
 ///
-/// `fastcache-lease-v1` is the label the lease token already carried, spelled
-/// identically, so moving that call site onto this seam changed no byte a lease
-/// authenticates. `fastcache-discovery-v1` was the discovery proof's, retired with it (#178).
+/// `fastcache-lease-v1` and `fastcache-discovery-v1` were the lease token's and the discovery
+/// proof's, both retired with their rows (#178).
 ///
 /// `fastcache-node-proof-v1` is the `0xFC` surface's (#1428): before it a caller there
 /// proved nothing, so there is no earlier tag for it to stay compatible with.
 inline constexpr EnumTable<SigningDomain, SigningDomainDescriptor> SigningDomainTable { {
-    { .domain = SigningDomain::LeaseToken, .label = "fastcache-lease-v1" },
     { .domain = SigningDomain::NodeProof, .label = "fastcache-node-proof-v1" },
 } };
 

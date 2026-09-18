@@ -99,6 +99,29 @@ key -- which the leader does for itself when it leads, and which `--cluster-admi
 `@<key>` does for anybody else. A mixed cluster shows as
 `fastcache_raft_peer_connections_refused_no_handshake_total` on the new nodes.
 
+## Signed leases and the certified roster
+
+**#178 signs every lease with the issuing scheduler's own identity key and has every
+worker check it against a roster of the cluster's voters**, where a lease was an HMAC
+under the shared key. `0xFC` moved to version 12 for it (NODE-ANNOUNCE carries a
+voter's endorsement out and the certified roster back), the replicated cluster state
+to version 7 (it records the roster's version), and the lease format to 3. Nothing
+older reads any of them, so this is the whole-fleet step above, with three changes to
+what each machine is started with:
+
+1. **Every scheduler runs consensus, even alone.** Add `--listen-raft` and
+   `--raft-self` (and `--cluster-dir`, for a service) to a scheduler that had none; it
+   is a cluster of one. One without them is refused at startup, by name.
+2. **Every worker another machine can reach names the voters.** Run
+   `--print-identity` on each voter, with the flags it runs with, and give every such
+   worker one `--voter-key=<public-key>` per voter. Without one it is refused at
+   startup; a worker only its own machine can reach needs none. With `--cluster-dir` it
+   keeps the roster it adopts, and from then on that roster certifies its successor.
+3. **Confirm on the workers.** `fastcache_node_roster_expires_in_seconds` appears on
+   every checking worker once it holds a roster, and
+   `fastcache_worker_jobs_refused_lease_no_roster_total` rising without stopping means
+   a worker never reached a leader its `--voter-key` voters endorse.
+
 ## The consensus state directory
 
 **#1449 (learners) changed what a consensus member writes to disk and says to its

@@ -7,6 +7,7 @@
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
+#include "NodeRoster.hpp"
 #include "SchedulerLink.hpp"
 
 #include <FastCache/Core/Logger.hpp>
@@ -40,6 +41,9 @@ struct NodePresenceParts
     /// What is wrong with this machine (#1364), read per round and handed to the leader's fleet
     /// page. The one verb every node sends is the one that carries it.
     NodeConditions const& conditions;
+    /// The roster half of the verb (#178): this node's endorsement out, the certified roster
+    /// back. Null on a node that neither endorses nor verifies anything.
+    IPresenceRoster* roster;
 };
 
 /// What one presence announcement is made of.
@@ -61,6 +65,7 @@ struct PresenceRound
     std::string_view endpoint;                        ///< Where it answers; the key its row is filed under.
     ILogger& logger;                                  ///< Where a refusal is named.
     NodeConditions const& conditions;                 ///< What is wrong with this machine, as of this round.
+    IPresenceRoster* roster;                          ///< The roster half of the verb; may be null.
 };
 
 /// Announce this machine once, and hand over the history it owes.
@@ -74,6 +79,34 @@ struct PresenceRound
 /// @param dialer How a connection is made.
 /// @return Whether a scheduler recorded this machine.
 [[nodiscard]] bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpointDialer& dialer);
+
+/// What one presence announcement SAYS, whoever built it.
+struct PresenceMessage
+{
+    std::string_view endpoint;                        ///< Where this machine answers; its row's key.
+    CompileCacheWire::CapacityFields const& capacity; ///< What this machine is.
+    CompileCacheWire::LoadFields const& load;         ///< What it is doing, and the history it hands over.
+    ICredentialSource const& credential;              ///< What the announcement presents.
+    Cc::CredentialNotice& notice;                     ///< Where an unwanted credential is reported.
+    ILogger& logger;                                  ///< Where a refusal is named.
+};
+
+/// Make one presence announcement: dial, follow a redirect, fall back, and carry the roster both
+/// ways (#178).
+///
+/// The part of a round below the sampling, so a fleet harness exercises exactly what a node
+/// runs: `DialAndAnnounce`'s rules for WHICH scheduler, this node's endorsement out, and the
+/// reply handed to @p roster -- from whichever scheduler the round reached, which is what lets a
+/// worker whose remembered leader was deposed adopt the new leader's roster in the same round.
+/// @param message What to say.
+/// @param roster The roster half, or null on a node that neither endorses nor verifies.
+/// @param link Which scheduler to try, and what an answer teaches it.
+/// @param dialer How a connection is made.
+/// @return Whether a scheduler recorded this machine.
+[[nodiscard]] bool AnnouncePresence(PresenceMessage const& message,
+                                    IPresenceRoster* roster,
+                                    SchedulerLink& link,
+                                    IEndpointDialer& dialer);
 
 /// The loop that tells a scheduler this MACHINE exists, running on EVERY node.
 ///
@@ -128,6 +161,10 @@ class NodePresence
     /// A `condition_variable_any` with the stop token rather than a sleep, because a wait
     /// nothing can cancel is a thread a `SIGTERM` has to sit through. One helper rather than
     /// the lock dance at each of the two exits, which is where the two come to differ.
+    ///
+    /// `RosterWantingInterval` rather than `NodeAnnounceInterval` while this node holds no
+    /// roster it could verify a grant against (#178): until one arrives it refuses every
+    /// compile, and twenty seconds of that after every start is a worker nobody can use.
     /// @param stop Requested when the node is shutting down.
     /// @return True when the loop should end.
     [[nodiscard]] bool WaitOutInterval(std::stop_token const& stop);
@@ -142,6 +179,7 @@ class NodePresence
     ICredentialSource const& _credential;
     ILogger& _logger;
     NodeConditions const& _conditions;
+    IPresenceRoster* _roster;
 
     /// Where a credential the scheduler did not want is reported, once for this loop.
     Cc::CredentialNotice _notice;
