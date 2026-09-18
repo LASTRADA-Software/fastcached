@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <ranges>
 #include <utility>
 #include <variant>
@@ -52,20 +53,24 @@ std::expected<RaftNode, ConsensusError> RaftNode::Create(RaftConfig config,
 
 RaftNode::RaftNode(RaftConfig config, IRandomSource& random, TimePoint now, RecoveredState recovered):
     _config { std::move(config) },
-    _peers { _config.Peers() },
     _random { random },
     _currentTerm { recovered.state.currentTerm },
     _votedFor { std::move(recovered.state.votedFor) },
-    _log { std::move(recovered.entries), recovered.firstIndex, PrecedingTermOf(recovered) },
-    _members { _config.members }
+    _log { std::move(recovered.entries), recovered.firstIndex, PrecedingTermOf(recovered) }
 {
+    // The bootstrap configuration until the log or the snapshot says otherwise --
+    // and through `AdoptConfiguration`, the one writer of the peer lists, so they
+    // exist even when `RefreshConfiguration` below finds an entry it cannot read and
+    // keeps what is already in force.
+    AdoptConfiguration(_config.Bootstrap());
+
     if (recovered.snapshot.has_value())
     {
         auto const& snapshot = *recovered.snapshot;
 
         // Set before `RefreshConfiguration`, which falls back to the snapshot's
         // configuration when the retained log holds no entry to re-derive one from.
-        _snapshotMembers = snapshot.members;
+        _snapshotConfiguration = snapshot.configuration;
         _snapshotState = snapshot.state;
 
         // A snapshot is only ever taken of applied state, so both indices come
@@ -130,20 +135,43 @@ LogIndex RaftNode::CommitIndex() const noexcept
     return _commitIndex;
 }
 
-TimePoint RaftNode::NextDeadline() const noexcept
+Standing RaftNode::CurrentStanding() const
 {
-    // Nothing ever falls due on a node with no cluster, so it says so rather than
-    // naming a deadline `Tick` would then have to decline to act on. Standing
-    // would win -- an empty member set puts the quorum at one -- and a node that
-    // has won can never afterwards be admitted to somebody else's cluster; see
-    // `HasCluster`. Answering here rather than branching in `Tick` keeps the role
-    // table the single answer to "what is this node waiting for", and it costs the
-    // joiner not even the timer draw. The driver bounds its own sleep by the
-    // heartbeat interval regardless, so this cannot park a loop forever.
-    if (!HasCluster())
-        return TimePoint::max();
+    return Membership::StandingOf(_configuration, _config.self);
+}
 
-    return TraitsOf(_role).timer == TimerKind::Election ? _electionDeadline : _heartbeatDeadline;
+TimerKind RaftNode::CurrentTimer() const
+{
+    // The role decides, except where it would wait on an election and the standing
+    // says this node never stands. A leader keeps its heartbeat whatever its
+    // standing: one demoted or removed by a change it has not yet committed is the
+    // only node that can commit it.
+    auto const timer = TraitsOf(_role).timer;
+    return timer == TimerKind::Election ? TraitsOf(CurrentStanding()).timer : timer;
+}
+
+TimePoint RaftNode::NextDeadline() const
+{
+    // Nothing ever falls due on a node whose standing never stands, so it says so
+    // rather than naming a deadline `Tick` would then have to decline to act on.
+    // For a node with no cluster, standing would win -- an empty configuration puts
+    // the quorum at one -- and a node that has won can never afterwards be admitted
+    // to somebody else's cluster; see `HasCluster`. For a learner, standing is what
+    // it is a learner so as not to do (#1449). Answering here rather than branching
+    // in `Tick` keeps the two tables the single answer to "what is this node waiting
+    // for", and it costs the waiting node not even the timer draw. The driver bounds
+    // its own sleep by the heartbeat interval regardless, so this cannot park a loop
+    // forever.
+    switch (CurrentTimer())
+    {
+        case TimerKind::Election:
+            return _electionDeadline;
+        case TimerKind::Heartbeat:
+            return _heartbeatDeadline;
+        case TimerKind::None:
+            break;
+    }
+    return TimePoint::max();
 }
 
 void RaftNode::NoteLeaderContact(TimePoint now)
@@ -161,12 +189,12 @@ void RaftNode::NoteFollowerContact(NodeId const& follower, TimePoint now)
     _followerContact[follower] = now;
 }
 
-std::vector<NodeId> RaftNode::QuorumContactMembers() const
+Configuration RaftNode::QuorumContactConfiguration() const
 {
     // Nothing in flight: the latest configuration IS the committed one, and
     // deriving it again would answer the same question a second way.
     if (!HasUncommittedConfiguration())
-        return _members;
+        return _configuration;
 
     // The newest configuration AT OR BELOW the commit index. Downward from the
     // commit index rather than from the log's end -- above it is precisely the
@@ -177,7 +205,7 @@ std::vector<NodeId> RaftNode::QuorumContactMembers() const
     //
     // Derived by scanning rather than tracked forward, matching
     // `RefreshConfiguration`. Tracking THIS one forward would actually be sound --
-    // a committed entry cannot be truncated away, so unlike `_members` it only
+    // a committed entry cannot be truncated away, so unlike `_configuration` it only
     // ever moves in one direction -- and it is still not worth a second mechanism
     // that has to be kept in step at the four places `_commitIndex` moves. The log
     // carries configuration and cluster state only and is compacted, so the walk
@@ -199,7 +227,7 @@ std::vector<NodeId> RaftNode::QuorumContactMembers() const
 
         // An unreadable committed configuration is not an excuse to widen the
         // set: fall through to the snapshot and bootstrap chain rather than to
-        // `_members`, which is the uncommitted set this exists to avoid.
+        // `_configuration`, which is the uncommitted set this exists to avoid.
         break;
     }
 
@@ -208,7 +236,7 @@ std::vector<NodeId> RaftNode::QuorumContactMembers() const
     // same fall-back chain, and the same reason: a compacted log has no entry to
     // re-derive from, so going straight to the bootstrap set is how a node
     // forgets a membership change it took part in.
-    return _snapshotMembers.empty() ? _config.members : _snapshotMembers;
+    return Membership::IsEmpty(_snapshotConfiguration) ? _config.Bootstrap() : _snapshotConfiguration;
 }
 
 bool RaftNode::HasQuorumContact(TimePoint now) const
@@ -227,16 +255,18 @@ bool RaftNode::HasQuorumContact(TimePoint now) const
     // The old set is the right question because the leader was elected by it and
     // it is what still answers. CheckQuorum is not a commitment decision -- §4.1
     // requires the new configuration for those, and `AdvanceCommitIndex` goes on
-    // using `_members` for exactly that reason.
+    // using `_configuration` for exactly that reason.
     //
     // SAFETY, since this is what everything that READS from a leader rests on
     // (see `Tick`): a competing leader would need a majority of the NEW
-    // configuration, and `ProposeMembership` refuses any change but a single
-    // member precisely so that any majority of the old and any majority of the new
-    // share one. That shared member would have moved to a higher term to grant the
-    // vote and would have stopped confirming this leader -- so recent contact with
-    // a majority of the OLD set still rules out a second leader. The single-member
-    // restriction is load-bearing here and not only at commitment.
+    // configuration's voters, and `ProposeMembership` refuses any change but a
+    // single member moving precisely so that any majority of the old voters and any
+    // majority of the new share one. A learner change moves no voter, and a
+    // promotion or a demotion moves exactly one. That shared voter would have moved
+    // to a higher term to grant the vote and would have stopped confirming this
+    // leader -- so recent contact with a majority of the OLD voters still rules out a
+    // second leader. The single-member restriction is load-bearing here and not
+    // only at commitment.
     //
     // What this deliberately does NOT do is grant the admitted member a grace
     // period. That was #1061's fix and it is gone: a window closed by a constant
@@ -244,20 +274,25 @@ bool RaftNode::HasQuorumContact(TimePoint now) const
     // walk-back, which is what #1095 observed under coverage instrumentation --
     // and no constant is the right size for a quantity nobody has bounded. This
     // rule has no constant to outrun.
-    auto const members = QuorumContactMembers();
+    //
+    // VOTERS only, of that configuration (#1449). A learner is replicated to and
+    // answers, and its answers are recorded in `_followerContact` like anybody's --
+    // but its silence is not a lost quorum, because it was never part of one. That
+    // is the whole of what makes a usually-absent machine safe to admit: counted
+    // here, a two-machine cluster whose second machine left the VPN would depose its
+    // only leader at the next heartbeat.
+    auto const configuration = QuorumContactConfiguration();
 
-    // Itself, but only while it IS a member of THAT set -- the carve-out
+    // Itself, but only while it IS a voter of THAT set -- the carve-out
     // `AdvanceCommitIndex` makes, for the same reason: a leader that has been
-    // removed must not count itself toward a quorum of the set it is no longer in.
-    // Erring toward "no quorum" is also the safe direction here, since it only ever
-    // makes this node readier to let somebody else stand.
-    // `find` rather than `std::ranges::contains`, matching `IsMember`: one idiom for
-    // one question, and the C++23 algorithm is not on every standard library CI builds.
-    auto live = std::ranges::find(members, _config.self) != members.end() ? std::size_t { 1 } : std::size_t { 0 };
+    // removed or demoted must not count itself toward a quorum of the set it is no
+    // longer counted in. Erring toward "no quorum" is also the safe direction here,
+    // since it only ever makes this node readier to let somebody else stand.
+    auto live = Membership::IsVoter(configuration, _config.self) ? std::size_t { 1 } : std::size_t { 0 };
 
-    // Over the member set rather than over the map, so an entry left by a member
-    // that has since been removed cannot be counted.
-    for (auto const& peer: members)
+    // Over the voter set rather than over the map, so an entry left by a member
+    // that has since been removed -- or by a learner -- cannot be counted.
+    for (auto const& peer: configuration.voters)
     {
         if (peer == _config.self)
             continue;
@@ -273,28 +308,21 @@ bool RaftNode::HasQuorumContact(TimePoint now) const
             ++live;
     }
 
-    // A quorum of the set that was measured, never `Quorum()`, which answers for
-    // `_members`. Reading contact from one configuration and the threshold from
-    // another is a quorum of neither.
+    // A quorum of the configuration that was measured, never `Quorum()`, which
+    // answers for `_configuration`. Reading contact from one configuration and the
+    // threshold from another is a quorum of neither. Through `QuorumOf`, the one
+    // threshold every quorum read takes, so the rule that learners are not counted
+    // is written once for all four of them.
     //
-    // The code this replaces was NOT making that mistake, and saying so matters
-    // because the shape invites the suspicion: it walked `_peers` and compared
-    // against `Quorum()`, two derivations of one set. They were provably in step
-    // -- `_peers` has exactly two writers, the constructor from
-    // `_config.Peers()` (which is `_config.members` minus self, and `_members` is
-    // initialised from `_config.members` beside it) and `AdoptMembers`, which
-    // rewrites both in one function -- so there was no window in which the
-    // threshold described a set the walk did not. Not a defect that was closed
-    // here as a side effect: a hazard that EXISTS and a hazard that has FIRED are
-    // different claims, and the words for them are nearly identical -- this one
-    // had not fired and could not.
-    //
-    // It is still two things that have to be kept in step, and this now needs a
-    // THIRD set that is neither, so all three inputs are taken from one value. The
-    // rulebook's *who a node dials is not who it counts* is about a different pair
-    // -- the driver's dial list against the configuration -- and does not license
-    // a divergence here.
-    return live >= (members.size() / 2) + 1;
+    // The code this replaced walked `_peers` and compared against `Quorum()`, two
+    // derivations of one set that were provably in step -- and saying so matters,
+    // because a hazard that EXISTS and a hazard that has FIRED are different claims
+    // with nearly identical words. It is still two things that would have to be kept
+    // in step, and this needs a THIRD configuration that is neither, so every input
+    // is taken from one value. The rulebook's *who a node dials is not who it
+    // counts* is about a different pair -- the driver's dial list against the
+    // configuration -- and does not license a divergence here.
+    return live >= Membership::QuorumOf(configuration);
 }
 
 bool RaftNode::HasLiveLeader(TimePoint now) const
@@ -369,9 +397,9 @@ void RaftNode::MarkPersist(RaftOutput& output) const
     output.persist = PersistentState { .currentTerm = _currentTerm, .votedFor = _votedFor };
 }
 
-void RaftNode::BroadcastToPeers(RaftOutput& output, RaftMessage const& message) const
+void RaftNode::BroadcastToVoters(RaftOutput& output, RaftMessage const& message) const
 {
-    for (auto const& peer: _peers)
+    for (auto const& peer: _voterPeers)
         output.messages.push_back(OutboundMessage { .to = peer, .message = message });
 }
 
@@ -409,7 +437,7 @@ RaftSnapshot RaftNode::CurrentSnapshot() const
     // second thing that can come to disagree with it after a compaction.
     return RaftSnapshot { .lastIncludedIndex = _log.SnapshotIndex(),
                           .lastIncludedTerm = _log.SnapshotTerm(),
-                          .members = _snapshotMembers,
+                          .configuration = _snapshotConfiguration,
                           .state = _snapshotState };
 }
 
@@ -420,12 +448,16 @@ InstallSnapshotRequest RaftNode::MakeInstallSnapshotFor() const
                                     .leaderId = _config.self,
                                     .lastIncludedIndex = snapshot.lastIncludedIndex,
                                     .lastIncludedTerm = snapshot.lastIncludedTerm,
-                                    .members = std::move(snapshot.members),
+                                    .configuration = std::move(snapshot.configuration),
                                     .state = std::move(snapshot.state) };
 }
 
 void RaftNode::ReplicateToPeers(RaftOutput& output) const
 {
+    // Voters AND learners (#1449): a learner is sent the log and the snapshots
+    // exactly as a voter is, which is what keeps it ready to be promoted and able
+    // to answer reads. What it is excluded from is counting, which is decided where
+    // the answers are read, never by not asking.
     for (auto const& peer: _peers)
     {
         // A follower whose next entry has been compacted away cannot be caught up
@@ -447,15 +479,16 @@ bool RaftNode::CompactThroughApplied(std::vector<std::byte> state, RaftOutput& o
     if (_lastApplied <= _log.SnapshotIndex())
         return false;
 
-    // The member set is captured BEFORE the log is cut, because afterwards there
+    // The configuration is captured BEFORE the log is cut, because afterwards there
     // may be no configuration entry left to re-derive it from -- which is exactly
-    // the case this record exists to answer.
-    auto members = _members;
+    // the case this record exists to answer. Both sets: a snapshot that kept only
+    // the voters would restore a learner as nothing at all.
+    auto configuration = _configuration;
 
     if (!_log.Compact(_lastApplied))
         return false;
 
-    _snapshotMembers = std::move(members);
+    _snapshotConfiguration = std::move(configuration);
     _snapshotState = std::move(state);
 
     // Emitted rather than written here, so the driver orders it against the other
@@ -488,25 +521,34 @@ void RaftNode::AdvanceFollowerProgress(NodeId const& follower, LogIndex reported
 
 void RaftNode::AdvanceCommitIndex()
 {
-    // The highest index a quorum holds: sort every member's match index
-    // descending and take the one at position quorum-1. This node counts itself,
-    // and its own match index is its whole log -- a leader trivially has what it
-    // wrote.
+    // The highest index a quorum holds: sort every VOTER's match index descending
+    // and take the one at position quorum-1. This node counts itself, and its own
+    // match index is its whole log -- a leader trivially has what it wrote.
+    //
+    // Voters only (#1449). A learner's match index is tracked -- it is what moves
+    // its `nextIndex` -- and read by nothing here, because an entry a learner holds
+    // is not an entry the cluster can promise to keep.
     auto matches = std::vector<LogIndex> {};
-    matches.reserve(_members.size());
+    matches.reserve(_configuration.voters.size());
 
-    // Itself, but only while it IS a member. A leader that has been removed keeps
-    // replicating until the entry removing it commits -- and that commitment is
-    // decided by the NEW configuration, which it is not part of. Counting itself
-    // there would let it commit its own removal on a quorum that does not
-    // include enough of the members who have to live with it.
-    if (IsMember(_config.self))
+    // Itself, but only while it IS a voter. A leader that has been removed or
+    // demoted keeps replicating until the entry that did it commits -- and that
+    // commitment is decided by the NEW configuration, which does not count it.
+    // Counting itself there would let it commit its own removal on a quorum that
+    // does not include enough of the voters who have to live with it.
+    if (IsVoter(_config.self))
         matches.push_back(_log.LastIndex());
-    for (auto const& peer: _peers)
+    for (auto const& peer: _voterPeers)
     {
         auto const found = _matchIndex.find(peer);
         matches.push_back(found != _matchIndex.end() ? found->second : LogIndex::BeforeFirst());
     }
+
+    // Every voter is in `matches`, so a quorum of them always fits -- and one that did
+    // not would be a threshold no set of answers could meet, where the index below
+    // would read past the end instead of saying so.
+    if (Quorum() > matches.size())
+        return;
 
     std::ranges::sort(matches, std::greater {});
     auto const replicated = matches[Quorum() - 1];
@@ -561,7 +603,11 @@ void RaftNode::ApplyCommitted(RaftOutput& output)
     // keeps leading a cluster it is no longer part of for exactly as long as it
     // takes to make its own removal durable. Staying leader past that point would
     // let a node outside the configuration keep replicating to it.
-    if (_role == Role::Leader && !IsMember(_config.self) && LatestConfigurationIndex() <= _commitIndex)
+    //
+    // A leader DEMOTED to learner is the same case (#1449): a learner may not lead,
+    // and the demotion is a voter removal whose commitment only this leader can
+    // bring about. Once committed it follows, and its standing stops it standing.
+    if (_role == Role::Leader && !IsVoter(_config.self) && LatestConfigurationIndex() <= _commitIndex)
     {
         _role = Role::Follower;
         _knownLeader.reset();
@@ -588,34 +634,51 @@ Term RaftNode::TermOf(RaftMessage const& message) noexcept
 
 bool RaftNode::IsMember(NodeId const& id) const
 {
-    return std::ranges::find(_members, id) != _members.end();
+    return Membership::IsMember(_configuration, id);
+}
+
+bool RaftNode::IsVoter(NodeId const& id) const
+{
+    return Membership::IsVoter(_configuration, id);
 }
 
 std::size_t RaftNode::Quorum() const noexcept
 {
-    // From the ACTIVE member set, never from the bootstrap configuration. A
-    // quorum computed against a stale size is the one number that makes every
-    // other rule unsafe: too small and a minority commits, too large and a
-    // healthy cluster cannot.
-    return (_members.size() / 2) + 1;
+    // From the ACTIVE configuration, never from the bootstrap one. A quorum
+    // computed against a stale size is the one number that makes every other rule
+    // unsafe: too small and a minority commits, too large and a healthy cluster
+    // cannot. `QuorumOf` counts voters and nothing else, which is the whole of the
+    // difference a learner makes (#1449).
+    return Membership::QuorumOf(_configuration);
 }
 
-void RaftNode::AdoptMembers(std::vector<NodeId> members)
+void RaftNode::CountOwnVote(std::unordered_set<NodeId>& tally) const
 {
-    _members = std::move(members);
+    if (IsVoter(_config.self))
+        tally.insert(_config.self);
+}
 
-    _peers.clear();
-    for (auto const& member: _members)
-        if (member != _config.self)
-            _peers.push_back(member);
+void RaftNode::AdoptConfiguration(Configuration configuration)
+{
+    _configuration = std::move(configuration);
 
-    // Progress bookkeeping for a member that is no longer one would count toward
-    // a quorum it is not part of.
+    auto const others = [this](NodeId const& id) {
+        return id != _config.self;
+    };
+    _voterPeers.clear();
+    std::ranges::copy_if(_configuration.voters, std::back_inserter(_voterPeers), others);
+    _peers = _voterPeers;
+    std::ranges::copy_if(_configuration.learners, std::back_inserter(_peers), others);
+
+    // Progress bookkeeping for a member that is no longer one would be sent to and
+    // read from a node the cluster has let go. A learner keeps its progress -- it is
+    // still replicated to -- and loses its place in a vote tally, where its answer
+    // was never counted.
     std::erase_if(_nextIndex, [this](auto const& entry) { return !IsMember(entry.first); });
     std::erase_if(_matchIndex, [this](auto const& entry) { return !IsMember(entry.first); });
     std::erase_if(_followerContact, [this](auto const& entry) { return !IsMember(entry.first); });
-    std::erase_if(_votesGranted, [this](NodeId const& id) { return !IsMember(id); });
-    std::erase_if(_preVotesGranted, [this](NodeId const& id) { return !IsMember(id); });
+    std::erase_if(_votesGranted, [this](NodeId const& id) { return !IsVoter(id); });
+    std::erase_if(_preVotesGranted, [this](NodeId const& id) { return !IsVoter(id); });
 }
 
 void RaftNode::RefreshConfiguration()
@@ -640,7 +703,7 @@ void RaftNode::RefreshConfiguration()
             // something that cannot vote.
             if (auto decoded = Membership::Decode(entry->payload);
                 decoded.has_value() && Membership::Validate(*decoded).has_value())
-                AdoptMembers(*std::move(decoded));
+                AdoptConfiguration(*std::move(decoded));
             return;
         }
     }
@@ -650,7 +713,7 @@ void RaftNode::RefreshConfiguration()
     // to re-derive from, so falling straight back to the bootstrap set is how a
     // node forgets a membership change it took part in, silently and only after a
     // restart.
-    AdoptMembers(_snapshotMembers.empty() ? _config.members : _snapshotMembers);
+    AdoptConfiguration(Membership::IsEmpty(_snapshotConfiguration) ? _config.Bootstrap() : _snapshotConfiguration);
 }
 
 void RaftNode::StepDown(Term term, NodeId const& from, TimePoint now, RaftOutput& output)
@@ -714,7 +777,7 @@ void RaftNode::StartPreVote(TimePoint now, RaftOutput& output)
     _knownLeader.reset();
 
     _preVotesGranted.clear();
-    _preVotesGranted.insert(_config.self);
+    CountOwnVote(_preVotesGranted);
 
     ArmElectionTimer(now);
 
@@ -729,11 +792,11 @@ void RaftNode::StartPreVote(TimePoint now, RaftOutput& output)
     // The term asked about is one ABOVE this node's own: the question is "would
     // you support me if I stood", and the term it would stand in is the one a
     // voter has to compare its log against.
-    BroadcastToPeers(output,
-                     PreVoteRequest { .term = _currentTerm.Next(),
-                                      .candidateId = _config.self,
-                                      .lastLogIndex = _log.LastIndex(),
-                                      .lastLogTerm = _log.LastTerm() });
+    BroadcastToVoters(output,
+                      PreVoteRequest { .term = _currentTerm.Next(),
+                                       .candidateId = _config.self,
+                                       .lastLogIndex = _log.LastIndex(),
+                                       .lastLogTerm = _log.LastTerm() });
 }
 
 void RaftNode::StartElection(TimePoint now, RaftOutput& output)
@@ -745,8 +808,10 @@ void RaftNode::StartElection(TimePoint now, RaftOutput& output)
 
     // A candidate votes for itself, which is why a single-node cluster elects
     // immediately and why the quorum test below is the same one for every size.
+    // Counted only while it is a VOTER: `_votedFor` above still spends its vote for
+    // the term, which is the durable half and is right whatever it counts.
     _votesGranted.clear();
-    _votesGranted.insert(_config.self);
+    CountOwnVote(_votesGranted);
 
     // The pre-vote round is over; its answers were about whether to stand, not
     // about who to elect, and counting them here would be counting votes nobody
@@ -762,11 +827,11 @@ void RaftNode::StartElection(TimePoint now, RaftOutput& output)
         return;
     }
 
-    BroadcastToPeers(output,
-                     RequestVoteRequest { .term = _currentTerm,
-                                          .candidateId = _config.self,
-                                          .lastLogIndex = _log.LastIndex(),
-                                          .lastLogTerm = _log.LastTerm() });
+    BroadcastToVoters(output,
+                      RequestVoteRequest { .term = _currentTerm,
+                                           .candidateId = _config.self,
+                                           .lastLogIndex = _log.LastIndex(),
+                                           .lastLogTerm = _log.LastTerm() });
 }
 
 void RaftNode::BecomeLeader(TimePoint now, RaftOutput& output)
@@ -780,7 +845,8 @@ void RaftNode::BecomeLeader(TimePoint now, RaftOutput& output)
     // so it guesses that each is fully caught up and walks the guess back on
     // rejection -- one round trip per missing entry, against a wrong optimistic
     // guess costing nothing but that. matchIndex starts at zero because it
-    // records what is *known*, and nothing is yet.
+    // records what is *known*, and nothing is yet. Learners included: they are
+    // replicated to, so they need somewhere to be replicated from.
     _nextIndex.clear();
     _matchIndex.clear();
     for (auto const& peer: _peers)
@@ -839,10 +905,15 @@ void RaftNode::BecomeLeader(TimePoint now, RaftOutput& output)
 RaftOutput RaftNode::Tick(TimePoint now)
 {
     auto output = RaftOutput {};
-    if (now < NextDeadline())
+
+    // A node waiting on nothing has nothing to do at ANY instant, including the one
+    // `NextDeadline` answers with; asked explicitly rather than left to the
+    // comparison below, which `TimePoint::max()` itself would pass.
+    auto const timer = CurrentTimer();
+    if (timer == TimerKind::None || now < NextDeadline())
         return output;
 
-    if (TraitsOf(_role).timer == TimerKind::Election)
+    if (timer == TimerKind::Election)
     {
         // A pre-vote round, not an election. The term is untouched until a
         // quorum says an election is winnable, which is what keeps a node that
@@ -932,42 +1003,45 @@ bool RaftNode::HasUncommittedConfiguration() const
     return LatestConfigurationIndex() > _commitIndex;
 }
 
-std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(std::vector<NodeId> members, TimePoint now)
+std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(Configuration configuration, TimePoint now)
 {
     if (_role != Role::Leader)
         return std::unexpected { FastCache::NotLeader(_knownLeader) };
 
-    if (auto valid = Membership::Validate(members); !valid.has_value())
+    if (auto valid = Membership::Validate(configuration); !valid.has_value())
         return std::unexpected { valid.error() };
 
     // One change at a time, and it must have committed. A second built on a
     // configuration that a truncation can still roll back would have its safety
-    // argument made against a set that never existed.
+    // argument made against a set that never existed. A learner change waits too:
+    // it moves no quorum, and it is still an entry a truncation can take back.
     if (HasUncommittedConfiguration())
         return std::unexpected { ConfigurationChangeInFlight(
             "a membership change is already in flight; wait for it to commit") };
 
-    switch (Membership::Classify(_members, members))
+    switch (Membership::Classify(_configuration, configuration))
     {
         case Membership::ChangeShape::Unchanged:
             return std::unexpected { MembershipUnchanged("the proposed member set is the current one") };
         case Membership::ChangeShape::Unsafe:
             return std::unexpected { InvalidConfiguration(
-                "only one member may be added or removed at a time; two majorities that share no member "
-                "could otherwise elect two leaders in one term") };
+                "only one member may be added, removed, promoted or demoted at a time; two voter majorities "
+                "that share no voter could otherwise elect two leaders in one term") };
         case Membership::ChangeShape::AddedOne:
         case Membership::ChangeShape::RemovedOne:
+        case Membership::ChangeShape::PromotedOne:
+        case Membership::ChangeShape::DemotedOne:
             break;
     }
 
     auto output = RaftOutput {};
     auto const index = _log.Append(
-        LogEntry { .term = _currentTerm, .kind = EntryKind::Configuration, .payload = Membership::Encode(members) });
+        LogEntry { .term = _currentTerm, .kind = EntryKind::Configuration, .payload = Membership::Encode(configuration) });
 
     // Adopted here, before commitment and before replication, because a
     // configuration that waited for commitment could not be used to REACH it:
     // committing this entry needs a quorum of the very set it describes.
-    AdoptMembers(std::move(members));
+    AdoptConfiguration(std::move(configuration));
 
     RecordLogAppend(output, index);
     ReplicateToPeers(output);
@@ -1086,7 +1160,8 @@ void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoin
     //
     // `HasCluster()` for the same reason as there: a node waiting to be admitted
     // has no member set to test against, and refusing would make it unjoinable by
-    // exactly the message that catches it up.
+    // exactly the message that catches it up. `IsMember` rather than `IsVoter` for
+    // the reason given there, too.
     if (HasCluster() && !IsMember(request.leaderId))
     {
         reply(AppendResult::Rejected, LogIndex::BeforeFirst());
@@ -1120,14 +1195,15 @@ void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request, TimePoin
     _log.ResetToSnapshot(request.lastIncludedIndex, request.lastIncludedTerm);
 
     // The configuration travels with the snapshot because a follower catching up
-    // from it has no entries left to learn the member set from.
-    AdoptMembers(request.members);
+    // from it has no entries left to learn the member set from -- both sets, so a
+    // learner caught up this way learns that it is one.
+    AdoptConfiguration(request.configuration);
 
     // The snapshot IS committed state -- a leader only ever snapshots what it has
     // applied -- so both indices move to it.
     _commitIndex = request.lastIncludedIndex;
     _lastApplied = request.lastIncludedIndex;
-    _snapshotMembers = request.members;
+    _snapshotConfiguration = request.configuration;
     _snapshotState = request.state;
 
     // Persisted before the acknowledgement below, under the rule the log and the
@@ -1176,15 +1252,31 @@ void RaftNode::OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutpu
                                          .voterId = _config.self } });
     };
 
-    // Nothing below writes, records a vote, or moves a timer. A pre-vote must
+    // Nothing here writes, records a vote, or moves a timer. A pre-vote must
     // leave this node exactly as it found it -- otherwise a node asking
     // repeatedly from behind a partition could delay every healthy node's
     // election simply by asking, which is the disruption in a new costume.
-    if (request.term <= _currentTerm || !IsMember(request.candidateId))
-    {
-        reply(VoteDecision::Denied);
-        return;
-    }
+    output.voteRefusal = PreVoteRefusal(request, now);
+    reply(output.voteRefusal.has_value() ? VoteDecision::Denied : VoteDecision::Granted);
+}
+
+std::optional<VoteRefusal> RaftNode::PreVoteRefusal(PreVoteRequest const& request, TimePoint now) const
+{
+    // The ROW first (#1449): a node whose standing casts no vote refuses whatever
+    // else the request says, and says so by name. A learner answering by silence
+    // would be a node a candidate cannot tell from a lost message; answering by
+    // whichever rule happened to come first would be a refusal no case could pin.
+    if (!TraitsOf(CurrentStanding()).votes)
+        return VoteRefusal::CastsNoVote;
+
+    if (request.term <= _currentTerm)
+        return VoteRefusal::StaleTerm;
+
+    // A VOTER, not merely a member: a learner never stands, so a learner asking is
+    // a node whose configuration disagrees with this one's, and supporting it would
+    // count towards an election something no quorum here would recognise.
+    if (!IsVoter(request.candidateId))
+        return VoteRefusal::CandidateNotAVoter;
 
     // The one condition beyond the log check, and the one that does the work:
     // there must not be a live leader. A cluster with a healthy leader refuses
@@ -1198,13 +1290,12 @@ void RaftNode::OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutpu
     // refusing without checking whether a majority still answers would leave a
     // partitioned leader vetoing its own replacement forever.
     if (HasLiveLeader(now))
-    {
-        reply(VoteDecision::Denied);
-        return;
-    }
+        return VoteRefusal::LeaderLive;
 
-    reply(_log.CandidateIsAtLeastAsUpToDate(request.lastLogIndex, request.lastLogTerm) ? VoteDecision::Granted
-                                                                                       : VoteDecision::Denied);
+    if (!_log.CandidateIsAtLeastAsUpToDate(request.lastLogIndex, request.lastLogTerm))
+        return VoteRefusal::LogBehind;
+
+    return std::nullopt;
 }
 
 void RaftNode::OnPreVoteResponse(PreVoteResponse const& response, TimePoint now, RaftOutput& output)
@@ -1218,7 +1309,9 @@ void RaftNode::OnPreVoteResponse(PreVoteResponse const& response, TimePoint now,
     if (response.decision != VoteDecision::Granted)
         return;
 
-    if (!IsMember(response.voterId))
+    // Voters only: a learner's grant is an answer it should not have given, and
+    // counted it would be a quorum of somebody the configuration does not count.
+    if (!IsVoter(response.voterId))
         return;
 
     _preVotesGranted.insert(response.voterId);
@@ -1234,30 +1327,8 @@ void RaftNode::OnRequestVote(RequestVoteRequest const& request, TimePoint now, R
             .message = RequestVoteResponse { .term = _currentTerm, .decision = decision, .voterId = _config.self } });
     };
 
-    // A candidate from an older term has already lost; the term in the refusal is
-    // what tells it so.
-    if (request.term < _currentTerm)
-    {
-        reply(VoteDecision::Denied);
-        return;
-    }
-
-    // A non-member cannot be voted for, for the reason its AppendEntries is
-    // refused: a granted vote is spent for the whole term and re-arms the election
-    // timer, so a machine outside the configuration could both consume this
-    // node's vote and delay its candidacy.
-    if (!IsMember(request.candidateId))
-    {
-        reply(VoteDecision::Denied);
-        return;
-    }
-
-    // At most one vote per term. `votedFor == candidateId` is not laxity: it makes
-    // the grant idempotent, so a retransmitted request after a lost response gets
-    // the same answer rather than a refusal that would stall an election nobody
-    // has any reason to lose.
-    auto const alreadyPromised = _votedFor.has_value() && *_votedFor != request.candidateId;
-    if (alreadyPromised || !_log.CandidateIsAtLeastAsUpToDate(request.lastLogIndex, request.lastLogTerm))
+    output.voteRefusal = VoteRefusalFor(request);
+    if (output.voteRefusal.has_value())
     {
         reply(VoteDecision::Denied);
         return;
@@ -1271,6 +1342,40 @@ void RaftNode::OnRequestVote(RequestVoteRequest const& request, TimePoint now, R
     // election simply by asking repeatedly.
     ArmElectionTimer(now);
     reply(VoteDecision::Granted);
+}
+
+std::optional<VoteRefusal> RaftNode::VoteRefusalFor(RequestVoteRequest const& request) const
+{
+    // The ROW first, as for a pre-vote (#1449). A learner that granted here would
+    // spend a durable vote -- and a candidate whose configuration still names it a
+    // voter would count it -- for an election in which it has no say.
+    if (!TraitsOf(CurrentStanding()).votes)
+        return VoteRefusal::CastsNoVote;
+
+    // A candidate from an older term has already lost; the term in the refusal is
+    // what tells it so.
+    if (request.term < _currentTerm)
+        return VoteRefusal::StaleTerm;
+
+    // A non-voter cannot be voted for, for the reason its AppendEntries is
+    // refused: a granted vote is spent for the whole term and re-arms the election
+    // timer, so a machine outside the configuration could both consume this
+    // node's vote and delay its candidacy. A learner is inside the configuration and
+    // still cannot win anything a vote here would help it to.
+    if (!IsVoter(request.candidateId))
+        return VoteRefusal::CandidateNotAVoter;
+
+    // At most one vote per term. `votedFor == candidateId` is not laxity: it makes
+    // the grant idempotent, so a retransmitted request after a lost response gets
+    // the same answer rather than a refusal that would stall an election nobody
+    // has any reason to lose.
+    if (_votedFor.has_value() && *_votedFor != request.candidateId)
+        return VoteRefusal::AlreadyVoted;
+
+    if (!_log.CandidateIsAtLeastAsUpToDate(request.lastLogIndex, request.lastLogTerm))
+        return VoteRefusal::LogBehind;
+
+    return std::nullopt;
 }
 
 void RaftNode::OnRequestVoteResponse(RequestVoteResponse const& response, TimePoint now, RaftOutput& output)
@@ -1292,7 +1397,11 @@ void RaftNode::OnRequestVoteResponse(RequestVoteResponse const& response, TimePo
     // it: one member can still claim another's id. Distinguishing *that* needs
     // the sender's authenticated identity from the transport, which does not
     // exist until the wire does, and is where the check belongs.
-    if (!IsMember(response.voterId))
+    //
+    // A VOTER, not merely a member (#1449): a learner's vote is one the
+    // configuration does not count, so a tally that took it would be a quorum of
+    // somebody the arithmetic was never asked about.
+    if (!IsVoter(response.voterId))
         return;
 
     _votesGranted.insert(response.voterId);
@@ -1326,6 +1435,13 @@ void RaftNode::OnAppendEntries(AppendEntriesRequest const& request, TimePoint no
     // waiting to be admitted, and the only way it can learn a member set is to be
     // sent one -- so refusing here would make a node unjoinable by exactly the
     // message that joins it. See `HasCluster` for why that gives nothing away.
+    //
+    // A MEMBER, voter or learner, and deliberately not `IsVoter` (#1449). A learner
+    // never stands, so a sender this node's configuration calls a learner can lead
+    // only because a later configuration promoted it -- one this node has not
+    // received yet, and would never receive if it refused the leader carrying it.
+    // What the guard exists for is a machine the configuration does not contain,
+    // and a learner is in it.
     if (HasCluster() && !IsMember(request.leaderId))
     {
         reply(AppendResult::Rejected, LogIndex::BeforeFirst());

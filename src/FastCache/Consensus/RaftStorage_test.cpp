@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Consensus/InMemoryRaftStorage.hpp>
+#include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Consensus/RaftNode.hpp>
 #include <FastCache/Core/Bytes.hpp>
+#include <FastCache/Core/Crc32c.hpp>
+#include <FastCache/Core/Endian.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -262,7 +268,8 @@ TEST_CASE("A node recovers its term and vote across a restart", "[consensus][raf
     auto store = OpenStore(scratch.Path());
 
     auto const config = RaftConfig { .self = "n1",
-                                     .members = { "n1", "n2", "n3" },
+                                     .voters = { "n1", "n2", "n3" },
+                                     .learners = {},
                                      .electionTimeoutMin = 150ms,
                                      .electionTimeoutMax = 300ms,
                                      .heartbeatInterval = 50ms };
@@ -318,7 +325,8 @@ TEST_CASE("A node recovers its log across a restart", "[consensus][raft][storage
 
     ScriptedRandomSource random { { 0 } };
     auto node = std::move(RaftNode::Create(RaftConfig { .self = "n1",
-                                                        .members = { "n1", "n2", "n3" },
+                                                        .voters = { "n1", "n2", "n3" },
+                                                        .learners = {},
                                                         .electionTimeoutMin = 150ms,
                                                         .electionTimeoutMax = 300ms,
                                                         .heartbeatInterval = 50ms },
@@ -452,7 +460,8 @@ TEST_CASE("A leader's own writes round-trip through the store", "[consensus][raf
     auto store = OpenStore(scratch.Path());
 
     auto const config = RaftConfig { .self = "n1",
-                                     .members = { "n1", "n2", "n3" },
+                                     .voters = { "n1", "n2", "n3" },
+                                     .learners = {},
                                      .electionTimeoutMin = 150ms,
                                      .electionTimeoutMax = 300ms,
                                      .heartbeatInterval = 50ms };
@@ -575,7 +584,7 @@ TEST_CASE("A saved snapshot survives a reopen and trims the log", "[consensus][r
     ScratchDirectory scratch { "fc-raft-store" };
     auto const snapshot = RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 2 },
                                          .lastIncludedTerm = Term { .value = 1 },
-                                         .members = { "n1", "n2", "n3" },
+                                         .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
                                          .state = FastCache::BytesFromString("state-bytes") };
 
     auto seed = [&](IRaftStorage& store) {
@@ -619,7 +628,7 @@ TEST_CASE("A log trimmed to nothing still knows where it resumes", "[consensus][
     ScratchDirectory scratch { "fc-raft-store" };
     auto const snapshot = RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 3 },
                                          .lastIncludedTerm = Term { .value = 2 },
-                                         .members = { "n1" },
+                                         .configuration = { .voters = { "n1" }, .learners = {} },
                                          .state = FastCache::BytesFromString("all-of-it") };
 
     InMemoryRaftStorage memory;
@@ -670,7 +679,7 @@ TEST_CASE("An append below the snapshot boundary is refused", "[consensus][raft]
         REQUIRE(target
                     ->SaveSnapshot(RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 2 },
                                                   .lastIncludedTerm = Term { .value = 1 },
-                                                  .members = { "n1" },
+                                                  .configuration = { .voters = { "n1" }, .learners = {} },
                                                   .state = {} })
                     .has_value());
 
@@ -695,7 +704,7 @@ TEST_CASE("A corrupt snapshot is refused rather than read as an empty one", "[co
         REQUIRE(store
                     .SaveSnapshot(RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 4 },
                                                  .lastIncludedTerm = Term { .value = 2 },
-                                                 .members = { "n1" },
+                                                 .configuration = { .voters = { "n1" }, .learners = {} },
                                                  .state = FastCache::BytesFromString("real") })
                     .has_value());
     }
@@ -732,7 +741,7 @@ TEST_CASE("A reopened store knows its boundary before anything reads it", "[cons
         REQUIRE(store
                     .SaveSnapshot(RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 2 },
                                                  .lastIncludedTerm = Term { .value = 1 },
-                                                 .members = { "n1" },
+                                                 .configuration = { .voters = { "n1" }, .learners = {} },
                                                  .state = FastCache::BytesFromString("s") })
                     .has_value());
     }
@@ -748,4 +757,242 @@ TEST_CASE("A reopened store knows its boundary before anything reads it", "[cons
     CHECK(loaded->firstIndex == LogIndex { .value = 3 });
     REQUIRE(loaded->entries.size() == 1);
     CHECK(FastCache::AsStringView(loaded->entries[0].payload) == "c");
+}
+
+// --------------------------------------------------------------------------
+// The format bump (#1449): a store the previous build wrote is refused BY NAME.
+
+namespace
+{
+
+/// The previous format, written out by hand: format 1, as it was before learners.
+///
+/// A PINNED FIXTURE, deliberately not produced by `FileRaftStorage`: the encoder under
+/// test now writes format 2, so a fixture derived from it would be a format-2 store
+/// with a different number in it, and "the old store is refused" would pass against a
+/// reader that had never seen the old layout. Every byte below follows format 1's
+/// layout as it shipped -- a u16 version of 1 in the state and snapshot headers, a log
+/// record with NO version at all, and a configuration as ONE flat id list -- and only
+/// the CRC32C primitive is borrowed, since it is a checksum and not a layout.
+namespace FormatOne
+{
+    constexpr std::uint16_t Version = 1;
+
+    /// Append a big-endian integer.
+    /// @param out Where.
+    /// @param value What.
+    template <typename T>
+    void Put(std::vector<std::byte>& out, T value)
+    {
+        auto scratch = std::array<std::byte, sizeof(T)> {};
+        WriteBigEndian<T>(scratch, value);
+        out.insert(out.end(), scratch.begin(), scratch.end());
+    }
+
+    /// Append one `[u32 length][bytes]` field.
+    /// @param out Where.
+    /// @param bytes The field.
+    void PutField(std::vector<std::byte>& out, std::span<std::byte const> bytes)
+    {
+        Put<std::uint32_t>(out, static_cast<std::uint32_t>(bytes.size()));
+        out.insert(out.end(), bytes.begin(), bytes.end());
+    }
+
+    /// Seal a record with its trailing CRC32C.
+    /// @param body Everything before the CRC.
+    /// @return The whole record.
+    [[nodiscard]] std::vector<std::byte> Sealed(std::vector<std::byte> body)
+    {
+        Put<std::uint32_t>(body, Crc32c::Compute(body));
+        return body;
+    }
+
+    /// Format 1's configuration: one flat list of ids.
+    /// @param members The members.
+    /// @return The payload.
+    [[nodiscard]] std::vector<std::byte> FlatMembers(std::vector<std::string> const& members)
+    {
+        auto out = std::vector<std::byte> {};
+        for (auto const& member: members)
+            PutField(out, FastCache::AsBytes(member));
+        return out;
+    }
+
+    /// A format-1 `raft-state`: term 3, voted for "n2".
+    [[nodiscard]] std::vector<std::byte> State()
+    {
+        auto body = std::vector<std::byte> {};
+        Put<std::uint32_t>(body, 0x46435253U); // "FCRS"
+        Put<std::uint16_t>(body, Version);
+        Put<std::uint64_t>(body, 3);
+        Put<std::uint32_t>(body, 2);
+        body.push_back(std::byte { 1 });
+        body.push_back(std::byte { 'n' });
+        body.push_back(std::byte { '2' });
+        return Sealed(std::move(body));
+    }
+
+    /// A format-1 `raft-snapshot` at index 4, term 2, of three members.
+    [[nodiscard]] std::vector<std::byte> Snapshot()
+    {
+        auto body = std::vector<std::byte> {};
+        Put<std::uint32_t>(body, 0x4643524EU); // "FCRN"
+        Put<std::uint16_t>(body, Version);
+        Put<std::uint64_t>(body, 4);
+        Put<std::uint64_t>(body, 2);
+        PutField(body, FlatMembers({ "n1", "n2", "n3" }));
+        PutField(body, FastCache::BytesFromString("state"));
+        return Sealed(std::move(body));
+    }
+
+    /// A format-1 `raft-log` of one Configuration entry at index 1: no version field
+    /// anywhere, the index straight after the magic.
+    [[nodiscard]] std::vector<std::byte> Log()
+    {
+        auto const payload = FlatMembers({ "n1", "n2", "n3" });
+        auto body = std::vector<std::byte> {};
+        Put<std::uint32_t>(body, 0x4643524CU); // "FCRL"
+        Put<std::uint64_t>(body, 1);
+        Put<std::uint64_t>(body, 1);
+        body.push_back(static_cast<std::byte>(EntryKind::Configuration));
+        Put<std::uint32_t>(body, static_cast<std::uint32_t>(payload.size()));
+        body.insert(body.end(), payload.begin(), payload.end());
+        return Sealed(std::move(body));
+    }
+
+    /// Write `bytes` to `path`, replacing it.
+    /// @param path Where.
+    /// @param bytes What.
+    void Write(std::filesystem::path const& path, std::vector<std::byte> const& bytes)
+    {
+        std::ofstream out { path, std::ios::binary | std::ios::trunc };
+        REQUIRE(out.is_open());
+        auto const text = FastCache::AsStringView(bytes);
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        REQUIRE(out.good());
+    }
+} // namespace FormatOne
+
+/// Open `directory` and read it back, and say how that ended.
+/// @param directory The store.
+/// @return Nothing when it opened and loaded; otherwise the refusal.
+[[nodiscard]] std::optional<ConsensusError> OpenAndLoad(std::filesystem::path const& directory)
+{
+    auto store = FileRaftStorage::Open(directory);
+    if (!store.has_value())
+        return store.error();
+    auto loaded = store->Load();
+    if (!loaded.has_value())
+        return loaded.error();
+    return std::nullopt;
+}
+
+} // namespace
+
+TEST_CASE("A store the previous format wrote is refused as UnsupportedFormatVersion, never as damage",
+          "[consensus][raft][storage][learner]")
+{
+    // The storage rule, arriving in the Raft store: the code is what an operator acts
+    // on, and "damaged" is what gets a healthy store deleted. Before #1449 an old
+    // state or snapshot file was refused as `StorageFailure` -- the damage code -- and
+    // an old log could not be refused at all, since its records carried no version.
+    //
+    // One file per section, alone in a fresh directory -- the other two absent, which
+    // a store reads as empty rather than refusing -- so a refusal here is the old
+    // file's and nothing else's.
+    ScratchDirectory scratch { "fc-raft-store" };
+
+    auto const expectForeign = [&scratch](std::string_view file, std::vector<std::byte> const& bytes) {
+        FormatOne::Write(scratch.Path() / file, bytes);
+        auto const refused = OpenAndLoad(scratch.Path());
+        REQUIRE(refused.has_value());
+        auto const& error = Unwrap(refused);
+        CAPTURE(error.context);
+        CHECK(error.code == ConsensusErrorCode::UnsupportedFormatVersion);
+        CHECK(error.code != ConsensusErrorCode::StorageFailure);
+
+        // It names the version it found and the one this build reads, and says what
+        // to do -- which is not what the damage message says.
+        CHECK(error.context.contains("format 1"));
+        CHECK(error.context.contains("format 2"));
+        CHECK(error.context.contains("no conversion"));
+    };
+
+    SECTION("the state file")
+    {
+        expectForeign("raft-state", FormatOne::State());
+    }
+
+    SECTION("the snapshot file")
+    {
+        expectForeign("raft-snapshot", FormatOne::Snapshot());
+    }
+
+    SECTION("the log, whose records carried no version at all")
+    {
+        expectForeign("raft-log", FormatOne::Log());
+    }
+}
+
+TEST_CASE("A store this build wrote opens, and damage to it is still damage", "[consensus][raft][storage][learner]")
+{
+    // The two controls the case above needs. A reader that refused EVERY store would
+    // pass it; so would one that called damage a foreign format. So: a current store,
+    // carrying learners in both the snapshot and a log entry, opens and reads back
+    // whole -- and the same kinds of file with their bytes damaged are `StorageFailure`.
+    ScratchDirectory scratch { "fc-raft-store" };
+    auto const configuration = Configuration { .voters = { "n1", "n2" }, .learners = { "laptop" } };
+    auto const snapshot = RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 2 },
+                                         .lastIncludedTerm = Term { .value = 1 },
+                                         .configuration = configuration,
+                                         .state = FastCache::BytesFromString("state") };
+    {
+        auto store = OpenStore(scratch.Path());
+        REQUIRE(store.SaveState(PersistentState { .currentTerm = Term { .value = 3 }, .votedFor = "n2" }).has_value());
+        REQUIRE(store
+                    .SaveLog(LogAppend { .fromIndex = LogIndex { .value = 1 },
+                                         .entries = { Entry(1, "a"),
+                                                      Entry(1, "b"),
+                                                      LogEntry { .term = Term { .value = 1 },
+                                                                 .kind = EntryKind::Configuration,
+                                                                 .payload = Membership::Encode(configuration) } } })
+                    .has_value());
+        REQUIRE(store.SaveSnapshot(snapshot).has_value());
+    }
+
+    {
+        auto store = OpenStore(scratch.Path());
+        auto const loaded = store.Load();
+        REQUIRE(loaded.has_value());
+        REQUIRE(loaded->snapshot.has_value());
+        CHECK(Unwrap(loaded->snapshot).configuration == configuration);
+        REQUIRE(loaded->entries.size() == 1);
+        CHECK(Membership::Decode(loaded->entries[0].payload) == std::optional { configuration });
+    }
+
+    // The same log, damaged in its only record's payload: torn, not foreign, so it is
+    // discarded as a tail and the store still opens and loads -- which is the
+    // torn-tail rule, and the opposite of what a foreign FIRST record gets.
+    auto const logPath = scratch.Path() / "raft-log";
+    {
+        std::fstream inout { logPath, std::ios::binary | std::ios::in | std::ios::out };
+        REQUIRE(inout.is_open());
+        inout.seekp(-6, std::ios::end);
+        char const flipped = 0x7F;
+        inout.write(&flipped, 1);
+    }
+    CHECK_FALSE(OpenAndLoad(scratch.Path()).has_value());
+
+    // The snapshot damaged in its CRC is refused as DAMAGE.
+    auto const snapshotPath = scratch.Path() / "raft-snapshot";
+    {
+        std::fstream inout { snapshotPath, std::ios::binary | std::ios::in | std::ios::out };
+        REQUIRE(inout.is_open());
+        inout.seekp(-1, std::ios::end);
+        char const flipped = 0x7F;
+        inout.write(&flipped, 1);
+    }
+    auto const damaged = OpenAndLoad(scratch.Path());
+    REQUIRE(damaged.has_value());
+    CHECK(Unwrap(damaged).code == ConsensusErrorCode::StorageFailure);
 }

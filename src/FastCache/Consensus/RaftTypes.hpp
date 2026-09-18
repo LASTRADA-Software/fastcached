@@ -100,6 +100,56 @@ struct LogIndex
 /// from the discovery handshake.
 using NodeId = std::string;
 
+/// A cluster configuration: who is COUNTED, and who is only replicated to (#1449).
+///
+/// **Two sets, because voting is a property of the configuration and not of a node's
+/// role.** A learner still follows -- it receives and applies the log and snapshots,
+/// and it answers reads as any follower does -- so it cannot be a fifth `Role` that
+/// `Tick` moves a node between. What it lacks is a vote, and whether a member has one
+/// is decided by which set the LATEST configuration names it in.
+///
+/// - `voters` are what every quorum read counts: commitment, pre-vote, votes and
+///   CheckQuorum. A configuration that names anybody names at least one voter,
+///   because a cluster of learners has nobody who may lead it.
+/// - `learners` are replicated to and counted by nothing. That is what lets a machine
+///   that is usually absent -- a laptop on a VPN -- be a member without its absence
+///   costing the always-on node its quorum.
+///
+/// The two are DISJOINT, and `Membership::Validate` refuses a configuration where they
+/// are not: an id in both would be counted by the arithmetic that reads `voters` and
+/// excused by the rule that reads `learners`, which is one member meaning two things.
+///
+/// Empty in both is "no cluster yet"; see `RaftConfig::voters`.
+struct Configuration
+{
+    std::vector<NodeId> voters {};   ///< Counted by every quorum.
+    std::vector<NodeId> learners {}; ///< Replicated to and counted by nothing.
+
+    /// Value equality, which a configuration entry's round trip is asserted on.
+    [[nodiscard]] bool operator==(Configuration const&) const = default;
+};
+
+/// Where a node sits in a configuration: `Membership::StandingOf`'s answer.
+///
+/// **Private: never transmitted or persisted**, so the enumerators carry no values. It
+/// is derived from a configuration and an id every time it is asked, and a copy that
+/// could lag the configuration it describes would be a second source of truth. A
+/// surface that reports it maps it to a wire value of its own by table, as
+/// `--node-status` does, so a reordering here moves no byte anybody reads.
+///
+/// Separate from `Role` because a role is what `Tick` moves a node between and a
+/// standing is what the configuration says about it: a learner is a follower whose
+/// standing forbids the two things a follower may otherwise do -- stand, and vote
+/// (`RaftNode.hpp`'s `StandingTable`).
+enum class Standing : std::uint8_t
+{
+    NoCluster, ///< The configuration names nobody: waiting to be admitted.
+    Voter,     ///< Counted by every quorum.
+    Learner,   ///< Replicated to and counted by nothing (#1449).
+    Outsider,  ///< The configuration names others and not this node: removed, or never admitted.
+    Last,      ///< Not a standing, and has no row: the length of a table keyed by one.
+};
+
 /// What a log entry is for.
 ///
 /// The consensus layer needs entries of its own — a new leader appends one to
@@ -363,7 +413,7 @@ struct InstallSnapshotRequest
     NodeId leaderId;               ///< So a follower can redirect a client.
     LogIndex lastIncludedIndex {}; ///< Last index the snapshot covers.
     Term lastIncludedTerm {};      ///< Term of that index.
-    std::vector<NodeId> members;   ///< The configuration as of that index.
+    Configuration configuration;   ///< The configuration as of that index, voters and learners.
     std::vector<std::byte> state;  ///< The application's own bytes, never interpreted.
     /// Value equality, so a round trip can be asserted whole rather than
     /// field by field — which is what makes a transposed field visible.

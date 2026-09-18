@@ -674,6 +674,16 @@ enum class Op : std::uint8_t
     /// reported answer and the enforced one can disagree -- which is the defect class #1471
     /// exists to make visible rather than to add to.
     ExplainAdmission = 0x1B,
+
+    /// Operator admits a member as a LEARNER, or moves one into that set (#1449).
+    ///
+    /// `ClusterAdmit`'s payload and receipt under a byte of its own, for the reason
+    /// `ClusterAdmitClient` has one: which set consensus counts a member in must not
+    /// depend on a FIELD a build may not know. A verb rather than a field, so
+    /// `CurrentVersion` does not move -- a build without it refuses the byte by name.
+    /// Admitting a voter through it DEMOTES that voter, and `ClusterAdmit` on a learner
+    /// promotes it: the seat follows the verb, as `Cluster::MemberSeatTable` says.
+    ClusterAdmitLearner = 0x1C,
 };
 
 /// Reply status, the first byte of every reply.
@@ -1863,6 +1873,13 @@ inline constexpr std::array OpTable {
     OpDescriptor { .code = Op::ClusterAdmit,
                    .name = "cluster-admit",
                    .fieldCount = 2, // member id, consensus endpoint
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler },
+    OpDescriptor { .code = Op::ClusterAdmitLearner,
+                   .name = "cluster-admit-learner",
+                   .fieldCount = 2, // member id, consensus endpoint -- ClusterAdmit's
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
@@ -4353,28 +4370,45 @@ struct ClusterAdmitView
     std::span<std::byte const> raftEndpoint;
 };
 
-/// Frame a CLUSTER-ADMIT request.
+/// Whether `op` admits a MEMBER: `ClusterAdmit` (a voter) or `ClusterAdmitLearner` (#1449).
+/// @param op A verb.
+/// @return True for the two verbs that share `ClusterAdmitRequest` and its receipt.
+[[nodiscard]] constexpr bool IsMemberAdmission(Op op) noexcept
+{
+    return op == Op::ClusterAdmit || op == Op::ClusterAdmitLearner;
+}
+
+/// Frame a CLUSTER-ADMIT or CLUSTER-ADMIT-LEARNER request.
 ///
 /// Two fields and not one: an id with no address is a node the cluster counts
 /// towards quorum and cannot reach, which is the defect `Cluster::ClusterMember`
 /// exists to make unrepresentable. The scheduler endpoint is deliberately absent —
 /// a member announces its own, and nothing an operator types about somebody else
 /// could supply it.
+///
+/// One encoder for both verbs, for `EncodeClusterClientVerb`'s reason: the payload is
+/// the same, and which set the member is admitted into is the verb's byte.
+/// @tparam op `Op::ClusterAdmit` or `Op::ClusterAdmitLearner`, held by the type system.
 /// @param request Who to admit, and where it answers.
 /// @param version Version to advertise.
 /// @return The framed request.
+template <Op op>
+    requires(IsMemberAdmission(op))
 [[nodiscard]] inline std::vector<std::byte> EncodeClusterAdmit(ClusterAdmitRequest const& request,
                                                                WireVersion version = CurrentVersion)
 {
-    return Detail::EncodeRequest(version, Op::ClusterAdmit, { AsBytes(request.memberId), AsBytes(request.raftEndpoint) });
+    return Detail::EncodeRequest(version, op, { AsBytes(request.memberId), AsBytes(request.raftEndpoint) });
 }
 
-/// Split a CLUSTER-ADMIT payload.
+/// Split a CLUSTER-ADMIT or CLUSTER-ADMIT-LEARNER payload.
+/// @tparam op Which of the two verbs the payload belongs to, held the same way.
 /// @param payload The bytes following the request header.
 /// @return The fields, or nullopt when malformed.
+template <Op op>
+    requires(IsMemberAdmission(op))
 [[nodiscard]] inline std::optional<ClusterAdmitView> DecodeClusterAdmitPayload(std::span<std::byte const> payload)
 {
-    auto const fields = SplitFields(payload, OpFieldCount(Op::ClusterAdmit));
+    auto const fields = SplitFields(payload, OpFieldCount(op));
     if (!fields.has_value())
         return std::nullopt;
     return ClusterAdmitView { .memberId = (*fields)[0], .raftEndpoint = (*fields)[1] };
@@ -4820,6 +4854,27 @@ enum class WireCordonState : std::uint8_t
     Drained = 0x03,  ///< Cordoned, and nothing is running.
 };
 
+/// Where a node sits in its own consensus configuration (#1449).
+///
+/// Mirrors `Consensus::Standing`, which lives in the library this header may not depend on;
+/// the node app holds the two together by a table, as it does `WireMembership`. A tri-state
+/// and more where it is reported, and DISENGAGED on a node that runs no consensus, for
+/// `WireEnrollmentState`'s reason: a standing is a claim about a configuration, and a node
+/// with none to hold has nothing to claim.
+///
+/// It is what consensus COUNTS the node as right now, which is not always the seat the
+/// replicated record names: an operator's admit is recorded first and the configuration
+/// follows one change at a time, so the two differ for as long as a change replicates.
+///
+/// Explicit values because these bytes are transmitted.
+enum class WireConsensusStanding : std::uint8_t
+{
+    NoCluster = 0x01, ///< Holds no configuration: waiting to be admitted.
+    Voter = 0x02,     ///< Counted by every quorum; may stand for election.
+    Learner = 0x03,   ///< Replicated to and counted by no quorum; never stands.
+    Outsider = 0x04,  ///< Its configuration names others and not itself: removed, or never admitted.
+};
+
 /// What a node concludes about one host's admission (#1471).
 ///
 /// Mirrors `Distributed::Membership`, which lives in the library this header may not depend on.
@@ -5025,6 +5080,14 @@ struct NodeRuntimeFields
     /// is forgotten is a different verb; the seam's `Explain(host)` answers that where a caller
     /// has the host, and the fleet page carries the leader's set.
     std::optional<std::uint32_t> forgottenClients {};
+
+    /// Where this node sits in the configuration its consensus operates under, or
+    /// disengaged on a node that runs no consensus (#1449).
+    ///
+    /// The question a `components` mask and a scheduler role cannot answer between them:
+    /// a learner and a voter that follows both report `consensus` and `follower`, and only
+    /// one of them will ever stand when the leader goes.
+    std::optional<WireConsensusStanding> consensusStanding {};
 };
 
 /// What an operator reads `NodeRuntimeFields::consensusEndpoint` under, as prose: the
@@ -5140,6 +5203,7 @@ namespace Detail
     auto const consensusEndpoint =
         runtime.consensusEndpoint.has_value() ? AsBytes(*runtime.consensusEndpoint) : std::span<std::byte const> {};
     auto const forgottenClients = Detail::OptionalBigEndian(runtime.forgottenClients);
+    auto const consensusStanding = Detail::OptionalEnumByte(runtime.consensusStanding);
 
     // Positional, so the ORDER here is the wire contract for this record. Append only:
     // an insertion shifts every later field and every peer decodes one fact as the next.
@@ -5157,7 +5221,8 @@ namespace Detail
                                 enrollmentPending,
                                 cordon,
                                 consensusEndpoint,
-                                forgottenClients });
+                                forgottenClients,
+                                consensusStanding });
 }
 
 /// Read a runtime record back.
@@ -5296,6 +5361,24 @@ namespace Detail
     // and a sender that predates the field sends fewer fields, which `at` answers empty.
     if (auto const consensusEndpoint = at(13); !consensusEndpoint.empty())
         out.consensusEndpoint = std::string { AsStringView(consensusEndpoint) };
+
+    if (auto const standing = at(15); !standing.empty())
+    {
+        if (standing.size() != 1)
+            return std::nullopt;
+        // Skipped rather than refused when unnamed, for the enrollment state's reason.
+        switch (static_cast<WireConsensusStanding>(standing[0]))
+        {
+            case WireConsensusStanding::NoCluster:
+            case WireConsensusStanding::Voter:
+            case WireConsensusStanding::Learner:
+            case WireConsensusStanding::Outsider:
+                out.consensusStanding = static_cast<WireConsensusStanding>(standing[0]);
+                break;
+            default:
+                break;
+        }
+    }
 
     return out;
 }

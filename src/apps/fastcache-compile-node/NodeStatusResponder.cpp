@@ -47,6 +47,28 @@ namespace
     static_assert(RowsInEnumeratorOrder(WireRoles, &WireRoleRow::role),
                   "WireRoles must hold one row per SchedulerRole, in enumerator order");
 
+    /// One row of `WireStandings`.
+    struct WireStandingRow
+    {
+        Consensus::Standing standing;                ///< What consensus calls it.
+        CompileCacheWire::WireConsensusStanding tag; ///< What the wire calls it.
+    };
+
+    /// Which wire tag each consensus standing travels as (#1449).
+    ///
+    /// A table for `WireRoles`' reason: `Consensus::Standing` is private and free to be
+    /// reordered, so transmitting it directly would make its declaration order a wire
+    /// contract nobody signed.
+    constexpr EnumTable<Consensus::Standing, WireStandingRow> WireStandings { {
+        { .standing = Consensus::Standing::NoCluster, .tag = CompileCacheWire::WireConsensusStanding::NoCluster },
+        { .standing = Consensus::Standing::Voter, .tag = CompileCacheWire::WireConsensusStanding::Voter },
+        { .standing = Consensus::Standing::Learner, .tag = CompileCacheWire::WireConsensusStanding::Learner },
+        { .standing = Consensus::Standing::Outsider, .tag = CompileCacheWire::WireConsensusStanding::Outsider },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(WireStandings, &WireStandingRow::standing),
+                  "WireStandings must hold one row per Consensus::Standing, in enumerator order");
+
     /// What this surface does about one refusal it may be asked to answer.
     ///
     /// **Exactly one of the two is set**, checked per row rather than described: a
@@ -461,6 +483,15 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     // it -- and were it, absent is the honest reading of an address nobody stated.
     if (auto dial = ConsensusDialAddressOf(_cfg); dial.has_value())
         fields.runtime.consensusEndpoint = std::move(*dial);
+
+    // Where this node sits in the configuration consensus holds (#1449): a learner and a
+    // following voter are one role and one component mask, and only one of them stands
+    // when the leader goes. Absent on a node with no source, which is a node running no
+    // consensus -- and on one whose tier is not attached yet or already gone, where
+    // absent is the honest answer about a configuration nothing can be asked for.
+    if (_sources.consensus != nullptr)
+        if (auto const standing = _sources.consensus->CurrentStanding(); standing.has_value())
+            fields.runtime.consensusStanding = WireStandings[static_cast<std::size_t>(*standing)].tag;
 
     for (auto const& mapping: mappings)
     {

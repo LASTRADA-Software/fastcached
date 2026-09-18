@@ -46,7 +46,8 @@ constexpr auto ElectionMin = 150ms;
 [[nodiscard]] RaftConfig ThreeNodes(NodeId self = "n1")
 {
     return RaftConfig { .self = std::move(self),
-                        .members = { "n1", "n2", "n3" },
+                        .voters = { "n1", "n2", "n3" },
+                        .learners = {},
                         .electionTimeoutMin = ElectionMin,
                         .electionTimeoutMax = 300ms,
                         .heartbeatInterval = 50ms };
@@ -234,7 +235,7 @@ TEST_CASE("A leader sends a snapshot to a follower it can no longer replay to", 
 
     // The configuration travels with it, because a follower catching up from a
     // snapshot has no entries left to learn the member set from.
-    CHECK(snapshots[0].members == fix.node.ActiveMembers());
+    CHECK(snapshots[0].configuration == fix.node.ActiveConfiguration());
 }
 
 TEST_CASE("A follower adopts a snapshot it cannot replay to", "[consensus][raft][snapshot]")
@@ -242,20 +243,21 @@ TEST_CASE("A follower adopts a snapshot it cannot replay to", "[consensus][raft]
     ScriptedRandomSource random { { 0 } };
     auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
 
-    auto const output = node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
-                                                              .leaderId = "n1",
-                                                              .lastIncludedIndex = LogIndex { .value = 9 },
-                                                              .lastIncludedTerm = Term { .value = 3 },
-                                                              .members = { "n1", "n2", "n3", "n4" },
-                                                              .state = BytesFromString("caught-up") },
-                                     At(10));
+    auto const output =
+        node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
+                                              .leaderId = "n1",
+                                              .lastIncludedIndex = LogIndex { .value = 9 },
+                                              .lastIncludedTerm = Term { .value = 3 },
+                                              .configuration = { .voters = { "n1", "n2", "n3", "n4" }, .learners = {} },
+                                              .state = BytesFromString("caught-up") },
+                     At(10));
 
     CHECK(node.Log().SnapshotIndex() == LogIndex { .value = 9 });
     CHECK(node.Log().LastIndex() == LogIndex { .value = 9 });
     CHECK(node.CommitIndex() == LogIndex { .value = 9 });
 
     // The configuration came with it.
-    CHECK(node.ActiveMembers().size() == 4);
+    CHECK(node.ActiveConfiguration().voters.size() == 4);
 
     // The application is told to REPLACE, not to advance.
     REQUIRE(output.restoreSnapshot.has_value());
@@ -297,7 +299,7 @@ TEST_CASE("A snapshot from the leader of this term ends the election", "[consens
                                                  .leaderId = "n1",
                                                  .lastIncludedIndex = LogIndex { .value = 4 },
                                                  .lastIncludedTerm = Term { .value = 1 },
-                                                 .members = { "n1", "n2", "n3" },
+                                                 .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
                                                  .state = BytesFromString("caught-up") },
                         At(ElectionMin.count() + 10));
 
@@ -320,7 +322,7 @@ TEST_CASE("A snapshot from outside the configuration is refused", "[consensus][r
                                                               .leaderId = "stranger",
                                                               .lastIncludedIndex = LogIndex { .value = 9 },
                                                               .lastIncludedTerm = Term { .value = 3 },
-                                                              .members = { "stranger" },
+                                                              .configuration = { .voters = { "stranger" }, .learners = {} },
                                                               .state = BytesFromString("planted") },
                                      At(10));
 
@@ -331,7 +333,7 @@ TEST_CASE("A snapshot from outside the configuration is refused", "[consensus][r
     // Nothing was adopted: not the log point, not the member set, not the state.
     CHECK(node.Log().SnapshotIndex() == LogIndex::BeforeFirst());
     CHECK(node.CommitIndex() == LogIndex::BeforeFirst());
-    CHECK(node.ActiveMembers() == std::vector<NodeId> { "n1", "n2", "n3" });
+    CHECK(node.ActiveConfiguration() == Configuration { .voters = { "n1", "n2", "n3" }, .learners = {} });
     CHECK_FALSE(output.restoreSnapshot.has_value());
     CHECK_FALSE(node.KnownLeader().has_value());
 }
@@ -344,23 +346,24 @@ TEST_CASE("A node with no cluster adopts the snapshot that catches it up", "[con
     // node unjoinable by exactly the message that joins it.
     ScriptedRandomSource random { { 0 } };
     auto joining = ThreeNodes("n4");
-    joining.members.clear();
+    joining.voters.clear();
     auto node = std::move(RaftNode::Create(std::move(joining), random, TimePoint {})).value();
     REQUIRE_FALSE(node.HasCluster());
 
-    auto const output = node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
-                                                              .leaderId = "n1",
-                                                              .lastIncludedIndex = LogIndex { .value = 9 },
-                                                              .lastIncludedTerm = Term { .value = 3 },
-                                                              .members = { "n1", "n2", "n3", "n4" },
-                                                              .state = BytesFromString("caught-up") },
-                                     At(10));
+    auto const output =
+        node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
+                                              .leaderId = "n1",
+                                              .lastIncludedIndex = LogIndex { .value = 9 },
+                                              .lastIncludedTerm = Term { .value = 3 },
+                                              .configuration = { .voters = { "n1", "n2", "n3", "n4" }, .learners = {} },
+                                              .state = BytesFromString("caught-up") },
+                     At(10));
 
     auto const replies = MessagesOfType<InstallSnapshotResponse>(output);
     REQUIRE(replies.size() == 1);
     CHECK(replies[0].result == AppendResult::Accepted);
     CHECK(node.HasCluster());
-    CHECK(node.ActiveMembers().size() == 4);
+    CHECK(node.ActiveConfiguration().voters.size() == 4);
 }
 
 TEST_CASE("A stale snapshot does not roll a follower backwards", "[consensus][raft][snapshot]")
@@ -375,18 +378,19 @@ TEST_CASE("A stale snapshot does not roll a follower backwards", "[consensus][ra
                                                  .leaderId = "n1",
                                                  .lastIncludedIndex = LogIndex { .value = 9 },
                                                  .lastIncludedTerm = Term { .value = 3 },
-                                                 .members = { "n1", "n2", "n3" },
+                                                 .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
                                                  .state = BytesFromString("newer") },
                         At(10));
     REQUIRE(node.CommitIndex() == LogIndex { .value = 9 });
 
-    auto const output = node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
-                                                              .leaderId = "n1",
-                                                              .lastIncludedIndex = LogIndex { .value = 4 },
-                                                              .lastIncludedTerm = Term { .value = 2 },
-                                                              .members = { "n1", "n2", "n3" },
-                                                              .state = BytesFromString("older") },
-                                     At(11));
+    auto const output =
+        node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
+                                              .leaderId = "n1",
+                                              .lastIncludedIndex = LogIndex { .value = 4 },
+                                              .lastIncludedTerm = Term { .value = 2 },
+                                              .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
+                                              .state = BytesFromString("older") },
+                     At(11));
 
     CHECK(node.CommitIndex() == LogIndex { .value = 9 });
     CHECK(node.Log().SnapshotIndex() == LogIndex { .value = 9 });
@@ -413,13 +417,14 @@ TEST_CASE("A snapshot from an older term is refused", "[consensus][raft][snapsho
                                                .leaderCommit = LogIndex::BeforeFirst() },
                         At(10));
 
-    auto const output = node.Receive(InstallSnapshotRequest { .term = Term { .value = 2 },
-                                                              .leaderId = "n3",
-                                                              .lastIncludedIndex = LogIndex { .value = 9 },
-                                                              .lastIncludedTerm = Term { .value = 1 },
-                                                              .members = { "n1", "n2", "n3" },
-                                                              .state = BytesFromString("stale") },
-                                     At(11));
+    auto const output =
+        node.Receive(InstallSnapshotRequest { .term = Term { .value = 2 },
+                                              .leaderId = "n3",
+                                              .lastIncludedIndex = LogIndex { .value = 9 },
+                                              .lastIncludedTerm = Term { .value = 1 },
+                                              .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
+                                              .state = BytesFromString("stale") },
+                     At(11));
 
     CHECK(node.Log().SnapshotIndex() == LogIndex::BeforeFirst());
     CHECK_FALSE(output.restoreSnapshot.has_value());
@@ -477,7 +482,7 @@ TEST_CASE("Compaction emits the snapshot it needs made durable", "[consensus][ra
 
     // The configuration travels with it, because after the cut there may be no
     // configuration entry left in the log to re-derive one from.
-    CHECK(snapshot.members == std::vector<NodeId> { "n1", "n2", "n3" });
+    CHECK(snapshot.configuration == Configuration { .voters = { "n1", "n2", "n3" }, .learners = {} });
 
     // A refused compaction emits nothing: there is no new durable point to record.
     auto second = RaftOutput {};
@@ -494,13 +499,14 @@ TEST_CASE("An installed snapshot is persisted before it is acknowledged", "[cons
     ScriptedRandomSource random { { 0 } };
     auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
 
-    auto const output = node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
-                                                              .leaderId = "n1",
-                                                              .lastIncludedIndex = LogIndex { .value = 9 },
-                                                              .lastIncludedTerm = Term { .value = 3 },
-                                                              .members = { "n1", "n2", "n3" },
-                                                              .state = BytesFromString("caught-up") },
-                                     At(300));
+    auto const output =
+        node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
+                                              .leaderId = "n1",
+                                              .lastIncludedIndex = LogIndex { .value = 9 },
+                                              .lastIncludedTerm = Term { .value = 3 },
+                                              .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
+                                              .state = BytesFromString("caught-up") },
+                     At(300));
 
     REQUIRE(output.saveSnapshot.has_value());
     auto const saved = Unwrap(output.saveSnapshot);
@@ -515,13 +521,14 @@ TEST_CASE("An installed snapshot is persisted before it is acknowledged", "[cons
 
     // And a snapshot that was already covered changes nothing, so there is nothing
     // to write.
-    auto const duplicate = node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
-                                                                 .leaderId = "n1",
-                                                                 .lastIncludedIndex = LogIndex { .value = 9 },
-                                                                 .lastIncludedTerm = Term { .value = 3 },
-                                                                 .members = { "n1", "n2", "n3" },
-                                                                 .state = BytesFromString("caught-up") },
-                                        At(400));
+    auto const duplicate =
+        node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
+                                              .leaderId = "n1",
+                                              .lastIncludedIndex = LogIndex { .value = 9 },
+                                              .lastIncludedTerm = Term { .value = 3 },
+                                              .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
+                                              .state = BytesFromString("caught-up") },
+                     At(400));
     CHECK_FALSE(duplicate.saveSnapshot.has_value());
 }
 
@@ -537,7 +544,7 @@ TEST_CASE("A node recovered from a snapshot resumes above the boundary", "[conse
                          .firstIndex = LogIndex { .value = 10 },
                          .snapshot = RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 9 },
                                                     .lastIncludedTerm = Term { .value = 3 },
-                                                    .members = { "n1", "n2", "n3" },
+                                                    .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
                                                     .state = BytesFromString("recovered") } };
 
     auto node = std::move(RaftNode::Create(ThreeNodes(), random, TimePoint {}, recovered)).value();
@@ -573,14 +580,14 @@ TEST_CASE("A membership change survives compaction and a restart", "[consensus][
                          .firstIndex = LogIndex { .value = 8 },
                          .snapshot = RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 7 },
                                                     .lastIncludedTerm = Term { .value = 4 },
-                                                    .members = grown,
+                                                    .configuration = { .voters = grown, .learners = {} },
                                                     .state = BytesFromString("s") } };
 
     // Bootstrapped with three members, recovered under four.
     auto node = std::move(RaftNode::Create(ThreeNodes(), random, TimePoint {}, recovered)).value();
     // Not cosmetic: this set is what a quorum is counted over, so forgetting the
     // fourth member would let three nodes commit on a majority of the wrong set.
-    CHECK(node.ActiveMembers() == grown);
+    CHECK(node.ActiveConfiguration().voters == grown);
 }
 
 TEST_CASE("A recovered log that still covers its snapshot is reconciled", "[consensus][raft][snapshot]")
@@ -600,7 +607,7 @@ TEST_CASE("A recovered log that still covers its snapshot is reconciled", "[cons
                          .firstIndex = LogIndex { .value = 1 },
                          .snapshot = RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 3 },
                                                     .lastIncludedTerm = Term { .value = 3 },
-                                                    .members = { "n1", "n2", "n3" },
+                                                    .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
                                                     .state = BytesFromString("s") } };
 
     auto node = std::move(RaftNode::Create(ThreeNodes(), random, TimePoint {}, recovered)).value();
@@ -611,4 +618,34 @@ TEST_CASE("A recovered log that still covers its snapshot is reconciled", "[cons
     CHECK(node.Log().LastIndex() == LogIndex { .value = 5 });
     CHECK(node.Log().SnapshotTerm() == Term { .value = 3 });
     CHECK(node.SnapshotIndex() == LogIndex { .value = 3 });
+}
+
+TEST_CASE("A learner caught up by a snapshot learns that it is one", "[consensus][raft][snapshot][learner]")
+{
+    // Compaction is what leaves no configuration entry to re-derive a standing from,
+    // so the snapshot has to carry BOTH sets (#1449). One that carried the voters
+    // alone would restore a learner as an outsider -- a node that stands, in a cluster
+    // that never meant it to.
+    ScriptedRandomSource random { { 0 } };
+    auto joining = ThreeNodes("n4");
+    joining.voters.clear();
+    auto node = std::move(RaftNode::Create(std::move(joining), random, TimePoint {})).value();
+    REQUIRE(node.CurrentStanding() == Standing::NoCluster);
+
+    auto const configuration = Configuration { .voters = { "n1", "n2", "n3" }, .learners = { "n4" } };
+    auto const output = node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
+                                                              .leaderId = "n1",
+                                                              .lastIncludedIndex = LogIndex { .value = 9 },
+                                                              .lastIncludedTerm = Term { .value = 3 },
+                                                              .configuration = configuration,
+                                                              .state = BytesFromString("caught-up") },
+                                     At(10));
+
+    CHECK(node.ActiveConfiguration() == configuration);
+    CHECK(node.CurrentStanding() == Standing::Learner);
+    CHECK(node.NextDeadline() == TimePoint::max());
+
+    // And what it makes durable is the same pair, so a restart comes back a learner.
+    REQUIRE(output.saveSnapshot.has_value());
+    CHECK(output.saveSnapshot.value_or(RaftSnapshot {}).configuration == configuration);
 }

@@ -74,11 +74,21 @@ class RaftClusterHarness
     /// Makes the credential a member proves the cluster key with.
     using CredentialFactory = std::function<std::unique_ptr<IRaftPeerCredential const>(NodeId const& who)>;
 
-    /// @param members Every node in the cluster.
+    /// @param members Every node in the cluster, each one a voter.
     /// @param credentials What each member, and each later `Join`, proves the key with.
     /// @param seedOffset Staggers each node's election timer draws, so a cluster
     ///        whose members all draw identically does not split its vote forever.
     RaftClusterHarness(std::vector<NodeId> members, CredentialFactory credentials, std::uint64_t seedOffset = 1);
+
+    /// A cluster bootstrapped with voters AND learners (#1449).
+    ///
+    /// Every node named in either set is started, each with the whole configuration
+    /// as its bootstrap -- which is how a learner a configuration names on its own
+    /// command line comes up.
+    /// @param configuration The voters and the learners.
+    /// @param credentials What each member, and each later `Join`, proves the key with.
+    /// @param seedOffset As for the other constructor.
+    RaftClusterHarness(Configuration configuration, CredentialFactory credentials, std::uint64_t seedOffset = 1);
 
     /// Advance the clock, deliver what is due, and tick every node.
     ///
@@ -172,10 +182,10 @@ class RaftClusterHarness
     /// @return Where it landed, or nullopt when nobody leads.
     [[nodiscard]] std::optional<LogIndex> ProposeOnLeader(std::vector<std::byte> payload);
 
-    /// Offer a new member set through whichever node leads.
-    /// @param members The proposed member set.
+    /// Offer a new configuration through whichever node leads.
+    /// @param configuration The proposed voters and learners.
     /// @return Where it landed, or nullopt when nobody leads or it was refused.
-    [[nodiscard]] std::optional<LogIndex> ProposeMembershipOnLeader(std::vector<NodeId> members);
+    [[nodiscard]] std::optional<LogIndex> ProposeMembershipOnLeader(Configuration configuration);
 
     /// @param who Which node.
     /// @return That node's view.
@@ -208,13 +218,13 @@ class RaftClusterHarness
         std::unique_ptr<IRaftStateMachine> machine;
         std::unique_ptr<RaftDriver> driver;
 
-        /// The member set this node was started with, empty for a joiner.
+        /// The configuration this node was started with, empty for a joiner.
         ///
         /// Recorded per node rather than taken from the harness, because a
         /// restart has to reconstruct the configuration *this* node was given —
         /// and a joiner was given none, so reading the harness's list would hand
         /// it a bootstrap set on its second start that it never had on its first.
-        std::vector<NodeId> bootstrap;
+        Configuration bootstrap;
 
         /// What this node has applied, in order. The state machine's whole job.
         std::vector<AppliedEntry> applied;
@@ -289,9 +299,9 @@ class RaftClusterHarness
     /// is one that can drift -- a restarted node quietly running different
     /// timeouts would change what the simulation is testing without saying so.
     /// @param who Which member the configuration is for.
-    /// @param bootstrap That member's own bootstrap set; empty for a joiner.
+    /// @param bootstrap That member's own bootstrap configuration; empty for a joiner.
     /// @return The configuration.
-    [[nodiscard]] static RaftConfig ConfigFor(NodeId const& who, std::vector<NodeId> bootstrap);
+    [[nodiscard]] static RaftConfig ConfigFor(NodeId const& who, Configuration bootstrap);
 
     /// Build one node's whole world and put it on the network.
     ///
@@ -300,9 +310,9 @@ class RaftClusterHarness
     /// into bootstrap nodes and silently absent from joiners — a difference in
     /// exactly the dimension this harness exists to compare.
     /// @param who The node's id.
-    /// @param bootstrap Its bootstrap member set; empty for a joiner.
+    /// @param bootstrap Its bootstrap configuration; empty for a joiner.
     /// @param credential What it proves the key with.
-    void AddNode(NodeId const& who, std::vector<NodeId> bootstrap, std::unique_ptr<IRaftPeerCredential const> credential);
+    void AddNode(NodeId const& who, Configuration bootstrap, std::unique_ptr<IRaftPeerCredential const> credential);
 
     /// Refuse a second node under an id already on the network.
     /// @param who The id about to be added.
@@ -355,7 +365,9 @@ class RaftClusterHarness
     /// series rather than start a second one that could collide with it.
     std::uint64_t _seedOffset { 1 };
 
-    std::vector<NodeId> _members;
+    /// The configuration the harness was constructed with: every bootstrap node,
+    /// by the set it was started in.
+    Configuration _members;
     std::vector<std::unique_ptr<Member>> _nodes;
     std::vector<InFlight> _wire;
 
@@ -393,16 +405,27 @@ class RaftClusterHarness
 inline RaftClusterHarness::RaftClusterHarness(std::vector<NodeId> members,
                                               CredentialFactory credentials,
                                               std::uint64_t seedOffset):
+    RaftClusterHarness { Configuration { .voters = std::move(members), .learners = {} }, std::move(credentials), seedOffset }
+{
+}
+
+inline RaftClusterHarness::RaftClusterHarness(Configuration configuration,
+                                              CredentialFactory credentials,
+                                              std::uint64_t seedOffset):
     _credentials { std::move(credentials) },
     _seedOffset { seedOffset },
-    _members { std::move(members) }
+    _members { std::move(configuration) }
 {
-    for (auto const& id: _members)
-        AddNode(id, _members, _credentials(id));
+    // Voters first and then learners, which is the order the seed series is drawn
+    // in: a cluster of voters alone gets exactly the seeds it got before learners
+    // existed, so no existing case's schedule moved.
+    for (auto const* const set: { &_members.voters, &_members.learners })
+        for (auto const& id: *set)
+            AddNode(id, _members, _credentials(id));
 }
 
 inline void RaftClusterHarness::AddNode(NodeId const& who,
-                                        std::vector<NodeId> bootstrap,
+                                        Configuration bootstrap,
                                         std::unique_ptr<IRaftPeerCredential const> credential)
 {
     auto member = std::make_unique<Member>();
@@ -428,10 +451,11 @@ inline void RaftClusterHarness::AddNode(NodeId const& who,
     _nodes.push_back(std::move(member));
 }
 
-inline RaftConfig RaftClusterHarness::ConfigFor(NodeId const& who, std::vector<NodeId> bootstrap)
+inline RaftConfig RaftClusterHarness::ConfigFor(NodeId const& who, Configuration bootstrap)
 {
     return RaftConfig { .self = who,
-                        .members = std::move(bootstrap),
+                        .voters = std::move(bootstrap.voters),
+                        .learners = std::move(bootstrap.learners),
                         .electionTimeoutMin = std::chrono::milliseconds { 150 },
                         .electionTimeoutMax = std::chrono::milliseconds { 300 },
                         .heartbeatInterval = std::chrono::milliseconds { 50 } };
@@ -791,13 +815,13 @@ inline std::optional<LogIndex> RaftClusterHarness::ProposeOnLeader(std::vector<s
     return *proposed;
 }
 
-inline std::optional<LogIndex> RaftClusterHarness::ProposeMembershipOnLeader(std::vector<NodeId> members)
+inline std::optional<LogIndex> RaftClusterHarness::ProposeMembershipOnLeader(Configuration configuration)
 {
     auto const leader = Leader();
     if (!leader.has_value())
         return std::nullopt;
 
-    auto const proposed = Find(*leader).driver->ProposeMembership(std::move(members), _clock.Now());
+    auto const proposed = Find(*leader).driver->ProposeMembership(std::move(configuration), _clock.Now());
     if (!proposed.has_value())
         return std::nullopt;
 
@@ -845,7 +869,7 @@ inline void RaftClusterHarness::Intrude(NodeId const& who, std::unique_ptr<IRaft
     RequireNew(who);
 
     auto bootstrap = _members;
-    bootstrap.push_back(who);
+    bootstrap.voters.push_back(who);
     AddNode(who, std::move(bootstrap), std::move(credential));
 }
 

@@ -726,3 +726,76 @@ TEST_CASE("Each client verb encodes as its own op, over one encoder", "[node][cl
     // while both cases above still passed.
     CHECK(admit != forget);
 }
+
+// --------------------------------------------------------------------------
+// Learners (#1449).
+
+TEST_CASE("A learner admission takes --cluster-admit's token and encodes as its own op", "[node][clusteradmin][learner]")
+{
+    auto const cfg = ParsedFrom({ "--cluster-admit-learner=laptop=10.0.0.9:6680" });
+    CHECK(cfg.cluster.action == ClusterAction::AdmitLearner);
+    CHECK(cfg.cluster.key == "laptop");
+    CHECK(cfg.cluster.value == "10.0.0.9:6680");
+
+    // The same refusals, since it is the same grammar through the same parser.
+    for (auto const* const spec: { "--cluster-admit-learner=laptop", "--cluster-admit-learner=laptop=nowhere" })
+    {
+        INFO("spec: " << spec);
+        NodeConfig refused;
+        std::vector<char const*> const args { spec };
+        CHECK_FALSE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { args }, refused).has_value());
+    }
+
+    // The BYTE the request carries, and not the voter admission's: a learner admitted
+    // as a voter grows the very quorum it was admitted to stay out of.
+    auto const learner = EncodeClusterRequest(Ask(ClusterAction::AdmitLearner, "laptop", "10.0.0.9:6680"));
+    auto const learnerHeader = Wire::DecodeRequestHeader(learner);
+    REQUIRE(learnerHeader.has_value());
+    CHECK(Unwrap(learnerHeader).opRaw == 0x1C);
+
+    auto const voterHeader =
+        Wire::DecodeRequestHeader(EncodeClusterRequest(Ask(ClusterAction::Admit, "laptop", "10.0.0.9:6680")));
+    REQUIRE(voterHeader.has_value());
+    CHECK(Unwrap(voterHeader).opRaw == 0x0B);
+}
+
+TEST_CASE("A learner admission reaches the cluster as AddLearner and says which seat it asked for",
+          "[node][clusteradmin][learner]")
+{
+    // End to end through the real service and protocol, for the receipt case's reason:
+    // the flag, the op, the scheduler's verb choice and the renderer must all AGREE.
+    FakeCluster cluster;
+    Fixture fixture;
+    fixture.service.AdministerWith(cluster);
+
+    auto const reply = fixture.Ask(Ask(ClusterAction::AdmitLearner, "laptop", "10.0.0.9:6680"));
+    REQUIRE(StatusOf(reply) == Wire::Status::Ok);
+    REQUIRE(cluster.proposed.size() == 1);
+    CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::AddLearner, "laptop", "10.0.0.9:6680"));
+
+    auto const rendered = InterpretClusterReply(ClusterAction::AdmitLearner, PayloadOf(reply));
+    REQUIRE(rendered.has_value());
+    CHECK(rendered->contains("10.0.0.9:6680"));
+    CHECK(rendered->contains("learner (the verb this request was sent as)"));
+    // The ceiling holds for this verb too.
+    CHECK(rendered->contains("Appended, not committed"));
+    CHECK_FALSE(rendered->contains("admitted"));
+
+    // And the voter admission names its own seat, so a renderer spelling one seat for
+    // both verbs is red here.
+    auto const voter = InterpretClusterReply(ClusterAction::Admit,
+                                             PayloadOf(fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680"))));
+    REQUIRE(voter.has_value());
+    CHECK(voter->contains("voter (the verb this request was sent as)"));
+}
+
+TEST_CASE("A status report names the seat each member was admitted into", "[node][clusteradmin][learner]")
+{
+    auto state = Agreed();
+    Apply(state, Cmd(Cluster::CommandKind::AddLearner, "laptop", "10.0.0.9:6680"));
+
+    auto const rendered = RenderClusterState(state);
+    CHECK(rendered.contains("seat=learner raft=10.0.0.9:6680"));
+    CHECK(rendered.contains("seat=voter raft=10.0.0.1:6680"));
+    CHECK(rendered.contains("seat=voter raft=10.0.0.2:6680"));
+}

@@ -345,6 +345,10 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         "--cluster-set",
         "--cluster-forget",
         "--cluster-admit",
+        // Same rule, and the consequence is a flap (#1449): a registration carrying it
+        // would demote the member again at every boot of this node, whoever had since
+        // promoted it.
+        "--cluster-admit-learner",
         // The client pair (#1309), same rule and one sharper consequence: a registration
         // carrying `--cluster-forget-client` would re-forget the host at every boot, so a
         // host re-admitted from anywhere else would be removed again by this node's next
@@ -3132,6 +3136,12 @@ TEST_CASE("A cluster change an operator commits is in the column; forgetting is 
                                      "n" });
     REQUIRE_FALSE(set.has_value());
     CHECK(set.error().field == "--cluster-set");
+
+    // The learner admission commits the same two strings `--cluster-admit` does (#1449).
+    auto const learner = ParseNodeArgv({ "--cluster-admit-learner=gr\xFC"
+                                         "n=host:6677" });
+    REQUIRE_FALSE(learner.has_value());
+    CHECK(learner.error().field == "--cluster-admit-learner");
 
     // `--cluster-forget` is deliberately NOT in the column, and this pins the
     // omission rather than tolerating it. Its operand IS the offending id, so a

@@ -105,6 +105,13 @@ namespace
                             .code = Wire::ErrorCode::NoCluster,
                             .why = "this endpoint is a cache and belongs to no cluster; ask a "
                                    "fastcache-compile-node --serve-scheduler instead" },
+        // With `ClusterAdmit` and for its reason: the same replicated change, recording
+        // the other seat (#1449), so one endpoint must not refuse the two spellings with
+        // two codes.
+        Wire::RefusedVerb { .op = Wire::Op::ClusterAdmitLearner,
+                            .code = Wire::ErrorCode::NoCluster,
+                            .why = "this endpoint is a cache and belongs to no cluster; ask a "
+                                   "fastcache-compile-node --serve-scheduler instead" },
         // **`DispatchNotPermitted` and never `UnknownOpcode`**, for the reason `Withdraw`
         // above states and which applies here with more force, these verbs being newer
         // than every deployed client: *unimplemented is not served elsewhere*. A client
@@ -1218,6 +1225,7 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             case Wire::Op::ClusterAdmitClient:
             case Wire::Op::ClusterForgetClient:
             case Wire::Op::ClusterAdmit:
+            case Wire::Op::ClusterAdmitLearner:
             // The operator verbs, answered by a compile node and refused HERE by name.
             // Sharing the arm above is right rather than convenient: `HandleDistributed`
             // is the one door to `RefusalFor`, which is the table that says which code

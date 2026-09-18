@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "ConsensusStanding.hpp"
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
@@ -194,7 +195,7 @@ namespace FastCache::Node
 /// `IReactor::Run` returns with its timer heap and its parked work exactly where
 /// they were, so a loop still suspended at that moment is a coroutine frame nobody
 /// ever resumes and nobody ever frees.
-class ConsensusTier final: public Distributed::IClusterAdmin
+class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusStandingSource
 {
   public:
     /// Applied entries above the snapshot before the log is traded for one.
@@ -315,6 +316,13 @@ class ConsensusTier final: public Distributed::IClusterAdmin
     /// set and the commit index describe one moment rather than four.
     /// @return This node's consensus state.
     [[nodiscard]] ConsensusStatus Status() const;
+
+    /// Where this node sits in the configuration consensus holds (#1449).
+    ///
+    /// Asked of `Consensus::Membership::StandingOf` with this node's own id, so the
+    /// answer `--node-status` reports and the one `RaftNode` acts on have one author.
+    /// @return The standing; always engaged, since a tier that exists runs consensus.
+    [[nodiscard]] std::optional<Consensus::Standing> CurrentStanding() const override;
 
     /// Offer a change to the cluster, discarding where it landed.
     ///
@@ -606,11 +614,11 @@ class ConsensusTier final: public Distributed::IClusterAdmin
 
     /// What this node last said it counts, and whether it has said anything yet.
     ///
-    /// The flag is not redundant with an empty vector: a node waiting to be admitted
+    /// The flag is not redundant with an empty configuration: a node waiting to be admitted
     /// legitimately counts nobody, so "empty" is a real reading rather than the
     /// absence of one, and reporting only on a CHANGE would leave that state silent
     /// and indistinguishable from a loop that never ran. Reconciler thread only.
-    std::vector<Consensus::NodeId> _reportedMembers;
+    Consensus::Configuration _reportedConfiguration;
 
     /// Whether `ReportQuorum` has said anything yet.
     bool _quorumReported { false };
