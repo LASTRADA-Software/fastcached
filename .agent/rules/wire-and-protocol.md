@@ -550,6 +550,42 @@ Every rule below has already been a bug.
   catch-all happens to give. Three surfaces answering this question in three
   hand-written ways is how they drifted apart to begin with.
 
+  **A new verb is not one dispatch, and none of the other four places fails the BUILD.**
+  Measured on `Op::ExplainAdmission` (#1471), which the node's responder served correctly
+  while four separate checks went red:
+
+  - **An arm in `CompileCacheHandler`'s `switch`.** A missing one does not fail the build --
+    MSVC's C4062 is off by default -- and what it produces is a **dropped frame** rather than
+    a refusal: the client waits, times out, and reports a dead endpoint for a daemon that is
+    working perfectly. `Every op in the table is dispatched` is what catches it, and the tell
+    is that the symptom names the wrong subject.
+  - **A `RelocatedVerbs` row**, saying which code and which sentence. `DispatchNotPermitted`
+    for a verb another binary serves; `NoCluster` only for one asking about replicated state.
+    Admission is a property of the PROCESS being asked, so a client told `NoCluster` goes
+    looking for consensus it does not need. The generic walk only asserts the refusal is not
+    `UnknownOpcode`, so the case that asserts WHICH refusal is a second one.
+  - **A documentation row for any counter the verb adds**, because the node's page is
+    compared against `RenderPrometheus` rather than against `MetricsCatalog`. That check is a
+    Catch2 source walk, so **grepping `docs/` and `scripts/` for a counter list answers that
+    no such check exists** -- which is what happened here.
+  - **The live-stats layout pin**, which moves whenever a catalogue row does, with the reason
+    recorded beside the earlier moves. Clients and nodes upgrade together.
+
+  - **A transmitted BITMASK is a namespace of `constexpr std::uint32_t`, never an
+    `enum class`** -- `NodeComponentBit` is the precedent, and `WireMembershipRoute` missed it
+    and was corrected by CI. A bitmask is not an enumeration: the values combine, so no
+    variable of the type ever holds one of them and a `switch` over it means nothing.
+    `performance-enum-size` is what says so, on every TU including the header, and the
+    tempting fix is wrong twice: narrowing the base type caps a set the WIRE has room to grow,
+    and makes the type's width disagree with the field's. The namespace keeps every call
+    site's spelling and leaves no enum to be the wrong size.
+
+  And a sixth thing, which is not a place but a consequence: **a sentence already on the page
+  can stop being true.** The node's payload-too-large row said its operator verbs are *both
+  fieldless, so this came from no client of this tree at any version* -- true of `node-status`
+  and `node-metrics`, false the moment `VerbFamily::Node` gained a third op carrying a host.
+  The conclusion survived and the reason changed. Nothing checks a reason.
+
   **The code itself is ONE named constant -- `Wire::UnimplementedVerb` -- that every
   surface's table and the client's tolerance spell.** #283 fixed the cache tier
   because that is what its acceptance named; the scheduler and compile ports kept

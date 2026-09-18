@@ -661,6 +661,19 @@ enum class Op : std::uint8_t
     /// only on the verb that carried the batch*) then has two answers depending on a
     /// configuration flag.
     NodeAnnounce = 0x1A,
+
+    /// Ask a node which route admits or refuses a NAMED host (#1471).
+    ///
+    /// **Its own verb rather than a field of `NodeStatus`, because it takes an ARGUMENT.**
+    /// `NodeStatus` answers *what am I* and is in `FieldlessOps`; this answers *what do you make
+    /// of that host*, which is a question about a third party and cannot be asked without naming
+    /// one. Folding it in would move `NodeStatus` out of `FieldlessOps` for every caller, to
+    /// carry a field all but one of them would leave empty.
+    ///
+    /// It reports the fold the SURFACES enforce, through the same `IMembershipOracle`, or the
+    /// reported answer and the enforced one can disagree -- which is the defect class #1471
+    /// exists to make visible rather than to add to.
+    ExplainAdmission = 0x1B,
 };
 
 /// Reply status, the first byte of every reply.
@@ -1872,6 +1885,17 @@ inline constexpr std::array OpTable {
                    .name = "node-status",
                    .fieldCount = 0, // nothing to ask with
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Node },
+    OpDescriptor { .code = Op::ExplainAdmission,
+                   .name = "explain-admission",
+                   .fieldCount = 1, // the host being asked about
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   // Not pre-auth: it reports what this node would conclude about an arbitrary
+                   // host, which is the shape of its admission policy. A caller who can read that
+                   // unauthenticated learns which routes are configured and which hosts are
+                   // forgotten, so it sits behind the same gate every other node verb does.
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
                    .family = VerbFamily::Node },
@@ -4796,6 +4820,57 @@ enum class WireCordonState : std::uint8_t
     Drained = 0x03,  ///< Cordoned, and nothing is running.
 };
 
+/// What a node concludes about one host's admission (#1471).
+///
+/// Mirrors `Distributed::Membership`, which lives in the library this header may not depend on.
+/// The two are held together by a table in the node app, not by having the same shape here.
+///
+/// Explicit values because these bytes are transmitted.
+enum class WireMembership : std::uint8_t
+{
+    Outsider = 0x01,  ///< No route has an opinion: refused, and nothing claims authorship.
+    Member = 0x02,    ///< Some route admits it.
+    Forgotten = 0x03, ///< A replicated tombstone refuses it, outranking every admission route.
+};
+
+/// Which routes concluded a verdict, as a BITMASK (#1471).
+///
+/// **A set rather than one value, and that is the whole point of the verb.** Admission is a fold
+/// over several participants, and an operator who drops a host from `--fleet-member` and finds it
+/// still served needs to know the CLUSTER admits it. A single value could not say *both*, and
+/// reporting only the winner would answer the question the operator did not ask.
+///
+/// Empty is the honest answer for `Outsider`: `DecidedBy` never attributes it, because an oracle
+/// answering `Outsider` has no opinion rather than an answer it produced, and naming an author
+/// for a silence is the confident wrong signal this verb exists to remove.
+///
+/// Explicit values because these bytes are transmitted, and powers of two because they combine.
+/// A NAMESPACE of constants rather than an `enum class`, following `NodeComponentBit` above --
+/// which is the same question on the same wire, and the precedent this originally missed.
+///
+/// A bitmask is not an enumeration: its values combine, so no variable of the type holds one
+/// of them and a `switch` over it means nothing. `performance-enum-size` says the quiet part --
+/// an `enum class : std::uint32_t` whose named values reach 0x10 is four bytes carrying one --
+/// and the tempting fix, narrowing the base type, is wrong twice: it caps a set the WIRE has
+/// room to grow at eight, and it makes the type's width disagree with the field's.
+namespace WireMembershipRoute
+{
+    constexpr std::uint32_t FleetMemberList = 0x01; ///< `--fleet-member`'s list on this node.
+    constexpr std::uint32_t ClusterMembers = 0x02;  ///< The member set the cluster has agreed.
+    constexpr std::uint32_t ClientTombstone = 0x04; ///< A replicated `--cluster-forget-client` entry.
+    constexpr std::uint32_t OpenPolicy = 0x08;      ///< `--fleet-open`, which admits every caller.
+    constexpr std::uint32_t ProvenKeyHolder = 0x10; ///< The caller proved the cluster key on this connection.
+} // namespace WireMembershipRoute
+
+/// One node's answer about one host.
+struct AdmissionExplanationFields
+{
+    WireMembership verdict { WireMembership::Outsider }; ///< What the fold concluded.
+    std::uint32_t decidedBy { 0 };                       ///< `WireMembershipRoute` values, OR-ed.
+
+    [[nodiscard]] bool operator==(AdmissionExplanationFields const&) const = default;
+};
+
 /// What a node's live components report about themselves, as opposed to what its
 /// configuration asked for.
 ///
@@ -5273,6 +5348,79 @@ namespace NodeComponentBit
 [[nodiscard]] inline std::vector<std::byte> EncodeNodeMetricsRequest(WireVersion version = CurrentVersion)
 {
     return Detail::EncodeRequest(version, Op::NodeMetrics, {});
+}
+
+/// Frame an EXPLAIN-ADMISSION request (#1471).
+/// @param host The address to ask about, as an operator would spell it.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeExplainAdmissionRequest(std::string_view host,
+                                                                          WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::ExplainAdmission, { AsBytes(host) });
+}
+
+/// Read an EXPLAIN-ADMISSION payload.
+///
+/// The host is returned as a STRING rather than a view: the payload is a borrowed span and a
+/// caller that held a view of it past the frame would read freed bytes, which on this field is a
+/// membership decision made from freed memory rather than a wrong number.
+///
+/// @param payload The bytes following the request header.
+/// @return The host, or nullopt when the fields do not exactly fill the payload.
+[[nodiscard]] inline std::optional<std::string> DecodeExplainAdmissionPayload(std::span<std::byte const> payload)
+{
+    auto const fields = WireFields::SplitExactly(payload, OpFieldCount(Op::ExplainAdmission));
+    if (!fields.has_value())
+        return std::nullopt;
+    return std::string { AsStringView((*fields)[0]) };
+}
+
+/// Frame an EXPLAIN-ADMISSION reply.
+/// @param fields What this node concluded.
+/// @return The reply body.
+[[nodiscard]] inline std::vector<std::byte> EncodeAdmissionExplanation(AdmissionExplanationFields const& fields)
+{
+    auto const verdict = std::array { static_cast<std::byte>(fields.verdict) };
+    return WireFields::Encode(
+        { std::span<std::byte const> { verdict }, std::span<std::byte const> { EncodeU32Field(fields.decidedBy) } });
+}
+
+/// Read an EXPLAIN-ADMISSION reply.
+///
+/// **An unknown verdict byte is REFUSED rather than defaulted.** A reader that fell back to
+/// `Outsider` would report a host as refused-by-nobody on a build that had learned a fourth
+/// answer, which reads exactly like the healthy case — and this verb exists to remove a
+/// confident wrong signal, not to add one.
+///
+/// **An unknown ROUTE bit is kept**, which is the opposite decision and deliberate: the routes
+/// are a SET, a bit this build cannot name still says *something decided*, and dropping it would
+/// under-report authorship on a fleet mid-upgrade. The verdict is one value and must be known;
+/// the set is evidence and may be partial.
+///
+/// @param payload The reply body.
+/// @return The explanation, or nullopt when it is malformed or names no verdict this build has.
+[[nodiscard]] inline std::optional<AdmissionExplanationFields> DecodeAdmissionExplanation(std::span<std::byte const> payload)
+{
+    auto const fields = WireFields::SplitExactly(payload, 2);
+    if (!fields.has_value() || (*fields)[0].size() != 1)
+        return std::nullopt;
+
+    auto const decidedBy = DecodeU32Field((*fields)[1]);
+    if (!decidedBy.has_value())
+        return std::nullopt;
+
+    auto const verdict = static_cast<WireMembership>(std::to_integer<std::uint8_t>((*fields)[0][0]));
+    switch (verdict)
+    {
+        case WireMembership::Outsider:
+        case WireMembership::Member:
+        case WireMembership::Forgotten:
+            break;
+        default:
+            return std::nullopt;
+    }
+    return AdmissionExplanationFields { .verdict = verdict, .decidedBy = *decidedBy };
 }
 
 /// What a CORDON asks for: cordon the worker, or lift the cordon.

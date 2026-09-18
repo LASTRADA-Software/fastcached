@@ -140,7 +140,7 @@ the help renders `Verbs()` grouped by `WireSpec::heading`, and
 | Write | `set`, `del`, `incr`, `decr`, `incrby`, `decrby`, `expire`, `persist`, `flush` |
 | Read (memcached) | `gat`, `gats`, `inspect`, `mc-stats` |
 | Write (memcached) | `touch`, `add`, `replace`, `append`, `prepend`, `cas`, `cache-memlimit` |
-| Node (`0xFC`) | `node`, `node-metrics`, `fleet`, `cordon`, `uncordon` |
+| Node (`0xFC`) | `node`, `node-metrics`, `fleet`, `cordon`, `uncordon`, `explain-admission` |
 | Cluster (`0xFC`) | `cluster-members`, `cluster-settings`, `cluster-set`, `cluster-forget`, `cluster-admit` |
 
 ### The fleet verb
@@ -416,6 +416,47 @@ fastcache-cli: 10.0.0.7:6674 refused `node`: not-a-member (this node reports its
 ```
 
 The remedy is on the node — `--fleet-member` — not here.
+
+Which is the next question: *`--fleet-member` names it and it is still refused, so what
+decided?* `explain-admission <host>` asks a node to fold that decision and report it:
+
+```console
+$ fastcache-cli explain-admission 10.0.0.42
+host        10.0.0.42
+verdict     admitted
+decided-by  --fleet-member, the cluster's member set
+```
+
+**Every route that decided, not only the winning one**
+([#1471](https://github.com/LASTRADA-Software/fastcached/issues/1471)). Admission is a fold
+over several participants and more than one can be right at once, so an operator who drops
+a host from `--fleet-member` and finds it still served is told the cluster admits it too —
+where naming only the winner would send them to edit a file that changes nothing.
+
+`verdict` is `admitted`, `refused` or `forgotten`, and the third is not a stronger second:
+a `--cluster-forget-client` tombstone outranks every admission route, so a forgotten host
+stays refused however many lists name it. That is the case where the obvious remedy is the
+wrong one, and it comes with the sentence saying so.
+
+`decided-by` is **absent** when nothing decided. A plain refusal is a refusal by absence —
+no route had an opinion — and naming an author for that silence would report a list as the
+reason a host was refused when the list never mentioned it. A route this client is too old
+to name is **counted** rather than dropped, for the mirror reason: under-reporting during
+an upgrade would say fewer things decided this than did.
+
+The answer is **that node's own fold**, which is the point rather than a limitation. Two
+nodes disagreeing about one host is the finding — a `--fleet-member` list edited on 39
+machines and missed on the fortieth is invisible from any single one of them — so ask the
+machine that is behaving oddly, and ask a second when the answers differ.
+
+It is gated like `node` and `node-metrics`, on fleet membership — so a host refused by
+every route cannot ask this verb why, and the operator asks from a machine that is
+admitted, or from the node itself.
+
+The verdict does not reach the **exit code**: `refused` is a successful answer to the
+question asked. Mapping it to a failure would break a script that was only asking, and
+would collapse `refused` and `forgotten` onto one number.
+
 
 ### The memcached-only verbs
 

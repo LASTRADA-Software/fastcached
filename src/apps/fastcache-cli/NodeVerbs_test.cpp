@@ -7,6 +7,7 @@
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Distributed/MembershipWire.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
@@ -2056,5 +2057,118 @@ TEST_CASE("`node` reports where peers dial its consensus, apart from the port it
         auto const answer = RunNodeVerb("node", node);
         CHECK(answer.outcome == Outcome::Affirmative);
         CHECK(CellOf(answer, Cc::ConsensusEndpointField) == nullptr);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #1471: `explain-admission` asks a node which routes decided about one host.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("explain-admission sends the host asked about, under the opcode the wire table names", "[cli][node][admission]")
+{
+    // The BYTES, not only the rendering: the reply is scripted, so a verb that sent the
+    // wrong opcode -- or the right one carrying no host -- renders exactly as a right one.
+    ScriptedNodeExchange node { { Cc::EncodeReply(
+        Cc::Status::Ok, Cc::EncodeAdmissionExplanation({ .verdict = Cc::WireMembership::Member, .decidedBy = 0 })) } };
+    (void) RunNodeVerb("explain-admission", node, { "10.0.0.9" });
+
+    REQUIRE(node.Sent().size() == 1);
+    CHECK(OpOf(SentFrame(node)) == 0x1B);
+    CHECK(SentFrame(node) == Cc::EncodeExplainAdmissionRequest("10.0.0.9"));
+}
+
+TEST_CASE("explain-admission names EVERY route that decided, never only the winner", "[cli][node][admission]")
+{
+    // The whole of #1471: an operator who drops a host from `--fleet-member` and finds it
+    // still served has to be told the cluster admits it too. Each section asserts what
+    // DISTINGUISHES its case -- a renderer naming only the first route passes the
+    // one-route sections and fails this first one alone.
+    auto const explain = [](Cc::AdmissionExplanationFields fields) {
+        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, Cc::EncodeAdmissionExplanation(fields)) } };
+        return RunNodeVerb("explain-admission", node, { "10.0.0.9" });
+    };
+
+    SECTION("a host admitted by two routes has both named")
+    {
+        auto const answer =
+            explain({ .verdict = Cc::WireMembership::Member,
+                      .decidedBy = Cc::WireMembershipRoute::FleetMemberList | Cc::WireMembershipRoute::ClusterMembers });
+
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(RequiredCell(answer, "host").lexical == "10.0.0.9");
+        CHECK(RequiredCell(answer, "verdict").lexical == "admitted");
+        CHECK(RequiredCell(answer, "decided-by").lexical.contains("--fleet-member"));
+        CHECK(RequiredCell(answer, "decided-by").lexical.contains("member set"));
+    }
+
+    SECTION("a forgotten host names the tombstone and says re-listing it will not help")
+    {
+        auto const answer =
+            explain({ .verdict = Cc::WireMembership::Forgotten, .decidedBy = Cc::WireMembershipRoute::ClientTombstone });
+
+        CHECK(RequiredCell(answer, "verdict").lexical == "forgotten");
+        CHECK(RequiredCell(answer, "decided-by").lexical == "--cluster-forget-client");
+        // The advisory is the half an operator acts on: a tombstone outranks every
+        // admission route, so the obvious remedy is the wrong one.
+        CHECK(AdvisoryText(answer).contains("--fleet-member"));
+    }
+
+    SECTION("a host nobody has an opinion about renders an ABSENT route cell, never an author")
+    {
+        // The silence case, and the reason the verb exists. `Outsider` is refused by
+        // ABSENCE: attributing it to a route would report a list as the reason a host was
+        // refused when that list never mentioned it.
+        auto const answer = explain({ .verdict = Cc::WireMembership::Outsider, .decidedBy = 0 });
+
+        CHECK(RequiredCell(answer, "verdict").lexical == "refused");
+        CHECK(RequiredCell(answer, "decided-by").kind == CellKind::Absent);
+        CHECK_FALSE(AdvisoryText(answer).contains("--fleet-member"));
+    }
+
+    SECTION("a route bit this client is too old to name is COUNTED, and the named ones still shown")
+    {
+        // A newer node may set a bit this build has no row for. Dropping it would say
+        // FEWER things decided this than did, which is the reading that sends somebody to
+        // change a route that was never consulted.
+        constexpr auto unknownBit = std::uint32_t { 0x8000'0000 };
+        auto const answer = explain(
+            { .verdict = Cc::WireMembership::Member, .decidedBy = Cc::WireMembershipRoute::FleetMemberList | unknownBit });
+
+        CHECK(RequiredCell(answer, "decided-by").lexical.contains("--fleet-member"));
+        CHECK(RequiredCell(answer, "decided-by").lexical.contains("1 route(s) this client is too old to name"));
+    }
+
+    SECTION("a body this client cannot read is refused by name, never rendered as nobody deciding")
+    {
+        std::vector<std::byte> const noPayload;
+        ScriptedNodeExchange node { { Cc::EncodeReply(Cc::Status::Ok, noPayload) } };
+        auto const answer = RunNodeVerb("explain-admission", node, { "10.0.0.9" });
+
+        CHECK(answer.outcome == Outcome::Protocol);
+        CHECK(AdvisoryText(answer).contains("cannot read"));
+    }
+}
+
+TEST_CASE("every admission route the node can send has a spelling an operator can act on", "[cli][node][admission]")
+{
+    // The table is `RowsInEnumeratorOrder`-checked, so it cannot MISS a route; what that
+    // says nothing about is whether a row is useful. Each spelling is asserted to reach
+    // the rendering, so a row left empty -- which compiles and keeps the count right --
+    // renders one fewer route than decided.
+    for (auto const& row: Distributed::MembershipWireRoutes)
+    {
+        INFO("route bit: " << static_cast<std::uint32_t>(row.bit));
+        ScriptedNodeExchange node { { Cc::EncodeReply(
+            Cc::Status::Ok,
+            Cc::EncodeAdmissionExplanation(
+                { .verdict = Cc::WireMembership::Member, .decidedBy = static_cast<std::uint32_t>(row.bit) })) } };
+        auto const answer = RunNodeVerb("explain-admission", node, { "10.0.0.9" });
+
+        auto const& described = RequiredCell(answer, "decided-by");
+        CHECK(described.kind == CellKind::Text);
+        CHECK_FALSE(described.lexical.empty());
+        // And that it is a SPELLING rather than the bit falling through as unnamed, which
+        // is what a missing row would produce and what every other assertion here allows.
+        CHECK_FALSE(described.lexical.contains("too old to name"));
     }
 }

@@ -1084,3 +1084,165 @@ TEST_CASE("MergedResponder routes the Node family to the node responder and nowh
         CHECK(shape.code == Wire::UnimplementedVerb);
     }
 }
+
+TEST_CASE("explain-admission names every route that decided, and attributes a silence to nobody",
+          "[node][node-status][forget]")
+{
+    // #1471's remaining half. `MembershipDecision` has computed the deciding route since #1309,
+    // and until now `Explain()` had exactly ONE production caller and it was internal: the fold
+    // was right and no operator could ask it.
+    //
+    // The acceptance is explicit that asserting *admitted* is not enough -- a reader that
+    // answered `Member` for both routes is green while the attribution is wrong -- so every
+    // section below asserts WHICH route, and the two-route section is the one that discriminates.
+    ManualClock clock;
+    AtomicMetricsSink metrics;
+    Fixture const fixture { { .admin = true }, clock };
+    CapturedReadings const readings { metrics, {} };
+
+    // NOT `CallerAddress`, which is also 10.0.0.7: the subject has to be a third party, or every
+    // section below would be asking the node about the very caller the gate just admitted -- and
+    // the forgotten section would forget the caller and be refused before the verb ran.
+    constexpr auto Subject = std::string_view { "10.0.0.42" };
+
+    auto const ask = [&](Distributed::IMembershipOracle const& oracle, std::string_view host) {
+        NodeStatusResponder responder { fixture.status, readings, oracle, metrics };
+        auto const reply = AnswerNow(responder, Wire::EncodeExplainAdmissionRequest(host));
+        REQUIRE(ShapeOf(reply).status == Wire::Status::Ok);
+        auto const header = Wire::DecodeReplyHeader(reply);
+        REQUIRE(header.has_value());
+        auto const decoded = Wire::DecodeAdmissionExplanation(PayloadOf(reply, Unwrap(header)));
+        REQUIRE(decoded.has_value());
+        return Unwrap(decoded);
+    };
+
+    // The caller must itself be admitted, or the membership gate refuses before the verb runs --
+    // so every oracle below lists `CallerAddress` as well as its subject.
+    ListedMembership const fleetList { { std::string { CallerAddress }, std::string { Subject } },
+                                       Distributed::MembershipParticipant::FleetMemberList };
+    ListedMembership const clusterSet { { std::string { CallerAddress }, std::string { Subject } },
+                                        Distributed::MembershipParticipant::ClusterMembers };
+
+    SECTION("a host on --fleet-member alone is attributed to that list and to nothing else")
+    {
+        auto const answer = ask(fleetList, Subject);
+        CHECK(answer.verdict == Wire::WireMembership::Member);
+        CHECK(answer.decidedBy == Wire::WireMembershipRoute::FleetMemberList);
+    }
+
+    SECTION("a host the CLUSTER admits is attributed to the cluster, which the section above cannot show")
+    {
+        // The pair is the point: either section alone passes against a reader that hardcodes one
+        // bit, and the two together cannot.
+        auto const answer = ask(clusterSet, Subject);
+        CHECK(answer.verdict == Wire::WireMembership::Member);
+        CHECK(answer.decidedBy == Wire::WireMembershipRoute::ClusterMembers);
+    }
+
+    SECTION("a host on BOTH reports BOTH, which is the question an operator actually has")
+    {
+        // The acceptance clause. An operator who drops a host from `--fleet-member` and finds it
+        // still served needs to know the cluster admits it; a reader that reported only the
+        // winner would answer a question nobody asked and send them to the wrong file.
+        Distributed::AnyOfMembership const both { { &fleetList, &clusterSet } };
+        auto const answer = ask(both, Subject);
+
+        CHECK(answer.verdict == Wire::WireMembership::Member);
+        CHECK((answer.decidedBy & Wire::WireMembershipRoute::FleetMemberList) != 0);
+        CHECK((answer.decidedBy & Wire::WireMembershipRoute::ClusterMembers) != 0);
+    }
+
+    SECTION("a forgotten host is Forgotten and attributed to the TOMBSTONE, outranking the listing")
+    {
+        // Forgotten beats member, and the attribution must follow the VERDICT rather than the
+        // first participant asked: reporting `FleetMemberList` beside a `Forgotten` verdict would
+        // name the wrong file twice over. `FixedMembership` exists because a host list cannot
+        // spell `Forgotten` at all.
+        // Through the REAL oracle and a published cluster state rather than a fake, because a
+        // fake that answers `Forgotten` to everything forgets the caller too and the membership
+        // gate then refuses before the verb runs -- the case would pass its setup and test
+        // nothing. `listedCaller` keeps the caller admitted while the tombstone names the
+        // subject alone.
+        NullLogger logger;
+        auto const cfg = NodeConfigOf(ConfigShape {});
+        NodeMembership tombstone { cfg, logger };
+        auto state = Cluster::ClusterState {};
+        state.forgotten = { std::string { Subject } };
+        tombstone.PublishCluster(state);
+
+        ListedMembership const listedCaller { { std::string { CallerAddress } },
+                                              Distributed::MembershipParticipant::FleetMemberList };
+        Distributed::AnyOfMembership const both { { &listedCaller, &tombstone } };
+
+        auto const answer = ask(both, Subject);
+        CHECK(answer.verdict == Wire::WireMembership::Forgotten);
+        CHECK((answer.decidedBy & Wire::WireMembershipRoute::ClientTombstone) != 0);
+    }
+
+    SECTION("a host nobody has an opinion about is Outsider, attributed to NOBODY")
+    {
+        // The silence case, and the one this verb exists for: `DecidedBy` never attributes
+        // `Outsider`, because an oracle answering it has no opinion rather than an answer it
+        // produced. Naming an author here would report the tombstone as the reason a host was
+        // refused when the tombstone never mentioned it -- a confident wrong signal.
+        auto const answer = ask(fleetList, "10.0.0.250");
+        CHECK(answer.verdict == Wire::WireMembership::Outsider);
+        CHECK(answer.decidedBy == 0);
+    }
+
+    SECTION("a payload that is not one field is refused by name and counted")
+    {
+        NodeStatusResponder responder { fixture.status, readings, fleetList, metrics };
+        auto const shape = ShapeOf(AnswerNow(responder, HeaderFor(Wire::Op::ExplainAdmission)));
+
+        CHECK(shape.status == Wire::Status::Error);
+        CHECK(shape.code == Wire::ErrorCode::MalformedFrame);
+        CHECK(metrics.Read(IMetricsSink::Counter::NodeAdmissionExplanationsRefusedMalformed) == 1);
+    }
+}
+
+TEST_CASE("an admission explanation survives the wire, and an unknown verdict is refused", "[node][node-status][forget]")
+{
+    // The round trip, asserted on the FIELDS and not only on equality: a codec that flattened
+    // the route set to its winner would round-trip a value that compares equal to itself.
+    auto const original = Wire::AdmissionExplanationFields {
+        .verdict = Wire::WireMembership::Member,
+        .decidedBy = Wire::WireMembershipRoute::FleetMemberList | Wire::WireMembershipRoute::ClusterMembers,
+    };
+
+    auto const decoded = Wire::DecodeAdmissionExplanation(Wire::EncodeAdmissionExplanation(original));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded) == original);
+    CHECK(Unwrap(decoded).verdict == Wire::WireMembership::Member);
+    CHECK((Unwrap(decoded).decidedBy & Wire::WireMembershipRoute::ClusterMembers) != 0);
+
+    SECTION("a verdict byte this build cannot name is REFUSED, never defaulted to Outsider")
+    {
+        // Defaulting would report a host as refused-by-nobody on a build that had learned a
+        // fourth answer, which reads exactly like the healthy case -- and this verb exists to
+        // remove a confident wrong signal rather than to add one.
+        auto damaged = Wire::EncodeAdmissionExplanation(original);
+        auto const fields = WireFields::SplitExactly(damaged, 2);
+        REQUIRE(fields.has_value());
+
+        // The verdict is the first field's single byte; 0x7F names no `WireMembership`.
+        auto const at = static_cast<std::size_t>(Unwrap(fields)[0].data() - damaged.data());
+        damaged[at] = std::byte { 0x7F };
+
+        CHECK_FALSE(Wire::DecodeAdmissionExplanation(damaged).has_value());
+    }
+
+    SECTION("but an unknown ROUTE bit is KEPT, which is the opposite decision and deliberate")
+    {
+        // The verdict is one value and must be known; the set is evidence and may be partial. A
+        // reader that dropped a bit it could not name would under-report authorship on a fleet
+        // mid-upgrade -- reporting fewer deciders than there were.
+        auto const withUnknown = Wire::AdmissionExplanationFields {
+            .verdict = Wire::WireMembership::Member,
+            .decidedBy = Wire::WireMembershipRoute::FleetMemberList | 0x8000U,
+        };
+        auto const back = Wire::DecodeAdmissionExplanation(Wire::EncodeAdmissionExplanation(withUnknown));
+        REQUIRE(back.has_value());
+        CHECK((Unwrap(back).decidedBy & 0x8000U) != 0);
+    }
+}

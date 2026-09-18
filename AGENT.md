@@ -451,6 +451,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   admission route including `--fleet-open`: `Membership::Forgotten`, `PrecedenceOf`, and a fold
   rather than `any_of` — which flattened it to `Outsider` so no counted refusal could fire.
   Published from `PublishCluster` and never from `Adopt`; loopback is never forgotten.
+- And the fold REPORTS: `Op::ExplainAdmission` answers a verdict AND the SET of routes that
+  produced it, through the same oracle the surfaces enforce, never a second walk. `Outsider` is
+  attributed to nobody; an unknown VERDICT is refused while an unknown ROUTE bit is KEPT. The
+  library-to-wire mirror has one mapping, `Distributed/MembershipWire.hpp`, because the node
+  encodes and `fastcache-cli` renders.
 - REMOVAL is the direction a live admission path has to get right, and the direction a test skips:
   adding a member fails CLOSED and self-heals, removing one fails **OPEN**. A client forget now
   REPORTS — its own counter, apart from a stranger's, because the two are opposite diagnoses — and
@@ -650,6 +655,10 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A wire constant has TWO facts, its name and its value, and a symbol both ends spell can only
   test the first. Pin the **byte** as well, and keep one test on the raw enumerator — it is
   the anchor, not the code smell it looks like.
+- **A new verb is not one dispatch, and none of the other places fails the BUILD**: the daemon
+  needs a `switch` arm — a missing one DROPS the frame rather than refusing, so the client
+  reports a dead endpoint — and a `RelocatedVerbs` row; a counter it adds needs a row on the
+  node's documentation page; and the live-stats layout pin moves.
 - `Net/` must not depend on `Core/`. `Async/` travels with it, plus three named
   dependency-free leaf headers; `ctest -R net-boundary` enforces the table.
 - `CompileCacheWire.hpp` must stay header-only and dependency-free — the launcher does not
@@ -1006,8 +1015,9 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   different question rather than a softening**: a row this BUILD cannot represent is omitted
   and counted by `fastcached_metrics_catalogue_skew`, never rendered as a plausible zero.
 - A SECOND carve-out: a row no writer in this PROCESS could move is absent, never zero. Which
-  surface writes each of the 148 rows is `CounterSoleWriterTable`, complete and
-  `static_assert`ed — a scan for `Increment(Counter::X)` finds 39 of them, because the rest are
+  surface writes each catalogue row is `CounterSoleWriterTable`, complete and
+  `static_assert`ed (**the count is not repeated here**, for the reason the loop ratchet's is
+  not: the table owns it) — a scan for `Increment(Counter::X)` finds 39 of them, because the rest are
   written through a table. Its `size()` counts (counter, surface) PAIRS and is not a count of
   counters; `AttributedCounterCount()` is. **Err unattributed**, and narrow a BINARY's set only
   from the flags that decide whether the component is CONSTRUCTED — `ServedSurfaces{}` means

@@ -168,6 +168,11 @@ inline constexpr std::array ExchangeLogTable {
                  .rationale = "half of an exchange that decides nothing on its own: every node-to-node connection "
                               "opens with one, so at Info a fleet's ordinary dial rounds would bury the line that "
                               "matters -- which is prove-node's outcome, not the nonce that preceded it" },
+    VerbLogRow { .code = CompileCacheWire::Op::ExplainAdmission,
+                 .level = LogLevel::Debug,
+                 .rationale = "a read that answers about a host and changes nothing, which an operator runs several "
+                              "times in a row while working out why a machine is still served; at Info that "
+                              "diagnosis would look like the fleet doing something" },
     VerbLogRow { .code = CompileCacheWire::Op::ProveNode,
                  .level = LogLevel::Info,
                  .rationale = "records that a machine was admitted by what it PROVED rather than by its address, "

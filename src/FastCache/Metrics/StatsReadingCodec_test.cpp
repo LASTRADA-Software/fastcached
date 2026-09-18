@@ -385,9 +385,13 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // `fastcache-cli` built before this refuses a node built after it, by name
     // (`ForeignLayout`) rather than by decoding plausible numbers into the wrong fields.
     //
+    // Moved by #1471: one counter joined the catalogue for the admission-explanation verb
+    // (`node_admission_explanations_refused_malformed`), which changes which cells every
+    // live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
     // Moved by #1484 before that: the counter cells carry a second bitmap saying WHICH absence
     // each absent cell is, so `StatsReadingWire::Grammar` went to `-4`.
-    CHECK(StatsReadingLayout == 0x5cb08e312b077362ULL);
+    CHECK(StatsReadingLayout == 0x1d62a8398609a77eULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

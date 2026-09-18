@@ -2557,3 +2557,112 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(Unwrap(runtime.forgottenClients) == 2);
     }
 }
+
+// --- Explaining an admission (#1471) ----------------------------------------
+
+TEST_CASE("The explain-admission verb occupies the byte it was assigned, in the node family", "[wire][admission]")
+{
+    // The value as well as the name, for the cordon byte's reason: a consistent
+    // renumbering keeps every in-tree test agreeing while a deployed CLI breaks.
+    CHECK(static_cast<std::uint8_t>(Op::ExplainAdmission) == 0x1B);
+    CHECK(std::ranges::count(OpTable, Op::ExplainAdmission, &OpDescriptor::code) == 1);
+
+    // The node family, because the question is about THIS node's own fold rather than
+    // about the cluster's agreed state -- so a node running no consensus still answers it.
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::ExplainAdmission)) == VerbFamily::Node);
+    // Never pre-auth: the answer describes who this node admits, which is the one thing a
+    // caller it does not admit must not be able to read.
+    CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::ExplainAdmission)));
+
+    // And the bytes a client of another build reads back.
+    CHECK(static_cast<std::uint8_t>(WireMembership::Outsider) == 0x01);
+    CHECK(static_cast<std::uint8_t>(WireMembership::Member) == 0x02);
+    CHECK(static_cast<std::uint8_t>(WireMembership::Forgotten) == 0x03);
+    CHECK(WireMembershipRoute::FleetMemberList == 0x01);
+    CHECK(WireMembershipRoute::ClusterMembers == 0x02);
+    CHECK(WireMembershipRoute::ClientTombstone == 0x04);
+    CHECK(WireMembershipRoute::OpenPolicy == 0x08);
+    CHECK(WireMembershipRoute::ProvenKeyHolder == 0x10);
+}
+
+TEST_CASE("An explain-admission request carries exactly one host, and anything else is refused", "[wire][admission]")
+{
+    auto const frame = EncodeExplainAdmissionRequest("10.0.0.42");
+    auto const header = DecodeRequestHeader(frame);
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).opRaw == 0x1B);
+    auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
+    CHECK(DecodeExplainAdmissionPayload(payload) == std::optional<std::string> { "10.0.0.42" });
+
+    // An EMPTY host is a legal field and is not the same as no field: the node decides
+    // what to make of it, and a decoder that refused here would refuse a frame whose
+    // arity is exactly right.
+    CHECK(DecodeExplainAdmissionPayload(
+              std::span<std::byte const> { EncodeExplainAdmissionRequest("") }.subspan(RequestHeaderSize))
+          == std::optional<std::string> { "" });
+
+    // Two fields is a different question arriving under this verb's name -- refused
+    // rather than answered about the first of them.
+    auto const first = AsBytes(std::string_view { "10.0.0.42" });
+    auto const second = AsBytes(std::string_view { "10.0.0.43" });
+    CHECK_FALSE(DecodeExplainAdmissionPayload(WireFields::Encode({ first, second })).has_value());
+    CHECK_FALSE(DecodeExplainAdmissionPayload({}).has_value());
+}
+
+TEST_CASE("An admission explanation round-trips every verdict and the whole route set", "[wire][admission]")
+{
+    // A different route set per verdict, so an encoder that dropped either half cannot
+    // agree with all three.
+    for (auto const& sent: { AdmissionExplanationFields { .verdict = WireMembership::Member,
+                                                          .decidedBy = WireMembershipRoute::FleetMemberList
+                                                                       | WireMembershipRoute::ClusterMembers },
+                             AdmissionExplanationFields { .verdict = WireMembership::Forgotten,
+                                                          .decidedBy = WireMembershipRoute::ClientTombstone },
+                             // The silence: refused, and no route claims authorship. Zero is the READING
+                             // here rather than a missing field.
+                             AdmissionExplanationFields { .verdict = WireMembership::Outsider, .decidedBy = 0 } })
+    {
+        auto const back = DecodeAdmissionExplanation(EncodeAdmissionExplanation(sent));
+        REQUIRE(back.has_value());
+        CHECK(Unwrap(back) == sent);
+    }
+}
+
+TEST_CASE("An unknown VERDICT is refused and an unknown ROUTE is kept, which is not one rule twice", "[wire][admission]")
+{
+    auto const routes = WireFields::ToBigEndian<std::uint32_t>(WireMembershipRoute::FleetMemberList);
+
+    SECTION("a verdict byte this build cannot name is refused, never read as a refusal nobody authored")
+    {
+        // Falling back to `Outsider` would report a host as refused-by-nobody on a build
+        // that had learned a fourth answer -- which reads exactly like the healthy case.
+        auto const unnamed = std::array { std::byte { 0x7F } };
+        CHECK_FALSE(DecodeAdmissionExplanation(WireFields::Encode({ std::span<std::byte const> { unnamed },
+                                                                    std::span<std::byte const> { routes } }))
+                        .has_value());
+        CHECK_FALSE(DecodeAdmissionExplanation({}).has_value());
+    }
+
+    SECTION("a route bit this build cannot name is KEPT, so authorship is not under-reported")
+    {
+        // The opposite decision, deliberately: the routes are a SET, so a bit this build
+        // cannot name still says *something decided*. Dropping it would say fewer things
+        // decided this than did, on a fleet mid-upgrade -- and the reader can tell,
+        // because the bit it does not know is still there to count.
+        constexpr auto ahead = std::uint32_t { 0x8000'0000 };
+        auto const sent = AdmissionExplanationFields { .verdict = WireMembership::Member,
+                                                       .decidedBy = WireMembershipRoute::FleetMemberList | ahead };
+        auto const back = DecodeAdmissionExplanation(EncodeAdmissionExplanation(sent));
+        REQUIRE(back.has_value());
+        CHECK(Unwrap(back).decidedBy == sent.decidedBy);
+        CHECK((Unwrap(back).decidedBy & ahead) == ahead);
+    }
+
+    SECTION("a verdict field that is not one byte is refused rather than read from its first")
+    {
+        auto const wide = std::array { std::byte { 0x02 }, std::byte { 0x02 } };
+        CHECK_FALSE(DecodeAdmissionExplanation(
+                        WireFields::Encode({ std::span<std::byte const> { wide }, std::span<std::byte const> { routes } }))
+                        .has_value());
+    }
+}

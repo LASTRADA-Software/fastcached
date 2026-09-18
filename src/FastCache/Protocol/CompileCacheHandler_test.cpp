@@ -771,6 +771,28 @@ TEST_CASE("The daemon refuses a fleet read by name and sends it to the fleet's s
     CHECK(error.message.contains("--serve-scheduler"));
 }
 
+TEST_CASE("The daemon refuses an admission explanation by name and sends it to a compile node", "[compile-cache][handler]")
+{
+    // #1471, and the sibling of the fleet case above. The generic walk only asserts the
+    // refusal is not `UnknownOpcode`; this asserts WHICH refusal, which is the half that
+    // distinguishes a working daemon from one that has quietly stopped answering.
+    //
+    // `DispatchNotPermitted` and NOT `NoCluster`, which the cluster and enrollment rows take:
+    // admission is a property of the PROCESS being asked -- which routes it would admit a host
+    // through -- so a client told `NoCluster` goes looking for consensus it does not need,
+    // when the answer is that it asked the wrong binary.
+    CcFixture fix;
+    auto const reply = SoleReply(Exchange(fix, Wire::EncodeExplainAdmissionRequest("10.0.0.42")));
+    REQUIRE(reply.present);
+    auto const error = ErrorOf(reply);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(error.code != Wire::ErrorCode::NoCluster);
+    // The WORDS, for the fleet case's reason: a relocated verb with no row is refused with the
+    // same code and names no destination, so the code alone cannot tell the two apart.
+    CHECK(error.message.contains("fastcache-compile-node"));
+}
+
 TEST_CASE("A dropped frame is logged", "[compile-cache][handler][version]")
 {
     // Every other handler reports a frame drop through the session logger; this
