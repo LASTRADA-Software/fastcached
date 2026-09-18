@@ -24,6 +24,12 @@ namespace FastCache::Consensus
 /// that for an extra flush on the hot path, and re-applying a deterministic state
 /// machine from a log is cheap by comparison — but a state machine with side
 /// effects outside itself has to know.
+///
+/// **And a recovered node that holds a snapshot starts from the snapshot**: its
+/// state is handed to `RestoreSnapshot` when the driver is constructed, before any
+/// entry above it is applied, and only the entries above it are re-applied. The
+/// log below the snapshot is gone, so this restore is the only way the state it
+/// produced comes back (#1542).
 class IRaftStateMachine
 {
   public:
@@ -49,11 +55,18 @@ class IRaftStateMachine
 
     /// Replace this machine's state with `state`, wholesale.
     ///
-    /// Called when a follower is handed state it cannot replay its way to,
-    /// because the entries that would have taken it there have been compacted
-    /// away everywhere. **Replace, do not merge**: the snapshot is the complete
-    /// state as of its index, and folding it into what this machine already holds
-    /// would keep entries the cluster has superseded.
+    /// Called in TWO situations, and an implementation must not assume either:
+    ///   - on **recovery**, once, when the driver is constructed over a node that
+    ///     recovered a snapshot from its own storage -- before any entry is applied;
+    ///   - on **install**, when a follower is handed state it cannot replay its way
+    ///     to, because the entries that would have taken it there have been
+    ///     compacted away everywhere.
+    ///
+    /// Both have the same reason: the entries below the snapshot will never be
+    /// applied here again, so the state they produced arrives only through this call.
+    /// **Replace, do not merge**: the snapshot is the complete state as of its index,
+    /// and folding it into what this machine already holds would keep entries the
+    /// cluster has superseded.
     /// @param state Bytes previously produced by `TakeSnapshot` on some node.
     virtual void RestoreSnapshot(std::span<std::byte const> state) = 0;
 };
