@@ -7,13 +7,21 @@
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Net/BlockingSocket.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cstdint>
+#include <filesystem>
+#include <format>
+#include <fstream>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include <tests/BoundedWait.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -323,4 +331,91 @@ TEST_CASE("A node that runs no consensus hands a scrape nothing to call", "[node
     // that runs consensus and counts nobody -- which is the #388 fault state being
     // claimed about every daemon and every node started without `--listen-raft`.
     CHECK_FALSE(static_cast<bool>(ConsensusScrapeSource(nullptr)));
+}
+
+TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothing reaches the log",
+          "[node][consensus][forget]")
+{
+    // #1539's refusal, at the door an operator's `--cluster-forget` reaches: a real tier's
+    // `ProposeToCluster`, over a real listener, a real state directory and a driver that
+    // elected itself -- because a refusal decided by a function nothing calls is the bug it
+    // was written to fix. The policy cases pin `ValidateForget`; this pins that `Propose`
+    // asks it before anything is appended.
+    NullLogger logger;
+    AtomicMetricsSink metrics;
+
+    // Port 0 is refused by the member grammar, so bind an ephemeral one the ordinary way.
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->BoundPort();
+    probe.reset();
+
+    auto const scratch = Testing::UniqueScratchPath("consensus-forget-only-voter");
+    std::filesystem::create_directories(scratch);
+    {
+        auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
+        key << std::string(32, 'k');
+    }
+
+    NodeConfig cfg;
+    cfg.nodeId = "n1";
+    cfg.raftListen = std::format("127.0.0.1:{}", port);
+    cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec(std::format("n1=127.0.0.1:{}", port))) };
+    cfg.clusterKeyFile = scratch / "cluster.key";
+    cfg.clusterDir = scratch / "state";
+
+    // Asked of ONE state value: `ClusterState()` answers by value, so two calls are two
+    // vectors whose iterators cannot be compared.
+    auto const records = [](Cluster::ClusterState const& state, Consensus::NodeId const& id) {
+        return std::ranges::find(state.members, id, &Cluster::ClusterMember::id) != state.members.end();
+    };
+    auto const self = Consensus::NodeId { "n1" };
+
+    auto started = ConsensusTier::Start(
+        cfg,
+        {},
+        [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
+        [](Cluster::ClusterState const&) {},
+        metrics,
+        logger);
+    REQUIRE(started.has_value());
+    auto const& tier = *started;
+
+    // Leading, and settled: its own record committed, after which its reconciler proposes
+    // nothing -- so the commit index moves only for what this case proposes.
+    REQUIRE(Testing::WaitUntil(
+        "the one-voter tier to lead and record itself",
+        [&tier, &records, &self] {
+            return tier->Status().role == Consensus::Role::Leader && records(tier->ClusterState(), self);
+        },
+        [&tier] { return std::format("commit index {}", tier->Status().commitIndex.value); }));
+    auto const before = tier->Status().commitIndex;
+
+    // CHECK rather than REQUIRE, and the error read only when there is one: the log
+    // assertion below has to be REACHED when the refusal is missing, or a tier that
+    // appended the forget would stop this case before the half that measures it.
+    auto const refused = tier->ProposeToCluster(
+        Cluster::Command { .kind = Cluster::CommandKind::RemoveMember, .key = "n1", .value = {}, .schedulerEndpoint = {} });
+    CHECK_FALSE(refused.has_value());
+    if (!refused.has_value())
+    {
+        CHECK(refused.error().code == ConsensusErrorCode::InvalidConfiguration);
+        CHECK(refused.error().context.starts_with("cannot forget n1: it is the cluster's only voter"));
+    }
+
+    // Nothing reached the log, measured rather than assumed: the next entry proposed lands
+    // exactly one index later. Had the forget been appended, a one-voter cluster would
+    // have committed it at once and this entry would sit two along.
+    REQUIRE(tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
+                                                      .key = "lease-lifetime",
+                                                      .value = "20min",
+                                                      .schedulerEndpoint = {} })
+                .has_value());
+    REQUIRE(Testing::WaitUntil(
+        "the sentinel setting to commit",
+        [&tier] { return tier->ClusterState().SettingOf("lease-lifetime") == "20min"; },
+        [&tier] { return std::format("commit index {}", tier->Status().commitIndex.value); }));
+    CHECK(tier->Status().commitIndex.value == before.value + 1);
+    CHECK(records(tier->ClusterState(), self));
 }
