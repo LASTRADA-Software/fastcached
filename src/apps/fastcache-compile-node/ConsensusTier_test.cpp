@@ -30,6 +30,7 @@
 
 #include <tests/BoundedWait.hpp>
 #include <tests/PreviousClusterState.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -204,7 +205,8 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.1:6680")) };
         NodeMembership membership { cfg, membershipLog };
 
-        auto const tier = StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", membership, metrics, logger);
+        auto const tier =
+            StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", std::nullopt, membership, metrics, logger);
         REQUIRE(tier.has_value());
         CHECK(*tier == nullptr);
     }
@@ -218,23 +220,24 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         // Refused, and refused by NAME: a null tier here would mean the gate is still
         // reading the id, and any other refusal would mean it got somewhere this test
         // does not intend to reach.
-        auto const tier = StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", membership, metrics, logger);
+        auto const tier =
+            StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", std::nullopt, membership, metrics, logger);
         REQUIRE_FALSE(tier.has_value());
         CHECK(tier.error() == ConsensusNamesNoSelfPeerRefusal);
     }
 }
 
-TEST_CASE("A consensus tier refuses to start without the cluster key", "[node][consensus][handshake]")
+TEST_CASE("A consensus tier refuses to start without an identity key", "[node][consensus][handshake]")
 {
-    // #1308. Every connection between members proves the key before a message is read,
-    // so a node with no key is not a degraded member but one that can neither be heard
-    // nor hear anybody -- and a tier that started one anyway would be the port open with
-    // every refusal counter reading zero. Decided HERE, once, before anything is bound;
-    // the startup table asks the same question where an operator is watching.
+    // #178. Every connection between members proves each end's OWN key before a message is
+    // read, so a node with no key is not a degraded member but one that can neither be heard
+    // nor hear anybody -- and a tier that started one anyway would be the port open with every
+    // refusal counter reading zero. Decided HERE, once, before anything is bound.
     //
-    // No I/O in either section: both return before a directory, a listener or a reactor
-    // exists. The configuration otherwise gets past every earlier gate, so the refusal
-    // observed is the key's and not the self-peer rule's.
+    // No I/O: the refusal returns before a directory, a listener or a reactor exists. The
+    // configuration otherwise gets past every earlier gate -- including the cluster key file,
+    // which this tier no longer reads at all -- so the refusal observed is the identity key's
+    // and not the self-peer rule's.
     NullLogger logger;
     AtomicMetricsSink metrics;
     std::unique_ptr<SchedulerTier> const noScheduler;
@@ -243,27 +246,12 @@ TEST_CASE("A consensus tier refuses to start without the cluster key", "[node][c
     cfg.nodeId = "n1";
     cfg.raftListen = "6680";
     cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.1:6680")) };
+    cfg.clusterKeyFile = "cluster.key";
+    NodeMembership membership { cfg, membershipLog };
 
-    SECTION("no key file named is refused by name")
-    {
-        NodeMembership membership { cfg, membershipLog };
-        auto const tier = StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", membership, metrics, logger);
-        REQUIRE_FALSE(tier.has_value());
-        CHECK(tier.error() == ConsensusNeedsClusterKeyRefusal);
-    }
-
-    SECTION("a key file that cannot be read is refused, naming the flag")
-    {
-        // The other half: the table judges the PATH, and only the tier can find that the
-        // file is not there. Distinguishable from the section above by its text, so a
-        // tier that dropped the empty-path check and let the read answer would fail the
-        // first section rather than pass both.
-        cfg.clusterKeyFile = Testing::UniqueScratchPath("consensus-key") / "cluster.key";
-        NodeMembership membership { cfg, membershipLog };
-        auto const tier = StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", membership, metrics, logger);
-        REQUIRE_FALSE(tier.has_value());
-        CHECK(tier.error().starts_with("--cluster-key-file: "));
-    }
+    auto const tier = StartConsensusOrExplain(cfg, noScheduler, "127.0.0.1:6674", std::nullopt, membership, metrics, logger);
+    REQUIRE_FALSE(tier.has_value());
+    CHECK(tier.error() == ConsensusNeedsIdentityKeyRefusal);
 }
 
 TEST_CASE("What a node reports about its own quorum is one read of the driver", "[node][consensus][observability]")
@@ -385,6 +373,7 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
     auto started = ConsensusTier::Start(
         cfg,
         {},
+        Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
         metrics,
@@ -539,6 +528,7 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         return ConsensusTier::Start(
             cfg,
             {},
+            Testing::TestKeyPair("n1"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [published](Cluster::ClusterState const&) { published->fetch_add(1); },
             metrics,

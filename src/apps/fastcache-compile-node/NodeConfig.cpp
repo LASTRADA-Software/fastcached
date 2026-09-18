@@ -1624,6 +1624,16 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "destination comes from the table this binary's startup\n"
                            "lookup walks, so the two cannot drift apart.",
         },
+        { .primary = "--print-identity",
+          .arity = Arity::None,
+          .apply = SetTrue<&NodeConfig::printIdentity>(),
+          .description = "print this node's id, its identity key and the\n"
+                         "--raft-peer token its peers type, and exit. Mints\n"
+                         "the id and the key into the state directory when it\n"
+                         "holds none yet, which is how a cluster's members\n"
+                         "learn each other's keys before any of them starts:\n"
+                         "run it as the account the node runs as, with the\n"
+                         "flags it runs with." },
         { .primary = "--print-surfaces",
           .arity = Arity::None,
           .apply = SetTrue<&NodeConfig::printSurfaces>(),
@@ -1732,6 +1742,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { "--seed-config",
           "installs the file a key would be read from, then exits; a key for it would re-seed at every start" },
         { "--print-surfaces", "prints the ports and exits; a key would print them instead of serving them" },
+        { "--print-identity", "prints this node's identity and exits; a key would print it instead of serving" },
         { "--cordon",
           "cordons the running worker and exits; a key would cordon it at every start, which is a machine that "
           "never comes back to the fleet" },
@@ -3745,16 +3756,16 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--discovery needs --cluster-key-file: a beacon is unauthenticated by construction, so the "
                      "key is the only thing separating a peer from anything else on the segment. With none, no "
                      "peer can ever be admitted and this node would announce itself forever to no effect." },
-        // Consensus needs the key, full stop (#1308). After the `--discovery` row, which
-        // is the more specific sentence for a node that also asked for discovery: first
-        // match wins, and this row would otherwise answer in its place.
+        // Consensus needs the key (#1308), for reasons that moved at #178: the Raft peer
+        // wire proves each node's own identity key now, and what still reads the cluster
+        // key on a consensus node is the rest of the fleet's surfaces -- see the refusal's
+        // own comment. After the `--discovery` row, which is the more specific sentence for
+        // a node that also asked for discovery: first match wins, and this row would
+        // otherwise answer in its place.
         //
-        // A STARTUP refusal and never a per-connection fallback, which is the whole of
-        // the decision: a node that ran consensus unsigned when it had no key is the port
-        // open with every refusal counter reading zero. Asked of the PATH being named, as
-        // the discovery row asks it -- whether the file can be read is `ConsensusTier`'s
-        // question, answered at boot, because a registration is judged by this table
-        // long before the file need exist.
+        // A STARTUP refusal and never a per-connection fallback. Asked of the PATH being
+        // named, as the discovery row asks it, because a registration is judged by this
+        // table long before the file need exist.
         { .refuses = [](NodeConfig const& c) { return RunsConsensus(c) && c.clusterKeyFile.empty(); },
           .message = ConsensusNeedsClusterKeyRefusal },
         { .refuses = [](NodeConfig const& c) { return c.discoveryReplyPort != 0 && c.discoveryAddress.empty(); },

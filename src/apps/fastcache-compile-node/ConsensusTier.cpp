@@ -5,7 +5,6 @@
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Async/PlatformReactor.hpp>
-#include <FastCache/Cluster/PskRaftPeerCredential.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Consensus/RaftNode.hpp>
 #include <FastCache/Core/Clock.hpp>
@@ -206,7 +205,8 @@ std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::stri
 
 ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                              Consensus::FileRaftStorage storage,
-                             std::unique_ptr<Consensus::IRaftPeerCredential const> credential,
+                             Ed25519KeyPair identityKey,
+                             std::span<Cluster::ClusterMember const> knownMembers,
                              std::string boundEndpoint,
                              RoleObserver onRole,
                              MembersObserver onMembers,
@@ -219,7 +219,8 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     // replayed, and nothing replays a production node. Handshake nonces are `_nonces`'s.
     _random { std::make_unique<SystemRandomSource>() },
     _metrics { metrics },
-    _credential { std::move(credential) },
+    _roster { std::move(identityKey), knownMembers },
+    _identity { self.id, _roster },
     _connector { std::make_unique<PlatformConnector>(_reactor, _resolver, _clock) },
     _application { logger, [this](Cluster::ClusterState const& state) { OnStateChanged(state); } },
     _onRole { std::move(onRole) },
@@ -248,12 +249,14 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                                                 .publicKey = _self.publicKey });
 }
 
-std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(NodeConfig const& cfg,
-                                                                                std::string_view schedulerBound,
-                                                                                RoleObserver onRole,
-                                                                                MembersObserver onMembers,
-                                                                                IMetricsSink& metrics,
-                                                                                ILogger& logger)
+std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
+    NodeConfig const& cfg,
+    std::string_view schedulerBound,
+    std::optional<Ed25519KeyPair> const& identityKey,
+    RoleObserver onRole,
+    MembersObserver onMembers,
+    IMetricsSink& metrics,
+    ILogger& logger)
 {
     // The bootstrap set, and this node must be in it. A node whose own id names no
     // member could never win a vote and could never be voted for -- it would stand
@@ -272,17 +275,13 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     if (self == nullptr)
         return std::unexpected { std::string { ConsensusNamesNoSelfPeerRefusal } };
 
-    // The key, before anything is bound or dialled (#1308). The startup table refuses a
-    // node that names no key file, and this is that answer arriving for a `NodeConfig` no
-    // argv produced; the READ is this tier's alone, because a registration is judged by
-    // the table long before the file need exist. A key that cannot be read is fatal here
-    // for the reason a missing one is: there is no unauthenticated consensus to fall back
-    // to.
-    if (cfg.clusterKeyFile.empty())
-        return std::unexpected { std::string { ConsensusNeedsClusterKeyRefusal } };
-    auto key = ReadClusterKey(cfg.clusterKeyFile);
-    if (!key.has_value())
-        return std::unexpected { std::format("--cluster-key-file: {}", key.error()) };
+    // The identity key, before anything is bound or dialled (#178). Every peer connection
+    // proves each end's OWN key, so there is no unauthenticated consensus to fall back to --
+    // #1308's rule, carried from the pre-shared key to the key that replaced it on this wire.
+    // A consensus node always has a state directory (`HoldsNodeKey`) and the start resolves
+    // the key there before this tier exists, so this is the answer to a caller that did not.
+    if (!identityKey.has_value())
+        return std::unexpected { std::string { ConsensusNeedsIdentityKeyRefusal } };
 
     // `--raft-join` takes the SAME tokens and means something else by them: these
     // are the nodes this one can REACH, not the cluster it is a member of. So the
@@ -336,18 +335,22 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // addresses are known at once: the consensus one is what an operator typed and
     // every peer dials, and the scheduler one is a port nobody connects to and so
     // nobody could otherwise learn.
+    //
+    // Its key is the one it proves itself with, and nobody else can state that: the member
+    // entry `ApplyNodeIdentity` synthesised carries the same key, but the pair is the source.
     auto announced = *self;
     announced.schedulerEndpoint = AdvertisedSchedulerEndpoint(self->raftEndpoint, schedulerBound);
+    announced.publicKey = identityKey->PublicKey();
 
-    auto tier = std::unique_ptr<ConsensusTier> { new ConsensusTier {
-        std::move(announced),
-        *std::move(storage),
-        std::make_unique<Cluster::PskRaftPeerCredential const>(*std::move(key)),
-        std::format("{}:{}", endpoint.host, endpoint.port),
-        std::move(onRole),
-        std::move(onMembers),
-        metrics,
-        logger } };
+    auto tier = std::unique_ptr<ConsensusTier> { new ConsensusTier { std::move(announced),
+                                                                     *std::move(storage),
+                                                                     *identityKey,
+                                                                     members,
+                                                                     std::format("{}:{}", endpoint.host, endpoint.port),
+                                                                     std::move(onRole),
+                                                                     std::move(onMembers),
+                                                                     metrics,
+                                                                     logger } };
 
     if (auto started = tier->Launch(cfg, members, bootstrap, endpoint.host, endpoint.port); !started.has_value())
         return std::unexpected { started.error() };
@@ -441,7 +444,7 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     auto ids = _bootstrapIds;
 
     _transport = std::make_unique<Consensus::RaftPeerTransport>(
-        cfg.nodeId, std::move(peers), _reactor, *_connector, _logger, _metrics, *_credential, _nonces);
+        std::move(peers), _reactor, *_connector, _logger, _metrics, _identity, _nonces);
 
     auto recovered = _storage.Load();
     if (!recovered.has_value())
@@ -505,8 +508,8 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     Republish();
 
     _sink = std::make_unique<DriverSink>(*_driver, _logger);
-    _peerServer = std::make_unique<Consensus::RaftPeerServer>(
-        *_listener, _reactor, *_sink, _logger, _metrics, *_credential, cfg.nodeId, _nonces);
+    _peerServer =
+        std::make_unique<Consensus::RaftPeerServer>(*_listener, _reactor, *_sink, _logger, _metrics, _identity, _nonces);
 
     // Both loops on ONE reactor, and neither through `SyncRun`: that function
     // resumes a coroutine exactly once and throws when it is still suspended, so a
@@ -1080,6 +1083,11 @@ void ConsensusTier::PublishRole(Consensus::RaftDriver::RoleChange const& change)
 
 void ConsensusTier::OnStateChanged(Cluster::ClusterState const& state)
 {
+    // The roster FIRST, so the keys every peer connection is judged by are the committed
+    // ones before anything else reacts to the change. An applied `RevokeKey` reaches every
+    // open session from here: each re-asks the roster before its next frame (#178).
+    _roster.Adopt(state);
+
     // The member set reaches the fleet's oracle from here, so admitting a peer and
     // serving it are one decision rather than two facts that can disagree.
     if (_onMembers)
@@ -1151,6 +1159,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
     NodeConfig const& cfg,
     std::unique_ptr<SchedulerTier> const& schedulerTier,
     std::string_view schedulerBound,
+    std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
     IMetricsSink& metrics,
     ILogger& logger)
@@ -1168,6 +1177,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
     auto tier = ConsensusTier::Start(
         cfg,
         schedulerBound,
+        identityKey,
         [&schedulerTier](Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t term) {
             // Null when this node runs no scheduler surface, which is a legitimate
             // shape: a member that contributes CPU and consensus without handing out

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The dialling end and the accepting end, against EACH OTHER (#1308).
+// The dialling end and the accepting end, against EACH OTHER (#1308, #178).
 //
 // `RaftPeerTransport_test.cpp` scripts an acceptor and `RaftPeerServer_test.cpp` scripts a
 // dialler, and both scripts are built on the real session code -- which is what makes them
@@ -11,16 +11,13 @@
 // because a refusal pinned at one end only is half of a diagnosis.
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Cluster/PskRaftPeerCredential.hpp>
 #include <FastCache/Consensus/RaftPeerRefusals.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/IConnector.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -29,11 +26,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <ranges>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
+
+#include <tests/ListenerConnector.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Consensus;
@@ -41,18 +42,6 @@ using namespace std::chrono_literals;
 
 namespace
 {
-
-/// The cluster key the server holds, and a well-behaved dialler with it.
-[[nodiscard]] SecureByteBuffer ClusterKey()
-{
-    return SecureByteBuffer(32, std::byte { 0x5A });
-}
-
-/// A key the server does not hold.
-[[nodiscard]] SecureByteBuffer StrangerKey()
-{
-    return SecureByteBuffer(32, std::byte { 0x33 });
-}
 
 /// Records every message the server delivers.
 class RecordingSink final: public IRaftMessageSink
@@ -67,37 +56,23 @@ class RecordingSink final: public IRaftMessageSink
     std::vector<RaftMessage> received; ///< In arrival order.
 };
 
-/// Every dial lands on one in-memory listener, whatever address it names.
-class ListenerConnector final: public IConnector
-{
-  public:
-    /// @param listener Where every dial arrives; must outlive the connector.
-    explicit ListenerConnector(InMemoryListener& listener) noexcept:
-        _listener { listener }
-    {
-    }
-
-    /// @copydoc IConnector::Connect
-    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions options) override
-    {
-        std::ignore = host;
-        std::ignore = port;
-        std::ignore = options;
-        co_return std::unique_ptr<ISocket> { _listener.ConnectClient() };
-    }
-
-  private:
-    InMemoryListener& _listener;
-};
-
 /// Who is on each end of the link, and what the dialler holds.
 struct LinkShape
 {
-    std::string server { "n2" };                  ///< The id the server is.
-    std::string dialler { "n1" };                 ///< The id the transport is.
-    std::string target { "n2" };                  ///< The id the transport believes it dials.
-    SecureByteBuffer diallerKey { ClusterKey() }; ///< What the transport proves with.
+    std::string server { "n2" };  ///< The id the server is.
+    std::string dialler { "n1" }; ///< The id the transport proves itself as.
+    std::string target { "n2" };  ///< The id the transport believes it dials.
+
+    /// Whose private key the transport signs with; empty means its own id's.
+    std::string diallerMachine {};
+
+    /// What BOTH ends believe about everybody's keys: one cluster's replicated roster, so a
+    /// revocation reaches the two ends at once, as an applied `RevokeKey` does.
+    std::shared_ptr<Testing::SharedRoster> roster { Testing::SharedRoster::Of({ "n1", "n2", "n3" }) };
 };
+
+/// How long the transport waits before redialling, which a case advances the clock past.
+constexpr auto ReconnectBackoff = 100ms;
 
 /// A transport and a server on one reactor, the transport's only peer being the server.
 ///
@@ -107,34 +82,30 @@ struct LinkShape
 struct Link
 {
     /// @param shape Who is on each end.
-    explicit Link(LinkShape shape):
+    explicit Link(LinkShape const& shape):
         target { shape.target },
         dialler { shape.dialler },
-        diallerKey { std::move(shape.diallerKey) },
-        server { listener,
-                 reactor,
-                 sink,
-                 logger,
-                 serverMetrics,
-                 serverKey,
-                 NodeId { shape.server },
-                 serverRandom,
-                 PeerServerOptions { .handshakeBound = 0ms } }
+        roster { shape.roster },
+        serverIdentity { NodeId { shape.server }, Testing::TestKeyPair(shape.server), roster },
+        diallerIdentity { NodeId { shape.dialler },
+                          Testing::TestKeyPair(shape.diallerMachine.empty() ? shape.dialler : shape.diallerMachine),
+                          roster },
+        server { listener,      reactor,        sink,         logger,
+                 serverMetrics, serverIdentity, serverRandom, PeerServerOptions { .handshakeBound = 0ms } }
     {
         [](RaftPeerServer* accepting) -> DetachedTask {
             co_await accepting->Run();
         }(&server);
 
         transport = std::make_unique<RaftPeerTransport>(
-            NodeId { shape.dialler },
             std::vector { PeerEndpoint { .id = NodeId { shape.target }, .host = "in-memory", .port = 1 } },
             reactor,
             connector,
             logger,
             diallerMetrics,
-            diallerKey,
+            diallerIdentity,
             diallerRandom,
-            PeerTransportOptions { .handshakeBound = 0ms });
+            PeerTransportOptions { .reconnectBackoff = ReconnectBackoff, .handshakeBound = 0ms });
         transport->Start();
         reactor.Drain();
     }
@@ -206,10 +177,11 @@ struct Link
     ManualClock clock;
     TestReactor reactor { clock };
     InMemoryListener listener;
-    ListenerConnector connector { listener };
+    Testing::ListenerConnector connector { listener };
     NullLogger logger;
-    Cluster::PskRaftPeerCredential const serverKey { ClusterKey() };
-    Cluster::PskRaftPeerCredential const diallerKey;
+    std::shared_ptr<Testing::SharedRoster> roster;
+    Testing::TestPeerIdentity const serverIdentity;
+    Testing::TestPeerIdentity const diallerIdentity;
     SystemSecureRandom serverRandom;
     SystemSecureRandom diallerRandom;
     RaftPeerServer server;
@@ -218,7 +190,7 @@ struct Link
 
 } // namespace
 
-TEST_CASE("A transport and a server holding one key form a session and deliver", "[consensus][raft][handshake]")
+TEST_CASE("A transport and a server that each prove their id form a session and deliver", "[consensus][raft][handshake]")
 {
     // The control every refusal below needs beside it: the same two ends, the same link,
     // and the only difference is the one each case names.
@@ -233,12 +205,13 @@ TEST_CASE("A transport and a server holding one key form a session and deliver",
     CHECK(link.AnyRefusals() == 0);
 }
 
-TEST_CASE("A transport with another key is refused by the server, and each end counts its own half",
+TEST_CASE("A transport signing with a key that is not its id's is refused by the server, and each end counts its own half",
           "[consensus][raft][handshake]")
 {
-    // The server cannot sign a verdict for a proof it could not verify, so it closes; the
-    // transport reads a close after its proof as the row that names a key mismatch.
-    Link link { LinkShape { .diallerKey = StrangerKey() } };
+    // n3, holding every byte it ever held, claiming n1's id. The server cannot sign a verdict
+    // for a proof it could not verify, so it closes; the transport reads a close after its
+    // proof as the row that names an acceptor that could not verify it.
+    Link link { LinkShape { .diallerMachine = "n3" } };
     link.SendVote(1);
 
     CHECK(link.sink.received.empty());
@@ -251,11 +224,10 @@ TEST_CASE("A transport with another key is refused by the server, and each end c
 TEST_CASE("A transport dialling the wrong member hears a signed refusal and counts it by name",
           "[consensus][raft][handshake]")
 {
-    // #1308, A1. Both ends hold the key, so the refusal is SIGNED -- and a transport that
-    // counted it as the connection ending would send an operator looking for a key
-    // mismatch that is not there. Each end's own row moves, and the key-mismatch row does
-    // not.
-    Link link { LinkShape { .target = "n9" } };
+    // #1308, A1. Both ends prove their ids, so the refusal is SIGNED -- and a transport that
+    // counted it as the connection ending would send an operator looking for a key problem
+    // that is not there. Each end's own row moves, and the ended-by-acceptor row does not.
+    Link link { LinkShape { .target = "n3" } };
     link.SendVote(1);
 
     CHECK(link.sink.received.empty());
@@ -269,8 +241,8 @@ TEST_CASE("A transport dialling the wrong member hears a signed refusal and coun
 TEST_CASE("A transport under the server's own id hears a signed refusal and counts it by name",
           "[consensus][raft][handshake]")
 {
-    // A copied --cluster-dir: a second machine proving the key under an id the server is.
-    // Asked before the target, so this is OwnId whatever the transport thought it dialled.
+    // A copied --cluster-dir: a second machine holding the server's own private key. Asked
+    // before the target, so this is OwnId whatever the transport thought it dialled.
     Link link { LinkShape { .server = "n1", .dialler = "n1", .target = "n3" } };
     link.SendVote(1);
 
@@ -280,4 +252,82 @@ TEST_CASE("A transport under the server's own id hears a signed refusal and coun
     CHECK(link.Refused(DiallerRefusal::OwnId) == 1);
     CHECK(link.Refused(DiallerRefusal::EndedByAcceptor) == 0);
     CHECK(link.AnyRefusals() == 2);
+}
+
+TEST_CASE("A key revoked mid-session closes that session, and the redial is refused, signed",
+          "[consensus][raft][handshake][revocation]")
+{
+    // #178's case (b) on one link. The cluster revokes a key while a session it proved is
+    // open; the session ends at its next frame, and when the dialler dials again the refusal
+    // is SIGNED and says what happened -- which is what an operator reading the counters needs,
+    // since nothing else about either machine changed. Both directions, because a cluster has
+    // both: every pair of members dials each other.
+
+    SECTION("the revoked machine is the dialler")
+    {
+        Link link { LinkShape { .server = "n1", .dialler = "n3", .target = "n1" } };
+        link.SendVote(1);
+        REQUIRE(link.sink.received.size() == 1);
+        REQUIRE(link.Connected() == 1);
+
+        link.roster->Revoke("n3");
+        link.SendVote(2);
+
+        // The acceptor reads the frame after the revocation and ends the connection there.
+        CHECK(link.sink.received.size() == 1);
+        CHECK(link.Refused(AcceptorRefusal::KeyWithdrawn) == 1);
+
+        // Over TCP the dialler learns that from its next write, which the peer's reset fails;
+        // the in-memory socket accepts writes nobody reads, so the fixture makes the redial
+        // happen the way a moved address would rather than waiting for a reset that never comes.
+        REQUIRE(link.transport->Learn(PeerEndpoint { .id = "n1", .host = "in-memory", .port = 2 })
+                == PeerChange::Readdressed);
+        link.SendVote(3);
+        link.clock.Advance(ReconnectBackoff);
+        link.reactor.Drain();
+
+        CHECK(link.sink.received.size() == 1);
+        CHECK(link.Connected() == 0);
+        CHECK(link.Refused(AcceptorRefusal::RevokedKey) == 1);
+        CHECK(link.Refused(DiallerRefusal::OwnKeyRevoked) == 1);
+
+        // Never reported as a proof nobody could verify: the refusal names the revocation.
+        CHECK(link.Refused(DiallerRefusal::EndedByAcceptor) == 0);
+        CHECK(link.Refused(AcceptorRefusal::Proof) == 0);
+    }
+
+    SECTION("the revoked machine is the acceptor")
+    {
+        Link link { LinkShape { .server = "n3", .dialler = "n1", .target = "n3" } };
+        link.SendVote(1);
+        REQUIRE(link.sink.received.size() == 1);
+        REQUIRE(link.Connected() == 1);
+
+        link.roster->Revoke("n3");
+        link.SendVote(2);
+
+        // The dialler asks before sealing, so the frame after the revocation is never written.
+        CHECK(link.sink.received.size() == 1);
+        CHECK(link.Refused(DiallerRefusal::KeyWithdrawn) == 1);
+        CHECK(link.Connected() == 0);
+
+        link.clock.Advance(ReconnectBackoff);
+        link.reactor.Drain();
+
+        // The redial: n3 still proves n3 with the key it always had, and that key is revoked.
+        CHECK(link.sink.received.size() == 1);
+        CHECK(link.Connected() == 0);
+        CHECK(link.Refused(DiallerRefusal::AcceptorKeyRevoked) == 1);
+        CHECK(link.Refused(DiallerRefusal::AcceptorProof) == 0);
+    }
+
+    SECTION("the control: the same links with nothing revoked keep delivering")
+    {
+        Link link { LinkShape { .server = "n1", .dialler = "n3", .target = "n1" } };
+        link.SendVote(1);
+        link.SendVote(2);
+        CHECK(link.sink.received.size() == 2);
+        CHECK(link.Connected() == 1);
+        CHECK(link.AnyRefusals() == 0);
+    }
 }

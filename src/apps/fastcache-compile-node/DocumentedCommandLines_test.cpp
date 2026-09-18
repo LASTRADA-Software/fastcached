@@ -154,6 +154,9 @@ constexpr std::array NonStartVerbs {
     NonStartVerb { .flag = "--print-surfaces",
                    .why = "prints the resolved surface map and exits, deliberately ahead of the startup rules, "
                           "because it is reached for when a port is wrong" },
+    NonStartVerb { .flag = "--print-identity",
+                   .why = "prints this node's identity and exits, ahead of the startup rules for --print-surfaces' "
+                          "reason: it is reached for while the members' command lines are still being written" },
     NonStartVerb { .flag = "--install-service",
                    .why = "registers a service and exits; judged by NodeInstallRejection, which is stricter" },
     NonStartVerb { .flag = "--uninstall-service", .why = "removes a registration and exits" },

@@ -79,6 +79,26 @@ to do step 5 rather than a reason to skip it.
 The asymmetry is worth stating plainly: **the server can see this and the client
 cannot.** Check the servers.
 
+## The consensus peer wire, version 4
+
+**#178 made every consensus connection prove each member's OWN identity key**, where it
+proved the cluster's shared key, so the peer wire moved from version 3 to 4 and the two
+cannot talk: an older peer proves only the shared key, and accepting it would be the
+fallback the handshake exists to refuse. Upgrade a cluster's consensus members together,
+and before you do, give each member's `--raft-peer` list every other member's key:
+
+1. On each member, run `fastcache-compile-node --print-identity` with the flags it runs
+   with, as the account it runs as. It prints the member's `raft-peer` token, key included.
+   A member that already has a state directory keeps its id; a key is minted beside it.
+2. Put every token into every member's `--raft-peer` list.
+3. Stop all of them, upgrade, start all of them.
+
+A member left out of step 2 is refused by the others as a key never given
+(`fastcache_raft_peer_connections_refused_unknown_key_total`) until the cluster records its
+key -- which the leader does for itself when it leads, and which `--cluster-admit` with
+`@<key>` does for anybody else. A mixed cluster shows as
+`fastcache_raft_peer_connections_refused_no_handshake_total` on the new nodes.
+
 ## The consensus state directory
 
 **#1449 (learners) changed what a consensus member writes to disk and says to its
@@ -88,7 +108,7 @@ moved, each refused by name rather than misread:
 | What | Now | Refused as |
 |---|---|---|
 | The Raft store in `--cluster-dir` (`raft-state`, `raft-log`, `raft-snapshot`) | format 2: a configuration carries voters and learners, and every log record carries the format it was written in | `UnsupportedFormatVersion` — never the damage code — naming the format it found and the one it reads |
-| The consensus peer wire | version 3 | refused at the handshake by its version, never read as this layout -- a fleet's consensus members upgrade together |
+| The consensus peer wire | version 3 (4 since #178, above) | refused at the handshake by its version, never read as this layout -- a fleet's consensus members upgrade together |
 | The replicated cluster state (a snapshot, and the `--cluster-status` reply) | version 5: each member records its seat | `UnsupportedVersion`, naming both versions |
 
 The store has **no conversion**, and a node started on an older one refuses to start,

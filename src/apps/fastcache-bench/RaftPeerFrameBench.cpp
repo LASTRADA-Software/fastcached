@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 /// What authenticating a Raft peer frame costs
-/// ([#1308](https://github.com/LASTRADA-Software/fastcached/issues/1308)).
+/// ([#1308](https://github.com/LASTRADA-Software/fastcached/issues/1308),
+/// [#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
 ///
 /// Every frame on a proven connection is sealed by the sender and opened by the receiver: one
-/// HMAC-SHA256 each, over both session nonces, the frame's position, its header and its
+/// HMAC-SHA256 each, under the session's own key, over the frame's position, its header and its
 /// payload. A heartbeat is a few dozen bytes and costs next to nothing; the frame worth
 /// measuring is the LARGEST the server accepts, `PeerServerOptions::maxFrameBytes`, which is
 /// what one AppendEntries carrying a snapshot-sized batch can reach. The number answers whether
 /// the tag is a cost anybody would see beside the replication it guards.
 ///
-/// **It measures the shipped seam, not a stand-in**: `FrameSealer` and `FrameOpener` over a
-/// `PskRaftPeerCredential`, the objects `RaftPeerTransport` and `RaftPeerServer` hold. The frame
+/// **It measures the shipped seam, not a stand-in**: `Core/SessionSeal`'s `FrameSealer` and
+/// `FrameOpener` over a key from `DeriveSessionKey`, the objects `RaftPeerTransport` and
+/// `RaftPeerServer` hold. The handshake that agrees the key is paid once per connection and is
+/// not measured here. The frame
 /// size is printed with the figures; the BUILD is printed once for the whole binary by
 /// `BuildBannerListener.cpp`, because a digest's throughput at `-O0` and at `-O2` differ by an
 /// order of magnitude and a figure without that condition invites exactly the wrong comparison.
@@ -19,13 +22,11 @@
 /// build *optimised* -- which `NDEBUG` does not say, since `-O0 -DNDEBUG` defines it and
 /// optimises nothing (#1439).
 
-#include <FastCache/Cluster/PskRaftPeerCredential.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
-#include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Nonce.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
@@ -58,11 +59,12 @@ namespace
 
 TEST_CASE("bench: sealing and opening a Raft peer frame", "[!benchmark][raftframe]")
 {
-    Cluster::PskRaftPeerCredential const credential { SecureByteBuffer(32, std::byte { 0x5A }) };
-    // The nonces' VALUES cost nothing a MAC can see, so they come from where production draws
-    // them rather than from a seed (#1527).
+    // The key's VALUE costs nothing a MAC can see, so it is derived from bytes drawn where
+    // production draws them rather than from a seed (#1527).
     SystemSecureRandom random;
-    SessionNonces const nonces { .acceptor = DrawNonce(random).value(), .dialler = DrawNonce(random).value() };
+    auto const secret = DrawNonce(random).value();
+    auto const salt = DrawNonce(random).value();
+    auto const key = DeriveSessionKey(secret, salt, WireFields::AsBytes("bench")).value();
 
     for (auto const payloadBytes: { std::size_t { 64 }, PeerServerOptions {}.maxFrameBytes })
     {
@@ -73,27 +75,24 @@ TEST_CASE("bench: sealing and opening a Raft peer frame", "[!benchmark][raftfram
         BENCHMARK(std::format("seal {} bytes", payloadBytes))
         {
             // A fresh sealer per run, so every run seals position 0 -- the same work each time.
-            FrameSealer sealer { credential, nonces };
-            return sealer.Seal(bytes);
+            FrameSealer sealer { key };
+            return sealer.Seal(bytes.first(RaftWire::HeaderSize), bytes.subspan(RaftWire::HeaderSize));
         };
 
-        auto const tag = FrameSealer { credential, nonces }.Seal(bytes);
+        auto const tag = FrameSealer { key }.Seal(bytes.first(RaftWire::HeaderSize), bytes.subspan(RaftWire::HeaderSize));
         BENCHMARK(std::format("open {} bytes", payloadBytes))
         {
-            FrameOpener opener { credential, nonces };
+            FrameOpener opener { key };
             return opener.Open(bytes.first(RaftWire::HeaderSize), bytes.subspan(RaftWire::HeaderSize), tag);
         };
 
         // Where a seal's time goes, so a figure worth changing says WHICH change: the
-        // length-prefixed copy `SignFields` makes of every field, and the digest over it.
-        // A seal is roughly one of each plus an allocation; the two together should
-        // account for it.
+        // length-prefixed copy of every field, and the digest over it. A seal is roughly one
+        // of each plus an allocation; the two together should account for it.
         BENCHMARK(std::format("encode the fields of {} bytes", payloadBytes))
         {
             auto const position = WireFields::ToBigEndian<std::uint64_t>(0);
-            return WireFields::Encode({ std::span<std::byte const> { nonces.acceptor },
-                                        std::span<std::byte const> { nonces.dialler },
-                                        std::span<std::byte const> { position },
+            return WireFields::Encode({ std::span<std::byte const> { position },
                                         bytes.first(RaftWire::HeaderSize),
                                         bytes.subspan(RaftWire::HeaderSize) });
         };

@@ -1234,10 +1234,37 @@ recorded. Without `@<key>` an admission keeps whatever key is already recorded, 
 member's key also reaches the cluster from the member itself, which announces the key it
 holds when it leads.
 
-**Nothing verifies against these keys yet.** They are recorded, reported and carried;
-what proves a node is a member of the cluster is still the cluster key. Proving
-identity with them is the next step of
-[#178](https://github.com/LASTRADA-Software/fastcached/issues/178).
+**Every consensus connection proves these keys**: the node at each end signs the
+handshake with its own key, and the other checks the signature against the key the
+cluster records for the id it claims -- or, until the cluster has recorded any, the
+`@<key>` this node's own `--raft-peer` typed for it. So **every member's `--raft-peer`
+list names every other member's key** when a cluster is first formed; a member named
+without one cannot be verified, and a cluster none of whose members was given keys does
+not form. What that refuses, and how a refusal reads, is under
+[Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication).
+The cluster key is still what the leases, the node port and enrollment use
+([#178](https://github.com/LASTRADA-Software/fastcached/issues/178) moves them next).
+
+`--print-identity` is how you learn a node's key before any member starts. Run it with the
+flags the node runs with, **as the account the node runs as** -- it mints the id and the key
+into the state directory when it holds none yet, and a key file another account created is
+one the service cannot read -- and it prints the three things its peers need:
+
+```
+node-id n1
+public-key 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+raft-peer n1=10.0.0.1:6680@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+```
+
+The `raft-peer` line is the token every other member's `--raft-peer` takes, and the first
+start afterwards reads the same key back (`recorded`). A node whose peers could not dial it
+yet -- it names itself neither by `--raft-peer` nor by `--raft-self` -- prints no token rather
+than a guessed one. Without a state directory there is no identity to print, and it says so.
+
+**Removing a machine is revoking its key.** A revoked key is refused on every connection,
+the connections it proved close at their next message, and its redial is answered with a
+signed *your key is revoked*. Nothing on any other member changes -- no key is rotated
+anywhere, which is what a key per machine buys over a key shared by all of them.
 
 A node must name itself among its own peers, and it is refused if it does not —
 such a node could never win a vote and could never be voted for, so it would stand
@@ -1254,7 +1281,7 @@ nobody reads:
 | this node is named, by a `--raft-peer` of its own or by `--raft-self` | The address its peers dial is the half only it knows — whether it bootstraps a cluster or joins one with `--raft-join`. |
 | not both, naming different addresses | Two answers to one question, with nothing to rank them by. |
 | `--listen-raft` names a usable port | That is where every peer dials it, and giving it is what turns consensus on. A value that is not an address is refused with the text you typed. |
-| `--cluster-key-file` names the cluster's key | Every connection between members proves that key before a message is read, so a node without it could neither be heard nor hear anybody. The refusal says how to make a key and how to be handed one; a file that is named and cannot be read is refused when consensus starts. See [Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication). |
+| `--cluster-key-file` names the cluster's key | A consensus node signs the scheduler's leases with it, proves itself on the node port with it, and hands it over at enrollment. It no longer proves anything between members -- each member's own identity key does, see [Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication) -- but it is still required until those move too. The refusal says how to make a key and how to be handed one. |
 
 The reverse holds too: `--node-id` or `--raft-peer` **without** `--listen-raft` is
 refused rather than ignored. This node would run no consensus at all, so neither
@@ -2902,24 +2929,31 @@ byte-budget refusal that fires in practice is a cache `STORE`.
 | `fastcache_enrollment_requests_refused_already_collected_total` | An `ENROLL` naming an id whose key has already been collected. Refused with **no key bytes served** — the grant is spendable once. A healthy enrolment produces none of these, because a joiner that collects the key writes it and exits, so this is not a second spelling of the hand-over tally: that one says the key left, this one says somebody asked after it had left. Two causes and the rate separates them — one is a joiner whose reply was lost, a run of them is somebody answering to an id an operator approved. Both are fixed by `--enroll-approve` on that id, which re-arms exactly one more collection. | `ENROLL` |
 | `fastcache_enrollment_control_refused_unauthenticated_total` | An `ENROLL-CONTROL` from an admitted host that never presented a credential. Counted apart from the row above — and answered `unauthenticated` where that one answers `not-a-member` — because those are different machines with opposite remedies: one is a host to add to the membership policy, the other a host that is already trusted and whose operator tool is missing its token. A single "refused" tally would make the two indistinguishable at exactly the moment somebody is trying to work out why an approval will not go through. | `ENROLL-CONTROL` |
 
-**A Raft peer that could not prove the cluster key, or proved it and still could not be served.** Every connection between consensus members opens with a handshake: the accepting node challenges, the dialling node proves the key over that challenge and names the member it meant to dial, and the acceptor answers with a signed verdict. The first eight rows are counted by the node that ACCEPTED the connection, the last six by the node that DIALLED it — so one misconfigured machine shows on both, from opposite ends. See [cluster communication](../operations/cluster-communication.md#raft-peer-authentication).
+**A Raft peer that could not prove which member it is, or proved it and still could not be served.** Every connection between consensus members opens with a handshake: the accepting node challenges, the dialling node signs that challenge with its own identity key and names the member it meant to dial, and the acceptor answers with a verdict signed with its own. Each end checks the other's signature against the key the cluster records for the id it claims. The `connections` and `frames` rows are counted by the node that ACCEPTED the connection, the `dials` rows by the node that DIALLED it — so one misconfigured machine shows on both, from opposite ends. See [cluster communication](../operations/cluster-communication.md#raft-peer-authentication).
 
 | Series | Says |
 |---|---|
 | `fastcache_raft_peer_connections_refused_no_handshake_total` | Raft peer connections closed because the first frame was not a handshake proof this build reads: a Raft message sent without one (a build from before the handshake), a proof at another wire version, one over its size ceiling, or bytes that are not this wire at all. The log line beside it names which and the address it came from. Nothing was read from the connection. |
 | `fastcache_raft_peer_connections_refused_handshake_timeout_total` | Raft peer connections closed because no proof arrived within the handshake bound. Before the handshake existed such a connection held a slot for as long as its socket lived; now it is closed and counted. A few is a slow or stalled peer; a steady rate from one address is something holding connections open on purpose. |
-| `fastcache_raft_peer_connections_refused_proof_total` | Raft peer connections refused because the proof did not verify against this node's cluster key: the dialler holds a different key, or none. The address is in the log line; no id is, because an id nobody proved is not one worth printing. On a healthy fleet this is flat at zero, so any rise is a machine with the wrong --cluster-key-file or something that is not a member at all. |
-| `fastcache_raft_peer_connections_refused_wrong_target_total` | Raft peer connections from a dialler that proved the key but dialled another member at this address: its record of where that member answers is stale, usually because a node moved or two swapped addresses. Refused with a signed verdict, so the dialler reports it by name rather than as a key problem. The log names both ids. |
-| `fastcache_raft_peer_connections_refused_own_id_total` | Raft peer connections from a dialler that proved the key under THIS node's own id: two machines answer to one identity, which is a copied --cluster-dir or a duplicated --node-id. Refused with a signed verdict. Never ordinary; the address in the log is the second machine. |
-| `fastcache_raft_peer_frames_refused_tag_total` | Raft connections closed because a frame's tag did not verify on a connection that had proved the key: a frame changed, injected, replayed, reordered or carried over from another connection. A correct peer never produces one, so a rise is the network path or something on it. |
-| `fastcache_raft_peer_frames_refused_sender_total` | Raft connections closed because a frame whose tag verified carried a message naming a sender other than the id its connection proved. Only a holder of the key can produce one, so a rise is a defect in a member rather than an attacker. |
-| `fastcache_raft_peer_connections_refused_full_total` | Raft peer connections closed on arrival because the listener already served as many as it holds. A cluster needs one per peer, so a rise is something opening connections it does not need -- the last thing a stranger can still do before proving the key, now that a silent connection is closed at the handshake bound. |
+| `fastcache_raft_peer_connections_refused_proof_total` | Raft peer connections refused because the proof's signature did not verify under the key this node holds for the id it claims: another machine claiming that member's id, which only the member's own private key can prove. No verdict is sent. On a healthy fleet this is flat at zero, so any rise is an impersonation attempt or a member whose key file was replaced without re-admitting it. |
+| `fastcache_raft_peer_connections_refused_unknown_key_total` | Raft peer connections refused because this node holds no key for the id the proof claims, so nothing could be verified and nothing was answered. A member whose key was never given -- a --raft-peer without @<key>, or a member admitted without one -- or a machine that is not a member at all. The address is in the log line and the claimed id is not: nobody proved it. |
+| `fastcache_raft_peer_connections_refused_revoked_key_total` | Raft peer connections refused because the proof verified under a key the cluster has REVOKED: the removed machine itself, still dialling. Answered with a signed verdict saying so, so the removed machine reports its own revocation rather than a key problem here. Expected briefly after a --cluster-forget of a key; a steady rate is a machine nobody stopped. |
+| `fastcache_raft_peer_connections_refused_wrong_target_total` | Raft peer connections from a dialler that proved its id but dialled another member at this address: its record of where that member answers is stale, usually because a node moved or two swapped addresses. Refused with a signed verdict, so the dialler reports it by name rather than as a key problem. The log names both ids. |
+| `fastcache_raft_peer_connections_refused_own_id_total` | Raft peer connections from a dialler that proved THIS node's own id, which only this node's private key can do: two machines hold one identity, which is a copied --cluster-dir. Refused with a signed verdict. Never ordinary; the address in the log is the second machine. |
+| `fastcache_raft_peer_frames_refused_tag_total` | Raft connections closed because a frame's tag did not verify under the connection's own session key: a frame changed, injected, replayed, reordered or carried over from another connection. A correct peer never produces one, so a rise is the network path or something on it. |
+| `fastcache_raft_peer_frames_refused_sender_total` | Raft connections closed because a frame whose tag verified carried a message naming a sender other than the id its connection proved. Only the proven member can produce one, so a rise is a defect in a member rather than an attacker. |
+| `fastcache_raft_peer_connections_ended_key_withdrawn_total` | Proven Raft peer connections this node closed because the key the dialler proved them with stopped being that member's in the cluster's roster: revoked, or replaced by a re-admission. Checked on every frame, so a revocation reaches every open connection at the next message rather than when the connection happens to break. |
+| `fastcache_raft_peer_connections_refused_full_total` | Raft peer connections closed on arrival because the listener already served as many as it holds. A cluster needs one per peer, so a rise is something opening connections it does not need -- the last thing a stranger can still do before proving an id, now that a silent connection is closed at the handshake bound. |
 | `fastcache_raft_peer_dials_refused_timeout_total` | Raft dials abandoned because the acceptor sent no challenge, or no verdict, within the handshake bound. The ordinary cause is a peer running a build from before the handshake, which never sends one, or an address that is not a Raft port. Read beside the peer's own no_handshake series, which rises on the other machine for the same connection. |
 | `fastcache_raft_peer_dials_refused_no_challenge_total` | Raft dials abandoned because the acceptor opened with something other than a challenge this build reads: another wire version, or a port that is not this protocol. The log names the version seen. |
-| `fastcache_raft_peer_dials_refused_acceptor_proof_total` | Raft dials abandoned because the acceptor's signed verdict did not verify against this node's key: whatever answers at that address does not hold the cluster key. Nothing was sent to it. On a healthy fleet flat at zero; a rise names an address that is not the member this node dialled. |
+| `fastcache_raft_peer_dials_refused_acceptor_proof_total` | Raft dials abandoned because the acceptor's verdict did not verify under the key this node holds for the member that answered: another machine answering under that id. Nothing was sent to it. On a healthy fleet flat at zero; a rise names an address that is not the member it claims to be. |
+| `fastcache_raft_peer_dials_refused_acceptor_key_unknown_total` | Raft dials abandoned because this node holds no key for the member that answered, so its verdict could not be verified. Nothing was sent to it. Give the member's key with @<key> on --raft-peer, or wait for the cluster to replicate it. |
+| `fastcache_raft_peer_dials_refused_acceptor_key_revoked_total` | Raft dials abandoned because the member that answered signed with a key the cluster has revoked: a removed machine still answering at an address this node dials. Nothing was sent to it. |
 | `fastcache_raft_peer_dials_refused_wrong_target_total` | Raft dials refused, by a verified verdict, because the member answering at the address is not the one this node dialled: this node's record of that member's address is stale. The log names both. It clears when the replicated state or discovery re-addresses the member. |
-| `fastcache_raft_peer_dials_refused_own_id_total` | Raft dials refused, by a verified verdict, because the acceptor answers to this node's own id: two machines share an identity, a copied --cluster-dir or a duplicated --node-id. |
-| `fastcache_raft_peer_dials_ended_by_acceptor_total` | Raft dials the acceptor closed after this node sent its proof, without a signed verdict. The causes are the ones an acceptor cannot sign: this node's key is not the acceptor's, or the acceptor refused the proof's shape or ran out of handshake time. Never a stale address or a shared identity, which arrive signed and have series of their own. |
+| `fastcache_raft_peer_dials_refused_own_id_total` | Raft dials refused, by a verified verdict, because the acceptor proved this node's own id from this node: two machines hold one private key, a copied --cluster-dir. |
+| `fastcache_raft_peer_dials_refused_own_key_revoked_total` | Raft dials refused, by a verified verdict, because the acceptor's roster has revoked THIS node's key: this machine was removed from the cluster. It never clears by itself; the machine must mint a new identity -- a fresh --cluster-dir -- and be admitted under it. |
+| `fastcache_raft_peer_dials_ended_by_acceptor_total` | Raft dials the acceptor closed after this node sent its proof, without a signed verdict. The causes are the ones an acceptor cannot sign: it holds no key for this node's id, or a different one, or it refused the proof's shape or ran out of handshake time. Never a stale address, a shared identity or a revoked key, which arrive signed and have series of their own. |
+| `fastcache_raft_peer_dials_ended_key_withdrawn_total` | Proven Raft sessions this node ended before sending a frame, because the key the acceptor proved the session with stopped being that member's in the cluster's roster: revoked, or replaced. The redial that follows is judged against the roster as it is now. |
 
 **A member admitted with a key the leader could not read.** `--cluster-admit` and
 `fastcache-cli cluster-admit` may name the member's identity key. The leader reads it
@@ -3549,10 +3583,10 @@ worker's compiler do, and an incident is read against what was in force at the t
 Until it closes, the boundary of those framed surfaces is **network reachability plus
 membership**, and a token on it is worse than no token. The credentials that *are*
 real: `--dashboard-token-file` for the fleet page, `fastcached`'s own `--requirepass`
-for the shared cache, and the cluster key — which every lease grant is signed with, and
-which every **consensus** connection proves before a message is read, so the Raft port
-is not open to whoever can reach it. That handshake authenticates; it does not encrypt,
-and one shared key cannot tell its holders apart. See
+for the shared cache, the cluster key — which every lease grant is signed with — and each
+member's own identity key, which every **consensus** connection proves before a message is
+read, so the Raft port is not open to whoever can reach it and one member cannot speak as
+another. That handshake authenticates; it does not encrypt. See
 [Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication).
 
 Keep `--serve-scheduler` off any network you would not run a compiler for. That

@@ -2993,9 +2993,13 @@ that is every node that runs consensus. It took a second clause until then — c
 AND a named `--cluster-key-file`, the predicate `EnrollmentConfigured` — because a keyless
 consensus node was legal, and on one the window was openable, listable and APPROVABLE
 while it could never admit anybody: the hand-over reads a key file that was not
-configured. Every Raft peer connection now proves the key, so consensus without one is a
-startup refusal, the clause could only ever read true where it was asked, and the
-predicate was DELETED rather than kept answering a question nothing can reach.
+configured. Consensus without the key is a startup refusal (`ConsensusNeedsClusterKeyRefusal`),
+so the clause could only ever read true where it was asked, and the predicate was DELETED
+rather than kept answering a question nothing can reach. **That refusal outlived its first
+reason**: since #178 the Raft peer wire proves each node's own identity key rather than this
+one, and the rule stays because this window -- with the lease and the node proof -- still
+hands over and reads the pre-shared key. Relax it only together with the last of them, or
+this window becomes openable on a node with nothing to hand over again.
 `ServesEnrollment` in `main.cpp` asks `RunsConsensus` and whether a scheduler tier was
 built — the second a runtime fact only that translation unit holds.
 

@@ -7,9 +7,9 @@ It is off unless you ask for it. Turn it on with `--discovery`, which needs
 `--listen-raft` and `--cluster-key-file` and is refused without them; without it a
 cluster is exactly the `--raft-peer` list an operator typed, which works and is
 the right answer for a fleet that does not change. Either way every member holds the
-key: consensus itself needs it, because every connection between members proves it
-before a message is read — see
-[Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication). The flags, and what a
+key, and a consensus node refuses to start without it. What proves one member to
+another on the consensus port is each member's OWN identity key rather than this one —
+see [Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication). The flags, and what a
 deployment looks like end to end, are under
 [finding peers instead of typing them](../tools/fastcache-compile-node.md#finding-peers-instead-of-typing-them);
 where this exchange sits among everything else a fleet says to itself — and which

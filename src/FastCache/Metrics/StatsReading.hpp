@@ -470,7 +470,7 @@ struct CounterSoleWriter
 /// row ABSENT rather than as a plausible zero.
 ///
 /// **One row per (counter, surface) PAIR, and a counter may have several.** A set-valued field
-/// would be a fixed-size array carrying exactly one element for 148 of 149 counters, to serve
+/// would be a fixed-size array carrying exactly one element for 156 of 157 counters, to serve
 /// the single row -- `LiveSubscriptionsRevoked` -- written from two components. Two rows say
 /// the same thing with no arithmetic, and `CounterHasAWriterIn` folds them.
 ///
@@ -493,21 +493,21 @@ struct CounterSoleWriter
 /// a row silently absent from the attribution and indistinguishable from one nobody had
 /// considered, cannot recur by omission ([#1501](https://github.com/LASTRADA-Software/fastcached/issues/1501)).
 ///
-/// **How the 149 rows were attributed**, since a scan for `Increment(Counter::X)` finds only 39
-/// of them and would have rendered the other 109 absent -- the same defect as the bug, nearly
-/// four times larger. The rows are written by four mechanisms, and reading only `SurfaceRefusal`
-/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 102 of the 110 and
+/// **How the 157 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 39
+/// of them and would have rendered the other 118 absent -- the same defect as the bug, three
+/// times larger. The rows are written by four mechanisms, and reading only `SurfaceRefusal`
+/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 110 of the 118 and
 /// leaves eight looking unwritten:
 ///
 /// | mechanism | rows |
 /// |---|---|
-/// | a `SurfaceRefusal` row, spent by `Refuse(row)` | 103 |
+/// | a `SurfaceRefusal` row, spent by `Refuse(row)` | 111 |
 /// | a `LeaseToken.hpp` outcome row's `workerCounter` | 7 |
 /// | returned by a classifier for its caller to spend | 4 |
 /// | `Increment(Counter::X)` directly | 39 |
 ///
-/// The column sums past 149 because four rows are written two ways -- and the 102 above is not
-/// the 103 here: 103 rows HAVE a refusal row, and 102 of those have no increment site, which is
+/// The column sums past 157 because four rows are written two ways -- and the 110 above is not
+/// the 111 here: 111 rows HAVE a refusal row, and 110 of those have no increment site, which is
 /// what a `SurfaceRefusal`-only reading would reach. Two figures one apart, measuring different
 /// things, is exactly how a census comes to be quoted wrong, so both are asserted.
 ///
@@ -798,16 +798,31 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::ConsensusPeerWire },
     CounterSoleWriter { .counter = IMetricsSink::Counter::ClusterAdmissionsRefusedMalformedKey,
                         .surface = MetricsSurface::CompileScheduler },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedUnknownKey,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedRevokedKey,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerConnectionsEndedKeyWithdrawn,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedAcceptorKeyUnknown,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedAcceptorKeyRevoked,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedOwnKeyRevoked,
+                        .surface = MetricsSurface::ConsensusPeerWire },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::RaftPeerDialsEndedKeyWithdrawn,
+                        .surface = MetricsSurface::ConsensusPeerWire },
 };
 
 /// Whether every catalogue row has at least one surface attributed to it.
 ///
 /// The guard #1501 exists to install. Before it, a row absent from `CounterSoleWriterTable` and
-/// a row nobody had considered were spelled identically -- and 146 of 149 rows were in that
-/// state, so the silence read as coverage exactly the way the rulebook says it does.
+/// a row nobody had considered were spelled identically -- and 145 of the 148 rows the catalogue
+/// held then were in that state, so the silence read as coverage exactly the way the rulebook
+/// says it does. A measurement of that moment, so it does not move with the catalogue.
 ///
 /// A `consteval` fold rather than a size comparison, because `CounterSoleWriterTable.size()`
-/// counts (counter, surface) PAIRS: it is 150 for 149 counters today, and a row duplicated
+/// counts (counter, surface) PAIRS: it is 158 for 157 counters today, and a row duplicated
 /// while another went missing would leave any arithmetic on the size perfectly consistent.
 ///
 /// @return True when no enumerator is missing from the table.

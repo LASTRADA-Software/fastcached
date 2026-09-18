@@ -5,7 +5,7 @@
 #include <FastCache/Async/Cancellation.hpp>
 #include <FastCache/Async/IReactor.hpp>
 #include <FastCache/Async/Task.hpp>
-#include <FastCache/Consensus/IRaftPeerCredential.hpp>
+#include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/IRaftTransport.hpp>
 #include <FastCache/Consensus/RaftPeerRefusals.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
@@ -154,16 +154,21 @@ struct PeerTransportOptions
 /// changes is that one component now has one lifecycle model, one socket
 /// implementation, and closes what it opened.
 ///
-/// ## A peer is sent nothing until it has proved the key (#1308)
+/// ## A peer is sent nothing until it has proved its id (#1308, #178)
 ///
 /// Each connection runs `RaftPeerSession`'s handshake before the first message: this end
 /// answers the acceptor's challenge with a proof naming the member it dialled, and reads
-/// the acceptor's signed verdict. Only an `Accepted` verdict that verifies starts the
-/// session -- and only then does the peer count in `ConnectedPeers()` -- so an address
-/// that no longer answers as the member, or answers without the key, is sent no Raft
-/// message at all. Every other ending moves its own counter (`DiallerRefusals`), the
-/// signed refusals under their own names, so a stale address book or a shared identity
-/// is never reported as a wrong key. Every frame after the verdict carries its tag.
+/// the acceptor's signed verdict. Only an `Accepted` verdict that verifies under the key the
+/// roster holds for that member starts the session -- and only then does the peer count in
+/// `ConnectedPeers()` -- so an address that no longer answers as the member, or answers as a
+/// machine this node holds no key for, is sent no Raft message at all. Every other ending
+/// moves its own counter (`DiallerRefusals`), the signed refusals under their own names, so a
+/// stale address book or a shared identity is never reported as a key problem. Every frame
+/// after the verdict carries its tag.
+///
+/// And before each frame is sealed, the roster is asked whether it still holds the key the
+/// acceptor proved the session with (`IRaftPeerIdentity::StillProves`). A key revoked since
+/// ends the session there, and the redial is judged against the roster as it is then.
 ///
 /// ## Send never blocks and may drop
 ///
@@ -186,8 +191,10 @@ class RaftPeerTransport final: public IRaftTransport
     static constexpr std::chrono::seconds RefusalReportInterval { 60 };
 
     /// Construct over its collaborators; all must outlive the transport.
-    /// @param self This node's own id, so a message addressed to it is refused
-    ///        rather than looped through a socket.
+    ///
+    /// The id this node dials as is the identity's (`IRaftPeerIdentity::Self`), so a message
+    /// addressed to it is refused rather than looped through a socket -- one source for the id,
+    /// rather than a parameter that could name somebody the proofs do not.
     /// @param peers Where each other member can be reached.
     /// @param reactor The loop every sender runs on. Named before the connector
     ///        because the connector's sockets are pinned to it.
@@ -195,18 +202,17 @@ class RaftPeerTransport final: public IRaftTransport
     ///        one whose sockets belong to `reactor`.
     /// @param logger Where connection state changes are reported.
     /// @param metrics Where a refused dial is counted.
-    /// @param credential What this node's proofs are made with, and an acceptor's
-    ///        verdicts checked against.
-    /// @param random Where each connection's nonce comes from. A connection this node cannot
-    ///        draw one for is abandoned before it proves anything (#1527).
+    /// @param identity Who this node is, what its proofs are signed with, and what an
+    ///        acceptor's verdicts are checked against.
+    /// @param random Where each connection's nonce and ephemeral key come from. A connection
+    ///        this node cannot draw them for is abandoned before it proves anything (#1527).
     /// @param options Timeouts and queue bound.
-    RaftPeerTransport(NodeId self,
-                      std::vector<PeerEndpoint> peers,
+    RaftPeerTransport(std::vector<PeerEndpoint> peers,
                       IReactor& reactor,
                       IConnector& connector,
                       ILogger& logger,
                       IMetricsSink& metrics,
-                      IRaftPeerCredential const& credential,
+                      IRaftPeerIdentity const& identity,
                       ISecureRandom& random,
                       PeerTransportOptions options = {});
 
@@ -399,7 +405,7 @@ class RaftPeerTransport final: public IRaftTransport
     /// @param detail What was seen, for the log line.
     void NoteDialRefusal(Peer& peer, PeerEndpoint const& where, DiallerRefusal refusal, std::string_view detail);
 
-    /// Say that this node could not prove the key to a peer for a reason of its OWN, at most
+    /// Say that this node could not prove its id to a peer for a reason of its OWN, at most
     /// once per `RefusalReportInterval` per peer. Reactor thread only.
     ///
     /// **Not a `DiallerRefusal`, and it moves no counter**: every row there names something
@@ -408,17 +414,17 @@ class RaftPeerTransport final: public IRaftTransport
     /// it is said as an Error.
     /// @param peer The peer that was dialled.
     /// @param where Where it was dialled.
-    /// @param reason Why this node could not, completing "cannot prove the key to ...: ".
+    /// @param reason Why this node could not, completing "cannot prove its id to ...: ".
     void NoteOwnFault(Peer& peer, PeerEndpoint const& where, std::string_view reason);
 
     friend struct PeerSenderAccess;
 
+    IRaftPeerIdentity const& _identity;
     NodeId _self;
     IReactor& _reactor;
     IConnector& _connector;
     ILogger& _logger;
     IMetricsSink& _metrics;
-    IRaftPeerCredential const& _credential;
     ISecureRandom& _random;
     PeerTransportOptions _options;
 

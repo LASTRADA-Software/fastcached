@@ -99,9 +99,13 @@ struct NodeKey
 /// which is worse than none: the cluster would be asked to admit a stranger each time. So it
 /// holds none, says so at startup, and reports no key.
 ///
-/// Asked only of a node that is about to SERVE: every verb that answers and exits returns
-/// before the start path reaches the key, so none of them can create a directory as a side
-/// effect of being asked a question.
+/// Asked of a node that is about to SERVE, and of `--print-identity`, whose purpose is the
+/// key: every other verb that answers and exits returns before the start path reaches it, so
+/// none of them can create a directory as a side effect of being asked a question.
+///
+/// **A node running consensus always holds one**, because consensus always has a state
+/// directory -- and since #178 every Raft peer connection proves each end's key, so that is
+/// load-bearing rather than incidental: `ConsensusTier` refuses to start without one.
 /// @param cfg The resolved configuration.
 /// @return True when this node holds a key.
 [[nodiscard]] bool HoldsNodeKey(NodeConfig const& cfg) noexcept;

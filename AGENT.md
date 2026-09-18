@@ -14,6 +14,7 @@ src/FastCache/
                 CSPRNG every nonce and minted id is drawn from), Logger, BufferPool,
                 Base64, Bytes, Endian, Crc32c, MurmurHash3, Sha256/HMAC, StringHash, Owner,
                 SecureBytes (the one zeroing primitive, and the allocator credentials live in),
+                SessionSeal (a session's frames tagged under the key its handshake agreed),
                 Utf8 (the one strict decoder), Markup (the one markup escaper, over
                 Utf8 and reached by all three targets that emit XML-family documents),
                 Compression, WireFrame + WireFields
@@ -45,13 +46,15 @@ src/FastCache/
   Consensus/    Raft, split into a pure state machine (RaftNode) and a coroutine
                 driver, behind IRaftStorage / IRaftTransport / IRaftStateMachine;
                 plus RaftLog, RaftWire, RaftPeerSession (the handshake every peer
-                connection proves the cluster key with, behind IRaftPeerCredential),
-                RaftPeerTransport/RaftPeerServer, RaftMembership, and
-                RaftClusterHarness (a whole cluster in one process, against scripted
-                partitions, loss and restarts, every message authenticated)
+                connection proves each end's OWN identity key with, behind
+                IRaftPeerIdentity over IRaftPeerKeys), RaftPeerTransport/RaftPeerServer,
+                RaftMembership, and RaftClusterHarness (a whole cluster in one process,
+                against scripted partitions, loss and restarts, every message signed
+                by the member it names)
   Cluster/      DiscoveryService + DiscoveryWire (the LAN beacon and its PSK
-                challenge), PskRaftPeerCredential (the key, as the peer wire proves
-                it), PeerDirectory, ClusterState + ClusterStateMachine,
+                challenge), RosterKeys (the keys the peer wire judges members by: the
+                command line's, then the replicated state's), PeerDirectory,
+                ClusterState + ClusterStateMachine,
                 MembershipPolicy — who is a member, WHERE they answer, and the
                 settings every member must agree on
   Distributed/  WorkerRegistry, LeaseTable and SchedulerService — the fleet's
@@ -323,11 +326,13 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   length-prefixed, never joined.
 - The PSK signs through ONE seam and the domain is a required PARAMETER, never a string a caller
   remembers: `Cluster/ClusterSigning.hpp`'s `SigningDomain` and its `SigningDomainTable`. Discovery,
-  the lease and the Raft peer wire each own rows, and every verifier goes through `VerifyFields`.
+  the lease and the node proof each own rows, and every verifier goes through `VerifyFields`. The
+  Raft peer wire's rows LEFT at #178 and their labels are retired, never reused.
 - That change moved the proof's MAC *input* and **`DiscoveryWire::CurrentVersion` deliberately
   did not move** — the datagram grammar is unchanged. "We changed the MAC, so bump the version"
-  is the tempting correction, and it is wrong. `RaftWire`'s did move for #1308, because a
-  handshake and a tag trailer are GRAMMAR: the question is always which of the two changed.
+  is the tempting correction, and it is wrong. `RaftWire`'s did move for #1308 and for #178,
+  because a handshake, a tag trailer and signatures are GRAMMAR: the question is always which of
+  the two changed.
 - The MAC is checked before any other claim is reported on, or a named refusal is an oracle. The
   expiry bounds how long a *captured* token is useful and is **not** a capacity bound.
 - A grant is spendable **once**, at the worker it names. The spend runs LAST, so a grant refused
@@ -539,25 +544,38 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   draw is a REFUSAL, never a fallback (#1527). Its test is CROSS-PROCESS, because an engine
   seeded once per process repeats only across processes.
 - Discovery never changes membership: it reports who proved the key and where.
-- **Every Raft peer connection proves the cluster key before a message is read** — through
-  `Consensus::IRaftPeerCredential` over `Cluster::SignFields`, under `SigningDomain` rows of its
-  own. Consensus without `--cluster-key-file` is a STARTUP refusal, never a per-connection
-  fallback, and the server and transport take the credential as a required constructor argument.
-- The ACCEPTOR challenges first and checks the MAC before any claim in the proof — then `OwnId`
-  before `WrongTarget`. The verdict is SIGNED, refusals included, so a dialler counts
-  `wrong_target` and `own_id` by name; `ended_by_acceptor` means only a close after the proof
-  with no signed verdict. **An unsigned refusal of a key holder is a confident wrong signal.**
-- Every session frame carries a MAC over both nonces and an implicit sequence number, and a
-  verified message naming a sender other than the proven dialler closes the connection. The ids
-  are bound and the ENDPOINT deliberately is not: a shared key cannot tell holders apart, and an
-  identity in the frame is #178's question.
-- `RaftWire::CurrentVersion` and `MinSupportedVersion` are both 3: the handshake changed the
-  GRAMMAR (2), and so did a configuration of two sets inside `InstallSnapshot` (3, #1449) — the
-  opposite of discovery's #402, where only the MAC input did. Accepting an older peer would be
-  the per-connection fallback, so a fleet upgrades its consensus members together.
+- **Every Raft peer connection proves each end's OWN identity key before a message is read**
+  (#178) — Ed25519 signatures through `Consensus::IRaftPeerIdentity` over `IRaftPeerKeys`, never the
+  pre-shared key, which proved "holds the key" and never WHICH holder. **Each signature covers the
+  WHOLE transcript**, ephemeral keys included, and a case changes each field in turn. Consensus
+  without an identity key is a STARTUP refusal, never a per-connection fallback; the start resolves
+  the key and PASSES it to the tier, and the server and transport take the identity as a required
+  constructor argument, their own id being the identity's.
+- The ACCEPTOR challenges first and checks the SIGNATURE before any claim in the proof — the
+  claimed id only selects the key — then `OwnId` before `WrongTarget`. An unknown key and a forged
+  proof are answered with NOTHING; the verdict is SIGNED for everything else, refusals and a
+  REVOKED key included, so a dialler counts `wrong_target`, `own_id` and `own_key_revoked` by name;
+  `ended_by_acceptor` means only a close after the proof with no signed verdict. **An unsigned
+  refusal of a member is a confident wrong signal.**
+- Every session frame carries an HMAC under the session key HKDF derives from both ends' ephemeral
+  X25519 keys (`Core/SessionSeal.hpp`), over an implicit sequence number, and a verified message
+  naming a sender other than the proven dialler closes the connection. The ids are bound and the
+  ENDPOINT deliberately is not.
+- **An applied `RevokeKey` closes the sessions that key proved, at their next frame**: both ends
+  re-ask the roster per frame (`StillProves`) — PULLED, because a push would close a reactor's
+  connection from the apply thread — and the redial is judged, and refused SIGNED, against the
+  roster as it is then. The roster is `--raft-peer`'s `@<key>` until the replicated state says
+  otherwise, and a bootstrap key the state REVOKED stays revoked, or a restart undoes a removal.
+- `RaftWire::CurrentVersion` and `MinSupportedVersion` are both 4: the handshake changed the
+  GRAMMAR (2), so did a configuration of two sets inside `InstallSnapshot` (3, #1449), and so did
+  signatures and ephemeral keys in every handshake frame (4, #178) — the opposite of discovery's
+  #402, where only the MAC input did. Accepting an older peer would be the per-connection fallback,
+  so a fleet upgrades its consensus members together.
 - `RaftClusterHarness` authenticates EVERY message through the real session objects, with a
-  REQUIRED credential factory and a nonce source apart from `_network`. An intruder case says
-  nothing without the formation case beside it staying green under the same neuter.
+  REQUIRED identity factory and a nonce source apart from `_network`; a machine's network NAME and
+  the id it proves are two things, which is how `Intrude` puts n3's twin on the wire as n2. An
+  intruder case says nothing without the formation case beside it staying green under the same
+  neuter.
 - `RaftNode` reads no clock, opens no socket and draws no randomness of its own.
 - A snapshot is durable before it is acknowledged, and the configuration travels inside it.
 - A snapshot reaches the APPLICATION on recovery AND on install: `RaftDriver::Create` restores a

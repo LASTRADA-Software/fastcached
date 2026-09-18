@@ -278,6 +278,28 @@ TEST_CASE("A minted key file is readable by its owner and nobody else", "[node][
 }
 #endif
 
+TEST_CASE("A node running consensus always holds an identity key", "[node][identity][key][consensus]")
+{
+    // #178: every Raft peer connection proves each end's own key, and `ConsensusTier` refuses to
+    // start without one. What keeps that refusal unreachable from any configuration is this
+    // implication, asserted over the shapes a consensus node comes in -- including the one that
+    // names NO --cluster-dir, whose state directory is the built-in default.
+    ScratchDirectory const scratch { "node-key-consensus" };
+
+    auto named = ClusteredNode(scratch.Path());
+    auto defaulted = named;
+    defaulted.clusterDir.clear();
+    auto joiner = named;
+    joiner.raftJoin = true;
+
+    for (auto const* const cfg: { &named, &defaulted, &joiner })
+    {
+        REQUIRE(RunsConsensus(*cfg));
+        CHECK(HoldsNodeKey(*cfg));
+        CHECK_FALSE(NodeKeyPath(*cfg).empty());
+    }
+}
+
 TEST_CASE("A node holds a key exactly when it has a state directory to keep one in", "[node][identity][key]")
 {
     ScratchDirectory const scratch { "node-key-holds" };

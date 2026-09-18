@@ -7,10 +7,9 @@
 // who is elected, what commits.
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/MembershipPolicy.hpp>
-#include <FastCache/Cluster/PskRaftPeerCredential.hpp>
+#include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/RaftClusterHarness.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -26,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -34,13 +34,17 @@ using FastCache::Testing::Unwrap;
 
 namespace
 {
-/// The key every member holds.
-/// @param who Which member; every one gets the same key.
-/// @return Its credential.
-[[nodiscard]] std::unique_ptr<Consensus::IRaftPeerCredential const> ClusterKey(Consensus::NodeId const& who)
+/// Who every member is: itself, under its own key, over one roster naming every machine a case
+/// here starts -- a later joiner included, as an operator admitting it with its key makes it.
+/// @return The factory the harness requires.
+[[nodiscard]] Consensus::RaftClusterHarness::IdentityFactory Identities()
 {
-    std::ignore = who;
-    return std::make_unique<PskRaftPeerCredential const>(SecureByteBuffer(32, std::byte { 0x5A }));
+    auto roster =
+        std::shared_ptr<Testing::SharedRoster const> { Testing::SharedRoster::Of({ "n1", "n2", "n3", "n4", "n5" }) };
+    return
+        [roster = std::move(roster)](Consensus::NodeId const& who) -> std::unique_ptr<Consensus::IRaftPeerIdentity const> {
+            return Testing::TestPeerIdentity::Honest(who, roster);
+        };
 }
 
 /// Where member `n<k>` answers consensus: a machine of its own, `10.0.0.<k>`.
@@ -80,14 +84,14 @@ class Fleet
     /// @param ids Every member, each a voter.
     explicit Fleet(std::vector<Consensus::NodeId> ids):
         _ids { ids },
-        _cluster { std::move(ids), ClusterKey }
+        _cluster { std::move(ids), Identities() }
     {
     }
 
     /// @param configuration The voters and the learners, every one bootstrapped with both.
     explicit Fleet(Consensus::Configuration const& configuration):
         _ids { MembersOf(configuration) },
-        _cluster { configuration, ClusterKey }
+        _cluster { configuration, Identities() }
     {
     }
 

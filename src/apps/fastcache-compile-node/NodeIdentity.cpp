@@ -268,6 +268,18 @@ std::optional<std::string> SelfKeyContradiction(NodeConfig const& cfg, std::opti
                        FormatEd25519PublicKey(*held));
 }
 
+std::string DescribeIdentity(std::string_view id, Ed25519PublicKey const& key, std::optional<std::string> const& dialAddress)
+{
+    auto const spelled = FormatEd25519PublicKey(key);
+    auto text = std::string {};
+    if (!id.empty())
+        text += std::format("node-id {}\n", id);
+    text += std::format("public-key {}\n", spelled);
+    if (!id.empty() && dialAddress.has_value())
+        text += std::format("raft-peer {}={}@{}\n", id, *dialAddress, spelled);
+    return text;
+}
+
 void ApplyNodeIdentity(NodeConfig& cfg, NodeIdentity const& identity)
 {
     // The key first, because it does not need an id: a node that runs no consensus has

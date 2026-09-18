@@ -482,16 +482,17 @@ using Node::NodeReloader;
 ///
 /// A function rather than a block in `main` for `AdoptNodeIdentity`'s reason, and what it
 /// decides is `NodeKey`'s: this only reports it. The PUBLIC half is logged whole, in the one
-/// spelling `--node-status` and `@<key>` share; the secret half is never logged, and is
-/// released when this returns -- nothing in this build signs with it yet (#178 PR 3), so it is
-/// not held a moment longer than reading it back needed.
+/// spelling `--node-status` and `@<key>` share; the secret half is never logged. It is held
+/// for the process's life, because the Raft peer wire signs every handshake with it (#178),
+/// and read ONCE: the key a node announces and the key it proves itself with are then one
+/// reading of one file rather than two that a replaced file could make disagree.
 /// @param cfg The resolved configuration.
 /// @param random Where a minted key's seed comes from.
 /// @param logger Where the key, or its absence, is reported.
-/// @return The public key, DISENGAGED on a node that holds none, or why there is none.
-[[nodiscard]] std::expected<std::optional<Ed25519PublicKey>, std::string> AdoptNodeKey(NodeConfig const& cfg,
-                                                                                       ISecureRandom& random,
-                                                                                       ILogger& logger)
+/// @return The key pair, DISENGAGED on a node that holds none, or why there is none.
+[[nodiscard]] std::expected<std::optional<Ed25519KeyPair>, std::string> AdoptNodeKey(NodeConfig const& cfg,
+                                                                                     ISecureRandom& random,
+                                                                                     ILogger& logger)
 {
     auto nodeKey = Node::ResolveNodeKeyFor(cfg, random);
     if (!nodeKey.has_value())
@@ -499,18 +500,29 @@ using Node::NodeReloader;
     if (!nodeKey->has_value())
     {
         logger.Logf(LogLevel::Info, "{}", Node::NoNodeKeySentence);
-        return std::optional<Ed25519PublicKey> {};
+        return std::optional<Ed25519KeyPair> {};
     }
 
-    auto const& held = **nodeKey;
+    auto& held = **nodeKey;
     logger.Logf(LogLevel::Info,
                 "identity key {} ({})",
                 FormatEd25519PublicKey(held.pair.PublicKey()),
                 Node::DescribeNodeKeyOrigin(held.origin));
-    return std::optional { held.pair.PublicKey() };
+    return std::optional { std::move(held.pair) };
 }
 
-[[nodiscard]] int WorkerBody(NodeConfig const& cfg, ILogger& logger, NodeReloader* reloader)
+/// The public half of a key this node may hold.
+/// @param key The key pair, or nothing.
+/// @return Its public key, or nothing.
+[[nodiscard]] std::optional<Ed25519PublicKey> PublicHalf(std::optional<Ed25519KeyPair> const& key)
+{
+    return key.transform([](Ed25519KeyPair const& pair) { return pair.PublicKey(); });
+}
+
+[[nodiscard]] int WorkerBody(NodeConfig const& cfg,
+                             std::optional<Ed25519KeyPair> const& identityKey,
+                             ILogger& logger,
+                             NodeReloader* reloader)
 {
     // ONE origin for every uptime this process reports. `/healthz` and the `0xFC`
     // `NodeStatus` verb both answer *how long has this been serving*, and two
@@ -1091,6 +1103,7 @@ using Node::NodeReloader;
         Node::StartConsensusOrExplain(cfg,
                                       schedulerTier,
                                       nodeSurface != nullptr ? nodeSurface->BoundEndpoint() : std::string {},
+                                      identityKey,
                                       membership,
                                       metrics,
                                       logger);
@@ -1461,6 +1474,57 @@ struct EarlyVerbRow
     return ExitUsage;
 }
 
+/// Print this node's identity, minting what the state directory does not hold yet
+/// (`--print-identity`, #178).
+///
+/// **Minting is the point, not a side effect**, which is what separates this verb from every
+/// other one in `EarlyVerbs`: a cluster's members each need every other member's key on their
+/// `--raft-peer` before any of them starts, and the key does not exist until something mints
+/// it. The start that follows reads the same files back as `Recorded`. Through the resolvers
+/// the start uses, so an id or a key this prints is the one that start will run as -- and a
+/// key file that is there and cannot be used is refused here exactly as it is there.
+/// @param context The configuration and the console logger.
+/// @return `ExitOk` once printed; `ExitUsage` for a node with nowhere to keep an identity, or
+///         one whose identity could not be read or minted.
+[[nodiscard]] int RunPrintIdentity(EarlyVerbContext const& context)
+{
+    auto& cfg = context.cfg;
+    if (!Node::HoldsNodeKey(cfg))
+    {
+        context.logger.Logf(LogLevel::Error, "{}", Node::PrintIdentityNeedsStateDirectory);
+        return ExitUsage;
+    }
+
+    SystemSecureRandom random;
+    auto key = Node::ResolveNodeKeyFor(cfg, random);
+    if (!key.has_value() || !key->has_value())
+    {
+        context.logger.Logf(LogLevel::Error,
+                            "{}",
+                            key.has_value() ? std::string { Node::PrintIdentityNeedsStateDirectory } : key.error().message);
+        return ExitUsage;
+    }
+    auto const publicKey = (*key)->pair.PublicKey();
+
+    auto dialAddress = std::optional<std::string> {};
+    if (RunsConsensus(cfg))
+    {
+        auto identity = Node::ResolveNodeIdentity(Node::NodeStateDirectory(cfg), cfg.nodeId, random);
+        if (!identity.has_value())
+        {
+            context.logger.Logf(LogLevel::Error, "{}", identity.error());
+            return ExitUsage;
+        }
+        identity->publicKey = publicKey;
+        Node::ApplyNodeIdentity(cfg, *identity);
+        if (auto const dial = ConsensusDialAddressOf(cfg); dial.has_value())
+            dialAddress = *dial;
+    }
+
+    std::cout << Node::DescribeIdentity(cfg.nodeId, publicKey, dialAddress);
+    return ExitOk;
+}
+
 /// Write the packaged configuration template to this binary's own system path
 /// (`--seed-config`).
 ///
@@ -1615,7 +1679,7 @@ struct EarlyVerbRow
 /// Each row carries the reason it sits where it does. That ordering used to be expressed
 /// by the LAYOUT of seven `if` blocks in `main` -- true, readable only by scrolling, and
 /// with nothing that made reordering them show up as a change to the thing being ordered.
-constexpr std::array<EarlyVerbRow, 8> EarlyVerbs { {
+constexpr std::array<EarlyVerbRow, 9> EarlyVerbs { {
     // **Below the logger and still above the startup table** (#582). Its refusal has to
     // reach the same terminal a start prints to, rendered the same way -- an operator
     // who meets that sentence here and again at boot should be reading one message, not
@@ -1624,6 +1688,12 @@ constexpr std::array<EarlyVerbRow, 8> EarlyVerbs { {
     // withholding the map until the configuration is valid would withhold it exactly
     // when it is wanted. It opens nothing, so there is no state to protect.
     { .applies = [](NodeConfig const& cfg) { return cfg.printSurfaces; }, .run = &RunPrintSurfaces },
+
+    // Beside the worksheet and for its reason: it is reached for while a cluster is being
+    // PUT TOGETHER, before any member's command line is complete -- each needs the others'
+    // keys -- so gating it on the startup rules would withhold it exactly when it is wanted.
+    // Unlike the worksheet it writes, and deliberately: see `RunPrintIdentity`.
+    { .applies = [](NodeConfig const& cfg) { return cfg.printIdentity; }, .run = &RunPrintIdentity },
 
     // Seeding, ahead of the startup table for `--print-surfaces`' reason: it is an
     // INSTALLER step, run before this machine has a working configuration at all, so
@@ -1956,14 +2026,15 @@ int main(int argc, char** argv)
     // none there; a key file that is there and cannot be used is a refusal, never a re-mint.
     // A node with no state directory holds none, and says so.
     SystemSecureRandom identityRandom;
-    auto const publicKey = AdoptNodeKey(cfg, identityRandom, logger);
-    if (!publicKey.has_value())
+    auto const identityKey = AdoptNodeKey(cfg, identityRandom, logger);
+    if (!identityKey.has_value())
     {
-        logger.Logf(LogLevel::Error, "{}; refusing to start", publicKey.error());
+        logger.Logf(LogLevel::Error, "{}; refusing to start", identityKey.error());
         return ExitUsage;
     }
+    auto const publicKey = PublicHalf(*identityKey);
 
-    auto const identity = AdoptNodeIdentity(cfg, cliOnly, identityRandom, logger, *publicKey);
+    auto const identity = AdoptNodeIdentity(cfg, cliOnly, identityRandom, logger, publicKey);
     if (!identity.has_value())
     {
         logger.Logf(LogLevel::Error, "{}; refusing to start", identity.error());
@@ -1972,7 +2043,7 @@ int main(int argc, char** argv)
 
     // An `@<key>` this node's own `--raft-peer` states is a claim about the machine it is
     // typed on, so one that is not the key it holds is refused rather than announced.
-    if (auto const contradiction = Node::SelfKeyContradiction(cfg, *publicKey); contradiction.has_value())
+    if (auto const contradiction = Node::SelfKeyContradiction(cfg, publicKey); contradiction.has_value())
     {
         logger.Logf(LogLevel::Error, "{}; refusing to start", *contradiction);
         return ExitUsage;
@@ -2148,5 +2219,6 @@ int main(int argc, char** argv)
         host = std::make_unique<ForegroundHost>();
 
     auto* const reloaderPtr = reloader.has_value() ? &*reloader : nullptr;
-    return host->Run([&cfg, &logger, reloaderPtr] { return WorkerBody(cfg, logger, reloaderPtr); });
+    return host->Run(
+        [&cfg, &identityKey, &logger, reloaderPtr] { return WorkerBody(cfg, *identityKey, logger, reloaderPtr); });
 }

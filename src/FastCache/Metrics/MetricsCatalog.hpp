@@ -955,41 +955,41 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedProof,
       .prometheusName = "fastcache_raft_peer_connections_refused_proof_total",
-      .help = "Raft peer connections refused because the proof did not verify against this node's cluster key: the "
-              "dialler holds a different key, or none. The address is in the log line; no id is, because an id "
-              "nobody proved is not one worth printing. On a healthy fleet this is flat at zero, so any rise is a "
-              "machine with the wrong --cluster-key-file or something that is not a member at all.",
+      .help = "Raft peer connections refused because the proof's signature did not verify under the key this node "
+              "holds for the id it claims: another machine claiming that member's id, which only the member's own "
+              "private key can prove. No verdict is sent. On a healthy fleet this is flat at zero, so any rise is "
+              "an impersonation attempt or a member whose key file was replaced without re-admitting it.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedWrongTarget,
       .prometheusName = "fastcache_raft_peer_connections_refused_wrong_target_total",
-      .help = "Raft peer connections from a dialler that proved the key but dialled another member at this address: "
+      .help = "Raft peer connections from a dialler that proved its id but dialled another member at this address: "
               "its record of where that member answers is stale, usually because a node moved or two swapped "
               "addresses. Refused with a signed verdict, so the dialler reports it by name rather than as a key "
               "problem. The log names both ids.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedOwnId,
       .prometheusName = "fastcache_raft_peer_connections_refused_own_id_total",
-      .help = "Raft peer connections from a dialler that proved the key under THIS node's own id: two machines "
-              "answer to one identity, which is a copied --cluster-dir or a duplicated --node-id. Refused with a "
-              "signed verdict. Never ordinary; the address in the log is the second machine.",
+      .help = "Raft peer connections from a dialler that proved THIS node's own id, which only this node's private "
+              "key can do: two machines hold one identity, which is a copied --cluster-dir. Refused with a signed "
+              "verdict. Never ordinary; the address in the log is the second machine.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerFramesRefusedTag,
       .prometheusName = "fastcache_raft_peer_frames_refused_tag_total",
-      .help = "Raft connections closed because a frame's tag did not verify on a connection that had proved the "
-              "key: a frame changed, injected, replayed, reordered or carried over from another connection. A "
-              "correct peer never produces one, so a rise is the network path or something on it.",
+      .help = "Raft connections closed because a frame's tag did not verify under the connection's own session key: "
+              "a frame changed, injected, replayed, reordered or carried over from another connection. A correct "
+              "peer never produces one, so a rise is the network path or something on it.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerFramesRefusedSender,
       .prometheusName = "fastcache_raft_peer_frames_refused_sender_total",
       .help = "Raft connections closed because a frame whose tag verified carried a message naming a sender other "
-              "than the id its connection proved. Only a holder of the key can produce one, so a rise is a defect "
-              "in a member rather than an attacker.",
+              "than the id its connection proved. Only the proven member can produce one, so a rise is a defect in "
+              "a member rather than an attacker.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedFull,
       .prometheusName = "fastcache_raft_peer_connections_refused_full_total",
       .help = "Raft peer connections closed on arrival because the listener already served as many as it holds. A "
               "cluster needs one per peer, so a rise is something opening connections it does not need -- the last "
-              "thing a stranger can still do before proving the key, now that a silent connection is closed at the "
+              "thing a stranger can still do before proving an id, now that a silent connection is closed at the "
               "handshake bound.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedTimeout,
@@ -1006,9 +1006,9 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedAcceptorProof,
       .prometheusName = "fastcache_raft_peer_dials_refused_acceptor_proof_total",
-      .help = "Raft dials abandoned because the acceptor's signed verdict did not verify against this node's key: "
-              "whatever answers at that address does not hold the cluster key. Nothing was sent to it. On a healthy "
-              "fleet flat at zero; a rise names an address that is not the member this node dialled.",
+      .help = "Raft dials abandoned because the acceptor's verdict did not verify under the key this node holds for "
+              "the member that answered: another machine answering under that id. Nothing was sent to it. On a "
+              "healthy fleet flat at zero; a rise names an address that is not the member it claims to be.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedWrongTarget,
       .prometheusName = "fastcache_raft_peer_dials_refused_wrong_target_total",
@@ -1018,21 +1018,65 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedOwnId,
       .prometheusName = "fastcache_raft_peer_dials_refused_own_id_total",
-      .help = "Raft dials refused, by a verified verdict, because the acceptor answers to this node's own id: two "
-              "machines share an identity, a copied --cluster-dir or a duplicated --node-id.",
+      .help = "Raft dials refused, by a verified verdict, because the acceptor proved this node's own id from this "
+              "node: two machines hold one private key, a copied --cluster-dir.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerDialsEndedByAcceptor,
       .prometheusName = "fastcache_raft_peer_dials_ended_by_acceptor_total",
       .help = "Raft dials the acceptor closed after this node sent its proof, without a signed verdict. The causes "
-              "are the ones an acceptor cannot sign: this node's key is not the acceptor's, or the acceptor refused "
-              "the proof's shape or ran out of handshake time. Never a stale address or a shared identity, which "
-              "arrive signed and have series of their own.",
+              "are the ones an acceptor cannot sign: it holds no key for this node's id, or a different one, or it "
+              "refused the proof's shape or ran out of handshake time. Never a stale address, a shared identity or "
+              "a revoked key, which arrive signed and have series of their own.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::ClusterAdmissionsRefusedMalformedKey,
       .prometheusName = "fastcache_cluster_admissions_refused_malformed_key_total",
       .help = "cluster-admit requests the leader refused because the member's identity key was not one: not 43 "
               "base64url characters naming 32 bytes. Nothing was proposed. This project's clients check the key "
               "where it is typed, so a rise names a client that does not.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedUnknownKey,
+      .prometheusName = "fastcache_raft_peer_connections_refused_unknown_key_total",
+      .help = "Raft peer connections refused because this node holds no key for the id the proof claims, so "
+              "nothing could be verified and nothing was answered. A member whose key was never given -- a "
+              "--raft-peer without @<key>, or a member admitted without one -- or a machine that is not a member "
+              "at all. The address is in the log line and the claimed id is not: nobody proved it.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedRevokedKey,
+      .prometheusName = "fastcache_raft_peer_connections_refused_revoked_key_total",
+      .help = "Raft peer connections refused because the proof verified under a key the cluster has REVOKED: the "
+              "removed machine itself, still dialling. Answered with a signed verdict saying so, so the removed "
+              "machine reports its own revocation rather than a key problem here. Expected briefly after a "
+              "--cluster-forget of a key; a steady rate is a machine nobody stopped.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::RaftPeerConnectionsEndedKeyWithdrawn,
+      .prometheusName = "fastcache_raft_peer_connections_ended_key_withdrawn_total",
+      .help = "Proven Raft peer connections this node closed because the key the dialler proved them with stopped "
+              "being that member's in the cluster's roster: revoked, or replaced by a re-admission. Checked on "
+              "every frame, so a revocation reaches every open connection at the next message rather than when "
+              "the connection happens to break.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedAcceptorKeyUnknown,
+      .prometheusName = "fastcache_raft_peer_dials_refused_acceptor_key_unknown_total",
+      .help = "Raft dials abandoned because this node holds no key for the member that answered, so its verdict "
+              "could not be verified. Nothing was sent to it. Give the member's key with @<key> on --raft-peer, "
+              "or wait for the cluster to replicate it.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedAcceptorKeyRevoked,
+      .prometheusName = "fastcache_raft_peer_dials_refused_acceptor_key_revoked_total",
+      .help = "Raft dials abandoned because the member that answered signed with a key the cluster has revoked: a "
+              "removed machine still answering at an address this node dials. Nothing was sent to it.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::RaftPeerDialsRefusedOwnKeyRevoked,
+      .prometheusName = "fastcache_raft_peer_dials_refused_own_key_revoked_total",
+      .help = "Raft dials refused, by a verified verdict, because the acceptor's roster has revoked THIS node's "
+              "key: this machine was removed from the cluster. It never clears by itself; the machine must mint a "
+              "new identity -- a fresh --cluster-dir -- and be admitted under it.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::RaftPeerDialsEndedKeyWithdrawn,
+      .prometheusName = "fastcache_raft_peer_dials_ended_key_withdrawn_total",
+      .help = "Proven Raft sessions this node ended before sending a frame, because the key the acceptor proved "
+              "the session with stopped being that member's in the cluster's roster: revoked, or replaced. The "
+              "redial that follows is judged against the roster as it is now.",
       .type = MetricType::Counter },
 } };
 

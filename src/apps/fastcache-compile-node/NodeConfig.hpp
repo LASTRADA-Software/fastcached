@@ -830,6 +830,12 @@ struct NodeConfig
 
     bool printSurfaces { false };
 
+    /// `--print-identity`: print this node's id, its public key and the `--raft-peer` token
+    /// its peers type, minting whatever the state directory does not hold yet, and exit
+    /// (#178). What an operator bootstrapping a cluster needs from every member BEFORE any of
+    /// them starts, since each member's `--raft-peer` has to name every other member's key.
+    bool printIdentity { false };
+
     /// This node's identity key as the start resolved it, or absent on a node that holds
     /// none (#178).
     ///
@@ -1375,24 +1381,29 @@ inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
     "--listen-raft turns consensus on and no --raft-peer names this node: it must name the endpoint its peers "
     "dial, whether it bootstraps a cluster or joins one, and consensus cannot start without one";
 
-/// Why a node running consensus with no `--cluster-key-file` cannot start (#1308).
+/// Why a node running consensus with no `--cluster-key-file` cannot start (#1308, #178).
 ///
-/// A named constant for `ConsensusNamesNoSelfPeerRefusal`'s reason: the startup table
-/// refuses the configuration where an operator is watching, and `ConsensusTier::Start`
-/// answers with this same string for a `NodeConfig` no argv produced. It ends without a
+/// A named constant for `ConsensusNamesNoSelfPeerRefusal`'s reason, and it ends without a
 /// full stop for the same reason that one does.
 ///
-/// **Decided once, before anything is served, and never per connection.** A node that
-/// ran consensus unsigned when it had no key would be the fallback where the port is open
-/// and every refusal counter reads zero -- which is the shape the worker's lease rule
-/// (#282) refuses, one surface over. It is also not a node that could work: every peer
-/// connection proves the key before a single message is read, so a keyless member could
-/// neither be heard nor hear anybody.
+/// **The reason MOVED at #178 and the rule did not.** It was the Raft peer wire: every
+/// connection between members proved the pre-shared key. That wire now proves each node's OWN
+/// identity key, which a consensus node always holds (`HoldsNodeKey`), so the tier no longer
+/// reads this file at all. What still needs it on a consensus node is everything the key has
+/// not been retired from yet -- the scheduler's leases, a member's proof on the `0xFC` surface,
+/// and the key an enrollment window hands a joiner, which `ServesEnrollment` relies on
+/// consensus implying. Relaxing this before those move would leave each of them to decide
+/// what "no key" means on its own; #178 retires the key surface by surface, and this rule goes
+/// with the last of them.
+///
+/// **Decided once, before anything is served, and never per connection** -- the shape the
+/// worker's lease rule (#282) takes one surface over.
 inline constexpr std::string_view ConsensusNeedsClusterKeyRefusal =
-    "--listen-raft turns consensus on, and consensus needs --cluster-key-file: every connection between members "
-    "proves the cluster's pre-shared key before a message is read, so a node without the key could neither be heard "
-    "nor hear anybody. Give every member the same key file -- generate one with `head -c 32 /dev/urandom | base64`, "
-    "or run --enroll-from against a member to be handed it -- or drop --listen-raft to run one machine alone";
+    "--listen-raft turns consensus on, and consensus needs --cluster-key-file: the cluster's pre-shared key no "
+    "longer proves anything between members, which each member's own identity key does, but it still signs the "
+    "scheduler's leases, proves a member on the node port and is what an enrollment window hands a joiner. Give "
+    "every member the same key file -- generate one with `head -c 32 /dev/urandom | base64`, or run --enroll-from "
+    "against a member to be handed it -- or drop --listen-raft to run one machine alone";
 
 /// Why a node with no worker, no scheduler, no consensus and no cache tier is refused.
 inline constexpr std::string_view NodeRunsNothingRefusal =

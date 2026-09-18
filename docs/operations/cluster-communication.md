@@ -371,7 +371,7 @@ client's own cache connection.
 | `fastcache-cc` | the leader's scheduler | `:6675` | a **second** connection, on every path out of the compile | `RELEASE` |
 | a **node** | the leader's scheduler | `--scheduler`, `:6675` | `REGISTER` once per toolchain, then `HEARTBEAT` every **20 s** | capacity, load, and its closed history buckets |
 | a node | the shared cache | `--upstream`, `:6674` | once per operation, best-effort | `FETCH`, `STORE` — **the only leg that carries a credential** |
-| a node | another node | `--listen-raft` (no conventional number) | long-lived; the leader speaks every **50 ms** | consensus, after a handshake proving the cluster key, with every frame tagged. Its own framing, not the cache protocol |
+| a node | another node | `--listen-raft` (no conventional number) | long-lived; the leader speaks every **50 ms** | consensus, after a handshake proving each end's identity key, with every frame tagged. Its own framing, not the cache protocol |
 | a node | the local segment | `--discovery`, UDP, plus a per-node reply port | a beacon every **15 s** | who is here, then a challenge and a proof |
 | an operator | the leader's scheduler | `:6675` | on demand | `CLUSTER-STATUS`, `-SET`, `-FORGET`, `-ADMIT` |
 | a browser or scraper | a node's `--admin-listen`, or `fastcached`'s `--metrics` (default `:9259`) | as configured | on demand | HTTP: `/fleet`, `/fleet.json`, `/metrics`, `/healthz` |
@@ -512,11 +512,13 @@ Connections between peers are long-lived; the leader speaks to each follower eve
 starts an election. It is a private binary protocol, distinct from the compile
 cache's — pointing a cache client at it gets nothing useful.
 
-**Every consensus connection proves the cluster key before a single message is
-read**, so every member needs `--cluster-key-file`, and a node given `--listen-raft`
-without one refuses to start, naming the flag. That is the one leg of this page
-whose every byte is authenticated; what it checks and how a failure shows is under
-[Raft peer authentication](#raft-peer-authentication).
+**Every consensus connection proves which member is at each end before a single
+message is read**, each with its own identity key, so every member's `--raft-peer` list
+names every other member's key. That is the one leg of this page whose every byte is
+authenticated; what it checks and how a failure shows is under
+[Raft peer authentication](#raft-peer-authentication). Every member still needs
+`--cluster-key-file` too, for the leases and enrollment, and a node given `--listen-raft`
+without one refuses to start, naming the flag.
 
 That cadence is the reason the consensus port wants a network that is not
 congested. Nothing breaks if it is — an election settles again — but leadership
@@ -838,91 +840,127 @@ in front of every port.
 
 The credentials that are real and unaffected: `--dashboard-token-file` for the fleet
 page, and `fastcached`'s own `--requirepass` for the shared cache. **The cluster key
-is real too, in two places**: every consensus connection proves it (next), and the
-scheduler signs every lease grant with it ([below](#the-lease-token-and-what-it-buys)).
+is real too**: the scheduler signs every lease grant with it
+([below](#the-lease-token-and-what-it-buys)). And every consensus connection proves each
+member's own identity key (next), which is stronger than any shared key: it proves WHICH
+machine, and removing one is a single revocation rather than a new key everywhere.
 
 ### Raft peer authentication
 
-The consensus port checks the cluster key on every connection, before it reads a
-message. Anything that can reach `--listen-raft` used to be able to vote, depose a
-leader or replicate a log under any member's name, because each message names its own
-sender and nothing tied that name to the connection. Now each connection opens with a
-handshake, in this order:
+The consensus port checks, on every connection and before it reads a message, that the
+machine at the other end IS the member it claims to be. Anything that can reach
+`--listen-raft` used to be able to vote, depose a leader or replicate a log under any
+member's name, because each message names its own sender and nothing tied that name to the
+connection. Each connection now opens with a handshake, in this order:
 
-1. **The accepting node sends a challenge** — a fresh random nonce — before it has read
-   anything. It signs nothing for a peer that has not proved the key yet.
-2. **The dialling node answers with a proof**: its own id, the id of the member it
-   meant to dial, a nonce of its own, and an HMAC-SHA256 over both nonces and both ids
-   under the cluster's pre-shared key.
-3. **The acceptor checks the MAC first**, and only then the claims. It answers with a
-   **signed verdict** — accepted, *you dialled another member*, or *that id is mine* —
-   and closes on either refusal.
-4. **The dialler checks the verdict's signature** before it sends a single consensus
-   message. Every message after that carries a 32-byte tag over both nonces, a running
-   sequence number and the message itself.
+1. **The accepting node sends a challenge** — a fresh random nonce and an ephemeral key —
+   before it has read anything. It signs nothing for a peer that has not proved who it is.
+2. **The dialling node answers with a proof**: its own id, the id of the member it meant
+   to dial, a nonce and an ephemeral key of its own, and an **Ed25519 signature** over all
+   of that and the challenge, made with its own [identity key](../tools/fastcache-compile-node.md#its-identity-key).
+3. **The acceptor checks the signature first**, under the key the cluster records for the
+   id the proof claims, and only then the claims. It answers with a **signed verdict** —
+   accepted, *you dialled another member*, *that id is mine*, or *your key is revoked* —
+   and closes on any refusal.
+4. **The dialler checks the verdict's signature** under the key the cluster records for
+   the member that answered, before it sends a single consensus message. Both ends then
+   derive a session key from the two ephemeral keys, which neither sent, and every message
+   after that carries a 32-byte tag under it over a running sequence number and the message.
+
+Each signature covers everything the handshake has carried so far, so nothing on the path
+can change one field — least of all an ephemeral key, which would let it share the session
+key with each end — and keep the signature.
 
 What that refuses, and what it does not:
 
-- **A node without the cluster's key, or with none**, is refused before anything it
-  sent is read, so it cannot vote. It hears nothing either: a member dialling it is
-  refused the same way from the other side, and sends it no message.
+- **A machine claiming a member's id it cannot prove** is refused before anything it sent
+  is read, so it cannot vote. That includes a former member holding every byte it ever
+  held — its own key, the cluster key, the log — claiming another member's id: only that
+  member's own key signs as it. It hears nothing either: a member dialling it is refused the
+  same way from the other side, and sends it no message.
+- **A machine the cluster has removed** — its key revoked — is refused with a signed
+  *your key is revoked*, whatever id it claims, so it reports its own removal rather than a
+  key problem somewhere else. **Revoking a key closes the connections it proved at their next message**: both
+  ends ask the cluster's record of keys again for every message, so a revocation reaches an
+  open connection within a heartbeat, and its redial is refused. Nothing on any other
+  member changes — no key is rotated anywhere.
 - **A recorded connection, replayed later**, fails against a new challenge. **A message
   replayed, reordered, dropped or injected** into a live connection fails its tag, and so
-  does one spliced in from another connection.
+  does one spliced in from another connection, which agreed another key.
 - **A message naming a sender other than the member the connection proved** closes the
   connection. The proven id is the one consensus acts on.
 - **It does not encrypt.** Log entries — membership, settings — cross in cleartext, as
   before.
-- **It proves "holds the cluster key", not which machine holds it.** Every member shares
-  one key, so a machine holding it can claim any member's id. Treat the key file as the
-  cluster: a leaked key is a new member.
 - **The address is deliberately not part of the proof.** A node binds the wildcard and
   its peers reach it through `--raft-self` or NAT, so the two ends could never state the
   address identically; a relay elsewhere can only forward messages whose tags it cannot
   make.
 
-**A node running consensus without `--cluster-key-file` does not start.** The refusal
-names the flag and both ways to satisfy it — generate one key for the fleet
-(`head -c 32 /dev/urandom | base64`) and copy it to every member, or run
-`--enroll-from` against a member to be handed it. A key file that is named but cannot
-be read is refused when consensus starts, before it binds its port or dials anybody. It
-is decided once,
-at startup, and never per connection: a node that quietly ran consensus unsigned when
-it had no key would look healthy from both ends while trusting anybody.
+**Where the keys come from.** A member's key is what the cluster records for it —
+`--cluster-admit` states it, and a leader announces its own — and, until the cluster has
+recorded anything, what that node's command line types after its address:
+`--raft-peer=n2=10.0.0.2:6680@<key>`. The cluster's record wins wherever it says anything,
+and a key the cluster has revoked stays revoked whatever a command line says. So **every
+member's `--raft-peer` list names every other member's key** when a cluster is first
+formed; a member named without one cannot be verified, and a cluster none of whose members
+were given keys does not form. `fastcache-compile-node --print-identity`, run with a node's
+own flags and as the account it runs as, mints its identity into its state directory and
+prints the token its peers type:
 
-**Upgrading.** The consensus wire moved to version 2 with this handshake, and a version 2
-node and an older one cannot talk at all — there is no compatibility mode, on purpose,
-because an older peer authenticates nothing and accepting one would be the fallback
-the handshake exists to refuse. So:
+```
+node-id n1
+public-key 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+raft-peer n1=10.0.0.1:6680@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+```
 
-- provision the key on **every** consensus member first — a member without one will not
-  start on the new build;
+**A node running consensus without an identity key does not start**, and no configuration
+leads there: a node that runs consensus always has a state directory, and mints its key into
+it on its first start. It is decided once, at startup, and never per connection: a node that
+quietly ran consensus unsigned would look healthy from both ends while trusting anybody.
+`--cluster-key-file` is still required on a consensus node, for the leases, the node port
+and enrollment, which still use it — but it no longer proves anything on this port.
+
+**Upgrading.** The consensus wire moved to version 4 with identity keys (it was 2 with the
+first handshake, which proved the cluster key, and 3 with learners). A version 4 node and an
+older one cannot talk at all — there is no compatibility mode, on purpose, because an older
+peer proves only the cluster key and accepting one would be the fallback the handshake
+exists to refuse. So:
+
+- print every consensus member's identity with `--print-identity` and give each member's
+  `--raft-peer` list every other member's `@<key>` first — a cluster whose members cannot
+  verify each other does not form;
 - then upgrade **all** consensus members together. A mixed cluster shows as
-  `fastcache_raft_peer_dials_refused_timeout_total` on the new nodes (an older peer
-  never sends a challenge) and `fastcache_raft_peer_connections_refused_no_handshake_total`
-  on them as well (an older peer sends a consensus message where a proof belongs).
+  `fastcache_raft_peer_dials_refused_no_challenge_total` on the new nodes (an older peer's
+  challenge is at another version) and `fastcache_raft_peer_connections_refused_no_handshake_total`
+  on them as well (an older peer's proof is at another version).
 
 **How long a handshake may take.** Five seconds, at either end. An accepting node closes
-a connection that has not proved the key by then — before, a connection that sent
-nothing held a slot for as long as its socket lived — and a dialling node gives up on an
-address that sent no challenge or no verdict, then retries on its ordinary backoff.
+a connection that has not proved an id by then — before, a connection that sent nothing
+held a slot for as long as its socket lived — and a dialling node gives up on an address
+that sent no challenge or no verdict, then retries on its ordinary backoff.
 
 **Reading a refusal.** Every refusal has its own counter, on the node that saw it, and the
 same misconfiguration usually shows on both ends of the connection:
 
 | You see | On the accepting node | On the dialling node | Meaning |
 |---|---|---|---|
-| A key mismatch | `..._connections_refused_proof_total` | `..._dials_ended_by_acceptor_total` | The dialler's key is not the acceptor's. The acceptor cannot sign a verdict for a proof it could not check, so the dialler sees the connection close |
-| An impostor at a member's address | — (it is not a member) | `..._dials_refused_acceptor_proof_total` | Whatever answers there signed its verdict with another key. Nothing was sent to it |
-| A stale address | `..._connections_refused_wrong_target_total` | `..._dials_refused_wrong_target_total` | Both hold the key, and the address answers as a different member. The logs name both ids |
-| One identity on two machines | `..._connections_refused_own_id_total` | `..._dials_refused_own_id_total` | A copied `--cluster-dir` or a duplicated `--node-id`. The accepting node's log names the second machine's address |
+| A key never given | `..._connections_refused_unknown_key_total` | `..._dials_ended_by_acceptor_total` | The acceptor holds no key for the id the dialler claims: a `--raft-peer` without `@<key>`, a member admitted without one, or a machine that is not a member. It cannot sign a verdict for a proof it could not check, so the dialler sees the connection close |
+| A member's id, claimed by another machine | `..._connections_refused_proof_total` | `..._dials_ended_by_acceptor_total` | The proof did not verify under the key the acceptor holds for that id |
+| A key this node was never given | — | `..._dials_refused_acceptor_key_unknown_total` | The member that answered signed its verdict, and this node holds no key to check it with. Nothing was sent to it |
+| An impostor at a member's address | — (it is not a member) | `..._dials_refused_acceptor_proof_total` | Whatever answers there signed its verdict with a key that is not the member's. Nothing was sent to it |
+| A removed machine, still dialling | `..._connections_refused_revoked_key_total` | `..._dials_refused_own_key_revoked_total` | Its key is revoked. The acceptor says so, signed; the removed machine needs a new identity and a new admission |
+| A removed machine, still answering | — | `..._dials_refused_acceptor_key_revoked_total` | The member at that address signed with a revoked key |
+| A key revoked mid-connection | `..._connections_ended_key_withdrawn_total` | `..._dials_ended_key_withdrawn_total` | The connection had proved a key the cluster no longer holds for that member, and was closed at its next message |
+| A stale address | `..._connections_refused_wrong_target_total` | `..._dials_refused_wrong_target_total` | Both proved their ids, and the address answers as a different member. The logs name both ids |
+| One identity on two machines | `..._connections_refused_own_id_total` | `..._dials_refused_own_id_total` | A copied `--cluster-dir`: two machines holding one private key. The accepting node's log names the second machine's address |
 | An old build, or not a consensus port | `..._connections_refused_no_handshake_total` | `..._dials_refused_timeout_total` or `..._dials_refused_no_challenge_total` | The other end does not speak this handshake |
 | Something tampering in flight | `..._frames_refused_tag_total` | — | A message on a proven connection failed its tag. A correct peer never produces one |
 
-Every series is prefixed `fastcache_raft_peer_`. Refusals before the key is proved are
+Every series is prefixed `fastcache_raft_peer_`. Refusals before an id is proved are
 logged at most once a minute and name only the source address — anything on the network
-can provoke them, and an id nobody proved is not worth printing; refusals after it name
-both member ids. The full list, with a description of each series, is on
+can provoke them, and an id nobody proved is not worth printing — except a revoked key,
+which is named whole, since it is what you match against the revocation you made; refusals
+after it name both member ids. The full list, with a description of each series, is on
 [the node's page](../tools/fastcache-compile-node.md#what-a-refused-connection-looks-like).
 
 ### The lease token, and what it buys

@@ -399,11 +399,14 @@ Run several and exactly one must schedule at a time — two nodes handing out th
 same machine's slots is not a degraded fleet, it is the one thing the design says
 cannot happen. Electing that one node is what **consensus** is for. It uses Raft,
 it is off until you give a node `--listen-raft`, and the node holding the election's
-outcome is called the **leader**. Every member holds the cluster's
-`--cluster-key-file`, and a node without one refuses to start: each connection between
-members opens with a handshake proving that key, and every message after it carries a
-tag, so nothing that merely reaches the port can vote or lead
+outcome is called the **leader**. Every member holds an identity key of its own, minted
+into its state directory, and each connection between members opens with a handshake in
+which both ends sign with theirs and check the other's against the key the cluster
+records for it; every message after it carries a tag, so nothing that merely reaches the
+port can vote or lead, and no member can speak as another
 ([Raft peer authentication](operations/cluster-communication.md#raft-peer-authentication)).
+Every member also holds the cluster's `--cluster-key-file`, which the leases and
+enrollment use, and a node without one refuses to start.
 
 ### What a node does when it starts, in order
 
