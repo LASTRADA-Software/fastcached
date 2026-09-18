@@ -103,7 +103,7 @@ key -- which the leader does for itself when it leads, and which `--cluster-admi
 
 **#178 signs every lease with the issuing scheduler's own identity key and has every
 worker check it against a roster of the cluster's voters**, where a lease was an HMAC
-under the shared key. `0xFC` moved to version 12 for it (NODE-ANNOUNCE carries a
+under the shared key. `0xFC` moved to version 13 for it (NODE-ANNOUNCE carries a
 voter's endorsement out and the certified roster back), the replicated cluster state
 to version 7 (it records the roster's version), and the lease format to 3. Nothing
 older reads any of them, so this is the whole-fleet step above, with three changes to

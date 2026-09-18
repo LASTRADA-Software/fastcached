@@ -183,13 +183,13 @@ using WireVersion = std::uint8_t;
 /// wire. Refused by version, before a byte of the request is read, is the one outcome that
 /// hands nothing to anybody.
 ///
-/// **12 made NODE-ANNOUNCE carry a voter's roster endorsement and answer with the certified
+/// **13 made NODE-ANNOUNCE carry a voter's roster endorsement and answer with the certified
 /// roster** (#178). The request gained a fourth top-level field, which the exact-arity decoder
-/// cannot step over, and the reply gained a body where it had none: a version-11 node would
-/// refuse every announcement a version-12 voter sends, and a version-11 worker would never
+/// cannot step over, and the reply gained a body where it had none: a version-12 node would
+/// refuse every announcement a version-13 voter sends, and a version-12 worker would never
 /// adopt a roster and refuse every grant once its old one lapsed -- both silently, in the
 /// words of the refusal that ends it.
-inline constexpr WireVersion CurrentVersion = 12;
+inline constexpr WireVersion CurrentVersion = 13;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -336,10 +336,10 @@ inline constexpr WireVersion CurrentVersion = 12;
 /// ENROLL is answered, when approved, with the cluster KEY, and a leader that still accepted one
 /// would have to either refuse it anyway or keep a secret-handing path alive for it.
 ///
-/// Version 12 moves it for version 11's: a version-11 announcement is three fields, which the
-/// exact-arity decoder refuses, and a version-11 client has no reading for the roster the reply
+/// Version 13 moves it for version 12's: a version-12 announcement is three fields, which the
+/// exact-arity decoder refuses, and a version-12 client has no reading for the roster the reply
 /// now carries.
-inline constexpr WireVersion MinSupportedVersion = 12;
+inline constexpr WireVersion MinSupportedVersion = 13;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
