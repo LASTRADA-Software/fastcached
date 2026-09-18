@@ -242,6 +242,8 @@ struct DirectSources
     NodeMembership const* membership { nullptr };
     /// Where consensus counts this node; null is a node running no consensus (#1449).
     IConsensusStandingSource const* consensus { nullptr };
+    /// The node's condition registry; null is a build that reports none (#1364).
+    NodeConditions const* conditions { nullptr };
 };
 
 /// A `ConfiguredNodeStatus` beside the configuration it holds a reference to.
@@ -279,7 +281,8 @@ struct Fixture
                                       .capacity = direct.capacity,
                                       .scheduler = direct.scheduler,
                                       .membership = direct.membership,
-                                      .consensus = direct.consensus } }
+                                      .consensus = direct.consensus,
+                                      .conditions = direct.conditions } }
     {
     }
 
@@ -1316,4 +1319,49 @@ TEST_CASE("The consensus standing is absent with no consensus, and read per requ
             CHECK(fix.status.Describe().runtime.consensusStanding == std::optional { tag });
         }
     }
+}
+
+TEST_CASE("A node reports its condition rows as they stand when asked, and none at all when unwired",
+          "[node][node-status][conditions]")
+{
+    // #1364. Three answers the reply must keep apart. WIRED with a row raised is the list, every
+    // row in table order, carrying the words and the remedy the node holds -- text is SENT, so the
+    // reader need not share this build's table. WIRED with nothing raised is the same list, all
+    // `clear` or `not-evaluated`: the node saying "none" rather than going quiet. UNWIRED is no list
+    // at all, which is what a build older than conditions answers and must not read as either.
+    ManualClock clock;
+    NodeConditions conditions;
+    conditions.Clear(NodeCondition::EnrollmentWindowOpen);
+    Fixture wired { ConfigShape {}, clock, {}, std::nullopt, DirectSources { .conditions = &conditions } };
+
+    // Every row travels, including the ones nobody has decided yet -- and those ask for attention,
+    // because "nobody evaluated this" is not "none raised".
+    auto const early = Unwrap(wired.status.Describe().runtime.conditions);
+    REQUIRE(early.size() == NodeConditionTable.size());
+    CHECK(std::ranges::count_if(early, [](auto const& row) { return Wire::AsksForAttention(row); })
+          == static_cast<std::ptrdiff_t>(NodeConditionTable.size() - 1));
+
+    // Every row decided benign: still the whole list, and nothing in it asks.
+    for (auto const& row: NodeConditionTable)
+        conditions.Clear(row.condition);
+    auto const settled = Unwrap(wired.status.Describe().runtime.conditions);
+    REQUIRE(settled.size() == NodeConditionTable.size());
+    CHECK(std::ranges::none_of(settled, [](auto const& row) { return Wire::AsksForAttention(row); }));
+
+    // Re-read per call: a raise after construction is in the NEXT reply, which is what lets a live
+    // row be watched clearing from `fastcache-cli`.
+    conditions.Raise(NodeCondition::EnrollmentWindowOpen, "the window is open");
+    auto const raised = Unwrap(wired.status.Describe().runtime.conditions);
+    auto const row =
+        std::ranges::find(raised, RowFor(NodeCondition::EnrollmentWindowOpen).id, &Wire::NodeConditionFields::id);
+    REQUIRE(row != raised.end());
+    CHECK(row->state == "raised");
+    CHECK(row->persistence == "live");
+    CHECK(row->severity == "alert");
+    CHECK(row->detail == "the window is open");
+    CHECK(row->remedy == RowFor(NodeCondition::EnrollmentWindowOpen).remedy);
+
+    // The unwired arm: absent, not an empty list and not a list of `clear`.
+    Fixture unwired { ConfigShape {}, clock };
+    CHECK_FALSE(unwired.status.Describe().runtime.conditions.has_value());
 }

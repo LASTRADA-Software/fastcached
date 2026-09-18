@@ -724,4 +724,13 @@ class CompileJobRunner final: public ICompileJobRunner
 ///         every one of them can, which is every ordinary deployment.
 [[nodiscard]] std::vector<std::string> ScratchRootMappingWarnings(std::string_view scratchRoot);
 
+/// Which prefix-map flags @p scratchRoot cannot be written into, by their spelling.
+///
+/// The same rows `ScratchRootMappingWarnings` words as sentences, for a reader that reports the
+/// condition rather than the prose: the node's `scratch-root-unmappable` row (#1364). One
+/// derivation behind both, so the two cannot name different flags.
+/// @param scratchRoot The root this worker has claimed.
+/// @return The flags, in table order; empty for every ordinary deployment.
+[[nodiscard]] std::vector<std::string_view> ScratchRootUnmappableFlags(std::string_view scratchRoot);
+
 } // namespace FastCache::Cc

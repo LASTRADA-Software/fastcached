@@ -2343,11 +2343,12 @@ TEST_CASE("A heartbeat carries the cordon, and a record without it is a serving 
     REQUIRE(serving.has_value());
     CHECK_FALSE(Unwrap(serving).cordoned);
 
-    // The encoding is kept in a local: `SplitAll` hands back spans INTO it.
+    // The encoding is kept in a local: `SplitAll` hands back spans INTO it. Seven since #1364
+    // appended the conditions list; the cuts below are still counted from the cordon's position.
     auto const encoded = EncodeLoad(cordoned);
     auto const parts = WireFields::SplitAll(encoded);
     REQUIRE(parts.has_value());
-    REQUIRE(Unwrap(parts).size() == 6);
+    REQUIRE(Unwrap(parts).size() == 7);
     auto const five = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 5 };
     auto const shorter = DecodeLoad(WireFields::Encode(WireFields::FieldList { five }));
     REQUIRE(shorter.has_value());
@@ -2495,15 +2496,23 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
     sent.consensusEndpoint = "10.0.0.4:6680";
     sent.forgottenClients = 2;
     sent.consensusStanding = WireConsensusStanding::Learner;
+    sent.conditions = std::vector { NodeConditionFields { .id = "unsigned-lease-grants",
+                                                          .persistence = "latched",
+                                                          .severity = "warning",
+                                                          .state = "raised",
+                                                          .detail = "no key",
+                                                          .remedy = "name one" } };
     // Kept in a local: `SplitAll` hands back spans INTO it.
     auto const emitted = EncodeNodeRuntime(sent);
     auto const parts = WireFields::SplitAll(emitted);
     REQUIRE(parts.has_value());
-    // Sixteen: thirteen that predate #1328, the endpoint it added, #1471's applied-tombstone
-    // count and #1449's consensus standing. Pinned, since every cut below is counted from it and
-    // a record that grew would move what "older" means -- which is how this case caught #1471's
-    // append, and then #1449's, rather than letting either shift the cuts silently.
-    REQUIRE(Unwrap(parts).size() == 16);
+    // Seventeen: thirteen that predate #1328, the endpoint it added, #1471's applied-tombstone
+    // count, #1449's consensus standing and #1364's condition list. Pinned, since every cut below
+    // is counted from it and a record that grew would move what "older" means -- which is how this
+    // case caught #1471's append, then #1449's and #1364's, rather than letting any of them shift
+    // the cuts silently. #1449 and #1364 each appended at sixteen on their own; the integration
+    // orders them, the standing first.
+    REQUIRE(Unwrap(parts).size() == 17);
 
     SECTION("thirteen fields, as a build before #1328 emits: both disengaged, and the cordon still read")
     {
@@ -2543,12 +2552,29 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
         REQUIRE(back.has_value());
         CHECK_FALSE(Unwrap(back).consensusStanding.has_value());
+        CHECK_FALSE(Unwrap(back).conditions.has_value());
         auto const runtime = Unwrap(back);
         REQUIRE(runtime.forgottenClients.has_value());
         CHECK(Unwrap(runtime.forgottenClients) == 2);
     }
 
-    SECTION("sixteen fields, this build: all three engaged")
+    SECTION("sixteen fields, as a build after #1449 and before #1364 emits: the conditions are absent")
+    {
+        // The cut #1364 has to survive: a peer that knows the standing and has never heard of
+        // conditions. Its list must come back ABSENT -- a node too old to say, which every
+        // renderer shows as its absent marker -- and never as an empty list, which would read as a
+        // node with nothing raised.
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 16 };
+        auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
+        REQUIRE(back.has_value());
+        CHECK_FALSE(Unwrap(back).conditions.has_value());
+        auto const runtime = Unwrap(back);
+        REQUIRE(runtime.forgottenClients.has_value());
+        CHECK(Unwrap(runtime.forgottenClients) == 2);
+        CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
+    }
+
+    SECTION("seventeen fields, this build: every fact engaged")
     {
         auto const current = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { current }));
@@ -2558,9 +2584,10 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         REQUIRE(runtime.forgottenClients.has_value());
         CHECK(Unwrap(runtime.forgottenClients) == 2);
         CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
+        CHECK(runtime.conditions == sent.conditions);
     }
 
-    SECTION("seventeen fields, from a build ahead of this one: the surplus is skipped")
+    SECTION("eighteen fields, from a build ahead of this one: the surplus is skipped")
     {
         auto ahead = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const extra = AsBytes(std::string_view { "a fact from the future" });
@@ -2572,6 +2599,7 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         REQUIRE(runtime.forgottenClients.has_value());
         CHECK(Unwrap(runtime.forgottenClients) == 2);
         CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
+        CHECK(runtime.conditions == sent.conditions);
     }
 }
 
@@ -2766,4 +2794,159 @@ TEST_CASE("Both member admissions frame one payload under their own byte", "[wir
     REQUIRE(decoded.has_value());
     CHECK(AsStringView(Unwrap(decoded).memberId) == "laptop");
     CHECK(AsStringView(Unwrap(decoded).raftEndpoint) == "10.0.0.9:6675");
+}
+
+namespace
+{
+/// A row with every field distinct, so a decoder that reads one field into its neighbour cannot
+/// pass by returning the same word from the wrong place.
+/// @param id Its id.
+/// @param state Its state word.
+/// @return The row.
+[[nodiscard]] NodeConditionFields ConditionRow(std::string id, std::string state)
+{
+    return NodeConditionFields { .id = std::move(id),
+                                 .persistence = "latched",
+                                 .severity = "warning",
+                                 .state = std::move(state),
+                                 .detail = "the detail",
+                                 .remedy = "the remedy" };
+}
+} // namespace
+
+TEST_CASE("The condition vocabulary travels as WORDS, and each word is pinned", "[wire][conditions]")
+{
+    // #1364. The enumerators bind nothing on the wire -- a row travels as text, so an older reader
+    // renders a newer node's row as written -- which makes the WORD the contract. A symbol both ends
+    // spell cannot test it, so the spellings are written out here, once, as the anchor.
+    CHECK(ConditionName(ConditionPersistence::Latched) == "latched");
+    CHECK(ConditionName(ConditionPersistence::Live) == "live");
+    CHECK(ConditionName(ConditionSeverity::Notice) == "notice");
+    CHECK(ConditionName(ConditionSeverity::Warning) == "warning");
+    CHECK(ConditionName(ConditionSeverity::Alert) == "alert");
+    CHECK(ConditionName(ConditionState::Raised) == "raised");
+    CHECK(ConditionName(ConditionState::Clear) == "clear");
+    CHECK(ConditionName(ConditionState::NotEvaluated) == "not-evaluated");
+    CHECK(ConditionName(ConditionState::Undecided) == "undecided");
+
+    // And every word reads back as its enumerator, so the two halves are one table.
+    for (auto const& word: ConditionStateWords)
+        CHECK(ConditionStateNamed(word.name) == word.state);
+    CHECK_FALSE(ConditionStateNamed("suppressed").has_value());
+
+    // The field ORDER is the row's wire layout; pinned by name, position by position.
+    auto const names = ConditionFieldTable | std::views::transform(&ConditionFieldRow::name);
+    CHECK(std::ranges::equal(
+        names, std::array<std::string_view, 6> { "id", "persistence", "severity", "state", "detail", "remedy" }));
+}
+
+TEST_CASE("A condition row's bytes are pinned, field by field", "[wire][conditions]")
+{
+    // The value half of the wire contract: a list is a field list of rows, and a row a field list of
+    // six texts, each `[u32 big-endian length][bytes]`. A change to either framing moves these bytes.
+    auto const rows = std::vector { NodeConditionFields {
+        .id = "a", .persistence = "live", .severity = "alert", .state = "raised", .detail = "", .remedy = "r" } };
+    auto const encoded = EncodeNodeConditions(rows);
+    auto const expected = std::vector<std::uint8_t> {
+        0, 0, 0, 41,                               // the one row's length
+        0, 0, 0, 1,  'a',                          // id
+        0, 0, 0, 4,  'l', 'i', 'v', 'e',           // persistence
+        0, 0, 0, 5,  'a', 'l', 'e', 'r', 't',      // severity
+        0, 0, 0, 6,  'r', 'a', 'i', 's', 'e', 'd', // state
+        0, 0, 0, 0,                                // detail: empty is a reading here, not an absence
+        0, 0, 0, 1,  'r',                          // remedy
+    };
+    REQUIRE(encoded.size() == expected.size());
+    CHECK(std::ranges::equal(
+        encoded, expected, [](std::byte b, std::uint8_t e) { return std::to_integer<std::uint8_t>(b) == e; }));
+}
+
+TEST_CASE("A condition list survives the wire, and absent is not an empty list", "[wire][conditions][node-status]")
+{
+    SECTION("every row, every field, in order")
+    {
+        NodeRuntimeFields fields {};
+        fields.conditions = std::vector { ConditionRow("one", "raised"), ConditionRow("two", "clear") };
+        auto const back = DecodeNodeRuntime(EncodeNodeRuntime(fields));
+        REQUIRE(back.has_value());
+        CHECK(Unwrap(back).conditions == fields.conditions);
+    }
+
+    SECTION("a node that says nothing about conditions decodes ABSENT")
+    {
+        // The reading an older node gives, and the one every renderer must show as absent rather
+        // than as *none raised*: the zero-length field is the only spelling it has.
+        auto const back = DecodeNodeRuntime(EncodeNodeRuntime(NodeRuntimeFields {}));
+        REQUIRE(back.has_value());
+        CHECK_FALSE(Unwrap(back).conditions.has_value());
+    }
+
+    SECTION("an announcement carries them on its load record, and a heartbeat does not")
+    {
+        LoadFields load {};
+        load.conditions = std::vector { ConditionRow("one", "raised") };
+        auto const announced = DecodeLoad(EncodeLoad(load));
+        REQUIRE(announced.has_value());
+        CHECK(Unwrap(announced).conditions == load.conditions);
+
+        auto const quiet = DecodeLoad(EncodeLoad(LoadFields {}));
+        REQUIRE(quiet.has_value());
+        CHECK_FALSE(Unwrap(quiet).conditions.has_value());
+    }
+}
+
+TEST_CASE("A condition row from a newer node keeps what this build can read", "[wire][conditions]")
+{
+    // A seventh field is a fact appended by a build ahead of this one: skipped, and the six this
+    // build knows are still read. A state word it has never seen is KEPT, and asks for attention.
+    std::vector<std::span<std::byte const>> fields;
+    auto const texts = std::array<std::string_view, 7> { "id", "latched", "warning", "suppressed", "d", "r", "since" };
+    for (auto const text: texts)
+        fields.push_back(AsBytes(text));
+    auto const row = WireFields::Encode(WireFields::FieldList { fields });
+    auto const list = WireFields::Encode({ std::span<std::byte const> { row } });
+
+    std::optional<std::vector<NodeConditionFields>> out;
+    REQUIRE(ReadNodeConditions(list, out));
+    REQUIRE(out.has_value());
+    REQUIRE(Unwrap(out).size() == 1);
+    CHECK(Unwrap(out).front().state == "suppressed");
+    CHECK(Unwrap(out).front().remedy == "r");
+    CHECK(AsksForAttention(Unwrap(out).front()));
+}
+
+TEST_CASE("A condition list this build cannot read is refused, never read short", "[wire][conditions]")
+{
+    std::optional<std::vector<NodeConditionFields>> out;
+
+    SECTION("a row short of the six fields")
+    {
+        auto const five = WireFields::Encode({ AsBytes(std::string_view { "id" }),
+                                               AsBytes(std::string_view { "latched" }),
+                                               AsBytes(std::string_view { "warning" }),
+                                               AsBytes(std::string_view { "raised" }),
+                                               AsBytes(std::string_view { "d" }) });
+        CHECK_FALSE(ReadNodeConditions(WireFields::Encode({ std::span<std::byte const> { five } }), out));
+    }
+
+    SECTION("a field above its ceiling")
+    {
+        auto const longDetail = std::string(MaxConditionDetailBytes + 1, 'x');
+        auto row = ConditionRow("one", "raised");
+        row.detail = longDetail;
+        CHECK_FALSE(ReadNodeConditions(EncodeNodeConditions(std::vector { row }), out));
+    }
+
+    SECTION("more rows than a list may carry")
+    {
+        // Built by hand, because the encoder honours the ceiling and would never produce one.
+        auto const row = EncodeNodeConditions(std::vector { ConditionRow("one", "raised") });
+        auto const inner = WireFields::SplitAll(row);
+        REQUIRE(inner.has_value());
+        auto const many = std::vector<std::span<std::byte const>>(MaxNodeConditions + 1, Unwrap(inner).front());
+        CHECK_FALSE(ReadNodeConditions(WireFields::Encode(WireFields::FieldList { many }), out));
+    }
+
+    // Refused means refused: nothing was written into the caller's list on the way out.
+    CHECK_FALSE(out.has_value());
 }

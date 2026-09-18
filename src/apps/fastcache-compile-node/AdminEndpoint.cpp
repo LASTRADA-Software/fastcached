@@ -941,7 +941,8 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
                                                                     std::optional<Distributed::FleetSources> fleet,
                                                                     FleetSampler const* sampler,
                                                                     AdminCredential const& credential,
-                                                                    ILogger& logger)
+                                                                    ILogger& logger,
+                                                                    NodeConditions& conditions)
 {
     AdminSurface surface;
 
@@ -1017,10 +1018,22 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
     // logged here against what their browser shows and knows they reached the
     // machine rather than something in between.
     if (surface.tls && cfg.tlsSelfSigned)
+    {
         logger.Logf(LogLevel::Info,
                     "admin TLS uses a self-signed certificate generated at startup; SHA-256 fingerprint {} "
                     "(it changes on every restart)",
                     surface.tls->CertificateFingerprint());
+        // And kept where somebody who was not watching the startup can read it (#1364): the line
+        // above scrolls, and the fingerprint is the one thing an operator can compare.
+        conditions.Raise(NodeCondition::GeneratedTlsCertificate,
+                         std::format("the admin surface serves a certificate generated at startup; SHA-256 fingerprint {}",
+                                     surface.tls->CertificateFingerprint()));
+    }
+    else
+        conditions.Clear(NodeCondition::GeneratedTlsCertificate);
+#else
+    // A build without TLS cannot have generated one: `--tls-self-signed` is refused above.
+    conditions.Clear(NodeCondition::GeneratedTlsCertificate);
 #endif
     logger.Logf(
         LogLevel::Info, "metrics endpoint on {}://{}/metrics (and /healthz)", scheme, surface.endpoint->BoundEndpoint());

@@ -16,6 +16,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <fstream>
+#include <string>
+
+#include <tests/ScratchPath.hpp>
+
 using namespace FastCache;
 
 /// `NodeMembership` reports an unreadable `fleet-open` row here; no case asserts on it.
@@ -39,6 +44,7 @@ struct TierFixture
     ManualWallClock wallClock;
     AtomicMetricsSink metrics;
     NullLogger logger;
+    NodeConditions conditions;
 };
 
 /// A node that runs consensus: a Raft port, which is what turns it on (#1022).
@@ -86,7 +92,8 @@ TEST_CASE("A clustered scheduler does not claim leadership before consensus repo
     auto const cfg = ClusteredNode();
     NodeMembership membership { cfg, membershipLog };
 
-    auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
+    auto tier =
+        SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
     REQUIRE(tier.has_value());
 
     // `Undecided` is the state this already has a name and a refusal for: `Gate()`
@@ -105,7 +112,8 @@ TEST_CASE("Consensus reporting leadership is what makes a clustered scheduler le
     auto const cfg = ClusteredNode();
     NodeMembership membership { cfg, membershipLog };
 
-    auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
+    auto tier =
+        SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
     REQUIRE(tier.has_value());
 
     (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
@@ -126,7 +134,8 @@ TEST_CASE("A node leading alone still leads from the moment it starts", "[node][
     auto const cfg = LoneNode();
     NodeMembership membership { cfg, membershipLog };
 
-    auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
+    auto tier =
+        SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
     REQUIRE(tier.has_value());
 
     CHECK((*tier)->Service().Role() == Distributed::SchedulerRole::Leader);
@@ -154,7 +163,8 @@ TEST_CASE("The scheduler tier follows the consensus switch, not the node id", "[
         cfg.raftListen = "127.0.0.1:6680";
         NodeMembership membership { cfg, membershipLog };
 
-        auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
+        auto tier = SchedulerTier::Start(
+            cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
         REQUIRE(tier.has_value());
         CHECK((*tier)->Service().Role() != Distributed::SchedulerRole::Leader);
     }
@@ -170,8 +180,44 @@ TEST_CASE("The scheduler tier follows the consensus switch, not the node id", "[
         cfg.nodeId = "n1";
         NodeMembership membership { cfg, membershipLog };
 
-        auto tier = SchedulerTier::Start(cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger);
+        auto tier = SchedulerTier::Start(
+            cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
         REQUIRE(tier.has_value());
         CHECK((*tier)->Service().Role() == Distributed::SchedulerRole::Leader);
+    }
+}
+
+TEST_CASE("A scheduler says whether it signs its grants, as a latched condition", "[node][scheduler][conditions]")
+{
+    // #1364. Unsigned grants were one Warn at the first grant (#303); the tier now answers the
+    // condition as it starts, from the key it read -- the one fact that decides it. WHAT
+    // DISTINGUISHES: no key and a key give opposite answers, so a tier that raised it always, or
+    // never, fails one section.
+    namespace Wire = CompileCacheWire;
+    TierFixture fix;
+    auto cfg = LoneNode();
+
+    SECTION("no --cluster-key-file raises it")
+    {
+        NodeMembership membership { cfg, membershipLog };
+        auto tier = SchedulerTier::Start(
+            cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
+        REQUIRE(tier.has_value());
+        CHECK(fix.conditions.StateOf(NodeCondition::UnsignedLeaseGrants) == Wire::ConditionState::Raised);
+    }
+
+    SECTION("a key clears it")
+    {
+        FastCache::Testing::ScratchDirectory keys { "scheduler-conditions" };
+        cfg.clusterKeyFile = keys / "cluster.key";
+        {
+            std::ofstream out { cfg.clusterKeyFile, std::ios::binary };
+            out << std::string(32, 'k');
+        }
+        NodeMembership membership { cfg, membershipLog };
+        auto tier = SchedulerTier::Start(
+            cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.conditions);
+        REQUIRE(tier.has_value());
+        CHECK(fix.conditions.StateOf(NodeCondition::UnsignedLeaseGrants) == Wire::ConditionState::Clear);
     }
 }

@@ -7,6 +7,7 @@
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/MembershipWire.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
@@ -2264,4 +2265,191 @@ TEST_CASE("`node` reports which set consensus counts it in", "[cli][node][verbs]
     auto const answer = RunNodeVerb("node", none);
     CHECK(answer.outcome == Outcome::Affirmative);
     CHECK(CellOf(answer, "consensus-standing") == nullptr);
+}
+
+namespace
+{
+
+/// One condition row as a node sends it: words, never an enumerator.
+/// @param id The row's id.
+/// @param persistence Its persistence word.
+/// @param severity Its severity word.
+/// @param state Its state word.
+/// @return The row.
+[[nodiscard]] Cc::NodeConditionFields ConditionRow(std::string id,
+                                                   std::string persistence,
+                                                   std::string severity,
+                                                   std::string state)
+{
+    return Cc::NodeConditionFields { .id = std::move(id),
+                                     .persistence = std::move(persistence),
+                                     .severity = std::move(severity),
+                                     .state = std::move(state),
+                                     .detail = "what the node saw",
+                                     .remedy = "what to do about it" };
+}
+
+/// A node that raises one LATCHED row and one LIVE row, with a third row clear.
+[[nodiscard]] std::vector<Cc::NodeConditionFields> LatchedAndLiveRaised()
+{
+    return { ConditionRow("unsigned-lease-grants", "latched", "warning", "raised"),
+             ConditionRow("enrollment-window-open", "live", "alert", "raised"),
+             ConditionRow("counter-table-skew", "latched", "warning", "clear") };
+}
+
+/// A node that sent every row and raised none.
+[[nodiscard]] std::vector<Cc::NodeConditionFields> NoneRaisedRows()
+{
+    return { ConditionRow("unsigned-lease-grants", "latched", "warning", "clear"),
+             ConditionRow("enrollment-window-open", "live", "alert", "not-evaluated") };
+}
+
+/// A `NodeStatus` reply carrying @p conditions, or none at all.
+/// @param conditions What the node reports; `std::nullopt` is a build older than conditions.
+/// @return The reply frame.
+[[nodiscard]] std::vector<std::byte> StatusWithConditions(std::optional<std::vector<Cc::NodeConditionFields>> conditions)
+{
+    return StatusReply({ .version = "1.2.3",
+                         .nodeId = "node-a",
+                         .uptimeSeconds = 5,
+                         .surfaces = {},
+                         .components = Cc::NodeComponentBit::Worker,
+                         .runtime = { .conditions = std::move(conditions) } });
+}
+
+} // namespace
+
+TEST_CASE("`node` names each raised condition with its persistence, says none, and is absent from an old node",
+          "[cli][node][verbs][conditions]")
+{
+    // #1364. One field, three answers, and the case drives all three because each is the other's
+    // false positive: "none raised" printed for a node that said NOTHING is the lie this field
+    // exists to avoid, and a list that dropped the persistence would read the same for a condition
+    // that will clear by itself and one that never will.
+    SECTION("raised: each id with latched or live beside it")
+    {
+        ScriptedNodeExchange node { { StatusWithConditions(LatchedAndLiveRaised()) } };
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(RequiredCell(answer, "conditions").lexical
+              == "raised: unsigned-lease-grants (latched), enrollment-window-open (live)");
+    }
+    SECTION("none raised is SAID")
+    {
+        ScriptedNodeExchange node { { StatusWithConditions(NoneRaisedRows()) } };
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(RequiredCell(answer, "conditions").lexical == "none raised");
+        CHECK(RequiredCell(answer, "conditions").kind == CellKind::Text);
+    }
+    SECTION("a node too old to carry conditions renders the field ABSENT")
+    {
+        ScriptedNodeExchange node { { StatusWithConditions(std::nullopt) } };
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(answer.outcome == Outcome::Affirmative);
+        CHECK(RequiredCell(answer, "conditions").kind == CellKind::Absent);
+        CHECK(RequiredCell(answer, "conditions").lexical != "none raised");
+    }
+    SECTION("a row nobody decided is named with its state, never folded into a plain raise")
+    {
+        ScriptedNodeExchange node { { StatusWithConditions(
+            std::vector { ConditionRow("scratch-root-unmappable", "latched", "warning", "undecided") }) } };
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(RequiredCell(answer, "conditions").lexical == "raised: scratch-root-unmappable (latched, undecided)");
+    }
+}
+
+TEST_CASE("`node-conditions` lists every row, exits by whether any asks, and refuses an old node's silence",
+          "[cli][node][verbs][conditions]")
+{
+    // The table is every row as the node SENT it -- columns from the wire's own field table -- so the
+    // persistence is a column rather than a decoration, and a clear row is still shown.
+    SECTION("something raised: ok, and every row with its persistence")
+    {
+        ScriptedNodeExchange node { { StatusWithConditions(LatchedAndLiveRaised()) } };
+        auto const answer = RunNodeVerb("node-conditions", node);
+        CHECK(answer.outcome == Outcome::Affirmative);
+
+        std::vector<std::string> expected;
+        for (auto const& field: Cc::ConditionFieldTable)
+            expected.emplace_back(field.name);
+        CHECK(answer.value.columns == expected);
+
+        auto const& rows = RowsOf(answer);
+        REQUIRE(rows.size() == 3);
+        auto const id = ColumnOf(answer, "id");
+        auto const persistence = ColumnOf(answer, "persistence");
+        auto const state = ColumnOf(answer, "state");
+        auto const remedy = ColumnOf(answer, "remedy");
+        CHECK(rows[0][id].lexical == "unsigned-lease-grants");
+        CHECK(rows[0][persistence].lexical == "latched");
+        CHECK(rows[1][id].lexical == "enrollment-window-open");
+        CHECK(rows[1][persistence].lexical == "live");
+        CHECK(rows[2][state].lexical == "clear");
+        CHECK(rows[0][remedy].lexical == "what to do about it");
+        CHECK(Remarks(answer, "2 of 3 condition(s) raised"));
+    }
+    SECTION("nothing raised: no, with every row still printed and the words on stderr")
+    {
+        ScriptedNodeExchange node { { StatusWithConditions(NoneRaisedRows()) } };
+        auto const answer = RunNodeVerb("node-conditions", node);
+        CHECK(answer.outcome == Outcome::Negative);
+        CHECK(RowsOf(answer).size() == 2);
+        CHECK(Remarks(answer, "none raised"));
+    }
+    SECTION("a node too old to say: refused as unreadable, never an empty table")
+    {
+        ScriptedNodeExchange node { { StatusWithConditions(std::nullopt) } };
+        auto const answer = RunNodeVerb("node-conditions", node);
+        CHECK(answer.outcome == Outcome::Protocol);
+        CHECK(answer.value.shape != Shape::Table);
+        CHECK(Remarks(answer, "not the same answer as none raised"));
+    }
+}
+
+TEST_CASE("`fleet conditions` carries the leader's rows, latched and live apart and an old machine absent",
+          "[cli][node][fleet][conditions]")
+{
+    // The leader's own rendering, fed back through the verb rather than a document written here: the
+    // property is that what the LEADER wrote reaches the operator's terminal with each distinction
+    // intact, and a hand-written document would only test that this client reads what its author
+    // expected the leader to write.
+    Distributed::FleetSnapshot snapshot;
+    snapshot.role = Distributed::SchedulerRole::Leader;
+    auto machine = [](std::string endpoint, std::optional<std::vector<Cc::NodeConditionFields>> conditions) {
+        auto report = Distributed::NodeReport {};
+        report.endpoint = std::move(endpoint);
+        report.conditions = std::move(conditions);
+        return report;
+    };
+    snapshot.nodes = {
+        machine("10.0.0.2:7100", std::vector { ConditionRow("unsigned-lease-grants", "latched", "warning", "raised") }),
+        machine("10.0.0.3:7100", std::vector { ConditionRow("enrollment-window-open", "live", "alert", "raised") }),
+        machine("10.0.0.4:7100", NoneRaisedRows()),
+        machine("10.0.0.5:7100", std::nullopt)
+    };
+    auto const document =
+        Distributed::RenderFleetText(snapshot, Distributed::FleetHistoryView {}, Distributed::FleetSection::Conditions);
+    ScriptedNodeExchange node { { FleetDocumentReply(document) } };
+
+    auto const answer = RunFleet(node, nullptr, { "conditions" });
+    REQUIRE(answer.outcome == Outcome::Affirmative);
+    auto const& rows = RowsOf(answer);
+    REQUIRE(rows.size() == 5);
+    auto const endpoint = ColumnOf(answer, "endpoint");
+    auto const condition = ColumnOf(answer, "condition");
+    auto const state = ColumnOf(answer, "state");
+    auto const persistence = ColumnOf(answer, "persistence");
+
+    CHECK(rows[0][endpoint].lexical == "10.0.0.2:7100");
+    CHECK(rows[0][state].lexical == "raised");
+    CHECK(rows[0][persistence].lexical == "latched");
+    CHECK(rows[1][state].lexical == "raised");
+    CHECK(rows[1][persistence].lexical == "live");
+    CHECK(rows[2][state].lexical == "clear");
+    CHECK(rows[3][state].lexical == "not-evaluated");
+    // The machine that said nothing: a row of its own, every cell but its address ABSENT.
+    CHECK(rows[4][endpoint].lexical == "10.0.0.5:7100");
+    CHECK(rows[4][condition].kind == CellKind::Absent);
+    CHECK(rows[4][state].kind == CellKind::Absent);
+    CHECK(rows[4][persistence].kind == CellKind::Absent);
 }

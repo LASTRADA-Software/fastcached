@@ -3,6 +3,7 @@
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
+#include <FastCache/Protocol/NodeConditionWire.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -241,6 +242,15 @@ struct NodeReport
     /// What a person calls the machine, from the contributing entry. Empty means it
     /// did not say -- see `WorkerInfo::displayName`, and note it decides nothing.
     std::string displayName {};
+    /// What the machine last said is wrong with it (#1364), or ABSENT when it said nothing --
+    /// a node too old to carry conditions, or one whose announcements have stopped reaching
+    /// this leader while a worker entry keeps its row alive.
+    ///
+    /// **From the machine's presence and never from a worker entry**, because `NodeAnnounce` is
+    /// the one verb that carries it: every node sends that one, and a workerless machine sends
+    /// nothing else. The rows are what the machine wrote, filed under it and rendered as they
+    /// arrived, so a leader older than a row shows it all the same.
+    std::optional<std::vector<CompileCacheWire::NodeConditionFields>> conditions {};
 };
 
 /// One node's cache, as `NodeCaches()` reports it.
@@ -287,6 +297,11 @@ struct NodePresence
     /// What it is doing, and what its cache holds. A machine with no worker still has a CPU, a
     /// memory figure and a cache, so this is not an empty passenger.
     NodeLoad load {};
+
+    /// What the machine says is wrong with it (#1364), or absent from one that says nothing.
+    /// Owned rather than borrowed: the registry keeps it, and every string in it is refused at
+    /// `SchedulerService::AnnounceNode` unless it is text.
+    std::optional<std::vector<CompileCacheWire::NodeConditionFields>> conditions {};
 };
 
 struct WorkerRegistration
@@ -483,7 +498,13 @@ class WorkerRegistry
     /// @param capacity What the machine is.
     /// @param load What it is doing, and what its cache holds.
     /// @param version What software it runs; empty means it did not say.
-    void NoteNodePresent(std::string endpoint, NodeCapacity const& capacity, NodeLoad const& load, std::string version);
+    /// @param conditions What it says is wrong with it; absent when it said nothing. Replaced
+    ///        wholesale, so a live condition that cleared is clear here on the next announcement.
+    void NoteNodePresent(std::string endpoint,
+                         NodeCapacity const& capacity,
+                         NodeLoad const& load,
+                         std::string version,
+                         std::optional<std::vector<CompileCacheWire::NodeConditionFields>> conditions = std::nullopt);
 
     /// Drop one registration because the worker says it no longer serves it.
     ///
@@ -619,6 +640,7 @@ class WorkerRegistry
         NodeCapacity capacity {};
         NodeLoad load {};
         std::string version {};
+        std::optional<std::vector<CompileCacheWire::NodeConditionFields>> conditions {};
         TimePoint lastSeen {};
     };
     std::map<std::string, Presence> _present;

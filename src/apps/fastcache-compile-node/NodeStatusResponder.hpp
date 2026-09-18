@@ -5,6 +5,7 @@
 #include "ConsensusStanding.hpp"
 #include "EnrollmentWindow.hpp"
 #include "FrameEndpoint.hpp"
+#include "NodeConditions.hpp"
 #include "NodeMembership.hpp"
 
 #include <FastCache/Core/Clock.hpp>
@@ -534,6 +535,14 @@ struct NodeRuntimeSources
     /// production, because the tier is built after this surface -- see
     /// `ConsensusStandingSlot`. Appended, for `membership`'s reason.
     IConsensusStandingSource const* consensus { nullptr };
+
+    /// This node's conditions (#1364); null only where nothing was wired, which reports the
+    /// field ABSENT -- the reading an older node gives -- rather than an empty list.
+    ///
+    /// Every node has one, so on a running node this is never null: a node with nothing raised
+    /// sends every row as `clear` or `not-evaluated`, which is how *nothing raised* is told apart
+    /// from *does not carry conditions* at the far end.
+    NodeConditions const* conditions { nullptr };
 };
 
 /// The production `INodeStatusSource`: config for the surfaces, a clock for the uptime.

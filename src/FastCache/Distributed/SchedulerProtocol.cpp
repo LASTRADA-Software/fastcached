@@ -403,7 +403,11 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                                         // literal type.
                                                         .version = fields->capacity.version,
                                                         .capacity = *capacity,
-                                                        .load = LoadFromWire(fields->load, 0) },
+                                                        .load = LoadFromWire(fields->load, 0),
+                                                        // What the machine says is wrong with it
+                                                        // (#1364). Off the load record, the one
+                                                        // variable-arity carrier this verb has.
+                                                        .conditions = fields->load.conditions },
                                          HistoryFromWire(fields->load.history));
         }
         case Wire::Op::Heartbeat: {

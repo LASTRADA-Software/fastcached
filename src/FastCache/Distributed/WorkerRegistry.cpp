@@ -428,13 +428,15 @@ std::chrono::milliseconds WorkerRegistry::AgeOf(TimePoint lastSeen, TimePoint no
 void WorkerRegistry::NoteNodePresent(std::string endpoint,
                                      NodeCapacity const& capacity,
                                      NodeLoad const& load,
-                                     std::string version)
+                                     std::string version,
+                                     std::optional<std::vector<CompileCacheWire::NodeConditionFields>> conditions)
 {
     std::scoped_lock const guard { _mutex };
     auto& slot = _present[std::move(endpoint)];
     slot.capacity = capacity;
     slot.load = load;
     slot.version = std::move(version);
+    slot.conditions = std::move(conditions);
     slot.lastSeen = _clock.Now();
 }
 
@@ -533,8 +535,15 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
     {
         if (now - presence.lastSeen > _heartbeatTimeout)
             continue;
-        if (byEndpoint.contains(endpoint))
+        if (auto const held = byEndpoint.find(endpoint); held != byEndpoint.end())
+        {
+            // **The one field presence contributes to a row a worker entry owns**, and the
+            // exception is forced: `NodeAnnounce` is the only verb that carries a machine's
+            // conditions (#1364), so a worker entry has none to offer and the row would read
+            // ABSENT on every machine that runs a worker. Nothing else is taken from here.
+            held->second.report.conditions = presence.conditions;
             continue;
+        }
 
         // `registeredSlots` stays ABSENT and `fingerprints` stays empty, which is what makes
         // this a machine rather than a worker offering nothing: the page renders both at the
@@ -547,7 +556,9 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
                                                               .registeredSlots = std::nullopt,
                                                               .fleetJobsInFlight = 0,
                                                               .heartbeatAge = AgeOf(presence.lastSeen, now),
-                                                              .version = presence.version },
+                                                              .version = presence.version,
+                                                              .displayName = {},
+                                                              .conditions = presence.conditions },
                                        .lastSeen = presence.lastSeen,
                                        .contributorSaysCache = SaysAnything(presence.load.cache) });
     }

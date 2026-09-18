@@ -5,6 +5,7 @@
 #include "CompileResponder.hpp"
 #include "EndpointDialer.hpp"
 #include "NodeAnnounce.hpp"
+#include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
 #include "NodeReload.hpp"
@@ -113,6 +114,10 @@ struct WorkerTierParts
     IClusterKeySource const* proofKey;
     IMetricsSink& metrics; ///< Where the worker counts.
     ILogger& logger;       ///< Where it reports.
+    /// Where the worker's conditions are answered (#1364): whether its scratch root can be
+    /// written into a debug-prefix-map rule. Evaluated where the root is claimed, beside the
+    /// warning that says the same thing at startup.
+    NodeConditions& conditions;
 };
 
 class WorkerTier;

@@ -129,6 +129,13 @@ namespace
         /// an ordinary compile still running, so reusing that decor would paint
         /// every row amber and the colour would stop meaning anything at all.
         LeaseAge,
+        /// A condition's severity: a chip coloured by how loudly it asks (#1364).
+        Severity,
+        /// A condition's state: a chip for a row that asks for attention, plain for one that does not.
+        ConditionState,
+        /// Prose: a sentence that wraps rather than a figure that must not, so a remedy does not
+        /// drag its whole table a screen wide.
+        Prose,
     };
 
     /// Append the headline figures as a table, and the same for the JSON object.
@@ -349,6 +356,117 @@ namespace
                                    .format = CellFormat::Text,
                                    .keep = ColumnKeep::Identity,
                                    .project = [](std::string const& host) { return FleetCell::Of(host); } },
+    };
+
+    /// One row of the conditions section: a machine, and one condition it reported (#1364).
+    ///
+    /// **A machine that reported NO list is one row with no condition**, every cell but the
+    /// endpoint absent. That is the absent state -- a node too old to carry conditions, or whose
+    /// announcements have stopped arriving -- and it must not read as a machine with nothing
+    /// raised, which reports every row of its table as `clear` or `not-evaluated`. Collapsing the
+    /// two would hide exactly the machines nobody can vouch for.
+    struct MachineCondition
+    {
+        std::string_view endpoint;                              ///< The machine; borrows the snapshot.
+        CompileCacheWire::NodeConditionFields const* condition; ///< One of its rows, or null when it sent none.
+    };
+
+    /// The section's rows, machine by machine, each machine's rows in the order it sent them.
+    /// @param snapshot What to read; must outlive the rows, which borrow it.
+    /// @return The rows.
+    [[nodiscard]] std::vector<MachineCondition> ConditionRowsOf(FleetSnapshot const& snapshot)
+    {
+        std::vector<MachineCondition> rows;
+        for (auto const& node: snapshot.nodes)
+        {
+            if (!node.conditions.has_value())
+            {
+                rows.push_back(MachineCondition { .endpoint = node.endpoint, .condition = nullptr });
+                continue;
+            }
+            for (auto const& condition: *node.conditions)
+                rows.push_back(MachineCondition { .endpoint = node.endpoint, .condition = &condition });
+        }
+        return rows;
+    }
+
+    /// One text field of a condition, or absent for a machine that sent none.
+    /// @param row The row.
+    /// @param member Which field.
+    /// @return The cell.
+    [[nodiscard]] FleetCell ConditionText(MachineCondition const& row,
+                                          std::string CompileCacheWire::NodeConditionFields::* member)
+    {
+        if (row.condition == nullptr)
+            return FleetCell::Nothing();
+        // A detail is legitimately empty on a clear row, and an empty cell there is the reading
+        // rather than an absence: the machine sent the row and had nothing to add.
+        return FleetCell::Of(row.condition->*member);
+    }
+
+    /// What a conditions row shows.
+    ///
+    /// Every column is TEXT the machine wrote, never looked up: a leader older than a row renders
+    /// it exactly as the node sent it, which is the whole reason the row travels as words.
+    constexpr std::array<FleetColumn<MachineCondition>, 7> ConditionColumns {
+        FleetColumn<MachineCondition> {
+            .name = "endpoint",
+            .help = "host:port the machine answers on.",
+            .format = CellFormat::Text,
+            .keep = ColumnKeep::Identity,
+            .project = [](MachineCondition const& r) { return FleetCell::Of(std::string { r.endpoint }); } },
+        FleetColumn<MachineCondition> {
+            .name = "condition",
+            .help = "Which condition, by its stable id. Absent on a machine that reports no conditions at all: a "
+                    "build older than them, or one whose announcements have stopped arriving.",
+            .format = CellFormat::Text,
+            // Vital rather than Identity: the ENDPOINT says which machine a line is, and a section has
+            // one identity column. This is what the section exists to show, so it goes last of the rest.
+            .keep = ColumnKeep::Vital,
+            .project =
+                [](MachineCondition const& r) { return ConditionText(r, &CompileCacheWire::NodeConditionFields::id); } },
+        FleetColumn<MachineCondition> {
+            .name = "state",
+            .help = "raised: it holds now. clear: checked and benign. not-evaluated: this machine runs nothing that "
+                    "could raise it. undecided: nothing evaluated it, which is a node wired wrongly.",
+            .format = CellFormat::Text,
+            .decor = CellDecor::ConditionState,
+            .keep = ColumnKeep::Vital,
+            .project =
+                [](MachineCondition const& r) { return ConditionText(r, &CompileCacheWire::NodeConditionFields::state); } },
+        FleetColumn<MachineCondition> {
+            .name = "persistence",
+            .help = "latched: fixed for the life of the process, so only a restart on a different build or "
+                    "configuration clears it. live: it can clear while the process runs.",
+            .format = CellFormat::Text,
+            .keep = ColumnKeep::Vital,
+            .project =
+                [](MachineCondition const& r) {
+                    return ConditionText(r, &CompileCacheWire::NodeConditionFields::persistence);
+                } },
+        FleetColumn<MachineCondition> { .name = "severity",
+                                        .help = "How loudly a raised condition asks: notice, warning or alert.",
+                                        .format = CellFormat::Text,
+                                        .decor = CellDecor::Severity,
+                                        .project =
+                                            [](MachineCondition const& r) {
+                                                return ConditionText(r, &CompileCacheWire::NodeConditionFields::severity);
+                                            } },
+        FleetColumn<MachineCondition> {
+            .name = "detail",
+            .help = "What was observed when raised, or why nothing could be when not evaluated.",
+            .format = CellFormat::Text,
+            .decor = CellDecor::Prose,
+            .project =
+                [](MachineCondition const& r) { return ConditionText(r, &CompileCacheWire::NodeConditionFields::detail); } },
+        FleetColumn<MachineCondition> {
+            .name = "remedy",
+            .help = "What to do about it, in the machine's own words.",
+            .format = CellFormat::Text,
+            .decor = CellDecor::Prose,
+            .keep = ColumnKeep::Detail,
+            .project =
+                [](MachineCondition const& r) { return ConditionText(r, &CompileCacheWire::NodeConditionFields::remedy); } },
     };
 
     /// What a node row shows, before its per-tier cache columns.
@@ -737,7 +855,7 @@ namespace
     {
         auto whole = ColumnNamesAreKebab(MemberColumns) && ColumnNamesAreKebab(NodeColumns)
                      && ColumnNamesAreKebab(WorkerColumns) && ColumnNamesAreKebab(LeaseColumns)
-                     && IsKebabName(TierEndpointColumn);
+                     && ColumnNamesAreKebab(ConditionColumns) && IsKebabName(TierEndpointColumn);
         for (auto const& tier: StorageTierTable)
             for (auto const& column: TierColumns)
                 whole = whole && IsKebabJoin({ tier.name, TierColumnSeparator, column.suffix });
@@ -1091,11 +1209,65 @@ namespace
         {
             case CellDecor::Plain:
             case CellDecor::Limit:
+            case CellDecor::Severity:
+            case CellDecor::ConditionState:
+            case CellDecor::Prose:
                 return CellTone::Plain;
             case CellDecor::Freshness:
                 return agedPast(HeartbeatStaleAfterMillis);
             case CellDecor::LeaseAge:
                 return agedPast(LeaseOldAfterMillis);
+        }
+        return CellTone::Plain;
+    }
+
+    /// How a human surface dresses one condition severity: the page's chip and a terminal's tone.
+    struct SeverityDress
+    {
+        CompileCacheWire::ConditionSeverity severity; ///< The enumerator this row describes.
+        std::string_view chipClass;                   ///< The page's chip.
+        CellTone tone;                                ///< The tone a terminal gives it.
+    };
+
+    /// One row per severity, in enumerator order: one dress for the page and every terminal, so a
+    /// warning cannot be amber on one screen and red on another.
+    constexpr EnumTable<CompileCacheWire::ConditionSeverity, SeverityDress> SeverityDressTable { {
+        { .severity = CompileCacheWire::ConditionSeverity::Notice, .chipClass = "chip--notice", .tone = CellTone::Plain },
+        { .severity = CompileCacheWire::ConditionSeverity::Warning,
+          .chipClass = "chip--warning",
+          .tone = CellTone::Limited },
+        { .severity = CompileCacheWire::ConditionSeverity::Alert, .chipClass = "chip--alert", .tone = CellTone::Alert },
+    } };
+    static_assert(RowsInEnumeratorOrder(SeverityDressTable, &SeverityDress::severity),
+                  "SeverityDressTable must hold one row per ConditionSeverity, in enumerator order");
+
+    /// The tone @p decor gives the text @p text, for the decorations that judge a word.
+    ///
+    /// A word this build cannot name is plain rather than a guess -- except a condition STATE,
+    /// which `AsksForAttention` already says is worth a look when unknown: a newer node's word for
+    /// a state may be a raised one, and the reassuring default is the wrong one.
+    /// @param decor The column's decoration.
+    /// @param text The cell's text.
+    /// @return The tone.
+    [[nodiscard]] CellTone TextToneOf(CellDecor decor, std::string_view text) noexcept
+    {
+        switch (decor)
+        {
+            case CellDecor::Limit: {
+                auto const* const dress = LimitDressFor(text);
+                return dress != nullptr ? dress->tone : CellTone::Plain;
+            }
+            case CellDecor::Severity: {
+                auto const severity = CompileCacheWire::ConditionSeverityNamed(text);
+                return severity.has_value() ? SeverityDressTable[static_cast<std::size_t>(*severity)].tone : CellTone::Plain;
+            }
+            case CellDecor::ConditionState:
+                return CompileCacheWire::StateAsksForAttention(text) ? CellTone::Stale : CellTone::Plain;
+            case CellDecor::Plain:
+            case CellDecor::Freshness:
+            case CellDecor::LeaseAge:
+            case CellDecor::Prose:
+                return CellTone::Plain;
         }
         return CellTone::Plain;
     }
@@ -1138,6 +1310,20 @@ namespace
                 // rest of the row. Everything on it is as old as this number.
             case CellDecor::LeaseAge:
                 return AgePill(text, ToneOf(column.decor, cell.number));
+            case CellDecor::Severity: {
+                auto const severity = CompileCacheWire::ConditionSeverityNamed(cell.text);
+                // A severity this build cannot name gets the plain chip: the word is shown as sent,
+                // and a colour would be a guess about how loud it is.
+                auto const chip =
+                    severity.has_value() ? SeverityDressTable[static_cast<std::size_t>(*severity)].chipClass : "";
+                return std::format(R"(<span class="chip {}">{}</span>)", chip, text);
+            }
+            case CellDecor::ConditionState:
+                return TextToneOf(column.decor, cell.text) == CellTone::Stale
+                           ? std::format(R"(<span class="chip chip--raised">{}</span>)", text)
+                           : text;
+            case CellDecor::Prose:
+                return std::format(R"(<span class="prose">{}</span>)", text);
         }
         return text;
     }
@@ -1221,6 +1407,14 @@ std::string RenderFleetJson(FleetSnapshot const& snapshot, FleetHistoryView cons
         AppendJsonRows(out, MemberColumns, snapshot.cluster->members);
     else
         out += "null"; // Runs no cluster at all -- not "a cluster with no members".
+
+    // Every row every machine reported, and one row with a null condition for a machine that
+    // reported none (#1364) -- so *absent* and *nothing raised* are two shapes a consumer can
+    // tell apart without knowing which states are quiet.
+    out += ',';
+    AppendJsonString(out, "conditions");
+    out += ':';
+    AppendJsonRows(out, ConditionColumns, ConditionRowsOf(snapshot));
 
     out += ',';
     AppendJsonString(out, "forgotten");
@@ -1409,6 +1603,9 @@ namespace
                                ForgottenColumns,
                                snapshot.cluster.has_value() ? snapshot.cluster->forgotten : std::vector<std::string> {});
                 return;
+            case FleetSection::Conditions:
+                AppendTextRows(out, ConditionColumns, ConditionRowsOf(snapshot));
+                return;
             case FleetSection::Tiers:
                 AppendTierText(out, snapshot);
                 return;
@@ -1453,6 +1650,8 @@ std::vector<std::string> FleetColumnNames(FleetSection section, FleetSnapshot co
             return namesOf(MemberColumns);
         case FleetSection::Forgotten:
             return namesOf(ForgottenColumns);
+        case FleetSection::Conditions:
+            return namesOf(ConditionColumns);
         case FleetSection::Tiers: {
             // Laid down exactly as `AppendTierText` lays them: the endpoint column, then
             // every present tier crossed with every suffix. `tiersPresent` is what makes
@@ -1527,6 +1726,8 @@ namespace
                 return factsOf(MemberColumns);
             case FleetSection::Forgotten:
                 return factsOf(ForgottenColumns);
+            case FleetSection::Conditions:
+                return factsOf(ConditionColumns);
             case FleetSection::Tiers:
                 if (name == TierEndpointColumn)
                     return ColumnFacts { .format = CellFormat::Text,
@@ -1586,10 +1787,7 @@ CellTone SlotLimitTone(SlotLimit limit) noexcept
 CellTone FleetCellTone(FleetSection section, std::string_view name, std::string_view text)
 {
     auto const facts = FactsOf(section, name);
-    if (!facts.has_value() || facts->decor != CellDecor::Limit)
-        return CellTone::Plain;
-    auto const* const dress = LimitDressFor(text);
-    return dress != nullptr ? dress->tone : CellTone::Plain;
+    return facts.has_value() ? TextToneOf(facts->decor, text) : CellTone::Plain;
 }
 
 std::optional<std::string> HumanFigureFromMachineText(std::string_view lexical, CellFormat format)
@@ -1791,6 +1989,23 @@ th[title] { text-decoration:underline dotted var(--line); text-underline-offset:
 .chip--scratch { background:var(--crit-soft); color:var(--crit); }
 .chip--cordoned { background:var(--sunk); color:var(--ink); border-color:var(--line); }
 .chip--registered { background:var(--ok-soft); color:var(--ok); }
+.chip--notice { background:var(--accent-soft); color:var(--accent); }
+.chip--warning { background:var(--warn-soft); color:var(--warn); }
+.chip--alert { background:var(--crit-soft); color:var(--crit); }
+.chip--raised { background:var(--warn-soft); color:var(--warn); }
+.prose { display:inline-block; white-space:normal; min-width:24ch; max-width:64ch; }
+.pill--latched { background:var(--sunk); color:var(--ink); border-color:var(--line); }
+.pill--live { background:var(--accent-soft); color:var(--accent); }
+.conditions { padding:1rem 1.2rem 1.1rem; border-left:3px solid var(--warn); }
+.conditions--quiet { border-left-color:var(--ok); }
+.conditions--absent { border-left-color:var(--inert); }
+.machine-conditions + .machine-conditions { margin-top:1rem; padding-top:.9rem; border-top:1px solid var(--hairline); }
+.machine-conditions h3 { margin:0 0 .4rem; font:600 13px/1.3 ui-monospace,monospace; }
+.condition { margin:.35rem 0 0; display:flex; flex-wrap:wrap; align-items:baseline; gap:.3rem .6rem; }
+.condition-id { font:600 12.5px/1.3 ui-monospace,monospace; }
+.condition-detail, .condition-remedy { flex-basis:100%; margin:0; font-size:12.5px; max-width:96ch; }
+.condition-remedy { color:var(--muted); }
+details summary { cursor:pointer; color:var(--muted); font-size:12.5px; margin-top:.8rem; }
 .bar { display:inline-flex; align-items:center; gap:.45rem; }
 .bar-track { width:54px; height:6px; border-radius:2px; background:var(--sunk);
              overflow:hidden; border:1px solid var(--hairline); flex:none; }
@@ -2579,6 +2794,143 @@ std::span<FleetKpiText const> FleetKpis() noexcept
     return KpiTexts;
 }
 
+namespace
+{
+    /// How the page dresses one persistence: its pill, and what the word means to somebody hovering.
+    struct PersistenceDress
+    {
+        CompileCacheWire::ConditionPersistence persistence; ///< The enumerator this row describes.
+        std::string_view pillClass;                         ///< The pill's class.
+        std::string_view meaning;                           ///< The pill's title.
+    };
+
+    /// One row per persistence, in enumerator order.
+    ///
+    /// **Two looks for two different promises** (#1364): a latched row cannot clear while that
+    /// process runs, so an operator waiting for it to clear is waiting for nothing; a live one can,
+    /// and watching it is watching progress. The WORD is on the pill either way, so the page does not
+    /// depend on colour to say which.
+    constexpr EnumTable<CompileCacheWire::ConditionPersistence, PersistenceDress> PersistenceDressTable { {
+        { .persistence = CompileCacheWire::ConditionPersistence::Latched,
+          .pillClass = "pill--latched",
+          .meaning = "fixed for the life of this process: only a restart on a different build or configuration "
+                     "clears it" },
+        { .persistence = CompileCacheWire::ConditionPersistence::Live,
+          .pillClass = "pill--live",
+          .meaning = "can clear while this process runs" },
+    } };
+    static_assert(RowsInEnumeratorOrder(PersistenceDressTable, &PersistenceDress::persistence),
+                  "PersistenceDressTable must hold one row per ConditionPersistence, in enumerator order");
+
+    /// One condition a machine raised, as the panel lists it.
+    /// @param out Appended to.
+    /// @param row The row, as the machine sent it.
+    void AppendRaisedCondition(std::string& out, CompileCacheWire::NodeConditionFields const& row)
+    {
+        auto const severity = CompileCacheWire::ConditionSeverityNamed(row.severity);
+        auto const persistence = CompileCacheWire::ConditionPersistenceNamed(row.persistence);
+        // A word this build cannot name is shown as sent, undressed: a colour or a meaning for it
+        // would be this leader's guess about a newer node's vocabulary.
+        auto const chip = severity.has_value() ? SeverityDressTable[static_cast<std::size_t>(*severity)].chipClass : "";
+        auto const dress = persistence.has_value()
+                               ? PersistenceDressTable[static_cast<std::size_t>(*persistence)]
+                               : PersistenceDress { .persistence = CompileCacheWire::ConditionPersistence::Last,
+                                                    .pillClass = "",
+                                                    .meaning = "" };
+        out += std::format(R"(<div class="condition"><span class="chip {}">{}</span>)"
+                           R"(<span class="condition-id">{}</span>)"
+                           R"(<span class="pill pill--value {}" title="{}">{}</span>)",
+                           chip,
+                           EscapeHtml(row.severity),
+                           EscapeHtml(row.id),
+                           dress.pillClass,
+                           EscapeHtml(dress.meaning),
+                           EscapeHtml(row.persistence));
+        // The state only where it is not the ordinary `raised`: an `undecided` row, or a word from a
+        // newer node, is exactly the one a reader must not take for a plain raise.
+        if (CompileCacheWire::ConditionStateNamed(row.state) != CompileCacheWire::ConditionState::Raised)
+            out += std::format(R"(<span class="chip chip--raised">{}</span>)", EscapeHtml(row.state));
+        if (!row.detail.empty())
+            out += std::format(R"(<p class="condition-detail">{}</p>)", EscapeHtml(row.detail));
+        out += std::format(R"(<p class="condition-remedy">{}</p></div>)", EscapeHtml(row.remedy));
+    }
+
+    /// What is wrong across the fleet, before anything else on the page (#1364).
+    ///
+    /// **A panel, not a column**: forty machines each with a cell of ids would put the one thing an
+    /// operator came to find in the widest table on the page. Every machine whose conditions ask for
+    /// attention gets its rows here, with its severity, its persistence and its remedy; the rest are
+    /// COUNTED in words, apart -- a machine reporting nothing raised and a machine reporting nothing
+    /// at all are opposite readings, and a bare *everything is fine* would hide the second.
+    ///
+    /// Every row every machine sent follows behind a disclosure, walked from `ConditionColumns` like
+    /// every other table: the panel is a reading of the same rows, never a second list of them.
+    /// @param out Appended to.
+    /// @param snapshot What to render.
+    void AppendConditionsPanel(std::string& out, FleetSnapshot const& snapshot)
+    {
+        std::vector<NodeReport const*> asking;
+        std::size_t quiet = 0;
+        std::vector<std::string> absent;
+        for (auto const& node: snapshot.nodes)
+        {
+            if (!node.conditions.has_value())
+                absent.push_back(node.endpoint);
+            else if (std::ranges::any_of(*node.conditions, &CompileCacheWire::AsksForAttention))
+                asking.push_back(&node);
+            else
+                ++quiet;
+        }
+
+        auto const* const modifier = !asking.empty() ? "" : absent.empty() ? " conditions--quiet" : " conditions--absent";
+        out += std::format(R"(<section><div class="sec-head"><h2>Conditions</h2><span class="rule"></span>)"
+                           R"(<span class="meta">what each machine says is wrong with it</span></div>)"
+                           R"(<div class="panel conditions{}">)",
+                           modifier);
+
+        for (auto const* const node: asking)
+        {
+            out += std::format(R"(<div class="machine-conditions"><h3>{}{}</h3>)",
+                               EscapeHtml(node->endpoint),
+                               node->displayName.empty() ? std::string {}
+                                                         : std::format(" &middot; {}", EscapeHtml(node->displayName)));
+            for (auto const& row: *node->conditions)
+                if (CompileCacheWire::AsksForAttention(row))
+                    AppendRaisedCondition(out, row);
+            out += "</div>";
+        }
+
+        if (snapshot.nodes.empty())
+            out += R"(<p class="note">No machine has announced itself, so no machine has anything to report.</p>)";
+        else if (asking.empty() && absent.empty())
+            out += std::format(R"(<p class="note"><strong>No conditions raised</strong> on any of the {} machine(s).</p>)",
+                               quiet);
+        else if (quiet != 0)
+            // "other" only beside machines listed above it: with none listed, the word points at nothing.
+            out += std::format(R"(<p class="note">{} {}machine(s) report no conditions raised.</p>)",
+                               quiet,
+                               asking.empty() ? "" : "other ");
+
+        if (!absent.empty())
+        {
+            std::string names;
+            for (auto const& endpoint: absent)
+                names += std::format("{}{}", names.empty() ? "" : ", ", EscapeHtml(endpoint));
+            out += std::format(R"(<p class="note"><strong>{} machine(s) report no conditions at all</strong> &mdash; )"
+                               R"(a build older than them, or announcements that have stopped reaching this leader. )"
+                               R"(That is not the same as none raised: nothing here can vouch for them. {}</p>)",
+                               absent.size(),
+                               names);
+        }
+
+        auto const rows = ConditionRowsOf(snapshot);
+        out += std::format(R"(<details><summary>every row every machine reported ({})</summary><div class="wrap">)",
+                           rows.size());
+        AppendHtmlRows(out, ConditionColumns, rows);
+        out += "</div></details></div></section>";
+    }
+} // namespace
+
 std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView const& history, unsigned refreshSeconds)
 {
     std::string out;
@@ -2630,6 +2982,9 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView cons
     }
 
     auto const totals = TotalsFor(snapshot);
+
+    // ---- what is wrong, before anything else ---------------------------------
+    AppendConditionsPanel(out, snapshot);
 
     // ---- the readouts, before any table ------------------------------------
     //

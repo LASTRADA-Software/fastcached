@@ -1063,6 +1063,10 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
   from the flags that decide whether the component is CONSTRUCTED — `ServedSurfaces{}` means
   *not narrowed* and therefore every surface. `ctest -R counter-attribution`.
 - A duration is a `_sum`/`_count` pair, never a gauge.
+- A condition an operator must act on is a row of `NodeConditionTable`, never a log line alone.
+  **Latched and live are drawn apart on every surface**; `none raised` is SAID and a node that
+  sent no list is ABSENT; `undecided` is *nobody evaluated it* and must not read as `clear`. Rows
+  travel as WORDS, the remedy included. The `[conditions]` Catch2 tag, in three binaries.
 - A merged snapshot is one tier's answer standing in for all of them: `SnapshotTiers()` reports
   the split, the `tier` label comes from a table, and a tier the cache does not have renders no
   line at all.

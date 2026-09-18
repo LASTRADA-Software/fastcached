@@ -1149,20 +1149,42 @@ namespace
                            std::string(MaxStemLength, 'a'),
                            std::string(longestExtension, 'a'));
     }
+
+    /// Every prefix-map row a job on @p scratchRoot could not be written into.
+    ///
+    /// The one derivation behind both the startup warnings and the node's condition row, so the
+    /// line an operator reads while the node starts and the row they read an hour later cannot
+    /// name different flags.
+    /// @param scratchRoot The claimed root; empty names none.
+    /// @return The rows, in table order.
+    [[nodiscard]] std::vector<PathValueFlag const*> UnmappableRows(std::string_view scratchRoot)
+    {
+        std::vector<PathValueFlag const*> rows;
+        if (scratchRoot.empty())
+            return rows;
+
+        auto const longest = LongestScratchSourcePath(scratchRoot);
+        for (PathValueFlag const& row: PathValueFlags())
+            if (row.role == PathValueRole::PrefixMap && !SpellableInRule(longest, row))
+                rows.push_back(&row);
+        return rows;
+    }
 } // namespace
+
+std::vector<std::string_view> ScratchRootUnmappableFlags(std::string_view scratchRoot)
+{
+    std::vector<std::string_view> flags;
+    for (auto const* row: UnmappableRows(scratchRoot))
+        flags.push_back(row->spelling);
+    return flags;
+}
 
 std::vector<std::string> ScratchRootMappingWarnings(std::string_view scratchRoot)
 {
     std::vector<std::string> warnings;
-    if (scratchRoot.empty())
-        return warnings;
-
-    auto const longest = LongestScratchSourcePath(scratchRoot);
-    for (PathValueFlag const& row: PathValueFlags())
+    for (auto const* const unmappable: UnmappableRows(scratchRoot))
     {
-        if (row.role != PathValueRole::PrefixMap || SpellableInRule(longest, row))
-            continue;
-
+        auto const& row = *unmappable;
         // The FLAG rather than the family, because the flag is what an operator can
         // search for and it names the family unambiguously; there is no family-name
         // table in this tree, and inventing one to render a warning would be a second

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -106,7 +108,11 @@ class NodeMembership final: public Distributed::IMembershipOracle
   public:
     /// @param cfg The parsed configuration.
     /// @param logger Where an unreadable `fleet-open` row is reported, once.
-    NodeMembership(NodeConfig const& cfg, ILogger& logger):
+    /// @param conditions Where a `--fleet-member` entry the cluster has FORGOTTEN is raised (#1364),
+    ///        or null on a node that runs no consensus -- which has no committed tombstone set, so
+    ///        its row is answered from its scope rather than as a reassuring `clear`. Must outlive
+    ///        this.
+    NodeMembership(NodeConfig const& cfg, ILogger& logger, NodeConditions* conditions = nullptr):
         _open {},
         // The two lists differ in nothing but the QUESTION they answer, which is why each is
         // told which route it is rather than deriving it from its type (#1471). An operator who
@@ -132,9 +138,12 @@ class NodeMembership final: public Distributed::IMembershipOracle
         // OPEN, and admission succeeding is the ordinary case -- nothing reports it.
         _openly { { &_forgotten, &_open } },
         _logger { logger },
+        _conditions { conditions },
+        _listing { cfg.fleetMembers },
         _flagOpen { cfg.fleetOpen },
         _isOpen { cfg.fleetOpen }
     {
+        ReportStaleListing(nullptr);
     }
 
     NodeMembership(NodeMembership const&) = delete;
@@ -174,6 +183,9 @@ class NodeMembership final: public Distributed::IMembershipOracle
         _flagOpen.store(cfg.fleetOpen, std::memory_order_relaxed);
         SettleOpenness();
         _listed.Publish(cfg.fleetMembers);
+        // The listing half of the stale-entry condition moved; the reload that REMOVES a forgotten
+        // host is exactly the one this row exists to watch clear.
+        ReportStaleListing(&cfg.fleetMembers);
     }
 
     /// @copydoc Distributed::IMembershipOracle::Explain
@@ -247,6 +259,9 @@ class NodeMembership final: public Distributed::IMembershipOracle
         // direction that cannot be recovered from: the compile has already been
         // served.
         _forgotten.Publish(state.forgotten);
+        // The tombstone half moved: a forget can make an entry this node lists stale, and a
+        // re-admit can make it current again.
+        ReportStaleListing(nullptr);
     }
 
     /// Record the cluster's member set alone.
@@ -291,6 +306,43 @@ class NodeMembership final: public Distributed::IMembershipOracle
     }
 
   private:
+    /// Raise or clear the stale-listing condition from what `--fleet-member` names and what the
+    /// cluster has forgotten (#1364).
+    ///
+    /// **Asked of `_forgotten` itself**, through the oracle's own `Explain`, so the host a surface
+    /// refuses as forgotten and the entry this reports as stale cannot be two readings of one set:
+    /// `SameHost`'s IPv6 fold, the loopback silence and the whole-string match all come with it.
+    ///
+    /// The entry is harmless -- the forget outranks it, so the host is refused either way -- which
+    /// is why this is a Warning rather than an alarm. What it costs is a list that says one thing
+    /// and a fleet that does another, and an operator who re-admits the host months later expecting
+    /// the list to govern.
+    /// @param listing The `--fleet-member` list now in force, or null when only the tombstones
+    ///        moved.
+    void ReportStaleListing(std::vector<std::string> const* listing)
+    {
+        if (_conditions == nullptr)
+            return;
+
+        // One lock over both the copy and the question, so a reload and a commit racing each other
+        // leave the row describing whichever of them landed LAST -- each writes its own half first
+        // and then asks, and the last to ask sees both halves.
+        std::scoped_lock const guard { _listingMutex };
+        if (listing != nullptr)
+            _listing = *listing;
+
+        std::vector<std::string> stale;
+        for (auto const& entry: _listing)
+            if (_forgotten.Explain(HostOfEndpoint(entry)).verdict == Distributed::Membership::Forgotten)
+                stale.push_back(entry);
+
+        if (stale.empty())
+            _conditions->Clear(NodeCondition::ForgottenFleetMember);
+        else
+            _conditions->Raise(NodeCondition::ForgottenFleetMember,
+                               ListDetail("--fleet-member names host(s) the cluster has forgotten, and so refuses:", stale));
+    }
+
     /// What the cluster's `fleet-open` row says.
     ///
     /// A named enumeration rather than `-1`/`0`/`1`, because the encoding is the part
@@ -407,6 +459,17 @@ class NodeMembership final: public Distributed::IMembershipOracle
 
     /// Where an unreadable `fleet-open` row is reported, once.
     ILogger& _logger;
+
+    /// Where a stale `--fleet-member` entry is reported; null on a node that runs no consensus.
+    NodeConditions* _conditions;
+
+    /// Guards `_listing`, and serialises the question asked of it with the answer written.
+    std::mutex _listingMutex;
+
+    /// The `--fleet-member` entries as the operator spelled them, for the stale-entry condition.
+    /// `_listed` keeps only their hosts, and a condition naming `10.0.0.7` where the operator
+    /// typed `10.0.0.7:6674` would send them looking for an entry their file does not contain.
+    std::vector<std::string> _listing;
 
     /// What `--fleet-open` says on THIS node. Separate from `_isOpen` since #1112,
     /// which is the whole shape of that ticket: the effective answer is now a

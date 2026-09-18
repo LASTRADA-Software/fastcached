@@ -412,3 +412,36 @@ TEST_CASE("A report carries ages as durations and the state the wire spells", "[
     CHECK(report.pending[1].nodeId == "joiner-b");
     CHECK(report.pending[1].firstSeenSecondsAgo == 15);
 }
+
+TEST_CASE("An open window is a LIVE condition: raised on open, clear on close, raised again",
+          "[enrollment][window][conditions]")
+{
+    // #1364. The repeating Warn reaches only whoever reads this node's log; the row reaches the
+    // leader's page and `node-conditions`. LIVE, because watching it clear is the progress an
+    // operator is waiting for -- so the case drives it round twice, which a latched row cannot do.
+    ManualClock clock;
+    NodeConditions conditions;
+    EnrollmentWindow window { clock, &conditions };
+
+    // Checked at construction, not assumed: a process starts with no window open.
+    CHECK(conditions.StateOf(NodeCondition::EnrollmentWindowOpen) == Wire::ConditionState::Clear);
+
+    REQUIRE(window.Open() == EnrollControlOutcome::Done);
+    CHECK(conditions.StateOf(NodeCondition::EnrollmentWindowOpen) == Wire::ConditionState::Raised);
+    REQUIRE(window.Close() == EnrollControlOutcome::Done);
+    CHECK(conditions.StateOf(NodeCondition::EnrollmentWindowOpen) == Wire::ConditionState::Clear);
+    REQUIRE(window.Open() == EnrollControlOutcome::Done);
+    CHECK(conditions.StateOf(NodeCondition::EnrollmentWindowOpen) == Wire::ConditionState::Raised);
+}
+
+TEST_CASE("A window on a node that serves none reports nothing about itself", "[enrollment][window][conditions]")
+{
+    // Handed no registry -- `main`'s `AddressWhen(servesEnrollment, ...)` on a node with no cluster
+    // -- the window touches nothing, so its row is left for the scope to answer `not-evaluated`
+    // rather than a reassuring `clear` about a window nothing can open.
+    ManualClock clock;
+    NodeConditions conditions;
+    EnrollmentWindow window { clock, nullptr };
+    REQUIRE(window.Open() == EnrollControlOutcome::Done);
+    CHECK(conditions.StateOf(NodeCondition::EnrollmentWindowOpen) == Wire::ConditionState::Undecided);
+}

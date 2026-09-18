@@ -1453,6 +1453,62 @@ namespace
         return fact;
     }
 
+    /// How a raised condition's id is dressed, by its severity: one row per severity, in enumerator order.
+    ///
+    /// A notice asks for nothing, so it is plain; a warning is dressed as a stale age is, *look at this*; an
+    /// alert as a refusal is. A severity this build cannot name is plain, since a colour would be a guess.
+    struct SeverityTone
+    {
+        CompileCacheWire::ConditionSeverity severity; ///< The enumerator this row describes.
+        std::optional<FrameTone> tone;                ///< How an id of that severity is dressed; none for plain.
+    };
+    constexpr EnumTable<CompileCacheWire::ConditionSeverity, SeverityTone> SeverityTones { {
+        { .severity = CompileCacheWire::ConditionSeverity::Notice, .tone = std::nullopt },
+        { .severity = CompileCacheWire::ConditionSeverity::Warning, .tone = FrameTone::Stale },
+        { .severity = CompileCacheWire::ConditionSeverity::Alert, .tone = FrameTone::Alert },
+    } };
+    static_assert(RowsInEnumeratorOrder(SeverityTones, &SeverityTone::severity),
+                  "SeverityTones must hold one row per ConditionSeverity, in enumerator order");
+
+    /// The node's conditions as a fact line (#1364): the marker when it carried none, `none raised` when nothing
+    /// asks for attention, and otherwise each condition that does, toned by its severity and followed by its
+    /// persistence -- `unsigned-lease-grants latched  enrollment-window-open live` -- so a latched row, which no
+    /// fix short of a restart clears, cannot be read as a live one an operator can watch clear.
+    ///
+    /// The words are the node's, as they travelled: this panel restates no list of conditions, and a row a newer
+    /// node reports is drawn as that node wrote it.
+    /// @param in The frame's inputs.
+    /// @return The fact.
+    [[nodiscard]] FactText ConditionsFact(FrameInputs const& in)
+    {
+        auto const* status = StatusOf(in);
+        auto const mentions = ConditionsAskingForAttention(status != nullptr ? status->runtime.conditions : std::nullopt);
+        if (!mentions.has_value())
+            return Said(std::string { in.absent });
+        if (mentions->empty())
+            return Said(std::string { NoConditionsRaised }, FrameTone::Fresh);
+
+        auto fact = FactText {};
+        for (auto const& mention: *mentions)
+        {
+            auto const first = fact.pieces.empty();
+            auto const priority = first ? Priority::Essential : Priority::High;
+            fact.pieces.push_back(Piece {
+                .text = std::format("{}{}", first ? std::string_view {} : FactFigureGap, mention.id),
+                .priority = priority,
+                .tone = mention.severity.has_value() ? SeverityTones[static_cast<std::size_t>(*mention.severity)].tone
+                                                     : std::nullopt });
+            // The persistence, and the state where it is not a plain `raised`, as the id's qualifier.
+            fact.pieces.push_back(Piece { .text = std::format(" {}{}{}",
+                                                              mention.persistence,
+                                                              mention.unusualState.has_value() ? " " : "",
+                                                              mention.unusualState.value_or(std::string {})),
+                                          .priority = priority,
+                                          .tone = FrameTone::Label });
+        }
+        return fact;
+    }
+
     /// What a leading node's `leader` reads: it names no endpoint because it is the leader.
     constexpr std::string_view SelfLeader = "this node";
 
@@ -1476,6 +1532,10 @@ namespace
           .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
               auto const* status = StatusOf(in);
               return Said(status == nullptr ? std::string { in.absent } : DescribeComponents(status->components));
+          } },
+        { .fact = StatusFact::Conditions,
+          .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
+              return ConditionsFact(in);
           } },
         { .fact = StatusFact::Toolchains,
           .render = [](FrameInputs const& in, FactCell const& /*cell*/, std::size_t /*width*/) -> std::optional<FactText> {
@@ -1993,10 +2053,12 @@ namespace
         std::string_view key; ///< The keystroke's bytes; empty for a section the strip does not name.
     };
 
-    /// One row per `FleetSection`, in enumerator order: what the strip's `keys  m w l c f t` hint lists.
+    /// One row per `FleetSection`, in enumerator order: what the strip's `keys  m w l c f ! t` hint lists.
     ///
     /// A letter per tab, from the section's key -- except `members`, whose `m` `machines` already has, so it
-    /// answers to `c`, for cluster. None is a quit key or `/`, which the panel reads first.
+    /// answers to `c`, for cluster, and `conditions`, whose `c` members then has: it answers to `!`, the key a
+    /// person reaches for when asking what is wrong (#1364). None is a quit key or `/`, which the panel reads
+    /// first.
     constexpr EnumTable<FleetSection, SectionHotkey> SectionHotkeyTable { {
         { .section = FleetSection::Kpi, .key = {} },
         { .section = FleetSection::Machines, .key = "m" },
@@ -2004,6 +2066,7 @@ namespace
         { .section = FleetSection::Leases, .key = "l" },
         { .section = FleetSection::Members, .key = "c" },
         { .section = FleetSection::Forgotten, .key = "f" },
+        { .section = FleetSection::Conditions, .key = "!" },
         { .section = FleetSection::Tiers, .key = "t" },
         // Not a tab: the history is not in the document a live panel is pushed.
         { .section = FleetSection::Series, .key = {} },
