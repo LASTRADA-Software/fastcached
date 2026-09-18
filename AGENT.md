@@ -220,6 +220,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   question in silence**, and a driver found disagreeing is a finding, not a check to adjust.
 - A path a COMPILER wrote is not this process's text: `cl` writes `/showIncludes` in the
   console output code page. Decoded at `RootReconciler::Path`, or the compile is not cached.
+- **A hit reproduces BOTH artefacts or is not a hit**: a value with no depfile region is not served
+  to a compile that names a depfile (`Cc::ReproducesDepFile`) -- recompiled and re-stored instead
+  (#1531). And clang-cl under CMake asks for a GNU depfile through `-clang:-MF<dep>` (`deps = gcc`),
+  not for `/showIncludes`: the pass-through spellings are `PathValueFlags()` rows.
 - The `/showIncludes` MARKER is a canonical form exactly as `<SRCROOT>` is: the LAUNCHER
   normalizes its own prefix to `IncludeNoteMarker` before storing and restores this build's
   after localizing, so the stored bytes are locale-free and no server changed. The restore
