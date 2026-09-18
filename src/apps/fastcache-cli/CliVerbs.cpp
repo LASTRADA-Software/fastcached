@@ -2150,7 +2150,7 @@ namespace
           // `the fleet verb offers every section the server serves` in
           // `CliVerbs_test.cpp`, which walks that table: a section added and not
           // spelled here reddens rather than going quietly missing from the help.
-          .operands = " <kpi|machines|workers|leases|members|tiers|series>",
+          .operands = " <kpi|machines|workers|leases|members|forgotten|tiers|series>",
           .summary = "one of the leader's fleet tables, read over 0xFC from\n"
                      "the node that leads -- no admin surface, browser or JSON parser",
           .protocolCommand = "fleet-text",

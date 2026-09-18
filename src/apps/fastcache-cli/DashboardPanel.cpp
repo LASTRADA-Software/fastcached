@@ -1993,7 +1993,7 @@ namespace
         std::string_view key; ///< The keystroke's bytes; empty for a section the strip does not name.
     };
 
-    /// One row per `FleetSection`, in enumerator order: what the strip's `keys  m w l c t` hint lists.
+    /// One row per `FleetSection`, in enumerator order: what the strip's `keys  m w l c f t` hint lists.
     ///
     /// A letter per tab, from the section's key -- except `members`, whose `m` `machines` already has, so it
     /// answers to `c`, for cluster. None is a quit key or `/`, which the panel reads first.
@@ -2003,6 +2003,7 @@ namespace
         { .section = FleetSection::Workers, .key = "w" },
         { .section = FleetSection::Leases, .key = "l" },
         { .section = FleetSection::Members, .key = "c" },
+        { .section = FleetSection::Forgotten, .key = "f" },
         { .section = FleetSection::Tiers, .key = "t" },
         // Not a tab: the history is not in the document a live panel is pushed.
         { .section = FleetSection::Series, .key = {} },

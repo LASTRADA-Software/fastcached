@@ -148,7 +148,10 @@ TEST_CASE("Every fleet column reaches the page, the JSON and the text", "[distri
                                     .id = "n1", .raftEndpoint = "10.0.0.2:6675", .schedulerEndpoint = "10.0.0.2:6676" } },
                                 .settings = {},
                                 .clients = {},
-                                .forgotten = {} };
+                                // A tombstone for the tier's reason: this case walks the TABLES, and a
+                                // section rendering from an empty vector would be covered by asserting
+                                // almost nothing about it.
+                                .forgotten = { "10.0.0.9" } };
     snapshot.workers = { WorkerReport { .info = WorkerInfo { .id = "w1",
                                                              .fingerprint = "gcc-13-abcdef",
                                                              .endpoint = "10.0.0.2:7100",
@@ -2154,4 +2157,82 @@ TEST_CASE("Each refusal tile names the counter it renders, in its own tile", "[d
     // The count is part of the assertion: a loop that ran zero times would otherwise
     // report no mismatches and pass.
     CHECK((detail.empty() && seen == LeaseOutcomeTable.size()));
+}
+
+TEST_CASE("The forgotten clients reach every surface, and absent is not the same as none",
+          "[distributed][fleetview][forget]")
+{
+    // #1471. The tombstones were the one piece of replicated membership state no surface
+    // showed: `node` reports how MANY a node enforces and never which, so an operator who
+    // has issued three forgets cannot tell which machine a given node is refusing.
+    //
+    // WHAT DISTINGUISHES: three states that a renderer collapsing any two of them would
+    // pass at least one of -- no cluster, a cluster with no tombstones, and a cluster with
+    // some -- asserted on all three surfaces.
+    auto snapshot = LeadingSnapshot();
+
+    SECTION("a node running no cluster reports null, never an empty set")
+    {
+        REQUIRE_FALSE(snapshot.cluster.has_value());
+        CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("forgotten":null)"));
+        CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("runs no cluster"));
+    }
+
+    SECTION("a cluster that has forgotten nobody reports an empty set, and says so in words")
+    {
+        snapshot.cluster = Cluster::ClusterState {};
+        CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("forgotten":[])"));
+        // The sentence rather than a bare empty table, which reads as a section that
+        // failed to render.
+        CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("forgotten nobody"));
+        // And the column still reaches the page in this state: a section whose columns
+        // appear only when it has rows is one no table-walking test can hold to account.
+        CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("Forgotten clients"));
+    }
+
+    SECTION("every forgotten host is named on all three surfaces")
+    {
+        // Built through `Apply`, which is how a leader acquires this state; a literal
+        // would assert the representation rather than what the cluster records.
+        Cluster::ClusterState state;
+        Apply(state,
+              Cluster::Command {
+                  .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.7", .value = {}, .schedulerEndpoint = {} });
+        Apply(state,
+              Cluster::Command {
+                  .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.8", .value = {}, .schedulerEndpoint = {} });
+        snapshot.cluster = state;
+
+        auto const json = RenderFleetJson(snapshot, NoHistory());
+        CHECK(json.contains("10.0.0.7"));
+        CHECK(json.contains("10.0.0.8"));
+        CHECK(RenderFleetHtml(snapshot, NoHistory(), 0).contains("10.0.0.8"));
+
+        // The section's own table: a header and one line per host, and nothing else --
+        // the form a reader pipes into `cut`.
+        auto const section = RenderFleetText(snapshot, NoHistory(), FleetSection::Forgotten);
+        CHECK(LineCount(section) == 3);
+        CHECK(HeaderLine(section) == "host");
+        CHECK(section.contains("10.0.0.7"));
+        CHECK(section.contains("10.0.0.8"));
+    }
+
+    SECTION("a host admitted again is no longer forgotten, on the page as in the fold")
+    {
+        // The direction that fails OPEN elsewhere in this tree, and the one a renderer
+        // reading a stale copy would get wrong: a re-admit removes the tombstone, so a
+        // surface still naming the host would send an operator to undo a forget that is
+        // already undone.
+        Cluster::ClusterState state;
+        Apply(state,
+              Cluster::Command {
+                  .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.7", .value = {}, .schedulerEndpoint = {} });
+        Apply(state,
+              Cluster::Command {
+                  .kind = Cluster::CommandKind::AdmitClient, .key = "10.0.0.7", .value = {}, .schedulerEndpoint = {} });
+        snapshot.cluster = state;
+
+        CHECK(RenderFleetJson(snapshot, NoHistory()).contains(R"("forgotten":[])"));
+        CHECK(LineCount(RenderFleetText(snapshot, NoHistory(), FleetSection::Forgotten)) == 1);
+    }
 }

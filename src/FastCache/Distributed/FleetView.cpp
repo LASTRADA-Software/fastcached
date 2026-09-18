@@ -334,6 +334,23 @@ namespace
                 } },
     };
 
+    /// What a forgotten-client row shows (#1471).
+    ///
+    /// One column, because a tombstone IS a host: `ClusterState::forgotten` records the set and
+    /// not when each entry joined it, so a date column could only be invented. The section earns
+    /// its place from the other direction -- `node` reports how many tombstones a node enforces
+    /// and never which, so an operator who has issued three forgets cannot tell which machine a
+    /// given node is refusing, and a count that disagrees between two nodes says only that they
+    /// disagree.
+    constexpr std::array<FleetColumn<std::string>, 1> ForgottenColumns {
+        FleetColumn<std::string> { .name = "host",
+                                   .help = "A client host `--cluster-forget-client` removed. It stays refused however many "
+                                           "admission routes name it.",
+                                   .format = CellFormat::Text,
+                                   .keep = ColumnKeep::Identity,
+                                   .project = [](std::string const& host) { return FleetCell::Of(host); } },
+    };
+
     /// What a node row shows, before its per-tier cache columns.
     constexpr std::array<FleetColumn<NodeReport>, 12> NodeColumns {
         FleetColumn<NodeReport> { .name = "endpoint",
@@ -1206,6 +1223,14 @@ std::string RenderFleetJson(FleetSnapshot const& snapshot, FleetHistoryView cons
         out += "null"; // Runs no cluster at all -- not "a cluster with no members".
 
     out += ',';
+    AppendJsonString(out, "forgotten");
+    out += ':';
+    if (snapshot.cluster.has_value())
+        AppendJsonRows(out, ForgottenColumns, snapshot.cluster->forgotten);
+    else
+        out += "null"; // Runs no cluster -- not "a cluster that has forgotten nobody".
+
+    out += ',';
     AppendJsonString(out, "nodes");
     out += ':';
     AppendJsonRows(out, NodeColumns, snapshot.nodes);
@@ -1376,6 +1401,14 @@ namespace
                                snapshot.cluster.has_value() ? snapshot.cluster->members
                                                             : std::vector<Cluster::ClusterMember> {});
                 return;
+            case FleetSection::Forgotten:
+                // Empty where the node runs no cluster, exactly as `Members` is: the marker
+                // line in the full document carries that difference, a TSV table has no room
+                // for it, and an empty table is the honest rendering of *nothing to show*.
+                AppendTextRows(out,
+                               ForgottenColumns,
+                               snapshot.cluster.has_value() ? snapshot.cluster->forgotten : std::vector<std::string> {});
+                return;
             case FleetSection::Tiers:
                 AppendTierText(out, snapshot);
                 return;
@@ -1418,6 +1451,8 @@ std::vector<std::string> FleetColumnNames(FleetSection section, FleetSnapshot co
             return namesOf(LeaseColumns);
         case FleetSection::Members:
             return namesOf(MemberColumns);
+        case FleetSection::Forgotten:
+            return namesOf(ForgottenColumns);
         case FleetSection::Tiers: {
             // Laid down exactly as `AppendTierText` lays them: the endpoint column, then
             // every present tier crossed with every suffix. `tiersPresent` is what makes
@@ -1490,6 +1525,8 @@ namespace
                 return factsOf(LeaseColumns);
             case FleetSection::Members:
                 return factsOf(MemberColumns);
+            case FleetSection::Forgotten:
+                return factsOf(ForgottenColumns);
             case FleetSection::Tiers:
                 if (name == TierEndpointColumn)
                     return ColumnFacts { .format = CellFormat::Text,
@@ -2792,6 +2829,29 @@ std::string RenderFleetHtml(FleetSnapshot const& snapshot, FleetHistoryView cons
         out += R"(<div class="panel wrap">)";
         AppendHtmlRows(out, MemberColumns, snapshot.cluster->members);
         out += "</div>";
+    }
+    else
+        out += R"(<p class="note">This node runs no cluster: it leads itself, and has no replicated state.</p>)";
+    out += "</section>";
+
+    // ---- forgotten clients --------------------------------------------------
+    out += R"(<section><div class="sec-head"><h2>Forgotten clients</h2><span class="rule"></span>)"
+           R"(<span class="meta">replicated tombstones</span></div>)";
+    if (snapshot.cluster.has_value())
+    {
+        // The table is drawn whether or not the set is empty, exactly as Members is: a
+        // section that renders its columns only when it has rows is one whose columns
+        // reach the page in some states and not others, which is a coverage hole no test
+        // over the tables can see.
+        out += R"(<div class="panel wrap">)";
+        AppendHtmlRows(out, ForgottenColumns, snapshot.cluster->forgotten);
+        out += "</div>";
+        if (snapshot.cluster->forgotten.empty())
+            // And an empty set is a READING, so it says so: a bare empty table reads as a
+            // section that failed to render.
+            out += R"(<p class="note">The cluster has forgotten nobody. A forget is a positive act &mdash; )"
+                   R"(--cluster-forget-client records a tombstone, which outranks every admission route )"
+                   R"(including --fleet-open.</p>)";
     }
     else
         out += R"(<p class="note">This node runs no cluster: it leads itself, and has no replicated state.</p>)";

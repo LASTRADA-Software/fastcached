@@ -296,14 +296,15 @@ struct FleetHistoryView;
 /// `EnumTable`'s anchor and not a wire contract.
 enum class FleetSection : std::uint8_t
 {
-    Kpi = 0,  ///< The headline figures the page's strip carries.
-    Machines, ///< One row per machine — the grain a fleet total is computed over.
-    Workers,  ///< One row per `(toolchain, endpoint)` registry entry.
-    Leases,   ///< The oldest outstanding leases, bounded as the page bounds them.
-    Members,  ///< What the cluster has agreed, when this node runs one.
-    Tiers,    ///< Per-tier cache figures, for the tiers some member runs.
-    Series,   ///< The fleet's history over a range: one row per bucket, one column per series.
-    Last,     ///< Not a section, and has no row: the length of a table keyed by one.
+    Kpi = 0,   ///< The headline figures the page's strip carries.
+    Machines,  ///< One row per machine — the grain a fleet total is computed over.
+    Workers,   ///< One row per `(toolchain, endpoint)` registry entry.
+    Leases,    ///< The oldest outstanding leases, bounded as the page bounds them.
+    Members,   ///< What the cluster has agreed, when this node runs one.
+    Forgotten, ///< The client hosts the cluster has agreed to stop admitting.
+    Tiers,     ///< Per-tier cache figures, for the tiers some member runs.
+    Series,    ///< The fleet's history over a range: one row per bucket, one column per series.
+    Last,      ///< Not a section, and has no row: the length of a table keyed by one.
 };
 
 /// What one section is called.
@@ -383,6 +384,14 @@ inline constexpr EnumTable<FleetSection, FleetSectionRow> FleetSectionTable {
                       .one = "member",
                       .many = "members",
                       .summary = "what the cluster has agreed; absent when this node runs none",
+                      .tabular = true,
+                      .inWhole = true },
+    FleetSectionRow { .section = FleetSection::Forgotten,
+                      .key = "forgotten",
+                      .one = "forgotten client",
+                      .many = "forgotten clients",
+                      .summary = "client hosts the cluster has agreed to stop admitting; absent when this node "
+                                 "runs no cluster",
                       .tabular = true,
                       .inWhole = true },
     FleetSectionRow { .section = FleetSection::Tiers,
