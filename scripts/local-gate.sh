@@ -152,6 +152,10 @@
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Where a build tree goes when the root is on a protocol filesystem (#1227). The local disk
+# of whoever runs the gate, keyed per worktree below -- never shared between trees.
+gate_build_home="${FASTCACHED_GATE_BUILD_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/fastcached/gate}"
 cd "$repo_root" || exit 1
 
 # The status a usage error exits with. Defined here because the argument loop below
@@ -1914,6 +1918,175 @@ report_or_refuse() {
     [[ -n "$line" ]] || fail "the gate's own reporter '$1' produced no line at all (exit $status), so there is no verdict to read. That is a bug in the GATE, not a verdict about this tree -- every arm of every reporter echoes, so this means the reporter did not run. There is a line on stderr above this one saying why"
     [[ "$status" -eq 0 ]] || fail "$line"
     echo "$line"
+}
+
+# Filesystems a build tree must not live on (#1227): reached over a PROTOCOL, where every
+# `open` and `stat` is an RPC and a build is millions of them. Measured under WSL2 on `9p`,
+# which `findmnt` reports and `stat -f` spells `v9fs` -- one mount, two names, so both rows,
+# or one of the two readings misses it. `drvfs` is WSL1's name for the same Windows-drive
+# mount and the same mechanism, and it is NOT measured: it is a row because it is that mount,
+# not because of a reading.
+#
+# Deliberately narrow. NFS, CIFS and sshfs are protocol filesystems too, and nobody has
+# measured a build on any of them here; moving a native-Linux developer's build out of an NFS
+# home would be a behaviour change made on an inference. A reason that generalises further
+# than the fact it was drawn from is worse than the narrow one, so the next filesystem is a
+# row AND a measurement, never a row alone.
+protocol_filesystems=(9p v9fs drvfs)
+
+# @param 1 A filesystem type, as `findmnt -n -o FSTYPE` reports it.
+# @return 0 when a build tree on it pays the per-operation RPC.
+is_protocol_filesystem() {
+    local fs
+    for fs in "${protocol_filesystems[@]}"; do
+        [[ "$1" == "$fs" ]] && return 0
+    done
+    return 1
+}
+
+# Where a preset's build tree should physically live -- a DECISION over two readings.
+#
+# Pure, so `--self-test` drives every outcome with no second filesystem: the acquisition is
+# the easy half and the decision is the half that can be wrong. FOUR answers, and the last is
+# not the first in disguise:
+#   in-tree          the root is on a local filesystem, so there is nothing to move
+#   relocate         the root is on a protocol filesystem and the home is local
+#   home-unsuitable  the home is not local either, or cannot be read, so moving buys nothing
+#   unknown          the ROOT could not be asked -- which is not the same as local
+# @param 1 The root's filesystem type, or empty when it could not be read.
+# @param 2 The home's filesystem type, or empty when it could not be read.
+build_placement() {
+    if [[ -z "$1" ]]; then
+        echo "unknown"
+    elif ! is_protocol_filesystem "$1"; then
+        echo "in-tree"
+    elif [[ -z "$2" ]] || is_protocol_filesystem "$2"; then
+        echo "home-unsuitable"
+    else
+        echo "relocate"
+    fi
+}
+
+# Whether this root may use a build home that records @p 1 as its owner.
+#
+# **The check that makes the relocation sound**: two worktrees sharing one build tree would
+# give one of them a verdict built from the OTHER's sources, which is the failure this file
+# exists to refuse. The key alone could collide or be hand-edited, so the directory names its
+# owner and is refused, never reused, when that is anybody else -- compared WHOLE, because a
+# root that is a prefix of another root is a different tree.
+# @param 1 The root the home's `ROOT` file records, or empty when it has none.
+# @param 2 This gate's root.
+# @return claim | ok | refuse
+build_home_claim() {
+    if [[ -z "$1" ]]; then
+        echo "claim"
+    elif [[ "$1" == "$2" ]]; then
+        echo "ok"
+    else
+        echo "refuse"
+    fi
+}
+
+# A key for @p 1 that two roots do not share, or nothing when no digest tool exists.
+build_home_key() {
+    local digest
+    if command -v sha256sum > /dev/null 2>&1; then
+        digest="$(sha256sum <<< "$1")"
+    elif command -v shasum > /dev/null 2>&1; then
+        digest="$(shasum -a 256 <<< "$1")"
+    else
+        return 1
+    fi
+    echo "${digest:0:16}"
+}
+
+# The filesystem type @p 1 is on, or nothing when that cannot be asked.
+filesystem_of() {
+    command -v findmnt > /dev/null 2>&1 || return 0
+    findmnt -n -o FSTYPE --target "$1" 2>/dev/null
+}
+
+# Put out/build/<preset> where `build_placement` says, and SAY what was decided.
+#
+# A SYMLINK rather than a path threaded through this script. The build directory is spelled
+# exactly once, in `run_preset`, and every later read goes through that spelling -- and CMake
+# records the SPELLED path in its cache rather than the resolved one, so `cmake --build
+# --preset` and a re-configure both agree with it. Probed, not assumed: configure, build, test,
+# re-configure and re-build, all through a 9p-to-ext4 link, all clean. `cmake -B` beside
+# `--preset` is the tempting alternative and moves only the configure: the build step reads
+# the preset's own `binaryDir`.
+#
+# Nothing is deleted. An in-tree build an earlier gate left is MOVED aside and named, so its
+# space is recovered by a person deciding to rather than by a script deciding for them. A link
+# pointing anywhere else is this gate's own earlier placement under another home -- output,
+# not input -- so re-pointing it costs one configure and loses nothing.
+# @param 1 The preset.
+# @return What was decided on stdout; status 1, with the reason, when it is refused.
+place_build_dir() {
+    local preset="$1" dir="out/build/$1"
+    local root_fs home_fs decision
+    root_fs="$(filesystem_of "$repo_root")"
+    mkdir -p "$gate_build_home" 2>/dev/null
+    home_fs="$(filesystem_of "$gate_build_home")"
+    decision="$(build_placement "$root_fs" "$home_fs")"
+
+    case "$decision" in
+        in-tree)
+            return 0
+            ;;
+        unknown)
+            echo "== $preset: build directory stays in the tree -- the filesystem $repo_root is on could not be asked (no findmnt)"
+            return 0
+            ;;
+        home-unsuitable)
+            echo "== $preset: build directory stays in the tree -- $repo_root is on $root_fs and $gate_build_home is on ${home_fs:-an unreadable filesystem}, so moving it buys nothing"
+            return 0
+            ;;
+        relocate)
+            ;;
+        *)
+            echo "build_placement answered '$decision', which place_build_dir has no arm for"
+            return 1
+            ;;
+    esac
+
+    local key
+    if ! key="$(build_home_key "$repo_root")" || [[ -z "$key" ]]; then
+        echo "no sha256sum or shasum to key the build home by, and an unkeyed home would be shared between worktrees"
+        return 1
+    fi
+    local home="$gate_build_home/$key"
+    mkdir -p "$home" || { echo "cannot create $home"; return 1; }
+    local recorded=""
+    [[ -f "$home/ROOT" ]] && recorded="$(cat "$home/ROOT")"
+    case "$(build_home_claim "$recorded" "$repo_root")" in
+        claim)
+            printf '%s\n' "$repo_root" > "$home/ROOT" || { echo "cannot write $home/ROOT"; return 1; }
+            ;;
+        ok)
+            ;;
+        *)
+            echo "$home belongs to $recorded, not to $repo_root -- refusing to build one tree in another tree's directory"
+            return 1
+            ;;
+    esac
+
+    local target="$home/$preset"
+    mkdir -p "$target" out/build || { echo "cannot create $target"; return 1; }
+    if [[ -L "$dir" ]]; then
+        if [[ "$(readlink "$dir")" == "$target" ]]; then
+            echo "== $preset: build directory on $home_fs at $target (the root is on $root_fs, #1227)"
+            return 0
+        fi
+        rm "$dir" || { echo "cannot remove the stale link $dir"; return 1; }
+    elif [[ -e "$dir" ]]; then
+        local aside
+        aside="${dir}.in-tree.$(date +%Y%m%d-%H%M%S)"
+        mv "$dir" "$aside" || { echo "cannot move the in-tree $dir aside"; return 1; }
+        echo "== $preset: moved the in-tree build directory aside to $aside -- nothing reads it, delete it when you like"
+    fi
+    ln -s "$target" "$dir" || { echo "cannot link $dir to $target"; return 1; }
+    echo "== $preset: build directory on $home_fs at $target (the root is on $root_fs, #1227)"
 }
 
 # Why this preset has to be configured, or empty when it does not.
@@ -3957,6 +4130,31 @@ unresolved src/tests/CMakeLists.txt:288' 'alpha' 2 2)" == *"does not claim to ha
         esac
     done
 
+    # #1227's placement, as DECISIONS over readings rather than over real filesystems.
+    expect "placement: a local root stays in the tree" "in-tree" "$(build_placement ext4 ext4)"
+    expect "placement: a 9p root with a local home relocates" "relocate" "$(build_placement 9p ext4)"
+    expect "placement: v9fs is the same mount as spelled by stat -f" "relocate" "$(build_placement v9fs ext4)"
+    expect "placement: WSL1's drvfs relocates" "relocate" "$(build_placement drvfs ext4)"
+    expect "placement: a home on a protocol filesystem too buys nothing" "home-unsuitable" "$(build_placement 9p 9p)"
+    expect "placement: an unreadable home buys nothing" "home-unsuitable" "$(build_placement 9p '')"
+    # The collapse this guards against: a root whose filesystem could not be READ answered
+    # as if it were local, which would hide exactly the case the relocation exists for.
+    expect "placement: an unreadable ROOT is unknown, not local" "unknown" "$(build_placement '' ext4)"
+    # Out of the table ON PURPOSE -- nobody has measured a build there.
+    expect "placement: NFS is not relocated without a measurement" "in-tree" "$(build_placement nfs4 ext4)"
+
+    expect "build home: an unclaimed home is claimed" "claim" "$(build_home_claim '' /mnt/d/a)"
+    expect "build home: this tree's own home is reused" "ok" "$(build_home_claim /mnt/d/a /mnt/d/a)"
+    expect "build home: ANOTHER tree's home is refused" "refuse" "$(build_home_claim /mnt/d/b /mnt/d/a)"
+    expect "build home: a root that PREFIXES this one is another tree" "refuse" "$(build_home_claim /mnt/d/a /mnt/d/ab)"
+    if key_a="$(build_home_key /mnt/d/a)" && key_b="$(build_home_key /mnt/d/b)" && [[ -n "$key_a" ]]; then
+        expect "build home: two worktrees never share a key" "different" \
+            "$([[ "$key_a" != "$key_b" ]] && echo different || echo same)"
+        expect "build home: one worktree always gets the same key" "$key_a" "$(build_home_key /mnt/d/a)"
+    else
+        self_test_skipped="${self_test_skipped:+$self_test_skipped, }the build-home key (no sha256sum or shasum here)"
+    fi
+
     echo "local-gate --self-test: ${self_test_ran} checks ran, ${self_test_failures} failed"
     [[ "$self_test_failures" -eq 0 ]] || exit 1
 
@@ -4234,6 +4432,12 @@ run_preset() {
     # it appeared was a failure message telling a developer where to look.
     local build_dir="out/build/${preset}"
     local ninja="${build_dir}/build.ninja"
+
+    # Placed BEFORE anything reads the directory, so every later read -- the configure
+    # decision, the launcher check, the coverage count -- goes through the one placement.
+    local placed
+    placed="$(place_build_dir "$preset")" || fail "$preset build directory: $placed"
+    [[ -z "$placed" ]] || echo "$placed"
 
     # The analyser is passed as a cache entry rather than through the preset,
     # because `find_program` short-circuits on a cache entry that is already set --
