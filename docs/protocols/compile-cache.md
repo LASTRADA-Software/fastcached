@@ -97,8 +97,8 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x16` | invalid-cluster-change | The cluster cannot accept that change — a setting nobody has heard of, a member named with no address, a field a verb ignores. The message says which. |
 | `0x17` | endpoint-busy | This endpoint has reached its own concurrent-request cap or in-flight byte budget. A statement about one node's front door, never about the fleet. |
 | `0x18` | malformed-registration | A REGISTER named its toolchain, its endpoint or its version in bytes that are not valid UTF-8. The message says which field. Refused rather than repaired: a fingerprint is matched byte for byte, so a worker admitted under a cleaned-up name would match nothing and never be picked. |
-| `0x19` | lease-unauthorized | The lease token is not one this cluster issued: its MAC does not verify under the shared key, or it is not a lease token at all. Deliberately one code for both — a receiver cannot tell a forgery from a random string. Distinct from `unknown-lease`, which names a lease the scheduler *did* issue and has since forgotten. Nothing the token claimed is echoed back. |
-| `0x1a` | lease-endpoint-mismatch | An authentic lease, presented to a worker it was not issued for. Only ever reported once the MAC has verified, so it is a diagnostic rather than a hint: the message names both endpoints, because the common cause is a worker registered under an address clients do not dial, not a replay. |
+| `0x19` | lease-unauthorized | The lease token is not one this cluster issued: its signature does not verify under the key the worker's roster holds for the voter it names, that key has been revoked, or it is not a lease token at all. Deliberately one code for all of them — a receiver cannot tell a forgery from a random string, and a client's answer to a revoked signer is the same. Distinct from `unknown-lease`, which names a lease the scheduler *did* issue and has since forgotten. Nothing the token claimed is echoed back. |
+| `0x1a` | lease-endpoint-mismatch | An authentic lease, presented to a worker it was not issued for. Only ever reported once the signature has verified, so it is a diagnostic rather than a hint: the message names both endpoints, because the common cause is a worker registered under an address clients do not dial, not a replay. |
 | `0x1b` | lease-expired | An authentic lease, presented past its expiry and the clock-skew slack. Not a capacity statement — a worker's slots bound what it runs, the expiry bounds how long a *captured* token is worth replaying. |
 | `0x1c` | worker-toolchain-survey-in-flight | The worker is still identifying its toolchains and serves nothing yet. Distinct from `fingerprint-mismatch`: that one says this worker serves a different toolchain, this one says the same request will succeed shortly. Reachable only by dialling the node directly — a node registers nothing until its survey finishes, so the scheduler never offers it to anyone who asked the fleet. |
 | `0x1d` | request-deadline-exceeded | The request was admitted and outran the window this surface allows for answering it. Not `endpoint-busy`, which says the node is momentarily full and to come back: this one says the work was abandoned on time, and for a compile it is a question about the lease timeout rather than about the worker. Sent only when the server can still reach the client — a peer swept while the connection is parked on the socket gets the close alone. |
@@ -109,6 +109,12 @@ never by failing. They are distinct codes rather than one "no" because they mean
 different things to an operator: `not-a-member` is a policy decision somebody
 made, `no-worker` is a fingerprint nobody in the fleet serves, `no-capacity` is a
 fleet that is too small, and `already-in-flight` is none of the three.
+
+`0x28`, **roster-expired** ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)),
+is a worker saying it can check nobody's lease right now: it holds no roster of the
+cluster's voters yet, or the one it holds has not been re-certified within its lifetime
+and the clock-skew slack. A statement about the worker, never about the lease — asking
+the scheduler for a fresh grant would get the same answer.
 
 ### STORE
 

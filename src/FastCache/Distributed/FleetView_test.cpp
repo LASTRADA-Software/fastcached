@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -902,7 +903,8 @@ TEST_CASE("Collecting a fleet reads the registry per machine and the counters as
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    auto const signer = FastCache::Testing::TestLeaseSigner();
+    SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
 
     CallerContext const member { .membership = Membership::Member, .peerId = "peer" };
@@ -938,7 +940,8 @@ TEST_CASE("Collecting a fleet without a cluster is a snapshot, not a crash", "[d
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    auto const signer = FastCache::Testing::TestLeaseSigner();
+    SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
 
     auto const snapshot = CollectFleet(FleetSources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics });
     CHECK_FALSE(snapshot.cluster.has_value());
@@ -2314,7 +2317,7 @@ constexpr std::string_view SilentMachine = "10.0.0.5:7100";
 [[nodiscard]] NodeReport LatchedRaised()
 {
     return Saying(LatchedMachine,
-                  std::vector { Condition("unsigned-lease-grants", "latched", "warning", "raised"),
+                  std::vector { Condition("scratch-root-unmappable", "latched", "warning", "raised"),
                                 Condition("enrollment-window-open", "live", "alert", "clear") });
 }
 
@@ -2322,7 +2325,7 @@ constexpr std::string_view SilentMachine = "10.0.0.5:7100";
 [[nodiscard]] NodeReport LiveRaised()
 {
     return Saying(LiveMachine,
-                  std::vector { Condition("unsigned-lease-grants", "latched", "warning", "clear"),
+                  std::vector { Condition("scratch-root-unmappable", "latched", "warning", "clear"),
                                 Condition("enrollment-window-open", "live", "alert", "raised") });
 }
 
@@ -2330,7 +2333,7 @@ constexpr std::string_view SilentMachine = "10.0.0.5:7100";
 [[nodiscard]] NodeReport NoneRaised()
 {
     return Saying(QuietMachine,
-                  std::vector { Condition("unsigned-lease-grants", "latched", "warning", "clear"),
+                  std::vector { Condition("scratch-root-unmappable", "latched", "warning", "clear"),
                                 Condition("enrollment-window-open", "live", "alert", "not-evaluated") });
 }
 
@@ -2376,7 +2379,7 @@ TEST_CASE("A latched condition and a live one render differently on the page, in
     CHECK(latched.contains("pill--latched"));
     CHECK(latched.contains(">latched</span>"));
     CHECK_FALSE(latched.contains("pill--live"));
-    CHECK(latched.contains("unsigned-lease-grants"));
+    CHECK(latched.contains("scratch-root-unmappable"));
     CHECK_FALSE(latched.contains("enrollment-window-open")); // a clear row is not listed as raised
     CHECK(latched.contains("chip--warning"));
     CHECK(live.contains("pill--live"));
@@ -2391,14 +2394,14 @@ TEST_CASE("A latched condition and a live one render differently on the page, in
     CHECK_FALSE(html.contains("No conditions raised"));
 
     auto const json = RenderFleetJson(snapshot, NoHistory());
-    CHECK(json.contains(R"({"endpoint":"10.0.0.2:7100","condition":"unsigned-lease-grants","state":"raised",)"
+    CHECK(json.contains(R"({"endpoint":"10.0.0.2:7100","condition":"scratch-root-unmappable","state":"raised",)"
                         R"("persistence":"latched","severity":"warning")"));
     CHECK(json.contains(R"({"endpoint":"10.0.0.3:7100","condition":"enrollment-window-open","state":"raised",)"
                         R"("persistence":"live","severity":"alert")"));
 
     auto const text = RenderFleetText(snapshot, NoHistory(), FleetSection::Conditions);
     CHECK(HeaderLine(text) == "endpoint\tcondition\tstate\tpersistence\tseverity\tdetail\tremedy");
-    CHECK(text.contains("10.0.0.2:7100\tunsigned-lease-grants\traised\tlatched\twarning\t"));
+    CHECK(text.contains("10.0.0.2:7100\tscratch-root-unmappable\traised\tlatched\twarning\t"));
     CHECK(text.contains("10.0.0.3:7100\tenrollment-window-open\traised\tlive\talert\t"));
 }
 
@@ -2419,10 +2422,10 @@ TEST_CASE("A fleet with nothing raised SAYS so, and a machine that said nothing 
         CHECK_FALSE(html.contains(R"(<div class="machine-conditions">)"));
         // Every row still travels: "none raised" is a reading of rows, never their absence.
         auto const json = RenderFleetJson(snapshot, NoHistory());
-        CHECK(json.contains(R"("condition":"unsigned-lease-grants","state":"clear")"));
+        CHECK(json.contains(R"("condition":"scratch-root-unmappable","state":"clear")"));
         CHECK(json.contains(R"("condition":"enrollment-window-open","state":"not-evaluated")"));
         CHECK(RenderFleetText(snapshot, NoHistory(), FleetSection::Conditions)
-                  .contains("10.0.0.4:7100\tunsigned-lease-grants\tclear\tlatched\t"));
+                  .contains("10.0.0.4:7100\tscratch-root-unmappable\tclear\tlatched\t"));
     }
     SECTION("absent")
     {

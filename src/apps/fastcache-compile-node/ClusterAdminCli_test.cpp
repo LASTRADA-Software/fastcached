@@ -19,6 +19,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -71,7 +72,8 @@ struct Fixture
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, {} };
+    Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
     Distributed::SchedulerProtocol protocol { service, metrics };
 
     /// Frame `request`, answer it, and hand back the reply bytes.

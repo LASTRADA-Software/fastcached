@@ -7,7 +7,7 @@
 
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/EnumTable.hpp>
-#include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Distributed/LeaseSigner.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 
@@ -31,6 +31,7 @@
 #include <thread>
 #include <vector>
 
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
@@ -100,24 +101,35 @@ class StubRunner final: public IProcessRunner
 /// here.
 enum class LeasePolicy : std::uint8_t
 {
-    /// `UncheckedLeaseValidator()`: a node with no cluster key. The default, because
+    /// `UncheckedLeaseValidator()`: a node with no roster. The default, because
     /// most cases in this file are about codecs, framing and fingerprints and a lease
     /// they would have to mint first is noise.
     Unchecked,
-    /// `SignedLeaseValidator()`: a node that holds the key and checks what it is
-    /// handed.
+    /// `SignedLeaseValidator()`: a node that holds a roster and checks what it is
+    /// handed against it.
     Verifying,
 };
 
-/// The cluster key both actors in a lease case share.
+/// The roster every verifying worker in this file checks grants against: the scheduler that
+/// mints them, as a voter (#178).
 ///
-/// A constant rather than a random draw: what these cases turn on is which FIELDS a
-/// grant names, and a key that differs per run would make a failure look like a
-/// flake. Its bytes are otherwise arbitrary.
-/// @return The key.
-[[nodiscard]] SecureByteBuffer TestClusterKey()
+/// One instance for the file, because a validator BORROWS its roster and the ordinary case
+/// has no reason to care whose it is. A case about the roster itself -- absent, expired,
+/// revoked -- builds its own and says so.
+/// @return The roster.
+[[nodiscard]] Testing::FixedLeaseRoster const& TestRoster()
 {
-    return SecureByteBuffer(32, std::byte { 0x5A });
+    static Testing::FixedLeaseRoster const roster { { "scheduler" } };
+    return roster;
+}
+
+/// The scheduler that mints every grant here, with a key derived from its name, so what these
+/// cases turn on is which FIELDS a grant names and never a key that differs per run.
+/// @return The signer.
+[[nodiscard]] Distributed::KeyPairLeaseSigner const& TestSigner()
+{
+    static auto const signer = Testing::TestLeaseSigner("scheduler");
+    return signer;
 }
 
 /// The endpoint the worker under test advertises, and the one grants must name.
@@ -223,14 +235,15 @@ constexpr std::uint64_t GrantTerm = 4;
                                    std::string_view serial = "17")
 {
     return FastCache::Distributed::MintLeaseToken(
-        TestClusterKey(),
+        TestSigner(),
         FastCache::Distributed::LeaseClaims { .serial = std::string { serial },
                                               .endpoint = std::string { endpoint },
                                               .fingerprint = std::string { fingerprint },
                                               .key = "obj-abc",
                                               .expiresAt = LeaseClock.Now() + validFor,
                                               .clusterId = std::string { cluster },
-                                              .epoch = epoch });
+                                              .epoch = epoch,
+                                              .signer = {} });
 }
 
 /// Build one of the two production lease validators.
@@ -255,7 +268,7 @@ constexpr std::uint64_t GrantTerm = 4;
     // REGISTER reply said, so a validator built for a test has to be told the same way
     // a production one is. A case that wants the UNREGISTERED worker leaves it unpinned.
     lease.fleet.Pin(std::string { ThisCluster });
-    return SignedLeaseValidator(TestClusterKey(), endpoint, LeaseClock, lease, metrics, slack);
+    return SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics, slack);
 }
 
 struct Fixture
@@ -2223,7 +2236,7 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         // Deliberately NOT pinned: this is a worker whose first registration round has
         // not completed, which is every worker for the first moments of its life.
         MovingEndpoint const endpoint { ThisWorker };
-        auto const validator = SignedLeaseValidator(TestClusterKey(), endpoint, LeaseClock, lease, metrics);
+        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
 
         auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
         REQUIRE(refusal.has_value());
@@ -2239,7 +2252,7 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
         lease.fleet.Pin(std::string { ThisCluster });
         MovingEndpoint const endpoint { ThisWorker };
-        auto const validator = SignedLeaseValidator(TestClusterKey(), endpoint, LeaseClock, lease, metrics);
+        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
 
         CHECK_FALSE(validator(GrantFor(ThisWorker), "gcc-13").refusal.has_value());
     }
@@ -2253,7 +2266,7 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
         lease.fleet.Pin(std::string {});
         MovingEndpoint const endpoint { ThisWorker };
-        auto const validator = SignedLeaseValidator(TestClusterKey(), endpoint, LeaseClock, lease, metrics);
+        auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
 
         CHECK_FALSE(
             validator(GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ""), "gcc-13").refusal.has_value());
@@ -2263,6 +2276,82 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
         REQUIRE(foreign.has_value());
         CHECK(Unwrap(foreign).reason == Distributed::LeaseRefusalReason::ClusterMismatch);
     }
+}
+
+TEST_CASE("A worker whose roster is absent or lapsed refuses every grant, and says which",
+          "[worker-protocol][lease][roster]")
+{
+    // #178. A grant is verified against the roster, so a worker with none -- or one whose
+    // certification has lapsed -- has nothing it could honour a grant against, however
+    // perfect the grant. Both answers travel on ONE wire code, `roster-expired`, because the
+    // client's move is the same (compile locally), and on two counters, because the
+    // operator's is not: NO roster never reached a leader its anchors certify, an EXPIRED one
+    // did and has since been cut off.
+    //
+    // The control is the same grant through the same validator once the roster is current:
+    // accepted. Without it both refusals would pass against a validator that refused
+    // everything, which is the shape a "check the roster first" change ships as.
+    AtomicMetricsSink metrics;
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+    lease.fleet.Pin(std::string { ThisCluster });
+    MovingEndpoint const endpoint { ThisWorker };
+    Testing::FixedLeaseRoster roster { { "scheduler" } };
+    auto const validator = SignedLeaseValidator(roster, endpoint, LeaseClock, lease, metrics);
+
+    SECTION("no roster at all")
+    {
+        roster.SetStanding(Distributed::RosterStanding::Absent);
+        auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::NoRoster);
+        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).code == Wire::ErrorCode::RosterExpired);
+        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).workerCounter
+              == IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster);
+    }
+
+    SECTION("a roster whose certification lapsed")
+    {
+        auto const lapsed = LeaseClock.Now() - std::chrono::hours { 1 };
+        roster.SetStanding(Distributed::RosterStanding::Expired, lapsed);
+        auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::RosterExpired);
+        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).code == Wire::ErrorCode::RosterExpired);
+        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).workerCounter
+              == IMetricsSink::Counter::WorkerJobsRefusedLeaseRosterExpired);
+        // The detail names WHEN, because the actionable version of "expired" is "this worker
+        // has not heard a certified roster since then".
+        CHECK_FALSE(Unwrap(refusal).detail.empty());
+    }
+
+    SECTION("the control: a current roster accepts the same grant")
+    {
+        roster.SetStanding(Distributed::RosterStanding::Current, LeaseClock.Now() + std::chrono::minutes { 45 });
+        CHECK_FALSE(validator(GrantFor(ThisWorker), "gcc-13").refusal.has_value());
+    }
+}
+
+TEST_CASE("A grant from a scheduler the cluster revoked is refused by name at the worker",
+          "[worker-protocol][lease][roster]")
+{
+    // The ex-leader that still holds its key and still mints (#178). Its grant verifies under
+    // the revoked key, so it is named -- `SignerRevoked` -- rather than lumped with junk.
+    AtomicMetricsSink metrics;
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+    lease.fleet.Pin(std::string { ThisCluster });
+    MovingEndpoint const endpoint { ThisWorker };
+    Testing::FixedLeaseRoster roster { { "scheduler" } };
+    auto const validator = SignedLeaseValidator(roster, endpoint, LeaseClock, lease, metrics);
+
+    auto const before = GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, GrantTerm, "50");
+    auto const after = GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, GrantTerm, "51");
+    CHECK_FALSE(validator(before, "gcc-13").refusal.has_value());
+
+    roster.Revoke("scheduler");
+    auto const refusal = validator(after, "gcc-13").refusal;
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::SignerRevoked);
+    CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).code == Wire::ErrorCode::LeaseUnauthorized);
 }
 
 TEST_CASE("A worker that learns a new address verifies grants naming it, and stops honouring the old one",
@@ -2284,7 +2373,7 @@ TEST_CASE("A worker that learns a new address verifies grants naming it, and sto
     lease.fleet.Pin(std::string { ThisCluster });
 
     MovingEndpoint endpoint { ThisWorker };
-    auto const validator = SignedLeaseValidator(TestClusterKey(), endpoint, LeaseClock, lease, metrics);
+    auto const validator = SignedLeaseValidator(TestRoster(), endpoint, LeaseClock, lease, metrics);
 
     // Minted up front, both of them, so nothing about WHEN a token was signed can
     // explain the difference in how it is answered -- the only thing that changes

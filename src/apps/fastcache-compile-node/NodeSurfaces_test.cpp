@@ -29,7 +29,7 @@ namespace
 /// The documented scheduler command line, minus `--cluster-key-file`.
 ///
 /// **The configuration #582 was found on**, and it is the documented one on purpose:
-/// a scheduler signs the grants its workers check, so it cannot work without the key,
+/// a scheduler is a consensus member (#178) and consensus cannot start without the key,
 /// and that is a `StartupPolicyRejection` row. Every other field is present so that
 /// row is the ONLY thing wrong -- a fixture broken two ways would assert nothing about
 /// which rule answered.
@@ -47,6 +47,8 @@ namespace
     cfg.advertise = "scheduler.internal:6675";
     cfg.fleetMembers = { "worker-01.internal" };
     cfg.toolchains = { "/usr/bin/g++" };
+    cfg.raftListen = "6680";
+    cfg.raftSelf = "scheduler.internal";
     return cfg;
 }
 
@@ -382,9 +384,9 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
 
     SECTION("a configuration that would not start is printed AND refused")
     {
-        // The documented scheduler line, minus `--cluster-key-file`. A scheduler signs
-        // the grants its workers check, so it cannot work without the key -- which is a
-        // `StartupPolicyRejection` row, and exactly the shape the ticket was found on.
+        // The documented scheduler line, minus `--cluster-key-file`. A scheduler runs
+        // consensus, which cannot work without the key -- a `StartupPolicyRejection` row,
+        // and exactly the shape the ticket was found on.
         auto cfg = SchedulerWithoutKey();
 
         auto const report = ReportSurfaces(cfg);

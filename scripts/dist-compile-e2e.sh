@@ -281,17 +281,17 @@ workdir="$(mktemp -d)"
 
 # The cluster key every node in this fixture shares.
 #
-# It is what makes the dispatch path here the SIGNED one. Without it the scheduler
-# hands out bare serials and every worker runs `UncheckedLeaseValidator`, so a fixture
-# that dispatches hundreds of compiles would exercise none of the lease check (#282) --
-# and the two fixtures that DO carry a key, cluster-e2e and fleet-dashboard-e2e, never
-# dispatch a compile, so between them they proved only that a keyed node starts.
+# It no longer makes the dispatch path the SIGNED one: since #178 every scheduler signs
+# with its own identity key, and what makes a worker CHECK the signature is the
+# `--voter-key` `start_node` hands it -- see there. A scheduler runs consensus, which
+# still needs this file, and a node proving the cluster key on the node port reads it.
 #
-# With it, every case below is a real client presenting a real signed grant to a real
-# worker over a real socket, and the grant's MAC covers the endpoint that worker
-# advertised. A worker advertising an address the scheduler did not grant fails every
-# case rather than none, which is the property no in-process test can show: the unit
-# tests mint and verify inside one process.
+# With both, every case below is a real client presenting a real signed grant to a real
+# worker over a real socket, checked against a roster that worker adopted from its
+# scheduler, and the grant's signature covers the endpoint that worker advertised. A
+# worker advertising an address the scheduler did not grant fails every case rather
+# than none, which is the property no in-process test can show: the unit tests mint and
+# verify inside one process.
 #
 # Fixed text rather than /dev/urandom: nothing here turns on its value, and a per-run
 # secret would make a failure look like a flake. Sixteen bytes is the minimum.
@@ -519,22 +519,67 @@ started_port=""
 start_node() {
     local tag="$1" host="$2" port="$3"
     shift 3
-    local log="${workdir}/${tag}.log" pid="" arg=""
+    local log="${workdir}/${tag}.log" pid="" arg="" identity="" key="" worker="yes" voterKeyFile=""
+    : > "$log"
     # The stated drain is a WORKER's setting, so a node running none (`--slots=0`,
     # #206) is not handed it: it refuses a worker-only setting by name, and it has no
     # compile to drain.
     local drain=("$stated_drain")
+    # A scheduler is a consensus member even alone (#178): it signs every lease with an
+    # identity key it keeps in a state directory, and runs a cluster of one to hold the
+    # roster its workers check those signatures against. Its consensus port is bound to
+    # loopback, where nothing dials it.
+    local consensus=()
     for arg in ${@+"$@"}; do
-        if [ "$arg" = "--slots=0" ]; then drain=(); fi
+        case "$arg" in
+            --slots=0)
+                drain=()
+                worker=""
+                ;;
+            --serve-scheduler)
+                consensus=(--listen-raft="127.0.0.1:$(free_port)" --raft-self=127.0.0.1
+                    --cluster-dir="${workdir}/${tag}.state")
+                ;;
+            --scheduler=*)
+                voterKeyFile="${workdir}/scheduler-${arg##*:}.key"
+                ;;
+        esac
     done
+    # Minted BEFORE the start, by `--print-identity` over the same state directory, and
+    # filed under the port its workers name; the start then reads the same files back
+    # rather than minting a second identity.
+    if [ -n "${consensus[*]+x}" ]; then
+        identity="$("$node" --print-identity --cluster-key-file="$cluster_key" "${consensus[@]}" 2>> "$log")" \
+            || { cat "$log" >&2; fail "${tag}: --print-identity could not mint this scheduler's identity"; }
+        key="$(sed -n 's/^public-key //p' <<< "$identity")"
+        [ -n "$key" ] || fail "${tag}: --print-identity printed no public-key line: ${identity}"
+        printf '%s\n' "$key" > "${workdir}/scheduler-${port}.key"
+    fi
+    # And every worker is told its scheduler's key, which is what puts this fixture's
+    # dispatches on the CHECKED path: a worker with no --voter-key that only this machine
+    # can reach verifies no lease at all, so without it every compile below would run
+    # through the unchecked validator and exercise none of the signature, the roster or
+    # its adoption (#282, #178). A worker naming a scheduler this fixture did not start
+    # has no file, and checks nothing.
+    local voter=()
+    if [ -n "$worker" ] && [ -n "$voterKeyFile" ] && [ -f "$voterKeyFile" ]; then
+        voter=(--voter-key="$(cat "$voterKeyFile")")
+    fi
     "$node" ${drain[@]+"${drain[@]}"} --cluster-key-file="$cluster_key" \
         --listen-node="${host}:${port}" --advertise="${host}:${port}" \
-        ${@+"$@"} > "$log" 2>&1 &
+        ${consensus[@]+"${consensus[@]}"} ${voter[@]+"${voter[@]}"} \
+        ${@+"$@"} >> "$log" 2>&1 &
     pid=$!
     started_pid="$pid"
     started_log="$log"
     started_port="$port"
     wait_for_node_ready "$host" "$port" "$pid" "$tag" "$log"
+    # A lease reaching a worker before it holds a roster is refused `roster-expired` and
+    # compiled locally, which every case below would report as a dispatch that never
+    # happened -- so a checking worker is not started until it holds one.
+    if [ -n "${voter[*]+x}" ]; then
+        wait_for_log "roster: adopted roster version" "$pid" "$tag" "$log"
+    fi
 }
 
 # Start one `fastcached` daemon, and wait for it to be ACCEPTING.

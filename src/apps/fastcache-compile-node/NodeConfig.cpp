@@ -507,6 +507,18 @@ namespace
         return *std::move(member);
     }
 
+    /// A voter's identity key, in the one spelling a key has (#178).
+    /// @param sv Text to parse.
+    /// @return The key, or why the text is not one -- in the sentence that says what a key looks like.
+    [[nodiscard]] std::expected<Ed25519PublicKey, ConfigError> ParseVoterKey(std::string_view sv)
+    {
+        auto key = ParseEd25519PublicKey(sv);
+        if (!key.has_value())
+            return std::unexpected(ArgvError(
+                ConfigErrorCode::ParseError, "voter-key", std::string { DescribePublicKeyTextFault(key.error()) }));
+        return *key;
+    }
+
     /// A filesystem path, taken as written.
     /// @param sv Text to parse.
     /// @return The path.
@@ -716,6 +728,24 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .clear = ClearList<&NodeConfig::schedulers>(),
         },
         {
+            .primary = "--voter-key",
+            .arity = Arity::Value,
+            .operand = "=<key>",
+            // Repeatable, and no provenance bit, for `--scheduler`'s reason: a list's default
+            // is empty, so every value present is one the operator typed.
+            .apply = AppendFrom<&NodeConfig::voterKeys, ParseVoterKey>(),
+            .description = "the identity key of one of the cluster's voters, as its\n"
+                           "--print-identity prints it; repeatable. A worker that runs no\n"
+                           "consensus trusts the first roster a strict majority of these\n"
+                           "endorse, and from then on only the roster it holds -- so a\n"
+                           "key here never outvotes the cluster's own revocation.",
+            .yamlKey = "voter_key",
+            .same = FieldEq<&NodeConfig::voterKeys>(),
+            .clear = ClearList<&NodeConfig::voterKeys>(),
+            .component = &WorkerComponent,
+            .present = PresentIn<&NodeConfig::voterKeys>(),
+        },
+        {
             .primary = "--advertise",
             .arity = Arity::Value,
             .operand = "=<host:port>",
@@ -919,10 +949,11 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .explicitBit = &NodeConfig::raftListenExplicit,
             .description = "where peers reach this node's consensus port. Giving\n"
                            "it turns consensus ON, and consensus needs\n"
-                           "--cluster-key-file: it signs the scheduler's leases\n"
-                           "and proves this node on the node port. Without this\n"
-                           "flag the node leads alone, which is right for one\n"
-                           "machine and is the default. A bare port binds the\n"
+                           "--cluster-key-file, which proves this node on the\n"
+                           "node port. A scheduler needs this flag too, even on\n"
+                           "one machine: it is a cluster of one. Without this flag\n"
+                           "the node runs no consensus, which is right for a pure\n"
+                           "worker and is the default. A bare port binds the\n"
                            "WILDCARD: peers are on other machines by definition,\n"
                            "so loopback would silently not work.",
             .yamlKey = "listen_raft",
@@ -1228,7 +1259,10 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "and only while this node LEADS the cluster; a\n"
                            "follower redirects to the leader and an election in\n"
                            "progress refuses, both of which a client answers by\n"
-                           "compiling locally. It also decides where a bare\n"
+                           "compiling locally. Needs --listen-raft even alone:\n"
+                           "a scheduler signs leases with its identity key and\n"
+                           "hands workers a roster its voters certify, so it is\n"
+                           "a cluster of one. It also decides where a bare\n"
                            "--listen-node binds: the wildcard here, because\n"
                            "peers have to reach it, and loopback without it.",
             .yamlKey = "serve_scheduler",
@@ -2082,25 +2116,33 @@ std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previo
 
     constexpr auto PairRules = std::to_array<PairRule>({
         // **The hole #405 would otherwise open, and it is the socket-activation one
-        // again** (#282). A keyless worker is legitimate for exactly one shape of node:
-        // one no other machine can dial. The startup table decides that from
+        // again** (#282). A worker that checks no lease is legitimate for exactly one
+        // shape of node: one no other machine can dial. The startup table decides that from
         // `CompilePortFacesTheNetwork`, which reads the listen flags -- and under
         // socket activation the unit chose the address, so those flags describe
         // nothing. `MakeWorkerLeaseValidator` is the backstop for that, and it runs
         // ONCE, at startup, against the configuration the process started with.
         //
-        // So a reload that made `AdmitsRemotePeers` true on a socket-activated keyless
-        // worker would hand it an open, unauthenticated compile port with every refusal
-        // counter reading zero -- the exact defect, reached through the door #405 adds.
-        // Neither the startup table nor the validator can see it: the first is blind
-        // under activation, the second has already run.
+        // So a reload that made `AdmitsRemotePeers` true on a socket-activated worker
+        // that checks nothing would hand it an open, unauthenticated compile port with
+        // every refusal counter reading zero -- the exact defect, reached through the door
+        // #405 adds. Neither the startup table nor the validator can see it: the first is
+        // blind under activation, the second has already run.
+        //
+        // "Checks nothing" is a roster question since #178, and the configuration answers
+        // it only in one direction: consensus or `--voter-key` means a roster, while their
+        // absence may still mean one, since a state directory can hold a roster an earlier
+        // run adopted and no configuration can see that. So this asks the half it can
+        // answer and fails CLOSED on the other -- a worker running on a kept roster alone
+        // is refused a widening it could have taken, and the message names the flag that
+        // makes the answer visible. The startup table's row asks the opposite way, because
+        // `NodeRoster::Build` reads the directory at that moment.
         //
         // Asked as a WIDENING rather than as a state, which is what keeps it from
-        // refusing a node that is running happily today: a keyless worker that already
-        // admits remote peers passed its own startup rules and may reload freely,
-        // including to NARROW. Only the transition is refused, and the remedy an
-        // operator needs -- give the node a key, or restart it -- is what the message
-        // says.
+        // refusing a node that is running happily today: a worker that already admits
+        // remote peers passed its own startup rules and may reload freely, including to
+        // NARROW. Only the transition is refused, and the remedy an operator needs --
+        // name the voters, and restart -- is what the message says.
         //
         // Scoped to the worker, as the startup row about the lease check is: a node started
         // with `--slots=0` built no validator and serves no compile verb, so widening its
@@ -2109,13 +2151,15 @@ std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previo
         { .scope = &WorkerComponent,
           .refuses =
               [](NodeConfig const& previous, NodeConfig const& candidate) {
-                  return candidate.clusterKeyFile.empty() && AdmitsRemotePeers(candidate) && !AdmitsRemotePeers(previous);
+                  return !RunsConsensus(candidate) && candidate.voterKeys.empty() && AdmitsRemotePeers(candidate)
+                         && !AdmitsRemotePeers(previous);
               },
-          .message = "a reload may not widen --fleet-member or --fleet-open on a node with no --cluster-key-file: "
-                     "this worker chose its lease check at startup and built one that verifies nothing, which is "
-                     "only safe while no machine but this one is admitted. Widening now would open an "
-                     "unauthenticated compile port with every refusal counter reading zero. Give "
-                     "--cluster-key-file and restart, or leave the admission policy as it is." },
+          .message = "a reload may not widen --fleet-member or --fleet-open on a worker that runs no consensus and "
+                     "names no --voter-key: this worker chose its lease check at startup, and nothing in its "
+                     "configuration says it has a roster to check against -- a check that verifies nothing is only "
+                     "safe while no machine but this one is admitted. Widening now could open an unauthenticated "
+                     "compile port with every refusal counter reading zero. Name the cluster's voters with "
+                     "--voter-key and restart, or leave the admission policy as it is." },
     });
 
     for (auto const& rule: PairRules)
@@ -2255,6 +2299,10 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // single point of re-provisioning the list exists to remove (#1310).
     for (auto const& scheduler: cfg.schedulers)
         argv.push_back(std::format("--scheduler={}", scheduler));
+    // Every key, for the list's reason: a registration carrying one voter of three trusts a
+    // roster only that one endorses.
+    for (auto const& key: cfg.voterKeys)
+        argv.push_back(std::format("--voter-key={}", FormatEd25519PublicKey(key)));
     emitIfExplicit("advertise", cfg.advertise, cfg.advertiseExplicit);
     // On presence, for `--reserve-cores`' reason below: since #206 a zero is the
     // instruction that runs no worker.
@@ -3058,6 +3106,11 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
     return std::ranges::any_of(nodePort, [](SurfaceEndpoint const& endpoint) { return !IsLoopbackHost(endpoint.host); });
 }
 
+bool CompileVerbsReachOtherMachines(NodeConfig const& cfg)
+{
+    return CompilePortFacesTheNetwork(cfg) && AdmitsRemotePeers(cfg);
+}
+
 std::string WorkerReadinessPhrase(NodeConfig const& cfg, std::optional<std::uint32_t> workerSlots, std::size_t toolchains)
 {
     if (!workerSlots.has_value())
@@ -3502,14 +3555,12 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // `RunsConsensus` and not a spelling of its own: `StartConsensusOrExplain`
         // decides whether a driver starts from that same expression, and if the two
         // disagreed one of them would be wrong about the other (#613).
-        { .refuses =
-              [](NodeConfig const& c) {
-                  return c.serveScheduler && !c.fleetOpen && c.fleetMembers.empty() && !RunsConsensus(c);
-              },
-          .message = "--serve-scheduler needs --fleet-member or --fleet-open on a node that is not clustered: a "
-                     "scheduler with an empty member set refuses every caller, which is the right default but not a "
-                     "working configuration. It would start, bind, log nothing wrong, and decline the whole fleet. "
-                     "On a clustered node consensus supplies the member set, so neither flag is required there." },
+        //
+        // Since #178 a scheduler IS a consensus member, so the non-clustered scheduler this row
+        // used to ask about -- one with no member set to admit anybody by -- no longer exists:
+        // it is refused by name, and consensus supplies its member set.
+        { .refuses = [](NodeConfig const& c) { return c.serveScheduler && !RunsConsensus(c); },
+          .message = SchedulerNeedsConsensusRefusal },
         { .refuses = [](NodeConfig const& c) { return c.fleetOpen && !c.fleetMembers.empty(); },
           .message = "--fleet-open and --fleet-member contradict each other: one admits everybody and the other "
                      "admits a list. Silently preferring either would make the narrower of the two a no-op an "
@@ -3736,8 +3787,8 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--node-id names this node inside a cluster, and --listen-raft is what turns consensus ON: "
                      "without it this node runs none, so the id is never used, never announced and never voted "
                      "for. Nothing would say so, which is the silent no-op this list exists to refuse. Give "
-                     "--listen-raft, or drop --node-id -- a node with neither leads itself, which is right for "
-                     "one machine and is the default." },
+                     "--listen-raft, or drop --node-id -- a node with neither runs no consensus, which is right "
+                     "for a pure worker and is the default." },
         // The other half of the same flag group: the cluster's addresses given with
         // the switch that turns consensus on left off. `--cluster-dir` is deliberately
         // NOT here -- `FleetHistoryPath` reads it for the dashboard's history file, so
@@ -3766,6 +3817,8 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // table long before the file need exist.
         { .refuses = [](NodeConfig const& c) { return RunsConsensus(c) && c.clusterKeyFile.empty(); },
           .message = ConsensusNeedsClusterKeyRefusal },
+        { .refuses = [](NodeConfig const& c) { return RunsConsensus(c) && !c.voterKeys.empty(); },
+          .message = VoterKeyOnConsensusNodeRefusal },
         { .refuses = [](NodeConfig const& c) { return c.discoveryReplyPort != 0 && c.discoveryAddress.empty(); },
           .message = "--discovery-reply-port is where discovery is ANSWERED, and --discovery is not set. A port "
                      "pinned for a service that is off is a port nothing will ever bind, so this is a typo or a "
@@ -3861,16 +3914,20 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // Scoped to the worker: a node running none (#206) serves no compile verbs and
         // checks no lease, so the question does not arise for it; what its scheduler signs
         // is #303's.
+        //
+        // Since #178 the question is whether it has a ROSTER to check against, not whether it
+        // holds a key: a lease is signed by the issuing voter's own key and verified against the
+        // roster -- the applied state on a consensus member, the certified roster on any other,
+        // which `--voter-key` roots. A state directory may already hold one an earlier run
+        // adopted, so a node naming one is asked again at startup, of the directory itself
+        // (`NodeRoster::Build`), where the answer lives.
         { .scope = &WorkerComponent,
           .refuses =
               [](NodeConfig const& c) {
-                  return c.clusterKeyFile.empty() && CompilePortFacesTheNetwork(c) && AdmitsRemotePeers(c);
+                  return !RunsConsensus(c) && c.voterKeys.empty() && c.clusterDir.empty()
+                         && CompileVerbsReachOtherMachines(c);
               },
-          .message = "a node that admits peers on other machines needs --cluster-key-file: the scheduler signs "
-                     "the lease a client presents to a worker, and without the key this node cannot check that "
-                     "signature -- so it would compile for anybody who can reach its port, and report nothing "
-                     "wrong while doing it. A node admitting only its own machine needs no key, because a "
-                     "process on this host already has this host's compiler." },
+          .message = RosterlessWorkerRefusal },
         // The rule that keeps a fleet map off an open port. Loopback needs no
         // credential -- reaching it already means being on the machine -- but a
         // bind an operator deliberately exposed does, and HTTPS alone does not

@@ -112,6 +112,9 @@ struct WorkerTierParts
     /// Where the cluster key is read from to PROVE membership, or null when this node holds
     /// none (#1428). One instance per process, shared with whatever else reads that file.
     IClusterKeySource const* proofKey;
+    /// What a lease grant is verified against (#178), or null when this node verifies none --
+    /// legal only where no other machine can reach it. Owned by `main`'s `NodeRoster`.
+    Distributed::ILeaseRoster const* leaseRoster;
     IMetricsSink& metrics; ///< Where the worker counts.
     ILogger& logger;       ///< Where it reports.
     /// Where the worker's conditions are answered (#1364): whether its scratch root can be

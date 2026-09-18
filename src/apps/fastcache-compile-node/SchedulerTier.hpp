@@ -8,7 +8,9 @@
 
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/LeaseSigner.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
@@ -18,8 +20,12 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <tuple>
 
 namespace FastCache::Node
 {
@@ -34,20 +40,12 @@ class NodeIoLoop;
 /// silently so, and `WorkerBody` is a function with a cognitive-complexity budget
 /// that two inline surfaces do not fit inside. Both being one object each is also
 /// what makes them read as the pair they are.
-/// Whether this node is the only scheduler there will ever be.
-///
-/// **An enum rather than a `bool`, because the two answers are opposite claims about
-/// the FUTURE rather than a setting**: `Yes` says nothing will ever publish a role, so
-/// standalone leadership at term 0 is the final answer; `No` says a consensus driver
-/// will publish one and this tier must not pretend to a leadership it has not been
-/// given (#613). A bare `true` at the call site reads as neither.
-enum class LeadsAlone : std::uint8_t
-{
-    /// A consensus driver will report a role and a real term; wait for it.
-    No,
-    /// Nothing will ever call `SetRole`, so lead now and at term 0.
-    Yes,
-};
+/// Why a scheduler with no identity key is refused. Unreachable from any configuration -- a
+/// scheduler runs consensus, and a consensus node always holds a key -- so this is the answer
+/// to a caller that did not resolve one, never a fallback (#178).
+inline constexpr std::string_view SchedulerNeedsIdentityKeyRefusal =
+    "a scheduler signs every lease with this node's identity key, and this node holds none: it runs consensus, so "
+    "its state directory should have minted one -- check that --cluster-dir is writable";
 
 class SchedulerTier
 {
@@ -58,17 +56,15 @@ class SchedulerTier
     /// one `0xFC` listener, beside the cache's, so this is a component rather than a
     /// surface; `StartNodeSurfaceOrExplain` opens that listener.
     ///
-    /// Reads `--cluster-key-file` when one is named, because that key is what a
-    /// lease grant is signed with. An unreadable one is fatal here rather than a
-    /// warning: an operator who named a key file and got a scheduler handing out
-    /// unsigned grants has a fleet that looks configured and is not.
+    /// Signs every grant with this node's identity key (#178): a worker verifies it against
+    /// the key its roster holds for this node, and refuses a signer the cluster revoked.
     /// @param cfg The parsed configuration.
     /// @param clock Time source for registry expiry and lease timeouts.
     /// @param wallClock Where a grant's absolute expiry comes from.
     /// @param metrics Where dispatch outcomes are counted.
     /// @param logger Where the tier reports what it is doing.
-    /// @param conditions Where whether this scheduler signs its grants is answered (#1364): a
-    ///        property of the key it read here, fixed for the life of the process.
+    /// @param identityKey This node's identity key pair, as its start resolved it; copied,
+    ///        so the tier signs with its own copy for as long as it lives.
     /// @return The tier, or why it could not be built.
     [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, std::string> Start(
         NodeConfig const& cfg,
@@ -77,7 +73,7 @@ class SchedulerTier
         WallClockRef wallClock,
         IMetricsSink& metrics,
         ILogger& logger,
-        NodeConditions& conditions);
+        std::optional<Ed25519KeyPair> const& identityKey);
 
     ~SchedulerTier() = default;
 
@@ -88,8 +84,7 @@ class SchedulerTier
 
     /// Tell the scheduler what this node is, and who leads if it does not.
     ///
-    /// The seam consensus drives. Without a `--node-id` nobody ever calls it and the
-    /// constructor's standalone leadership stands, which is what one machine wants.
+    /// The seam consensus drives, and the only one: every scheduler runs consensus.
     /// @param role What this node is now.
     /// @param leaderEndpoint Where the leader answers, empty when nobody leads.
     void SetRole(Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch)
@@ -97,17 +92,30 @@ class SchedulerTier
         _service.SetRole(role, leaderEndpoint, epoch);
     }
 
+    /// Take this node's own endorsement of the roster it applied (#178).
+    ///
+    /// The door a node's OWN endorsement reaches its own scheduler through, so a lone
+    /// scheduler certifies its roster without dialling itself; every other voter's arrives on
+    /// NODE-ANNOUNCE, through the same `AcceptEndorsement`.
+    ///
+    /// Kept as well as offered, because it can arrive BEFORE `Administer`: the consensus tier's
+    /// reconciler starts inside its own start, and the tier is handed to this one only after.
+    /// An endorsement offered to a scheduler with no cluster is refused `NoState`, and dropping
+    /// it would leave a lone scheduler with no certified roster until the next refresh -- a
+    /// quarter of an hour of every grant refused. `Administer` offers it again.
+    /// @param endorsement The endorsement.
+    void Endorse(Cluster::RosterEndorsement const& endorsement);
+
     /// Give this surface a cluster to administer.
     ///
     /// The second seam consensus drives, and it is a setter for the same reason
     /// `SetRole` is: consensus is constructed after this surface, because it needs
     /// the port this one bound. Left uncalled, the cluster verbs answer
     /// `NoCluster`, which is what a node running no cluster should say.
+    /// And the node's own endorsement, when one arrived before the cluster did, is offered again
+    /// now: see `Endorse`.
     /// @param admin The cluster; must outlive this tier.
-    void Administer(Distributed::IClusterAdmin& admin) noexcept
-    {
-        _service.AdministerWith(admin);
-    }
+    void Administer(Distributed::IClusterAdmin& admin);
 
     /// The scheduler itself, for reporting.
     ///
@@ -181,13 +189,18 @@ class SchedulerTier
                   WallClockRef wallClock,
                   IMetricsSink& metrics,
                   ILogger& logger,
-                  std::span<std::byte const> signingKey,
+                  std::string signerId,
+                  Ed25519KeyPair identityKey,
                   std::string_view clusterId,
-                  std::shared_ptr<AuthPolicy const> policy,
-                  LeadsAlone leadsAlone);
+                  std::shared_ptr<AuthPolicy const> policy);
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it.
+
+    /// This node's identity, as every grant names and signs it (#178). Declared before
+    /// `_service`, which borrows it.
+    Distributed::KeyPairLeaseSigner _signer;
+
     Distributed::SchedulerService _service;
     Distributed::SchedulerProtocol _protocol;
 
@@ -196,6 +209,13 @@ class SchedulerTier
     std::shared_ptr<AuthPolicy const> _policy;
 
     SchedulerResponder _responder;
+
+    /// This node's latest own endorsement, and the lock that serialises it against
+    /// `Administer`: the reconciler thread offers endorsements while `main` hands the service
+    /// its cluster, and the service's cluster pointer is not otherwise guarded until the
+    /// surfaces start serving.
+    std::mutex _ownEndorsementMutex;
+    std::optional<Cluster::RosterEndorsement> _ownEndorsement; ///< Guarded by `_ownEndorsementMutex`.
 };
 
 } // namespace FastCache::Node

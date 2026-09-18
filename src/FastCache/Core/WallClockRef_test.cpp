@@ -24,12 +24,12 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <span>
 #include <string_view>
 #include <type_traits>
 
@@ -58,7 +58,7 @@ static_assert(std::is_constructible_v<Distributed::SchedulerService,
                                       SystemWallClock&,
                                       AtomicMetricsSink&,
                                       NullLogger&,
-                                      std::span<std::byte const>,
+                                      Distributed::ILeaseSigner const&,
                                       std::string_view>,
               "lvalue into the scheduler");
 static_assert(!std::is_constructible_v<Distributed::SchedulerService,
@@ -66,7 +66,7 @@ static_assert(!std::is_constructible_v<Distributed::SchedulerService,
                                        SystemWallClock,
                                        AtomicMetricsSink&,
                                        NullLogger&,
-                                       std::span<std::byte const>,
+                                       Distributed::ILeaseSigner const&,
                                        std::string_view>,
               "rvalue into the scheduler");
 

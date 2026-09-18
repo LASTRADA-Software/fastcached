@@ -13,8 +13,10 @@
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <span>
+#include <string>
 #include <system_error>
 #include <tuple>
 #include <utility>
@@ -120,8 +122,8 @@ namespace
     /// each member's `SchedulerEndpointHistory` (#1340). 4 added the admitted clients and
     /// the forgotten hosts, and states every group's count up front (#1309). 5 added each
     /// member's `MemberSeat` (#1449). 6 added each member's public key, the principals and
-    /// the revoked keys (#178).
-    constexpr std::uint8_t StateVersion = 6;
+    /// the revoked keys (#178). 7 added the roster version every voter endorses (#178).
+    constexpr std::uint8_t StateVersion = 7;
 
     /// Fields one member occupies in an encoded state: id, Raft, scheduler, the
     /// scheduler endpoint's history, the seat, and the public key.
@@ -142,8 +144,11 @@ namespace
     constexpr std::size_t RevokedKeyFields = 2;
 
     /// Fields in front of the groups: the version, then the member, setting, client,
-    /// forgotten-host, principal and revoked-key counts.
-    constexpr std::size_t StateHeaderFields = 7;
+    /// forgotten-host, principal and revoked-key counts, then the roster version.
+    constexpr std::size_t StateHeaderFields = 8;
+
+    /// Where the roster version sits in the header.
+    constexpr std::size_t RosterVersionField = 7;
 
     /// A key field's bytes: empty when no key is stated, the 32 bytes when one is.
     /// @param key The key, or nothing.
@@ -448,6 +453,7 @@ std::vector<std::byte> Encode(ClusterState const& state)
     auto const forgottenCount = countOf(state.forgotten.size());
     auto const principalCount = countOf(state.principals.size());
     auto const revokedCount = countOf(state.revokedKeys.size());
+    auto const rosterVersion = WireFields::ToBigEndian<std::uint64_t>(state.rosterVersion);
 
     // Every history and seat byte is written before any span into them is taken,
     // because the list below holds spans and a vector that grew under them would leave
@@ -474,6 +480,7 @@ std::vector<std::byte> Encode(ClusterState const& state)
     fields.emplace_back(forgottenCount);
     fields.emplace_back(principalCount);
     fields.emplace_back(revokedCount);
+    fields.emplace_back(rosterVersion);
     auto cursor = std::span<std::byte const> { memberBytes };
     for (auto const& member: state.members)
     {
@@ -524,7 +531,7 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
             std::format("cluster state encoding version {} (this build reads {})", version, StateVersion)));
 
     if (fields->size() < StateHeaderFields)
-        return std::unexpected(MalformedWireFrame("a cluster state does not state its six counts"));
+        return std::unexpected(MalformedWireFrame("a cluster state does not state its six counts and its roster version"));
     auto const memberCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[1]);
     auto const settingCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[2]);
     auto const clientCount = WireFields::FromBigEndian<std::uint32_t>((*fields)[3]);
@@ -534,6 +541,9 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
     if (!memberCount.has_value() || !settingCount.has_value() || !clientCount.has_value() || !forgottenCount.has_value()
         || !principalCount.has_value() || !revokedCount.has_value())
         return std::unexpected(MalformedWireFrame("a cluster state's counts are not four bytes each"));
+    auto const rosterVersion = WireFields::FromBigEndian<std::uint64_t>((*fields)[RosterVersionField]);
+    if (!rosterVersion.has_value())
+        return std::unexpected(MalformedWireFrame("a cluster state's roster version is not eight bytes"));
 
     // Members as sextuples, settings as pairs, clients and forgotten hosts one field each,
     // principals as triples and revoked keys as pairs -- and the TOTAL is checked against
@@ -556,6 +566,7 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
     };
 
     ClusterState state;
+    state.rosterVersion = *rosterVersion;
     state.members.reserve(*memberCount);
     state.settings.reserve(*settingCount);
     state.clients.reserve(*clientCount);
@@ -647,159 +658,199 @@ std::expected<ClusterState, ConsensusError> DecodeState(std::span<std::byte cons
     return state;
 }
 
+namespace
+{
+    /// A member as the roster sees it: who, where it is dialled, which seat, which key --
+    /// and none of the scheduler endpoint's bookkeeping, which changes as members lead.
+    using RosterMemberFacts =
+        std::tuple<std::string const&, std::string const&, MemberSeat, std::optional<Ed25519PublicKey> const&>;
+
+    /// Whether @p before and @p after hold different rosters: the members as the roster sees
+    /// them, the principals and the revoked keys.
+    /// @param before The state before a command.
+    /// @param after The state after it.
+    /// @return True when the roster changed.
+    [[nodiscard]] bool RosterDiffers(ClusterState const& before, ClusterState const& after)
+    {
+        auto const facts = [](ClusterMember const& member) {
+            return RosterMemberFacts { member.id, member.raftEndpoint, member.seat, member.publicKey };
+        };
+        return !std::ranges::equal(before.members, after.members, {}, facts, facts) || before.principals != after.principals
+               || before.revokedKeys != after.revokedKeys;
+    }
+
+    /// Apply @p command to @p state, as `Apply` does before it asks whether the roster moved.
+    /// @param state The state.
+    /// @param command The committed command.
+    void ApplyChange(ClusterState& state, Command const& command)
+    {
+        switch (command.kind)
+        {
+            // One arm for both, because they are one verb recording two seats: the seat is
+            // the only thing that differs, and `MemberSeatTable` is where it is read from.
+            // A member re-admitted through the other verb changes seat and nothing else it
+            // did not also restate -- which is how an operator promotes and demotes.
+            case CommandKind::AddMember:
+            case CommandKind::AddLearner: {
+                // Dropped when the rules a key obeys no longer hold (#178): an id that is a
+                // principal, or a key that is revoked or somebody else's. `ValidateAgainst`
+                // refuses all three before the append; this is the second proposal judged
+                // against the same state, committed after the first changed it.
+                if (IsPrincipal(state, command.key))
+                    return;
+                if (command.publicKey.has_value()
+                    && StandingOf(state, command.key, *command.publicKey) != KeyStanding::Available)
+                    return;
+
+                // Update in place when the id is already known. One verb for "join" and
+                // "moved" because they are one intention, and removing first would leave a
+                // window in which the cluster has agreed the node does not exist.
+                auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id);
+
+                // The endpoint is replaced wholesale and its HISTORY is not, which is what
+                // lets a report say *cleared* rather than *never announced* after a re-admit
+                // (#1340). Derived here from what the state already records, so no command
+                // carries it. Only a removal forgets it: a forget is a positive act, and an
+                // id admitted from absence has announced nothing yet.
+                auto const announcedBefore =
+                    it != state.members.end() && it->schedulerEndpointHistory == SchedulerEndpointHistory::Announced;
+                auto const admitted =
+                    ClusterMember { .id = command.key,
+                                    .raftEndpoint = command.value,
+                                    .schedulerEndpoint = command.schedulerEndpoint,
+                                    .schedulerEndpointHistory = announcedBefore || !command.schedulerEndpoint.empty()
+                                                                    ? SchedulerEndpointHistory::Announced
+                                                                    : SchedulerEndpointHistory::NeverAnnounced,
+                                    .seat = SeatAdmittedBy(command.kind).value_or(MemberSeat::Voter),
+                                    // No opinion keeps what is recorded: a machine that moves
+                                    // keeps its identity, and only `RevokeKey` takes one away.
+                                    .publicKey = command.publicKey.or_else(
+                                        [&] { return it != state.members.end() ? it->publicKey : std::nullopt; }) };
+                // Admitting a member at a host re-admits that host: a forget it carries is
+                // over (#1309).
+                EraseHost(state.forgotten, HostOfEndpoint(command.value));
+                if (it != state.members.end())
+                {
+                    // Wholesale, both endpoints. A record is re-proposed only when it has
+                    // changed, and a node that moved moved both of its ports -- so keeping
+                    // a scheduler endpoint the command did not repeat would redirect
+                    // clients at an address that member no longer answers.
+                    *it = admitted;
+                    return;
+                }
+                state.members.push_back(admitted);
+                SortByKey(state.members, &ClusterMember::id);
+                return;
+            }
+            case CommandKind::RemoveMember: {
+                auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id);
+                if (it == state.members.end())
+                    return;
+                // A forget is a positive act, so it leaves a TOMBSTONE for the member's host
+                // (#1309): a node whose own `--fleet-member` list still names that machine is
+                // then refused it, rather than serving a decommissioned member until every
+                // list is edited. Derived HERE, from the record being removed, so the command
+                // carries nothing new. Never for loopback, which is always this machine's own
+                // and a tombstone could never narrow.
+                auto host = std::string { HostOfEndpoint(it->raftEndpoint) };
+                state.members.erase(it);
+                if (!IsLoopbackHost(host))
+                    InsertHost(state.forgotten, host);
+                return;
+            }
+
+            case CommandKind::AdmitClient: {
+                auto const host = HostOfEndpoint(command.key);
+                InsertHost(state.clients, host);
+                EraseHost(state.forgotten, host);
+                return;
+            }
+
+            case CommandKind::ForgetClient: {
+                auto const host = HostOfEndpoint(command.key);
+                EraseHost(state.clients, host);
+                InsertHost(state.forgotten, host);
+                return;
+            }
+
+            case CommandKind::AdmitPrincipal: {
+                // Dropped rather than applied when any of `ValidateAgainst`'s rules has stopped
+                // holding since it was judged -- above all a revocation committed first, which
+                // this must never undo.
+                if (!command.publicKey.has_value() || !command.role.has_value() || IsMember(state, command.key)
+                    || StandingOf(state, command.key, *command.publicKey) != KeyStanding::Available)
+                    return;
+
+                auto const admitted =
+                    ClusterPrincipal { .id = command.key, .publicKey = *command.publicKey, .role = *command.role };
+                auto const it = std::ranges::find(state.principals, command.key, &ClusterPrincipal::id);
+                if (it != state.principals.end())
+                {
+                    *it = admitted;
+                    return;
+                }
+                state.principals.push_back(admitted);
+                SortByKey(state.principals, &ClusterPrincipal::id);
+                return;
+            }
+
+            case CommandKind::RevokeKey: {
+                if (!command.publicKey.has_value())
+                    return;
+                auto const& key = *command.publicKey;
+
+                // Taken from whatever holds it, whoever the command named: the label is a label,
+                // and a revocation dropped because it named the wrong holder would be a key left
+                // live that an operator was told is gone.
+                std::erase_if(state.principals,
+                              [&key](ClusterPrincipal const& principal) { return principal.publicKey == key; });
+                for (auto& member: state.members)
+                    if (member.publicKey == key)
+                        member.publicKey.reset();
+
+                if (state.IsRevoked(key))
+                    return;
+                state.revokedKeys.push_back(RevokedKey { .id = command.key, .publicKey = key });
+                std::ranges::sort(state.revokedKeys, {}, [](RevokedKey const& revoked) {
+                    return std::tie(revoked.id, revoked.publicKey);
+                });
+                return;
+            }
+
+            case CommandKind::SetSetting: {
+                auto const it = std::ranges::find(state.settings, command.key, &Setting::name);
+                if (it != state.settings.end())
+                {
+                    it->value = command.value;
+                    return;
+                }
+                state.settings.push_back(Setting { .name = command.key, .value = command.value });
+                SortByKey(state.settings, &Setting::name);
+                return;
+            }
+
+            // Not a verb -- it is the enum's own count, which is what sizes the table in
+            // `Validate`. Named rather than swept up by a `default`, because a `default`
+            // is what would let a verb added later reach this switch unhandled and be
+            // applied as nothing at all, silently.
+            case CommandKind::Last:
+                break;
+        }
+    }
+} // namespace
+
 void Apply(ClusterState& state, Command const& command)
 {
-    switch (command.kind)
-    {
-        // One arm for both, because they are one verb recording two seats: the seat is
-        // the only thing that differs, and `MemberSeatTable` is where it is read from.
-        // A member re-admitted through the other verb changes seat and nothing else it
-        // did not also restate -- which is how an operator promotes and demotes.
-        case CommandKind::AddMember:
-        case CommandKind::AddLearner: {
-            // Dropped when the rules a key obeys no longer hold (#178): an id that is a
-            // principal, or a key that is revoked or somebody else's. `ValidateAgainst`
-            // refuses all three before the append; this is the second proposal judged
-            // against the same state, committed after the first changed it.
-            if (IsPrincipal(state, command.key))
-                return;
-            if (command.publicKey.has_value()
-                && StandingOf(state, command.key, *command.publicKey) != KeyStanding::Available)
-                return;
-
-            // Update in place when the id is already known. One verb for "join" and
-            // "moved" because they are one intention, and removing first would leave a
-            // window in which the cluster has agreed the node does not exist.
-            auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id);
-
-            // The endpoint is replaced wholesale and its HISTORY is not, which is what
-            // lets a report say *cleared* rather than *never announced* after a re-admit
-            // (#1340). Derived here from what the state already records, so no command
-            // carries it. Only a removal forgets it: a forget is a positive act, and an
-            // id admitted from absence has announced nothing yet.
-            auto const announcedBefore =
-                it != state.members.end() && it->schedulerEndpointHistory == SchedulerEndpointHistory::Announced;
-            auto const admitted =
-                ClusterMember { .id = command.key,
-                                .raftEndpoint = command.value,
-                                .schedulerEndpoint = command.schedulerEndpoint,
-                                .schedulerEndpointHistory = announcedBefore || !command.schedulerEndpoint.empty()
-                                                                ? SchedulerEndpointHistory::Announced
-                                                                : SchedulerEndpointHistory::NeverAnnounced,
-                                .seat = SeatAdmittedBy(command.kind).value_or(MemberSeat::Voter),
-                                // No opinion keeps what is recorded: a machine that moves
-                                // keeps its identity, and only `RevokeKey` takes one away.
-                                .publicKey = command.publicKey.or_else(
-                                    [&] { return it != state.members.end() ? it->publicKey : std::nullopt; }) };
-            // Admitting a member at a host re-admits that host: a forget it carries is
-            // over (#1309).
-            EraseHost(state.forgotten, HostOfEndpoint(command.value));
-            if (it != state.members.end())
-            {
-                // Wholesale, both endpoints. A record is re-proposed only when it has
-                // changed, and a node that moved moved both of its ports -- so keeping
-                // a scheduler endpoint the command did not repeat would redirect
-                // clients at an address that member no longer answers.
-                *it = admitted;
-                return;
-            }
-            state.members.push_back(admitted);
-            SortByKey(state.members, &ClusterMember::id);
-            return;
-        }
-        case CommandKind::RemoveMember: {
-            auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id);
-            if (it == state.members.end())
-                return;
-            // A forget is a positive act, so it leaves a TOMBSTONE for the member's host
-            // (#1309): a node whose own `--fleet-member` list still names that machine is
-            // then refused it, rather than serving a decommissioned member until every
-            // list is edited. Derived HERE, from the record being removed, so the command
-            // carries nothing new. Never for loopback, which is always this machine's own
-            // and a tombstone could never narrow.
-            auto host = std::string { HostOfEndpoint(it->raftEndpoint) };
-            state.members.erase(it);
-            if (!IsLoopbackHost(host))
-                InsertHost(state.forgotten, host);
-            return;
-        }
-
-        case CommandKind::AdmitClient: {
-            auto const host = HostOfEndpoint(command.key);
-            InsertHost(state.clients, host);
-            EraseHost(state.forgotten, host);
-            return;
-        }
-
-        case CommandKind::ForgetClient: {
-            auto const host = HostOfEndpoint(command.key);
-            EraseHost(state.clients, host);
-            InsertHost(state.forgotten, host);
-            return;
-        }
-
-        case CommandKind::AdmitPrincipal: {
-            // Dropped rather than applied when any of `ValidateAgainst`'s rules has stopped
-            // holding since it was judged -- above all a revocation committed first, which
-            // this must never undo.
-            if (!command.publicKey.has_value() || !command.role.has_value() || IsMember(state, command.key)
-                || StandingOf(state, command.key, *command.publicKey) != KeyStanding::Available)
-                return;
-
-            auto const admitted =
-                ClusterPrincipal { .id = command.key, .publicKey = *command.publicKey, .role = *command.role };
-            auto const it = std::ranges::find(state.principals, command.key, &ClusterPrincipal::id);
-            if (it != state.principals.end())
-            {
-                *it = admitted;
-                return;
-            }
-            state.principals.push_back(admitted);
-            SortByKey(state.principals, &ClusterPrincipal::id);
-            return;
-        }
-
-        case CommandKind::RevokeKey: {
-            if (!command.publicKey.has_value())
-                return;
-            auto const& key = *command.publicKey;
-
-            // Taken from whatever holds it, whoever the command named: the label is a label,
-            // and a revocation dropped because it named the wrong holder would be a key left
-            // live that an operator was told is gone.
-            std::erase_if(state.principals,
-                          [&key](ClusterPrincipal const& principal) { return principal.publicKey == key; });
-            for (auto& member: state.members)
-                if (member.publicKey == key)
-                    member.publicKey.reset();
-
-            if (state.IsRevoked(key))
-                return;
-            state.revokedKeys.push_back(RevokedKey { .id = command.key, .publicKey = key });
-            std::ranges::sort(
-                state.revokedKeys, {}, [](RevokedKey const& revoked) { return std::tie(revoked.id, revoked.publicKey); });
-            return;
-        }
-
-        case CommandKind::SetSetting: {
-            auto const it = std::ranges::find(state.settings, command.key, &Setting::name);
-            if (it != state.settings.end())
-            {
-                it->value = command.value;
-                return;
-            }
-            state.settings.push_back(Setting { .name = command.key, .value = command.value });
-            SortByKey(state.settings, &Setting::name);
-            return;
-        }
-
-        // Not a verb -- it is the enum's own count, which is what sizes the table in
-        // `Validate`. Named rather than swept up by a `default`, because a `default`
-        // is what would let a verb added later reach this switch unhandled and be
-        // applied as nothing at all, silently.
-        case CommandKind::Last:
-            break;
-    }
+    // The roster version is DERIVED here rather than carried, so every voter applying the
+    // same log reaches the same number for the same roster (`ClusterState::rosterVersion`).
+    // Asked of the projection after the fact rather than of each verb, because a verb that
+    // changes the roster only sometimes -- a re-admission restating what is recorded, a
+    // revocation of a key nobody holds -- must not move it, and a per-arm bump is one arm
+    // away from moving it on a no-op.
+    auto const before = state;
+    ApplyChange(state, command);
+    if (RosterDiffers(before, state))
+        ++state.rosterVersion;
 }
 
 std::expected<std::chrono::milliseconds, std::string> ParseLeaseLifetime(std::string_view value)

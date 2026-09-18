@@ -71,7 +71,7 @@ struct ConditionMention
 ///
 /// **Three answers, and the third is not the second.** A node with nothing asking for attention
 /// says `NoConditionsRaised`; a node with something says each such condition by its id and its
-/// persistence -- `unsigned-lease-grants (latched), enrollment-window-open (live)` -- because a
+/// persistence -- `scratch-root-unmappable (latched), enrollment-window-open (live)` -- because a
 /// latched row will still be there after the operator has done everything a live one needs, and
 /// the two must not read alike; and a node that carried NO list at all is ABSENT, answered here as
 /// nothing, for the caller to render as its absent marker. A node too old to carry conditions has

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Cluster/ClusterSigning.hpp>
 #include <FastCache/Core/Base64.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/WireFields.hpp>
@@ -56,11 +56,20 @@
 ///
 /// `apps/fastcache-cc/WorkerProtocol.cpp` is where a lease will be verified, and that
 /// file is compiled into `fastcache-cc`, which deliberately does **not link**
-/// `FastCache`. Being header-only over `Core/Sha256`, `Core/Base64` and the
+/// `FastCache`. Being header-only over `Core/Ed25519`, `Core/Base64` and the
 /// header-only `Core/WireFields` is what lets the launcher's build reach this
-/// with two dependency-free rows in `_fc_cc_core` rather than a link against the
-/// library -- the same rule `Protocol/CompileCacheWire.hpp` states about itself,
-/// and for the same reason.
+/// with dependency-free rows in `_fc_cc_core` -- and the vendored Monocypher, which
+/// depends on nothing -- rather than a link against the library: the same rule
+/// `Protocol/CompileCacheWire.hpp` states about itself, and for the same reason.
+///
+/// ## Signed by a MEMBER, not by the cluster (#178)
+///
+/// A grant was an HMAC under the cluster's pre-shared key until #178, so every holder of the
+/// key could mint one, and a machine removed from the cluster went on minting grants every
+/// worker honoured. It is now an Ed25519 signature by the issuing voter's OWN identity key,
+/// and it names that voter: a worker verifies it against the key its roster holds for the
+/// named signer, and refuses a signer that is not a voter there -- or whose key the cluster
+/// revoked -- however well-formed the grant is.
 ///
 /// It performs no I/O and holds no state: every function here is a pure transform,
 /// and `now` is a parameter rather than an injected clock precisely so that both
@@ -115,13 +124,15 @@ struct LeaseClaims
 
     /// Which cluster issued it.
     ///
-    /// Inside the MAC for the reason `endpoint` is: without it a grant is good on
-    /// every fleet that trusts the same key, and two fleets sharing a key file is
-    /// the ORDINARY outcome of copying a working configuration to a second site or
-    /// cloning staging from production. The MAC verifies, the endpoint matches, the
-    /// fingerprint matches, the expiry is in the future -- and cluster B's worker
-    /// compiles work leased by a scheduler that is not its own
-    /// ([#322](https://github.com/LASTRADA-Software/fastcached/issues/322)).
+    /// Inside the signature for the reason `endpoint` is: without it a grant is good on
+    /// every fleet that trusts the same key. That was the pre-shared key until #178, and
+    /// two fleets sharing a key file was the ORDINARY outcome of copying a working
+    /// configuration to a second site or cloning staging from production -- the MAC
+    /// verified, the endpoint matched, the fingerprint matched, the expiry was in the
+    /// future, and cluster B's worker compiled work leased by a scheduler that was not its
+    /// own ([#322](https://github.com/LASTRADA-Software/fastcached/issues/322)). A grant is
+    /// signed by a voter's own identity key now, and the same outcome survives one layer
+    /// down: a state directory copied to a second site copies the node, key included.
     ///
     /// Empty is legal and means a node with no `--cluster-id`, which is the
     /// one-machine deployment. A verifier that has none expects none: two nodes that
@@ -141,33 +152,69 @@ struct LeaseClaims
     /// consensus, which is a real deployment and not a missing answer.
     std::uint64_t epoch {};
 
-    // Declared LAST, matching the wire order in `PackClaims`: these two are appended
-    // after the fields version 1 carried, so the struct reads in the order the bytes
-    // do and a designated initializer lists them in the order it declares them.
+    /// The voter whose identity key signed this grant (#178).
+    ///
+    /// Read BEFORE the signature is checked, and that is not the oracle the
+    /// signature-first rule guards against: the claimed signer only SELECTS the key to
+    /// verify under, exactly as a Raft proof's claimed id does. A signer the verifier's
+    /// roster names no key for is refused as unauthorized, with nothing reported about the
+    /// rest of the grant.
+    std::string signer;
+
+    // Declared in wire order, matching `PackClaims`, so the struct reads in the order the
+    // bytes do and a designated initializer lists them in the order it declares them.
 };
 
 /// Why a lease was refused. One enumerator per outcome that is not "compile it".
 ///
-/// Ordered as the checks run, which is also the order of increasing information:
-/// the first two are reachable by anybody, and everything below them is only ever
-/// reported for a token whose MAC has already verified.
+/// Ordered as the checks run, which is also the order of increasing information: the
+/// first four are reachable by anybody, and everything below them is only ever reported
+/// for a token whose signature has already verified. Private to this process -- a refusal
+/// travels as its row's wire code, never as this ordinal -- so a row may be inserted where
+/// its check runs.
 enum class LeaseRefusalReason : std::uint8_t
 {
     /// Not a lease token at all -- not base64, not this format, not this version.
-    Malformed = 0,
-    /// A lease token this cluster's key does not authenticate.
+    Malformed,
+    /// This worker holds no roster it can verify a grant against: it has not yet been
+    /// handed one it could certify, and holds none from an earlier run (#178).
+    ///
+    /// A fact about THIS WORKER, like `Unregistered`, so answering it before the signature
+    /// is no oracle. Its own reason rather than a share of `RosterExpired`, because the
+    /// operator actions are opposite: this one never reached a leader whose roster its
+    /// anchors certify, while an expired one did and has since been cut off.
+    NoRoster,
+    /// This worker's roster has not been re-certified by a majority of its voters for longer
+    /// than its lifetime and the skew slack (#178).
+    ///
+    /// The bound on how long a worker cut off from the cluster -- or kept talking to an
+    /// ex-leader that withholds every newer roster -- goes on trusting the voters it last
+    /// heard of. Past it, a grant signed by a machine the cluster has since revoked would
+    /// verify, so none is honoured.
+    RosterExpired,
+    /// A grant no key this worker's roster holds for the named signer verifies: an unknown
+    /// signer, a signer that is not a voter, or a forgery.
     Unauthorized,
+    /// A grant whose signature verifies under a key the cluster has REVOKED (#178).
+    ///
+    /// The removed machine itself, still minting. Its own reason rather than a share of
+    /// `Unauthorized` because the operator action is opposite: a rise here names a machine
+    /// somebody removed and nobody stopped, while `Unauthorized` is junk, a forgery or a
+    /// roster that has not caught up. The wire code is shared, because the client's answer
+    /// is the same.
+    SignerRevoked,
     /// An authentic lease reaching a worker that has not registered, so it has no
     /// fleet to compare against.
     ///
     /// Its own reason rather than a share of `ClusterMismatch`, because the operator
-    /// actions are opposite: a mismatch means two fleets share a key file, while this
+    /// actions are opposite: a mismatch means one identity key votes in two fleets, while this
     /// means a worker is serving before its first registration round completed --
     /// which is ordinary and transient at startup, and permanent if the scheduler is
     /// unreachable. Collapsing them would report a key-provisioning fault every time
     /// a node started (#401).
     Unregistered,
-    /// An authentic lease, issued by a different fleet that shares this key.
+    /// An authentic lease, issued by a different fleet whose voter holds a key this roster
+    /// trusts -- one identity key voting in two clusters.
     ClusterMismatch,
     /// An authentic lease, for a different worker.
     EndpointMismatch,
@@ -217,11 +264,17 @@ struct LeaseRefusalDescriptor
 /// one: a client already answers it correctly, and a second spelling of one fact
 /// is how two peers come to disagree about what happened.
 ///
+/// `NoRoster` and `RosterExpired` share a code of their own, `RosterExpired` (#178):
+/// neither is a statement about the grant, both say this WORKER cannot verify anybody's
+/// grant right now, and a client that read either as "your lease is bad" would stop asking
+/// the right scheduler for a fresh one. `SignerRevoked` shares `LeaseUnauthorized` and keeps
+/// a counter of its own, for `ClusterMismatch`'s reason below.
+///
 /// `ClusterMismatch` and `Replayed` share `LeaseUnauthorized` too, and each keeps a
 /// counter of its own. The wire code is the same because the client's answer is the
 /// same -- compile it locally -- and a code it does not know would be worse than one
 /// it does. The counters are separate because the OPERATOR's answer is not: a rise in
-/// the first says two fleets are sharing a key file, which is a provisioning mistake,
+/// the first says one identity key votes in two fleets, which is a provisioning mistake,
 /// and a rise in the second says somebody is presenting a grant that has already been
 /// spent, which is not. Summing them would send somebody to the wrong one.
 ///
@@ -237,9 +290,18 @@ inline constexpr EnumTable<LeaseRefusalReason, LeaseRefusalDescriptor> LeaseRefu
     { .reason = LeaseRefusalReason::Malformed,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized },
+    { .reason = LeaseRefusalReason::NoRoster,
+      .code = CompileCacheWire::ErrorCode::RosterExpired,
+      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster },
+    { .reason = LeaseRefusalReason::RosterExpired,
+      .code = CompileCacheWire::ErrorCode::RosterExpired,
+      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseRosterExpired },
     { .reason = LeaseRefusalReason::Unauthorized,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized },
+    { .reason = LeaseRefusalReason::SignerRevoked,
+      .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
+      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseSignerRevoked },
     { .reason = LeaseRefusalReason::Unregistered,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnregistered },
@@ -296,7 +358,116 @@ struct LeaseRefusal
 /// covers. Every outstanding version-1 grant stops authenticating, which is exactly
 /// why that ticket argued for doing it while the format is new: a covered field
 /// added after a fleet is deployed is a flag day, and nothing is deployed.
-inline constexpr std::uint8_t LeaseTokenVersion = 2;
+///
+/// **3 since #178**: the grant names its signer and carries an Ed25519 signature by that
+/// voter's identity key where it carried an HMAC under the cluster key. The envelope's
+/// second field changed width and meaning, so a version-2 grant is refused as malformed
+/// rather than read.
+inline constexpr std::uint8_t LeaseTokenVersion = 3;
+
+/// The label a grant's signature is made under (#178).
+///
+/// Its own label, beside the grant it signs, rather than a `Cluster::SigningDomain` row:
+/// that table is the PRE-SHARED key's, and this is signed by a member's own key. Versioned
+/// with the token, so a signature over a version-2 claim list could never verify as a
+/// version-3 one even under the same key. `fastcache-lease-v1`, the HMAC label, is retired
+/// and never reused.
+inline constexpr std::string_view LeaseSignatureLabel = "fastcache-lease-v3";
+
+/// Who signs a grant: the issuing scheduler's identity (#178).
+///
+/// A seam rather than a key pair, so the private key stays wherever the node keeps it --
+/// `SchedulerService` holds no secret -- and a test signs through the same door production
+/// does.
+class ILeaseSigner
+{
+  public:
+    ILeaseSigner() = default;
+    ILeaseSigner(ILeaseSigner const&) = delete;
+    ILeaseSigner(ILeaseSigner&&) = delete;
+    ILeaseSigner& operator=(ILeaseSigner const&) = delete;
+    ILeaseSigner& operator=(ILeaseSigner&&) = delete;
+    virtual ~ILeaseSigner() = default;
+
+    /// @return The id a grant names as its signer: this node's member id.
+    [[nodiscard]] virtual std::string_view SignerId() const = 0;
+
+    /// @return The public half of the key `Sign` signs with -- what a release handed back to
+    ///         this scheduler is verified under.
+    [[nodiscard]] virtual Ed25519PublicKey PublicKey() const = 0;
+
+    /// Sign @p message with this node's identity key.
+    /// @param message What is signed.
+    /// @return The signature.
+    [[nodiscard]] virtual Ed25519Signature Sign(std::span<std::byte const> message) const = 0;
+};
+
+/// What a verifier's roster says about the keys one signer id may sign a grant with.
+struct LeaseSignerKeys
+{
+    /// The key the id signs with NOW -- present only for a VOTER the roster records a key
+    /// for. A learner, a principal and a stranger have none: a grant is a scheduler's, and
+    /// only a voter can lead.
+    std::optional<Ed25519PublicKey> live;
+
+    /// Every key the roster has revoked, whichever id it was revoked under: a signature that
+    /// verifies under one is reported as the removed machine rather than as a forgery. The
+    /// id a revocation carries is a label, so the SIGNATURE says who signed.
+    std::vector<Ed25519PublicKey> revoked;
+};
+
+/// Where a verifier reads who may sign a grant.
+class ILeaseSignerKeys
+{
+  public:
+    ILeaseSignerKeys() = default;
+    ILeaseSignerKeys(ILeaseSignerKeys const&) = delete;
+    ILeaseSignerKeys(ILeaseSignerKeys&&) = delete;
+    ILeaseSignerKeys& operator=(ILeaseSignerKeys const&) = delete;
+    ILeaseSignerKeys& operator=(ILeaseSignerKeys&&) = delete;
+    virtual ~ILeaseSignerKeys() = default;
+
+    /// @param signer The id a grant names.
+    /// @return What the roster says about it now.
+    [[nodiscard]] virtual LeaseSignerKeys KeysOf(std::string_view signer) const = 0;
+};
+
+/// Whether a worker's roster may be trusted at an instant (#178).
+///
+/// **PRIVATE: persisted and transmitted nowhere.** Three answers rather than a `bool`,
+/// because the two ways of being unusable are opposite operator actions: a worker with no
+/// roster never reached a leader its anchors certify, while an expired one did and has since
+/// been cut off.
+enum class RosterStanding : std::uint8_t
+{
+    Current, ///< Trusted: certified, and not past its certification and the slack.
+    Expired, ///< Held, and past its certification and the slack.
+    Absent,  ///< Nothing a grant could be verified against.
+};
+
+/// What a worker's roster says about itself at an instant.
+struct RosterReading
+{
+    RosterStanding standing { RosterStanding::Absent }; ///< Whether it may be trusted.
+
+    /// When its certification lapses -- or lapsed. Absent for no roster at all, and for a
+    /// roster that needs no certificate: a consensus member's own applied state.
+    std::optional<std::chrono::system_clock::time_point> certifiedUntil;
+};
+
+/// A worker's roster: who may sign its grants, and whether it may be trusted now (#178).
+///
+/// Implemented twice, because a node answers the question two ways: a consensus member from
+/// the state it applied, which needs no certificate, and a worker with no consensus from the
+/// certified roster it adopted (`Distributed::RosterTrust`). Both are read per request, so an
+/// applied revocation or an adopted roster reaches the next grant rather than the next restart.
+class ILeaseRoster: public ILeaseSignerKeys
+{
+  public:
+    /// @param now This machine's wall clock.
+    /// @return Whether the roster may be trusted at @p now, and until when.
+    [[nodiscard]] virtual RosterReading Read(std::chrono::system_clock::time_point now) const = 0;
+};
 
 /// How far a verifier's wall clock may trail the minting scheduler's.
 ///
@@ -387,14 +558,25 @@ namespace Detail
             std::span<std::byte const> { expiry },
             WireFields::AsBytes(claims.clusterId),
             std::span<std::byte const> { epoch },
+            WireFields::AsBytes(claims.signer),
         });
     }
 
-    /// How many fields a token's outer envelope holds: the claims, and the tag.
+    /// What a grant's signature is over: its label, then the claims AS PACKED -- one field,
+    /// so a verifier signs over the bytes a peer sent rather than a re-encoding of them.
+    /// One function for the minter and the verifier, for `PackClaims`' reason.
+    /// @param packed The packed claims.
+    /// @return The signed message.
+    [[nodiscard]] inline std::vector<std::byte> SignedLeaseMessage(std::span<std::byte const> packed)
+    {
+        return WireFields::Encode({ WireFields::AsBytes(LeaseSignatureLabel), packed });
+    }
+
+    /// How many fields a token's outer envelope holds: the claims, and the signature.
     inline constexpr std::size_t EnvelopeFieldCount = 2;
 
     /// How many fields the packed claims hold.
-    inline constexpr std::size_t ClaimFieldCount = 8;
+    inline constexpr std::size_t ClaimFieldCount = 9;
 
     /// The largest expiry this host's wall clock can represent, in milliseconds.
     ///
@@ -412,25 +594,22 @@ namespace Detail
 
 /// Mint a signed grant.
 ///
-/// @param signingKey The cluster's pre-shared key; must not be empty. A caller with
-///        no key does not call this -- it has nothing to sign with. Nothing here
-///        enforces that, and nothing needs to: `AuthenticateLeaseToken` refuses an
-///        empty key outright, so a token minted with one authenticates nowhere.
+/// @param signer The issuing scheduler's identity. The grant names it as its signer
+///        whatever @p claims says, so a grant can never name one member and carry
+///        another's signature.
 /// @param claims What the grant says.
 /// @return The token, as base64 text.
-[[nodiscard]] inline std::string MintLeaseToken(std::span<std::byte const> signingKey, LeaseClaims const& claims)
+[[nodiscard]] inline std::string MintLeaseToken(ILeaseSigner const& signer, LeaseClaims claims)
 {
+    claims.signer = std::string { signer.SignerId() };
     auto const packed = Detail::PackClaims(LeaseTokenVersion, claims);
 
-    // The claims go into the message as ONE field rather than as eight, which is
-    // what lets `AuthenticateLeaseToken` authenticate the bytes a peer actually
-    // sent instead of a re-encoding of them. Signed through the seam directly, so
-    // the mint and the verify below reach one construction through one door --
-    // there was briefly a `Detail::ExpectedTag` wrapper here, and once verify moved
-    // onto `VerifyFields` it covered only half the pair it existed to keep together.
-    auto const tag =
-        Cluster::SignFields(signingKey, Cluster::SigningDomain::LeaseToken, { std::span<std::byte const> { packed } });
-    auto const envelope = WireFields::Encode({ std::span<std::byte const> { packed }, std::span<std::byte const> { tag } });
+    // The claims go into the message as ONE field rather than as nine, which is
+    // what lets `AuthenticateLeaseToken` verify the bytes a peer actually sent
+    // instead of a re-encoding of them.
+    auto const signature = signer.Sign(Detail::SignedLeaseMessage(packed));
+    auto const envelope =
+        WireFields::Encode({ std::span<std::byte const> { packed }, std::span<std::byte const> { signature } });
 
     // Base64 rather than the raw bytes, which would travel perfectly well: the token
     // is a `string_view` on three wire fields, lands in the launcher's verbose output
@@ -446,22 +625,13 @@ namespace Detail
 /// The half `SchedulerService::Release` needs: the scheduler is not a worker, so the
 /// endpoint and fingerprint a grant names are not facts about *it*, but the serial
 /// inside is what resolves the lease.
-/// @param signingKey The cluster's pre-shared key.
+/// @param signers Who may sign a grant, as the verifier's roster says.
 /// @param token The token as presented.
-/// @return The authentic claims, or why they are not.
-[[nodiscard]] inline std::expected<LeaseClaims, LeaseRefusalReason> AuthenticateLeaseToken(
-    std::span<std::byte const> signingKey, std::string_view token)
+/// @return The authentic claims, or why they are not: `Malformed`, `Unauthorized` or
+///         `SignerRevoked`, and nothing else.
+[[nodiscard]] inline std::expected<LeaseClaims, LeaseRefusalReason> AuthenticateLeaseToken(ILeaseSignerKeys const& signers,
+                                                                                           std::string_view token)
 {
-    // An empty key authenticates NOTHING, and that has to be said here rather than
-    // left to each caller. An empty HMAC key is a perfectly valid HMAC key, so
-    // without this a node whose key file failed to load would happily verify every
-    // token minted by another node that also had none -- two machines agreeing on
-    // "no secret" and calling it authentication. A caller that legitimately runs
-    // without a key does not reach this function at all; it decides, in the open,
-    // that it is not checking.
-    if (signingKey.empty())
-        return std::unexpected { LeaseRefusalReason::Unauthorized };
-
     auto const decoded = Base64Decode(token);
     if (!decoded.has_value())
         return std::unexpected { LeaseRefusalReason::Malformed };
@@ -472,8 +642,8 @@ namespace Detail
         return std::unexpected { LeaseRefusalReason::Malformed };
 
     auto const packed = (*outer)[0];
-    auto const tag = (*outer)[1];
-    if (tag.size() != Sha256::DigestSize)
+    auto const signatureField = (*outer)[1];
+    if (signatureField.size() != Ed25519SignatureBytes)
         return std::unexpected { LeaseRefusalReason::Malformed };
 
     auto const fields = WireFields::SplitExactly(packed, Detail::ClaimFieldCount);
@@ -488,17 +658,26 @@ namespace Detail
     if (!epoch.has_value())
         return std::unexpected { LeaseRefusalReason::Malformed };
 
-    // The tag is recomputed over the bytes AS RECEIVED rather than over a re-encoding
-    // of the decoded claims. Re-encoding would authenticate what this build would have
-    // written, not what the peer sent, so any encoder asymmetry -- now or after a
-    // future field is added -- would quietly accept a token whose bytes say something
-    // else. `Cluster::VerifyFields` compares in constant time because a caller can
-    // retry, and a comparison that stops at the first difference lets them recover
-    // the tag one byte at a time.
-    Sha256::Digest presented {};
-    std::ranges::copy(tag, presented.begin());
-    if (!Cluster::VerifyFields(signingKey, Cluster::SigningDomain::LeaseToken, { packed }, presented))
-        return std::unexpected { LeaseRefusalReason::Unauthorized };
+    // Verified over the bytes AS RECEIVED rather than over a re-encoding of the decoded
+    // claims. Re-encoding would authenticate what this build would have written, not what
+    // the peer sent, so any encoder asymmetry -- now or after a future field is added --
+    // would quietly accept a token whose bytes say something else.
+    //
+    // The claimed signer SELECTS the key and is the only claim read before the signature
+    // is, which is the Raft handshake's rule: nothing else is reported about a grant whose
+    // signature has not verified.
+    Ed25519Signature presented {};
+    std::ranges::copy(signatureField, presented.begin());
+    auto const message = Detail::SignedLeaseMessage(packed);
+    auto const keys = signers.KeysOf(WireFields::AsStringView((*fields)[8]));
+    if (!keys.live.has_value() || !Ed25519Verify(*keys.live, message, presented))
+    {
+        // Only a signature that VERIFIES under a revoked key is reported as one, so
+        // `SignerRevoked` is a statement about who signed rather than about the claim.
+        auto const byRevoked = std::ranges::any_of(
+            keys.revoked, [&](Ed25519PublicKey const& revoked) { return Ed25519Verify(revoked, message, presented); });
+        return std::unexpected { byRevoked ? LeaseRefusalReason::SignerRevoked : LeaseRefusalReason::Unauthorized };
+    }
 
     return LeaseClaims { .serial = std::string { WireFields::AsStringView((*fields)[1]) },
                          .endpoint = std::string { WireFields::AsStringView((*fields)[2]) },
@@ -507,7 +686,8 @@ namespace Detail
                          .expiresAt = std::chrono::system_clock::time_point { std::chrono::milliseconds {
                              static_cast<std::int64_t>(*expiryMillis) } },
                          .clusterId = std::string { WireFields::AsStringView((*fields)[6]) },
-                         .epoch = *epoch };
+                         .epoch = *epoch,
+                         .signer = std::string { WireFields::AsStringView((*fields)[8]) } };
 }
 
 /// What learning a scheduler term did to a worker's picture of the fleet.
@@ -932,7 +1112,7 @@ struct LeaseExpectation
 
 /// Authenticate a grant and check it names this worker, this toolchain, and now.
 ///
-/// **The MAC is checked first, and the order is the whole design.** Every refusal
+/// **The signature is checked first, and the order is the whole design.** Every refusal
 /// below it is only ever reported for a token that provably came from the
 /// scheduler, so a forger learns exactly one thing -- that their forgery failed --
 /// while an operator whose worker advertises `build-07:6675` where the scheduler
@@ -951,20 +1131,20 @@ struct LeaseExpectation
 /// Every refusal below is a reading of the token; a grant refused for one of them has
 /// not been consumed, so nothing here can burn a lease on its way to declining it.
 ///
-/// @param signingKey The cluster's pre-shared key.
+/// @param signers Who may sign a grant, as this worker's roster says.
 /// @param token The token the client presented.
 /// @param expected What this worker is, and what it knows.
 /// @param now This machine's wall clock.
 /// @param slack How far this clock may trail the scheduler's.
 /// @return The authentic claims, or why the job is refused.
 [[nodiscard]] inline std::expected<LeaseClaims, LeaseRefusal> VerifyLeaseToken(
-    std::span<std::byte const> signingKey,
+    ILeaseSignerKeys const& signers,
     std::string_view token,
     LeaseExpectation const& expected,
     std::chrono::system_clock::time_point now,
     std::chrono::seconds slack = LeaseTokenClockSkewSlack)
 {
-    auto authentic = AuthenticateLeaseToken(signingKey, token);
+    auto authentic = AuthenticateLeaseToken(signers, token);
     if (!authentic.has_value())
         return std::unexpected { LeaseRefusal { .reason = authentic.error(), .detail = {} } };
 

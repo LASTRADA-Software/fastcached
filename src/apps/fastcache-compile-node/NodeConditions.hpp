@@ -39,7 +39,6 @@ enum class NodeCondition : std::uint8_t
 {
     CounterTableSkew = 0,     ///< The metrics catalogue names counters this build's sink has no slot for (#1362).
     ScratchRootUnmappable,    ///< The worker's scratch root cannot be written into a debug-prefix-map rule (#810).
-    UnsignedLeaseGrants,      ///< This scheduler signs nothing, because no cluster key is configured (#303).
     GeneratedTlsCertificate,  ///< The admin surface serves a certificate generated at startup.
     EnrollmentWindowOpen,     ///< A stranger that asks can be handed the cluster key (#1298).
     ForgottenFleetMember,     ///< `--fleet-member` names a host the cluster has forgotten (#1309).
@@ -146,14 +145,6 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
                 "character, then restart the node: the scratch root is chosen once, at startup. Compiles are "
                 "unaffected meanwhile; only the debug names inside objects this worker builds for other machines "
                 "record its own scratch path instead of the client's." },
-    { .condition = NodeCondition::UnsignedLeaseGrants,
-      .id = "unsigned-lease-grants",
-      .persistence = CompileCacheWire::ConditionPersistence::Latched,
-      .severity = CompileCacheWire::ConditionSeverity::Warning,
-      .scope = ConditionScope::Scheduler,
-      .remedy = "Give every node in the fleet the same --cluster-key-file and restart this one: the key is read once, "
-                "at startup. Until grants are signed, any client that can reach a worker's compile port can spend it "
-                "without asking this scheduler." },
     { .condition = NodeCondition::GeneratedTlsCertificate,
       .id = "generated-tls-certificate",
       .persistence = CompileCacheWire::ConditionPersistence::Latched,

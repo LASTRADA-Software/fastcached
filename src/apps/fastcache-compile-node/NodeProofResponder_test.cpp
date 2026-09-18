@@ -19,6 +19,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -50,7 +51,8 @@ struct ProvingNode
     NullLogger logger;
     ManualClock clock;
     ManualWallClock wallClock;
-    Distributed::SchedulerService service { clock, wallClock, metrics, logger, {}, {} };
+    Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
     Distributed::SchedulerProtocol protocol { service, metrics };
 
     /// One listed host, and it is NOT the address the cases dial from. That is what makes
@@ -382,7 +384,8 @@ TEST_CASE("A node holding no cluster key refuses the whole node-proof family by 
     NullLogger logger;
     ManualClock clock;
     ManualWallClock wallClock;
-    Distributed::SchedulerService service { clock, wallClock, metrics, logger, {}, {} };
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
     Distributed::SchedulerProtocol protocol { service, metrics };
     Distributed::ClusterMembership const membership { Distributed::MembershipParticipant::FleetMemberList, {} };
     SchedulerResponder scheduler { protocol, membership, metrics };

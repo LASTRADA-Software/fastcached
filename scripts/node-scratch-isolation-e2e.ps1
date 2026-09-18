@@ -1186,10 +1186,16 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
     # worker half answers on $schedPort and the separate $schedWork is gone.
     $cachePort = Get-FreePort; $schedPort = Get-FreePort
     $workerA   = Get-FreePort; $workerB   = Get-FreePort; $adminPort = Get-FreePort
+    # The scheduler's consensus port (#178): a scheduler is a cluster of one, bound to
+    # loopback where nothing dials it -- and consensus needs a cluster key, which nothing
+    # here turns on the value of.
+    $schedRaft = Get-FreePort
 
     $phaseDir = Join-Path $scratch $label
     $proj = Join-Path $phaseDir "proj"
     New-Item -ItemType Directory -Force -Path (Join-Path $proj "build") | Out-Null
+    $clusterKey = Join-Path $phaseDir "cluster.key"
+    Set-Content -Path $clusterKey -Value "e2e-fixture-cluster-key-not-a-secret" -NoNewline
     $srcA = Join-Path $proj "a.cpp"; $srcB = Join-Path $proj "b.cpp"
     New-SlowSource $srcA 101
     New-SlowSource $srcB 202
@@ -1269,8 +1275,12 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
 
         # The scheduler runs no worker (`--slots=0`, #206), so every lease has to land on
         # worker A or worker B -- and it names no --scheduler, having nothing to register.
+        # It runs consensus, a cluster of one (#178), keeping the identity key it signs
+        # leases with in a state directory of its own; the loopback workers check nothing.
         $schedProc = Start-NodeIn "sched" @(
             "--serve-scheduler", "--listen-node=127.0.0.1:$schedPort", "--fleet-open",
+            "--listen-raft=127.0.0.1:$schedRaft", "--raft-self=127.0.0.1",
+            "--cluster-dir=$(Join-Path $phaseDir 'sched.state')", "--cluster-key-file=$clusterKey",
             "--advertise=127.0.0.1:$schedPort",
             "--slots=0",
             "--admin-listen=127.0.0.1:$adminPort") $null

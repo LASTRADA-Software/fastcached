@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <tests/FleetHistoryFakes.hpp>
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -60,7 +61,8 @@ struct Fixture
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
     ManualWallClock wallClock;
-    SchedulerService service { clock, wallClock, metrics, schedulerLogger, {}, FleetIdentity };
+    KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
+    SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, FleetIdentity };
     SchedulerProtocol protocol { service, metrics };
 };
 

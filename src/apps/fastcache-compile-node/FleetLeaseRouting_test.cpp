@@ -197,24 +197,28 @@ TEST_CASE("A demoted scheduler settles its own lease and still refuses one it ne
     // B is demoted with the lease still outstanding.
     fleet.ElectLeader(SchedulerA);
 
-    // A token B never minted is refused, by name, and does not disturb the real one.
+    // A token B never minted is refused, by name, and does not disturb the real one. Every
+    // grant is signed since #178, so one B never signed fails authentication before B's table
+    // is read.
     auto const bogus = fleet.Exchange(SchedulerB,
                                       Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = "not-a-token", .key = Key }),
                                       Cc::Credential {},
                                       Cc::ExchangeBudget {});
     CHECK(bogus.kind == Cc::CacheOutcomeKind::Rejected);
-    CHECK(bogus.code == Wire::ErrorCode::UnknownLease);
+    CHECK(bogus.code == Wire::ErrorCode::LeaseUnauthorized);
     CHECK(fleet.IsInFlight(SchedulerB, Key));
 
-    // The right token against the WRONG key is refused too -- `LeaseTable` matches on
-    // both, so a release cannot free a key it does not name.
+    // The right token against the WRONG key is refused too -- the token names its key and
+    // `LeaseTable` matches on both, so a release cannot free a key it does not name. The
+    // token's own key is the check that answers first, and it answers as an unauthorised
+    // release (#323).
     auto const wrongKey =
         fleet.Exchange(SchedulerB,
                        Wire::EncodeRelease(Wire::ReleaseRequest { .leaseToken = token, .key = "obj-somebody-else" }),
                        Cc::Credential {},
                        Cc::ExchangeBudget {});
     CHECK(wrongKey.kind == Cc::CacheOutcomeKind::Rejected);
-    CHECK(wrongKey.code == Wire::ErrorCode::UnknownLease);
+    CHECK(wrongKey.code == Wire::ErrorCode::LeaseUnauthorized);
     CHECK(fleet.IsInFlight(SchedulerB, Key));
 
     // And the genuine one settles, from a node that is no longer the leader.
