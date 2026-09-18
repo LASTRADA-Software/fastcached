@@ -5744,10 +5744,30 @@ and every run says which it decided.
   has measured a build on them here, and the next row comes with its measurement.
 - **Nothing is deleted.** An in-tree build left by an earlier gate is moved aside and named.
 
-What it does NOT reach: the hygiene checks that walk the SOURCE tree still read it over 9p,
-because the sources stay where git and the Windows toolchain can reach them. Those are the
-ticket's own measured rows (11x to 104x). Moving the sources is the copy this section
-declines, so that half is a known residual rather than a forgotten one.
+**The first real run through it**: `bash scripts/local-gate.sh` on `c4010d87` from a 9p root
+**passed** in 1412 s wall, both legs, 4909 and 4904 tests, 0 failed, with both build directories
+reported and found on ext4. That is a statement that the placement WORKS, not a speedup figure:
+no gate was timed from a 9p build tree under the same conditions, so none is claimed here.
+
+**What it does NOT reach, measured and ACCEPTED rather than deferred**: the hygiene checks that
+walk the SOURCE tree still read it over 9p, because the sources stay where git and the Windows
+toolchain can reach them. One pass of `ctest -L hygiene -j 8`, the same commit, sources on each
+filesystem (pinned, 2026-09-18, the host of the table above):
+
+<!-- table-total: none -->
+| sources on | wall | summed test time | host load at start |
+|---|---|---|---|
+| 9p | 92.6 s | 735 s over 227 tests | 0.29 |
+| ext4 (a clone, configured only) | 75.3 s | 333 s over 224 tests | 17.4 -- a concurrent build |
+
+The per-check ratios are the ticket's shape (`target-pragmas` 15.5 s against 0.09 s), but the
+WALL cost is about 17 s per pass, because the pass's critical path is `e2e-helpers-selftest`,
+which is bound by its own sleeps rather than by I/O. The ext4 arm ran under a concurrent build and
+the 9p arm did not, so the difference is if anything understated. It is accepted rather than
+filed: the only remedy is building from a COPY of the sources, and a gate reporting on a copy
+reopens the wrong-tree family this file enumerates, for a figure around one percent of a leg. The ext4
+arm's 224 against 227 is a different configuration's test set, and its ten failures are tests
+that need binaries a configure-only tree does not have; neither is a finding.
 
 ## What the TSan scope covers, and the three ways it has been wrong
 
