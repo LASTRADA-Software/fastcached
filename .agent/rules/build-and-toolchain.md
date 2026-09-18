@@ -3403,6 +3403,60 @@ makes it anyway and says so there.
     fallback rule above applied to an engine: a branch no leg compiles rots with nothing to
     report it. The platforms still on the scalar path are under Open work (#1432).
 
+- **MSVC 19.44 targeting ARM64 miscompiled two coroutine shapes, and each is fixed at its one
+  site rather than guarded tree-wide.** Measured with cl 19.44.35228, `cl-release`, on the
+  `windows-11-arm` runner, and on nothing else: the same cases pass on the x64 MSVC, clang-cl,
+  gcc and clang legs AND on gcc for Linux ARM64, so this is a fact about that compiler for that
+  target, not about "MSVC" and not about "ARM64". Debug was not measured either way.
+  - **A call's result held across a `co_await` was kept on the resume function's STACK** (#1545).
+    `HandleMs` parsed its flags before the two payload reads and used them after. The ARM64
+    `/FAs` listing shows `ParseSetFlags` returning through `x8` into the stack area (`x23+0x110`,
+    `x23` being sp after `sub sp,sp,#0x4D0`), and every flag read after resuming loading from
+    there -- the stack of a LATER activation -- while the key and the saved source tag beside it
+    came from the coroutine frame. A CAS-guarded append ran as a quiet store and answered nothing.
+    **So compute such a value after the last `co_await` it would otherwise have to survive, or
+    re-derive it there**: `MemcachedMeta.cpp`'s `HandleMs` now parses after the reads. A synthetic
+    copy of the function's shape was copied into the frame correctly, so the trigger is NOT known
+    and the shape cannot be recognised by reading source -- which is why the remedy is structural.
+  - **A `co_await` on a TEMPORARY awaiter whose `await_ready` made a virtual call lost its enclosing
+    `try` block** (#1546). `DelayAwaiter::await_ready` read the clock through `IClock::now()`, and the
+    `OperationCancelled` its `await_resume` threw passed a typed `catch` and `catch (...)` alike.
+    Measured: it escapes for that shape, also with `await_suspend` `noexcept` and with the stop
+    callback member moved; it is caught when `await_ready` makes no call, when the clock is read in
+    the constructor, and when the same awaiter is a named local. The listing shows what went
+    missing. The resume function's exception table declares ONE try block, the coroutine's own
+    catch-all. The typed handler is emitted, but no try-map entry names it. With the fix the table
+    declares two. **So an `await_ready` stays
+    trivial -- a member read or a constant -- and a decision that needs a call moves into
+    `await_suspend`**, which may decline to park. `vendor/endo/tui/runtime/TuiRuntime.hpp`'s
+    `DelayAwaiter` now answers a constant `false`; that is a `VENDOR.md` row, and endo `c09959fc`.
+  - **The evidence, by run**: 35340951724 is the failure; 35346860955 and 35348183117 the
+    #1546 variants, on master and on #1432's branch; 35350059398 the #1545 flags read back as
+    garbage beside an intact tag; 35352105607 the listing; 35354435799 both fixes built as CI
+    builds, with a control leg on which the new #1545 case fails three runs out of three;
+    35366019632 the #1546 exception tables, with and without the fix.
+  - **What guards it is small, and is stated as such.** Two pins: "meta ms keeps its flags across
+    the payload read" dirties the stack under the reads and fails only where the compiler misplaces
+    the flags, and `TuiRuntime_test.cpp` `static_assert`s that `await_ready` is a constant, so
+    reading the clock there fails to COMPILE everywhere. Neither can fail on x64 or under a
+    sanitizer, because the C++ is correct. The NEXT instance of either shape is seen only by the
+    ctest of the `Windows-cl-release-arm64` leg #1432 adds, which is `NotBinding` in
+    `check-merge-queue-contexts.sh`: its failure stops no merge, and `merge-group-report.yml`
+    reports it.
+  - **The stack-slot audit is a probe, not a CI check, by decision.**
+    `scripts/probes/msvc-arm64-coro-stack-slots.py` reads `/FAs` listings, builds each resume
+    function's control flow (jump tables included), and names every read of a slot a call's
+    result was returned into through `x8` that a path of the SAME activation reaches unwritten.
+    It is kept as a probe because what it yields is candidates, not proof -- a value spilled to
+    the stack any other way is not looked for at all -- it needs an ARM64 build with listings, and
+    a heuristic check that fails on arrival gets disabled. Measured with it on run 35362081853,
+    over the 307 production translation units (the library, `fastcached`, `fastcache-cc`,
+    `fastcache-cli`, `fastcache-compile-node` and the vendored tui): all 303 resume functions
+    modelled, and master's `HandleMs` the only one with candidates -- 21 reads of its flags --
+    and none with the fix. **Its first version read the listing in text order and passed every
+    small-frame resume function without reading it**, so the clean result first reported for 307
+    units covered only part of them; a function it cannot model is now named, never passed.
+
 ## What a `char` is
 
 - **Every Windows executable declares UTF-8 as its process code page, and the
