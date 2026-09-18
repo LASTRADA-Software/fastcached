@@ -216,7 +216,8 @@ RaftDriver::Progress RaftDriver::CurrentProgress() const
                       // Copied out rather than referenced, like `configuration`: the
                       // timer loop and every peer reader move this, and the lock ends
                       // with this statement.
-                      .knownLeader = _node.KnownLeader() };
+                      .knownLeader = _node.KnownLeader(),
+                      .matchIndex = _node.MatchIndices() };
 }
 
 std::expected<LogIndex, ConsensusError> RaftDriver::Land(std::expected<RaftNode::Proposal, ConsensusError> proposed)

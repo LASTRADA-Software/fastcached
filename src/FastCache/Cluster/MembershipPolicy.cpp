@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <format>
+#include <vector>
 
 namespace FastCache::Cluster
 {
@@ -157,124 +158,191 @@ MembershipPlan MembershipProposals(ClusterState const& state,
     return plan;
 }
 
-std::optional<Consensus::Configuration> NextQuorumChange(ClusterState const& state,
-                                                         Consensus::Configuration const& active,
-                                                         ClusterMember const& self,
-                                                         std::span<Consensus::NodeId const> bootstrap)
+bool Replication::CaughtUp(Consensus::NodeId const& id) const
 {
-    // A node with no cluster counts nobody and proposes nothing. It is never a
-    // leader either -- see `RaftNode::HasCluster` -- so this is a guard against
-    // being asked rather than a case that arises.
-    if (Consensus::Membership::IsEmpty(active))
-        return std::nullopt;
+    auto const found = matchIndex.find(id);
+    return found != matchIndex.end() && found->second >= commitIndex;
+}
 
-    auto const rowOf = [](MemberSeat seat) -> MemberSeatRow const& {
-        return MemberSeatTable[static_cast<std::size_t>(seat)];
-    };
-
-    // Additions first: growing before shrinking keeps the quorum reachable while a
-    // replacement is in progress, where the other order passes through a
-    // configuration smaller than either endpoint. A member is added into the set its
-    // record names -- a learner addition changes no quorum at all.
-    for (auto const& member: state.members)
+namespace
+{
+    /// Whether `member` may be COUNTED yet: dialable, and holding every committed entry.
+    ///
+    /// The leader itself has trivially caught up -- its log is the log -- and appears in
+    /// no match index, so it is answered by name rather than looked up.
+    /// @param member The record.
+    /// @param self This node's id.
+    /// @param replication What the leader knows of each member's log.
+    /// @return True when a quorum may count it.
+    [[nodiscard]] bool Countable(ClusterMember const& member, Consensus::NodeId const& self, Replication const& replication)
     {
-        if (Consensus::Membership::IsMember(active, member.id))
-            continue;
-
-        // A member the transport cannot dial must not be counted: the quorum would
-        // grow and the votes to satisfy it could never arrive. Asked of a learner too,
-        // which counts nothing but is replicated to -- and replication to an address
-        // nobody can dial is a member that never catches up.
-        if (!Dialable(member))
-            continue;
-
-        auto proposed = active;
-        (proposed.*rowOf(member.seat).set).push_back(member.id);
-        return proposed;
+        return Dialable(member) && (member.id == self || replication.CaughtUp(member.id));
     }
 
-    // Then a seat change (#1449): a member counted in one set whose record names the
-    // other. Promotions before demotions, for the reason additions come first.
-    for (auto const into: SeatChangeOrder)
+    /// Members recorded as voters that consensus holds as learners until they catch up.
+    /// @param state The replicated state.
+    /// @param active The configuration consensus holds.
+    /// @param self This node's id.
+    /// @param replication What the leader knows of each member's log.
+    /// @return Their ids, in state order.
+    [[nodiscard]] std::vector<Consensus::NodeId> CatchingUp(ClusterState const& state,
+                                                            Consensus::Configuration const& active,
+                                                            Consensus::NodeId const& self,
+                                                            Replication const& replication)
     {
+        auto ids = std::vector<Consensus::NodeId> {};
+        for (auto const& member: state.members)
+            if (member.seat == MemberSeat::Voter && Consensus::Membership::Contains(active.learners, member.id)
+                && Dialable(member) && !Countable(member, self, replication))
+                ids.push_back(member.id);
+        return ids;
+    }
+
+    /// The one change `NextQuorumChange` proposes; see there for the rules.
+    /// @param state The replicated state.
+    /// @param active The configuration consensus holds.
+    /// @param self This node's own record.
+    /// @param bootstrap The ids this node was started with.
+    /// @param replication What the leader knows of each member's log.
+    /// @return The configuration to propose, or nullopt.
+    [[nodiscard]] std::optional<Consensus::Configuration> NextStep(ClusterState const& state,
+                                                                   Consensus::Configuration const& active,
+                                                                   ClusterMember const& self,
+                                                                   std::span<Consensus::NodeId const> bootstrap,
+                                                                   Replication const& replication)
+    {
+        // A node with no cluster counts nobody and proposes nothing. It is never a
+        // leader either -- see `RaftNode::HasCluster` -- so this is a guard against
+        // being asked rather than a case that arises.
+        if (Consensus::Membership::IsEmpty(active))
+            return std::nullopt;
+
+        auto const rowOf = [](MemberSeat seat) -> MemberSeatRow const& {
+            return MemberSeatTable[static_cast<std::size_t>(seat)];
+        };
+
+        // Additions first: growing before shrinking keeps the quorum reachable while a
+        // replacement is in progress, where the other order passes through a
+        // configuration smaller than either endpoint. Every member joins the configuration
+        // as a LEARNER, whatever its record names (#1537): a learner addition changes no
+        // quorum, and a member consensus has never replicated to has caught up with
+        // nothing. One the record names a voter is then PROMOTED, below, once it has.
         for (auto const& member: state.members)
         {
-            // Only a member consensus already counts somewhere: one it counts nowhere
-            // is an ADDITION, which the pass above either proposed or refused.
-            if (member.seat != into || !Consensus::Membership::IsMember(active, member.id)
-                || Consensus::Membership::Contains(active.*rowOf(into).set, member.id))
+            if (Consensus::Membership::IsMember(active, member.id))
                 continue;
 
-            // A promotion is a voter ADDITION, and follows its rule: never counted
-            // before every node can dial it. A demotion counts nobody new.
-            if (rowOf(into).counted && !Dialable(member))
+            // A member the transport cannot dial is not added: replication to an address
+            // nobody can dial is a member that never catches up.
+            if (!Dialable(member))
                 continue;
 
             auto proposed = active;
-            for (auto const& row: MemberSeatTable)
-                std::erase(proposed.*row.set, member.id);
-            (proposed.*rowOf(into).set).push_back(member.id);
-
-            // Never the last voter: a configuration nobody is counted in can commit
-            // nothing, including the change that would undo it. The record then says
-            // learner while consensus goes on counting the member, which is the
-            // fail-closed direction -- one voter too many rather than none.
-            if (!KeepsAVoter(proposed))
-                continue;
+            (proposed.*rowOf(MemberSeat::Learner).set).push_back(member.id);
             return proposed;
         }
-    }
 
-    // A node that was given no bootstrap set has nothing to compare against, so
-    // every member is equally unexplained to it -- and a `--raft-join` node elected
-    // leader would remove all of them, one per commit, which is the failure the
-    // parameter exists to prevent reached through the one path with no baseline.
-    // It still removes ITSELF once forgotten, below: that question is answered by the
-    // tombstone, not by the bootstrap set.
-    if (bootstrap.empty())
-        return OwnRemoval(state, active, self);
-
-    // Removals, from either set. A learner is removed on exactly the terms a voter is
-    // -- forgotten by the operator, and never for being ABSENT: nothing here reads
-    // whether a member answers, so a learner that has been offline for a week is as
-    // safe as one that answered a moment ago.
-    for (auto const& row: MemberSeatTable)
-    {
-        for (auto const& id: active.*row.set)
+        // Then a seat change (#1449): a member counted in one set whose record names the
+        // other. Promotions before demotions, for the reason additions come first.
+        for (auto const into: SeatChangeOrder)
         {
-            // Not itself here: this node's own removal is decided LAST, below, and
-            // only once it is forgotten -- absent a forget the next pass would propose
-            // putting it back, because a node always desires its own record.
-            if (id == self.id)
-                continue;
+            for (auto const& member: state.members)
+            {
+                // Only a member consensus already counts somewhere: one it counts nowhere
+                // is an ADDITION, which the pass above either proposed or refused.
+                if (member.seat != into || !Consensus::Membership::IsMember(active, member.id)
+                    || Consensus::Membership::Contains(active.*rowOf(into).set, member.id))
+                    continue;
 
-            // Membership only, and deliberately not dialability. A member already
-            // counted whose recorded endpoint has become unreadable is a bad record,
-            // and shrinking the quorum over one turns a typo into a cluster that
-            // cannot elect.
-            if (std::ranges::find(state.members, id, &ClusterMember::id) != state.members.end())
-                continue;
+                // A promotion is what COUNTS a member, so it waits for the two things a
+                // counted member must already have (#1537): an address every node can dial,
+                // and every committed entry. Counted before it has caught up, a voter that
+                // is away makes every commit wait for it -- in a one-voter cluster the
+                // promotion itself cannot commit, and nothing after it can either. A
+                // demotion counts nobody new and waits for neither.
+                if (rowOf(into).counted && !Countable(member, self.id, replication))
+                    continue;
 
-            // Absent, but was it ever meant to be there? `--raft-peer` puts a member in
-            // the configuration and nothing puts it in the state, so on a typed cluster
-            // every peer is absent from birth -- and reading that as "forgotten"
-            // proposes removing all of them, one per commit, until the leader is alone.
-            // A member an operator typed is a member by their assertion; only one
-            // admitted at runtime can be un-admitted at runtime.
-            if (std::ranges::find(bootstrap, id) != bootstrap.end())
-                continue;
+                auto proposed = active;
+                for (auto const& row: MemberSeatTable)
+                    std::erase(proposed.*row.set, member.id);
+                (proposed.*rowOf(into).set).push_back(member.id);
 
-            auto proposed = active;
-            std::erase(proposed.*row.set, id);
-            if (!KeepsAVoter(proposed))
-                continue;
-            return proposed;
+                // Never the last voter: a configuration nobody is counted in can commit
+                // nothing, including the change that would undo it. The record then says
+                // learner while consensus goes on counting the member, which is the
+                // fail-closed direction -- one voter too many rather than none.
+                if (!KeepsAVoter(proposed))
+                    continue;
+                return proposed;
+            }
         }
-    }
 
-    // Last, this node itself (#1539): after every change it can still make as the
-    // leader, since once its own removal commits it leads nothing.
-    return OwnRemoval(state, active, self);
+        // A node that was given no bootstrap set has nothing to compare against, so
+        // every member is equally unexplained to it -- and a `--raft-join` node elected
+        // leader would remove all of them, one per commit, which is the failure the
+        // parameter exists to prevent reached through the one path with no baseline.
+        // It still removes ITSELF once forgotten, below: that question is answered by the
+        // tombstone, not by the bootstrap set.
+        if (bootstrap.empty())
+            return OwnRemoval(state, active, self);
+
+        // Removals, from either set. A learner is removed on exactly the terms a voter is
+        // -- forgotten by the operator, and never for being ABSENT: nothing here reads
+        // whether a member answers, so a learner that has been offline for a week is as
+        // safe as one that answered a moment ago.
+        for (auto const& row: MemberSeatTable)
+        {
+            for (auto const& id: active.*row.set)
+            {
+                // Not itself here: this node's own removal is decided LAST, below, and
+                // only once it is forgotten -- absent a forget the next pass would propose
+                // putting it back, because a node always desires its own record.
+                if (id == self.id)
+                    continue;
+
+                // Membership only, and deliberately not dialability. A member already
+                // counted whose recorded endpoint has become unreadable is a bad record,
+                // and shrinking the quorum over one turns a typo into a cluster that
+                // cannot elect.
+                if (std::ranges::find(state.members, id, &ClusterMember::id) != state.members.end())
+                    continue;
+
+                // Absent, but was it ever meant to be there? `--raft-peer` puts a member in
+                // the configuration and nothing puts it in the state, so on a typed cluster
+                // every peer is absent from birth -- and reading that as "forgotten"
+                // proposes removing all of them, one per commit, until the leader is alone.
+                // A member an operator typed is a member by their assertion; only one
+                // admitted at runtime can be un-admitted at runtime.
+                if (std::ranges::find(bootstrap, id) != bootstrap.end())
+                    continue;
+
+                auto proposed = active;
+                std::erase(proposed.*row.set, id);
+                if (!KeepsAVoter(proposed))
+                    continue;
+                return proposed;
+            }
+        }
+
+        // Last, this node itself (#1539): after every change it can still make as the
+        // leader, since once its own removal commits it leads nothing.
+        return OwnRemoval(state, active, self);
+    }
+} // namespace
+
+QuorumPlan NextQuorumChange(ClusterState const& state,
+                            Consensus::Configuration const& active,
+                            ClusterMember const& self,
+                            std::span<Consensus::NodeId const> bootstrap,
+                            Replication const& replication)
+{
+    // A node with no cluster counts nobody and proposes nothing, and waits on nobody.
+    if (Consensus::Membership::IsEmpty(active))
+        return QuorumPlan { .change = std::nullopt, .catchingUp = {} };
+
+    return QuorumPlan { .change = NextStep(state, active, self, bootstrap, replication),
+                        .catchingUp = CatchingUp(state, active, self.id, replication) };
 }
 
 std::expected<void, ConsensusError> ValidateForget(Consensus::Configuration const& active, Consensus::NodeId const& id)

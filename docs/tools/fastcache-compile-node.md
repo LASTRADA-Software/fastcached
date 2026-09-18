@@ -1427,9 +1427,24 @@ heard from any leader it is `undecided`, as every node waiting to be admitted is
 it; `--cluster-admit-learner` on a voter demotes it. The cluster moves one member at a
 time, in a fixed order — additions, then promotions, then demotions, then removals —
 because a configuration change that moved two voters at once could give the old and the
-new configuration majorities with no voter in common. A promotion waits, like any voter
-addition, until the member's address can be dialled; a demotion that would leave the
-cluster with no voter at all is never proposed. A learner is removed on exactly the
+new configuration majorities with no voter in common. A demotion that would leave the
+cluster with no voter at all is never proposed.
+
+**A voter is counted only once it has caught up**
+([#1537](https://github.com/LASTRADA-Software/fastcached/issues/1537)). Every member
+enters the configuration as a learner — an admitted voter too — and one recorded as a
+voter is promoted once its address can be dialled **and** it holds every entry the
+cluster has committed. Counted any earlier, a voter that is away makes every commit
+wait for it: in a one-voter cluster the promotion itself cannot commit, and nothing
+after it can either. So promoting a machine that is away costs the cluster nothing until
+it returns. `--cluster-status` shows `seat=voter` throughout, since that is the record;
+the machine's own `consensus-standing` says `learner` until it is counted, and the
+leader says why, once, and again at Warn if it is still waiting after thirty seconds:
+
+```
+cluster: n2 is recorded as a voter and counted as a learner until it has caught up: it holds entry 3 of the 17 committed
+```
+ A learner is removed on exactly the
 terms any member is — `--cluster-forget` — and **never for being absent**: nothing here
 asks whether a member answers.
 
@@ -1863,10 +1878,10 @@ fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-admit=n2=10.0.0.2:668
 
 So a fleet formed by discovery alone has **one** voter — the machine that bootstrapped —
 until you promote more, and a voter lost is a cluster that can neither commit nor elect.
-Promote two for three voters, which survive losing one. Promote a machine that is up: a
-promotion waits for its address to be dialable, not for it to have caught up
-([#1537](https://github.com/LASTRADA-Software/fastcached/issues/1537)), so a learner
-promoted while it is away is a voter the cluster must wait for. A machine already recorded or
+Promote two for three voters, which survive losing one. A promotion takes effect once
+the learner has caught up
+([#1537](https://github.com/LASTRADA-Software/fastcached/issues/1537)), so promoting one
+that is away costs the cluster nothing until it returns. A machine already recorded or
 counted keeps its seat when it is discovered again: a promoted learner stays a voter, a
 `--raft-peer` member stays whatever that list made it, and a demoted voter stays demoted.
 

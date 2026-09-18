@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace FastCache::Cluster
@@ -151,6 +152,42 @@ struct MembershipPlan
                                                  Consensus::Configuration const& active,
                                                  std::span<DesiredMember const> desired);
 
+/// What the leader knows about how far each member has replicated its log (#1537).
+///
+/// Read together with the configuration, from one `RaftDriver::Progress`, because the
+/// two are compared: a member has CAUGHT UP when its match index reaches the commit
+/// index, and the two read apart could straddle a commit.
+struct Replication
+{
+    Consensus::LogIndex commitIndex; ///< The leader's commit index.
+
+    /// Per member, the highest index known to match the leader's log. A member absent
+    /// from it has acknowledged nothing to this leader -- including one it has never
+    /// replicated to -- and has caught up with nothing.
+    std::unordered_map<Consensus::NodeId, Consensus::LogIndex> matchIndex;
+
+    /// Whether `id` holds every entry the cluster has committed.
+    /// @param id The member.
+    /// @return True when its match index reaches the commit index.
+    [[nodiscard]] bool CaughtUp(Consensus::NodeId const& id) const;
+};
+
+/// What `NextQuorumChange` decided: the one change, and who a promotion waits for.
+struct QuorumPlan
+{
+    /// The configuration to propose, or nullopt when nothing should change now.
+    std::optional<Consensus::Configuration> change;
+
+    /// Members recorded as voters that consensus holds as learners until they have
+    /// caught up (#1537), in state order.
+    ///
+    /// Named rather than left for somebody to infer, because from the outside the wait
+    /// is indistinguishable from a promotion nobody asked for: `--cluster-status` reads
+    /// `seat=voter` and the member's own standing reads `learner`, for as long as it
+    /// is away. The caller reports it.
+    std::vector<Consensus::NodeId> catchingUp;
+};
+
 /// The one consensus membership change that moves the quorum towards the state.
 ///
 /// The other half of `MembershipProposals`, and the two are deliberately separate
@@ -175,10 +212,25 @@ struct MembershipPlan
 /// A learner is proposed, moved and removed on the same terms as a voter, with one
 /// difference that follows from what it is: adding one changes no quorum, so it is
 /// always safe -- and it still waits for a dialable address, since a member nothing
-/// can replicate to never catches up. A promotion is a voter ADDITION and waits for
-/// one for the voter reason. A demotion or removal that would leave no voter is never
-/// proposed: a configuration nobody is counted in can commit nothing, including the
-/// change that would undo it.
+/// can replicate to never catches up. A demotion or removal that would leave no voter
+/// is never proposed: a configuration nobody is counted in can commit nothing,
+/// including the change that would undo it.
+///
+/// ## A voter is counted only once it has caught up (#1537)
+///
+/// **Every member enters the configuration as a learner**, whatever its record names,
+/// and one recorded as a voter is PROMOTED -- a second change -- once it is dialable
+/// AND its match index has reached the commit index (`Replication::CaughtUp`). The
+/// record still says voter throughout; only consensus is staged, which is Raft's own
+/// answer (§4.2.1: catch a new server up before it is counted). Counted before it has
+/// caught up, a voter that is away makes every commit wait for it: in a one-voter
+/// cluster the promotion itself needs both machines, so nothing after it commits until
+/// it returns -- reproduced, before this rule, by promoting an absent learner.
+///
+/// It covers an operator's promotion of a learner and an admission of a fresh voter
+/// alike, since both are the member being COUNTED. It is not a decision about WHETHER
+/// to promote -- that is the operator's (#1535) -- only about WHEN the promotion may
+/// take effect. A member waiting for it is named in `QuorumPlan::catchingUp`.
 ///
 /// **A learner is never removed for being absent**, which is the property `--raft-peer`
 /// members already have below, and for the same reason: nothing here asks whether a
@@ -192,7 +244,9 @@ struct MembershipPlan
 /// the other side: the cluster's quorum grows and the votes to satisfy it cannot
 /// arrive. A member already *counted* is never dropped for this, though — an
 /// endpoint that has become unreadable is a bad record, and shrinking the quorum
-/// over one would turn a typo into a cluster that cannot elect.
+/// over one would turn a typo into a cluster that cannot elect. A dialable address
+/// is necessary and not sufficient: the votes have to be able to arrive NOW, which is
+/// the catch-up rule above.
 ///
 /// **This node's own removal -- until the operator forgets it (#1539).** A leader
 /// taking itself out of the quorum it leads is an operator's decision, and absent a
@@ -256,11 +310,13 @@ struct MembershipPlan
 ///        endpoint are read, the endpoint to ask whether its host was forgotten.
 /// @param bootstrap The ids this node was started with, in either set; never removed,
 ///        except this node itself once it is forgotten.
-/// @return The configuration to propose, or nullopt when nothing should change.
-[[nodiscard]] std::optional<Consensus::Configuration> NextQuorumChange(ClusterState const& state,
-                                                                       Consensus::Configuration const& active,
-                                                                       ClusterMember const& self,
-                                                                       std::span<Consensus::NodeId const> bootstrap);
+/// @param replication What this leader knows of each member's log: who has caught up.
+/// @return The change to propose, if any, and the members a promotion waits for.
+[[nodiscard]] QuorumPlan NextQuorumChange(ClusterState const& state,
+                                          Consensus::Configuration const& active,
+                                          ClusterMember const& self,
+                                          std::span<Consensus::NodeId const> bootstrap,
+                                          Replication const& replication);
 
 /// Whether forgetting `id` leaves the quorum something it can follow (#1539).
 ///

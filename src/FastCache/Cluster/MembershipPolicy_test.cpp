@@ -91,12 +91,53 @@ namespace
     return Plan(state, desired, active).proposals;
 }
 
+/// A configuration of both sets.
+/// @param voters Counted by every quorum.
+/// @param learners Counted by none.
+/// @return The configuration.
+[[nodiscard]] Consensus::Configuration Configured(std::vector<Consensus::NodeId> voters,
+                                                  std::vector<Consensus::NodeId> learners)
+{
+    return Consensus::Configuration { .voters = std::move(voters), .learners = std::move(learners) };
+}
+
 /// A configuration of voters alone: every configuration before #1449.
 /// @param voters The voters.
 /// @return The configuration.
 [[nodiscard]] Consensus::Configuration Voters(std::vector<Consensus::NodeId> voters)
 {
     return Consensus::Configuration { .voters = std::move(voters), .learners = {} };
+}
+
+/// What the leader knows when every member it counts or replicates to has caught up.
+///
+/// The default of every case that is not ABOUT catching up (#1537): a promotion then
+/// waits for nothing but a dialable address, which is what those cases pin.
+/// @param active The configuration.
+/// @return Every member of it at the commit index.
+[[nodiscard]] Replication EveryoneCaughtUp(Consensus::Configuration const& active)
+{
+    constexpr auto Committed = Consensus::LogIndex { .value = 7 };
+    auto replication = Replication { .commitIndex = Committed, .matchIndex = {} };
+    for (auto const& id: active.voters)
+        replication.matchIndex.emplace(id, Committed);
+    for (auto const& id: active.learners)
+        replication.matchIndex.emplace(id, Committed);
+    return replication;
+}
+
+/// `NextQuorumChange`'s change alone, with everybody caught up.
+/// @param state What the cluster holds.
+/// @param active What consensus holds, both sets.
+/// @param self This node's own record.
+/// @param bootstrap What this node was started with.
+/// @return The proposed configuration, or nullopt.
+[[nodiscard]] std::optional<Consensus::Configuration> Step(ClusterState const& state,
+                                                           Consensus::Configuration const& active,
+                                                           ClusterMember const& self,
+                                                           std::vector<Consensus::NodeId> const& bootstrap)
+{
+    return NextQuorumChange(state, active, self, bootstrap, EveryoneCaughtUp(active)).change;
 }
 
 /// `NextQuorumChange`, spelled without the span conversions at every call.
@@ -108,7 +149,7 @@ namespace
 /// @param active What consensus holds, both sets.
 /// @param self This node's id. Its record is given an endpoint on a host of its own,
 ///        which no case here forgets -- the cases about a forgotten leader call
-///        `NextQuorumChange` with the record they mean.
+///        `Step` with the record they mean.
 /// @param bootstrap What this node was started with; itself by default.
 /// @return The proposed configuration, or nullopt.
 [[nodiscard]] std::optional<Consensus::Configuration> QuorumChange(
@@ -118,7 +159,7 @@ namespace
     std::optional<std::vector<Consensus::NodeId>> const& bootstrap = std::nullopt)
 {
     auto const started = bootstrap.value_or(std::vector<Consensus::NodeId> { self });
-    return NextQuorumChange(state, active, Member(self, self + ".self:6675"), started);
+    return Step(state, active, Member(self, self + ".self:6675"), started);
 }
 
 /// The same, for a configuration of voters alone -- which every case before #1449 was.
@@ -258,9 +299,15 @@ TEST_CASE("A member the cluster admitted is added to the quorum", "[cluster][mem
     auto const state =
         StateOf({ Member("n1", "10.0.0.1:6675"), Member("n2", "10.0.0.2:6675"), Member("n3", "10.0.0.3:6675") });
 
-    auto const change = QuorumChange(state, { "n1", "n2" });
-    REQUIRE(change.has_value());
-    CHECK(Unwrap(change) == Voters({ "n1", "n2", "n3" }));
+    // Two changes (#1537): into the learners, where it is replicated to and counted by
+    // nothing, and then promoted -- once it has caught up, which everybody has here.
+    auto const added = QuorumChange(state, { "n1", "n2" });
+    REQUIRE(added.has_value());
+    CHECK(Unwrap(added) == Configured({ "n1", "n2" }, { "n3" }));
+
+    auto const counted = QuorumChange(state, Unwrap(added));
+    REQUIRE(counted.has_value());
+    CHECK(Unwrap(counted) == Voters({ "n1", "n2", "n3" }));
 }
 
 TEST_CASE("Only one member is added at a time", "[cluster][membership][quorum]")
@@ -275,7 +322,8 @@ TEST_CASE("Only one member is added at a time", "[cluster][membership][quorum]")
 
     auto const change = QuorumChange(state, { "n1" });
     REQUIRE(change.has_value());
-    CHECK(Unwrap(change).voters.size() == 2);
+    CHECK(Unwrap(change).voters.size() == 1);
+    CHECK(Unwrap(change).learners.size() == 1);
 }
 
 TEST_CASE("A member the cluster forgot is removed from the quorum", "[cluster][membership][quorum]")
@@ -325,7 +373,7 @@ TEST_CASE("Growing comes before shrinking", "[cluster][membership][quorum]")
 
     auto const change = QuorumChange(state, { "n1", "n2" });
     REQUIRE(change.has_value());
-    CHECK(Unwrap(change) == Voters({ "n1", "n2", "n3" }));
+    CHECK(Unwrap(change) == Configured({ "n1", "n2" }, { "n3" }));
 }
 
 TEST_CASE("A member with no dialable address is not counted", "[cluster][membership][quorum]")
@@ -364,7 +412,7 @@ TEST_CASE("A node given no bootstrap set proposes no removal", "[cluster][member
     auto const grown = StateOf({ Member("n4", "10.0.0.4:6675"), Member("n5", "10.0.0.5:6675") });
     auto const change = QuorumChange(grown, { "n4" }, "n4", std::vector<Consensus::NodeId> {});
     REQUIRE(change.has_value());
-    CHECK(Unwrap(change) == Voters({ "n4", "n5" }));
+    CHECK(Unwrap(change) == Configured({ "n4" }, { "n5" }));
 }
 
 TEST_CASE("A member whose port nobody can connect to is not counted", "[cluster][membership][quorum]")
@@ -400,19 +448,6 @@ TEST_CASE("A node with no cluster proposes no change", "[cluster][membership][qu
 // --------------------------------------------------------------------------
 // Learners (#1449): which SET a member is in is part of its record, and consensus is
 // moved towards it one change at a time.
-
-namespace
-{
-/// A configuration of both sets.
-/// @param voters Counted by every quorum.
-/// @param learners Counted by none.
-/// @return The configuration.
-[[nodiscard]] Consensus::Configuration Configured(std::vector<Consensus::NodeId> voters,
-                                                  std::vector<Consensus::NodeId> learners)
-{
-    return Consensus::Configuration { .voters = std::move(voters), .learners = std::move(learners) };
-}
-} // namespace
 
 TEST_CASE("A member admitted as a learner is added to the learners", "[cluster][membership][quorum][learner]")
 {
@@ -594,7 +629,7 @@ struct Leader
         auto const top = state;
         for (auto const& command: Proposals(top, desired, active))
             Apply(state, command);
-        if (auto const change = NextQuorumChange(top, active, Self(), boot); change.has_value())
+        if (auto const change = Step(top, active, Self(), boot); change.has_value())
             active = Unwrap(change);
     }
 
@@ -849,12 +884,12 @@ TEST_CASE("A forgotten leader proposes its own removal, after every other change
 
     // Its own bootstrap entry does not protect it: it names itself because it could not
     // start otherwise, which asserts nothing about whether it belongs.
-    auto const change = NextQuorumChange(state, Voters({ "n1", "n2", "n3" }), self, typed);
+    auto const change = Step(state, Voters({ "n1", "n2", "n3" }), self, typed);
     REQUIRE(change.has_value());
     CHECK(Unwrap(change) == Voters({ "n2", "n3" }));
 
     // Nor does having no bootstrap set at all, which stops a node removing any PEER.
-    auto const joined = NextQuorumChange(state, Voters({ "n1", "n2", "n3" }), self, std::vector<Consensus::NodeId> {});
+    auto const joined = Step(state, Voters({ "n1", "n2", "n3" }), self, std::vector<Consensus::NodeId> {});
     REQUIRE(joined.has_value());
     CHECK(Unwrap(joined) == Voters({ "n2", "n3" }));
 
@@ -862,7 +897,7 @@ TEST_CASE("A forgotten leader proposes its own removal, after every other change
     // removal commits it leads nothing.
     auto grown = state;
     grown.members.push_back(Learner("n4", "10.0.0.4:6680"));
-    auto const first = NextQuorumChange(grown, Voters({ "n1", "n2", "n3" }), self, typed);
+    auto const first = Step(grown, Voters({ "n1", "n2", "n3" }), self, typed);
     REQUIRE(first.has_value());
     CHECK(Unwrap(first) == Configured({ "n1", "n2", "n3" }, { "n4" }));
 }
@@ -876,14 +911,14 @@ TEST_CASE("A leader is forgotten only by both facts a forget writes", "[cluster]
 
     SECTION("nothing recorded yet: a fresh leader's first pass")
     {
-        CHECK_FALSE(NextQuorumChange(StateOf({}), Voters({ "n1", "n2", "n3" }), self, typed).has_value());
+        CHECK_FALSE(Step(StateOf({}), Voters({ "n1", "n2", "n3" }), self, typed).has_value());
     }
 
     SECTION("its host tombstoned while its record stands: a client forget naming a member's machine")
     {
         auto recorded = StateOf({ Member("n1", "10.0.0.1:6680") });
         recorded.forgotten = { "10.0.0.1" };
-        CHECK_FALSE(NextQuorumChange(recorded, Voters({ "n1", "n2", "n3" }), self, typed).has_value());
+        CHECK_FALSE(Step(recorded, Voters({ "n1", "n2", "n3" }), self, typed).has_value());
     }
 }
 
@@ -895,8 +930,7 @@ TEST_CASE("The last voter is never removed, and forgetting it is refused by name
     auto state = StateOf({});
     state.forgotten = { "10.0.0.1" };
     CHECK_FALSE(
-        NextQuorumChange(state, Voters({ "n1" }), Member("n1", "10.0.0.1:6680"), std::vector<Consensus::NodeId> { "n1" })
-            .has_value());
+        Step(state, Voters({ "n1" }), Member("n1", "10.0.0.1:6680"), std::vector<Consensus::NodeId> { "n1" }).has_value());
 
     auto const refused = ValidateForget(Voters({ "n1" }), "n1");
     REQUIRE_FALSE(refused.has_value());
@@ -907,4 +941,62 @@ TEST_CASE("The last voter is never removed, and forgetting it is refused by name
     CHECK(ValidateForget(Voters({ "n1", "n2" }), "n1").has_value());
     CHECK(ValidateForget(Configured({ "n1" }, { "n2" }), "n2").has_value());
     CHECK(ValidateForget(Voters({ "n1" }), "n9").has_value());
+}
+
+// --------------------------------------------------------------------------
+// A voter is counted only once it has caught up (#1537).
+
+TEST_CASE("A recorded voter held as a learner is promoted only once it has caught up",
+          "[cluster][membership][quorum][learner]")
+{
+    // The operator promoted `n2` -- its record says voter -- and consensus holds it as a
+    // learner. Whether to promote was the operator's; WHEN is this rule's.
+    auto const state = StateOf({ Member("n1", "10.0.0.1:6675"), Member("n2", "10.0.0.2:6675") });
+    auto const active = Configured({ "n1" }, { "n2" });
+    auto const self = Member("n1", "10.0.0.1:6675");
+    auto const typed = std::vector<Consensus::NodeId> { "n1" };
+    constexpr auto Committed = Consensus::LogIndex { .value = 7 };
+
+    SECTION("behind the commit index: held, and named")
+    {
+        auto const plan = NextQuorumChange(
+            state,
+            active,
+            self,
+            typed,
+            Replication { .commitIndex = Committed, .matchIndex = { { "n2", Consensus::LogIndex { .value = 3 } } } });
+        CHECK_FALSE(plan.change.has_value());
+        CHECK(plan.catchingUp == std::vector<Consensus::NodeId> { "n2" });
+    }
+
+    SECTION("never heard from: held, and named")
+    {
+        auto const plan =
+            NextQuorumChange(state, active, self, typed, Replication { .commitIndex = Committed, .matchIndex = {} });
+        CHECK_FALSE(plan.change.has_value());
+        CHECK(plan.catchingUp == std::vector<Consensus::NodeId> { "n2" });
+    }
+
+    SECTION("caught up: promoted, one change, and nobody waiting")
+    {
+        auto const plan = NextQuorumChange(
+            state, active, self, typed, Replication { .commitIndex = Committed, .matchIndex = { { "n2", Committed } } });
+        REQUIRE(plan.change.has_value());
+        CHECK(Unwrap(plan.change) == Voters({ "n1", "n2" }));
+        CHECK(plan.catchingUp.empty());
+    }
+}
+
+TEST_CASE("A learner nobody promoted is never named as catching up", "[cluster][membership][quorum][learner]")
+{
+    // The control: the wait is a PROMOTION waiting, so an operator's learner -- the laptop
+    // meant to stay one -- is not reported however far behind it is.
+    auto const state = StateOf({ Member("n1", "10.0.0.1:6675"), Learner("laptop", "10.0.0.9:6675") });
+    auto const plan = NextQuorumChange(state,
+                                       Configured({ "n1" }, { "laptop" }),
+                                       Member("n1", "10.0.0.1:6675"),
+                                       std::vector<Consensus::NodeId> { "n1" },
+                                       Replication { .commitIndex = Consensus::LogIndex { .value = 7 }, .matchIndex = {} });
+    CHECK_FALSE(plan.change.has_value());
+    CHECK(plan.catchingUp.empty());
 }

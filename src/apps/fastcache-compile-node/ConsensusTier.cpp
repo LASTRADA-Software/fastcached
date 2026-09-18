@@ -909,7 +909,18 @@ void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
 
     _quorumWaited = 0;
 
-    auto change = Cluster::NextQuorumChange(state, progress.configuration, _self, _bootstrapIds);
+    // With what this leader knows of every member's log, from the same read as the
+    // configuration and the commit index: a promotion waits until the member has caught
+    // up (#1537), and the members it is waiting for are named.
+    auto const plan = Cluster::NextQuorumChange(
+        state,
+        progress.configuration,
+        _self,
+        _bootstrapIds,
+        Cluster::Replication { .commitIndex = progress.commitIndex, .matchIndex = progress.matchIndex });
+    ReportCatchingUp(plan.catchingUp, progress);
+
+    auto const& change = plan.change;
     if (!change.has_value())
         return;
 
@@ -969,6 +980,43 @@ void ConsensusTier::ReconcileQuorum(Cluster::ClusterState const& state)
                      "cluster: the cluster forgot this node ({}), so it proposes its own removal and steps down once "
                      "that commits",
                      _self.id);
+}
+
+void ConsensusTier::ReportCatchingUp(std::span<Consensus::NodeId const> waiting,
+                                     Consensus::RaftDriver::Progress const& progress)
+{
+    // Said when the wait starts, and again -- at Warn -- once it has lasted as long as an
+    // uncommitted change is allowed to before it is reported: a voter an operator
+    // admitted or promoted, held as a learner, is otherwise visible only as a record and
+    // a standing that disagree. Once each rather than per pass, for the reason every
+    // report in this loop is.
+    for (auto const& id: waiting)
+    {
+        auto const [entry, started] = _catchingUp.try_emplace(id, 0);
+        ++entry->second;
+
+        auto const match = progress.matchIndex.find(id);
+        auto const held = match != progress.matchIndex.end() ? match->second.value : 0;
+        if (started)
+            _logger.Logf(LogLevel::Info,
+                         "cluster: {} is recorded as a voter and counted as a learner until it has caught up: it holds "
+                         "entry {} of the {} committed",
+                         id,
+                         held,
+                         progress.commitIndex.value);
+        else if (entry->second == QuorumProposalPatience)
+            _logger.Logf(LogLevel::Warn,
+                         "cluster: {} has not caught up after {} seconds (entry {} of {}), so no quorum counts it yet; "
+                         "it is promoted once it holds every committed entry",
+                         id,
+                         (QuorumProposalPatience * ReconcileInterval).count() / 1000,
+                         held,
+                         progress.commitIndex.value);
+    }
+
+    // A member no longer waiting is forgotten here, so a later wait is said again.
+    std::erase_if(_catchingUp,
+                  [waiting](auto const& entry) { return std::ranges::find(waiting, entry.first) == waiting.end(); });
 }
 
 void ConsensusTier::PublishRole(Consensus::RaftDriver::RoleChange const& change)

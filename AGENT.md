@@ -563,7 +563,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   replication and `_followerContact` reach both sets. A learner asked for a vote refuses by ROW
   (`VoteRefusal::CastsNoVote`), never by silence.
 - The quorum follows the replicated state, one change at a time — additions, then promotions,
-  then demotions, then removals — and a member is never COUNTED before every node can dial it.
+  then demotions, then removals — and a member is never COUNTED before every node can dial it
+  AND it has CAUGHT UP (#1537): every member enters as a learner, and a recorded voter is
+  promoted once its match index reaches the commit index; the wait is named, never silent.
   **One at a time is load-bearing for READS as well as for commitment**: CheckQuorum consults the
   committed configuration while a change is in flight, and that is only safe because any
   majority of the old VOTERS and any majority of the new share a voter; a learner change touches

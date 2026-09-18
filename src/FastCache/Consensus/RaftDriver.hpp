@@ -16,6 +16,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace FastCache::Consensus
@@ -249,6 +250,14 @@ class RaftDriver
         /// `role == Role::Leader`, which answers only whether the leader is this
         /// node.
         std::optional<NodeId> knownLeader;
+
+        /// How far each member's log is known to match this node's, when it leads (#1537).
+        ///
+        /// Under the same lock as `commitIndex`, and for the reason `term` is: the two are
+        /// compared -- a member has CAUGHT UP when its match index reaches the commit
+        /// index -- and read apart they could straddle a commit. Empty on a node that
+        /// does not lead, which tracks nobody's log but its own.
+        std::unordered_map<NodeId, LogIndex> matchIndex;
     };
 
     /// @return What this node believes about its own cluster, read together.

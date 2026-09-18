@@ -135,6 +135,11 @@ LogIndex RaftNode::CommitIndex() const noexcept
     return _commitIndex;
 }
 
+std::unordered_map<NodeId, LogIndex> const& RaftNode::MatchIndices() const noexcept
+{
+    return _matchIndex;
+}
+
 Standing RaftNode::CurrentStanding() const
 {
     return Membership::StandingOf(_configuration, _config.self);

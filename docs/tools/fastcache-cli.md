@@ -298,7 +298,9 @@ majority involved, so that much comes back:
 `cluster-admit-learner` is `cluster-admit` recording a **learner**. On a voter it
 demotes that voter, and `cluster-admit` on a learner promotes it; either way the
 cluster moves one member at a time, and a demotion that would leave no voter is never
-proposed.
+proposed. A voter — admitted or promoted — is counted only once it has caught up with
+the leader's log; until then it is replicated to as a learner, and the leader logs that
+it is waiting ([#1537](https://github.com/LASTRADA-Software/fastcached/issues/1537)).
 
 Hold both values against the machine being brought in: the id it minted into its own
 `--cluster-dir`, and the address it answers consensus on (`--raft-self` together with
