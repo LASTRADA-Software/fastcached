@@ -52,9 +52,10 @@
 # already expanded for it by the shared walk -- so the `writer` is the job key, followed by the
 # combination's label when the job has a matrix. Every leg is a writer, because legs of one job run
 # concurrently exactly as two jobs do: a key the legs do NOT vary is one key written several times,
-# which is #318 arriving through a matrix. `unresolved` is empty, or says why this row's key cannot
-# be compared at all -- a matrix the walk cannot read, or a matrix reference it left unexpanded --
-# and the shell refuses such a row rather than comparing its text.
+# which is #318 arriving through a matrix -- unless the step's own `if:` DECIDEDLY rules a leg out,
+# which gets that leg no row (#1540). `unresolved` is empty, or says why this row's key cannot be
+# compared at all -- a matrix the walk cannot read, a matrix reference it left unexpanded, a step
+# output -- and the shell refuses such a row rather than comparing its text.
 #
 # `JOBS` is a POSITIVE CONTROL, and it is the only record here that is not a finding. Every
 # rule in this check reports on what it did NOT find -- an unguarded job, a missing reader, an
@@ -140,6 +141,13 @@ function FlushStep() {
 # One `CACHE` row per combination of this job's matrix, the key and the runner expanded for it. A
 # matrix the walk cannot read has no combinations, so it gets one row saying so rather than none --
 # a writer that vanished from the comparison would be the silent half.
+#
+# A leg the step's own `if:` DECIDEDLY rules out is no writer on that leg (#1540): that is how a
+# cache is restored on every leg and written by ONE leg per KEY -- never one per job, whose legs may
+# use several keys -- `actions/cache/restore` everywhere and `actions/cache/save` guarded by
+# `if: matrix.suffix == ''`. The walk decides the condition from the
+# leg's matrix values alone, and anything it cannot decide -- `steps.*`, `needs.*`, a function --
+# leaves the leg a writer, so an `if:` this cannot read keeps the refusal it had before.
 function EmitCacheRows(   c, runsOn, key, writer, why) {
     if (WfMatrixUnread != "") {
         printf "CACHE\t%s%s%s%s%s%s%s%s%s\n", WfJob, sep, WfStepUses, sep, WorkflowTrim(WfRunsOn), sep,
@@ -147,11 +155,16 @@ function EmitCacheRows(   c, runsOn, key, writer, why) {
         return
     }
     for (c = 1; c <= WfComboCount; c++) {
+        if (WorkflowMatrixDecide(stepIf, c) == "F") continue
         runsOn = WorkflowTrim(WorkflowMatrixExpand(WfRunsOn, c))
         key = WorkflowMatrixExpand(stepKey, c)
         writer = WfJob (WfHasMatrix ? " " WorkflowComboLabel(c) : "")
         # Case-folded, because a reference the walk LEFT is one whose case differs from a key.
         why = (tolower(runsOn " " key) ~ /\$\{\{[^}]*matrix/) ? "a matrix reference is left unexpanded" : ""
+        # A step output is a value THIS leg computed at run time -- `cache-primary-key` is the
+        # obvious one to save under -- so two legs spelling it alike are not one key, and comparing
+        # the text would refuse a correct workflow for a collision that does not exist.
+        if (why == "" && key ~ /\$\{\{[^}]*steps\./) why = "it names a step output, which each leg computes for itself, so its text says nothing about whether two legs collide -- spell the key the way the step that restored it does"
         printf "CACHE\t%s%s%s%s%s%s%s%s%s\n", writer, sep, WfStepUses, sep, runsOn, sep, key, sep, why
     }
 }
