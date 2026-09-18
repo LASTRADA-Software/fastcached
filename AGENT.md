@@ -1619,6 +1619,11 @@ what differs between compilers, standard libraries, hosts and tool versions.
   wrong object is worse than no test, because it RETIRES THE SUSPICION**: ask not *is this tested*
   but *is the thing tested the thing that ships*, and where they differ as TEXT, extract the step's
   own `run:` block from the workflow and execute THAT.
+- **A probe of one capability cannot clear a runner that degraded in another, and a ctest TIMEOUT is
+  not a verdict about the tree** — a hang in the tree and a stalled runner both end in one. The
+  Windows spawn probe once told a reader to blame the tree over a 170 ms check that timed out at
+  60 s (#1515); the verdict is `scripts/ci-ctest-red-reading.sh`'s now, from `--output-log`, since
+  `LastTest.log` writes `Test Failed.` for both. Never raise the `TIMEOUT` instead.
 - `PEDANTIC_COMPILER_WERROR` decides **fatality, not which warnings exist**, so a flag and the
   suppressions it makes necessary are governed by ONE condition — split, a build directory reused
   across presets holds `PEDANTIC_COMPILER` ON with `WERROR` OFF, which is a database no correction to

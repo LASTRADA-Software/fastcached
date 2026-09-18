@@ -4857,7 +4857,7 @@ So `ctest` is BRACKETED by a spawn probe, and the PAIR is what carries the meani
 | before | after | what it means |
 |---|---|---|
 | red | — | the runner was broken on arrival; nothing after it is about the tree |
-| green | green | not this shape; read the failures as being about the tree |
+| green | green | not #966's shape — and that is ALL it says (#1515, below) |
 | green | red | the runner degraded DURING the run — #966 exactly |
 
 - The probe is `cmd /c exit 0`: it starts a process and does nothing else, so it
@@ -4867,6 +4867,34 @@ So `ctest` is BRACKETED by a spawn probe, and the PAIR is what carries the meani
 - It has **three** outcomes, not two — broken, working, and *could not conclude* —
   because a probe that can only answer the two you expect will answer one of them
   whatever it sees. And it says out loud that it is a reading taken after the fact.
+
+**A probe of one capability cannot clear a runner that degraded in another**
+([#1515](https://github.com/LASTRADA-Software/fastcached/issues/1515)). The green/green
+row used to read *"read the failures as being about the tree"*, and the step printed
+exactly that over one red: `mkdocs-validation`, measured at 170 ms, `***Timeout` at
+60.34 s on a branch whose inputs were disjoint from it. The runner could still spawn,
+so the probe was right about what it tested and wrong about what it licensed — and it
+licensed it in the direction that gets acted on, since a red on a required context
+already reads as *my branch is bad*.
+
+So the verdict moved to `scripts/ci-ctest-red-reading.sh`, which reads the spawn
+reading **and** the log `ctest --output-log` wrote:
+
+- **A timeout never reaches the tree verdict.** A hang in the tree and a runner that
+  stopped making progress both end in one, and nothing in the log separates them; the
+  timed-out tests are named and the reader is sent to their cost on a green run of the
+  same leg. `TIMEOUT` is not raised: a sub-second check that did not finish in 60 s did
+  not run out of budget.
+- **`--output-log`, because nothing else carries the distinction.** `LastTest.log`
+  writes `Test Failed.` for a timeout and a failed assertion alike; only the console
+  and `--output-log` say `***Timeout` and `N - name (Timeout)`.
+- **The FAILED list is checked against ctest's own count** before a missing
+  `(Timeout)` row is believed, and no log, no summary and a short list are three named
+  unclassified warnings rather than one fall-through.
+- **Both wiring mistakes fail toward unclassified, never toward the tree**: a log path
+  that disagrees with the `Test` step's is `no-log`, and a misspelt step id substitutes
+  an EMPTY spawn reading, which is not `ok`. `ctest -R ctest-red-reading-selftest`
+  drives every verdict and asserts only `tree` tells a reader to blame the tree.
 
 ### Doc-subject checks were skipped on doc-only changes (#687)
 

@@ -3140,6 +3140,30 @@ if(NOT WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
+# What a red Windows `Test` step says about the tree (#1515). The spawn probe after a
+# red used to tell the reader to "read the failures as being about the tree" whenever
+# spawning still worked -- and said so over a 170 ms check that had TIMED OUT at 60 s
+# on a runner that could still spawn. A probe of one capability cannot clear a runner
+# that degraded in another, and a timeout is not a verdict about the tree: a hang in
+# the tree and a stalled runner both end in one.
+#
+# `scripts/ci-ctest-red-reading.sh` now draws that verdict from the spawn reading AND
+# the ctest log, and this drives every verdict against staged logs, CR-terminated ones
+# included -- and asserts that only the `tree` verdict tells a reader to blame the tree.
+#
+# Registered on EVERY platform, Windows included, unlike the POSIX-only workflow
+# checks above: it is pure text processing, and Git Bash on a Windows runner is where
+# it actually runs.
+add_test(
+    NAME "ctest-red-reading-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/ci-ctest-red-reading.sh" --self-test
+)
+set_tests_properties("ctest-red-reading-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# ---------------------------------------------------------------------------
 # A non-required job failing inside a merge group reaches somebody (#684).
 #
 # Measured over every failing `merge_group` `Build` run the API still held on
