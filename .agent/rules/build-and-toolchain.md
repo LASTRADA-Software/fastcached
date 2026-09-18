@@ -4706,7 +4706,8 @@ which reads identically to complete coverage. It walks every workflow file as a 
 (#1448, #1175), and generalising it was not a wider glob but a MODEL of each shell:
 
 - The shell is DERIVED per step — its `shell:`, the job's or workflow's
-  `defaults.run.shell`, else the runner default for a literal `runs-on` — and a step
+  `defaults.run.shell`, else the runner default of `runs-on` in EVERY combination of the
+  job's matrix, which must agree (#1432: `varying-shell` otherwise) — and a step
   whose shell cannot be derived, or has no model, is refused. Run over `build.yml` at
   fa8fb0c3, the one-workflow model refused 13 PowerShell steps for `$LASTEXITCODE` and
   `$null`, and 4 bash steps for `{ c=$?; }`, all falsely; PowerShell reads the
@@ -4836,6 +4837,33 @@ was extracted from it, and its output over the real files is byte-for-byte uncha
 - **The two libraries are separate, and one consumer proves it**: `check-merge-queue-contexts.sh`
   loads the walk and not the lexer, because it reads no shell. Merging them would have made every
   YAML reader carry a bash model it has no use for.
+- **A job MATRIX is the walk's too, and three private partial models of one is the same defect as
+  five private walks** ([#1432](https://github.com/LASTRADA-Software/fastcached/issues/1432)). One
+  check expanded `${{ matrix.preset }}` over a `preset:` flow list and nothing else, one mapped
+  `runs-on` to an OS only when it was literal, one refused any expression in `runs-on`. So the first
+  matrix to grow a `runner:` axis, adding an arm64 leg as a ROW so the required context names do not
+  move, failed all three, each on its own misreading. The walk now turns `strategy.matrix` into
+  combinations with GitHub's semantics: the cartesian product of the axes, less every `exclude`,
+  then each `include` row merged into every BASE combination whose ORIGINAL values it overwrites
+  none of, else added as a combination of its own. A key a combination lacks expands EMPTY, as
+  GitHub does, which is what keeps the x86 legs' names where they were. **Both arms of the include
+  rule are the load-bearing part**: a row overwriting an original value is a NEW leg (#1432's
+  `runner:` row), and a row matching one, or naming no axis at all, MERGES. The fixture that pins
+  it is GitHub's own documented example, the one expected answer not written by the model's author.
+- **A matrix the walk cannot read is a REFUSAL (`unreadable-matrix`) and leaves NO combinations,
+  never one plausible leg**: an expression in its place, a row that is not a block mapping of plain
+  scalars, a value carrying an expression, an exclude naming no axis -- and a plain value YAML TYPES
+  as anything but a string, an integer or `true`/`false`, since `3.10` is the number 3.1 and that
+  is what GitHub renders. A reference differing from a key only in CASE is left unexpanded for the
+  consumer to refuse rather than expanded empty. Each consumer then asks per combination: a
+  context per leg (a matrix job whose name carries NO expression is refused, because GitHub
+  decorates it with the leg's values), a shell per leg's runner, a cache writer per leg.
+- **A cache key the legs do not vary is one key written by every leg at once** -- legs run
+  concurrently exactly as jobs do, so that is #318 arriving through a matrix, and rule F refuses it.
+  The first patch for #1432 was refused for exactly that on its CPM key. The shape IDENTICAL
+  content wants -- restore on every leg, save on one -- is NOT accepted, because rule F does not
+  evaluate a step `if:` and so counts that save in every leg; the refusal says so rather than
+  advising a shape the check would refuse again.
 
 
 **A Windows leg that cannot start processes reports six red smoke tests, not a

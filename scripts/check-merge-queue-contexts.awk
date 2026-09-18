@@ -34,10 +34,23 @@
 #   RETRIGGER \t <types>                 the same-SHA re-trigger types this file names, joined
 #   CANCEL    \t <line numbers>          where `cancel-in-progress: true` is set, joined
 #   CONTEXT   \t <context> \t <job key> \t <job if:>   one per context the file can produce
+#   UNKNOWN   \t <job key> \t <why>      a job whose contexts cannot be told
 #
-# `CONTEXT` is the old `EmitJobContexts` verbatim in shape: the context name is the job's `name:`
-# or, absent one, its key, with `${{ matrix.preset }}` expanded once per value of a `preset:` flow
-# sequence. That expansion is what makes one job key several required contexts.
+# `CONTEXT` is the job's `name:` or, absent one, its key -- expanded once per COMBINATION of the
+# job's matrix, which the shared walk computes with GitHub's semantics (#1432). That expansion is
+# what makes one job key several required contexts, and a key a combination lacks expands to
+# nothing, which is how a `suffix` only an `include` row carries leaves the other legs' names --
+# the REQUIRED ones -- where they were.
+#
+# `UNKNOWN` is every way of not knowing, and each is a REFUSAL rather than a guess, because both
+# wrong guesses are silent: a context produced under a name the table does not hold joins with no
+# verdict, and one the table holds that nothing produces reads as a rename.
+#
+#   * a matrix the walk cannot read, which leaves the job NO combinations to name;
+#   * a matrix job whose name carries no expression -- GitHub then APPENDS the combination's values
+#     to the name, in a form this check does not model, so the literal name is not a context;
+#   * a name still carrying an expression once the matrix is expanded -- `${{ github.* }}`, or a
+#     reference to the matrix the walk left unexpanded, which it does rather than guess.
 
 function WorkflowOn(kind) {
     if (kind == "raw") return               # nothing here reads a line before the walk has placed it
@@ -78,34 +91,30 @@ function OnKey(   v, i, n, part) {
     if (WfJob == "") return
     if (WfPath == "jobs/" WfJob "/name") jobName = WorkflowUnquote(WfValue)
     else if (WfPath == "jobs/" WfJob "/if") jobIf = WfValue
-    else if (WfPath == "jobs/" WfJob "/strategy/matrix/preset" && substr(WfValue, 1, 1) == "[") {
-        presets = WfValue
-        sub(/^\[/, "", presets); sub(/\].*$/, "", presets)
-    }
 }
 
-# One job's contexts. A job with a `preset:` matrix produces one context per value, because the
-# context is the EXPANDED name -- which is why a second hand-written list of job-to-context would
-# not be a cross-check but a second thing to be wrong.
-function FlushJob(   name, i, n, value, expanded, part) {
+# One job's contexts: one per combination of its matrix, because the context is the EXPANDED name
+# -- which is why a second hand-written list of job-to-context would not be a cross-check but a
+# second thing to be wrong. A job with no matrix has one combination, with no keys.
+function FlushJob(   name, c, expanded) {
     if (WfPass != 2) { ResetJobFacts(); return }
     name = (jobName != "" ? jobName : WfJob)
-    if (presets != "") {
-        n = split(presets, part, ",")
-        for (i = 1; i <= n; i++) {
-            value = part[i]
-            gsub(/^[ \t]+|[ \t]+$/, "", value)
-            value = WorkflowUnquote(value)
-            expanded = name
-            gsub(/\$\{\{ *matrix\.preset *\}\}/, value, expanded)
-            printf "CONTEXT\t%s\t%s\t%s\n", expanded, WfJob, jobIf
+    if (WfMatrixUnread != "")
+        printf "UNKNOWN\t%s\t%s\n", WfJob, "its matrix cannot be read -- " WfMatrixUnread
+    else if (WfHasMatrix && index(name, "${{") == 0)
+        printf "UNKNOWN\t%s\t%s\n", WfJob, "it is a matrix job whose name `" name "` carries no expression, and GitHub then appends each combination's values to it in a form this check does not model"
+    else
+        for (c = 1; c <= WfComboCount; c++) {
+            expanded = WorkflowMatrixExpand(name, c)
+            if (index(expanded, "${{") > 0)
+                printf "UNKNOWN\t%s\t%s\n", WfJob, "its name expands to `" expanded "`" (WfHasMatrix ? " for " WorkflowComboLabel(c) : "") ", which still carries an expression this check cannot evaluate"
+            else
+                printf "CONTEXT\t%s\t%s\t%s\n", expanded, WfJob, jobIf
         }
-    } else
-        printf "CONTEXT\t%s\t%s\t%s\n", name, WfJob, jobIf
     ResetJobFacts()
 }
 
-function ResetJobFacts() { jobName = ""; jobIf = ""; presets = "" }
+function ResetJobFacts() { jobName = ""; jobIf = "" }
 
 # A line the walk cannot place is COUNTED and not silently dropped. This check's verdict does not
 # turn on it -- a workflow it cannot read is `check-workflow-step-env.sh`'s subject, and two checks

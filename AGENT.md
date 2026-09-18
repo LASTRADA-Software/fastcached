@@ -1389,7 +1389,8 @@ what differs between compilers, standard libraries, hosts and tool versions.
   that REACHES it, so eight hooks would have been seven silences -- `raw` fires on every line. A
   kind with no arm returns, so every consumer spells one for every kind. `ctest -R
   workflow-walk-sole` refuses a new private walk; `ctest -R workflow-walk-selftest` drives every
-  kind, because its consumers reach three of them.
+  kind, because its consumers reach three of them. It reads a job MATRIX too (#1432) -- a check
+  asks per COMBINATION, never per axis, and a matrix the walk cannot read is REFUSED with no legs.
 - Every check whose SUBJECT is documentation was skipped on exactly the change it exists to catch,
   because `code=false` is right for a compiler and backwards for prose. Prose drifts by being
   EDITED. The set is the `docs-subject` ctest LABEL, read out of `src/tests/CMakeLists.txt` and

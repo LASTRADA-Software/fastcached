@@ -196,16 +196,51 @@ if [[ "${1:-}" == "--self-test" ]]; then
         cp .github/workflows/*.yml "$scratch/tree/.github/workflows/"
     }
 
+    # @param 3 optional text the output must hold. A `want-fail` alone cannot tell
+    # the rule a case is about from any other refusal the same tree trips.
     SelfTestCase() {
-        local what="$1" want="$2" out got=0
+        local what="$1" want="$2" mustSay="${3:-}" out got=0
         selfTestCases=$((selfTestCases + 1))
         out="$(bash "$scratch/tree/scripts/$(basename "$me")" 2>&1)" || got=$?
-        if [[ "$want" == "want-pass" && "$got" -eq 0 ]] || [[ "$want" == "want-fail" && "$got" -ne 0 ]]; then
+        if { [[ "$want" == "want-pass" && "$got" -eq 0 ]] || [[ "$want" == "want-fail" && "$got" -ne 0 ]]; } \
+            && [[ -z "$mustSay" || "$out" == *"$mustSay"* ]]; then
             echo "  ok    ($want) $what"
         else
-            echo "  FAIL  ($want, exit $got) $what" >&2
+            echo "  FAIL  ($want, exit $got${mustSay:+, must say '$mustSay'}) $what" >&2
             printf '%s\n' "$out" | sed 's/^/        /' >&2
             selfTestStatus=1
+        fi
+    }
+
+    # A synthetic workflow holding one matrix job, staged beside the real ones,
+    # and NotBinding rows for exactly the contexts named -- so a case passes only
+    # when the check derives THAT set: a context the model produced and no row
+    # names is refused as having no verdict, and a row naming a context the model
+    # did not produce is refused as stale. Both directions of one set, in one run.
+    #
+    # The rows go in at the opening line of `NonBindingContexts`, and through
+    # ENVIRON rather than `-v`, which may not carry a newline on BSD awk.
+    # @param 1 the job's `strategy:` block and everything after `runs-on:`, as YAML
+    # @param 2... the contexts to give rows
+    StageMatrix() {
+        local body="$1" rows="" context
+        shift
+        {
+            printf 'on: push\njobs:\n  fixture:\n'
+            printf '%s\n' "$body"
+        } > "$scratch/tree/.github/workflows/matrix-fixture.yml"
+        for context in ${1+"$@"}; do
+            rows="${rows}    \"${context}|NotBinding|a matrix fixture row\""$'\n'
+        done
+        cp "$scratch/tree/scripts/$(basename "$me")" "$scratch/before"
+        MatrixRows="$rows" awk '
+            { print }
+            /^NonBindingContexts=\($/ && !done { printf "%s", ENVIRON["MatrixRows"]; done = 1 }
+            END { if (!done) exit 3 }
+        ' "$scratch/before" > "$scratch/tree/scripts/$(basename "$me")" \
+            || { echo "  FAIL  the NonBindingContexts anchor is missing; no matrix case can stage its rows" >&2; selfTestStatus=1; return 1; }
+        if [[ -n "$rows" ]]; then
+            Injected "matrix fixture rows" "$scratch/tree/scripts/$(basename "$me")" "$scratch/before" || return 1
         fi
     }
 
@@ -358,6 +393,72 @@ PY
         Injected "verdict '$defect'" "$scratch/tree/scripts/$(basename "$me")" "$scratch/before" \
             && SelfTestCase "a row spelled '$defect' is REFUSED rather than read as a decision" want-fail
     done
+
+    # A job MATRIX, read through the shared walk's model of one (#1432). Each case
+    # names the exact set of contexts it expects, so a model that produced one too
+    # many or one too few fails it -- see `StageMatrix`.
+    #
+    # #1432's shape: the include row would overwrite the ORIGINAL `runner`, so it
+    # fits no base combination and is a third leg; `suffix`, which only that row
+    # carries, expands EMPTY on the other two, so their names do not move.
+    ArmShape='    name: "Fixture-${{ matrix.preset }}${{ matrix.suffix }}"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        preset: [clang-release, gcc-release]
+        runner: [ubuntu-24.04]
+        include:
+          - preset: gcc-release
+            runner: ubuntu-24.04-arm
+            suffix: "-arm64"
+    steps:
+      - run: true'
+    Stage
+    StageMatrix "$ArmShape" Fixture-clang-release Fixture-gcc-release Fixture-gcc-release-arm64 \
+        && SelfTestCase "an include row that fits no base combination is a context of its own, and a key only it carries expands EMPTY on the others" want-pass
+
+    Stage
+    StageMatrix "$ArmShape" Fixture-clang-release Fixture-gcc-release \
+        && SelfTestCase "the same matrix with no row for its third leg is REFUSED -- the leg is produced, not merged away" \
+            want-fail "'Fixture-gcc-release-arm64' (from .github/workflows/matrix-fixture.yml) carries no verdict"
+
+    # The other arm of the rule: a row that overwrites no ORIGINAL value MERGES.
+    # Appended instead, the first row would add `Fixture-gcc-release` beside
+    # `Fixture-gcc-release-merged`, and the second a context named `Fixture-`.
+    Stage
+    StageMatrix '    name: "Fixture-${{ matrix.preset }}${{ matrix.suffix }}"
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        preset: [clang-release, gcc-release]
+        include:
+          - preset: gcc-release
+            suffix: "-merged"
+          - note: every leg
+    steps:
+      - run: true' Fixture-clang-release Fixture-gcc-release-merged \
+        && SelfTestCase "an include row matching an axis value, and one naming no axis at all, MERGE into the combinations they fit" want-pass
+
+    Stage
+    StageMatrix '    name: "Fixture-${{ matrix.preset }}"
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - run: true' \
+        && SelfTestCase "a matrix the walk cannot read is REFUSED by name, never read as the job producing nothing" \
+            want-fail "produces contexts this check cannot tell: its matrix cannot be read"
+
+    Stage
+    StageMatrix '    name: "Fixture"
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        preset: [clang-release, gcc-release]
+    steps:
+      - run: true' \
+        && SelfTestCase "a matrix job whose name carries no expression is REFUSED -- GitHub decorates it with each leg's values, so the literal name is no context" \
+            want-fail "carries no expression"
 
     # And the empty read, which is the failure every table in this tree shares:
     # with no workflows nothing produces a context, so every row would look
@@ -597,9 +698,9 @@ TriggersOnMergeGroup() {
 # second thing to be wrong -- the same reasoning `check-tsan-scope.cmake` records
 # for reading the gate's tag expression instead of restating it.
 #
-# Indentation is the discriminator throughout, and it is reliable here because
-# these are the repository's own files: a job key is two spaces, a job's `name:`
-# and `if:` are four, and a step's are six and eight.
+# One row per COMBINATION of the job's matrix, computed by the shared walk with
+# GitHub's semantics (#1432): a matrix `include` row that fits no base
+# combination is a leg of its own, and a key a leg lacks expands to nothing.
 EmitJobContexts() {
     WorkflowFacts "$1" CONTEXT
 }
@@ -773,6 +874,13 @@ if [[ "${#allWorkflows[@]}" -eq 0 ]]; then
 fi
 
 # `context<TAB>workflow` for every context the tree can produce.
+#
+# And every job whose contexts cannot be TOLD, which is refused rather than
+# skipped: a job that produced no row here would be exactly the leg that joins
+# unrequired with nobody told, arriving through the reader instead of the
+# workflow. `scripts/check-merge-queue-contexts.awk` lists the ways it happens --
+# a matrix the shared walk cannot read, a matrix job whose name GitHub decorates,
+# a name still carrying an expression.
 producedContexts=""
 for workflow in "${allWorkflows[@]}"; do
     while IFS= read -r line; do
@@ -780,6 +888,10 @@ for workflow in "${allWorkflows[@]}"; do
         producedContexts="${producedContexts}${line}	${workflow}
 "
     done < <(EmitJobContexts "$workflow" | cut -f1)
+    while IFS= read -r unknown; do
+        [[ -n "$unknown" ]] || continue
+        Fail "job '${unknown%%	*}' in $workflow produces contexts this check cannot tell: ${unknown#*	}. Refused rather than guessed, because both wrong guesses are silent -- a leg under a name no table holds joins with no verdict, and a required name nothing really produces reads as reported. Name the job so each combination's context is spelled with \`\${{ matrix.* }}\`, or write its matrix as block mappings of plain scalars; if the construct is needed, teach scripts/lib/workflow-walk.awk to read it, with a case."
+    done < <(WorkflowFacts "$workflow" UNKNOWN)
 done
 
 # `${arr[@]+"${arr[@]}"}` and not a bare `"${arr[@]}"`, in both places the

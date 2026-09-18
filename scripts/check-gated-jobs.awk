@@ -45,8 +45,16 @@
 #   NEEDS   \t <job>                              an entry of `release.needs`
 #   JOBIF   \t <job> <sep> <job if:>              every job that carries a condition
 #   CCACHE  \t <job> <sep> <with.save:>           a step using @p action, its `save:` or empty
-#   CACHE   \t <job> <sep> <uses> <sep> <runs-on> <sep> <matrix spec> <sep> <with.key:>
+#   CACHE   \t <writer> <sep> <uses> <sep> <runs-on> <sep> <with.key:> <sep> <unresolved>
 #   JOBS    \t <how many jobs the walk placed>
+#
+# `CACHE` is one row per COMBINATION of the job's matrix (#1432), with `runs-on` and the key
+# already expanded for it by the shared walk -- so the `writer` is the job key, followed by the
+# combination's label when the job has a matrix. Every leg is a writer, because legs of one job run
+# concurrently exactly as two jobs do: a key the legs do NOT vary is one key written several times,
+# which is #318 arriving through a matrix. `unresolved` is empty, or says why this row's key cannot
+# be compared at all -- a matrix the walk cannot read, or a matrix reference it left unexpanded --
+# and the shell refuses such a row rather than comparing its text.
 #
 # `JOBS` is a POSITIVE CONTROL, and it is the only record here that is not a finding. Every
 # rule in this check reports on what it did NOT find -- an unguarded job, a missing reader, an
@@ -85,7 +93,7 @@ function OnText(   line) {
     else if (WfScope == "job") jobIf = (jobIf == "" ? line : jobIf " " line)
 }
 
-function OnKey(   v, axis) {
+function OnKey(   v) {
     if (WfPass != 2) return
     v = WfValue
     if (NamesClassifier(v)) usesClassifier = 1
@@ -99,12 +107,6 @@ function OnKey(   v, axis) {
     # The job's own keys, by path, so a step's `name:` or `if:` cannot be mistaken for one.
     if (WfPath == "jobs/" WfJob "/name") jobName = WorkflowUnquote(v)
     else if (WfPath == "jobs/" WfJob "/if") jobIf = (v ~ /^[|>]/) ? "" : v
-    else if (WfPath ~ ("^jobs/" WfJob "/strategy/matrix/[^/]+$") && substr(v, 1, 1) == "[") {
-        axis = WfKey "=" v
-        sub(/=\[/, "=", axis); sub(/\][ \t]*$/, "", axis)
-        gsub(/[ \t]/, "", axis)
-        matrixSpec = matrixSpec (matrixSpec == "" ? "" : ";") axis
-    }
 
     if (!WfInStepKeys()) return
     if (WfPath == "jobs/" WfJob "/steps/if") stepIf = (v ~ /^[|>]/) ? "" : v
@@ -123,7 +125,7 @@ function OnItem() {
     if (WfPath == "jobs/release/needs") printf "NEEDS\t%s\n", WfItem
 }
 
-function FlushStep(   i, line) {
+function FlushStep() {
     if (WfPass != 2) { ResetStepFacts(); return }
     # A `run:` body reaches `OnText` line by line already, except for a value written on the `run:`
     # key line itself -- which `OnKey` sees. Both are covered, so nothing is scanned twice here.
@@ -131,10 +133,27 @@ function FlushStep(   i, line) {
         printf "DOCSUBJ\t%s%s%s%s%s%s%s\n", WfJob, sep, jobName, sep, jobIf, sep, stepIf
     if (stepUsesAction)
         printf "CCACHE\t%s%s%s\n", WfJob, sep, stepSave
-    if (WfStepUses != "" && stepKey != "")
-        printf "CACHE\t%s%s%s%s%s%s%s%s%s\n", WfJob, sep, WfStepUses, sep, WorkflowTrim(WfRunsOn),
-               sep, matrixSpec, sep, stepKey
+    if (WfStepUses != "" && stepKey != "") EmitCacheRows()
     ResetStepFacts()
+}
+
+# One `CACHE` row per combination of this job's matrix, the key and the runner expanded for it. A
+# matrix the walk cannot read has no combinations, so it gets one row saying so rather than none --
+# a writer that vanished from the comparison would be the silent half.
+function EmitCacheRows(   c, runsOn, key, writer, why) {
+    if (WfMatrixUnread != "") {
+        printf "CACHE\t%s%s%s%s%s%s%s%s%s\n", WfJob, sep, WfStepUses, sep, WorkflowTrim(WfRunsOn), sep,
+               stepKey, sep, "its job's matrix cannot be read -- " WfMatrixUnread
+        return
+    }
+    for (c = 1; c <= WfComboCount; c++) {
+        runsOn = WorkflowTrim(WorkflowMatrixExpand(WfRunsOn, c))
+        key = WorkflowMatrixExpand(stepKey, c)
+        writer = WfJob (WfHasMatrix ? " " WorkflowComboLabel(c) : "")
+        # Case-folded, because a reference the walk LEFT is one whose case differs from a key.
+        why = (tolower(runsOn " " key) ~ /\$\{\{[^}]*matrix/) ? "a matrix reference is left unexpanded" : ""
+        printf "CACHE\t%s%s%s%s%s%s%s%s%s\n", writer, sep, WfStepUses, sep, runsOn, sep, key, sep, why
+    }
 }
 
 function FlushJob() {
@@ -151,4 +170,4 @@ function FlushJob() {
 }
 
 function ResetStepFacts() { stepIf = ""; stepSave = ""; stepKey = ""; stepUsesRunner = 0; stepUsesAction = 0 }
-function ResetJobFacts() { ResetStepFacts(); jobName = ""; jobIf = ""; matrixSpec = ""; usesClassifier = 0 }
+function ResetJobFacts() { ResetStepFacts(); jobName = ""; jobIf = ""; usesClassifier = 0 }

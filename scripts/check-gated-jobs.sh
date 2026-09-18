@@ -157,6 +157,11 @@ CacheRestoreAction="actions/cache/restore"
 # EMPTY string and rule F refuses on it, rather than defaulting to one of the
 # three: a wrong OS silently merges two keys that never collide, or splits two
 # that do, and both readings are worse than being told the label is new.
+#
+# The rows are SUBSTRINGS, so GitHub's arm64 images need none of their own:
+# `ubuntu-24.04-arm` is Linux and `windows-11-arm` is Windows, which is what
+# `runner.os` says on them -- the architecture is `runner.arch`, a field rule F
+# refuses to resolve rather than guesses. The self-test drives both labels.
 RunnerOs() {
     case "$1" in
         *ubuntu*|*linux*) echo "Linux" ;;
@@ -425,23 +430,32 @@ fi
 # on ONE runner and was the defect. Measured on this tree: a check reading the
 # raw text flags five groups, four of which are simply different operating
 # systems, so it refuses a correct workflow. `runner.os` is therefore resolved
-# from `runs-on`, and a `matrix.` axis is expanded over the job's own values --
-# one step with two legs is not two writers of one key, it is two keys.
+# from `runs-on`, and both are resolved PER COMBINATION of the job's matrix,
+# which the shared walk computes with GitHub's semantics (#1432): `runs-on` may
+# itself be `${{ matrix.runner }}`, an `include` row that fits no base
+# combination is a leg of its own, and a key a leg lacks expands to NOTHING,
+# as GitHub substitutes it.
+#
+# Every leg is a WRITER. A step whose key varies with the legs is several keys,
+# one each; a step whose key does NOT vary with them is one key written by every
+# leg at once -- legs of one job run concurrently exactly as two jobs do, so that
+# is #318 arriving through a matrix, and it is compared like any other pair.
 #
 # Every other `${{ ... }}` is left as text deliberately: `hashFiles('CMakeLists.txt')`
 # resolves to the same digest in every job of one run, so two steps spelling it
 # identically DO collide and must be compared rather than excused. What is
-# refused rather than compared is a key still naming `runner.` or `matrix.`
-# after resolution -- a key this check cannot resolve is one it cannot vouch for
-# in either direction, and vouching for it is the silent half.
+# refused rather than compared is a row the walk could not resolve -- a matrix it
+# cannot read, a matrix reference it left unexpanded -- and a key still naming
+# `runner.` after resolution: a key this check cannot resolve is one it cannot
+# vouch for in either direction, and vouching for it is the silent half.
 cacheSteps="$(WorkflowRecords "$workflow" CACHE)"
 
 cacheTotal=0
 cacheProblemsBefore=$problems
 resolvedRows=""
 osPattern='${{ runner.os }}'
-while IFS="$FieldSep" read -r jobKey stepUses runsOn matrixSpec cacheKey; do
-    [[ -n "$jobKey" ]] || continue
+while IFS="$FieldSep" read -r writer stepUses runsOn cacheKey unresolved; do
+    [[ -n "$writer" ]] || continue
     # The reader spelling is tested FIRST because it is a prefix of the writer's.
     # Reversed, every restore step reads as a writer and the check refuses a
     # correct workflow -- loudly, but for a reason nobody could act on.
@@ -452,43 +466,41 @@ while IFS="$FieldSep" read -r jobKey stepUses runsOn matrixSpec cacheKey; do
     esac
     cacheTotal=$((cacheTotal + 1))
 
-    runnerOs="$(RunnerOs "$runsOn")"
-    if [[ -z "$runnerOs" ]]; then
-        Fail "the cache step in job '$jobKey' runs on '$runsOn', which this check cannot map to a \`runner.os\`, so it cannot say whether that job's key collides with another job's. Teach \`RunnerOs\` the new label rather than leaving the key uncompared."
+    if [[ -n "$unresolved" ]]; then
+        Fail "the cache step in job '$writer' has a key this check cannot resolve: $unresolved -- key: $cacheKey, runs-on: $runsOn. Whether it collides with another writer's key cannot be decided in either direction, so it is refused rather than compared as text."
         continue
     fi
 
-    expanded="${cacheKey//"$osPattern"/$runnerOs}"
-    for axisSpec in $(printf '%s' "$matrixSpec" | tr ';' ' '); do
-        axisName="${axisSpec%%=*}"
-        axisPattern='${{ matrix.'"$axisName"' }}'
-        [[ "$expanded" == *"$axisPattern"* ]] || continue
-        grown=""
-        while IFS= read -r oneKey; do
-            [[ -n "$oneKey" ]] || continue
-            for axisValue in $(printf '%s' "${axisSpec#*=}" | tr ',' ' '); do
-                grown="${grown}${oneKey//"$axisPattern"/$axisValue}"$'\n'
-            done
-        done <<< "$expanded"
-        expanded="$grown"
-    done
+    runnerOs="$(RunnerOs "$runsOn")"
+    if [[ -z "$runnerOs" ]]; then
+        Fail "the cache step in job '$writer' runs on '$runsOn', which this check cannot map to a \`runner.os\`, so it cannot say whether that job's key collides with another job's. Teach \`RunnerOs\` the new label rather than leaving the key uncompared."
+        continue
+    fi
 
-    while IFS= read -r resolvedKey; do
-        [[ -n "$resolvedKey" ]] || continue
-        if [[ "$resolvedKey" == *'${{ matrix.'* || "$resolvedKey" == *'${{ runner.'* ]]; then
-            Fail "job '$jobKey' has a cache key this check cannot resolve -- key: $resolvedKey. It names a \`matrix.\` axis the job does not declare as an inline list, or a \`runner.\` field other than \`os\`, so whether it collides with another job's key cannot be decided in either direction."
-            continue
-        fi
-        resolvedRows="${resolvedRows}${resolvedKey}${FieldSep}${jobKey}"$'\n'
-    done <<< "$expanded"
+    resolvedKey="${cacheKey//"$osPattern"/$runnerOs}"
+    if [[ "$resolvedKey" == *'${{ runner.'* ]]; then
+        Fail "job '$writer' has a cache key this check cannot resolve -- key: $resolvedKey. It names a \`runner.\` field other than \`os\`, so whether it collides with another job's key cannot be decided in either direction."
+        continue
+    fi
+    resolvedRows="${resolvedRows}${resolvedKey}${FieldSep}${writer}"$'\n'
 done <<< "$cacheSteps"
 
 if [[ -n "$resolvedRows" ]]; then
     duplicateKeys="$(printf '%s' "$resolvedRows" | grep -v '^$' | cut -d"$FieldSep" -f1 | sort | uniq -d || true)"
     while IFS= read -r duplicateKey; do
         [[ -n "$duplicateKey" ]] || continue
-        writingJobs="$(printf '%s' "$resolvedRows" | grep -F "${duplicateKey}${FieldSep}" | cut -d"$FieldSep" -f2 | sort -u | tr '\n' ' ' || true)"
-        Fail "the cache key '$duplicateKey' is WRITTEN by more than one job (${writingJobs% }). On a run where that key misses, every one of them fetches the content and every one of them tries to save it; whichever finishes second finds the key taken and discards an archive it has already paid to build and upload (#318). Keep exactly one writer and change the others to \`${CacheRestoreAction}@v4\` -- never to a second key, which spends the repository's 10 GB cache budget on a duplicate."
+        writers="$(printf '%s' "$resolvedRows" | grep -F "${duplicateKey}${FieldSep}" | cut -d"$FieldSep" -f2 | sort -u || true)"
+        # Joined with `; ` because a matrix leg's label carries commas of its own.
+        writingJobs="$(awk 'NR > 1 { printf "; " } { printf "%s", $0 }' <<< "$writers")"
+        # Whether every writer is a LEG of one matrix job. The remedy differs, because one step
+        # cannot be a writer in one leg and a reader in another.
+        writerJobs="$(sed 's/ (.*$//' <<< "$writers" | sort -u)"
+        cause="On a run where that key misses, every one of them fetches the content and every one of them tries to save it; whichever finishes second finds the key taken and discards an archive it has already paid to build and upload (#318)."
+        if [[ "$writerJobs" != *$'\n'* && "$writers" == *" ("* ]]; then
+            Fail "the cache key '$duplicateKey' is WRITTEN by more than one leg of the matrix job '$writerJobs' (${writingJobs}). Legs of one job run concurrently, exactly as two jobs do, so a key the legs do not vary is one key saved by each of them. $cause Vary the key with the legs -- add a \`\${{ matrix.* }}\` value they differ in, to \`key:\` and \`restore-keys:\` alike. Where the legs' content is IDENTICAL, a restore step every leg runs plus a save step gated on one leg is the shape that avoids a duplicate entry, and this check does NOT accept it: it does not evaluate a step's \`if:\`, so it counts that save in every leg."
+        else
+            Fail "the cache key '$duplicateKey' is WRITTEN by more than one job (${writingJobs}). $cause Keep exactly one writer and change the others to \`${CacheRestoreAction}@v4\` -- never to a second key, which spends the repository's 10 GB cache budget on a duplicate."
+        fi
     done <<< "$duplicateKeys"
 fi
 
@@ -546,7 +558,9 @@ REQ
     #   $8 = the `coverage` job's ccache step:
     #        none | canonical | nosave | eventonly | comment
     #   $9 = rule F's cache jobs: none | single | twowriters | writerreader |
-    #        crossos | matrixleg | unknownaxis
+    #        crossos | matrixleg | unknownaxis | matrixinclude | matrixlegcollide |
+    #        crossarch | foldedref | unreadablematrix -- the last six are #1432's
+    #        matrix shapes, read through the shared walk's model of a matrix
     Generate() {
         local out="$1" comparison="$2" cancelled="$3" docStep="$4" docJob="$5"
         local trim="${6:-none}" gate="${7:-all}" ccache="${8:-none}"
@@ -625,20 +639,53 @@ REQ
             # satisfied nor broken by the jobs rules A-E use.
             if [[ "$cacheKnob" != "none" ]]; then
                 echo "  pkg-a:"
-                echo "    runs-on: ubuntu-24.04"
-                if [[ "$cacheKnob" == "matrixleg" ]]; then
-                    echo "    strategy:"
-                    echo "      matrix:"
-                    echo "        preset: [one, two]"
-                fi
+                case "$cacheKnob" in
+                    matrixinclude|matrixlegcollide|crossarch)
+                        echo "    runs-on: \${{ matrix.runner }}" ;;
+                    *)  echo "    runs-on: ubuntu-24.04" ;;
+                esac
+                case "$cacheKnob" in
+                    matrixleg|unknownaxis|foldedref)
+                        echo "    strategy:"
+                        echo "      matrix:"
+                        echo "        preset: [one, two]" ;;
+                    # #1432's shape: the include row would overwrite the ORIGINAL
+                    # `runner`, so it fits no base combination and is a third leg.
+                    matrixinclude|matrixlegcollide)
+                        echo "    strategy:"
+                        echo "      matrix:"
+                        echo "        preset: [one, two]"
+                        echo "        runner: [ubuntu-24.04]"
+                        echo "        include:"
+                        echo "          - preset: two"
+                        echo "            runner: ubuntu-24.04-arm"
+                        echo "            suffix: \"-arm64\"" ;;
+                    crossarch)
+                        echo "    strategy:"
+                        echo "      matrix:"
+                        echo "        runner:"
+                        echo "          - ubuntu-24.04-arm"
+                        echo "          - windows-11-arm" ;;
+                    unreadablematrix)
+                        echo "    strategy:"
+                        echo "      matrix: \${{ fromJSON(needs.plan.outputs.matrix) }}" ;;
+                esac
                 echo "    steps:"
                 echo "      - name: \"Cache CPM packages\""
                 echo "        uses: ${CacheAction}@v4"
                 echo "        with:"
                 echo "          path: .cpm"
                 case "$cacheKnob" in
-                    matrixleg|unknownaxis)
+                    matrixleg|matrixlegcollide)
                         echo "          key: cpm-\${{ runner.os }}-\${{ matrix.preset }}-x" ;;
+                    matrixinclude)
+                        echo "          key: cpm-\${{ runner.os }}-\${{ matrix.preset }}\${{ matrix.suffix }}-x" ;;
+                    # A key no combination defines. GitHub expands it EMPTY, so both
+                    # legs resolve to one key -- the typo is a collision, not a mystery.
+                    unknownaxis)
+                        echo "          key: cpm-\${{ runner.os }}-\${{ matrix.flavour }}-x" ;;
+                    foldedref)
+                        echo "          key: cpm-\${{ runner.os }}-\${{ matrix.Preset }}-x" ;;
                     *)  echo "          key: cpm-\${{ runner.os }}-x" ;;
                 esac
                 echo "      - run: ctest"
@@ -833,8 +880,38 @@ REQ
     Generate "${scratch}/wf.yml" safe yes ungated required none all none matrixleg
     Case "rule F: one step over two matrix legs -- two keys, not two writers of one key" want-pass
 
+    # #1432. Every leg of a matrix is a writer, and the legs come from the shared
+    # walk's model of a matrix rather than from the key's own axes -- so these
+    # are the model's two arms seen through rule F, in both directions. A model
+    # that merged the include row would see two keys and pass the collision
+    # below; one that did not expand a missing key to NOTHING would refuse the
+    # passing case for an unresolved reference.
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none matrixinclude
+    Case "rule F: an include row that fits no base combination is a leg of its own on an arm64 runner, and \`matrix.suffix\`, which only that row carries, expands EMPTY on the other legs -- three keys, one writer each (#1432)" want-pass
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none matrixlegcollide
+    CaseSaying "rule F: the same matrix with a key the legs do NOT vary -- two legs of one job saving one key at once is #318 arriving through a matrix" \
+        "more than one leg of the matrix job 'pkg-a'" \
+        "WRITTEN by more than one job ("
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none crossarch
+    Case "rule F: GitHub's arm64 labels map to their OS -- \`ubuntu-24.04-arm\` is Linux and \`windows-11-arm\` is Windows -- so one key text over the two legs is two keys" want-pass
+
+    # This case used to expect a refusal for a job that DECLARES no such axis,
+    # because the check could not resolve the reference. GitHub can: it expands
+    # a key the combination lacks to nothing. So the hazard a typo really poses
+    # is two legs resolving to ONE key, and that is what is refused now.
     Generate "${scratch}/wf.yml" safe yes ungated required none all none unknownaxis
-    Case "rule F: a key naming a \`matrix.\` axis the job does not declare is REFUSED, not read as 'resolves to something unique'" want-fail
+    CaseSaying "rule F: a key naming a matrix key no combination defines expands EMPTY, as GitHub does, so two legs resolve to ONE key -- refused as its two writers, not read as 'resolves to something unique'" \
+        "more than one leg of the matrix job 'pkg-a'" ""
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none foldedref
+    CaseSaying "rule F: a matrix reference differing from a key only in CASE is left unexpanded by the walk and REFUSED, not expanded EMPTY" \
+        "a matrix reference is left unexpanded" ""
+
+    Generate "${scratch}/wf.yml" safe yes ungated required none all none unreadablematrix
+    CaseSaying "rule F: a cache step in a job whose matrix the walk cannot read is REFUSED, not compared as text" \
+        "its job's matrix cannot be read" ""
 
     # The verdicts must come from the SHARED walk, which is a different claim from
     # "the check refuses". `Case` runs `bash "$0"`, which resolves its awk beside

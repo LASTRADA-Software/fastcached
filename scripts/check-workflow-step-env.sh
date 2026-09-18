@@ -53,9 +53,11 @@
 #
 # ## Which shell reads the script
 #
-# The step's `shell:`, else its job's `defaults.run.shell`, else the workflow's, else the runner's default for a
-# literal `runs-on` (pwsh on Windows, bash on Ubuntu, macOS or Linux). A step whose shell cannot be resolved that way,
-# or names a shell `ShellModels` has no row for, is REFUSED rather than read by the wrong model:
+# The step's `shell:`, else its job's `defaults.run.shell`, else the workflow's, else the runner's default (pwsh on
+# Windows, bash on Ubuntu, macOS or Linux) -- for `runs-on` as written, or, where it names the job's matrix, for EVERY
+# combination of that matrix, which the shared walk computes (#1432). Combinations whose runners' defaults differ are
+# REFUSED (`varying-shell`): one script cannot be held to two models. A step whose shell cannot be resolved, or names
+# a shell `ShellModels` has no row for, is REFUSED rather than read by the wrong model:
 #
 #   * bash reads `$NAME` and `${NAME...}`, outside single quotes, quoted heredocs, and `\$`.
 #   * PowerShell reads the environment only as `$env:NAME` or `${env:NAME}`, case-insensitively, outside single
@@ -189,7 +191,9 @@ Remedies="undefined-expression|A \`\${{ env.NAME }}\` expression naming nothing 
 stale-action-export|An \`ActionExports\` row describes nothing in this tree. Either no step \`uses:\` that action any more, or no \`\${{ env.NAME }}\` expression reads that name any more. A row kept past its subject is the \"forgot\" state wearing the vocabulary of a decision: it goes on satisfying reads that no longer exist and would satisfy a new one by accident. Delete the row, or restore whichever half went away.
 undefined|A step's environment is its own: a sibling step's or another job's \`env:\` does not lend it one, so under \`set -u\` the step dies on that line and without it the name expands to EMPTY and a branch is silently taken the wrong way (#1174). Add the row to THIS step's \`env:\` (or its job's), or assign it in the script. A name an earlier step or an action exported is named the same way, as \`NAME: \${{ env.NAME }}\`.
 unknown-shell|This check reads a script by the model of the shell that runs it, and has none for this one. Add a row to ShellModels only with a model of how that shell reads its environment, and cases for it.
-unresolved-shell|The shell could not be derived: no \`shell:\` on the step, no \`defaults.run.shell\` above it, and a \`runs-on\` that is not a literal Windows, Ubuntu, macOS or Linux runner. Name the shell on the step.
+unresolved-shell|The shell could not be derived: no \`shell:\` on the step, no \`defaults.run.shell\` above it, and a \`runs-on\` that is not a Windows, Ubuntu, macOS or Linux runner -- literally, or in some combination of the job's matrix once \`\${{ matrix.* }}\` is expanded for it (a key that combination lacks expands EMPTY, as GitHub expands it). Name the shell on the step.
+varying-shell|The step names no shell, and its job's matrix puts it on runners whose DEFAULT shells differ, so one script would be read by two shells and there is no one model to hold it to. Name the shell on the step, or in the job's \`defaults.run.shell\`. This check does not evaluate a step's \`if:\`, so a step an \`if:\` confines to some legs still needs its shell named -- a script that must differ per runner is two steps, each with an \`if:\` on the matrix value AND a \`shell:\` of its own.
+unreadable-matrix|The job's \`strategy.matrix\` is not one the shared model of a matrix (\`scripts/lib/workflow-walk.awk\`) can read -- an expression in its place, a flow mapping, an include or exclude row that is not a block mapping of plain scalars, a value carrying an expression, a list that does not close on its line, an axis with no values, an exclude naming no axis, two keys that differ only in case, a plain value YAML types as anything but a string, an integer or \`true\`/\`false\` (\`3.10\` is the number 3.1; quote it) -- so which runner, name and cache key each leg has cannot be told, and nothing that depends on them is judged. Write it as block mappings of plain-scalar lists and rows; if the construct is needed, teach the walk to read it, with a case.
 unreadable-run|The \`run:\` value is not a string this check can read: an alias, a tag, a flow collection, or a quoted scalar that does not close on its own line, has text after its closing quote, or holds a YAML escape other than \`\\\\\"\`, \`\\\\\\\\\` or \`\\\\/\`. YAML quoting is not shell quoting, and a quote read as the shell would read it hides the reads inside it. Write the script as a block scalar (\`run: |\`), or as a plain or quoted string on one line.
 unreadable-env|The \`env:\` is not a block mapping this check can read. Write one \`NAME: value\` row per line.
 unreadable-yaml|This check places every line of a workflow by its indentation, and cannot place this one -- a flow mapping, an alias, a quoted key, or a second document -- so no step around it can be judged. Write it as a block mapping; if the construct is needed, teach the reader and add a case.
@@ -541,6 +545,85 @@ jobs:
     steps:
       - name: "which shell"
         run: echo hi
+WF
+
+    # ---- a job MATRIX (#1432) -- the runner, and so the default shell, per combination -----------------------------
+    #
+    # `runs-on` may be `${{ matrix.runner }}`, and the shared walk computes the combinations. Each refusing case here
+    # has an accepting twin below, because a model that refused every matrix would pass all of these.
+
+    # Two runners whose default shells differ: one script, two shells, no one model to hold it to.
+    Case matrixShellsDisagree 1 'whose default shell is bash, and `windows-2025` for (runner=windows-2025), whose default shell is pwsh' <<'WF'
+jobs:
+  a:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, windows-2025]
+    steps:
+      - name: "which shell"
+        run: echo hi
+WF
+
+    # An include row that fits no base combination is a combination of ITS OWN keys, so it has no `runner` and
+    # `${{ matrix.runner }}` expands EMPTY for it -- as GitHub expands it -- which names no runner at all.
+    Case matrixRowWithNoRunner 1 'which is `` for (os=b)' <<'WF'
+jobs:
+  a:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        os: [a]
+        runner: [ubuntu-24.04]
+        include:
+          - os: b
+    steps:
+      - name: "a leg with no runner"
+        run: echo hi
+WF
+
+    Case matrixUnreadable 1 'is not a block mapping of axes' <<'WF'
+jobs:
+  a:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: "on whichever runner"
+        run: echo hi
+WF
+
+    # A matrix that cannot be read is refused on its own line, and its steps are still JUDGED when `runs-on` does not
+    # depend on the legs: a literal runner answers for every one of them, so this refuses the read, not the shell.
+    Case matrixUnreadableLiteralRunner 1 'step "on a literal runner": reads $STILL_READ' <<'WF'
+jobs:
+  a:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: "on a literal runner"
+        run: echo "$STILL_READ"
+WF
+
+    # The shape that motivated the model: its runners agree, so the step is READ -- and a read it cannot see is still
+    # refused. Without this, the accepting twin below would pass as well for a step nobody judged.
+    Case matrixStepStillJudged 1 'step "on every leg": reads $MATRIX_UNDEFINED' <<'WF'
+jobs:
+  linux:
+    name: "Linux-${{ matrix.preset }}${{ matrix.suffix }}"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        preset: [clang-release, gcc-release]
+        runner: [ubuntu-24.04]
+        include:
+          - preset: gcc-release
+            runner: ubuntu-24.04-arm
+            suffix: "-arm64"
+    steps:
+      - name: "on every leg"
+        run: echo "$MATRIX_UNDEFINED"
 WF
 
     Case unknownShell 1 'shell `python`' <<'WF'
@@ -1150,6 +1233,70 @@ jobs:
       - run: |
           $local = 1
           Write-Host $local
+WF
+
+    # ---- a job MATRIX (#1432) -- what must NOT be refused ---------------------------------------------------------
+
+    # #1432's shape: the include row would overwrite the ORIGINAL `runner`, so it is a third combination, on an arm64
+    # image -- and every combination's default shell is bash.
+    Case matrixShellsAgree 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  linux:
+    name: "Linux-${{ matrix.preset }}${{ matrix.suffix }}"
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        preset: [clang-release, gcc-release]
+        runner: [ubuntu-24.04]
+        include:
+          - preset: gcc-release
+            runner: ubuntu-24.04-arm
+            suffix: "-arm64"
+    steps:
+      - name: "on every leg"
+        run: echo "$RUNNER_TEMP"
+WF
+
+    # The remedy the refusal above names, followed: a shell named on the step is the shell, whatever the runners say.
+    Case matrixShellsDisagreeNamed 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  a:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, windows-2025]
+    steps:
+      - name: "which shell"
+        shell: bash
+        run: echo hi
+WF
+
+    # An include row naming only keys that are not axes MERGES into every combination rather than adding one -- a
+    # model that appended it would give that combination no runner and refuse the step, as the case above does.
+    Case matrixIncludeMerges 0 '1 run step(s), 1 read as bash' <<'WF'
+jobs:
+  a:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+        include:
+          - note: every leg
+    steps:
+      - run: echo hi
+WF
+
+    # A matrix written AFTER the steps still reaches them: the second pass starts the job from the combinations the
+    # first pass computed, as it already does for `runs-on` and the job's `env:`.
+    Case matrixAfterSteps 0 '1 run step(s), 0 read as bash, 1 as PowerShell' <<'WF'
+jobs:
+  w:
+    steps:
+      - run: Write-Host hi
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-2025, windows-11-arm]
 WF
 
     # ---- ORDER (#1461) -- what the ordering must NOT refuse -------------------------------------------------------
