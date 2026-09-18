@@ -3345,6 +3345,20 @@ makes it anyway and says so there.
   test leg's compile database and plants a flag it must refuse, each Package job asks the build that
   ships through `scripts/check-instruction-set-flags.sh`, and `ctest -R target-pragmas` refuses a
   target pragma under `src/` (#1442). What neither covers is listed in the checks' headers.
+  - **And a database records only what CMake PUT on a command line** (#1447). The build-time
+    environment (`CL`, `_CL_`, `CCC_OVERRIDE_OPTIONS`), a clang driver configuration file and a
+    compiler's built-in default all widen the instruction set without appearing there. They all
+    arrive in the compiler's PREDEFINED MACROS, so every executable compiles
+    `src/tests/InstructionSetBaseline.cpp` (`cmake/InstructionSetProbe.cmake`), which `#error`s
+    naming each macro above its architecture's baseline row. It is a unit the BUILD compiles
+    rather than a check a test runs, because a test inherits ctest's environment, which need not be
+    the build's: a `CL` set for the build and not for the suite passes any probe driven from ctest.
+    **An architecture with no row is refused, not passed.** The two complement each other -- #1442
+    names the FLAG, the probe names the MACRO -- and `ctest -R instruction-set-probe-selftest`
+    drives the refusing direction with this build's own compiler (every leg's build is the passing
+    one): a flag, `CL=/arch:AVX2` for cl, `CCC_OVERRIDE_OPTIONS` and `--config` for clang, and a
+    target-attributed function that must pass. cl's `#error` is FATAL, so it names the FIRST row
+    it reaches -- `__AVX__` for `/arch:AVX2` -- where clang names every one.
   - **And nothing made a FUTURE shipping configure get that step** (#1450). #1442 put it into the
     three `Package` jobs, and that step is the only thing reading what SHIPS -- the macOS package is
     configured by a hand-written `cmake` line no `ctest` leg configures. A fourth packaging job, a

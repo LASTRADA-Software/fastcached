@@ -1249,7 +1249,10 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - An instruction-set extension is used only inside a function that asks for it
   (`__attribute__((target(...)))`), never through a global `-m` flag: a flagged TU's inline copies
   can reach a fallback path on a CPU without the instructions. And that function runs only once
-  `Core/CpuFeatures` says the CPU has them. `ctest -R instruction-set-flags`. **And every
+  `Core/CpuFeatures` says the CPU has them. `ctest -R instruction-set-flags` reads the FLAGS; what no
+  flag spells -- `CL`, `CCC_OVERRIDE_OPTIONS`, a driver config file, a compiler default -- is caught by
+  `src/tests/InstructionSetBaseline.cpp`, which every executable COMPILES in the build's own
+  environment and which refuses an architecture it has no row for (#1447). **And every
   SHIPPING configure runs that check, in its own job and before its build** — selected by the
   `-DFASTCACHED_BUILD_TESTS=OFF` flag, never by a list of job names, since `Package` jobs are
   not required contexts and a fourth one shipping unchecked is green everywhere.

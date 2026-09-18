@@ -7515,6 +7515,33 @@ set_tests_properties("instruction-set-flags-selftest" PROPERTIES
     TIMEOUT 300
 )
 
+# And the routes a compile database cannot see (#1447): the environment, a driver configuration
+# file, a compiler's own default. Every executable compiles src/tests/InstructionSetBaseline.cpp
+# (cmake/InstructionSetProbe.cmake), so every leg's BUILD is the passing direction; this drives the
+# refusing one with this build's own compiler, which is the direction no build shows.
+if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID)
+    set(_isaProbeArch "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
+else()
+    set(_isaProbeArch "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+add_test(
+    NAME "instruction-set-probe-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DCXX=${CMAKE_CXX_COMPILER}"
+        "-DCOMPILER_ID=${CMAKE_CXX_COMPILER_ID}"
+        "-DFRONTEND=${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}"
+        "-DARCH=${_isaProbeArch}"
+        "-DAPPLE_HOST=${APPLE}"
+        "-DPROBE=${FASTCACHED_INSTRUCTION_SET_PROBE}"
+        "-DSCRATCH=${CMAKE_CURRENT_BINARY_DIR}/instruction-set-probe-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-instruction-set-probe-selftest.cmake"
+)
+set_tests_properties("instruction-set-probe-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 # This build's own compile database, and a plant into its real Sha256.cpp entries that must be refused. Only the
 # Makefile and Ninja generators write a database; every configure preset here is Ninja.
 if(CMAKE_GENERATOR MATCHES "Ninja|Makefiles")
