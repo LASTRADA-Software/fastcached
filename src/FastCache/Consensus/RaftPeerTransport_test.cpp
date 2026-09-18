@@ -15,14 +15,16 @@
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/Clock.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -39,6 +41,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include <tests/SecureRandomFakes.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Consensus;
@@ -79,6 +83,18 @@ class AcceptsEverything final: public IRaftPeerCredential
   private:
     Cluster::PskRaftPeerCredential _stranger { StrangerKey() };
 };
+
+/// The bytes the scripted acceptor draws its nonce from on the connection with @p seed.
+///
+/// Scripted rather than drawn, so the acceptor can be REBUILT from the seed when the proof
+/// arrives and hold the nonce its challenge carried. Distinct for every seed below 256, which
+/// is more connections than any case here opens.
+/// @param seed The connection's seed.
+/// @return The bytes.
+[[nodiscard]] std::vector<std::byte> ConnectionNonceScript(std::uint64_t seed)
+{
+    return Testing::ScriptedSecureRandom::Ascending(NonceBytes, static_cast<std::uint8_t>(seed & 0xFFU));
+}
 
 /// How the scripted acceptor behaves before the session starts.
 enum class AcceptorScript : std::uint8_t
@@ -170,9 +186,9 @@ class RecordingSocket final: public ISocket
         switch (_script)
         {
             case AcceptorScript::Answers: {
-                SystemRandomSource random { _seed };
-                auto const challenge =
-                    RaftWire::EncodeChallenge(AcceptorHandshake { *_acceptorKey, "unused", random }.Challenge());
+                Testing::ScriptedSecureRandom random { ConnectionNonceScript(_seed) };
+                auto const challenge = RaftWire::EncodeChallenge(
+                    AcceptorHandshake::Create(*_acceptorKey, "unused", random).value().Challenge());
                 _inbound.insert(_inbound.end(), challenge.begin(), challenge.end());
                 break;
             }
@@ -316,7 +332,7 @@ class RecordingSocket final: public ISocket
   private:
     /// Judge the proof the transport wrote, and queue the verdict for its next read.
     ///
-    /// The real `AcceptorHandshake`, rebuilt from this connection's seed so its nonce is
+    /// The real `AcceptorHandshake`, rebuilt from this connection's script so its nonce is
     /// the one the challenge carried. Rebuilt rather than kept because who this acceptor
     /// IS may be "whoever was dialled", which is known only once the proof names it.
     /// @param buffer The proof frame.
@@ -337,8 +353,8 @@ class RecordingSocket final: public ISocket
             self = _record->acceptorId.value_or(proof->target);
         }
 
-        SystemRandomSource random { _seed };
-        AcceptorHandshake handshake { *_acceptorKey, self, random };
+        Testing::ScriptedSecureRandom random { ConnectionNonceScript(_seed) };
+        auto handshake = AcceptorHandshake::Create(*_acceptorKey, self, random).value();
         auto const judgement = handshake.Judge(*proof);
         if (judgement.verdict.has_value())
         {
@@ -473,10 +489,15 @@ struct Harness
     ManualClock clock;
     TestReactor reactor { clock };
     ScriptedConnector connector { record, reactor };
-    NullLogger logger;
+    CapturingLogger logger;
     AtomicMetricsSink metrics;
     Cluster::PskRaftPeerCredential credential { ClusterKey() };
-    SystemRandomSource random { 0xD1A1 };
+    SystemSecureRandom random;
+
+    /// Where the transport draws its nonces: `random`, unless a case points it elsewhere
+    /// before `Build`.
+    ISecureRandom* nonces { &random };
+
     std::unique_ptr<RaftPeerTransport> transport;
 
     /// Make the peer's socket refuse or accept writes.
@@ -497,7 +518,7 @@ struct Harness
     void Build(PeerTransportOptions options = {})
     {
         transport = std::make_unique<RaftPeerTransport>(
-            NodeId { "n1" }, OnePeer(), reactor, connector, logger, metrics, credential, random, options);
+            NodeId { "n1" }, OnePeer(), reactor, connector, logger, metrics, credential, *nonces, options);
     }
 
     /// Build the transport over one peer and start its sender.
@@ -577,6 +598,35 @@ TEST_CASE("A sent message reaches the peer as a decodable frame", "[consensus][r
     harness.RequestStopAndDrain();
 }
 
+TEST_CASE("A dialler that cannot draw a nonce sends no proof and blames itself rather than the peer",
+          "[consensus][raft][transport]")
+{
+    // The connection is abandoned before this node proves anything, rather than proved with a
+    // weak nonce (#1527). Nothing about the PEER is wrong, so no `DiallerRefusal` moves -- a
+    // count there would send an operator to a machine that is fine -- and the Error names this
+    // host's generator instead.
+    Harness harness;
+    Testing::ScriptedSecureRandom denied { Testing::ScriptedSecureRandom::DeniedFailure() };
+    harness.nonces = &denied;
+    harness.Start();
+
+    harness.transport->Send("n2", Vote(1));
+    harness.reactor.Drain();
+
+    CHECK(denied.FillCount() >= 1);
+    CHECK(harness.Writes() == 0);
+    for (auto const& row: DiallerRefusals)
+        CHECK(harness.Refused(row.refusal) == 0);
+
+    auto const lines = harness.logger.Snapshot();
+    CHECK(std::ranges::any_of(lines, [](CapturingLogger::Record const& record) {
+        return record.level == LogLevel::Error && record.message.contains("cannot draw a handshake nonce")
+               && record.message.contains(Testing::ScriptedSecureRandom::DeniedFailure().primitive);
+    }));
+
+    harness.RequestStopAndDrain();
+}
+
 TEST_CASE("Send hands the message over without advancing the sender", "[consensus][raft][transport]")
 {
     // Sharper than "Send does not block", which a merely fast implementation
@@ -609,7 +659,7 @@ TEST_CASE("A message for this node itself is not sent anywhere", "[consensus][ra
     NullLogger logger;
     AtomicMetricsSink metrics;
     Cluster::PskRaftPeerCredential const credential { ClusterKey() };
-    SystemRandomSource random { 1 };
+    SystemSecureRandom random;
 
     std::vector<PeerEndpoint> peers { PeerEndpoint { .id = "n1", .host = "self", .port = 1 },
                                       PeerEndpoint { .id = "n2", .host = "unused", .port = 2 } };
@@ -843,7 +893,7 @@ TEST_CASE("Stop is idempotent and safe before Start", "[consensus][raft][transpo
     NullLogger logger;
     AtomicMetricsSink metrics;
     Cluster::PskRaftPeerCredential const credential { ClusterKey() };
-    SystemRandomSource random { 1 };
+    SystemSecureRandom random;
 
     RaftPeerTransport transport { "n1", OnePeer(), reactor, connector, logger, metrics, credential, random };
     transport.Stop();

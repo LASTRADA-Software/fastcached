@@ -2144,6 +2144,35 @@ set_tests_properties("unique-temp-paths-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Separate PROCESSES draw separate handshake nonces (#1527).
+#
+# Nonces were drawn from an engine seeded once per process from `std::random_device`, which
+# on the host #1507 was measured on answers zero for 57% of draws -- and a process seeded zero
+# draws the same stream as every other one, while never repeating within itself. So no
+# in-process case can see the defect, and this asks processes: `secure-random-probe` is run
+# eight times and a nonce seen twice is refused. `scripts/secure-random-gate.cmake` first runs
+# the pre-#1527 construction seeded zero in two processes and requires the SAME detector to
+# fire, because a detector nobody has watched refuse proves nothing by staying quiet.
+#
+# Beside the check above because both answer #1507's measurement: that one for temp-path
+# names, this one for nonces.
+# Not guarded to Debug, unlike the canary gates it is shaped like: nothing here is an
+# `assert`, and the generator a Release build ships is the one worth asking.
+add_executable(secure-random-probe SecureRandomProbe.cpp)
+target_link_libraries(secure-random-probe PRIVATE FastCache)
+add_test(
+    NAME "secure-random-cross-process"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_PROBE=$<TARGET_FILE:secure-random-probe>"
+        -P "${CMAKE_SOURCE_DIR}/scripts/secure-random-gate.cmake"
+)
+set_tests_properties("secure-random-cross-process" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # A test may not decide anything from the architecture it was COMPILED for.
 #
 # `#if defined(_M_ARM64)` in a test picks an expected value from a fact about the

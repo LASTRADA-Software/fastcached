@@ -3,7 +3,7 @@
 
 #include "../apps/fastcache-compile-node/ClusterKeySource.hpp"
 
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 
 #include <cstddef>
@@ -12,6 +12,8 @@
 #include <string>
 #include <string_view>
 #include <utility>
+
+#include <tests/SecureRandomFakes.hpp>
 
 namespace FastCache::Testing
 {
@@ -56,33 +58,17 @@ class ScriptedClusterKey final: public Node::IClusterKeySource
     std::string _failure;
 };
 
-/// A randomness source whose draws are fixed, so a challenge is reproducible.
+/// The script for a `ScriptedSecureRandom` whose every challenge is the same nonce.
 ///
 /// **What this buys is that a test can MINT the tag the server will expect** without reaching
 /// inside the server to read the nonce it drew -- which is the only way to write this case
-/// against the production seam rather than against a friend declaration.
-///
-/// A degenerate range still answers its one legal value, because `IRandomSource`'s contract
-/// says equal bounds yield that value and a fake more permissive than the thing it stands for
-/// is the shape this repository records.
-class FixedRandomSource final: public IRandomSource
+/// against the production seam rather than against a friend declaration. Exactly one nonce
+/// long, so the scripted source cycles back to it on every draw.
+/// @return The bytes.
+[[nodiscard]] inline std::vector<std::byte> FixedChallengeScript()
 {
-  public:
-    /// @param draw What every non-degenerate range answers.
-    explicit FixedRandomSource(std::uint64_t draw = 0x0123456789ABCDEFULL) noexcept:
-        _draw { draw }
-    {
-    }
-
-    /// @copydoc IRandomSource::UniformInRange
-    [[nodiscard]] std::uint64_t UniformInRange(std::uint64_t lowInclusive, std::uint64_t highInclusive) override
-    {
-        return lowInclusive == highInclusive ? lowInclusive : _draw;
-    }
-
-  private:
-    std::uint64_t _draw;
-};
+    return ScriptedSecureRandom::Ascending(NonceBytes);
+}
 
 /// The bytes of @p text, for a key or a challenge a case spells out.
 /// @param text The text.

@@ -603,7 +603,10 @@ if(WIN32)
     # same reason ws2_32 is -- every executable that links FastCache asks the cache
     # surface who a caller is, and a private link would leave that unresolved in each
     # of them.
-    target_link_libraries(FastCache PUBLIC ws2_32 iphlpapi)
+    #
+    # bcrypt: BCryptGenRandom, behind Core/ISecureRandom -- where every handshake nonce
+    # and every minted node id comes from (#1527). PUBLIC for the same reason.
+    target_link_libraries(FastCache PUBLIC ws2_32 iphlpapi bcrypt)
     target_compile_definitions(FastCache PUBLIC
         WIN32_LEAN_AND_MEAN
         NOMINMAX

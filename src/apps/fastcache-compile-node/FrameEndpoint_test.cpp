@@ -3649,7 +3649,7 @@ struct ProvingFleet
 {
     Fleet fleet;
     Testing::ScriptedClusterKey key { ProofKeyBytes };
-    Testing::FixedRandomSource random;
+    Testing::ScriptedSecureRandom random { Testing::FixedChallengeScript() };
     NodeProofResponder prover { key, random, fleet.metrics, fleet.logger };
     MergedResponder merged { SurfaceComponents { .scheduler = &fleet.responder, .nodeProof = &prover } };
 };
@@ -3776,7 +3776,7 @@ TEST_CASE("Asking for a second challenge abandons the first", "[node][frame][pro
     // either -- a replay window opened by nothing but politeness. The FIRST challenge is used
     // after a second has been asked for, and it is refused for having been abandoned.
     //
-    // `FixedRandomSource` draws the same bytes every time, so the two challenges are EQUAL and
+    // `FixedChallengeScript` draws the same bytes every time, so the two challenges are EQUAL and
     // this case cannot tell them apart by their contents. That is the point: what it asserts is
     // that the outstanding one was CLEARED by the second ask, which no byte comparison could see
     // even with a real random source.
@@ -3800,4 +3800,32 @@ TEST_CASE("Asking for a second challenge abandons the first", "[node][frame][pro
     // The second is the one outstanding, so the proof is accepted once and only once.
     CHECK(Testing::StatusOf(client.Send(ProveFrame(second))) == Wire::Status::Ok);
     CHECK(ErrorOf(client.Send(ProveFrame(first))) == Wire::ErrorCode::NodeProofUnchallenged);
+}
+
+TEST_CASE("A second challenge the node cannot draw is refused and still abandons the first", "[node][frame][proof]")
+{
+    // The old challenge goes BEFORE the draw, so a draw that fails leaves none outstanding
+    // rather than the last one (#1527). Held the other way round, a caller whose second ask
+    // was refused would still hold a live nonce the server had meant to retire -- the replay
+    // window one live challenge per connection exists to close.
+    ProvingFleet rig;
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(rig.fleet.io,
+                                         NodeSurface::Node,
+                                         LoopbackFor(NodeSurface::Node, port),
+                                         rig.merged,
+                                         rig.fleet.metrics,
+                                         rig.fleet.logger);
+    REQUIRE(endpoint.has_value());
+    rig.fleet.Serve();
+
+    Conversation client { port };
+    auto const first = ChallengeIn(client.Send(Wire::EncodeNodeChallenge()));
+    REQUIRE(first.size() == Wire::NodeChallengeBytes);
+
+    rig.random.Deny(Testing::ScriptedSecureRandom::DeniedFailure());
+    CHECK(ErrorOf(client.Send(Wire::EncodeNodeChallenge())) == Wire::ErrorCode::NoCluster);
+
+    CHECK(ErrorOf(client.Send(ProveFrame(first))) == Wire::ErrorCode::NodeProofUnchallenged);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsAccepted) == 0);
 }

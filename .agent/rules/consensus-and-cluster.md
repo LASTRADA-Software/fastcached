@@ -256,11 +256,33 @@ plausible simpler design gets wrong.
   verdict fresh, so a recorded `Accepted` cannot answer a dialler talking to something
   without the key. A proof harvested in advance is useless, because step 4 needs a live
   verdict and frames are only produced live, so a correct PREDICTION buys nothing a relay
-  does not. That is why `SystemRandomSource` is good enough here and why
-  `Core/IRandomSource.hpp` says so. **Size and source are one seam** (A2): `Core/Nonce.hpp`
-  holds `NonceBytes` (32, `static_assert`ed at least that and a multiple of a draw) and
-  `DrawNonce`, and discovery's challenge draws through the same helper -- a second loop over
-  `UniformInRange` would be a second answer to how big a nonce is.
+  does not. **Size and source are one seam** (A2): `Core/Nonce.hpp` holds `NonceBytes` (32,
+  `static_assert`ed at least that) and `DrawNonce`, and discovery's challenge and the node
+  proof's draw through the same helper -- a second draw site would be a second answer to how
+  big a nonce is.
+
+- **Never-repeat needs an ENTROPY SOURCE, not a seeded engine** (#1527). This bullet used to
+  conclude that `SystemRandomSource` was good enough, and the conclusion rested on a premise
+  nobody wrote down: that its seed was random. It is seeded from `std::random_device`, which on
+  the host #1507 was measured on answers zero for 57% of draws, so about a third of processes
+  there (0.57 squared -- inferred, not reproduced) seed zero and draw ONE nonce stream: a
+  restarted acceptor re-issues its previous run's challenges. So nonces and minted node ids
+  come from `Core/ISecureRandom.hpp` -- `getrandom` on Linux, `getentropy` on macOS,
+  `BCryptGenRandom` on Windows -- and `SystemRandomSource` keeps jitter and tie-breaking.
+  - **A draw that fails is a REFUSAL, never a fallback** to the device, a clock or an engine.
+    The handshakes are FACTORIES (`AcceptorHandshake::Create`, `DiallerHandshake::Create`), so
+    a handshake with a weak nonce cannot be constructed: the acceptor closes unchallenged, the
+    dialler abandons before proving, discovery withholds its challenge (`ChallengeWithheld`),
+    the node-proof surface refuses `NoCluster`, and a mint refuses to start the node by name.
+  - **Each of those is uncounted, and says so in an Error naming the primitive**: every refusal
+    row on these surfaces describes a PEER, and this describes THIS host. The transport's
+    precedent is its "cannot prove the key" line; the acceptor and discovery throttle theirs,
+    because anything on the network can provoke them.
+  - **Its test is CROSS-PROCESS, because the defect was.** An engine seeded once per process
+    never repeats within it, so every in-process "two nonces differ" case passed on the broken
+    build -- measured: with `DrawNonce` neutered back to a zero-seeded engine, that case stays
+    green and `ctest -R secure-random-cross-process` goes red. That gate runs the pre-#1527
+    construction first and requires its repeat detector to FIRE, before believing its silence.
 
 - **The ids are bound; the endpoint deliberately is NOT**, although discovery's proof binds
   a `(node, endpoint)` pair. Discovery produces an ADDRESS somebody records, so the address
@@ -329,7 +351,7 @@ plausible simpler design gets wrong.
   sentences still answer first. `ConsensusTier::Start` returns the same constant for a
   `NodeConfig` no argv produced, and reads the key through `ReadClusterKey` BEFORE anything
   is bound or dialled. The server and transport take the credential, their own id and an
-  `IRandomSource` as REQUIRED constructor arguments -- no default and no null -- so an
+  `ISecureRandom` as REQUIRED constructor arguments -- no default and no null -- so an
   unauthenticated peer connection cannot be constructed. "No key, so skip the check" is
   the shape the worker's lease rule (#282) refuses one surface over: the port open, every
   refusal counter at zero, and the fleet healthy-looking from both ends.
@@ -376,7 +398,9 @@ plausible simpler design gets wrong.
     unit cases' subject.
   - **Nonces come from a source of their own**, never `_network`, so every existing seed
     sees a byte-identical delay and loss schedule. Drawing from `_network` would silently
-    change what every adversarial run tests.
+    change what every adversarial run tests. That source is the operating system's
+    generator (#1527), as in production, and a run stays a function of its seeds: a nonce's
+    VALUE decides nothing, since every MAC over it verifies under the right key alone.
   - **The credential factory is REQUIRED at construction.** A defaulted one would let a
     case forget the key and still read as a cluster that forms.
   - **An intruder case is read beside the formation case, under the same neuter.**
@@ -524,7 +548,9 @@ and it is recorded here because the question will be asked again.
     so a node returning under its old id having forgotten which term it voted in is
     `--cluster-dir`'s own documented hazard -- two leaders in one term -- arriving
     automatically. **A wiped state directory MUST produce a new identity.** So the mint
-    is 128 bits from `IRandomSource` and there is no platform seam for a machine-id at
+    is 128 bits from `ISecureRandom` (#1527 -- an engine seeded from `std::random_device`
+    reproduces the cloned-image collision wherever that device answers a constant) and
+    there is no platform seam for a machine-id at
     all: folded in beside fresh randomness it changes no outcome, and a three-platform
     reader whose value decides nothing is a claim with no reader.
   - **A derived id cannot be typed, so `--raft-self=<host>` is not separable

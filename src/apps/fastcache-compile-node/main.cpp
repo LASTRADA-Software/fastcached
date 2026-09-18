@@ -442,7 +442,7 @@ using Node::NodeReloader;
 ///         two states a caller acts on differently and two optionals render alike.
 [[nodiscard]] std::expected<std::optional<Node::NodeIdentity>, std::string> AdoptNodeIdentity(NodeConfig& cfg,
                                                                                               NodeConfig& cliOnly,
-                                                                                              IRandomSource& random,
+                                                                                              ISecureRandom& random,
                                                                                               ILogger& logger)
 {
     if (Node::NodeIdentityNeed(cfg) != Node::IdentityNeed::Mint)
@@ -902,11 +902,11 @@ using Node::NodeReloader;
                                     logger,
                                     schedulerTier->Policy());
 
-    // Where a node-proof challenge's bytes come from. Its own source rather than a share of
-    // `identityRandom` above, which is a different lifetime and a different question -- an
-    // identity is minted once at startup and challenges are drawn for as long as the process
-    // serves.
-    SystemRandomSource proofRandom;
+    // Where a node-proof challenge's bytes come from: the operating system's generator
+    // (#1527). Its own instance rather than a share of `identityRandom` above, which is a
+    // different lifetime -- an identity is minted once at startup and challenges are drawn for
+    // as long as the process serves.
+    SystemSecureRandom proofRandom;
 
     // The cluster-key prover (#1428), built wherever this node HOLDS a key -- which is a
     // narrower condition than `servesEnrollment` and a wider one than a scheduler: #1308 makes
@@ -1419,7 +1419,7 @@ struct EarlyVerbRow
     // An uninstall reaches neither -- `NodeIdentityNeed` declines it -- because removing
     // a registration is the recovery an operator reaches for when the configuration is
     // already wrong.
-    SystemRandomSource identityRandom;
+    SystemSecureRandom identityRandom;
     if (auto const adopted = AdoptNodeIdentity(context.cfg, context.cliOnly, identityRandom, context.logger);
         !adopted.has_value())
     {
@@ -1495,7 +1495,7 @@ struct EarlyVerbRow
 /// @return What the exchange answered, rendered by `ReportOneShotVerb`.
 [[nodiscard]] int RunEnrollFrom(EarlyVerbContext const& context)
 {
-    SystemRandomSource enrollRandom;
+    SystemSecureRandom enrollRandom;
     Node::ConfiguredCredential const credential { context.cfg, nullptr };
     return ReportOneShotVerb(Node::RunEnrollClient(context.cfg, credential, enrollRandom), "fastcache-compile-node: ");
 }
@@ -1844,7 +1844,7 @@ int main(int argc, char** argv)
     // The install path resolves at its OWN site, after its own table, for the same
     // reason and it cannot share this one: `--install-service` returns long before
     // here, and its refusals are `NodeInstallRejection`'s rather than these.
-    SystemRandomSource identityRandom;
+    SystemSecureRandom identityRandom;
     auto const identity = AdoptNodeIdentity(cfg, cliOnly, identityRandom, logger);
     if (!identity.has_value())
     {

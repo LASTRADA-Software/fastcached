@@ -15,6 +15,7 @@
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
@@ -480,10 +481,12 @@ class ConsensusTier final: public Distributed::IClusterAdmin
 
     Consensus::FileRaftStorage _storage;
 
-    /// Election timeouts and every peer connection's handshake nonce. One source for
-    /// both, because `SystemRandomSource` is safe from any thread and the two draw at
-    /// rates measured in seconds.
+    /// Election timeouts.
     std::unique_ptr<IRandomSource> _random;
+
+    /// Every peer connection's handshake nonce: the operating system's generator, and NOT
+    /// `_random`, whose seeded engine repeats wherever its seed does (#1527).
+    SystemSecureRandom _nonces;
 
     /// Where a refused peer connection is counted.
     IMetricsSink& _metrics;

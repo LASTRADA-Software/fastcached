@@ -275,7 +275,7 @@ TEST_CASE("Enrolling with nowhere to put the key is refused before anything is a
     NodeConfig cfg;
     cfg.enrollFrom = "10.0.0.1:7000";
 
-    SystemRandomSource random;
+    SystemSecureRandom random;
     auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random);
     REQUIRE(!refused.has_value());
     CHECK(refused.error().contains("--cluster-key-file"));
@@ -296,7 +296,7 @@ TEST_CASE("A seed address that is not an address to dial is refused before any s
     cfg.clusterKeyFile = scratch / "cluster.key";
     cfg.enrollFrom = "10.0.0.1";
 
-    SystemRandomSource random;
+    SystemSecureRandom random;
     auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random);
     REQUIRE(!refused.has_value());
     CHECK(refused.error().contains("--enroll-from"));
@@ -333,7 +333,7 @@ TEST_CASE("A machine that already holds a cluster key is refused without spendin
     cfg.clusterKeyFile = path;
     cfg.enrollFrom = "10.0.0.1:7000";
 
-    SystemRandomSource random;
+    SystemSecureRandom random;
     auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random);
     REQUIRE(!refused.has_value());
     CHECK(refused.error().contains("already exists"));
@@ -545,7 +545,7 @@ TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[
     } };
 
     InstantWait wait;
-    SystemRandomSource random;
+    SystemSecureRandom random;
     auto const outcome = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, wait, dialer);
 
     REQUIRE(!outcome.has_value());
@@ -600,7 +600,7 @@ TEST_CASE("A consecutive redirect chain is still bounded", "[enrollment][client]
     } };
 
     InstantWait wait;
-    SystemRandomSource random;
+    SystemSecureRandom random;
     auto const outcome = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, wait, dialer);
 
     REQUIRE(!outcome.has_value());

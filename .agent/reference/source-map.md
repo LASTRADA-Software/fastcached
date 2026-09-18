@@ -14,7 +14,8 @@ in-memory transport.
 src/FastCache/
   Core/         Errors taxonomy, Clock, HostPort (one parser for
                 `port` / `host:port` / `[v6]:port`), IRandomSource (the randomness seam,
-                beside Clock and for the same reason), Logger, BufferPool,
+                beside Clock and for the same reason), ISecureRandom (the OS CSPRNG,
+                for bytes that must never repeat: nonces and minted ids), Logger, BufferPool,
                 Bytes, Endian, Crc32c, MurmurHash3 (128-bit key digest),
                 StringHash, Owner, SecureBytes (the one zeroing primitive, and
                 `SecureByteBuffer` -- the allocator every credential lives behind, so

@@ -6,12 +6,14 @@
 #include <FastCache/Cluster/PskRaftPeerCredential.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
+#include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -21,9 +23,11 @@
 #include <utility>
 #include <vector>
 
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
+using FastCache::Testing::ScriptedSecureRandom;
 using FastCache::Testing::Unwrap;
 using namespace FastCache::Consensus;
 
@@ -43,16 +47,19 @@ constexpr unsigned char ClusterKeyFill = 0x5A;
 constexpr unsigned char StrangerKeyFill = 0x33;
 
 /// One node's side of a connection: its credential and its randomness.
+///
+/// The operating system's generator, as production draws a nonce (#1527), rather than a seed
+/// per side: what these cases need is that the two sides' nonces DIFFER, which is the very
+/// property a seeded engine was found not to guarantee. A case that needs to know the bytes
+/// scripts them with `ScriptedSecureRandom` instead.
 struct Side
 {
     Cluster::PskRaftPeerCredential credential;
-    SystemRandomSource random;
+    SystemSecureRandom random;
 
     /// @param fill The key's byte.
-    /// @param seed The randomness seed, distinct per side so the two nonces differ.
-    Side(unsigned char fill, std::uint64_t seed):
-        credential { Key(fill) },
-        random { seed }
+    explicit Side(unsigned char fill):
+        credential { Key(fill) }
     {
     }
 };
@@ -99,8 +106,8 @@ struct Handshake
 [[nodiscard]] Handshake Run(
     Side& acceptor, NodeId const& acceptorId, Side& dialler, NodeId const& diallerId, NodeId const& target)
 {
-    AcceptorHandshake accepting { acceptor.credential, acceptorId, acceptor.random };
-    DiallerHandshake dialling { dialler.credential, diallerId, target, dialler.random };
+    auto accepting = AcceptorHandshake::Create(acceptor.credential, acceptorId, acceptor.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.credential, diallerId, target, dialler.random).value();
 
     auto judgement = accepting.Judge(ProofFor(dialling, accepting.Challenge()));
 
@@ -113,8 +120,8 @@ struct Handshake
 
 TEST_CASE("Two holders of the key complete a handshake and agree on the session", "[consensus][raft][session]")
 {
-    Side acceptor { ClusterKeyFill, 1 };
-    Side dialler { ClusterKeyFill, 2 };
+    Side acceptor { ClusterKeyFill };
+    Side dialler { ClusterKeyFill };
 
     auto const result = Run(acceptor, "n2", dialler, "n1", "n2");
 
@@ -130,13 +137,55 @@ TEST_CASE("Two holders of the key complete a handshake and agree on the session"
     CHECK(result.judgement.nonces.acceptor != result.judgement.nonces.dialler);
 }
 
+TEST_CASE("Each end's nonce is the bytes its random seam drew", "[consensus][raft][session]")
+{
+    // Scripted per end, with bytes that differ between the ends, so a nonce taken from
+    // anywhere but the seam -- an engine, the other end's source, a zeroed array -- shows as
+    // the wrong bytes rather than as a handshake that still happens to complete (#1527).
+    Cluster::PskRaftPeerCredential const credential { Key(ClusterKeyFill) };
+    ScriptedSecureRandom acceptorRandom { ScriptedSecureRandom::Ascending(NonceBytes, 0) };
+    ScriptedSecureRandom diallerRandom { ScriptedSecureRandom::Ascending(NonceBytes, 100) };
+
+    auto accepting = AcceptorHandshake::Create(credential, "n2", acceptorRandom).value();
+    auto dialling = DiallerHandshake::Create(credential, "n1", "n2", diallerRandom).value();
+    auto const proof = ProofFor(dialling, accepting.Challenge());
+
+    auto const scripted = [](std::uint8_t first) {
+        Nonce nonce {};
+        std::ranges::copy(ScriptedSecureRandom::Ascending(NonceBytes, first), nonce.begin());
+        return nonce;
+    };
+    CHECK(accepting.Challenge().nonce == scripted(0));
+    CHECK(proof.nonce == scripted(100));
+    CHECK(accepting.Judge(proof).outcome == ProofOutcome::Accepted);
+}
+
+TEST_CASE("A handshake whose nonce cannot be drawn is not begun, at either end", "[consensus][raft][session]")
+{
+    // No handshake object exists to run with a weak nonce: the refusal IS the result, and it
+    // carries the seam's own failure, so nothing else can have supplied the bytes (#1527).
+    Cluster::PskRaftPeerCredential const credential { Key(ClusterKeyFill) };
+    ScriptedSecureRandom denied { ScriptedSecureRandom::DeniedFailure() };
+
+    auto const accepting = AcceptorHandshake::Create(credential, "n2", denied);
+    REQUIRE_FALSE(accepting.has_value());
+    CHECK(accepting.error().primitive == ScriptedSecureRandom::DeniedFailure().primitive);
+
+    auto const dialling = DiallerHandshake::Create(credential, "n1", "n2", denied);
+    REQUIRE_FALSE(dialling.has_value());
+    CHECK(dialling.error().primitive == ScriptedSecureRandom::DeniedFailure().primitive);
+
+    // Both ends ASKED -- a factory that refused without drawing would pass the checks above.
+    CHECK(denied.FillCount() == 2);
+}
+
 TEST_CASE("A dialler that does not hold the key is refused, and told nothing", "[consensus][raft][session]")
 {
-    Side acceptor { ClusterKeyFill, 1 };
+    Side acceptor { ClusterKeyFill };
 
     SECTION("a different key")
     {
-        Side stranger { StrangerKeyFill, 2 };
+        Side stranger { StrangerKeyFill };
         auto const result = Run(acceptor, "n2", stranger, "n1", "n2");
         CHECK(result.judgement.outcome == ProofOutcome::Refused);
         CHECK_FALSE(result.judgement.verdict.has_value());
@@ -147,9 +196,9 @@ TEST_CASE("A dialler that does not hold the key is refused, and told nothing", "
 
     SECTION("no key at all: a proof whose tag is whatever a peer without one can send")
     {
-        AcceptorHandshake accepting { acceptor.credential, "n2", acceptor.random };
-        auto const judgement = accepting.Judge(
-            RaftWire::ProofFrame { .dialler = "n1", .target = "n2", .nonce = DrawNonce(acceptor.random), .tag = {} });
+        auto accepting = AcceptorHandshake::Create(acceptor.credential, "n2", acceptor.random).value();
+        auto const judgement = accepting.Judge(RaftWire::ProofFrame {
+            .dialler = "n1", .target = "n2", .nonce = DrawNonce(acceptor.random).value(), .tag = {} });
         CHECK(judgement.outcome == ProofOutcome::Refused);
         CHECK_FALSE(judgement.verdict.has_value());
     }
@@ -160,15 +209,15 @@ TEST_CASE("A recorded proof cannot answer a later challenge", "[consensus][raft]
     // The replay the acceptor's nonce exists to stop: a proof harvested from one
     // connection, presented on the next. Everything about it is genuine except the
     // challenge it answers.
-    Side acceptor { ClusterKeyFill, 1 };
-    Side dialler { ClusterKeyFill, 2 };
+    Side acceptor { ClusterKeyFill };
+    Side dialler { ClusterKeyFill };
 
-    AcceptorHandshake first { acceptor.credential, "n2", acceptor.random };
-    DiallerHandshake dialling { dialler.credential, "n1", "n2", dialler.random };
+    auto first = AcceptorHandshake::Create(acceptor.credential, "n2", acceptor.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.credential, "n1", "n2", dialler.random).value();
     auto const recorded = ProofFor(dialling, first.Challenge());
     REQUIRE(first.Judge(recorded).outcome == ProofOutcome::Accepted);
 
-    AcceptorHandshake second { acceptor.credential, "n2", acceptor.random };
+    auto second = AcceptorHandshake::Create(acceptor.credential, "n2", acceptor.random).value();
     REQUIRE(second.Challenge().nonce != first.Challenge().nonce);
     CHECK(second.Judge(recorded).outcome == ProofOutcome::Refused);
 }
@@ -177,11 +226,11 @@ TEST_CASE("A handshake judges one proof, even a genuine second one", "[consensus
 {
     // Spent whatever the outcome: a nonce that could answer twice is one a recorded
     // exchange could be replayed against on the same connection.
-    Side acceptor { ClusterKeyFill, 1 };
-    Side dialler { ClusterKeyFill, 2 };
+    Side acceptor { ClusterKeyFill };
+    Side dialler { ClusterKeyFill };
 
-    AcceptorHandshake accepting { acceptor.credential, "n2", acceptor.random };
-    DiallerHandshake dialling { dialler.credential, "n1", "n2", dialler.random };
+    auto accepting = AcceptorHandshake::Create(acceptor.credential, "n2", acceptor.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.credential, "n1", "n2", dialler.random).value();
     auto const proof = ProofFor(dialling, accepting.Challenge());
 
     CHECK(accepting.Judge(proof).outcome == ProofOutcome::Accepted);
@@ -190,18 +239,18 @@ TEST_CASE("A handshake judges one proof, even a genuine second one", "[consensus
 
 TEST_CASE("A tag from one half of the handshake does not verify as the other", "[consensus][raft][session]")
 {
-    Side acceptor { ClusterKeyFill, 1 };
-    Side dialler { ClusterKeyFill, 2 };
+    Side acceptor { ClusterKeyFill };
+    Side dialler { ClusterKeyFill };
 
-    AcceptorHandshake accepting { acceptor.credential, "n2", acceptor.random };
-    DiallerHandshake dialling { dialler.credential, "n1", "n2", dialler.random };
+    auto accepting = AcceptorHandshake::Create(acceptor.credential, "n2", acceptor.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.credential, "n1", "n2", dialler.random).value();
     auto const proof = ProofFor(dialling, accepting.Challenge());
     auto const judgement = accepting.Judge(proof);
     REQUIRE(judgement.verdict.has_value());
 
     SECTION("the acceptor's verdict tag, reflected back as a proof")
     {
-        AcceptorHandshake reflected { acceptor.credential, "n2", acceptor.random };
+        auto reflected = AcceptorHandshake::Create(acceptor.credential, "n2", acceptor.random).value();
         auto echo = proof;
         echo.tag = Unwrap(judgement.verdict).tag;
         CHECK(reflected.Judge(echo).outcome == ProofOutcome::Refused);
@@ -220,8 +269,8 @@ TEST_CASE("A proven dialler that dialled another member is told so, signed", "[c
     // #178's shape: the dialler's address for n9 now answers as n2. Both hold the key, so
     // the refusal is signed and the dialler can name the member that did answer rather
     // than reporting a key it does not have wrong.
-    Side acceptor { ClusterKeyFill, 1 };
-    Side dialler { ClusterKeyFill, 2 };
+    Side acceptor { ClusterKeyFill };
+    Side dialler { ClusterKeyFill };
 
     auto const result = Run(acceptor, "n2", dialler, "n1", "n9");
 
@@ -235,8 +284,8 @@ TEST_CASE("A proven dialler that dialled another member is told so, signed", "[c
 TEST_CASE("A proven dialler claiming the acceptor's own id is told so, signed", "[consensus][raft][session]")
 {
     // A cloned `--cluster-dir`, or a duplicated `--node-id`: two machines answering to n2.
-    Side acceptor { ClusterKeyFill, 1 };
-    Side dialler { ClusterKeyFill, 2 };
+    Side acceptor { ClusterKeyFill };
+    Side dialler { ClusterKeyFill };
 
     auto const result = Run(acceptor, "n2", dialler, "n2", "n2");
 
@@ -248,11 +297,11 @@ TEST_CASE("A proven dialler claiming the acceptor's own id is told so, signed", 
 
 TEST_CASE("A verdict the dialler cannot authenticate is forged, whatever it says", "[consensus][raft][session]")
 {
-    Side acceptor { ClusterKeyFill, 1 };
-    Side dialler { ClusterKeyFill, 2 };
+    Side acceptor { ClusterKeyFill };
+    Side dialler { ClusterKeyFill };
 
-    AcceptorHandshake accepting { acceptor.credential, "n2", acceptor.random };
-    DiallerHandshake dialling { dialler.credential, "n1", "n2", dialler.random };
+    auto accepting = AcceptorHandshake::Create(acceptor.credential, "n2", acceptor.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.credential, "n1", "n2", dialler.random).value();
     auto const proof = ProofFor(dialling, accepting.Challenge());
     auto const genuine = accepting.Judge(proof);
     REQUIRE(genuine.verdict.has_value());
@@ -262,7 +311,7 @@ TEST_CASE("A verdict the dialler cannot authenticate is forged, whatever it says
     {
         // An impostor judging the proof under its own key refuses it, and so has no
         // honest verdict to send. What it CAN send is a verdict it made up.
-        Side impostor { StrangerKeyFill, 3 };
+        Side impostor { StrangerKeyFill };
         auto forged = Unwrap(genuine.verdict);
         forged.tag = impostor.credential.Sign(RaftPeerMac::AcceptorVerdict, {});
         CHECK(dialling.Conclude(forged).outcome == VerdictOutcome::Forged);
@@ -273,8 +322,8 @@ TEST_CASE("A verdict the dialler cannot authenticate is forged, whatever it says
         // On ONE dialler, which answered the challenge the verdict is about: a fresh
         // dialler would call any verdict forged for having answered nothing, and the case
         // would pass with the MAC removed.
-        AcceptorHandshake refusing { acceptor.credential, "n2", acceptor.random };
-        DiallerHandshake misdialled { dialler.credential, "n1", "n2-as-it-used-to-be", dialler.random };
+        auto refusing = AcceptorHandshake::Create(acceptor.credential, "n2", acceptor.random).value();
+        auto misdialled = DiallerHandshake::Create(dialler.credential, "n1", "n2-as-it-used-to-be", dialler.random).value();
         auto const refusal = refusing.Judge(ProofFor(misdialled, refusing.Challenge()));
         REQUIRE(refusal.verdict.has_value());
         REQUIRE(misdialled.Conclude(Unwrap(refusal.verdict)).outcome == VerdictOutcome::WrongTarget);
@@ -287,7 +336,7 @@ TEST_CASE("A verdict the dialler cannot authenticate is forged, whatever it says
 
     SECTION("a verdict for a challenge this dialler never answered")
     {
-        DiallerHandshake unasked { dialler.credential, "n1", "n2", dialler.random };
+        auto unasked = DiallerHandshake::Create(dialler.credential, "n1", "n2", dialler.random).value();
         CHECK(unasked.Conclude(Unwrap(genuine.verdict)).outcome == VerdictOutcome::Forged);
     }
 }
@@ -297,12 +346,12 @@ TEST_CASE("The handshake MACs are the documented fields, in the documented order
     // Written out the long way against the credential, so the construction is pinned to
     // something other than the code that produces it: "the tests still pass" cannot show
     // a field transposed on both ends at once, because the tests would move with the code.
-    Side acceptor { ClusterKeyFill, 1 };
-    Side dialler { ClusterKeyFill, 2 };
+    Side acceptor { ClusterKeyFill };
+    Side dialler { ClusterKeyFill };
     Cluster::PskRaftPeerCredential const key { Key(ClusterKeyFill) };
 
-    AcceptorHandshake accepting { acceptor.credential, "n2", acceptor.random };
-    DiallerHandshake dialling { dialler.credential, "n1", "n2", dialler.random };
+    auto accepting = AcceptorHandshake::Create(acceptor.credential, "n2", acceptor.random).value();
+    auto dialling = DiallerHandshake::Create(dialler.credential, "n1", "n2", dialler.random).value();
     auto const proof = ProofFor(dialling, accepting.Challenge());
     auto const judgement = accepting.Judge(proof);
     REQUIRE(judgement.verdict.has_value());
@@ -339,12 +388,12 @@ TEST_CASE("A signed acceptance naming a member other than the one dialled is not
 {
     // No acceptor of this build sends one -- it accepts only as itself, and only when it
     // is the target -- so the tag is built by hand, the way a holder of the key could.
-    Side dialler { ClusterKeyFill, 2 };
+    Side dialler { ClusterKeyFill };
     Cluster::PskRaftPeerCredential const key { Key(ClusterKeyFill) };
-    ScriptedRandomSource fixed { { 7, 7, 7, 7 } };
+    ScriptedSecureRandom fixed { ScriptedSecureRandom::Ascending(NonceBytes, 7) };
 
-    DiallerHandshake dialling { dialler.credential, "n1", "n2", dialler.random };
-    auto const challenge = RaftWire::ChallengeFrame { .nonce = DrawNonce(fixed) };
+    auto dialling = DiallerHandshake::Create(dialler.credential, "n1", "n2", dialler.random).value();
+    auto const challenge = RaftWire::ChallengeFrame { .nonce = DrawNonce(fixed).value() };
     auto const proof = ProofFor(dialling, challenge);
 
     auto const accepted = std::array { std::byte { static_cast<std::uint8_t>(RaftWire::HandshakeVerdict::Accepted) } };
@@ -363,26 +412,26 @@ TEST_CASE("A signed acceptance naming a member other than the one dialled is not
 
 TEST_CASE("A dialler whose id no handshake can carry refuses to send a proof", "[consensus][raft][session]")
 {
-    Side dialler { ClusterKeyFill, 2 };
+    Side dialler { ClusterKeyFill };
     auto const challenge = RaftWire::ChallengeFrame {};
 
-    DiallerHandshake tooLong {
-        dialler.credential, std::string(RaftWire::MaxHandshakeIdBytes + 1, 'x'), "n2", dialler.random
-    };
+    auto tooLong = DiallerHandshake::Create(
+                       dialler.credential, std::string(RaftWire::MaxHandshakeIdBytes + 1, 'x'), "n2", dialler.random)
+                       .value();
     auto const refused = tooLong.Answer(challenge);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().contains("this node's id"));
 
-    DiallerHandshake atTheBound {
-        dialler.credential, std::string(RaftWire::MaxHandshakeIdBytes, 'x'), "n2", dialler.random
-    };
+    auto atTheBound =
+        DiallerHandshake::Create(dialler.credential, std::string(RaftWire::MaxHandshakeIdBytes, 'x'), "n2", dialler.random)
+            .value();
     CHECK(atTheBound.Answer(challenge).has_value());
 }
 
 TEST_CASE("Session frames open in order, once, on their own session only", "[consensus][raft][session]")
 {
-    Side acceptor { ClusterKeyFill, 1 };
-    Side dialler { ClusterKeyFill, 2 };
+    Side acceptor { ClusterKeyFill };
+    Side dialler { ClusterKeyFill };
     auto const session = Run(acceptor, "n2", dialler, "n1", "n2").judgement.nonces;
 
     FrameSealer sealer { dialler.credential, session };
@@ -422,7 +471,7 @@ TEST_CASE("Session frames open in order, once, on their own session only", "[con
     SECTION("a frame injected by something without the key is refused")
     {
         FrameOpener opener { acceptor.credential, session };
-        Side stranger { StrangerKeyFill, 3 };
+        Side stranger { StrangerKeyFill };
         FrameSealer forging { stranger.credential, session };
         CHECK_FALSE(OpenWhole(opener, first, forging.Seal(first)));
     }

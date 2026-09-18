@@ -817,11 +817,16 @@ namespace
     {
         if (opRaw == static_cast<std::uint8_t>(Wire::Op::NodeChallenge))
         {
-            // **Re-drawn on a second ask, and the old one is gone.** A caller that asks again has
+            // **Re-drawn on a second ask, and the old one is gone** -- gone BEFORE the draw, so a
+            // draw that fails leaves none rather than the last. A caller that asks again has
             // abandoned the first, and a server holding two live nonces would accept a proof over
             // either -- a replay window opened by nothing but politeness. It also keeps *a
             // challenge is spent whatever the outcome* true with no second rule beside it.
-            challenge = prover.IssueChallenge();
+            challenge.reset();
+            auto issued = prover.IssueChallenge();
+            if (!issued.has_value())
+                return std::move(issued).error();
+            challenge = *issued;
             return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeNodeChallengeReply(*challenge));
         }
 

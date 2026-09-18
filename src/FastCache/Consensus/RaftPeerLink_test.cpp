@@ -16,7 +16,7 @@
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Core/Clock.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -210,8 +210,8 @@ struct Link
     NullLogger logger;
     Cluster::PskRaftPeerCredential const serverKey { ClusterKey() };
     Cluster::PskRaftPeerCredential const diallerKey;
-    SystemRandomSource serverRandom { 0x5E };
-    SystemRandomSource diallerRandom { 0xD1 };
+    SystemSecureRandom serverRandom;
+    SystemSecureRandom diallerRandom;
     RaftPeerServer server;
     std::unique_ptr<RaftPeerTransport> transport;
 };

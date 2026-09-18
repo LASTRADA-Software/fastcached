@@ -322,10 +322,15 @@ class INodeProver
     ///
     /// Drawn HERE rather than in the endpoint, because the randomness seam belongs with the
     /// component that holds the key: `FrameServer` serves six surfaces that have no use for an
-    /// `IRandomSource&`, and threading one through every construction site would put the
+    /// `ISecureRandom&`, and threading one through every construction site would put the
     /// dependency where nothing reads it.
-    /// @return The nonce to state on the wire and to verify the next proof against.
-    [[nodiscard]] virtual Nonce IssueChallenge() = 0;
+    ///
+    /// **A draw can fail, and the refusal comes back ENCODED**, for `Verify`'s reason below: the
+    /// surface owns its wording and whether it is counted. A challenge that cannot be drawn is
+    /// never replaced by a weak one (#1527).
+    /// @return The nonce to state on the wire and to verify the next proof against, or the
+    ///         encoded refusal to send back.
+    [[nodiscard]] virtual std::expected<Nonce, std::vector<std::byte>> IssueChallenge() = 0;
 
     /// Whether @p payload proves the cluster key against @p challenge.
     ///

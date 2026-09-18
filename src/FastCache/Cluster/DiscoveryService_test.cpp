@@ -2,8 +2,9 @@
 #include <FastCache/Cluster/DiscoveryService.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Core/IRandomSource.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Net/InMemoryDatagram.hpp>
 #include <FastCache/Net/SharedPortDatagram.hpp>
@@ -14,17 +15,20 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <ranges>
 #include <string>
 #include <vector>
 
 #include <tests/CoHostedDatagram.hpp>
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cluster;
 using FastCache::Testing::CoHostedDatagramSocket;
+using FastCache::Testing::ScriptedSecureRandom;
 using FastCache::Testing::TestBeaconPort;
 using FastCache::Testing::Unwrap;
 using namespace std::chrono_literals;
@@ -87,7 +91,7 @@ struct Node
     Node(std::unique_ptr<IDatagramSocket> ownSocket,
          DatagramAddress beaconAddress,
          IClock& clock,
-         IRandomSource& random,
+         ISecureRandom& random,
          ILogger& logger,
          std::string id,
          std::string endpoint,
@@ -119,7 +123,7 @@ struct Node
     /// @param key The cluster key it holds.
     Node(DatagramBus& bus,
          IClock& clock,
-         IRandomSource& random,
+         ISecureRandom& random,
          ILogger& logger,
          std::string const& id,
          std::string const& endpoint,
@@ -146,6 +150,19 @@ struct Node
     PeerDirectory directory;
     DiscoveryService service;
 };
+
+/// Nonces for a scripted generator: one per value in @p fills, each `NonceBytes` of that
+/// value, served in turn and cycling. So `{ 1, 2 }` is two distinct nonces and then the first
+/// again -- how many a case can draw before one repeats is the number of values it names.
+/// @param fills One byte value per nonce.
+/// @return The script.
+[[nodiscard]] std::vector<std::byte> NonceScript(std::initializer_list<std::uint8_t> fills)
+{
+    std::vector<std::byte> script;
+    for (auto const fill: fills)
+        script.insert(script.end(), NonceBytes, static_cast<std::byte>(fill));
+    return script;
+}
 
 /// Drain everything waiting for @p node, so a test can settle the segment.
 /// @param node Whose inbox to drain.
@@ -175,7 +192,7 @@ TEST_CASE("Two nodes on one host share a beacon port and still prove the key", "
     // forever with nothing logged.
     DatagramBus bus;
     ManualClock clock;
-    ScriptedRandomSource random { { 1, 2, 3, 4, 5, 6, 7, 8 } };
+    ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     NullLogger logger;
 
     auto const beacon = DatagramBus::BroadcastAddressOn(TestBeaconPort);
@@ -233,7 +250,7 @@ TEST_CASE("A peer that cannot name itself is never challenged", "[cluster][disco
     // (another fleet's beacon, and this node's own) deliberately are not.
     DatagramBus bus;
     ManualClock clock;
-    ScriptedRandomSource random { { 1, 2, 3, 4, 5, 6, 7, 8 } };
+    ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     CapturingLogger logger;
 
     Node listener { bus, clock, random, logger, "listener", "10.0.0.1:7000", "prod", "secret" };
@@ -292,7 +309,7 @@ TEST_CASE("A proof is refused before this node logs what it claimed", "[cluster]
     // and then one lie, holding no key at all.
     DatagramBus bus;
     ManualClock clock;
-    ScriptedRandomSource random { { 1, 2, 3, 4, 5, 6, 7, 8 } };
+    ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     CapturingLogger logger;
 
     Node listener { bus, clock, random, logger, "listener", "10.0.0.1:7000", "prod", "secret" };
@@ -317,6 +334,43 @@ TEST_CASE("A proof is refused before this node logs what it claimed", "[cluster]
     CHECK(listener.directory.AuthenticatedPeers().empty());
 }
 
+TEST_CASE("A beacon this node cannot draw a challenge for is recorded, not challenged, and said once",
+          "[cluster][discovery][service]")
+{
+    // Withheld rather than issued with a weak nonce (#1527): no challenge goes out, nothing is
+    // left pending that a proof could answer, and the Error names this host's generator --
+    // once per interval, because a beacon is unauthenticated and anything on the segment can
+    // provoke the line.
+    DatagramBus bus;
+    ManualClock clock;
+    ScriptedSecureRandom denied { ScriptedSecureRandom::DeniedFailure() };
+    ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
+    CapturingLogger logger;
+
+    Node listener { bus, clock, denied, logger, "listener", "10.0.0.1:7000", "prod", "secret" };
+    Node peer { bus, clock, random, logger, "peer", "10.0.0.2:7000", "prod", "secret" };
+
+    REQUIRE(peer.service.SendBeacon());
+    CHECK(listener.service.PumpOnce(1ms) == DiscoveryEvent::ChallengeWithheld);
+    CHECK(denied.FillCount() == 1);
+    CHECK(listener.service.PendingChallenges() == 0);
+
+    // Nothing reached the peer: there was no challenge to answer.
+    CHECK(peer.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
+    CHECK(peer.service.PumpOnce(1ms) == DiscoveryEvent::Nothing);
+
+    // A second beacon inside the interval is withheld too, and not said again.
+    REQUIRE(peer.service.SendBeacon());
+    CHECK(listener.service.PumpOnce(1ms) == DiscoveryEvent::ChallengeWithheld);
+
+    auto const said = std::ranges::count_if(logger.Snapshot(), [](CapturingLogger::Record const& record) {
+        return record.level == LogLevel::Error && record.message.contains("cannot draw a nonce")
+               && record.message.contains(ScriptedSecureRandom::DeniedFailure().primitive);
+    });
+    CHECK(said == 1);
+    CHECK(listener.directory.AuthenticatedPeers().empty());
+}
+
 TEST_CASE("Two nodes discover each other and prove the key", "[cluster][discovery][service]")
 {
     // The whole feature, end to end, in one process: beacon, challenge, proof,
@@ -324,7 +378,7 @@ TEST_CASE("Two nodes discover each other and prove the key", "[cluster][discover
     // segment, the clock and the nonces are all injected.
     DatagramBus bus;
     ManualClock clock;
-    ScriptedRandomSource random { { 1, 2, 3, 4, 5, 6, 7, 8 } };
+    ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     NullLogger logger;
 
     Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", "secret" };
@@ -358,7 +412,7 @@ TEST_CASE("A node with the wrong key is never admitted", "[cluster][discovery][s
     // shared cache and object injection into everybody's build.
     DatagramBus bus;
     ManualClock clock;
-    ScriptedRandomSource random { { 11, 22, 33, 44 } };
+    ScriptedSecureRandom random { NonceScript({ 11 }) };
     NullLogger logger;
 
     Node insider { bus, clock, random, logger, "insider", "10.0.0.1:7000", "prod", "secret" };
@@ -383,7 +437,7 @@ TEST_CASE("A proof nobody asked for is refused", "[cluster][discovery][service]"
     // make the nonce -- and therefore the replay protection -- pointless.
     DatagramBus bus;
     ManualClock clock;
-    ScriptedRandomSource random { { 5 } };
+    ScriptedSecureRandom random { NonceScript({ 5 }) };
     NullLogger logger;
 
     Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", "secret" };
@@ -409,7 +463,7 @@ TEST_CASE("A challenge is spent once", "[cluster][discovery][service]")
     // re-admitted without ever holding the key.
     DatagramBus bus;
     ManualClock clock;
-    ScriptedRandomSource random { { 7, 8, 9, 10 } };
+    ScriptedSecureRandom random { NonceScript({ 7 }) };
     NullLogger logger;
 
     Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", "secret" };
@@ -441,7 +495,7 @@ TEST_CASE("Two fleets on one segment ignore each other", "[cluster][discovery][s
 {
     DatagramBus bus;
     ManualClock clock;
-    ScriptedRandomSource random { { 1, 2 } };
+    ScriptedSecureRandom random { NonceScript({ 1 }) };
     NullLogger logger;
 
     Node prod { bus, clock, random, logger, "prod-a", "10.0.0.1:7000", "prod", "secret" };
@@ -465,7 +519,7 @@ TEST_CASE("Discovery survives a lost beacon", "[cluster][discovery][service]")
     // directory's expiry is generous relative to the beacon interval.
     DatagramBus bus;
     ManualClock clock;
-    ScriptedRandomSource random { { 3, 4, 5, 6 } };
+    ScriptedSecureRandom random { NonceScript({ 3 }) };
     NullLogger logger;
 
     Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", "secret" };
@@ -492,7 +546,7 @@ TEST_CASE("A challenge expires rather than accumulating", "[cluster][discovery][
     // a memory-exhaustion hole reachable without holding the key.
     DatagramBus bus;
     ManualClock clock;
-    ScriptedRandomSource random { { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 } };
+    ScriptedSecureRandom random { NonceScript({ 1, 2, 3 }) };
     NullLogger logger;
 
     Node watcher { bus, clock, random, logger, "watcher", "10.0.0.1:7000", "prod", "secret" };
