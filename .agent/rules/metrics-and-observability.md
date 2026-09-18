@@ -202,7 +202,7 @@ fault.
   most wants to know and gets wrong: *nothing has connected to this node*. Found by dogfooding,
   on a node that two builds had just gone through.
 
-  **All 148 rows are attributed now (#1501), and the guard is a `static_assert` rather than a
+  **Every catalogue row is attributed now (#1501), and the guard is a `static_assert` rather than a
   convention.** The state that made this dangerous was not the 145 unattributed rows, it was that
   *absent from the table* and *nobody has considered this row* were spelled identically -- silence
   reading as coverage, one level down from the refusal scan. `EveryCounterIsAttributed()` is a
@@ -210,16 +210,21 @@ fault.
   which surface writes it.
 
   **The attribution is one row per (counter, surface) PAIR, so its `size()` is not a count of
-  counters.** 149 rows for 148 rows-of-the-catalogue, and `fastcached_metrics_surface_absent` was
-  asserted against `CounterSoleWriterTable.size()` while the two happened to be equal.
-  `AttributedCounterCount()` is the derivation that stays right.
+  counters** -- it exceeds the catalogue by however many rows are written from two components,
+  and `fastcached_metrics_surface_absent` was asserted against `CounterSoleWriterTable.size()`
+  while the two happened to be equal. `AttributedCounterCount()` is the derivation that stays
+  right.
 
-  **And a scan for `Increment(Counter::X)` attributes 39 of the 148.** Four mechanisms write a
-  counter here -- a `SurfaceRefusal` row spent by `Refuse(row)` (102), a `LeaseToken` outcome row
-  (7), a classifier returning the row for its caller to spend (4), and a direct `Increment` (39) --
-  and reading only the `SurfaceRefusal` tables reaches 101 of the 109 that have no increment site.
-  `ctest -R counter-attribution` re-derives every one of those figures, because the previous
-  sentence here said "106 of 144" for a tree that had moved to 148 and nothing was watching it.
+  **And a scan for `Increment(Counter::X)` attributes barely a quarter of them.** FOUR mechanisms
+  write a counter here -- a `SurfaceRefusal` row spent by `Refuse(row)`, a `LeaseToken` outcome
+  row, a classifier returning the row for its caller to spend, and a direct `Increment` -- so
+  reading only the `SurfaceRefusal` tables, which is the obvious reading of *written through
+  `Refuse(row)`*, leaves a handful looking unwritten.
+
+  **The figures live in `ctest -R counter-attribution` and are deliberately not copied here.**
+  The sentence this replaces said "106 of 144" for a tree that had moved to 148, and then 149;
+  a prose copy of a number a check owns is the second source of truth `table-totals` refuses
+  everywhere else, and it had already gone stale once by the time anybody read it.
 
   **What must NOT be narrowed casually is a BINARY's surface set, not this table.** The table says
   where a counter is written, which is a fact about the source; what hides a figure is the set a

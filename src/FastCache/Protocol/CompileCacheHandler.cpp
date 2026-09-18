@@ -124,14 +124,23 @@ namespace
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache, not a compile node; its counters are on the admin "
                                    "surface's /metrics, which needs no credential" },
-        // With the two node rows and for their reason: a cordon asks about a worker
+        // With the node rows above and for their reason: admission is a property of the
+        // PROCESS being asked -- which routes IT would admit a host through -- and a cache
+        // folds no such routes. Not `NoCluster`: a client told that goes looking for
+        // consensus, when the answer is that it asked the wrong binary.
+        Wire::RefusedVerb { .op = Wire::Op::ExplainAdmission,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache, not a compile node: it folds no admission routes, so "
+                                   "there is nothing here to explain; ask a fastcache-compile-node which routes "
+                                   "admit a host" },
+        // With the node rows and for their reason: a cordon asks about a worker
         // PROCESS, and this endpoint runs none. A client told this goes to the compile
         // node on its machine, which is where a cordon is answered.
         Wire::RefusedVerb { .op = Wire::Op::Cordon,
                             .code = Wire::NoCompileWorker::Code,
                             .why = "this endpoint runs no compile worker: it is a cache, so there is nothing here to "
                                    "cordon; ask the fastcache-compile-node on this machine" },
-        // **`NoCluster`, with the four cluster rows and NOT with the two node rows
+        // **`NoCluster`, with the cluster rows and NOT with the node rows
         // above.** `Enroll` is a self-service `ClusterAdmit` -- it asks to be written
         // into the replicated membership configuration, and `EnrollControl`'s `Approve`
         // performs exactly the `ClusterAdmit` an operator would have typed. Two verbs
@@ -1221,6 +1230,7 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             // it, and it caught exactly this.
             case Wire::Op::NodeStatus:
             case Wire::Op::NodeMetrics:
+            case Wire::Op::ExplainAdmission:
             case Wire::Op::Cordon:
             // The enrollment pair, answered by a compile node that runs consensus. Same
             // arm for the same reason: `RefusalFor` is the one place the code and the

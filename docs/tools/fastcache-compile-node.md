@@ -540,6 +540,25 @@ A member on a build older than these verbs skips the committed entry and goes on
 the host, which the leader warns about at forget time; that member records the skip in
 its own log, naming the entry it did not apply.
 
+Because admission is a **fold** over several routes -- this node's `--fleet-member` list,
+the cluster's member set, the tombstones, `--fleet-open`, and a caller that proved the
+cluster key -- the question *why is this host still served* rarely has one answer. Ask the
+node that is behaving oddly:
+
+```console
+$ fastcache-cli explain-admission 10.0.0.7 --addr=worker-07.internal:6677
+host        10.0.0.7
+verdict     admitted
+decided-by  --fleet-member, the cluster's member set
+```
+
+It names **every route that decided**, not only the winning one, which is what separates
+*the forget has not reached this node* from *this node lists the host itself*. A forgotten
+host reads `forgotten` however many lists name it, because a tombstone outranks every
+admission route. And because the answer is that node's own fold, two nodes disagreeing
+about one host is the finding -- a `--fleet-member` line edited on thirty-nine machines and
+missed on the fortieth is invisible from any single one of them.
+
 ## A cache of its own
 
 A node can hold a cache tier in front of the shared `fastcached`, and point the
@@ -802,7 +821,8 @@ unauthenticated.
 | Counter | What a rise means |
 |---|---|
 | `fastcache_node_status_requests_refused_not_a_member_total` | An operator verb was refused because the caller is not a fleet member. Unlike the cache tier's not-local refusal this is not ordinary on any deployment: a steady rise is a member list that has fallen behind whoever is running `fastcache-cli`, and a burst from one host is somebody scanning. |
-| `fastcache_node_status_requests_refused_payload_too_large_total` | A header declared more payload than these verbs may carry. Both are **fieldless**, so this came from no client of this tree at any version. Never sum it with the cache tier's row of the same name. |
+| `fastcache_node_status_requests_refused_payload_too_large_total` | A header declared more payload than these verbs may carry. Two of the three are **fieldless** and the third carries one short host, so this came from no client of this tree at any version. Never sum it with the cache tier's row of the same name. |
+| `fastcache_node_admission_explanations_refused_malformed_total` | An `explain-admission` arrived that was not exactly one field naming a host. No shipped client can build one -- the CLI encodes it through `EncodeExplainAdmissionRequest` -- so a rise is a client of another build or somebody probing the port by hand, and the two are told apart by whether anything else on this surface refuses at the same time. Kept apart from the node-status refusals, which are fieldless verbs and cannot arise from the same mistake. |
 | `fastcache_node_status_requests_refused_endpoint_busy_total` | The surface had no bytes left in flight. These are the verbs somebody reaches for when a node is in trouble, so this is the node saying it is too busy to say what it is. Read it beside `fastcache_node_cache_requests_refused_endpoint_busy_total`, never summed: this says the diagnosis failed, that says why. |
 
 #### A host the cluster has forgotten

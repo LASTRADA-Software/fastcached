@@ -737,6 +737,20 @@ class IMetricsSink
         /// says the diagnosis failed, that one says why.
         NodeStatusRequestsRefusedEndpointBusy,
 
+        /// An `explain-admission` whose payload is not exactly one field naming a host
+        /// ([#1471](https://github.com/LASTRADA-Software/fastcached/issues/1471)).
+        ///
+        /// Counted rather than uncounted, because a rise means something an operator acts on and
+        /// it is not what a healthy caller produces: the CLI encodes this verb through
+        /// `EncodeExplainAdmissionRequest`, which cannot build a malformed one. So a rise is
+        /// either a client of another build or somebody probing the port by hand, and the two
+        /// are told apart by whether anything else on this surface is refusing at the same time.
+        ///
+        /// Its own row rather than `NodeStatusRequestsRefusedMalformed`: that verb is fieldless,
+        /// so the two refusals cannot arise from the same mistake, and one counter for two
+        /// unrelated causes is the thing `Refuse`'s per-row rule exists to prevent.
+        NodeAdmissionExplanationsRefusedMalformed,
+
         /// A cache verb whose header declared more payload than the surface will
         /// buffer, so nothing was read.
         ///

@@ -631,6 +631,38 @@ Consequences that are each load-bearing:
         centrally and cannot describe a host whose address is not stable (a VPN peer,
         DHCP, a container). Same conclusion #242 reached from the other direction, and
         it is [#977](https://github.com/LASTRADA-Software/fastcached/issues/977).
+      - **A fold that is right and unaskable is half a feature**
+        ([#1471](https://github.com/LASTRADA-Software/fastcached/issues/1471)). Every rule
+        above decides admission correctly and NONE of them could be asked about: an operator
+        who drops a host from `--fleet-member` and finds it still served had no way to learn
+        the cluster admits it too. So the decision is a `MembershipDecision` — a verdict and
+        the SET of routes that produced it — `IMembershipOracle`'s one virtual returns it,
+        and `Op::ExplainAdmission` reports it through the SAME oracle the surfaces enforce.
+        Never a second walk over the same participants: two folds kept in step by discipline
+        is the defect this verb exists to make visible rather than one more instance of it.
+        - **A set, never a winner.** Two routes may admit one host and reporting either
+          alone answers a question nobody asked, sending the operator to edit a file that
+          changes nothing. `Outsider` is attributed to NOBODY (`DecidedBy`): an oracle
+          answering it has no opinion rather than an answer it produced, and naming the
+          author of a silence is the confident wrong signal.
+        - **The verdict must be known and the route set may be partial**, which is one
+          decision per field rather than one rule twice. `DecodeAdmissionExplanation`
+          REFUSES a verdict byte this build cannot name — defaulting it to `Outsider`
+          would report *refused by nobody* on a build that learned a fourth answer, and
+          that reads exactly like the healthy case — and KEEPS a route bit it cannot
+          name, because dropping it under-reports authorship on a fleet mid-upgrade. The
+          renderer counts the leftovers rather than dropping them, for the same reason.
+        - **The library↔wire mirror has ONE mapping**, `Distributed/MembershipWire.hpp`.
+          `CompileCacheWire.hpp` must stay dependency-free so it MIRRORS `Membership` and
+          `MembershipParticipant`, and a mirror needs a reader at each end — the node
+          ENCODES an answer and `fastcache-cli` RENDERS one. Two copies are two things
+          that can disagree about which bit means which route, inside the verb whose whole
+          subject is attributing a decision. The client's SPELLINGS are keyed on the
+          participant rather than on the wire bit, and that is the guard rather than a
+          preference: a bitmask enum has no `Last`, so a table keyed on one cannot be
+          checked for completeness, and a route added without a spelling would render as
+          *a route this client is too old to name* — blaming the node's version for the
+          client's omission.
 - **An unbounded wait does not avoid an ending, it only chooses who picks it — and
   the supervisor picks `SIGKILL` with no diagnostic.** `~WorkerServer` drained on an
   unbounded condition variable, and the comment defending that was right about its

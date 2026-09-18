@@ -4,6 +4,7 @@
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Distributed/MembershipWire.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
@@ -259,6 +260,25 @@ Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, P
             if (!capture.has_value())
                 co_return Cc::RefuseWithoutCounter(NodeIsStopping, "this node is stopping");
             co_return CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok, capture->body);
+        }
+        case CompileCacheWire::Op::ExplainAdmission: {
+            // #1471. The fold the SURFACES enforce, through the same `_membership` oracle they
+            // bind -- never a second walk over the same three participants, or the reported
+            // answer and the enforced one can disagree, which is the defect this verb exists to
+            // make visible rather than to add to.
+            auto const payload = frame.subspan(CompileCacheWire::RequestHeaderSize);
+            auto const host = payload.size() == header->payloadLength
+                                  ? CompileCacheWire::DecodeExplainAdmissionPayload(payload)
+                                  : std::nullopt;
+            if (!host.has_value())
+                co_return Cc::Refuse(_metrics,
+                                     { .code = CompileCacheWire::ErrorCode::MalformedFrame,
+                                       .counter = IMetricsSink::Counter::NodeAdmissionExplanationsRefusedMalformed },
+                                     "explain-admission takes exactly one field, the host to ask about");
+
+            co_return CompileCacheWire::EncodeReply(
+                CompileCacheWire::Status::Ok,
+                CompileCacheWire::EncodeAdmissionExplanation(Distributed::OnTheWire(_membership.Explain(*host))));
         }
         default:
             break;

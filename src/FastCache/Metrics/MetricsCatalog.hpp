@@ -518,6 +518,15 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "Read beside fastcache_node_cache_requests_refused_endpoint_busy_total rather than "
               "summed with it: this says the diagnosis failed, that says why.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeAdmissionExplanationsRefusedMalformed,
+      .prometheusName = "fastcache_node_admission_explanations_refused_malformed_total",
+      .help = "explain-admission requests refused because the payload was not exactly one field "
+              "naming a host. No shipped client can build one: the CLI encodes this verb through "
+              "EncodeExplainAdmissionRequest. So a rise is a client of another build or somebody "
+              "probing the port by hand, and the two are told apart by whether anything else on "
+              "this surface refuses at the same time. Kept apart from the node-status refusals, "
+              "which are a fieldless verb and cannot arise from the same mistake.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedPayloadTooLarge,
       .prometheusName = "fastcache_node_cache_requests_refused_payload_too_large_total",
       .help = "Cache verbs refused because the header declared more payload than the surface "

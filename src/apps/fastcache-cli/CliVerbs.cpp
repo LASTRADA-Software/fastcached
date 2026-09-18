@@ -8,9 +8,12 @@
 
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Distributed/MembershipWire.hpp>
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -1210,6 +1213,133 @@ namespace
         return Answered(NodeStatusRecord(*fields));
     }
 
+    /// What to call one admission verdict.
+    ///
+    /// The word an operator would use, not the enumerator: `refused` rather than `Outsider`,
+    /// which reads as a status this tool invented.
+    /// @param verdict The wire tag.
+    /// @return A stable lower-case name.
+    [[nodiscard]] std::string_view NameOfMembership(CompileCacheWire::WireMembership verdict) noexcept
+    {
+        switch (verdict)
+        {
+            case CompileCacheWire::WireMembership::Outsider:
+                return "refused";
+            case CompileCacheWire::WireMembership::Member:
+                return "admitted";
+            case CompileCacheWire::WireMembership::Forgotten:
+                return "forgotten";
+        }
+        // Unreachable for `NameOfCordonState`'s reason: `DecodeAdmissionExplanation` REFUSES a
+        // verdict this build cannot name rather than passing it through, because a verdict is
+        // the answer itself -- an unknown route can be counted, an unknown verdict cannot.
+        return "unknown";
+    }
+
+    /// One row of `AdmissionRouteNames`.
+    struct AdmissionRouteName
+    {
+        Distributed::MembershipParticipant route; ///< The route.
+        std::string_view name;                    ///< What an operator calls it.
+    };
+
+    /// How each admission route is spelled for a person.
+    ///
+    /// **The flag or the act, never the enumerator.** An operator told `--fleet-member` knows
+    /// which line to edit; one told `FleetMemberList` has to go and look it up.
+    ///
+    /// Keyed on the PARTICIPANT rather than on the wire bit, and that is the guard rather than a
+    /// preference: a bitmask enum has no `Last`, so a table keyed on one cannot be checked for
+    /// completeness. Keyed here, `RowsInEnumeratorOrder` fails the build when a route is added
+    /// and not spelled -- where a bit-keyed array would compile and render the new route as *a
+    /// route this client cannot name*, blaming the node's version for this client's omission.
+    /// That is the confident wrong signal the verb exists to remove, arriving inside the verb.
+    constexpr EnumTable<Distributed::MembershipParticipant, AdmissionRouteName> AdmissionRouteNames { {
+        { .route = Distributed::MembershipParticipant::FleetMemberList, .name = "--fleet-member" },
+        { .route = Distributed::MembershipParticipant::ClusterMembers, .name = "the cluster's member set" },
+        { .route = Distributed::MembershipParticipant::ClientTombstone, .name = "--cluster-forget-client" },
+        { .route = Distributed::MembershipParticipant::OpenPolicy, .name = "--fleet-open" },
+        { .route = Distributed::MembershipParticipant::ProvenKeyHolder, .name = "proved the cluster key" },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(AdmissionRouteNames, &AdmissionRouteName::route),
+                  "AdmissionRouteNames must hold one row per MembershipParticipant, in enumerator order");
+
+    /// Every route in @p decidedBy, as an operator reads them.
+    ///
+    /// **A route this build cannot name is COUNTED, never dropped.** The node may be newer, and
+    /// under-reporting authorship during an upgrade would say *fewer things decided this than
+    /// did* -- which is the reading that sends somebody to change a route that was never
+    /// consulted. Counted, the operator knows to ask a client of the node's own version.
+    /// @param decidedBy The bitmask the node sent.
+    /// @return The routes, joined, or empty when nothing decided.
+    [[nodiscard]] std::string DescribeAdmissionRoutes(std::uint32_t decidedBy)
+    {
+        auto described = std::string {};
+        auto named = std::uint32_t { 0 };
+        for (auto const& row: Distributed::MembershipWireRoutes)
+        {
+            auto const bit = static_cast<std::uint32_t>(row.bit);
+            if ((decidedBy & bit) == 0)
+                continue;
+            named |= bit;
+            if (!described.empty())
+                described += ", ";
+            described += AdmissionRouteNames[static_cast<std::size_t>(row.route)].name;
+        }
+
+        if (auto const unnamed = decidedBy & ~named; unnamed != 0)
+        {
+            if (!described.empty())
+                described += ", ";
+            described += std::format("{} route(s) this client is too old to name", std::popcount(unnamed));
+        }
+        return described;
+    }
+
+    /// `explain-admission <host>` -- which routes admit or refuse that host, as THIS node folds it.
+    ///
+    /// **Every route that decided, not just the winner**
+    /// ([#1471](https://github.com/LASTRADA-Software/fastcached/issues/1471)). An operator who
+    /// drops a host from `--fleet-member` and finds it still served needs to know the cluster
+    /// admits it too; naming only the winning route answers a question they did not ask, and
+    /// sends them to edit a file that will change nothing.
+    ///
+    /// The verdict does NOT reach the exit code. `refused` is a successful answer to *why is this
+    /// host refused*, and mapping it to a non-zero status would fail a script that was only
+    /// asking -- while collapsing `refused` and `forgotten` onto one number, which is the
+    /// distinction the whole verb exists to carry.
+    /// @param context What to run against.
+    /// @return The answer.
+    [[nodiscard]] Answer ExplainAdmission(VerbContext const& context)
+    {
+        auto const reply = AskNode(context, CompileCacheWire::EncodeExplainAdmissionRequest(context.operands[0]));
+        if (!reply.has_value())
+            return reply.error();
+
+        auto const fields = CompileCacheWire::DecodeAdmissionExplanation(reply->payload);
+        if (!fields.has_value())
+            return Concluded(
+                Outcome::Protocol,
+                std::format("{} answered explain-admission with a body this client cannot read", context.node->Address()));
+
+        auto routes = DescribeAdmissionRoutes(fields->decidedBy);
+        auto answer = Answered(RecordValue(
+            { Field { .name = "host", .value = TextCell(std::string { context.operands[0] }) },
+              Field { .name = "verdict", .value = TextCell(std::string { NameOfMembership(fields->verdict) }) },
+              // An empty set is a READING -- no route had an opinion -- so the field is present
+              // and ABSENT, exactly as `leader` is when no leader is known. Dropping the field
+              // would say this node cannot answer that half; a `0` or an empty string would read
+              // as a value nobody wrote.
+              Field { .name = "decided-by", .value = routes.empty() ? AbsentCell() : TextCell(std::move(routes)) } }));
+
+        if (fields->verdict == CompileCacheWire::WireMembership::Forgotten)
+            answer.advisories.emplace_back(
+                "a forgotten client outranks every admission route, so listing this host in `--fleet-member` will "
+                "not bring it back; `--cluster-admit-client` on the node binary clears the tombstone");
+        return answer;
+    }
+
     /// `cordon` or `uncordon`: take this machine's worker out of the fleet, or put it back.
     ///
     /// **Answered with the state the worker is in NOW**, and the running count beside it,
@@ -2027,6 +2157,21 @@ namespace
           .modifiers = Modifier::Range,
           .handler = &Fleet,
           // No fallback: an endpoint that is not a node has no fleet to report.
+          .nodeFallback = nullptr,
+          .session = nullptr },
+        // Asked of ANY node, about any host: the answer is that node's own fold, which is the
+        // point -- two nodes disagreeing about one host is the finding, and a verb that could
+        // only be asked of one of them could not surface it.
+        { .name = "explain-admission",
+          .wire = Wire::Node,
+          .minOperands = 1,
+          .maxOperands = 1,
+          .operands = " <host>",
+          .summary = "why this node admits or refuses a host, naming every\n"
+                     "route that decided rather than only the winning one",
+          .protocolCommand = "explain-admission",
+          .modifiers = Modifier::None,
+          .handler = &ExplainAdmission,
           .nodeFallback = nullptr,
           .session = nullptr },
         { .name = "node-metrics",
