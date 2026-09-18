@@ -1693,6 +1693,25 @@ and the quorum goes on counting it. Taking a *typed* member out of the quorum me
 dropping it from `--raft-peer` on the machines that name it and restarting them —
 a leader never proposes removing a member its own bootstrap list asserts.
 
+**It sticks while the machine is still running**
+([#1528](https://github.com/LASTRADA-Software/fastcached/issues/1528)). A forgotten
+machine keeps the cluster key, so discovery goes on proving it and the leader goes on
+seeing it — and the forget tombstones its host, which the leader will not record a
+member at again. It says so once:
+
+```
+cluster: not recording n3 at 10.0.0.3:6680: the cluster forgot host 10.0.0.3, and only --cluster-admit undoes a forget
+```
+
+Bringing it back is `--cluster-admit=n3=10.0.0.3:6680`, which lifts the tombstone.
+Two limits follow from the tombstone naming a **host**: another node at that address is
+not recorded either, and members that share one machine over loopback — a test rig —
+leave no tombstone at all, so a member forgotten there comes back at its next proof.
+Forgetting the **leader** stops it recording itself, but it goes on leading and being
+counted, because a leader never proposes its own removal: the quorum drops it only once
+another member leads — and, as for every removal, only one that bootstrapped from a
+`--raft-peer` list not naming it.
+
 **It withdraws the admission consensus granted, and only that.** A host that a node
 also lists in its own `--fleet-member` stays admitted to that node's three surfaces
 after the forget, because the two are separate routes and forgetting speaks for one

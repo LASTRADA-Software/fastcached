@@ -581,6 +581,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - Absence from `ClusterState` is not removal: a member named in the bootstrap set is never
   proposed for removal, and a node given no bootstrap set proposes none at all. **A learner is
   never removed for being absent** — nothing in the policy asks whether a member answers.
+- **A forget outranks an observation (#1528).** A forgotten machine keeps the key and discovery
+  proves it again, so `MembershipProposals` refuses a desire at a forgotten host BY NAME
+  (`MembershipPlan::forgotten`) — at the decision, never by pruning a desire the next proof
+  restores. Only `--cluster-admit` lifts a tombstone.
 - The SEAT an operator chose is the record (`ClusterMember::seat`, written only by the verb:
   `AddMember` a voter, `AddLearner` a learner, `MemberSeatTable`). A caller with NO opinion —
   a node desiring itself, an enrollment re-approval — keeps the recorded seat
