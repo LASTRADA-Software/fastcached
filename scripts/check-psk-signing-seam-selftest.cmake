@@ -55,7 +55,7 @@ file(REMOVE_RECURSE "${root}")
 set(failures)
 
 # ---------------------------------------------------------------------------
-# The three files the signer table allows, written as stand-ins rather than
+# The four files the signer table allows, written as stand-ins rather than
 # copied from the tree: a selftest that copied the real ones would start
 # failing for reasons that belong to those files rather than to this check.
 #
@@ -78,6 +78,9 @@ function(fastcached_make_tree name seamBody extraPath extraBody outVar)
     file(WRITE "${tree}/src/FastCache/Core/Sha256.cpp"
          "Digest HmacSha256(Key key, Message message) { return Compute(key, message); }\n")
     file(WRITE "${tree}/src/FastCache/Cluster/ClusterSigning.hpp" "${seamBody}")
+    # HKDF's derivation, the one allowed caller that is not the seam (#178).
+    file(WRITE "${tree}/src/FastCache/Core/Hkdf.cpp"
+         "Prk Extract(Salt salt, Ikm ikm) { return HmacSha256(salt, ikm); }\n")
 
     if(NOT extraPath STREQUAL "")
         file(WRITE "${tree}/src/${extraPath}" "${extraBody}\n")
@@ -126,13 +129,13 @@ function(fastcached_run_check tree outObjected outOutput)
 endfunction()
 
 # ---------------------------------------------------------------------------
-# 1. The three allowed signers and nothing else. Without this the check could
+# 1. The four allowed files and nothing else. Without this the check could
 #    refuse everything, which is exactly as useless as refusing nothing and
 #    looks a great deal more like rigour.
 fastcached_make_tree("clean" "${signingSeam}" "" "" tree)
 fastcached_run_check("${tree}" objected output)
 if(objected)
-    list(APPEND failures "clean: a tree with exactly the three allowed signers was refused -- the check refuses everything")
+    list(APPEND failures "clean: a tree with exactly the four allowed files was refused -- the check refuses everything")
 endif()
 
 # 2. A fourth signer. The whole point: a new caller of the primitive is an
@@ -196,6 +199,7 @@ file(WRITE "${tree}/src/FastCache/Core/Sha256.cpp"
      "Digest MacIt(Key key, Message message) { return Compute(key, message); }\n")
 file(WRITE "${tree}/src/FastCache/Cluster/ClusterSigning.hpp"
      "Digest SignFields(Key key, Domain domain, Fields fields) { return MacIt(key, Encode(domain, fields)); }\n")
+file(WRITE "${tree}/src/FastCache/Core/Hkdf.cpp" "Prk Extract(Salt salt, Ikm ikm) { return MacIt(salt, ikm); }\n")
 fastcached_run_check("${tree}" objected output)
 if(NOT objected)
     list(APPEND failures "renamed: the primitive was spelled something else everywhere and the check reported success -- it had stopped looking at anything and would have gone on passing")

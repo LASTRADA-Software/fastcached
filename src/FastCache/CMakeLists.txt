@@ -48,10 +48,13 @@ target_sources(FastCache
         Consensus/RaftPeerTransport.cpp
         Core/CpuFeatures.cpp
         Core/Crc32c.cpp
+        Core/Ed25519.cpp
         Core/FigureText.cpp
+        Core/Hkdf.cpp
         Core/PathKind.cpp
         Core/SecureBytes.cpp
         Core/Sha256.cpp
+        Core/X25519.cpp
         Cluster/ClusterState.cpp
         Cluster/ClusterStateMachine.cpp
         Cluster/DiscoveryService.cpp
