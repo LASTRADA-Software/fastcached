@@ -23,7 +23,7 @@ file names, so a new copy needs a row here the day it arrives.
 
 | root | upstream | files | lines |
 |---|---|---|---|
-| `vendor/endo` | endo and contour, "`vendor/endo`" below | 176 | 49,467 |
+| `vendor/endo` | endo and contour, "`vendor/endo`" below | 176 | 49,485 |
 | `vendor/monocypher` | Monocypher 4.0.3, "`vendor/monocypher`" below | 6 | 4,182 |
 
 ## `vendor/endo`: what is here, and where it came from
