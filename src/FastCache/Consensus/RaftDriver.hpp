@@ -156,11 +156,21 @@ class RaftDriver
     /// compaction gets the behaviour that cannot lose anything -- a log that grows
     /// is wasteful, and a snapshot taken by a machine whose `TakeSnapshot` is not
     /// yet meaningful is wrong.
+    ///
+    /// **Constructing a driver restores the node's snapshot into `application`**
+    /// (#1542), before anything else can reach it. A node recovered from storage
+    /// comes back with its applied index AT the snapshot's boundary, so nothing the
+    /// snapshot covers will ever be applied again: were its state not handed over
+    /// here, a restarted node would run without every fact the snapshot held -- and
+    /// for a membership state that includes the forget tombstones, so removal would
+    /// fail OPEN. Folded into construction rather than left to the caller, because
+    /// the defect was precisely a caller that did not know to do it, and every
+    /// driver ever built goes through here.
     RaftDriver(RaftNode node,
                IRaftStorage& storage,
                IRaftTransport& transport,
                IRaftStateMachine& application,
-               CompactionPolicy compaction = {}) noexcept;
+               CompactionPolicy compaction = {});
 
     /// Install the role observer.
     ///

@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/TestReactor.hpp>
+#include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/ClusterStateMachine.hpp>
+#include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Consensus/InMemoryRaftStorage.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
 #include <FastCache/Core/Bytes.hpp>
+#include <FastCache/Core/Logger.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -10,17 +14,22 @@
 #include <chrono>
 #include <cstdint>
 #include <format>
+#include <memory>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Consensus;
 using namespace std::chrono_literals;
+using FastCache::Testing::ScratchDirectory;
 using FastCache::Testing::Unwrap;
 
 namespace
@@ -834,4 +843,219 @@ TEST_CASE("CurrentProgress reports the role and the leader, under the same lock"
     CHECK(deposed.role == Role::Follower);
     CHECK(deposed.knownLeader == std::optional<NodeId> { "n3" });
     CHECK(deposed.term == Term { .value = 2 });
+}
+
+// --------------------------------------------------------------------------
+// Recovery hands the snapshot to the application (#1542).
+
+TEST_CASE("Constructing a driver over a recovered snapshot restores it before anything else happens",
+          "[consensus][raft][driver][snapshot]")
+{
+    // The contract at its narrowest: the node recovered a snapshot, and before any
+    // step -- before anything could apply an entry above it -- the application has
+    // been handed the snapshot's state. And the control: a node that recovered no
+    // snapshot restores nothing, because "no snapshot" is not "an empty state".
+    Journal journal;
+    RecordingStorage storage { journal };
+    RecordingTransport transport { journal };
+    ScriptedRandomSource random { { 0 } };
+
+    SECTION("a recovered snapshot reaches the application at construction")
+    {
+        auto const state = FastCache::BytesFromString("the state as of index 5");
+        auto recovered =
+            RecoveredState { .state = PersistentState { .currentTerm = Term { .value = 2 }, .votedFor = std::nullopt },
+                             .entries = {},
+                             .firstIndex = LogIndex { .value = 6 },
+                             .snapshot = RaftSnapshot { .lastIncludedIndex = LogIndex { .value = 5 },
+                                                        .lastIncludedTerm = Term { .value = 2 },
+                                                        .configuration = SoloConfig().Bootstrap(),
+                                                        .state = state } };
+
+        RecordingMachine machine { journal };
+        RaftDriver const driver {
+            std::move(RaftNode::Create(SoloConfig(), random, TimePoint {}, std::move(recovered))).value(),
+            storage,
+            transport,
+            machine
+        };
+
+        REQUIRE(journal.events == std::vector<std::string> { "restore" });
+        CHECK(machine.State() == state);
+        CHECK(machine.Applied().empty());
+        CHECK(driver.Node().LastApplied() == LogIndex { .value = 5 });
+    }
+
+    SECTION("a node with no snapshot restores nothing")
+    {
+        RecordingMachine machine { journal };
+        RaftDriver const driver {
+            std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine
+        };
+
+        CHECK(journal.events.empty());
+        CHECK(driver.Node().SnapshotIndex() == LogIndex::BeforeFirst());
+    }
+}
+
+namespace
+{
+/// A transport for a node that has nobody to talk to.
+class NoPeers final: public IRaftTransport
+{
+  public:
+    void Send(NodeId const& to, RaftMessage message) override
+    {
+        std::ignore = to;
+        std::ignore = message;
+    }
+};
+
+/// Propose one cluster command on a leading driver, requiring that it landed.
+/// @param driver A driver whose node leads.
+/// @param command The change.
+/// @param at When.
+/// @return The index it landed at.
+[[nodiscard]] LogIndex ProposeCommand(RaftDriver& driver, Cluster::Command const& command, TimePoint at)
+{
+    auto const landed = driver.Propose(Cluster::Encode(command), at);
+    REQUIRE(landed.has_value());
+    return *landed;
+}
+
+/// Build a solo driver over `store` and `machine`, recovered from `store`, the way
+/// `ConsensusTier` builds one: `Load`, `RaftNode::Create`, construct.
+/// @param store The node's durable state.
+/// @param machine Its application.
+/// @param transport Its peers, of which it has none.
+/// @param random Its randomness.
+/// @param start When it starts.
+/// @return The driver, a follower until `Elect`.
+[[nodiscard]] std::unique_ptr<RaftDriver> SoloOver(
+    FileRaftStorage& store, IRaftStateMachine& machine, NoPeers& transport, IRandomSource& random, TimePoint start)
+{
+    auto recovered = store.Load();
+    REQUIRE(recovered.has_value());
+    auto node = RaftNode::Create(SoloConfig(), random, start, *std::move(recovered));
+    REQUIRE(node.has_value());
+    auto driver = std::make_unique<RaftDriver>(
+        *std::move(node), store, transport, machine, CompactionPolicy { .appliedEntriesBeforeCompaction = 4 });
+    return driver;
+}
+
+/// Carry a solo driver to leadership.
+/// @param driver The driver.
+/// @param at When its election timeout falls due.
+void Elect(RaftDriver& driver, TimePoint at)
+{
+    REQUIRE(driver.Tick(at).has_value());
+    REQUIRE(CarryPreVote(driver, at));
+    REQUIRE(driver.Node().CurrentRole() == Role::Leader);
+}
+} // namespace
+
+TEST_CASE("A node restarted after compacting comes back holding every cluster fact its snapshot covered",
+          "[consensus][raft][driver][snapshot][cluster]")
+{
+    // #1542 at the production seam: the store `ConsensusTier` opens, the state machine
+    // it applies to, and a driver built the way it builds one. A node compacted past a
+    // member, a setting and a forget tombstone, then restarted. Before the fix the
+    // recovered node's applied index sat at the snapshot's boundary and nothing handed
+    // the snapshot to the application, so all three were gone -- and a forgotten client
+    // was admitted again, with nothing reporting it: removal failing OPEN.
+    ScratchDirectory scratch { "fc-raft-restore" };
+    NullLogger logger;
+    NoPeers transport;
+    ScriptedRandomSource random { { 0 } };
+
+    auto forgottenAt = LogIndex {};
+    auto aboveAt = LogIndex {};
+    auto before = Cluster::ClusterState {};
+
+    {
+        auto store = FileRaftStorage::Open(scratch.Path());
+        REQUIRE(store.has_value());
+        Cluster::ClusterStateMachine machine { logger, {} };
+        auto const driver = SoloOver(*store, machine, transport, random, TimePoint {});
+        Elect(*driver, TimePoint {} + 150ms);
+
+        auto const at = TimePoint {} + 200ms;
+        (void) ProposeCommand(
+            *driver,
+            Cluster::Command {
+                .kind = Cluster::CommandKind::AddMember, .key = "n2", .value = "10.0.0.2:6675", .schedulerEndpoint = {} },
+            at);
+        forgottenAt = ProposeCommand(
+            *driver,
+            Cluster::Command {
+                .kind = Cluster::CommandKind::ForgetClient, .key = "10.0.0.7", .value = {}, .schedulerEndpoint = {} },
+            at);
+        (void) ProposeCommand(*driver,
+                              Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
+                                                 .key = std::string { Cluster::LeaseLifetimeSetting },
+                                                 .value = "40min",
+                                                 .schedulerEndpoint = {} },
+                              at);
+
+        // Padded until the snapshot covers the tombstone -- counted by the boundary
+        // rather than by a hand-computed number of entries, for the compaction case's
+        // reason: a new leader's own no-op is an entry too. Bounded, so a driver that
+        // never compacts fails here rather than looping.
+        for (auto const step: std::views::iota(0, 16))
+        {
+            if (driver->Node().SnapshotIndex() >= forgottenAt)
+                break;
+            (void) ProposeCommand(*driver,
+                                  Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
+                                                     .key = std::string { Cluster::FleetOpenSetting },
+                                                     .value = step % 2 == 0 ? "1" : "0",
+                                                     .schedulerEndpoint = {} },
+                                  at);
+        }
+        REQUIRE(driver->Node().SnapshotIndex() >= forgottenAt);
+
+        // And one fact ABOVE the snapshot, which a restart re-applies rather than
+        // restores -- so the case sees both halves of recovery, in their order.
+        aboveAt = ProposeCommand(
+            *driver,
+            Cluster::Command {
+                .kind = Cluster::CommandKind::AdmitClient, .key = "10.0.0.9", .value = {}, .schedulerEndpoint = {} },
+            at);
+        REQUIRE(driver->Node().SnapshotIndex() < aboveAt);
+
+        before = machine.State();
+        REQUIRE(before.HasForgotten("10.0.0.7"));
+        REQUIRE(before.AdmitsClient("10.0.0.9"));
+    }
+
+    // The restart: the same directory, a fresh state machine -- a process remembers
+    // nothing it applied -- and a driver built exactly as before.
+    auto store = FileRaftStorage::Open(scratch.Path());
+    REQUIRE(store.has_value());
+    Cluster::ClusterStateMachine machine { logger, {} };
+    auto const driver = SoloOver(*store, machine, transport, random, TimePoint {} + 1s);
+    REQUIRE(driver->Node().SnapshotIndex() >= forgottenAt);
+
+    // Before a single step: everything the snapshot covered is back.
+    //
+    // The tombstone is a REQUIRE, and not for tidiness. A missed restore fails every
+    // check below together, and exactly four of them used to: a Catch2 binary's exit
+    // status is its failed-assertion count, and four collides with `SKIP_RETURN_CODE 4`,
+    // so the neutered fix was scored SKIPPED rather than failed (#1152) -- measured, on
+    // this case, before this line was a REQUIRE. Stopping at the headline property
+    // makes that defect one failure, whatever is appended below it.
+    auto const restored = machine.State();
+    REQUIRE(restored.HasForgotten("10.0.0.7"));
+    CHECK(restored.RaftEndpointOf("n2") == std::optional<std::string> { "10.0.0.2:6675" });
+    CHECK(restored.SettingOf(Cluster::LeaseLifetimeSetting) == std::optional<std::string> { "40min" });
+    // And nothing above it yet: that is re-applied once it is committed again, never
+    // restored -- a snapshot is state as of its index and no further.
+    CHECK_FALSE(restored.AdmitsClient("10.0.0.9"));
+
+    // Leading again, it commits what it holds, and the entry above the snapshot lands ON
+    // TOP of the restored state rather than in place of it: the whole state is what it
+    // was before the restart.
+    Elect(*driver, TimePoint {} + 1s + 150ms);
+    CHECK(driver->Node().LastApplied() >= aboveAt);
+    CHECK(machine.State() == before);
 }

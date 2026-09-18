@@ -439,6 +439,20 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     if (!node.has_value())
         return std::unexpected { node.error().context };
 
+    // Read from the node rather than left at its default, because a node recovered
+    // from storage comes back at whatever term it had reached. Only the term can
+    // differ -- a recovered node is always a follower knowing no leader -- so this
+    // changes what the first line SAYS and not what it announces.
+    //
+    // Read BEFORE the driver exists, and that order is #1542's: constructing the driver
+    // restores a recovered snapshot into `_application`, whose observer publishes the
+    // state -- the member set, the tombstones, and a role announcement through
+    // `Republish`. Read after, that first announcement would name term 0.
+    _lastTerm = node->CurrentTerm();
+
+    // The constructor hands a recovered snapshot to `_application` before anything
+    // can apply an entry above it, so the replicated member set, settings and
+    // tombstones are back -- and published -- before either loop below starts.
     _driver = std::make_unique<Consensus::RaftDriver>(
         *std::move(node),
         _storage,
@@ -452,16 +466,12 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // this from either the timer thread or a peer reader.
     _driver->ObserveRole([this](Consensus::RaftDriver::RoleChange const& change) { PublishRole(change); });
 
-    // Read from the node rather than left at its default, because a node recovered
-    // from storage comes back at whatever term it had reached. Only the term can
-    // differ -- a recovered node is always a follower knowing no leader -- so this
-    // changes what the first line SAYS and not what it announces.
-    _lastTerm = _driver->Node().CurrentTerm();
-
     // Announced BEFORE anything starts, and unconditionally. Until consensus says
     // otherwise this node is `Undecided`, which is what a node in a cluster that
     // has not elected anybody is -- and the scheduler surface would otherwise go
-    // on believing the standalone leadership it was constructed with.
+    // on believing the standalone leadership it was constructed with. A node that
+    // recovered a snapshot has already announced exactly this, from the restore's
+    // publication above; `Republish` then finds nothing moved and says nothing.
     Republish();
 
     _sink = std::make_unique<DriverSink>(*_driver, _logger);
