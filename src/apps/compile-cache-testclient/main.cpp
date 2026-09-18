@@ -110,6 +110,10 @@ struct DriverSpec
     /// nothing to suppress, which is why this is a column and not a constant.
     std::string_view quietFlag;
     PathCanon::Grammar grammar; ///< The grammar the record is written in.
+    /// The grammar the launcher tags a captured STREAM region with for this family --
+    /// `ShowIncludes` for an MSVC driver, whose notes are its output, and
+    /// `GccDiagnostics` for a GNU one, whose record is a separate file.
+    PathCanon::Grammar streamGrammar;
 };
 
 /// MSVC drivers report includes as `/showIncludes` notes on their output; GNU
@@ -120,14 +124,16 @@ constexpr auto MsvcDriver = DriverSpec { .objectFlag = "/Fo",
                                          .dependencyFlag = "/showIncludes",
                                          .dependencyValue = {},
                                          .quietFlag = "/nologo",
-                                         .grammar = PathCanon::Grammar::ShowIncludes };
+                                         .grammar = PathCanon::Grammar::ShowIncludes,
+                                         .streamGrammar = PathCanon::Grammar::ShowIncludes };
 
 constexpr auto GnuDriver = DriverSpec { .objectFlag = "-o",
                                         .compileOnly = "-c",
                                         .dependencyFlag = "-MD",
                                         .dependencyValue = "-MF",
                                         .quietFlag = {},
-                                        .grammar = PathCanon::Grammar::GccDepfile };
+                                        .grammar = PathCanon::Grammar::GccDepfile,
+                                        .streamGrammar = PathCanon::Grammar::GccDiagnostics };
 
 /// Pick the driver family from the compiler's name.
 ///
@@ -304,17 +310,25 @@ int DoStore(TestClient::Args const& a)
     // file. Reading the record from where THIS driver put it is the whole
     // difference, and getting it wrong stores a region with nothing in it -- which
     // still round-trips, so nothing would fail.
-    std::string record = output;
+    //
+    // And the record goes where the LAUNCHER puts it, because a value stored here is
+    // served to the launcher: region 0 is the captured output, region 1 stderr (the
+    // capture is combined, so empty), region 2 the GNU depfile. This used to store a GNU
+    // depfile as region 0 alone, which a hit replayed onto stdout as another unit's
+    // dependency list and restored as no depfile at all -- a value the launcher could
+    // never have written, and since #1531 one it refuses to serve to a compile that names
+    // a depfile.
+    CompileValue value;
+    value.objectBlob = ReadFileBytes(objPath);
+    value.textRegions.push_back({ .grammar = driver.streamGrammar, .bytes = output });
+    value.textRegions.push_back({ .grammar = driver.streamGrammar, .bytes = {} });
     if (!driver.dependencyValue.empty())
     {
         auto const bytes = ReadFileBytes(depPath);
-        record.assign(reinterpret_cast<char const*>(bytes.data()), bytes.size());
+        value.textRegions.push_back({ .grammar = driver.grammar,
+                                      .bytes = std::string { reinterpret_cast<char const*>(bytes.data()), bytes.size() } });
         std::filesystem::remove(depPath);
     }
-
-    CompileValue value;
-    value.objectBlob = ReadFileBytes(objPath);
-    value.textRegions.push_back({ .grammar = driver.grammar, .bytes = record });
 
     auto const encoded = EncodeCompileValue(value);
 

@@ -250,11 +250,11 @@ EOF
     FASTCACHE_VERIFY=1 "$launcher" "$compiler" -std=c++23 -MD -MF "${proj}/build/a.d" \
         -c "${proj}/a.cpp" -o "${proj}/build/a.o" 2> "${workdir}/verify.log" \
         || { cat "${workdir}/verify.log" >&2; fail "the verifying compile returned non-zero"; }
-    # Only the launcher's own lines. The rest of that log is the PLANTED value's
-    # replayed diagnostics -- a hit replays the producing compile's streams, and
-    # the plant was compiled with `-MD` writing to one, so it is ~150 lines of
-    # another translation unit's dependency list. Correct behaviour, and noise
-    # that would bury the two lines this case is about.
+    # Only the launcher's own lines: the rest is the PLANTED value's replayed
+    # streams. The plant stores the launcher's layout -- its depfile in the depfile
+    # region, not on stdout -- because since #1531 a value with no depfile region is
+    # not served to a compile that names a depfile, and this case would then verify
+    # nothing.
     grep '^fastcache-cc:' "${workdir}/verify.log" || true
 
     grep -q "fastcache-cc: HIT" "${workdir}/verify.log" \
