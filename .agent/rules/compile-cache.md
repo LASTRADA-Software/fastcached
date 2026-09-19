@@ -15,6 +15,8 @@ rule below has already been at least one of the two.
 
 ## The five rules the end-to-end tests assert
 
+<!-- agent-tripwire: Preprocess with line markers suppressed -->
+
 `fastcached` and `fastcache-cc` are both installed. Three things the launcher's
 cache key depends on, each of which has already caused a silent hit-rate
 collapse or a mis-serve and is now covered by regression tests:
@@ -67,6 +69,8 @@ cold cache, so `scripts/compile-cache-e2e.sh` (POSIX) and
 platforms.
 
 ## The compiler identity is the driver AND the target it generates for
+
+<!-- agent-tripwire: The compiler identity is the driver AND the target it generates for. The **key** folds the target, the **fingerprint** must not -->
 
 A banner identifies the **driver**. A driver's code generation is not a function of
 the driver alone, and for `clang-cl` it is not even close: clang detects the MSVC
@@ -257,6 +261,8 @@ same on both — the same defect with no MSVC anywhere near it.
   driver, beside the `--version` one already paid there.
 
 ## What the key is a function of
+
+<!-- agent-tripwire: Only machine-independent dependency paths are hashed, and a path is classified by what it *resolves to*, never by its spelling -->
 
 - **A key determines two artefacts, so it must be a function of both.** Preprocessing
   suppresses line markers (`-E -P`, `/EP`) so a checkout path never reaches the key —
@@ -1042,6 +1048,8 @@ same on both — the same defect with no MSVC anywhere near it.
       so a regression in the reconciliation cannot present as a failure of something else.
 ## Relativizing a path-valued flag
 
+<!-- agent-tripwire: `/` introduces an option only on a Windows layout; on POSIX it starts a path -->
+
 - **A flag's value is relativized off one table, or it is relativized in one spelling
   only.** A path-valued flag can be written two ways — `/Fo <path>` and `/Fo<path>` —
   and the separated form needs no table at all: the value is a bare argument, so it
@@ -1090,6 +1098,8 @@ same on both — the same defect with no MSVC anywhere near it.
     presence is why `manifest-v4` had to be argued from the manifest side rather than
     from this one.
 ## The digest
+
+<!-- agent-tripwire: untriaged: #1567 the object key digest rule (MurmurHash3 x64_128, length-prefixed pieces, bit-identical everywhere) has no AGENT.md bullet -->
 
 - **A key that is 128 bits wide is not a key with 128 bits of strength, and four
   lanes of one polynomial are one lane.** The object key was four CRC32C digests of
@@ -1159,6 +1169,8 @@ same on both — the same defect with no MSVC anywhere near it.
 
 ## Store caps, and a refusal the client can read
 
+<!-- agent-tripwire: SIGPIPE is suppressed per socket, never process-wide: an ignored disposition is inherited across exec -->
+
 - **A cache that can fail a build is not optional, and a refusal nobody can read
   is not a refusal.** The launcher STOREs an object by streaming one frame, and the
   daemon refused an over-cap frame by replying and then closing — while the sender
@@ -1211,6 +1223,8 @@ same on both — the same defect with no MSVC anywhere near it.
 
 ## A path a compiler wrote is not this process's text
 
+<!-- agent-tripwire: A path a COMPILER wrote is not this process's text -->
+
 - **`RootReconciler::Path` is where a tool-emitted path becomes text, because it is
   the funnel every one of them already passes through** (`All` and `Region` both
   come here) and because nothing downstream can do it. The launcher's roots come
@@ -1257,6 +1271,8 @@ same on both — the same defect with no MSVC anywhere near it.
   could not check.
 
 ## A compiler's WORDS are localized too, and `VSLANG` may only touch the probe
+
+<!-- agent-tripwire: Reading `/showIncludes` and WRITING it are different questions and must not be consolidated -->
 
 - **`VSLANG=1033` goes on the probe spawn and never on the real compile.** The
   launcher matches `cl`'s `/showIncludes` notes against the literal English
@@ -1351,6 +1367,8 @@ same on both — the same defect with no MSVC anywhere near it.
 
 ## An object file is not a byte string, and `FASTCACHE_VERIFY` is where that bites
 
+<!-- agent-tripwire: An object file is not a byte string. Every MSVC driver stamps the clock into the COFF `TimeDateStamp` -->
+
 `FASTCACHE_VERIFY` compiles a sampled hit again and compares the two objects. It
 compared them with `memcmp`, and on Windows that **can never succeed**: every
 MSVC-family driver stamps the wall clock into the COFF header, and a cached object
@@ -1412,6 +1430,8 @@ and an object from another checkout still answering `Mismatched`, on **real comp
 output** rather than only on synthetic bytes.
 
 ## A compiler records WHERE it was built, and the key cannot see that
+
+<!-- agent-tripwire: A compiler with debug info on records the WORKING DIRECTORY, which is on no command line -->
 
 The key is portable across checkouts by design — that is what the launcher is
 for. A compiler with debug info on is not: it writes the compile's working
@@ -1804,6 +1824,8 @@ stops being one — the same confound that cost #493 a re-run.
 
 ## Two servers on one wire are two VERSIONS on one wire
 
+<!-- agent-tripwire: And by every **VERSION** of them, or the rule holds at no moment a fleet is actually in -->
+
 `AGENT.md` requires every server on this wire to canonicalize a stored value's text
 regions identically, through the one `CanonicalStoredValue`. That rule was written
 about a *moment* — the moment #229 made a compile node a second server and it turned
@@ -2044,6 +2066,8 @@ were open to breaking it, and neither needed anybody's install to be stale.
 
 ## Accepted trade-offs
 
+<!-- agent-tripwire: none: trades argued in place above and deliberately not rules; AGENT.md tripwires the rules they trade against -->
+
 These are argued in place above and are **not** open work — do not "fix" one
 without reopening the argument:
 
@@ -2142,6 +2166,8 @@ without reopening the argument:
   wrong coverage report is a lie that looks like data.
 
 ## A performance figure is a quantity under conditions, and both halves get lost separately
+
+<!-- agent-tripwire: A performance figure is a quantity UNDER CONDITIONS, and the two halves get lost separately -->
 
 `ProbeToolchainFiles` walks a toolchain's include roots and hashes **every byte** of
 every file. Its header recorded the cost as **"about 2 s warm"** — measured
@@ -2316,6 +2342,8 @@ guard catches that one. Only reading the source you cite does.
 
 ## Prefer not needing the cache at all
 
+<!-- agent-tripwire: Computing a value once and returning what you already have beats caching it -->
+
 Computing a value once and returning what you already have beats caching it.
 
 `CachedToolchainFingerprint` derived the resolved path, the include roots and the stamp,
@@ -2338,6 +2366,19 @@ no probe* -- which is the `exitCode == NotSpawned` guard from
 into the type.
 
 ## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
+
+- **[#1567](https://github.com/LASTRADA-Software/fastcached/issues/1567)** — `## The digest` has no `AGENT.md`
+  tripwire, so the object key being MurmurHash3 x64_128 rather than four CRC32C lanes
+  — the 32-bit key that served an unrelated TU's object under a zero exit code —
+  fires in no session that does not open this file. Its marker says `untriaged:` and
+  not `none:`, because `none` would claim the section needs no tripwire; `ctest -R
+  rulebook-tripwires` prints the count against this issue on every run. Three sections
+  here are tripwired for ONE HALF of what they state — `VSLANG` on the probe spawn
+  only, `CmdLine::PathValueFlags()`, and the drained over-cap frame — which the
+  guard passes correctly, since its stated blind spot is that it does not judge
+  whether a phrase is the RIGHT tripwire. The issue lists them.
 
 - **[#878](https://github.com/LASTRADA-Software/fastcached/issues/878)** — the
   localized `/showIncludes` prefix is NAMED by an operator

@@ -15,6 +15,8 @@ Every rule below has already been a bug.
 
 ## Discovery and the identity key
 
+<!-- agent-tripwire: A discovery proof is a signature by the node's OWN identity key over a nonce -->
+
 - **A discovery proof is a SIGNATURE by the node's OWN identity key, and discovery admits
   nobody (#178).** It was an HMAC under the pre-shared key until then, and a proof of
   possession of the fleet's key WAS membership, so any machine holding the file on the
@@ -195,6 +197,8 @@ Every rule below has already been a bug.
   would ever have shown that.
 
 ## The Raft peer wire
+
+<!-- agent-tripwire: Every Raft peer connection proves each end's OWN identity key before a message is read -->
 
 Until #1308 a Raft connection authenticated nothing. `RaftPeerServer` delivered whatever
 decoded, and every message names its own sender (`candidateId`, `voterId`, `leaderId`,
@@ -480,6 +484,8 @@ simpler design gets wrong.
 
 ## A refusal code carries its own permanence, and there are THREE answers
 
+<!-- agent-tripwire: A refusal code carries its own PERMANENCE, and there are THREE answers -->
+
 `ConsensusErrorCode::InvalidConfiguration` had two producers that meant opposite
 things. `Cluster::Validate` returns it for a command nothing could ever apply --
 permanent. `RaftNode::ProposeMembership` returned it for *a membership change is
@@ -518,6 +524,8 @@ and it is recorded here because the question will be asked again.
 
 
 ## The replicated cluster configuration
+
+<!-- agent-tripwire: A replicated setting must not decide where a node sends a CREDENTIAL -->
 
 - **A cluster setting that nothing can change at runtime is a log entry pretending to
   be configuration.** The replicated log carried settings, applied them, snapshotted
@@ -593,6 +601,8 @@ and it is recorded here because the question will be asked again.
   intermittent.
 
 ## Raft
+
+<!-- agent-tripwire: A node IS its state directory: its identity is MINTED into `--cluster-dir` and read back forever -->
 
 - **A node IS its state directory, and its identity is MINTED there rather than derived
   from the machine**
@@ -1383,6 +1393,8 @@ and it is recorded here because the question will be asked again.
 
 ## Learners: a member no quorum counts
 
+<!-- agent-tripwire: Voting is a property of the CONFIGURATION, never of a role -->
+
 [#1449](https://github.com/LASTRADA-Software/fastcached/issues/1449), for the machine
 [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) describes: an always-on
 node and a laptop. With the laptop a voter, two voters are a quorum of two, so the laptop
@@ -1496,6 +1508,8 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
   window leaves the cluster waiting for it to return rather than electing around it.
 
 ## Identity keys and the roster
+
+<!-- agent-tripwire: Only an ABSENT `node-key` mints (#178): a key file that is there and cannot be used is refused by name -->
 
 [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) PR 2: every node with a
 state directory holds an Ed25519 identity key, and `ClusterState` records members' keys,
@@ -1613,6 +1627,8 @@ right, because the wire now trusts it.
   that judged the arity first passes the flipped-byte test and fails this one.
 
 ## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
 
 - **[#144](https://github.com/LASTRADA-Software/fastcached/issues/144)** — a
   follower answering `/fleet` names the leader but cannot link to it, because

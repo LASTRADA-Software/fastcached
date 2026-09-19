@@ -11,6 +11,8 @@ Every rule below has already been a bug.
 
 ## Framing
 
+<!-- agent-tripwire: A frame declares its own length, so a rejection is a **reply** and a resynchronization -->
+
 - **A compile-cache frame declares its own length, so a rejection can be a reply
   instead of a close.** The pre-1 header was `[magic][op]` with no length, and
   that is what made every refusal — bad magic, unknown opcode, oversize field —
@@ -461,6 +463,8 @@ Every rule below has already been a bug.
 
 ## Authentication on the compile-cache port
 
+<!-- agent-tripwire: Which verbs are reachable before authentication is a *column of the table*, and the gate runs before the payload is buffered -->
+
 - **Every protocol checks the configured credential, and the compile cache was the
   one that did not.** `session.CurrentAuth()` was consulted by `MemcachedText`,
   `MemcachedBinary` and `RedisResp` — and by nothing in `CompileCacheHandler`. So a
@@ -627,6 +631,8 @@ Every rule below has already been a bug.
 
 ## The Net boundary
 
+<!-- agent-tripwire: `Net/` must not depend on `Core/`. `Async/` travels with it, plus three named dependency-free leaf headers -->
+
 - **`Net/` is meant to be lifted out of this tree, so what it may include is a
   table and a test rather than an intention.** The constraint was already written
   down -- "`Net` must not depend on `Core`, so `ConnectTcp` takes host and port
@@ -683,6 +689,8 @@ Every rule below has already been a bug.
     never being reachable from production `Net/` code at all.)
 
 ## Sockets
+
+<!-- agent-tripwire: There is exactly one TCP client, `Net/TcpClient`. Do not write a second -->
 
 - **Three implementations of one TCP client, and the rot was in the one nobody
   built.** `Net/BlockingConnector` dialled non-blocking through `getaddrinfo` and
@@ -1230,6 +1238,8 @@ Every rule below has already been a bug.
 
 ## Dialing, and the reactor underneath it
 
+<!-- agent-tripwire: A synchronous dial spends a thread the caller does not own -->
+
 - **A synchronous dial spends a thread the caller does not own, and the argument
   for it reasoned about the wrong thing.** `IConnector::Connect` blocked, and its
   header defended that at length: the caller has nothing to do until the
@@ -1369,6 +1379,8 @@ Every rule below has already been a bug.
   and is left alone deliberately: their `Dispatch` cannot reach the socket handle.
 
 ## Socket and coroutine lifetime
+
+<!-- agent-tripwire: `Close()` can be the last thing that runs on a socket, so it must touch no member after it completes an awaitable -->
 
 - **`Close()` can be the last thing that runs on a socket, so it must touch no member
   after it completes an awaitable.** `EpollSocket::Close` walked `{readOp, writeOp}`
@@ -2183,6 +2195,8 @@ Every rule below has already been a bug.
 
 ## Keyspace events for what nobody asked for
 
+<!-- agent-tripwire: A missing keyspace event has two ends -->
+
 `expired` and `evicted` are the two keyspace events no verb handler can fire,
 because no verb is executing when they happen. The path that produces them —
 tier records, `NotifyingStorage` drains, `RedisMutationObserver` publishes —
@@ -2227,6 +2241,8 @@ And one that is about the cache rather than the wire:
   `LayeredStorage` forwards expiries to L2 and swallows its evictions.
 
 ## The active expiry cycle
+
+<!-- agent-tripwire: A reclaimer nothing constructs is the bug it was written to fix -->
 
 `ExpiryReaper` is the only thing that calls `IStorage::PurgeExpired` in
 production, and for a long time nothing did — which made every rule below a
@@ -2275,6 +2291,8 @@ consequence rather than a precaution.
   `reloader.Current()` reporting an interval the daemon is not sweeping at.
 
 ## Reclaiming on the disk tier
+
+<!-- agent-tripwire: On disk a read may not reclaim and a write must -->
 
 - **A read may not reclaim; a write must.** `CowTreeStorage::Get` and `Peek`
   reject a lapsed record without erasing it, because a read can be holding nothing

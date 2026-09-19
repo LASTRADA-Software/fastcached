@@ -10,6 +10,8 @@ determinism rests on.
 
 ## The local gate
 
+<!-- agent-tripwire: **`bash <path>`, never the bare path** -->
+
 `scripts/local-gate.sh` is the gate. Run it before pushing.
 
 - **A hygiene check traverses each directory ONCE, not once per file pattern.**
@@ -1428,6 +1430,8 @@ determinism rests on.
 
 ## `NDEBUG` is not optimisation, and only the compiler can say which build this is
 
+<!-- agent-tripwire: `NDEBUG` is not optimisation, and `CMAKE_BUILD_TYPE` is a LABEL that decides nothing -->
+
 The same "the cache and the log are the two places that lie" rule, arriving where a
 number gets quoted. `fastcache-bench` printed timings that said nothing about the build
 behind them, and a Debug bench prints a plausible number: reviewing #1420 the manager read
@@ -1491,6 +1495,8 @@ to a bench file tomorrow fails a check rather than being safe by luck about whic
 is running and which endpoint happens to end in a newline.
 
 ## A retry makes every one of these disappear without fixing it
+
+<!-- agent-tripwire: A retry makes an instrument's own failures disappear without fixing them -->
 
 Eleven separate ways the gate reported something that was not about the tree under
 test turned up across four tickets — a tally over THOSE FOUR, not a running total, and
@@ -1798,6 +1804,8 @@ So the lock is taken by the thing being serialised, and omission stops being pos
 
 ## A count that OVERSTATES what is wrong is the same defect as one that understates it
 
+<!-- agent-tripwire: A count that OVERSTATES what is wrong is the same defect as one that understates it -->
+
 Everything above is about an instrument reporting **fewer** things than are wrong, or
 reporting on the wrong subject entirely. The other direction is a defect of exactly the
 same kind and had no entry here until #796:
@@ -1860,6 +1868,8 @@ does not fail at all.
 
 ## A claim about a tool is checked against the tool
 
+<!-- agent-tripwire: A claim about a tool is checked against the tool -->
+
 The section above is about instruments reporting on the wrong tree. This one is about
 the step before: **reasoning about what a tool does instead of reading what it does.**
 Both were found in the same hour as the last two entries above, and they are the same
@@ -1914,6 +1924,8 @@ locally.
 
 ## A probe's result is only evidence if the probe could have produced the other one
 
+<!-- agent-tripwire: Run both directions: which one you skipped decides which way it lies -->
+
 The two sections above are about an instrument reporting on the wrong tree, and about
 reasoning where reading was called for. This is the third: **a measurement that was
 honestly taken, of the wrong thing, and read as an answer about the right one.** Both
@@ -1956,6 +1968,8 @@ sentence. The storage-side instance is in
 
 ## A correction is a search, not a recollection
 
+<!-- agent-tripwire: untriaged: #1567 no AGENT.md bullet carries this rule; the nearest is testing.md's census rule, which this section itself calls borrowed -->
+
 The section above is about acquiring evidence. This one is about **repairing a claim
 after you have it**, which fails its own way: a wrong statement is rarely written down
 once, and the copies you can list are not the copies that exist.
@@ -1985,6 +1999,8 @@ check the pattern sees it. On wrapped markdown, match a single distinctive word,
 strip the wrapping first; never a phrase that spans a newline or a `**`.
 
 ## A comment can be true in its premise and false in its conclusion
+
+<!-- agent-tripwire: a full replacement computed from the labels it read when its run started -->
 
 `pr-labels.yml` carried this, and every word before the comma was correct:
 
@@ -2024,6 +2040,8 @@ problems, which is why it survived being seen repeatedly.
   how often the race occurs — which is exactly how the original survived.
 
 ## A `cmake -P` check cannot fail its own test
+
+<!-- agent-tripwire: A `cmake -P` check is judged by its OUTPUT, never by its exit code -->
 
 This section used to open by stating, as a measurement, that `message(FATAL_ERROR)`
 in script mode prints `CMake Error ...` and then exits **0** on CMake 3.28 — this
@@ -2198,6 +2216,8 @@ rule, rest on that sentence, and it does not reproduce** (#565).
 
 ## A guard's stated BLIND SPOT is nobody's to re-derive, so it must name its DIRECTION
 
+<!-- agent-tripwire: A guard's own stated BLIND SPOT is nobody's to re-derive, so it must name the DIRECTION it fails in -->
+
 **Being blind to a MENTION is free. Being blind to a USE is the whole job.**
 
 `fastcached_strip_comment_line` in `scripts/lib/CheckCommon.cmake` is the one comment stripper
@@ -2248,6 +2268,8 @@ Three things to carry out of it, none of which is "read guards more carefully":
   limits are pinned by cases so they stay decisions rather than becoming discoveries.
 
 ## A guard's REMEDY TEXT is part of the guard
+
+<!-- agent-tripwire: A guard's REMEDY TEXT is part of the guard. Nothing tests it, and it is the only part of a check most people ever read -->
 
 **Nothing tests it, and it is the only part of a check most people ever read.**
 
@@ -2300,6 +2322,8 @@ authority than either — it arrives at the moment of failure, from the tool doi
 refusing.
 
 ## The Windows Debug leg exists for the RUNTIME, and proves it is live
+
+<!-- agent-tripwire: A Windows **Debug** leg is run for `_ITERATOR_DEBUG_LEVEL=2`, not for the compiler -->
 
 `build.yml`'s Windows matrix ran `cl-release` and `clangcl-release` only, so the
 one Debug configuration on Windows was never built in CI — while being the default
@@ -2410,6 +2434,8 @@ here, and four test binaries link `Catch2::Catch2WithMain`, so they set nothing.
   manifest and are not checked.
 
 ## What CI costs
+
+<!-- agent-tripwire: A ccache hit does NOT skip clang-tidy: the launcher and the analyser are two independent commands -->
 
 The workflow's *critical path* is the longest single job, and for a long time that
 was one job: `clang-tidy`, at 28.6 minutes out of a 28.6-minute workflow (run
@@ -3050,6 +3076,8 @@ makes it anyway and says so there.
 
 ## Language and ABI pitfalls
 
+<!-- agent-tripwire: A return type is not part of a function's mangled name on Linux, so two functions differing only in return type silently collide -->
+
 - **`readability-qualified-auto`'s own suggested fix does not COMPILE on MSVC, so
   applying it converts a Linux-only lint into a Windows-only build failure.** Over a
   `std::array`, libstdc++ and libc++ give `std::ranges::find` a **raw pointer**, so
@@ -3459,6 +3487,8 @@ makes it anyway and says so there.
 
 ## What a `char` is
 
+<!-- agent-tripwire: A `char` is UTF-8 here, at run time and at compile time -->
+
 - **Every Windows executable declares UTF-8 as its process code page, and the
   declaration is applied by walking the build system rather than by a line per
   target.** Windows keeps command lines, environment blocks and paths as UTF-16 and
@@ -3526,6 +3556,8 @@ makes it anyway and says so there.
 
 ## Line endings
 
+<!-- agent-tripwire: Line endings are LF everywhere, enforced by `.gitattributes` -->
+
 Line endings are LF everywhere, and that is a `.gitattributes` rule
 (`* text=auto eol=lf`) rather than an instruction to set `core.autocrlf`. The
 config is per-clone and per-developer, so without the rule two people editing one
@@ -3537,6 +3569,8 @@ though the general rule covers it, because the consequence there is specific: a
 CRLF shebang makes the kernel look for an interpreter whose name ends in a
 carriage return, so such a script does not misbehave — it fails to start at all.
 ## A reference build that is not one is wrong in BOTH directions
+
+<!-- agent-tripwire: A reference-build refusal is a REFUSAL and not a warning -->
 
 - **The gate REFUSES a launcher-fronted build rather than warning about it, and the
   reason is the direction nobody investigates.** The observed case
@@ -3583,6 +3617,8 @@ carriage return, so such a script does not misbehave — it fails to start at al
   A cache keyed per build directory is [#816](https://github.com/LASTRADA-Software/fastcached/issues/816).
 
 ## `PEDANTIC_COMPILER_WERROR` decides fatality, not which warnings exist
+
+<!-- agent-tripwire: `PEDANTIC_COMPILER_WERROR` decides **fatality, not which warnings exist** -->
 
 - **A flag and the suppressions it makes necessary are governed by ONE condition.**
   `cmake/portable/PedanticCompiler.cmake` added `-pedantic` and
@@ -3884,6 +3920,8 @@ carriage return, so such a script does not misbehave — it fails to start at al
 
 ## The portable compile-cache module
 
+<!-- agent-tripwire: `cmake/portable/CompileCache.cmake` stays stock-CMake-only and must never fail a configure -->
+
 - **`cmake/portable/CompileCache.cmake` must stay stock-CMake-only, and must never fail a
   configure.** Same constraint as `Cli/UsageDoc` and `Protocol/CompileCacheWire`,
   for the same reason: the file is *meant* to be copied verbatim into other
@@ -3922,6 +3960,8 @@ carriage return, so such a script does not misbehave — it fails to start at al
     path. **Relative does not imply machine-independent**, and a value that looks
     portable is worse than one that obviously is not.
 ## `USE_COMPILER_CACHE` in full
+
+<!-- agent-tripwire: sccache is never selected AUTOMATICALLY (`ALLOW_SCCACHE_FALLBACK`, default OFF) -->
 
 `USE_COMPILER_CACHE` (default ON, `cmake/portable/CompileCache.cmake`) fronts the compiler
 with our own `fastcache-cc` when it is on `PATH` and a daemon answers — at
@@ -4087,6 +4127,8 @@ PDB is a second artefact no hit can reproduce).
 
 ## Running the launcher is not testing it
 
+<!-- agent-tripwire: Running the launcher is not testing it. The synthetic fixtures prove it RUNS -->
+
 `compile-cache-e2e` and the `fastcache-cc smoke` job compile synthetic single files
 and never execute what came out, so they prove the launcher **runs** and produces
 **an** object — not that it is the **right** object. That gap is why #319 (a
@@ -4121,6 +4163,8 @@ object comes from, so a fixture that only builds cold tests nothing.
   object is one the build system has no reason to touch again.
 
 ## Code coverage
+
+<!-- agent-tripwire: Coverage is Clang source-based, never gcov: ~2000 Catch2 cases are ~2000 processes -->
 
 `cmake --preset clang-coverage`, build, then `--target coverage`. That target runs the
 **whole** CTest suite under instrumentation and writes
@@ -4213,6 +4257,8 @@ measured from a red build is published.
 
 ## Scoping the matrix to what a change can affect
 
+<!-- agent-tripwire: A `paths-ignore` filter on a workflow whose checks are **required** makes a pull request unmergeable, not fast -->
+
 **A `paths-ignore` filter on a workflow whose checks are REQUIRED converts "slow"
 into "unmergeable".** Master here is protected by a ruleset (`default-master`,
 enforcement `active`), not by classic branch protection — so the
@@ -4274,6 +4320,8 @@ and every heavy job is gated on it.
   `code=true` unconditionally, so nothing is ever skipped underneath a release.
 
 ## A merge queue is a third door to the same never-arrives failure
+
+<!-- agent-tripwire: A **merge queue** is the third door to that same never-arrives failure -->
 
 `strict_required_status_checks_policy: true` means every merge puts every other
 open branch behind, so the matrix is paid once per pull request **per merge that
@@ -4520,6 +4568,8 @@ attached to that SHA.
   table does not name is refused by name.
 
 ## A gate that does not report reads as a gate that passed
+
+<!-- agent-tripwire: A gate that does not REPORT reads as a gate that passed -->
 
 The three doors above are all about a required context that never arrives. These
 two are the same disease with the *required* clause removed, and they were found
@@ -5405,6 +5455,8 @@ without anybody touching it. A green suite distinguishes neither.
 
 ## A configure's OUTPUT is the module's claim; the generated buildsystem is the artefact
 
+<!-- agent-tripwire: A configure's OUTPUT is the module's CLAIM; the generated buildsystem is the artefact -->
+
 `check-compile-cache-caveat.cmake` asserted entirely on what a configure PRINTED --
 every row comparing against `${configureOutput}${configureError}`. So it proved what
 `CompileCache.cmake` **says** and never what it **wired**, and a row could print
@@ -5484,6 +5536,8 @@ two accepting ones stay green.
 
 ## A branch behind master is unverified, and only a build says otherwise
 
+<!-- agent-tripwire: A branch BEHIND master is unverified, and only a build says otherwise -->
+
 A pull request's CI ran against the master it was branched from. Every green check
 on it is a statement about *that* tree, and it stays a statement about that tree
 however many times it is re-read. When master has moved, the only thing that
@@ -5561,6 +5615,8 @@ planted two-dot range, because a grep that finds nothing has said nothing until 
 been shown finding something.
 
 ## A rulebook entry that has gone false instructs the next person
+
+<!-- agent-tripwire: A rulebook `## Open work` entry names an OPEN issue, or it is a rule that has gone false -->
 
 Every `## Open work` entry in this directory names an issue that is still open, and
 `ctest -R rulebook-open-work` is what says so. Seven of thirty-nine did not when the
@@ -5646,6 +5702,8 @@ the total stayed healthy.
 
 ## A diagnostic that never RAN and one that ran and found nothing are the same green
 
+<!-- agent-tripwire: A diagnostic that never RAN and one that ran and found nothing are the same green -->
+
 **`continue-on-error` is right for a diagnostic and is exactly what hides one that could
 not start.** A probe added to `Package (macOS .pkg)` to settle #376 staged its helper with
 a here-document, which had to survive YAML's literal scalar **and** bash's parser. It lost
@@ -5682,6 +5740,8 @@ This is the same family as the entry below, one layer out: there the local run a
 different **trees**; here the tested script and the shipped script were different **text**.
 
 ## A green local gate says NOTHING when the subject under test is the build environment
+
+<!-- agent-tripwire: When the SUBJECT under test is the build environment, a green local gate is not weak evidence -->
 
 **Measured across one change, in one afternoon: three platforms, three defects, none of
 them visible locally.** A check that measures which translation units the analyser sees
@@ -5791,6 +5851,8 @@ unreadable work tree; after `repair-worktree-pointers.sh --apply`, none failed.
   a live one from a dead one's leftovers unless something clears them.
 
 ## A build under WSL is I/O-bound on the Windows drive mount, not CPU-bound
+
+<!-- agent-tripwire: A build under WSL is I/O-bound on `/mnt/<drive>`, not CPU-bound -->
 
 **The build TREE must not live under `/mnt/<drive>`.** Under WSL2 that is a **9p** mount
 (DrvFs under WSL1), where every `open` and `stat` is an RPC to the Windows side, and a build
@@ -5927,6 +5989,8 @@ that need binaries a configure-only tree does not have; neither is a finding.
 
 ## What the TSan scope covers, and the three ways it has been wrong
 
+<!-- agent-tripwire: The TSan scope is one Catch2 tag expression, in `tsan-gate.sh`'s `TARGETS` table, READ from there and never restated -->
+
 The scope is **one Catch2 tag expression**, living in `scripts/tsan-gate.sh`'s `TARGETS`
 table. `scripts/check-tsan-scope.cmake` **reads** it from there rather than restating it —
 a second copy is not a cross-check, it is a second thing to be wrong, which is the rule
@@ -6057,6 +6121,8 @@ signal says clean.
 
 ## A gate that fails CLOSED and UNCONDITIONALLY can sit for days
 
+<!-- agent-tripwire: a gate that fails CLOSED and UNCONDITIONALLY can sit for days with nobody filing it -->
+
 Every entry in *A retry makes every one of these disappear* is the gate reporting on the
 WRONG TREE. This is the other shape, and it is not in that list: the gate refusing EVERY
 tree, at its first leg, with a confidently worded false cause.
@@ -6089,6 +6155,8 @@ not only the refusing one. The same sentence is made from the other side in
 sequential pair of writes and requires the acceptance marker before it double-arms.
 
 ## Which files are this project's own is ONE answer (#1370)
+
+<!-- agent-tripwire: Which files are this project's own is ONE answer: `scripts/lib/third-party-roots.txt` -->
 
 Importing `vendor/` for #134 needed **five** tree-wide enumerators told about it one at a
 time -- `tidy-sweep.sh`, the header filter and the registration derivation in
@@ -6143,6 +6211,8 @@ its own directory -- and nothing checks an enumerator that is anchored under `sr
 is correct: an inclusion list naming this repository's own layout needs no roots.
 
 ## And HOW a file set is found is ONE answer too (#1485)
+
+<!-- agent-tripwire: And HOW a file set is found is one answer too: `fastcached_tracked_files` -->
 
 #1370 settled *which files are this project's own*. The sibling question — *how is a file
 set obtained at all* — had **eight** answers, one per `check-*.cmake`, each a byte-identical
@@ -6209,6 +6279,8 @@ and nothing would say so.
 
 ## The enumerators of an enum are a view, and a hand-spelled walk is refused
 
+<!-- agent-tripwire: An enum's ENUMERATORS are `Enumerators<Enum>()` / `Enumerators(from)`, never `views::iota` to `EnumeratorCount<Enum>` -->
+
 `Core/EnumTable.hpp` offers `Enumerators<Enum>()` and `Enumerators(Enum from)` (#1441), and
 `ctest -R enumerator-walks` refuses the hand-spelled form: `views::iota` to
 `EnumeratorCount<Enum>` on one line, or a `for`/`while` bounded by it.
@@ -6235,6 +6307,8 @@ REFUSES rather than reporting a clean tree, because *no violations* and *the rul
 applies* are different answers and only one of them is good news.
 
 ## A C-style loop is classified by its BODY, and "not a range-for" is not "stays a `for`"
+
+<!-- agent-tripwire: A C-style loop is classified by its BODY; the head is not a classifier -->
 
 #1452 converted the three-clause form across `src/`, and **the head is not a classifier.** Of
 the 134 backlogged sites the opening estimate called 78 mechanical; 68 were, and nothing about a
@@ -6321,6 +6395,16 @@ because argv is the raw array `std::span` exists for and an `iota(1, argc)` stil
 pointer.
 
 ## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
+
+- **[#1567](https://github.com/LASTRADA-Software/fastcached/issues/1567)** — `## A correction is a search,
+  not a recollection` has no `AGENT.md` tripwire. The nearest bullet is `testing.md`'s
+  census rule, which this section itself calls borrowed, so the rule that a claim
+  corrected in the places you REMEMBER writing it is not corrected fires in no session
+  that does not open this file. Marked `untriaged:` and not `none:`, because `none`
+  would claim the section needs no tripwire, and `ctest -R rulebook-tripwires` prints
+  the count against this issue on every run.
 
 - **[#829](https://github.com/LASTRADA-Software/fastcached/issues/829)** — six
   contexts are still `Undecided` in `check-merge-queue-contexts.sh`'s binding table

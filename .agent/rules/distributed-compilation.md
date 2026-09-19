@@ -2993,6 +2993,8 @@ only thing that would catch an encoding that drops a field on the way.
 
 ## The cordon (#1303)
 
+<!-- agent-tripwire: A cordon is the worker PROCESS's state, never replicated and never persisted -->
+
 A bounded stop abandons whatever outlives `--drain-timeout`, which is exactly the compile
 that was about to succeed. A cordon refuses new compiles, lets the running ones finish,
 and reports once when nothing is left. Four rules, each of which has a plausible wrong
@@ -3029,6 +3031,8 @@ cordoned worker answers is `NoCapacity` on the wire -- the client compiles local
 way -- and its own counter, because a stop ends by itself and a cordon does not.
 
 ## The enrollment window (#1298, #1299; on keys since #178)
+
+<!-- agent-tripwire: An enrollment window is served by a node that runs consensus (`ServesEnrollment`) -->
 
 `--enroll-open` puts a node into the one interval in which a machine this cluster has
 never heard of can put itself on the list an operator approves from. Until #178 what an
@@ -3153,6 +3157,8 @@ reading leaves the field's whole purpose untested; absent-against-`closed` is wh
 earns its place.
 
 ## The node proof (#1428; identity keys and sealed frames since #178)
+
+<!-- agent-tripwire: a caller that PROVES a live identity key is a member wherever it dialled from -->
 
 Node-to-node admission on the `0xFC` surface was decided by the caller's SOURCE ADDRESS and
 nothing else — `ClusterMembership` against the committed endpoints, `--fleet-member` against a
@@ -3287,6 +3293,8 @@ its door and its per-tick re-gate. There is no spelling that refuses to widen, s
 surface folds by reaching the one function rather than by remembering to.
 
 ## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
 - **[#661](https://github.com/LASTRADA-Software/fastcached/issues/661)** — `IProcessRunner`
   has no cancellable seam, so a compile whose client has GONE runs to completion and this
   machine pays for an object nobody will read. The departure is already detected and

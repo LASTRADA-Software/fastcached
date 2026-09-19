@@ -43,6 +43,8 @@ still fail for its original reason before the change was believed.
 
 ## A wall clock is not a duration, because it can be STEPPED
 
+<!-- agent-tripwire: A wall clock is not a duration -->
+
 `SECONDS`, `TIMEFORMAT='%3R'` and `date +%s.%N` all read CLOCK_REALTIME, and a VM
 guest's host time sync moves that in both directions. An interval computed from
 two readings of it is therefore not a lower bound, not an upper bound, and can be
@@ -243,6 +245,8 @@ the one remedy that cannot work.
 
 ## A fixed port needs a reaper, and a leftover listener is refused rather than adopted
 
+<!-- agent-tripwire: A fixed one needs a reaper -->
+
 `run-launcher-e2e.ps1` bound the constant `21714` and nothing reaped the daemon when
 a run did not reach its cleanup — a ctest interrupted, a test killed by a timeout, a
 build cancelled mid-suite. `fastcached.exe` then listened for as long as the machine
@@ -297,6 +301,8 @@ mutation is the reason it cannot stand alone.
 
 
 ## A bounded wait must also say WHICH KIND of failure it was
+
+<!-- agent-tripwire: when it times out, which KIND of failure it was -->
 
 "Every wait is bounded" is the rule above, and it is not enough on its own. A wait
 that reports only `waited 300s for worker A` cannot tell a loaded machine from a
@@ -353,6 +359,8 @@ follows the same rule from the other side, and the general form is worth stating
 instrument, not a better reading of the same one.**
 
 ## What that classifier then got wrong, which is worth more than what it got right
+
+<!-- agent-tripwire: A cumulative figure cannot answer a question about now -->
 
 The first version of it shipped, fired on its fifth occurrence, and was wrong:
 
@@ -462,6 +470,8 @@ not.
 
 ## A fixture waits on what a line MEANS, and a rename is not what changes it
 
+<!-- agent-tripwire: A fixture waits on what a line MEANS, not on its wording -->
+
 `node-scratch-isolation-e2e` starts three nodes one at a time, and the paragraph
 explaining why has been in the file since it was written: two include-tree walks
 racing on a two-core runner exceeded the budget and the fixture failed having never
@@ -520,6 +530,8 @@ a fixture depends on has to be in what it *does*.
 
 ## Do not measure a stand-in through an instrument as costly as the thing measured
 
+<!-- agent-tripwire: A stand-in built to exhibit a MAGNITUDE must not be measured through an instrument -->
+
 The first version of that test drove real processes. Six stand-ins, each arranged
 to exhibit one reading -- a growing log, a self-spinner, a quiet parent with a
 spinning child, a sleeper, a trickle-then-silence, one that dies -- and it read the
@@ -577,6 +589,8 @@ comparable to that magnitude. Both halves of this file got that wrong once, in t
 same direction -- towards a confident wrong answer.
 
 ## A case name is an ARGUMENT, so it may not begin with `-`
+
+<!-- agent-tripwire: A Catch2 case name is an ARGUMENT, and that one fact has three consequences -->
 
 `catch_discover_tests` registers each case as
 `add_test(NAME <case> COMMAND <exe> <case>)`. The name therefore reaches Catch2 on
@@ -702,6 +716,8 @@ byte-identical output — two empty lists agree perfectly (#729).
 
 ## A failing `REQUIRE` above an explicit `Stop()` turns a RED into a HANG
 
+<!-- agent-tripwire: A failing `REQUIRE` above an explicit `Stop()` turns a RED into a HANG -->
+
 A test starts something that needs an explicit stop — a reactor on a `jthread`, a
 server, a loop — and puts its `REQUIRE`s above the `Stop()`. **Catch2 unwinds on a
 failed `REQUIRE`**, so the failure skips the stop, and `~jthread` then joins a loop
@@ -798,6 +814,8 @@ missing was the rule, which is why this section exists with no accompanying code
 change.
 
 ## The shared helpers: `Unwrap`, `ScratchPath` and `ScriptedSocket`
+
+<!-- agent-tripwire: `Unwrap(x)` after `REQUIRE(x.has_value())` for `std::optional`; a bare `*x` is a build failure -->
 
 `src/tests/` holds the helpers every test target shares -- `Unwrap.hpp` and
 `ScratchPath.hpp` -- and they are there rather than beside one caller for the same
@@ -1206,6 +1224,8 @@ why an analyser that has been on the whole time has said nothing about them.
 
 ## The POSIX fixtures share one helper library, and a bound is read from a clock
 
+<!-- agent-tripwire: The POSIX shell fixtures share `scripts/lib/e2e-common.sh` -->
+
 `scripts/lib/e2e-common.sh` holds `fail`, `free_port`, `port_answers`,
 `wait_until`, `wait_for_port`, `wait_for_log`, `stop_and_require_exit` and
 `http_get`. It was seven copies, and every argument the C++ side of this file
@@ -1390,6 +1410,8 @@ unbounded against exactly the TERM-ignoring child these suites stage on purpose.
 
 ## An in-process fleet, and what a harness has to earn
 
+<!-- agent-tripwire: A fleet property that spans two machines needs `src/tests/FleetHarness.hpp` -->
+
 `tests/FleetHarness.hpp` runs a compile fleet in one process: N `SchedulerService`
 instances addressed by endpoint, real `SchedulerProtocol` framing, the launcher's
 own `Cc::ExchangeFramed` on the client side, and `Cc::Dispatch` running unmodified.
@@ -1427,6 +1449,8 @@ rules apart, and a suite containing only cases like it would have looked like
 coverage.
 
 ## Registering a script-driven test
+
+<!-- agent-tripwire: A script-driven test naming more than one executable is registered in `src/tests` -->
 
 Not every test is a Catch2 case. Script-driven tests are registered in
 `src/tests/CMakeLists.txt`: the `smoke`-labelled ones start a real daemon or
@@ -1503,6 +1527,8 @@ fixture whose client is always local cannot test who is admitted*, below.
 
 ## A shared failure message describes one caller, and lies to the others
 
+<!-- agent-tripwire: untriaged: #1567 no AGENT.md bullet carries this rule -->
+
 `cluster-e2e`'s `find_leader` ended with:
 
     fail "no node ever answered a cluster question; the cluster never elected a leader"
@@ -1520,6 +1546,8 @@ the finding is in the refusals, each of which names the endpoint that node belie
 leads.
 
 ## A reproduction models the wiring as it is
+
+<!-- agent-tripwire: untriaged: #1567 no AGENT.md bullet carries this rule -->
 
 **A fix at a different layer invalidates the reproduction that found the bug — and
 the failing test is the signal, not the nuisance.**
@@ -1547,6 +1575,8 @@ relaxed until it passes.
 
 ## What `cluster-e2e` covers
 
+<!-- agent-tripwire: assert leadership stability only after formation -->
+
 `cluster-e2e` is the consensus counterpart, and what it covers is deliberately
 disjoint from the unit tests rather than a slower repeat of them: three real
 processes elect a leader and *keep* that leader for three seconds of polling, a
@@ -1563,6 +1593,8 @@ platform-independent and the fixture is not, so a Windows counterpart would be a
 translation rather than new coverage.
 
 ## The first real run of a fixture is where its defects are
+
+<!-- agent-tripwire: A fixture that has never completed has told you nothing -->
 
 `launcher-replay-e2e` was reviewed, reasoned about and merged into a CI job, and
 its first execution anywhere died on the first line that starts a process. Four
@@ -1610,6 +1642,8 @@ stops with a sentence about the injection rather than a verdict about the cache.
 
 ## A canary reports on the guard AND on itself, and cannot say which
 
+<!-- agent-tripwire: A guard written to prove a fixture bites can itself fail to bite -->
+
 The `static_assert` that every cache refusal policy states a counter *or* a
 rationale (#491) was watched refusing only on the **third** attempt. The first two
 runs both printed *the guard does not bite*, and the guard was correct both times.
@@ -1641,6 +1675,8 @@ those, it reports INCONCLUSIVE and names the reading it is missing.
 
 ## `--repeat until-fail` reports the last iteration, so a flake reads as a pass
 
+<!-- agent-tripwire: `ctest --repeat until-fail:N` reports the LAST iteration, so a 1% flake reads as -->
+
 `ctest --repeat until-fail:N` reports the **last** iteration's result, so a test that
 fails a small fraction of the time is reported `100% tests passed` whenever the final
 run happens to pass.
@@ -1665,6 +1701,8 @@ Use `scripts/flake-rate.sh`, which keeps a tally. Two things it deliberately kee
   clean line states how many runs it is about.
 
 ## Assert what DISTINGUISHES, not what both sides produce
+
+<!-- agent-tripwire: Assert what DISTINGUISHES, not what both sides produce -->
 
 In one evening four lanes found **five** tests that could not fail for the reason
 they existed ([#355](https://github.com/LASTRADA-Software/fastcached/issues/355)).
@@ -1788,6 +1826,8 @@ mutation, and read back through that binding afterwards.
 
 ## A query that FAILED is not an observation about the subject
 
+<!-- agent-tripwire: Where the answer cannot be determined, report that as its own outcome rather than the nearest neighbour -->
+
 A required-context checker was written for the shape
 [#542](https://github.com/LASTRADA-Software/fastcached/issues/542) names: read the
 required names, report each one's state, and keep ABSENT distinct from pending so a
@@ -1869,6 +1909,8 @@ silently matched nothing also passes everything.
 
 ## A path-scoped revert is scoped to the FILE, not to the mistake
 
+<!-- agent-tripwire: untriaged: #1567 no AGENT.md bullet carries this rule; the only revert bullet is about ancestry after `git revert` -->
+
 `git checkout -- <path>` took two completed review fixes with it — a `static_assert`
 and a repaired documentation block — because they were uncommitted in the same file
 as the botched scripted rewrite it was aimed at. Nothing reported the loss: the
@@ -1887,6 +1929,8 @@ and it did not fire here because the loss was in the file being reverted rather 
 in the build describing it.
 
 ## Attribution by adjacency is a guess, and a guard built on one is a lottery
+
+<!-- agent-tripwire: Attribute by asking the process, never by adjacency in interleaved output -->
 
 The same fixture reported `115 hit(s), 106 miss(es)` on a build of identical
 source and passed, on the strength of "something hit". Either reading of that
@@ -1910,6 +1954,8 @@ labels — and an outcome that arrives with no label is counted as *neither* and
 refused by name, rather than folded into whichever bucket was adjacent.
 
 ## A registration names a binary that may not have been built
+
+<!-- agent-tripwire: A `$<TARGET_FILE:x>` naming a target that was NOT built is a hard error at **generate** time -->
 
 **`$<TARGET_FILE:x>` naming a target that was not built is not a test that gets
 skipped. It is a hard error at GENERATE time**, so the whole configure fails:
@@ -1986,6 +2032,8 @@ All three are named failures.
 
 ## A fixture whose client is always local cannot test who is admitted
 
+<!-- agent-tripwire: A fixture whose client is always LOCAL cannot test who is admitted -->
+
 `scripts/dist-compile-e2e.sh` had twelve cases, three real processes each, and every
 leg of every one of them was loopback. `ClusterMembership::Classify` admits loopback
 **before** it consults a member list — deliberately, because that is what makes an
@@ -2049,6 +2097,8 @@ Four things about the shape, and the last two are the ones that generalise.
 
 ## A fixture must state which PATH it exercised
 
+<!-- agent-tripwire: A fixture states which PATH it exercised. A synthetic tree is not a git repository -->
+
 `check-catch-skip-return-code` derives the files it scans from `git ls-files`, and
 falls back to a directory walk where there is no git index. Its selftest had six cases
 and they all passed. CI then failed on a vendored registration the check should never
@@ -2080,6 +2130,8 @@ them ran the code that runs in production.
   dependency cache lives inside the source tree.
 
 ## A SKIP that ctest scores as a failure
+
+<!-- agent-tripwire: A Catch2 `SKIP(...)` exits **4**, and ctest must be told what that means -->
 
 A Catch2 case that calls `SKIP(...)` exits **4**, and ctest must be told what that
 means or it scores the skip as a *failure*. None of the five `catch_discover_tests`
@@ -2221,6 +2273,8 @@ option. `catch-skip-exit-collision` is the reader that will say when a premise m
 
 ## A `SUCCEED` where the case could not RUN is a false GREEN
 
+<!-- agent-tripwire: `SUCCEED` is right when a case RAN and had nothing to assert -->
+
 The converse of the rule above, and the direction nobody investigates. `SUCCEED("...")`
 records a **passing assertion**, so a case that bails out because its environment could
 not be arranged reports a pass for a property nothing established (#685).
@@ -2300,6 +2354,8 @@ the other direction (#1128, above); it is still the least-bad option available.
 
 ## A CRASHED run is a fifth state, and a mutation harness reading a count scores it as caught
 
+<!-- agent-tripwire: The repair for one collapse is the prime site for the next -->
+
 A test binary that crashes reports **zero failures in every summary format there
 is**. A mutation harness asks one question — *was this mutation caught?* — and
 answers it from a failure count, so a run that died partway through arrives as
@@ -2362,6 +2418,8 @@ which is why this is a rule rather than a habit of reading carefully.
 
 ## A leader-pinned command goes to whoever leads NOW
 
+<!-- agent-tripwire: A leader-pinned **mutating** command is put to whoever leads NOW, re-derived -->
+
 `$leader_endpoint` is derived by whichever section of `cluster-e2e.sh` needed it
 first, and leadership may legitimately move before a later section runs. A cluster
 that has ELECTED is not one that has FORMED, a slow runner blows any election
@@ -2398,6 +2456,8 @@ helper does.
 
 ## A first failure masks its identical siblings
 
+<!-- agent-tripwire: A first failure MASKS its identical siblings -->
+
 `--cluster-forget` in section 5 of `cluster-e2e.sh` was one-shot against a pinned
 leader endpoint, byte-identical in shape to the `--cluster-admit` in section 4, and
 had **never once been observed failing**. Not because it was sound: because the
@@ -2424,6 +2484,8 @@ else has this shape, and would I have seen it fail?"
 ([#172](https://github.com/LASTRADA-Software/fastcached/issues/172))
 
 ## An identifier is READ, never reconstructed, and zero rows is not a verdict
+
+<!-- agent-tripwire: An abbreviated identifier is a DISPLAY form: the full one is read -->
 
 Two instrument failures in one session shared one shape, and neither returned an
 error. A query was answered about a set that did not contain the subject, and the
@@ -2540,6 +2602,8 @@ output.
 
 ## A check that asserts WHICH refusal beats one that asks only whether it refused
 
+<!-- agent-tripwire: A refusal test asserts WHICH refusal -->
+
 **Measured, on Windows.** `reactor-teardown-gate-selftest` stages its stand-in canaries as
 `#!/bin/sh` scripts, and CMake's `execute_process` is `CreateProcess` there, which **cannot
 start a shebang script** -- ENOEXEC, *"inappropriate file type or format"*. So every case
@@ -2563,6 +2627,8 @@ Two rules fall out of the same fixture:
   tidies, and otherwise you learn it twice from a 25-minute gate.
 
 ## A background helper runs the fixture's cleanup until you have watched it not
+
+<!-- agent-tripwire: A background helper in these scripts runs the fixture's CLEANUP until you have watched it not -->
 
 Anything forked into the background in these scripts **inherits the shell's traps**, and
 in a fixture the EXIT trap *is* the run's cleanup. So a helper signalled with a catchable
@@ -2611,6 +2677,18 @@ that shows this is macOS's bash 3.2 — the one no development host here can mea
 green Linux run is not evidence about it.
 
 ## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
+
+- **[#1567](https://github.com/LASTRADA-Software/fastcached/issues/1567)** — three sections here have no `AGENT.md`
+  tripwire: `## A shared failure message describes one caller, and lies to the others`,
+  `## A reproduction models the wiring as it is`, and `## A path-scoped revert is scoped
+  to the FILE, not to the mistake`. Each fires in no session that does not open this
+  file. A fourth, `## A CRASHED run is a fifth state`, is tripwired by a sentence it
+  QUOTES rather than by its own rule, so the guard passes it — correctly, since it
+  does not judge whether a phrase is the right tripwire. Marked `untriaged:` and not
+  `none:`, and `ctest -R rulebook-tripwires` prints the count against this issue on
+  every run.
 
 - **[#1152](https://github.com/LASTRADA-Software/fastcached/issues/1152)** — ctest
   cannot be told about a Catch2 skip through any property `catch_discover_tests`

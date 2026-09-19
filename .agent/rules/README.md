@@ -6,6 +6,8 @@ lives here.
 
 ## What a rule in this directory is
 
+<!-- agent-tripwire: Every rule there has already been a bug -->
+
 **Every rule here has already been a bug.** That is the entry criterion, and it is
 why the prose keeps the failure it prevents rather than stating the rule alone: a
 rule with no consequence attached is one the next reader will argue away, usually
@@ -24,6 +26,8 @@ If a rule's failure mode is loud, it usually does not need to be written down �
 the build or the test suite already says it.
 
 ## Files
+
+<!-- agent-tripwire: none: the file table is this directory's own index; AGENT.md's rulebook links are the same map -->
 
 <!-- table-total: none -->
 | File | Governs |
@@ -44,6 +48,8 @@ how-to rather than a rulebook, and
 tree.
 
 ## Adding a rule
+
+<!-- agent-tripwire: without a bullet here fires in no session that does not open its file -->
 
 Add it to the file that governs the code it constrains, under the existing
 headings, and state three things: what the rule is, what breaks when it is
@@ -73,117 +79,80 @@ delete the heading when the last entry goes, or the file leaves the scanned set
 without anything saying so. The reasoning is in
 [`build-and-toolchain.md`](build-and-toolchain.md).
 
+## The `AGENT.md` tripwire markers
+
+<!-- agent-tripwire: none: this documents the marker mechanism itself; the rules it guards carry their own -->
+
+Every `##` section in this directory carries one, directly under the heading, and
+`ctest -R rulebook-tripwires` refuses a section that does not — mandatory rather
+than opt-in, because an opt-in marker is exact about the sections it knows and
+silent about the ones it does not, and silence reads identically to complete
+coverage.
+
+```
+<!-- agent-tripwire: a distinctive phrase from the AGENT.md bullet -->
+<!-- agent-tripwire: none: why this section needs no tripwire -->
+<!-- agent-tripwire: untriaged: #123 nobody has decided about this one yet -->
+```
+
+The check verifies the quoted phrase appears in `AGENT.md`, which makes *yes* a
+claim somebody can be **wrong** about rather than a box ticked. `AGENT.md` is only
+ever READ, which is the property that makes this affordable in a file several
+sessions edit at once. **Three spellings and not two**, because *deliberately
+untripwired* must not be spelled like *forgot* — and the third is safe only
+because the check TALLIES untriaged markers and prints the total per issue on
+every run.
+
+**Why a nominated phrase rather than a structural correspondence.** #876 asked for
+a check over a unit this tree does not have, and each of these kills a cheaper
+design:
+
+*The correspondence cannot be heading text.* #876 cited `e12a4c9a` as adding *"A
+green local gate says NOTHING when the subject under test is the build
+environment"* with no tripwire. `AGENT.md` carries one — *"When the SUBJECT under
+test is the build environment, a green local gate is not weak evidence — it is
+none."* Same fact, no matchable text between them. Any fuzzy ruler refuses correct
+entries and misses incorrect ones, which is the ticket’s own objection to a
+threaded-source census, turned on the ticket.
+
+*A tripwire may live under ANOTHER file’s link, and may be a nested bullet.*
+[`compile-cache.md`](compile-cache.md)’s `## Two servers on one wire are two
+VERSIONS on one wire` is tripwired as a `  - ` sub-bullet under
+**[`distributed-compilation.md`](distributed-compilation.md)** — correctly,
+because the rule spans both and that is where a reader of the fleet section needs
+it. So *a bullet under that file’s link* would refuse a correct tree, and any
+reader keyed on `^- ` misses it silently. The phrase is therefore searched over
+the WHOLE of `AGENT.md`.
+
+*The rule above is CONDITIONAL.* “Adding a rule” says to add a tripwire *if the
+rule is one a reader could plausibly break without noticing*, so a check written
+to #876’s acceptance clause would refuse entries this file says need no tripwire.
+That is what `none:` is for.
+
+*A census states its PATTERN, not only its number.* Sizing this produced one
+disagreement worth keeping, pinned to `abb530ed`, 2026-09-11 — pinned because a
+measurement’s conditions are the world at one instant and must not track their
+source. One reader counted **350** top-level `AGENT.md` bullets and a second
+**348** — near agreement — while their per-file figures differed by **twenty**, 57
+against 77 for `distributed-compilation.md`. *Totals that nearly agree while their
+parts do not* is a **contradiction, not a rounding difference**: two patterns
+merely differing move the total by roughly the sum of the per-file differences, so
+two errors cancelling means something is being **attributed** to the wrong file
+rather than merely counted differently. Both readers wrote it off as “two
+reasonable walkers” before either pulled on it. It resolved completely — neither
+walker bounded a file’s section at the next `^## `, so the last section ran to
+end-of-file and swallowed 36 bullets from `## Issues and pull requests` onward —
+and the reusable half is the tell: **a disagreement whose shape the patterns
+explain is a difference; one they do not is a defect.**
+
+Do not restate the live counts here. The check prints them on every run, which is
+the one place they cannot drift from the tree.
+
 ## Do not `@`-import these
+
+<!-- agent-tripwire: Link these as plain markdown, never as an `@`-prefixed path -->
 
 `CLAUDE.md` imports `AGENT.md`, and Claude Code resolves `@` imports recursively.
 An `@`-prefixed reference to a file in this directory, anywhere in `AGENT.md`,
 would pull every one of them back into every session and undo the entire point of
 the split. Link them as plain markdown.
-
-## Open work
-
-- **[#876](https://github.com/LASTRADA-Software/fastcached/issues/876)** — nothing
-  checks that a rule here has a tripwire in `AGENT.md`, and a rule with no tripwire
-  is, for most sessions, a rule that does not exist. **The ticket asks for a check
-  over a unit this tree does not have, and that is the finding rather than a
-  caveat** — a check built against it would assert the wrong correspondence, and
-  assert it confidently, in the file every session reads first.
-
-  Measured 2026-09-11 on `abb530ed`, each figure with the pattern that produced it,
-  because a census states its pattern and not only its number. `^## ` over
-  `.agent/rules/*.md` excluding `README.md`: **112** headings. `^- ` over `AGENT.md`
-  from one `**[`.agent/rules/X.md`]**` link to the next link **or the next `^## `
-  heading, whichever comes first**: **314** top-level bullets, **322** counting the
-  eight nested `  - ` ones.
-
-  **That second bound is load-bearing and this figure was wrong without it.** The
-  first reading said 350, because the walker had no heading bound and the LAST
-  section therefore ran to end-of-file, sweeping in 36 bullets from
-  `## Issues and pull requests` onward — `testing.md`'s row read 71 where it is 35.
-  Only the last section is exposed, since no `^## ` falls between two links, which
-  is why every other row survived unchanged and the error hid in the total.
-
-  **The tell was there and was nearly missed, and it is the reusable part.** A
-  second reader over the same file reported **348** top-level against this one's
-  350 — near-agreement — while the per-file figures differed by **twenty**, 57
-  against 77 for `distributed-compilation.md`. *Totals that nearly agree while
-  their parts do not* is a **contradiction, not a rounding difference**: two
-  patterns merely differing move the total by roughly the sum of the per-file
-  differences, so two errors cancelling means something is being **attributed** to
-  the wrong file rather than merely counted differently. Both readers wrote it off
-  as "two reasonable walkers" before either pulled on it.
-
-  It resolved completely, and the resolution is better than the tell. The other
-  walker also lacked the `^## ` bound, which is where its 77 came from; and its 348
-  was **every top-level bullet in `AGENT.md`** — 312 inside rules-file sections
-  plus **the same 36 outside them** that this walker's unbounded last section had
-  swallowed. Two different defects converging on one block of 36 bullets from
-  opposite ends of the file, one of them a wrong SUBJECT rather than a wrong
-  pattern.
-
-  What remains is **314 here against 312 there — two bullets, one each in two
-  files — and that is left unreconciled deliberately**, because its shape IS what
-  two patterns differing looks like. That is the test worth carrying away: a
-  disagreement whose shape the patterns explain is a difference; one they do not is
-  a defect. None of it touches the conclusion, which rests on the shape rather than
-  on any of these numbers.
-
-  <!-- table-total: none -->
-
-  | file | `##` headings | top-level tripwire bullets |
-  |---|--:|--:|
-  | `distributed-compilation.md` | 1 (`Open work`) | 57 |
-  | `build-and-toolchain.md` | 29 | 72 |
-  | `testing.md` | 33 | 35 |
-  | `packaging-and-release.md` | 4 | 6 |
-
-  A file with ONE heading carries dozens of tripwires. Most rules here are bullets
-  and prose; a `##` entry is a subset, so there is no 1:1 structure to derive a
-  correspondence from. The three rows are a sample chosen to show the SHAPE, not a
-  census — the totals above the table are the census.
-
-  **Four things a reader reaching for this should know before designing anything.**
-
-  *The cited instance is repaired.* #876 names `e12a4c9a` as adding *"A green local
-  gate says NOTHING when the subject under test is the build environment"* with no
-  tripwire. `AGENT.md` now carries one — *"When the SUBJECT under test is the build
-  environment, a green local gate is not weak evidence — it is none."* The ticket's
-  substance stands; its example does not, so do not go hunting a live gap.
-
-  *The correspondence cannot be heading text.* That very pair is the worked
-  example: same fact, no matchable text. Any fuzzy rule refuses correct entries and
-  misses incorrect ones — the ticket's own objection to the threaded-source census,
-  turned on the ticket.
-
-  *A tripwire may live under ANOTHER file's link, and may be a nested bullet.*
-  `compile-cache.md`'s `## Two servers on one wire are two VERSIONS on one wire` is
-  tripwired at `AGENT.md:580`, a `  - ` sub-bullet under **`distributed-compilation.md`**
-  — correctly, because the rule spans both and that is where a reader of the fleet
-  section needs it. So "a bullet under that file's link" would refuse a correct
-  tree, and any reader keyed on `^- ` misses it silently.
-
-  *The rule this file states is already CONDITIONAL.* "Adding a rule" above says to
-  add a tripwire *if the rule is one a reader could plausibly break without
-  noticing*. #876 asks to enforce something stronger than the rulebook asks for, so
-  a check written to its acceptance clause would refuse entries this file says need
-  no tripwire.
-
-  **The design that survives all four**, recorded so it is not re-derived: a marker
-  in the RULES file under each `##` heading, mandatory, either naming a distinctive
-  phrase from its `AGENT.md` bullet or spelling `none` with a reason — the
-  `table-total: none` idiom, so opt-in silence is impossible. The check verifies the
-  quoted phrase appears in `AGENT.md`, which makes *yes* a claim somebody can be
-  wrong about rather than a box ticked. `AGENT.md` is only READ, which is the
-  property that makes it affordable in a file several sessions edit at once. What
-  it costs is ~112 markers and a human decision per entry, against a unit the
-  tree does not use — which is why it is recorded here rather than built.
-
-  **The sizing ruler is not trustworthy and is not a check.** Word overlap between
-  a heading and a file's whole `AGENT.md` section says a tripwire is PLAUSIBLE,
-  never that one exists. Its first version reported **0 of 104** matched, including
-  the one instance already confirmed by hand — its section walker cleared its
-  current file on any line starting at column zero, and these sections carry
-  blockquotes and paragraphs that do. Fixed, it reports 66 plausible and 18
-  needing a human decision; by hand most of the 18 are covered by a bullet sharing
-  no vocabulary. **18 is the number that decides the cost and it is the one least
-  worth betting on.**

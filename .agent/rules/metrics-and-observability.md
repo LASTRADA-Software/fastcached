@@ -525,6 +525,8 @@ fault.
 
 ## Skipped, absent, unstarted and failed are four states, and tools collapse them
 
+<!-- agent-tripwire: Skipped, absent, unstarted and failed are FOUR states -->
+
 `Absent is not zero` above is the metrics instance of a rule that is not about
 metrics. In one working session this project's own tooling collapsed at least two
 of these four states **five separate times, in four different instruments** — none
@@ -652,6 +654,8 @@ your own, because in your own the collapsed state is the one you were not thinki
 about when you chose the representation.
 
 ## A refusal answered while nothing rises is a port that looks unused
+
+<!-- agent-tripwire: A refusal's wire code and its counter are one row -->
 
 Six refusals in `WorkerProtocol.cpp` answered the right wire code and incremented
 nothing (#327). That was not six oversights: `Wire::EncodeErrorReply` takes a code and
@@ -848,6 +852,8 @@ looks exactly like a port nobody is talking to.
 
 ## Text a peer sent is text, or the fleet refuses it
 
+<!-- agent-tripwire: Text a peer sent is text, or the fleet refuses it: one byte that is not UTF-8 -->
+
 Every string a peer states about itself -- a toolchain fingerprint, an endpoint,
 a version, a cluster member id -- is copied into the leader's view of the fleet
 and read back out of it by an operator: `/fleet.json`, the page, the charts,
@@ -925,6 +931,8 @@ outright rather than drawing with a gap.
 
 ## A live-stats stream is counted by how it ended
 
+<!-- agent-tripwire: A live stream's ending is a row named for what was OBSERVED -->
+
 A subscription is the one `0xFC` exchange whose ending is not an answer, so its endings are
 the whole diagnosis ([#1399](https://github.com/LASTRADA-Software/fastcached/issues/1399)).
 
@@ -942,6 +950,8 @@ the whole diagnosis ([#1399](https://github.com/LASTRADA-Software/fastcached/iss
   refused by name at the grant, before any snapshot arrives, and refused again per reading.
 
 ## A condition an operator must act on is a row, never a log line alone
+
+<!-- agent-tripwire: A condition an operator must act on is a row of `NodeConditionTable`, never a log line alone -->
 
 A node detects things an operator has to act on, and until
 [#1364](https://github.com/LASTRADA-Software/fastcached/issues/1364) each one reached only the
@@ -990,6 +1000,8 @@ The log lines stay.
   raise would read `undecided` forever -- the defect above, shipped on purpose.
 
 ## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
 
 - **[#592](https://github.com/LASTRADA-Software/fastcached/issues/592)** — whether the
   fleet scheduler should count a non-member caller in a series of its own. #494 left it
