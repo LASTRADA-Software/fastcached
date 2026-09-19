@@ -2,6 +2,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -119,6 +120,56 @@ enum class Grammar : std::uint8_t
 /// literal one layer down, so the grammar and the launcher's two readers were three
 /// spellings of one wire constant that nothing made agree.
 inline constexpr std::string_view IncludeNoteMarker = "Note: including file:";
+
+/// Where a `/showIncludes` note's marker ENDS on one line, or npos when the line is
+/// not a note.
+///
+/// **The one recognition rule every reader shares.** Three of them exist and they are
+/// in two binaries: `SplitLine`, which finds the path span to rewrite, and
+/// `RewriteIncludeNoteMarker`, which re-spells the prefix in front of it, both in
+/// `PathCanon.cpp`; and the launcher's `Cc::IncludeNotePath`, which feeds
+/// `SplitIncludeNotes` and `ParseIncludePaths`. A line one of them calls a note and
+/// another does not is a stored region carrying a canonical token under a prefix
+/// nobody can find, or the reverse. This lives in the header rather than beside its
+/// first caller precisely because the third reader is in the other binary; two
+/// hand-maintained copies of a recognition rule is the mechanism that produced
+/// [#891](https://github.com/LASTRADA-Software/fastcached/issues/891) and then
+/// [#1270](https://github.com/LASTRADA-Software/fastcached/issues/1270).
+///
+/// **Anchored at COLUMN ZERO: nothing may precede the marker, blanks included.**
+/// Measured 2026-09-19 on Windows 11 Pro 10.0.26200, Visual Studio 18 Community,
+/// MSVC 14.44.35207 and 14.51.36231 plus that install's `clang-cl` as the control,
+/// under `/c` and under `/EP`, at inclusion depths one to six: the marker sits at
+/// column zero on every note, and what varies with depth is a run of blanks BETWEEN
+/// the marker and the path — one per level. The indentation is `<marker><indent><path>`
+/// and never `<indent><marker>`. Depth therefore lands inside the blank run the path
+/// grammar already skips, and it survives a round trip untouched without this rule
+/// knowing it exists.
+///
+/// So skipping leading blanks here matched a shape no driver emits, and it was not
+/// free. `SplitIncludeNotes` applies this rule to a stream that ALSO carries
+/// preprocessed SOURCE, where an indented line is the ordinary case: a raw string
+/// literal inside a function whose continuation line reads
+/// `  Note: including file: A` is deleted from the bytes the cache key is hashed
+/// over, so a revision differing only in that literal keys identically to its
+/// predecessor and is served the predecessor's object. Reproduced with a real `cl`
+/// rather than argued. One layer down it is milder and still real: both regions the
+/// launcher stores carry `Grammar::ShowIncludes` and one of them is the DIAGNOSTIC
+/// stream, so a loosened anchor rewrites a path a compiler merely quoted.
+///
+/// @param body   One line, already stripped of its terminators (a trailing `\r`
+///               included — it cannot precede the marker, so it does not matter
+///               here, but the path span the caller then reads does care).
+/// @param marker The prefix a note begins with. An empty view matches nothing, so a
+///               build that does not know its own prefix rewrites nothing rather
+///               than every line.
+/// @return The offset just past @p marker, or npos when @p body is not a note.
+[[nodiscard]] constexpr std::size_t IncludeNoteMarkerEnd(std::string_view body, std::string_view marker) noexcept
+{
+    if (marker.empty() || !body.starts_with(marker))
+        return std::string_view::npos;
+    return marker.size();
+}
 
 /// True for an ASCII letter — the only thing a Windows drive specifier may start
 /// with, and the single definition of that rule.

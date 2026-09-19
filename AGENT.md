@@ -241,7 +241,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
 - The `/showIncludes` MARKER is a canonical form exactly as `<SRCROOT>` is: the LAUNCHER
   normalizes its own prefix to `IncludeNoteMarker` before storing and restores this build's
   after localizing, so the stored bytes are locale-free and no server changed. The restore
-  runs AFTER the stale-hit guard, and recognition is anchored — leading blanks only.
+  runs AFTER the stale-hit guard, and recognition is anchored at COLUMN ZERO: nothing may
+  precede the marker, blanks included, through one `PathCanon::IncludeNoteMarkerEnd` all
+  three readers share. `cl` puts the inclusion depth AFTER the marker, so admitting blanks
+  in front bought nothing and deleted an indented source line out of the hashed bytes.
 - Reading `/showIncludes` and WRITING it are different questions and must not be
   consolidated: `RenderShowIncludes` takes the marker as a REQUIRED, undefaulted parameter
   and spells no literal of its own.

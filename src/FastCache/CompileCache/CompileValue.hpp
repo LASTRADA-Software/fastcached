@@ -66,21 +66,23 @@ namespace FastCache
 /// [#879](https://github.com/LASTRADA-Software/fastcached/issues/879) and
 /// [#891](https://github.com/LASTRADA-Software/fastcached/issues/891), which are two
 /// ways for one grammar to find no path spans at all.** `Grammar::ShowIncludes`
-/// recognised a note only when the line began, at column zero, with the literal
-/// English `Note: including file:`. A localized `cl` prints a translated prefix
-/// (#879) and `cl` indents a note by inclusion depth whatever its language (#891), so
-/// in both cases the region was stored with the producing checkout's absolute paths
-/// in it — [#229](https://github.com/LASTRADA-Software/fastcached/issues/229) reached
-/// through the grammar rather than through a missing canonicalizer, and a replayed
-/// region becomes the object's dependency record, so those never invalidate.
+/// recognised a note only when the line began with the literal English
+/// `Note: including file:`. A localized `cl` prints a translated prefix (#879), so the
+/// region was stored with the producing checkout's absolute paths in it —
+/// [#229](https://github.com/LASTRADA-Software/fastcached/issues/229) reached through
+/// the grammar rather than through a missing canonicalizer, and a replayed region
+/// becomes the object's dependency record, so those never invalidate. #891 rode along
+/// on a reading of `cl`'s indentation that
+/// [#1270](https://github.com/LASTRADA-Software/fastcached/issues/1270) later measured
+/// and reversed; generation 5 is where that lands.
 ///
-/// Two things move with the byte. The marker becomes a CANONICAL FORM — see
+/// What moves with the byte is the marker becoming a CANONICAL FORM — see
 /// `PathCanon::IncludeNoteMarker`, and note that the producer normalizes to it, since
-/// only the producing machine knows what language its own notes are in — and the
-/// grammar skips leading blanks before matching. Both change what a value's bytes look
-/// like without changing the key, which is precisely the half the previous paragraph
-/// says needs this byte: a generation-2 value from either machine is unusable and is
-/// now refused rather than localized under rules it was not written by.
+/// only the producing machine knows what language its own notes are in. It changes
+/// what a value's bytes look like without changing the key, which is precisely the
+/// half the previous paragraph says needs this byte: a generation-2 value from either
+/// machine is unusable and is now refused rather than localized under rules it was not
+/// written by.
 ///
 /// What it does NOT close: a localized toolchain whose prefix nothing has told this
 /// build about still stores an unnormalized region, because an unmatched marker
@@ -88,7 +90,23 @@ namespace FastCache
 /// [#878](https://github.com/LASTRADA-Software/fastcached/issues/878), and it needs no
 /// further generation — the stored form is already locale-free, so #878 only supplies
 /// a better value to normalize with.
-inline constexpr std::uint8_t CompileValueVersion = 4;
+/// **Generation 5 retired generation 4 at
+/// [#1270](https://github.com/LASTRADA-Software/fastcached/issues/1270), which put
+/// back the half of the anchor #891 gave away.** #891 read `cl`'s inclusion-depth
+/// indentation as preceding the marker and widened `Grammar::ShowIncludes` to skip
+/// leading blanks. Measured on both installed toolsets and on `clang-cl`, under `/c`
+/// and `/EP`, at depths one to six: the marker is at COLUMN ZERO on every note and the
+/// depth is a run of blanks BETWEEN marker and path. The widened rule therefore
+/// matched a shape no driver emits, while admitting one that occurs — an indented line
+/// that merely begins with the marker, which in a DIAGNOSTIC region is a path a
+/// compiler quoted and one layer up, in preprocessed source, is a line the launcher
+/// deleted from the bytes the key is hashed over.
+///
+/// The byte moves because the two rewrite text differently: a generation-4 value whose
+/// diagnostic region carried such a line was stored canonicalized, and a generation-5
+/// build replaying it would put a `<SRCROOT>` token into the build log rather than a
+/// path. That is what `ForeignGeneration` refuses, and refusing it costs a miss.
+inline constexpr std::uint8_t CompileValueVersion = 5;
 
 /// Where the generation sits in an encoded value: its leading byte.
 ///

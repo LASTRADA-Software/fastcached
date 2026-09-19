@@ -349,58 +349,91 @@ TEST_CASE("An empty or unchanged marker rewrites nothing")
     CHECK(PathCanon::RewriteIncludeNoteMarker("", PathCanon::IncludeNoteMarker, "X").empty());
 }
 
-// --- Indented notes (#891) --------------------------------------------------
+// --- Inclusion depth, and the anchor it does not license (#891, #1270) -------
 
-TEST_CASE("An indented /showIncludes note canonicalizes, and keeps its indentation")
+TEST_CASE("A depth-indented /showIncludes note canonicalizes, and keeps its depth")
 {
-    // `cl` indents a note by inclusion depth, so this is what a note for anything a
-    // header pulls in transitively looks like -- essentially all of them. The grammar
-    // demanded the marker at column zero, so these were stored with the producing
-    // checkout's absolute paths in them, independent of language.
+    // What `cl` emits, measured on MSVC 14.44.35207 and 14.51.36231 plus clang-cl,
+    // under /c and /EP, at depths one to six: the marker is at COLUMN ZERO on every
+    // note and the depth is a run of blanks BETWEEN marker and path, one per level.
+    // So the depth rides inside the blank run the path grammar already skips.
     Layout const layout { .sourceRoot = R"(C:\ci\deep\src)", .buildTree = R"(C:\ci\deep\build)" };
-    std::string const in = " Note: including file: "
+    std::string const in = "Note: including file: "
                            R"(C:\ci\deep\src\a.h)"
                            "\r\n"
-                           "   Note: including file: "
+                           "Note: including file:    "
                            R"(C:\ci\deep\src\b.h)"
                            "\r\n";
     auto const out = PathCanon::CanonicalizeRegion(in, Grammar::ShowIncludes, layout);
 
-    // The path is rewritten AND the indentation survives byte-for-byte, because the
-    // depth is what a human reads the note for and no defect asked for it to move.
+    // The path is rewritten AND the depth survives byte-for-byte, because the depth
+    // is what a human reads the note for and no defect asked for it to move.
     CHECK(out
-          == " Note: including file: <SRCROOT>/a.h\r\n"
-             "   Note: including file: <SRCROOT>/b.h\r\n");
+          == "Note: including file: <SRCROOT>/a.h\r\n"
+             "Note: including file:    <SRCROOT>/b.h\r\n");
 }
+
+TEST_CASE("A line with blanks in front of the marker is not a note")
+{
+    // #891 read `cl`'s indentation as preceding the marker and widened the anchor to
+    // skip leading blanks. No driver emits that shape, and the widening was not free:
+    // one layer up, `SplitIncludeNotes` applies the same rule to a stream that also
+    // carries preprocessed SOURCE, where an indented line is the ordinary case.
+    //
+    // Distinguishing rather than merely shaped: the path lies UNDER the source root,
+    // so a rule that matched would produce `<SRCROOT>/a.h` here. Asserting the input
+    // comes back is asserting the refusal.
+    Layout const layout { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
+    std::string const in = "  Note: including file: /home/dev/proj/a.h\r\n"
+                           "\tNote: including file: /home/dev/proj/b.h\n";
+    CHECK(PathCanon::CanonicalizeRegion(in, Grammar::ShowIncludes, layout) == in);
+}
+
+// The raw-string shape `cl /EP` actually emits -- two revisions differing only inside
+// an indented raw string literal, which the widened rule deleted from the hashed bytes
+// -- is pinned in `DependencyProbe_test.cpp`, at `SplitIncludeNotes`, and deliberately
+// NOT here. A first draft of it lived in this file and could not fail: the raw string's
+// contents lie under no root, so the canonicalizer echoes the line verbatim whether it
+// calls it a note or not, and the case was green with the anchor neutered. The defect
+// is the launcher DELETING the line, which is one layer up. The case above carries this
+// file's half, with a path UNDER the source root so a matching rule rewrites it.
 
 TEST_CASE("A depth-zero note canonicalizes, which it did before and must still do")
 {
-    // The control the indentation case needs. It passes in BOTH states -- that is the
-    // point of it: without it, "recognise an indented note" and "recognise a note at
-    // all" are one passing test, and a change that broke column zero while fixing
-    // depth would look identical. Deliberately not a distinguishing assertion.
+    // The control the two cases above need. It passes in BOTH states -- that is the
+    // point of it: without it, "refuse a line with blanks in front" and "recognise no
+    // note at all" are one passing test, and a change that broke column zero while
+    // tightening the anchor would look identical. Deliberately not a distinguishing
+    // assertion.
     Layout const layout { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
     std::string const in = "Note: including file: /home/dev/proj/a.h\n";
     CHECK(PathCanon::CanonicalizeRegion(in, Grammar::ShowIncludes, layout) == "Note: including file: <SRCROOT>/a.h\n");
 }
 
-TEST_CASE("An indented note's marker rewrites, and the indentation is not part of it")
+TEST_CASE("The marker rewrite answers the anchor exactly as the grammar does")
 {
     // The marker half of the same recognition rule. Both callers share
-    // `IncludeNoteMarkerEnd`, so a grammar that recognised an indented note while the
-    // marker rewrite did not would store a canonical `<SRCROOT>` token under a prefix
-    // no consumer can find.
+    // `IncludeNoteMarkerEnd`, so a grammar that recognised a line while the marker
+    // rewrite did not would store a canonical `<SRCROOT>` token under a prefix no
+    // consumer can find, and the reverse would re-spell the prefix of a line whose
+    // path was never canonicalized. Both directions are asserted, or one of them is
+    // an assumption.
     constexpr std::string_view localized = "Hinweis: Einlesen der Datei:";
-    std::string const in = "  Hinweis: Einlesen der Datei: /a/b.h\r\n";
-    CHECK(PathCanon::RewriteIncludeNoteMarker(in, localized, PathCanon::IncludeNoteMarker)
-          == "  Note: including file: /a/b.h\r\n");
+    // Column zero, depth in the blanks after the marker: rewrites, depth untouched.
+    CHECK(PathCanon::RewriteIncludeNoteMarker(
+              "Hinweis: Einlesen der Datei:   /a/b.h\r\n", localized, PathCanon::IncludeNoteMarker)
+          == "Note: including file:   /a/b.h\r\n");
+    // Blanks in FRONT of the marker: not a note, so not re-spelled (#1270).
+    std::string const indented = "  Hinweis: Einlesen der Datei: /a/b.h\r\n";
+    CHECK(PathCanon::RewriteIncludeNoteMarker(indented, localized, PathCanon::IncludeNoteMarker) == indented);
 }
 
 TEST_CASE("A blank-only line is not a note")
 {
-    // Skipping leading blanks must not turn a line that is ENTIRELY blanks into a
-    // match against an empty remainder. The path grammar would then see an empty span
-    // where there is no note at all.
+    // A line that is ENTIRELY blanks must not match against an empty remainder; the
+    // path grammar would then see an empty span where there is no note at all. Under
+    // column-zero anchoring it cannot, which makes this a control rather than a live
+    // guard -- kept because it is the case a re-widened anchor breaks first.
     Layout const layout { .sourceRoot = "/home/dev/proj", .buildTree = "/home/dev/proj/build" };
     std::string const in = "   \r\n\t\n";
     CHECK(PathCanon::CanonicalizeRegion(in, Grammar::ShowIncludes, layout) == in);

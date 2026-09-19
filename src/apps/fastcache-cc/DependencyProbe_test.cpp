@@ -321,16 +321,54 @@ TEST_CASE("SplitIncludeNotes removes every note line from the hashed text")
     CHECK(out.notePaths[1] == "/home/dev/proj/b.hpp");
 }
 
-TEST_CASE("SplitIncludeNotes recognises an indented note and CRLF endings")
+TEST_CASE("SplitIncludeNotes recognises a depth-indented note and CRLF endings")
 {
-    // `cl` indents a note by inclusion depth, so the marker is matched anywhere in
-    // the line rather than at its start — exactly as ParseIncludePaths matches it.
+    // `cl` renders inclusion depth as blanks BETWEEN the marker and the path, with
+    // the marker itself at column zero — measured, see `PathCanon::IncludeNoteMarkerEnd`.
+    // The marker is matched at the start of the line, exactly as ParseIncludePaths
+    // matches it, and the depth falls inside the blanks that are trimmed off the path.
     auto const out = SplitIncludeNotes("int a;\r\n"
-                                       "  Note: including file:  C:\\src\\proj\\a.hpp\r\n");
+                                       "Note: including file:    C:\\src\\proj\\a.hpp\r\n");
 
     CHECK(out.preprocessed == "int a;\r\n");
     REQUIRE(out.notePaths.size() == 1);
     CHECK(out.notePaths[0] == R"(C:\src\proj\a.hpp)");
+}
+
+TEST_CASE("SplitIncludeNotes keeps an indented source line that begins with the marker")
+{
+    // #1270, and the shape that makes the anchor worth a generation. The two inputs
+    // below are `cl /EP` output — reproduced with MSVC 14.51.36231, not argued — for
+    // two revisions of
+    //
+    //     namespace { char const* const Banner = R"(
+    //       Note: including file: A
+    //     )"; }
+    //
+    // differing only inside the raw string. A rule that skipped leading blanks called
+    // the middle line a note and deleted it from the bytes the key is computed over,
+    // so both revisions keyed identically and the second was served the first's
+    // object — a silent wrong build, and an indented line inside a function is the
+    // ordinary shape of C++ rather than a contrivance.
+    //
+    // `notePaths` is asserted empty as well as the text surviving: a rule that kept
+    // the line but still harvested `A` as a dependency would pass the first check and
+    // put a path that is not a file into the key's dependency set.
+    constexpr std::string_view First = "char const* const Banner = R\"(\n"
+                                       "  Note: including file: A\n"
+                                       ")\";\n";
+    constexpr std::string_view Second = "char const* const Banner = R\"(\n"
+                                        "  Note: including file: B\n"
+                                        ")\";\n";
+
+    auto const first = SplitIncludeNotes(First);
+    auto const second = SplitIncludeNotes(Second);
+
+    CHECK(first.preprocessed == First);
+    CHECK(second.preprocessed == Second);
+    CHECK(first.preprocessed != second.preprocessed);
+    CHECK(first.notePaths.empty());
+    CHECK(second.notePaths.empty());
 }
 
 TEST_CASE("SplitIncludeNotes preserves non-note text byte-for-byte")

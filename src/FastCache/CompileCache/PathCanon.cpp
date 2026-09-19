@@ -333,62 +333,6 @@ namespace
 
     // --- Region grammar --------------------------------------------------------
 
-    /// Where a `/showIncludes` note's marker ENDS on one line, or npos when the
-    /// line is not a note.
-    ///
-    /// The one recognition rule for the two readers IN THIS FILE: `SplitLine`, which
-    /// finds the path span to rewrite, and `RewriteIncludeNoteMarker`, which re-spells
-    /// the prefix in front of it. A line one of them calls a note and the other does
-    /// not is a stored region carrying a canonical token under a prefix nobody can
-    /// find, or the reverse.
-    ///
-    /// **The launcher's `IncludeNotePath` is a THIRD reader and does not share this**,
-    /// which is stated rather than implied because two hand-maintained copies of this
-    /// rule is exactly the mechanism that produced
-    /// [#891](https://github.com/LASTRADA-Software/fastcached/issues/891): that one
-    /// skipped leading blanks while `SplitLine` demanded column zero, and nothing made
-    /// them agree. They agree again now, by hand, which is the same footing. Promoting
-    /// this helper to the header and calling it from `IncludeNotePath` is the repair --
-    /// legal and free, since the app->library edge and the `_fc_cc_core` link edge both
-    /// already exist -- and it is deliberately not folded in here.
-    ///
-    /// Anchored at the start of the line, and nothing may precede it but blanks.
-    /// That is load-bearing on the launcher's side of the same rule: the splitter
-    /// there runs over a stream that also carries preprocessed SOURCE, so a rule
-    /// matching the marker anywhere in a line would delete an ordinary line that
-    /// merely contains the text from the bytes the cache key is hashed over. Here
-    /// it is milder and still real — both regions the launcher stores are tagged
-    /// `ShowIncludes` and one of them is the diagnostic stream.
-    ///
-    /// **Leading blanks are skipped because `cl` INDENTS a note by inclusion depth**,
-    /// and this grammar used to demand the marker at column zero while
-    /// `IncludeNotePath` already skipped them. Nothing made the two agree, so a note
-    /// for anything a header pulled in transitively — which is essentially all of
-    /// them — had its path found by the launcher's reader and NOT by the
-    /// canonicalizer, and the region was stored with the producing checkout's
-    /// absolute paths in it. Independent of language, so it reached every MSVC direct
-    /// compile with an include tree deeper than one
-    /// ([#891](https://github.com/LASTRADA-Software/fastcached/issues/891)).
-    ///
-    /// The indentation itself is not part of the match and is preserved verbatim by
-    /// both callers: Ninja ignores it, and rewriting it would be a change to text no
-    /// defect asked for.
-    ///
-    /// @param body   One line, already stripped of its terminators.
-    /// @param marker The prefix a note begins with.
-    /// @return The offset just past `marker`, or npos when `body` is not a note.
-    [[nodiscard]] std::size_t IncludeNoteMarkerEnd(std::string_view body, std::string_view marker) noexcept
-    {
-        // An empty marker would otherwise match at the head of every line, which
-        // turns "this build does not know its own prefix" into "rewrite everything".
-        if (marker.empty())
-            return std::string_view::npos;
-        auto const indent = body.find_first_not_of(" \t");
-        if (indent == std::string_view::npos || !body.substr(indent).starts_with(marker))
-            return std::string_view::npos;
-        return indent + marker.size();
-    }
-
     /// Split a line into (leading text kept verbatim, path span, trailing text kept
     /// verbatim) for the given grammar. Returns false when the line does not match
     /// the grammar's shape (then the whole line is preserved).
@@ -819,7 +763,9 @@ std::string RewriteIncludeNoteMarker(std::string_view text, std::string_view fro
             out.append(line);
             continue;
         }
-        out.append(line.substr(0, markerEnd - from.size())); // whatever preceded the marker
+        // The marker is anchored at column zero, so there is nothing in front of it
+        // to copy: the line IS its marker followed by the rest. The indentation `cl`
+        // uses for inclusion depth sits after the marker and rides along in the tail.
         out.append(to);
         out.append(line.substr(markerEnd)); // the path, its blanks and the terminators
     }
