@@ -32,19 +32,40 @@
 namespace
 {
 
-/// Connect a fresh client socket to localhost:port using blocking
-/// Winsock so the test can drive it from its own thread.
-std::uintptr_t ConnectClient(std::uint16_t port)
+/// Connect a fresh client socket to localhost:port using blocking Winsock, asserting NOTHING -- the
+/// form a helper thread calls.
+///
+/// **A Catch2 assertion belongs to the case's thread (#1211).** Catch2 is not thread-safe for
+/// assertions, so the round trip below, which drives this from its own thread, reports what happened
+/// and asserts it after `join()`. Found on Windows by the off-thread assertion guard, which the Linux
+/// runs that established the rule could not reach: this file is Windows-only.
+/// @param port The loopback port to connect to.
+/// @return The connected socket, or `nullopt` when it could not be made.
+std::optional<std::uintptr_t> TryConnectClient(std::uint16_t port)
 {
     auto sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    REQUIRE(sock != FastCache::InvalidSocketValue);
+    if (sock == FastCache::InvalidSocketValue)
+        return std::nullopt;
     sockaddr_in addr {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-    auto const rc = ::connect(sock, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr));
-    REQUIRE(rc == 0);
+    if (::connect(sock, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) != 0)
+    {
+        ::closesocket(sock);
+        return std::nullopt;
+    }
     return static_cast<std::uintptr_t>(sock);
+}
+
+/// `TryConnectClient` on the case's own thread, asserting that it connected.
+/// @param port The loopback port to connect to.
+/// @return The connected socket.
+std::uintptr_t ConnectClient(std::uint16_t port)
+{
+    auto const sock = TryConnectClient(port);
+    REQUIRE(sock.has_value());
+    return FastCache::Testing::Unwrap(sock);
 }
 
 /// Find a free ephemeral port by binding a probe socket, reading the
@@ -180,19 +201,30 @@ TEST_CASE("IocpReactor + IocpListener + IocpSocket round-trip", "[reactor][iocp]
     // Client lives on a separate thread so the reactor thread (this one)
     // can drive the accept + read + write.
     std::string response;
-    std::jthread client { [port, &response] {
-        auto const sock = ConnectClient(port);
+    bool connected = false;
+    std::jthread client { [port, &response, &connected, &reactor] {
+        auto const sock = TryConnectClient(port);
+        if (!sock.has_value())
+        {
+            // Asserted below, on the case's thread. Stopped here, or the accept this reactor is
+            // parked on never completes and the case hangs instead of failing.
+            reactor.Stop();
+            return;
+        }
+        connected = true;
+        auto const raw = static_cast<SOCKET>(*sock);
         std::string_view const msg = "ping!";
-        (void) ::send(static_cast<SOCKET>(sock), msg.data(), static_cast<int>(msg.size()), 0);
+        (void) ::send(raw, msg.data(), static_cast<int>(msg.size()), 0);
         std::array<char, 64> buf {};
-        auto const got = ::recv(static_cast<SOCKET>(sock), buf.data(), static_cast<int>(buf.size()), 0);
+        auto const got = ::recv(raw, buf.data(), static_cast<int>(buf.size()), 0);
         if (got > 0)
             response.assign(buf.data(), buf.data() + got);
-        ::closesocket(static_cast<SOCKET>(sock));
+        ::closesocket(raw);
     } };
 
     reactor.Run();
     client.join();
+    REQUIRE(connected);
     REQUIRE(response == "ping!");
     // The client connected from the IPv4 loopback, so AcceptEx's peer address
     // resolves to 127.0.0.1 (port omitted by FormatPeerAddress).
