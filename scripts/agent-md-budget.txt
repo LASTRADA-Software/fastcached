@@ -1,0 +1,66 @@
+# The size budget for `AGENT.md`. Read by `scripts/check-agent-md-budget.sh`.
+#
+# key|value
+#
+# `AGENT.md` is loaded in FULL into every session -- `CLAUDE.md` is one line,
+# `@AGENT.md` -- so every line here is a line every session pays for, whether or
+# not it needs the rule. It had grown to 2,411 lines before the pass that created
+# this file, of which its own rulebook index was 1,878; 286 of its 379 tripwire
+# bullets ran to three lines or more and the longest to 36. AGENT.md states the
+# rule that growth broke:
+#
+#   "what belongs here is the sentence that makes the rule fire and the pointer
+#    to where the argument lives. A tripwire that has acquired measurements,
+#    ticket archaeology or a counter-argument has stopped being one."
+#
+# TWO measures, because either alone is gameable.
+#
+# `max-bullet-lines` is the PRIMARY one, and it is primary because **it cannot be
+# satisfied by deleting a rule**. A file-size limit can always be met by dropping
+# a bullet, which is the one thing this budget must never encourage: AGENT.md also
+# says "a rule landed in `.agent/rules/` without a bullet here fires in no session
+# that does not open its file". A per-bullet ceiling can only be met by moving the
+# DERIVATION to the matching `.agent/rules/*.md`, where length is explicitly fine.
+#
+# `total-lines` is the ratchet, and it is an EQUALITY rather than a ceiling. More
+# than this is growth and is refused -- the answer is to compress a bullet, never
+# to raise the number. FEWER is a number that has stopped describing the file,
+# refused as stale, so a compression is recorded in the same change that makes it
+# and the slack it created is not room for the next arrival. That is the
+# `check-test-loops-backlog.txt` ratchet, applied to a different subject.
+#
+# **The numbers live HERE and nowhere else, and AGENT.md may never quote its own
+# size.** The check refuses `total-lines` appearing in AGENT.md other than as an
+# issue reference, because a file stating its own length is a second source of
+# truth that goes stale the first time anybody edits it -- which is this
+# repository's own `table-totals` rule, and the defect
+# `check-test-loops-backlog.txt` records by name against itself: "The count was
+# spelled out here as `148 sites` and went stale the first time a batch landed."
+# Every run PRINTS the measured figures; read those, never a number restated in
+# prose.
+#
+# SCOPE IS `AGENT.md` ALONE. `.agent/rules/*.md` is deliberately NOT budgeted:
+# AGENT.md says reasoning there "can be as long as it needs to be", so a budget on
+# those files would contradict the rule this one enforces and push derivations
+# back into the file this exists to keep small. They are loaded on demand; AGENT.md
+# is not.
+#
+# A bullet's LINES are its own: the `- ` line plus the blank and indented lines
+# under it, stopping at the first line that is neither. A nested `  - ` sub-bullet
+# is measured separately and against the same ceiling, so a bullet carrying five
+# genuine sub-rules is five rules rather than one bloated one -- and a standalone
+# paragraph after a bullet belongs to neither.
+#
+# The ceiling is 8 and the longest bullets sit exactly on it, so it bites on any
+# growth rather than banking slack. When the measured maximum falls the check SAYS
+# SO and does not refuse: lowering the ceiling is a decision somebody makes, and a
+# second equality here would mean every unrelated edit to the longest bullet fails
+# the build.
+#
+# The live bullet-length distribution is NOT written here. The check prints it on
+# every run, which is the one place it cannot drift -- and a draft of this header
+# did restate it, in a form that disagreed with what the check measures, two
+# paragraphs below the sentence forbidding exactly that.
+
+max-bullet-lines|8
+total-lines|1610

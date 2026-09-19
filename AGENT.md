@@ -159,6 +159,12 @@ it can be as long as it needs to be; what belongs here is the sentence that make
 rule fire and the pointer to where the argument lives. A tripwire that has acquired
 measurements, ticket archaeology or a counter-argument has stopped being one.
 
+Both halves are checked. Every `##` section over there says whether this file
+tripwires it and names the phrase, and `ctest -R rulebook-tripwires` verifies the
+phrase is still here; `ctest -R agent-md-budget` holds this file to
+`scripts/agent-md-budget.txt`, which is where its size lives and the only place it
+is written down.
+
 > Link these as plain markdown, never as an `@`-prefixed path. Claude Code resolves
 > `@` imports recursively out of `CLAUDE.md`, so `@`-importing a rule file would
 > pull every one of them back into every session and put the context cost straight

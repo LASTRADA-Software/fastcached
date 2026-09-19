@@ -3867,6 +3867,66 @@ if(NOT WIN32)
         LABELS "hygiene"
         TIMEOUT 120
     )
+
+    # ---------------------------------------------------------------------
+    # `AGENT.md` stays within `scripts/agent-md-budget.txt` (#876's neighbour).
+    #
+    # `AGENT.md` is loaded in FULL into every session -- `CLAUDE.md` is one line,
+    # `@AGENT.md` -- so every line is one every session pays for whether or not
+    # it needs the rule. It reached 2,411 lines while stating the rule that
+    # growth broke: *a tripwire that has acquired measurements, ticket
+    # archaeology or a counter-argument has stopped being one.* Prose did not
+    # hold it and re-reading did not hold it, which is the `RowsInEnumeratorOrder`
+    # argument arriving in markdown for a third time.
+    #
+    # TWO measures, because either alone is gameable. `max-bullet-lines` is the
+    # PRIMARY one and cannot be satisfied by deleting a rule -- a bare file-size
+    # limit scores dropping a bullet as an improvement, which is the one thing
+    # this must never encourage. `total-lines` is an EQUALITY rather than a
+    # ceiling: more is growth, FEWER is a number that has stopped describing the
+    # file, so a compression is recorded in the change that makes it and the
+    # slack is not room for the next arrival. A ceiling banks slack; an equality
+    # tightens. That is `check-test-loops-backlog.txt`'s ratchet on a new subject.
+    #
+    # The figures live in that one file and AGENT.md may never quote its own
+    # size, which the check enforces -- `check-test-loops-backlog.txt` records
+    # that defect by name against itself ("The count was spelled out here as
+    # `148 sites` and went stale the first time a batch landed").
+    #
+    # The budget covers AGENT.md ALONE. `.agent/rules/*.md` is deliberately not
+    # budgeted: AGENT.md says reasoning there can be as long as it needs to be,
+    # so budgeting those files would contradict the rule this enforces and push
+    # derivations back into the file it keeps small.
+    #
+    # `docs-subject` for its neighbours' reason: the subject IS prose, and
+    # `ci-scope.sh` classifies a docs-only change as running no ctest at all, so
+    # without the label the change class that regrows a bullet is green by
+    # absence. Default set, not `smoke` -- it opens no socket.
+    add_test(
+        NAME "agent-md-budget"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-agent-md-budget.sh"
+                "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties("agent-md-budget" PROPERTIES
+        LABELS "hygiene;docs-subject"
+        TIMEOUT 60
+    )
+
+    # Both directions, and the accepting one first: a ratchet nobody has watched
+    # ACCEPT is not known to work, and a suite whose only case is a refusal
+    # passes under a check that refuses everything. Both ends of the ratchet are
+    # watched (a rise AND an unrecorded fall, which are fixed in different places
+    # and so carry different messages), along with the per-bullet ceiling, the
+    # self-size prohibition and its issue-reference counterpart, and each way the
+    # check can fail to LOOK.
+    add_test(
+        NAME "agent-md-budget-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-agent-md-budget.sh" --self-test
+    )
+    set_tests_properties("agent-md-budget-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
 endif()
 
 
