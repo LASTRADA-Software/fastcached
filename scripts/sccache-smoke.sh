@@ -241,15 +241,108 @@ server_pid=$!
 # that was merely not up yet.
 wait_for_port 127.0.0.1 "$port" "$server_pid" "fastcached" "$daemon_log"
 
-sccache --stop-server >/dev/null 2>&1 || true
-# A start-server failure is now a plain failure. The "feature configuration"
-# special case that used to live here has moved ABOVE, to a question asked of
-# `--help` before anything runs -- because this call does not fail for a missing
-# backend, it succeeds and falls back, which is what made the old branch dead.
+# THE STOP IS THE WHOLE MECHANISM, so its outcome is captured rather than discarded.
+#
+# `${backendEnv}` is read by the sccache SERVER at ITS start, never by the client at
+# compile time, so exporting it cannot retarget a server that is already up -- and
+# `--start-server` against a running server SUCCEEDS while doing nothing. A server
+# that refused to stop therefore keeps whatever backend it was started with, and
+# this box runs sccache for its own builds, which is the population where a stray
+# one is likely.
+#
+# What that costs is a MISATTRIBUTION rather than a missed failure: since #1318 the
+# backend is asserted by name, so the run does go red -- three assertions later,
+# saying `sccache did not use the memcached backend`, which sends a reader to the
+# URL, to the daemon and to the feature list. The cause was a stop that did not
+# stop, reported nowhere, because both its output and its status went to /dev/null
+# and `|| true` (#1283).
+#
+# ## The status alone cannot be the gate, and that was MEASURED
+#
+# On sccache 0.14.0 (Windows), `--stop-server` with NO server running exits **2**
+# with `couldn't connect to server`, and with one running exits **0**. So the
+# ordinary clean box -- the state this fixture most wants -- answers non-zero, and
+# `if ! sccache --stop-server; then fail; fi` would refuse it. That is why the
+# original was best-effort, and the fix is not to make it fatal.
+#
+# The status is kept as EVIDENCE, and the verdict comes from the two questions
+# below that can actually be answered.
+stop_status=0
+stop_out="$(sccache --stop-server 2>&1)" || stop_status=$?
+
+# What a surviving server does to `--start-server` IS VERSION-DEPENDENT, and both
+# versions are in play: CI pins **0.7.7** and a developer box here runs **0.14.0**.
+#
+#   * 0.14.0, MEASURED here: it FAILS -- `Server startup failed: Address in use`,
+#     non-zero. This branch is where a surviving server surfaces.
+#   * 0.7.7, REPORTED by #1283 and not re-measured (the binary is not on this box):
+#     it SUCCEEDS while doing nothing, so the surviving server keeps its own
+#     backend and the restart check below is what catches it.
+#
+# Stated apart because they are different claims with different evidence. Both
+# arms carry the stop's outcome, or whichever one fires on the day names sccache
+# and not the cause.
 if ! start_err="$(sccache --start-server 2>&1)"; then
-    echo "$start_err" >&2
+    echo "sccache smoke (${protocol}) FAILED: \`sccache --start-server\` would not start a server" >&2
+    echo "  it said: ${start_err:-(nothing)}" >&2
+    echo "  \`sccache --stop-server\` exited ${stop_status} saying: ${stop_out:-(nothing)}" >&2
+    echo "  An 'Address in use' here means a server SURVIVED that stop, and it keeps the" >&2
+    echo "  backend it was started with: \`${backendEnv}\` is read by the SERVER at its" >&2
+    echo "  start, so exporting it cannot retarget one that is already up (#1283)." >&2
     exit 1
 fi
+
+# DID IT ACTUALLY RESTART? Asked of the server, before anything compiles, and it is
+# the arm that covers the 0.7.7 half above.
+#
+# A server this fixture started read `${backendEnv}` out of this shell's
+# environment; a server that survived the stop did not, and reports whatever it was
+# started with. So `Cache location` IS the restart reading, and it needs no PID and
+# no start time -- neither of which sccache 0.14.0 reports in `--show-stats` or in
+# its JSON, which was checked rather than assumed.
+#
+# It is the same evidence #1318 reads between the compiles, asked one step EARLIER
+# for a different reason, and the file already argues for exactly this move: asking
+# before the thing that would otherwise fail first turns a downstream symptom into
+# a sentence naming the cause. Here the cause is the stop, so the stop's own
+# outcome is printed beside it.
+#
+# Asserted POSITIVELY, by the configured backend's name: the negative -- "does not
+# say Local disk" -- fails OPEN the day sccache gains a third fallback, because a
+# new name is neither `Local disk` nor the backend and an absence test accepts it.
+# That is the bet an exclusion list makes about the shape of the world.
+#
+# ONE predicate, asked at three moments below, because three copies of a grep whose
+# regex is the whole assertion is three chances for them to stop agreeing. A
+# HERESTRING and not a pipe: `producer | grep -q` is a false NEGATIVE under
+# `pipefail`, since `grep -q` exits at the first match and the producer dies of
+# SIGPIPE.
+#
+# Read from a PASSED capture, never a scan of surrounding output: a CI job's log
+# holds several `Cache location` lines from unrelated sccache calls, two of which
+# say `Local disk` even on a leg whose backend is healthy.
+#
+# @param 1 a `--show-stats` capture
+# @return 0 when its `Cache location` names the backend under test. Sets
+#         `backend_location_line` to whatever it found, for the message.
+backend_location_line=""
+names_backend() {
+    backend_location_line="$(grep -E '^[[:space:]]*Cache location' <<< "$1" || true)"
+    grep -qE "^[[:space:]]*Cache location[[:space:]]+${backendLocation}" <<< "$backend_location_line"
+}
+
+names_backend "$(sccache --show-stats)" || {
+    echo "sccache smoke (${protocol}) FAILED: the sccache server we started is not using the ${protocol} backend" >&2
+    echo "  expected 'Cache location' to name '${backendLocation}'." >&2
+    echo "  got: ${backend_location_line:-(no Cache location line at all)}" >&2
+    echo "  \`sccache --stop-server\` exited ${stop_status} saying: ${stop_out:-(nothing)}" >&2
+    echo "  A server that refuses to stop KEEPS the backend it was started with, and" >&2
+    echo "  \`--start-server\` against a running server succeeds while doing nothing." >&2
+    echo "  \`${backendEnv}\` is read by the SERVER at its start, so exporting it cannot" >&2
+    echo "  retarget one that is already up (#1283)." >&2
+    exit 1
+}
+
 sccache --zero-stats >/dev/null
 
 # First compile: cache miss, and it is what populates fastcached.
@@ -265,20 +358,15 @@ rm -f "$obj"
 # fallback that actually happened. Asking first turns that into a sentence naming
 # the cause.
 #
-# Asserted POSITIVELY, by the configured backend's name. The tempting negative --
-# "does not say Local disk" -- fails OPEN the day sccache gains a third fallback,
-# because a new name is neither `Local disk` nor the backend and an absence test
-# accepts it. That is the bet an exclusion list makes about the shape of the world.
-#
-# Read from THIS capture, never a scan of surrounding output: a CI job's log holds
-# several `Cache location` lines from unrelated sccache calls, two of which say
-# `Local disk` even on a leg whose backend is healthy.
+# `names_backend` above is the predicate; what differs here is WHEN and WHY, which
+# is what the message carries. The restart check already asked this of a server
+# that had compiled nothing; this one asks it of a server that has, so a backend
+# that was right at startup and fell back under load is still caught.
 firstStats="$(sccache --show-stats)"
-location="$(grep -E '^[[:space:]]*Cache location' <<< "$firstStats" || true)"
-grep -qE "^[[:space:]]*Cache location[[:space:]]+${backendLocation}" <<< "$location" || {
+names_backend "$firstStats" || {
     echo "sccache smoke (${protocol}) FAILED: sccache did not use the ${protocol} backend" >&2
     echo "  expected 'Cache location' to name '${backendLocation}'." >&2
-    echo "  got: ${location:-(no Cache location line at all)}" >&2
+    echo "  got: ${backend_location_line:-(no Cache location line at all)}" >&2
     echo "  sccache falls back to its own local disk cache SILENTLY, and a hit from" >&2
     echo "  that cache satisfies the hit assertion with no fastcached involved (#1318)." >&2
     exit 1
@@ -329,11 +417,10 @@ grep -qE "Cache hits[[:space:]]+[1-9]" <<< "$stats" \
 #    be named as a fallback instead of expiring the store wait. Re-asserted here
 #    only because the two captures are different invocations and a backend that
 #    changed under us would otherwise go unremarked.
-location="$(grep -E '^[[:space:]]*Cache location' <<< "$stats" || true)"
-grep -qE "^[[:space:]]*Cache location[[:space:]]+${backendLocation}" <<< "$location" \
+names_backend "$stats" \
     || fail_smoke "sccache stopped using the ${protocol} backend mid-run" \
         "expected 'Cache location' to name '${backendLocation}'." \
-        "got: ${location:-(no Cache location line at all)}"
+        "got: ${backend_location_line:-(no Cache location line at all)}"
 
 # 3. WHICH DIALECT the daemon was spoken to. The daemon is the only thing that
 #    knows: `Cache location` reports the backend TYPE, so memcached-text and
