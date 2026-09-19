@@ -2002,9 +2002,26 @@ run_case() {
     # a different fact about a different machine; the two together say our bound
     # ended a response the server had not finished.
     #
-    # Costs `_e2e_http_read_bound`, which is what a HOLDING peer costs by
-    # construction -- there is no cheaper way to exhibit a peer that holds.
+    # THE BOUNDS ARE LOWERED HERE, in the case body. Exhibiting a peer that holds
+    # is free; waiting out the library's five-second default is what costs, and
+    # these 35 socket cases run serially. Measured: 5 s on bash 5, and 9 s on bash
+    # 3.2, where the status cannot decide and the probe burns its own bound too --
+    # against 44.3 s for this whole test, which is a tenth of it for one case.
+    #
+    # Nothing asserted below reads the numbers: the claims are the STATUS, that
+    # the body is a prefix, and that the sentence says CUT SHORT. `wait_for_port`
+    # has already proved the listener bound, and the stand-in holds for 20 s --
+    # ten times the reduced bound. The library's real defaults stay exercised by
+    # `http-silence-inconclusive`, which spends them.
+    #
+    # 2 s rather than 1: under `ctest --parallel 32` a one-second margin for the
+    # headers and the prefix line is thinner than this case needs to be.
+    #
+    # Safe to assign because each case body runs in its own `bash "$0" --case`
+    # child, so the override cannot reach a sibling case.
     http-truncated)
+        _e2e_http_read_bound=2
+        _e2e_http_probe_bound=2
         p="$(free_port)"
         _selftest_listener "$p" 0 "${scratch}/truncated.log" truncate \
             >/dev/null 2>>"${scratch}/truncated.log" &
@@ -2861,29 +2878,54 @@ fi
 # It is deliberately NOT a check that the line is byte-identical to an expected
 # one. That would refuse a reformat, which is a false red on a correct tree, and a
 # check that fails on arrival is a check somebody disables.
+# ONE extractor, used by the check AND by its canary. A canary spelling its own
+# simplification of the pattern is a positive control over a regex the guard does
+# not use: break the guard's second alternation and such a canary still passes, so
+# the guard goes on "reporting clean over a gate it cannot read" -- which is the
+# failure its own message names.
+#
+# @param 1 the file to read
+# @return echoes the offending gate line(s), or nothing
+_probe_gate_violations() {
+    grep -nE '^[[:space:]]*if .*_e2e_probe_needed' "$1" \
+        | grep -E '_e2e_probe_needed.*(&&|\|\|)|(&&|\|\|).*_e2e_probe_needed' || true
+}
+
 ran=$(( ran + 1 ))
 probe_gate="$(grep -nE '^[[:space:]]*if .*_e2e_probe_needed' "$library" || true)"
 if [ -z "$probe_gate" ]; then
     echo "FAIL probe-gate: no line in ${library##*/} arms the probe through _e2e_probe_needed." >&2
     echo "     Either it was renamed, or the gate went back to an inline condition (#1257)." >&2
     note_failure "probe-gate"
-elif grep -qE '_e2e_probe_needed.*(&&|\|\|)|(&&|\|\|).*_e2e_probe_needed' <<< "$probe_gate"; then
+elif [ -n "$(_probe_gate_violations "$library")" ]; then
     echo "FAIL probe-gate: the probe's gate carries a second clause." >&2
     echo "     It read \`[ \"\$status\" -le 128 ] && [ -z \"\$body\" ]\`, and that body clause is" >&2
     echo "     #1257: a PARTIAL body skipped the probe, so on bash 3.2 -- where the status" >&2
     echo "     cannot decide -- a response OUR bound cut short was classified as the PEER" >&2
     echo "     having answered. The status is the whole condition." >&2
-    printf '%s\n' "$probe_gate" | sed 's/^/     | /' >&2
+    _probe_gate_violations "$library" | sed 's/^/     | /' >&2
     note_failure "probe-gate"
 fi
-# A guard nobody has watched REFUSE is not known to work, and this one reads a
-# single line, which is the shape that quietly matches nothing.
+# BOTH directions, through the extractor the check itself uses. The negative half
+# is not optional: a pattern that matched everything would refuse the real gate,
+# and a run where the check happened not to be reached looks the same as a clean
+# one.
+probe_gate_canary_dir="$(mktemp -d)"
+printf 'if _e2e_probe_needed "$status" && [ -z "$body" ]; then\n' > "${probe_gate_canary_dir}/bad.sh"
+printf 'if _e2e_probe_needed "$status"; then\n' > "${probe_gate_canary_dir}/good.sh"
 ran=$(( ran + 1 ))
-if ! grep -qE '_e2e_probe_needed.*&&' <<< 'if _e2e_probe_needed "$status" && [ -z "$body" ]; then'; then
-    echo "FAIL probe-gate-canary: the second-clause pattern does not match a staged violation," >&2
-    echo "     so the check above reports clean over a gate it cannot read." >&2
+if [ -z "$(_probe_gate_violations "${probe_gate_canary_dir}/bad.sh")" ]; then
+    echo "FAIL probe-gate-canary: the check does not catch a staged second clause, so it" >&2
+    echo "     reports clean over a gate it cannot read." >&2
     note_failure "probe-gate-canary"
 fi
+ran=$(( ran + 1 ))
+if [ -n "$(_probe_gate_violations "${probe_gate_canary_dir}/good.sh")" ]; then
+    echo "FAIL probe-gate-canary: the check refuses a gate that carries NO second clause," >&2
+    echo "     so it would refuse the correct tree." >&2
+    note_failure "probe-gate-canary"
+fi
+rm -rf "$probe_gate_canary_dir"
 
 echo "== the drain's verdict, against staged readings"
 read_bound_rows=(

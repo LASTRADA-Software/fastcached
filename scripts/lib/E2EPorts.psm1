@@ -93,26 +93,41 @@ function New-E2EPort {
 # @param port the TCP port to ask about.
 # @return $null, or a record with ProcessId, Name and Path.
 function Get-E2EPortHolder([int]$port) {
+    # THE BIND PROBE RUNS FIRST, and the ordering is the whole cost of this
+    # function. It is the authority and needs no elevation -- so when it SUCCEEDS
+    # the port is free and there is no holder to name, which is the common case
+    # and the only one that runs in a loop.
+    #
+    # Measured on this host, 20 iterations each: `Get-NetTCPConnection -LocalPort
+    # N -State Listen` is 223 ms warm and 727 ms cold (it autoloads NetTCPIP in a
+    # fresh process); the `TcpListener` start/stop is 0.4 ms. **550x.** Asking the
+    # cmdlet first put 223 ms inside every iteration of the reap wait below, whose
+    # `50 x 100 ms` reads as a 5 s bound and really took ~16 s -- so the refusal
+    # arrived about eleven seconds after the moment it claims to describe. A bound
+    # nobody has measured is not a bound.
+    $listener = $null
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
+        $listener.Start()
+        return $null
+    } catch {
+        # Something holds it. NOW it is worth asking who.
+    } finally {
+        if ($null -ne $listener) { $listener.Stop() }
+    }
+
+    # Best-effort from here down: `Get-NetTCPConnection` is absent on some hosts
+    # and `Get-Process` fails for a process owned by another user, and neither of
+    # those means the port is free -- so a failure to NAME the holder still
+    # reports a holder, with what it could learn.
     $owner = $null
     try {
         $owner = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction Stop |
                  Select-Object -First 1 -ExpandProperty OwningProcess
     } catch {
-        # No cmdlet, or nothing listening. Fall through to the bind probe, which
-        # is the authority and needs no elevation.
     }
-    if ($null -eq $owner) {
-        $listener = $null
-        try {
-            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
-            $listener.Start()
-            return $null
-        } catch {
-            return @{ ProcessId = 0; Name = "(unknown)"; Path = "" }
-        } finally {
-            if ($null -ne $listener) { $listener.Stop() }
-        }
-    }
+    if ($null -eq $owner) { return @{ ProcessId = 0; Name = "(unknown)"; Path = "" } }
+
     $name = "(unknown)"
     $path = ""
     try {
@@ -357,6 +372,41 @@ function Wait-E2EPortAnswers([int]$port, $process, [string]$what, [string[]]$log
            "It is still running, so this is a slow machine or a process that never bound.")
 }
 
+# Read a file a LIVE process is still writing to.
+#
+# `Get-Content -Raw` is the obvious spelling and it is the wrong one here. On
+# Windows, opening a file another process holds fails with a sharing violation
+# depending on the FileShare mode that process opened it with -- and every caller
+# below is dumping a `-RedirectStandardOutput` target of a daemon that is STILL
+# RUNNING, which is the timeout arm's whole situation. Inside a swallowing `catch`
+# that prints NOTHING, so the failure message loses the daemon's own reason, which
+# is the reason the wait was converted in the first place.
+#
+# `FileShare.ReadWrite` says explicitly that a concurrent writer is expected. The
+# same argument, and the same implementation, as `Read-LiveText` in
+# `scripts/dist-compile-e2e.ps1`, which met it first.
+#
+# Empty rather than throwing when the file is missing or momentarily unreadable:
+# both are ordinary on a failure path.
+#
+# @param path the file to read.
+# @return its text, or "".
+function Read-E2ELiveText([string]$path) {
+    if (-not $path) { return "" }
+    if (-not (Test-Path $path)) { return "" }
+    try {
+        $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open,
+                                         [System.IO.FileAccess]::Read,
+                                         [System.IO.FileShare]::ReadWrite)
+        try {
+            $reader = New-Object System.IO.StreamReader($stream)
+            try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+        } finally { $stream.Dispose() }
+    } catch {
+        return ""
+    }
+}
+
 # Dump whatever a failed wait can offer. Every read is best-effort: a diagnostic
 # on an already-failed case must be able to EXPLAIN the verdict and never change
 # it.
@@ -367,7 +417,7 @@ function Write-E2ELogs([string[]]$logs) {
         if (-not $log) { continue }
         if (-not (Test-Path $log)) { continue }
         Write-Host "--- ${log} ---"
-        try { Write-Host (Get-Content -Raw $log) } catch { }
+        Write-Host (Read-E2ELiveText $log)
     }
 }
 
@@ -428,10 +478,16 @@ $script:E2EPortConsumers = @(
         Name  = 'sccache-smoke.ps1'
         Path  = 'scripts/sccache-smoke.ps1'
         Stage = @('fastcached.exe')
-        # The ONE row that may legitimately answer 77: it asks for `sccache` and
-        # for the backend to be COMPILED INTO that sccache, both of which are
-        # ordinary absences on a developer machine. See `MaySkip`.
-        MaySkip = $true
+        # The ONE row that may legitimately answer 77, and it says WHICH 77.
+        #
+        # A bare `$true` accepts any of this fixture's four skip exits -- sccache
+        # absent, fastcached absent, compiler absent, backend not compiled in --
+        # and two of those are staged away by the `Stage` list and the `--compiler`
+        # argument above. So if that bookkeeping ever drifts, a `$true` row
+        # degrades to a PERMANENT SILENT SKIP, which is the one outcome the column
+        # exists to prevent, reinstated for the row that has it. The reason is a
+        # pattern matched against what the fixture SAID.
+        MaySkip = 'sccache not found|built without the .* backend'
         Argv  = {
             param($stage, $port)
             # `--compiler` names THIS interpreter, which certainly exists. The
@@ -543,8 +599,55 @@ function Invoke-E2EPortSelfTest {
     # is approximate in both directions -- it cannot see a concatenation split
     # across a line continuation, and it fires on either token appearing in a
     # comment -- while `(a + b) -f args` is exactly one node shape.
-    Expect "no message in this module concatenates in front of -f" 0 `
-        (Measure-E2EFormatPrecedence (Join-Path $PSScriptRoot 'E2EPorts.psm1'))
+    # EVERY tracked PowerShell file, not just this one. The hazard is a property
+    # of the LANGUAGE, and its history is that it was written twice inside one
+    # change by one author -- so scoping the guard to the file where it happened
+    # to be noticed is scoping it to the one place it has already been fixed.
+    $psFiles = @(Get-ChildItem -Path $script:RepoRoot -Recurse -File -Include *.ps1, *.psm1 `
+                     -ErrorAction SilentlyContinue |
+                 Where-Object { $_.FullName -notmatch '[\\/](out|vendor|\.git)[\\/]' })
+    $offenders = @()
+    foreach ($f in $psFiles) {
+        if ((Measure-E2EFormatPrecedence $f.FullName) -gt 0) { $offenders += $f.Name }
+    }
+    # A walk that matched nothing reports every file clean, which reads exactly
+    # like complete coverage.
+    Expect "the PowerShell walk found files to read" $true ($psFiles.Count -ge 5)
+    Expect "no tracked PowerShell file concatenates in front of -f" "" ($offenders -join ', ')
+
+    # AND NO SIXTH PRIVATE PORT DRAW. Nothing in PowerShell makes a fixture reach
+    # for `New-E2EPort`, and the next author will write whatever looks right --
+    # which is how five copies accumulated and how one of them came to draw
+    # 20000..30000 while the others drew 20000..32000. Same shape as the scan
+    # `.agent/rules/testing.md` records for `UniqueScratchPath`: the fix is a
+    # seam, so the guard is a scan.
+    #
+    # A numeric `Get-Random -Minimum <4-5 digits>` IS a port draw here; nothing
+    # else in this tree draws a number in that band. Each exemption carries its
+    # reason, because an exemption spelled like a forgotten row is the thing this
+    # repository refuses.
+    $drawExempt = @{
+        'E2EPorts.psm1' = 'the module itself -- this is the draw every other file is meant to call'
+        'dist-compile-e2e.ps1' = 'Get-FreePortBlock draws CONSECUTIVE ports with a CONNECT probe, which New-E2EPort cannot stand in for'
+    }
+    $drawOffenders = @()
+    foreach ($f in $psFiles) {
+        if ((Read-E2ELiveText $f.FullName) -notmatch 'Get-Random\s+-Minimum\s+\d{4,5}') { continue }
+        if ($drawExempt.ContainsKey($f.Name)) { continue }
+        $drawOffenders += $f.Name
+    }
+    Expect "no tracked PowerShell file draws its own port" "" ($drawOffenders -join ', ')
+    # An exemption that has stopped describing a draw is a licence outliving its
+    # argument, so a row naming a file that no longer draws is refused.
+    $staleExempt = @()
+    foreach ($name in $drawExempt.Keys) {
+        $f = $psFiles | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+        if ($null -eq $f) { $staleExempt += "${name} (no such file)"; continue }
+        if ((Read-E2ELiveText $f.FullName) -notmatch 'Get-Random\s+-Minimum\s+\d{4,5}') {
+            $staleExempt += "${name} (no longer draws a port)"
+        }
+    }
+    Expect "every draw exemption still describes a draw" "" ($staleExempt -join ', ')
     # A guard nobody has watched REFUSE is not known to work, and this one was
     # BACKWARDS on its first writing: it reported the module clean while matching
     # nothing at all, and only this staged line said so.
@@ -704,7 +807,11 @@ function Invoke-E2EPortSiteCases([int]$held) {
             # would report that as a clean refusal. A row that may skip and does is
             # reported as SKIPPED with the fixture's own reason, because absent and
             # skipped are two states and neither is a pass.
-            $maySkip = $row.ContainsKey('MaySkip') -and $row.MaySkip
+            #
+            # The column is the REASON, so a 77 this row did not predict still
+            # fails it. See the row's own comment for why a boolean is not enough.
+            $maySkip = $row.ContainsKey('MaySkip') -and $row.MaySkip -and
+                       (($output -replace '\s+', ' ') -match $row.MaySkip)
             if ($maySkip -and $code -eq 77) {
                 Write-Host "  SKIP $($row.Name): it reported a missing prerequisite (77), so its"
                 Write-Host "       port pre-flight was not reached on this host. It said:"
@@ -733,4 +840,5 @@ function Invoke-E2EPortSiteCases([int]$held) {
 
 Export-ModuleMember -Function New-E2EPort, Get-E2EPortHolder, Resolve-E2EPortHolder, Get-E2EPortRefusal, Measure-E2EFormatPrecedence,
                               Resolve-E2EImagePath, Assert-E2EPortAvailable,
-                              Get-E2EFixturePort, Wait-E2EPortAnswers, Invoke-E2EPortSelfTest
+                              Get-E2EFixturePort, Wait-E2EPortAnswers, Read-E2ELiveText,
+                              Invoke-E2EPortSelfTest
