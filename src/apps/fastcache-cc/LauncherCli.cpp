@@ -324,6 +324,15 @@ namespace
                                 "msvc_deps_prefix build.ninja -- taking the text AFTER the\n"
                                 "'=' and not the whole line, since a prefix carrying the\n"
                                 "assignment matches nothing and fails the same silent way.\n"
+                                "Set it to \"auto\" to have the launcher ASK the compiler\n"
+                                "instead: it preprocesses a one-header translation unit\n"
+                                "with /EP /showIncludes and reads the prefix back off the\n"
+                                "note, falling back to English if the compiler will not\n"
+                                "say. That is opt-in because it spawns a second compiler\n"
+                                "per file -- on cache hits too -- and the answer cannot be\n"
+                                "remembered: a language pack moves the prefix without\n"
+                                "moving anything a cache stamp covers. If you already know\n"
+                                "the string, naming it is cheaper and more certain.\n"
                                 "Only dispatched compiles synthesise notes; a\n"
                                 "local compile emits the compiler's own and needs nothing." },
     };

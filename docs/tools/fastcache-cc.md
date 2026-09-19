@@ -236,7 +236,7 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_TOKEN` | Shared secret presented to a **daemon** started with `--requirepass`. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe against a daemon that requires none: such a daemon accepts it and ignores it. **Not safe with `FASTCACHE_SCHEDULER`** — a compile node serves no `AUTH` verb, so the credential is refused and dispatch stops working entirely ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)). | unset — **no credential sent** |
 | `FASTCACHE_USER` | Username to accompany `FASTCACHE_TOKEN`. Unset (the usual case) authenticates against the secret alone, which is what `--requirepass` configures. Ignored without a token — a username on its own is a misconfiguration, not a request to authenticate, and sending an empty secret would be refused by every server that wants one. | unset |
 | `FASTCACHE_VERIFY` | Verify one hit in every N by compiling the translation unit again and comparing the objects — see [Verifying that a hit is the right object](#verifying-that-a-hit-is-the-right-object). Costs a whole compile per verified hit, so it is for CI, a nightly, or reproducing a report. `1` checks every hit. Which hits are sampled is decided by hashing the key rather than by chance, so the rate holds over a build and a translation unit that verified verifies again. A value that is not a whole number reads as **off** rather than as an error: this is a diagnostic set by hand, and refusing to compile over a typo in it would break the build it was brought in to investigate. | unset (off) |
-| `FASTCACHE_MSVC_DEPS_PREFIX` | The prefix a **dispatched** compile's synthesised `/showIncludes` notes carry — that is, this build's `msvc_deps_prefix`. Only dispatch needs it: a worker compiles preprocessed text and reports no dependencies, so the launcher writes the record itself, while a local compile emits the compiler's own notes and needs nothing here. Ninja matches the prefix **literally** and knows nothing about languages, so an English note against a localized `msvc_deps_prefix` records **no dependencies at all** for that translation unit and the next header edit does not rebuild it — see [A localized MSVC toolchain](#a-localized-msvc-toolchain). | unset — the English `Note: including file:` |
+| `FASTCACHE_MSVC_DEPS_PREFIX` | The prefix a **dispatched** compile's synthesised `/showIncludes` notes carry — that is, this build's `msvc_deps_prefix`. Only dispatch needs it: a worker compiles preprocessed text and reports no dependencies, so the launcher writes the record itself, while a local compile emits the compiler's own notes and needs nothing here. Ninja matches the prefix **literally** and knows nothing about languages, so an English note against a localized `msvc_deps_prefix` records **no dependencies at all** for that translation unit and the next header edit does not rebuild it — see [A localized MSVC toolchain](#a-localized-msvc-toolchain). | unset — the English `Note: including file:`. Set it to `auto` to have the launcher ASK the compiler instead; see [A localized MSVC toolchain](#a-localized-msvc-toolchain) for why that is opt-in |
 
 The statistics log is located from the usual per-user state variables rather than
 one of the launcher's own. These are read but never written:
@@ -329,13 +329,70 @@ mismatched, and localized-matching) and reports the dependency count and whether
 header edit rebuilds. It needs no MSVC and no language pack, because the defect is a
 property of the *string*, not of any compiler's UI language.
 
-**The launcher cannot discover this for itself.** `msvc_deps_prefix` is a value the
-build holds and never exports, so an unset variable means the launcher writes English
-on trust. With `FASTCACHE_VERBOSE` it says so on every dispatched compile that
-synthesises notes, naming the prefix it used and where that came from — which is the
-one line that answers *why did my build stop rebuilding this file*. Learning the
-prefix from the compiler instead is
-[#878](https://github.com/LASTRADA-Software/fastcached/issues/878).
+**Where the prefix comes from, in order.** `msvc_deps_prefix` is a value the build
+holds and never exports, so there are three sources and the launcher takes the first
+that answers:
+
+| `FASTCACHE_MSVC_DEPS_PREFIX` | What the launcher does |
+|---|---|
+| A prefix, e.g. `Hinweis: Einlesen der Datei:` | Uses it. This is the only source that can be right about a build the launcher cannot see: you copied it out of `build.ninja`, so you are stating a fact. |
+| `auto` | **Asks the compiler.** Writes a one-header translation unit somewhere temporary, preprocesses it with `/EP /showIncludes`, and reads the prefix back off the line that ends in the header it just wrote. Falls back to English if the compiler will not say. |
+| unset | The English `Note: including file:`, on trust. |
+
+With `FASTCACHE_VERBOSE` the launcher names the prefix it used and where it came from,
+on every dispatched compile that synthesises notes — the one line that answers *why did
+my build stop rebuilding this file*.
+
+Three settings, but **four** things that line can say, because `auto` has two outcomes
+and they need different remedies:
+
+| It says | What happened | What to do |
+|---|---|---|
+| `named by FASTCACHE_MSVC_DEPS_PREFIX` | You stated the prefix. | Nothing. |
+| `discovered from the compiler` | `auto`, and the compiler answered. | Nothing. |
+| `the compiler was asked and did not say, so the default; name it with FASTCACHE_MSVC_DEPS_PREFIX` | `auto`, and the probe learned nothing — so this build is on English and your notes may not match. | Copy `msvc_deps_prefix` out of `build.ninja` and set it directly. |
+| `the default; override with FASTCACHE_MSVC_DEPS_PREFIX` | Nobody asked for anything; English on trust. | Nothing, unless your toolchain is localized. |
+
+The last two carry the **same prefix** and are told apart only by that line. They are
+separate because the remedy differs: *override with `FASTCACHE_MSVC_DEPS_PREFIX`* is
+advice already taken by whoever wrote `auto`, and telling them to do it again is a
+confident wrong answer to the one question they asked.
+
+**`auto` is opt-in because it costs a compiler spawn per file.** One `fastcache-cc`
+process serves one translation unit, and under CMake + Ninja + MSVC `/showIncludes` is
+on every compile line — so a probe that ran whenever nobody named a prefix would start a
+second compiler for every file in your build, including on **cache hits**, where not
+running a compiler is the entire point. On an English toolchain it would pay that to
+rediscover the default. And the answer cannot be remembered to spread the cost:
+installing a language pack changes what the notes say without changing anything a cache
+stamp covers, so a remembered answer goes stale in the direction that produces a wrong
+result which looks right.
+
+**The chain, stated so nobody optimises it back into a cache later:** the answer cannot
+be memoized, so the only correct *automatic* shape is per translation unit; per
+translation unit is too expensive to impose on every build; **therefore opt-in.** Each
+link depends on the one before it. If you find yourself about to add a cache here, the
+link that has to break first is the first one — and it does not break, because the thing
+that invalidates a discovered prefix is an installer run that touches no cache stamp.
+
+So `auto` is for the build that needs it — and if you already know the string, setting
+it directly is both cheaper and more certain.
+
+The probe runs in your build's **own** environment rather than the anglicized one the
+launcher uses for its other spawns, because the question is what *your* compiles print.
+
+Two things it will not do, both deliberate. It refuses a line with blanks in front of
+the prefix, because a note begins at column zero — `cl` puts the inclusion depth
+*after* the prefix, not before it. And where two lines suggest two different prefixes
+it reports nothing rather than picking one: a `#pragma message` whose text happens to
+end in a path looks exactly like a note to this rule, and a *wrong* prefix is worse
+than none.
+
+**The localized case is untested against a real localized compiler**, and that is
+recorded rather than implied: `VSLANG` selects among the language packs an
+installation *has*, so an English-only Visual Studio cannot be made to produce a
+German note. [#878](https://github.com/LASTRADA-Software/fastcached/issues/878) stays
+open for that half. If you run a localized toolchain, set the variable.
 
 **Sharing a cache across UI languages is safe from generation 3 onward**, and this
 paragraph records what it took, because the hazard was real and an operator running a
@@ -359,7 +416,13 @@ the identity probe is forced to English,
 [#692](https://github.com/LASTRADA-Software/fastcached/issues/692)). Closing it moved
 `CompileValueVersion` to 3
 ([#879](https://github.com/LASTRADA-Software/fastcached/issues/879)), so a value written
-by a generation-2 build is refused rather than replayed. **Expect one cold cache on the
+by a generation-2 build is refused rather than replayed.
+
+The byte has moved twice since: to 4 for
+[#202](https://github.com/LASTRADA-Software/fastcached/issues/202), and to **5** for
+[#1270](https://github.com/LASTRADA-Software/fastcached/issues/1270), which put back the
+half of the note anchor #891 gave away. Each of those is its own cold cache, and the
+paragraph below applies to every one of them unchanged. **Expect one cold cache on the
 upgrade** — one, because a refused generation now falls through to the miss path and the
 STORE that follows overwrites the key with a value of this generation. A bump that
 refused and then declined to re-store would leave the old value under a key that does not
