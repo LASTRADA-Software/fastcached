@@ -94,7 +94,10 @@ Task<void> Connection::Run()
             break;
     }
 
-    _socket->Close();
+    // Not a bare `Close()`: a handler that refused a request it had not finished reading
+    // returns with the rest of it unread, and closing then resets the connection and
+    // destroys the refusal before a Windows client reads it (#1554).
+    (void) co_await CloseLingering(_socket.get(), _held.session.reactor, Linger);
     co_return;
 }
 

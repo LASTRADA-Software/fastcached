@@ -8,12 +8,14 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
+#include <FastCache/Net/LingeringClose.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/PubSubRegistry.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
 #include <FastCache/Protocol/RedisTransaction.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
 #include <FastCache/Protocol/StreamWaiterRegistry.hpp>
+#include <FastCache/Server/Connection.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -59,9 +61,9 @@ FastCache::Task<bool> WriteString(FastCache::ISocket* s, std::string_view payloa
 /// the other ExchangeTx/ExchangeKs helpers in this file). The partial-read
 /// branch is a heuristic — it can theoretically park if a reply is exactly
 /// `chunk.size()` bytes long and the peer is still open. To make the loop
-/// deterministic regardless, `Exchange` below explicitly Closes the server
-/// side after `handler.Run` returns, so DrainResponse always sees EOF (`*r
-/// == 0`) on the next Read.
+/// deterministic regardless, `Exchange` below closes the server side after
+/// `handler.Run` returns, so DrainResponse always sees EOF (`*r == 0`) on the
+/// next Read.
 FastCache::Task<std::string> DrainResponse(FastCache::ISocket* s)
 {
     std::string out;
@@ -89,7 +91,13 @@ std::string Exchange(RespFixture& fix, std::string_view request, FastCache::Sess
     // historical partial-read heuristic above. The non-pubsub handler path
     // does not close its own write side on normal exit; only SUBSCRIBE
     // cleanup does.
-    fix.pair.server->Close();
+    //
+    // Closed the way `Connection` closes it once a handler returns, never with a
+    // bare `Close()`: a handler that refused a request it had not finished reading
+    // returns with the rest unread, and a bare close over unread bytes is a reset
+    // that destroys the reply before the client reads it (#1554). This client has
+    // half-closed, so the linger meets EOF at once.
+    FastCache::SyncRun(FastCache::CloseLingering(fix.pair.server.get(), nullptr, FastCache::Connection::Linger));
     return FastCache::SyncRun(DrainResponse(fix.pair.client.get()));
 }
 

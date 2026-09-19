@@ -5,8 +5,10 @@
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Net/LingeringClose.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
 
+#include <chrono>
 #include <memory>
 #include <type_traits>
 
@@ -94,6 +96,15 @@ class Connection
     /// Run the connection's protocol loop to completion.
     /// @return Task that resolves when the connection closes.
     [[nodiscard]] Task<void> Run();
+
+    /// How long a connection whose handler has returned listens to its client before
+    /// closing, and how much (#1554). A handler that refuses a request it did not finish
+    /// reading returns with the rest of it unread, and a close then is a reset that
+    /// destroys the refusal on a Windows client -- `CloseLingering` says why. A client
+    /// that closed first costs one read.
+    static constexpr LingerBounds Linger { .total = std::chrono::milliseconds { 2000 },
+                                           .maxBytes = std::size_t { 1024 } * 1024,
+                                           .reads = 64 };
 
   private:
     std::unique_ptr<ISocket> _socket;

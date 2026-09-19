@@ -2,9 +2,12 @@
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
+#include <FastCache/Core/Clock.hpp>
+#include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
+#include <FastCache/Net/LingeringClose.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -30,6 +33,24 @@ FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view p
 {
     auto const result = co_await socket->Write(FastCache::AsBytes(payload));
     co_return result.has_value();
+}
+
+/// Close a socket the surface was served on the way a served connection is closed,
+/// never with a bare `Close()`.
+///
+/// Every refusal this surface writes over a head it did not finish reading is followed
+/// by the close, and a bare close over unread bytes is a reset that destroys the
+/// refusal before the client reads it (#1554) -- which is what production's own close
+/// avoids. A fixture closing more bluntly than production would assert on a response
+/// no real client of it receives.
+///
+/// Through the socket the surface was SERVED on, decorator included, as production
+/// closes it: a decorator whose reads fail ends the linger at once, where the pipe
+/// under it would wait for a peer that never closes.
+/// @param servedOn The socket the surface was driven on.
+void CloseAsServed(FastCache::ISocket* servedOn)
+{
+    FastCache::SyncRun(FastCache::CloseLingering(servedOn, nullptr, FastCache::AdminHttpServer::Linger));
 }
 
 FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
@@ -64,7 +85,7 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
 ///
 /// @param serveOn The socket the surface is driven on -- `pair.server.get()`, or a
 ///        decorator wrapping it.
-/// @param pair The pair `serveOn` belongs to; closed and drained here.
+/// @param pair The pair `serveOn` belongs to; its client is drained here.
 /// @param metrics The sink the surface renders from.
 /// @param stats The storage figures the snapshot carries.
 /// @return Everything the server wrote, which is empty when it wrote none.
@@ -79,7 +100,7 @@ std::string ServeAndCollect(FastCache::ISocket* serveOn,
     };
     FastCache::SteadyClock clock;
     FastCache::SyncRun(FastCache::ServeAdminHttp(serveOn, &metrics, provider, &clock));
-    pair.server->Close();
+    CloseAsServed(serveOn);
     return FastCache::SyncRun(ReadAvailable(pair.client.get()));
 }
 
@@ -309,7 +330,7 @@ std::string ExchangeWithRoutes(std::string_view request, std::vector<FastCache::
     };
     FastCache::SteadyClock clock;
     FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider, &clock, routes));
-    pair.server->Close();
+    CloseAsServed(pair.server.get());
     return FastCache::SyncRun(ReadAvailable(pair.client.get()));
 }
 
@@ -556,6 +577,10 @@ TEST_CASE("AdminHttp: a silent peer gets the preconnect budget, and a started he
     // A test that only checked "a request is served" passes on the broken tree too.
     auto pair = FastCache::InMemorySocketPair::Create();
     REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\n\r\n")));
+    // Behind a complete head, so the server answers before it could reach it. It is here
+    // for the close: a served connection listens until its peer closes, and this
+    // in-process pair has no clock to end the listening the way a real deadline does.
+    pair.client->ShutdownWrite();
     DeadlineRecordingSocket recorder { *pair.server };
 
     FastCache::AtomicMetricsSink metrics;
@@ -584,6 +609,11 @@ TEST_CASE("AdminHttp: a head that dribbles past its total budget is refused 408"
     // test.
     auto pair = FastCache::InMemorySocketPair::Create();
     REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\nX: ")));
+    // The half-close sits BEHIND bytes the server never reaches before its budget runs
+    // out, so it cannot inform the refusal. It is here for the close that follows: the
+    // server listens to a refused peer until that peer closes, and a real socket stops
+    // listening at a deadline this in-process pair has no clock for.
+    pair.client->ShutdownWrite();
     FastCache::ManualClock clock;
     // Each read costs time, which is what a dribbling client actually does -- the fake
     // advances the clock rather than the test doing it, because the reads happen inside
@@ -598,7 +628,7 @@ TEST_CASE("AdminHttp: a head that dribbles past its total budget is refused 408"
                                             .uptime = FastCache::Uptime { 1s } };
     };
     FastCache::SyncRun(FastCache::ServeAdminHttp(&dribble, &metrics, provider, &clock));
-    pair.server->Close();
+    CloseAsServed(&dribble);
     auto const response = FastCache::SyncRun(ReadAvailable(pair.client.get()));
     CHECK(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
 }
@@ -657,6 +687,37 @@ TEST_CASE("AdminHttp: a head that overruns the byte cap is refused 431, not serv
     request += "X-Pad: " + std::string(9000, 'p') + "\r\n";
     request += "\r\n";
     auto const response = ExchangeMaybeSilent(request);
+    INFO("response was: " << response.substr(0, 64));
+    REQUIRE(response.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"));
+}
+
+TEST_CASE("AdminHttp: a served connection's refusal over a head it did not finish reading reaches the client",
+          "[metrics][http][admin][linger]")
+{
+    // #1554. The case above asserts the 431 through `CloseAsServed`, a fixture's copy of
+    // how a served connection closes; this one asserts production's own, through
+    // `AdminHttpServer::Run`. The head runs past the cap, so the surface refuses with the
+    // rest unread, and a bare close over unread bytes is a reset that destroys the
+    // refusal before a Windows client reads it. The served connection lingers instead,
+    // until this client closes.
+    FastCache::InMemoryListener listener;
+    FastCache::AtomicMetricsSink metrics;
+    FastCache::NullLogger logger;
+    FastCache::SteadyClock clock;
+    FastCache::AdminHttpServer server { listener, metrics, [] { return FastCache::MetricsSnapshot {}; }, logger, clock };
+
+    auto client = listener.ConnectClient();
+    std::string request = "GET /healthz HTTP/1.1\r\nHost: x\r\n";
+    request += "X-Pad: " + std::string(9000, 'p') + "\r\n";
+    request += "\r\n";
+    REQUIRE(FastCache::SyncRun(WriteString(client.get(), request)));
+    client->ShutdownWrite();
+    // Queued connections are accepted before the closed listener ends the loop.
+    listener.Close();
+    FastCache::SyncRun(server.Run());
+    server.Shutdown();
+
+    auto const response = FastCache::SyncRun(ReadAvailable(client.get()));
     INFO("response was: " << response.substr(0, 64));
     REQUIRE(response.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"));
 }
