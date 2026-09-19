@@ -482,7 +482,7 @@ struct CounterSoleWriter
 /// row ABSENT rather than as a plausible zero.
 ///
 /// **One row per (counter, surface) PAIR, and a counter may have several.** A set-valued field
-/// would be a fixed-size array carrying exactly one element for 164 of 165 counters, to serve
+/// would be a fixed-size array carrying exactly one element for 165 of 166 counters, to serve
 /// the single row -- `LiveSubscriptionsRevoked` -- written from two components. Two rows say
 /// the same thing with no arithmetic, and `CounterHasAWriterIn` folds them.
 ///
@@ -505,20 +505,20 @@ struct CounterSoleWriter
 /// a row silently absent from the attribution and indistinguishable from one nobody had
 /// considered, cannot recur by omission ([#1501](https://github.com/LASTRADA-Software/fastcached/issues/1501)).
 ///
-/// **How the 160 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 42
-/// of them and would have rendered the other 118 absent -- the same defect as the bug, three
+/// **How the 166 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 45
+/// of them and would have rendered the other 121 absent -- the same defect as the bug, three
 /// times larger. The rows are written by four mechanisms, and reading only `SurfaceRefusal`
-/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 109 of the 120 and
+/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 110 of the 121 and
 /// leaves eleven looking unwritten:
 ///
 /// | mechanism | rows |
 /// |---|---|
-/// | a `SurfaceRefusal` row, spent by `Refuse(row)` | 110 |
+/// | a `SurfaceRefusal` row, spent by `Refuse(row)` | 111 |
 /// | a `LeaseToken.hpp` outcome row's `workerCounter` | 10 |
 /// | returned by a classifier for its caller to spend | 4 |
-/// | `Increment(Counter::X)` directly | 42 |
+/// | `Increment(Counter::X)` directly | 45 |
 ///
-/// The column sums past 160 because four rows are written two ways -- and the 110 above is not
+/// The column sums past 166 because four rows are written two ways -- and the 110 above is not
 /// the 111 here: 111 rows HAVE a refusal row, and 110 of those have no increment site, which is
 /// what a `SurfaceRefusal`-only reading would reach. Two figures one apart, measuring different
 /// things, is exactly how a census comes to be quoted wrong, so both are asserted.
@@ -854,7 +854,7 @@ inline constexpr std::array CounterSoleWriterTable {
 /// says it does. A measurement of that moment, so it does not move with the catalogue.
 ///
 /// A `consteval` fold rather than a size comparison, because `CounterSoleWriterTable.size()`
-/// counts (counter, surface) PAIRS: it is 166 for 165 counters today, and a row duplicated
+/// counts (counter, surface) PAIRS: it is 167 for 166 counters today, and a row duplicated
 /// while another went missing would leave any arithmetic on the size perfectly consistent.
 ///
 /// @return True when no enumerator is missing from the table.
