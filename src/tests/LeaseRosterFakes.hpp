@@ -50,7 +50,7 @@ class FixedLeaseRoster final: public Distributed::ILeaseRoster
     {
     }
 
-    /// Revoke @p machine: its key leaves the voters and joins the revoked, as `RevokeKey` does.
+    /// Revoke @p machine: it leaves the voters and its key joins the revoked, as `Forget` does (#1555).
     /// @param machine The machine.
     void Revoke(std::string const& machine)
     {

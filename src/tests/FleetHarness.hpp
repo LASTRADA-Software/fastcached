@@ -371,10 +371,10 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         NodeAt(scheduler).cluster.state = std::move(state);
     }
 
-    /// A state whose voters are @p voters, each keyed with its test key, with @p revoked's
-    /// keys revoked -- and its roster version, as `Apply` would have derived it.
+    /// A state whose voters are @p voters, each keyed with its test key, with @p revoked
+    /// forgotten -- and its roster version, as `Apply` would have derived it.
     /// @param voters The voters, by member id.
-    /// @param revoked Machines whose test keys the cluster revoked.
+    /// @param revoked Machines the cluster forgot, which revoked their test keys.
     /// @param version The roster version the state carries.
     /// @return The state.
     [[nodiscard]] static Cluster::ClusterState StateOf(std::vector<std::string> const& voters,
@@ -390,13 +390,11 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                          .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
                                          .seat = Cluster::MemberSeat::Voter,
                                          .publicKey = TestKeyPair(id).PublicKey() });
-        // As `Apply` revokes: the key leaves the member's record and joins the revoked list, so
-        // the member stays a voter nobody can verify.
+        // As `Apply` forgets (#1555): the member leaves `members` and its key joins the revoked
+        // list in the same entry, so it is no longer a voter at all.
         for (auto const& id: revoked)
         {
-            for (auto& member: state.members)
-                if (member.id == id)
-                    member.publicKey.reset();
+            std::erase_if(state.members, [&id](Cluster::ClusterMember const& member) { return member.id == id; });
             state.revokedKeys.push_back(Cluster::RevokedKey { .id = id, .publicKey = TestKeyPair(id).PublicKey() });
         }
         state.rosterVersion = version;
