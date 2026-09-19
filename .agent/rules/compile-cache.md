@@ -2364,10 +2364,33 @@ into the type.
 
 ## Open work
 
-- **[#878](https://github.com/LASTRADA-Software/fastcached/issues/878)** — the
-  localized `/showIncludes` prefix is NAMED by an operator
-  (`FASTCACHE_MSVC_DEPS_PREFIX`) and not discovered from the compiler, so a build that
-  sets nothing gets the English marker on trust. Split from #700 on exercisability
+- **[#878](https://github.com/LASTRADA-Software/fastcached/issues/878)** — **the
+  mechanism now exists and its localized leg is still unexercised, which is what keeps
+  this entry open.** `Cc::ResolveIncludeNoteMarker` walks `MarkerSourceTable` —
+  operator, then a probe that ASKS the compiler, then the English default — and
+  `Cc::ProbeIncludeNoteMarker` writes a one-header translation unit, preprocesses it
+  with `/EP /showIncludes` **in the build's own environment**, and reads the prefix off
+  the line ending in the header it just wrote. Three things about it are worth carrying
+  here rather than leaving in the header:
+  - **The probe must NOT be anglicized.** `RunCaptureSplitInEnglish` forces `VSLANG=1033`
+    on every spawn whose output only this launcher reads, and that is right for all of
+    them and exactly wrong for this one: the question is what the BUILD's own compiles
+    emit, and those run in the ordinary environment. A probe that anglicized itself
+    would answer English on every machine and report it with confidence — a confident
+    wrong signal, and the one this ticket exists to remove.
+  - **The answer is not cached anywhere.** Installing a language pack moves the prefix
+    without moving anything a cache stamp covers, so a remembered answer goes stale in
+    the direction that produces a wrong result that looks right —
+    `DiscoverTargetTriple`'s argument, one field over. The cost is kept down by asking
+    RARELY instead: `WantsMarkerProbe` requires a parsed compile, `/showIncludes` in
+    play, an MSVC-family driver, and nothing named by the operator.
+  - **A wrong prefix is worse than no prefix**, so the parser refuses rather than
+    guesses: a candidate line with blanks in front of the prefix is refused (the #1270
+    anchor, on the writing side), a bare path line teaches nothing, and two candidate
+    lines suggesting two different prefixes teach nothing at all — the `#pragma message`
+    hazard below is exactly what that last clause is for.
+
+  **What is left is the leg no machine here can run.** Split from #700 on exercisability
   rather than cost: discovery's input is the compiler's output language, so an English
   `cl` discovers English and proves nothing, and a stub asserts its own premise. Two
   driver behaviours a stub cannot settle — `cl` indents nested notes, and a localized
@@ -2381,7 +2404,11 @@ into the type.
   and cannot conjure one**, so it cannot be run backwards to synthesise the case: a
   localized `cl` is an INSTALLER choice, not an environment variable. Whoever picks this
   up needs a host with a non-English pack installed, and no arrangement of this one will
-  substitute.
+  substitute. **RE-DERIVED 2026-09-19 on the same host, independently and before the
+  mechanism above was built** — same two resource directories, same four `VSLANG`
+  values, same byte-identical English. That is recorded because the date is the claim: a
+  premise about an INSTALLATION is one an installer can change under you, and this one
+  is the premise the whole entry rests on.
   Both hazards were then measured anyway, because neither is localization-dependent and
   a stub was never needed for either.
   **The indent is AFTER the marker, not before it.** Measured on both toolsets at depths

@@ -59,6 +59,7 @@
 #include "HitVerification.hpp"
 #include "IProcessRunner.hpp"
 #include "LauncherCli.hpp"
+#include "MarkerDiscovery.hpp"
 #include "ParallelFor.hpp"
 #include "PathResolve.hpp"
 #include "ReactorExchange.hpp"
@@ -160,23 +161,26 @@ struct Config
     bool stats { true };  ///< Record each invocation to the per-user log.
     bool direct { true }; ///< Try the manifest shortcut before preprocessing.
 
-    /// Whether the operator NAMED `showIncludesMarker`, rather than getting the default.
+    /// Where `showIncludesMarker` came from.
     ///
-    /// Provenance, recorded by the read -- never recovered by comparing the value to
-    /// the default, which cannot see the operator who typed the default. That is the
+    /// Provenance, recorded by the resolution -- never recovered by comparing the value
+    /// to the default, which cannot see the operator who typed the default. That is the
     /// config rule from `AGENT.md`, and the cost of breaking it here is specific: an
     /// English toolchain being explicit, or a value correctly copied out of an English
     /// `build.ninja`, would be told "the default; set FASTCACHE_MSVC_DEPS_PREFIX" --
     /// advice they have already followed, on the one line this whole setting exists to
     /// emit.
     ///
-    /// "Named" means named a USABLE value: a set-but-empty variable collapses to the
-    /// default here as it does everywhere else in this file, because an empty prefix is
-    /// not one Ninja could match a note against.
+    /// Three-valued rather than a bool since
+    /// [#878](https://github.com/LASTRADA-Software/fastcached/issues/878) gave the
+    /// launcher a way to ASK: "the operator said so", "the compiler said so" and
+    /// "nobody said, so English" are three different things to tell an operator
+    /// investigating a build that stopped rebuilding, and a bool can carry two.
     ///
-    /// In this run of bools deliberately -- one placed between two 8-aligned members
-    /// costs seven bytes of padding and fails the analyser's budget.
-    bool showIncludesMarkerNamed { false };
+    /// `Operator` means a USABLE value was named: a set-but-empty variable collapses to
+    /// the default here as it does everywhere else in this file, because an empty prefix
+    /// is not one Ninja could match a note against.
+    Cc::MarkerSource showIncludesMarkerSource { Cc::MarkerSource::Default };
 
     /// Verify one hit in every this many, or `VerificationOff` to verify none.
     ///
@@ -228,9 +232,17 @@ struct Config
     /// values ever meet: that keeps one definition of the literal in the tree while
     /// letting the renderer take the marker as a required, undefaulted parameter.
     ///
-    /// The launcher CANNOT derive this. It is a value the build holds and never tells
-    /// anybody, so an operator names it or the launcher guesses English. Discovering
-    /// it from the compiler is #878, and is unexercisable in this repository's CI.
+    /// ONE value with one place that decides it: `Cc::ResolveIncludeNoteMarker` walks
+    /// `MarkerSourceTable` and the first row that answers lands here, with
+    /// `showIncludesMarkerSource` recording which. The rows are, in order, the operator's
+    /// `FASTCACHE_MSVC_DEPS_PREFIX`, a probe that ASKS the compiler
+    /// ([#878](https://github.com/LASTRADA-Software/fastcached/issues/878)), and this
+    /// English default.
+    ///
+    /// The default is spelled HERE, which is the only place the launcher's own reading
+    /// marker and the build's `msvc_deps_prefix` ever meet: that keeps one definition of
+    /// the literal in the tree while letting the renderer take its marker as a required,
+    /// undefaulted parameter.
     std::string showIncludesMarker { Cc::IncludeNoteMarker };
 };
 
@@ -297,7 +309,12 @@ struct Config
     return *resolver;
 }
 
-[[nodiscard]] Config LoadConfig()
+/// Read the environment into a `Config`.
+///
+/// @param probe The `/showIncludes` marker probe, or nullptr when this invocation must
+///        not spawn one -- which is most of them. See `MarkerProbeFor` for who decides.
+/// @return The configuration this invocation runs under.
+[[nodiscard]] Config LoadConfig(Cc::IMarkerDiscovery* probe)
 {
     Config c;
     // Three-valued on purpose, unlike every other setting here. UNSET means "use
@@ -340,21 +357,24 @@ struct Config
     c.schedulerAddr = EnvOr(Cc::EnvName::Scheduler, "");
     c.credential.username = EnvOr(Cc::EnvName::User, "");
     c.credential.secret = EnvOr(Cc::EnvName::Token, "");
-    // Read ONCE, and the provenance recorded rather than inferred later by comparing
-    // the value to the default -- which cannot see the operator who typed the default,
-    // and would tell an English build that explicitly named the English prefix to go
-    // and set the variable it had just set.
+    // Resolved ONCE, through the one table, with the provenance recorded by the
+    // resolution rather than inferred later by comparing the value to the default --
+    // which cannot see the operator who typed the default, and would tell an English
+    // build that explicitly named the English prefix to go and set the variable it had
+    // just set.
     //
     // Set-but-empty collapses to the default, as everywhere else here, and that is
     // right rather than merely consistent: an empty `msvc_deps_prefix` is not a prefix
     // Ninja could match a note against -- it would match every line -- so there is no
-    // reading of the empty value that is better than the default. Assigning only when
-    // it is named also leaves the member's own initializer to supply the default,
-    // instead of building a second copy of it to move over the first.
-    auto named = EnvOr(Cc::EnvName::MsvcDepsPrefix, "");
-    c.showIncludesMarkerNamed = !named.empty();
-    if (c.showIncludesMarkerNamed)
-        c.showIncludesMarker = std::move(named);
+    // reading of the empty value that is better than the default. The table's
+    // `Operator` row asks exactly that question.
+    //
+    // `probe` is null unless this invocation has a reason to spawn one; see
+    // `MarkerProbeFor`. That is where the cost is kept down, because the answer itself
+    // must NOT be remembered across invocations (#878).
+    auto resolved = Cc::ResolveIncludeNoteMarker(EnvOr(Cc::EnvName::MsvcDepsPrefix, ""), probe);
+    c.showIncludesMarker = std::move(resolved.marker);
+    c.showIncludesMarkerSource = resolved.source;
     // Clamped, not merely cast: the reader is 64-bit and `std::size_t` need not
     // be, and a truncating cast turns a ceiling somebody raised into a tiny one
     // that silently stops caching almost everything.
@@ -896,6 +916,62 @@ void NoteIfRootsDoNotDescribeCompile(InvocationRecord const& record,
 {
     static std::unique_ptr<Cc::IProcessRunner> const runner = Cc::MakeProcessRunner();
     return *runner;
+}
+
+/// The real compiler probe, behind the seam `LoadConfig` takes.
+///
+/// A thin adapter rather than logic: everything it knows is `ProbeIncludeNoteMarker`'s,
+/// and it exists so `ResolveIncludeNoteMarker` can be driven in a test with no compiler
+/// on the machine.
+class CompilerMarkerProbe: public Cc::IMarkerDiscovery
+{
+  public:
+    explicit CompilerMarkerProbe(std::string compiler):
+        _compiler { std::move(compiler) }
+    {
+    }
+
+    [[nodiscard]] std::optional<std::string> Discover() override
+    {
+        return Cc::ProbeIncludeNoteMarker(ProcessRunner(), _compiler);
+    }
+
+  private:
+    std::string _compiler;
+};
+
+/// Whether this invocation has any reason to ask the compiler for its note prefix.
+///
+/// **The whole cost control lives here**, because the ANSWER must not be remembered:
+/// the prefix decides how a stored value's notes are normalized and how a replayed
+/// one is re-spelled, and installing a language pack moves it without moving anything
+/// a cache stamp covers -- the shape `AGENT.md` names as not cacheable however
+/// expensive the probe. So instead of a cache, three clauses that make the question
+/// rare:
+///
+/// - the compile has to have PARSED, or there is no compiler to ask and no notes to
+///   write;
+/// - it has to deal in `/showIncludes`, which is the only thing the prefix is for --
+///   a GNU driver reports through a depfile and never reads this;
+/// - and the operator must have named nothing, since their value outranks a probe and
+///   spawning to produce something we would discard is pure cost.
+///
+/// The last clause is duplicated by `MarkerSourceTable`'s own `Operator` row and that
+/// is deliberate: the table decides what WINS, this decides whether to pay, and folding
+/// them would make a null probe mean two different things.
+///
+/// @param cmd The parsed command line.
+/// @return True when a probe is worth spawning.
+[[nodiscard]] bool WantsMarkerProbe(Cc::ParsedCommand const& cmd) noexcept
+{
+    if (!cmd.parsedOk || !cmd.wantShowIncludes)
+        return false;
+    if (!EnvOr(Cc::EnvName::MsvcDepsPrefix, "").empty())
+        return false;
+    // MSVC-family only. `/showIncludes` is an MSVC spelling, and the probe's own
+    // command line (`/nologo /EP /showIncludes`) is one a GNU driver would read as
+    // three paths.
+    return cmd.flavor == Cc::Flavor::Cl || cmd.flavor == Cc::Flavor::ClangCl;
 }
 
 /// The machine's filesystem, registry and environment, as the toolchain probe
@@ -2334,11 +2410,14 @@ void RecordManifest(InvocationRecord const& record,
                  "/showIncludes: no dependencies to write, so this translation unit gets no notes at all "
                  "and the build records none for it");
         else
+            // The source is the table's own label rather than a ternary, so a fourth
+            // row is a row and the three answers stay distinguishable: "you named
+            // this", "the compiler said so" and "nobody said, so English" send an
+            // operator to three different places.
             Note(record.verbose,
-                 std::format("/showIncludes: writing notes with prefix \"{}\" ({} {})",
+                 std::format("/showIncludes: writing notes with prefix \"{}\" ({})",
                              cfg.showIncludesMarker,
-                             cfg.showIncludesMarkerNamed ? "named by" : "the default; override with",
-                             Cc::EnvName::MsvcDepsPrefix));
+                             Cc::MarkerSourceLabel(cfg.showIncludesMarkerSource)));
         // Prepended, not appended: `cl` emits its notes before its diagnostics, and
         // the stored value's region ordering is what a later hit replays verbatim.
         //
@@ -3154,7 +3233,19 @@ int main(int argc, char** argv)
             break;
     }
 
-    Config const cfg = LoadConfig();
+    // Parsed BEFORE the configuration, which is the reverse of how this read until
+    // #878, because one setting now depends on the command line: the `/showIncludes`
+    // marker is resolved by asking the compiler when nobody named one, and `cmd` is
+    // what says whether there is a compiler worth asking. Nothing between here and
+    // `LoadConfig` may report anything -- `record.verbose` is not settled yet -- which
+    // is why the `!parsedOk` block moved down with it rather than staying put.
+    auto const cmd = Cc::ParseCommand(std::span<std::string const> { args });
+
+    // The probe object is a string; what costs anything is CALLING it, so the decision
+    // is which pointer `LoadConfig` gets rather than whether to construct one.
+    // `WantsMarkerProbe` owns that; `ResolveIncludeNoteMarker` owns what wins.
+    CompilerMarkerProbe markerProbe { cmd.compiler };
+    Config const cfg = LoadConfig(WantsMarkerProbe(cmd) ? &markerProbe : nullptr);
     record.verbose = cfg.verbose;
     // Seeded before anything can dispatch, so the axis always says something true.
     // `NotConfigured` is an ABSENCE, not a failure: a launcher with no scheduler
@@ -3165,7 +3256,6 @@ int main(int argc, char** argv)
     // never reached it", which is a different fact again.
     record.dispatch = DispatchConfigured(cfg) ? Cc::DispatchOutcome::NotAttempted : Cc::DispatchOutcome::NotConfigured;
 
-    auto const cmd = Cc::ParseCommand(std::span<std::string const> { args });
     if (!cmd.parsedOk)
     {
         // Not a cacheable compile (a link or preprocess-only step). Recording it
