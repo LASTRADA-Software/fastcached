@@ -2731,6 +2731,50 @@ Two rules fall out of the same fixture:
   build `gate-clang-debug` before gating anything that ADDS a file: it is the only leg that
   tidies, and otherwise you learn it twice from a 25-minute gate.
 
+## Widening a gate makes the latent defects BEHIND it live, and they are in nobody's diff
+
+`http_get` returned **0 for a response its own read bound cut short**, documenting only
+*returns 1 if the connection was refused* — so every caller reported a truncation as the
+endpoint having ANSWERED, and one of them concluded *the refusing worker exports no
+`..._refused_not_a_member_total` series* from a scrape whose completeness nothing had
+established (#1257, #1184). Measured against a real listener, both arms: a server that
+answers and closes and one that holds the socket open mid-body were both status **0**, and
+only the second's body was missing its terminator. Three named statuses now, because the
+exit status is the ONLY channel that survives `$( )` — `_http_drain_ended` is set correctly
+in that subshell and measured UNSET at the caller.
+
+Underneath it, `_http_drain_fd3` took the sticky-EOF probe only when the body was EMPTY, so
+a partial body on bash 3.2 — where a timeout and EOF both carry 1 — reached the classifier
+as `(1, "-")` and was called `peer`. **The body is not a reading about who ended the read.**
+
+What generalises is what happened next. Widening that gate to every ambiguous status made
+an arm that had been reachable from ONE caller reachable from all of them, and the arm's
+teardown was `kill -KILL "$sleeper"` and `wait "$sleeper"` with no `|| true`. **`wait` on a
+job the previous line killed returns 137**, which under `set -e` ends the shell with a
+status nothing explains and no output at all. It had been latent purely because of WHERE it
+was reachable from: the one caller that met the old gate is invoked as `... && rc=0 || rc=$?`,
+which suspends `set -e` through the whole function. On bash 3.2, where no status is decisive,
+**every** probe would have taken it.
+
+So: when a change makes a path reachable from more callers, the defects on that path become
+live, and **none of them is in the diff** — the diff shows a condition being relaxed, not the
+twenty lines below it that nobody had run. It is the reachability twin of *adding an OUTCOME
+changes what an old condition does to every case that tolerated the wrong answer*, and it was
+found the same way: by a neighbouring case going red for a reason that looked unrelated
+(`http-headers exit=137`, printing nothing).
+
+Its regression case asserts the script REACHES ITS OWN LAST LINE, and calls `http_get` in an
+**untested position** deliberately — `&& rc=0 || rc=$?` or `$( )` suspends `set -e` and the
+case would pass under the defect. Shown red: with the bare `kill`/`wait` restored it exits
+137 while `http-complete`, whose caller IS in a tested position, stays green.
+
+**What is NOT established**: the inverted bash 3.2 classification was not reproduced. No
+bash 3.2 was available — Docker Desktop's daemon was not running and WSL carries no podman —
+so `podman run docker.io/library/bash:3.2` was not run. What covers the decision everywhere
+is `_e2e_probe_needed` as a pure predicate with both answers staged, plus a shape scan
+refusing a second clause at the call site. Neither is the live 3.2 case and neither is
+claimed to be.
+
 ## A background helper runs the fixture's cleanup until you have watched it not
 
 <!-- agent-tripwire: A background helper in these scripts runs the fixture's CLEANUP until you have watched it not -->

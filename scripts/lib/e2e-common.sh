@@ -1952,6 +1952,34 @@ _e2e_http_read_bound=5
 # count down relative intervals, so a `CLOCK_REALTIME` step moves neither.
 _e2e_http_probe_bound=4
 
+# Must the sticky-EOF probe be taken, or has the STATUS already decided?
+#
+# Split out for the same reason `_e2e_read_ended_at_bound` below is: it was an
+# inline condition inside `_http_drain_fd3` and it carried a second clause that
+# was wrong.
+#
+# It read `[ "$status" -le 128 ] && [ -z "$body" ]` -- the probe only when the body
+# was EMPTY. On bash 4+ that is invisible, because a timeout carries 142 and the
+# status decides. On bash 3.2, which macOS ships as `/bin/bash`, a timeout and EOF
+# BOTH carry 1, so a PARTIAL body reached `_e2e_read_ended_at_bound` as `(1, "-")`
+# and was classified `peer` -- *the server answered* -- for a response our own
+# bound had cut short (#1257).
+#
+# The body is NOT a reading about who ended the read. A closed peer answers the
+# probe in microseconds because EOF is sticky, so taking it whenever the status
+# cannot decide costs the healthy path nothing and only a HOLDING peer pays the
+# bound.
+#
+# No version test, for the reason the drain gives in full: the arm is selected by
+# what was OBSERVED, so 3.2 reaches it by construction rather than by this file
+# asserting a version number about the interpreter running it.
+#
+# @param 1 the exit status of the read that ended the loop
+# @return 0 the probe IS needed, 1 the status decided on its own
+_e2e_probe_needed() {
+    [ "$1" -le 128 ]
+}
+
 # Did the bound end that read, or did the peer?
 #
 # The verdict, split out as a pure function over a READING, for the reason
@@ -2124,8 +2152,13 @@ _http_drain_fd3() {
     # runs `/bin/bash`, and macOS is where #1048 and #1058 each ejected a pull request
     # within an hour. EOF is STICKY -- a closed peer leaves the fd ready forever -- so a
     # second read returns at once where a holding peer consumes its whole bound.
+    # THE GATE IS THE STATUS AND NOTHING ELSE. It used to be
+    # `[ "$status" -le 128 ] && [ -z "$body" ]`, and that second clause is #1257:
+    # a PARTIAL body on bash 3.2 skipped the probe and was then classified as the
+    # PEER having answered. `_e2e_probe_needed` is the whole condition; do not add
+    # a clause beside it here.
     local probeBlocked="-" marker="" sleeper=""
-    if [ "$status" -le 128 ] && [ -z "$body" ]; then
+    if _e2e_probe_needed "$status"; then
         # The marker is made by `sleep`, which counts down a RELATIVE interval and is
         # therefore immune to the wall clock stepping. Reading `SECONDS` here instead
         # would put the drain's verdict back on the clock that caused #1048. Both
@@ -2198,8 +2231,22 @@ _http_drain_fd3() {
         # An ABANDONED one needs no ledger and is not a new site for #845: it is a
         # `sleep 1`, so it is gone within a second whatever happens to this shell,
         # which a daemon-shaped background job would not be.
-        kill -KILL "$sleeper" 2>/dev/null
-        wait "$sleeper" 2>/dev/null
+        # `|| true` ON BOTH, and it is not defensiveness. `wait` on a job this
+        # line has just KILLED returns **137**, and `kill` on one that has already
+        # exited returns 1 -- so under `set -e`, in a caller that is not in a
+        # tested position, either ENDS THE SHELL with a status nothing explains.
+        #
+        # It was latent only because of where the arm used to be reachable from:
+        # the gate took the probe solely for an EMPTY body, and the one caller
+        # that met that (`http_response_to_silence`) is invoked as
+        # `... && rc=0 || rc=$?`, which suspends `set -e` through the whole
+        # function. #1257 widens the gate to every ambiguous status, so an
+        # ordinary `http_get "$h" "$p" /x >/dev/null` reaches it -- and on bash
+        # 3.2, where no status is decisive, EVERY probe does. Measured: with the
+        # gate widened and these two bare, `http-headers` died `exit=137` twice
+        # out of two, having printed nothing at all.
+        kill -KILL "$sleeper" 2>/dev/null || true
+        wait "$sleeper" 2>/dev/null || true
         rm -f "$marker"
     fi
     if _e2e_read_ended_at_bound "$status" "$probeBlocked"; then
@@ -2275,16 +2322,41 @@ http_response_to_silence() {
 # request. The read half, its bound and the last-chunk recovery are
 # `_http_drain_fd3`'s.
 #
+# **Three outcomes, three statuses, and the statuses are NAMED**, exactly as
+# `E2eSilence*` above are and for the same argument: a bare literal FAILS OPEN,
+# while a name that is mistyped is an unbound variable under the `set -u` every
+# caller here runs with, so the same mistake stops the run and says where.
+#
+# It used to return **0 for a response its own read bound cut short**, and
+# documented only *returns 1 if the connection was refused* -- so a caller had no
+# channel at all for the third outcome, and every one of them reported a truncation
+# as the endpoint having ANSWERED (#1257). Measured against a real listener, both
+# arms: a server that answers and closes and a server that holds the socket open
+# mid-body were both status **0**, and only the second one's body was missing its
+# terminator.
+#
+# The exit status is the ONLY channel that survives, and that is why this is the
+# repair rather than an output variable. `_http_drain_fd3` echoes the body, so every
+# caller runs this inside `$( )`; `_http_drain_ended` is set correctly in that
+# subshell and dies with it. Measured: a caller reads `_http_drain_ended` as UNSET.
+E2eHttpAnswered=0
+E2eHttpRefused=1
+E2eHttpTruncated=2
+
 # @param 1 host
 # @param 2 port
 # @param 3 path
 # @param 4.. extra request header lines, without CRLF, e.g. "Authorization: x"
-# @return echoes the response; returns 1 if the connection was refused
+# @return echoes whatever arrived, headers included.
+#         `$E2eHttpAnswered` the peer ended the response, so the body is complete;
+#         `$E2eHttpRefused` the connection was refused, so nothing was ever asked;
+#         `$E2eHttpTruncated` OUR read bound ended it, so the body is a PREFIX of
+#         the response and any conclusion drawn from what is missing is unfounded.
 http_get() {
     local host="$1" port="$2" path="$3"
     shift 3
     local header=""
-    exec 3<>"/dev/tcp/${host}/${port}" || return 1
+    exec 3<>"/dev/tcp/${host}/${port}" || return "$E2eHttpRefused"
     {
         printf 'GET %s HTTP/1.1\r\nHost: %s\r\n' "$path" "$host"
         for header in ${@+"$@"}; do
@@ -2293,6 +2365,32 @@ http_get() {
         printf 'Connection: close\r\n\r\n'
     } >&3
     _http_drain_fd3
+    # What ENDED the read, never how long it took -- `http_response_to_silence`
+    # above asks the same question of the same variable.
+    [ "$_http_drain_ended" = "peer" ] || return "$E2eHttpTruncated"
+    return "$E2eHttpAnswered"
+}
+
+# What an `http_get` status MEANS, as a sentence a fixture can put in a failure.
+#
+# One place, because the whole defect was callers saying *the admin endpoint
+# refused a /metrics request* for every non-zero -- a diagnosis they had not
+# established, about the wrong machine, for a read our own bound cut short.
+#
+# @param 1 the status `http_get` returned
+# @param 2 what was being asked for, e.g. "the worker admin endpoint's /metrics"
+# @return echoes one sentence
+e2e_http_outcome() {
+    case "$1" in
+        "$E2eHttpAnswered")
+            echo "${2}: the server answered and ended the response" ;;
+        "$E2eHttpRefused")
+            echo "${2}: the connection was REFUSED, so nothing was ever asked" ;;
+        "$E2eHttpTruncated")
+            echo "${2}: the response was CUT SHORT by our own ${_e2e_http_read_bound}s read bound -- the peer was still holding the socket, so what arrived is a PREFIX and its missing parts say nothing about the server" ;;
+        *)
+            echo "${2}: http_get returned ${1}, which names no outcome this library defines" ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
