@@ -1314,10 +1314,19 @@ class StopOnDemandInstaller final: public IStopSignalInstaller
 
     /// Press Ctrl-C. Only while the session still waits on the signal, which outlives any dial
     /// that is out: the source releases it only once its wait has returned.
+    ///
+    /// Asserts NOTHING, because it is pressed from the dial, which is not the case's thread: a
+    /// Catch2 assertion there damages the reporter's state rather than failing the case
+    /// (#1211). A press with nothing installed is recorded instead, and `RunningSeat::Run`
+    /// asserts on the case's thread that none happened.
     void Press()
     {
         auto* const installed = _installed.load();
-        REQUIRE(installed != nullptr);
+        if (installed == nullptr)
+        {
+            _pressedUnarmed.store(true);
+            return;
+        }
         installed->Fire();
     }
 
@@ -1327,10 +1336,17 @@ class StopOnDemandInstaller final: public IStopSignalInstaller
         return _calls.load();
     }
 
+    /// @return Whether Ctrl-C was pressed while no signal was installed to receive it.
+    [[nodiscard]] bool PressedUnarmed() const noexcept
+    {
+        return _pressedUnarmed.load();
+    }
+
   private:
     IReactor& _reactor;
     std::atomic<ScriptedStopSignal*> _installed { nullptr };
     std::atomic<int> _calls { 0 };
+    std::atomic<bool> _pressedUnarmed { false };
 };
 
 /// A subscription whose dial presses Ctrl-C and then waits for the case to open a gate: a dial that is
@@ -1546,6 +1562,8 @@ struct RunningSeat
         watchdog.request_stop();
         watchdog.join();
         CHECK_FALSE(fired.load());
+        // The dial's press, asserted here on the case's thread rather than on the dial's.
+        CHECK_FALSE(onDemand.PressedUnarmed());
         return ending;
     }
 

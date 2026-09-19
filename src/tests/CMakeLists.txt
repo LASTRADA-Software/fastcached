@@ -7314,6 +7314,60 @@ set_tests_properties("third-party-roots-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# A Catch2 assertion made off its test case's thread ends the process (#1211).
+#
+# `OffThreadAssertionGuard.cpp` is an INTERFACE source of the Catch2 target (the top-level
+# CMakeLists.txt), so every executable that links Catch2 compiles it. Two registrations
+# prove it, and they answer different questions:
+#
+#   * `off-thread-assertion-guard-coverage` reads the GENERATED link lines and refuses an
+#     executable that links Catch2 without the guard's object -- the attachment's claim,
+#     checked against the artefact rather than trusted.
+#   * `off-thread-assertion-canary` asks the RUNTIME: a Catch2WithMain program that asserts
+#     on its own thread and then on a helper thread, whose gate requires the accept first
+#     and then the guard's own words at a non-zero exit. Not guarded to Debug, because the
+#     guard is no `assert`: it acts in every build type, so it is watched in every one.
+add_executable(off-thread-assertion-canary OffThreadAssertionCanary.cpp)
+target_link_libraries(off-thread-assertion-canary PRIVATE Catch2::Catch2WithMain)
+add_test(
+    NAME "off-thread-assertion-canary"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_CANARY=$<TARGET_FILE:off-thread-assertion-canary>"
+        -P "${CMAKE_SOURCE_DIR}/scripts/off-thread-assertion-gate.cmake"
+)
+set_tests_properties("off-thread-assertion-canary" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+add_test(
+    NAME "off-thread-assertion-guard-coverage"
+    COMMAND ${CMAKE_COMMAND}
+        "-DBUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DCONFIG=$<CONFIG>"
+        -DANCHOR=FastCacheTest
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-off-thread-assertion-guard.cmake"
+)
+set_tests_properties("off-thread-assertion-guard-coverage" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+add_test(
+    NAME "off-thread-assertion-guard-coverage-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/off-thread-assertion-guard-coverage-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-off-thread-assertion-guard-selftest.cmake"
+)
+set_tests_properties("off-thread-assertion-guard-coverage-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # No executable raises a modal error dialog on Windows (#1389).
 #
 # `cmake/ErrorPopups.cmake` attaches `ErrorPopupsAtStartup.cpp` to every executable by
