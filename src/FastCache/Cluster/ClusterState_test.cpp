@@ -17,6 +17,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/PreviousClusterState.hpp>
@@ -394,21 +395,21 @@ TEST_CASE("A state another build encoded is refused by its version while a comma
     CHECK(newerState.error().context.contains("version 8"));
     CHECK(newerState.error().context.contains("reads 7"));
 
-    // #178 moved the COMMAND layout as well -- two fields, a key and a role -- so its version
-    // moved with it, and for that reason only: a committed entry this build cannot decode is
-    // skipped, so moving this byte for a change that left the layout alone would make a node
-    // restarting onto its own log skip every entry in it.
+    // #178 moved the COMMAND layout as well -- two fields, a key and a role -- and #1555 moved
+    // the version again with the layout untouched, because it changed what a verb MEANS: a
+    // node whose own log holds an older entry refuses to start by name (#1542) rather than
+    // replay it as something its writer never meant.
     auto command = Encode(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     REQUIRE(command.size() > 4);
-    CHECK(command[4] == std::byte { 3 });
+    CHECK(command[4] == std::byte { 4 });
 
     // And a command another build encoded is refused by ITS version, by name, never as damage.
-    command[4] = std::byte { 4 };
+    command[4] = std::byte { 5 };
     auto const newer = DecodeCommand(command);
     REQUIRE_FALSE(newer.has_value());
     CHECK(newer.error().code == ConsensusErrorCode::UnsupportedVersion);
-    CHECK(newer.error().context.contains("command encoding version 4"));
-    CHECK(newer.error().context.contains("reads 3"));
+    CHECK(newer.error().context.contains("command encoding version 5"));
+    CHECK(newer.error().context.contains("reads 4"));
 }
 
 TEST_CASE("A state the previous build wrote is refused as another build's, never as damage",
@@ -438,19 +439,33 @@ TEST_CASE("A state the previous build wrote is refused as another build's, never
 TEST_CASE("A command the previous build wrote is refused by its version before its arity is judged",
           "[cluster][state][wire][identity]")
 {
-    // A v2 command is FOUR fields, and this build expects six -- so a decoder that counted
-    // the fields first would call an intact entry from before the upgrade malformed, and a
-    // node replaying its own log would report damage in every entry. The version is read
-    // first, and the answer is *another build*.
+    // Two older builds, refused for two different reasons that must both reach the version.
     //
-    // The builder is shared (`tests/PreviousClusterState.hpp`), and its verb byte is pinned
-    // here against the enumerator it stands for.
+    // A v2 command is FOUR fields, and this build expects six -- so a decoder that counted
+    // the fields first would call an intact entry from an older build malformed, and a node
+    // replaying its own log would report damage in every entry. The version is read first,
+    // and the answer is *another build*.
+    //
+    // A v3 command is the SIX fields this build writes, and its verb 1 was `RemoveMember`
+    // where here it is `Forget` (#1555) -- so nothing but the version tells it apart, and a
+    // decoder that judged anything else first would accept it and replay a forget its writer
+    // never meant.
+    //
+    // The builders are shared (`tests/PreviousClusterState.hpp`), and their verb bytes are
+    // pinned here against the enumerators they stand for.
     REQUIRE(static_cast<std::uint8_t>(CommandKind::AddMember) == 0);
-    auto const refused = DecodeCommand(Testing::EncodePreviousClusterCommand());
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().code == ConsensusErrorCode::UnsupportedVersion);
-    CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterCommandVersion)));
-    CHECK(refused.error().context.contains("reads 3"));
+    REQUIRE(static_cast<std::uint8_t>(CommandKind::Forget) == 1);
+    for (auto const& [older, version]:
+         { std::pair { Testing::EncodeFourFieldClusterCommand(), Testing::FourFieldClusterCommandVersion },
+           std::pair { Testing::EncodePreviousClusterCommand(), Testing::PreviousClusterCommandVersion } })
+    {
+        INFO("command version " << static_cast<unsigned>(version));
+        auto const refused = DecodeCommand(older);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::UnsupportedVersion);
+        CHECK(refused.error().context.contains(std::format("version {}", version)));
+        CHECK(refused.error().context.contains("reads 4"));
+    }
 }
 
 TEST_CASE("A member's scheduler endpoint says whether it was never announced or cleared by a re-admit", "[cluster][state]")
@@ -1070,7 +1085,7 @@ TEST_CASE("A command carries its key and role, and a role this build cannot name
     CHECK(unknown.error().code == ConsensusErrorCode::UnknownMessageType);
 
     // A key field that is neither absent nor 32 bytes is damage, not a shorter key.
-    auto const header = std::array { std::byte { 3 }, static_cast<std::byte>(CommandKind::AdmitPrincipal) };
+    auto const header = std::array { std::byte { 4 }, static_cast<std::byte>(CommandKind::AdmitPrincipal) };
     auto const shortKey = std::vector<std::byte>(31, std::byte { 0x55 });
     auto const malformed = DecodeCommand(WireFields::Encode({ std::span<std::byte const> { header },
                                                               WireFields::AsBytes(std::string_view { "w1" }),

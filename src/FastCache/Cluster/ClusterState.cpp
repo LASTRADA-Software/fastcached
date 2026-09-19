@@ -97,19 +97,29 @@ namespace
     ///
     /// **Not the state's version, and the two must not become one constant again.**
     /// They were one until #1340, which was safe only while every change moved both
-    /// layouts. A committed entry this build cannot decode is logged and SKIPPED
-    /// (`ClusterStateMachine::Apply`), so bumping this for a change that left the
-    /// command layout alone makes a node restarting onto its own log skip every entry
-    /// in it. It moves when a command's LAYOUT does. A fact `Apply` derives from
-    /// commands it already reads -- `SchedulerEndpointHistory` -- is state, and moves
-    /// `StateVersion` alone. So does a new VERB (#1309's `AdmitClient`/`ForgetClient`):
-    /// the layout is unchanged, and a build that lacks the verb refuses its byte by name
-    /// as `UnknownMessageType` rather than as another encoding.
+    /// layouts. It moves when a command's LAYOUT does, and when a verb an entry already
+    /// written may carry stops meaning what it meant. A fact `Apply` derives from commands
+    /// it already reads -- `SchedulerEndpointHistory` -- is state, and moves `StateVersion`
+    /// alone. So does a new VERB (#1309's `AdmitClient`/`ForgetClient`): the layout is
+    /// unchanged, and a build that lacks the verb refuses its byte by name as
+    /// `UnknownMessageType` rather than as another encoding.
+    ///
+    /// What a move costs is a node whose OWN log holds an older entry: it refuses to start,
+    /// by name, rather than replay entries it would read differently (#1542). This used to
+    /// say such a node SKIPPED every entry, which was true before #1542 and was the reason
+    /// the rule above stopped at the layout. A committed entry from a PEER on another
+    /// command version is still skipped (`ClusterStateMachine::Apply`), which is what a
+    /// mixed fleet costs and why its consensus members upgrade together.
     ///
     /// 3 added the key and the role every command carries (#178), for `AdmitPrincipal` and a
-    /// member's key on `AddMember` -- two fields the layout had no room for, which is the one
-    /// case above that moves this.
-    constexpr std::uint8_t CommandVersion = 3;
+    /// member's key on `AddMember` -- two fields the layout had no room for.
+    ///
+    /// 4 left the layout alone and changed what the verbs MEAN (#1555): `RevokeKey` was
+    /// deleted, and `RemoveMember`'s ordinal became `Forget`, which also revokes the key the
+    /// removed record held. A v3 entry naming a keyed member decodes cleanly here and would
+    /// be replayed as a forget that revokes a key the build that wrote it never revoked. A
+    /// NEW verb's byte is refused by name; a CHANGED verb's is not, so only this can detect it.
+    constexpr std::uint8_t CommandVersion = 4;
 
     /// Fields in an encoded command: the header, then key, value, scheduler endpoint,
     /// public key and role.
