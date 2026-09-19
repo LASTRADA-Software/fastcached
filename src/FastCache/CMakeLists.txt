@@ -89,6 +89,7 @@ target_sources(FastCache
         Net/IocpSocket.cpp
         Net/KqueueConnector.cpp
         Net/KqueueSocket.cpp
+        Net/LingeringClose.cpp
         Net/SocketAddress.cpp
         Net/TcpClient.cpp
         Net/ThreadedAddressResolver.cpp

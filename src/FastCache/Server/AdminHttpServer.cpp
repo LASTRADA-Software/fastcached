@@ -703,7 +703,7 @@ static DetachedTask ServeAdminConnection(std::unique_ptr<ISocket> socket,
                                          std::atomic<std::size_t>* inFlight)
 {
     co_await ServeAdminHttp(socket.get(), metrics, std::move(snapshotProvider), clock, routes, surfaces);
-    socket->Close();
+    (void) co_await CloseLingering(socket.get(), nullptr, AdminHttpServer::Linger);
     inFlight->fetch_sub(1, std::memory_order_acq_rel);
 }
 
@@ -744,7 +744,7 @@ Task<void> AdminHttpServer::Run()
             // socket and tells an honest client something.
             (void) co_await WriteResponse((*accepted).get(),
                                           PlainRefusal("503 Service Unavailable", "admin: too many concurrent reqs\n"));
-            (*accepted)->Close();
+            (void) co_await CloseLingering((*accepted).get(), nullptr, Linger);
             continue;
         }
         ServeAdminConnection(

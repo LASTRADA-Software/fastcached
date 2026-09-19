@@ -32,6 +32,7 @@ src/FastCache/
                 IAsyncAddressResolver + ThreadedAddressResolver,
                 TcpClient (the ONE TCP client), SocketAddress, BlockingSocket,
                 the reactor sockets, TLS, InMemoryTransport, HealthProbe,
+                LingeringClose (how a server closes after it has answered),
                 IAdmissionControl, IDatagramSocket + UdpSocket/InMemoryDatagram
                 and SharedPortDatagram (listen shared, answer private)
   Cli/          UsageDoc (usage text as data) and Options (the one parse loop).
@@ -805,6 +806,10 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   `ShutdownWrite` is a silent no-op on every socket the listener accepted.
 - A socket DECORATOR forwards `SetReceiveDeadline`, or the deadline lands on a layer that never
   reads — `TlsSocket` inherited the base's no-op, and #828's bounds never applied under TLS.
+- A close over unread input is a RESET, and on Windows a reset destroys every byte the peer had
+  not read yet — so a server that answers a request it did NOT finish reading and then closes
+  closes through `CloseLingering`: ONE helper, a row of bounds per surface, and a lingering
+  connection still holds its admission slot. A fixture closes the way production does.
 - An object a reactor OWNS is destroyed on that reactor's worker thread, or with that reactor
   stopped — `IReactor::TeardownIsSerialisedWithDispatch()`, asked of EVERY reactor. **Match the
   ASSERTION, never the case that happened to be running.** The defect is PORTABLE and only the

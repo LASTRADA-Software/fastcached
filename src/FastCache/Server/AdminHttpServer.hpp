@@ -9,6 +9,7 @@
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Net/ISocket.hpp>
+#include <FastCache/Net/LingeringClose.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -253,6 +254,17 @@ class AdminHttpServer
     /// cannot express a total and a total cannot express a stall, so both exist and
     /// neither is derived from the other.
     static constexpr auto HeadTimeout = std::chrono::milliseconds { 10000 };
+
+    /// How long a served connection listens to its client before closing, and how much.
+    ///
+    /// Every refusal this surface writes over a head it did not finish reading -- `431`
+    /// past the byte cap, `408` past the total, `503` past the concurrency cap -- is
+    /// followed by a close, and a close over unread bytes is a reset that destroys the
+    /// refusal before a Windows client reads it (#1554; `CloseLingering` has the
+    /// measurement). Short, because these sockets BLOCK the one admin thread while it
+    /// listens: no longer than one `RequestTimeout`, spread over the reads -- a read
+    /// that meets a quarter of it in silence ends the linger.
+    static constexpr LingerBounds Linger { .total = RequestTimeout, .maxBytes = std::size_t { 64 } * 1024, .reads = 4 };
 
     /// Provider for a fresh metrics snapshot (storage stats + uptime), so
     /// `/metrics` reflects live state on each scrape rather than a stale copy.
