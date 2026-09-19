@@ -488,13 +488,21 @@ launch_node() {
 #
 # It was `start_node`, which `scripts/dist-compile-e2e.sh` also defines with an
 # INCOMPATIBLE contract -- `start_node <tag> <host> <port> <flags...>` there against
-# `<index>` here, neither able to stand in for the other for a single call. Harmless
-# while both are private, and a silent shadowing the day either is promoted into
-# `scripts/lib/e2e-common.sh`: the file that sources the library would then start
-# nodes with the other fixture's flag set, and the helper-copy scan in
-# `check-e2e-helpers.sh` would not notice, because after such a lift there is exactly
-# one definition in a `scripts/*.sh` and one in the library, which is the state that
-# scan exists to produce (#645).
+# `<index>` here, neither able to stand in for the other for a single call (#645).
+#
+# **THE FAILURE THE TICKET PREDICTS DOES NOT HAPPEN, and saying so is the point of
+# this paragraph.** It expects a silent shadowing the day either is promoted into
+# `scripts/lib/e2e-common.sh`. Checked rather than repeated: `_helper_redefinitions`
+# in `check-e2e-helpers.sh` reads the library's function names with
+# `_library_helper_names` -- a live `grep` of the library, not a list -- and refuses
+# any `scripts/**/*.sh` outside a two-row allowlist that defines one at any
+# indentation. Neither fixture is on that allowlist. So the moment `start_node` is IN
+# the library, the still-local copy is a `helper-scan` FAIL naming the file, the name
+# and the line. Loud, not silent.
+#
+# The rename is still worth having: it removes the name pair, so the lift is not
+# blocked on a rename under time pressure. It is NOT justified by the scan being
+# blind, because it is not.
 #
 # The two contracts are NOT reconciled: they do genuinely different jobs -- this one
 # derives an id, a slot and a log from one index, that one takes a tag, a host and a

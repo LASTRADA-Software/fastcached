@@ -1627,13 +1627,22 @@ metric_value() {
 # likes, because three requests are three different instants and comparing series
 # taken a round trip apart asserts something nobody meant.
 #
+# **It returns `http_get`'s status UNCHANGED**, and that is #1257 reaching its own
+# callers. Folding every non-zero into 1 would restate the sentence above -- *nothing
+# answered the request at all* -- about a response our own bound CUT SHORT, which is
+# the exact misattribution the three named statuses exist to end. The repair has to
+# reach the wrapper most scrapes go through, or it stops at the three call sites
+# somebody remembered to teach.
+#
 # @param 1 host
 # @param 2 port
 # @param 3 the Prometheus series name
-# @return echoes the reading; returns 1 if the scrape itself failed
+# @return echoes the reading; on a failed scrape returns `http_get`'s own status --
+#         `$E2eHttpRefused` or `$E2eHttpTruncated`, never a flattened 1
 counter_value() {
-    local host="$1" port="$2" name="$3" body=""
-    body="$(http_get "$host" "$port" /metrics)" || return 1
+    local host="$1" port="$2" name="$3" body="" status=0
+    body="$(http_get "$host" "$port" /metrics)" || status=$?
+    [ "$status" -eq "$E2eHttpAnswered" ] || return "$status"
     metric_value "$body" "$name"
 }
 
@@ -1703,13 +1712,22 @@ node_counter_value() {
 # @param 3 the floor the reading had to reach
 # @param 4 the series name
 # @param 5 optional: the door that was asked, `/metrics` (the default) or `node-metrics`
+# @param 6 optional: the status the LAST failing read returned, or `-` if none did.
+#          Rendered only for the `/metrics` door, whose statuses are `http_get`'s.
 _e2e_counter_finding() {
-    local answered="$1" value="$2" floor="$3" name="$4" door="${5:-/metrics}"
+    local answered="$1" value="$2" floor="$3" name="$4" door="${5:-/metrics}" status="${6:--}"
 
     if [ "$answered" != "yes" ]; then
         echo "  COUNTER: nothing ever answered a ${door} request, so ${name} was never read."
         echo "           Nothing above is a statement about the counter; the surface that"
         echo "           was asked is the subject."
+        # WHICH kind of not-answered, where the door can say. `nothing ever
+        # answered` is true of a refused connection and MISLEADING for a response
+        # our own bound cut short -- something answered, incompletely -- and that
+        # is #1257 arriving at the wait rather than at the one-shot call.
+        if [ "$door" = "/metrics" ] && [ "$status" != "-" ]; then
+            echo "           $(e2e_http_outcome "$status" "the last read")"
+        fi
         return 0
     fi
 
@@ -1744,6 +1762,10 @@ _e2e_counter_answered="no"
 
 # Which door the last counter wait asked, for its finding. Private.
 _e2e_counter_door="/metrics"
+
+# The status the last FAILING read of the last counter wait returned, or `-` when
+# none failed. Private; `_e2e_counter_finding` is what reads it.
+_e2e_counter_last_status="-"
 
 # Wait until a counter on an admin endpoint reaches a floor, the way
 # `wait_for_port` waits for a listener.
@@ -1836,20 +1858,24 @@ _e2e_counter_wait() {
     E2eCounterReading=""
     _e2e_counter_answered="no"
     _e2e_counter_door="$door"
+    _e2e_counter_last_status="-"
 
     # A FAILED READ DOES NOT END THE WAIT, because not ending it is what a retry
     # loop is for -- but it is remembered, so a bound that expires having never
-    # had an answer says THAT rather than blaming the counter.
+    # had an answer says THAT rather than blaming the counter. The STATUS is
+    # remembered too: `counter_value` hands back `http_get`'s own, so the finding
+    # can say whether the reads were refused or cut short (#1257).
     _e2e_counter_ready() {
         local reading=""
-        reading="$(_e2e_counter_read)" || return 1
+        reading="$(_e2e_counter_read)" || { _e2e_counter_last_status=$?; return 1; }
         _e2e_counter_answered="yes"
         E2eCounterReading="$reading"
         [ -n "$reading" ] || return 1
         [ "$reading" -ge "$floor" ]
     }
     _e2e_counter_findings() {
-        _e2e_counter_finding "$_e2e_counter_answered" "$E2eCounterReading" "$floor" "$name" "$_e2e_counter_door"
+        _e2e_counter_finding "$_e2e_counter_answered" "$E2eCounterReading" "$floor" "$name" \
+            "$_e2e_counter_door" "$_e2e_counter_last_status"
     }
 
     # The deadline is this wait's own, so the sixth argument is empty; the seventh
@@ -2016,7 +2042,11 @@ _e2e_probe_needed() {
 #          closed peer answers in microseconds and a holding one consumes its bound.
 # @return 0 when OUR bound ended the read, 1 when the PEER did
 _e2e_read_ended_at_bound() {
-    if [ "$1" -gt 128 ]; then
+    # `! _e2e_probe_needed` rather than a second `-gt 128`: the two are one
+    # reading -- *the status decided on its own* -- and spelling it twice gives
+    # the literal 128 two homes, so a shell that answers differently has to be
+    # found in both. The predicate's own table stages both answers.
+    if ! _e2e_probe_needed "$1"; then
         return 0
     fi
     [ "$2" != "-" ] && [ "$2" -ne 0 ]
