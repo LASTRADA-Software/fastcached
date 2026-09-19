@@ -3,12 +3,15 @@
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/LeaseSigner.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/RosterStore.hpp>
 #include <FastCache/Distributed/RosterTrust.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -248,4 +251,64 @@ TEST_CASE("A consensus member's roster is the state it applied: no certificate, 
     CHECK_FALSE(roster.Read(Noon).certifiedUntil.has_value());
     CHECK(roster.Summary().version == 11);
     CHECK(roster.Summary().voters == 1);
+}
+
+TEST_CASE("A grant signed by a voter the cluster has since forgotten is refused as the removed machine's",
+          "[distributed][roster][lease]")
+{
+    // #1555 asked it of the whole path rather than of a fake: a voter is admitted, signs, is then
+    // FORGOTTEN -- `--cluster-forget`'s one act, which removes the record and revokes its key --
+    // and a member applying that state names the grant it still mints `SignerRevoked`.
+    auto const admitted = [](std::string const& id) {
+        return Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                                  .key = id,
+                                  .value = id + ":6680",
+                                  .schedulerEndpoint = {},
+                                  .publicKey = TestKeyPair(id).PublicKey(),
+                                  .role = std::nullopt };
+    };
+    auto const forget = [](Cluster::ClusterState& state, std::string const& id) {
+        Cluster::Apply(state,
+                       Cluster::Command { .kind = Cluster::CommandKind::Forget,
+                                          .key = id,
+                                          .value = {},
+                                          .schedulerEndpoint = {},
+                                          .publicKey = std::nullopt,
+                                          .role = std::nullopt });
+    };
+    auto const grant = LeaseClaims { .serial = "17",
+                                     .endpoint = "10.0.0.7:6675",
+                                     .fingerprint = "clang-19-x86_64",
+                                     .key = "obj-abc",
+                                     .expiresAt = Noon + 10min,
+                                     .clusterId = "fleet",
+                                     .epoch = 7,
+                                     .signer = {} };
+
+    Cluster::ClusterState state;
+    for (auto const* id: { "n1", "n2", "n3" })
+        Cluster::Apply(state, admitted(id));
+    StateLeaseRoster roster;
+    roster.Adopt(state);
+
+    auto const removed = KeyPairLeaseSigner { "n3", TestKeyPair("n3") };
+    auto const token = MintLeaseToken(removed, grant);
+    // The premise: while it was a voter, its grant was good.
+    REQUIRE(AuthenticateLeaseToken(roster, token).has_value());
+
+    forget(state, "n3");
+    REQUIRE(std::ranges::none_of(state.members, [](Cluster::ClusterMember const& m) { return m.id == "n3"; }));
+    roster.Adopt(state);
+
+    // Named as the removed machine rather than as a forgery: its signature still verifies, under
+    // a key the state keeps whole for exactly this. Unwired, the key is merely UNKNOWN and the
+    // refusal reads `Unauthorized` -- the same refusal a stranger earns, which is the confident
+    // wrong signal the separate counter exists to avoid.
+    auto const refused = AuthenticateLeaseToken(roster, token);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == LeaseRefusalReason::SignerRevoked);
+
+    // And the control: a voter still in good standing signs exactly as before.
+    auto const kept = KeyPairLeaseSigner { "n1", TestKeyPair("n1") };
+    CHECK(AuthenticateLeaseToken(roster, MintLeaseToken(kept, grant)).has_value());
 }
