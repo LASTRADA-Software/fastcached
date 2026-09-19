@@ -13,6 +13,8 @@ readable and silently ignored. Every rule below has already been one of them.
 
 ## Registering a service
 
+<!-- agent-tripwire: A service to register is a `ServiceSpec`; what it runs as is part of it -->
+
 - **A service to register is a `ServiceSpec`, and what it runs as is part of it.**
   Every function in `Platform/ServiceControl` took `Config const&` -- the *daemon's*
   configuration type -- so a second binary could reach none of it without either
@@ -484,6 +486,8 @@ readable and silently ignored. Every rule below has already been one of them.
   and `fastcached-uninstall` mirrors it.
 ## Finding and trusting a configuration file
 
+<!-- agent-tripwire: A machine-wide config is obeyed only when only an administrator could have written it -->
+
 - **A candidate config location names an application, not `fastcached`.** Every row
   of `DefaultConfigCandidates()` hardcoded the daemon's file name, so a second
   binary had nothing to generalize onto. The rows carry `{app}` now, and two things
@@ -654,6 +658,8 @@ readable and silently ignored. Every rule below has already been one of them.
   account can write.
 ## A configuration FILE through the option table
 
+<!-- agent-tripwire: A configuration FILE reaches the same fields through the SAME appliers, in that order -->
+
 - **The file's values and the command line's reach the same fields through the
   SAME appliers, in that order, so "the command line wins" is which loop runs
   second.** Both binaries do: `ReadYamlSettings` then `ApplyFileSettings` over the
@@ -771,6 +777,8 @@ readable and silently ignored. Every rule below has already been one of them.
 
 ## The CLI option table
 
+<!-- agent-tripwire: Every flag is one row of `CliOptions()`, which drives parsing **and** help -->
+
 - **A flag is one row, and every binary's row table drives both parsing and
   help.** The daemon used to declare flags four ways — hand-written `if (arg ==
   …)`, a descriptor array, two inline `initializer_list<tuple<…>>` tables, and
@@ -852,6 +860,8 @@ readable and silently ignored. Every rule below has already been one of them.
 
 ## The daemon host, and what a machine IS
 
+<!-- agent-tripwire: untriaged: #1567 the architecture-is-what-the-compiler-built-for rule has no AGENT.md bullet, and the nearest one is about a different subject -->
+
 - **A daemon host wraps the body, so what must reach a terminal has to happen
   first.** `WorkerBody` is separate from `main` because `IDaemonHost` double-forks on
   POSIX or hands control to the SCM, and neither can wrap a `main` that has already
@@ -872,6 +882,8 @@ readable and silently ignored. Every rule below has already been one of them.
   worker cannot write and must not offer to a scheduler as room it has.
 
 ## Which supervisor stamps a log line, and which does not
+
+<!-- agent-tripwire: untriaged: #1567 the log-default-cannot-be-picked-per-binary rule has no AGENT.md bullet -->
 
 Measured while closing #485, and expensive to rediscover — the ticket that raised it
 guessed, and guessed wrong in both directions. **A binary's console logger is not the
@@ -956,6 +968,16 @@ boot, silently, because a registration replays its command line forever. So:
   neighbour's emission covers it.
 
 ## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
+
+- **[#1567](https://github.com/LASTRADA-Software/fastcached/issues/1567)** — two sections here have
+  no `AGENT.md` tripwire: `## The daemon host, and what a machine IS` — an
+  architecture is what the compiler BUILT FOR and not what the kernel is running, so a
+  scheduler weighing an x86-64 process under Rosetta or WOW64 is told `arm64` — and
+  `## Which supervisor stamps a log line, and which does not`, whose rule is that a log
+  default cannot be picked per binary. Both marked `untriaged:` and not `none:`, and
+  `ctest -R rulebook-tripwires` prints the count against this issue on every run.
 
 - **[#867](https://github.com/LASTRADA-Software/fastcached/issues/867)** — the seeded
   config grants read to `NT AUTHORITY\SERVICE` (S-1-5-6), which is every principal

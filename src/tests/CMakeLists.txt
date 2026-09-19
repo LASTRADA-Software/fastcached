@@ -3796,6 +3796,81 @@ endif()
 
 
 # ---------------------------------------------------------------------------
+# Every `##` section of a rulebook file says whether `AGENT.md` tripwires it, and
+# names the phrase (#876).
+#
+# `AGENT.md` states the rule: "a rule landed in `.agent/rules/` without a bullet
+# here fires in no session that does not open its file -- which is the population
+# the rule was written for. It has shipped that way (#355), caught by a review
+# rather than by the author."
+#
+# The ticket's own acceptance clause is REFUTED by `.agent/rules/README.md`,
+# which worked the design out and recorded it rather than building it: the
+# correspondence cannot be heading text (README's worked example is a heading and
+# a tripwire stating one fact with no matchable text between them), a tripwire may
+# legitimately live under ANOTHER file's link or be a nested bullet, and the
+# rulebook's own rule is CONDITIONAL -- so a check written to the clause would
+# refuse correct trees confidently, in the file every session reads first. What
+# is registered here is README's recorded design instead, which is why the commit
+# closes #876 rather than implementing it as written.
+#
+# The claim travels in a MARKER the author writes and the check verifies it,
+# which makes *yes* something somebody can be WRONG about. `AGENT.md` is only ever
+# READ -- the property that makes this affordable in a file several sessions edit
+# at once.
+#
+# THREE spellings, because two collapse *decided-no* into *not-yet-decided*: a
+# phrase, `none:` with a reason, and `untriaged:` naming an issue. The third is
+# safe only because the check TALLIES it and prints the total per issue on EVERY
+# run, which is `RefuseUntriaged` from `.agent/rules/metrics-and-observability.md`
+# arriving in markdown. Its first seeding found SEVEN sections with no tripwire at
+# all (#1567) -- #876's premise, confirmed by the guard on its first run.
+#
+# Labelled `docs-subject`: its subject IS prose, so it must run on the change that
+# has no code in it. `ci-scope.sh` classifies `.agent/**` as docs-only and every
+# `linux` job is gated on that, so without the label a pull request editing only
+# `.agent/rules/*.md` -- exactly the change class that adds a rule and forgets the
+# tripwire -- would run no ctest at all and be green by absence, which is #687
+# word for word.
+#
+# Not `smoke`: it reads markdown and opens no socket, so it belongs in the default
+# set where whoever edits a rulebook file is the one who sees it break. Written in
+# bash rather than `cmake -P` for `check-table-totals.sh`'s reason: these files are
+# dense with `[#876](...)`, and a `file(STRINGS)` reader merges list elements on
+# brackets.
+#
+# `if(NOT WIN32)` for the reason its neighbours carry it -- the script is POSIX and
+# what it checks is platform-independent.
+if(NOT WIN32)
+    add_test(
+        NAME "rulebook-tripwires"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-rulebook-tripwires.sh"
+                "${CMAKE_SOURCE_DIR}"
+    )
+    set_tests_properties("rulebook-tripwires" PROPERTIES
+        LABELS "hygiene;docs-subject"
+        TIMEOUT 60
+    )
+
+    # And the verdicts, against synthetic trees, in BOTH directions -- a guard
+    # nobody has watched ACCEPT is not known to work either, and a suite whose
+    # only case is a refusal passes under a check that refuses everything. So the
+    # first case is the accepting one, and each of the ways this check can fail to
+    # LOOK (no AGENT.md, an AGENT.md that normalises to nothing, a marker syntax
+    # that has stopped matching) is watched refusing, because all three read
+    # exactly like a clean tree.
+    add_test(
+        NAME "rulebook-tripwires-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-rulebook-tripwires.sh" --self-test
+    )
+    set_tests_properties("rulebook-tripwires-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
+
+# ---------------------------------------------------------------------------
 # A full clang-tidy sweep still happens somewhere, and it still reaches a person.
 #
 # Since #554 a pull request and a merge-queue entry both diff-scope, and the

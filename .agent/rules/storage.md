@@ -11,6 +11,8 @@ it is the worst outcome available.
 
 ## The format version
 
+<!-- agent-tripwire: An old store is `UnsupportedFormatVersion`, never `Corrupt` -->
+
 **A store's record layout is stamped, and a build reads exactly one version.**
 `CowTreeStorage::CurrentFormatVersion` is what this build writes;
 `FormatMarkerKey` is where it is recorded. Both live on the class rather than in
@@ -64,6 +66,8 @@ conversion.
 `Corrupt`. There is no version to report and nothing to convert.
 
 ## When the bytes really are damaged
+
+<!-- agent-tripwire: `Corrupt` means the BYTES ARE DAMAGED, and nothing a client sends may reach it -->
 
 Everything above is about keeping `Corrupt` narrow, so that it stays worth
 believing. The other half is what an operator does when it fires, and a rule that
@@ -236,6 +240,8 @@ damage says which binary it is about.
 
 ## What a tier's byte figures are denominated in
 
+<!-- agent-tripwire: A tier's `bytesUsed` is denominated differently per tier -->
+
 **The two tiers count different bytes, and neither is wrong.**
 `InMemoryLruStorage` charges its budget the STORED size — `_bytesUsed += storedSize`
 in `InsertNew`, where `storedSize` is whatever `EncodeForStorage` returned, so a
@@ -263,6 +269,8 @@ for both halves, which is why it is reported separately and must not be added to
 either (#175).
 
 ## Converting a store
+
+<!-- agent-tripwire: A format is convertible exactly as long as its reader is in `RecordFormats()` -->
 
 **A format is convertible exactly as long as its reader is in
 `RecordFormats()`.** That table *is* the migration policy stated as data: bumping
@@ -325,6 +333,8 @@ the real store stayed refused at every start.
 
 ## The tree beneath it
 
+<!-- agent-tripwire: A tree walk is bounded by `PageCount()`, and must not overlap a commit -->
+
 **`ReadTxn::ForEach` is an administrative scan, not a lookup path.** It reads
 every page, so it costs the size of the store rather than its depth. `Get` is
 what a lookup uses.
@@ -347,6 +357,8 @@ Staging into an *uncommitted* write transaction from inside a walk is fine, and
 is what the conversion does.
 
 ## What a refused `Open` can say
+
+<!-- agent-tripwire: A refused `Open` carries the **errno it classified** -->
 
 **A lock refusal carries the errno it was classified from.** `FilePageStore::Open` classified a
 system error and then discarded it, so the refusal reached a log as
@@ -393,6 +405,8 @@ condition `EWOULDBLOCK`/`EAGAIN` and `ERROR_SHARING_VIOLATION` and a named one w
 case a statement about the host it was written on.
 
 ## What a reopened store can name
+
+<!-- agent-tripwire: The LRU mirror holds what this SESSION touched -->
 
 **The LRU mirror holds what this SESSION touched, never what is on disk.** `_lru` and
 `_index` are populated by `TouchOrInsert` alone, which every read and write verb calls

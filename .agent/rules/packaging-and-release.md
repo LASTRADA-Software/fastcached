@@ -8,6 +8,8 @@ installer pane, the version derivation, or the release job's asset list.
 
 ## Packaging
 
+<!-- agent-tripwire: The payload is rooted at `/`, not `/usr`; third-party `install()` rules are excluded -->
+
 - **The package payload is rooted at `/`, not `/usr`.** `/etc` cannot sit under
   a `/usr` prefix, so `FASTCACHED_INSTALL_BINDIR`/`DOCDIR` spell their own
   `usr/` (and `opt/fastcached/` on macOS). A relative destination for the units
@@ -77,6 +79,8 @@ installer pane, the version derivation, or the release job's asset list.
 
 ## The version
 
+<!-- agent-tripwire: The git tag is the only version source. `version.txt` must never come back -->
+
 - **The git tag is the only version source, and `version.txt` must never come
   back.** There used to be a committed `version.txt`, and because
   `cmake/Version.cmake` read it *first* it was the real source of truth: a second
@@ -103,6 +107,8 @@ installer pane, the version derivation, or the release job's asset list.
   a burnt notarization slot would.
 ## CI and the release job
 
+<!-- agent-tripwire: Every `build.yml` checkout that could configure passes `fetch-depth: 0` -->
+
 - **Every checkout in `build.yml` that could configure the project passes
   `fetch-depth: 0`, and the release job's asset list must stay the last key of its
   `with:` mapping.** The default depth-1
@@ -123,6 +129,8 @@ installer pane, the version derivation, or the release job's asset list.
   whitespace or a colon, so the rule is enforced rather than merely documented.
 
 ## Releasing
+
+<!-- agent-tripwire: Cutting a release is pushing a tag; CI runs the entire suite against the tagged tree -->
 
 The version is the git tag, so cutting a release is pushing one:
 
