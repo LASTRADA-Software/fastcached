@@ -505,21 +505,21 @@ struct CounterSoleWriter
 /// a row silently absent from the attribution and indistinguishable from one nobody had
 /// considered, cannot recur by omission ([#1501](https://github.com/LASTRADA-Software/fastcached/issues/1501)).
 ///
-/// **How the 163 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 42
-/// of them and would have rendered the other 121 absent -- the same defect as the bug, three
+/// **How the 165 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 45
+/// of them and would have rendered the other 120 absent -- the same defect as the bug, three
 /// times larger. The rows are written by four mechanisms, and reading only `SurfaceRefusal`
-/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 110 of the 118 and
-/// leaves eight looking unwritten:
+/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 109 of the 120 and
+/// leaves eleven looking unwritten:
 ///
 /// | mechanism | rows |
 /// |---|---|
-/// | a `SurfaceRefusal` row, spent by `Refuse(row)` | 111 |
+/// | a `SurfaceRefusal` row, spent by `Refuse(row)` | 110 |
 /// | a `LeaseToken.hpp` outcome row's `workerCounter` | 10 |
 /// | returned by a classifier for its caller to spend | 4 |
-/// | `Increment(Counter::X)` directly | 42 |
+/// | `Increment(Counter::X)` directly | 45 |
 ///
-/// The column sums past 163 because four rows are written two ways -- and the 110 above is not
-/// the 111 here: 111 rows HAVE a refusal row, and 110 of those have no increment site, which is
+/// The column sums past 165 because four rows are written two ways -- and the 109 above is not
+/// the 110 here: 110 rows HAVE a refusal row, and 109 of those have no increment site, which is
 /// what a `SurfaceRefusal`-only reading would reach. Two figures one apart, measuring different
 /// things, is exactly how a census comes to be quoted wrong, so both are asserted.
 ///
