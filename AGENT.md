@@ -1932,6 +1932,11 @@ and what they may assume.
   this the harder half of the rule above. Every property defined by parking is vacuous over
   `InMemorySocket`. The survey of which such properties have a real-socket case, and which have
   none, is in the rules file.
+- `InMemorySocket`'s CLOSED states are one table pinned against a real loopback pair
+  (`Net/SocketClosedStates_test.cpp`): where the platforms disagree it answers the way Windows
+  does, and on Windows every row is exact. A fake answering MORE permissively than a real socket is
+  a red there, never a relaxed row — the cases #1553 turned red were asserting what PRODUCTION got
+  wrong.
 - So is a BUILDER, and it hides better: `src/tests/ForeignGenerationValue.hpp`. Hand-rolled copies
   fail SILENTLY, because every one asserts a REFUSAL and a value damaged another way is refused too
   — so a field moving leaves each copy stamping something different while every case goes on passing

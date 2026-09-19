@@ -1000,6 +1000,63 @@ new read. Measured while writing the case above: the read after a double cancel 
 the same two lines behave differently again. What is idempotent is a cancel with **nothing
 parked**, which is the arrangement the contract is about.
 
+### A fake's CLOSED states are one table, pinned against a real pair
+
+#1553. `InMemorySocket` accepted a write to a peer that had closed, so a session the OTHER end
+ended was invisible to every in-memory case: session teardown, revocation, a leader deposed
+mid-send, a worker that went away. #178's revocation tests found it by having to force the
+redial through a readdress, because the dialler's writes kept succeeding. The rule it broke is
+the one above -- *a fake more permissive than the thing it stands for* -- in its purest form:
+nothing was wrong with any case, and every case over the gap passed.
+
+Every closed state is now a row, and `Net/SocketClosedStates_test.cpp` drives each sequence of
+rows twice -- over `InMemorySocketPair`, and over a `PlatformListener` socket facing a blocking
+client -- asserting that the fake answered the table and that the real pair answered it too:
+
+- the peer CLOSED with nothing unread: reads drain then EOF; the FIRST write after it is
+  accepted and lost and draws the reset; every later write and read fails `SystemError`
+  (`EPIPE`, `WSAECONNABORTED`);
+- the peer closed with bytes of ours UNREAD: a reset at once, so every write and read fails
+  `ConnReset` (`ECONNRESET`, `WSAECONNRESET`);
+- the peer HALF-closed: reads reach EOF, writes still succeed;
+- THIS end closed: `BadFileHandle` from every operation that can report one, as all four
+  platform sockets answer. `ShutdownWrite` returns `void` on `ISocket` and every platform
+  socket ignores it after a close, so the fake does too: making it report is an interface
+  change across every transport, not a property of the fake;
+- this end half-closed: writes fail `SystemError` (`EPIPE`, `WSAESHUTDOWN`) -- the fake used to
+  answer `WouldBlock`, the one failure a caller is entitled to retry.
+
+Every code is the one `ISocket` maps the platform's error to, and each failing row of the table
+names it.
+
+**Where the platforms disagree, the model takes the stricter answer, and it is Windows's.**
+Measured on loopback on Windows 11, Windows Server 2025, Linux under WSL2 and on
+`ubuntu-24.04`, and macOS 14: after a reset, Linux and macOS hand over bytes already buffered and
+then report EOF again; Windows fails every read and drops what was buffered. And POSIX reports
+a pending reset to whichever call comes first, so the code a later call meets depends on the
+order. A row that lets Linux and macOS fail under another code, or answer where the model fails,
+says so, and **on Windows no row grants anything** -- the model IS Windows, error codes
+included, so a Windows run that differs means the justification has stopped being true.
+
+- **The pin's first finding was not about the fake.** Driving `ShutdownWrite` over a real
+  accepted socket showed Windows writing on after the half-close: `IocpListener` never set
+  `SO_UPDATE_ACCEPT_CONTEXT`, so `shutdown` failed `WSAENOTCONN` on every socket it accepted and
+  the failure was ignored (#1556). No in-memory case could see that and no Linux gate runs IOCP.
+  A pin against a real pair tests BOTH sides of its comparison.
+- **The cases that passed only because of the gap were right, and production was wrong.** Three
+  (`RedisResp_test` "a value exceeding the cap gets a protocol error reply, not a bare reset",
+  and the admin surface's `408` dribble and `431` byte-cap cases) asserted a refusal the client
+  read after the server closed over a request it had not finished reading. Over a real socket
+  that close is a reset, and on Windows the reset destroys the refusal. They were fixed at their
+  subject -- production closes through `CloseLingering` now (#1554,
+  [`wire-and-protocol.md`](wire-and-protocol.md)) -- and each fixture closes the way production
+  does, beside a case through `Server::Run` or `AdminHttpServer::Run` that guards the call site
+  itself. Relaxing the model to keep them green would have re-asserted a claim that is false for
+  every Windows client.
+- **An in-process pair has no clock**, so a fixture whose server lingers half-closes its client;
+  a real socket's linger ends at a deadline the pair cannot reach, and a parked `SyncRun` is a
+  thrown `logic_error` over a frame the fake still points at.
+
 ### A value from another generation is BUILT by the shared helper, never by hand
 
 `tests/ForeignGenerationValue.hpp` (#649). Four cases across two test binaries need a

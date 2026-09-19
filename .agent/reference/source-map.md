@@ -59,11 +59,12 @@ src/FastCache/
                 IoAwaitable, IAdmissionControl, SocketAddress,
                 BlockingSocket (Winsock + POSIX),
                 EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
-                InMemoryTransport (paired pipes + InMemoryListener),
-                LingeringClose (how a server closes after answering:
-                half-close, listen until the peer closes or a bound says stop,
-                then close -- a bare close over unread input is a reset that
-                destroys the answer)
+                InMemoryTransport (paired pipes + InMemoryListener, answering
+                every closed state the way a loopback socket does, pinned
+                against one by SocketClosedStates_test), LingeringClose (how a
+                server closes after answering: half-close, listen until the
+                peer closes or a bound says stop, then close -- a bare close
+                over unread input is a reset that destroys the answer)
   Cli/          UsageDoc (usage text as data: sections of aligned rows and
                 prose, rendered with an ANSI palette) and Options (OptionSpec
                 row type, the matching rules, the one parse loop). Dependency-
