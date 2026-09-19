@@ -864,12 +864,11 @@ TEST_CASE("Rejecting a machine that was already approved says the cluster still 
                               [](Cluster::ClusterMember const& m) { return m.id == JoinerId; }));
 }
 
-TEST_CASE("Rejecting an approved WORKER names no flag that would not remove it", "[enrollment][responder][security]")
+TEST_CASE("Rejecting an approved WORKER names the forget that removes it", "[enrollment][responder][security]")
 {
-    // The role's remedy, not the member's: `--cluster-forget` is `RemoveMember`, which never
-    // touches a principal, so naming it here would send an operator to a command that
-    // reports success and removes nothing. What is true is that nothing an operator can type
-    // revokes a principal's key yet, and the warning says so and names the issue.
+    // One remedy for both roles since #1555: `--cluster-forget` takes the id out of whichever
+    // list records it -- a principal included -- and revokes its key. The case below is what
+    // makes naming it here true rather than hopeful.
     Seed seed;
     CapturingLogger logger { LogLevel::Trace };
     EnrollmentResponder responder { seed.window, seed.service, seed.membership, seed.metrics, logger };
@@ -889,8 +888,83 @@ TEST_CASE("Rejecting an approved WORKER names no flag that would not remove it",
         return r.level == LogLevel::Warn && r.message.contains("worker-a");
     });
     REQUIRE(warned != records.end());
-    CHECK(warned->message.contains("#1555"));
-    CHECK_FALSE(warned->message.contains("--cluster-forget"));
+    CHECK(warned->message.contains("--cluster-forget=worker-a"));
+    CHECK(warned->message.contains("revokes that key"));
+}
+
+TEST_CASE("A forgotten worker's key is revoked: its next enrollment is refused at the door, and never approved again",
+          "[enrollment][responder][security][forget]")
+{
+    // #1555, end to end on the one wire a worker principal's key is presented on in this
+    // build. The operator approves worker-a, then forgets it through the verb
+    // `--cluster-forget` reaches; the forget takes its principal row and revokes its key. The
+    // neuter is a forget that leaves the principal where it was, under which the next poll is
+    // answered `Approved`, roster and all -- still admitted.
+    Seed seed;
+    auto const workerKey = Filled(0x57);
+    auto const enroll = [&](std::string_view id) {
+        return AnswerNow(seed.responder, EnrollFrame(id, "", Wire::EnrollRole::Worker, workerKey), JoinerAddress);
+    };
+
+    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
+    REQUIRE(RefusalIn(enroll("worker-a")) == std::nullopt);
+    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, "worker-a")) == std::nullopt);
+
+    // Admitted, which is what makes the rest mean something: it is handed the roster.
+    auto const admitted = enroll("worker-a");
+    REQUIRE(RefusalIn(admitted) == std::nullopt);
+    REQUIRE(Unwrap(Wire::DecodeEnrollReply(PayloadOf(admitted))).outcome == Wire::EnrollOutcome::Approved);
+
+    auto const forgot =
+        seed.service.ClusterForget(Distributed::CallerContext { .membership = Distributed::Membership::Member,
+                                                                .peerId = std::string { OperatorAddress } },
+                                   "worker-a");
+    REQUIRE(forgot.status == Wire::Status::Ok);
+
+    auto const state = seed.cluster.ClusterState();
+    CHECK(state.principals.empty());
+    CHECK(state.IsRevoked(workerKey));
+    CHECK(std::ranges::contains(state.revokedKeys, Cluster::RevokedKey { .id = "worker-a", .publicKey = workerKey }));
+
+    // The next poll is REFUSED, by name and counted -- not `Pending`, which would keep a
+    // removed machine polling for an answer that cannot come, and not `Approved`.
+    auto const refused = enroll("worker-a");
+    CHECK(RefusalIn(refused) == Wire::ErrorCode::InvalidClusterChange);
+    auto const message = Unwrap(Wire::DecodeErrorPayload(PayloadOf(refused))).second;
+    CHECK(message.contains("never admitted again"));
+    CHECK(message.contains(FormatEd25519PublicKey(workerKey)));
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedRevokedKey) == 1);
+
+    // Under another id too: the key is what is refused, not the name it arrives with -- and
+    // nothing is recorded for the operator to be shown.
+    CHECK(RefusalIn(enroll("worker-b")) == Wire::ErrorCode::InvalidClusterChange);
+    CHECK_FALSE(seed.window.Find("worker-b").has_value());
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedRevokedKey) == 2);
+
+    // And the row the window still holds cannot be approved back: rejected, then approved
+    // again, the approval reaches the cluster and is refused there as a revoked key.
+    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Reject, "worker-a")) == std::nullopt);
+    auto const again = Control(seed, Wire::EnrollControlVerb::Approve, "worker-a");
+    CHECK(RefusalIn(again) == Wire::ErrorCode::InvalidClusterChange);
+    CHECK(Unwrap(Wire::DecodeErrorPayload(PayloadOf(again))).second.contains("a revoked key is never admitted again"));
+    CHECK(seed.cluster.ClusterState().principals.empty());
+}
+
+TEST_CASE("A machine nobody forgot enrolls as before, beside a revoked key", "[enrollment][responder][forget]")
+{
+    // The control for the door: a revocation refuses the key it names and nothing else, so a
+    // cluster holding one still records and admits a stranger asking under its own key.
+    Seed seed;
+    auto state = seed.cluster.ClusterState();
+    state.revokedKeys.push_back(Cluster::RevokedKey { .id = "gone", .publicKey = Filled(0x58) });
+    seed.cluster.SetState(std::move(state));
+
+    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Open)) == std::nullopt);
+    auto const reply = Enroll(seed);
+    CHECK(RefusalIn(reply) == std::nullopt);
+    CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(reply))).outcome == Wire::EnrollOutcome::Pending);
+    CHECK(seed.window.Find(JoinerId).has_value());
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedRevokedKey) == 0);
 }
 
 TEST_CASE("Rejecting a machine that was only waiting says nothing, so the warning stays worth reading",

@@ -1317,7 +1317,12 @@ echo "cluster E2E: a member can be removed"
 # --- 6. leadership survives losing the leader --------------------------------
 
 # A cluster that formed once and could not re-form is one that works until the
-# first reboot. Three of four remain, which is still a majority.
+# first reboot. Three of four remain, which is still a majority -- n3 among them,
+# although it was forgotten a moment ago and its key revoked: a member keeps its key
+# for itself until the configuration drops it (#1555), and the leader may well be
+# stopped before any pass has. Cut off at the revocation instead, n3 would leave two of
+# four, which elects nobody, and nobody could then propose the removal -- the wedge
+# this section caught the first time a forget revoked a key.
 for index in "${!scheduler_ports[@]}"; do
     [[ -n "${scheduler_ports[$index]}" ]] || continue
     if [[ "127.0.0.1:${scheduler_ports[$index]}" == "$leader_endpoint" ]]; then

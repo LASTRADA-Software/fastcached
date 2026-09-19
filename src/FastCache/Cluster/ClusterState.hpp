@@ -120,8 +120,8 @@ struct ClusterMember
     /// keys existed, or admitted by a verb that named none, simply has not said; what asserts
     /// one is the member itself, announcing its own record, or an operator's `@<key>`. A
     /// re-admit that names no key KEEPS what is recorded -- unlike the scheduler endpoint, a
-    /// machine that moves keeps its identity -- and only a revocation clears it
-    /// (`CommandKind::RevokeKey`).
+    /// machine that moves keeps its identity -- and only a forget takes it away, revoking it
+    /// with the record (`CommandKind::Forget`).
     std::optional<Ed25519PublicKey> publicKey;
 
     [[nodiscard]] friend bool operator==(ClusterMember const&, ClusterMember const&) = default;
@@ -189,8 +189,13 @@ struct ClusterPrincipal
 /// never an oracle for a caller who holds no key at all.
 struct RevokedKey
 {
-    /// Whose it was, as the revocation named them. A LABEL for an operator reading the
-    /// state: nothing is keyed on it, because the key is what is refused.
+    /// Whose it was: the id the forget removed, taken from that record (`CommandKind::Forget`).
+    ///
+    /// The WIRE keys nothing on it, because the key is what is refused there, whatever id a
+    /// proof then claims. The QUORUM does: a member consensus still counts, recorded nowhere
+    /// and named here, was forgotten rather than never recorded, and whoever leads removes it
+    /// (`NextQuorumChange`) -- a member the configuration counts keeps its own key on the
+    /// consensus wire (`RosterKeys`), so one nobody removed would go on voting (#1555).
     Consensus::NodeId id;
     Ed25519PublicKey publicKey {}; ///< The key.
 
@@ -554,7 +559,7 @@ struct ClusterState
     /// `clients` is the ordinary state of every machine a node's own list names, so a
     /// forget that only erased would leave nothing a node could narrow its local list
     /// by -- and a local list is exactly where a decommissioned machine lingers. Written
-    /// by `ForgetClient` and by `RemoveMember` (the removed member's consensus host),
+    /// by `ForgetClient` and by `Forget` (the removed member's consensus host),
     /// cleared by `AdmitClient` and `AddMember` for that host.
     ///
     /// **Bounded by the distinct hosts ever forgotten and not re-admitted**, never by
@@ -563,18 +568,17 @@ struct ClusterState
 
     /// Machines admitted by key rather than as members, sorted by id (#178).
     ///
-    /// Written by `AdmitPrincipal` and cleared, per key, by `RevokeKey`. Nothing in this
-    /// build proposes one yet: enrollment (#178 PR 4) is its producer, and this is the
-    /// record it will write into.
+    /// Written by `AdmitPrincipal`, which enrollment proposes for a worker (#178 PR 4), and
+    /// removed by `Forget`, which revokes the key with it (#1555).
     std::vector<ClusterPrincipal> principals;
 
     /// Keys the cluster will never admit again, sorted by id and then key, one entry per
     /// key (#178).
     ///
     /// **Bounded by the keys ever revoked**, never by traffic, for `forgotten`'s reason:
-    /// nothing but a committed `RevokeKey` adds one. Nothing ever shortens it -- a
-    /// revocation that could be undone would be a key that could come back, and the
-    /// property is that it cannot.
+    /// nothing but a committed `Forget` of an id holding a key adds one. Nothing ever
+    /// shortens it -- a revocation that could be undone would be a key that could come
+    /// back, and the property is that it cannot.
     std::vector<RevokedKey> revokedKeys;
 
     /// How many times the ROSTER has changed: the members' ids, endpoints, seats and keys,
@@ -686,7 +690,33 @@ enum class CommandKind : std::uint8_t
     /// same identity and a new address, and making the operator remove it first
     /// would leave a window in which the cluster has agreed it does not exist.
     AddMember = 0,
-    RemoveMember,
+
+    /// Forget an id: remove it wherever the cluster records it, as a member or as a
+    /// principal, and REVOKE the key that record held (#1555). `--cluster-forget`.
+    ///
+    /// **One act, because an operator removing a machine has one intention.** The two
+    /// halves apart are a state nobody asked for: a record gone and its key live is a
+    /// machine every node whose `--raft-peer` still types that key goes on accepting --
+    /// removal failing OPEN -- and a key revoked under a record that stays is a member the
+    /// configuration goes on counting, so on the consensus wire the revocation never takes
+    /// effect. So there is no verb for either half alone.
+    ///
+    /// What it takes is DERIVED from the record being removed, as a member's host tombstone
+    /// is (#1309), so it cannot disagree with what the state holds when it commits -- a key
+    /// replaced between the proposal and the commit is the one revoked. A member leaves a
+    /// tombstone for its host too; a principal has no host. Beside that, the command may
+    /// carry the key the proposing LEADER holds live for the id (`PrepareForget`): the one
+    /// thing the state cannot derive, because a member a `--raft-peer` line typed with its
+    /// key is recorded without one, or not at all, and its key lives only on the command
+    /// lines that type it. Never another id's key -- refused at the proposal, skipped at
+    /// commit.
+    ///
+    /// The ordinal is `RemoveMember`'s, and the verb is that one widened rather than a new
+    /// one: every entry a RELEASED build wrote names a member with no key, which this
+    /// applies exactly as `RemoveMember` did, and no released build can be a member of a
+    /// cluster that has keys -- the Raft peer wire refuses its version
+    /// (`RaftWire::MinSupportedVersion`).
+    Forget,
     SetSetting,
 
     /// Admit a client host to the fleet, clearing any tombstone for it (#1309).
@@ -716,18 +746,10 @@ enum class CommandKind : std::uint8_t
     ///
     /// Refused for a key that is revoked, for a key another id holds, and for an id that
     /// is a member. Re-admitting a principal's id replaces its record, which is how a
-    /// principal's key is rotated -- the old key is then simply nobody's, and an operator
-    /// who wants it refused for good revokes it.
+    /// principal's key is rotated -- the old key is then simply nobody's, refused on every
+    /// wire as a key nobody holds. A key an operator wants refused FOR GOOD is revoked by
+    /// forgetting the id before it is admitted again under its new one (`Forget`).
     AdmitPrincipal,
-
-    /// Revoke a key, for good (#178).
-    ///
-    /// Clears the key from whatever holds it -- a principal is removed, a member keeps its
-    /// record and loses the key -- and records it in `revokedKeys`, which nothing shortens.
-    /// **Never dropped on commit**: every other verb is dropped at `Apply` when its
-    /// preconditions no longer hold, and this one is applied whatever the state says,
-    /// because a revocation that could be lost is removal failing OPEN.
-    RevokeKey,
 
     Last, ///< Not a verb, and has no row: the length of a table keyed by one.
 };
@@ -808,10 +830,10 @@ static_assert(RowsInEnumeratorOrder(MemberSeatTable, &MemberSeatRow::seat),
 struct Command
 {
     CommandKind kind { CommandKind::AddMember };
-    /// The member id for `AddMember`/`AddLearner`/`RemoveMember`, the setting name for
-    /// `SetSetting`, the client's host (a port, if given, is ignored) for
-    /// `AdmitClient`/`ForgetClient`, the principal's id for `AdmitPrincipal`, and whose the
-    /// key was -- a label -- for `RevokeKey`.
+    /// The member id for `AddMember`/`AddLearner`, the setting name for `SetSetting`, the
+    /// client's host (a port, if given, is ignored) for `AdmitClient`/`ForgetClient`, the
+    /// principal's id for `AdmitPrincipal`, and the id -- a member's or a principal's -- for
+    /// `Forget`.
     std::string key;
     /// The consensus endpoint for `AddMember`/`AddLearner`, the value for `SetSetting`,
     /// empty otherwise.
@@ -831,8 +853,9 @@ struct Command
 
     /// The key the verb acts on (#178): the member's for `AddMember`/`AddLearner`, where
     /// absent is NO OPINION and keeps what is recorded; the principal's for
-    /// `AdmitPrincipal` and the revoked one for `RevokeKey`, where it is required. Refused
-    /// for every other verb.
+    /// `AdmitPrincipal`, where it is required; and for `Forget`, the key the proposing leader
+    /// holds live for the id, revoked beside whatever the record holds (`PrepareForget`).
+    /// Refused for every other verb.
     std::optional<Ed25519PublicKey> publicKey;
 
     /// `AdmitPrincipal` only, and required there: what the principal may do. Refused for
@@ -899,7 +922,7 @@ void Apply(ClusterState& state, Command const& command);
 /// `/fleet.json` emits -- RFC 8259 requires that document to be UTF-8 -- which the
 /// fleet page embeds in an SVG, which is XML, and which `--cluster-status` and the
 /// logs print. `SetSetting` constrains its value; its name is already settled by
-/// `FindSetting`. And `RemoveMember` constrains **nothing**, which is the rule that
+/// `FindSetting`. And `Forget` constrains **nothing**, which is the rule that
 /// matters: its key *is* the id being forgotten, so a member that reached replicated
 /// state through a peer built before any of this existed has to stay forgettable.
 /// One rule for every verb alike would refuse the one id an operator most needs to
@@ -927,8 +950,8 @@ void Apply(ClusterState& state, Command const& command);
 /// asked, with its reason.
 ///
 /// **It is a courtesy, and `Apply` is the guarantee.** Two proposals judged against one state
-/// can both be appended before either commits -- a revocation and an admission of the same
-/// key -- so `Apply` enforces the same rules on commit and drops a command that has stopped
+/// can both be appended before either commits -- a forget and an admission of the same key --
+/// so `Apply` enforces the same rules on commit and drops a command that has stopped
 /// satisfying them. What that costs is a silent drop; what this buys is that the ordinary case
 /// is refused where somebody reads the answer.
 /// @param state The state the command would apply to.

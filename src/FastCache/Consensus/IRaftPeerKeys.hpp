@@ -35,7 +35,7 @@ struct PeerKeys
 /// requirements (b) and (c)).
 ///
 /// A seam rather than a key pair and a map passed in, because the roster MOVES while the node
-/// runs: an applied `RevokeKey` has to reach every connection that key proved, and a handshake
+/// runs: an applied forget has to reach every connection its revoked key proved, and a handshake
 /// judged a moment later has to read the roster as it is then. Consensus cannot read
 /// `Cluster::ClusterState` itself -- `Cluster/` includes `Consensus/`, not the reverse -- so it
 /// states what it needs, and the node answers from the replicated state.

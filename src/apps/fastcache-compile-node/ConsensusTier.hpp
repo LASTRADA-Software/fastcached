@@ -561,13 +561,17 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     ///        between, so a leader would dial one set and propose from another.
     void LearnMembers(Cluster::ClusterState const& state, std::span<Cluster::DesiredMember const> desired);
 
-    /// Say, once per member, that a desire was refused because its host was forgotten.
+    /// Say, once per member, that a desire was refused because the cluster forgot its
+    /// host or its id.
     ///
-    /// The refusal itself is `Cluster::MembershipProposals`'s (#1528); this is only
+    /// The refusal itself is `Cluster::MembershipProposals`'s (#1528, #1555); this is only
     /// what makes it visible, since a refused desire and one the state already matches
-    /// both propose nothing. Reconciler thread only.
+    /// both propose nothing. Which forget is named, because a host tombstone refuses
+    /// ANOTHER id at that host too, and an operator reading the line has to know which
+    /// machine's forget is being honoured. Reconciler thread only.
+    /// @param state The state the plan was made against.
     /// @param refused The desires this pass's plan refused.
-    void ReportForgottenDesires(std::span<Cluster::DesiredMember const> refused);
+    void ReportForgottenDesires(Cluster::ClusterState const& state, std::span<Cluster::DesiredMember const> refused);
 
     /// Move the quorum one step towards the cluster's member set.
     ///

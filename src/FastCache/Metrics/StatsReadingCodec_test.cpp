@@ -355,12 +355,16 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    // Moved by #178's certified roster: six counters joined the catalogue -- the three lease
-    // refusals a roster makes possible (`no_roster`, `roster_expired`, `signer_revoked`), the
-    // two ways a worker refuses a roster it is offered (`uncertified`, `expired`) and the
-    // scheduler's refused endorsements -- and the snapshot gained the roster's remaining
-    // lifetime, so `StatsReadingWire::Grammar` went to `-6`. Clients and nodes upgrade together,
-    // as below.
+    // Moved by #1555: `enrollment_requests_refused_revoked_key` joined the catalogue, for the
+    // enrollment a forgotten machine asks for under the key its forget revoked. Clients and
+    // nodes upgrade together, as below.
+    //
+    // Moved by #178's certified roster before that: six counters joined the catalogue -- the
+    // three lease refusals a roster makes possible (`no_roster`, `roster_expired`,
+    // `signer_revoked`), the two ways a worker refuses a roster it is offered (`uncertified`,
+    // `expired`) and the scheduler's refused endorsements -- and the snapshot gained the roster's
+    // remaining lifetime, so `StatsReadingWire::Grammar` went to `-6`. Clients and nodes upgrade
+    // together, as below.
     //
     // Moved by #178's enrollment and discovery on keys before that: three counters joined the
     // catalogue for the discovery proofs a key makes possible to refuse (`unknown_key`,
@@ -397,7 +401,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     //
     // Moved by #1484 before that: the counter cells carry a second bitmap saying WHICH absence
     // each absent cell is, so `StatsReadingWire::Grammar` went to `-4`.
-    CHECK(StatsReadingLayout == 0x35c419073b15e390ULL);
+    CHECK(StatsReadingLayout == 0x905753890eaf12c2ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

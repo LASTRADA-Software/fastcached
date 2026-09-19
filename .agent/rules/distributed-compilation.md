@@ -3077,12 +3077,20 @@ cluster-wide fingerprint would make a batch of approvals disagree for no attack 
 **A role is a table (`EnrollRoleTable`), and each column is a decision.** A member states
 an endpoint and is admitted by `ClusterAdmit`, with no seat opinion so an approval cannot
 promote a demoted learner; a worker states none and is admitted by `AdmitPrincipal`. The
-role follows from `RunsConsensus`, so nobody asks for one the machine will not be.
-`removalFlag` is what the reject-after-approve warning names: `--cluster-forget` for a
-member, and NOTHING for a principal
-([#1555](https://github.com/LASTRADA-Software/fastcached/issues/1555)) -- naming
-`--cluster-forget` there would send an operator to a command that reports success and
-removes nothing.
+role follows from `RunsConsensus`, so nobody asks for one the machine will not be. There is
+no removal column, because one verb removes either role
+([#1555](https://github.com/LASTRADA-Software/fastcached/issues/1555)): `--cluster-forget`
+takes the id out of whichever list records it and revokes its key, so the
+reject-after-approve warning names it for both. Until #1555 it could not be named for a
+worker -- it touched members only, and a warning naming it would have sent an operator to a
+command that reported success and removed nothing.
+
+**A revoked key is refused at the door**, before the window records anything
+(`EnrollmentRequestsRefusedRevokedKey`, `InvalidClusterChange` -- the code the approval would
+be refused with). No approval could admit it, so a row for it is one the operator reading the
+list cannot act on, and `Pending` would keep a forgotten machine polling for an answer that
+cannot come. The door is the courtesy; `ValidateAgainst` refusing `KeyRevoked` at the
+approval, and `Apply` dropping it on commit, are the guarantee.
 
 **A window is openable wherever consensus runs.** `ServesEnrollment` in `main.cpp` asks
 `RunsConsensus` and whether a scheduler tier was built -- the second a runtime fact only
@@ -3242,13 +3250,6 @@ its door and its per-tick re-gate. There is no longer a spelling that refuses to
 seventh surface folds by reaching the one function rather than by remembering to.
 
 ## Open work
-- **[#1555](https://github.com/LASTRADA-Software/fastcached/issues/1555)** — nothing an
-  operator can type proposes `RevokeKey`, so a worker principal an enrollment admitted
-  cannot be removed: `--cluster-forget` is `RemoveMember` and touches members only. The
-  reject-after-approve warning says so by name (`EnrollRoleRow::removalFlag` is absent for
-  a worker) rather than naming a flag that would report success and remove nothing. In
-  #178 PR 4 a principal's key admits nothing on any wire, so the exposure is a roster row;
-  it becomes an access path when node verbs require identity.
 - **[#661](https://github.com/LASTRADA-Software/fastcached/issues/661)** — `IProcessRunner`
   has no cancellable seam, so a compile whose client has GONE runs to completion and this
   machine pays for an object nobody will read. The departure is already detected and

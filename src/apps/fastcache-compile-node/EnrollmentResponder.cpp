@@ -226,6 +226,20 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
                                       role.name,
                                       role.statesEndpoint ? "must name" : "names no"));
 
+    // A key the cluster has REVOKED is refused at the door (#1555), before the window records
+    // anything. No approval could admit it -- `Cluster::ValidateAgainst` refuses it by name --
+    // so a row for it is one the operator reading the list cannot act on, and `Pending` would
+    // keep a forgotten machine polling for an answer that cannot come. Same code as that
+    // refusal, so the joiner hears what an approval would have been told.
+    if (auto const state = _scheduler.AdministeredState(); state.has_value() && state->IsRevoked(fields->publicKey))
+        return Cc::Refuse(_metrics,
+                          { .code = Wire::ErrorCode::InvalidClusterChange,
+                            .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedRevokedKey },
+                          std::format("{} was revoked when this cluster forgot the machine holding it, and a "
+                                      "revoked key is never admitted again: move this machine's --cluster-dir "
+                                      "aside so it mints a new identity, and enrol that",
+                                      FormatEd25519PublicKey(fields->publicKey)));
+
     auto const claim =
         JoinerClaim { .nodeId = nodeId, .raftEndpoint = raftEndpoint, .role = fields->role, .publicKey = fields->publicKey };
     switch (_window.Offer(claim, peer))
@@ -423,26 +437,17 @@ std::vector<std::byte> EnrollmentResponder::AnswerDecision(Wire::EnrollControlVe
     // it, and widening the wire for one advisory line would be the expensive way to say
     // this.
     //
-    // The remedy is the ROLE's (`EnrollRoleRow::removalFlag`): a member is removed by
-    // `--cluster-forget`, and a worker principal by nothing an operator can type yet (#1555),
-    // which is said rather than papered over with a flag that would report success and remove
-    // nothing.
+    // One remedy for every role, because one verb removes either (#1555): `--cluster-forget`
+    // takes the id out of whichever list records it and revokes the key it was admitted under.
     if (decided == Wire::EnrollmentDecision::Rejected && entry->decision == Wire::EnrollmentDecision::Approved)
-    {
-        auto const& role = EnrollRoleRowFor(entry->role);
-        auto const remedy = role.removalFlag.has_value()
-                                ? std::format("run {}={} if that is what you meant", *role.removalFlag, subject)
-                                : std::format("no operator verb removes a {} yet (#1555), though its key admits "
-                                              "nothing on any wire until node verbs require identity",
-                                              role.name);
         _logger.Logf(LogLevel::Warn,
                      "enrollment: {} was rejected after it had already been approved, so it will not be handed the "
                      "roster -- but the approval had already committed it to the cluster as a {}, and this did NOT "
-                     "remove it. It is still recorded, under the key it asked with: {}.",
+                     "remove it. It is still recorded, under the key it asked with: run --cluster-forget={} if that "
+                     "is what you meant, which also revokes that key.",
                      subject,
-                     role.name,
-                     remedy);
-    }
+                     EnrollRoleRowFor(entry->role).name,
+                     subject);
 
     return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollmentReport(_window.Report()));
 }

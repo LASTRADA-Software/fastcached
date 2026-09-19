@@ -592,8 +592,10 @@ Admission is fully dynamic and **removal is not**, and the asymmetry is worth st
 plainly because the machine an operator most wants to revoke is the one most likely to
 be in both lists.
 
-**Two verbs, and they revoke different things.** `--cluster-forget` names a *member
-id* and removes a machine from consensus. `--cluster-forget-client` names a *host* and
+**Two verbs, and they revoke different things.** `--cluster-forget` names an *id* — a
+member's, or a worker's that enrolled — takes it out of the cluster, and revokes the
+identity key it was admitted under ([#1555](https://github.com/LASTRADA-Software/fastcached/issues/1555)),
+so it is never admitted as itself again. `--cluster-forget-client` names a *host* and
 records that the fleet has forgotten it ([#1309](https://github.com/LASTRADA-Software/fastcached/issues/1309));
 a client never joins consensus, so it has no id for the first verb to name.
 

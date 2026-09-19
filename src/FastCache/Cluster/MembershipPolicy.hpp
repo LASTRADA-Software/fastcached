@@ -78,12 +78,13 @@ struct MembershipPlan
     /// The commands to propose, in `desired` order; empty when nothing differs.
     std::vector<Command> proposals;
 
-    /// Desires refused because the cluster FORGOT the host they name (#1528).
+    /// Desires refused because the cluster FORGOT the host they name (#1528), or the id
+    /// they name and revoked its key (#1555).
     ///
     /// Named rather than dropped, because a refusal nothing can see reads exactly like a
     /// desire that already matches: both propose nothing. The caller reports them, once
-    /// per member -- a forgotten machine that still holds the key is desired again at
-    /// every proof, so it stays on this list for as long as it runs.
+    /// per member -- the same desire comes back every pass for as long as whatever holds it
+    /// runs, so it stays on this list for that long.
     std::vector<DesiredMember> forgotten;
 };
 
@@ -125,37 +126,41 @@ struct MembershipPlan
 /// ## What it refuses to propose
 ///
 /// **A record at a host the cluster has FORGOTTEN (#1528).** Everything this function
-/// is handed is an OBSERVATION -- a peer proved the key, this node knows its own record
+/// is handed is an OBSERVATION -- a peer proved its key, this node knows its own record
 /// -- and a forget is an operator's positive act, so an observation must not undo one.
-/// It would, and silently: `--cluster-forget` leaves the machine running with the key,
-/// so discovery proves it again and this node goes on desiring it, and `AddMember`
-/// lifts the tombstone for the host it admits at. The next pass would put the member
-/// back, the quorum would flap -- removed on one pass, re-added on the next -- and the
-/// tombstone every surface refuses the host by would be gone.
+/// It would, and silently: `--cluster-forget` leaves the machine running, a machine
+/// always desires its own record, and `AddMember` lifts the tombstone for the host it
+/// admits at. (Discovery no longer hands one over: a forget revokes the key, and a peer
+/// is desired only once it proves the key the cluster holds for it -- #1555.) The next
+/// pass would put the member back, the quorum would flap -- removed on one pass,
+/// re-added on the next -- and the tombstone every surface refuses the host by would be
+/// gone.
 ///
-/// Decided HERE, against the state, and not by forgetting the desire: discovery hands
-/// the desire back at the machine's next proof, for as long as it holds the key. The
-/// predicate is exactly the one `Apply` lifts a tombstone by, so a refusal here is
-/// precisely a proposal that would have cleared one. Asked only of a desire that would
-/// propose something -- one the state already matches changes nothing and lifts
-/// nothing. It covers this node's OWN record too: a leader whose host was forgotten
-/// stops re-proposing itself, and proposes its own removal instead
-/// (`NextQuorumChange`, #1539).
+/// Decided HERE, against the state, and not by forgetting the desire: whatever holds the
+/// desire hands it back at the next pass, for as long as it runs. The predicate is
+/// exactly the one `Apply` lifts a tombstone by, so a refusal here is precisely a
+/// proposal that would have cleared one. Asked only of a desire that would propose
+/// something -- one the state already matches changes nothing and lifts nothing. It
+/// covers this node's OWN record too: a leader whose host was forgotten stops
+/// re-proposing itself, and proposes its own removal instead (`NextQuorumChange`, #1539).
 ///
 /// **Undoing a forget is the operator's, and it is deliberate**: `--cluster-admit`
 /// commits `AddMember` directly -- never through this function -- and that lifts the
 /// tombstone, after which the desire matches and nothing here moves.
 ///
 /// **A loopback host is never tombstoned**, so a cluster whose members share one
-/// machine over loopback -- a test rig, not a deployment -- has nothing to refuse by: a
-/// member forgotten there is re-admitted at its next proof. A host names no machine
-/// among members that all have the same one.
+/// machine over loopback -- a test rig, not a deployment -- has no host to refuse by. What
+/// refuses a member forgotten there is the key its forget revoked, which names the id
+/// (#1555): a desire for an id recorded nowhere whose key `revokedKeys` holds is refused
+/// here too. Only a member recorded without a key leaves neither fact, and is re-admitted
+/// at its next proof, because a host names no machine among members that all have the
+/// same one.
 /// @param state The cluster's state as this node last applied it.
 /// @param active The configuration consensus currently holds, both sets: where a member
 ///        the state does not record is already counted.
 /// @param desired Records this node believes should be present.
-/// @return What to propose, in `desired` order, and what was refused because its host
-///         was forgotten.
+/// @return What to propose, in `desired` order, and what was refused because the
+///         cluster forgot its host or its id.
 [[nodiscard]] MembershipPlan MembershipProposals(ClusterState const& state,
                                                  Consensus::Configuration const& active,
                                                  std::span<DesiredMember const> desired);
@@ -263,23 +268,35 @@ struct QuorumPlan
 /// is worse than one that is merely wrong.
 ///
 /// A forget IS that decision, and it means the same thing whoever currently leads. A
-/// leader whose own record is gone AND whose host the cluster has forgotten -- the
-/// two facts `RemoveMember` writes together, and the one reading of *forgotten* that
-/// the first pass of a fresh leader, which has recorded nothing yet, cannot produce
-/// -- stops re-proposing its record (`MembershipProposals`, #1528) and proposes its
+/// leader whose own record is gone AND whose host the cluster has forgotten or whose
+/// key it has revoked -- what `Forget` writes, and the one reading of *forgotten*
+/// that the first pass of a fresh leader, which has recorded nothing yet, cannot
+/// produce -- stops re-proposing its record (`MembershipProposals`, #1528) and proposes its
 /// own removal, LAST: after every other change it can still make as the leader.
 /// Once that commits it steps down (`RaftNode`, §4.2.2 -- #1449's demoted leader is
 /// the same rule), and the remaining voters elect a leader that never admits it
 /// again. Never the last voter: a configuration nobody is counted in can commit
 /// nothing, and forgetting the only voter is refused BY NAME before anything is
-/// proposed (`ValidateForget`), so the record never runs ahead of a quorum that
+/// proposed (`PrepareForget`), so the record never runs ahead of a quorum that
 /// could not follow it.
 ///
 /// Its own bootstrap entry does not protect it, for a reason that holds only for
 /// this one entry: a node cannot start without naming itself, so that entry records
 /// how it was started, not an operator's assertion about who belongs. Every OTHER
-/// member this node's command line names is still such an assertion, and a forgotten
-/// one stays counted, below, exactly as before.
+/// member this node's command line names is still such an assertion -- until the
+/// cluster forgets it, which outranks it (below).
+///
+/// **A forgotten member leaves the quorum, whoever typed it (#1555).** A forget revokes
+/// the key the member was admitted under, and on the consensus wire that takes effect when
+/// the configuration stops counting the member: until then it keeps its key for itself
+/// (`RosterKeys`), because cutting a counted voter off could leave a quorum nobody can
+/// reach. So a forgotten member this policy KEPT would go on voting for as long as it runs
+/// -- the forget failing open on the wire it most concerns. Whoever leads therefore
+/// removes a counted member that is recorded nowhere and that `revokedKeys` names, with a
+/// bootstrap set or without one. That is not absence read as removal: the
+/// revocation is the forget's own record, which nothing else writes and a fresh leader's
+/// empty state cannot contain. A member recorded without a key leaves no revocation,
+/// and is removed on the terms below, as it always was.
 ///
 /// **The removal of a bootstrap member.** This is the one that is not obvious, and
 /// getting it wrong shrinks a healthy cluster to one node: `--raft-peer` puts a
@@ -303,8 +320,9 @@ struct QuorumPlan
 /// member set and nothing logged. The bootstrap set comes off the command line and
 /// says the same thing after every start.
 ///
-/// **A node given no bootstrap set proposes no removal at all**, which is the same
-/// rule read at its limit rather than an exception to it. A `--raft-join` node was
+/// **A node given no bootstrap set removes no member merely for being absent**, which
+/// is the same rule read at its limit rather than an exception to it -- a FORGOTTEN one
+/// it removes, above. A `--raft-join` node was
 /// told nothing about the cluster's shape, so every member is equally unexplained to
 /// it — and once such a node is elected it would otherwise remove all of them, one
 /// per commit, which is the identical failure the parameter exists to prevent
@@ -316,8 +334,8 @@ struct QuorumPlan
 /// @param active The configuration consensus currently holds, both sets.
 /// @param self This node's own record as it announces it; its id and its consensus
 ///        endpoint are read, the endpoint to ask whether its host was forgotten.
-/// @param bootstrap The ids this node was started with, in either set; never removed,
-///        except this node itself once it is forgotten.
+/// @param bootstrap The ids this node was started with, in either set; never removed
+///        for being absent, and removed like any other member once forgotten.
 /// @param replication What this leader knows of each member's log: who has caught up.
 /// @return The change to propose, if any, and the members a promotion waits for.
 [[nodiscard]] QuorumPlan NextQuorumChange(ClusterState const& state,
@@ -326,24 +344,36 @@ struct QuorumPlan
                                           std::span<Consensus::NodeId const> bootstrap,
                                           Replication const& replication);
 
-/// Whether forgetting `id` leaves the quorum something it can follow (#1539).
+/// The `Forget` a leader proposes for `id`, or why it may not propose one (#1539, #1555).
 ///
-/// Asked before a `RemoveMember` is proposed, because afterwards is too late: the
-/// command applies whatever it names, and the only voter's removal is one
-/// `NextQuorumChange` can never propose -- a configuration with no voter commits
-/// nothing, including the change that would undo it. So the record would say
-/// *forgotten* while consensus went on counting the member, and its host would be
-/// refused by every surface while it led. Refused by NAME instead, while the operator
-/// who typed `--cluster-forget` is reading the answer.
+/// Asked before a `Forget` is proposed, because afterwards is too late, and it answers
+/// two questions only the proposing node can:
 ///
-/// Against the configuration consensus holds rather than the state: which members
-/// are COUNTED is the question, and a typed `--raft-peer` voter is counted while
-/// recorded nowhere.
+/// **Whether forgetting `id` leaves the quorum something it can follow.** The command
+/// applies whatever it names, and the only voter's removal is one `NextQuorumChange`
+/// can never propose -- a configuration with no voter commits nothing, including the
+/// change that would undo it. So the record would say *forgotten* while consensus went
+/// on counting the member, and its host would be refused by every surface while it
+/// led. Refused by NAME instead, while the operator who typed `--cluster-forget` is
+/// reading the answer. Against the configuration consensus holds rather than the state:
+/// which members are COUNTED is the question, and a typed `--raft-peer` voter is counted
+/// while recorded nowhere.
+///
+/// **Which key the forget revokes beyond its record's.** `Apply` revokes whatever key the
+/// record holds, and a member the state records without one -- or not at all, which is
+/// every member a `--raft-peer` line typed -- would keep a key that line states live on
+/// every node that types it: the forgotten machine goes on proving itself there, which is
+/// removal failing OPEN. The proposer states the key it holds live for the id, and the
+/// replicated revocation then outranks every command line that types it
+/// (`RosterKeys::KeysOf`).
 /// @param active The configuration consensus currently holds.
-/// @param id The member to be forgotten.
-/// @return Nothing when it may be proposed; `InvalidConfiguration`, naming the member,
-///         when it is the only voter.
-[[nodiscard]] std::expected<void, ConsensusError> ValidateForget(Consensus::Configuration const& active,
-                                                                 Consensus::NodeId const& id);
+/// @param id The machine to be forgotten.
+/// @param liveKey The key this node holds live for @p id (`Consensus::IRaftPeerKeys::KeysOf`),
+///        or nullopt when it holds none -- a principal, which consensus never dials, is one.
+/// @return The command to propose; `InvalidConfiguration`, naming the member, when it is
+///         the only voter.
+[[nodiscard]] std::expected<Command, ConsensusError> PrepareForget(Consensus::Configuration const& active,
+                                                                   Consensus::NodeId const& id,
+                                                                   std::optional<Ed25519PublicKey> const& liveKey);
 
 } // namespace FastCache::Cluster

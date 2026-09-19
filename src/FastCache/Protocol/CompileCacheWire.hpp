@@ -410,7 +410,7 @@ enum class Op : std::uint8_t
     // questions the gate asks are exactly the two that matter.
     ClusterStatus = 0x08, ///< Operator asks what the cluster has agreed.
     ClusterSet = 0x09,    ///< Operator changes a replicated setting.
-    ClusterForget = 0x0A, ///< Operator removes a member.
+    ClusterForget = 0x0A, ///< Operator forgets a member or a principal, revoking its key.
     ClusterAdmit = 0x0B,  ///< Operator adds a member, or moves one.
     /// Operator admits a CLIENT host: a machine that may ask the fleet for capacity and
     /// never joins consensus. Not `ClusterAdmit`, which admits a MEMBER (#1309).

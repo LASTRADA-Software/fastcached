@@ -4,10 +4,11 @@
 //
 // Under the pre-shared key, removing a machine meant rotating the key on every other one: the
 // removed machine still held it, and holding it WAS membership. Here each machine proves its
-// own key, the cluster revokes one, and nothing else changes anywhere -- which is the claim
-// this file checks, with every production piece that carries it: the key files as a start
-// mints and reads them, the replicated `RevokeKey`, the roster each node adopts from the state,
-// and the real server and transport between them.
+// own key, the cluster forgets one machine and so revokes its key, and nothing else changes
+// anywhere -- which is the claim this file checks, with every production piece that carries it:
+// the key files as a start mints and reads them, the replicated `Forget` an operator's
+// `--cluster-forget` commits (#1555), the roster each node adopts from the state, and the real
+// server and transport between them.
 #include "NodeKey.hpp"
 
 #include <FastCache/Async/Task.hpp>
@@ -248,8 +249,8 @@ struct Dialler
 
 } // namespace
 
-TEST_CASE("After RevokeKey(n3), n3's session closes and its redial is refused, and nothing else changes",
-          "[node][consensus][handshake][revocation]")
+TEST_CASE("After --cluster-forget=n3, n3's session closes and its redial is refused, and nothing else changes",
+          "[node][consensus][handshake][revocation][forget]")
 {
     ScratchDirectory const scratch { "raft-key-revocation" };
     Machine const n1 { "n1", scratch.Path() };
@@ -281,17 +282,24 @@ TEST_CASE("After RevokeKey(n3), n3's session closes and its redial is refused, a
     REQUIRE(network.sink.received.size() == 1);
     REQUIRE(fromN3.transport.ConnectedPeers() == 1);
 
-    // The operator revokes n3's key. The entry commits and every member applies it, n3 included.
+    // The operator forgets n3. The entry commits and every member applies it, n3 included. Every
+    // node's command line still types n3 WITH its key, so it is the revocation the forget carries
+    // that does the rest -- removing the record alone would leave the typed key live (#1555).
     Cluster::Apply(state,
-                   Cluster::Command { .kind = Cluster::CommandKind::RevokeKey,
+                   Cluster::Command { .kind = Cluster::CommandKind::Forget,
                                       .key = "n3",
                                       .value = {},
                                       .schedulerEndpoint = {},
-                                      .publicKey = n3.PublicKey(),
+                                      .publicKey = std::nullopt,
                                       .role = std::nullopt });
     REQUIRE(state.IsRevoked(n3.PublicKey()));
+    // And the configuration drops n3, which is when the revocation takes effect on this wire:
+    // a member still counted keeps its key for itself until then (`RosterKeys`, #1555).
     for (auto* const view: { &v1, &v2, &v3 })
+    {
         view->roster.Adopt(state);
+        view->roster.AdoptConfiguration(Consensus::Configuration { .voters = { "n1", "n2" }, .learners = {} });
+    }
 
     // n3's session closes at its next frame, which is not delivered.
     fromN3.Vote(2, "n3");

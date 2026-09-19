@@ -1075,7 +1075,11 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
           .arity = Arity::Value,
           .operand = "=<node-id>",
           .apply = SelectClusterAction<ClusterAction::Forget>(),
-          .description = "remove a member from the cluster and exit. The one\n"
+          .description = "forget a machine and exit: take the id out of the\n"
+                         "cluster -- a member, or an enrolled worker -- and\n"
+                         "revoke the key it was admitted under, which is\n"
+                         "never admitted again: it can come back only under\n"
+                         "a new identity (a fresh --cluster-dir). The one\n"
                          "membership change nothing automatic makes:\n"
                          "discovery only ever adds, because a peer goes\n"
                          "quiet far more often than it leaves." },
