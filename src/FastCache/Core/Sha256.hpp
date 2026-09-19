@@ -73,11 +73,11 @@ enum class Sha256Engine : std::uint8_t
 /// `std::rotr` rather than a shift pair that is UB at zero.
 ///
 /// **Every engine must produce the same digest, byte for byte.** The digest is a
-/// contract between MACHINES: lease grants, discovery proofs and cluster signing
-/// are tags one node computes and another checks. A node whose CPU has the SHA
-/// instructions and one whose CPU has not run different engines, so an engine that
-/// is wrong makes those two refuse each other, and the refusal reads as a wrong
-/// cluster key. `Sha256_test.cpp` guards that with the published vectors and a
+/// contract between MACHINES: every sealed frame's tag and every session key HKDF
+/// derives are computed on one node and checked, or matched, on another. A node whose
+/// CPU has the SHA instructions and one whose CPU has not run different engines, so an
+/// engine that is wrong makes those two refuse each other, and the refusal reads as a
+/// forged frame. `Sha256_test.cpp` guards that with the published vectors and a
 /// byte-for-byte comparison against `Scalar`, on every engine the test host's CPU
 /// runs, in the default test set.
 class Sha256
@@ -151,9 +151,9 @@ class Sha256
 
 /// HMAC-SHA256 (RFC 2104).
 ///
-/// The keyed function a pre-shared-key handshake needs: a bare hash of
-/// `key || challenge` is length-extendable and a hash of `challenge || key` is
-/// weaker than HMAC against collisions in the underlying hash, so this is the
+/// The keyed function a session seal and a key derivation need (`Core/SessionSeal`,
+/// `Core/Hkdf`): a bare hash of `key || message` is length-extendable and a hash of
+/// `message || key` is weaker than HMAC against collisions in the underlying hash, so this is the
 /// construction with published vectors (RFC 4231) rather than either of the
 /// obvious hand-rolled ones.
 /// @param key The shared secret; any length.

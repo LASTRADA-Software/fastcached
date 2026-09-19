@@ -54,26 +54,48 @@ inline constexpr Cc::SurfaceRefusal HostForgotten {
 inline constexpr std::string_view HostForgottenWhy =
     "this fleet was told to forget this host; it is served nothing here until an operator admits it again";
 
-/// Answer one already-taken verdict, or nullopt when it admits the caller.
+/// The refusal a connection that proved a REVOKED identity key gets, wherever it knocks (#178).
+///
+/// `HostForgotten`'s wire code, for its reason -- a client acts on the two identically -- and a
+/// counter of its own, because the diagnoses are opposite: a forgotten HOST is an address the
+/// cluster stopped serving, while this is the removed MACHINE itself, still holding its key and
+/// still dialling in. An operator watching for the second must not find it summed into the first.
+inline constexpr Cc::SurfaceRefusal KeyForgotten {
+    .code = CompileCacheWire::ErrorCode::NotAMember,
+    .counter = IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked,
+};
+
+/// What a machine whose key the cluster revoked is told.
+inline constexpr std::string_view KeyForgottenWhy =
+    "this fleet revoked the identity key this connection proved; the machine was forgotten, and it is served "
+    "nothing here from any address until it is admitted again under a new key";
+
+/// Answer one already-taken decision, or nullopt when it admits the caller.
 ///
 /// Split out when the second way of ASKING arrived (#1428): the two spellings below differ
 /// only in what they ask about -- a connection, or an address -- and the answer they give is
 /// one decision that must not be written twice.
-/// @param verdict What the fold concluded.
+///
+/// Takes the DECISION rather than the verdict since #178, because `Forgotten` now has two
+/// authors with two diagnoses: a revoked identity key names the machine, a forgotten host names
+/// an address. Where both decided, the key is the more specific of the two and is what is said.
+/// @param decision What the fold concluded, and which routes concluded it.
 /// @param metrics Where the refusal is counted.
 /// @param stranger What THIS surface answers a host nobody listed.
 /// @param strangerWhy The words that ride with it.
 /// @return The refusal to answer, or nullopt when the caller is a member.
-[[nodiscard]] inline std::optional<std::vector<std::byte>> AnswerMembership(Distributed::Membership verdict,
+[[nodiscard]] inline std::optional<std::vector<std::byte>> AnswerMembership(Distributed::MembershipDecision decision,
                                                                             IMetricsSink& metrics,
                                                                             Cc::SurfaceRefusal stranger,
                                                                             std::string_view strangerWhy)
 {
-    switch (verdict)
+    switch (decision.verdict)
     {
         case Distributed::Membership::Member:
             return std::nullopt;
         case Distributed::Membership::Forgotten:
+            if (decision.decidedBy.Has(Distributed::MembershipParticipant::KeyTombstone))
+                return Cc::Refuse(metrics, KeyForgotten, KeyForgottenWhy);
             return Cc::Refuse(metrics, HostForgotten, HostForgottenWhy);
         case Distributed::Membership::Outsider:
         case Distributed::Membership::Last:
@@ -86,14 +108,15 @@ inline constexpr std::string_view HostForgottenWhy =
     return Cc::Refuse(metrics, stranger, strangerWhy);
 }
 
-/// Refuse @p peer unless this node's oracle admits it, or unless this CONNECTION proved the
-/// cluster key.
+/// Refuse @p peer unless this node's oracle admits it -- by its address, or by the identity this
+/// CONNECTION proved.
 ///
-/// **The proof is folded here and nowhere else**, which is what makes *a key holder is a
-/// member* true at every gate that asks this question rather than at the ones somebody
-/// remembered (#1428). `Distributed::ExplainConnection` is the fold, on the same
-/// `PrecedenceOf` the address routes are composed with -- so a forgotten host stays refused
-/// and a connection that proved nothing gets exactly what the oracle answered.
+/// **The identity is folded here and nowhere else**, which is what makes *a proven machine is a
+/// member, and a revoked one is not* true at every gate that asks this question rather than at the
+/// ones somebody remembered (#1428, #178). `Distributed::ExplainConnection` is the fold, on the same
+/// `PrecedenceOf` the address routes are composed with -- so a forgotten host stays refused, a
+/// revoked key is refused whatever its address, and a connection that proved nothing gets exactly
+/// what the oracle answered.
 ///
 /// @param membership The node's oracle, bound once by the surface -- never re-asked for,
 ///        which is what makes a removal reach a running surface at all.
@@ -110,28 +133,26 @@ inline constexpr std::string_view HostForgottenWhy =
     Cc::SurfaceRefusal stranger,
     std::string_view strangerWhy)
 {
-    auto const decision = Distributed::ExplainConnection(membership, peer.host, peer.provenNodeId.has_value());
-    return AnswerMembership(decision.verdict, metrics, stranger, strangerWhy);
+    return AnswerMembership(
+        Distributed::ExplainConnection(membership, peer.host, peer.proven), metrics, stranger, strangerWhy);
 }
 
-/// Refuse @p watcher unless this node's oracle admits it, or unless its CONNECTION proved the
-/// cluster key.
+/// Refuse @p watcher unless this node's oracle admits it, by its address or by the identity its
+/// CONNECTION proved.
 ///
 /// The same fold as the overload above, reached from the live-stream path, where what is
-/// available is a `LiveWatcher` rather than the connection's full identity -- narrower on
-/// purpose, and narrower in the one field a gate could not have checked anyway.
+/// available is a `LiveWatcher` rather than the connection's `PeerIdentity`.
 ///
-/// **It is an overload rather than a `(host, bool)` parameter pair deliberately.** A bare
-/// `bool` argument at a call site says nothing about which question it answers, and this
-/// header already carries the rule that a claim must not be spellable the way a default is.
-/// Two named types, one fold, and no call site that could pass the wrong one silently.
+/// **It is an overload rather than a `(host, identity)` parameter pair deliberately.** Two named
+/// types, one fold, and no call site that could pass a host from one connection with the identity
+/// of another.
 ///
 /// **Two gates reach this for ONE subscription** -- `RefuseWatcher` at the door and `Recheck`
 /// on every tick -- and that is the property #1512 turns on: they must answer alike, or a
 /// proven watcher is admitted and dropped a tick later.
 /// @param membership The node's oracle, bound once by the surface.
 /// @param metrics Where the refusal is counted.
-/// @param watcher Who is watching: the host, and whether the cluster key was proved.
+/// @param watcher Who is watching: the host, and the identity its connection proved.
 /// @param stranger What THIS surface answers a host nobody listed.
 /// @param strangerWhy The words that ride with it.
 /// @return The refusal to answer, or nullopt when the watcher is a member.
@@ -142,12 +163,12 @@ inline constexpr std::string_view HostForgottenWhy =
     Cc::SurfaceRefusal stranger,
     std::string_view strangerWhy)
 {
-    auto const decision = Distributed::ExplainConnection(membership, watcher.host, watcher.provedClusterKey);
-    return AnswerMembership(decision.verdict, metrics, stranger, strangerWhy);
+    return AnswerMembership(
+        Distributed::ExplainConnection(membership, watcher.host, watcher.proven), metrics, stranger, strangerWhy);
 }
 
 // `RefuseUnlessMemberAtAddress` stood here until #1512, and it is GONE rather than left
-// unused. It existed to say *the cluster-key proof must not widen this gate*, and its one
+// unused. It existed to say *the node proof must not widen this gate*, and its one
 // caller -- the live-stats door -- chose it for a reason about the SEAM rather than about the
 // subject: `Protocol::ILiveGate` took a bare host, so the per-tick `Recheck` could not have
 // seen a proof, and a door honouring one alone would admit a proven watcher and end its

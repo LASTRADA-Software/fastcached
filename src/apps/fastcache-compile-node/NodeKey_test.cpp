@@ -104,7 +104,6 @@ void WriteBytes(std::filesystem::path const& path, std::span<std::byte const> by
     cfg.raftListen = "6680";
     cfg.raftSelf = "10.0.0.7";
     cfg.clusterDir = dir;
-    cfg.clusterKeyFile = dir / "cluster.key";
     return cfg;
 }
 

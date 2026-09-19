@@ -65,7 +65,7 @@ struct SecretProvenanceFacts
 /// **The provenance question is the CALLER's and is deliberately absent here.**
 /// #384's rule is provenance-gated because the secret it protects can also arrive
 /// in argv, where the exposure is `ps` rather than a mode. A secret reached BY
-/// PATH -- a cluster key, a scheduler or dashboard token, a TLS private key -- has
+/// PATH -- an identity key, a scheduler or dashboard token, a TLS private key -- has
 /// no such second route: the path is not the secret and the file is, so a
 /// world-readable key is exposed whether the path was typed or read out of a
 /// file, and asking whether it was typed answers a question nobody has

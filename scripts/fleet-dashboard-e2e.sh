@@ -68,24 +68,16 @@ fi
 workdir="$(mktemp -d)"
 node_pid=""
 
-# The cluster's pre-shared key, which every node here shares.
+# No key file (#178 PR 6). This node says `--fleet-open`, so its compile verbs admit
+# every caller that can reach the port, and a node in that shape has to be able to check
+# the lease a client presents it (#282). It runs consensus, so it holds the roster that
+# check reads and signs its leases with its own identity key -- which is what a real fleet
+# in this shape does, and what makes these fixtures exercise the SIGNING scheduler and the
+# VERIFYING worker rather than the unchecked pair.
 #
-# Not decoration: these nodes say `--fleet-open`, so their compile verbs admit
-# every caller that can reach the port, and a node in that shape has to be able to
-# check the lease a client presents it (#282). Giving them the key is what a real
-# fleet in this shape does, and it means these fixtures exercise the SIGNING
-# scheduler and the VERIFYING worker rather than the unchecked pair.
-#
-# The bind is loopback, which is the OTHER half of #282's rule and is why the key is
-# a choice here rather than a requirement: either a loopback bind or a loopback-only
-# policy closes the port on its own, and this fixture has the first and deliberately
-# not the second. The key is still what makes the exchange a checked one.
-#
-# Fixed text rather than /dev/urandom: what these scripts assert has nothing to do
-# with the key's value, and a per-run secret would make a failure look like a flake.
-# Sixteen bytes is the minimum `ReadClusterKey` accepts.
-cluster_key="${workdir}/cluster.key"
-printf 'e2e-fixture-cluster-key-not-a-secret\n' > "$cluster_key"
+# The bind is loopback, which is the OTHER half of #282's rule: either a loopback bind or
+# a loopback-only policy closes the port on its own, and this fixture has the first and
+# deliberately not the second.
 
 cleanup() {
     [[ -n "$node_pid" ]] && kill "$node_pid" 2>/dev/null
@@ -214,7 +206,6 @@ tls_args=()
     --raft-self 127.0.0.1 \
     --cluster-dir "${workdir}/state" \
     --fleet-open \
-    --cluster-key-file "$cluster_key" \
     --admin-listen "$admin_port" \
     --dashboard \
     --dashboard-token-file "${workdir}/token" \

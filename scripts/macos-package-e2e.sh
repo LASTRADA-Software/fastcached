@@ -699,11 +699,18 @@ node_plist="/Library/LaunchDaemons/${NODE_LABEL}.plist"
 # The unset default escapes that rule (an activated socket may be forwarded, so
 # `--advertise` is authoritative there) which is why the ORIGINAL command was
 # accepted with a 6674 bind and a 6676 advertisement.
+#
+# `--cluster-dir` since #178 PR 6: a worker proves an identity key kept there on
+# every connection to its scheduler, so naming a scheduler without one is refused
+# at install time as it is at startup. A directory of its own under the prefix,
+# because the registration hands the directory it names to the worker's account,
+# so it must be one nothing else uses.
 node_port=$(( port + 3 ))
 if ! node_log="$(sudo "${PREFIX}/bin/fastcache-compile-node" --install-service --service-scope=system \
         --listen-node=127.0.0.1:${node_port} \
         --advertise=127.0.0.1:${node_port} \
         --scheduler=127.0.0.1:6675 \
+        --cluster-dir="${PREFIX}/var/fastcache-node" \
         --toolchain=/usr/bin/cc 2>&1)"; then
     # **Ask launchd what it did with the job before giving up on the reading.**
     #

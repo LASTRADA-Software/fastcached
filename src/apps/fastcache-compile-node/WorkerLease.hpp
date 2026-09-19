@@ -54,7 +54,7 @@ enum class SocketActivation : std::uint8_t
 ///
 /// Since #178 a grant is signed by the voter that issued it, with its own identity key, and
 /// verified against the roster: the state a consensus member applies, or the roster a strict
-/// majority of the voters certified on any other node. The cluster key signs no lease.
+/// majority of the voters certified on any other node.
 ///
 /// @param cfg What this node was told to be.
 /// @param roster What a grant is verified against, or null when this node holds none. Borrowed
@@ -84,8 +84,8 @@ enum class SocketActivation : std::uint8_t
 ///        run (#614), the scheduler term it last learned (#421), and where a term going
 ///        backwards is reported. Borrowed by the validator, so it must outlive it, and
 ///        shared by every compile thread. Taken even on the paths that build an
-///        unchecked validator, because whether a node has a cluster key is not a reason
-///        for its caller to hold a different set of objects.
+///        unchecked validator, because whether a node has a roster is not a reason for its
+///        caller to hold a different set of objects.
 /// @param metrics Where an adopted term reset is counted.
 /// @param logger Where the chosen mode is announced.
 /// @return The validator, or why this node must not serve.

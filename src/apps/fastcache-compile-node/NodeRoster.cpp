@@ -4,6 +4,7 @@
 // Its own header FIRST and in a group of its own, for `WorkerLease.cpp`'s reason.
 #include "NodeMembership.hpp"
 
+#include <algorithm>
 #include <format>
 #include <tuple>
 #include <utility>
@@ -80,6 +81,28 @@ Distributed::ILeaseRoster const* NodeRoster::Lease() const noexcept
     if (_state != nullptr)
         return _state.get();
     return _trust.get();
+}
+
+ServerStanding NodeRoster::StandingOf(std::string_view serverId, Ed25519PublicKey const& serverKey) const
+{
+    auto const* const roster = Lease();
+    if (roster == nullptr || roster->Read(_wallClock.Now()).standing == Distributed::RosterStanding::Absent)
+        return ServerStanding::Unchecked;
+
+    // A revocation first, whatever id it was revoked under: the key is the fact, and a removed
+    // machine claiming a voter's id is still the removed machine.
+    auto const keys = roster->KeysOf(serverId);
+    if (std::ranges::contains(keys.revoked, serverKey))
+        return ServerStanding::Revoked;
+    if (keys.live == serverKey)
+        return ServerStanding::Voter;
+    // A consensus member whose applied state names no voter's key yet has nothing to place a server
+    // against -- itself included, when it schedules for itself. Calling that server a stranger made
+    // every such node refuse to prove itself to its OWN scheduler until a heartbeat round after the
+    // commit that recorded its key, warning at every start. The revocation above is still asked.
+    if (_state != nullptr && !_state->HoldsVoterKeys())
+        return ServerStanding::Unchecked;
+    return ServerStanding::NotVoter;
 }
 
 void NodeRoster::Applied(Cluster::ClusterState const& state)

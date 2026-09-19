@@ -9,6 +9,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -41,8 +42,13 @@ namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
-/// A caller the fleet has admitted.
-CallerContext const Insider { .membership = Membership::Member, .peerId = "peer-1" };
+/// A machine the fleet has admitted by the identity it proved, which is what every verb a machine
+/// joins the fleet with needs since #178.
+CallerContext const Insider { .membership = Membership::Member, .peerId = "peer-1", .provenNodeId = "node-1" };
+
+/// A caller the fleet admits by its ADDRESS and that proved nothing: a client, which may lease and
+/// may not join.
+CallerContext const AddressAdmitted { .membership = Membership::Member, .peerId = "peer-2" };
 
 /// A scheduler that already leads, plus the protocol in front of it.
 /// The fleet this fixture's scheduler leads. Named rather than empty so the
@@ -949,4 +955,64 @@ TEST_CASE("A peer too old to report held-back memory schedules as it always did"
     auto const back = Wire::DecodeCapacity(Wire::EncodeCapacity(wire));
     REQUIRE(back.has_value());
     CHECK(Unwrap(back).reservedMemoryBytes == 0U);
+}
+
+TEST_CASE("A verb a machine joins the fleet with is refused to a caller that proved no identity",
+          "[distributed][scheduler][protocol]")
+{
+    // Owner decision 5 of #178: a NODE is admitted by the identity it proves, and an address admits
+    // only a CLIENT. The pair is the assertion -- the same verbs from the same address, differing
+    // only in whether the connection proved an identity -- so a scheduler refusing everybody would
+    // fail the second half and one refusing nobody the first.
+    Fixture fixture;
+
+    auto const registration = Wire::EncodeRegister(
+        Wire::RegisterRequest { .fingerprint = "gcc-14", .endpoint = "10.0.0.2:7100", .slots = 2, .acceptedCodecs = {} });
+    auto const joiningVerbs = std::array {
+        registration,
+        Wire::EncodeNodeAnnounce(Wire::NodeAnnounceRequest { .endpoint = "10.0.0.2:7100" }),
+        Wire::EncodeHeartbeat("w-1", /*inFlight=*/0),
+        Wire::EncodeWithdraw("w-1"),
+    };
+
+    // Asked twice per verb, at both of the protocol's doors: `RefusePeer` before the payload is
+    // read, and `Answer` after. Each counts once, because only one of them runs per request.
+    for (auto const& frame: joiningVerbs)
+    {
+        auto const opRaw = std::to_integer<std::uint8_t>(frame[2]);
+        auto const early = fixture.protocol.RefusePeer(AddressAdmitted, opRaw);
+        REQUIRE(early.has_value());
+        CHECK(ErrorOf(Unwrap(early)) == Wire::ErrorCode::NodeIdentityRequired);
+        CHECK(ErrorOf(fixture.protocol.Answer(frame, AddressAdmitted)) == Wire::ErrorCode::NodeIdentityRequired);
+    }
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedNodeIdentityRequired)
+          == 2 * joiningVerbs.size());
+    CHECK(fixture.service.Workers().LiveWorkers().empty());
+
+    // A client verb from the same caller is not an identity question: the fleet answers it, and
+    // `NoWorker` is that answer.
+    auto const ask = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k1", .acceptedCodecs = {} });
+    CHECK_FALSE(fixture.protocol.RefusePeer(AddressAdmitted, std::to_integer<std::uint8_t>(ask[2])).has_value());
+    CHECK(ErrorOf(fixture.protocol.Answer(ask, AddressAdmitted)) == Wire::ErrorCode::NoWorker);
+
+    // And the control: the identical registration, from a caller that proved an identity, joins.
+    CHECK_FALSE(fixture.protocol.RefusePeer(Insider, std::to_integer<std::uint8_t>(registration[2])).has_value());
+    CHECK(StatusOf(fixture.protocol.Answer(registration, Insider)) == Wire::Status::Ok);
+    CHECK(fixture.service.Workers().LiveWorkers().size() == 1);
+    CHECK(fixture.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedNodeIdentityRequired)
+          == 2 * joiningVerbs.size());
+}
+
+TEST_CASE("Exactly the verbs a machine joins the fleet with require a proven identity", "[distributed][scheduler][protocol]")
+{
+    // The column, read back: a verb gaining the requirement by accident refuses every client that
+    // sends it, and one losing it re-opens the address route for a node. Named here rather than
+    // derived, because the SET is the decision being pinned.
+    auto const joining = std::array { Wire::Op::Register, Wire::Op::NodeAnnounce, Wire::Op::Heartbeat, Wire::Op::Withdraw };
+    for (auto const& row: Wire::OpTable)
+    {
+        auto const joins = std::ranges::contains(joining, row.code);
+        INFO(row.name);
+        CHECK((row.identity == Wire::IdentityRequirement::ProvenNodeOnly) == joins);
+    }
 }

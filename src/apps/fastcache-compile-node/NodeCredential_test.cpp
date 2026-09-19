@@ -390,11 +390,10 @@ TEST_CASE("Site 3: a registration presents the secret in force NOW", "[node][cre
                                  .metrics = metrics,
                                  .credential = credential,
                                  .notice = notice,
-                                 // Nothing to prove and nothing to present: every case in this
-                                 // file is about the announce round itself, and a round with no
-                                 // cluster key is the ordinary single-machine shape.
-                                 .proofKey = nullptr,
-                                 .nodeId = {},
+                                 // Nothing proves: every case in this file is about the announce
+                                 // round itself, against a scripted fleet that serves no handshake
+                                 // (#178). The proof is `FrameEndpoint_test`'s, over a real socket.
+                                 .prover = nullptr,
                                  .lease = lease,
                                  .fleetMismatch = fleetMismatch,
                                  .logger = logger };
@@ -436,11 +435,16 @@ TEST_CASE("The production source answers from the LIVE snapshot, not the startup
     // fail at the `CHECK` -- and those are two different repairs in two different
     // files, which is why they are separate assertions rather than one.
     Testing::ScratchDirectory const scratch { "node-credential-rotation" };
-    auto const path =
-        WriteConfig(scratch.Path(), std::format("scheduler: scheduler.example:6676\nrequirepass: {}\n", SecondSecret));
+    // A state directory in both, because a node naming a scheduler must keep an identity (#178)
+    // and `cluster_dir` is not reloadable: a file and a live configuration disagreeing about it
+    // would make this reload refuse for a reason that has nothing to do with the credential.
+    auto const path = WriteConfig(
+        scratch.Path(),
+        std::format("scheduler: scheduler.example:6676\ncluster_dir: node-state\nrequirepass: {}\n", SecondSecret));
 
     NodeConfig initial;
     initial.schedulers = { "scheduler.example:6676" };
+    initial.clusterDir = "node-state";
     initial.token = std::string { FirstSecret };
 
     NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };

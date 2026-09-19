@@ -1,7 +1,7 @@
 # Consensus and cluster membership
 
 Rules for `src/FastCache/Consensus/` and `src/FastCache/Cluster/`: Raft itself,
-the LAN discovery beacon and its pre-shared-key handshake, the Raft peer wire and the
+the LAN discovery beacon and the identity-key challenge after it, the Raft peer wire and the
 handshake every connection on it proves each end's identity key with, the replicated
 cluster configuration, and the admin verbs that change it.
 
@@ -138,67 +138,34 @@ Every rule below has already been a bug.
     cases were hand-typed as hex runs and both were wrong (49 bytes for 50, 120 for
     131), which reads exactly like an implementation failure. They are constructed
     programmatically now.
-- **One key, one signing construction, and the domain label is a required
-  parameter rather than a constant each signer remembers to fold in.** The
-  pre-shared key MACs a lease token and a member's proof on the `0xFC` surface -- and
-  MACed a discovery proof until #178, and every Raft peer connection from #1308 until #178,
-  both moved to identity keys -- and the lease and the discovery proof each used to build
-  its message inline out of `HmacSha256` and `WireFields::Encode` -- which are
-  primitives, not a construction. So what a message is *made of* was written
-  twice, and the requirement that every message carry a domain label was true of
-  exactly one of them: the lease carried `fastcache-lease-v1`, the proof carried
-  nothing. Nothing was reachable, and that is the point rather than the reprieve
-  it reads as -- **the safety was a property of the PAIR, not of either
-  construction.** A proof was a four-field encoding beginning with a cluster id
-  and a lease tag a two-field one beginning with a literal, so no byte string was
-  a valid message under both. That is a coincidence, and it survives exactly as
-  long as nobody adds a field to discovery or adds a third signer whose shape
-  collides with one of them. **Arity is not domain separation.**
-  `Cluster/ClusterSigning.hpp` is now the only thing in `src/` that calls the
-  primitive (#402), and five things about it are each what some plausible simpler
-  design gets wrong:
-  - **The domain is a `SigningDomain`, and it has no default.** There is no
-    argument to pass a bare label to and nothing to omit, so a signer is a row of
-    `SigningDomainTable` or it does not sign. The labels are `static_assert`ed
-    present and distinct: an empty one encodes as a zero-length field and
-    separates domains exactly as well as no label did, and a duplicated one is
-    that same hole reached by copying the row above and changing only the
-    enumerator, which is how a new signer actually gets written.
-  - **The label is a FIELD, not a prefix glued onto the first one.** It goes
-    through the same length-prefixed grammar as everything after it, so no choice
-    of first field can shift bytes across the boundary and spell a different
-    domain's label. It is the object key's rule and the proof's own, applied to
-    the one part of the message a caller does not supply.
-  - **`VerifyFields` is the only comparison the seam exposes, and every verifier
-    goes through it** -- `AuthenticateLeaseToken` for the lease and `VerifyNodeProof` for
-    the `0xFC` surface's, and `DiscoveryWire::VerifyProofTag` for the discovery proof
-    until #178 retired it. That discovery one is the whole
-    reason this bullet is worth reading: the seam landed with `DiscoveryService`
-    still taking an expected tag and comparing it by hand, so the property was
-    true of one of the two wires it named. It was constant-time, so nothing was
-    exploitable -- but #402's subject is that an invariant stated and enforced
-    nowhere is not an invariant, and a seam whose own claim holds on half its
-    callers reproduces the ticket inside its fix. Signing entry points stay
-    public, because minting is a separate act, so a future caller *could* still
-    take a tag and compare it itself; that residual is smaller than it was rather
-    than gone, and `psk-signing-seam` does not cover it -- a legitimately obtained
-    tag compared with the wrong operator is not a call to the primitive.
-  - **What it deliberately does NOT own**, because each is per protocol and
-    getting it wrong here would be getting it wrong everywhere: which fields a
-    message carries, whether a weak or empty key may sign (`ReadClusterKey`
-    refuses a short one at load and `AuthenticateLeaseToken` an empty one at
-    verify -- two layers, one policy, and neither belongs in a MAC), and WHEN the
-    MAC is checked relative to everything else. The last is an ordering property
-    of a verifier and no seam can hold it for one.
-  - **A guard, because the rule was already written down and enforced nowhere.**
-    A required parameter binds whoever goes *through* the seam and says nothing
-    about a fourth signer calling `HmacSha256` itself, which is an ordinary call
-    to a public function in `Core/` that no compiler will remark on. `ctest -R
-    psk-signing-seam` is what refuses that, and it fails when its own scan matches
-    nothing -- a table row vouching for a file that has stopped signing, or a
-    primitive renamed out from under the scan, would otherwise leave it passing
-    vacuously forever. `psk-signing-seam-selftest` drives all seven verdicts,
-    including the two that must PASS.
+- **Every signature carries a domain LABEL, signed as its first FIELD -- and the pre-shared
+  key's one seam went with the key (#178 PR 6).** From #402 until then
+  `Cluster/ClusterSigning.hpp` was the only caller of the HMAC primitive under the pre-shared
+  key: a signer was a `SigningDomainTable` row or it did not sign, `VerifyFields` was the one
+  comparison, and `ctest -R psk-signing-seam` refused a signer calling `HmacSha256` itself.
+  Discovery and the Raft peer wire left it for identity keys at #178, the lease at PR 5 and
+  the node proof at PR 6, and the seam, the key file, `ClusterKeySource` and the check were
+  DELETED -- removed, never shimmed. What the seam existed to teach still holds of every
+  Ed25519 construction that replaced it, and each is what some plausible simpler design gets
+  wrong:
+  - **Arity is not domain separation.** Before #402 the lease carried `fastcache-lease-v1`
+    and the discovery proof carried nothing, and no byte string was valid under both only
+    because a four-field encoding began with a cluster id and a two-field one with a literal
+    -- a coincidence that lasts until somebody adds a field or a signer. **The safety was a
+    property of the PAIR, not of either construction.** It matters MORE with identity keys,
+    not less: one node key now signs its discovery proof, its Raft proof and verdict, its
+    roster endorsement, its challenge replies and -- on a scheduler -- every lease, so a label
+    is the only thing keeping one of those from verifying as another. Each construction
+    asserts its own labels present and distinct, and `NodeProof_test`'s cross-construction
+    case asserts them distinct from each OTHER, which nothing asked once the table went.
+  - **The label is a FIELD, not a prefix glued onto the first one.** It goes through the same
+    length-prefixed grammar as everything after it, so no choice of first field can shift
+    bytes across the boundary and spell a different domain's label.
+  - **A retired label is never reused**, so a MAC input from the pre-shared era and a signed
+    message can never be the same bytes (`RetiredNodeProofLabels`; the Raft `-v1` labels).
+  - **WHEN a signature is checked relative to every other claim belongs to each verifier**,
+    and no seam could ever hold it: the signature before the roster is consulted, and before
+    any claim is reported on.
 - **Giving the proof a label changed the proof wire, and the datagram version did
   not move.** Every tag differed from a pre-#402 build's; `CurrentVersion` stayed at
   1 because what changed was the MAC *input* and not the grammar, and bumping it
@@ -442,10 +409,11 @@ simpler design gets wrong.
   itself with are one reading of one file. The server and transport take the identity and an
   `ISecureRandom` as REQUIRED constructor arguments -- no default and no null -- and their own
   id IS the identity's, never a parameter beside it that could name somebody the proofs do
-  not. `ConsensusNeedsClusterKeyRefusal` stays in the startup table for reasons that MOVED:
-  the tier no longer reads the cluster key, and neither do discovery nor enrollment since #178
-  PR 4, and a lease is signed by the issuing voter's own key since #178 PR 5, but a consensus
-  node still proves itself on the node port with it, and #178 retires it surface by surface. "No key, so skip the check" is the shape the worker's lease rule (#282)
+  not. `ConsensusNeedsClusterKeyRefusal` went at #178 PR 6 with the key file it required,
+  once the node port -- the last surface reading that file -- proved identity keys too. Its
+  question moved one flag over: `SchedulerNeedsIdentityRefusal` refuses a node that names a
+  scheduler and holds no identity key, because every verb it would join the fleet with would
+  be refused. "No key, so skip the check" is the shape the worker's lease rule (#282)
   refuses one surface over: the port open, every refusal counter at zero, and the fleet
   healthy-looking from both ends.
 
@@ -458,9 +426,9 @@ simpler design gets wrong.
   signatures are labelled by `RaftPeerSignatureLabels` (`fastcache-raft-proof-v2`,
   `-verdict-v2`), `static_assert`ed present and distinct, so a proof reflected back as a
   verdict verifies as nothing; the session key's HKDF label is `fastcache-raft-session-v2`.
-  The pre-shared key's three Raft rows left `SigningDomainTable`, and their `-v1` labels are
-  retired rather than reused. Frame sealing is `Core/SessionSeal`, not Raft's, because the
-  `0xFC` wire needs it next. The session code never compares a tag itself.
+  The pre-shared key's three Raft rows left `SigningDomainTable` (itself deleted at #178 PR 6),
+  and their `-v1` labels are retired rather than reused. Frame sealing is `Core/SessionSeal`,
+  not Raft's, because the `0xFC` wire seals with it too (`SealedFrameSocket`, #178 PR 6). The session code never compares a tag itself.
 
 - **One refusal, one row -- at BOTH ends, because one misconfigured machine shows on two.**
   Every refusal is a row of `Consensus/RaftPeerRefusals.hpp` beside its log sentence, and the
@@ -477,11 +445,12 @@ simpler design gets wrong.
 - **What became false was removed, not kept** (the project's position on superseded
   code). `EnrollmentConfigured`'s key clause could no longer decide anything, so the
   predicate is gone and `ServesEnrollment` asks `RunsConsensus`; `EnrollmentResponder`
-  still reads the key before `ClusterAdmit`, because a key file readable at boot can break
-  later. `NodeMembership`'s refusal to let a replicated `fleet-open` WIDEN a keyless node is
-  gone too: cluster state reaches only a consensus node, and every consensus node holds the
-  key its lease check verifies with. The RELOAD guard in `ValidateNodeReloadable` stays,
-  because a node that runs no consensus can still be keyless and be opened by its operator.
+  read the key before `ClusterAdmit` until #178 PR 4 stopped handing one over.
+  `NodeMembership`'s refusal to let a replicated `fleet-open` WIDEN a keyless node is gone
+  too: cluster state reaches only a consensus node, and every consensus node holds the roster
+  its lease check verifies against. The RELOAD guard in `ValidateNodeReloadable` stays,
+  because a node that runs no consensus can still show no roster in its configuration and be
+  opened by its operator.
   And at #178 `PskRaftPeerCredential` went with its rows, rather than staying as a second way
   to authenticate this wire.
 
@@ -1533,8 +1502,8 @@ state directory holds an Ed25519 identity key, and `ClusterState` records member
 principals admitted by key, and keys revoked for good. PR 3 made the Raft peer wire VERIFY
 against them (see *The Raft peer wire*), and PR 4 moved discovery and enrollment onto them
 (see *Discovery and the identity key*, and the enrollment window in
-`distributed-compilation.md`); the `0xFC` surface and leases still use the cluster key until
-later PRs move them. Every rule below is about getting the record
+`distributed-compilation.md`); PR 5 moved leases onto them and PR 6 the `0xFC` surface, which
+is when the cluster key went. Every rule below is about getting the record
 right, because the wire now trusts it.
 
 - **Only an ABSENT key file mints.** `node-key` is read back on every start; a file that is

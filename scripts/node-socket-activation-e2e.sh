@@ -151,11 +151,13 @@ readonly DEFAULT_NODE_PORT=6674
 readonly READY_SECONDS=240
 
 # The packaged configuration: a scheduler that is not there (the worker must still come
-# up and keep retrying), an advertise naming the ACTIVATED port, and deliberately no
+# up and keep retrying), an advertise naming the ACTIVATED port, the state directory the
+# packaged unit provides for its identity key (#178 PR 6), and deliberately no
 # --listen-node.
 "$activator" --listen="127.0.0.1:${port}" -- \
     "$node" \
         --scheduler=127.0.0.1:6675 \
+        --cluster-dir="${workdir}/state" \
         --advertise="127.0.0.1:${port}" \
         --toolchain=/usr/bin/g++ \
         --cache-memory=0 \

@@ -9,6 +9,8 @@
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Nonce.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Distributed/NodeProof.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IListener.hpp>
 #include <FastCache/Protocol/CompileCacheAuth.hpp>
@@ -103,11 +105,11 @@ enum class EndpointRefusal : std::uint8_t
     /// connection on the surface. Never asked for one, or already spent one -- a challenge
     /// answers exactly one proof whatever that proof's outcome.
     ///
-    /// Every other way a proof can fail -- a payload that will not decode, a tag that does not
-    /// authenticate, a key file that has stopped being readable -- is the PROVER's to decide,
-    /// and `INodeProver::Verify` hands those back already encoded and already counted. They are
-    /// not rows here, because a row here obliges all seven surfaces to say why they do not count
-    /// a refusal only one of them can ever produce.
+    /// Every other way a proof can fail -- a payload that will not decode, a signature that does
+    /// not verify, a key the roster does not hold or has revoked -- is the PROVER's to decide, and
+    /// `INodeProver::Verify` hands those back already encoded and already counted. They are not
+    /// rows here, because a row here obliges all seven surfaces to say why they do not count a
+    /// refusal only one of them can ever produce.
     NodeProofUnchallenged,
 
     /// The count. See `Core/EnumTable.hpp`.
@@ -159,16 +161,16 @@ inline constexpr std::string_view AnswerDeadlineIsTheEndpointsRationale =
     "the answer deadline is the endpoint's decision and the endpoint counts it, in the sweep row and the "
     "refusal-sent row; a per-surface copy would be a third tally of one event";
 
-/// Why no surface but the cluster-key prover's counts a node-proof refusal, stated once for
+/// Why no surface but the identity prover's counts a node-proof refusal, stated once for
 /// every surface that has to say it.
 ///
 /// `CredentialIsTheSchedulersRationale`'s exact counterpart, and it is here rather than beside
 /// one responder for `EndpointRefusalCodes`' reason: this is a property of the ROUTING -- the
 /// two proof verbs are `VerbFamily::NodeProof`, which `MergedResponder` sends to the one
-/// component holding the cluster key -- so no other surface can ever be asked about them. Six
+/// component that verifies identities -- so no other surface can ever be asked about them. Six
 /// surfaces stating that separately is six sentences that agree today.
 inline constexpr std::string_view NodeProofIsTheProversRationale =
-    "the node-proof verbs are the NodeProof family, which MergedResponder routes to the cluster-key prover; no "
+    "the node-proof verbs are the NodeProof family, which MergedResponder routes to the identity prover; no "
     "proof outcome is ever decided against this surface";
 
 /// Answer an endpoint-decided refusal the way its row decided, counted or not.
@@ -296,7 +298,47 @@ class IFrameStream
                                                              IPushSink* sink) = 0;
 };
 
-/// Verifies that a caller holds the cluster's pre-shared key, one connection at a time.
+/// One connection's half-finished node handshake: what the caller opened with, what this server
+/// answered, and the ephemeral secret only this server holds (#178).
+///
+/// Connection state, held by the serve loop and spent by the next proof whatever its outcome. The
+/// secret lives in `SecureByteBuffer` and dies with the handshake.
+struct NodeHandshake
+{
+    CompileCacheWire::NodeChallengeRequest request; ///< The caller's nonce and ephemeral key.
+    CompileCacheWire::NodeChallengeReply reply;     ///< This server's half, signed.
+    SecureByteBuffer ephemeralSecret;               ///< This server's ephemeral secret.
+};
+
+/// A challenge issued: the state to keep on the connection, and the reply to send.
+struct NodeChallengeIssued
+{
+    NodeHandshake handshake;      ///< Kept by the serve loop until the proof.
+    std::vector<std::byte> reply; ///< The encoded `Ok`.
+};
+
+/// What one proof established, and what to answer it with.
+struct NodeProofVerdict
+{
+    /// The identity the proof's signature verified under, when the roster holds that key LIVE or
+    /// REVOKED -- the second so every later verb on the connection is refused as the forgotten
+    /// machine's. Disengaged for a proof that did not verify, or verified under a key the roster
+    /// does not know: those connections have established nothing.
+    std::optional<ProvenIdentity> identity;
+
+    /// The session keys, engaged whenever the handshake agreed one -- whatever the verdict. The
+    /// connection is sealed with them before `reply` is written, so the answer to a proof, an `Ok`
+    /// or a refusal alike, is always the first sealed frame: the caller engages its receiving seal
+    /// before it sends the proof, and a grammar that depended on the verdict would leave it reading
+    /// a refusal as the head of a sealed frame. Sealing a connection proves nothing about who is on
+    /// it; `identity` is what admission reads.
+    std::optional<Distributed::NodeSessionKeys> keys;
+
+    /// What to answer: `Ok`, or the refusal, already encoded and counted.
+    std::vector<std::byte> reply;
+};
+
+/// Proves, one connection at a time, WHICH machine a caller is (#178).
 ///
 /// **A seam of its own rather than two more methods on `IFrameResponder`**, for
 /// `IFrameStream`'s reason: only the surface that owns `VerbFamily::NodeProof` has anything to
@@ -305,9 +347,9 @@ class IFrameStream
 /// omissions.
 ///
 /// **The endpoint terminates both verbs rather than passing them to `Answer`**, exactly as it
-/// does `AUTH` and for the same reason: what they change is CONNECTION state, and the responder
-/// is shared by every connection on the surface. So the challenge lives in the serve loop and
-/// this object holds none.
+/// does `AUTH` and for the same reason: what they change is CONNECTION state -- the handshake
+/// outstanding, the identity proved and the seal -- and the responder is shared by every
+/// connection on the surface. So the handshake lives in the serve loop and this object holds none.
 class INodeProver
 {
   public:
@@ -318,39 +360,29 @@ class INodeProver
     INodeProver& operator=(INodeProver&&) = delete;
     virtual ~INodeProver() = default;
 
-    /// A fresh challenge for one connection.
+    /// Answer a `NodeChallenge`: draw this connection's nonce and ephemeral key, and sign the reply.
     ///
     /// Drawn HERE rather than in the endpoint, because the randomness seam belongs with the
     /// component that holds the key: `FrameServer` serves six surfaces that have no use for an
-    /// `ISecureRandom&`, and threading one through every construction site would put the
-    /// dependency where nothing reads it.
-    ///
-    /// **A draw can fail, and the refusal comes back ENCODED**, for `Verify`'s reason below: the
-    /// surface owns its wording and whether it is counted. A challenge that cannot be drawn is
-    /// never replaced by a weak one (#1527).
-    /// @return The nonce to state on the wire and to verify the next proof against, or the
-    ///         encoded refusal to send back.
-    [[nodiscard]] virtual std::expected<Nonce, std::vector<std::byte>> IssueChallenge() = 0;
+    /// `ISecureRandom&`. **A draw can fail, and the refusal comes back ENCODED**, for `Verify`'s
+    /// reason below; a challenge that cannot be drawn is never replaced by a weak one (#1527).
+    /// @param payload The `NodeChallenge` request payload.
+    /// @return The handshake to keep and the reply to send, or the encoded refusal.
+    [[nodiscard]] virtual std::expected<NodeChallengeIssued, std::vector<std::byte>> Challenge(
+        std::span<std::byte const> payload) = 0;
 
-    /// Whether @p payload proves the cluster key against @p challenge.
+    /// Judge a `ProveNode` against the connection's handshake.
     ///
-    /// **The refusal comes back ENCODED and already counted**, which is this endpoint's
-    /// standing division of labour -- the endpoint owns WHEN the question is asked, the surface
-    /// owns the answer, its wording and its counter. It is not an `EndpointRefusal` row for the
-    /// three ways this can fail, because a row there obliges every surface on the port to state
-    /// why it does not count a refusal only this one can produce; and the three do not share a
-    /// diagnosis: a payload that will not decode is a client-library mismatch, a tag that does
-    /// not authenticate is a wrong key or a search, and a key file that has stopped being
-    /// readable is this node's own fault and nobody else's.
-    ///
-    /// @param challenge The nonce this connection was told, as it was sent.
+    /// **Every refusal comes back ENCODED and already counted**, which is this endpoint's standing
+    /// division of labour -- the endpoint owns WHEN the question is asked, the surface owns the
+    /// answer, its wording and its counter. The four ways a proof fails do not share a diagnosis:
+    /// a payload that will not decode is a client-library mismatch, a signature that does not
+    /// verify is a forgery or a bug, an unknown key is a machine nobody admitted, and a revoked
+    /// key is a machine the cluster forgot.
+    /// @param handshake The connection's handshake, spent by this call whatever its outcome.
     /// @param payload The `ProveNode` request payload.
-    /// @return The id the caller claimed -- a label bound inside the MAC, never an authenticated
-    ///         identity, per `Distributed::NodeProof`'s header -- or the encoded refusal to send
-    ///         back. Never an empty id on success: a proof that authenticated for no id would
-    ///         read downstream as *nothing was proved*.
-    [[nodiscard]] virtual std::expected<std::string, std::vector<std::byte>> Verify(std::span<std::byte const> challenge,
-                                                                                    std::span<std::byte const> payload) = 0;
+    /// @return What was established and what to answer.
+    [[nodiscard]] virtual NodeProofVerdict Verify(NodeHandshake const& handshake, std::span<std::byte const> payload) = 0;
 };
 
 /// Who is at the other end of a connection, as an admission policy sees it.
@@ -460,12 +492,12 @@ class IFrameResponder
     /// not.
     ///
     /// **Takes what the connection PROVED as well as its address, since #1428.** That is a
-    /// `PeerIdentity` rather than a second parameter, and the widening is what makes a
-    /// key-holding node at an address on no list admissible at all: the address routes answer
-    /// the same as before, and the proof is unioned onto them per connection by
-    /// `Distributed::ExplainConnection`. A surface that ignores the new field answers exactly
-    /// what it answered, because *nothing was proved* is the empty id and the fold returns the
-    /// oracle's own decision for it.
+    /// `PeerIdentity` rather than a second parameter, and the widening is what makes a machine at
+    /// an address on no list admissible at all -- and a REVOKED machine refusable from any address
+    /// (#178): the address routes answer the same as before, and the identity is folded onto them
+    /// per connection by `Distributed::ExplainConnection`. A surface that ignores the field
+    /// answers exactly what it answered, because *nothing was proved* is a disengaged identity and
+    /// the fold returns the oracle's own decision for it.
     ///
     /// @param peer Who is at the other end: the kernel's host, and what this connection proved.
     /// @param opRaw The third header byte, as received; not necessarily a known verb.
@@ -872,7 +904,7 @@ class IFrameResponder
     /// @return The stream, which must outlive the endpoint, or null.
     [[nodiscard]] virtual IFrameStream* StreamFor(std::uint8_t opRaw) noexcept = 0;
 
-    /// The cluster-key prover this surface offers a connection, or null when it offers none.
+    /// The identity prover this surface offers a connection, or null when it offers none.
     ///
     /// **Not per verb**, unlike every question above it: the two verbs of
     /// `VerbFamily::NodeProof` are one exchange and a surface that served half of it would be a
@@ -883,8 +915,8 @@ class IFrameResponder
     /// answer here -- a surface offering no prover admits nobody it would not have admitted
     /// before -- so what a default would cost is not an open door but a silence. It would let a
     /// surface that ought to verify proofs inherit *I verify none*, which is a family refused at
-    /// the door with a sentence about this node running no component for it, on a node that holds
-    /// the key. A pure virtual makes the claim explicit at each surface.
+    /// the door with a sentence about this node running no cluster, on a node that runs one. A pure
+    /// virtual makes the claim explicit at each surface.
     /// @return The prover, which must outlive the endpoint, or null.
     [[nodiscard]] virtual INodeProver* NodeProver() noexcept = 0;
 };

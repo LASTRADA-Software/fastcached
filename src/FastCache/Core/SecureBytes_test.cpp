@@ -224,8 +224,8 @@ TEST_CASE("a reallocation zeroes the block it abandons", "[secure][secureallocat
     // while the credential is still very much alive, so a design that wipes only at the
     // end leaves a copy behind and nothing reports it.
     //
-    // No holder in this tree grows a key buffer today -- `ReadClusterKey` sizes its one
-    // allocation from `file_size` -- so this case is asserting cover for a change rather
+    // No holder in this tree grows a key buffer today -- `HkdfSha256Expand` reserves its
+    // output before it appends -- so this case is asserting cover for a change rather
     // than reproducing a live defect. That is worth having and worth being honest about:
     // the reason it is cheap to add now is exactly the reason nobody would think to add
     // it later, when some holder starts appending.
@@ -260,9 +260,9 @@ TEST_CASE("a reallocation zeroes the block it abandons", "[secure][secureallocat
 TEST_CASE("a moved-from credential buffer leaves no second copy", "[secure][secureallocator]")
 {
     // A move steals the block rather than copying it, so there is nothing to wipe and the
-    // one region stays live. Worth pinning: `SchedulerService` takes its signing key from
-    // a span and `SignedLeaseValidator` takes one by value, so buffers here are moved and
-    // copied, and a design that wiped on every transfer would be wrong in the other
+    // one region stays live. Worth pinning: an `Ed25519KeyPair` is moved and copied as an
+    // ordinary value, and its secret half is one of these buffers, so a design that wiped on
+    // every transfer would be wrong in the other
     // direction -- it would clear a key that is still in use.
     Arena arena;
     auto source = MakeBuffer(arena);
@@ -295,8 +295,8 @@ TEST_CASE("a copied credential buffer wipes each copy independently", "[secure][
     std::size_t copyRegion = 0;
     {
         // Through `CopyOf` rather than `auto copy = original;`. The copy IS the subject
-        // here -- `SignedLeaseValidator` takes the key BY VALUE, so a second buffer with
-        // its own block is the production shape -- but a local copy that is never
+        // here -- an `Ed25519KeyPair` copied by value carries a second buffer with its own
+        // block, which is the production shape -- but a local copy that is never
         // modified is what `performance-unnecessary-copy-initialization` exists to
         // refuse, and it cannot see that the point is the ALLOCATION rather than the
         // value. Returning it from a function states the intent where the check can read
@@ -339,7 +339,7 @@ TEST_CASE("SecureZero clears a region the caller owns", "[secure][securezero]")
 
 TEST_CASE("SecureZero accepts an empty region", "[secure][securezero]")
 {
-    // An empty credential is ordinary -- no `--cluster-key-file` is a supported
+    // An empty credential is ordinary -- no `--requirepass` is a supported
     // configuration -- and an empty `std::vector` may hold no allocation at all, so a
     // null pointer with a zero length reaches this on a perfectly healthy path.
     SecureZero(nullptr, 0);

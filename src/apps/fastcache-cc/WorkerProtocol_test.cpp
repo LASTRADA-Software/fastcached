@@ -1695,7 +1695,8 @@ TEST_CASE("A worker that has never learned a term refuses nothing for it", "[wor
     CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerSchedulerTermRegressions) == 0);
 }
 
-TEST_CASE("A worker with no cluster key refuses no lease, and that is a whole policy", "[worker-protocol][lease]")
+TEST_CASE("A worker with no roster to check against refuses no lease, and that is a whole policy",
+          "[worker-protocol][lease]")
 {
     // `UncheckedLeaseValidator` is what a single-machine install runs, and it is a
     // named production function rather than an accept-all lambda so that this
@@ -2494,7 +2495,7 @@ TEST_CASE("A compile inside its grant is served, and one from a keyless worker i
         CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseExpired) == 0);
     }
 
-    SECTION("a worker with no cluster key has no bound to enforce, and does not invent one")
+    SECTION("a worker with no roster has no bound to enforce, and does not invent one")
     {
         // The single-machine install. `UncheckedLeaseValidator` authenticates nothing,
         // so it reports NO remaining budget -- and a caller reading that disengaged

@@ -95,7 +95,8 @@ endif()
 include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 
 # Turn a list of shell globs into one anchored regex, so the tree is walked ONCE
-# (#502). Verbatim from check-psk-signing-seam.cmake; consolidating the copies is #495.
+# (#502). Once verbatim from check-psk-signing-seam.cmake, retired with the pre-shared key at #178;
+# consolidating the copies that remain is #495.
 # @param globs The shell globs, each like `*.hpp` or `*.hpp.in`.
 # @param outVar Set to an anchored alternation regex.
 function(fastcached_globs_to_regex globs outVar)
@@ -130,7 +131,7 @@ list(FILTER sources INCLUDE REGEX "${sourceRegex}")
 
 # `list(LENGTH)`, never `if(sources STREQUAL "")`: copying an empty glob result leaves
 # `sources` UNDEFINED, and `if()` then compares the literal name. Measured in
-# check-psk-signing-seam.cmake, where the reasoning is written out in full.
+# check-psk-signing-seam.cmake, retired at #178; its history holds the reasoning in full.
 list(LENGTH sources scannedCount)
 if(scannedCount EQUAL 0)
     message(FATAL_ERROR

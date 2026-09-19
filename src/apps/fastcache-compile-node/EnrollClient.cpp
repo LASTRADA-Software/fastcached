@@ -7,10 +7,13 @@
 
 #include <FastCache/Async/Task.hpp>
 #include <FastCache/Cluster/Roster.hpp>
+#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Core/Base64.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
+#include <FastCache/Distributed/RosterStore.hpp>
 #include <FastCache/Protocol/LeaderRedirect.hpp>
 
 #include <algorithm>
@@ -249,7 +252,8 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
 
     return EnrollReading { .progress = EnrollProgress::Admitted,
                            .detail = "approved",
-                           .roster = std::vector<std::byte> { reply->roster.begin(), reply->roster.end() } };
+                           .roster = std::vector<std::byte> { reply->roster.begin(), reply->roster.end() },
+                           .certificate = std::vector<std::byte> { reply->certificate.begin(), reply->certificate.end() } };
 }
 
 std::string RenderEnrollmentReport(Wire::EnrollmentReport const& report)
@@ -311,9 +315,7 @@ std::string RenderEnrollmentReport(Wire::EnrollmentReport const& report)
     return out;
 }
 
-std::expected<std::string, std::string> DescribeAdmission(JoinerIdentity const& self,
-                                                          std::span<std::byte const> roster,
-                                                          bool keyFileNamed)
+std::expected<std::string, std::string> DescribeAdmission(JoinerIdentity const& self, std::span<std::byte const> roster)
 {
     auto const decoded = Cluster::DecodeRoster(roster);
     if (!decoded.has_value())
@@ -359,13 +361,47 @@ std::expected<std::string, std::string> DescribeAdmission(JoinerIdentity const& 
     }
     else
         out += "Start this node with the same state directory; a worker principal joins no consensus.\n";
-
-    // Said now rather than met at the next start: the pre-shared key still signs leases and
-    // proves a caller on the node port, and enrollment no longer hands it over (#178).
-    if (!keyFileNamed)
-        out += "It also needs this cluster's --cluster-key-file, which enrollment no longer hands over: place it the "
-               "way it is placed on every other member.\n";
     return out;
+}
+
+std::string KeepEnrolledRoster(std::span<std::byte const> roster,
+                               std::span<std::byte const> certificate,
+                               std::chrono::system_clock::time_point now,
+                               Distributed::IRosterStore& store)
+{
+    if (certificate.empty())
+        return "The leader holds no certified roster yet, so none was kept: this worker adopts one when it first "
+               "reaches a scheduler, and until then checks grants against --voter-key if it names any.\n";
+
+    auto const compared = Cluster::DecodeRoster(roster);
+    auto const offered = Cluster::DecodeCertifiedRoster(certificate);
+    if (!compared.has_value() || !offered.has_value())
+        return "The leader's certified roster could not be read, so none was kept: this worker adopts one when it "
+               "first reaches a scheduler.\n";
+
+    // The voters of the roster the OPERATOR compared stand in for the anchors a worker would
+    // otherwise be given, so the certificate is judged exactly as any offered roster is.
+    auto const voters = Cluster::VotersOf(*compared);
+    auto adopted = Cluster::CertifyRoster(*offered,
+                                          Cluster::CertificationInput { .clusterId = offered->clusterId,
+                                                                        .voters = voters,
+                                                                        .minimumVersion = 0,
+                                                                        .held = std::nullopt,
+                                                                        .now = now,
+                                                                        .slack = Distributed::LeaseTokenClockSkewSlack });
+    if (!adopted.has_value())
+        return std::format("The leader's certified roster was not kept -- {} -- so this worker adopts one when it first "
+                           "reaches a scheduler.\n",
+                           Cluster::DescribeRosterRefusal(adopted.error()));
+
+    if (auto saved = store.Save(
+            Cluster::PersistedRoster { .certificate = adopted->certificate, .certifiedUntil = adopted->certifiedUntil });
+        !saved.has_value())
+        return std::format("The leader's certified roster could not be kept: {}.\n", saved.error());
+
+    return std::format("Kept the cluster's certified roster, version {}, as this worker's trust root: it checks every "
+                       "grant against it and needs no --voter-key.\n",
+                       adopted->certificate.version);
 }
 
 std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
@@ -472,7 +508,8 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                                                         ICredentialSource const& credential,
                                                         ISecureRandom& random,
                                                         IDrainWait& wait,
-                                                        IEndpointDialer& dialer)
+                                                        IEndpointDialer& dialer,
+                                                        IWallClock const& wallClock)
 {
     // **This mode's own preconditions are refused HERE and not as `StartupPolicyRejection`
     // rows, and that is a decision rather than a missed table row.** That table judges a
@@ -620,8 +657,15 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
 
         switch (reading.progress)
         {
-            case EnrollProgress::Admitted:
-                return DescribeAdmission(self, reading.roster, !cfg.clusterKeyFile.empty());
+            case EnrollProgress::Admitted: {
+                auto admitted = DescribeAdmission(self, reading.roster);
+                // A worker keeps the leader's certified roster as its trust root; a member applies the
+                // replicated state and needs none.
+                if (!admitted.has_value() || self.role != Wire::EnrollRole::Worker)
+                    return admitted;
+                Distributed::FileRosterStore store { NodeStateDirectory(cfg) / Distributed::RosterFileName };
+                return *admitted + KeepEnrolledRoster(reading.roster, reading.certificate, wallClock.Now(), store);
+            }
             case EnrollProgress::Refused:
                 return std::unexpected { std::format("{} refused this machine ({})", seed, reading.detail) };
             case EnrollProgress::Fatal:

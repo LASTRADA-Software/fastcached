@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# The cluster key must live in a container that zeroes its storage.
+# Key material must live in a container that zeroes its storage.
 #
-# #324 was six holders of one secret, every one of them a plain `std::vector<std::byte>`
+# #324 was six holders of one secret -- the cluster's pre-shared key, retired since (#178) -- every one of them a plain `std::vector<std::byte>`
 # that freed the bytes without touching them. Fixing the six is not the same as fixing
 # the defect: a seventh holder is one declaration away, it looks exactly like the six
 # did, and nothing about a plain vector reports that it is holding key material. This is
@@ -13,7 +13,7 @@
 # under a name this table does not carry is invisible to it, and no scan over identifiers
 # can be otherwise -- a cache is full of variables called `key` that hold nothing secret,
 # so a vocabulary wide enough to catch every credential would refuse most of the tree. So
-# the table is the claim: these identifiers denote cluster-key material, and each one is
+# the table is the claim: these identifiers denote key material, and each one is
 # required to still MATCH something, because a term that has quietly stopped matching is a
 # guard that has quietly stopped guarding and reads identically to a clean tree (#492).
 #
@@ -49,12 +49,11 @@ Refuse() {
 }
 
 # ---------------------------------------------------------------------------
-# The table. One row per identifier that denotes cluster-key material, with the
+# The table. One row per identifier that denotes key material, with the
 # reason it is on the list -- so a future reader can judge a row rather than
 # inherit it.
 # ---------------------------------------------------------------------------
 CredentialIdentifiers='
-clusterKey|the cluster key as a node reads it to prove itself on the node port; NodeProofClient holds it
 secretKey|an Ed25519 or X25519 secret key: what signs as a node, and what a key agreement is computed from (Core/Ed25519, Core/X25519, #178)
 _secretKey|the Ed25519KeyPair member holding the same, in the Monocypher layout: seed, then public key
 sharedSecret|a raw X25519 shared secret, the input keying material every session key is derived from (Core/X25519)
@@ -64,26 +63,16 @@ outputKeyMaterial|the HKDF output: the derived key itself (Core/Hkdf)
 identitySeed|the seed a node identity key is derived from, drawn when it is minted (NodeKey, #178)
 keyFileBytes|the contents of a node-key file, which carry that seed (NodeKey, #178)
 '
-# The six rows below `clusterKey` are the per-node identity's (#178), and they are here although
-# none of that material is the CLUSTER key: the table's claim is "these names hold key material",
-# and a node's signing key and a session's derived keys are exactly that. Each name is held by the
-# Core crypto seam today and matched there, so a rename in `Core/Ed25519`, `Core/X25519` or
-# `Core/Hkdf` is a refusal here.
-# `presharedKey` was a row until #178 PR 4, when discovery stopped reading the cluster key and
-# `DiscoveryConfig` stopped holding it: a row that matches nothing is a refusal here (case 3),
-# so it went with its last holder rather than being kept as a comment. `clusterKey` lost its
-# enrolment holder in the same change -- enrollment no longer hands the key over -- and is kept
-# for the node-proof client, which still holds the key under that name.
+# The rows are the per-node identity's (#178): the table's claim is "these names hold key
+# material", and a node's signing key and a session's derived keys are exactly that. Each name is
+# held by the Core crypto seam today and matched there, so a rename in `Core/Ed25519`,
+# `Core/X25519` or `Core/Hkdf` is a refusal here.
 #
-# `clusterKey` WAS excluded, and the note said "nothing here is called that" -- true when
-# it was written and false now. It was excluded because a term matching nothing is a
-# REFUSAL here (that is case 3, and deliberately so), not because the name is dangerous:
-# matching is `\b`-anchored, so the row cannot reach `clusterKeyFile`, which is a PATH and
-# not the secret, per the rule that a secret reached BY PATH is a different question.
-# Measured before the row was added: `\bclusterKey\b` matches the span views and the
-# `EnrollReading` member, and NO declaration of a plain owning type -- so it refuses
-# nothing today and guards the enrolment path, which had no row and no way to acquire one
-# while its member was called `key`.
+# `presharedKey` and `clusterKey` were rows for the cluster's pre-shared key, and each went with
+# its last holder rather than being kept as a comment -- a row that matches nothing is a refusal
+# here (case 3). `presharedKey` went at #178 PR 4, when discovery stopped reading the key;
+# `clusterKey` at #178 PR 6, when the node proof became a signature under each node's own key and
+# the pre-shared key left the tree altogether.
 #
 # A bare `key` still cannot be a row. This is a cache: `key` is the thing being cached in
 # most of the tree, so that row would refuse hundreds of correct declarations, and a guard
@@ -307,7 +296,6 @@ RunSelfTest() {
     # (#1031 stood for two days as a guard that refused every tree).
     mkdir -p "$tmp/clean"
     cat > "$tmp/clean/a.hpp" <<'EOF'
-SecureByteBuffer clusterKey;
 SecureByteBuffer secretKey;
 SecureByteBuffer _secretKey;
 SecureByteBuffer sharedSecret;
@@ -331,9 +319,9 @@ EOF
     # watched refusing something.
     mkdir -p "$tmp/dirty"
     cp "$tmp/clean/a.hpp" "$tmp/dirty/a.hpp"
-    printf 'std::vector<std::byte> clusterKey;\n' >> "$tmp/dirty/a.hpp"
+    printf 'std::vector<std::byte> sharedSecret;\n' >> "$tmp/dirty/a.hpp"
     verdict=$(bash "$0" --root "$tmp/dirty" 2>&1)
-    if grep -q 'clusterKey declared as std::vector<std::byte>' <<< "$verdict"; then
+    if grep -q 'sharedSecret declared as std::vector<std::byte>' <<< "$verdict"; then
         printf 'ok   case 2: a plain vector holding a credential is reported\n'
     else
         printf 'FAIL case 2: violation not reported. Got: %s\n' "$verdict"; return 1
@@ -351,10 +339,9 @@ SecureByteBuffer inputKeyMaterial;
 SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
-SecureByteBuffer keyFileBytes;
 EOF
     verdict=$(bash "$0" --root "$tmp/blind" 2>&1)
-    if grep -q "identifier 'clusterKey' matches nothing" <<< "$verdict"; then
+    if grep -q "identifier 'keyFileBytes' matches nothing" <<< "$verdict"; then
         printf 'ok   case 3: a term that has stopped matching is a refusal, not a pass\n'
     else
         printf 'FAIL case 3: blind term not refused. Got: %s\n' "$verdict"; return 1
@@ -374,7 +361,7 @@ EOF
     # Case 5: a comment naming the pattern is not a call site.
     mkdir -p "$tmp/comment"
     cp "$tmp/clean/a.hpp" "$tmp/comment/a.hpp"
-    printf '// std::vector<std::byte> clusterKey; -- the shape this check refuses\n' >> "$tmp/comment/a.hpp"
+    printf '// std::vector<std::byte> sharedSecret; -- the shape this check refuses\n' >> "$tmp/comment/a.hpp"
     verdict=$(bash "$0" --root "$tmp/comment" 2>&1)
     if grep -q '^ok: every credential identifier' <<< "$verdict"; then
         printf 'ok   case 5: a commented-out declaration is not a finding\n'
@@ -388,7 +375,6 @@ EOF
     # POSITIVES -- the direction that gets acted on, because a finding looks like work.
     mkdir -p "$tmp/precise"
     cat > "$tmp/precise/a.hpp" <<'EOF'
-SecureByteBuffer clusterKey;
 SecureByteBuffer secretKey;
 SecureByteBuffer _secretKey;
 SecureByteBuffer sharedSecret;
@@ -397,8 +383,8 @@ SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
-inline std::string SealWith(std::span<std::byte const> clusterKey, int claims);
-bool Authenticate(std::span<std::byte const> clusterKey, std::string_view token);
+inline std::string SealWith(std::span<std::byte const> sharedSecret, int claims);
+bool Authenticate(std::span<std::byte const> sharedSecret, std::string_view token);
 EOF
     verdict=$(bash "$0" --root "$tmp/precise" 2>&1)
     if grep -q '^ok: every credential identifier' <<< "$verdict"; then

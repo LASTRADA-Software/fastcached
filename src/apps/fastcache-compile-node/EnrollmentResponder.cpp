@@ -3,6 +3,7 @@
 #include "MembershipGate.hpp"
 
 #include <FastCache/Cluster/Roster.hpp>
+#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/Utf8.hpp>
@@ -11,6 +12,7 @@
 #include <algorithm>
 #include <format>
 #include <utility>
+#include <vector>
 
 namespace FastCache::Node
 {
@@ -283,7 +285,16 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
     auto const roster = Cluster::EncodeRoster(projected);
     _window.NoteServed(nodeId, Cluster::DigestOfRoster(roster));
     _metrics.Increment(IMetricsSink::Counter::EnrollmentRostersServed);
-    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Approved, roster));
+
+    // And the roster a majority of the voters has CERTIFIED, when there is one: an approved worker
+    // keeps it as its trust root and needs no `--voter-key`, once it has checked it against the
+    // roster above, which is the one its operator compares. Empty until the voters have endorsed
+    // one, which the worker then adopts on its first announcement instead.
+    auto const certificate =
+        _scheduler.CurrentCertifiedRoster()
+            .transform([](Cluster::CertifiedRoster const& certified) { return Cluster::EncodeCertifiedRoster(certified); })
+            .value_or(std::vector<std::byte> {});
+    return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(Wire::EnrollOutcome::Approved, roster, certificate));
 }
 
 std::vector<std::byte> EnrollmentResponder::AnswerControl(std::span<std::byte const> payload, PeerIdentity const& peer)

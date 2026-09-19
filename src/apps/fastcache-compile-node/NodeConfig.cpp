@@ -224,7 +224,8 @@ namespace
             request.action = Action;
 
             if constexpr (Action == ClusterAction::Admit || Action == ClusterAction::AdmitLearner
-                          || Action == ClusterAction::Set || Action == ClusterAction::AdmitClient)
+                          || Action == ClusterAction::Set || Action == ClusterAction::AdmitClient
+                          || Action == ClusterAction::AdmitWorker)
             {
                 // These two COMMIT their operand through consensus: an admitted
                 // member's id and endpoint land in every peer's `ClusterState` and
@@ -300,6 +301,26 @@ namespace
                 request.key = std::move(member->id);
                 request.value = std::move(member->raftEndpoint);
                 request.publicKey = member->publicKey;
+            }
+            else if constexpr (Action == ClusterAction::AdmitWorker)
+            {
+                // `<id>@<key>`, split at the LAST `@`: a key is base64url and holds none, so an id
+                // that does is still reachable, and the key is parsed here, in front of whoever
+                // typed it, through the one parser -- the leader parses the text once more,
+                // because the wire door is not the flag door.
+                auto const at = value.rfind('@');
+                if (at == std::string_view::npos || at == 0)
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError,
+                                                     "cluster-admit-worker",
+                                                     "is <id>@<key>, the two lines the worker's --print-identity prints"));
+                auto key = ParseEd25519PublicKey(value.substr(at + 1));
+                if (!key.has_value())
+                    return std::unexpected(ArgvError(ConfigErrorCode::ParseError,
+                                                     "cluster-admit-worker",
+                                                     std::string { DescribePublicKeyTextFault(key.error()) }));
+                request.key = std::string { value.substr(0, at) };
+                request.value.clear();
+                request.publicKey = *key;
             }
 
             return {};
@@ -948,10 +969,9 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .apply = AssignFrom<&NodeConfig::raftListen, ParseText>(),
             .explicitBit = &NodeConfig::raftListenExplicit,
             .description = "where peers reach this node's consensus port. Giving\n"
-                           "it turns consensus ON, and consensus needs\n"
-                           "--cluster-key-file, which proves this node on the\n"
-                           "node port. A scheduler needs this flag too, even on\n"
-                           "one machine: it is a cluster of one. Without this flag\n"
+                           "it turns consensus ON. A scheduler needs this flag\n"
+                           "too, even on one machine: it is a cluster of one.\n"
+                           "Without this flag\n"
                            "the node runs no consensus, which is right for a pure\n"
                            "worker and is the default. A bare port binds the\n"
                            "WILDCARD: peers are on other machines by definition,\n"
@@ -1015,7 +1035,10 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "its id, and where consensus keeps its durable state.\n"
                            "A node that answered a vote and forgot it votes\n"
                            "twice in one term after a restart, which is two\n"
-                           "leaders; a node that lost it is a new identity.",
+                           "leaders; a node that lost it is a new identity.\n"
+                           "REQUIRED of a worker, and of any node naming\n"
+                           "--scheduler that runs no consensus: the key kept\n"
+                           "here is what it proves to join the fleet.",
             .yamlKey = "cluster_dir",
             .same = FieldEq<&NodeConfig::clusterDir>(),
         },
@@ -1071,6 +1094,17 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                          "--cluster-admit on it promotes it; the same token\n"
                          "as --cluster-admit, and the member must likewise\n"
                          "have been started with --raft-join." },
+        { .primary = "--cluster-admit-worker",
+          .arity = Arity::Value,
+          .operand = "=<id>@<key>",
+          .apply = SelectClusterAction<ClusterAction::AdmitWorker>(),
+          .description = "admit a WORKER and exit: a machine that joins the\n"
+                         "fleet under its identity key and never joins\n"
+                         "consensus. The id and key are the two lines its\n"
+                         "--print-identity prints. What --enroll-from asks a\n"
+                         "window for, without the window: every verb a\n"
+                         "worker joins the fleet with needs an identity the\n"
+                         "cluster admitted. --cluster-forget removes it." },
         { .primary = "--cluster-forget",
           .arity = Arity::Value,
           .operand = "=<node-id>",
@@ -1149,23 +1183,6 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
                            "named ports only -- one per node on the machine.",
             .yamlKey = "discovery_reply_port",
             .same = FieldEq<&NodeConfig::discoveryReplyPort>(),
-        },
-        {
-            .primary = "--cluster-key-file",
-            .arity = Arity::Value,
-            .operand = "=<path>",
-            .apply = AssignFrom<&NodeConfig::clusterKeyFile, ParsePathValue>(),
-            .description = "the cluster's pre-shared key. A FILE and not a flag:\n"
-                           "a command line is readable through ps. REQUIRED with\n"
-                           "--listen-raft: the scheduler SIGNS lease grants with\n"
-                           "it, and a node proves itself on the node port with\n"
-                           "it. Consensus, discovery and enrollment prove each\n"
-                           "node's OWN identity key instead, and nothing hands\n"
-                           "this file over: place it on every member. Without\n"
-                           "one, a grant is unsigned and any client that can\n"
-                           "reach a worker's compile port can spend it.",
-            .yamlKey = "cluster_key_file",
-            .same = FieldEq<&NodeConfig::clusterKeyFile>(),
         },
         {
             .primary = "--scheduler-token-file",
@@ -1299,8 +1316,8 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             //
             // `NodeMembership::Adopt` is what makes the row true, and
             // `ValidateNodeReloadable` is what keeps it safe: a candidate that WIDENS
-            // admission on a node with no `--cluster-key-file` is refused, because such
-            // a node built an unchecked lease validator at startup.
+            // admission on a node with no roster to check grants against is refused,
+            // because such a node built an unchecked lease validator at startup.
             .reloadable = Reloadable::Yes,
             .same = FieldEq<&NodeConfig::fleetMembers>(),
             .clear = ClearList<&NodeConfig::fleetMembers>(),
@@ -1794,6 +1811,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
         { "--cluster-admit-learner",
           "admits a member as a learner and exits; a key would re-admit it at every start, demoting a "
           "member somebody had since promoted" },
+        { "--cluster-admit-worker", "admits a worker and exits" },
         { "--cluster-forget", "removes a member and exits" },
         { "--cluster-admit-client", "admits a client host and exits" },
         { "--cluster-forget-client",
@@ -2121,17 +2139,20 @@ std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previo
     constexpr auto PairRules = std::to_array<PairRule>({
         // **The hole #405 would otherwise open, and it is the socket-activation one
         // again** (#282). A worker that checks no lease is legitimate for exactly one
-        // shape of node: one no other machine can dial. The startup table decides that from
-        // `CompilePortFacesTheNetwork`, which reads the listen flags -- and under
-        // socket activation the unit chose the address, so those flags describe
-        // nothing. `MakeWorkerLeaseValidator` is the backstop for that, and it runs
-        // ONCE, at startup, against the configuration the process started with.
+        // shape of node: one no other machine can dial. The startup check
+        // (`NodeRoster::Build`) decides that from `CompileVerbsReachOtherMachines`, which
+        // reads the listen flags -- and under socket activation the unit chose the address,
+        // so those flags describe nothing. `MakeWorkerLeaseValidator` is the backstop for
+        // that, and both run ONCE, at startup, against the configuration the process
+        // started with.
         //
-        // So a reload that made `AdmitsRemotePeers` true on a socket-activated worker
-        // that checks nothing would hand it an open, unauthenticated compile port with
-        // every refusal counter reading zero -- the exact defect, reached through the door
-        // #405 adds. Neither the startup table nor the validator can see it: the first is
-        // blind under activation, the second has already run.
+        // So a reload that made `AdmitsRemotePeers` true on a worker that checks nothing
+        // would hand it an open, unauthenticated compile port with every refusal counter
+        // reading zero -- the exact defect, reached through the door #405 adds. Nothing that
+        // ran at startup can see it, and since #178 PR 6 no row of the startup table does
+        // either: the one that asked it of the configuration went when every worker came to
+        // keep a state directory, which may hold a roster no configuration can see. So this
+        // is the rule that answers it, for a self-binding worker as much as an activated one.
         //
         // "Checks nothing" is a roster question since #178, and the configuration answers
         // it only in one direction: consensus or `--voter-key` means a roster, while their
@@ -2139,7 +2160,7 @@ std::expected<void, ConfigError> ValidateNodeReloadable(NodeConfig const& previo
         // run adopted and no configuration can see that. So this asks the half it can
         // answer and fails CLOSED on the other -- a worker running on a kept roster alone
         // is refused a widening it could have taken, and the message names the flag that
-        // makes the answer visible. The startup table's row asks the opposite way, because
+        // makes the answer visible. The startup check asks the opposite way, because
         // `NodeRoster::Build` reads the directory at that moment.
         //
         // Asked as a WIDENING rather than as a state, which is what keeps it from
@@ -2368,7 +2389,6 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitIfExplicit("cluster-id", cfg.clusterId, cfg.clusterIdExplicit);
     emitIfExplicit("discovery", cfg.discoveryAddress, cfg.discoveryAddressExplicit);
     emitIfExplicit("discovery-reply-port", cfg.discoveryReplyPort, cfg.discoveryReplyPortExplicit);
-    emitPathIfSet("cluster-key-file", cfg.clusterKeyFile.string());
     // Repeatable, so one token per peer rather than one joined value -- for the
     // reason the toolchains are: a service that came back knowing fewer members than
     // it was installed with would present as a cluster that stopped forming quorum,
@@ -2695,7 +2715,8 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// table is a pure function of the parsed configuration, and enumerating the host's
 /// addresses is I/O behind `Platform/ILocalityOracle`. A rule that cannot state its
 /// premise without reaching for the machine has no business in this table -- the same
-/// argument the retired `--cluster-key-file` row records one screen down. Loopback is
+/// argument a retired `--cluster-key-file` rule once recorded, whose premise moved every time a new
+/// reader of the file arrived. Loopback is
 /// decidable from the text, so that is what is judged.
 ///
 /// The wider form the ticket calls unambiguous -- refuse whenever the advertised port
@@ -2835,7 +2856,7 @@ std::string AdvertisedEndpoint(NodeConfig const& cfg)
 /// once had to ask two. `--bind` was the whole answer until the compile verbs gained a
 /// second door on the merged `0xFC` listener, and for one release the question was the
 /// disjunction: asking either half alone let an open surface pass this table --
-/// `--bind 127.0.0.1 --serve-scheduler --fleet-open` with no `--cluster-key-file`
+/// `--bind 127.0.0.1 --serve-scheduler --fleet-open` with nothing to check a grant against
 /// looked local, passed, and served unauthenticated compiles on a wildcard-bound port
 /// with every `worker_jobs_refused_lease_*` counter reading zero. #290 stage 3 retires
 /// the dedicated port, so the surface row is the whole answer again -- and it is the
@@ -3195,9 +3216,6 @@ std::optional<std::string> NodeServiceRejection(NodeConfig const& cfg)
 std::span<NodeSecretFile const> NodeSecretFileTable() noexcept
 {
     static constexpr auto table = std::to_array<NodeSecretFile>({
-        // The PSK, and the worst of the four: it MACs lease grants AND a node's proof on
-        // the node port, so a leak spends the fleet's capacity and passes that proof.
-        { .flag = "--cluster-key-file", .path = [](NodeConfig const& cfg) { return cfg.clusterKeyFile; } },
         // What this node REQUIRES of its own callers. A leak makes membership -- a
         // host list, not a credential -- the only gate left on the scheduler verbs.
         { .flag = "--scheduler-token-file", .path = [](NodeConfig const& cfg) { return cfg.schedulerTokenFile; } },
@@ -3207,8 +3225,8 @@ std::span<NodeSecretFile const> NodeSecretFileTable() noexcept
         // refusing a missing credential fails closed and breaks nothing that worked,
         // while refusing an exposed one breaks a deployment that is running today.
         { .flag = "--dashboard-token-file", .path = [](NodeConfig const& cfg) { return cfg.dashboardTokenFile; } },
-        // A TLS private key, which #752's own list does not name. At least as severe
-        // as the PSK: anything holding it can terminate this node's admin surface.
+        // A TLS private key, which #752's own list does not name. As severe as the identity
+        // key below: anything holding it can terminate this node's admin surface.
         { .flag = "--tls-key", .path = [](NodeConfig const& cfg) { return cfg.tlsKeyFile; } },
         // The node's IDENTITY key (#178), which the flag does not name: it names the
         // state directory, and the key is the file inside it this node minted. A row of
@@ -3787,12 +3805,16 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
         // Not folded into the row below: an operator who typed `--node-id` is telling
         // this node who it is, and one who typed `--raft-peer` is telling it who else
         // there is. Those are different mistakes and the remedy sentence differs.
-        { .refuses = [](NodeConfig const& c) { return !c.nodeId.empty() && !RunsConsensus(c); },
-          .message = "--node-id names this node inside a cluster, and --listen-raft is what turns consensus ON: "
-                     "without it this node runs none, so the id is never used, never announced and never voted "
-                     "for. Nothing would say so, which is the silent no-op this list exists to refuse. Give "
-                     "--listen-raft, or drop --node-id -- a node with neither runs no consensus, which is right "
-                     "for a pure worker and is the default." },
+        //
+        // Since #178 the id is used wherever an identity KEY is held -- a worker with a
+        // `--cluster-dir` proves it on every connection to a scheduler -- so the question is
+        // `HoldsNodeKey`, the one predicate for that.
+        { .refuses = [](NodeConfig const& c) { return !c.nodeId.empty() && !HoldsNodeKey(c); },
+          .message = "--node-id names this node inside a cluster, and this node holds no identity key to prove it "
+                     "with: --listen-raft is what turns consensus ON, and this node gives neither it nor a "
+                     "--cluster-dir, so the id is never used, never proved and never voted for. Nothing would say "
+                     "so, which is the silent no-op this list exists to refuse. Give --cluster-dir, or --listen-raft "
+                     "to run consensus, or drop --node-id." },
         // The other half of the same flag group: the cluster's addresses given with
         // the switch that turns consensus on left off. `--cluster-dir` is deliberately
         // NOT here -- `FleetHistoryPath` reads it for the dashboard's history file, so
@@ -3808,19 +3830,27 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "Give --listen-raft, or drop them." },
         { .refuses = [](NodeConfig const& c) { return !c.discoveryAddress.empty() && !RunsConsensus(c); },
           .message = "--discovery needs --listen-raft: discovery finds peers for a CLUSTER, and without a "
-                     "consensus port this node is not in one. It would broadcast, be answered, prove the key and "
-                     "have nowhere to put the answer." },
-        // Consensus needs the key (#1308), for reasons that moved at #178: the Raft peer
-        // wire and discovery prove each node's own identity key now, and what still reads the
-        // cluster key on a consensus node is the rest of the fleet's surfaces -- see the
-        // refusal's own comment. `--discovery` needs no key of its own any more, so it has no
-        // row here (#178 PR 4).
+                     "consensus port this node is not in one. It would broadcast, be answered, prove its identity "
+                     "and have nowhere to put the answer." },
+        // A node that announces itself to a fleet must hold an identity to prove (#178): every
+        // verb a machine joins the fleet with is refused on a connection that proved none, so a
+        // node naming `--scheduler` with nowhere to keep an identity key would start, dial, and be
+        // refused every round. A STARTUP refusal, decided from the configuration alone --
+        // `HoldsNodeKey` is the one predicate for *this node keeps a key*, which the start asks
+        // again of the directory itself when it resolves the key.
         //
-        // A STARTUP refusal and never a per-connection fallback. Asked of the PATH being
-        // named, as the discovery row asks it, because a registration is judged by this
-        // table long before the file need exist.
-        { .refuses = [](NodeConfig const& c) { return RunsConsensus(c) && c.clusterKeyFile.empty(); },
-          .message = ConsensusNeedsClusterKeyRefusal },
+        // It is also the configuration's half of the LEASE rule (#282): a worker that admits
+        // other machines must be able to check the grants they present, and a node naming a
+        // scheduler keeps its roster in the state directory its identity lives in. Whether that
+        // directory HOLDS a roster -- or `--voter-key` roots one -- only the directory can say,
+        // so `NodeRoster::Build` asks it at startup and refuses a worker other machines can reach
+        // with nothing to check against (`RosterlessWorkerRefusal`). A startup refusal rather
+        // than a per-request fallback, because "no roster, so no check" decided per request is a
+        // compile port open to everybody with every refusal counter at zero. The row that asked
+        // it of the configuration went at #178 PR 6: every worker names `--scheduler`, so this
+        // row answered first for every configuration that one could refuse.
+        { .refuses = [](NodeConfig const& c) { return !c.schedulers.empty() && !HoldsNodeKey(c); },
+          .message = SchedulerNeedsIdentityRefusal },
         { .refuses = [](NodeConfig const& c) { return RunsConsensus(c) && !c.voterKeys.empty(); },
           .message = VoterKeyOnConsensusNodeRefusal },
         { .refuses = [](NodeConfig const& c) { return c.discoveryReplyPort != 0 && c.discoveryAddress.empty(); },
@@ -3839,22 +3869,6 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
                      "answers somewhere only it holds -- because just one of the sockets sharing a port is handed "
                      "a unicast. Pointing both at one port is the configuration that made two nodes on a host see "
                      "each other and never finish proving the key. Pick another, or leave it unset." },
-        // NOT here: a rule refusing `--cluster-key-file` when nothing reads it.
-        //
-        // It has been narrowed twice and is now gone, and each step is the same
-        // mistake caught later. It began as "unless --discovery"; the scheduler
-        // became a second reader when it started SIGNING grants (#281) and the rule
-        // turned a correct configuration into a node that would not start. It was
-        // widened to "unless --discovery or the scheduler tier"; the worker became a
-        // third reader here (#282), and the rule immediately refused the configuration
-        // the rule below REQUIRES -- a plain worker admitting remote peers, which
-        // needs the key precisely and runs neither of the other two surfaces.
-        //
-        // There is no fourth narrowing to make. Whether a worker tier exists is not a
-        // fact about the configuration at all: it depends on what `--toolchain` and
-        // discovery resolve to on this machine, which happens long after this table
-        // runs. A refusal whose premise has become false is worse than no refusal, and
-        // one that cannot state its premise without guessing has no business firing.
         // Newly reachable since the surfaces merged (#290), and silent without a row:
         // the scheduler verbs are answered on `--listen-node`, so emptying that flag
         // closes the port the scheduler would have been reached on. Before the merge
@@ -3892,46 +3906,6 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--tls-cert and --tls-key are both or neither: a certificate with no key cannot terminate "
                      "TLS, and this node would otherwise start and serve the admin surface in the clear while "
                      "an operator believed it was encrypted." },
-        // A worker that admits OTHER machines must be able to check the grants they
-        // present. The scheduler signs a lease; without the cluster key this node
-        // cannot verify that signature, so its compile port would serve whoever can
-        // reach it -- the fleet's CPU spent on an unauthenticated request (#282).
-        //
-        // A STARTUP refusal rather than a per-request fallback, and that distinction
-        // is the rule rather than an implementation detail. "No key, so skip the
-        // check" decided per request is silent degradation of exactly the kind this
-        // list exists to refuse: the surface is open, every refusal counter reads
-        // zero, and the fleet looks healthy from both ends. Decided once, before
-        // anything is served, it is a node that states what it cannot do.
-        //
-        // Scoped to the reachable-and-admitted node rather than to "is a key
-        // configured", because that is the question -- can a machine that is not this
-        // one reach the compile surface. It has two halves and EITHER closes it: a
-        // node bound to loopback answers nobody else whatever its policy says, and a
-        // node admitting only its own machine escalates nobody however it is bound. A
-        // process on this host already has this host's compiler, so refusing either
-        // shape would break every single-machine install to prevent nothing.
-        //
-        // See #303, which asks the same question of the scheduler and should take
-        // this shape rather than "is a key configured".
-        //
-        // Scoped to the worker: a node running none (#206) serves no compile verbs and
-        // checks no lease, so the question does not arise for it; what its scheduler signs
-        // is #303's.
-        //
-        // Since #178 the question is whether it has a ROSTER to check against, not whether it
-        // holds a key: a lease is signed by the issuing voter's own key and verified against the
-        // roster -- the applied state on a consensus member, the certified roster on any other,
-        // which `--voter-key` roots. A state directory may already hold one an earlier run
-        // adopted, so a node naming one is asked again at startup, of the directory itself
-        // (`NodeRoster::Build`), where the answer lives.
-        { .scope = &WorkerComponent,
-          .refuses =
-              [](NodeConfig const& c) {
-                  return !RunsConsensus(c) && c.voterKeys.empty() && c.clusterDir.empty()
-                         && CompileVerbsReachOtherMachines(c);
-              },
-          .message = RosterlessWorkerRefusal },
         // The rule that keeps a fleet map off an open port. Loopback needs no
         // credential -- reaching it already means being on the machine -- but a
         // bind an operator deliberately exposed does, and HTTPS alone does not

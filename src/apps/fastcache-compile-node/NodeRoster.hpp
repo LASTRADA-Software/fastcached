@@ -2,6 +2,7 @@
 #pragma once
 
 #include "NodeConfig.hpp"
+#include "NodeProofClient.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
@@ -78,7 +79,7 @@ class IPresenceRoster
 inline constexpr std::chrono::seconds RosterWantingInterval { 2 };
 
 /// The roster this node verifies grants against, as one object (#178).
-class NodeRoster final: public IPresenceRoster
+class NodeRoster final: public IPresenceRoster, public IServerTrust
 {
   public:
     /// Build the roster this configuration calls for.
@@ -86,8 +87,8 @@ class NodeRoster final: public IPresenceRoster
     /// Refuses a kept roster that cannot be used -- it may be the only thing standing between
     /// this worker and a voter the cluster has revoked since -- and one naming a fleet other
     /// than `--cluster-id` asserts. And refuses a worker other machines can reach that holds no
-    /// roster and names no `--voter-key`, the half of `RosterlessWorkerRefusal` only the state
-    /// directory can answer.
+    /// roster and names no `--voter-key`, which is where `RosterlessWorkerRefusal` is answered:
+    /// only the state directory knows whether it holds a roster.
     /// @param cfg The parsed configuration.
     /// @param wallClock What "now" is when an offered roster is judged. Borrowed.
     /// @param metrics Where a refused roster is counted. Borrowed.
@@ -100,6 +101,14 @@ class NodeRoster final: public IPresenceRoster
 
     /// @return What a grant is verified against, or null when this node verifies none.
     [[nodiscard]] Distributed::ILeaseRoster const* Lease() const noexcept;
+
+    /// @copydoc IServerTrust::StandingOf
+    ///
+    /// The roster a GRANT is verified against is the roster a server is (#178): a machine may
+    /// prove itself only to a scheduler whose grants it would accept, so both questions read the
+    /// one `Lease()`. A roster not yet held -- a fresh worker, a node verifying no grants -- checks
+    /// nothing and says so, and the seal is what still protects the connection.
+    [[nodiscard]] ServerStanding StandingOf(std::string_view serverId, Ed25519PublicKey const& serverKey) const override;
 
     /// Adopt what the cluster now says. A consensus member's roster only; a no-op otherwise.
     /// @param state The replicated state.

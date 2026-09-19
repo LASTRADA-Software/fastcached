@@ -123,9 +123,9 @@ struct WorkerTierFixture
                                                    .host = *host,
                                                    .cacheTier = nullptr,
                                                    .credential = credential,
-                                                   // No cluster key: every case here is about the worker tier itself, and a
-                                                   // worker with none is the ordinary single-machine shape.
-                                                   .proofKey = nullptr,
+                                                   // Nothing proves: every case here is about the worker tier
+                                                   // itself, against a scripted fleet that serves no handshake.
+                                                   .prover = nullptr,
                                                    // No roster either, for the same reason: a worker no other
                                                    // machine reaches checks no grant (#178).
                                                    .leaseRoster = nullptr,

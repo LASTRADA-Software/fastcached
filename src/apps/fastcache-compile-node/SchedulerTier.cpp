@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AdminEndpoint.hpp"
-#include "ClusterKeySource.hpp"
 #include "NodeIoLoop.hpp"
 #include "SchedulerTier.hpp"
 

@@ -8,6 +8,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -42,9 +43,6 @@ namespace
     cfg.raftListen = "6680";
     cfg.raftSelf = "10.0.0.7";
     cfg.clusterDir = dir;
-    // Named, never read: consensus needs the key (#1308), and the rules here are asked
-    // of the path.
-    cfg.clusterKeyFile = dir / "cluster.key";
     return cfg;
 }
 
@@ -348,7 +346,6 @@ TEST_CASE("A consensus node that names itself neither way is refused", "[node][i
     NodeConfig neither;
     neither.schedulers = { "127.0.0.1:6674" };
     neither.raftListen = "6680";
-    neither.clusterKeyFile = "cluster.key";
     auto const refusal = StartupPolicyRejection(neither);
     REQUIRE(refusal.has_value());
     CHECK(Unwrap(refusal) == ConsensusNamesNoSelfPeerRefusal);
@@ -446,7 +443,6 @@ TEST_CASE("A --raft-self that CONTRADICTS a --raft-peer for this node is refused
     both.nodeId = "n1";
     both.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.4:6680")) };
     both.raftSelf = "10.0.0.7";
-    both.clusterKeyFile = "cluster.key";
 
     auto const refusal = StartupPolicyRejection(both);
     REQUIRE(refusal.has_value());
@@ -734,7 +730,7 @@ TEST_CASE("What --print-identity prints is the token --raft-peer reads back into
 
     SECTION("a consensus member prints its id, its key and its token")
     {
-        auto const text = DescribeIdentity("n1", key, std::optional<std::string> { "10.0.0.7:6680" });
+        auto const text = DescribeIdentity("n1", key, std::optional<std::string> { "10.0.0.7:6680" }, IdentityRole::Member);
         CHECK(text.contains(std::format("node-id n1\n")));
         CHECK(text.contains(std::format("public-key {}\n", FormatEd25519PublicKey(key))));
 
@@ -750,14 +746,42 @@ TEST_CASE("What --print-identity prints is the token --raft-peer reads back into
 
     SECTION("a node its peers could not dial yet prints no token rather than a guessed one")
     {
-        auto const text = DescribeIdentity("n1", key, std::nullopt);
+        auto const text = DescribeIdentity("n1", key, std::nullopt, IdentityRole::Member);
         CHECK(text.contains("public-key "));
         CHECK_FALSE(text.contains("raft-peer"));
     }
 
-    SECTION("a node that runs no consensus has a key and no id to print")
+    SECTION("a node with no id yet has a key and nothing else to print")
     {
-        auto const text = DescribeIdentity("", key, std::nullopt);
+        auto const text = DescribeIdentity("", key, std::nullopt, IdentityRole::Worker);
         CHECK(text == std::format("public-key {}\n", FormatEd25519PublicKey(key)));
     }
+}
+
+TEST_CASE("What --print-identity prints for a worker is what --cluster-admit-worker reads back", "[node][identity][key]")
+{
+    // #178 PR 6: a worker that runs no consensus is admitted by the identity it proves, and an
+    // operator who does not open an enrollment window admits it by typing what it printed. So the
+    // line is asserted by PARSING it through the flag, the way the operator's command will be.
+    auto const key = Ed25519KeyPair::FromSeed(ScriptedSecureRandom::Ascending(Ed25519SeedBytes)).value().PublicKey();
+    auto const text = DescribeIdentity("w-7", key, std::nullopt, IdentityRole::Worker);
+    CHECK(text.contains("node-id w-7\n"));
+    // A worker is no consensus member, so it prints no token a `--raft-peer` would read.
+    CHECK_FALSE(text.contains("raft-peer"));
+
+    auto const lineAt = text.find("cluster-admit-worker ");
+    REQUIRE(lineAt != std::string::npos);
+    auto const value = std::string_view { text }.substr(lineAt + std::string_view { "cluster-admit-worker " }.size());
+    auto const argument = std::format("--cluster-admit-worker={}", value.substr(0, value.find('\n')));
+
+    NodeConfig parsed;
+    auto const argv = std::array { "--scheduler=10.0.0.1:6675", argument.c_str() };
+    REQUIRE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, parsed).has_value());
+    CHECK(parsed.cluster.action == ClusterAction::AdmitWorker);
+    CHECK(parsed.cluster.key == "w-7");
+    CHECK(parsed.cluster.publicKey == std::optional { key });
+
+    // A member prints the other line, never this one: the two routes admit different things.
+    CHECK_FALSE(DescribeIdentity("n1", key, std::optional<std::string> { "10.0.0.7:6680" }, IdentityRole::Member)
+                    .contains("cluster-admit-worker"));
 }

@@ -121,6 +121,19 @@ RuntimeDirectory=fastcache-node
 RuntimeDirectoryMode=0700
 WorkingDirectory=/run/fastcache-node
 
+# The node's STATE directory, /var/lib/fastcache-node, which `cluster_dir:` names.
+#
+# It is where the node keeps WHO IT IS -- its identity key and its id (#178) -- and
+# every worker needs one: a worker proves that key on every connection to its
+# scheduler, and a node that names a scheduler with no state directory is refused at
+# startup. The runtime directory above cannot be it, because systemd removes that at
+# every stop and a worker that mints a new identity on every restart is a machine the
+# cluster has to admit again each time. Under ProtectSystem=strict nothing else is
+# writable, so without this line the setting the configuration asks for could not
+# work. 0700 for the key's sake.
+StateDirectory=fastcache-node
+StateDirectoryMode=0700
+
 # --- Hardening -------------------------------------------------------------
 # This block is deliberately NOT a copy of fastcached's, and the difference is
 # the whole point of the service: fastcached executes nothing, while this

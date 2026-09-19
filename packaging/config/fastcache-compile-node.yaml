@@ -93,6 +93,9 @@
 # edit on every one of them. Kept HERE rather than on an --install-service
 # command line, re-pointing is an edit and a restart rather than a
 # re-registration.
+#
+# A node that names a scheduler and runs no consensus also needs cluster_dir:
+# its identity key is what the scheduler admits it by.
 #scheduler:
 #  - <host:port>
 #  - <host:port>
@@ -183,9 +186,8 @@
 # consensus on; this names the node that runs it.
 #node_id:
 
-# where peers reach this node's consensus port. Giving it turns consensus ON,
-# and consensus needs cluster_key_file. A scheduler needs it too, even on one
-# machine: it is a cluster of one. Without this setting the node runs no
+# where peers reach this node's consensus port. Giving it turns consensus ON.
+# A scheduler needs it too, even on one machine: it is a cluster of one. Without this setting the node runs no
 # consensus, which is right for a pure worker and is the default. A bare port
 # binds the WILDCARD: peers are on other machines by definition, so loopback
 # would silently not work.
@@ -216,9 +218,17 @@
 # this node's state directory: its identity key, its id, and where consensus
 # keeps its durable state. A node that answered a vote and forgot it votes
 # twice in one term after a restart, which is two leaders; a node that lost it
-# is a new identity. Name it on a worker too, or the worker holds no identity
-# key -- its working directory is no place a key would survive a restart.
-#cluster_dir:
+# is a new identity. REQUIRED of a node that names a scheduler and runs no
+# consensus -- every worker: the identity key kept here is what it proves on
+# every connection to its scheduler, which refuses registering, announcing and
+# heartbeating from a machine that proved nothing. The cluster admits the key
+# once, through --enroll-from or --cluster-admit-worker, and a worker enrolled
+# that way keeps the roster it was handed here too.
+#
+# On Linux the packaged service creates and owns /var/lib/fastcache-node for
+# this (systemd StateDirectory=); it is the one writable place a key survives a
+# restart in.
+#cluster_dir: /var/lib/fastcache-node
 
 # which fleet this node belongs to. Plain text in every beacon and NOT a
 # credential: what it buys is that two unrelated fleets on one segment
@@ -237,15 +247,6 @@
 # Pin it where a host firewall opens named ports only -- one per node on the
 # machine.
 #discovery_reply_port:
-
-# the cluster's pre-shared key. A FILE and not a flag: a command line is
-# readable through ps. REQUIRED with listen_raft: the scheduler SIGNS lease
-# grants with it, and a node proves itself on the node port with it.
-# Consensus, discovery and enrollment prove each node's OWN identity key
-# instead, and nothing hands this file over: place it on every member.
-# Without one, a grant is unsigned and any client that can reach a worker's
-# compile port can spend it.
-#cluster_key_file:
 
 # credential this node REQUIRES on its scheduler verbs. The inbound half of
 # --requirepass, which only says what this node presents. A FILE and not a
@@ -327,10 +328,10 @@
 # same thing, since the key spells a flag -- and reloading closes the node to
 # everybody fleet_member does not name.
 #
-# NEITHER can be WIDENED by a reload on a node with no cluster_key_file: such
-# a worker verifies no lease signatures, which is safe only while no machine
-# but its own is admitted, so the reload is refused by name and nothing is
-# applied. Narrowing is always allowed.
+# NEITHER can be WIDENED by a reload on a worker that runs no consensus and
+# names no voter_key: such a worker may verify no lease signatures, which is
+# safe only while no machine but its own is admitted, so the reload is refused
+# by name and nothing is applied. Narrowing is always allowed.
 #fleet_open: false
 
 # size of this node's own in-memory cache tier; k/m/g = KiB/MiB/GiB or N% of

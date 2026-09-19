@@ -154,8 +154,8 @@ class FleetTextResponder final: public IFrameResponder
     /// @copydoc IFrameResponder::NodeProver
     ///
     /// **None.** The credential this surface reads is the dashboard token, which is deliberately
-    /// not `--requirepass` and not the cluster key. The proof reaches its membership half through
-    /// `RefusePeer`.
+    /// not `--requirepass` and not an identity key. A proven identity reaches its membership half
+    /// through `RefusePeer`.
     [[nodiscard]] INodeProver* NodeProver() noexcept override
     {
         return nullptr;

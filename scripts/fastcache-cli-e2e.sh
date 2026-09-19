@@ -568,15 +568,16 @@ else
     nodePort="$(free_port)"
     nodeAdminPort="$(free_port)"
     nodeLog="$WORK/node-$nodePort.log"
-    # `--scheduler` naming itself: this node schedules nothing and registers with
-    # nobody, which is fine here and is what the startup refusal demands be stated.
-    # `--no-toolchain-discovery` with an explicit `--toolchain` keeps the include-tree
-    # walk out of the fixture -- it is over 300 s cold and measures nothing this case
-    # is about.
+    # A node that runs no worker (`--slots=0`, #206) and names no scheduler, so it
+    # surveys no compiler -- the include-tree walk is over 300 s cold and measures
+    # nothing this case is about -- and holds NO identity. That last is the point
+    # since #178 PR 6: a node that names a scheduler must keep an identity key in a
+    # `--cluster-dir` and so always has one minted, and the absent-identity case
+    # below needs a node that has none. A worker used to be started here, naming
+    # itself as its scheduler to satisfy the startup rule.
     "$NODE" --listen-node="127.0.0.1:$nodePort" \
             --admin-listen="127.0.0.1:$nodeAdminPort" \
-            --scheduler="127.0.0.1:$nodePort" \
-            --no-toolchain-discovery --toolchain=cc > "$nodeLog" 2>&1 &
+            --slots=0 > "$nodeLog" 2>&1 &
     nodePid=$!
     _CLI_E2E_PIDS="$_CLI_E2E_PIDS $nodePid"
     wait_for_port 127.0.0.1 "$nodePort" "$nodePid" "fastcache-compile-node" "$nodeLog"
@@ -597,9 +598,9 @@ else
     expect_stdout "components" "the node reports which components it runs"
     expect_stdout_line "^admin-port +$nodeAdminPort\$" "the reported admin port is the one it bound"
 
-    # **Absent is not zero, end to end.** This node runs no consensus, so it has no
-    # minted identity -- and the JSON must carry `null` rather than an empty string
-    # somebody could paste into `--raft-peer`.
+    # **Absent is not zero, end to end.** This node runs no consensus and keeps no
+    # state directory, so it has no minted identity -- and the JSON must carry `null`
+    # rather than an empty string somebody could paste into `--raft-peer`.
     run_node node --format=json
     expect_status 0 "node renders as JSON"
     expect_stdout '"node-id":null' "an unminted identity is null, not an empty string"

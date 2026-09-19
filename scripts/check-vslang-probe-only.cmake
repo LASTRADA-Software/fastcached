@@ -137,9 +137,9 @@ foreach(sourceFile IN LISTS scanFiles)
     # unbalanced bracket cannot land on a line the filter keeps, which is a
     # property of the current file contents and not of the script.
     #
-    # The sibling `check-psk-signing-seam` is the same reader on a corpus that
-    # DOES have a two-match file, and there one `]` took its count from 15 to 14
-    # while it still passed. Same shape, different corpus, opposite verdict --
+    # The sibling `check-psk-signing-seam`, retired at #178, was the same reader on a
+    # corpus that DID have a two-match file, and there one `]` took its count from 15
+    # to 14 while it still passed. Same shape, different corpus, opposite verdict --
     # which is why exposure is judged per (reader, file, surviving lines).
     file(READ "${sourceFile}" _vslangText)
     fastcached_split_lines_tokenised("${_vslangText}" matchedLines)
@@ -232,9 +232,9 @@ foreach(row IN LISTS vslangEnglishEntryPoints)
     # unbalanced bracket cannot land on a line the filter keeps, which is a
     # property of the current file contents and not of the script.
     #
-    # The sibling `check-psk-signing-seam` is the same reader on a corpus that
-    # DOES have a two-match file, and there one `]` took its count from 15 to 14
-    # while it still passed. Same shape, different corpus, opposite verdict --
+    # The sibling `check-psk-signing-seam`, retired at #178, was the same reader on a
+    # corpus that DID have a two-match file, and there one `]` took its count from 15
+    # to 14 while it still passed. Same shape, different corpus, opposite verdict --
     # which is why exposure is judged per (reader, file, surviving lines).
     file(READ "${resolvedHelper}" _vslangText)
     fastcached_split_lines_tokenised("${_vslangText}" helperLines)

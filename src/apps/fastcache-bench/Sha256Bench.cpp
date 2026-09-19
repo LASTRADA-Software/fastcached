@@ -16,9 +16,7 @@
 /// (`BuildBannerListener.cpp`, #1439); whoever quotes a figure still states the host, its load
 /// and the sample count, which no binary can read off itself.
 ///
-/// `HmacSha256` is deliberately not measured here: outside `Core/Sha256` and the one
-/// signing seam, naming it is a second signing construction
-/// (scripts/check-psk-signing-seam.cmake). An HMAC is two hashes over the message's
+/// `HmacSha256` is deliberately not measured here: an HMAC is two hashes over the message's
 /// length, so the per-engine hash rate is the figure that transfers.
 
 #include <FastCache/Core/EnumTable.hpp>

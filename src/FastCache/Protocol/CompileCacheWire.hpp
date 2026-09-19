@@ -189,7 +189,19 @@ using WireVersion = std::uint8_t;
 /// refuse every announcement a version-13 voter sends, and a version-12 worker would never
 /// adopt a roster and refuse every grant once its old one lapsed -- both silently, in the
 /// words of the refusal that ends it.
-inline constexpr WireVersion CurrentVersion = 13;
+///
+/// **14 made the node proof an IDENTITY and sealed everything after it** (#178). NODE-CHALLENGE
+/// now carries the caller's nonce and ephemeral key and is answered with the server's id, key,
+/// nonce, ephemeral key and a signature over all of it; PROVE-NODE carries the caller's id, key
+/// and a signature where it carried a MAC under the cluster key; and every frame after an
+/// accepted proof, in both directions, carries a tag under a session key only the two ends hold.
+/// Three request shapes and a frame grammar moved, which no reader can step over: a version-13
+/// node would refuse every version-14 challenge as malformed, and a version-14 node reading a
+/// version-13 proof would be asked to verify a MAC under a key it no longer has. The four verbs
+/// a joining machine sends -- `Register`, `NodeAnnounce`, `Heartbeat`, `Withdraw` -- also now
+/// require that identity (`OpDescriptor::identity`), and `ClusterAdmitWorker` and three error
+/// codes are new.
+inline constexpr WireVersion CurrentVersion = 14;
 
 /// The oldest version this build still accepts. Equal to `CurrentVersion` while
 /// only one version exists; widen the range when a second one ships and this
@@ -333,13 +345,18 @@ inline constexpr WireVersion CurrentVersion = 13;
 /// decoder refuses anyway.
 ///
 /// Version 12 moves it for version 3's reason, and for a sharper one of its own: a version-11
-/// ENROLL is answered, when approved, with the cluster KEY, and a leader that still accepted one
+/// ENROLL was answered, when approved, with the cluster KEY, and a leader that still accepted one
 /// would have to either refuse it anyway or keep a secret-handing path alive for it.
 ///
 /// Version 13 moves it for version 12's: a version-12 announcement is three fields, which the
 /// exact-arity decoder refuses, and a version-12 client has no reading for the roster the reply
 /// now carries.
-inline constexpr WireVersion MinSupportedVersion = 13;
+///
+/// Version 14 moves it for version 3's reason and a sharper one: a version-13 caller proves with a
+/// MAC under a key this build no longer holds, so accepting its request would either refuse the
+/// proof as a wrong key -- a confident wrong diagnosis for a version mismatch -- or keep a
+/// pre-shared-key path alive for it, which is the path #178 exists to retire.
+inline constexpr WireVersion MinSupportedVersion = 14;
 
 /// Size of the fixed request header: magic, version, op, payload length.
 inline constexpr std::size_t RequestHeaderSize = WireFrame::HeaderSize;
@@ -636,49 +653,56 @@ enum class Op : std::uint8_t
     /// `EveryOpcodeIsDistinct` refuses a byte two rows claim.
     CacheDrop = 0x15,
 
-    // The node proof. Two verbs with which a caller establishes, on THIS connection,
-    // that it holds the cluster's pre-shared key -- so a node whose ADDRESS is on no
-    // list is admitted by what it can prove rather than by where it dialled from
-    // ([#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428),
-    // [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) item 1).
+    // The node proof. Two verbs with which a caller establishes, on THIS connection, WHICH
+    // machine it is -- by signing with the identity key the cluster admitted -- and after which
+    // every frame both ways is sealed under a key the two ends agreed
+    // ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178),
+    // [#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
     //
     // Their own block and their own family, and `VerbFamily::NodeProof` carries the
     // argument. **Neither is `OpenBeforeAuth`**, which is the one thing about this pair
     // a reader of the enrollment block above will expect and not find: the proof
-    // upgrades MEMBERSHIP, and the credential gate is a different question that a
+    // establishes IDENTITY, and the credential gate is a different question that a
     // proving caller has to pass for every verb it came to send anyway.
 
-    /// The server states the challenge it will accept a proof against on this connection.
+    /// The caller opens the handshake; the server says who IT is, and states its challenge.
     ///
-    /// Empty request; the reply is `NodeChallengeBytes` of nonce and nothing else. The
-    /// challenge is the SERVER's and is drawn per connection, which is what makes a
-    /// captured proof useless on a second one -- discovery's rule
-    /// (`Cluster::DiscoveryService`) and the Raft handshake's, in the same words.
+    /// The request is the caller's nonce and ephemeral X25519 key. The reply is the server's
+    /// id, identity key, nonce and ephemeral key, and its signature over all of them and over
+    /// the caller's two -- so a caller that holds a roster learns, before it proves anything,
+    /// whether it is talking to a voter or to a revoked machine still named in its
+    /// `--scheduler`. Both nonces are drawn per connection, which is what makes a captured
+    /// handshake useless on a second one -- discovery's rule and the Raft handshake's.
     ///
     /// **Asking twice on one connection re-draws it**, and the old one is gone. That is
     /// the only answer that keeps *a challenge is spent whatever the outcome* true
     /// without a second rule: a caller that asks again has abandoned the first, and a
-    /// server holding two live nonces would accept a proof over either.
+    /// server holding two live challenges would accept a proof over either.
     NodeChallenge = 0x18,
 
-    /// The caller presents its node id and the tag it owes for this connection's challenge.
+    /// The caller presents its node id, its identity key and its signature over the handshake.
     ///
-    /// `Ok` means this connection now counts as a member for every verb sent on it
-    /// afterwards -- `Register` and `Heartbeat` are what the case was written for. It
-    /// does NOT authenticate an identity: under a shared key every holder can mint any
-    /// id's tag, so the id is a label bound inside the MAC rather than a claim about
-    /// which machine is speaking. `Distributed::NodeProof`'s header carries what that
-    /// does and does not buy, and why node REMOVAL still needs #178's credential in the
-    /// frame.
+    /// `Ok` means this connection has proved WHICH machine it is, for every verb sent on it
+    /// afterwards. The answer -- `Ok` or a refusal alike, once the handshake has agreed a key -- is
+    /// the first SEALED frame: from it on, every frame both ways carries a `SealedFrameTagBytes`
+    /// tag after its payload, under a session key derived from the two ephemeral keys. Sealed
+    /// whatever the verdict, so the grammar of the answer never depends on it. The seal is what makes the proof worth having
+    /// -- without it a machine that relayed a genuine handshake could inject verbs on the proven connection
+    /// (`Distributed::NodeProof` carries the argument). A frame whose tag fails closes the
+    /// connection, unanswered.
     ///
-    /// **The challenge is spent whatever the outcome.** A refusal leaves the connection
-    /// open and un-proved; the caller may ask for a new challenge and try again, which
-    /// costs it a round trip per attempt and gives it no nonce to grind against.
+    /// **The challenge is spent whatever the outcome.** A refusal decided before any key was
+    /// agreed -- a malformed proof -- leaves the connection open, un-proved and unsealed, and
+    /// the caller may ask for a new challenge. One decided after -- a bad signature, an unknown
+    /// or a revoked key -- is sealed like an acceptance, and a sealed connection proves nothing
+    /// further: either verb on it closes it, so that caller redials. Neither gives it a nonce to
+    /// grind against.
     ///
-    /// Refused `NodeProofUnchallenged` when no challenge is outstanding -- never asked,
-    /// or already spent -- and `NodeProofRejected` when the tag does not authenticate.
-    /// Two codes because the remedies are opposite: the first is a client that has the
-    /// exchange wrong, the second is a key that does not match.
+    /// Refused `NodeProofUnchallenged` when no challenge is outstanding, `NodeProofRejected`
+    /// when the signature does not verify under the key presented, `NodeKeyUnknown` when it
+    /// does and this cluster holds no such key for that id, and `NodeKeyRevoked` when the key
+    /// is one the cluster REVOKED -- which also marks the connection, so every later verb on it
+    /// is refused as the forgotten machine's whatever its address says.
     ProveNode = 0x19,
 
     /// A node tells the scheduler it EXISTS, whatever components it runs.
@@ -732,6 +756,15 @@ enum class Op : std::uint8_t
     /// Admitting a voter through it DEMOTES that voter, and `ClusterAdmit` on a learner
     /// promotes it: the seat follows the verb, as `Cluster::MemberSeatTable` says.
     ClusterAdmitLearner = 0x1C,
+
+    /// Admit a WORKER principal: a machine that joins the fleet under an identity key and never
+    /// joins consensus (#178).
+    ///
+    /// `AdmitPrincipal` without an enrollment window, for an operator who already has the id and
+    /// the key -- `--print-identity` prints both on the worker -- and would otherwise open a window
+    /// only to approve the one request it expects. Answered with `ClusterAdmitReceipt`, the
+    /// endpoint field empty: a principal has no consensus endpoint.
+    ClusterAdmitWorker = 0x1D,
 };
 
 /// Reply status, the first byte of every reply.
@@ -979,8 +1012,9 @@ enum class ErrorCode : std::uint8_t
 
     /// The lease presented is not one this cluster issued.
     ///
-    /// Its MAC does not verify under the shared key, or it is not a lease token at
-    /// all -- and those two are deliberately ONE code, because from the receiving
+    /// Its signature does not verify under the key the worker's roster holds for the
+    /// voter it names, that key is revoked, or it is not a lease token at all -- and
+    /// those are deliberately ONE code, because from the receiving
     /// end they are indistinguishable: a forged token and a random string differ
     /// only in how much effort went into them. It is also what an old launcher's
     /// bare serial arrives as, which is the right answer for it too: the client
@@ -990,7 +1024,7 @@ enum class ErrorCode : std::uint8_t
     /// Emphatically NOT `UnknownLease`, which is the scheduler saying it has no
     /// record of a token it may well have issued -- an expired or already-resolved
     /// lease, a fleet condition. This one says the token was never issued by
-    /// anybody holding the key, which is a security event and reads as one.
+    /// any voter the worker trusts, which is a security event and reads as one.
     ///
     /// Nothing the token CLAIMS is reported alongside it. A caller that cannot
     /// authenticate a token has established no fact about it, and echoing its
@@ -999,13 +1033,13 @@ enum class ErrorCode : std::uint8_t
 
     /// An authentic lease, presented to a worker it was not issued for.
     ///
-    /// Only ever reported once the MAC has verified, which is what makes it a
+    /// Only ever reported once the signature has verified, which is what makes it a
     /// diagnostic rather than a hint to an attacker: the endpoint the scheduler
     /// granted is stated in the message, because the overwhelmingly common cause is
     /// not a replay at all but a worker whose advertised endpoint and actual one
     /// disagree -- a NAT, or a hostname registered where clients resolve an address.
     ///
-    /// The replay it also closes is the reason the endpoint is inside the MAC:
+    /// The replay it also closes is the reason the endpoint is inside the signed claims:
     /// without it, a lease minted for one worker is a lease on every worker in the
     /// fleet.
     LeaseEndpointMismatch = 0x1A,
@@ -1171,17 +1205,18 @@ enum class ErrorCode : std::uint8_t
     /// looking like a protocol bug.
     NodeProofUnchallenged = 0x26,
 
-    /// A node proof did not authenticate under this node's cluster key.
+    /// A node proof's signature did not verify under the identity key it presented.
     ///
-    /// A wrong key, a tag over a different challenge, or a tag over a different id -- all three
-    /// are one answer, deliberately. The verification is a single MAC comparison and cannot tell
-    /// them apart, and a refusal that named which field was wrong would be an oracle a caller
-    /// could grind against one field at a time. `Cluster::VerifyFields` is where that reasoning
-    /// lives for every verifier in this tree.
+    /// A signature over a different challenge, a different id or a different handshake, or bytes
+    /// that are no signature at all -- one answer, deliberately: the verification cannot tell them
+    /// apart, and a refusal naming which field was wrong would be an oracle. Asked BEFORE the
+    /// roster is consulted, so a caller who cannot sign learns nothing about which ids and keys
+    /// this cluster holds.
     ///
     /// Not a diagnosis of the caller's whole posture: a connection that fails this is still
     /// admitted or refused by its ADDRESS exactly as it would have been without ever proving
-    /// anything. The proof is an upgrade, so failing it takes nothing away.
+    /// anything -- which, since #178, admits it to nothing a JOINING machine sends
+    /// (`OpDescriptor::identity`).
     NodeProofRejected = 0x27,
 
     /// This worker cannot verify ANY grant right now: it holds no roster its trust anchors
@@ -1196,6 +1231,34 @@ enum class ErrorCode : std::uint8_t
     /// only reach an ex-leader that withholds them -- and the worker's
     /// `fastcache_roster_expires_in_seconds` gauge is where it showed first.
     RosterExpired = 0x28,
+
+    /// A node proof verified under a key this cluster does not hold for the id it named (#178).
+    ///
+    /// A machine never admitted -- a worker nobody enrolled or `--cluster-admit-worker`ed -- or
+    /// one presenting a key other than the one admitted under its id. **Not `NodeProofRejected`**,
+    /// because the remedy is the operator's rather than the caller's: the signature is sound and
+    /// the machine is who it says it is, so what is missing is an admission, and a refusal naming
+    /// a bad signature would send somebody to regenerate a key that is fine.
+    NodeKeyUnknown = 0x29,
+
+    /// A node proof verified under a key this cluster has REVOKED (#178).
+    ///
+    /// The forgotten machine itself, still holding every byte it ever held. Named rather than
+    /// folded into `NodeKeyUnknown` because it is the one outcome an operator must be able to
+    /// SEE -- a removed machine still dialling in -- and because it is not merely a refusal: the
+    /// connection is kept and marked, and every later verb on it is refused as the forgotten
+    /// machine's, even from a host `--fleet-member` still names.
+    NodeKeyRevoked = 0x2A,
+
+    /// A verb only a machine that PROVED its identity may send, sent on a connection that has not
+    /// (#178).
+    ///
+    /// `Register`, `NodeAnnounce`, `Heartbeat` and `Withdraw`: the verbs with which a machine
+    /// joins the fleet, and which decide where the fleet's work is sent. An address admits a
+    /// CLIENT; it no longer admits a machine into the fleet, loopback included -- a process on the
+    /// scheduler's own host could otherwise register an endpoint of its choosing and be leased the
+    /// fleet's jobs. `OpDescriptor::identity` is the table the refusal is decided from.
+    NodeIdentityRequired = 0x2B,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -1308,6 +1371,25 @@ class PayloadCap
 /// verb reachable before authentication, which `PreAuthVerbsAreBounded` refuses.
 inline constexpr PayloadCap SessionCapGoverns { 0 };
 
+/// Who may send a verb: any caller its surface admits, or only a machine that PROVED its identity
+/// on this connection (#178).
+///
+/// **PRIVATE: in-process only**, read off `OpTable` at each end, so only the zero value is spelled.
+///
+/// A COLUMN rather than a list at the one site that enforces it, for `PreAuth`'s reason: which
+/// verbs a joining machine owns is a property of the verb, and a list kept beside the scheduler's
+/// gate is one a new verb joins by being remembered. `JoiningVerbsNeedAnIdentity` below pins the set.
+enum class IdentityRequirement : std::uint8_t
+{
+    /// Any caller the surface admits -- by address, by a credential, or by a proof.
+    AddressAdmits = 0,
+
+    /// Only a connection whose proved identity key is live in the cluster's roster: the verbs a
+    /// machine JOINS the fleet with, which decide where the fleet's work is sent. Loopback is not
+    /// exempt -- `ErrorCode::NodeIdentityRequired` says why.
+    ProvenNodeOnly,
+};
+
 /// This verb declares a ceiling of its own, tighter than the session's.
 /// @param bytes The ceiling.
 /// @return The cap to put in the row.
@@ -1396,44 +1478,44 @@ enum class VerbFamily : std::uint8_t
     /// says the fleet is served elsewhere, as the fleet subject of a subscription does.
     Fleet,
 
-    /// Establishes, for this CONNECTION, that the caller holds the cluster's pre-shared key.
+    /// Establishes, for this CONNECTION, WHICH machine the caller is: its node id, proved by a
+    /// signature under the identity key the cluster admitted, and a session key both ends then seal
+    /// every frame under (#178).
     ///
     /// ## Its own family, and not one of the two that look closer
     ///
     /// **Not `Session`**, although that family's own sentence -- *establishes a credential for
     /// the connection* -- describes this pair exactly. `Session` follows the SCHEDULER, because
-    /// the credential it establishes is `--scheduler-token-file`; the cluster key is a different
-    /// secret with a different population (every member holds it, and an operator's token is not
-    /// it) and lives in a different file. Folding them would put the fleet's shared key in the
-    /// component that owns the operator's, and would make a node running no scheduler unprovable
-    /// -- which is an ordinary worker.
+    /// the credential it establishes is `--scheduler-token-file`; an identity is a different fact
+    /// with a different population (every machine in the fleet has one, and an operator's token is
+    /// not it). Folding them would make identity a property of the component that owns the
+    /// operator's token.
     ///
     /// **Not `Scheduler`**, for the mirror reason: a row there would be gated by the very
-    /// membership answer this pair exists to widen, so the verb would be refused to exactly the
+    /// admission answer this pair exists to establish, so the verb would be refused to exactly the
     /// caller it was written for.
     ///
     /// ## Neither verb is pre-auth, and that is a decision
     ///
     /// The obvious reading of `Enrollment` -- *a verb that admits strangers must be
     /// `OpenBeforeAuth`* -- does not transfer, because the two verbs admit strangers to
-    /// different gates. `Enroll` exists for a machine that holds NO secret of this cluster, so a
-    /// credential gate there refuses the whole population. A node proving the cluster key is the
+    /// different gates. `Enroll` exists for a machine the cluster has not admitted yet, so a
+    /// credential gate there refuses the whole population. A node proving its identity is the
     /// opposite case: it came to send `Register`, which requires the credential when one is
     /// configured, so a caller that cannot pass that gate gains nothing from being proved and a
     /// caller that can passes it first. Nobody is refused by requiring it.
     ///
     /// What pre-auth would cost is real and one-sided: an unauthenticated stranger could make
-    /// this node draw a nonce and run an HMAC per frame, and `PreAuthVerbsAreBounded` would have
-    /// two more rows to be right about. So the answer is `RequiresAuth` on both, and this
-    /// paragraph exists because *the verb admits a non-member, therefore it is pre-auth* is the
-    /// inference a reader will make from the table alone.
+    /// this node draw an ephemeral key and compute a signature per frame, and
+    /// `PreAuthVerbsAreBounded` would have two more rows to be right about. So the answer is
+    /// `RequiresAuth` on both.
     ///
     /// ## Legitimately absent
     ///
-    /// A node holding no cluster key has nothing to verify a proof against, so it runs no
-    /// component for this family and the whole family is refused `UnimplementedVerb` -- *this
-    /// node serves no component for that verb family*, which is what a caller needs in order to
-    /// fall back to address admission and carry on.
+    /// A proof is checked against the cluster's applied roster, which only a node running
+    /// consensus holds, so any other node runs no component for this family and refuses it
+    /// `NoCluster` -- never `UnimplementedVerb`, which a caller reads as *this node's build is too
+    /// old* and acts on by upgrading a machine that is already current.
     NodeProof,
 
     /// The count, not a family: what sizes a table with one row per family
@@ -1480,6 +1562,10 @@ struct OpDescriptor
     /// Read by a merged listener to pick the component that answers, admits, gates
     /// and counts for this verb. `EveryVerbHasAFamily` refuses a row that omits it.
     VerbFamily family;
+
+    /// Who may send it: any admitted caller, or only a machine that proved its identity on this
+    /// connection. Stated on every row, never defaulted, for `preAuth`'s reason.
+    IdentityRequirement identity;
 };
 
 /// What an endpoint answers for a verb it does not implement.
@@ -1620,42 +1706,62 @@ inline constexpr std::size_t MaxEnrollPayload = 1024;
 static_assert(MaxEnrollPayload < MaxControlPayload,
               "a pre-auth verb must be bounded more tightly than one a member had to authenticate to reach");
 
-/// How many bytes a node-proof challenge carries on the wire.
+/// Bytes in a node's identity key as every verb carrying one spells it: an Ed25519 public key
+/// (#178).
+///
+/// Spelled here rather than taken from `Core/Ed25519.hpp`, which this header may not include --
+/// it is dependency-free by rule, and the launcher compiles it without the library. The node
+/// `static_assert`s the two equal where it fills the field, so they cannot drift apart silently.
+inline constexpr std::size_t IdentityPublicKeyBytes = 32;
+
+/// How many bytes a node-handshake nonce carries on the wire.
 ///
 /// Spelled HERE rather than included from `Core/Nonce.hpp`, because this header is what the
-/// launcher compiles in and stays free of everything but the three leaf headers above it. The
-/// two constants are pinned to each other with a `static_assert` in
-/// `Distributed/NodeProof.hpp`, which is the one place both the wire number and the nonce type
-/// are visible -- so a nonce that grew and a wire field that did not is a BUILD failure rather
-/// than a challenge silently truncated to the first 32 bytes.
+/// launcher compiles in and stays free of everything but the three leaf headers above it. Every
+/// width in this block is pinned to the type that fills it with a `static_assert` in
+/// `Distributed/NodeProof.hpp`, the one place both are visible -- so a nonce that grew and a wire
+/// field that did not is a BUILD failure rather than a field silently truncated, which would make
+/// both ends sign different inputs and report a forgery for a version mismatch.
 inline constexpr std::size_t NodeChallengeBytes = 32;
 
-/// How many bytes a node-proof tag carries on the wire.
-///
-/// One SHA-256 digest. Pinned to `Sha256::Digest`'s size in `Distributed/NodeProof.hpp` for
-/// `NodeChallengeBytes`' reason, and separate from it although the two numbers are equal today:
-/// a nonce's width is a claim about repeats and a tag's is a claim about forgery, and folding
-/// them into one constant would make either claim answerable by retuning the other.
-inline constexpr std::size_t NodeProofTagBytes = 32;
+/// How many bytes a node-handshake ephemeral key carries: one X25519 public key.
+inline constexpr std::size_t NodeEphemeralKeyBytes = 32;
 
-/// Payload ceiling for `ProveNode`.
+/// How many bytes a node-handshake signature carries: one Ed25519 signature.
+inline constexpr std::size_t NodeSignatureBytes = 64;
+
+/// How many bytes the tag after every sealed frame carries: one HMAC-SHA256 output.
 ///
-/// The request is a node id and a fixed-width tag, so the only variable part is an identifier a
-/// `--cluster-dir` minted or an operator typed. Its own constant rather than `MaxControlPayload`
-/// for `MaxEnrollPayload`'s reason -- the populations differ, and nothing else in the table
-/// records that this verb is reached by a caller whose membership has not been established yet,
-/// even though its credential has.
+/// NOT counted in the frame's declared length. The header still states the payload alone, so a
+/// reader that has not engaged the seal would read a sealed frame as a frame followed by 32 bytes
+/// of garbage and close -- which is the right failure for a peer that proved nothing.
+inline constexpr std::size_t SealedFrameTagBytes = 32;
+
+/// Payload ceiling for `NodeChallenge` and `ProveNode`.
 ///
-/// 512 rather than the 40-odd bytes a real request measures: the point of the bound is that it
+/// Both requests are fixed-width fields plus, for the proof, a node id a `--cluster-dir` minted or
+/// an operator typed. Their own constant rather than `MaxControlPayload` for `MaxEnrollPayload`'s
+/// reason -- the populations differ, and nothing else in the table records that these verbs are
+/// reached by a caller whose identity has not been established yet, even though its credential
+/// has.
+///
+/// 512 rather than the hundred-odd bytes a real proof measures: the point of the bound is that it
 /// cannot scale with anything, not that it is snug, and a ceiling somebody has to raise for a
 /// longer id is a ceiling that gets raised to the control cap.
 inline constexpr std::size_t MaxNodeProofPayload = 512;
 
 // The fixed part has to FIT, or the verb's own cap refuses every well-formed request and the
-// refusal names a payload ceiling rather than the encoding that cannot meet it. Two 4-byte field
-// prefixes (`WireFields`), the tag, and room left over for the id.
-static_assert(MaxNodeProofPayload > (2 * sizeof(std::uint32_t)) + NodeProofTagBytes,
-              "MaxNodeProofPayload must leave room for the tag, both field prefixes and an id");
+// refusal names a payload ceiling rather than the encoding that cannot meet it. Three 4-byte field
+// prefixes (`WireFields`), the key and the signature, and room left over for the id.
+static_assert(MaxNodeProofPayload > (3 * sizeof(std::uint32_t)) + IdentityPublicKeyBytes + NodeSignatureBytes,
+              "MaxNodeProofPayload must leave room for the key, the signature, three field prefixes and an id");
+
+/// Payload ceiling for a reply read on a SEALED connection by the side that proved.
+///
+/// The verbs a joining machine sends are answered from tables -- a worker id, a certified roster --
+/// so this bounds how much a sealing reader buffers before it can check a tag, rather than any
+/// reply a joining machine is owed. A certified roster for a fleet of hundreds is tens of kilobytes.
+inline constexpr std::size_t MaxSealedReplyPayload = 4U * 1024U * 1024U;
 
 /// How long a scheduler's lease lives, and therefore how long a client waits.
 ///
@@ -1794,7 +1900,8 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = SessionCapGoverns, // an object file; bounded by the operator's cap
-                   .family = VerbFamily::Cache },
+                   .family = VerbFamily::Cache,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::Fetch,
                    .name = "fetch",
                    .fieldCount = 1, // key
@@ -1802,7 +1909,8 @@ inline constexpr std::array OpTable {
                        static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Miss) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = SessionCapGoverns,
-                   .family = VerbFamily::Cache },
+                   .family = VerbFamily::Cache,
+                   .identity = IdentityRequirement::AddressAdmits },
     // `Miss` is legal and is not a failure: see `Op::CacheDrop`. Bounded rather than left to
     // the session cap, unlike `Fetch`, because the request carries a key and never an
     // artefact -- a verb that cannot grow with a build has no reason to accept 256 MiB.
@@ -1813,32 +1921,36 @@ inline constexpr std::array OpTable {
                        static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Miss) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Cache },
+                   .family = VerbFamily::Cache,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::Auth,
                    .name = "auth",
                    .fieldCount = 2, // username, secret
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = OpenBeforeAuth,
                    .maxPayload = BoundedTo(MaxAuthPayload),
-                   .family = VerbFamily::Session },
+                   .family = VerbFamily::Session,
+                   .identity = IdentityRequirement::AddressAdmits },
 
-    // The node proof (#1428). `RequiresAuth` on both, which is the one thing about these two
-    // rows that will look wrong beside `Op::Enroll` above -- `VerbFamily::NodeProof` carries the
-    // argument, and it is not a weaker version of enrollment's.
+    // The node proof (#1428, #178). `RequiresAuth` on both, which is the one thing about these
+    // two rows that will look wrong beside `Op::Enroll` above -- `VerbFamily::NodeProof` carries
+    // the argument, and it is not a weaker version of enrollment's.
     OpDescriptor { .code = Op::NodeChallenge,
                    .name = "node-challenge",
-                   .fieldCount = 0, // nothing to ask with: the server states the nonce
+                   .fieldCount = 2, // the caller's nonce, its ephemeral key
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxNodeProofPayload),
-                   .family = VerbFamily::NodeProof },
+                   .family = VerbFamily::NodeProof,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ProveNode,
                    .name = "prove-node",
-                   .fieldCount = 2, // nodeId, tag
+                   .fieldCount = 3, // nodeId, identity key, signature
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxNodeProofPayload),
-                   .family = VerbFamily::NodeProof },
+                   .family = VerbFamily::NodeProof,
+                   .identity = IdentityRequirement::AddressAdmits },
 
     // Distributed execution. None is `preAuth`: causing a compiler to run on
     // another machine is the last thing an unauthenticated peer should reach.
@@ -1848,7 +1960,8 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::NodeAnnounce,
                    .name = "node-announce",
                    .fieldCount = 4, // endpoint, capacity, load, endorsement
@@ -1858,28 +1971,32 @@ inline constexpr std::array OpTable {
                    // gate admits, so requiring it refuses nobody.
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::Heartbeat,
                    .name = "heartbeat",
                    .fieldCount = 3, // workerId, u32 inFlight, load
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::Lease,
                    .name = "lease",
                    .fieldCount = 3, // fingerprint, key, accepted codecs
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::Release,
                    .name = "release",
                    .fieldCount = 2, // leaseToken, key
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::AddressAdmits },
     // `Ok | Error` and no third status, which is what keeps `MinSupportedVersion`
     // where it is. Step-over is a REQUEST-side property -- a request carries an op
     // byte a server can refuse by name -- so an old scheduler meeting this answers
@@ -1894,63 +2011,80 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::ClusterStatus,
                    .name = "cluster-status",
                    .fieldCount = 0, // nothing to ask with
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterSet,
                    .name = "cluster-set",
                    .fieldCount = 2, // setting name, value
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterForget,
                    .name = "cluster-forget",
                    .fieldCount = 1, // member id
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterAdmit,
                    .name = "cluster-admit",
                    .fieldCount = 3, // member id, consensus endpoint, identity key (#178)
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterAdmitLearner,
                    .name = "cluster-admit-learner",
                    .fieldCount = 3, // member id, consensus endpoint, identity key -- ClusterAdmit's
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::AddressAdmits },
+    OpDescriptor { .code = Op::ClusterAdmitWorker,
+                   .name = "cluster-admit-worker",
+                   .fieldCount = 2, // principal id, identity key
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = BoundedTo(MaxControlPayload),
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterAdmitClient,
                    .name = "cluster-admit-client",
                    .fieldCount = 1, // client host
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ClusterForgetClient,
                    .name = "cluster-forget-client",
                    .fieldCount = 1, // client host
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Scheduler },
+                   .family = VerbFamily::Scheduler,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::NodeStatus,
                    .name = "node-status",
                    .fieldCount = 0, // nothing to ask with
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Node },
+                   .family = VerbFamily::Node,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::ExplainAdmission,
                    .name = "explain-admission",
                    .fieldCount = 1, // the host being asked about
@@ -1961,14 +2095,16 @@ inline constexpr std::array OpTable {
                    // forgotten, so it sits behind the same gate every other node verb does.
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Node },
+                   .family = VerbFamily::Node,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::NodeMetrics,
                    .name = "node-metrics",
                    .fieldCount = 0, // nothing to ask with
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Node },
+                   .family = VerbFamily::Node,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::Compile,
                    .name = "compile",
                    // leaseToken, fingerprint, args, preprocessed, accepted codecs, sourceName,
@@ -1983,7 +2119,8 @@ inline constexpr std::array OpTable {
                                                               | StatusBit(Status::Progress)),
                    .preAuth = RequiresAuth,
                    .maxPayload = SessionCapGoverns, // carries a preprocessed TU; the operator's cap governs
-                   .family = VerbFamily::Compile },
+                   .family = VerbFamily::Compile,
+                   .identity = IdentityRequirement::AddressAdmits },
 
     // Runtime enrollment, and deliberately NOT inside the distributed-execution block
     // above: that block's section comment states that none of it is `preAuth`, and the
@@ -1999,14 +2136,16 @@ inline constexpr std::array OpTable {
                    // that assertion discriminate anything.
                    .preAuth = OpenBeforeAuth,
                    .maxPayload = BoundedTo(MaxEnrollPayload),
-                   .family = VerbFamily::Enrollment },
+                   .family = VerbFamily::Enrollment,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::EnrollControl,
                    .name = "enroll-control",
                    .fieldCount = 2, // verb, subject
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Enrollment },
+                   .family = VerbFamily::Enrollment,
+                   .identity = IdentityRequirement::AddressAdmits },
 
     // Live stats (#1399). Not pre-auth: a dashboard reads the fleet, which is exactly what
     // an unauthenticated stranger must not be shown.
@@ -2019,7 +2158,8 @@ inline constexpr std::array OpTable {
                        static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error) | StatusBit(Status::Push)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Live },
+                   .family = VerbFamily::Live,
+                   .identity = IdentityRequirement::AddressAdmits },
 
     // The cordon (#1303). Gated on locality by the compile surface rather than on a
     // credential: see `CompileResponder::RefusePeer`.
@@ -2029,7 +2169,8 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Compile },
+                   .family = VerbFamily::Compile,
+                   .identity = IdentityRequirement::AddressAdmits },
 
     // The fleet document, read once (#1391). Not pre-auth, for `Subscribe`'s reason: it is the
     // fleet map.
@@ -2039,7 +2180,8 @@ inline constexpr std::array OpTable {
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .family = VerbFamily::Fleet },
+                   .family = VerbFamily::Fleet,
+                   .identity = IdentityRequirement::AddressAdmits },
 };
 
 /// Whether `Status::Progress` is confined to the one verb that can be slow enough to
@@ -2128,6 +2270,28 @@ static_assert(NoVerbIsInTheCountFamily(), "VerbFamily::Last is the count, not a 
 }
 
 static_assert(EveryOpcodeIsDistinct(), "two verbs claim one wire byte; the later one would be served as the earlier");
+
+/// Whether exactly the verbs a machine JOINS the fleet with require a proven identity (#178).
+///
+/// `Register`, `NodeAnnounce`, `Heartbeat` and `Withdraw` decide where the fleet's work is sent and
+/// what it knows about each machine, so an address may not stand in for who is sending them. Every
+/// other verb is a CLIENT's, an operator's or a peer handshake's, and an address still admits those
+/// -- which is owner decision 5 on #178 stated as a table rather than as a list at the gate.
+///
+/// Both directions, because each is a different mistake: a joining verb left open is an endpoint
+/// anybody on an admitted host can register, and any other verb marked here refuses every launcher.
+/// @return True when the column names exactly those four.
+[[nodiscard]] constexpr bool JoiningVerbsNeedAnIdentity() noexcept
+{
+    return std::ranges::all_of(OpTable, [](OpDescriptor const& row) {
+        auto const joining = row.code == Op::Register || row.code == Op::NodeAnnounce || row.code == Op::Heartbeat
+                             || row.code == Op::Withdraw;
+        return joining == (row.identity == IdentityRequirement::ProvenNodeOnly);
+    });
+}
+
+static_assert(JoiningVerbsNeedAnIdentity(),
+              "exactly Register, NodeAnnounce, Heartbeat and Withdraw require a proven identity -- see IdentityRequirement");
 
 /// One row of the error table: the code, its stable name, and the message sent
 /// when the caller has nothing more specific to say.
@@ -2236,11 +2400,20 @@ inline constexpr std::array ErrorTable {
                       .defaultMessage = "no challenge is outstanding on this connection; ask for one first" },
     ErrorDescriptor { .code = ErrorCode::NodeProofRejected,
                       .name = "node-proof-rejected",
-                      .defaultMessage = "the node proof did not authenticate under this cluster's key" },
+                      .defaultMessage = "the node proof's signature does not verify under the key it presented" },
     ErrorDescriptor { .code = ErrorCode::RosterExpired,
                       .name = "roster-expired",
                       .defaultMessage = "this worker holds no roster its voters currently certify, so it can verify no "
                                         "grant" },
+    ErrorDescriptor { .code = ErrorCode::NodeKeyUnknown,
+                      .name = "node-key-unknown",
+                      .defaultMessage = "this cluster holds no such identity key for that node; it has not been admitted" },
+    ErrorDescriptor { .code = ErrorCode::NodeKeyRevoked,
+                      .name = "node-key-revoked",
+                      .defaultMessage = "this cluster has revoked that identity key; the machine was forgotten" },
+    ErrorDescriptor { .code = ErrorCode::NodeIdentityRequired,
+                      .name = "node-identity-required",
+                      .defaultMessage = "only a node that has proved its identity on this connection may send that verb" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.
@@ -2334,7 +2507,7 @@ struct NoCompileWorker
 /// So "this verb asks nothing" is stated here rather than left looking like an
 /// omission, and `FieldCountsAgree` checks the two in both directions -- which is
 /// what makes this a check rather than a second place to be wrong.
-inline constexpr std::array FieldlessOps { Op::ClusterStatus, Op::NodeStatus, Op::NodeMetrics, Op::NodeChallenge };
+inline constexpr std::array FieldlessOps { Op::ClusterStatus, Op::NodeStatus, Op::NodeMetrics };
 
 /// Whether `op` legitimately carries no fields.
 /// @param op The verb.
@@ -4635,6 +4808,47 @@ struct ClusterAdmitReceipt
                                      key.empty() ? std::nullopt : std::optional { std::string { AsStringView(key) } } };
 }
 
+/// What an operator asks when admitting a WORKER principal (#178).
+///
+/// Borrowed views: the encoder copies them into the frame before it returns.
+struct ClusterAdmitWorkerRequest
+{
+    std::string_view workerId;  ///< The id the worker minted into its `--cluster-dir`.
+    std::string_view publicKey; ///< Its identity key, as `--print-identity` printed it.
+};
+
+/// A CLUSTER-ADMIT-WORKER payload, as views into it. Read in scope by the one handler.
+struct ClusterAdmitWorkerView
+{
+    std::span<std::byte const> workerId;  ///< As received.
+    std::span<std::byte const> publicKey; ///< As received: TEXT, parsed by the leader.
+};
+
+/// Frame a CLUSTER-ADMIT-WORKER request.
+///
+/// The key travels as the TEXT an operator typed, as `ClusterAdmit`'s does, so the one parser that
+/// decides what a key is runs where the command is proposed -- the leader -- whatever client sent it.
+/// @param request The worker's id and key.
+/// @param version Version to advertise.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeClusterAdmitWorker(ClusterAdmitWorkerRequest const& request,
+                                                                     WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, Op::ClusterAdmitWorker, { AsBytes(request.workerId), AsBytes(request.publicKey) });
+}
+
+/// Split a CLUSTER-ADMIT-WORKER payload.
+/// @param payload The bytes following the request header.
+/// @return The fields, or nullopt when malformed.
+[[nodiscard]] inline std::optional<ClusterAdmitWorkerView> DecodeClusterAdmitWorkerPayload(
+    std::span<std::byte const> payload)
+{
+    auto const fields = SplitFields(payload, OpFieldCount(Op::ClusterAdmitWorker));
+    if (!fields.has_value())
+        return std::nullopt;
+    return ClusterAdmitWorkerView { .workerId = (*fields)[0], .publicKey = (*fields)[1] };
+}
+
 /// Frame a COMPILE request.
 /// @param request The job.
 /// @param version Version to advertise.
@@ -4698,9 +4912,9 @@ struct LeaseGrant
     ///
     /// **In the CLEAR, beside the token rather than read out of it**, and that is a
     /// deliberate refusal to add an unauthenticated claims reader. The expiry is also
-    /// inside the MACed claims, where the WORKER reads it after verifying -- but the
-    /// client holds no key and cannot verify anything, so giving it a way to read
-    /// claims without checking them would put exactly the primitive the MAC-first rule
+    /// inside the signed claims, where the WORKER reads it after verifying -- but the
+    /// client holds no roster and verifies nothing, so giving it a way to read
+    /// claims without checking them would put exactly the primitive the verify-first rule
     /// forbids into a header three binaries include. What the client needs is not a
     /// claim about the token; it is its own budget, from the scheduler that is already
     /// telling it which worker to dial.
@@ -5042,7 +5256,8 @@ namespace WireMembershipRoute
     constexpr std::uint32_t ClusterMembers = 0x02;  ///< The member set the cluster has agreed.
     constexpr std::uint32_t ClientTombstone = 0x04; ///< A replicated `--cluster-forget-client` entry.
     constexpr std::uint32_t OpenPolicy = 0x08;      ///< `--fleet-open`, which admits every caller.
-    constexpr std::uint32_t ProvenKeyHolder = 0x10; ///< The caller proved the cluster key on this connection.
+    constexpr std::uint32_t ProvenIdentity = 0x10;  ///< The caller proved an identity key the cluster holds live.
+    constexpr std::uint32_t KeyTombstone = 0x20;    ///< The caller proved an identity key the cluster REVOKED.
 } // namespace WireMembershipRoute
 
 /// One node's answer about one host.
@@ -5053,13 +5268,6 @@ struct AdmissionExplanationFields
 
     [[nodiscard]] bool operator==(AdmissionExplanationFields const&) const = default;
 };
-
-/// Bytes in a node's identity key as `NodeStatus` carries it: an Ed25519 public key (#178).
-///
-/// Spelled here rather than taken from `Core/Ed25519.hpp`, which this header may not include --
-/// it is dependency-free by rule, and the launcher compiles it without the library. The node
-/// `static_assert`s the two equal where it fills the field, so they cannot drift apart silently.
-inline constexpr std::size_t IdentityPublicKeyBytes = 32;
 
 /// What `--node-status` says about the roster a node verifies lease grants against (#178).
 ///
@@ -6122,6 +6330,12 @@ struct EnrollReplyView
     EnrollOutcome outcome { EnrollOutcome::Pending };
 
     std::span<std::byte const> roster {}; ///< The roster, and EMPTY for every outcome but `Approved`.
+
+    /// The leader's CERTIFIED roster -- `Cluster::EncodeCertifiedRoster`'s bytes -- which an
+    /// approved worker keeps as its trust root, so it needs no `--voter-key` (#178). Empty for
+    /// every outcome but `Approved`, and empty on an approval while a majority of the voters has
+    /// not yet endorsed the roster: the worker then adopts one on its first announcement instead.
+    std::span<std::byte const> certificate {};
 };
 
 /// Frame the payload of an ENROLL reply.
@@ -6132,11 +6346,14 @@ struct EnrollReplyView
 /// equally correct in both the healthy and the broken build.
 /// @param outcome What was decided.
 /// @param roster `Cluster::EncodeRoster(Cluster::ProjectRoster(state))`'s bytes for `Approved`, empty otherwise.
+/// @param certificate The leader's certified roster for `Approved`, when it has one; empty otherwise.
 /// @return The reply payload, to be carried by `EncodeReply(Status::Ok, ...)`.
-[[nodiscard]] inline std::vector<std::byte> EncodeEnrollReply(EnrollOutcome outcome, std::span<std::byte const> roster)
+[[nodiscard]] inline std::vector<std::byte> EncodeEnrollReply(EnrollOutcome outcome,
+                                                              std::span<std::byte const> roster,
+                                                              std::span<std::byte const> certificate = {})
 {
     std::array<std::byte, 1> const tag { static_cast<std::byte>(outcome) };
-    return WireFields::Encode({ std::span<std::byte const> { tag }, roster });
+    return WireFields::Encode({ std::span<std::byte const> { tag }, roster, certificate });
 }
 
 /// Read an ENROLL reply payload back.
@@ -6151,7 +6368,7 @@ struct EnrollReplyView
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<EnrollReplyView> DecodeEnrollReply(std::span<std::byte const> payload)
 {
-    auto const fields = WireFields::SplitExactly(payload, 2);
+    auto const fields = WireFields::SplitExactly(payload, 3);
     if (!fields.has_value())
         return std::nullopt;
     auto const tag = (*fields)[0];
@@ -6166,7 +6383,9 @@ struct EnrollReplyView
         default:
             return std::nullopt;
     }
-    return EnrollReplyView { .outcome = static_cast<EnrollOutcome>(tag[0]), .roster = (*fields)[1] };
+    return EnrollReplyView { .outcome = static_cast<EnrollOutcome>(tag[0]),
+                             .roster = (*fields)[1],
+                             .certificate = (*fields)[2] };
 }
 
 /// Frame an ENROLL-CONTROL request.
@@ -6487,89 +6706,147 @@ struct EnrollmentReport
     return report;
 }
 
-// ---- The node proof (#1428) --------------------------------------------------------------
+// ---- The node proof (#1428, #178) --------------------------------------------------------
+
+/// What a caller opens the node handshake with.
+///
+/// Owned, fixed-width fields: a decoder returning this by value borrows nothing, and the arrays are
+/// what the `static_assert`s in `Distributed/NodeProof.hpp` pin to the types that fill them.
+struct NodeChallengeRequest
+{
+    std::array<std::byte, NodeChallengeBytes> nonce {};        ///< The caller's nonce, fresh per connection.
+    std::array<std::byte, NodeEphemeralKeyBytes> ephemeral {}; ///< The caller's ephemeral X25519 public key.
+
+    [[nodiscard]] friend bool operator==(NodeChallengeRequest const&, NodeChallengeRequest const&) = default;
+};
 
 /// Frame a NODE-CHALLENGE request.
-///
-/// No fields: what a caller could put here is a nonce of its own, and a challenge a caller
-/// chose is not a challenge. `OpFieldCount` says zero and `SplitFields` enforces it, so a
-/// request carrying anything at all is `MalformedFrame` rather than silently ignored.
+/// @param request The caller's nonce and ephemeral key.
 /// @param version Version to advertise; overridable so tests can offer a version the peer
 ///                does not support.
 /// @return The framed request.
-[[nodiscard]] inline std::vector<std::byte> EncodeNodeChallenge(WireVersion version = CurrentVersion)
+[[nodiscard]] inline std::vector<std::byte> EncodeNodeChallenge(NodeChallengeRequest const& request,
+                                                                WireVersion version = CurrentVersion)
 {
-    return Detail::EncodeRequest(version, Op::NodeChallenge, {});
+    return Detail::EncodeRequest(
+        version,
+        Op::NodeChallenge,
+        { std::span<std::byte const> { request.nonce }, std::span<std::byte const> { request.ephemeral } });
 }
 
-/// Frame the payload of a NODE-CHALLENGE reply.
+/// Split a NODE-CHALLENGE payload.
 ///
-/// The nonce and nothing else, un-prefixed: one fixed-width field needs no framing, and a
-/// length prefix would make a truncated reply decode as a short nonce rather than refuse.
-/// @param challenge Exactly `NodeChallengeBytes` of nonce.
-/// @return The reply payload, to be carried by `EncodeReply(Status::Ok, ...)`.
-[[nodiscard]] inline std::vector<std::byte> EncodeNodeChallengeReply(std::span<std::byte const> challenge)
+/// Each width is EXACT, for `NodeChallengeBytes`' reason: a wider field silently truncated would
+/// have both ends sign different inputs.
+/// @param payload The bytes following the request header.
+/// @return The request, or nullopt when malformed.
+[[nodiscard]] inline std::optional<NodeChallengeRequest> DecodeNodeChallengePayload(std::span<std::byte const> payload)
 {
-    return std::vector<std::byte> { challenge.begin(), challenge.end() };
+    auto const fields = SplitFields(payload, OpFieldCount(Op::NodeChallenge));
+    if (!fields.has_value() || (*fields)[0].size() != NodeChallengeBytes || (*fields)[1].size() != NodeEphemeralKeyBytes)
+        return std::nullopt;
+    auto request = NodeChallengeRequest {};
+    std::ranges::copy((*fields)[0], request.nonce.begin());
+    std::ranges::copy((*fields)[1], request.ephemeral.begin());
+    return request;
+}
+
+/// What a server answers a NODE-CHALLENGE with: who it is, and its half of the handshake.
+struct NodeChallengeReply
+{
+    std::string serverId;                                       ///< The node id the server claims.
+    std::array<std::byte, IdentityPublicKeyBytes> serverKey {}; ///< Its identity key.
+    std::array<std::byte, NodeChallengeBytes> nonce {};         ///< Its nonce: the challenge a proof must answer.
+    std::array<std::byte, NodeEphemeralKeyBytes> ephemeral {};  ///< Its ephemeral X25519 public key.
+    std::array<std::byte, NodeSignatureBytes> signature {};     ///< Over both halves, under `serverKey`.
+
+    [[nodiscard]] friend bool operator==(NodeChallengeReply const&, NodeChallengeReply const&) = default;
+};
+
+/// Frame the payload of a NODE-CHALLENGE reply.
+/// @param reply The server's half.
+/// @return The reply payload, to be carried by `EncodeReply(Status::Ok, ...)`.
+[[nodiscard]] inline std::vector<std::byte> EncodeNodeChallengeReply(NodeChallengeReply const& reply)
+{
+    return WireFields::Encode({ AsBytes(reply.serverId),
+                                std::span<std::byte const> { reply.serverKey },
+                                std::span<std::byte const> { reply.nonce },
+                                std::span<std::byte const> { reply.ephemeral },
+                                std::span<std::byte const> { reply.signature } });
 }
 
 /// Read a NODE-CHALLENGE reply payload back.
 ///
-/// The LENGTH is the whole validation, and it is exact rather than a minimum: a peer whose
-/// nonce is wider than this build's would otherwise have its challenge silently truncated to
-/// the first 32 bytes, both ends would sign different inputs, and the refusal would arrive as
-/// `NodeProofRejected` -- a wrong-key diagnosis for a version mismatch.
+/// Every fixed field's width is exact, for `DecodeNodeChallengePayload`'s reason.
 /// @param payload The reply payload.
-/// @return The challenge, or nullopt when it is not exactly `NodeChallengeBytes` long.
-[[nodiscard]] inline std::optional<std::span<std::byte const>> DecodeNodeChallengeReply(std::span<std::byte const> payload)
+/// @return The reply, or nullopt when malformed.
+[[nodiscard]] inline std::optional<NodeChallengeReply> DecodeNodeChallengeReply(std::span<std::byte const> payload)
 {
-    if (payload.size() != NodeChallengeBytes)
+    auto const fields = SplitFields(payload, 5);
+    if (!fields.has_value() || (*fields)[1].size() != IdentityPublicKeyBytes || (*fields)[2].size() != NodeChallengeBytes
+        || (*fields)[3].size() != NodeEphemeralKeyBytes || (*fields)[4].size() != NodeSignatureBytes)
         return std::nullopt;
-    return payload;
+    auto reply = NodeChallengeReply { .serverId = std::string { AsStringView((*fields)[0]) },
+                                      .serverKey = {},
+                                      .nonce = {},
+                                      .ephemeral = {},
+                                      .signature = {} };
+    std::ranges::copy((*fields)[1], reply.serverKey.begin());
+    std::ranges::copy((*fields)[2], reply.nonce.begin());
+    std::ranges::copy((*fields)[3], reply.ephemeral.begin());
+    std::ranges::copy((*fields)[4], reply.signature.begin());
+    return reply;
 }
 
-/// A node proving it holds the cluster key, as views into a received payload.
+/// A node proving which machine it is.
 ///
-/// A `*View` and named as one: both fields are read in scope by the one verifier, which hands
-/// them straight to `Cluster::VerifyFields`, and neither outlives the frame.
-struct ProveNodeView
+/// Carries the caller's PUBLIC key rather than leaving the server to look one up by id, which is
+/// discovery's shape (#178 PR 4): the server verifies the signature FIRST, under the key presented,
+/// and consults its roster second -- so *forged*, *unknown key* and *revoked key* are three
+/// answers, and the roster is never an oracle for a caller who cannot sign.
+struct ProveNodeRequest
 {
-    std::span<std::byte const> nodeId; ///< The id the caller claims. A label inside the MAC.
-    std::span<std::byte const> tag;    ///< The tag it owes for this connection's challenge.
+    std::string nodeId;                                         ///< The id the caller claims.
+    std::array<std::byte, IdentityPublicKeyBytes> publicKey {}; ///< The key it signs with.
+    std::array<std::byte, NodeSignatureBytes> signature {};     ///< Over the whole handshake.
+
+    [[nodiscard]] friend bool operator==(ProveNodeRequest const&, ProveNodeRequest const&) = default;
 };
 
 /// Frame a PROVE-NODE request.
 ///
-/// The challenge is NOT a field: it is the one the server stated on this connection, and a
-/// caller echoing it back would give a server two copies to disagree about -- with the
-/// caller's copy the one the MAC covers. So the tag is over the server's challenge and the
-/// server verifies against what it drew.
-/// @param nodeId The id this node minted into its `--cluster-dir`.
-/// @param tag `MintNodeProof`'s digest, exactly `NodeProofTagBytes` long.
+/// No challenge is a field: both nonces are the ones stated on this connection, and a caller
+/// echoing them back would give a server two copies to disagree about.
+/// @param request The caller's id, key and signature.
 /// @param version Version to advertise.
 /// @return The framed request.
-[[nodiscard]] inline std::vector<std::byte> EncodeProveNode(std::string_view nodeId,
-                                                            std::span<std::byte const> tag,
+[[nodiscard]] inline std::vector<std::byte> EncodeProveNode(ProveNodeRequest const& request,
                                                             WireVersion version = CurrentVersion)
 {
-    return Detail::EncodeRequest(version, Op::ProveNode, { AsBytes(nodeId), tag });
+    return Detail::EncodeRequest(version,
+                                 Op::ProveNode,
+                                 { AsBytes(request.nodeId),
+                                   std::span<std::byte const> { request.publicKey },
+                                   std::span<std::byte const> { request.signature } });
 }
 
 /// Split a PROVE-NODE payload.
 ///
-/// The tag's width is checked HERE rather than at the verifier, because a tag of the wrong
-/// length is a malformed FRAME and not a failed proof: answering `NodeProofRejected` to it
-/// would spend the challenge and report a key mismatch for a client that cannot encode.
+/// The widths are checked HERE rather than at the verifier, because a key or a signature of the
+/// wrong length is a malformed FRAME and not a failed proof: answering `NodeProofRejected` to it
+/// would report a forgery for a client that cannot encode.
 /// @param payload The bytes following the request header.
 /// @return The fields, or nullopt when malformed.
-[[nodiscard]] inline std::optional<ProveNodeView> DecodeProveNodePayload(std::span<std::byte const> payload)
+[[nodiscard]] inline std::optional<ProveNodeRequest> DecodeProveNodePayload(std::span<std::byte const> payload)
 {
     auto const fields = SplitFields(payload, OpFieldCount(Op::ProveNode));
-    if (!fields.has_value())
+    if (!fields.has_value() || (*fields)[1].size() != IdentityPublicKeyBytes || (*fields)[2].size() != NodeSignatureBytes)
         return std::nullopt;
-    if ((*fields)[1].size() != NodeProofTagBytes)
-        return std::nullopt;
-    return ProveNodeView { .nodeId = (*fields)[0], .tag = (*fields)[1] };
+    auto request =
+        ProveNodeRequest { .nodeId = std::string { AsStringView((*fields)[0]) }, .publicKey = {}, .signature = {} };
+    std::ranges::copy((*fields)[1], request.publicKey.begin());
+    std::ranges::copy((*fields)[2], request.signature.begin());
+    return request;
 }
 
 // ---- Live stats (#1399) ------------------------------------------------------------------

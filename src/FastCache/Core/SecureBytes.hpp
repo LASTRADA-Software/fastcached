@@ -28,17 +28,17 @@ void SecureZero(void* data, std::size_t bytes) noexcept;
 /// a guard called alongside one needs a scan to stay true.
 ///
 /// It is also what makes COPIES safe without anybody thinking about them, which is not
-/// hypothetical here — `SignedLeaseValidator` takes the key **by value** and
-/// `SchedulerService` builds its own from a span, so the one secret exists in several
-/// buffers with independent lifetimes, and each one's block is wiped when that buffer
+/// hypothetical here — an `Ed25519KeyPair` is an ordinary copyable value whose secret half
+/// is one of these, so a node's identity key exists in as many buffers as its key pair has
+/// copies, with independent lifetimes, and each one's block is wiped when that buffer
 /// dies. A destructor-wiping wrapper gets this right too, but only for holders somebody
 /// remembered to wrap.
 ///
 /// And it covers REALLOCATION, where a destructor-based design cannot: a vector that grows
 /// moves its elements to a new block and frees the old one long before it dies, leaving a
-/// copy the destructor will never see. **No holder in this tree grows one today** —
-/// `ReadClusterKey` sizes its buffer once from `file_size` and `SchedulerService` builds
-/// from a pair of iterators — so this is cover for a change nobody would connect to the
+/// copy the destructor will never see. **No holder in this tree grows one today** — the
+/// pre-shared key's reader sized its buffer once from `file_size` until #178 retired it, and
+/// `HkdfSha256Expand` reserves its output before it appends — so this is cover for a change nobody would connect to the
 /// secret, rather than a defect being fixed. Said plainly because the tempting version of
 /// this sentence cites a growing holder, and there isn't one.
 ///

@@ -183,8 +183,8 @@ set(failures "")
 # The collapse is not tidiness. `message(FATAL_ERROR)` word-wraps its output at a
 # column that depends on how long `CMAKE_CURRENT_BINARY_DIR` is, which differs
 # per preset, per checkout and per CI runner -- so a multi-word needle can break
-# across a line on one machine and not another. `check-psk-signing-seam-selftest`
-# already paid for this once, on a tree it had been passing on. Every needle
+# across a line on one machine and not another. `check-psk-signing-seam-selftest`,
+# retired since, paid for this once, on a tree it had been passing on. Every needle
 # below is a multi-word phrase, and the failure lands hardest on the NEGATIVE
 # assertions: a wrapped line makes a `must not appear` needle pass for free.
 #

@@ -500,13 +500,17 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentFull, .cause = DeclineCause::NotPermitted },
     // A fleet read, which no compile reaches: the same reasoning as the enrollment rows above.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnknownFleetSelector, .cause = DeclineCause::NotPermitted },
-    // The node proof (#1428). `NotPermitted` for the enrollment rows' reason and one more that
-    // is specific to these: the LAUNCHER holds no cluster key and never sends either verb, so a
-    // compile cannot reach them at all -- and if one somehow did, *not permitted* is the answer
-    // that makes the launcher compile locally and stop asking, which is right for a refusal no
-    // retry can clear.
+    // The node proof (#1428, #178). `NotPermitted` for the enrollment rows' reason and one more
+    // that is specific to these: the LAUNCHER holds no node identity and never sends either verb,
+    // so a compile cannot reach them at all -- and if one somehow did, *not permitted* is the
+    // answer that makes the launcher compile locally and stop asking, which is right for a
+    // refusal no retry can clear. The same holds for the identity rows after them: an unknown or
+    // revoked key, and a joining verb sent unproven, are all answers to a NODE.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeProofUnchallenged, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeProofRejected, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeKeyUnknown, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeKeyRevoked, .cause = DeclineCause::NotPermitted },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeIdentityRequired, .cause = DeclineCause::NotPermitted },
     // A worker that can verify nobody's grant (#178): ONE machine declining the job it was
     // handed, and the machine is where the cause is -- cut off from the leader whose roster
     // it would need, or only reaching an ex-leader that withholds it. Not `NotPermitted`,

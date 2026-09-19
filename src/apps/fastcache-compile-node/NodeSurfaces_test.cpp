@@ -26,29 +26,22 @@ using FastCache::Testing::Unwrap;
 namespace
 {
 
-/// The documented scheduler command line, minus `--cluster-key-file`.
+/// The documented worker command line, minus `--cluster-dir`.
 ///
-/// **The configuration #582 was found on**, and it is the documented one on purpose:
-/// a scheduler is a consensus member (#178) and consensus cannot start without the key,
-/// and that is a `StartupPolicyRejection` row. Every other field is present so that
-/// row is the ONLY thing wrong -- a fixture broken two ways would assert nothing about
-/// which rule answered.
-///
-/// `--scheduler` names 127.0.0.1 because a node running `--serve-scheduler` registers
-/// with ITSELF, which is what the docs show. A remote endpoint here would trip the
-/// advertise rows instead, and the case would pass for the wrong reason.
+/// **A configuration with exactly one thing wrong**, which is what #582's cases need: a
+/// fixture broken two ways would assert nothing about which rule answered. It used to be the
+/// documented scheduler line minus the cluster's pre-shared key; #178 retired the key, and a
+/// worker that names a scheduler with nowhere to keep its identity is the shape a
+/// `StartupPolicyRejection` row now refuses. Every other field is present.
 /// @return The config.
-[[nodiscard]] NodeConfig SchedulerWithoutKey()
+[[nodiscard]] NodeConfig WorkerWithoutIdentity()
 {
     NodeConfig cfg;
-    cfg.serveScheduler = true;
-    cfg.nodeListen = "0.0.0.0:6675";
-    cfg.schedulers = { "127.0.0.1:6675" };
-    cfg.advertise = "scheduler.internal:6675";
-    cfg.fleetMembers = { "worker-01.internal" };
+    cfg.nodeListen = "0.0.0.0:6674";
+    cfg.schedulers = { "scheduler.internal:6675" };
+    cfg.advertise = "worker-01.internal:6674";
+    cfg.advertiseExplicit = true;
     cfg.toolchains = { "/usr/bin/g++" };
-    cfg.raftListen = "6680";
-    cfg.raftSelf = "scheduler.internal";
     return cfg;
 }
 
@@ -384,22 +377,21 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
 
     SECTION("a configuration that would not start is printed AND refused")
     {
-        // The documented scheduler line, minus `--cluster-key-file`. A scheduler runs
-        // consensus, which cannot work without the key -- a `StartupPolicyRejection` row,
-        // and exactly the shape the ticket was found on.
-        auto cfg = SchedulerWithoutKey();
+        // The documented worker line, minus `--cluster-dir`: a node that names a scheduler
+        // with nowhere to keep the identity it proves -- a `StartupPolicyRejection` row.
+        auto cfg = WorkerWithoutIdentity();
 
         auto const report = ReportSurfaces(cfg);
 
         // Printed in FULL, which is the feature rather than a concession: an operator
         // reaches for this BECAUSE something is wrong, and withholding the worksheet
         // until the configuration is valid withholds it when it is wanted.
-        CHECK(report.text.contains("0.0.0.0:6675")); // the RESOLVED endpoint, which is what the flag exists to print
+        CHECK(report.text.contains("0.0.0.0:6674")); // the RESOLVED endpoint, which is what the flag exists to print
         CHECK_FALSE(report.text.empty());
 
         // And refused, which is what the exit code follows from.
         REQUIRE(report.refusal.has_value());
-        CHECK(Unwrap(report.refusal).contains("--cluster-key-file"));
+        CHECK(Unwrap(report.refusal) == SchedulerNeedsIdentityRefusal);
 
         // **The table's own words, byte for byte.** A second phrasing here would be a
         // second thing to be wrong, and an operator who met one sentence from this flag
@@ -412,11 +404,11 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
     {
         // The control, and the ticket names it explicitly: without it, a flag that
         // always fails satisfies the section above.
-        auto cfg = SchedulerWithoutKey();
-        cfg.clusterKeyFile = "cluster.key";
+        auto cfg = WorkerWithoutIdentity();
+        cfg.clusterDir = "cluster";
 
         auto const report = ReportSurfaces(cfg);
-        CHECK(report.text.contains("0.0.0.0:6675")); // the RESOLVED endpoint, which is what the flag exists to print
+        CHECK(report.text.contains("0.0.0.0:6674")); // the RESOLVED endpoint, which is what the flag exists to print
         CHECK_FALSE(report.refusal.has_value());
     }
 
@@ -425,12 +417,12 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
         // The map does not change shape according to the verdict: judging and rendering
         // are two answers about one configuration, and a reader comparing a broken run
         // with a fixed one should see the map differ only where the configuration does.
-        auto broken = SchedulerWithoutKey();
+        auto broken = WorkerWithoutIdentity();
         auto fixed = broken;
-        fixed.clusterKeyFile = "cluster.key";
+        fixed.clusterDir = "cluster";
 
-        // `--cluster-key-file` opens no port, so it appears in no surface row -- which
-        // is what makes this comparison exact rather than approximate.
+        // `--cluster-dir` opens no port on a node running no consensus, so it appears in no
+        // surface row -- which is what makes this comparison exact rather than approximate.
         CHECK(ReportSurfaces(broken).text == ReportSurfaces(fixed).text);
     }
 }

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeIdentity.hpp"
+#include "NodeKey.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
@@ -150,9 +151,11 @@ std::filesystem::path NodeStateDirectory(NodeConfig const& cfg)
 
 IdentityNeed NodeIdentityNeed(NodeConfig const& cfg) noexcept
 {
-    // Consensus first, because everything else here is a refinement of it: a node that
-    // opens no consensus port has no identity to keep and no cluster to be admitted to.
-    if (!RunsConsensus(cfg))
+    // A node that holds an identity KEY, first, because everything else here is a refinement of
+    // it: the id travels with the key (#178). A consensus member is admitted under it, and a
+    // worker with a `--cluster-dir` proves it on every connection to a scheduler, so both keep one
+    // in the directory their key is in. A node with neither has nowhere an id would survive.
+    if (!HoldsNodeKey(cfg))
         return IdentityNeed::None;
 
     // The verbs that answer and exit. Each of them would otherwise CREATE a state
@@ -163,7 +166,7 @@ IdentityNeed NodeIdentityNeed(NodeConfig const& cfg) noexcept
     if (cfg.printSurfaces || cfg.uninstallService || cfg.cluster.action != ClusterAction::None)
         return IdentityNeed::None;
 
-    // What is left is a node that will run consensus, or an `--install-service` that
+    // What is left is a node that will run holding an identity, or an `--install-service` that
     // registers a command line which will. The second is why this is not simply "am I
     // about to start": a registration replays its command line forever, so the value
     // baked into it has to be the one this machine will actually answer to -- otherwise
@@ -268,15 +271,22 @@ std::optional<std::string> SelfKeyContradiction(NodeConfig const& cfg, std::opti
                        FormatEd25519PublicKey(*held));
 }
 
-std::string DescribeIdentity(std::string_view id, Ed25519PublicKey const& key, std::optional<std::string> const& dialAddress)
+std::string DescribeIdentity(std::string_view id,
+                             Ed25519PublicKey const& key,
+                             std::optional<std::string> const& dialAddress,
+                             IdentityRole role)
 {
     auto const spelled = FormatEd25519PublicKey(key);
     auto text = std::string {};
     if (!id.empty())
         text += std::format("node-id {}\n", id);
     text += std::format("public-key {}\n", spelled);
-    if (!id.empty() && dialAddress.has_value())
+    if (id.empty())
+        return text;
+    if (role == IdentityRole::Member && dialAddress.has_value())
         text += std::format("raft-peer {}={}@{}\n", id, *dialAddress, spelled);
+    if (role == IdentityRole::Worker)
+        text += std::format("cluster-admit-worker {}@{}\n", id, spelled);
     return text;
 }
 

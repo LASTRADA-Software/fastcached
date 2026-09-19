@@ -417,11 +417,10 @@ struct AnnounceFixture
                                 .metrics = metrics,
                                 .credential = credential,
                                 .notice = notice,
-                                // Nothing to prove and nothing to present: every case in this
-                                // file is about the announce round itself, and a round with no
-                                // cluster key is the ordinary single-machine shape.
-                                .proofKey = nullptr,
-                                .nodeId = {},
+                                // Nothing proves: every case in this file is about the announce
+                                // round itself, against a scripted fleet that serves no handshake
+                                // (#178). The proof is `FrameEndpoint_test`'s, over a real socket.
+                                .prover = nullptr,
                                 .lease = lease,
                                 .fleetMismatch = fleetMismatch,
                                 .logger = logger };

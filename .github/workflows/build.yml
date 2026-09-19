@@ -2692,7 +2692,13 @@ jobs:
           # ONLY way to configure this worker since #291 -- an env file of
           # command-line arguments and a config file are two mechanisms that can
           # disagree about one setting, and nobody had written down which won.
-          printf 'scheduler: 127.0.0.1:6675\nadvertise: 127.0.0.1:6676\ntoolchain:\n  - /usr/bin/g++\n' \
+          #
+          # `cluster_dir` since #178 PR 6: a worker proves an identity key kept there
+          # on every connection to its scheduler, and naming a scheduler without one is
+          # refused at startup. /var/lib/fastcache-node is the StateDirectory= the unit
+          # creates for it -- the one writable place under ProtectSystem=strict that
+          # survives a restart, so this step also pins that the unit provides it.
+          printf 'scheduler: 127.0.0.1:6675\nadvertise: 127.0.0.1:6676\ncluster_dir: /var/lib/fastcache-node\ntoolchain:\n  - /usr/bin/g++\n' \
             | sudo tee /etc/fastcached/fastcache-compile-node.yaml >/dev/null
 
           # Enabling the SOCKET is what enables the worker; the service carries
@@ -3529,6 +3535,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $node = Resolve-Path 'target/fastcache-compile-node.exe'
           $cacheDir = Join-Path $env:RUNNER_TEMP 'fastcache-node-cache'
+          # Where the worker keeps the identity key it proves to its scheduler (#178 PR 6):
+          # naming a scheduler without one is refused at install time, as at startup.
+          $stateDir = Join-Path $env:RUNNER_TEMP 'fastcache-node-state'
           $toolchain = (Get-Command cl.exe).Source
 
           # --listen-node is NAMED, and it has to be since #290 stage 3.
@@ -3551,6 +3560,7 @@ jobs:
               --listen-node=127.0.0.1:6676 `
               --advertise=127.0.0.1:6676 `
               --cache-dir="$cacheDir" `
+              --cluster-dir="$stateDir" `
               --toolchain="$toolchain"
           if ($LASTEXITCODE -ne 0) { throw "worker --install-service failed with $LASTEXITCODE" }
 

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -123,7 +124,8 @@ class NodeMembership final: public Distributed::IMembershipOracle
         _forgotten {},
         // Pointers into this object's own members, which is safe because the type is
         // neither copyable nor movable and the composites are declared after all four.
-        _admitted { { &_forgotten, &_listed, &_cluster } },
+        _keys {},
+        _admitted { { &_forgotten, &_listed, &_cluster, &_keys } },
         // `--fleet-open` is folded with the forget rather than replacing it, and that
         // is a decision about what the flag MEANS (#1309). It says "I have not
         // enumerated who may use this fleet; serve whoever asks" -- a blanket over
@@ -136,7 +138,10 @@ class NodeMembership final: public Distributed::IMembershipOracle
         // forget wrongly refuses a machine, fails CLOSED, and is visible from the
         // refused end. Ignoring it serves a decommissioned host indefinitely, fails
         // OPEN, and admission succeeding is the ordinary case -- nothing reports it.
-        _openly { { &_forgotten, &_open } },
+        //
+        // The key roster joins both folds for the same reason the forget does: a REVOKED key is
+        // `Forgotten` and must outrank `--fleet-open` exactly as a forgotten host does (#178).
+        _openly { { &_forgotten, &_open, &_keys } },
         _logger { logger },
         _conditions { conditions },
         _listing { cfg.fleetMembers },
@@ -202,6 +207,15 @@ class NodeMembership final: public Distributed::IMembershipOracle
         return _isOpen.load(std::memory_order_relaxed) ? _openly.Explain(peerAddress) : _admitted.Explain(peerAddress);
     }
 
+    /// @copydoc Distributed::IMembershipOracle::ExplainKey
+    ///
+    /// Through the same fold `Explain` answers from, whichever it is, so opening a node changes what
+    /// an ADDRESS is worth and never what a revoked key is worth.
+    [[nodiscard]] Distributed::MembershipDecision ExplainKey(ProvenIdentity const& proven) const override
+    {
+        return _isOpen.load(std::memory_order_relaxed) ? _openly.ExplainKey(proven) : _admitted.ExplainKey(proven);
+    }
+
     /// How many `--cluster-forget-client` tombstones this node has APPLIED (#1471).
     ///
     /// Asked of the oracle rather than read off its set, because the lock that makes the set
@@ -262,6 +276,22 @@ class NodeMembership final: public Distributed::IMembershipOracle
         // The tombstone half moved: a forget can make an entry this node lists stale, and a
         // re-admit can make it current again.
         ReportStaleListing(nullptr);
+
+        // Which identity keys are live and which are revoked (#178), in one swap so a reader never
+        // sees a key admitted by one roster and revoked by the next as neither. Members of either
+        // seat and enrolled principals are live under their ids; a revoked key is revoked whatever
+        // id it was revoked under.
+        std::map<std::string, Ed25519PublicKey, std::less<>> live;
+        for (auto const& member: state.members)
+            if (member.publicKey.has_value())
+                live.emplace(member.id, *member.publicKey);
+        for (auto const& principal: state.principals)
+            live.emplace(principal.id, principal.publicKey);
+        std::vector<Ed25519PublicKey> revoked;
+        revoked.reserve(state.revokedKeys.size());
+        for (auto const& entry: state.revokedKeys)
+            revoked.push_back(entry.publicKey);
+        _keys.Publish(std::move(live), std::move(revoked));
     }
 
     /// Record the cluster's member set alone.
@@ -422,13 +452,14 @@ class NodeMembership final: public Distributed::IMembershipOracle
             return;
         }
 
-        // No keyless-node exception, and its absence is deliberate (#1308). One stood
-        // here: a node with no `--cluster-key-file` built a lease check that verifies
-        // nothing, so a replicated `fleet-open=1` widening it was #282 through a door the
-        // reload guard cannot watch. Cluster state reaches only a node running consensus,
-        // consensus refuses to start without the key, and so every node this row can
-        // open checks the grants its new callers present. The RELOAD guard stays: a
-        // node that runs no consensus can still be keyless and be opened by its operator.
+        // No unchecked-node exception, and its absence is deliberate (#1308). One stood
+        // here: a node with nothing to check a grant against built a lease check that
+        // verifies nothing, so a replicated `fleet-open=1` widening it was #282 through a
+        // door the reload guard cannot watch. Cluster state reaches only a node running
+        // consensus, and consensus verifies every grant against the state it applies (#178),
+        // so every node this row can open checks the grants its new callers present. The
+        // RELOAD guard stays: a node that runs no consensus can still check nothing and be
+        // opened by its operator.
         _isOpen.store(agreed == AgreedOpen::Open, std::memory_order_relaxed);
     }
 
@@ -449,8 +480,12 @@ class NodeMembership final: public Distributed::IMembershipOracle
     /// erasure fails open.
     Distributed::ForgottenMembership _forgotten;
 
+    /// Which identity keys the cluster holds live and which it revoked (#178). Written by
+    /// `PublishCluster` and by nothing else, for `_forgotten`'s reason: a key is the cluster's fact.
+    Distributed::KeyRosterMembership _keys;
+
     /// The fold the surfaces consult when this node has not been opened. Declared
-    /// after the three participants it borrows.
+    /// after the four participants it borrows.
     Distributed::AnyOfMembership _admitted;
 
     /// The fold they consult when it has. `_open` admits everybody and `_forgotten`

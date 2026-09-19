@@ -198,7 +198,7 @@ struct Seed
                                                std::string_view peer)
 {
     // Nothing PROVED, which is what every case here is about: the enrollment pair is for a
-    // machine that holds no cluster key, so a proof is not a state a joiner can be in.
+    // machine the cluster has not admitted yet, so a proof is not a state a joiner can be in.
     return SyncRun(responder.Answer(frame, PeerIdentity { .host = std::string { peer } })).bytes;
 }
 
@@ -287,7 +287,7 @@ void OpenAndApprove(Seed& seed)
 /// ever used for one: raw, standard base64, unpadded base64url, and hex in either case.
 ///
 /// **Every spelling, because a leak does not have to be raw.** A key read from a file is
-/// TEXT -- `--cluster-key-file` holds base64 -- and a hand-over that forwarded the file's
+/// TEXT -- the retired `--cluster-key-file` held base64 -- and a hand-over that forwarded the file's
 /// contents would carry no raw run of the key's bytes at all. A scan for the raw bytes alone
 /// passes under exactly that defect.
 /// @param haystack What was sent.
@@ -439,16 +439,16 @@ TEST_CASE("The approve reply carries no private key, and a planted one IS found 
     //
     // The secrets are the real shapes: the leader's identity key as `NodeKey` stores it (the
     // 32-byte seed) and as Monocypher signs with it (the seed followed by the public key),
-    // and a cluster key as `--cluster-key-file` holds one.
+    // and a shared secret as the retired `--cluster-key-file` held one.
     auto const leaderSeed = Filled(0x5A);
     auto const leaderPublic = Ed25519KeyPair::FromSeed(leaderSeed).value().PublicKey();
     auto secretKey = std::vector<std::byte>(leaderSeed.begin(), leaderSeed.end());
     secretKey.insert(secretKey.end(), leaderPublic.begin(), leaderPublic.end());
-    auto const clusterKey = Wire::AsBytes("this-cluster-shared-secret-0123456789");
+    auto const sharedSecret = Wire::AsBytes("this-cluster-shared-secret-0123456789");
     auto const secrets = std::array<std::vector<std::byte>, 3> {
         std::vector<std::byte>(leaderSeed.begin(), leaderSeed.end()),
         secretKey,
-        std::vector<std::byte>(clusterKey.begin(), clusterKey.end()),
+        std::vector<std::byte>(sharedSecret.begin(), sharedSecret.end()),
     };
 
     Seed seed;
@@ -456,7 +456,7 @@ TEST_CASE("The approve reply carries no private key, and a planted one IS found 
     // half must not be.
     auto state = seed.cluster.ClusterState();
     state.members.front().publicKey = leaderPublic;
-    // And a setting whose value is the cluster key's base64 -- a field the WHOLE state carries
+    // And a setting whose value is the shared secret's base64 -- a field the WHOLE state carries
     // and a roster must drop. No setting holds a secret today (`RefusedSettingTable` refuses
     // the credential-shaped ones by name); this is the defence under that one.
     state.settings.push_back(Cluster::Setting { .name = "upstream", .value = Base64Encode(secrets[2]) });

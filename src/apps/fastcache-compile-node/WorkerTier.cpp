@@ -306,7 +306,7 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     _reloader { parts.reloader },
     _cacheTier { parts.cacheTier },
     _credential { parts.credential },
-    _proofKey { parts.proofKey },
+    _prover { parts.prover },
     _metrics { parts.metrics },
     _logger { parts.logger },
     _announced { parts.announced },
@@ -446,12 +446,7 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, IClock const& statusCloc
                                  .metrics = _metrics,
                                  .credential = _credential,
                                  .notice = _registrarNotice,
-                                 .proofKey = _proofKey,
-                                 // The RESOLVED id, which `AdoptNodeIdentity` stamped into the
-                                 // running configuration -- so a node that minted one presents
-                                 // the same label the cluster knows it by, and one that runs no
-                                 // consensus presents an empty label, which is legal.
-                                 .nodeId = _cfg.nodeId,
+                                 .prover = _prover,
                                  .lease = *_leaseState,
                                  .fleetMismatch = _fleetAssertionFailed,
                                  .logger = _logger };

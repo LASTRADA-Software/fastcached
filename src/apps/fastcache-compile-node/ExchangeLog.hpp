@@ -128,6 +128,9 @@ inline constexpr std::array ExchangeLogTable {
     VerbLogRow { .code = CompileCacheWire::Op::ClusterAdmitLearner,
                  .level = LogLevel::Info,
                  .rationale = "adds, moves or demotes a member; same audit argument as cluster-admit" },
+    VerbLogRow { .code = CompileCacheWire::Op::ClusterAdmitWorker,
+                 .level = LogLevel::Info,
+                 .rationale = "admits a machine's identity key as a worker; same audit argument as cluster-admit" },
     VerbLogRow { .code = CompileCacheWire::Op::ClusterAdmitClient,
                  .level = LogLevel::Info,
                  .rationale = "admits a client host; same audit argument as cluster-admit" },
@@ -152,7 +155,7 @@ inline constexpr std::array ExchangeLogTable {
                               "produces traffic, which is exactly the reading an operator wants" },
     VerbLogRow { .code = CompileCacheWire::Op::EnrollControl,
                  .level = LogLevel::Info,
-                 .rationale = "decides who joins the fleet and hands a stranger this cluster's key; the same "
+                 .rationale = "decides who joins the fleet, and admits a stranger's identity key; the same "
                               "audit argument as cluster-admit, on the verb that reaches further" },
     VerbLogRow { .code = CompileCacheWire::Op::Subscribe,
                  .level = LogLevel::Info,
@@ -181,7 +184,7 @@ inline constexpr std::array ExchangeLogTable {
                  .rationale = "records that a machine was admitted by what it PROVED rather than by its address, "
                               "which is the only place a VPN worker's changing address is reconciled with a "
                               "stable identity; once per connection, and a refusal here is the line an operator "
-                              "reads when a node has the wrong --cluster-key-file" },
+                              "reads when a node's identity key was never admitted, or was revoked" },
 };
 
 /// Whether every verb this build serves states a log level.

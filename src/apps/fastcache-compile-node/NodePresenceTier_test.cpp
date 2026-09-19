@@ -141,7 +141,9 @@ struct PresenceFixture
                                .endpoint = ThisMachine,
                                .logger = logger,
                                .conditions = conditions,
-                               .roster = nullptr };
+                               .roster = nullptr,
+                               // Nothing proves: the scripted fleet serves no handshake (#178).
+                               .prover = nullptr };
     }
 
     /// Announce once through @p dialer.
@@ -259,7 +261,8 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
                                                               .endpoint = ThisMachine,
                                                               .logger = logger,
                                                               .conditions = conditions,
-                                                              .roster = nullptr },
+                                                              .roster = nullptr,
+                                                              .prover = nullptr },
                                               link,
                                               dialer);
 

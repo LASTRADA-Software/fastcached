@@ -193,8 +193,8 @@ class LeaseTable
         /// Four causes share it, which is why it is not counted: an ordinary second
         /// release of one token (the first erased the entry), a token from a
         /// scheduler instance that no longer exists whose number this one has not yet
-        /// reissued, a number that was never issued at all -- on a fleet with no
-        /// cluster key, where the token is the bare serial -- and a lease
+        /// reissued, a number that was never issued at all -- on a scheduler that
+        /// signs nothing, where the token is the bare serial -- and a lease
         /// `ReleaseWorker` reclaimed out from under a client that was still
         /// compiling.
         ///

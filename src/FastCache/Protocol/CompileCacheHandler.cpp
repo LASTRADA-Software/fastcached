@@ -902,7 +902,7 @@ namespace
 
         /// @copydoc ILiveGate::Recheck
         // The watcher is unnamed because this daemon decides on its own credential and never
-        // on who is asking: it holds no cluster key, so `provedClusterKey` is honestly false on
+        // on who is asking: it runs no node handshake, so `proven` is honestly disengaged on
         // every connection it will ever see, and reading it would be reading a constant.
         [[nodiscard]] std::optional<std::vector<std::byte>> Recheck(Wire::LiveSubject /*subject*/,
                                                                     LiveWatcher const& /*watcher*/) const override
@@ -964,8 +964,8 @@ namespace
 
         DaemonPushSink sink { socket, session->reactor, watch };
         DaemonLiveGate const gate { session, context.credentialAccepted };
-        // `provedClusterKey` is left false and that is the truth rather than a default: this
-        // daemon holds no cluster key, so no connection it serves can ever have proved one.
+        // `proven` is left disengaged and that is the truth rather than a default: this daemon
+        // runs no node handshake, so no connection it serves can ever have proved an identity.
         auto const terminal = co_await session->liveStats->Serve(
             frame, LiveWatcher { .host = socket->PeerAddress() }, &sink, &gate, session->reactor);
 
@@ -1226,6 +1226,7 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             case Wire::Op::ClusterForgetClient:
             case Wire::Op::ClusterAdmit:
             case Wire::Op::ClusterAdmitLearner:
+            case Wire::Op::ClusterAdmitWorker:
             // The operator verbs, answered by a compile node and refused HERE by name.
             // Sharing the arm above is right rather than convenient: `HandleDistributed`
             // is the one door to `RefusalFor`, which is the table that says which code
@@ -1247,10 +1248,10 @@ Task<void> CompileCacheHandler::Run(ISocket* socket,
             case Wire::Op::EnrollControl:
             // The fleet document, answered by the fleet's scheduler; same arm, same reason.
             case Wire::Op::FleetText:
-            // The node proof (#1428), answered by a compile node that holds the cluster key.
-            // This daemon holds none -- the key is `fastcache-compile-node`'s flag -- so both
-            // verbs take the same arm for the same reason as the enrollment pair: `RefusalFor`
-            // is the one place the code and the sentence are decided.
+            // The node proof (#1428, #178), answered by a compile node that runs consensus and so
+            // holds the roster a proven identity is judged against. This daemon holds none, so
+            // both verbs take the same arm for the same reason as the enrollment pair:
+            // `RefusalFor` is the one place the code and the sentence are decided.
             case Wire::Op::NodeChallenge:
             case Wire::Op::ProveNode:
                 next = co_await HandleDistributed(socket, descriptor->code);

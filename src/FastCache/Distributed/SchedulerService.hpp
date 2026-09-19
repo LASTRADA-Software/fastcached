@@ -108,16 +108,22 @@ enum class MembershipParticipant : std::uint8_t
     /// A policy that admits everybody (`OpenMembership`): one machine, or a fleet whose
     /// reachability is its boundary.
     OpenPolicy,
-    /// A caller that PROVED the cluster's pre-shared key on this connection
-    /// ([#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
+    /// A caller that PROVED, on this connection, an identity key the cluster holds live for the id
+    /// it claimed (#178, [#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
     ///
-    /// The one route here that is not a property of an ADDRESS, which is why it does not arrive
-    /// as an `IMembershipOracle` participant: that seam is asked `Explain(peerAddress)`, one
-    /// oracle serves every connection on a surface, and a participant answering from state some
-    /// other connection set would admit callers that proved nothing. It is folded per connection
-    /// instead, by `ExplainConnection`, on this same `PrecedenceOf` -- so a client tombstone
-    /// still outranks it and a proof cannot resurrect a forgotten host.
-    ProvenKeyHolder,
+    /// Not a property of an ADDRESS: it is answered by `IMembershipOracle::ExplainKey` about the
+    /// identity ONE connection proved, and folded with the address routes per connection by
+    /// `ExplainConnection`, on this same `PrecedenceOf` -- so a client tombstone still outranks it
+    /// and a proof cannot resurrect a forgotten host.
+    ProvenIdentity,
+    /// A caller that proved an identity key the cluster has REVOKED: the forgotten machine itself
+    /// (#178).
+    ///
+    /// `Forgotten`, so it outranks every admission route -- `--fleet-member` included, which is the
+    /// point: the host a removed machine dials from is exactly the one a node nobody reconfigured
+    /// still lists. Asked on every verb, so a key revoked while the connection is open refuses the
+    /// next one.
+    KeyTombstone,
     /// The count, for a table over this enum.
     Last,
 };
@@ -142,7 +148,7 @@ struct MembershipParticipantSet
 
     static_assert(static_cast<std::size_t>(MembershipParticipant::Last) <= 8,
                   "MembershipParticipantSet holds one bit per participant in a std::uint8_t; a "
-                  "sixth route needs a wider mask here, and the failure must be a BUILD error "
+                  "ninth route needs a wider mask here, and the failure must be a BUILD error "
                   "rather than a silently dropped attribution");
 
     /// @param participant The route to include.
@@ -308,6 +314,16 @@ struct CallerContext
     /// admission, and a fixed-width copy of a peer host, behind a request that has
     /// already cost a syscall, is not an amplifier.
     std::string peerId {};
+
+    /// The node id this connection PROVED, engaged only while the identity key it proved is LIVE in
+    /// the cluster's roster (#178).
+    ///
+    /// What the verbs a joining machine sends require (`CompileCacheWire::IdentityRequirement`):
+    /// an address admits a client, never a machine into the fleet. Disengaged for every connection
+    /// that proved nothing, and for one whose key is revoked -- which `membership` already refuses
+    /// as `Forgotten`. Filled by `Distributed::CallerContextOf`, the one place a connection becomes a
+    /// context, so the verb gate and the admission answer are read off one fold.
+    std::optional<std::string> provenNodeId {};
 };
 
 /// What the scheduler decided, in the vocabulary of the wire but not yet on it.
@@ -540,6 +556,11 @@ class SchedulerService
     [[nodiscard]] std::optional<Cluster::CertifiedRoster> CertifiedRosterNow(
         std::chrono::system_clock::time_point now) const;
 
+    /// `CertifiedRosterNow` at this node's own wall clock: what an approved enrollment hands a
+    /// worker as its trust root (#178), by the clock every endorsement here is judged at.
+    /// @return The certified roster, or nothing until a majority of the voters has endorsed it.
+    [[nodiscard]] std::optional<Cluster::CertifiedRoster> CurrentCertifiedRoster() const;
+
     /// Retire one registration at the worker's own request.
     ///
     /// `Register`'s missing counterpart. Without it a worker that re-surveyed and
@@ -610,8 +631,8 @@ class SchedulerService
     /// nothing short of per-client identity could -- and what that still costs is one
     /// duplicated compile and one premature decrement the next heartbeat corrects.
     ///
-    /// A scheduler with no `--cluster-key-file` signs nothing, so there is nothing to
-    /// unwrap and the token is the serial, exactly as before.
+    /// A scheduler with no identity key signs nothing, so there is nothing to unwrap and
+    /// the token is the serial, exactly as before.
     /// @param caller Who is asking.
     /// @param leaseToken The token this client was granted.
     /// @param key The object key it was granted on.
@@ -745,6 +766,31 @@ class SchedulerService
                                                 std::string_view principalId,
                                                 Ed25519PublicKey const& publicKey,
                                                 Cluster::PrincipalRole role);
+
+    /// Admit a WORKER principal an operator names by id and key, with no enrollment window (#178).
+    ///
+    /// `AdmitPrincipal` behind the one parser for a key an operator typed: the text arrives as
+    /// `ClusterAdmit`'s does and is refused by `MalformedAdmissionKey`'s row when it is not a key.
+    /// Answered with `ClusterAdmitReceipt`, the endpoint field empty, spelling back the key the
+    /// command RECORDED.
+    /// @param caller Who is asking.
+    /// @param workerId The id the worker minted into its `--cluster-dir`.
+    /// @param publicKey Its key, as `--print-identity` printed it.
+    /// @return The receipt, or why it was refused.
+    [[nodiscard]] SchedulerReply ClusterAdmitWorker(CallerContext const& caller,
+                                                    std::string_view workerId,
+                                                    std::string_view publicKey);
+
+    /// Refuse a verb only a machine that proved its identity may send, unless @p caller did (#178).
+    ///
+    /// Read off `CompileCacheWire::OpDescriptor::identity`, so which verbs need an identity is the
+    /// wire table's answer and never a list here. Loopback is not exempt: an address admits a
+    /// client, never a machine into the fleet.
+    /// @param caller Who is asking; `provenNodeId` says whether it proved a live identity.
+    /// @param op The verb.
+    /// @return The counted refusal, or nullopt when the verb needs none or the caller has one.
+    [[nodiscard]] std::optional<SchedulerReply> RefuseUnlessIdentified(CallerContext const& caller,
+                                                                       CompileCacheWire::Op op) const;
 
     /// The replicated state this node administers, or nothing on a node with no cluster.
     ///

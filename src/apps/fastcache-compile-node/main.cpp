@@ -619,9 +619,9 @@ using Node::NodeReloader;
     // the certified roster back. A WALL clock, because a certificate's lapse was stamped on
     // another machine.
     //
-    // Refusing here is the half of `RosterlessWorkerRefusal` only the state directory can
-    // answer, and a kept roster this build cannot use -- never a quiet fall back to the
-    // `--voter-key` anchors, which may name a voter revoked since.
+    // Refusing here is where `RosterlessWorkerRefusal` is answered, since only the state
+    // directory knows whether it holds a roster, and a kept roster this build cannot use -- never
+    // a quiet fall back to the `--voter-key` anchors, which may name a voter revoked since.
     SystemWallClock const rosterWallClock;
     auto rosterOrRefusal = Node::NodeRoster::Build(cfg, rosterWallClock, metrics, logger);
     if (!rosterOrRefusal.has_value())
@@ -761,26 +761,20 @@ using Node::NodeReloader;
     auto const capacity =
         Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()), Node::IndexReserveBytesOf(cacheTier.get()));
 
-    // **The one reader of `--cluster-key-file` in this process**, declared here because two
-    // consumers share it: the cluster-key PROOF this node VERIFIES, and the proof it PRESENTS on
-    // each heartbeat round (#1428). An approved joiner is no longer handed it (#178).
-    //
-    // One instance rather than one per consumer. `ReadClusterKey` holds the minimum-length rule
-    // and the trailing-newline trim, so every tier here authenticates against byte-for-byte the
-    // same key -- and a second reader would eventually differ by a newline, which is an HMAC
-    // that verifies nowhere and no diagnostic anywhere.
-    //
-    // It takes the PATH and re-reads the file at each use rather than holding the bytes: an
-    // outbound credential is read where it is presented, which here also means this process
-    // does not carry a second copy of the cluster's secret for its whole uptime to serve a
-    // handful of exchanges in a fleet's life.
-    //
-    // Declared ABOVE the worker tier because the tier borrows it and is destroyed before it.
-    Node::FileClusterKeySource const clusterKeySource { cfg.clusterKeyFile };
+    // Where a node handshake's nonce and ephemeral key come from, on both ends: the operating
+    // system's generator (#1527). Its own instance rather than a share of `identityRandom`, which
+    // is a different lifetime -- an identity is minted once at startup and handshakes are drawn
+    // for as long as the process serves.
+    SystemSecureRandom proofRandom;
 
-    // Whether this node has a key to prove at all. Null is the ordinary state on a
-    // single-machine install, which is this binary's default configuration.
-    Node::IClusterKeySource const* const proofKey = cfg.clusterKeyFile.empty() ? nullptr : &clusterKeySource;
+    // **How this machine proves WHICH machine it is to a scheduler** (#178): its id, the identity
+    // key it holds, whom it may prove itself to -- the roster its grants are checked against --
+    // and the generator above. Built wherever this node names a scheduler; `SchedulerNeedsIdentity`
+    // refuses a node that does so without an identity, so a serving node that announces always
+    // has one. Declared ABOVE the worker and presence tiers, which borrow it.
+    std::optional<Node::NodeProofClient> prover;
+    if (identityKey.has_value() && !cfg.schedulers.empty())
+        prover.emplace(cfg.nodeId, *identityKey, *nodeRoster, proofRandom);
 
     // The worker: survey, scratch root, lease check, slot cap, compile responder and
     // heartbeat, as one object (#1387). Built BELOW the cache tier, because the slots it
@@ -800,7 +794,7 @@ using Node::NodeReloader;
                                                         .host = *host,
                                                         .cacheTier = cacheTier.get(),
                                                         .credential = credential,
-                                                        .proofKey = proofKey,
+                                                        .prover = AddressOrNull(prover),
                                                         .leaseRoster = nodeRoster->Lease(),
                                                         .metrics = metrics,
                                                         .logger = logger,
@@ -999,29 +993,25 @@ using Node::NodeReloader;
                                     logger,
                                     schedulerTier->Policy());
 
-    // Where a node-proof challenge's bytes come from: the operating system's generator
-    // (#1527). Its own instance rather than a share of `identityRandom` above, which is a
-    // different lifetime -- an identity is minted once at startup and challenges are drawn for
-    // as long as the process serves.
-    SystemSecureRandom proofRandom;
-
-    // The cluster-key prover (#1428), built wherever this node HOLDS a key -- which is a
-    // narrower condition than `servesEnrollment` and a wider one than a scheduler: #1308 makes
-    // consensus imply a key, and a pure worker may hold one too, because the key is what signs
-    // lease grants. A proof presented to either has to be verifiable there.
-    //
-    // It reads the same `clusterKeySource`, which is the one reader of
-    // `--cluster-key-file` in this binary. A second reader would eventually differ by a
-    // trailing newline, which is an HMAC that verifies nowhere and no diagnostic anywhere.
+    // The identity prover (#178), built wherever this node runs CONSENSUS: a proof is judged
+    // against the cluster's applied roster -- members, enrolled principals and revoked keys --
+    // which only a consensus member holds, and it is asked of `membership`, whose `ExplainKey` is
+    // the one door to that answer for the proof and for every later verb alike. A consensus node
+    // always holds an identity key (`HoldsNodeKey`).
     //
     // The credential is the SCHEDULER's, for the reason the enrollment surface holds the same
     // object: `AUTH` is a `Session` verb and routes there, so a node with a token file must gate
-    // these two verbs with it as well -- and `schedulerTier` may legitimately be null on a node
-    // that holds a key and schedules nothing, which is what the conditional below reads.
+    // these two verbs with it as well -- and `schedulerTier` may legitimately be null on a
+    // consensus member that schedules nothing, which is what the conditional below reads.
     std::optional<Node::NodeProofResponder> nodeProofResponder;
-    if (proofKey != nullptr)
-        nodeProofResponder.emplace(
-            *proofKey, proofRandom, metrics, logger, schedulerTier != nullptr ? schedulerTier->Policy() : nullptr);
+    if (Node::RunsConsensus(cfg) && identityKey.has_value())
+        nodeProofResponder.emplace(cfg.nodeId,
+                                   *identityKey,
+                                   membership,
+                                   proofRandom,
+                                   metrics,
+                                   logger,
+                                   schedulerTier != nullptr ? schedulerTier->Policy() : nullptr);
 
     auto nodeSurfaceOrRefusal = Node::StartNodeSurfaceOrExplain(
         nodeIo,
@@ -1039,8 +1029,8 @@ using Node::NodeReloader;
                                   .enrollment = AddressOrNull(enrollmentResponder),
                                   .live = &liveStatsResponder,
                                   .fleet = &fleetTextResponder,
-                                  // Absent on a node holding no cluster key: the router then
-                                  // answers the node-proof family `NoCluster`, naming the flag.
+                                  // Absent on a node running no consensus: the router then
+                                  // answers the node-proof family `NoCluster`.
                                   .nodeProof = AddressOrNull(nodeProofResponder) },
         activated,
         metrics,
@@ -1319,7 +1309,8 @@ using Node::NodeReloader;
                                                                               .credential = credential,
                                                                               .logger = logger,
                                                                               .conditions = conditions,
-                                                                              .roster = nodeRoster.get() });
+                                                                              .roster = nodeRoster.get(),
+                                                                              .prover = AddressOrNull(prover) });
 
     // Installed only once the listener is up and the heartbeat is running, so a
     // stop arriving during startup cannot close a listener that does not exist yet.
@@ -1468,8 +1459,8 @@ struct EarlyVerbRow
 {
     // **The ordering is right; the exit code was the defect** (#582). This printed the
     // map and returned 0 for a configuration the node then refuses to run -- measured:
-    // the documented scheduler line without `--cluster-key-file` exits 2 on its own and
-    // exited 0 through this flag. Since the flag prints the RESOLVED configuration, an
+    // the documented scheduler line without the pre-shared key it then needed exited 2 on
+    // its own and 0 through this flag. Since the flag prints the RESOLVED configuration, an
     // operator reaches for it before writing a unit file, and it answered "fine" to a
     // command line with no chance of starting.
     //
@@ -1519,22 +1510,25 @@ struct EarlyVerbRow
     }
     auto const publicKey = (*key)->pair.PublicKey();
 
+    // The id travels with the key (#178): a consensus member is admitted under it, and a worker
+    // with a `--cluster-dir` proves it on every connection to a scheduler -- and is admitted under
+    // it by `--cluster-admit-worker=<id>@<key>`, typed from these very lines.
+    auto identity = Node::ResolveNodeIdentity(Node::NodeStateDirectory(cfg), cfg.nodeId, random);
+    if (!identity.has_value())
+    {
+        context.logger.Logf(LogLevel::Error, "{}", identity.error());
+        return ExitUsage;
+    }
+    identity->publicKey = publicKey;
+    Node::ApplyNodeIdentity(cfg, *identity);
+
     auto dialAddress = std::optional<std::string> {};
     if (RunsConsensus(cfg))
-    {
-        auto identity = Node::ResolveNodeIdentity(Node::NodeStateDirectory(cfg), cfg.nodeId, random);
-        if (!identity.has_value())
-        {
-            context.logger.Logf(LogLevel::Error, "{}", identity.error());
-            return ExitUsage;
-        }
-        identity->publicKey = publicKey;
-        Node::ApplyNodeIdentity(cfg, *identity);
         if (auto const dial = ConsensusDialAddressOf(cfg); dial.has_value())
             dialAddress = *dial;
-    }
 
-    std::cout << Node::DescribeIdentity(cfg.nodeId, publicKey, dialAddress);
+    std::cout << Node::DescribeIdentity(
+        cfg.nodeId, publicKey, dialAddress, RunsConsensus(cfg) ? Node::IdentityRole::Member : Node::IdentityRole::Worker);
     return ExitOk;
 }
 
@@ -2106,13 +2100,13 @@ int main(int argc, char** argv)
     // row of `NodeSecretFileTable()` beside its configuration file, where the daemon has
     // one. #384 landed that rule and wired only the daemon; the exposure here is
     // identical for `--requirepass` out of a configuration file, and WIDER for the
-    // secrets reached by path -- a world-readable `--cluster-key-file` is the PSK that
-    // MACs both discovery proofs and lease tokens, handed to every account on the machine
+    // secrets reached by path -- a world-readable identity key is this machine's signature on
+    // every proof it makes, handed to every account on the machine
     // ([#752](https://github.com/LASTRADA-Software/fastcached/issues/752)).
     //
     // **And re-asked at every accepted reload**, which is the half a snapshot cannot
-    // answer: a file's MODE is in no configuration, so an operator who loosens
-    // `--cluster-key-file` an hour after this worker started was met with silence for
+    // answer: a file's MODE is in no configuration, so an operator who loosens a key
+    // file an hour after this worker started was met with silence for
     // the rest of the process's life
     // ([#868](https://github.com/LASTRADA-Software/fastcached/issues/868)).
     //

@@ -175,9 +175,14 @@ class SchedulerProtocol
     /// rather than in the transport because encoding a `SchedulerReply` into wire
     /// bytes is this class's job, and because the predicate must stay the service's
     /// -- the transport asks, it does not decide.
+    ///
+    /// Asks the verb's identity requirement too (#178): a verb a joining machine sends is refused
+    /// here, before its payload is read, unless the connection proved a live identity -- by the
+    /// same `SchedulerService::RefuseUnlessIdentified` `Answer` asks after it is read.
     /// @param caller Who is asking, gathered by the transport.
+    /// @param opRaw The verb as received; not necessarily a known one.
     /// @return The encoded refusal, or nullopt when the caller is admitted.
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(CallerContext const& caller) const;
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(CallerContext const& caller, std::uint8_t opRaw) const;
 
   private:
     /// Decode one verb's payload and hand it to the service.

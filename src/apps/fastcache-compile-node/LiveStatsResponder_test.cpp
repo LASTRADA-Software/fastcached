@@ -29,6 +29,7 @@
 #include <vector>
 
 #include <tests/MembershipFakes.hpp>
+#include <tests/NodeProofFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -194,19 +195,28 @@ struct Stream
     std::vector<std::byte> reply {}; ///< What it returned.
 };
 
+/// The machine whose connection proves an identity in the cases that ask for one.
+constexpr std::string_view ProvenMachine = "watcher-node";
+
+/// What that machine's connection proved: its id, under its own test key.
+/// @return The identity.
+[[nodiscard]] ProvenIdentity ProvenWatcher()
+{
+    return ProvenIdentity { .id = std::string { ProvenMachine },
+                            .key = Testing::TestKeyPair(std::string { ProvenMachine }).PublicKey() };
+}
+
 /// Run one subscription on the reactor, as the endpoint would.
 ///
-/// @param proved Whether this CONNECTION proved the cluster key, which the endpoint records on
-///        the identity it hands down (#1428). Since #1512 this surface folds it, so a case can
-///        ask either question -- and the label is left EMPTY on purpose, because an ENGAGED
-///        optional is what *proved* means and an id is legitimately empty on a node that runs
-///        no consensus.
+/// @param proved Whether this CONNECTION proved an identity the rig's roster admits, which the
+///        endpoint records on the identity it hands down (#1428, #178). Since #1512 this surface
+///        folds it, so a case can ask either question.
 DetachedTask RunStream(
     LiveStatsResponder* responder, std::vector<std::byte> frame, std::string peer, bool proved, Stream* stream)
 {
     auto identity = PeerIdentity { .host = std::move(peer) };
     if (proved)
-        identity.provenNodeId = std::string {};
+        identity.proven = ProvenWatcher();
     stream->reply = co_await responder->Serve(frame, std::move(identity), &stream->sink);
     stream->finished = true;
 }
@@ -220,7 +230,11 @@ DetachedTask RunStream(
 /// into an AddressSanitizer abort that way, which reports nothing about the assertion.
 struct Rig
 {
-    Rig() = default;
+    Rig()
+    {
+        Testing::PublishKeyRoster(keys, { std::string { ProvenMachine } });
+    }
+
     Rig(Rig const&) = delete;
     Rig(Rig&&) = delete;
     Rig& operator=(Rig const&) = delete;
@@ -243,15 +257,20 @@ struct Rig
     // responder a fresh oracle would pass under the very defect re-gating exists for.
     ListedMembership membership { { std::string { Watcher }, "127.0.0.1", "10.0.0.8" },
                                   Distributed::MembershipParticipant::FleetMemberList };
-    LiveStatsResponder responder { sources, membership, AdminCredential {}, reactor, metrics };
+    // The identity keys the cluster holds, MUTABLE for the same reason: the revocation case
+    // below revokes one after the stream began.
+    Distributed::KeyRosterMembership keys;
+    // Composed as `NodeMembership` composes the node's oracle: the listed hosts and the key
+    // roster under one fold, bound once.
+    Distributed::AnyOfMembership oracle { { &membership, &keys } };
+    LiveStatsResponder responder { sources, oracle, AdminCredential {}, reactor, metrics };
     std::deque<std::unique_ptr<LiveStatsResponder>> responders;
     std::deque<std::unique_ptr<Stream>> streams;
 
     /// A responder of the case's own, owned here for the reason above.
     [[nodiscard]] LiveStatsResponder& Responder(AdminCredential dashboard)
     {
-        responders.push_back(
-            std::make_unique<LiveStatsResponder>(sources, membership, std::move(dashboard), reactor, metrics));
+        responders.push_back(std::make_unique<LiveStatsResponder>(sources, oracle, std::move(dashboard), reactor, metrics));
         return *responders.back();
     }
 
@@ -261,7 +280,7 @@ struct Rig
         return OpenOn(responder, std::move(frame), std::move(peer), false);
     }
 
-    /// Open a subscription whose connection PROVED the cluster key.
+    /// Open a subscription whose connection PROVED an identity the cluster holds.
     ///
     /// Its own spelling rather than a defaulted flag on `Open`: every existing case here is
     /// about a caller that proved nothing, and a default would let a new one be about a proof
@@ -457,9 +476,8 @@ TEST_CASE("A proven watcher dropped from the member list keeps its stream, becau
     // by the key after the list stops naming it (#1471's union, folded by `ExplainConnection`).
     //
     // It is here because it is the operator-visible consequence, and the direction an operator
-    // gets wrong: editing the list is not how a key holder is removed, and the rulebook says the
-    // forget has to REPORT rather than be inferred from a stream that did not end. Removing a
-    // key holder is a key rotation; per-node revocation is #178.
+    // gets wrong: editing the list is not how a proven machine is removed. Revoking its key is,
+    // and that ends the stream on the next tick -- the case after this one.
     Rig rig;
     auto& stream = rig.OpenProven(SubscribeFrame(Wire::LiveSubject::Node, 500), std::string { Watcher });
     REQUIRE_FALSE(stream.finished);
@@ -471,6 +489,37 @@ TEST_CASE("A proven watcher dropped from the member list keeps its stream, becau
     CHECK_FALSE(stream.finished);
     CHECK(stream.sink.SnapshotTicks() == std::vector<std::uint64_t> { 0, 1, 2 });
     CHECK(rig.Read(IMetricsSink::Counter::LiveSubscriptionsRevoked) == 0);
+}
+
+TEST_CASE("A proven watcher whose key is revoked loses its stream on the next tick, from any address",
+          "[node][livestats][revoke]")
+{
+    // #178: removing one machine is revoking its key, and a revocation has to reach a stream that
+    // is ALREADY RUNNING -- a gate asked once at subscribe time would leave a forgotten machine
+    // watching the fleet for as long as it keeps the connection open. The watcher dials from an
+    // address `--fleet-member` still lists, so the key's tombstone is what ends it.
+    Rig rig;
+    auto& stream = rig.OpenProven(SubscribeFrame(Wire::LiveSubject::Node, 500), std::string { Watcher });
+    REQUIRE_FALSE(stream.finished);
+    rig.RunTo(500ms);
+    REQUIRE_FALSE(stream.finished);
+
+    rig.keys.Publish({}, { ProvenWatcher().key });
+    rig.RunTo(1000ms);
+    CHECK(stream.finished);
+    CHECK(Testing::ErrorOf(stream.reply) == Wire::ErrorCode::NotAMember);
+    // Counted as the forgotten MACHINE, the gate's own row, rather than as the generic removal
+    // of a host: the two are opposite diagnoses, and an operator watching a subscriber drop has
+    // to be able to tell a revoked key from an edited list.
+    CHECK(rig.Read(IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked) == 1);
+    CHECK(rig.Read(IMetricsSink::Counter::LiveSubscriptionsRevoked) == 0);
+
+    // The control: a watcher at the same listed address that proved nothing is untouched by a
+    // revocation of a key it never presented.
+    auto& unproved = rig.Open(SubscribeFrame(Wire::LiveSubject::Node, 500), std::string { Watcher });
+    REQUIRE_FALSE(unproved.finished);
+    rig.RunTo(1500ms);
+    CHECK_FALSE(unproved.finished);
 }
 
 TEST_CASE("A fleet stream ends the tick its node stops leading, naming the new leader", "[node][livestats]")

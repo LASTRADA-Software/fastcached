@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -68,13 +69,18 @@ constexpr std::string_view Stranger = "10.0.0.99";
     return path;
 }
 
+/// Where the worker in these cases keeps its identity (#178): a node naming a scheduler must
+/// hold one, and `cluster_dir` is not reloadable, so the file and the live configuration name
+/// the same one. Never read -- validation asks the configuration, not the disk.
+constexpr std::string_view StateDirectory = "node-state";
+
 /// Write @p body to a worker's configuration file this case owns.
 /// @param dir Scratch directory.
-/// @param body The keys this case is about; the scheduler line is added.
+/// @param body The keys this case is about; the scheduler and state-directory lines are added.
 /// @return The path written.
 [[nodiscard]] std::filesystem::path WriteConfig(std::filesystem::path const& dir, std::string_view body)
 {
-    return WriteFile(dir, std::format("scheduler: {}\n{}", SelfScheduler, body));
+    return WriteFile(dir, std::format("scheduler: {}\ncluster_dir: {}\n{}", SelfScheduler, StateDirectory, body));
 }
 
 /// Read @p path into a fresh configuration, exactly as the worker's reloader does.
@@ -99,6 +105,7 @@ constexpr std::string_view Stranger = "10.0.0.99";
 {
     NodeConfig cfg;
     cfg.schedulers = { std::string { SelfScheduler } };
+    cfg.clusterDir = StateDirectory;
     cfg.fleetMembers = std::move(members);
     cfg.fleetOpen = open;
     return cfg;
@@ -415,25 +422,23 @@ TEST_CASE("A reload never revokes what the cluster agreed", "[node][membership][
     CHECK(Admits(oracle, "10.0.0.50"));
 }
 
-TEST_CASE("A node that binds its own network-facing port is closed by the STARTUP rule",
+TEST_CASE("A node that binds its own network-facing port is closed by the reload guard too",
           "[node][membership][reload][revocation]")
 {
     // **What decides how severe the widening hole is, pinned rather than reasoned.**
     //
-    // The guard above is a backstop for a node whose configuration does not describe
-    // its own port -- which is socket activation, where the unit chose the address and
-    // `--listen-node` keeps whatever was typed. The obvious worry is that a node which
-    // binds its own network-facing port is exposed too, and it is NOT: `StartupPolicyRejection`
-    // is re-run on the candidate by `ValidateNodeReloadable`, `CompilePortFacesTheNetwork`
-    // tells the truth for a self-binding node, and the pre-existing lease row refuses
-    // the widening before the backstop is ever consulted.
+    // The guard above was written as a backstop for a node whose configuration does not
+    // describe its own port -- socket activation, where the unit chose the address and
+    // `--listen-node` keeps whatever was typed. Until #178 PR 6 a node that binds its OWN
+    // network-facing port never reached it: `StartupPolicyRejection` is re-run on the candidate
+    // by `ValidateNodeReloadable`, and a startup row refused any worker other machines could
+    // reach with no roster to check against. That row went when every worker came to keep a
+    // state directory -- a node naming a scheduler must hold an identity -- because a directory
+    // may hold a roster no configuration can see, so the table cannot refuse it.
     //
-    // So this case is what makes "socket activation is a necessary condition" a measured
-    // claim instead of a reading, and it is asserted on WHICH rule answered -- both
-    // messages name `--voter-key` (#178), so matching that alone cannot tell them apart.
-    // It also guards a dependency across lanes: the severity stated in #405's commit
-    // body is only true while that startup row keeps catching this, so a change to it
-    // fails here rather than silently widening what this ticket left open.
+    // So the guard is now what closes this for EVERY worker, and this case pins that: the
+    // widening is refused, and refused by the guard's own words. A change that let it through
+    // would open an unauthenticated compile port with every refusal counter reading zero.
     //
     // `--advertise` is named because otherwise the reachability rows answer first -- a
     // membership policy plus a wildcard advertise is what they are about, and the case
@@ -448,7 +453,7 @@ TEST_CASE("A node that binds its own network-facing port is closed by the STARTU
     auto initial = RunningNode();
     initial.nodeListen = "0.0.0.0:6674";
     initial.advertise = "worker-01.internal:6674";
-    REQUIRE(initial.voterKeys.empty()); // no roster root (#178)
+    REQUIRE(initial.voterKeys.empty()); // no roster root the configuration can see (#178)
 
     auto const candidate = Reparse(path);
     REQUIRE(candidate.has_value());
@@ -456,16 +461,20 @@ TEST_CASE("A node that binds its own network-facing port is closed by the STARTU
     // the network. Without both, the case would pass having exercised nothing.
     REQUIRE(AdmitsRemotePeers(*candidate));
     REQUIRE_FALSE(AdmitsRemotePeers(initial));
-    // The port is stated rather than asked about: `CompilePortFacesTheNetwork` is
-    // private to `NodeConfig.cpp`, and a copy of it here would be a second reader of
-    // the predicate under test. The refusal below is the evidence that it answered
-    // true, because that startup row cannot fire on any other reading of this bind.
     REQUIRE(candidate->nodeListen == "0.0.0.0:6674");
+    // And the startup table lets the candidate through, which is what leaves the guard as the
+    // only thing standing: it names a state directory, which might hold a roster.
+    REQUIRE_FALSE(StartupPolicyRejection(*candidate).has_value());
 
     auto const outcome = ValidateNodeReloadable(initial, *candidate);
     REQUIRE_FALSE(outcome.has_value());
-    // The STARTUP row's own words, and NOT the reload guard's, which says "may not
-    // widen". Which one answers is the whole finding.
-    CHECK(outcome.error().context.contains(RosterlessWorkerRefusal));
-    CHECK_FALSE(outcome.error().context.contains("may not widen"));
+    CHECK(outcome.error().context.contains("may not widen"));
+
+    // The control: a worker that names the voters has a roster root the configuration CAN see,
+    // so the same widening is taken.
+    auto anchored = initial;
+    anchored.voterKeys = { Testing::TestKeyPair("scheduler").PublicKey() };
+    auto anchoredCandidate = *candidate;
+    anchoredCandidate.voterKeys = anchored.voterKeys;
+    CHECK(ValidateNodeReloadable(anchored, anchoredCandidate).has_value());
 }

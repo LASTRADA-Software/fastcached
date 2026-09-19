@@ -258,7 +258,7 @@ class EnrollmentResponder final: public IFrameResponder
     ///
     /// **None, and the pairing is the opposite way round from what it looks like.** This surface
     /// exists for a machine the cluster has never admitted, so there is nothing it could prove;
-    /// the prover exists for a machine that already holds the cluster key. Two components, two
+    /// the prover exists for a machine the cluster already admitted. Two components, two
     /// populations.
     [[nodiscard]] INodeProver* NodeProver() noexcept override
     {
@@ -292,16 +292,15 @@ class EnrollmentResponder final: public IFrameResponder
     /// One place the peer becomes a `CallerContext`, so an early refusal's
     /// classification is by construction the one the verb would have got --
     /// `SchedulerResponder::Context`'s argument, and the same shape.
-    /// **The proof is folded through `Distributed::ExplainConnection`, since #1428**, here and
-    /// not at the call site: this is the one place the peer becomes a `CallerContext`, and a
-    /// fold at one call site would make the door and the authoritative gate answer differently
-    /// about one connection.
+    /// **The identity is folded through `Distributed::CallerContextOf`, since #1428 and #178**,
+    /// here and not at the call site: this is the one place the peer becomes a `CallerContext`,
+    /// and a fold at one call site would make the door and the authoritative gate answer
+    /// differently about one connection.
     /// @param peer The caller, whose host is taken over by the returned context.
     /// @return The context.
     [[nodiscard]] Distributed::CallerContext Context(PeerIdentity peer) const
     {
-        auto const decision = Distributed::ExplainConnection(_membership, peer.host, peer.provenNodeId.has_value());
-        return Distributed::CallerContext { .membership = decision.verdict, .peerId = std::move(peer.host) };
+        return Distributed::CallerContextOf(_membership, std::move(peer.host), peer.proven);
     }
 
     EnrollmentWindow& _window;

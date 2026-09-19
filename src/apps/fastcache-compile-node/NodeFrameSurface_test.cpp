@@ -200,7 +200,7 @@ class NamedResponder final: public IFrameResponder
     }
     /// @copydoc IFrameResponder::NodeProver
     ///
-    /// **None.** This fake stands in for a surface, not for the cluster-key prover; a case that
+    /// **None.** This fake stands in for a surface, not for the node prover; a case that
     /// needs one builds a `NodeProofResponder`.
     [[nodiscard]] INodeProver* NodeProver() noexcept override
     {

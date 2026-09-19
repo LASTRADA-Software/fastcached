@@ -115,29 +115,9 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::
     // first is what lets the whole round move together.
     std::optional<std::string> leader;
 
-    // **The proof first, before anything else on this connection.** What it establishes is
-    // connection state, so one exchange covers every withdrawal, registration and heartbeat
-    // below it -- and it has to come first for the reason it exists: the scheduler's membership
-    // answer is what gates `Register`, and a proof sent after one had been refused would arrive
-    // too late to change the answer this round already got (#1428).
-    //
-    // **Every outcome but a refusal is silent, and a refusal does not stop the round.** A peer
-    // too old to know the verbs and a peer holding no cluster key are what a mixed fleet looks
-    // like mid-upgrade; a node that stopped registering over either would take itself out of a
-    // fleet that is admitting it by address perfectly well. So the round carries on in all four
-    // cases, and the one worth a person's attention says so -- a wrong `--cluster-key-file` on
-    // this machine is invisible from here in every other way, because the registration that
-    // follows then succeeds or fails for a reason that names the address instead.
-    if (round.proofKey != nullptr)
-    {
-        auto const attempt = ProveNodeOver(client, round.notice, *round.proofKey, round.nodeId, round.credential.Current());
-        if (attempt.result == NodeProofResult::Refused)
-            round.logger.Logf(LogLevel::Warn,
-                              "scheduler {} did not accept this node's cluster-key proof: {}. Registration continues "
-                              "by address; check --cluster-key-file on this machine if it is refused",
-                              endpoint,
-                              attempt.reason);
-    }
+    // **No proof here, and that is where it moved rather than a gap** (#178): the connection this
+    // arrives on was proved and sealed by `DialAndAnnounce` before this ran, because every verb
+    // below requires a proven identity and a presence announcement needs the same one.
 
     // **Withdrawals first, and the ordering mirrors the adding direction's.** Adding
     // runs the compile port before the registration -- `ReplaceToolchains` then
@@ -288,10 +268,39 @@ std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEnd
     };
 
     WorkerAnnouncement announcement { round };
-    return DialAndAnnounce(link, dialer, round.logger, announcement);
+    return DialAndAnnounce(
+        link,
+        dialer,
+        round.logger,
+        announcement,
+        AnnounceProof { .prover = round.prover, .credential = &round.credential, .notice = &round.notice });
 }
 
-std::size_t DialAndAnnounce(SchedulerLink& link, IEndpointDialer& dialer, ILogger& logger, IAnnouncement& announcement)
+namespace
+{
+    /// What an unproved connection is logged as, per outcome: each names a different machine to fix.
+    /// @param attempt What the proof learned.
+    /// @param target Where it was dialled.
+    /// @return The sentence.
+    [[nodiscard]] std::string DescribeUnproved(NodeProofAttempt const& attempt, std::string_view target)
+    {
+        switch (attempt.result)
+        {
+            case NodeProofResult::NotOffered:
+                return std::format(
+                    "{} serves no identity handshake, so it is no scheduler of this fleet: {}", target, attempt.reason);
+            case NodeProofResult::Untrusted:
+                return std::format("this machine will not prove itself to {}: {}", target, attempt.reason);
+            case NodeProofResult::Refused:
+            case NodeProofResult::Proved:
+                break;
+        }
+        return std::format("{} did not accept this machine's identity: {}", target, attempt.reason);
+    }
+} // namespace
+
+std::size_t DialAndAnnounce(
+    SchedulerLink& link, IEndpointDialer& dialer, ILogger& logger, IAnnouncement& announcement, AnnounceProof const& proof)
 {
     for (link.BeginRound();;)
     {
@@ -315,6 +324,29 @@ std::size_t DialAndAnnounce(SchedulerLink& link, IEndpointDialer& dialer, ILogge
             if (!next.has_value())
                 return 0;
             continue;
+        }
+
+        // Proved before anything is said, and sealed from then on (#178). A connection the proof did
+        // not seal is one no joining verb can be heard on, so it counts as an endpoint that did not
+        // answer: the next `--scheduler` is tried in this same round.
+        if (proof.prover != nullptr)
+        {
+            auto sealed = std::make_unique<SealedFrameSocket>(
+                std::move(client), SealedFrameEnd::Caller, CompileCacheWire::MaxSealedReplyPayload);
+            auto const attempt = proof.prover->Prove(*sealed, *proof.notice, proof.credential->Current());
+            if (attempt.result != NodeProofResult::Proved)
+            {
+                auto const unproved = link.Target();
+                auto const next = link.Lost();
+                logger.Logf(LogLevel::Warn,
+                            "{}{}",
+                            DescribeUnproved(attempt, unproved),
+                            next.has_value() ? std::format("; trying {}", *next) : std::string {});
+                if (!next.has_value())
+                    return 0;
+                continue;
+            }
+            client = std::move(sealed);
         }
 
         auto const outcome = announcement.Attempt(*client, link.Target());

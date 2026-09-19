@@ -287,13 +287,53 @@ function Wait-ForLine([string]$path, [string]$pattern, [int]$seconds, [string]$w
 # before it starts (#178): `--print-identity` over the same consensus flags, whose
 # `public-key` line is what a worker's --voter-key takes. The start that follows reads
 # the same files back rather than minting a second identity.
-function Get-SchedulerKey([string]$stateDir, [int]$raftPort, [string]$clusterKey) {
-    $identity = & $Node --print-identity "--cluster-key-file=$clusterKey" "--listen-raft=127.0.0.1:$raftPort" `
+function Get-SchedulerKey([string]$stateDir, [int]$raftPort) {
+    $identity = & $Node --print-identity "--listen-raft=127.0.0.1:$raftPort" `
                         "--raft-self=127.0.0.1" "--cluster-dir=$stateDir"
     if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint a scheduler identity in $stateDir (exit $LASTEXITCODE)" }
     $line = @($identity) | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
     if (-not $line) { throw "--print-identity printed no public-key line: $identity" }
     return $line.Substring('public-key '.Length)
+}
+
+# Admit a worker to the cluster its scheduler leads, under the identity it will prove there
+# (#178 PR 6), and wait until the leader has APPLIED the admission. The shell twin is
+# `dist-compile-e2e.sh`'s `admit_worker`, and the reasoning is the same: a worker that dials
+# in before the entry is applied is refused `node-key-unknown` and registers a heartbeat
+# interval late, and a scheduler that has just started answers `not-leader` until it leads
+# its cluster of one. What an operator runs, in the order an operator runs it: the worker's
+# `--print-identity` mints the identity into its state directory and prints the
+# `--cluster-admit-worker` line, and the start then reads the same files back.
+#
+# Bounded by a Stopwatch, which is monotonic, rather than by counting the sleeps it asked for.
+function Admit-Worker([string]$stateDir, [string]$scheduler, [string]$what) {
+    $identity = @(& $Node --print-identity "--cluster-dir=$stateDir")
+    if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint an identity for the $what in $stateDir (exit $LASTEXITCODE)" }
+    $tokenLine = $identity | Where-Object { $_ -like 'cluster-admit-worker *' } | Select-Object -First 1
+    $keyLine = $identity | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
+    if (-not $tokenLine -or -not $keyLine) {
+        throw "--print-identity printed no cluster-admit-worker line and key for the ${what}: $($identity -join ' | ')"
+    }
+    $token = $tokenLine.Substring('cluster-admit-worker '.Length)
+    $key = $keyLine.Substring('public-key '.Length)
+
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $recorded = $false
+    $last = ""
+    while ($clock.Elapsed.TotalSeconds -lt 30) {
+        if (-not $recorded) {
+            $last = (@(& $Node "--scheduler=$scheduler" "--cluster-admit-worker=$token") -join ' | ')
+            $recorded = ($LASTEXITCODE -eq 0)
+        }
+        if ($recorded) {
+            $status = (@(& $Node "--scheduler=$scheduler" --cluster-status) -join "`n")
+            if ($LASTEXITCODE -eq 0 -and $status.Contains("key=$key")) { return }
+            $last = $status
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    throw ("the scheduler at $scheduler did not admit the $what within " +
+           "$([int]$clock.Elapsed.TotalSeconds) s (recorded: $recorded): $last")
 }
 
 # The readiness markers, as a TABLE (#1213).
@@ -974,14 +1014,10 @@ try {
         if (Test-Path $scratch) { Remove-Item -Recurse -Force $scratch }
         New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
-        # The cluster key every node here shares: a scheduler runs consensus, which
-        # needs it (#178). It no longer makes the dispatch path the SIGNED one -- every
-        # scheduler signs with its own identity key, and a worker CHECKS the signature
-        # when it is given that key with --voter-key, as each worker below is. The
-        # shell twin does the same, with the same fixed text -- nothing here turns on
-        # the value, and a per-run secret would make a failure look like a flake.
-        $clusterKey = Join-Path $scratch "cluster.key"
-        Set-Content -Path $clusterKey -Value "e2e-fixture-cluster-key-not-a-secret" -NoNewline
+        # No key file (#178 PR 6): every scheduler signs with its own identity key, a
+        # worker CHECKS the signature when it is given that key with --voter-key, as each
+        # worker below is, and a worker JOINS only under an identity key of its own that
+        # the scheduler's cluster admitted (`Admit-Worker`). The shell twin does the same.
 
         if (-not (Test-CompilerWorks $cc $scratch)) {
             Write-Host "skip $cc (on PATH but cannot compile here)"
@@ -1029,9 +1065,9 @@ try {
         # worker told no voter checks no lease at all.
         $schedLog = Join-Path $scratch "scheduler.log"
         $schedState = Join-Path $scratch "scheduler.state"
-        $schedKey = Get-SchedulerKey $schedState $schedRaftPort $clusterKey
+        $schedKey = Get-SchedulerKey $schedState $schedRaftPort
         $scheduler = Start-Background $Node @(
-            $NoLocalCache, "--cluster-key-file=$clusterKey",
+            $NoLocalCache,
             "--serve-scheduler", "--listen-node=127.0.0.1:$dispatchPort", "--fleet-open",
             "--listen-raft=127.0.0.1:$schedRaftPort", "--raft-self=127.0.0.1",
             "--cluster-dir=$schedState",
@@ -1070,8 +1106,10 @@ try {
         $workerSlots = [Environment]::ProcessorCount
 
         $workerLog = Join-Path $scratch "worker.log"
+        $workerState = Join-Path $scratch "worker.state"
+        Admit-Worker $workerState "127.0.0.1:$dispatchPort" "worker"
         $worker = Start-Background $Node @(
-            $NoLocalCache, "--cluster-key-file=$clusterKey", "--voter-key=$schedKey",
+            $NoLocalCache, "--voter-key=$schedKey", "--cluster-dir=$workerState",
             "--scheduler=127.0.0.1:$dispatchPort", "--listen-node=127.0.0.1:$workerPort",
             "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=$workerSlots",
             "--log-level=debug") $workerLog
@@ -1276,9 +1314,9 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         # BE a matching worker and the case would pass without testing anything.
         $isoSchedLog = Join-Path $scratch "iso-scheduler.log"
         $isoSchedState = Join-Path $scratch "iso-scheduler.state"
-        $isoSchedKey = Get-SchedulerKey $isoSchedState $isoRaftPort $clusterKey
+        $isoSchedKey = Get-SchedulerKey $isoSchedState $isoRaftPort
         $isoScheduler = Start-Background $Node @(
-            $NoLocalCache, "--cluster-key-file=$clusterKey",
+            $NoLocalCache,
             "--serve-scheduler", "--listen-node=127.0.0.1:$isoDispatch", "--fleet-open",
             "--listen-raft=127.0.0.1:$isoRaftPort", "--raft-self=127.0.0.1",
             "--cluster-dir=$isoSchedState",
@@ -1288,8 +1326,10 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         Wait-ForReady Node $isoDispatch $isoScheduler "isolation scheduler" $isoSchedLog
 
         $isoWorkerLog = Join-Path $scratch "iso-worker.log"
+        $isoWorkerState = Join-Path $scratch "iso-worker.state"
+        Admit-Worker $isoWorkerState "127.0.0.1:$isoDispatch" "isolation worker"
         $isoNode = Start-Background $Node @(
-            $NoLocalCache, "--cluster-key-file=$clusterKey", "--voter-key=$isoSchedKey",
+            $NoLocalCache, "--voter-key=$isoSchedKey", "--cluster-dir=$isoWorkerState",
             "--scheduler=127.0.0.1:$isoDispatch", "--listen-node=127.0.0.1:$isoWorker",
             "--advertise=127.0.0.1:$isoWorker",
             "--toolchain=not-the-compiler-this-client-uses=$ccPath", "--slots=2",

@@ -151,8 +151,6 @@ TEST_CASE("The same state directory is fine at ordinary startup, which is why th
     cfg.raftSelf = "198.51.100.4";
     cfg.schedulers = { "10.0.0.1:7000" };
     cfg.nodeId = "node-a";
-    // A running consensus node holds the key (#1308); named, and never read by this table.
-    cfg.clusterKeyFile = scratch.Path() / "cluster.key";
 
     // The startup table is what judges a serving configuration, and it is asked here
     // exactly as `main` asks it. It must have nothing to say about a self-elected state

@@ -73,7 +73,8 @@ endfunction()
 # @param tree Which synthetic tree to run the check against.
 # @param outObjected Set TRUE when the check reported `CMake Error` or `CMake Warning`.
 # @param outOutput Set to everything the check printed, whitespace runs collapsed -- `message()`
-#        word-wraps, so a phrase can straddle a line break (check-psk-signing-seam-selftest.cmake).
+#        word-wraps, so a phrase can straddle a line break (measured in check-psk-signing-seam-selftest.cmake,
+#        retired with the pre-shared key at #178).
 function(fastcached_run_check tree outObjected outOutput)
     execute_process(
         COMMAND "${CMAKE_COMMAND}" "-DFASTCACHED_SOURCE_DIR=${tree}" -P "${check}"

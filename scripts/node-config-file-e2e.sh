@@ -56,8 +56,12 @@ FAILURES=0
 # both questions, so the cases that assert PARSING now supply the flag that startup
 # requires, leaving the file's own content the only thing under test.
 #
-# Any case here whose subject is the file rather than the policy needs this.
+# Any case here whose subject is the file rather than the policy needs this -- and,
+# since #178 PR 6, the state directory beside it: a node that names a scheduler and
+# runs no consensus proves an identity key kept there, and is refused at startup
+# without one. `--print-surfaces` opens nothing, so the directory is never created.
 SCHEDULER_FOR_STARTUP="--scheduler=scheduler.internal:6675"
+STATE_FOR_STARTUP="--cluster-dir=$WORK/state"
 report() {
     echo "  $1"
     FAILURES=$((FAILURES + 1))
@@ -112,6 +116,7 @@ expect_refusal() {
 # reading "not served", which is a different line rather than a missing one.
 cat >"$WORK/good.yaml" <<'YAML'
 scheduler: "cache.internal:6675"
+cluster_dir: "node-state"
 listen_node: "0.0.0.0:6699"
 YAML
 expect_ok "a setting in the file takes effect" "0.0.0.0:6699" "--config=$WORK/good.yaml"
@@ -160,7 +165,7 @@ chmod 644 "$WORK/locked.yaml" 2>/dev/null
 # document as a failure would refuse every fresh package install.
 printf '# nothing uncommented yet\n' >"$WORK/comments.yaml"
 expect_ok "a file of nothing but comments starts normally" "compile" "$SCHEDULER_FOR_STARTUP" \
-    "--config=$WORK/comments.yaml"
+    "$STATE_FOR_STARTUP" "--config=$WORK/comments.yaml"
 
 # --- a file this worker FOUND, with no --config at all -----------------------
 #
@@ -198,7 +203,8 @@ esac
 # machine with no configuration file at all must start on built-in defaults
 # rather than refuse. Only a path the operator NAMED is strict.
 rm -rf "$WORK/xdg/fastcache-compile-node"
-out="$(XDG_CONFIG_HOME="$WORK/xdg" HOME="$WORK" "$NODE" "$SCHEDULER_FOR_STARTUP" --print-surfaces 2>&1)"
+out="$(XDG_CONFIG_HOME="$WORK/xdg" HOME="$WORK" "$NODE" "$SCHEDULER_FOR_STARTUP" "$STATE_FOR_STARTUP" \
+    --print-surfaces 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ]; then
     echo "ok: no configuration file anywhere is not an error"
@@ -217,7 +223,7 @@ fi
 REFERENCE="$(dirname "$0")/../packaging/config/fastcache-compile-node.yaml"
 if [ -f "$REFERENCE" ]; then
     expect_ok "the shipped reference configuration parses" "compile" "$SCHEDULER_FOR_STARTUP" \
-        "--config=$REFERENCE"
+        "$STATE_FOR_STARTUP" "--config=$REFERENCE"
 else
     echo "FAIL: the shipped reference configuration parses"
     report "not found at $REFERENCE"

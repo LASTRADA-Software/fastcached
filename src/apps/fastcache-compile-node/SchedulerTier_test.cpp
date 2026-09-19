@@ -64,7 +64,6 @@ struct TierFixture
     cfg.serveScheduler = true;
     cfg.nodeId = "n1";
     cfg.raftListen = "127.0.0.1:6680";
-    cfg.clusterKeyFile = "cluster.key";
     return cfg;
 }
 
@@ -123,8 +122,8 @@ TEST_CASE("A scheduler that runs no consensus is refused before it could lead al
     // used to take at term 0 is gone, and the configuration that asked for it is refused BY
     // NAME at startup rather than run as a scheduler nothing could ever elect.
     //
-    // WHAT DISTINGUISHES: the same node given `--listen-raft` (and the key consensus needs) is
-    // accepted, so the rule is about consensus and not about scheduling.
+    // WHAT DISTINGUISHES: the same node given `--listen-raft` is accepted, so the rule is about
+    // consensus and not about scheduling.
     NodeConfig lone;
     lone.schedulers = { "127.0.0.1:6675" };
     lone.serveScheduler = true;
@@ -132,7 +131,6 @@ TEST_CASE("A scheduler that runs no consensus is refused before it could lead al
 
     auto clustered = lone;
     clustered.raftListen = "127.0.0.1:6680";
-    clustered.clusterKeyFile = "cluster.key";
     CHECK(StartupPolicyRejection(clustered)
           != std::optional<std::string> { std::string { SchedulerNeedsConsensusRefusal } });
 

@@ -83,6 +83,12 @@ std::vector<std::byte> EncodeClusterRequest(ClusterRequest const& request)
             return EncodeAdmission<Wire::Op::ClusterAdmit>(request);
         case ClusterAction::AdmitLearner:
             return EncodeAdmission<Wire::Op::ClusterAdmitLearner>(request);
+        case ClusterAction::AdmitWorker: {
+            // Parsed when the flag was read, so a request without a key is not one this can hold.
+            auto const keyText = request.publicKey.transform(FormatEd25519PublicKey).value_or(std::string {});
+            return Wire::EncodeClusterAdmitWorker(
+                Wire::ClusterAdmitWorkerRequest { .workerId = request.key, .publicKey = keyText });
+        }
 
         // One encoder for the pair, and the verb is a TEMPLATE argument rather than a
         // value: naming a third verb here does not compile. That is the obligation the
@@ -276,6 +282,30 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
                                "seat",
                                ReceiptLabelColumn,
                                Cluster::MemberSeatName(seat));
+        }
+
+        case ClusterAction::AdmitWorker: {
+            // The member receipt's reasoning, one field shorter: a principal has no consensus
+            // endpoint, so the leader echoes the id and the key it RECORDED and nothing else.
+            auto const receipt = Wire::DecodeClusterAdmitReceipt(reply);
+            if (!receipt.has_value())
+                return std::unexpected { std::string {
+                    "the leader took the request and answered with a receipt this build cannot read" } };
+            return std::format("recorded, as received:\n"
+                               "  {:<{}}{}\n"
+                               "  {:<{}}{}\n"
+                               "\n"
+                               "Appended, not committed: a majority has to take it, and this leader cannot\n"
+                               "see that yet. Ask for the cluster state again to see the result.\n"
+                               "\n"
+                               "Compare both lines against what the worker's own --print-identity printed.\n"
+                               "Each is one thing spelled on two machines, and nothing else compares them.\n",
+                               "worker id",
+                               ReceiptLabelColumn,
+                               receipt->memberId,
+                               "identity key",
+                               ReceiptLabelColumn,
+                               receipt->publicKey.value_or(std::string { NoKeyStated }));
         }
     }
 

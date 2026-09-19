@@ -43,6 +43,16 @@ case "$1" in
            && ! mountpoint -q /var/lib/fastcached 2>/dev/null; then
             rm -rf /var/lib/fastcached
         fi
+        # The compile node's state directory holds WHO the machine is -- its
+        # identity key and its id (#178) -- and a purge is the request to forget
+        # everything the package made, so it goes too, under the same guard. An
+        # ordinary `remove` keeps it, and so does the RPM's erase, which has no
+        # purge to tell the two apart: a reinstall then comes back as the machine
+        # the cluster already admitted, rather than as a stranger to re-admit.
+        if [ -d /var/lib/fastcache-node ] && [ ! -L /var/lib/fastcache-node ] \
+           && ! mountpoint -q /var/lib/fastcache-node 2>/dev/null; then
+            rm -rf /var/lib/fastcache-node
+        fi
         ;;
 esac
 
