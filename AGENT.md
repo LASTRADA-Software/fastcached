@@ -199,7 +199,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   clang-cl under CMake asks for a GNU depfile through `-clang:-MF<dep>` (`deps = gcc`), not
   for `/showIncludes`: the pass-through spellings are `PathValueFlags()` rows.
 - The `/showIncludes` MARKER is canonical as `<SRCROOT>` is — normalized to `IncludeNoteMarker`
-  before storing, restored AFTER the stale-hit guard, anchored on leading blanks only.
+  before storing, restored AFTER the stale-hit guard, anchored at COLUMN ZERO through one
+  `PathCanon::IncludeNoteMarkerEnd` all three readers share.
 - Reading `/showIncludes` and WRITING it are different questions and must not be consolidated:
   `RenderShowIncludes` takes the marker as a REQUIRED, undefaulted parameter and spells no literal.
 - A compiler with debug info on records the WORKING DIRECTORY, which is on no command line,

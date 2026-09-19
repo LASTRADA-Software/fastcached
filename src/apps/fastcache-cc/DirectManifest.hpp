@@ -328,20 +328,26 @@ inline constexpr std::string_view IncludeNoteMarker = PathCanon::IncludeNoteMark
 
 /// The path one line names, when that line is a `/showIncludes` note.
 ///
-/// The *recognition rule*, not just the marker, is what the two readers have to
-/// share — and it is anchored to the start of the line, after leading blanks
-/// only. Both halves of that are load-bearing:
+/// The *recognition rule*, not just the marker, is what every reader has to share,
+/// so this one is `PathCanon::IncludeNoteMarkerEnd` rather than a spelling of its
+/// own. It is anchored at COLUMN ZERO: nothing may precede the marker, blanks
+/// included.
 ///
-/// - Blanks are skipped because `cl` indents a note by inclusion depth, so the
-///   marker is not at column 0 for anything a header pulls in transitively.
-/// - Nothing else may precede it, because SplitIncludeNotes applies this to a
-///   stream that *also* carries preprocessed SOURCE. A rule that matched the
-///   marker anywhere in the line deletes an ordinary source line that merely
-///   contains the text — `char const* s = "Note: including file: x";` — from the
-///   bytes the cache key is computed over, so two revisions differing only in
-///   that literal key identically and the second is served the first's object.
-///   That is a silent wrong build, and this repository's own sources contain the
-///   literal, so it is not a hypothetical.
+/// Nothing may, because SplitIncludeNotes applies this to a stream that *also*
+/// carries preprocessed SOURCE, and a rule that admitted anything in front of the
+/// marker deletes an ordinary source line from the bytes the cache key is computed
+/// over — so two revisions differing only in such a line key identically and the
+/// second is served the first's object. That is a silent wrong build, and it is not
+/// a hypothetical in either direction: a mid-line rule is tripped by
+/// `char const* s = "Note: including file: x";`, and the leading-blank rule this
+/// carried until
+/// [#1270](https://github.com/LASTRADA-Software/fastcached/issues/1270) is tripped
+/// by any indented raw string literal whose continuation line begins with the
+/// marker — which is what a C++ source line inside a function looks like.
+///
+/// What is NOT a reason to loosen it is inclusion depth. `cl` indents a note after
+/// the marker rather than before it; see `PathCanon::IncludeNoteMarkerEnd` for the
+/// measurement.
 ///
 /// A trailing `\r` is stripped, so a note is recognised on either line ending.
 ///

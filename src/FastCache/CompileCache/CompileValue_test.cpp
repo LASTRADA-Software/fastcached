@@ -190,10 +190,10 @@ TEST_CASE("The generation byte is pinned by value, not only by name")
     // like, and it is expected to be edited by a deliberate generation bump -- which
     // is exactly the moment somebody should have to think about it.
     //
-    // Generation 3 since #879 / #891.
+    // Generation 5 since #1270.
     auto const encoded = EncodeCompileValue(CompileValue {});
     REQUIRE_FALSE(encoded.empty());
-    CHECK(encoded.front() == std::byte { 4 });
+    CHECK(encoded.front() == std::byte { 5 });
 }
 
 TEST_CASE("DecodeCompileValue refuses a region count the frame cannot supply")
@@ -848,19 +848,25 @@ constexpr std::array ConformanceCorpus {
                       .producerEffect = RegionEffect::Rewrites,
                       .consumerEffect = RegionEffect::Rewrites,
                       .replayMarkerEffect = RegionEffect::Rewrites },
-    ConformanceCase { .name = "an indented note canonicalizes, and its depth survives",
-                      // #891, and it needs no language pack: `cl` indents a note by
-                      // inclusion depth, so this is what a note for anything a header
-                      // pulls in transitively looks like. The grammar demanded the
-                      // marker at column zero while `IncludeNotePath` already skipped
-                      // blanks, so the launcher's reader found these paths and the
-                      // canonicalizer did not.
+    ConformanceCase { .name = "a depth-indented note canonicalizes, and its depth survives",
+                      // What `cl` actually emits, measured rather than assumed
+                      // (#1270): the marker sits at COLUMN ZERO on every note and the
+                      // inclusion depth is a run of blanks BETWEEN the marker and the
+                      // path, one per level. So depth lands inside the blank run the
+                      // path grammar already skips, and it survives a round trip
+                      // without the recognition rule knowing it exists.
+                      //
+                      // #891 read the shape the other way round and widened the rule
+                      // to skip blanks BEFORE the marker, which no driver emits; the
+                      // row that pinned that is the one this replaces. The line below
+                      // it -- blanks in FRONT of the marker -- is the refusal that
+                      // replaced it, and the two are deliberately adjacent.
                       //
                       // The first line is at depth zero deliberately -- the control,
-                      // in the same region as the thing it controls, so "recognise an
-                      // indented note" and "recognise a note at all" cannot be one
-                      // passing assertion. Both must rewrite, and the tabs and spaces
-                      // between them must come through untouched.
+                      // in the same region as the thing it controls, so "recognise a
+                      // depth-indented note" and "recognise a note at all" cannot be
+                      // one passing assertion. All three must rewrite, and the blanks
+                      // between marker and path must come through untouched.
                       .producerSourceRoot = R"(C:\ci\deep\src)",
                       .producerBuildTree = R"(C:\ci\deep\build)",
                       .consumerSourceRoot = R"(D:\project)",
@@ -868,16 +874,47 @@ constexpr std::array ConformanceCorpus {
                       .text = "Note: including file: "
                               R"(C:\ci\deep\src\a.h)"
                               "\r\n"
-                              " Note: including file: "
+                              "Note: including file:  "
                               R"(C:\ci\deep\src\b.h)"
                               "\r\n"
-                              "\t  Note: including file: "
+                              "Note: including file:      "
                               R"(C:\ci\deep\build\gen\cfg.h)"
                               "\r\n",
                       .grammar = Grammar::ShowIncludes,
                       .storeMarkerEffect = RegionEffect::Preserves,
                       .producerEffect = RegionEffect::Rewrites,
                       .consumerEffect = RegionEffect::Rewrites,
+                      .replayMarkerEffect = RegionEffect::Preserves },
+    ConformanceCase { .name = "a line with blanks in front of the marker is not a note",
+                      // The other half of the anchor, and the one #891 gave away
+                      // (#1270). Nothing may precede the marker, blanks included --
+                      // measured, no MSVC-family driver puts a note anywhere but
+                      // column zero, so this admits no real note and costs nothing.
+                      //
+                      // What it buys is the launcher's side of the same rule, where
+                      // `SplitIncludeNotes` runs over preprocessed SOURCE: an
+                      // indented raw string literal whose continuation line begins
+                      // with the marker is the ordinary shape of a C++ line inside a
+                      // function, and under the widened rule it was DELETED from the
+                      // bytes the cache key is hashed over. Two revisions differing
+                      // only there keyed identically and the second was served the
+                      // first's object.
+                      //
+                      // Preserves on every side, and that is the assertion rather
+                      // than the absence of one: the path lies under the producer's
+                      // source root, so a grammar that matched would canonicalize it
+                      // and this row would fail on `producerEffect` rather than
+                      // quietly not firing.
+                      .producerSourceRoot = "/home/dev/proj",
+                      .producerBuildTree = "/home/dev/proj/build",
+                      .consumerSourceRoot = "/srv/ci/checkout",
+                      .consumerBuildTree = "/srv/ci/checkout/out",
+                      .text = "  Note: including file: /home/dev/proj/inc/a.hpp\n"
+                              "\tNote: including file: /home/dev/proj/inc/b.hpp\n",
+                      .grammar = Grammar::ShowIncludes,
+                      .storeMarkerEffect = RegionEffect::Preserves,
+                      .producerEffect = RegionEffect::Preserves,
+                      .consumerEffect = RegionEffect::Preserves,
                       .replayMarkerEffect = RegionEffect::Preserves },
     ConformanceCase { .name = "a diagnostic quoting the marker mid-line is not a note",
                       // The anchor, on the side that matters. Both regions a launcher
@@ -984,9 +1021,9 @@ constexpr std::array StoredValueGenerations {
     // producer side and doubled its separator on the consumer side.
     StoredValueGeneration { .key = 1, .digest = "be1728170060f3f786faa7084585a7035385b9a6ab888cb386bbb63c89c72f5c" },
     // Generation 2 is RETIRED (#879, #891): `Grammar::ShowIncludes` matched only the
-    // literal English marker, at column zero, so a localized `cl` and an indented
-    // note both canonicalized to nothing and their regions kept the producing
-    // checkout's absolute paths.
+    // literal English marker, so a localized `cl` canonicalized to nothing and its
+    // regions kept the producing checkout's absolute paths. #891 rode along on a
+    // reading of `cl`'s indentation that generation 5 reverses.
     StoredValueGeneration { .key = 2, .digest = "04e18f13a5e1004d23f5f6b738609ff17d3d23a44b0bd39437084df531727af4" },
     // Generation 3 is RETIRED (#202): stderr was tagged `Grammar::ShowIncludes`, a
     // grammar that cannot see a diagnostic's path, so a replayed warning named the
@@ -994,7 +1031,14 @@ constexpr std::array StoredValueGenerations {
     // resolves to a different tree at a different revision, so the line number
     // lands on unrelated code.
     StoredValueGeneration { .key = 3, .digest = "01678295e5663e51cda388e8334ed57e01ab9326b8b2754811b53afd8ed9a90e" },
+    // Generation 4 is RETIRED (#1270): `Grammar::ShowIncludes` skipped blanks in front
+    // of the marker, which is a shape no MSVC-family driver emits -- measured on both
+    // installed toolsets and on clang-cl, the marker is at column zero and the
+    // inclusion depth is blanks BETWEEN marker and path. What the widening admitted
+    // instead was an indented line that merely begins with the marker, which a
+    // diagnostic region can carry and preprocessed source routinely does.
     StoredValueGeneration { .key = 4, .digest = "53089e7f32b6881cb354df3af4850c75f7fee50fed240c7ca5eaf3b448597edf" },
+    StoredValueGeneration { .key = 5, .digest = "97d625c0408e91238872947738821f167c69baf82a22b348ff09b8ddc225461f" },
 };
 
 /// One corpus row's own contribution to a generation's conformance digest.
@@ -1078,9 +1122,76 @@ struct FrozenGeneration
     std::uint8_t generation;         ///< The `CompileValueVersion` they were taken under.
 };
 
+/// Generation 5's rows, frozen as this build produces them.
+///
+/// Every row moved between 4 and 5, and that is the mechanism working rather than a
+/// pasted list: `AppendCoveredStages` digests `trace.storedBytes`, whose LEADING BYTE
+/// is `CompileValueVersion`, so a bump moves every row's digest by construction. The
+/// per-row table is still worth what #583 says it is -- it answers WHICH rows moved
+/// *within* a generation, which is the check that fires when somebody changes
+/// behaviour without bumping. What it cannot do is name the behavioural subset of a
+/// bump, and pretending otherwise by hand-pruning the claim would make the bump row a
+/// second source of truth that nothing checks.
+///
+/// That is [#1568](https://github.com/LASTRADA-Software/fastcached/issues/1568), and it
+/// has a DEADLINE rather than a backlog slot: repairing it means re-deriving
+/// `Generation4Rows` under a material layout that excludes the version byte, which can
+/// only be done while generation 4 is still the generation this build implements. After
+/// generation 5 ships, gen 4's rows are a dated record no tree can reproduce.
+constexpr std::array Generation5Rows {
+    RowDigest { .row = "posix showIncludes under both roots",
+                .digest = "81bf9b03d8bd0d796c1901fa8af5bd6f1276d05fd560b314755d0fc3b97a0b20" },
+    RowDigest { .row = "windows showIncludes, mixed case, CRLF",
+                .digest = "0420c827575855d2fe1f4a31fb50eaaf0ef7da1799cada1e2409b0c404cf56e3" },
+    RowDigest { .row = "showIncludes final line with no newline",
+                .digest = "43cfec256b8dfec8930a2ef5762e8049b8ed5bc0db383ea04b3712d48bddce33" },
+    RowDigest { .row = "showIncludes already carrying tokens is left alone",
+                .digest = "fd84adab3c8c18c6f723a0df106df3e3a6b218357cc8d935d33771d2e8a7d170" },
+    RowDigest { .row = "msvc diagnostics, line and column",
+                .digest = "b474fc42ab723dce1b6b77c49ed1d76f2d43d9c9a575abcb108041ad89127ab5" },
+    RowDigest { .row = "gcc depfile, target, continuations and escaped space",
+                .digest = "16eef7eb739934c69725706f7024157d746c140cfd255c3016a8a2315f36d363" },
+    RowDigest { .row = "depfile under a drive-relative root",
+                .digest = "262878f8a1ba0309a12cb684451a4f0d1dc1267c4904b8f53073b722abe41426" },
+    RowDigest { .row = "showIncludes under a UNC root",
+                .digest = "080dacf5ae25e18d006a4edc5333f68166d787ae1777e581ce103b18e8868722" },
+    RowDigest { .row = "a bare root produces, and a bare root consumes",
+                .digest = "49e09e9594dc4a9f21c411b2cbb2784e21f51f71b4c5e7ebb70ca32db86cf02d" },
+    // Equal to "a bare drive root consumes" below, exactly as generation 4's pair was:
+    // the two differ only on the PRODUCER side and erasing that difference is what the
+    // stored form is for. Equal is the property, not a redundancy.
+    RowDigest { .row = "a bare drive root produces, and a bare drive root consumes",
+                .digest = "aa7ccd3574424a67ca573df097783af517f521393c5f6b7a86023fbb3e9c6712" },
+    RowDigest { .row = "an untrimmed root produces, and an untrimmed root consumes",
+                .digest = "697959941d1277a48d2bcb7f72e04fd1c9d409f1fb6f6c0828640c68d4ae2b11" },
+    RowDigest { .row = "a drive-relative root consumes",
+                .digest = "d890f929423c68407ae020beb7395c0cae90a5e20e2c7be64adb31a43a94a92a" },
+    RowDigest { .row = "a UNC root consumes", .digest = "3a9aca2833342d0bf4c13e372ceb6c457acd68037806d229c6dfea12c1c7da76" },
+    RowDigest { .row = "a bare drive root consumes",
+                .digest = "aa7ccd3574424a67ca573df097783af517f521393c5f6b7a86023fbb3e9c6712" },
+    RowDigest { .row = "a localized producer normalizes its marker, and an English consumer matches it",
+                .digest = "587ba1be3ded23bf6a4438b7ec2df139ee10715327da4575904c3ef3aeee8dcc" },
+    RowDigest { .row = "an English producer's value replays under a localized consumer's marker",
+                .digest = "1393bb0a0b84eb43895efe5c17ff66b6b5f8f38dbf03e17885dd638f5479333b" },
+    RowDigest { .row = "a depth-indented note canonicalizes, and its depth survives",
+                .digest = "4db0c0f1644ea4af201799cc9344970efc9c56901564291ea0ea90d13cf53178" },
+    RowDigest { .row = "a line with blanks in front of the marker is not a note",
+                .digest = "5acdf856344c9f87cc1132bfed7d989a36f5c2782b0952afa234b2ebced09876" },
+    RowDigest { .row = "a diagnostic quoting the marker mid-line is not a note",
+                .digest = "093ea6bd10185861be037a4a70d31fdd414a07b1baa6b170bc146b58e8aaa997" },
+    RowDigest { .row = "empty region", .digest = "707d8dfda2e82419a5065aa39a5032ca63e3578adae7b206016c6ec84bb31dee" },
+    RowDigest { .row = "gcc diagnostic under the source root",
+                .digest = "841a6b57b3708e2b528eadf914e438621239c7267cd957275305dbdf1ec3df45" },
+    RowDigest { .row = "gcc include chain, header and continuation",
+                .digest = "b2e937e4fbb30a9fb5ee0ac18f8ba023007f1b752de0358cbc4408af50fe79a5" },
+    RowDigest { .row = "gcc diagnostic in a toolchain header is untouched",
+                .digest = "16fe82ed9c6251e1bcbd244378e69d4fb03670b65d489e180bb4415f24517fcc" },
+};
+
 /// Every generation frozen per row, oldest first.
 constexpr std::array FrozenGenerations {
     FrozenGeneration { .rows = Generation4Rows, .generation = 4 },
+    FrozenGeneration { .rows = Generation5Rows, .generation = 5 },
 };
 
 /// What a bump CLAIMS it changed.
@@ -1099,12 +1210,45 @@ struct GenerationBump
 
 /// Every bump between adjacent frozen generations.
 ///
-/// Empty while only one generation is frozen, which is not a licence to forget: the
-/// `static_assert` below fails the BUILD the moment a second generation is frozen
-/// without the row saying what it moved. A runtime check would let that ship and
-/// report it afterwards, and this is a *do something* obligation rather than a *say
-/// why* one, so it belongs to the type system.
-constexpr std::array<GenerationBump, 0> GenerationBumps {};
+/// Never empty once a second generation is frozen: the `static_assert` below fails
+/// the BUILD the moment one is added without the row saying what it moved. A runtime
+/// check would let that ship and report it afterwards, and this is a *do something*
+/// obligation rather than a *say why* one, so it belongs to the type system.
+///
+/// The 4-to-5 row lists every row the two generations share, and that is not a padded
+/// claim: the digested material opens with `trace.storedBytes`, whose leading byte is
+/// `CompileValueVersion`, so a bump moves every surviving row by construction. The
+/// three rows absent from it are the corpus edit rather than the behaviour change --
+/// one renamed (so it reads as one that left and one that arrived) and one added for
+/// the refusal #1270 introduces.
+constexpr std::array ChangedBy4To5 = std::to_array<std::string_view>({
+    "posix showIncludes under both roots",
+    "windows showIncludes, mixed case, CRLF",
+    "showIncludes final line with no newline",
+    "showIncludes already carrying tokens is left alone",
+    "msvc diagnostics, line and column",
+    "gcc depfile, target, continuations and escaped space",
+    "depfile under a drive-relative root",
+    "showIncludes under a UNC root",
+    "a bare root produces, and a bare root consumes",
+    "a bare drive root produces, and a bare drive root consumes",
+    "an untrimmed root produces, and an untrimmed root consumes",
+    "a drive-relative root consumes",
+    "a UNC root consumes",
+    "a bare drive root consumes",
+    "a localized producer normalizes its marker, and an English consumer matches it",
+    "an English producer's value replays under a localized consumer's marker",
+    "a diagnostic quoting the marker mid-line is not a note",
+    "empty region",
+    "gcc diagnostic under the source root",
+    "gcc include chain, header and continuation",
+    "gcc diagnostic in a toolchain header is untouched",
+});
+
+/// Every bump between adjacent frozen generations.
+constexpr std::array GenerationBumps {
+    GenerationBump { .changedRows = ChangedBy4To5, .from = 4, .to = 5 },
+};
 
 static_assert(GenerationBumps.size() + 1 == FrozenGenerations.size(),
               "Every adjacent pair of frozen generations needs a bump row saying which corpus rows it "
