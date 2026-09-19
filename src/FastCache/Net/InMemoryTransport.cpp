@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string>
@@ -47,6 +48,21 @@ void InMemoryPipe::CloseWrite() noexcept
         _progressCallback(_progressCallbackState);
 }
 
+bool InMemoryPipe::CloseRead() noexcept
+{
+    _readClosed = true;
+    return !_buffer.empty();
+}
+
+void InMemoryPipe::Reset(NetErrorCode code) noexcept
+{
+    _reset = true;
+    _resetCode = code;
+    _buffer.clear();
+    if (_progressCallback)
+        _progressCallback(_progressCallbackState);
+}
+
 std::size_t InMemoryPipe::TryPull(std::span<std::byte> into) noexcept
 {
     auto const take = std::min(into.size(), _buffer.size());
@@ -59,6 +75,25 @@ std::size_t InMemoryPipe::TryPull(std::span<std::byte> into) noexcept
 }
 
 // -- InMemorySocket --------------------------------------------------------
+
+namespace
+{
+    /// The peer closed over bytes it had not read, so its stack sent the reset at once:
+    /// `ECONNRESET` and `WSAECONNRESET`, which `ISocket` calls `ConnReset`.
+    constexpr auto ResetByPeersClose = NetErrorCode::ConnReset;
+
+    /// This end wrote after the peer's FIN, and that write drew the reset: `EPIPE` and
+    /// `WSAECONNABORTED`, which `ISocket` calls `SystemError`. Measured on loopback (#1553).
+    constexpr auto AbortedByOwnWrite = NetErrorCode::SystemError;
+
+    /// The error a reset connection answers with, on both of its operations.
+    /// @param code How the reset arrived, as the pipe recorded it.
+    /// @return The error.
+    [[nodiscard]] NetError ResetError(NetErrorCode code) noexcept
+    {
+        return NetError { .code = code, .systemCode = 0, .context = "InMemorySocket: the connection was reset" };
+    }
+} // namespace
 
 InMemorySocket::InMemorySocket(std::shared_ptr<InMemoryPipe> inbound,
                                std::shared_ptr<InMemoryPipe> outbound,
@@ -80,10 +115,23 @@ void InMemorySocket::Close() noexcept
     if (_closed)
         return;
     _closed = true;
-    if (_outbound)
-        _outbound->CloseWrite();
+
+    // Detached before anything below can fire it, so this socket's own parked read is
+    // answered by the `Cancelled` at the end and never by the reset it sends the peer.
     if (_inbound)
         _inbound->SetProgressCallback(nullptr, nullptr);
+
+    // A close with the peer's bytes still unread is answered with an RST rather than a
+    // FIN, by every stack measured (#1553): the peer's writes fail from the next one on,
+    // and its reads report the reset. Delivered before the FIN, so a peer parked on a
+    // read wakes to the reset and not to an EOF that a real socket would never report.
+    if (_inbound && _inbound->CloseRead() && _outbound)
+    {
+        _inbound->Reset(ResetByPeersClose);
+        _outbound->Reset(ResetByPeersClose);
+    }
+    if (_outbound)
+        _outbound->CloseWrite();
 
     // **A parked Read is retrieved here or it is never retrieved at all.** Clearing
     // the progress callback above is what makes that final: nothing else can complete
@@ -118,6 +166,10 @@ void InMemorySocket::CancelRead() noexcept
 
 void InMemorySocket::ShutdownWrite() noexcept
 {
+    // After `Close()` there is no write side left to shut, and each platform socket
+    // checks `_closed` and returns; this one did the half-close a second time.
+    if (_closed)
+        return;
     if (_outbound)
         _outbound->CloseWrite();
 }
@@ -127,6 +179,10 @@ IoAwaitable InMemorySocket::WaitReadable()
     if (_closed)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    // A reset is an error on every real reactor (#899), and not a readable byte.
+    if (_inbound && _inbound->IsReset())
+        return IoAwaitable { std::unexpected(ResetError(_inbound->ResetCode())) };
 
     // EOF is drained AND write-closed, which is the same pair `Read` uses to decide it
     // has reached the end -- taken from the inbound pipe, since that is the direction
@@ -146,6 +202,9 @@ IoAwaitable InMemorySocket::Read(std::span<std::byte> buffer)
     if (_closed)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    if (_inbound->IsReset())
+        return IoAwaitable { std::unexpected(ResetError(_inbound->ResetCode())) };
 
     // Synchronous fast path: bytes already buffered.
     if (_inbound->Buffered() > 0)
@@ -169,11 +228,36 @@ IoAwaitable InMemorySocket::Read(std::span<std::byte> buffer)
     return awaitable;
 }
 
+std::optional<IoResult> InMemorySocket::AnswerIfCannotWrite(std::size_t length) noexcept
+{
+    // This end's own half-close is `EPIPE` on POSIX and `WSAESHUTDOWN` on Windows, both
+    // `SystemError`. The pipe used to answer it as backpressure -- `WouldBlock`, the one
+    // failure a caller is entitled to retry.
+    if (_outbound->IsWriteClosed())
+        return std::unexpected(NetError { .code = NetErrorCode::SystemError,
+                                          .systemCode = 0,
+                                          .context = "InMemorySocket: a write after this end's ShutdownWrite" });
+    if (_outbound->IsReset())
+        return std::unexpected(ResetError(_outbound->ResetCode()));
+    if (!_outbound->IsReadClosed() || length == 0)
+        return std::nullopt;
+
+    // The first write after a graceful close: the bytes reach a peer that has gone, and
+    // are lost, and its stack answers with the RST that fails everything after. On a
+    // real socket that answer arrives a round trip later -- on loopback, before the next
+    // call, measured on Linux, macOS and Windows even with the writes back to back (#1553).
+    _outbound->Reset(AbortedByOwnWrite);
+    _inbound->Reset(AbortedByOwnWrite);
+    return IoResult { length };
+}
+
 IoAwaitable InMemorySocket::Write(std::span<std::byte const> buffer)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+    if (auto answer = AnswerIfCannotWrite(buffer.size()))
+        return IoAwaitable { std::move(*answer) };
 
     auto const accepted = _outbound->Push(buffer);
     if (accepted < buffer.size())
@@ -188,6 +272,14 @@ IoAwaitable InMemorySocket::WriteVectored(std::span<std::span<std::byte const> c
     if (_closed)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
+
+    // One write on the wire, so one answer when the peer has gone: the vectored write is
+    // the first after a close, or a later one, exactly as a contiguous one would be.
+    std::size_t length = 0;
+    for (auto const seg: segments)
+        length += seg.size();
+    if (auto answer = AnswerIfCannotWrite(length))
+        return IoAwaitable { std::move(*answer) };
 
     // Push each segment in order so the peer observes the exact same byte
     // stream a single contiguous Write would have produced. The keep-alive is
@@ -221,6 +313,12 @@ void InMemorySocket::OnInboundProgress(void* state) noexcept
     auto const buffer = self->_pendingReadBuffer;
     self->_pendingRead = nullptr;
     self->_pendingReadBuffer = {};
+
+    if (self->_inbound->IsReset())
+    {
+        awaitable->Complete(std::unexpected(ResetError(self->_inbound->ResetCode())));
+        return;
+    }
 
     if (self->_inbound->Buffered() > 0)
     {

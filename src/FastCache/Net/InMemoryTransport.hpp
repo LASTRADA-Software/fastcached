@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -36,6 +37,44 @@ class InMemoryPipe
 
     /// Mark the writing end as closed. Any blocked Read resumes with EOF.
     void CloseWrite() noexcept;
+
+    /// Mark the READING end as closed: the socket that reads this pipe has gone.
+    ///
+    /// What a later write meets is decided from this, the way a TCP stack decides it:
+    /// a peer that closed with nothing unread sent FIN, and the first write after it is
+    /// accepted and answered by an RST; a peer that closed with bytes still unread sent
+    /// the RST at once. `InMemorySocket` reads the answer and does the rest.
+    /// @return true when bytes were still unread, i.e. when the close was a RESET.
+    bool CloseRead() noexcept;
+
+    /// @return true once the reading end has closed.
+    [[nodiscard]] bool IsReadClosed() const noexcept
+    {
+        return _readClosed;
+    }
+
+    /// Deliver a reset in this direction: what is buffered is discarded, and the reader
+    /// is told the connection was reset rather than that the peer finished sending. A
+    /// blocked Read resumes with that error.
+    ///
+    /// **Buffered bytes are dropped because Winsock drops them.** Measured on loopback
+    /// (#1553): Linux and macOS hand a reset connection's buffered bytes over before the
+    /// error, Windows answers the error at once. The fake takes the stricter answer, so a
+    /// case that passes here does not depend on which platform it runs on.
+    /// @param code What the reader and the writer of this direction are told from now on.
+    void Reset(NetErrorCode code) noexcept;
+
+    /// @return true once a reset has been delivered in this direction.
+    [[nodiscard]] bool IsReset() const noexcept
+    {
+        return _reset;
+    }
+
+    /// @return What a reset in this direction reports; meaningful once `IsReset()`.
+    [[nodiscard]] NetErrorCode ResetCode() const noexcept
+    {
+        return _resetCode;
+    }
 
     /// Try to pull bytes synchronously. Returns the number copied; 0 with
     /// IsWriteClosed() means EOF.
@@ -69,12 +108,44 @@ class InMemoryPipe
     std::size_t _maxInFlight;
     std::deque<std::byte> _buffer;
     bool _writeClosed { false };
+    bool _readClosed { false };
+    bool _reset { false };
+    NetErrorCode _resetCode { NetErrorCode::ConnReset };
     ProgressCallback _progressCallback { nullptr };
     void* _progressCallbackState { nullptr };
 };
 
 /// In-process ISocket: one end of a paired InMemoryPipe pair. Reads pull
 /// from the inbound pipe; writes push into the outbound pipe.
+///
+/// **In every closed state it answers the way a loopback TCP socket does**, which
+/// `Net/SocketClosedStates_test.cpp` pins against a real socket pair on every platform CI
+/// runs (#1553). Until then a write to a peer that had closed simply succeeded, so no
+/// in-memory case could see a session the other end had ended:
+///   - the peer CLOSED with nothing of ours unread (FIN): reads drain, then EOF; the FIRST
+///     write after the close is accepted and lost, and the reset it draws fails every
+///     later write and every later read;
+///   - the peer CLOSED with bytes of ours unread (an RST at once): every write fails, and
+///     reads report the reset, with whatever was buffered for us discarded;
+///   - the peer HALF-closed (`ShutdownWrite`): reads drain, then EOF, and writes still
+///     succeed -- a half-closed peer still reads;
+///   - THIS end closed: `Read`, `Write`, `WriteVectored` and `WaitReadable` fail with
+///     `BadFileHandle`, and `ShutdownWrite` does nothing, exactly as the four platform
+///     sockets answer; a parked read is completed with `Cancelled`;
+///   - THIS end half-closed: writes fail with `SystemError` (`EPIPE`, `WSAESHUTDOWN`),
+///     never with the `WouldBlock` a caller would retry, and reads still work.
+///
+/// Its errors are the codes `ISocket` maps the platforms' errors to, and where the
+/// platforms differ they are Windows's, as the rest of the model is:
+///   - this end closed: `BadFileHandle`, from each platform socket's own check;
+///   - this end half-closed, then wrote: `SystemError` -- `EPIPE`, `WSAESHUTDOWN`;
+///   - the peer closed over bytes of ours it had not read, so the reset came at once:
+///     `ConnReset` -- `ECONNRESET`, `WSAECONNRESET` -- to reads and writes alike;
+///   - this end wrote after the peer's FIN, and that write drew the reset: `SystemError`
+///     -- `EPIPE` on Linux and macOS, `WSAECONNABORTED` on Windows -- to reads and writes.
+/// Where the platforms disagree beyond the spelling -- Linux and macOS read EOF after a
+/// reset where Windows repeats the error, and hand over bytes buffered before a reset
+/// where Windows drops them -- the fake takes the stricter answer.
 class InMemorySocket: public ISocket
 {
   public:
@@ -142,6 +213,13 @@ class InMemorySocket: public ISocket
 
   private:
     static void OnInboundProgress(void* state) noexcept;
+
+    /// What a write of `length` bytes meets when this end has half-closed or the peer has
+    /// closed, or nothing when neither has happened. The first write after a graceful
+    /// close draws the reset, both ways.
+    /// @param length The bytes the write carries.
+    /// @return The write's answer, or `std::nullopt` to write normally.
+    [[nodiscard]] std::optional<IoResult> AnswerIfCannotWrite(std::size_t length) noexcept;
 
     /// await_suspend hook for a parked Read. Records `awaitable` (which lives
     /// in the awaiting coroutine's frame, so its address is stable) as the
