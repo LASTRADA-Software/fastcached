@@ -1170,6 +1170,53 @@ Every rule below has already been a bug.
   something, so an inherited default on one is a forwarding nobody wrote. The case over a
   real pair gives the raw socket a LONG deadline of its own, so the defect is measured by
   it rather than hanging the case.
+- **A close over unread input is a RESET, and a reset destroys the answer the peer had
+  not read yet -- so a server that answers a request it did not finish reading, and
+  then closes, closes through `CloseLingering`**
+  ([#1554](https://github.com/LASTRADA-Software/fastcached/issues/1554)). Measured on
+  loopback (#1553): Windows drops every byte already buffered for the reader and fails
+  the read at once; Linux and macOS hand those bytes over first. So every refusal written
+  over a request the server stopped reading -- `-ERR Protocol error` past
+  `maxPayloadBytes`, the admin surface's `431`, `408` and `503` -- reached a Linux client
+  and a reset reached a Windows one, which is the client the refusal was for. The admin
+  case *a request split across reads is consumed to the end* pins the same mechanism with
+  a different remedy: a head can be read to its end before answering, and a refusal's
+  whole point is not reading on. `CloseLingering` half-closes, so the answer is followed
+  by a FIN a well-behaved peer closes on; discards what the peer still sends until it
+  closes or `LingerBounds` stop it; then closes; and says which of those ended it. Five
+  things travel with it:
+  - **It is ONE helper, and the node already had a second.** `FrameEndpoint` drained
+    before closing on its at-capacity refusal and its oversize step-over through a
+    private `DrainUntilPeerCloses`, correct and without the half-close. Both call
+    `CloseLingering` now and the copy is gone, because a surface that answers and hangs
+    up is the helper's whole population and the next one should find one door.
+  - **The bounds are rows, one per surface, and they bound three things**:
+    `Connection::Linger`, `AdminHttpServer::Linger` and the node's `RefusalLinger`. A
+    byte cap, which is what a fast peer meets -- never more than serving would have read.
+    A deadline, which is one reactor deadline over the whole drain, or `total / reads`
+    per read on a blocking socket, where a read that meets its share in silence ends the
+    linger; the admin's sockets block its one thread, which is why its row is short. The
+    node's row arms NO deadline of its own: its connections are tracked, and the sweep
+    that closes a silent one is counted by phase, so a second deadline would end the wait
+    first and hide the sweep that exists to count it. Under TLS the per-read share reaches
+    the raw socket only because `TlsSocket` forwards `SetReceiveDeadline` (#1557).
+  - **A lingering connection is still a connection.** It holds its admission slot until
+    it closes -- `OnConnectionEnded` runs after `Connection::Run`, which includes the
+    linger -- or lingering would be a way to hold sockets past the cap. Asserted on both
+    sides of the deadline, not only after it.
+  - **A peer that finished costs ONE read**, which answers EOF or the reset at once, so
+    an ordinary goodbye is never turned into a wait -- the outcome says `PeerFinished`
+    after one read, and a case asserts exactly that. Past the bounds the close is a reset
+    anyway; a refusal is never bought by reading an unbounded upload.
+  - **What it does NOT cover: a close that follows a request READ TO THE END, or no
+    answer at all.** `QUIT` on memcached text, memcached binary and RESP replies and
+    closes inside the handler, and RESP's has to -- that close is what cancels its
+    subscribe watcher -- so the only reply a reset can cost there is one to a client that
+    pipelined bytes past its own `QUIT`. The Raft acceptor's signed refusals follow a
+    proof the dialler sends and then waits on, so nothing is unread when it closes. And a
+    connection refused at ACCEPT, a sweep, or a failed handshake writes nothing a reset
+    could take back. The rule is about a refusal written over a request the server
+    STOPPED reading, not about every close.
 - **An AcceptEx socket is not a whole socket until `SO_UPDATE_ACCEPT_CONTEXT`**, the
   mirror of the `SO_UPDATE_CONNECT_CONTEXT` `IocpConnector` already sets. Without it
   `shutdown` fails `WSAENOTCONN`, and `ShutdownWrite` ignores its result, so until

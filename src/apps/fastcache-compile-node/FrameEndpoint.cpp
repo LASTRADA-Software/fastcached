@@ -9,6 +9,7 @@
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Ranges.hpp>
+#include <FastCache/Net/LingeringClose.hpp>
 #include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
@@ -16,10 +17,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -63,35 +66,27 @@ namespace
         co_return written.has_value() && *written == bytes.size();
     }
 
-    /// Read and discard until the peer closes, so OUR close can be graceful.
+    /// How this endpoint closes a connection it has refused: through `CloseLingering`, the
+    /// one helper every surface that answers and then hangs up goes through (#1554).
     ///
-    /// The counterpart of `WriteAll` on a path that answers and then hangs up: a close
-    /// with unread bytes still queued is a reset, and a reset takes the answer back
-    /// out of the peer's receive buffer. Returning as soon as the peer closes is what
-    /// makes this cheap -- a client that has read its refusal closes at once, so the
-    /// common case is one read and an EOF.
+    /// A close with unread bytes still queued is a reset, and a reset takes the answer back
+    /// out of the peer's receive buffer -- which is why this endpoint drained before it
+    /// closed long before the helper existed. The helper adds the half-close, so the
+    /// refusal is followed by a FIN and a client that has read it closes at once.
     ///
     /// Bounded by what the surface would have read had it accepted the request, so a
     /// refusal never costs more than serving would have; a peer past that has stopped
-    /// being one worth being polite to and gets the reset. The socket is tracked
-    /// besides, so a peer that goes silent without closing is swept rather than
-    /// waited on.
-    /// @param socket The socket about to be closed.
-    /// @param limit How many bytes may be discarded before giving up on politeness.
-    Task<void> DrainUntilPeerCloses(ISocket* socket, std::size_t limit)
+    /// being one worth being polite to and gets the reset. **No deadline and no read count
+    /// of its own**: the socket is tracked, and the sweep that closes a peer gone silent is
+    /// this surface's one time bound, counted by phase -- a second deadline here would end
+    /// the wait first and hide the sweep that exists to count it.
+    /// @param maxBytes What serving the request would have read.
+    /// @return The bounds.
+    [[nodiscard]] constexpr LingerBounds RefusalLinger(std::size_t maxBytes) noexcept
     {
-        // A `while`: each read advances the tally by however much arrived, which no `for`
-        // head can state, and that addition at the foot is the loop's only advance.
-        std::array<std::byte, 4096> scratch {};
-        auto discarded = std::size_t { 0 };
-        while (discarded < limit)
-        {
-            auto const read = co_await socket->Read(std::span<std::byte> { scratch });
-            if (!read.has_value() || *read == 0)
-                break;
-            discarded += *read;
-        }
-        co_return;
+        return LingerBounds { .total = std::chrono::milliseconds::zero(),
+                              .maxBytes = maxBytes,
+                              .reads = std::numeric_limits<std::size_t>::max() };
     }
 
     /// What this endpoint answers a connection it has no room for.
@@ -1832,7 +1827,7 @@ namespace
             auto const drainable = static_cast<std::uint64_t>(cap) * Wire::OversizeDrainFactor;
             if (declaredLength > drainable || !(co_await reader->Skip(declaredLength)).has_value())
             {
-                co_await DrainUntilPeerCloses(socket, cap);
+                (void) co_await CloseLingering(socket, nullptr, RefusalLinger(cap));
                 co_return false;
             }
             co_return true;
@@ -2453,7 +2448,7 @@ namespace
                                              std::format("{} is already holding {} connections",
                                                          state->what,
                                                          state->responder.MaxOpenConnections()))))
-                co_await DrainUntilPeerCloses(socket.get(), state->responder.MaxRequestBytes());
+                (void) co_await CloseLingering(socket.get(), nullptr, RefusalLinger(state->responder.MaxRequestBytes()));
         }
         catch (...)
         {

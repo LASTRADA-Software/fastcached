@@ -1,20 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Async/Task.hpp>
+#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/TracingStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Net/IAdmissionControl.hpp>
 #include <FastCache/Net/InMemoryTransport.hpp>
 #if defined(FC_TLS_ENABLED)
     #include <FastCache/Net/TlsContext.hpp>
 #endif
+#include <FastCache/Server/Connection.hpp>
 #include <FastCache/Server/Server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -23,6 +27,7 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -374,6 +379,74 @@ TEST_CASE("Server drops a connection whose handler throws instead of terminating
     // returns normally — the server survives a handler exception.
     FastCache::SyncRun(server.Run());
     REQUIRE(server.AcceptedCount() == 1);
+}
+
+TEST_CASE("Server: a refusal over a request the connection did not finish reading still reaches the client",
+          "[server][linger]")
+{
+    // #1554. The RESP handler refuses a value past `maxPayloadBytes` and returns with the
+    // rest of that value unread. A close then is a reset on the wire, and a reset destroys
+    // the refusal before a Windows client reads it. The connection lingers instead: it
+    // half-closes, listens until this client closes, then closes. Driven through
+    // `Server::Run`, so what is asserted is production's close rather than a fixture's copy
+    // of it.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::NullLogger logger;
+    FastCache::InMemoryListener listener;
+    FastCache::SessionContext session {};
+    session.maxPayloadBytes = 1024;
+    FastCache::Server server { listener, engine, logger, nullptr, nullptr, session };
+
+    auto client = listener.ConnectClient();
+    std::string const value(4096, 'x');
+    REQUIRE(FastCache::SyncRun(Send(client.get(), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4096\r\n" + value + "\r\n")));
+    client->ShutdownWrite();
+    listener.Close();
+    FastCache::SyncRun(server.Run());
+
+    auto const response = FastCache::SyncRun(ReadResponse(client.get()));
+    INFO("response was: " << response.substr(0, 64));
+    REQUIRE(response.starts_with("-ERR Protocol error:"));
+}
+
+TEST_CASE("Server: a lingering connection holds its admission slot until it closes", "[server][linger][admission]")
+{
+    // #1554. A connection that refused and is listening to its client before closing is
+    // still an open socket, so it counts against the admission cap -- or lingering would be a
+    // way to hold sockets past it. The client here stays connected and silent after the
+    // refusal, so only the linger's deadline ends the connection, and the slot is asserted
+    // held on both sides of it.
+    FastCache::ManualClock clock;
+    FastCache::InMemoryLruStorage storage;
+    FastCache::CacheEngine engine { storage, clock };
+    FastCache::NullLogger logger;
+    FastCache::TestReactor reactor { clock };
+    FastCache::InMemoryListener listener;
+    FastCache::CountingAdmissionControl admission { /*maxConcurrent*/ 4 };
+    FastCache::SessionContext session {};
+    session.maxPayloadBytes = 1024;
+    session.reactor = &reactor;
+    FastCache::Server server { listener, engine, logger, &admission, nullptr, session };
+
+    auto client = listener.ConnectClient();
+    std::string const value(4096, 'x');
+    REQUIRE(FastCache::SyncRun(Send(client.get(), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4096\r\n" + value + "\r\n")));
+    listener.Close();
+    FastCache::SyncRun(server.Run());
+
+    // Refused -- the refusal and the half-close have reached the client -- and still open.
+    CHECK(FastCache::SyncRun(ReadResponse(client.get())).starts_with("-ERR Protocol error:"));
+    CHECK(admission.InFlight() == 1);
+
+    clock.Advance(FastCache::Connection::Linger.total - std::chrono::milliseconds { 1 });
+    std::ignore = reactor.Drain();
+    CHECK(admission.InFlight() == 1);
+
+    clock.Advance(std::chrono::milliseconds { 1 });
+    std::ignore = reactor.Drain();
+    CHECK(admission.InFlight() == 0);
 }
 
 TEST_CASE("Server::Shutdown closes the listener", "[server]")
