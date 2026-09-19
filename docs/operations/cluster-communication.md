@@ -371,7 +371,7 @@ client's own cache connection.
 | `fastcache-cc` | the leader's scheduler | `FASTCACHE_SCHEDULER`, conventionally `:6675` | on a cache miss, when dispatch is configured | `LEASE` |
 | `fastcache-cc` | the worker named in the grant | whatever that worker advertises, which defaults to its `--listen-node` surface | once per dispatched compile, held for its duration | `COMPILE` |
 | `fastcache-cc` | the leader's scheduler | `:6675` | a **second** connection, on every path out of the compile | `RELEASE` |
-| a **node** | the leader's scheduler | `--scheduler`, `:6675` | `REGISTER` once per toolchain, then `HEARTBEAT` every **20 s** | capacity, load, and its closed history buckets |
+| a **node** | the leader's scheduler | `--scheduler`, `:6675` | `REGISTER` once per toolchain, then `HEARTBEAT` every **20 s** | capacity, load, and its closed history buckets — after a handshake proving the node's identity key, with every frame sealed |
 | a node | the shared cache | `--upstream`, `:6674` | once per operation, best-effort | `FETCH`, `STORE` — **the only leg that carries a credential** |
 | a node | another node | `--listen-raft` (no conventional number) | long-lived; the leader speaks every **50 ms** | consensus, after a handshake proving each end's identity key, with every frame tagged. Its own framing, not the cache protocol |
 | a node | the local segment | `--discovery`, UDP, plus a per-node reply port | a beacon every **15 s** | who is here, then a challenge and a proof |
@@ -518,9 +518,9 @@ cache's — pointing a cache client at it gets nothing useful.
 message is read**, each with its own identity key, so every member's `--raft-peer` list
 names every other member's key. That is the one leg of this page whose every byte is
 authenticated; what it checks and how a failure shows is under
-[Raft peer authentication](#raft-peer-authentication). Every member still needs
-`--cluster-key-file` too, for the leases and the node port, and a node given
-`--listen-raft` without one refuses to start, naming the flag.
+[Raft peer authentication](#raft-peer-authentication). The same key signs every lease a
+member issues and is what a member proves on the node port; there is no shared secret any
+member holds ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
 
 That cadence is the reason the consensus port wants a network that is not
 congested. Nothing breaks if it is — an election settles again — but leadership
@@ -642,11 +642,13 @@ fails closed and is visible from the refused end, while ignoring it serves a
 decommissioned host indefinitely with admission succeeding as the ordinary case and
 nothing reporting it.
 
-**One thing a reload will not do is widen a node that has no `--cluster-key-file`.**
-Such a worker chose at startup to verify no lease signatures, which is only safe while
-no machine but its own is admitted, so a reload that would newly admit a remote host is
-refused by name and nothing is applied. Give the node a key and restart it, or leave the
-policy alone. Narrowing is always allowed — that is the direction that closes it.
+**One thing a reload will not do is widen a worker that runs no consensus and names no
+`--voter-key`.** Such a worker may have chosen at startup to verify no lease signatures,
+which is only safe while no machine but its own is admitted, and a roster kept in its state
+directory is not something any configuration can see -- so a reload that would newly admit
+a remote host is refused by name and nothing is applied. Name the cluster's voters and
+restart it, or leave the policy alone. Narrowing is always allowed — that is the direction
+that closes it.
 
 This is [#265](https://github.com/LASTRADA-Software/fastcached/issues/265), and it was
 never a regression: before #251 a forget *appeared* to revoke, as a side effect of the
@@ -731,7 +733,7 @@ each, then exits without opening anything:
 $ fastcache-compile-node --print-surfaces --serve-scheduler --listen-node 6675 \
       --scheduler 127.0.0.1:6675 --advertise 10.0.0.7:6675 --fleet-open \
       --node-id n1 --listen-raft 6680 --raft-peer n1=10.0.0.7:6680 \
-      --discovery 255.255.255.255:6681 --cluster-key-file /etc/fastcached/cluster.key
+      --discovery 255.255.255.255:6681
 node              0.0.0.0:6675  TCP
 admin             -             not served; set --admin-listen
 raft              0.0.0.0:6680  TCP
@@ -750,11 +752,12 @@ notes:
     command has to be one the node would actually accept. The rules that apply to the
     flags above each refuse a configuration that would start and silently not
     work: `--serve-scheduler` needs `--listen-raft`, `--listen-raft` needs a `--raft-peer`
-    **and** a `--cluster-key-file`, membership needs an `--advertise` peers can dial,
-    and a worker needs a `--scheduler`. (`--discovery` had a key rule of its own until
-    [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) moved its proof
-    to each node's identity key.) An earlier version of this transcript omitted the five that applied
-    then, and the binary refused it with exit 2 — the printed table was right, the
+    naming this node, membership needs an `--advertise` peers can dial, and a worker needs
+    a `--scheduler`. (`--listen-raft` needed a `--cluster-key-file` as well, and
+    `--discovery` a key rule of its own, until
+    [#178](https://github.com/LASTRADA-Software/fastcached/issues/178) moved every proof to
+    each node's identity key.) An earlier version of this transcript omitted the five that
+    applied then, and the binary refused it with exit 2 — the printed table was right, the
     invocation was not
     ([#807](https://github.com/LASTRADA-Software/fastcached/issues/807)).
 
@@ -779,7 +782,6 @@ serves.
     ```sh
     fastcache-compile-node --serve-scheduler --listen-node 127.0.0.1:6675 \
         --listen-raft 127.0.0.1:6680 --raft-self 127.0.0.1 \
-        --cluster-key-file /etc/fastcached/cluster.key \
         --scheduler 127.0.0.1:6675 --fleet-open
     ```
 
@@ -889,7 +891,7 @@ What that refuses, and what it does not:
 
 - **A machine claiming a member's id it cannot prove** is refused before anything it sent
   is read, so it cannot vote. That includes a former member holding every byte it ever
-  held — its own key, the cluster key, the log — claiming another member's id: only that
+  held — its own key, the log — claiming another member's id: only that
   member's own key signs as it. It hears nothing either: a member dialling it is refused the
   same way from the other side, and sends it no message.
 - **A machine the cluster has removed** — its key revoked — is refused with a signed
@@ -931,9 +933,9 @@ raft-peer n1=10.0.0.1:6680@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
 leads there: a node that runs consensus always has a state directory, and mints its key into
 it on its first start. It is decided once, at startup, and never per connection: a node that
 quietly ran consensus unsigned would look healthy from both ends while trusting anybody.
-`--cluster-key-file` is still required on a consensus node, for the leases and the node
-port, which still use it — but it no longer proves anything on this port, on the LAN or at
-enrollment.
+The pre-shared `--cluster-key-file` a consensus node once also needed is gone: the leases
+and the node port prove identity keys too
+([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
 
 **Upgrading.** The consensus wire moved to version 4 with identity keys (it was 2 with the
 first handshake, which proved the cluster key, and 3 with learners). A version 4 node and an

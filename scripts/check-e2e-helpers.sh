@@ -2054,8 +2054,8 @@ run_case() {
 #
 # So the pair rides on the thing every stand-in must do anyway -- launching its
 # perl -- and there is no argument to pass an unbounded program to. This is the
-# same idiom as `Refuse` taking a row and `SigningDomain` being a required
-# parameter. `check-e2e-perl-bounds` (further down) is what stops a new stand-in
+# same idiom as `Refuse` taking a row. `check-e2e-perl-bounds` (further down) is
+# what stops a new stand-in
 # spelling `perl` for itself and bypassing the door.
 #
 # ## How the bound is injected without touching the program

@@ -40,6 +40,7 @@ namespace
                                         Wire::Op::ClusterForget,
                                         Wire::Op::ClusterAdmit,
                                         Wire::Op::ClusterAdmitLearner,
+                                        Wire::Op::ClusterAdmitWorker,
                                         Wire::Op::ClusterAdmitClient,
                                         Wire::Op::ClusterForgetClient };
 
@@ -80,19 +81,24 @@ namespace
                   "a refusal row for a verb this scheduler serves is dead: the lookup never reaches it");
 } // namespace
 
-std::optional<std::vector<std::byte>> SchedulerProtocol::RefusePeer(CallerContext const& caller) const
+std::optional<std::vector<std::byte>> SchedulerProtocol::RefusePeer(CallerContext const& caller, std::uint8_t opRaw) const
 {
-    auto const refusal = _service.RefuseUnlessMember(caller);
+    auto refusal = _service.RefuseUnlessMember(caller);
+    // Then the verb's identity requirement, when the verb is one this build knows: an unknown one
+    // is refused after the header by `Answer`, by name, and carries no requirement to ask about.
+    if (auto const* const descriptor = Wire::FindOp(opRaw); !refusal.has_value() && descriptor != nullptr)
+        refusal = _service.RefuseUnlessIdentified(caller, descriptor->code);
     if (!refusal.has_value())
         return std::nullopt;
     // Encoded exactly as `Answer` encodes a refusal, so an early refusal and a late
     // one are the same bytes on the wire -- a client must not be able to tell which
     // side of the payload read it was refused on.
-    // **Uncounted, and decided by `SchedulerService` rather than here.** This arm
-    // hands back whatever `RefuseUnlessMember` produced -- today `NotAMember`, which
-    // the service lists in `UncountedRefusals` on the argument that counting a policy
-    // answer beside the capacity refusals would put noise into the numbers a fleet is
-    // sized from.
+    // **Uncounted HERE, and decided by `SchedulerService` rather than here.** This arm
+    // hands back whatever `RefuseUnlessMember` or `RefuseUnlessIdentified` produced, and
+    // the service's own `Refuse` has already counted it or declined to: `NotAMember` is in
+    // `UncountedRefusals` on the argument that counting a policy answer beside the capacity
+    // refusals would put noise into the numbers a fleet is sized from, and
+    // `NodeIdentityRequired` is a `RefusalTable` row, counted once whichever path reaches it.
     //
     // A counter here would also count only ONE of the two paths to that refusal: the
     // same condition is answered again by `Route` -> `Gate` after the payload is read,
@@ -185,6 +191,15 @@ std::vector<std::byte> SchedulerProtocol::Answer(std::span<std::byte const> fram
         return Cc::Refuse(
             _metrics,
             { .code = Wire::ErrorCode::MalformedFrame, .counter = IMetricsSink::Counter::DispatchFramesRefusedTruncated });
+
+    // A verb a joining machine sends needs a proven identity (#178). Asked here as well as at the
+    // door, because a caller of `Answer` need not have asked `RefusePeer` first, and a gate that
+    // only the transport runs is a gate a second transport forgets.
+    if (auto refusal = _service.RefuseUnlessIdentified(caller, descriptor->code); refusal.has_value())
+        return Cc::RefuseWithoutCounter(
+            { .code = refusal->error,
+              .rationale = "counted at the decision, in SchedulerService::Refuse, whose RefusalTable carries this code" },
+            refusal->message);
 
     auto const reply = Route(descriptor->code, payload, caller);
     if (reply.status == Wire::Status::Ok)
@@ -500,6 +515,14 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                          Wire::AsStringView(fields->raftEndpoint),
                                          fields->publicKey.transform(Wire::AsStringView),
                                          Cluster::MemberSeat::Learner);
+        }
+
+        case Wire::Op::ClusterAdmitWorker: {
+            auto const fields = Wire::DecodeClusterAdmitWorkerPayload(payload);
+            if (!fields.has_value())
+                return SchedulerReply::Malformed();
+            return _service.ClusterAdmitWorker(
+                caller, Wire::AsStringView(fields->workerId), Wire::AsStringView(fields->publicKey));
         }
         default:
             // Unreachable: `IsSchedulerVerb` has already refused everything else.

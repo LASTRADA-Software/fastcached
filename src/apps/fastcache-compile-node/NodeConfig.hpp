@@ -67,6 +67,11 @@ enum class ClusterAction : std::uint8_t
     /// quorum, never a candidate. On a voter this demotes it; `Admit` on a learner
     /// promotes it.
     AdmitLearner,
+
+    /// Admit a WORKER principal by its id and identity key, with no enrollment window (#178):
+    /// `--cluster-admit-worker=<id>@<key>`, with the two lines the worker's `--print-identity`
+    /// printed.
+    AdmitWorker,
 };
 
 /// One cluster-administration request, as parsed from the command line.
@@ -75,7 +80,8 @@ struct ClusterRequest
     ClusterAction action { ClusterAction::None };
 
     /// The setting name for `Set`, the member id for `Forget`, `Admit` and
-    /// `AdmitLearner`, the client's host for `AdmitClient` and `ForgetClient`.
+    /// `AdmitLearner`, the worker's id for `AdmitWorker`, the client's host for `AdmitClient`
+    /// and `ForgetClient`.
     std::string key;
 
     /// The setting's new value for `Set`, the consensus endpoint for `Admit` and
@@ -84,7 +90,8 @@ struct ClusterRequest
 
     /// The member's identity key for `Admit` and `AdmitLearner` when the operator typed
     /// `@<key>` (#178), disengaged otherwise -- which the leader reads as *no opinion* and
-    /// which keeps whatever key is recorded, never as a key to clear.
+    /// which keeps whatever key is recorded, never as a key to clear. Always engaged for
+    /// `AdmitWorker`, whose grammar requires the key: a worker is admitted BY it.
     std::optional<Ed25519PublicKey> publicKey;
 };
 
@@ -107,7 +114,7 @@ enum class EnrollAction : std::uint8_t
     Open,     ///< Start accepting enrollment requests.
     Close,    ///< Stop accepting them, and forget what was waiting.
     List,     ///< Print the window and everything waiting.
-    Approve,  ///< Admit the named machine and let it collect the cluster key.
+    Approve,  ///< Admit the named machine and let it collect the roster.
     Reject,   ///< Refuse the named machine.
 
     Last, ///< Not an action: the length of a table keyed by one.
@@ -264,8 +271,8 @@ struct NodeConfig
 
     /// File holding the credential the dashboard requires, or empty for none.
     ///
-    /// A FILE and not a flag, for the reason `--cluster-key-file` is one: a command
-    /// line is readable through `ps`. And a credential of its own rather than
+    /// A FILE and not a flag, for the reason every secret this node reads is one: a
+    /// command line is readable through `ps`. And a credential of its own rather than
     /// `--requirepass`, which points the other way -- that is the secret this node
     /// *presents* to the scheduler, held by every member of the fleet, so reusing it
     /// would let any worker read every other node's fleet map.
@@ -535,18 +542,14 @@ struct NodeConfig
     /// What it buys in discovery is that two unrelated fleets on one segment ignore
     /// each other.
     ///
-    /// **It is also inside every lease grant's MAC since
+    /// **It is also inside every lease grant's signature since
     /// [#322](https://github.com/LASTRADA-Software/fastcached/issues/322)**, and that
     /// is a second job rather than a promotion to credential. A grant naming another
-    /// fleet is refused *after* its MAC has verified -- so what the id decides is
+    /// fleet is refused *after* its signature has verified -- so what the id decides is
     /// whose authentic grants this node honours, never whether a grant is authentic.
-    /// Two fleets that share a `--cluster-key-file` and differ here stop compiling for
-    /// each other; two that share both are one fleet as far as leases are concerned,
-    /// which is what the default means for everybody who never set it.
-    ///
-    /// So it now has an operational consequence: an operator running two fleets from
-    /// one key file must give them different ids, and the default is what makes that
-    /// a thing they have to do rather than get.
+    /// Since #178 a grant is signed by a voter's own key and verified against the roster a
+    /// worker holds, so two fleets share nothing a grant could verify under unless a voter
+    /// belongs to both; where one does, this id is what keeps their grants apart.
     std::string clusterId { "fastcache" };
 
     /// Where discovery beacons go, empty to leave discovery off.
@@ -573,22 +576,6 @@ struct NodeConfig
     /// admitted. Pinning this is what such a site opens instead -- one port per
     /// node on the machine, since two nodes cannot share it.
     std::uint16_t discoveryReplyPort { 0 };
-
-    /// File holding the cluster's pre-shared key.
-    ///
-    /// A path rather than the key itself, and that is a security decision rather
-    /// than a convenience: a command line is readable through `ps` on every POSIX
-    /// system and through the process list on Windows, and a service's arguments
-    /// end up in a unit file or a registry key that more accounts can read than
-    /// can read a mode-0600 file. A leaked key admits a node, and an admitted node
-    /// returns objects the whole fleet then caches.
-    ///
-    /// Read by **two** surfaces: the scheduler signs lease grants with it
-    /// (`Distributed/LeaseToken.hpp`), and a node proves itself on the node port with it.
-    /// Discovery and enrollment read it until #178 moved both to each node's own identity key.
-    /// Without one a grant is a bare serial and a worker has nothing to check, so anybody who
-    /// can reach a compile port can spend it.
-    std::filesystem::path clusterKeyFile;
 
     /// The name the platform's supervisor keys this worker's registration on.
     ///
@@ -1310,10 +1297,10 @@ inline constexpr std::string_view WorkerNodeListenDefaultHost = "127.0.0.1";
 ///
 /// - It would save one flag, and only for an operator who has already typed three.
 ///   Widening the bind is what makes `CompilePortFacesTheNetwork` true, so the
-///   `--cluster-key-file` row starts refusing; and the widened bind becomes the
-///   advertised endpoint, so `AdvertisesWildcard` refuses until `--advertise` is named
-///   too. The participant still cannot start without `--scheduler`, a membership flag,
-///   `--advertise` and `--cluster-key-file`.
+///   roster row starts refusing; and the widened bind becomes the advertised endpoint,
+///   so `AdvertisesWildcard` refuses until `--advertise` is named too. The participant
+///   still cannot start without `--scheduler`, a membership flag, `--advertise`, a
+///   `--cluster-dir` to keep its identity in and a roster to check grants against.
 /// - It would silence the refusal that teaches. `AdvertisesPastALoopbackBind` answers
 ///   the operator who named `--advertise` and left the bind alone, and its message is
 ///   `--listen-node=0.0.0.0:6674` -- the ergonomics fix, delivered while they are
@@ -1391,28 +1378,17 @@ inline constexpr std::string_view ConsensusNamesNoSelfPeerRefusal =
     "--listen-raft turns consensus on and no --raft-peer names this node: it must name the endpoint its peers "
     "dial, whether it bootstraps a cluster or joins one, and consensus cannot start without one";
 
-/// Why a node running consensus with no `--cluster-key-file` cannot start (#1308, #178).
+/// Why a node that announces itself to a fleet, and holds no identity to prove, cannot start (#178).
 ///
-/// A named constant for `ConsensusNamesNoSelfPeerRefusal`'s reason, and it ends without a
-/// full stop for the same reason that one does.
-///
-/// **The reason MOVED at #178 and the rule did not.** It was the Raft peer wire: every
-/// connection between members proved the pre-shared key. That wire now proves each node's OWN
-/// identity key, which a consensus node always holds (`HoldsNodeKey`), so the tier no longer
-/// reads this file at all. What still needs it on a consensus node is everything the key has
-/// not been retired from yet -- the scheduler's leases, a member's proof on the `0xFC` surface,
-/// and the key an enrollment window hands a joiner, which `ServesEnrollment` relies on
-/// consensus implying. Relaxing this before those move would leave each of them to decide
-/// what "no key" means on its own; #178 retires the key surface by surface, and this rule goes
-/// with the last of them.
-///
-/// **Decided once, before anything is served, and never per connection** -- the shape the
-/// worker's lease rule (#282) takes one surface over.
-inline constexpr std::string_view ConsensusNeedsClusterKeyRefusal =
-    "--listen-raft turns consensus on, and consensus needs --cluster-key-file: the cluster's pre-shared key no "
-    "longer proves anything between members, which each member's own identity key does, nor signs a lease, which "
-    "the leader's does, but it still proves a member on the node port. Give every member the same key file -- "
-    "generate one with `head -c 32 /dev/urandom | base64`";
+/// Every verb a machine joins the fleet with -- `Register`, `NodeAnnounce`, `Heartbeat`,
+/// `Withdraw` -- is refused on a connection that proved no identity the cluster admitted, and every
+/// node that names `--scheduler` sends one of them. A node that holds no key would start, dial and
+/// be refused every round; refused here instead, where an operator is watching.
+inline constexpr std::string_view SchedulerNeedsIdentityRefusal =
+    "--scheduler makes this node announce itself to a fleet, and the fleet admits a machine only by the identity "
+    "it proves: this node runs no consensus and names no --cluster-dir, so it has no identity key to prove. Give "
+    "it --cluster-dir=<dir>, where its key and id are kept, and have the cluster admit it -- --enroll-from=<seed>, "
+    "or --cluster-admit-worker=<id>@<key> with the two lines --print-identity prints";
 
 /// Why a scheduler that runs no consensus is refused (#178).
 ///
@@ -1429,8 +1405,10 @@ inline constexpr std::string_view SchedulerNeedsConsensusRefusal =
 
 /// Why a worker that could verify no lease is refused, when other machines can reach it (#178).
 ///
-/// Shared by the configuration table and the startup check of the state directory, which ask
-/// the one question at the two moments its answer can be known.
+/// Answered by the startup check of the state directory (`NodeRoster::Build`), the one moment the
+/// answer can be known: a worker names a scheduler, so it keeps a state directory, and only the
+/// directory says whether it holds a roster. The configuration's half -- a worker with nowhere
+/// to keep one -- is `SchedulerNeedsIdentityRefusal`.
 inline constexpr std::string_view RosterlessWorkerRefusal =
     "a node that admits peers on other machines checks the lease a client presents to its worker, against a roster "
     "its cluster's voters certify -- and this node runs no consensus, names no --voter-key and holds no roster, so "
@@ -1692,15 +1670,15 @@ using NodePublicPathFlag = PublicPathFlag;
 /// provenance-gated: `--requirepass` can arrive in argv instead, where the exposure
 /// is `ps` rather than a mode, and that is a different problem with a different
 /// owner. The files `NodeSecretFileTable()` names are not gated at all --
-/// the path is not the secret and the file is, so a world-readable cluster key is
+/// the path is not the secret and the file is, so a world-readable key file is
 /// exposed however its path was named
 /// ([#752](https://github.com/LASTRADA-Software/fastcached/issues/752)).
 ///
 /// **A named file is reported whether or not a tier reads it**, and that is the
-/// lesson the `--cluster-key-file` refusal in `StartupPolicyRejection` was narrowed
-/// twice to learn: whether a surface exists is not a fact about the configuration,
-/// so a rule whose premise is "somebody will read this" cannot state its premise
-/// without guessing. The file holds a secret on disk either way.
+/// lesson the retired `--cluster-key-file` refusal in `StartupPolicyRejection` was
+/// narrowed twice to learn: whether a surface exists is not a fact about the
+/// configuration, so a rule whose premise is "somebody will read this" cannot state its
+/// premise without guessing. The file holds a secret on disk either way.
 ///
 /// @param cfg The merged configuration.
 /// @param configFile The configuration file that was actually read, or empty when

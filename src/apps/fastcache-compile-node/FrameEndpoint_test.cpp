@@ -3,6 +3,7 @@
 #include "FrameEndpoint.hpp"
 #include "LiveStatsResponder.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeProofClient.hpp"
 #include "NodeProofResponder.hpp"
 #include "Responders.hpp"
 
@@ -11,12 +12,16 @@
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/Nonce.hpp>
+#include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/NodeProof.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/BlockingConnector.hpp>
 #include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/SealedFrameSocket.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -43,6 +48,7 @@
 #include <utility>
 #include <vector>
 
+#include <CacheProtocol.hpp>
 #include <tests/AbortiveClient.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/LeaseRosterFakes.hpp>
@@ -363,6 +369,19 @@ class Conversation
         return SyncRun(ReadOneReply(_socket.get()));
     }
 
+    /// Read the @p count bytes a sealed reply carries after its payload: its tag (#178).
+    /// @param count How many.
+    /// @return Them, or empty when the peer closed first.
+    [[nodiscard]] std::vector<std::byte> ReadTrailer(std::size_t count)
+    {
+        return SyncRun([](ISocket* peer, std::size_t want) -> Task<std::vector<std::byte>> {
+            std::vector<std::byte> received;
+            if (!co_await ReadAtLeast(peer, &received, want))
+                co_return std::vector<std::byte> {};
+            co_return received;
+        }(_socket.get(), count));
+    }
+
     /// Read whatever else the server sends, until it closes.
     /// @return Every remaining byte, or empty when the limit was hit first.
     [[nodiscard]] std::vector<std::byte> ReadRest()
@@ -524,11 +543,17 @@ TEST_CASE("Destroying the frame endpoint stops it, with nothing to remember", "[
     CHECK(again->IsBound());
 }
 
-TEST_CASE("A member registers over a real socket", "[node][scheduler]")
+TEST_CASE("A member that proved nothing is refused registration over a real socket, by name", "[node][scheduler]")
 {
     // End to end through the listener, because everything below it is already covered
     // by `SchedulerProtocol_test` and what this adds is the wiring: that the peer's
     // host reaches the oracle, and that a reply comes back framed.
+    //
+    // The ADDRESS admits this caller -- it is loopback, a member by every list -- and since
+    // #178 an address admits a client and never a joining machine: a registration needs the
+    // identity a connection proves, so it is refused by name, and counted. The registration a
+    // proven connection makes is `A proven connection is sealed, and the verb it sends after
+    // the proof is answered`, below.
     Fleet fleet;
     auto const port = FreePort();
     auto started = FrameEndpoint::Start(
@@ -548,9 +573,14 @@ TEST_CASE("A member registers over a real socket", "[node][scheduler]")
     auto const reply = Exchange(port, frame);
 
     REQUIRE_FALSE(reply.empty());
-    auto const header = Wire::DecodeReplyHeader(reply);
-    REQUIRE(header.has_value());
-    CHECK(Unwrap(header).status == Wire::Status::Ok);
+    CHECK(ErrorOf(reply) == Wire::ErrorCode::NodeIdentityRequired);
+    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedNodeIdentityRequired) == 1);
+    CHECK(fleet.service.Workers().LiveWorkers().empty());
+
+    // And a client verb from the same address is the fleet's to answer, which is what says the
+    // refusal above is about identity rather than about the address.
+    auto const lease = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+    CHECK(ErrorOf(Exchange(port, lease)) == Wire::ErrorCode::NoWorker);
 }
 
 TEST_CASE("This machine is admitted whatever the member list says", "[node][scheduler]")
@@ -882,7 +912,7 @@ class HoldableResponder final: public IFrameResponder
     }
     /// @copydoc IFrameResponder::NodeProver
     ///
-    /// **None.** This fake stands in for a surface, not for the cluster-key prover; a case that
+    /// **None.** This fake stands in for a surface, not for the node prover; a case that
     /// needs one builds a `NodeProofResponder`.
     [[nodiscard]] INodeProver* NodeProver() noexcept override
     {
@@ -3690,203 +3720,540 @@ TEST_CASE("A subscriber that stops reading is cut off past its hold and counted 
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps) == 0);
 }
 
-// ---- The node proof, on the connection it establishes (#1428) ---------------------------
+// ---- The node identity handshake, and the seal it puts on the connection (#1428, #178) ----
 
 namespace
 {
 
-/// This cluster's key, for the proof cases below.
-constexpr std::string_view ProofKeyBytes = "the-cluster-key-0123456789abcdef";
+/// The machine the honest caller in these cases is: admitted, its key live under this id.
+constexpr std::string_view ProvingMachine = "node-7";
 
-/// The label the proving side gives itself.
-constexpr std::string_view ProofNodeId = "node-7";
+/// A machine the cluster forgot: its key is revoked.
+constexpr std::string_view RetiredMachine = "retired";
 
-/// A node that can be proved to: a scheduler, and the cluster-key prover beside it.
+/// A machine the cluster never heard of.
+constexpr std::string_view StrangerMachine = "stranger";
+
+/// A node that can be proved to: a scheduler behind an oracle that folds the cluster's key
+/// roster, as `NodeMembership` composes one, and the prover beside it.
 ///
 /// Its own fixture rather than a field on `Fleet`, because what these cases drive is the
-/// ENDPOINT's half of the exchange -- the challenge it holds per connection and spends per
-/// proof -- and that is only reachable through a listener with a routing responder on it.
+/// ENDPOINT's half of the exchange -- the handshake it holds per connection, and the seal it
+/// engages -- and that is only reachable through a listener with a routing responder on it.
 struct ProvingFleet
 {
+    ProvingFleet()
+    {
+        Testing::PublishKeyRoster(keys, { std::string { ProvingMachine } }, { std::string { RetiredMachine } });
+    }
+
     Fleet fleet;
-    Testing::ScriptedClusterKey key { ProofKeyBytes };
-    Testing::ScriptedSecureRandom random { Testing::FixedChallengeScript() };
-    NodeProofResponder prover { key, random, fleet.metrics, fleet.logger };
-    MergedResponder merged { SurfaceComponents { .scheduler = &fleet.responder, .nodeProof = &prover } };
+    Distributed::KeyRosterMembership keys;
+    Distributed::AnyOfMembership oracle { { &fleet.membership, &keys } };
+    SchedulerResponder scheduler { fleet.protocol, oracle, fleet.metrics };
+    Ed25519KeyPair const identity = Testing::TestKeyPair("scheduler");
+    Testing::ScriptedSecureRandom random { Testing::ServerHandshakeScript() };
+    NodeProofResponder prover { "scheduler", identity, oracle, random, fleet.metrics, fleet.logger };
+    MergedResponder merged { SurfaceComponents { .scheduler = &scheduler, .nodeProof = &prover } };
+
+    /// Start an endpoint on a free port, serving this node's surface.
+    /// @return The endpoint and its port.
+    [[nodiscard]] std::pair<std::unique_ptr<FrameEndpoint>, std::uint16_t> Serve()
+    {
+        auto const port = FreePort();
+        auto endpoint = FrameEndpoint::Start(
+            fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), merged, fleet.metrics, fleet.logger);
+        REQUIRE(endpoint.has_value());
+        fleet.Serve();
+        return { *std::move(endpoint), port };
+    }
+
+    /// @return What @p counter reads.
+    [[nodiscard]] std::uint64_t Read(IMetricsSink::Counter counter) const noexcept
+    {
+        return fleet.metrics.Read(counter);
+    }
 };
 
-/// The challenge a reply carries, or empty when the reply is not one.
-/// @param reply The whole reply frame.
-/// @return The nonce.
-[[nodiscard]] std::vector<std::byte> ChallengeIn(std::span<std::byte const> reply)
-{
-    auto const payload = Testing::PayloadOf(reply);
-    auto const challenge = Wire::DecodeNodeChallengeReply(payload);
-    if (!challenge.has_value())
-        return {};
-    return std::vector<std::byte> { challenge->begin(), challenge->end() };
-}
-
-/// A framed `ProveNode` for @p challenge under this cluster's key.
-/// @param challenge The nonce the server stated.
+/// A registration: a verb only a machine that proved its identity may send.
 /// @return The framed request.
-[[nodiscard]] std::vector<std::byte> ProveFrame(std::span<std::byte const> challenge)
+[[nodiscard]] std::vector<std::byte> RegisterFrame()
 {
-    auto const key = Testing::ProofBytesOf(ProofKeyBytes);
-    return Wire::EncodeProveNode(ProofNodeId, Distributed::MintNodeProof(key, challenge, ProofNodeId));
+    return Wire::EncodeRegister(
+        Wire::RegisterRequest { .fingerprint = "gcc-14", .endpoint = "127.0.0.1:7100", .slots = 2, .acceptedCodecs = {} });
 }
 
-/// A lease request, which the scheduler gates on membership.
+/// A lease request: a CLIENT verb, which an address may still be admitted to.
 /// @return The framed request.
 [[nodiscard]] std::vector<std::byte> LeaseRequestFrame()
 {
     return Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
 }
 
+/// One caller's side of the handshake, driven byte by byte over a raw connection.
+///
+/// **By hand rather than through `NodeProofClient`**, because the relay case below needs to be
+/// the thing in the middle: it forwards every byte of an honest handshake and then writes a
+/// frame of its own, which no client object would ever do. The honest half computes exactly
+/// what the node's client computes, from the same functions.
+class HandshakeCaller
+{
+  public:
+    /// @param port Where the endpoint listens.
+    /// @param machine Whose test key this caller signs with.
+    /// @param scriptStart Where this caller's random script starts, so two callers draw apart.
+    HandshakeCaller(std::uint16_t port, std::string_view machine, std::uint8_t scriptStart = 0x80):
+        _machine { machine },
+        _random { Testing::ScriptedSecureRandom::Ascending(2 * NonceBytes, scriptStart) },
+        _opening { Testing::OpenHandshake(_random) },
+        _connection { port }
+    {
+    }
+
+    /// Ask for a challenge.
+    /// @return Whether the server answered with one this caller can verify.
+    [[nodiscard]] bool Challenge()
+    {
+        auto const answer = _connection.Send(Wire::EncodeNodeChallenge(_opening.request));
+        auto reply = Wire::DecodeNodeChallengeReply(Testing::PayloadOf(answer));
+        if (!reply.has_value() || !Distributed::VerifyNodeChallengeReply(_opening.request, *reply))
+            return false;
+        _reply = *std::move(reply);
+        return true;
+    }
+
+    /// Present this caller's proof over the challenge it holds, and read the SEALED answer.
+    /// @param claimedId The id to claim; this caller's own machine name by default.
+    /// @return The answer's header and payload, or empty when the server closed instead.
+    [[nodiscard]] std::vector<std::byte> Prove(std::optional<std::string_view> claimedId = std::nullopt)
+    {
+        auto const id = claimedId.value_or(_machine);
+        auto const proof = Distributed::MintNodeProof(Testing::TestKeyPair(_machine), id, _opening.request, _reply);
+        if (!_connection.SendOnly(Wire::EncodeProveNode(proof)))
+            return {};
+        auto keys = Distributed::DeriveNodeSessionKeys(_opening.secret, _opening.request, _reply, id, /*callerSide=*/true);
+        REQUIRE(keys.has_value());
+        // A copy out of `Unwrap`'s const reference, so the keys can be MOVED into this caller's
+        // sealer and opener.
+        auto session = Unwrap(keys);
+        _sealer.emplace(std::move(session.callerToServer));
+        _opener.emplace(std::move(session.serverToCaller));
+        return ReadSealedReply();
+    }
+
+    /// Send @p frame sealed under this connection's key, and read the sealed answer.
+    /// @param frame A whole request frame.
+    /// @return The answer's header and payload, or empty when the server closed instead.
+    [[nodiscard]] std::vector<std::byte> SendSealed(std::span<std::byte const> frame)
+    {
+        auto const sealed = Sealed(frame);
+        if (!_connection.SendOnly(sealed))
+            return {};
+        return ReadSealedReply();
+    }
+
+    /// @p frame with the tag this connection's next position gives it: exactly the bytes a
+    /// sealed caller puts on the wire.
+    /// @param frame A whole request frame.
+    /// @return The bytes.
+    [[nodiscard]] std::vector<std::byte> Sealed(std::span<std::byte const> frame)
+    {
+        if (!_sealer.has_value())
+        {
+            FAIL("a frame was sealed before the proof agreed a key");
+            return {};
+        }
+        auto const tag = _sealer->Seal(frame.first(Wire::RequestHeaderSize), frame.subspan(Wire::RequestHeaderSize));
+        auto bytes = std::vector<std::byte> { frame.begin(), frame.end() };
+        bytes.insert(bytes.end(), tag.begin(), tag.end());
+        return bytes;
+    }
+
+    /// Read one sealed reply and check its tag.
+    /// @return Its header and payload, or empty when the server closed, or sent a tag that does
+    ///         not verify -- which a case can tell apart by `LastTagVerified`.
+    [[nodiscard]] std::vector<std::byte> ReadSealedReply()
+    {
+        auto reply = _connection.ReadReply();
+        if (reply.empty())
+            return {};
+        auto const tagBytes = _connection.ReadTrailer(SessionTagBytes);
+        if (tagBytes.size() != SessionTagBytes || !_opener.has_value())
+            return {};
+        auto tag = SessionTag {};
+        std::ranges::copy(tagBytes, tag.begin());
+        _lastTagVerified = _opener->Open(std::span<std::byte const> { reply }.first(Wire::ReplyHeaderSize),
+                                         std::span<std::byte const> { reply }.subspan(Wire::ReplyHeaderSize),
+                                         tag);
+        return _lastTagVerified ? reply : std::vector<std::byte> {};
+    }
+
+    /// @return Whether the last sealed reply's tag verified under the server-to-caller key.
+    [[nodiscard]] bool LastTagVerified() const noexcept
+    {
+        return _lastTagVerified;
+    }
+
+    /// The raw connection, for a case that is the relay rather than the caller.
+    [[nodiscard]] Conversation& Connection() noexcept
+    {
+        return _connection;
+    }
+
+    /// @return What this caller sent to open the handshake.
+    [[nodiscard]] Wire::NodeChallengeRequest const& Opening() const noexcept
+    {
+        return _opening.request;
+    }
+
+  private:
+    std::string _machine;
+    Testing::ScriptedSecureRandom _random;
+    Testing::CallerHandshake _opening;
+    Conversation _connection;
+    Wire::NodeChallengeReply _reply {};
+    std::optional<FrameSealer> _sealer;
+    std::optional<FrameOpener> _opener;
+    bool _lastTagVerified { false };
+};
+
+/// @p frame behind a tag nobody computed: all a relay without the session key can send.
+/// @param frame A whole request frame.
+/// @return The bytes.
+[[nodiscard]] std::vector<std::byte> ForgedSeal(std::span<std::byte const> frame)
+{
+    auto bytes = std::vector<std::byte> { frame.begin(), frame.end() };
+    bytes.insert(bytes.end(), SessionTagBytes, std::byte { 0 });
+    return bytes;
+}
+
+/// A server trust a case states outright: every server has one standing.
+///
+/// One answer rather than a roster, because what the client DOES with each standing is the
+/// subject here; `NodeRoster`'s own cases are where a standing is derived from a roster.
+class FixedServerTrust final: public IServerTrust
+{
+  public:
+    /// @param standing What every server is.
+    explicit FixedServerTrust(ServerStanding standing):
+        _standing { standing }
+    {
+    }
+
+    /// @copydoc IServerTrust::StandingOf
+    [[nodiscard]] ServerStanding StandingOf(std::string_view /*serverId*/,
+                                            Ed25519PublicKey const& /*serverKey*/) const override
+    {
+        return _standing;
+    }
+
+  private:
+    ServerStanding _standing;
+};
+
+/// Dial @p port and wrap the connection in a caller's sealing layer, as `DialAndAnnounce` does.
+/// @param port Where the endpoint listens.
+/// @return The layer.
+[[nodiscard]] std::unique_ptr<SealedFrameSocket> DialSealed(std::uint16_t port)
+{
+    BlockingConnector connector;
+    auto socket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    REQUIRE(socket.has_value());
+    return std::make_unique<SealedFrameSocket>(*std::move(socket), SealedFrameEnd::Caller, Wire::MaxSealedReplyPayload);
+}
+
 } // namespace
 
-TEST_CASE("A challenge and the proof it answers are exchanged on one connection", "[node][frame][proof]")
+TEST_CASE("A proven connection is sealed, and the verb it sends after the proof is answered", "[node][frame][proof][seal]")
 {
-    // The ENDPOINT's half, end to end over a real socket: the challenge is drawn per connection
-    // and stated as exactly 32 bytes, and the tag minted over it is accepted. Nothing else
-    // reaches `AnswerNodeProof` -- these two verbs never arrive at `Answer`.
+    // The honest path end to end over a real socket, and the CONTROL for every seal case below:
+    // it stays green whatever the seal is made to accept, because every tag here is genuine. A
+    // registration is the verb, since it is one only a proven machine may send.
     ProvingFleet rig;
-    auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(rig.fleet.io,
-                                         NodeSurface::Node,
-                                         LoopbackFor(NodeSurface::Node, port),
-                                         rig.merged,
-                                         rig.fleet.metrics,
-                                         rig.fleet.logger);
-    REQUIRE(endpoint.has_value());
-    rig.fleet.Serve();
+    auto const [endpoint, port] = rig.Serve();
 
+    HandshakeCaller caller { port, ProvingMachine };
+    REQUIRE(caller.Challenge());
+    auto const proved = caller.Prove();
+    CHECK(Testing::StatusOf(proved) == Wire::Status::Ok);
+    CHECK(caller.LastTagVerified());
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsAccepted) == 1);
+
+    auto const registered = caller.SendSealed(RegisterFrame());
+    CHECK(Testing::StatusOf(registered) == Wire::Status::Ok);
+    CHECK(caller.LastTagVerified());
+    CHECK(rig.fleet.service.Workers().LiveWorkers().size() == 1);
+    CHECK(rig.Read(IMetricsSink::Counter::NodeSealedFramesRefused) == 0);
+}
+
+TEST_CASE("A relayed handshake followed by an injected verb is refused by the seal", "[node][frame][proof][seal]")
+{
+    // #178's reason for the seal, driven as the attack it defeats. Something between a worker and
+    // its scheduler -- a revoked ex-scheduler still named in the worker's `--scheduler`, or anything
+    // on the path -- forwards every byte of a genuine handshake, so the proof is accepted and the
+    // connection is admitted as the worker's. It then writes a verb of its OWN. It saw both
+    // ephemeral PUBLIC keys and neither secret, so it cannot compute the session key, and its frame
+    // fails the tag: the connection closes, nothing is registered, and the endpoint says why.
+    //
+    // Neutered -- `SealedFrameSocket` accepting any tag -- the injected registration is answered
+    // and recorded, and this case goes red on exactly those two assertions while the honest case
+    // above stays green.
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+
+    // The honest worker's half is computed here; the relay only moves its bytes.
+    HandshakeCaller worker { port, ProvingMachine };
+    REQUIRE(worker.Challenge());
+    auto const proved = worker.Prove();
+    REQUIRE(Testing::StatusOf(proved) == Wire::Status::Ok);
+    // The premise: the relayed proof really was accepted, so the connection really is admitted as
+    // the worker's. Without it the refusal below could be the proof's, and would prove nothing.
+    REQUIRE(rig.Read(IMetricsSink::Counter::NodeProofsAccepted) == 1);
+
+    // The injection, on the connection the proof admitted.
+    auto& relay = worker.Connection();
+    REQUIRE(relay.SendOnly(ForgedSeal(RegisterFrame())));
+    CHECK(relay.ReadReply().empty());
+
+    CHECK(WaitFor([&rig] { return rig.Read(IMetricsSink::Counter::NodeSealedFramesRefused) == 1; }));
+    CHECK(rig.fleet.service.Workers().LiveWorkers().empty());
+}
+
+TEST_CASE("A sealed frame replayed on its own connection is refused by the seal", "[node][frame][proof][seal]")
+{
+    // The genuine bytes, sent twice. The first is the worker's and is answered; the second is
+    // checked at the NEXT position, fails, and closes the connection -- a recorded frame cannot be
+    // spent again inside the session it was sealed for.
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+
+    HandshakeCaller worker { port, ProvingMachine };
+    REQUIRE(worker.Challenge());
+    REQUIRE(Testing::StatusOf(worker.Prove()) == Wire::Status::Ok);
+
+    auto const beat = worker.Sealed(Wire::EncodeHeartbeat("w-1", 0));
+    REQUIRE(worker.Connection().SendOnly(beat));
+    REQUIRE_FALSE(worker.ReadSealedReply().empty());
+
+    REQUIRE(worker.Connection().SendOnly(beat));
+    CHECK(worker.Connection().ReadReply().empty());
+    CHECK(WaitFor([&rig] { return rig.Read(IMetricsSink::Counter::NodeSealedFramesRefused) == 1; }));
+}
+
+TEST_CASE("Every answer to a proof is sealed, and a refused identity leaves an address-admitted client",
+          "[node][frame][proof][seal]")
+{
+    // The caller reads every answer to a proof with ONE grammar, so a refusal is sealed exactly as
+    // an acceptance is. And a machine refused its identity has not proved anything: what it may do
+    // on the connection is what its ADDRESS admits -- a client's verbs, never a joining one.
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+
+    HandshakeCaller stranger { port, StrangerMachine };
+    REQUIRE(stranger.Challenge());
+    auto const refused = stranger.Prove();
+    CHECK(ErrorOf(refused) == Wire::ErrorCode::NodeKeyUnknown);
+    CHECK(stranger.LastTagVerified());
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 1);
+
+    // Loopback is admitted by address, so a client verb is the fleet's to answer...
+    CHECK(ErrorOf(stranger.SendSealed(LeaseRequestFrame())) == Wire::ErrorCode::NoWorker);
+    // ...and a joining one is not the address's to grant.
+    CHECK(ErrorOf(stranger.SendSealed(RegisterFrame())) == Wire::ErrorCode::NodeIdentityRequired);
+    CHECK(rig.fleet.service.Workers().LiveWorkers().empty());
+}
+
+TEST_CASE("A revoked key's connection is refused every verb, although its address is admitted",
+          "[node][frame][proof][revoke]")
+{
+    // The forgotten machine proves the key the cluster revoked. It dials from loopback, which every
+    // list admits, and the key outranks the address for every verb on the connection it marked.
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+
+    HandshakeCaller retired { port, RetiredMachine };
+    REQUIRE(retired.Challenge());
+    CHECK(ErrorOf(retired.Prove()) == Wire::ErrorCode::NodeKeyRevoked);
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsRefusedRevokedKey) == 1);
+
+    CHECK(ErrorOf(retired.SendSealed(LeaseRequestFrame())) == Wire::ErrorCode::NotAMember);
+    CHECK(ErrorOf(retired.SendSealed(RegisterFrame())) == Wire::ErrorCode::NotAMember);
+    CHECK(rig.fleet.service.Workers().LiveWorkers().empty());
+
+    // The control: the same address proving nothing is a client the list admits.
     Conversation client { port };
-    auto const challenge = ChallengeIn(client.Send(Wire::EncodeNodeChallenge()));
-    REQUIRE(challenge.size() == Wire::NodeChallengeBytes);
-
-    CHECK(Testing::StatusOf(client.Send(ProveFrame(challenge))) == Wire::Status::Ok);
-    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsAccepted) == 1);
-
-    // And the connection goes on serving, which is what makes the proof worth having: one
-    // exchange covers every verb sent after it. `NoWorker` is the fleet's own answer.
     CHECK(ErrorOf(client.Send(LeaseRequestFrame())) == Wire::ErrorCode::NoWorker);
 }
 
-TEST_CASE("A challenge answers exactly one proof, whatever that proof's outcome", "[node][frame][proof]")
+TEST_CASE("A connection proves once, and asking again closes it", "[node][frame][proof][seal]")
 {
-    // **Spent, and spent before anything is verified.** A nonce that can answer twice is a nonce
-    // a recorded exchange can be replayed over, so the second proof over one challenge is
-    // refused for having none rather than for being wrong -- which is what says the challenge
-    // was cleared rather than merely re-checked.
+    // A second handshake on a sealed connection would have to re-key it mid-stream. Closed rather
+    // than refused, and not counted as a seal fault: the frame's tag was genuine.
     ProvingFleet rig;
-    auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(rig.fleet.io,
-                                         NodeSurface::Node,
-                                         LoopbackFor(NodeSurface::Node, port),
-                                         rig.merged,
-                                         rig.fleet.metrics,
-                                         rig.fleet.logger);
-    REQUIRE(endpoint.has_value());
-    rig.fleet.Serve();
+    auto const [endpoint, port] = rig.Serve();
 
-    Conversation client { port };
-    auto const challenge = ChallengeIn(client.Send(Wire::EncodeNodeChallenge()));
-    REQUIRE(challenge.size() == Wire::NodeChallengeBytes);
+    HandshakeCaller worker { port, ProvingMachine };
+    REQUIRE(worker.Challenge());
+    REQUIRE(Testing::StatusOf(worker.Prove()) == Wire::Status::Ok);
 
-    auto const proof = ProveFrame(challenge);
-    CHECK(Testing::StatusOf(client.Send(proof)) == Wire::Status::Ok);
-
-    // The identical frame again: refused `NodeProofUnchallenged`, NOT `NodeProofRejected`. The
-    // distinction is the whole assertion -- a server that had kept the nonce would answer `Ok`,
-    // and one that re-verified against a stale copy would answer `Rejected`.
-    CHECK(ErrorOf(client.Send(proof)) == Wire::ErrorCode::NodeProofUnchallenged);
-    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsUnchallenged) == 1);
-    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsRejected) == 0);
-    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsAccepted) == 1);
+    REQUIRE(worker.Connection().SendOnly(worker.Sealed(Wire::EncodeNodeChallenge(worker.Opening()))));
+    CHECK(worker.Connection().ReadReply().empty());
+    CHECK(rig.Read(IMetricsSink::Counter::NodeSealedFramesRefused) == 0);
 }
 
-TEST_CASE("A proof nobody challenged is refused before a key is read", "[node][frame][proof]")
+TEST_CASE("A proof nobody challenged is refused before anything is verified", "[node][frame][proof]")
 {
-    // The endpoint's own refusal, and it is the endpoint's because the challenge is connection
-    // state. Asserted with the counter AND with the two that must not move: a server that
-    // verified anyway would answer `Rejected`, and one that read an absent challenge as an
-    // empty one would answer `Ok` to a tag minted over 32 zero bytes, which is what this sends.
+    // The endpoint's own refusal, because the handshake is connection state. Unsealed: no
+    // handshake, so no key. Asserted with the counter AND with the two that must not move.
     ProvingFleet rig;
-    auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(rig.fleet.io,
-                                         NodeSurface::Node,
-                                         LoopbackFor(NodeSurface::Node, port),
-                                         rig.merged,
-                                         rig.fleet.metrics,
-                                         rig.fleet.logger);
-    REQUIRE(endpoint.has_value());
-    rig.fleet.Serve();
+    auto const [endpoint, port] = rig.Serve();
 
+    auto const proof = Distributed::MintNodeProof(Testing::TestKeyPair(std::string { ProvingMachine }),
+                                                  ProvingMachine,
+                                                  Wire::NodeChallengeRequest {},
+                                                  Wire::NodeChallengeReply {});
     Conversation client { port };
-    std::vector<std::byte> const zeroes(Wire::NodeChallengeBytes, std::byte { 0 });
-    CHECK(ErrorOf(client.Send(ProveFrame(zeroes))) == Wire::ErrorCode::NodeProofUnchallenged);
-    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsUnchallenged) == 1);
-    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsRejected) == 0);
-    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsAccepted) == 0);
+    CHECK(ErrorOf(client.Send(Wire::EncodeProveNode(proof))) == Wire::ErrorCode::NodeProofUnchallenged);
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsUnchallenged) == 1);
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsRejected) == 0);
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsAccepted) == 0);
 }
 
 TEST_CASE("Asking for a second challenge abandons the first", "[node][frame][proof]")
 {
-    // One live nonce per connection, because a server holding two would accept a proof over
-    // either -- a replay window opened by nothing but politeness. The FIRST challenge is used
-    // after a second has been asked for, and it is refused for having been abandoned.
-    //
-    // `FixedChallengeScript` draws the same bytes every time, so the two challenges are EQUAL and
-    // this case cannot tell them apart by their contents. That is the point: what it asserts is
-    // that the outstanding one was CLEARED by the second ask, which no byte comparison could see
-    // even with a real random source.
+    // One live handshake per connection, because a server holding two would accept a proof over
+    // either -- a replay window opened by nothing but politeness. The FIRST handshake's proof is
+    // presented after a second was asked for, and is judged against the second: it does not verify.
     ProvingFleet rig;
-    auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(rig.fleet.io,
-                                         NodeSurface::Node,
-                                         LoopbackFor(NodeSurface::Node, port),
-                                         rig.merged,
-                                         rig.fleet.metrics,
-                                         rig.fleet.logger);
-    REQUIRE(endpoint.has_value());
-    rig.fleet.Serve();
+    auto const [endpoint, port] = rig.Serve();
 
-    Conversation client { port };
-    auto const first = ChallengeIn(client.Send(Wire::EncodeNodeChallenge()));
-    REQUIRE(first.size() == Wire::NodeChallengeBytes);
-    auto const second = ChallengeIn(client.Send(Wire::EncodeNodeChallenge()));
-    REQUIRE(second.size() == Wire::NodeChallengeBytes);
+    SECTION("a proof over the abandoned handshake")
+    {
+        HandshakeCaller first { port, ProvingMachine };
+        REQUIRE(first.Challenge());
+        // The same connection asks again, with a different opening.
+        auto second = Testing::ScriptedSecureRandom { Testing::ScriptedSecureRandom::Ascending(2 * NonceBytes, 0xC0) };
+        auto const again = Testing::OpenHandshake(second);
+        REQUIRE(Testing::StatusOf(first.Connection().Send(Wire::EncodeNodeChallenge(again.request))) == Wire::Status::Ok);
 
-    // The second is the one outstanding, so the proof is accepted once and only once.
-    CHECK(Testing::StatusOf(client.Send(ProveFrame(second))) == Wire::Status::Ok);
-    CHECK(ErrorOf(client.Send(ProveFrame(first))) == Wire::ErrorCode::NodeProofUnchallenged);
+        auto const refused = first.Prove();
+        // Sealed under the SECOND handshake's keys, which this caller does not hold -- so what it
+        // reads is a reply whose tag it cannot verify, and the refusal is read from the counter.
+        CHECK_FALSE(first.LastTagVerified());
+        CHECK(WaitFor([&rig] { return rig.Read(IMetricsSink::Counter::NodeProofsRejected) == 1; }));
+        CHECK(rig.Read(IMetricsSink::Counter::NodeProofsAccepted) == 0);
+    }
+
+    SECTION("the control: a proof over the outstanding one")
+    {
+        HandshakeCaller caller { port, ProvingMachine };
+        REQUIRE(caller.Challenge());
+        REQUIRE(caller.Challenge());
+        CHECK(Testing::StatusOf(caller.Prove()) == Wire::Status::Ok);
+        CHECK(rig.Read(IMetricsSink::Counter::NodeProofsAccepted) == 1);
+    }
 }
 
 TEST_CASE("A second challenge the node cannot draw is refused and still abandons the first", "[node][frame][proof]")
 {
-    // The old challenge goes BEFORE the draw, so a draw that fails leaves none outstanding
-    // rather than the last one (#1527). Held the other way round, a caller whose second ask
-    // was refused would still hold a live nonce the server had meant to retire -- the replay
-    // window one live challenge per connection exists to close.
+    // The old handshake goes BEFORE the draw, so a draw that fails leaves none outstanding rather
+    // than the last one (#1527): a caller whose second ask was refused must not still hold a live
+    // handshake the server had meant to retire.
     ProvingFleet rig;
-    auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(rig.fleet.io,
-                                         NodeSurface::Node,
-                                         LoopbackFor(NodeSurface::Node, port),
-                                         rig.merged,
-                                         rig.fleet.metrics,
-                                         rig.fleet.logger);
-    REQUIRE(endpoint.has_value());
-    rig.fleet.Serve();
+    auto const [endpoint, port] = rig.Serve();
 
-    Conversation client { port };
-    auto const first = ChallengeIn(client.Send(Wire::EncodeNodeChallenge()));
-    REQUIRE(first.size() == Wire::NodeChallengeBytes);
+    HandshakeCaller caller { port, ProvingMachine };
+    REQUIRE(caller.Challenge());
 
     rig.random.Deny(Testing::ScriptedSecureRandom::DeniedFailure());
-    CHECK(ErrorOf(client.Send(Wire::EncodeNodeChallenge())) == Wire::ErrorCode::NoCluster);
+    CHECK(ErrorOf(caller.Connection().Send(Wire::EncodeNodeChallenge(caller.Opening()))) == Wire::ErrorCode::NoCluster);
 
-    CHECK(ErrorOf(client.Send(ProveFrame(first))) == Wire::ErrorCode::NodeProofUnchallenged);
-    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeProofsAccepted) == 0);
+    // Unsealed, because no handshake was outstanding: the refusal is the endpoint's own.
+    auto const proof = Distributed::MintNodeProof(
+        Testing::TestKeyPair(std::string { ProvingMachine }), ProvingMachine, caller.Opening(), Wire::NodeChallengeReply {});
+    CHECK(ErrorOf(caller.Connection().Send(Wire::EncodeProveNode(proof))) == Wire::ErrorCode::NodeProofUnchallenged);
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsAccepted) == 0);
+}
+
+TEST_CASE("A worker proves itself through the client a node runs, and then speaks sealed", "[node][frame][proof][client]")
+{
+    // `NodeProofClient` and `SealedFrameSocket` as `DialAndAnnounce` wires them, against the real
+    // endpoint: the two ends agree on the keys without either being told them.
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+
+    auto sealed = DialSealed(port);
+    FixedServerTrust const trust { ServerStanding::Voter };
+    Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+    auto const key = Testing::TestKeyPair(std::string { ProvingMachine });
+    NodeProofClient const client { std::string { ProvingMachine }, key, trust, random };
+    auto notice = Cc::CredentialNotice::Silent();
+
+    auto const attempt = client.Prove(*sealed, notice, Cc::Credential {});
+    INFO(attempt.reason);
+    REQUIRE(attempt.result == NodeProofResult::Proved);
+    CHECK(sealed->Sealed());
+
+    auto const registered = SyncRun(Cc::ExchangeFramed(sealed.get(), &notice, RegisterFrame()));
+    CHECK(registered.IsHit());
+    CHECK(rig.fleet.service.Workers().LiveWorkers().size() == 1);
+}
+
+TEST_CASE("A worker proves nothing to a server its roster does not hold as a voter", "[node][frame][proof][client]")
+{
+    // The client's half of #178's relay defence: a revoked ex-scheduler still named in a worker's
+    // `--scheduler` is refused by the WORKER, before any proof leaves it -- so it has nothing to
+    // relay. Asserted at the server as well: no proof arrived there at all.
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+    auto const key = Testing::TestKeyPair(std::string { ProvingMachine });
+    auto notice = Cc::CredentialNotice::Silent();
+
+    for (auto const standing: { ServerStanding::NotVoter, ServerStanding::Revoked })
+    {
+        auto sealed = DialSealed(port);
+        FixedServerTrust const trust { standing };
+        Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+        NodeProofClient const client { std::string { ProvingMachine }, key, trust, random };
+        auto const attempt = client.Prove(*sealed, notice, Cc::Credential {});
+        CHECK(attempt.result == NodeProofResult::Untrusted);
+        CHECK_FALSE(sealed->Sealed());
+        if (standing == ServerStanding::Revoked)
+            CHECK(attempt.reason.contains("REVOKED"));
+    }
+    for (auto const counter: { IMetricsSink::Counter::NodeProofsAccepted,
+                               IMetricsSink::Counter::NodeProofsRejected,
+                               IMetricsSink::Counter::NodeProofsRefusedUnknownKey,
+                               IMetricsSink::Counter::NodeProofsRefusedRevokedKey })
+        CHECK(rig.Read(counter) == 0);
+
+    // The control: a server with no roster to check against yet is proved to, since a worker that
+    // has not adopted one has nothing to refuse it with.
+    auto sealed = DialSealed(port);
+    FixedServerTrust const unchecked { ServerStanding::Unchecked };
+    Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+    NodeProofClient const client { std::string { ProvingMachine }, key, unchecked, random };
+    CHECK(client.Prove(*sealed, notice, Cc::Credential {}).result == NodeProofResult::Proved);
+}
+
+TEST_CASE("A worker told the node serves no proof reads it as no scheduler, not as a refusal",
+          "[node][frame][proof][client]")
+{
+    // A node running no consensus answers the family `NoCluster`; the worker names that apart
+    // from a refusal of ITS identity, because the remedies are different machines.
+    Fleet fleet;
+    MergedResponder merged { SurfaceComponents { .scheduler = &fleet.responder, .nodeProof = nullptr } };
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), merged, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto sealed = DialSealed(port);
+    FixedServerTrust const trust { ServerStanding::Voter };
+    Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+    auto const key = Testing::TestKeyPair(std::string { ProvingMachine });
+    NodeProofClient const client { std::string { ProvingMachine }, key, trust, random };
+    auto notice = Cc::CredentialNotice::Silent();
+    CHECK(client.Prove(*sealed, notice, Cc::Credential {}).result == NodeProofResult::NotOffered);
 }

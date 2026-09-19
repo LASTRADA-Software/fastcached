@@ -1416,7 +1416,8 @@ namespace
         { .route = Distributed::MembershipParticipant::ClusterMembers, .name = "the cluster's member set" },
         { .route = Distributed::MembershipParticipant::ClientTombstone, .name = "--cluster-forget-client" },
         { .route = Distributed::MembershipParticipant::OpenPolicy, .name = "--fleet-open" },
-        { .route = Distributed::MembershipParticipant::ProvenKeyHolder, .name = "proved the cluster key" },
+        { .route = Distributed::MembershipParticipant::ProvenIdentity, .name = "proved its identity key" },
+        { .route = Distributed::MembershipParticipant::KeyTombstone, .name = "a revoked identity key (--cluster-forget)" },
     } };
 
     static_assert(RowsInEnumeratorOrder(AdmissionRouteNames, &AdmissionRouteName::route),

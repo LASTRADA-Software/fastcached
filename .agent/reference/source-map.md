@@ -111,13 +111,13 @@ src/FastCache/
                 hand-written consensus implementation has no published
                 verification vector to check against the way MurmurHash3 has
                 SMHasher's, so that harness is the closest available oracle.
-  Cluster/      DiscoveryService + DiscoveryWire (the LAN beacon and its PSK
-                challenge, driven over the socket pair Net/SharedPortDatagram
+  Cluster/      DiscoveryService + DiscoveryWire (the LAN beacon and the
+                identity-key challenge after it, driven over the socket pair Net/SharedPortDatagram
                 gives a node: it listens where the segment shouts, on a port every
                 node shares, and answers from one only it holds, because just one
                 of the sockets sharing a port is handed a unicast and the
                 challenge and the proof are both unicast),
-                PeerDirectory (who proved the key, and where),
+                PeerDirectory (who proved which key, and where),
                 RosterKeys (the keys the Raft peer wire judges members by: the
                 command line's `@<key>` until the replicated state says otherwise,
                 with a revoked key staying revoked whatever the command line says),
@@ -175,6 +175,12 @@ src/FastCache/
                 itself after, with RosterStore keeping it in `--cluster-dir` over
                 the durable-file seam the Raft store uses. A consensus member uses
                 StateLeaseRoster instead -- its applied state IS the roster.
+                NodeProof is the handshake a machine joining the fleet proves its
+                identity key with on the 0xFC surface (#178): the server signs its
+                challenge first, the caller signs the whole transcript, and both
+                derive one session key per direction from an ephemeral X25519
+                exchange -- pure functions over the transcript, so every field a
+                signature covers is a unit test that changes it.
   Protocol/     IProtocolHandler, ProtocolAutodetect,
                 Framing/ByteReader (line and length-prefixed), MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
@@ -188,7 +194,13 @@ src/FastCache/
                 row carrying the counter, RefuseWithoutCounter with the reason
                 nothing rises, RefuseUntriaged with the issue that will decide
                 -- so a scan can tell a decision from an omission, which it
-                could not while both were a bare EncodeErrorReply)
+                could not while both were a bare EncodeErrorReply).
+                SealedFrameSocket seals every 0xFC frame after a node proof: an
+                ISocket decorator wrapped around the connection from the start and
+                ENGAGED at the proof, because the loop, the sweeper, the peer watch
+                and the progress pulse all hold the connection's socket and a swap
+                could not reach them at once. ProvenIdentity is what the proof
+                established -- the id claimed and the key it verified under.
   Server/       Connection (per-client coroutine), Server,
                 ReactorServerLoop (the server driver), AdminHttpServer (the
                 read-only HTTP surface; its routes are a table a caller

@@ -40,7 +40,7 @@ inline constexpr std::string_view UnreadableStateRemedy =
     "node. If its cluster is already running on this build, start it again with --raft-join added and its "
     "--raft-peer list unchanged, so it waits to be admitted rather than bootstrapping a cluster of itself: a cluster "
     "that still counts it catches it up from the leader, and one that has forgotten it admits it again with "
-    "--cluster-admit (or --cluster-admit-learner). It keeps its --cluster-key-file, so it needs no --enroll-from. If "
+    "--cluster-admit (or --cluster-admit-learner). It keeps its identity, so it needs no --enroll-from. If "
     "every member was moved aside together, start them under their --raft-peer bootstrap set instead and make again "
     "every --cluster-* change made since the cluster formed; see docs/operations/upgrading-a-fleet.md";
 

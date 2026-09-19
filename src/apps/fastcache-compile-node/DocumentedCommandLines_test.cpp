@@ -135,7 +135,7 @@ constexpr std::array<ExcludedPage, 0> ExcludedPages {};
 /// the documented example failed it, and five flags were added to the page one at a
 /// time to appease it. Each satisfied one more row of a gate the binary skips for
 /// that verb; not one changed a line of the output block beneath it; and the page
-/// ended up teaching that `--print-surfaces` demands a scheduler and a cluster key,
+/// ended up teaching that `--print-surfaces` demands a scheduler and a key file,
 /// which is false. The edit was reverted. **A fix that needs several rounds of
 /// appeasing a checker, against a page whose expected output never moves, is the
 /// checker asking the wrong question.**
@@ -179,7 +179,7 @@ constexpr std::array NonStartVerbs {
     NonStartVerb { .flag = "--enroll-approve", .why = "an enrollment verb: admits one pending id and exits" },
     NonStartVerb { .flag = "--enroll-reject", .why = "an enrollment verb: refuses one pending id and exits" },
     // Not a cluster verb but a one-shot JOIN: it asks a member to enrol this machine,
-    // polls until somebody decides, writes the cluster key and exits. It is judged by
+    // polls until somebody decides, keeps what it was handed and exits. It is judged by
     // its own refusal on that path and NOT by `StartupPolicyRejection`, which asks what
     // a node needs in order to SERVE -- so it names no `--scheduler`, and a check that
     // demanded one would be documenting a flag this verb has no use for.

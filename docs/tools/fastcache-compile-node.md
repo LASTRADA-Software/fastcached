@@ -11,7 +11,7 @@ about one of them:
 |---|---|---|
 | [A cache tier of its own](#a-cache-of-its-own) | `--cache-memory`, `--cache-dir` | on, 25% of RAM in memory, uncompressed |
 | [Fleet scheduler](#a-cluster-and-who-leads-it) | `--serve-scheduler`, which needs consensus | **off** |
-| [Consensus member](#a-cluster-and-who-leads-it) | `--listen-raft`, with `--cluster-key-file` | **off** — a pure worker runs none; a scheduler is a cluster of one |
+| [Consensus member](#a-cluster-and-who-leads-it) | `--listen-raft` | **off** — a pure worker runs none; a scheduler is a cluster of one |
 | [Peer discovery](#finding-peers-instead-of-typing-them) | `--discovery` | **off** — **UDP**, unlike every other surface |
 | [Metrics, and the fleet dashboard](#watching-one) | `--admin-listen`, `--dashboard` | **off** |
 
@@ -90,7 +90,7 @@ The surfaces, and what each is for:
 |---|---|---|---|
 | Node port — cache verbs, compile jobs, and the scheduler's with `--serve-scheduler` | `--listen-node` | `6674` — **always on**; a bare port takes **loopback**, or the **wildcard** with `--serve-scheduler` | TCP |
 | Admin / metrics | `--admin-listen` | off; a bare port takes **loopback** | TCP |
-| Consensus peer | `--listen-raft` | off; giving it turns consensus **on** (and requires `--cluster-key-file`), and a bare port takes the **wildcard** | TCP |
+| Consensus peer | `--listen-raft` | off; giving it turns consensus **on**, and a bare port takes the **wildcard** | TCP |
 | Discovery | `--discovery` + `--discovery-reply-port` | off; always binds the **wildcard** | **UDP** |
 
 Three things on that table are easy to get wrong and expensive to get wrong:
@@ -139,7 +139,7 @@ which node that is:
 fastcache-compile-node \
     --serve-scheduler --listen-node=0.0.0.0:6675 \
     --listen-raft=6680 --raft-self=scheduler.internal \
-    --fleet-open --cluster-key-file=/etc/fastcached/cluster.key \
+    --fleet-open \
     --scheduler=127.0.0.1:6675 \
     --advertise=scheduler.internal:6675 \
     --toolchain=/usr/bin/g++
@@ -148,14 +148,13 @@ fastcache-compile-node \
 `--listen-raft` is not optional here, even on one machine: a scheduler signs every lease
 with its own identity key and hands its workers a roster its cluster's voters certify,
 so it is a consensus member — a cluster of one — and `--raft-self` says where another
-member would dial it. Consensus needs `--cluster-key-file`. Both are startup refusals
+member would dial it. That is a startup refusal
 ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). The same line with
 `--print-identity` added prints the key its workers name:
 
 ```sh
 fastcache-compile-node --print-identity \
-    --listen-raft=6680 --raft-self=scheduler.internal \
-    --cluster-key-file=/etc/fastcached/cluster.key
+    --listen-raft=6680 --raft-self=scheduler.internal
 ```
 
 Give `--fleet-member` or `--fleet-open` too, or admit client machines with
@@ -170,9 +169,29 @@ fastcache-compile-node \
     --listen-node=0.0.0.0:6674 \
     --advertise=worker-01.internal:6674 \
     --fleet-open --voter-key=<scheduler-public-key> \
-    --cluster-key-file=/etc/fastcached/cluster.key \
+    --cluster-dir=/var/lib/fastcache-node \
     --toolchain=/usr/bin/g++
 ```
+
+`--cluster-dir` is not optional: a worker proves **which machine it is** on every
+connection to its scheduler, with an identity key it mints into that directory on its
+first start, and the scheduler refuses every verb a machine joins the fleet with —
+registering, announcing, heartbeating — on a connection that proved nothing. The
+cluster admits that key once, either way round:
+
+```sh
+# on the worker: ask a member to enrol it, and wait for an operator to approve
+fastcache-compile-node --cluster-dir=/var/lib/fastcache-node --enroll-from=build-cache.internal:6675
+
+# or print its identity on the worker, and admit it from anywhere
+fastcache-compile-node --cluster-dir=/var/lib/fastcache-node --print-identity
+fastcache-compile-node --scheduler=build-cache.internal:6675 --cluster-admit-worker=<id>@<key>
+```
+
+A worker enrolled with `--enroll-from` is also handed the cluster's certified roster
+and keeps it, so it needs no `--voter-key`; one admitted with `--cluster-admit-worker`
+has no roster until its scheduler hands it one, and names the voters it trusts until
+then. See [A node proves which machine it is](#a-node-proves-which-machine-it-is-and-every-frame-after-it-is-sealed).
 
 `--voter-key` is not optional here: `--fleet-open` over a bind that faces the network
 is a node that would compile for anybody who can reach the port, and it can check the
@@ -231,7 +250,8 @@ address other machines can reach.
 should. They do not, for four reasons:
 
 - **It would save one flag, and only after three others.** Widening the bind is what
-  makes the compile verbs face the network, so `--cluster-key-file` becomes required;
+  makes the compile verbs face the network, so a roster to check leases against becomes
+  required;
   and the widened bind becomes the advertised endpoint, so `--advertise` becomes
   required too. A fleet worker still names four flags either way.
 - **It would silence the message that teaches.** The refusal you get today for naming
@@ -559,8 +579,8 @@ the host, which the leader warns about at forget time; that member records the s
 its own log, naming the entry it did not apply.
 
 Because admission is a **fold** over several routes -- this node's `--fleet-member` list,
-the cluster's member set, the tombstones, `--fleet-open`, and a caller that proved the
-cluster key -- the question *why is this host still served* rarely has one answer. Ask the
+the cluster's member set, the tombstones, `--fleet-open`, and the identity a caller
+proved -- the question *why is this host still served* rarely has one answer. Ask the
 node that is behaving oddly:
 
 ```console
@@ -588,6 +608,7 @@ fastcache-compile-node \
     --upstream=build-cache.internal:6674 \
     --scheduler=scheduler.internal:6675 \
     --advertise=worker-01.internal:6677 \
+    --cluster-dir=/var/lib/fastcache-node \
     --toolchain=/usr/bin/g++
 ```
 
@@ -1034,8 +1055,8 @@ carried on this listener since #416.
 **Whether this node verifies the lease a client presents is decided once, at
 startup**, from whether a machine that is not this one could reach the compile verbs
 *at all*. `--listen-node` binds the wildcard on any
-node running `--serve-scheduler`, so such a node needs `--cluster-key-file` and is
-refused at startup without it. For one release the question had TWO answers to
+node running `--serve-scheduler`, so such a node needs a roster to check leases against,
+and runs consensus -- whose applied state IS that roster -- or is refused at startup. For one release the question had TWO answers to
 combine, and asking either alone let an open surface pass: `--bind 127.0.0.1
 --serve-scheduler --fleet-open` looked local and served unauthenticated compiles on a
 wildcard-bound port. There is one surface now, so there is one answer again.
@@ -1121,10 +1142,11 @@ fleet, and consensus is still what it runs
 grants is signed with its own identity key, and every worker checks that signature
 against a *roster* — the cluster's voters and their keys — that a strict majority of
 those voters endorse. The roster is replicated state, so even a lone scheduler keeps
-it through consensus: `--listen-raft`, `--raft-self` and `--cluster-key-file`, and one
-without them is refused at startup. A worker that runs no consensus is not a member at
-all; it names the voters it trusts with `--voter-key` and adopts the roster they
-endorse from its scheduler's replies.
+it through consensus: `--listen-raft` and `--raft-self`, and one without them is refused
+at startup. A worker that runs no consensus is not a member at all; it is admitted as a
+*worker principal* by its identity key, keeps the roster enrollment handed it or names
+the voters it trusts with `--voter-key`, and adopts each roster they endorse from its
+scheduler's replies.
 
 Run several and exactly one of them must schedule at a time. Without consensus
 every node believes it does — and two nodes handing out the same machine's slots is
@@ -1140,7 +1162,6 @@ fastcache-compile-node \
     --serve-scheduler --listen-node=6675 --fleet-open \
     --scheduler=10.0.0.1:6675 \
     --advertise=10.0.0.1:6675 \
-    --cluster-key-file=/etc/fastcached/cluster.key \
     --toolchain=/usr/bin/g++
 ```
 
@@ -1152,8 +1173,8 @@ why.
 ### A node's identity is its own
 
 **You do not invent a name per machine.** On its first start a node with a consensus
-port mints an identity and writes it into `--cluster-dir`, beside its Raft log; every
-later start reads it back. That is what the cluster admits, what every vote is
+port -- or a worker given `--cluster-dir` -- mints an identity and writes it into its state
+directory, beside its Raft log if it runs one; every later start reads it back. That is what the cluster admits, what every vote is
 counted against, and what survives a rename, a re-image and a restart.
 
 It says which it did, once, at startup:
@@ -1178,7 +1199,7 @@ identity could not name itself at all.
 
 ```sh
 # The whole of a first node
-fastcache-compile-node --listen-raft=6680 --raft-self=10.0.0.1     --cluster-dir=/var/lib/fastcache-node/cluster --cluster-key-file=/etc/fastcached/cluster.key --serve-scheduler ...
+fastcache-compile-node --listen-raft=6680 --raft-self=10.0.0.1     --cluster-dir=/var/lib/fastcache-node/cluster --serve-scheduler ...
 ```
 
 **A second node has to name the first by the id the first actually has**, because every
@@ -1303,7 +1324,7 @@ A node must name itself among its own peers, and it is refused if it does not �
 such a node could never win a vote and could never be voted for, so it would stand
 for election forever against a cluster that has never heard of it.
 
-Giving `--listen-raft` is what turns consensus on, and five things then have to hold.
+Giving `--listen-raft` is what turns consensus on, and four things then have to hold.
 Each is decided by the command line alone, so each is refused at startup **and** at
 `--install-service`, where you are watching, rather than at every boot into a log
 nobody reads:
@@ -1314,7 +1335,6 @@ nobody reads:
 | this node is named, by a `--raft-peer` of its own or by `--raft-self` | The address its peers dial is the half only it knows — whether it bootstraps a cluster or joins one with `--raft-join`. |
 | not both, naming different addresses | Two answers to one question, with nothing to rank them by. |
 | `--listen-raft` names a usable port | That is where every peer dials it, and giving it is what turns consensus on. A value that is not an address is refused with the text you typed. |
-| `--cluster-key-file` names the cluster's key | A consensus node signs the scheduler's leases with it and proves itself on the node port with it. It no longer proves anything between members, on the LAN or at enrollment -- each member's own identity key does, see [Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication) -- but it is still required until those two move too. Enrollment no longer hands it over, so it is placed on every member by hand. The refusal says how to make one. |
 
 The reverse holds too: `--node-id` or `--raft-peer` **without** `--listen-raft` is
 refused rather than ignored. This node would run no consensus at all, so neither
@@ -1404,9 +1424,8 @@ started, and only it names anybody.
 
 ### Adding a machine to a running cluster
 
-Two commands, on two machines. The joining node is started with `--raft-join` and
-the cluster's key — without the key it is refused at startup, and with a different one
-every member refuses its connections and it never follows anybody:
+Two commands, on two machines. The joining node is started with `--raft-join`, so it waits
+to be admitted rather than bootstrapping a cluster of itself:
 
 ```sh
 fastcache-compile-node \
@@ -1417,7 +1436,6 @@ fastcache-compile-node \
     --serve-scheduler --listen-node=6675 --fleet-open \
     --scheduler=10.0.0.4:6675 \
     --advertise=10.0.0.4:6675 \
-    --cluster-key-file=/etc/fastcached/cluster.key \
     --toolchain=/usr/bin/g++
 ```
 
@@ -1695,12 +1713,12 @@ secret — so a joiner whose reply went missing simply asks again. There is no s
 no re-approval and nothing to re-arm; that whole mechanism existed because a key
 handed over could not be handed over twice, and it went with the key.
 
-**Enrollment no longer hands over `--cluster-key-file`.** A consensus node still
-reads that file — it signs leases and proves a member on the node port — until those
-wires move to identity keys as well, so place it on a joining member the way it is
-placed on every other; a member that finishes enrolling without one says so. What
-the key no longer does is admit anybody: it travels nowhere, and a machine holding it
-is not thereby a member.
+**Enrollment hands over no secret at all.** The cluster's pre-shared key it used to
+carry is gone ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)): every
+wire proves a node's own identity key, so an admitted joiner needs nothing placed by hand.
+A worker is handed the cluster's *certified* roster beside the one it compares, and keeps it
+as its trust root once a majority of the compared roster's voters are seen to endorse it --
+so it checks the grants it is handed from its first start, with no `--voter-key`.
 
 **An open window says so, repeatedly.** The node logs a warning when the window
 opens and goes on logging it at an interval for as long as it is open, so a window
@@ -1944,13 +1962,9 @@ machine each time a member moves. `--discovery` replaces that editing with a
 broadcast:
 
 ```sh
-head -c 32 /dev/urandom | base64 > /etc/fastcached/cluster.key   # once, per fleet
-chmod 600 /etc/fastcached/cluster.key                            # then copy it around
-
 fastcache-compile-node \
     --node-id=n1 --listen-raft=6680 --raft-peer=n1=10.0.0.1:6680 \
     --discovery=255.255.255.255:6681 \
-    --cluster-key-file=/etc/fastcached/cluster.key \
     --cluster-id=build-farm \
     --scheduler=10.0.0.1:6675 --advertise=10.0.0.1:6675 \
     --serve-scheduler --listen-node=6675 --fleet-open --toolchain=/usr/bin/g++
@@ -1984,20 +1998,13 @@ signature where a 32-byte MAC was — so the discovery wire moved to version 2, 
 node on an older build is refused rather than misread; upgrade a segment's consensus
 members together.
 
-**`--cluster-key-file` is a file and not a flag**, and that is the whole reason it
-exists in that shape. A command line is readable through `ps` on every POSIX system,
-and a service's arguments end up in a unit file or a registry key that more accounts
-can read than can read a mode-0600 file.
-
-**Three readers are left.** The scheduler **signs lease grants** with it — a MAC
-over the granted worker's endpoint, the toolchain, the object key and an expiry
-([#281](https://github.com/LASTRADA-Software/fastcached/issues/281)) — the worker
-**verifies** that MAC before it compiles anything
-([#282](https://github.com/LASTRADA-Software/fastcached/issues/282)), and a caller
-proves it on the node port. Discovery and the consensus wire no longer read it at all:
-each proves a node's own key instead. So every node that runs consensus or a reachable
-worker still wants the file, and a node running consensus without it **will not
-start**; `--discovery` has no key requirement of its own any more.
+**There is no cluster key any more.** The pre-shared `--cluster-key-file` every member
+used to hold -- which signed lease grants, proved a node on the node port and, before
+that, admitted discovered peers -- is gone, and the flag with it
+([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)): a grant is signed by
+the voter that issued it, a node proves its own identity key, and removing one machine is
+revoking that one key rather than rotating a secret on every other. A command line naming
+`--cluster-key-file` is refused as a flag this node does not have.
 
 A worker nothing else can dial runs without the lease check and warns once, loudly. A
 scheduler with no key hands out unsigned grants and says so at the first one.
@@ -2109,10 +2116,17 @@ The package ships a socket-activated unit. Enable the **socket**, not the
 service:
 
 ```sh
-sudoedit /etc/fastcached/fastcache-compile-node.yaml   # scheduler and advertise;
-                                                       # the compilers are discovered
+sudoedit /etc/fastcached/fastcache-compile-node.yaml   # scheduler, advertise and
+                                                       # cluster_dir; the compilers
+                                                       # are discovered
 sudo systemctl enable --now fastcache-compile-node.socket
 ```
+
+`cluster_dir: /var/lib/fastcache-node` is the one to know about: the unit creates
+that directory for the worker (`StateDirectory=`), it is where the worker keeps the
+identity key it proves to its scheduler, and a worker naming a scheduler without one
+refuses to start. Its first start mints the key; admit it as
+[the node proof section says](#a-node-proves-which-machine-it-is-and-every-frame-after-it-is-sealed).
 
 The unit's `ExecStart` names that file, and the shipped copy is every setting
 commented out — so an untouched install behaves exactly like running the worker
@@ -2373,7 +2387,9 @@ msiexec /i fastcached.msi ^
 
 Both are required together or nothing is registered: a registration naming a
 scheduler and no advertised endpoint bakes in `0.0.0.0`, and that worker is
-leased out and never reached.
+leased out and never reached. The state directory is not a property: the MSI
+registers `%ProgramData%\fastcache-node`, and the cluster admits the identity key
+the worker mints there on its first start.
 
 Remove a registration with `--uninstall-service` (and the same
 `--service-scope`, on macOS: which domain a job lives in is decided at install
@@ -2426,12 +2442,13 @@ Dropping `fleet_open:` from the file and reloading closes the node again. Everyb
 `fleet_member:` list does not name is refused from that moment; this machine is still
 admitted, always, because a process on this host already has this host's compiler.
 
-**A reload will not widen a node that has no `cluster_key_file:`.** Such a worker chose
-at startup to verify no lease signatures, which is safe only while no machine but its
-own is admitted — and under socket activation nothing it can read tells it whether its
-port faces the network. A reload that would newly admit a remote host is therefore
-refused by name and *nothing* is applied. Give the node a key and restart it, or leave
-the policy as it is. Narrowing stays allowed on such a node, which is the direction that
+**A reload will not widen a worker that names no `voter_key:`.** Such a worker may have
+chosen at startup to verify no lease signatures, which is safe only while no machine but
+its own is admitted — and under socket activation nothing it can read tells it whether its
+port faces the network, while a roster kept in its state directory is a thing no
+configuration can see. A reload that would newly admit a remote host is therefore refused
+by name and *nothing* is applied. Name the cluster's voters and restart it, or leave the
+policy as it is. Narrowing stays allowed on such a node, which is the direction that
 closes it.
 
 ### Rotating `requirepass`
@@ -2782,6 +2799,7 @@ the network.
 ```sh
 fastcache-compile-node --scheduler scheduler.internal:6675 \
                        --advertise worker-01.internal:6674 \
+                       --cluster-dir /var/lib/fastcache-node \
                        --admin-listen 6677
 curl -s localhost:6677/healthz     # 200 while the worker is answering
 curl -s localhost:6677/metrics     # Prometheus exposition
@@ -2859,7 +2877,7 @@ exposition cannot drift apart again without a red build.
 | `fastcache_worker_cordons_refused_not_local_total` | Cordon requests refused because they came from another machine. A machine is cordoned from itself; a rise means somebody elsewhere is trying to take it out of the fleet. |
 
 
-**A dispatched compile whose envelope or lease did not hold.** The envelope rows are about the bytes; the lease rows are about the credential. A rise in a lease row on a healthy fleet names a clock, a cluster key or a rollout rather than a client.
+**A dispatched compile whose envelope or lease did not hold.** The envelope rows are about the bytes; the lease rows are about the credential. A rise in a lease row on a healthy fleet names a clock, a roster or a rollout rather than a client.
 
 | Series | Says |
 |---|---|
@@ -3202,7 +3220,6 @@ fastcache-compile-node --scheduler 127.0.0.1:6675 \
                        --serve-scheduler --listen-node 6675 --fleet-member 10.0.0.2 \
                        --listen-raft 6680 --raft-self 10.0.0.1 \
                        --admin-listen 6677 \
-                       --cluster-key-file /etc/fastcached/cluster.key \
                        --dashboard --dashboard-token-file /etc/fastcached/dashboard.token
 curl -s -u ":$(cat /etc/fastcached/dashboard.token)" localhost:6677/fleet.json | jq .
 ```
@@ -3669,7 +3686,7 @@ the build stays green while that translation unit silently stops being distribut
 `--allow-compile-arg` (`allow_compile_arg:` in the file) adds a spelling, repeatably:
 
 ```sh
-fastcache-compile-node --scheduler=sched:6676 \
+fastcache-compile-node --scheduler=sched:6676 --cluster-dir=/var/lib/fastcache-node \
     --allow-compile-arg=-fanalyzer \
     --allow-compile-arg=/Qvec-report:2
 ```
@@ -3711,11 +3728,13 @@ worker's compiler do, and an incident is read against what was in force at the t
 Until it closes, the boundary of those framed surfaces is **network reachability plus
 membership**, and a token on it is worse than no token. The credentials that *are*
 real: `--dashboard-token-file` for the fleet page, `fastcached`'s own `--requirepass`
-for the shared cache, the cluster key, and each member's own identity key, which every
-**consensus** connection proves before a message is read — so the Raft port is not open
-to whoever can reach it and one member cannot speak as another — and which every lease
-grant is signed with. That handshake authenticates; it does not encrypt. See
-[Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication).
+for the shared cache, and each node's own identity key, which every **consensus**
+connection proves before a message is read — so the Raft port is not open to whoever can
+reach it and one member cannot speak as another — which every connection a machine joins
+the fleet on proves before a joining verb is heard, and which every lease grant is signed
+with. Those handshakes authenticate; they do not encrypt. See
+[Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication)
+and [the node's own](#a-node-proves-which-machine-it-is-and-every-frame-after-it-is-sealed).
 
 Keep `--serve-scheduler` off any network you would not run a compiler for. That
 is why it is a separate process from the cache: the cache may reasonably be
@@ -3741,74 +3760,95 @@ where addresses can be spoofed is not a boundary this can hold.
 
 For anything beyond a trusted build network, put mTLS in front of every port.
 
-### A node proves its membership instead of being recognised by its address
+### A node proves which machine it is, and every frame after it is sealed
 
-**Every node-to-node connection now opens by proving the cluster key, and a node that
-proves it is admitted whatever address it dialled from.** There is no flag: a node that
-has `--cluster-key-file` presents a proof on every heartbeat round, and one that has the
-key verifies the proofs presented to it. Nothing else changes — a caller that proves
-nothing is admitted or refused by its address exactly as before.
+**Every connection a machine makes to its scheduler opens by proving its identity key, and
+the scheduler admits it by that identity whatever address it dialled from**
+([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). There is no flag: a
+node keeping an identity -- a consensus member, or a worker given `--cluster-dir` -- proves
+it on every heartbeat round, and a node running consensus verifies the proofs presented to
+it against the cluster's roster.
+
+**The verbs a machine JOINS the fleet with require it.** `REGISTER`, `NODE-ANNOUNCE`,
+`HEARTBEAT` and `WITHDRAW` are refused `node-identity-required` on a connection that proved
+no identity the cluster holds -- from any address, loopback included. An address still
+admits a **client**: a launcher asking for a lease, an operator's one-shot verb, a
+dashboard. That is why a worker needs `--cluster-dir` and a launcher needs nothing.
 
 This is what makes a machine on a VPN, a NAT or DHCP usable at all. Before it, admission
 was the peer's source address against the cluster's committed endpoints or against
 `--fleet-member`, so a worker that gets a different address each session had to be
 re-listed each session, on every node.
 
-The exchange is two verbs on the port the node already serves: the node asks for a
-challenge, the server states one drawn for that connection, and the node answers with an
-HMAC over it under the cluster key. A challenge answers exactly one proof and is spent
-whatever the outcome, so a recorded exchange cannot be replayed onto a second connection.
+**The exchange** is two verbs on the port the node already serves:
 
-**What it does and does not establish.** It establishes *this caller holds the cluster
-key*. It does **not** say WHICH holder: one shared key cannot tell its holders apart, so
-the node id a proof carries is a label the MAC covers — it cannot be swapped by a relay —
-rather than an identity. Two consequences worth knowing before you rely on it:
+1. The node sends a fresh nonce and an ephemeral X25519 key.
+2. The scheduler answers with its node id, its identity key, a nonce and an ephemeral key of
+   its own, and signs all of it. The node checks the signature and -- once it holds the
+   cluster's roster -- that the key is a live voter's. A machine the cluster revoked, still
+   named in a worker's `--scheduler`, is refused **by the worker**, which proves nothing to
+   it.
+3. The node signs the whole exchange with its identity key. The scheduler verifies the
+   signature first and asks its roster second, so a caller that cannot sign learns nothing
+   about which ids and keys the cluster holds.
 
-- **Removing one machine still means rotating the key on all the others.** A proof cannot
-  be revoked: `--cluster-forget` revokes the machine's IDENTITY key, which ends its Raft
-  peer sessions, but this proof is made with the shared cluster key, which a forgotten
-  machine still holds. Moving this proof onto the identity key is the rest of
-  [#178](https://github.com/LASTRADA-Software/fastcached/issues/178).
-- **A node that runs no consensus has no id to name**, because an identity is minted into
-  `--cluster-dir` only where consensus runs. Such a node proves with an empty label, which
-  is accepted; what it costs is that the server's log and `--node-status` then name the
-  address it proved from and nothing else.
+**Then every frame is sealed.** Both ends derive one key per direction from the ephemeral
+exchange -- bound to both nonces and both ids -- and every frame after the proof, the
+scheduler's answer to it first, carries an HMAC under it. That is what defeats a machine on
+the path: something between a worker and its scheduler can relay a genuine handshake byte
+for byte, but it cannot compute the session key, so a verb it injects fails its tag and the
+connection closes. A frame replayed, reordered or dropped inside the session fails the same
+way. A connection proves once; asking again closes it.
 
-**Where it does not reach.** A node's own cache tier still serves this machine only — that
-is a property of the verb and not of any list, so holding the fleet's key does not open
-it. The fleet page and a live-stats subscription both need `--dashboard-token-file` on top
-of membership, and that credential is unchanged: **a proof is not a substitute for the
-token.** What a proof does reach is the membership half of both, live stats included since
-[#1512](https://github.com/LASTRADA-Software/fastcached/issues/1512) — so a node admitted
-by its proof alone can read the fleet and subscribe to it with the dashboard token, and
-its subscription is re-checked against the same proof on every tick rather than being
-admitted once and dropped.
+**Admitting a machine.** A consensus member is admitted with `--cluster-admit` (or
+`--enroll-from`). A worker that runs no consensus is admitted as a *worker principal*:
+`--enroll-from=<member>` on the worker, approved with `--enroll-approve`, or
+`--cluster-admit-worker=<id>@<key>` from anywhere, with the two lines its `--print-identity`
+prints.
 
-**Reading the counters.** Four series, and they answer different questions:
+**Removing one.** `--cluster-forget=<id>` revokes the machine's key, and nothing is rotated
+on anybody else. A connection that proves a revoked key is refused `node-key-revoked` and
+**marked**: every later request on it is refused as the forgotten machine's -- including
+from a host `--fleet-member` still lists, and including a live-stats subscription already
+running, which ends on its next tick. The key outranks the listing.
+
+**Where it does not reach.** A node's own cache tier still serves this machine only -- that
+is a property of the verb and not of any list, so an admitted identity does not open it. The
+fleet page and a live-stats subscription both need `--dashboard-token-file` on top of
+membership, and that credential is unchanged: **a proof is not a substitute for the token.**
+What a proof does reach is the membership half of both.
+
+**Reading the counters.**
 
 | Series | What a rise means |
 |---|---|
 | `fastcache_node_proofs_accepted_total` | The route is live. Every other row below counts a refusal, so this is the only one that distinguishes *working* from *never used*. |
-| `fastcache_node_proofs_rejected_total` | A tag that did not authenticate: a machine with the wrong `--cluster-key-file`, or somebody guessing at the key. The **rate** separates them — one misconfigured machine moves it once per dial round, forever, at a cadence you can recognise. |
+| `fastcache_node_proofs_rejected_total` | A signature that did not verify under the key the proof presented: somebody who does not hold that key, or a proof relayed onto another handshake. Not a machine waiting to be admitted -- that is the next row. |
+| `fastcache_node_proofs_refused_unknown_key_total` | A genuine signature under a key the cluster does not hold for that id: a machine not yet admitted, or one admitted under another key. The remedy is `--enroll-approve` or `--cluster-admit-worker`, never a hunt for an attacker. |
+| `fastcache_node_proofs_refused_revoked_key_total` | The forgotten machine itself, still holding its key and still dialling. |
+| `fastcache_node_requests_refused_key_revoked_total` | Requests refused on a connection a revoked key marked, at every surface that folds the proven identity. Apart from a forgotten HOST's row, because the diagnoses are opposite. |
+| `fastcache_node_sealed_frames_refused_total` | A frame whose seal did not verify on a proven connection: injected, altered, replayed or reordered by something between the two ends. On a healthy network this reads zero; a rise is the alarm. |
 | `fastcache_node_proofs_unchallenged_total` | A client sent a proof with no challenge outstanding. A version or client-library mismatch, not a security signal. |
 | `fastcache_node_proofs_malformed_total` | A payload that would not decode. The same kind of mismatch, kept apart so an old client cannot hide a key search. |
+| `fastcache_scheduler_requests_refused_node_identity_required_total` | A joining verb sent on a connection that proved no identity: a node started without `--cluster-dir`, or an older build. |
 
 Never sum `node_proofs_rejected` with `scheduler_credentials_rejected`: that one is a
 wrong `--requirepass` against this node's `--scheduler-token-file`, which is an operator's
-token, and this is the cluster key every member holds. Two secrets, two remedies.
+token, and this is a machine's own key. Two credentials, two remedies.
 
-A node whose proof is refused says so once per round and **carries on registering by
-address**, because a mixed fleet mid-upgrade is the ordinary reason a peer answers no proof
-at all:
+A node whose proof is not accepted says so once per round, naming the scheduler and the
+reason, and **tries the next `--scheduler`** in the same round -- a connection that proved
+nothing is one on which no joining verb can be heard, so it counts as an endpoint that did
+not answer:
 
 ```
-WARN  scheduler 10.0.0.2:6676 did not accept this node's cluster-key proof: ...
-      Registration continues by address; check --cluster-key-file on this machine if it is refused
+WARN  scheduler.internal:6675 did not accept this machine's identity: node-key-unknown: this cluster holds no such key for w-7 ...
 ```
 
-A node that holds no cluster key answers both verbs `no-cluster`, naming the flag, rather
-than *unimplemented verb* — which a caller would read as *this node's build is too old* and
-act on by upgrading a machine that is already current.
+A node running no consensus answers both verbs `no-cluster` rather than *unimplemented
+verb* — which a caller would read as *this node's build is too old* and act on by upgrading
+a machine that is already current — and a worker reads it as *this is no scheduler of this
+fleet*.
 
 ## Known limitations
 

@@ -59,6 +59,8 @@ namespace
 {
     NodeConfig cfg;
     cfg.schedulers = { "cache.internal:6675" };
+    // Where its identity is kept (#178): a node naming a scheduler proves which machine it is.
+    cfg.clusterDir = "cluster";
     cfg.advertise = "worker-01.internal:6676";
     cfg.toolchains = { "/usr/bin/g++" };
     return cfg;

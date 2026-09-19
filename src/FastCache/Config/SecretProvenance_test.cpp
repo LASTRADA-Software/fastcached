@@ -216,7 +216,7 @@ TEST_CASE("SecretProvenance: the startup warning fires on an exposed file and no
     SECTION("one file named twice is one sentence")
     {
         // A single-machine deployment legitimately points two settings at one file --
-        // the cluster key and the scheduler token, say. The same remedy for the same
+        // the scheduler token and the dashboard token, say. The same remedy for the same
         // path twice reads as two problems, which is the alarm fatigue this check
         // exists to avoid rather than cause. Asserted on the COUNT and not merely on
         // "a warning arrived": both the deduplicating and the repeating version warn.
@@ -254,14 +254,14 @@ TEST_CASE("SecretProvenance: which paths are never asked about at all", "[config
     // NOT asked -- so running them only where `chmod` exists would leave the two skips
     // untested on the platform whose answer for a file it cannot inspect
     // (`Undetermined`, from an unreadable security descriptor) is the one that would
-    // turn a mistyped `--cluster-key-file` into a sentence about permissions.
+    // turn a mistyped `--tls-key` into a sentence about permissions.
     FastCache::Testing::ScratchDirectory const scratch { "fastcached-secret-skips" };
 
     SECTION("a path that is not there says nothing")
     {
         // Distinct from "the platform would not say who may read this", which IS
         // reported. `SecretFileExposure` answers `Undetermined` for a failed `stat`,
-        // so asking it unconditionally would answer a mistyped `--cluster-key-file`
+        // so asking it unconditionally would answer a mistyped `--tls-key`
         // with a sentence about permissions -- while whoever loads the file answers
         // with the real diagnosis a line later.
         std::array<std::filesystem::path, 1> const files { scratch / "never-written.key" };

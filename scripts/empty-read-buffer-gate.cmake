@@ -37,8 +37,8 @@ cmake_minimum_required(VERSION 3.28)
 # left to be discovered.** `scripts/read-slot-guard-gate.cmake` and
 # `scripts/reactor-teardown-gate.cmake` are the other two; measured, the executable
 # lines differ only in the two string literals this gate matches on. Keep it
-# byte-for-byte with them apart from those, for the reason `check-psk-signing-seam.cmake`
-# gives about its own copies: a copy that rewrites an escape or a spelling is equivalent
+# byte-for-byte with them apart from those, for the reason the retired `check-psk-signing-seam.cmake`
+# gave about its own copies: a copy that rewrites an escape or a spelling is equivalent
 # and non-identical, which is exactly the divergence a later consolidation cannot detect.
 # Consolidating the three into one parameterised gate is worth doing and is deliberately
 # NOT pre-empted here -- it would touch two guards this change has no other business in,

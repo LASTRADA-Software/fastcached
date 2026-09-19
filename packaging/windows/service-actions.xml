@@ -202,13 +202,22 @@
          comment, so flag names are written without their leading dashes here.
 
          Secure="yes" so the values survive the elevation to the deferred action's
-         own session, exactly as FASTCACHED_START_SERVICE does. -->
+         own session, exactly as FASTCACHED_START_SERVICE does.
+
+         The state directory is NOT a property, because it has a defensible default
+         and the other two do not: %ProgramData%\fastcache-node. A worker proves an
+         identity key kept there on every connection to its scheduler (#178), so a
+         registration naming a scheduler and no state directory is refused, and
+         with Return="ignore" that refusal would be a worker the MSI silently never
+         registered. The registration hands the directory to the service account.
+         The cluster still has to admit the key the worker mints there on its first
+         start: its print-identity flag says what to admit. -->
     <Property Id="FASTCACHE_NODE_SCHEDULER" Secure="yes" />
     <Property Id="FASTCACHE_NODE_ADVERTISE" Secure="yes" />
 
     <CustomAction Id="FastCacheNodeInstallService"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --install-service --scheduler=[FASTCACHE_NODE_SCHEDULER] --advertise=[FASTCACHE_NODE_ADVERTISE]"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --install-service --scheduler=[FASTCACHE_NODE_SCHEDULER] --advertise=[FASTCACHE_NODE_ADVERTISE] --cluster-dir=&quot;[CommonAppDataFolder]fastcache-node&quot;"
                   Execute="deferred"
                   Impersonate="no"
                   Return="ignore" />

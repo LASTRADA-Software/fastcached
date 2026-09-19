@@ -206,7 +206,7 @@ std::optional<std::vector<std::byte>> LiveStatsResponder::RefusePeer(PeerIdentit
     // The whole identity, narrowed to what a gate may act on. Since #1512 the re-gate sees the
     // same two facts this door does, so there is no longer a reason to ask a smaller question
     // here -- and asking one anyway would refuse a watcher the re-gate would have kept.
-    return RefuseWatcher(LiveWatcher { .host = peer.host, .provedClusterKey = peer.provenNodeId.has_value() });
+    return RefuseWatcher(LiveWatcher { .host = peer.host, .proven = peer.proven });
 }
 
 std::optional<std::vector<std::byte>> LiveStatsResponder::RefuseWatcher(LiveWatcher const& watcher) const
@@ -246,8 +246,8 @@ std::optional<std::vector<std::byte>> LiveStatsResponder::Admit(Wire::SubscribeR
 
     // The decision `FleetText` answers from too; what is this surface's is which counter each
     // refusal moves. The HOST alone, and that is unchanged by #1512: this is the dashboard
-    // credential and locality, which a cluster-key proof is not a substitute for -- two
-    // secrets answering two questions, and the token is its own file by rule.
+    // credential and locality, which a proven identity is not a substitute for -- two
+    // credentials answering two questions, and the token is its own file by rule.
     auto const verdict = DecideFleetRead(_sources.Leadership(), _dashboard, request.dashboardToken, watcher.host);
     switch (verdict.decision)
     {
@@ -288,15 +288,10 @@ std::optional<std::vector<std::byte>> LiveStatsResponder::Recheck(Wire::LiveSubj
 Task<std::vector<std::byte>> LiveStatsResponder::Serve(std::span<std::byte const> frame, PeerIdentity peer, IPushSink* sink)
 {
     // Narrowed, not dropped (#1512). `LiveWatcher` is what a gate may act on -- the host and
-    // whether the cluster key was proved -- and it OWNS its host because `Recheck` reads it
-    // again on every tick, long after this frame's storage is gone. The proven LABEL stays
-    // here: it is not something a gate can check, and it is legitimately empty.
+    // the identity its connection proved (#178) -- and it OWNS both because `Recheck` reads
+    // them again on every tick, long after this frame's storage is gone.
     co_return co_await _stream.Serve(
-        frame,
-        LiveWatcher { .host = std::move(peer.host), .provedClusterKey = peer.provenNodeId.has_value() },
-        sink,
-        this,
-        &_reactor);
+        frame, LiveWatcher { .host = std::move(peer.host), .proven = std::move(peer.proven) }, sink, this, &_reactor);
 }
 
 } // namespace FastCache::Node

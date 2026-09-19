@@ -53,7 +53,8 @@ static_assert(RowsInEnumeratorOrder(RaftPeerSignatureLabels, &RaftPeerSignatureL
 
 /// Whether every label is present and no two are the same.
 ///
-/// `Cluster::SigningLabelsSeparateDomains`' two halves, for signatures: an empty label separates
+/// The two halves the pre-shared key's `SigningDomainTable` asserted of its MAC labels until #178
+/// retired it, for signatures: an empty label separates
 /// nothing, and a copied row -- a new purpose added by duplicating the line above it -- would make
 /// one signature verify as the other.
 /// @return True when the labels separate every purpose.
@@ -158,7 +159,7 @@ class IRaftPeerIdentity
 ///
 /// What is signed is `[label][field]...` in this project's length-prefixed field grammar, so
 /// the label is a field like any other and no choice of first field can shift bytes across it
-/// -- `Cluster::SignFields`' construction, carried from a MAC to a signature.
+/// -- the construction the pre-shared key's `SignFields` used, carried from a MAC to a signature.
 class RaftPeerIdentity final: public IRaftPeerIdentity
 {
   public:

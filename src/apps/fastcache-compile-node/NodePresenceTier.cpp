@@ -124,6 +124,7 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
             .credential = round.credential,
             .notice = round.notice,
             .logger = round.logger,
+            .prover = round.prover,
         },
         round.roster,
         link,
@@ -142,7 +143,12 @@ bool AnnouncePresence(PresenceMessage const& message, IPresenceRoster* roster, S
     auto const endorsement = roster != nullptr ? roster->Endorsement() : std::vector<std::byte> {};
     PresenceAnnouncement announcement { message.endpoint,   message.capacity, message.load,  endorsement,
                                         message.credential, message.notice,   message.logger };
-    (void) DialAndAnnounce(link, dialer, message.logger, announcement);
+    (void) DialAndAnnounce(
+        link,
+        dialer,
+        message.logger,
+        announcement,
+        AnnounceProof { .prover = message.prover, .credential = &message.credential, .notice = &message.notice });
 
     if (announcement.Accepted() && roster != nullptr)
         roster->Offered(announcement.Reply());
@@ -169,6 +175,7 @@ NodePresence::NodePresence(NodePresenceParts const& parts, SchedulerLink link):
     _logger { parts.logger },
     _conditions { parts.conditions },
     _roster { parts.roster },
+    _prover { parts.prover },
     // Reported at Warn and once, exactly as the registrars' notice is: a credential the
     // scheduler did not want is a configuration fact, not a per-round event.
     _notice { [&logger = parts.logger](std::string_view text) { logger.Logf(LogLevel::Warn, "scheduler: {}", text); } },
@@ -208,7 +215,8 @@ void NodePresence::Loop(std::stop_token const& stop)
                                                        .endpoint = endpoint,
                                                        .logger = _logger,
                                                        .conditions = _conditions,
-                                                       .roster = _roster },
+                                                       .roster = _roster,
+                                                       .prover = _prover },
                                        _link,
                                        _dialer);
 

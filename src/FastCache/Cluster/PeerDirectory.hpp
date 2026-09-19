@@ -139,7 +139,7 @@ class PeerDirectory
     /// @return A snapshot, ordered by node id so callers and tests are stable.
     [[nodiscard]] std::vector<KnownPeer> Peers() const;
 
-    /// Peers that have proved they hold the cluster key.
+    /// Peers that have proved the identity key the cluster holds for them.
     ///
     /// What a membership change may be proposed from, and nothing else.
     /// @return A snapshot, ordered by node id.

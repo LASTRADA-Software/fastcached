@@ -44,6 +44,9 @@ struct NodePresenceParts
     /// The roster half of the verb (#178): this node's endorsement out, the certified roster
     /// back. Null on a node that neither endorses nor verifies anything.
     IPresenceRoster* roster;
+
+    /// How this machine proves itself on each connection (#178); null where nothing proves.
+    NodeProofClient const* prover;
 };
 
 /// What one presence announcement is made of.
@@ -66,6 +69,7 @@ struct PresenceRound
     ILogger& logger;                                  ///< Where a refusal is named.
     NodeConditions const& conditions;                 ///< What is wrong with this machine, as of this round.
     IPresenceRoster* roster;                          ///< The roster half of the verb; may be null.
+    NodeProofClient const* prover;                    ///< How this machine proves itself; null where nothing proves.
 };
 
 /// Announce this machine once, and hand over the history it owes.
@@ -89,6 +93,7 @@ struct PresenceMessage
     ICredentialSource const& credential;              ///< What the announcement presents.
     Cc::CredentialNotice& notice;                     ///< Where an unwanted credential is reported.
     ILogger& logger;                                  ///< Where a refusal is named.
+    NodeProofClient const* prover;                    ///< How this machine proves itself; null where nothing proves.
 };
 
 /// Make one presence announcement: dial, follow a redirect, fall back, and carry the roster both
@@ -180,6 +185,7 @@ class NodePresence
     ILogger& _logger;
     NodeConditions const& _conditions;
     IPresenceRoster* _roster;
+    NodeProofClient const* _prover;
 
     /// Where a credential the scheduler did not want is reported, once for this loop.
     Cc::CredentialNotice _notice;

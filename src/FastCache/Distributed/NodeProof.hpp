@@ -1,136 +1,204 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Cluster/ClusterSigning.hpp>
+#include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Nonce.hpp>
-#include <FastCache/Core/Sha256.hpp>
-#include <FastCache/Core/WireFields.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Core/SessionSeal.hpp>
+#include <FastCache/Core/X25519.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
-#include <span>
-#include <string>
+#include <array>
+#include <cstdint>
+#include <expected>
+#include <optional>
 #include <string_view>
 
 namespace FastCache::Distributed
 {
 
-/// What a caller on the `0xFC` surface proves when it holds the cluster key.
+/// Which machine a caller on the `0xFC` surface is, proved, and the key its frames are sealed
+/// under from then on (#178).
 ///
 /// ## What this is for
 ///
-/// Node-to-node admission on that surface is decided by the caller's SOURCE ADDRESS --
-/// `ClusterMembership::Classify` against the committed endpoints, `--fleet-member` against
-/// a local list. An address is a stand-in for *this is one of our nodes*, and it stops
-/// being one the moment an address is not stable: a worker that joins over a VPN gets a
-/// different one each session, and no literal host match can follow it
-/// ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178) item 1,
-/// [#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
+/// Admission on that surface used to be decided by the caller's SOURCE ADDRESS, and then by a MAC
+/// under the cluster's pre-shared key. An address stops standing in for *this is one of our nodes*
+/// the moment it is not stable; a shared key never said WHICH node, so removing one machine meant
+/// rotating the key on all the others, and a removed machine kept every byte it needed to prove
+/// itself. This is the replacement: each machine signs with its own identity key, the one the
+/// cluster admitted, and a revocation is one roster entry.
 ///
-/// Every caller that matters here already holds the cluster key -- #282 refuses a
-/// network-facing keyless worker at startup and #1308 refuses keyless consensus -- so it
-/// can PROVE membership instead of being inferred from where it dialled from.
+/// ## The handshake
 ///
-/// ## What a PSK proof establishes, and what it does NOT
+/// 1. `NodeChallenge{nonceC, ephC}`: the caller's nonce and ephemeral X25519 key.
+/// 2. `{serverId, serverKey, nonceS, ephS, sigS}`: the server says who it is and signs everything
+///    so far under `NodeProofSignature::ServerChallenge`. A caller that holds a roster checks that
+///    `serverKey` is a live voter's before it proves anything -- so a revoked ex-scheduler still
+///    named in a worker's `--scheduler` is refused by the WORKER.
+/// 3. `ProveNode{clientId, clientKey, sigC}`: the caller signs everything so far, `sigS` included,
+///    under `NodeProofSignature::NodeProof`. The server verifies under `clientKey` first and asks
+///    its roster second.
 ///
-/// It establishes *this caller holds the cluster key*. It does **not** establish WHICH
-/// holder: under a shared key every holder can mint any id's proof, so the node id below
-/// is a LABEL that travels inside the MAC rather than an authenticated identity. Binding
-/// it still buys something real -- a captured proof cannot have a different id swapped
-/// onto it, and the id is what this server records and logs -- but a reader who takes
-/// `provenNodeId` for an identity will build something that is not there.
+/// ## Why every frame after it is SEALED
 ///
-/// The consequence is stated because it decides what this can be used for: removing one
-/// key-holding machine still means rotating the key on all the others. Making node
-/// REMOVAL meaningful needs per-node identity, which is #178's threat model: the Raft peer
-/// wire has it (`Consensus::IRaftPeerIdentity`, each end signing with its own key, and a
-/// revocation one roster entry), and this surface does not yet.
+/// A signature proves who signed THIS handshake; it says nothing about the frames that follow on
+/// the connection. Without a seal, a machine the worker dials -- a revoked ex-scheduler still in
+/// its `--scheduler` list, or anything on the path -- relays the handshake to the real scheduler,
+/// lets the genuine proof through, and then injects verbs of its own on the connection the proof
+/// admitted. So both ends derive a key per DIRECTION from the X25519 exchange, which the relay
+/// cannot compute, and every later frame carries an HMAC under it (`Core/SessionSeal`): an
+/// injected frame fails its tag and the connection closes. That is the property the seal is for,
+/// and `FrameEndpoint_test` holds the endpoint to it with a relayed handshake over a real socket.
 ///
-/// ## The construction
+/// ## Pure
 ///
-/// One tag, over `[challenge][nodeId]`, in `SigningDomain::NodeProof`. Three properties,
-/// none of them incidental:
-///
-/// - **The challenge is the SERVER's**, freshly drawn per connection, so a proof is not
-///   replayable onto a second connection. It is spent whatever the outcome, which is
-///   discovery's rule (`DiscoveryService`) and is what stops a caller from retrying
-///   against one nonce until something verifies.
-/// - **The id is inside the MAC**, so the one this server records is the one the holder
-///   claimed rather than whatever a man in the middle substituted.
-/// - **The peer's ADDRESS is deliberately not covered.** That is the whole point: an
-///   address that changes per session is what this replaces. Covering it would reinvent
-///   the failure and also refuse the documented NAT and VPN setups, which #242 already
-///   settled for the registration endpoint.
-///
-/// There is no signed verdict, which is where this departs from the Raft handshake. There
-/// both ends must agree about the connection and an unsigned refusal of a key holder is a
-/// confident wrong signal. Here the proof is an OPTIONAL upgrade: a caller presenting none
-/// is admitted or refused by address exactly as before, so the only audience for a refusal
-/// is this server's own counters. `SigningDomain::NodeProof`'s comment carries that
-/// argument beside the label it is not paired with.
-///
-/// ## No seam, and that is not an omission
-///
-/// `Consensus/` needs `IRaftPeerKeys` because `Cluster/` includes `Consensus/`, so a
-/// consensus header reaching back would have made the two directories include each
-/// other. `Distributed/` already includes `Cluster/` and nothing goes the other way, so
-/// this calls `Cluster::SignFields` directly -- which is the one door the pre-shared key
-/// signs through, and `ctest -R psk-signing-seam` is what keeps it the only one.
-///
-/// This module performs no I/O, holds no state and reads no clock, so there is nothing to
-/// inject: the same stated exception `ClusterSigning` and `WireFields` document.
+/// No socket, no clock, no randomness: the ephemeral secret and the nonce arrive from a caller
+/// that drew them through `ISecureRandom`, and the identity key from one that read it once.
 
-// The wire's two widths against the types that fill them. `CompileCacheWire.hpp` spells its own
+// The wire's widths against the types that fill them. `CompileCacheWire.hpp` spells its own
 // numbers because the launcher compiles it in and it may include nothing from `Core/` beyond
-// three leaf headers; this is the one file where both those numbers and these types are visible,
-// so it is the only place the two can be held equal.
-//
-// A BUILD failure rather than a test, because the failure mode is silent on both sides: a nonce
-// that grew past the wire field would be truncated to its first 32 bytes, both ends would sign
-// different inputs, and the refusal would arrive as `NodeProofRejected` -- a wrong-key diagnosis
-// for a version mismatch, which is the confident wrong signal this tree keeps paying for.
+// three leaf headers; this is the one file where both are visible, so it is the only place the
+// two can be held equal. A BUILD failure rather than a test, because a field silently truncated
+// has both ends sign different inputs and report a forgery for a version mismatch.
 static_assert(NonceBytes == CompileCacheWire::NodeChallengeBytes,
-              "the challenge field on the wire must be exactly as wide as a Nonce");
-static_assert(Sha256::DigestSize == CompileCacheWire::NodeProofTagBytes,
-              "the tag field on the wire must be exactly as wide as a SHA-256 digest");
+              "the nonce field on the wire must be exactly as wide as a Nonce");
+static_assert(X25519KeyBytes == CompileCacheWire::NodeEphemeralKeyBytes,
+              "the ephemeral field on the wire must be exactly as wide as an X25519 public key");
+static_assert(Ed25519PublicKeyBytes == CompileCacheWire::IdentityPublicKeyBytes,
+              "the identity key field on the wire must be exactly as wide as an Ed25519 public key");
+static_assert(Ed25519SignatureBytes == CompileCacheWire::NodeSignatureBytes,
+              "the signature field on the wire must be exactly as wide as an Ed25519 signature");
+static_assert(SessionTagBytes == CompileCacheWire::SealedFrameTagBytes,
+              "the tag after a sealed frame must be exactly as wide as a session tag");
 
-/// The tag a key holder must present for @p nodeId against @p challenge.
+/// The two signatures the handshake carries.
 ///
-/// @param key The cluster's pre-shared key. An empty key signs perfectly well and
-///        authenticates nothing; refusing one is the caller's, exactly as
-///        `Cluster::SignFields` documents.
-/// @param challenge The server's nonce for this connection, as it was sent.
-/// @param nodeId The id the caller claims. Covered by the tag; not authenticated AS an
-///        identity, per this header's second section.
-/// @return The expected tag.
-[[nodiscard]] inline Sha256::Digest MintNodeProof(std::span<std::byte const> key,
-                                                  std::span<std::byte const> challenge,
-                                                  std::string_view nodeId)
+/// **PRIVATE: persisted and transmitted nowhere** -- what travels is the LABEL each row names, and
+/// the enumerator only selects it.
+enum class NodeProofSignature : std::uint8_t
 {
-    return Cluster::SignFields(key, Cluster::SigningDomain::NodeProof, { challenge, WireFields::AsBytes(nodeId) });
-}
+    ServerChallenge, ///< The server's, over the caller's half and its own.
+    NodeProof,       ///< The caller's, over the whole handshake including the server's signature.
+    Last,            ///< Not a signature, and has no row: the length of a table keyed by one.
+};
 
-/// Whether @p presented is the proof @p nodeId owes for @p challenge.
-///
-/// Through `Cluster::VerifyFields`, never by comparing a minted tag: `==` on two digests
-/// stops at the first difference, and a caller who can retry reads a tag out of the
-/// timing one byte at a time. That reasoning is `VerifyFields`' own and is not restated
-/// here beyond naming why this does not mint-and-compare.
-///
-/// @param key The cluster's pre-shared key.
-/// @param challenge The nonce this server sent on this connection.
-/// @param nodeId The id the caller claimed, as received.
-/// @param presented The tag the caller sent.
-/// @return True when it authenticates.
-[[nodiscard]] inline bool VerifyNodeProof(std::span<std::byte const> key,
-                                          std::span<std::byte const> challenge,
-                                          std::string_view nodeId,
-                                          Sha256::Digest const& presented)
+/// One row of `NodeProofSignatureLabels`.
+struct NodeProofSignatureLabel
 {
-    // The braced overload, not `AsFields`: that one views an initializer_list whose storage
-    // is bound to the full expression, and spelling it here would put a lifetime rule at a
-    // call site for no gain. `VerifyFields` already has the form that takes the list.
-    return Cluster::VerifyFields(
-        key, Cluster::SigningDomain::NodeProof, { challenge, WireFields::AsBytes(nodeId) }, presented);
-}
+    NodeProofSignature purpose; ///< The signature this row describes.
+    std::string_view label;     ///< The bytes signed ahead of the transcript.
+};
+
+/// What each signature signs ahead of its transcript.
+///
+/// Versioned and distinct, so a signature made for one purpose -- or for the Raft handshake, the
+/// lease or the roster -- verifies as nothing else. `v2` because `fastcache-node-proof-v1` was the
+/// pre-shared key's MAC label; a retired label is never reused, so a MAC input and a signed message
+/// can never be the same bytes.
+inline constexpr EnumTable<NodeProofSignature, NodeProofSignatureLabel> NodeProofSignatureLabels { {
+    { .purpose = NodeProofSignature::ServerChallenge, .label = "fastcache-node-challenge-v2" },
+    { .purpose = NodeProofSignature::NodeProof, .label = "fastcache-node-proof-v2" },
+} };
+
+static_assert(RowsInEnumeratorOrder(NodeProofSignatureLabels, &NodeProofSignatureLabel::purpose),
+              "NodeProofSignatureLabels must hold one row per NodeProofSignature, in enumerator order");
+
+/// The labels this wire has retired: never signed again, so never reused for a different purpose.
+inline constexpr std::array<std::string_view, 1> RetiredNodeProofLabels { "fastcache-node-proof-v1" };
+
+/// A fresh ephemeral X25519 key pair, whose secret half lives in `SecureByteBuffer`.
+struct NodeEphemeral
+{
+    SecureByteBuffer secret;   ///< Never transmitted; wiped at every release.
+    X25519PublicKey publicKey; ///< What travels.
+};
+
+/// Draw a fresh ephemeral key pair.
+/// @param random Where the secret comes from.
+/// @return The pair, or why nothing could be drawn -- which a caller answers by refusing the
+///         handshake, never by drawing from anywhere else (#1527).
+[[nodiscard]] std::expected<NodeEphemeral, SecureRandomError> DrawNodeEphemeral(ISecureRandom& random);
+
+/// The server's half of the handshake, before it is signed. Its identity key is the signing
+/// pair's own public half, never a second field that could disagree with it.
+struct ServerHello
+{
+    std::string_view serverId; ///< The node id the server claims.
+    Nonce nonce;               ///< Its nonce: the challenge a proof answers.
+    X25519PublicKey ephemeral; ///< Its ephemeral key.
+};
+
+/// Sign and frame the server's reply to @p request.
+/// @param identity The server's identity key pair; its public half is the key the reply names.
+/// @param request The caller's opening, as received.
+/// @param hello The server's half.
+/// @return The reply, signature included.
+[[nodiscard]] CompileCacheWire::NodeChallengeReply AnswerNodeChallenge(Ed25519KeyPair const& identity,
+                                                                       CompileCacheWire::NodeChallengeRequest const& request,
+                                                                       ServerHello const& hello);
+
+/// Whether @p reply's signature verifies under the key it names, over @p request as this caller sent it.
+///
+/// Says nothing about whether that key is one the caller should TRUST -- a caller holding a roster
+/// asks that separately, of the key this has shown signed.
+/// @param request What this caller sent.
+/// @param reply What came back.
+/// @return True when the server holds the key it named.
+[[nodiscard]] bool VerifyNodeChallengeReply(CompileCacheWire::NodeChallengeRequest const& request,
+                                            CompileCacheWire::NodeChallengeReply const& reply);
+
+/// Sign the caller's proof over the whole handshake.
+/// @param identity The caller's identity key pair.
+/// @param clientId The id it claims.
+/// @param request What it sent.
+/// @param reply What the server answered, signature included.
+/// @return The proof.
+[[nodiscard]] CompileCacheWire::ProveNodeRequest MintNodeProof(Ed25519KeyPair const& identity,
+                                                               std::string_view clientId,
+                                                               CompileCacheWire::NodeChallengeRequest const& request,
+                                                               CompileCacheWire::NodeChallengeReply const& reply);
+
+/// Whether @p proof's signature verifies under the key it presents, over this connection's handshake.
+///
+/// The first question a server asks, and the only one before the roster: a caller who cannot sign
+/// learns nothing about which ids and keys the cluster holds.
+/// @param request What the caller opened with.
+/// @param reply What this server answered, signature included.
+/// @param proof What the caller presented.
+/// @return True when the caller holds the key it presented.
+[[nodiscard]] bool VerifyNodeProof(CompileCacheWire::NodeChallengeRequest const& request,
+                                   CompileCacheWire::NodeChallengeReply const& reply,
+                                   CompileCacheWire::ProveNodeRequest const& proof);
+
+/// The two keys a proven connection is sealed under, one per direction.
+///
+/// Two because `Core/SessionSeal` holds one POSITION per key: a request/reply wire that sealed
+/// both directions under one key would have two senders claiming the same positions, and each end
+/// would refuse the other's frames.
+struct NodeSessionKeys
+{
+    SessionKey callerToServer; ///< What the caller seals its requests under.
+    SessionKey serverToCaller; ///< What the server seals its replies under.
+};
+
+/// Derive a proven connection's session keys.
+///
+/// HKDF over the X25519 output, salted with both nonces and bound to both ephemeral keys and both
+/// ids, so a key agreed in one exchange is the key of no other.
+/// @param ownSecret This end's ephemeral secret.
+/// @param request The caller's opening.
+/// @param reply The server's answer.
+/// @param clientId The id the caller proved.
+/// @param callerSide True on the caller, false on the server: which ephemeral key is the PEER's.
+/// @return The keys, or nothing when no secret could be agreed -- a low-order peer key fixes the
+///         "shared" secret to a value everybody knows, and `X25519SharedSecret` refuses it.
+[[nodiscard]] std::optional<NodeSessionKeys> DeriveNodeSessionKeys(SecureByteBuffer const& ownSecret,
+                                                                   CompileCacheWire::NodeChallengeRequest const& request,
+                                                                   CompileCacheWire::NodeChallengeReply const& reply,
+                                                                   std::string_view clientId,
+                                                                   bool callerSide);
 
 } // namespace FastCache::Distributed

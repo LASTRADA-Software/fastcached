@@ -167,7 +167,6 @@ TEST_CASE("The cluster's fleet-open row opens a node whose flag did not", "[node
     // subject, so the assertion is a stranger being admitted.
     NodeConfig cfg;
     cfg.nodeId = "node-a";
-    cfg.clusterKeyFile = "/etc/fastcached/cluster.key";
     REQUIRE_FALSE(cfg.fleetOpen);
 
     NodeMembership membership { cfg, membershipLog };
@@ -235,7 +234,6 @@ TEST_CASE("A row value this build cannot read falls back to the flag", "[node][m
     NodeConfig cfg;
     cfg.nodeId = "node-a";
     cfg.fleetOpen = true;
-    cfg.clusterKeyFile = "/etc/fastcached/cluster.key";
 
     NodeMembership membership { cfg, membershipLog };
     membership.PublishCluster(OpenSetTo("yes"));

@@ -597,6 +597,46 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
     return $false
 }
 
+# Admit a worker to the cluster its scheduler leads, under the identity it will prove there
+# (#178 PR 6), and wait until the leader has APPLIED the admission. Its twins are
+# `dist-compile-e2e.ps1`'s and `dist-compile-e2e.sh`'s `admit_worker`, and the reasoning is the same: a worker that dials
+# in before the entry is applied is refused `node-key-unknown` and registers a heartbeat
+# interval late, and a scheduler that has just started answers `not-leader` until it leads
+# its cluster of one. What an operator runs, in the order an operator runs it: the worker's
+# `--print-identity` mints the identity into its state directory and prints the
+# `--cluster-admit-worker` line, and the start then reads the same files back.
+#
+# Bounded by a Stopwatch, which is monotonic, rather than by counting the sleeps it asked for.
+function Admit-Worker([string]$stateDir, [string]$scheduler, [string]$what) {
+    $identity = @(& $Node --print-identity "--cluster-dir=$stateDir")
+    if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint an identity for the $what in $stateDir (exit $LASTEXITCODE)" }
+    $tokenLine = $identity | Where-Object { $_ -like 'cluster-admit-worker *' } | Select-Object -First 1
+    $keyLine = $identity | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
+    if (-not $tokenLine -or -not $keyLine) {
+        throw "--print-identity printed no cluster-admit-worker line and key for the ${what}: $($identity -join ' | ')"
+    }
+    $token = $tokenLine.Substring('cluster-admit-worker '.Length)
+    $key = $keyLine.Substring('public-key '.Length)
+
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $recorded = $false
+    $last = ""
+    while ($clock.Elapsed.TotalSeconds -lt 30) {
+        if (-not $recorded) {
+            $last = (@(& $Node "--scheduler=$scheduler" "--cluster-admit-worker=$token") -join ' | ')
+            $recorded = ($LASTEXITCODE -eq 0)
+        }
+        if ($recorded) {
+            $status = (@(& $Node "--scheduler=$scheduler" --cluster-status) -join "`n")
+            if ($LASTEXITCODE -eq 0 -and $status.Contains("key=$key")) { return }
+            $last = $status
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    throw ("the scheduler at $scheduler did not admit the $what within " +
+           "$([int]$clock.Elapsed.TotalSeconds) s (recorded: $recorded): $last")
+}
+
 function ConvertTo-QuotedArgs([string[]]$arguments) {
     # -ArgumentList joins an array with spaces into ONE command line, so an element
     # CONTAINING a space arrives at the child as two. `cl.exe` lives under
@@ -1187,15 +1227,12 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
     $cachePort = Get-FreePort; $schedPort = Get-FreePort
     $workerA   = Get-FreePort; $workerB   = Get-FreePort; $adminPort = Get-FreePort
     # The scheduler's consensus port (#178): a scheduler is a cluster of one, bound to
-    # loopback where nothing dials it -- and consensus needs a cluster key, which nothing
-    # here turns on the value of.
+    # loopback where nothing dials it.
     $schedRaft = Get-FreePort
 
     $phaseDir = Join-Path $scratch $label
     $proj = Join-Path $phaseDir "proj"
     New-Item -ItemType Directory -Force -Path (Join-Path $proj "build") | Out-Null
-    $clusterKey = Join-Path $phaseDir "cluster.key"
-    Set-Content -Path $clusterKey -Value "e2e-fixture-cluster-key-not-a-secret" -NoNewline
     $srcA = Join-Path $proj "a.cpp"; $srcB = Join-Path $proj "b.cpp"
     New-SlowSource $srcA 101
     New-SlowSource $srcB 202
@@ -1280,7 +1317,7 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         $schedProc = Start-NodeIn "sched" @(
             "--serve-scheduler", "--listen-node=127.0.0.1:$schedPort", "--fleet-open",
             "--listen-raft=127.0.0.1:$schedRaft", "--raft-self=127.0.0.1",
-            "--cluster-dir=$(Join-Path $phaseDir 'sched.state')", "--cluster-key-file=$clusterKey",
+            "--cluster-dir=$(Join-Path $phaseDir 'sched.state')",
             "--advertise=127.0.0.1:$schedPort",
             "--slots=0",
             "--admin-listen=127.0.0.1:$adminPort") $null
@@ -1342,16 +1379,23 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # for as SERVING, and its ready line must say so. The survey bounds are unused.
         Wait-ForNodeUp "sched" $schedProc $false 180 0 0
 
+        # Each worker proves its OWN identity to the scheduler (#178 PR 6), so it keeps a
+        # state directory and is admitted there before it starts: the scheduler refuses
+        # registering and heartbeating from a machine that proved nothing, loopback included.
+        $workerAState = Join-Path $phaseDir "workerA.state"
+        Admit-Worker $workerAState "127.0.0.1:$schedPort" "workerA"
         $workerAProc = Start-NodeIn "workerA" @(
-            "--scheduler=127.0.0.1:$schedPort", "--listen-node=127.0.0.1:$workerA",
+            "--scheduler=127.0.0.1:$schedPort", "--cluster-dir=$workerAState", "--listen-node=127.0.0.1:$workerA",
             "--advertise=127.0.0.1:$workerA",
             "--toolchain=$Compiler", "--slots=1") $null
         $procs += $workerAProc
         Wait-ForNodeUp "workerA" $workerAProc $true 120 $SurveySeconds $SurveyIdleSeconds
 
         $bTemp = if ($separateTempForB) { Join-Path $phaseDir "tempB" } else { $null }
+        $workerBState = Join-Path $phaseDir "workerB.state"
+        Admit-Worker $workerBState "127.0.0.1:$schedPort" "workerB"
         $workerBProc = Start-NodeIn "workerB" @(
-            "--scheduler=127.0.0.1:$schedPort", "--listen-node=127.0.0.1:$workerB",
+            "--scheduler=127.0.0.1:$schedPort", "--cluster-dir=$workerBState", "--listen-node=127.0.0.1:$workerB",
             "--advertise=127.0.0.1:$workerB",
             "--toolchain=$Compiler", "--slots=1") $bTemp
         $procs += $workerBProc

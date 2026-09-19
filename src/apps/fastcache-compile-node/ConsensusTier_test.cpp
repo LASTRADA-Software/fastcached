@@ -268,9 +268,8 @@ TEST_CASE("A consensus tier refuses to start without an identity key", "[node][c
     // refusal counter reading zero. Decided HERE, once, before anything is bound.
     //
     // No I/O: the refusal returns before a directory, a listener or a reactor exists. The
-    // configuration otherwise gets past every earlier gate -- including the cluster key file,
-    // which this tier no longer reads at all -- so the refusal observed is the identity key's
-    // and not the self-peer rule's.
+    // configuration otherwise gets past every earlier gate, so the refusal observed is the
+    // identity key's and not the self-peer rule's.
     NullLogger logger;
     AtomicMetricsSink metrics;
     std::unique_ptr<SchedulerTier> const noScheduler;
@@ -279,7 +278,6 @@ TEST_CASE("A consensus tier refuses to start without an identity key", "[node][c
     cfg.nodeId = "n1";
     cfg.raftListen = "6680";
     cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.1:6680")) };
-    cfg.clusterKeyFile = "cluster.key";
     NodeMembership membership { cfg, membershipLog };
     auto const roster = NodeRoster::Build(NodeConfig {}, DefaultSystemWallClock(), metrics, logger);
     REQUIRE(roster.has_value());
@@ -405,7 +403,6 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
     cfg.nodeId = "n1";
     cfg.raftListen = std::format("127.0.0.1:{}", port);
     cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec(std::format("n1=127.0.0.1:{}", port))) };
-    cfg.clusterKeyFile = scratch / "cluster.key";
     cfg.clusterDir = scratch / "state";
 
     // Asked of ONE state value: `ClusterState()` answers by value, so two calls are two
@@ -500,7 +497,6 @@ TEST_CASE("A lone voter endorses the roster it applied, under its own key, and r
     cfg.clusterId = "fleet";
     cfg.raftListen = std::format("127.0.0.1:{}", port);
     cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec(std::format("n1=127.0.0.1:{}", port))) };
-    cfg.clusterKeyFile = scratch / "cluster.key";
     cfg.clusterDir = scratch / "state";
 
     // Collected off the reconciler thread, read on this one.
@@ -666,7 +662,6 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
     cfg.nodeId = "n1";
     cfg.raftListen = std::format("127.0.0.1:{}", port);
     cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec(std::format("n1=127.0.0.1:{}", port))) };
-    cfg.clusterKeyFile = scratch / "cluster.key";
     cfg.clusterDir = scratch / "state";
     auto const directory = NodeStateDirectory(cfg);
 
@@ -974,7 +969,6 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
             std::format("n1=127.0.0.1:{}@{}", leaderPort, FormatEd25519PublicKey(Testing::TestKeyPair("n1").PublicKey())))),
         Unwrap(Cluster::ParseMemberSpec(std::format("n2=127.0.0.1:{}", self)))
     };
-    cfg.clusterKeyFile = scratch / "cluster.key";
     cfg.clusterDir = scratch / "state";
 
     auto started = ConsensusTier::Start(

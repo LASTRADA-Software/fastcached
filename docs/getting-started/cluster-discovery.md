@@ -158,7 +158,7 @@ nothing; a peer that genuinely goes away is forgotten and Raft handles the rest.
 | Replay a captured proof | Refused: the nonce it answers has been spent. |
 | Capture a proof and re-aim it at another endpoint | Refused: the endpoint is inside the signature. |
 | Claim a known member's id | Reported as an unknown key: the id is a label, and the key the roster holds for it is the credential. |
-| Obtain the cluster key file | Nothing here: discovery no longer reads it. |
+| Obtain a shared cluster key | There is none: every node proves its own identity key, and the pre-shared key discovery once read is gone. |
 | Obtain one member's identity key | That member's address can be moved by a proof — the same exposure as that member's consensus connections, and ended by revoking the key, which nothing on any other machine has to change for. |
 
 A proof under an unknown or a revoked key on a healthy segment is a machine nobody

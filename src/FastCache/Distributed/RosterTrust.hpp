@@ -136,6 +136,14 @@ class StateLeaseRoster final: public ILeaseRoster
     /// @return The roster applied, summarised, with no certificate.
     [[nodiscard]] RosterSummary Summary() const;
 
+    /// Whether the state applied names any voter's key yet (#178).
+    ///
+    /// Not until the first commit that records one -- a scheduler of one records its OWN key there
+    /// -- so between a member's start and that commit, a server it cannot place is not evidence
+    /// of anything: there is no voter it could have been.
+    /// @return True once some voter's key is known.
+    [[nodiscard]] bool HoldsVoterKeys() const;
+
   private:
     mutable std::shared_mutex _lock;
     std::map<std::string, Ed25519PublicKey, std::less<>> _voters; ///< Voters with a key, by id.

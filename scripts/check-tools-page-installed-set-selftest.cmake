@@ -23,7 +23,7 @@
 # `docs/tools/index.md` is markdown: `[` and `]` everywhere, in links and tables. A
 # reader that splits lines into a CMake list merges elements at every unbalanced
 # bracket, which is how `net-boundary` passed over a real cross-boundary include and
-# `psk-signing-seam` counted 15 calls as 14 -- both SILENTLY, both green.
+# `psk-signing-seam` (retired at #178) counted 15 calls as 14 -- both SILENTLY, both green.
 #
 # A clean-tree bracket injection cannot see that. On a clean tree everything a merged
 # element swallows is something the check had nothing to say about, so nothing changes

@@ -364,8 +364,8 @@ deliberately, because that is where `fastcache-cc` already looks. On a machine r
 node loses the bind, warns, and carries on with no local tier — the launcher
 reaches the daemon on that port instead. Give one of them a port of its own if you
 want the node's tier as well.
-A node running consensus additionally binds `--listen-raft` — and needs the
-cluster's `--cluster-key-file`, which every connection on that port proves — and,
+A node running consensus additionally binds `--listen-raft` — every connection on that
+port proves the member's own identity key before a message is read — and,
 with discovery on, a UDP `--discovery` port plus a per-node answering port; none has
 a conventional number, and all are off unless configured.
 

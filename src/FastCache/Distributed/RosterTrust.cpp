@@ -225,4 +225,10 @@ RosterSummary StateLeaseRoster::Summary() const
     return _summary;
 }
 
+bool StateLeaseRoster::HoldsVoterKeys() const
+{
+    std::shared_lock const lock { _lock };
+    return !_voters.empty();
+}
+
 } // namespace FastCache::Distributed

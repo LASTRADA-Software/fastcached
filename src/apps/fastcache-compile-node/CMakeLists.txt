@@ -43,7 +43,6 @@ add_executable(fastcache-compile-node
     CacheProxy.cpp
     CacheTier.cpp
     ClusterAdminCli.cpp
-    ClusterKeySource.cpp
     ConsensusTier.cpp
     CordonCli.cpp
     DiscoveryTier.cpp
@@ -111,8 +110,6 @@ if(FASTCACHED_BUILD_TESTS)
         CacheTier_test.cpp
         ClusterAdminCli.cpp
         ClusterAdminCli_test.cpp
-        ClusterKeySource.cpp
-        ClusterKeySource_test.cpp
         ConsensusTier.cpp
         ConsensusTier_test.cpp
         CordonCli.cpp

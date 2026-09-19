@@ -152,8 +152,7 @@ tombstones). Either way the directory is intact; what an operator does is:
    instead of bootstrapping a cluster of itself — which a node whose bootstrap set names
    only itself would otherwise do — and a cluster that still counts it catches it up from
    the leader; one that has forgotten it admits it again with `--cluster-admit` (or
-   `--cluster-admit-learner`). It keeps its `--cluster-key-file`, so it needs no
-   `--enroll-from`.
+   `--cluster-admit-learner`). It keeps its identity, so it needs no `--enroll-from`.
 4. If **every** member was moved aside together, start them as they were. They come back
    with empty logs under their bootstrap configuration (`--raft-peer`), or waiting to be
    admitted if they were started with `--raft-join`.

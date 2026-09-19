@@ -496,7 +496,11 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                                                                         .load = load,
                                                                                         .credential = _credential,
                                                                                         .notice = Unwatched(),
-                                                                                        .logger = _fleet._logger },
+                                                                                        .logger = _fleet._logger,
+                                                                                        // Nothing proves over this
+                                                                                        // harness's transport; see
+                                                                                        // `Caller`.
+                                                                                        .prover = nullptr },
                                                      _roster.get(),
                                                      _link,
                                                      _fleet);
@@ -710,9 +714,11 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// worker, for one -- must not be subject to the membership a case is testing, or arranging
     /// the fleet fails before the assertion runs.
     /// @return A member calling from loopback.
-    [[nodiscard]] static Distributed::CallerContext SetupCaller() noexcept
+    [[nodiscard]] static Distributed::CallerContext SetupCaller()
     {
-        return Distributed::CallerContext { .membership = Distributed::Membership::Member, .peerId = "127.0.0.1" };
+        return Distributed::CallerContext { .membership = Distributed::Membership::Member,
+                                            .peerId = "127.0.0.1",
+                                            .provenNodeId = std::string { ProvenMachine } };
     }
 
     /// The context handed to @p node's service for the current caller.
@@ -726,12 +732,25 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// started refusing them.
     /// @param node Whose oracle to ask.
     /// @return The context, carrying that node's verdict about `_callerHost`.
+    ///
+    /// **Every admitted caller is a PROVEN one** (#178): a joining verb is refused on a
+    /// connection that proved no identity, and this harness's transport runs no handshake -- the
+    /// handshake and the seal are a socket's, held to their rules by `FrameEndpoint_test` over a
+    /// real one. So the harness states what production's endpoint would have established, and
+    /// only for a caller the oracle admits, as `CallerContextOf` does.
     [[nodiscard]] Distributed::CallerContext Caller(Node const& node) const
     {
         auto const verdict =
             node.membership != nullptr ? node.membership->Classify(_callerHost) : Distributed::Membership::Member;
-        return Distributed::CallerContext { .membership = verdict, .peerId = _callerHost };
+        auto proven =
+            verdict == Distributed::Membership::Member ? std::optional { std::string { ProvenMachine } } : std::nullopt;
+        return Distributed::CallerContext { .membership = verdict,
+                                            .peerId = _callerHost,
+                                            .provenNodeId = std::move(proven) };
     }
+
+    /// The id every admitted caller of this harness proved.
+    static constexpr std::string_view ProvenMachine = "harness-machine";
 
     /// The verb byte a framed request carries, for the call log.
     ///

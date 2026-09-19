@@ -59,6 +59,13 @@ class ListedMembership final: public Distributed::IMembershipOracle
     /// stop being one mid-case, because its subject is that a subscription is re-gated on
     /// EVERY tick rather than once at subscribe time.
     /// @param peer Who to remove.
+    /// No opinion: a host list knows no keys, exactly as `Distributed::HostSetMembership` answers.
+    /// A case about a PROVED identity composes this with a `Distributed::KeyRosterMembership`.
+    [[nodiscard]] Distributed::MembershipDecision ExplainKey(ProvenIdentity const& /*proven*/) const override
+    {
+        return {};
+    }
+
     void Remove(std::string_view peer)
     {
         std::erase(_members, peer);
@@ -99,6 +106,13 @@ class FixedMembership final: public Distributed::IMembershipOracle
     [[nodiscard]] Distributed::MembershipDecision Explain(std::string_view /*peerAddress*/) const override
     {
         return Distributed::DecidedBy(_verdict, _participant);
+    }
+
+    /// No opinion: this answers about ADDRESSES, one verdict for all of them. A case about a PROVED
+    /// identity composes a `Distributed::KeyRosterMembership` beside it.
+    [[nodiscard]] Distributed::MembershipDecision ExplainKey(ProvenIdentity const& /*proven*/) const override
+    {
+        return {};
     }
 
   private:

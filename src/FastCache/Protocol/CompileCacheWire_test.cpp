@@ -79,8 +79,13 @@ TEST_CASE("The wire constants have their specified byte values")
     // Version 13 (#178) gives NODE-ANNOUNCE a fourth field -- a voter's roster endorsement --
     // and its `Ok` a body, the certified roster. The arity is exact, so an older peer cannot
     // read the request at all, and both move for that reason.
-    CHECK(CurrentVersion == 13);
-    CHECK(MinSupportedVersion == 13);
+    //
+    // Version 14 (#178) replaces the shared-key node proof with a signed handshake and SEALS
+    // every frame after it. The challenge now carries the caller's nonce and ephemeral key, and
+    // a version-13 peer's empty `NodeChallenge` is a frame this build refuses; a version-13
+    // peer reading a sealed reply would take its tag for the next frame's header. Both move.
+    CHECK(CurrentVersion == 14);
+    CHECK(MinSupportedVersion == 14);
     CHECK(RequestHeaderSize == 7);
     CHECK(ReplyHeaderSize == 5);
 
@@ -126,7 +131,7 @@ TEST_CASE("EncodeFetch emits the specified bytes exactly")
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x0D,                   // version
+        0x0E,                   // version
         0x02,                   // op = Fetch
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -145,7 +150,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
 
     auto const expected = Bytes({
         0xFC,                               // magic
-        0x0D,                               // version
+        0x0E,                               // version
         0x01,                               // op = Store
         0x00, 0x00, 0x00, 0x19,             // payloadLength = 25 = (4+1) + (4+0) + (4+1) + (4+1) + (4+2)
         0x00, 0x00, 0x00, 0x01, 0x6B,       // key           = "k"
@@ -344,7 +349,7 @@ TEST_CASE("EncodeCacheDrop emits the specified bytes exactly", "[wire][cache-dro
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
         0xFC,                   // magic
-        0x0D,                   // version
+        0x0E,                   // version
         0x15,                   // op = CacheDrop
         0x00, 0x00, 0x00, 0x06, // payloadLength = 6
         0x00, 0x00, 0x00, 0x02, // field[0] length = 2
@@ -537,7 +542,7 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly")
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
     auto const expected = Bytes({
-        0xFC, 0x0D, 0x03,       // magic, version, op=Auth
+        0xFC, 0x0E, 0x03,       // magic, version, op=Auth
         0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
         0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
     });
@@ -2843,7 +2848,8 @@ TEST_CASE("The explain-admission verb occupies the byte it was assigned, in the 
     CHECK(WireMembershipRoute::ClusterMembers == 0x02);
     CHECK(WireMembershipRoute::ClientTombstone == 0x04);
     CHECK(WireMembershipRoute::OpenPolicy == 0x08);
-    CHECK(WireMembershipRoute::ProvenKeyHolder == 0x10);
+    CHECK(WireMembershipRoute::ProvenIdentity == 0x10);
+    CHECK(WireMembershipRoute::KeyTombstone == 0x20);
 }
 
 TEST_CASE("An explain-admission request carries exactly one host, and anything else is refused", "[wire][admission]")
@@ -2984,8 +2990,9 @@ TEST_CASE("A member admission carries three fields and a version no version-10 p
 {
     // #178. The COUNT and the VERSION, as values and as the bytes a frame carries -- a symbol
     // both ends spell can only test that they agree with each other, and a version-10 peer
-    // reads the byte, not the name. Version 11 made the admission three fields; 12 is this
-    // build's, moved again by ENROLL (#178 PR 4), and the byte is pinned at what is SENT.
+    // reads the byte, not the name. Version 11 made the admission three fields; 14 is this
+    // build's, moved since by ENROLL, the roster and the sealed handshake (#178), and the byte is
+    // pinned at what is SENT.
     CHECK(OpFieldCount(Op::ClusterAdmit) == 3);
     CHECK(OpFieldCount(Op::ClusterAdmitLearner) == 3);
 
@@ -2996,7 +3003,7 @@ TEST_CASE("A member admission carries three fields and a version no version-10 p
     {
         REQUIRE(frame.size() > RequestHeaderSize);
         CHECK(std::to_integer<unsigned>(frame[0]) == 0xFC);
-        CHECK(std::to_integer<unsigned>(frame[1]) == 13);
+        CHECK(std::to_integer<unsigned>(frame[1]) == 14);
 
         // No key is a zero-length THIRD field, never a two-field payload: the arity is exact.
         auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
@@ -3201,7 +3208,7 @@ TEST_CASE("NODE-ANNOUNCE carries a voter's endorsement as its fourth field, empt
         auto const frame = EncodeNodeAnnounce(
             NodeAnnounceRequest { .endpoint = "10.0.0.2:6674", .capacity = {}, .load = {}, .endorsement = carried });
         REQUIRE(frame.size() > RequestHeaderSize);
-        CHECK(std::to_integer<unsigned>(frame[1]) == 13);
+        CHECK(std::to_integer<unsigned>(frame[1]) == 14);
         auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
         REQUIRE(WireFields::SplitExactly(payload, 4).has_value());
 
@@ -3252,4 +3259,164 @@ TEST_CASE("A node's roster travels in its runtime record, absent when it holds n
         REQUIRE(Unwrap(decoded).roster.has_value());
         CHECK_FALSE(Unwrap(Unwrap(decoded).roster).certifiedUntilMillis.has_value());
     }
+}
+
+// --- The node identity handshake (#178) -------------------------------------
+
+namespace
+{
+
+/// @p count bytes, each @p value: a fixed-width field a case fills with something recognisable.
+/// @param count How many.
+/// @param value What each one is.
+/// @return The bytes.
+[[nodiscard]] std::vector<std::byte> Filled(std::size_t count, std::uint8_t value)
+{
+    return std::vector<std::byte>(count, std::byte { value });
+}
+
+} // namespace
+
+TEST_CASE("The node handshake's widths, verbs and refusals are pinned as bytes", "[wire][nodeproof]")
+{
+    // A symbol both ends spell can only test that they agree with each other; a peer of another
+    // build reads the BYTE. Every width here is one both ends sign over, so a field silently one
+    // byte wider on one side reads as a forgery rather than as a version mismatch.
+    CHECK(NodeChallengeBytes == 32);
+    CHECK(NodeEphemeralKeyBytes == 32);
+    CHECK(IdentityPublicKeyBytes == 32);
+    CHECK(NodeSignatureBytes == 64);
+    CHECK(SealedFrameTagBytes == 32);
+
+    CHECK(static_cast<std::uint8_t>(Op::NodeChallenge) == 0x18);
+    CHECK(static_cast<std::uint8_t>(Op::ProveNode) == 0x19);
+    CHECK(static_cast<std::uint8_t>(Op::ClusterAdmitWorker) == 0x1D);
+    CHECK(OpFieldCount(Op::NodeChallenge) == 2);
+    CHECK(OpFieldCount(Op::ProveNode) == 3);
+    CHECK(OpFieldCount(Op::ClusterAdmitWorker) == 2);
+
+    struct Pinned
+    {
+        ErrorCode code;
+        std::uint8_t byte;
+        std::string_view name;
+    };
+    for (auto const& pinned:
+         { Pinned { .code = ErrorCode::NodeKeyUnknown, .byte = 0x29, .name = "node-key-unknown" },
+           Pinned { .code = ErrorCode::NodeKeyRevoked, .byte = 0x2A, .name = "node-key-revoked" },
+           Pinned { .code = ErrorCode::NodeIdentityRequired, .byte = 0x2B, .name = "node-identity-required" } })
+    {
+        CHECK(static_cast<std::uint8_t>(pinned.code) == pinned.byte);
+        auto const* const row = Describe(pinned.code);
+        REQUIRE(row != nullptr);
+        CHECK(row->name == pinned.name);
+    }
+}
+
+TEST_CASE("A node challenge carries a nonce and an ephemeral key, each exactly as wide as it is", "[wire][nodeproof]")
+{
+    auto request = NodeChallengeRequest {};
+    std::ranges::fill(request.nonce, std::byte { 0x11 });
+    std::ranges::fill(request.ephemeral, std::byte { 0x22 });
+    auto const frame = EncodeNodeChallenge(request);
+    auto const decoded = DecodeNodeChallengePayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded) == request);
+
+    // One byte short in either field, a third field and a missing one are all refused: a nonce
+    // silently truncated would have both ends sign different transcripts.
+    auto const nonce = Filled(NodeChallengeBytes, 0x11);
+    auto const shortNonce = Filled(NodeChallengeBytes - 1, 0x11);
+    auto const ephemeral = Filled(NodeEphemeralKeyBytes, 0x22);
+    auto const shortEphemeral = Filled(NodeEphemeralKeyBytes - 1, 0x22);
+    CHECK(DecodeNodeChallengePayload(WireFields::Encode({ nonce, ephemeral })).has_value());
+    CHECK_FALSE(DecodeNodeChallengePayload(WireFields::Encode({ shortNonce, ephemeral })).has_value());
+    CHECK_FALSE(DecodeNodeChallengePayload(WireFields::Encode({ nonce, shortEphemeral })).has_value());
+    CHECK_FALSE(DecodeNodeChallengePayload(WireFields::Encode({ nonce, ephemeral, {} })).has_value());
+    CHECK_FALSE(DecodeNodeChallengePayload(WireFields::Encode({ nonce })).has_value());
+}
+
+TEST_CASE("A node challenge reply round-trips, and every fixed field is exactly as wide as it is", "[wire][nodeproof]")
+{
+    auto reply =
+        NodeChallengeReply { .serverId = "scheduler-1", .serverKey = {}, .nonce = {}, .ephemeral = {}, .signature = {} };
+    std::ranges::fill(reply.serverKey, std::byte { 0x33 });
+    std::ranges::fill(reply.nonce, std::byte { 0x44 });
+    std::ranges::fill(reply.ephemeral, std::byte { 0x55 });
+    std::ranges::fill(reply.signature, std::byte { 0x66 });
+    auto const payload = EncodeNodeChallengeReply(reply);
+    auto const decoded = DecodeNodeChallengeReply(payload);
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded) == reply);
+
+    auto const id = AsBytes(std::string_view { "scheduler-1" });
+    auto const key = Filled(IdentityPublicKeyBytes, 0x33);
+    auto const nonce = Filled(NodeChallengeBytes, 0x44);
+    auto const ephemeral = Filled(NodeEphemeralKeyBytes, 0x55);
+    auto const signature = Filled(NodeSignatureBytes, 0x66);
+    auto const shortKey = Filled(IdentityPublicKeyBytes - 1, 0x33);
+    auto const shortSignature = Filled(NodeSignatureBytes - 1, 0x66);
+    CHECK(DecodeNodeChallengeReply(WireFields::Encode({ id, key, nonce, ephemeral, signature })).has_value());
+    CHECK_FALSE(DecodeNodeChallengeReply(WireFields::Encode({ id, shortKey, nonce, ephemeral, signature })).has_value());
+    CHECK_FALSE(DecodeNodeChallengeReply(WireFields::Encode({ id, key, nonce, ephemeral, shortSignature })).has_value());
+    CHECK_FALSE(DecodeNodeChallengeReply(WireFields::Encode({ id, key, nonce, ephemeral })).has_value());
+}
+
+TEST_CASE("A node proof carries an id, a key and a signature, the last two exactly as wide as they are", "[wire][nodeproof]")
+{
+    auto proof = ProveNodeRequest { .nodeId = "node-7", .publicKey = {}, .signature = {} };
+    std::ranges::fill(proof.publicKey, std::byte { 0x77 });
+    std::ranges::fill(proof.signature, std::byte { 0x88 });
+    auto const frame = EncodeProveNode(proof);
+    auto const decoded = DecodeProveNodePayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded) == proof);
+
+    // An EMPTY id is a well-formed proof: the roster is what refuses it, by name, rather than a
+    // decoder that would make it read as a malformed frame.
+    auto const key = Filled(IdentityPublicKeyBytes, 0x77);
+    auto const longKey = Filled(IdentityPublicKeyBytes + 1, 0x77);
+    auto const signature = Filled(NodeSignatureBytes, 0x88);
+    auto const shortSignature = Filled(NodeSignatureBytes - 1, 0x88);
+    CHECK(DecodeProveNodePayload(WireFields::Encode({ {}, key, signature })).has_value());
+    CHECK_FALSE(DecodeProveNodePayload(WireFields::Encode({ {}, longKey, signature })).has_value());
+    CHECK_FALSE(DecodeProveNodePayload(WireFields::Encode({ {}, key, shortSignature })).has_value());
+    CHECK_FALSE(DecodeProveNodePayload(WireFields::Encode({ {}, key })).has_value());
+}
+
+TEST_CASE("An enroll reply carries the certified roster as its third field, empty when there is none", "[wire][enrollment]")
+{
+    // Named payloads, for the borrowing reason the pending-reply case gives.
+    auto const roster = AsBytes(std::string_view { "roster" });
+    auto const certificate = AsBytes(std::string_view { "certificate" });
+    auto const withPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster, certificate);
+    auto const with = DecodeEnrollReply(withPayload);
+    REQUIRE(with.has_value());
+    CHECK(AsStringView(Unwrap(with).certificate) == "certificate");
+
+    // No certificate is a zero-length THIRD field, never a two-field payload.
+    auto const withoutPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster);
+    REQUIRE(WireFields::SplitExactly(withoutPayload, 3).has_value());
+    auto const without = DecodeEnrollReply(withoutPayload);
+    REQUIRE(without.has_value());
+    CHECK(Unwrap(without).certificate.empty());
+
+    // The two-field reply an older build sent is refused rather than read as one with no certificate.
+    auto const tag = std::array { static_cast<std::byte>(EnrollOutcome::Approved) };
+    CHECK_FALSE(DecodeEnrollReply(WireFields::Encode({ std::span<std::byte const> { tag }, roster })).has_value());
+}
+
+TEST_CASE("cluster-admit-worker carries the worker's id and its key as text", "[wire][nodeproof]")
+{
+    // The key travels as the text `--print-identity` printed, and the LEADER parses it -- so a
+    // mistyped key is refused by the one parser every door reaches, in its own words.
+    auto const frame = EncodeClusterAdmitWorker(ClusterAdmitWorkerRequest { .workerId = "w-1", .publicKey = "key-text" });
+    auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
+    auto const decoded = DecodeClusterAdmitWorkerPayload(payload);
+    REQUIRE(decoded.has_value());
+    CHECK(AsStringView(Unwrap(decoded).workerId) == "w-1");
+    CHECK(AsStringView(Unwrap(decoded).publicKey) == "key-text");
+
+    auto const idOnly = WireFields::Encode({ AsBytes(std::string_view { "w-1" }) });
+    CHECK_FALSE(DecodeClusterAdmitWorkerPayload(idOnly).has_value());
 }

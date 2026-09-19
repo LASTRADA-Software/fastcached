@@ -367,8 +367,9 @@ inline constexpr std::uint8_t LeaseTokenVersion = 3;
 
 /// The label a grant's signature is made under (#178).
 ///
-/// Its own label, beside the grant it signs, rather than a `Cluster::SigningDomain` row:
-/// that table is the PRE-SHARED key's, and this is signed by a member's own key. Versioned
+/// Its own label, beside the grant it signs, as every construction signed by a member's own key
+/// carries one: a label distinct from every other is what keeps a signature made for one from
+/// verifying as another. Versioned
 /// with the token, so a signature over a version-2 claim list could never verify as a
 /// version-3 one even under the same key. `fastcache-lease-v1`, the HMAC label, is retired
 /// and never reused.

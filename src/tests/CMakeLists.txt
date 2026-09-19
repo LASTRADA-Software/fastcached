@@ -5307,70 +5307,6 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# The cluster pre-shared key's signing seam. Fails when anything in `src/` other
-# than `Core/Sha256.{hpp,cpp}`, `Cluster/ClusterSigning.hpp` and HKDF's `Core/Hkdf.cpp`
-# (#178, a derivation under keys that are never the cluster key) calls the MAC
-# primitive directly. scripts/check-psk-signing-seam.cmake carries the signer
-# table and the reason each row is in it, and prints the whole table on failure.
-#
-# One key MACs a discovery proof and a lease token. `SignFields` takes the domain
-# label as a required `SigningDomain` parameter, so nothing that goes THROUGH the
-# seam can omit one -- and nothing at all stops a fourth signer calling
-# `HmacSha256` itself and producing an unlabelled tag under the same key, which is
-# the state discovery was in before #402: separated from the lease token by a
-# coincidence of field arity rather than by any property of either construction.
-# There is no compile-time guard for that, because a new caller of a public
-# function in `Core/` is an ordinary call that no compiler remarks on.
-#
-# Not labelled "smoke", for the reason net-boundary is not: it starts no daemon,
-# opens no socket and needs no compiler, so it belongs in the default `ctest` set
-# and must survive `ctest -LE smoke`. It has no skip path -- it reads the source
-# tree, which is present in an exported tarball exactly as it is in a checkout.
-add_test(
-    NAME "psk-signing-seam"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-psk-signing-seam.cmake"
-)
-set_tests_properties("psk-signing-seam" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
-)
-
-# ---------------------------------------------------------------------------
-# And `psk-signing-seam` must be SEEN to refuse, on each thing it claims and on
-# nothing else.
-#
-# It is a scan, and this tree keeps catching scans going blind: #510's reader lost
-# four of five targets to one stray `]` in a comment and reported success, found by
-# a deliberate canary rather than by the check. Three of the seven cases here are
-# that failure in its three available forms -- the primitive renamed away so every
-# scan matches nothing, a table row vouching for a file that has stopped signing,
-# and a glob that reads no source at all. Two more are the opposite direction: a
-# check that refused prose, or refused a test naming the primitive, would be as
-# useless as one that refused nothing and looks a great deal more like rigour.
-#
-# Shown to bite: disarming the check's two vacuity refusals turns this red on
-# exactly `stalerow` and `renamed`.
-#
-# In the default set with the other hygiene checks: it writes small synthetic trees
-# under its own scratch directory and compares strings. No shell, so no POSIX-only
-# skip -- a skipped required check reads as passing.
-add_test(
-    NAME "psk-signing-seam-selftest"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/psk-signing-seam-selftest"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-psk-signing-seam-selftest.cmake"
-)
-set_tests_properties("psk-signing-seam-selftest" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 120
-)
-
-# ---------------------------------------------------------------------------
 # An `IMetricsSink::Counter` becomes an index in one place, `CounterIndex`. Fails when
 # anything in `src/` -- tests included -- casts a counter to a number anywhere else, when
 # the converter's own file holds a different number of conversions than its row allows,
@@ -6135,7 +6071,7 @@ set_tests_properties("unguarded-prerequisites-selftest" PROPERTIES
     TIMEOUT 300
 )
 
-# The cluster key must live in a container that zeroes its storage (#324).
+# Key material must live in a container that zeroes its storage (#324).
 #
 # Registered because fixing the eight holders is not fixing the defect: a ninth is one
 # declaration away and looks exactly like the eight did. It earned this row on its first
@@ -6153,8 +6089,8 @@ set_tests_properties("unguarded-prerequisites-selftest" PROPERTIES
 # firing in BOTH directions: the table's first draft carried that row, the check refused the
 # real tree because the row matched nothing, and the row came out. #1298 then gave the tree a
 # `clusterKey` -- `EnrollReading` holds the secret an enrolling node is handed -- so the row
-# went back in, and the same arm is what makes its absence a refusal now rather than an
-# oversight. The reasoning for the row lives on the script beside the row itself and is not
+# went back in, and the same arm is what made #178 PR 6 take it out again with the key's last
+# holder rather than leave a row guarding nothing. The reasoning for the row lives on the script beside the row itself and is not
 # restated here; what this comment owes is the reason the ARM exists, which is unchanged.
 #
 # ## What this costs, on which shell, and what that means for the 300 s below (#1331)

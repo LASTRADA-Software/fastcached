@@ -76,10 +76,10 @@ set(_fc_cc_core
 # four reach only Net/NetError.hpp, Async/Task.hpp and Core/Profiling.hpp,
 # all header-only and all std-only. ws2_32 was already linked below.
 
-# Core/SecureBytes.cpp is here because `SignedLeaseValidator` holds the cluster key,
-# and it is in WorkerProtocol.cpp -- this directory's file, compiled into both
-# binaries -- so the type the key lives in has to be linkable in a launcher build
-# too. It is one row for the same reason Sha256 is: the alternative is a second
+# Core/SecureBytes.cpp is here because the lease validator's collaborators hold key
+# material in it, and the validator is in WorkerProtocol.cpp -- this directory's file,
+# compiled into both binaries -- so the type key material lives in has to be linkable in
+# a launcher build too. It is one row for the same reason Sha256 is: the alternative is a second
 # zeroing primitive, and two of those is one that gets it wrong.
 #
 # It costs nothing the rule above protects. SecureBytes.hpp reaches <cstddef>,
@@ -88,7 +88,7 @@ set(_fc_cc_core
 # credential holder includes.
 
 # Core/Sha256.cpp and Core/Base64.cpp are what a signed lease token was made of when
-# it was an HMAC under the cluster key, and Base64 still renders it as text; Sha256
+# it was an HMAC under the retired pre-shared key, and Base64 still renders it as text; Sha256
 # keys the spent-grant set (src/FastCache/Distributed/LeaseToken.hpp). The worker's
 # protocol is WorkerProtocol.cpp, which lives in THIS directory and is compiled into
 # both binaries, so the verification half is linked into a launcher build too.

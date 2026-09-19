@@ -109,9 +109,10 @@ struct WorkerTierParts
     IHostFactsSource const& host;                     ///< The hostname a registration labels.
     CacheTier const* cacheTier;                       ///< Null on a node with no cache.
     ICredentialSource const& credential;              ///< What the heartbeat presents.
-    /// Where the cluster key is read from to PROVE membership, or null when this node holds
-    /// none (#1428). One instance per process, shared with whatever else reads that file.
-    IClusterKeySource const* proofKey;
+    /// How this machine proves WHICH machine it is to a scheduler (#178), or null where nothing
+    /// proves -- a test whose scripted fleet serves no handshake. One instance per process,
+    /// shared with the presence loop.
+    NodeProofClient const* prover;
     /// What a lease grant is verified against (#178), or null when this node verifies none --
     /// legal only where no other machine can reach it. Owned by `main`'s `NodeRoster`.
     Distributed::ILeaseRoster const* leaseRoster;
@@ -303,15 +304,14 @@ class WorkerTier
     CacheTier const* _cacheTier;
     ICredentialSource const& _credential;
 
-    /// Where the cluster key is read from to prove membership, or null when this node holds
-    /// none. Borrowed, and it outlives this tier: `main` declares the one source above the
-    /// tier and destroys it after.
-    IClusterKeySource const* _proofKey;
+    /// How this machine proves itself, or null where nothing proves. Borrowed, and it outlives
+    /// this tier: `main` declares it above the tier and destroys it after.
+    NodeProofClient const* _prover;
     IMetricsSink& _metrics;
     ILogger& _logger;
     /// What this worker advertises, and the one thing the registration and the lease
     /// check both read. Borrowed from `main`, which declares it above this tier and destroys
-    /// it after -- `_proofKey`'s arrangement, for `_proofKey`'s reason.
+    /// it after -- `_prover`'s arrangement, for `_prover`'s reason.
     AnnouncedEndpoint& _announced;
     WorkerMachine _machine;
     SteadyClock _toolchainClock;

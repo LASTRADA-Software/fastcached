@@ -6,7 +6,9 @@
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/Roster.hpp>
+#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Distributed/RosterStore.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -16,11 +18,13 @@
 #include <filesystem>
 #include <format>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <CacheProtocol.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
@@ -243,7 +247,7 @@ TEST_CASE("An admission is believed only when the roster records this machine un
 
     // The honest roster: the joiner is told what to compare and what to start with.
     auto const roster = RosterWith(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x42)));
-    auto const admitted = DescribeAdmission(self, roster, true);
+    auto const admitted = DescribeAdmission(self, roster);
     REQUIRE(admitted.has_value());
     CHECK(admitted->contains(Cluster::RenderRosterFingerprint(Cluster::DigestOfRoster(roster))));
 
@@ -259,7 +263,7 @@ TEST_CASE("An admission is believed only when the roster records this machine un
     // under ANOTHER key is either an operator who approved the wrong row or a reply somebody
     // rewrote -- and in both, every key the roster names is untrustworthy, so nothing it
     // says is printed as advice.
-    auto const swapped = DescribeAdmission(self, RosterWith(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x99))), true);
+    auto const swapped = DescribeAdmission(self, RosterWith(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x99))));
     REQUIRE_FALSE(swapped.has_value());
     CHECK(swapped.error().contains("does not record"));
     CHECK(swapped.error().contains(FormatEd25519PublicKey(KeyOf(0x42))));
@@ -267,7 +271,7 @@ TEST_CASE("An admission is believed only when the roster records this machine un
 
     // And bytes that are not a roster are refused as that, never as an admission.
     auto const garbage = std::vector<std::byte> { std::byte { 0x01 }, std::byte { 0x02 } };
-    CHECK_FALSE(DescribeAdmission(self, garbage, true).has_value());
+    CHECK_FALSE(DescribeAdmission(self, garbage).has_value());
 }
 
 TEST_CASE("A worker is admitted as a principal, and a member row does not stand in for one", "[enrollment][client]")
@@ -280,27 +284,145 @@ TEST_CASE("A worker is admitted as a principal, and a member row does not stand 
     state.members.push_back(Member("leader", "10.0.0.1:7100", KeyOf(0x01)));
     state.principals.push_back(
         Cluster::ClusterPrincipal { .id = "worker-a", .publicKey = KeyOf(0x77), .role = Cluster::PrincipalRole::Worker });
-    auto const admitted = DescribeAdmission(self, Cluster::EncodeRoster(Cluster::ProjectRoster(state)), true);
+    auto const admitted = DescribeAdmission(self, Cluster::EncodeRoster(Cluster::ProjectRoster(state)));
     REQUIRE(admitted.has_value());
     CHECK(admitted->contains("worker"));
     CHECK_FALSE(admitted->contains("--raft-peer"));
 
     // The same id and key as a MEMBER is not what this machine asked to be: a worker counted
     // towards quorum is a vote nobody can collect.
-    CHECK_FALSE(DescribeAdmission(self, RosterWith(Member("worker-a", "10.0.0.9:7100", KeyOf(0x77))), true).has_value());
+    CHECK_FALSE(DescribeAdmission(self, RosterWith(Member("worker-a", "10.0.0.9:7100", KeyOf(0x77)))).has_value());
 }
 
-TEST_CASE("An admitted member with no cluster key file is told enrollment did not hand one over", "[enrollment][client]")
+TEST_CASE("An admission asks the joiner to place nothing by hand", "[enrollment][client]")
 {
-    // The interim cost of #178 PR 4, said at the moment it bites rather than at the next start:
-    // a consensus node still needs `--cluster-key-file` for leases and the node port, and
-    // enrollment no longer carries it. Both directions, or a sentence printed always passes.
-    auto const self = JoinerIdentity {
+    // #178 PR 4 left a member joiner needing `--cluster-key-file` placed by hand, and said so at
+    // this moment; PR 6 retired the key, so the admission is the whole of joining. A sentence
+    // still naming the flag would send an operator after a file nothing reads.
+    auto const member = JoinerIdentity {
         .nodeId = "joiner-a", .raftEndpoint = "198.51.100.4:7100", .role = Wire::EnrollRole::Member, .publicKey = KeyOf(0x42)
     };
-    auto const roster = RosterWith(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x42)));
-    CHECK(Unwrap(DescribeAdmission(self, roster, false)).contains("--cluster-key-file"));
-    CHECK_FALSE(Unwrap(DescribeAdmission(self, roster, true)).contains("--cluster-key-file"));
+    auto const admitted = DescribeAdmission(member, RosterWith(Member("joiner-a", "198.51.100.4:7100", KeyOf(0x42))));
+    REQUIRE(admitted.has_value());
+    CHECK_FALSE(admitted->contains("--cluster-key-file"));
+    // The control: the admission is really there, so the absence above is not an empty string's.
+    CHECK(admitted->contains("--raft-join"));
+}
+
+namespace
+{
+
+/// A wall-clock instant the certificate cases are judged at.
+constexpr auto EnrolledAt = std::chrono::system_clock::time_point { std::chrono::hours { 500'000 } };
+
+/// The roster a worker compares when it is admitted: voters @p voters, each under its test key,
+/// and the worker itself as a principal.
+/// @param voters The voters.
+/// @return The roster.
+[[nodiscard]] Cluster::Roster EnrollmentRoster(std::vector<std::string> const& voters)
+{
+    auto state = Cluster::ClusterState {};
+    for (auto const& id: voters)
+        state.members.push_back(Member(id, id + ":6680", Testing::TestKeyPair(id).PublicKey()));
+    state.principals.push_back(
+        Cluster::ClusterPrincipal { .id = "worker-a", .publicKey = KeyOf(0x77), .role = Cluster::PrincipalRole::Worker });
+    return Cluster::ProjectRoster(state);
+}
+
+/// @p roster at @p version, endorsed by @p endorsers until an hour after `EnrolledAt`.
+/// @param roster The roster.
+/// @param version Its version.
+/// @param endorsers Who signs it, each with its test key.
+/// @return The certificate's bytes.
+[[nodiscard]] std::vector<std::byte> CertificateOf(Cluster::Roster const& roster,
+                                                   std::uint64_t version,
+                                                   std::vector<std::string> const& endorsers)
+{
+    auto certified = Cluster::CertifiedRoster {
+        .clusterId = "fleet", .version = version, .roster = Cluster::EncodeRoster(roster), .endorsements = {}
+    };
+    for (auto const& endorser: endorsers)
+    {
+        auto const key = Testing::TestKeyPair(endorser);
+        certified.endorsements.push_back(
+            Cluster::SignEndorsement(Cluster::RosterEndorsement { .clusterId = "fleet",
+                                                                  .version = version,
+                                                                  .rosterDigest = Cluster::DigestOfRoster(certified.roster),
+                                                                  .notAfter = EnrolledAt + std::chrono::hours { 1 },
+                                                                  .endorser = endorser,
+                                                                  .signature = {} },
+                                     [&key](std::span<std::byte const> message) { return key.Sign(message); }));
+    }
+    return Cluster::EncodeCertifiedRoster(certified);
+}
+
+} // namespace
+
+TEST_CASE("An enrolled worker keeps the leader's certified roster, certified against the roster it compared",
+          "[enrollment][client][roster]")
+{
+    // #178 PR 6: the worker enrollment admits is handed the cluster's certified roster and keeps
+    // it as its trust root, so it checks grants from its first start with no `--voter-key`. The
+    // certificate is judged by the voters of the roster the OPERATOR compared -- never taken on
+    // the leader's word, which is the one thing a relayed reply could change.
+    Testing::ScratchDirectory const scratch { "enroll-keep-roster" };
+    auto const path = scratch.Path() / Distributed::RosterFileName;
+    Distributed::FileRosterStore store { path };
+
+    auto const compared = Cluster::EncodeRoster(EnrollmentRoster({ "n1", "n2", "n3" }));
+    auto const certificate = CertificateOf(EnrollmentRoster({ "n1", "n2", "n3" }), 5, { "n1", "n2" });
+
+    auto const said = KeepEnrolledRoster(compared, certificate, EnrolledAt, store);
+    CHECK(said.contains("version 5"));
+
+    auto const kept = Distributed::LoadPersistedRoster(path);
+    REQUIRE(kept.has_value());
+    REQUIRE(Unwrap(kept).has_value());
+    CHECK(Unwrap(Unwrap(kept)).certificate == Unwrap(Cluster::DecodeCertifiedRoster(certificate)));
+}
+
+TEST_CASE("A certificate the compared roster's voters did not endorse is not kept", "[enrollment][client][roster]")
+{
+    // The refusals, each against the SAME compared roster, so what differs is the certificate.
+    Testing::ScratchDirectory const scratch { "enroll-refuse-roster" };
+    auto const path = scratch.Path() / Distributed::RosterFileName;
+    Distributed::FileRosterStore store { path };
+    auto const compared = Cluster::EncodeRoster(EnrollmentRoster({ "n1", "n2", "n3" }));
+
+    SECTION("one voter of three is no majority")
+    {
+        auto const said = KeepEnrolledRoster(
+            compared, CertificateOf(EnrollmentRoster({ "n1", "n2", "n3" }), 5, { "n1" }), EnrolledAt, store);
+        CHECK(said.contains("was not kept"));
+    }
+
+    SECTION("machines that are not the compared roster's voters")
+    {
+        // A relayed reply could carry a certificate its sender's own friends signed; the voters
+        // the operator compared never did.
+        auto const said = KeepEnrolledRoster(
+            compared, CertificateOf(EnrollmentRoster({ "x1", "x2", "x3" }), 5, { "x1", "x2" }), EnrolledAt, store);
+        CHECK(said.contains("was not kept"));
+    }
+
+    SECTION("no certificate at all")
+    {
+        auto const said = KeepEnrolledRoster(compared, {}, EnrolledAt, store);
+        CHECK(said.contains("holds no certified roster"));
+    }
+
+    SECTION("bytes that are not a certificate")
+    {
+        auto const garbage = std::vector<std::byte> { std::byte { 0x01 }, std::byte { 0x02 } };
+        auto const said = KeepEnrolledRoster(compared, garbage, EnrolledAt, store);
+        CHECK(said.contains("could not be read"));
+    }
+
+    // Nothing was written in any of them: a worker that kept a roster its operator's voters never
+    // endorsed would check every grant against a trust root nobody chose.
+    auto const kept = Distributed::LoadPersistedRoster(path);
+    REQUIRE(kept.has_value());
+    CHECK_FALSE(Unwrap(kept).has_value());
 }
 
 TEST_CASE("Enrolling a node that keeps no identity key is refused before anything is asked of anybody",

@@ -594,8 +594,9 @@ Consequences that are each load-bearing:
         the reload passes under precisely that defect — so bind the reference BEFORE the
         reload and classify through it after, which is what the fixture does and what
         the production call sites do.
-      - **A reload may not WIDEN admission on a node with no `--cluster-key-file`.**
-        Such a node built `Cc::UncheckedLeaseValidator()` at startup, which is safe only
+      - **A reload may not WIDEN admission on a worker that runs no consensus and names no
+        `--voter-key`** (on a node with no `--cluster-key-file` until #178 PR 6 deleted it).
+        Such a node may have built `Cc::UncheckedLeaseValidator()` at startup, which is safe only
         while no machine but this one is admitted — and neither guard for that can see a
         reload. `StartupPolicyRejection` decides reachability from the listen flags,
         which describe nothing under socket activation, and
@@ -965,8 +966,9 @@ Consequences that are each load-bearing:
   `src/FastCache/Distributed/LeaseToken.hpp` (#281, #282, #178).
 - **A credential lives in `SecureByteBuffer`, and the wipe is an ALLOCATOR rather than a
   destructor.** The cluster key was a plain `std::vector<std::byte>` in every one of its
-  holders, freed without being touched — the key that MACed discovery proofs then and still
-  MACs every lease grant, left in freed memory for whatever allocated next (#324). The wipe rides on
+  holders, freed without being touched — the key that MACed discovery proofs and lease grants
+  then, left in freed memory for whatever allocated next (#324). The key is gone since #178
+  PR 6; the rule is about every credential, and an identity key's secret half is one. The wipe rides on
   `deallocate` so that every release goes through one door and no holder has a line it can
   forget — the `Refuse`/`ClaimReadSlot` argument again, a guard folded INTO the operation
   being self-enforcing where one called alongside it needs a scan. It is what makes the
@@ -1020,14 +1022,14 @@ Consequences that are each load-bearing:
     that has quietly stopped guarding and reads exactly like a clean tree. It earned its
     place on its first real run, finding two holders in `src/tests/FleetHarness.hpp` that a
     careful hand census had just missed.
-- **One seam signs with the pre-shared key, and the domain label is a required
-  parameter rather than a string each caller remembers.**
-  `Cluster/ClusterSigning.hpp` carries `SigningDomain` and a `SigningDomainTable` row
-  per construction, so there is no argument to pass a bare label to and a fourth signer
-  cannot be written against `HmacSha256` directly. The same key MACs node proofs and
-  lease tokens (and MACed discovery proofs until #178), so a construction that omits its
-  domain is a credential valid on the other surface — which is the failure the label existed to prevent and which two
-  hand-rolled constructions could only prevent by both remembering to (#402).
+- **Every signature carries its domain label as its first FIELD, and one identity key signs
+  under all of them.** The pre-shared key's seam for this -- `Cluster/ClusterSigning.hpp`, its
+  `SigningDomainTable` and `ctest -R psk-signing-seam` -- was DELETED with the key at #178 PR 6
+  (#402 is why it existed). The question it answered did not go: a scheduler's node key signs
+  its leases, its challenge replies, its Raft proofs and verdicts, its discovery proof and its
+  roster endorsements, so a construction whose label another shares is a credential valid on
+  the other surface. `NodeProof_test` asserts the labels distinct ACROSS constructions; the
+  argument is in `consensus-and-cluster.md`.
 - **Asymmetric cryptography has ONE seam too: `Core/Ed25519`, `Core/X25519` and `Core/Hkdf`,
   over the vendored Monocypher (#178).** Only `Ed25519.cpp` and `X25519.cpp` include a Monocypher
   header, and `ctest -R crypto-seam` refuses any other first-party file that does -- the include
@@ -1297,13 +1299,14 @@ Consequences that are each load-bearing:
   because they left `--bind` at the wildcard, and neither compiles anything — so for
   a while the only end-to-end evidence for the lease check was construction. (Both
   bind loopback since #290 stage 3, which merged the compile port into
-  `--listen-node`; they keep the key, and their own comments now say the bind is the
-  half that closes them rather than the half that opens them.) Meanwhile
-  the fixtures that *do* dispatch bind loopback, slipped under the startup rule, and
-  ran `UncheckedLeaseValidator` for every one of their hundreds of compiles. Both
-  halves have to meet in one fixture, which is why `dist-compile-e2e` carries the key
-  on every node: an in-process test mints and verifies inside one process and cannot
-  show that the endpoint a worker ADVERTISED is the endpoint the scheduler signed.
+  `--listen-node`; they carried the key until #178 PR 6 deleted it, and their own
+  comments say the bind is the half that closes them rather than the half that opens
+  them.) Meanwhile the fixtures that *do* dispatch bind loopback, slipped under the
+  startup rule, and ran `UncheckedLeaseValidator` for every one of their hundreds of
+  compiles. Both halves have to meet in one fixture, which is why `dist-compile-e2e`
+  hands every worker its scheduler's `--voter-key` (the cluster key, until #178): an
+  in-process test mints and verifies inside one process and cannot show that the
+  endpoint a worker ADVERTISED is the endpoint the scheduler signed.
 - **A flag that describes nothing under socket activation cannot answer whether a
   port faces the network.**
 
@@ -1572,8 +1575,9 @@ Consequences that are each load-bearing:
   reached BY PATH remain `Reloadable::No`. The half that was always here is the one a snapshot cannot
   answer: an operator edits `log_level:`, sends SIGHUP, the reload is accepted, and
   nothing re-asks the filesystem, so a `--cluster-key-file` that went to 0644 an hour
-  after the node started is silent for the rest of the process's life. That key MACs
-  node proofs AND lease grants. `SecretExposureWatcher` re-asks and remembers
+  after the node started is silent for the rest of the process's life. That key MACed
+  node proofs AND lease grants until #178 PR 6 retired it; `--scheduler-token-file` is the
+  same case today. `SecretExposureWatcher` re-asks and remembers
   `(path, exposure)`, so a standing exposure is said once; an implementation reasoning
   from the reloader's previous-and-current pair concludes nothing changed and never
   looks, which is what makes the snapshot-diffing version look correct while covering
@@ -2070,7 +2074,7 @@ Six more about what the tier IS and who gets to see it:
   ([#463](https://github.com/LASTRADA-Software/fastcached/issues/463)). Widening it for
   a *fleet participant* -- `--scheduler`, `--fleet-member`, `--fleet-open` -- restores
   no ergonomics: the wider bind is what makes `CompilePortFacesTheNetwork` true, so
-  `--cluster-key-file` becomes required, and the wider bind *becomes* the advertised
+  a way to check a lease becomes required, and the wider bind *becomes* the advertised
   endpoint, so `AdvertisesWildcard` requires `--advertise` too. It costs three things.
   It silences `AdvertisesPastALoopbackBind`, whose message is the remedy. It moves the
   fleet-facing bind onto the DEFAULTED path, where a port already held is a warning and
@@ -3098,8 +3102,8 @@ that translation unit holds. It took a key clause until #1308, and the APPROVAL 
 key before `ClusterAdmit` until #178, because a key file that broke after boot let an
 approval commit a member that could never collect -- a phantom counted towards every
 election. Nothing is collected any more, so that read had nothing left to protect and
-went; consensus still refuses to start without `--cluster-key-file`, for the lease and the
-node proof, and that rule no longer mentions enrollment.
+went. The `--cluster-key-file` consensus still required then, for the lease and the node
+proof, went at #178 PR 6 once both proved identity keys.
 
 **A node that runs no consensus refuses the family `NoCluster`, never
 `UnimplementedVerb`.** This is *unimplemented is not served elsewhere* on a new
@@ -3148,34 +3152,86 @@ pointed at it three times — so the claim was circular. A case asserting only t
 reading leaves the field's whole purpose untested; absent-against-`closed` is what
 earns its place.
 
-## The node proof (#1428)
+## The node proof (#1428; identity keys and sealed frames since #178)
 
 Node-to-node admission on the `0xFC` surface was decided by the caller's SOURCE ADDRESS and
 nothing else — `ClusterMembership` against the committed endpoints, `--fleet-member` against a
 local list. An address is a stand-in for *this is one of our nodes*, and it stops being one the
 moment an address is not stable: a worker that joins over a VPN gets a different one each
-session and no literal host match can follow it (#178 item 1). Every caller that matters here
-already holds the cluster key — #282 refuses a network-facing keyless worker at startup and
-#1308 refuses keyless consensus — so it can PROVE membership rather than being inferred from
-where it dialled from.
+session and no literal host match can follow it (#178 item 1). #1428 let a caller PROVE the
+cluster's pre-shared key instead; #178 PR 6 made it prove WHICH machine it is, by signing with
+its own identity key, and sealed every frame after the proof. Each rule below is what some
+plausible simpler design gets wrong.
 
-**The proof is an UPGRADE and never a replacement.** A connection that proves nothing is
-admitted or refused by its address exactly as it was before, which is what makes every existing
-deployment unaffected by construction: `Distributed::ExplainConnection` returns the oracle's own
-decision when nothing was proved, and unions `ProvenKeyHolder` onto it when something was. A tie
-unions rather than choosing, for `AnyOfMembership`'s reason — a host in `--fleet-member` that
-also holds the key is admitted by both, and an operator who drops it from the list has to be
-told the key still admits it.
+**An address admits CLIENTS; it no longer admits a machine into the fleet.** The verbs a machine
+joins with -- `Register`, `NodeAnnounce`, `Heartbeat`, `Withdraw` -- decide where the fleet's work
+is sent, and they are `IdentityRequirement::ProvenNodeOnly`, a COLUMN of `OpTable` pinned by
+`JoiningVerbsNeedAnIdentity`, refused `NodeIdentityRequired` and counted
+(`SchedulerRequestsRefusedNodeIdentityRequired`). Loopback is NOT exempt: a process on the
+scheduler's own host could otherwise register an endpoint of its choosing and be leased the
+fleet's jobs. Every node naming `--scheduler` therefore needs a key to prove, so the startup
+table refuses one that runs no consensus and names no `--cluster-dir`
+(`SchedulerNeedsIdentityRefusal`) -- a registration that would be refused forever, found at
+startup rather than in a heartbeat log. So every PACKAGED registration carries a state
+directory too -- the Linux unit's `StateDirectory=fastcache-node`, the MSI's
+`%ProgramData%\fastcache-node` -- or a packaged worker is refused at its first start, and
+under the MSI's `Return="ignore"` that refusal is a worker silently never registered. A client
+asking for a lease or a cache entry proves nothing and is admitted exactly as before.
 
-**A forget still outranks it**, on the same `PrecedenceOf` the address routes are composed with.
-That is not a softening of what a proof means: under a shared key a forget cannot revoke a key
-holder at all, which is why removal needs #178's credential in the frame, and the precedence is
-the direction the composition already fails in.
+**A proof is worth nothing unless every frame after it is SEALED.** Without the seal, a machine on
+the path relays a genuine worker's handshake to the scheduler, watches it succeed, and writes a
+`Register` of its own into the connection the worker's proof admitted -- an identity check that
+authenticates the first frame and trusts the rest. So both ends derive two session keys from an
+ephemeral X25519 exchange (HKDF over both nonces, both ephemeral keys and both ids), and every
+frame both ways carries a `Core/SessionSeal` tag over an implicit position, its header and its
+payload (`Protocol/SealedFrameSocket`). A bad tag, a replayed frame, the other direction's key
+or an oversized frame closes the connection UNANSWERED and is counted
+(`NodeSealedFramesRefused`). The acceptance case is that relay, injecting a `Register` with a
+forged tag after an honest proof, and its neuter is a seal that accepts any tag -- under which
+the relay's worker is registered and the honest control stays green.
 
-**The fold lives in ONE function and every gate reaches it**, `Node::RefuseUnlessMember`. The
-alternative — folding at each surface — is the shape this file already records for the membership
-verdict itself: five copies of a one-armed decision were exactly as correct as one until a second
-arm arrived, and then five files each had to grow it.
+**The socket is wrapped from the start and ENGAGED later**, rather than swapped at the proof: the
+loop's reader, the sweeper's registration, the peer watch and the progress pulse all hold the
+connection's socket, and a swap would have to reach every one at the same instant. Until a proof
+engages it the layer passes bytes straight through, so a launcher on the same port pays one
+virtual call per operation.
+
+**The answer to `ProveNode` is the first sealed frame, WHATEVER it says** -- `Ok`, or a refusal
+decided after the keys were agreed (a bad signature, an unknown key, a revoked key) -- so the
+grammar of the answer never depends on the verdict, and a caller learns the two ends agree on the
+keys before it sends a verb. Only a refusal decided before any key exists (a payload that does
+not decode) leaves the connection unsealed. **A connection proves ONCE**: either verb on one that
+has proved or is sealed closes it, because a second handshake would re-key mid-stream and a
+revoked machine re-proving under another key on the connection its tombstone marks would be
+asking to be judged afresh by the one fact that condemns it. Bytes pipelined past `ProveNode`
+close the connection too: they arrived in the clear, before the seal existed.
+
+**The SERVER signs first, and a caller that holds a roster checks it** (`NodeProofClient`). A
+revoked ex-scheduler still named in a worker's `--scheduler` gets nothing -- not even a proof it
+could relay -- and the four answers about the server (`Voter`, `Unchecked`, `NotVoter`,
+`Revoked`) are kept apart because the two refusals are opposite diagnoses. A machine with no
+roster yet takes the server's word for its key, and the seal is what still stops a relay.
+
+**Three verdicts on a VERIFIED proof, and the revoked one is not a refusal.** A key the roster
+holds live for that id admits (`ProvenIdentity`); one it holds for no one is `NodeKeyUnknown`
+(`NodeProofsRefusedUnknownKey`), whose remedy is the operator's -- an admission -- rather than the
+caller's; one it REVOKED is `NodeKeyRevoked` (`NodeProofsRefusedRevokedKey`), and the connection
+KEEPS that identity, marked: every later verb on it is `Forgotten` through `KeyTombstone`, which
+outranks every address route on `PrecedenceOf` -- a host still on `--fleet-member` included --
+and is counted at the gate (`NodeRequestsRefusedKeyRevoked`). Dropping the identity instead would
+hand the forgotten machine back to its address, which is the one outcome a forget exists to
+prevent. The signature is checked BEFORE the roster is consulted, so a caller who cannot sign
+learns nothing about which ids and keys the cluster holds. Admission is re-asked of the roster
+on every verb (`IMembershipOracle::ExplainKey`), never frozen at the handshake, so a key revoked
+while the connection is open refuses its very next verb.
+
+**The fold lives in ONE function and every gate reaches it**, `Node::RefuseUnlessMember` over
+`Distributed::ExplainConnection(oracle, host, proven)`. The alternative — folding at each surface
+— is the shape this file already records for the membership verdict itself: five copies of a
+one-armed decision were exactly as correct as one until a second arm arrived, and then five files
+each had to grow it. A tie unions rather than choosing, for `AnyOfMembership`'s reason: a host in
+`--fleet-member` that also proved a live key is admitted by both, and an operator who drops it
+from the list has to be told the key still admits it.
 
 **Every gate INCLUDES the live-stats one since #1512, and how that came about is the transferable
 part.** It was the one exception, and the reason was never about subscriptions: a subscription is
@@ -3185,69 +3241,50 @@ alone would admit a proven watcher and end its stream one tick later, which is w
 refusing it. The exception was therefore a property of the SEAM, and it was recorded as a
 deliberate narrowing (`RefuseUnlessMemberAtAddress`, a differently-named spelling that took a
 written reason) rather than as an omission — which is what made it findable and fixable instead
-of looking like policy. #1512 widened the seam to a `LiveWatcher` carrying the host and a
-`provedClusterKey` bool, both ends now fold, and the narrow spelling was DELETED rather than left
-unused: a policy that reads as available and describes nothing is how a table stops describing
-the file it is about.
+of looking like policy. #1512 widened the seam to a `LiveWatcher` carrying the host and the
+proof, both ends now fold, and the narrow spelling was DELETED rather than left unused: a policy
+that reads as available and describes nothing is how a table stops describing the file it is
+about. Since #178 PR 6 the watcher carries the `ProvenIdentity` itself, so a key revoked while a
+stream runs ends it at the next tick.
 
 **Neither verb is pre-auth, and the reasoning from `Enroll` does not transfer.** `Enroll` exists
 for a machine that holds NO secret of this cluster, so a credential gate there refuses the whole
-population. A node proving the cluster key is the opposite case: it came to send `Register`,
-which requires the credential when one is configured, so a caller that cannot pass that gate
-gains nothing from being proved and one that can passes it first. Nobody is refused by requiring
-it, and what pre-auth would cost is one-sided — an unauthenticated stranger able to make this
-node draw a nonce and run an HMAC per frame, and two more rows for `PreAuthVerbsAreBounded` to
-be right about. *The verb admits a non-member, therefore it is pre-auth* is the inference a
-reader makes from the table alone, so `VerbFamily::NodeProof` states the answer beside the rows.
+population. A node proving its identity is the opposite case: it came to send `Register`, which
+requires the credential when one is configured, so a caller that cannot pass that gate gains
+nothing from being proved and one that can passes it first. *The verb admits a non-member,
+therefore it is pre-auth* is the inference a reader makes from the table alone, so
+`VerbFamily::NodeProof` states the answer beside the rows.
 
 **The challenge is the SERVER's, per connection, and spent whatever the outcome.** Discovery's
 rule and the Raft handshake's, in the same words, and the endpoint holds it because it is
 connection state — the prover is shared by every connection on the surface. Asking twice
 re-draws it and the old one is gone: a server holding two live nonces would accept a proof over
-either, which is a replay window opened by nothing but politeness, and re-drawing keeps *spent
-whatever the outcome* true with no second rule beside it.
+either, which is a replay window opened by nothing but politeness.
 
-**The id inside the tag is a LABEL and is legitimately EMPTY.** Binding it buys one thing — a
-captured tag cannot be relabelled, so the id this server records is the one the holder claimed —
-and it establishes nothing about WHICH holder is speaking, because under a shared key every
-holder can mint any id's tag. An identity is minted into `--cluster-dir` only by a node that
-runs consensus, so requiring a non-empty one would refuse exactly the population this exists for:
-an ordinary worker, which holds the key because that is what signs its lease grants. So *this
-connection proved the key* is carried by `PeerIdentity::provenNodeId` being ENGAGED, and
-`ExplainConnection` takes a `bool` rather than the label — a parameter carrying the label would
-make an empty one indistinguishable from no proof at all.
+**`NodeProofsAccepted` is the positive half and is not decoration**: every other row counts a
+refusal, so a fleet where the proof is configured but never taken reads identically on all of
+them to one where it works perfectly. `NodeProofsMalformed` is a client-library mismatch,
+`NodeProofsRejected` a signature that did not verify, `NodeProofsUnchallenged` a client with the
+exchange wrong -- five refusal diagnoses beside it, and not one of them is folded into another.
 
-**Three ways to fail, three diagnoses, and only one of them is about the caller's key.** A
-payload that will not decode is a client-library mismatch (`NodeProofsMalformed`); a tag that
-does not authenticate is a wrong `--cluster-key-file` or somebody guessing, which the RATE
-separates (`NodeProofsRejected`); a proof with no challenge outstanding is a client that has the
-exchange wrong (`NodeProofsUnchallenged`). A key file that has stopped being readable is a fact
-about THIS machine and answers `NoCluster` with a Warn naming the path — telling that caller its
-key did not match would send whoever reads it to check a key that is fine, and no counter can
-carry which machine is broken. `NodeProofsAccepted` is the positive half and is not decoration:
-every other row counts a refusal, so a fleet where the proof is configured but never taken reads
-identically on all of them to one where it works perfectly.
-
-**The presenting half runs once per CONNECTION, at the top of each heartbeat round, and carries
-on in every outcome.** A peer too old to know the verbs answers `UnknownOpcode` by the step-over
-rule and one holding no key answers `NoCluster` from its unserved-family row; both are what a
-mixed fleet looks like mid-upgrade, and a node that stopped registering over either would take
-itself out of a fleet that was admitting it by address perfectly well. Only a REFUSAL is logged,
-because that is the one an operator acts on and it is invisible from here in every other way —
-the registration that follows then succeeds or fails for a reason that names the address instead.
+**The presenting half runs once per CONNECTION, before the first joining verb, and an unproved
+connection is UNREACHABLE.** Anything but `Proved` means every verb that round came to send would
+be refused, so `DialAndAnnounce` moves on to the next `--scheduler` rather than sending them --
+which is also what keeps a revoked ex-scheduler from being told anything.
 
 **What it does not cover, stated rather than left to be found.** The cache tier is unaffected and
-that is the fix rather than an omission: locality is a property of the VERB, and a machine
-holding the fleet's key is still not this one (#287). `FleetText` and a live-stats subscription
+that is the fix rather than an omission: locality is a property of the VERB, and a machine that
+proved its identity is still not this one (#287). `FleetText` and a live-stats subscription
 are BOTH behind the dashboard credential as well as membership, and that credential is untouched
 -- it answers a different question and is its own file by rule, so a proof is not a substitute
-for the token.
+for the token. And a REGISTER's endpoint is still not bound to the machine that proved: the proof
+says WHICH machine, never that the address it registers is its own.
 
 **Every membership gate on this surface folds the proof, and that is a census rather than a
 description**: `CompileResponder`, `EnrollmentResponder`, `FleetTextResponder`,
 `NodeStatusResponder`, `SchedulerResponder` and -- since #1512 -- `LiveStatsResponder` at BOTH
-its door and its per-tick re-gate. There is no longer a spelling that refuses to widen, so a
-seventh surface folds by reaching the one function rather than by remembering to.
+its door and its per-tick re-gate. There is no spelling that refuses to widen, so a seventh
+surface folds by reaching the one function rather than by remembering to.
 
 ## Open work
 - **[#661](https://github.com/LASTRADA-Software/fastcached/issues/661)** — `IProcessRunner`
@@ -3265,7 +3302,7 @@ seventh surface folds by reaching the one function rather than by remembering to
   `ISocket::ShutdownWrite`, and #663's read-slot rule), which is why it is one entry and
   not four.
 - **[#1125](https://github.com/LASTRADA-Software/fastcached/issues/1125)** — the same
-  defect #324 fixed for the cluster key is still live for the file-backed STRING
+  defect #324 fixed for the since-retired cluster key is still live for the file-backed STRING
   credentials (`--requirepass`, the two token files), and the seam #324 built does not
   finish it. `SecureAllocator` instantiates for `std::basic_string` perfectly well, and
   short-string optimisation means it is never CALLED for a short value — measured on

@@ -52,8 +52,8 @@ src/FastCache/
                 RaftMembership, and RaftClusterHarness (a whole cluster in one process,
                 against scripted partitions, loss and restarts, every message signed
                 by the member it names)
-  Cluster/      DiscoveryService + DiscoveryWire (the LAN beacon and its PSK
-                challenge), RosterKeys (the keys the peer wire judges members by: the
+  Cluster/      DiscoveryService + DiscoveryWire (the LAN beacon and the
+                identity-key challenge after it), RosterKeys (the keys the peer wire judges members by: the
                 command line's, then the replicated state's), PeerDirectory,
                 ClusterState + ClusterStateMachine,
                 MembershipPolicy — who is a member, WHERE they answer, and the
@@ -68,13 +68,17 @@ src/FastCache/
                 machine handed over); plus FleetView and FleetChart, which render
                 what the leader can see as a page, as SVG and as JSON; RosterTrust
                 and RosterStore (the certified roster a worker that runs no
-                consensus holds, and keeps)
+                consensus holds, and keeps); NodeProof (the handshake a machine
+                joining the fleet proves its identity key with, and the two
+                session keys that seal the connection after it)
   Protocol/     IProtocolHandler, ProtocolAutodetect, Framing/ByteReader,
                 MemcachedText, MemcachedMeta, MemcachedBinary, RedisResp,
                 CompileCacheHandler (the 0xFC executor), CompileCacheWire
                 (header-only and dependency-free, shared verbatim by every
-                binary) and SurfaceRefusal (the three ways a 0xFC surface
-                refuses: counted, decided-not-to, not-yet-decided)
+                binary), SurfaceRefusal (the three ways a 0xFC surface
+                refuses: counted, decided-not-to, not-yet-decided), and
+                SealedFrameSocket + ProvenIdentity (every frame after a node
+                proof, tagged and checked, and WHICH machine the proof named)
   Server/       Connection (per-client coroutine), Server, ReactorServerLoop,
                 AdminHttpServer (its routes are a table) + AdminCredential
   Platform/     IDaemonHost, ISignalSource, DaemonControls, CpuAffinity,
@@ -329,11 +333,11 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   inline wipe too. Holders are found by NAME, so a row that has stopped matching is a refusal.
 - A lease token is a credential, and its signature covers the granted **endpoint**. Fields
   length-prefixed, never joined.
-- The PSK signs through ONE seam and the domain is a required PARAMETER, never a string a caller
-  remembers: `Cluster/ClusterSigning.hpp`'s `SigningDomain` and its `SigningDomainTable`. The node
-  proof owns the one row left, and every verifier goes through `VerifyFields`. The Raft peer
-  wire's rows, discovery's and the lease's LEFT at #178, for each node's own key, and their labels
-  are retired, never reused.
+- **There is no pre-shared key** (#178): `--cluster-key-file`, `ClusterKeySource`,
+  `Cluster/ClusterSigning.hpp` and `psk-signing-seam` were DELETED, never shimmed. Every proof is an
+  Ed25519 signature by a machine's OWN identity key, and one key signs under every construction a
+  node takes part in, so each has a versioned LABEL signed as the first FIELD, and one case asserts
+  the labels distinct ACROSS constructions. A retired label is never reused.
 - #402 moved the discovery proof's MAC *input* and **`DiscoveryWire::CurrentVersion` deliberately
   did not move** — the datagram grammar was unchanged. "We changed the MAC, so bump the version"
   is the tempting correction, and it is wrong. It DID move at #178 (1→2), and `RaftWire`'s for #1308
@@ -453,15 +457,24 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   free members a running job is still inside.
 - A REGISTER endpoint is **not** verified against the caller — `DispatchWorkerEndpointMismatch` only
   counts it. Comparing hosts refuses the documented setup and stops only a *third* host; the fix is
-  a credential, as discovery's `(node, endpoint)` MAC is.
+  a credential, as discovery's `(node, endpoint)` signature is.
 - `CallerContext::peerId` is the kernel's peer host and IS trusted — membership is decided from it.
   It carries no port; a peer dials from an ephemeral one.
 - An address is a stand-in for *one of our nodes* and stops being one when it is not stable, so a
-  caller that PROVES the cluster key is a member wherever it dialled from. One fold
-  (`Distributed::ExplainConnection`, reached only through `Node::RefuseUnlessMember`), a
-  server-chosen challenge per connection spent whatever the outcome, and the id in the tag is a
-  LABEL — legitimately empty, since only a consensus node mints one. Neither verb is pre-auth:
-  the population already passes the credential gate, so requiring it refuses nobody.
+  caller that PROVES a live identity key is a member wherever it dialled from — and since #178 an
+  address admits CLIENTS only: the verbs a machine JOINS the fleet with are
+  `IdentityRequirement::ProvenNodeOnly`, loopback included, refused `NodeIdentityRequired` -- so a
+  node naming a scheduler with no consensus and no `--cluster-dir` is refused at startup, and every
+  PACKAGED registration carries a state directory (`StateDirectory=`, the MSI's). One fold
+  (`Distributed::ExplainConnection`, over the `ProvenIdentity` the connection proved, reached only
+  through `Node::RefuseUnlessMember`), and a REVOKED key is `Forgotten` (`KeyTombstone`) from every
+  address, `--fleet-member` included. Neither verb is pre-auth: the population already passes the
+  credential gate, so requiring it refuses nobody.
+- **A proof is worth nothing unless every frame after it is SEALED**: a machine that relays a
+  genuine handshake would otherwise inject a verb into the connection it admitted. So the answer to
+  `ProveNode` is the first sealed frame WHATEVER it says, a bad tag closes the connection
+  unanswered, and a connection proves ONCE — either verb on a sealed one closes it. The test is a
+  relay injecting a `Register`, and its neuter is a seal that accepts any tag.
 - A node's cache tier serves **this machine**, always: locality is a property of the VERB, never of
   the bind and never of a member list. `CacheResponder` therefore takes no membership oracle — its
   absence IS the fix. The question is ambient, so it arrives through `Platform/ILocalityOracle`:
@@ -490,9 +503,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   warns and the admit is SILENT, and that silence is the assertion.
   So `NodeMembership` IS the oracle rather than handing one out — surfaces bind an
   `IMembershipOracle const&` once, and a test that re-asks `Oracle()` after a reload passes under
-  exactly that defect. And a reload may not WIDEN admission on a node with no `--cluster-key-file`,
-  which built an unchecked lease validator at startup. Asked as a TRANSITION, or it refuses the
-  keyless nodes running happily today.
+  exactly that defect. And a reload may not WIDEN admission on a worker that runs no consensus and
+  names no `--voter-key`, which may have built an unchecked lease validator at startup. Asked as a
+  TRANSITION, or it refuses the rosterless nodes running happily today.
 - An enrollment window is served by a node that runs consensus (`ServesEnrollment`). **No secret
   crosses it** (#178): the joiner sends its role and PUBLIC key, and the approved reply is the
   roster, answered only once the leader's own roster records that key — so nothing is spendable,

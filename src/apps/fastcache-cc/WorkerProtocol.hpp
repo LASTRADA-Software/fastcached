@@ -127,21 +127,21 @@ struct LeaseDecision
     /// a job is abandoned `slack` past the point the scheduler reclaimed its key rather
     /// than at it.
     ///
-    /// **Disengaged is a state and not a missing value**: a worker with no cluster key
-    /// checks nothing (`UncheckedLeaseValidator`), so there is no authenticated bound for
+    /// **Disengaged is a state and not a missing value**: a worker with no roster to check
+    /// against checks nothing (`UncheckedLeaseValidator`), so there is no authenticated bound for
     /// it to report, and an engaged zero would mean *no time left* rather than *no bound*
     /// -- which would refuse every compile on the single-machine install. That is the same
     /// rule the toolchain evidence follows: evidence a caller may not have is a disengaged
     /// optional, never an empty field.
     ///
-    /// Populated only after the MAC verified, so what it is derived from is a fact the
+    /// Populated only after the signature verified, so what it is derived from is a fact the
     /// scheduler signed rather than something the client wrote.
     std::optional<std::chrono::milliseconds> remaining;
 };
 
 /// Decide whether a lease token authorizes a job.
 ///
-/// Injected rather than called directly, because reading a cluster key and a wall
+/// Injected rather than called directly, because reading a roster and a wall
 /// clock is I/O and this file has none. It is also the seam where a worker's trust
 /// model lives: today the two implementations are "verify the scheduler's
 /// signature" and "accept anything", and which one a node builds is a startup

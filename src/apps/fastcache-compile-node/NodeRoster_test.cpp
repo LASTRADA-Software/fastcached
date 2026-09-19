@@ -128,6 +128,62 @@ TEST_CASE("A consensus member verifies grants against the state it applies, whic
     CHECK_FALSE(node.Wanting());
 }
 
+TEST_CASE("A consensus member places a server only once its applied state names a voter's key", "[node][roster][proof]")
+{
+    // #178 PR 6: a node proves itself only to a server its roster does not call a stranger. A
+    // consensus member's roster is the state it applied, and until the first commit records a
+    // voter's key -- its OWN, when it schedules for itself -- there is no voter a server could have
+    // been. Calling it `NotVoter` then made a scheduler that also runs a worker refuse to prove
+    // itself to itself until a heartbeat round after that commit, with a warning at every start.
+    auto cfg = Worker();
+    cfg.raftListen = "127.0.0.1:6680";
+    ManualWallClock const clock { Noon };
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
+    REQUIRE(roster.has_value());
+    auto& node = *Testing::Unwrap(roster);
+
+    CHECK(node.StandingOf("n1", TestKeyPair("n1").PublicKey()) == ServerStanding::Unchecked);
+
+    Cluster::ClusterState state;
+    state.members = { Cluster::ClusterMember { .id = "n1",
+                                               .raftEndpoint = "n1:6680",
+                                               .schedulerEndpoint = {},
+                                               .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                               .seat = Cluster::MemberSeat::Voter,
+                                               .publicKey = TestKeyPair("n1").PublicKey() } };
+    state.revokedKeys = { Cluster::RevokedKey { .id = Consensus::NodeId { "n0" },
+                                                .publicKey = TestKeyPair("n0").PublicKey() } };
+    node.Applied(state);
+
+    // Once a voter's key is known, the three answers are the roster's.
+    CHECK(node.StandingOf("n1", TestKeyPair("n1").PublicKey()) == ServerStanding::Voter);
+    CHECK(node.StandingOf("n1", TestKeyPair("x").PublicKey()) == ServerStanding::NotVoter);
+    CHECK(node.StandingOf("n0", TestKeyPair("n0").PublicKey()) == ServerStanding::Revoked);
+}
+
+TEST_CASE("A consensus member names a revoked server as revoked before it knows any voter's key", "[node][roster][proof]")
+{
+    // The control on the rule above: what a member has NOT learned yet excuses a stranger, never a
+    // machine the state it applied says was forgotten.
+    auto cfg = Worker();
+    cfg.raftListen = "127.0.0.1:6680";
+    ManualWallClock const clock { Noon };
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
+    REQUIRE(roster.has_value());
+    auto& node = *Testing::Unwrap(roster);
+
+    Cluster::ClusterState state;
+    state.revokedKeys = { Cluster::RevokedKey { .id = Consensus::NodeId { "n0" },
+                                                .publicKey = TestKeyPair("n0").PublicKey() } };
+    node.Applied(state);
+
+    CHECK(node.StandingOf("n0", TestKeyPair("n0").PublicKey()) == ServerStanding::Revoked);
+}
+
 TEST_CASE("A worker no other machine can reach holds no roster and checks no grant", "[node][roster]")
 {
     ManualWallClock const clock { Noon };
@@ -218,8 +274,8 @@ TEST_CASE("A kept roster this machine cannot use refuses the start, never falls 
 
 TEST_CASE("A worker other machines can reach refuses to start holding no roster and no anchor", "[node][roster]")
 {
-    // The half of `RosterlessWorkerRefusal` only the state directory can answer: the table
-    // let this configuration through because it names a `--cluster-dir`, which might have held
+    // Where `RosterlessWorkerRefusal` is answered, since only the state directory can: the table
+    // lets this configuration through because it names a `--cluster-dir`, which might have held
     // a roster. It holds none.
     auto const scratch = Testing::ScratchDirectory { "node-roster-none" };
     auto cfg = NetworkFacingWorker();

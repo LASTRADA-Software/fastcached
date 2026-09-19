@@ -30,7 +30,7 @@ the build or the test suite already says it.
 |---|---|
 | [`compile-cache.md`](compile-cache.md) | `apps/fastcache-cc/`, `CompileCache/` — the cache key, path canonicalization, manifests, replay |
 | [`distributed-compilation.md`](distributed-compilation.md) | `Distributed/`, `apps/fastcache-compile-node/` — dispatch, workers, the scheduler, node tiers |
-| [`consensus-and-cluster.md`](consensus-and-cluster.md) | `Consensus/`, `Cluster/` — Raft, discovery, the PSK handshake, membership |
+| [`consensus-and-cluster.md`](consensus-and-cluster.md) | `Consensus/`, `Cluster/` — Raft, discovery, the identity-key handshakes, membership |
 | [`wire-and-protocol.md`](wire-and-protocol.md) | `Protocol/`, `Net/` — framing, the auth gate, sockets |
 | [`platform-service-and-config.md`](platform-service-and-config.md) | `Platform/`, `Config/` — service registration, config lookup and trust, the CLI table |
 | [`metrics-and-observability.md`](metrics-and-observability.md) | `Metrics/` — the counter table, refusal codes, scrape surfaces |

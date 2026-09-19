@@ -604,30 +604,29 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeProofsAccepted,
       .prometheusName = "fastcache_node_proofs_accepted_total",
-      .help = "Connections admitted by PROVING the cluster key rather than by their source "
-              "address (#1428). The positive half: every other node_proofs row counts a "
-              "refusal, so a fleet where the proof is never taken reads the same on all of "
-              "them as one where it works. Per exchange, never per verb.",
+      .help = "Connections that PROVED which machine they are, under an identity key this cluster holds live, "
+              "and are sealed from then on (#178). The positive half: every other node_proofs row counts a "
+              "refusal, so a fleet where the proof is never taken reads the same on all of them as one where it "
+              "works. Per exchange, never per verb.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeProofsRejected,
       .prometheusName = "fastcache_node_proofs_rejected_total",
-      .help = "Node proofs that decoded and did not authenticate: a wrong "
-              "--cluster-key-file, or somebody guessing at the fleet's key. The RATE "
-              "separates them. Never sum with scheduler_credentials_rejected -- that is a "
-              "wrong --requirepass, an operator's token, and this is the cluster key every "
-              "member holds.",
+      .help = "Node proofs whose signature does not verify under the key they presented: a client of another "
+              "build, or somebody forging one. Asked before the roster, so it says nothing about which keys the "
+              "cluster holds. Never sum with scheduler_credentials_rejected -- that is a wrong --requirepass, an "
+              "operator's token.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeProofsUnchallenged,
       .prometheusName = "fastcache_node_proofs_unchallenged_total",
       .help = "prove-node frames sent with no challenge outstanding on their connection: "
               "never asked for one, or already spent one. A client that has the exchange "
               "wrong, not a security signal -- kept apart from node_proofs_rejected so an "
-              "old client cannot hide a key search.",
+              "old client cannot hide a forgery.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeProofsMalformed,
       .prometheusName = "fastcache_node_proofs_malformed_total",
-      .help = "prove-node payloads that would not decode into an id and a tag: a version or "
-              "client-library mismatch, kept apart from node_proofs_rejected for "
+      .help = "node-challenge and prove-node payloads that would not decode into their fixed-width fields: a "
+              "version or client-library mismatch, kept apart from node_proofs_rejected for "
               "scheduler_credentials_malformed's reason.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::KeyspaceReclaimEventsDropped,
@@ -1129,6 +1128,35 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Roster endorsements this scheduler refused because they were not signed by a voter it holds a key "
               "for. Endorsements of an older roster are dropped without counting: they are what a change looks like "
               "for a few seconds. A rise names a machine claiming to vote that does not.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeProofsRefusedUnknownKey,
+      .prometheusName = "fastcache_node_proofs_refused_unknown_key_total",
+      .help = "Node proofs whose signature verified under a key this cluster does not hold for the id named: a "
+              "machine nobody enrolled or admitted with --cluster-admit-worker, or one presenting a key other than "
+              "the one admitted under its id. The remedy is an admission, not a key.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeProofsRefusedRevokedKey,
+      .prometheusName = "fastcache_node_proofs_refused_revoked_key_total",
+      .help = "Node proofs whose signature verified under a key this cluster revoked: the forgotten machine "
+              "itself, still dialling in. Should read zero; a rise names a machine somebody removed and nobody "
+              "stopped.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked,
+      .prometheusName = "fastcache_node_requests_refused_key_revoked_total",
+      .help = "Requests refused at any door because their connection proved an identity key the cluster revoked, "
+              "whatever address it came from -- --fleet-member included. Never sum with "
+              "node_requests_refused_host_forgotten: that is a forgotten address, this is the removed machine.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeSealedFramesRefused,
+      .prometheusName = "fastcache_node_sealed_frames_refused_total",
+      .help = "Proven connections closed because a frame's seal did not verify: something between the two ends "
+              "injected, altered, replayed or reordered a frame. Should read zero; the frame is never answered.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedNodeIdentityRequired,
+      .prometheusName = "fastcache_scheduler_requests_refused_node_identity_required_total",
+      .help = "register, node-announce, heartbeat and withdraw requests refused because their connection proved no "
+              "identity the cluster holds live. An address admits a client, never a machine joining the fleet. A "
+              "rise from one host is a node not yet admitted, or one whose proof is being refused.",
       .type = MetricType::Counter },
 } };
 

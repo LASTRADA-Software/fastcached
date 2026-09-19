@@ -45,9 +45,9 @@ namespace FastCache::Cluster
 
 /// The label a roster endorsement is signed under.
 ///
-/// Its own label beside the construction it signs, as the Raft handshake's and the lease's
-/// are: this is signed by a member's OWN key, never the pre-shared one, so it has no
-/// `SigningDomain` row.
+/// Its own label beside the construction it signs, as the Raft handshake's, the lease's and the
+/// node proof's are: each is signed by a member's OWN key, and a label distinct from every other
+/// is what keeps a signature made for one from verifying as another.
 inline constexpr std::string_view RosterEndorsementLabel = "fastcache-roster-endorsement-v1";
 
 /// How long one endorsement vouches for a roster: one hour (owner decision 4, #178).

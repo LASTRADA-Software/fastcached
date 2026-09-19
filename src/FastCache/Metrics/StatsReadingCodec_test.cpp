@@ -355,7 +355,15 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    // Moved by #1555: `enrollment_requests_refused_revoked_key` joined the catalogue, for the
+    // Moved by #178's node identity handshake: five counters joined the catalogue -- a proof whose
+    // key the cluster does not hold or has revoked (`node_proofs_refused_unknown_key`,
+    // `_revoked_key`), a request refused on a connection a revoked key marked
+    // (`node_requests_refused_key_revoked`), a sealed frame that failed its tag
+    // (`node_sealed_frames_refused`) and a joining verb sent unproven
+    // (`scheduler_requests_refused_node_identity_required`) -- which changes which cells every
+    // live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved by #1555 before that: `enrollment_requests_refused_revoked_key` joined the catalogue, for the
     // enrollment a forgotten machine asks for under the key its forget revoked. Clients and
     // nodes upgrade together, as below.
     //
@@ -389,7 +397,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // refuses a node built after it by name (`ForeignLayout`), rather than reading the
     // learners as the leader's id.
     //
-    // Moved by #1428: four counters joined the catalogue for the cluster-key proof
+    // Moved by #1428: four counters joined the catalogue for the node proof, then under the cluster key
     // (`node_proofs_accepted`, `_rejected`, `_unchallenged`, `_malformed`), which changes which
     // cells every live-stats reading carries. Clients and nodes upgrade together -- a
     // `fastcache-cli` built before this refuses a node built after it, by name
@@ -401,7 +409,7 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     //
     // Moved by #1484 before that: the counter cells carry a second bitmap saying WHICH absence
     // each absent cell is, so `StatsReadingWire::Grammar` went to `-4`.
-    CHECK(StatsReadingLayout == 0x6583cbebde876097ULL);
+    CHECK(StatsReadingLayout == 0x901eb685752f8f7aULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

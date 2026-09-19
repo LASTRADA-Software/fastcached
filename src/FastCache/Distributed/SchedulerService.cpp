@@ -61,6 +61,11 @@ namespace
         // matters is WHO is described, and that is unchanged.
         RefusalDescriptor { .code = Wire::ErrorCode::LeaseUnauthorized,
                             .counter = IMetricsSink::Counter::DispatchLeasesUnauthorized },
+        // A verb a joining machine sends, on a connection that proved no live identity (#178).
+        // Counted, unlike `NotAMember`: an address that is admitted and still cannot join is either
+        // a node nobody admitted or one whose proof is being refused, and both are worth a series.
+        RefusalDescriptor { .code = Wire::ErrorCode::NodeIdentityRequired,
+                            .counter = IMetricsSink::Counter::SchedulerRequestsRefusedNodeIdentityRequired },
     };
 
     /// The refusals this service makes that deliberately move nothing.
@@ -787,6 +792,47 @@ SchedulerReply SchedulerService::AdmitPrincipal(CallerContext const& caller,
                                     .role = role });
 }
 
+SchedulerReply SchedulerService::ClusterAdmitWorker(CallerContext const& caller,
+                                                    std::string_view workerId,
+                                                    std::string_view publicKey)
+{
+    // The gate before the parse, so a stranger learns nothing about what a key looks like here.
+    if (auto refusal = Gate(caller); refusal.has_value())
+        return std::move(*refusal);
+
+    auto const parsed = ParseEd25519PublicKey(publicKey);
+    if (!parsed.has_value())
+    {
+        _metrics.Increment(MalformedAdmissionKey.counter);
+        return Refuse(MalformedAdmissionKey.code,
+                      std::format("{} was sent with a key that is not one ({}): {}",
+                                  workerId,
+                                  publicKey,
+                                  DescribePublicKeyTextFault(parsed.error())));
+    }
+
+    auto reply = AdmitPrincipal(caller, workerId, *parsed, Cluster::PrincipalRole::Worker);
+    if (reply.status != Wire::Status::Ok)
+        return reply;
+    // The receipt spells back the key the command RECORDED, through the one encoder, for
+    // `ClusterAdmit`'s reason; a principal has no consensus endpoint, so that field is empty.
+    reply.payload = Wire::EncodeClusterAdmitReceipt(Wire::ClusterAdmitReceipt {
+        .memberId = std::string { workerId }, .raftEndpoint = {}, .publicKey = FormatEd25519PublicKey(*parsed) });
+    return reply;
+}
+
+std::optional<SchedulerReply> SchedulerService::RefuseUnlessIdentified(CallerContext const& caller, Wire::Op op) const
+{
+    auto const* const descriptor = Wire::FindOp(static_cast<std::uint8_t>(op));
+    if (descriptor == nullptr || descriptor->identity != Wire::IdentityRequirement::ProvenNodeOnly
+        || caller.provenNodeId.has_value())
+        return std::nullopt;
+    return Refuse(Wire::ErrorCode::NodeIdentityRequired,
+                  std::format("{} is sent only by a machine that proved its identity on this connection; prove it "
+                              "first, and have it admitted with --enroll-from or --cluster-admit-worker",
+                              descriptor->name));
+}
+
 std::optional<Cluster::ClusterState> SchedulerService::AdministeredState() const
 {
     if (_admin == nullptr)
@@ -1011,6 +1057,11 @@ SchedulerService::EndorsementOutcome SchedulerService::AcceptEndorsement(Cluster
     if (!inserted && (held->second.version != endorsement.version || held->second.notAfter < endorsement.notAfter))
         held->second = endorsement;
     return EndorsementOutcome::Accepted;
+}
+
+std::optional<Cluster::CertifiedRoster> SchedulerService::CurrentCertifiedRoster() const
+{
+    return CertifiedRosterNow(_wallClock.Now());
 }
 
 std::optional<Cluster::CertifiedRoster> SchedulerService::CertifiedRosterNow(std::chrono::system_clock::time_point now) const

@@ -545,11 +545,10 @@ class IMetricsSink
         /// Jobs refused because an AUTHENTIC lease came from a different fleet.
         ///
         /// Its own counter rather than a share of the one above, because the operator
-        /// action is different and specific: two clusters are running from the same
-        /// `--cluster-key-file`, which is the ordinary outcome of copying a working
-        /// configuration to a second site or cloning staging from production. Nothing
-        /// else produces this. Before #322 the token bound no cluster identity, so
-        /// those grants verified and the other fleet's workers simply compiled them.
+        /// action is different and specific: a voter one fleet trusts signs for another,
+        /// which is the ordinary outcome of copying a working state directory to a second
+        /// site or cloning staging from production. Nothing else produces this. Before #322 the token bound no cluster
+        /// identity, so those grants verified and the other fleet's workers simply compiled them.
         WorkerJobsRefusedLeaseWrongCluster,
         /// Jobs refused because an AUTHENTIC lease had ALREADY BEEN SPENT here.
         ///
@@ -883,48 +882,47 @@ class IMetricsSink
         /// component can be asked for it.
         NodeFrameConnectionsRefusedAtCapacity,
 
-        /// Node proofs that authenticated, so a connection was admitted by what it PROVED
-        /// rather than by where it dialled from
-        /// ([#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
+        /// Node proofs that verified under an identity key the cluster holds live, so a connection
+        /// was admitted by WHICH MACHINE it proved it is rather than by where it dialled from, and is
+        /// sealed from then on (#178,
+        /// [#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
         ///
         /// **The positive half, and it is not decoration.** Every other row about this exchange
         /// counts a refusal, and a fleet where the proof is configured but never taken reads
         /// identically on all of them to a fleet where it works perfectly: zero refusals. So
         /// this is what says the route is live, and the pair with `NodeProofsRejected` is what
-        /// says whether a wrong key is a rollout mistake on one machine or somebody guessing.
+        /// says whether a refused proof is a rollout mistake on one machine or somebody forging.
         ///
         /// Counted per EXCHANGE, never per verb: a connection that proves once and then sends
         /// forty heartbeats moves this once. What it measures is how often a machine's identity
         /// was established, which is per connection by construction.
         NodeProofsAccepted,
 
-        /// Node proofs that decoded and did not authenticate under this node's cluster key.
+        /// Node proofs whose signature did not verify under the identity key they presented.
         ///
-        /// A node configured with the wrong `--cluster-key-file`, or somebody guessing at the
-        /// fleet's key. **The rate is what separates them**, exactly as the scheduler term's
-        /// does for a stale lease: one machine misconfigured moves this once per dial round
-        /// forever, at a cadence an operator can recognise, while a search moves it as fast as
-        /// the network allows.
+        /// A client of another build, or somebody forging a proof. Asked BEFORE the roster, so a
+        /// caller who cannot sign learns nothing about which ids and keys the cluster holds -- and
+        /// a machine the cluster simply never admitted lands in `NodeProofsRefusedUnknownKey`
+        /// instead, because its signature is sound (#178).
         ///
         /// `SchedulerCredentialsRejected`'s sibling and never summed with it: that one is a
         /// wrong `--requirepass` against this node's `--scheduler-token-file`, an operator's
-        /// token; this is a wrong cluster key, which every member holds. Two secrets, two
-        /// remedies.
+        /// token. Two facts, two remedies.
         NodeProofsRejected,
 
         /// `ProveNode` frames that arrived with no challenge outstanding on their connection.
         ///
         /// Never asked for one, or already spent one. Not a security signal and it says so:
         /// what moves it is a client that has the exchange wrong, which is a version or
-        /// client-library fault. Summed with the rejection above it would hide a key search
+        /// client-library fault. Summed with the rejection above it would hide a forgery
         /// inside an old client's traffic, which is the shape `SchedulerCredentialsMalformed`
         /// was split out for.
         NodeProofsUnchallenged,
 
-        /// `ProveNode` payloads that would not decode into an id and a tag.
+        /// `NodeChallenge` and `ProveNode` payloads that would not decode into their fixed-width fields.
         ///
         /// `SchedulerCredentialsMalformed`'s counterpart, for its reason: a peer that cannot
-        /// form the frame is a mismatch, and one forming it correctly with the wrong key is the
+        /// form the frame is a mismatch, and one forming it correctly and failing to verify is the
         /// security question.
         NodeProofsMalformed,
 
@@ -1425,6 +1423,25 @@ class IMetricsSink
         WorkerRostersRefusedExpired,
         /// A roster endorsement the leader refused: not a voter's, or not signed by one. (#178)
         SchedulerRosterEndorsementsRefused,
+
+        /// A node proof whose signature verified under a key this cluster does not hold for the id
+        /// it named: a machine nobody admitted, or one presenting a key other than its own. (#178)
+        NodeProofsRefusedUnknownKey,
+        /// A node proof whose signature verified under a key this cluster REVOKED: the forgotten
+        /// machine itself, still dialling in. The connection is kept and marked, and every later
+        /// verb on it is refused as that machine's. (#178)
+        NodeProofsRefusedRevokedKey,
+        /// A verb refused, at any door, because the connection proved an identity key the cluster
+        /// revoked -- whatever its address, `--fleet-member` included. `node_requests_refused_host_forgotten`
+        /// is a forgotten ADDRESS; this is the removed MACHINE. (#178)
+        NodeRequestsRefusedKeyRevoked,
+        /// A proven connection closed because a frame's seal did not verify: something between the
+        /// two ends injected, altered, replayed or reordered a frame. Never answered -- an injected
+        /// verb is what the seal exists to make worthless. (#178)
+        NodeSealedFramesRefused,
+        /// A verb only a machine that proved its identity may send -- REGISTER, NODE-ANNOUNCE,
+        /// HEARTBEAT, WITHDRAW -- refused on a connection that proved none that is live. (#178)
+        SchedulerRequestsRefusedNodeIdentityRequired,
 
         Last,
     };

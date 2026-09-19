@@ -24,8 +24,8 @@ declares:
 | Offset | Size | Field | Meaning |
 |--------|------|-------|---------|
 | 0 | 1 | magic | Always `0xFC`. |
-| 1 | 1 | version | Protocol version. Current: **2**. |
-| 2 | 1 | op | `0x01` STORE, `0x02` FETCH. |
+| 1 | 1 | version | Protocol version. Current: **14**, and the oldest accepted is also **14** — see [Versioning](#versioning). |
+| 2 | 1 | op | `0x01` STORE, `0x02` FETCH, `0x03` AUTH; the rest are [distributed execution](#distributed-execution) and [node identity](#node-identity-and-sealed-frames). |
 | 3 | 4 | payloadLength | Bytes of payload following the header. |
 
 Every reply carries a fixed 5-byte header and then exactly the payload it
@@ -51,6 +51,8 @@ daemon, the launcher, and the test client cannot disagree about the layout.
 | `0x00` | Miss | FETCH found nothing. Payload empty. A legitimate negative, not an error. |
 | `0x01` | Ok | Command succeeded; payload is the result, if any. |
 | `0x02` | Error | Command refused; payload is `[u8 errorCode][message]`. |
+| `0x03` | Progress | The server is still working on this request. Payload empty. **Not** an outcome: zero or more precede exactly one of the three above, and only on COMPILE. |
+| `0x04` | Push | One frame of a subscription's stream. **Not** an outcome either, and only on SUBSCRIBE. |
 
 Which statuses an op may be answered with is table data, not convention:
 
@@ -63,7 +65,7 @@ Which statuses an op may be answered with is table data, not convention:
 | HEARTBEAT | Ok, Error |
 | LEASE | Ok, Error |
 | RELEASE | Ok, Error |
-| COMPILE | Ok, Error |
+| COMPILE | Ok, Progress, Error |
 
 A miss and a refusal being distinct is the point. When both were the byte `0x00`,
 a client the daemon could not serve saw an endlessly cold cache and no
@@ -103,6 +105,19 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x1c` | worker-toolchain-survey-in-flight | The worker is still identifying its toolchains and serves nothing yet. Distinct from `fingerprint-mismatch`: that one says this worker serves a different toolchain, this one says the same request will succeed shortly. Reachable only by dialling the node directly — a node registers nothing until its survey finishes, so the scheduler never offers it to anyone who asked the fleet. |
 | `0x1d` | request-deadline-exceeded | The request was admitted and outran the window this surface allows for answering it. Not `endpoint-busy`, which says the node is momentarily full and to come back: this one says the work was abandoned on time, and for a compile it is a question about the lease timeout rather than about the worker. Sent only when the server can still reach the client — a peer swept while the connection is parked on the socket gets the close alone. |
 | `0x1e` | foreign-value-generation | A STORE whose value *is* a compile value, well formed, written under a canonicalization generation this build does not implement. Emphatically not `malformed-value`, which says the bytes are not a compile value at all: this one is the normal, expected answer to a peer of a *different* generation during a rolling upgrade, and reporting it as malformed tells an operator their cache is damaged when the fleet is merely mixed. Either direction — a producer behind this server answers it exactly as one ahead of it — so the message names both generations rather than a direction, and that is the whole diagnostic. |
+| `0x1f` | cluster-change-in-flight | One membership change is already uncommitted, so this one must wait. The one **retriable** code in the cluster-administration range: the cluster could accept the change and will, shortly. Not `invalid-cluster-change`, which would send an operator to correct a record that is already correct. |
+| `0x20` | cluster-change-not-needed | The change asked for is already in force, so nothing was recorded — `--cluster-admit` naming a member the cluster already has. Idempotence rather than a mistake, and a code rather than a success because no entry was appended and there is no index to name. |
+| `0x21` | worker-compiler-unclassified | The worker ran the program its own `--toolchain` names and cannot tell what it is, so it cannot build a command line for it. Split from `worker-spawn-failed`, which says the program could not be run at all. |
+| `0x22` | enrollment-closed | This node runs no enrollment window right now. The **default** answer to an enrollment request — the window is closed unless an operator has just opened it — and counted, since a rise with nobody at a terminal is somebody trying the door. |
+| `0x23` | enrollment-full | The window is open and its pending list is full, so the request was not recorded. A refusal rather than an eviction, so a flood cannot push the real joiner off the list the operator is reading. |
+| `0x24` | *(reserved)* | Never sent. Was `enrollment-already-collected`, which made a key hand-over spendable once; an approved enrollment no longer carries a secret ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). The number is burnt. |
+| `0x25` | unknown-fleet-selector | A fleet read named a section or a range this build does not serve. The message lists the ones it does. |
+| `0x26` | node-proof-unchallenged | A node proof arrived with no challenge outstanding on this connection — never asked for one, or already spent it. The exchange was got wrong, so ask for a challenge; not a statement about the key. |
+| `0x27` | node-proof-rejected | A node proof's signature did not verify under the identity key it presented. One answer for every way that happens, since naming the field would be an oracle, and asked **before** the roster is consulted. |
+| `0x28` | roster-expired | The worker can check nobody's lease right now: it holds no roster of the cluster's voters, or the one it holds has not been re-certified within its lifetime and the clock-skew slack. A statement about the worker, never about the lease — a fresh grant would get the same answer. |
+| `0x29` | node-key-unknown | A node proof verified, under a key this cluster does not hold for the id it named: a machine nobody admitted, or one presenting a key other than the one admitted under its id. The remedy is an admission, not a new key. |
+| `0x2a` | node-key-revoked | A node proof verified under a key the cluster has **revoked** — the forgotten machine itself. The connection is kept and marked, and every later verb on it is refused as the forgotten machine's, even from a host `--fleet-member` still names. |
+| `0x2b` | node-identity-required | A verb only a machine that **proved** its identity may send — REGISTER, NODE-ANNOUNCE, HEARTBEAT, WITHDRAW — arrived on a connection that has not. An address admits a client; it no longer admits a machine into the fleet, loopback included. |
 
 Every one of these is a **refusal the client answers by compiling locally**,
 never by failing. They are distinct codes rather than one "no" because they mean
@@ -110,11 +125,10 @@ different things to an operator: `not-a-member` is a policy decision somebody
 made, `no-worker` is a fingerprint nobody in the fleet serves, `no-capacity` is a
 fleet that is too small, and `already-in-flight` is none of the three.
 
-`0x28`, **roster-expired** ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)),
-is a worker saying it can check nobody's lease right now: it holds no roster of the
-cluster's voters yet, or the one it holds has not been re-certified within its lifetime
-and the clock-skew slack. A statement about the worker, never about the lease — asking
-the scheduler for a fresh grant would get the same answer.
+The byte values are wire contracts and are never reassigned, which is why the table is
+not in the order the codes were added: a burnt number stays burnt, and a new code takes
+the next free byte rather than the one beside its neighbour in meaning. The enumeration
+and every code's full argument live in `CompileCacheWire.hpp`'s `ErrorCode`.
 
 ### STORE
 
@@ -306,10 +320,10 @@ remedy is the same: raise `lease-lifetime`.
 **How long a lease lives travels on the grant**, as `leaseLifetime`, in the clear
 beside the token. It is a replicated cluster setting (`lease-lifetime`) rather than a
 constant each end compiles in, so the number has to reach the client somehow — and
-the client holds no cluster key, so reading it out of the token's authenticated
-claims is not open to it. Handing it a way to read claims *without* checking them
-would put exactly the primitive the MAC-first rule forbids into a header every binary
-includes; what the client needs is not a claim about the token but its own budget,
+the client holds no roster to verify the token's signature against, so reading it out
+of the token's authenticated claims is not open to it. Handing it a way to read claims
+*without* checking them would put exactly the primitive the verify-first rule forbids
+into a header every binary includes; what the client needs is not a claim about the token but its own budget,
 from the scheduler that is already telling it which worker to dial.
 
 The worker reads the same number from inside the MAC, where it belongs, because the
@@ -347,6 +361,58 @@ session cap. That listener is meant to be reachable by a whole fleet, and a sche
 that can be made to allocate 256 MiB per frame by anything that authenticated
 once is a scheduler that stops scheduling. `COMPILE` is the deliberate exception,
 since it carries a whole translation unit.
+
+## Node identity and sealed frames
+
+A machine that **joins the fleet** — registers a worker, announces itself, heartbeats,
+withdraws — proves which machine it is before it sends any of those verbs, and every frame
+after that proof is sealed ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
+A client asking for a lease or a cache entry proves nothing: it is admitted by its address
+or its credential exactly as before, and pays no round trip for any of this.
+
+```
+NODE-CHALLENGE 0x18  [nonceC(32)][ephC(32)]
+                  -> [serverId][serverKey(32)][nonceS(32)][ephS(32)][signature(64)]
+PROVE-NODE     0x19  [nodeId][publicKey(32)][signature(64)]
+                  -> Ok, or a refusal -- sealed either way once keys are agreed
+```
+
+1. The caller opens with a fresh nonce and a fresh X25519 ephemeral key.
+2. The server answers with its node id, its identity key, a nonce and an ephemeral key of
+   its own, and an Ed25519 signature over all of them **and** the caller's two, under the
+   label `fastcache-node-challenge-v2`. A caller that holds a roster of the cluster's voters
+   checks it before proving anything, and so learns whether it reached a voter, a machine
+   the cluster has revoked, or something it cannot vouch for.
+3. The caller signs that whole transcript, the server's signature included, plus its own
+   id and key, under `fastcache-node-proof-v2`, and sends PROVE-NODE. The server checks the
+   signature first (`node-proof-rejected`), then the cluster's roster: a key it does not
+   hold for that id is `node-key-unknown`, a key it has revoked is `node-key-revoked`.
+
+Both ends then derive two session keys — HKDF-SHA256 over the X25519 shared secret, salted
+with both nonces, bound to both ephemeral keys and both ids — one for each direction. **The
+answer to PROVE-NODE is the first sealed frame**, whatever it says: from it on, every frame
+both ways carries a 32-byte HMAC-SHA256 tag after its payload, over an implicit position,
+the frame's header and its payload. A frame whose tag does not verify, one that is replayed,
+one sent under the other direction's key, or one longer than a frame may be closes the
+connection, unanswered.
+
+**The seal is what makes the proof worth having.** Without it, a machine on the path could
+relay a genuine worker's handshake to the scheduler, watch it succeed, and then write a
+REGISTER of its own into the connection the worker's proof admitted — naming an endpoint of
+its choosing and being leased the fleet's jobs. It holds neither session key, so it cannot
+tag that frame.
+
+A challenge is spent whatever the outcome, and asking for a second one abandons the first.
+A connection proves **once**: either verb on a connection that has already proved, or that
+is already sealed, closes it, so a caller refused for its key redials rather than trying
+again in place. Bytes a caller pipelined behind PROVE-NODE close the connection too — they
+arrived in the clear, before the seal existed, so nothing can say whose they are.
+
+A worker holds its identity key in `--cluster-dir`, which it mints on first start; the
+cluster admits the key through an enrollment window or `--cluster-admit-worker=<id>@<key>`
+(`0x1d`), and forgets it — refusing it from every address — with `--cluster-forget`. What
+an operator sees of all of this is on the
+[node's page](../tools/fastcache-compile-node.md#a-node-proves-which-machine-it-is-and-every-frame-after-it-is-sealed).
 
 ## Authentication
 
@@ -456,13 +522,13 @@ through the daemon's connection logger, so a rejection is visible to the
 operator as well as to the client.
 
 An `unsupported-version` message names the offered version *and* the supported
-range (`unsupported wire version 1; this server speaks 2..2`). A rejection that
+range (`unsupported wire version 13; this server speaks 14..14`). A rejection that
 does not say what would have worked cannot be acted on, and this is the only
 message an operator with a mismatched install will ever see.
 
 ### Why there is no handshake
 
-There is no HELLO and no negotiation round trip. `fastcache-cc` opens a **fresh
+There is no HELLO and no negotiation round trip on the cache path. `fastcache-cc` opens a **fresh
 connection per operation** — manifest fetch, object fetch, object store,
 manifest store — so a handshake would cost two to four extra round trips *per
 translation unit*, on the hot path where this project has already measured
@@ -472,6 +538,11 @@ common case, one wasted round trip in the case that is already broken.
 
 Because both binaries ship in one package, version skew is an operator error — a
 mixed install — so the goal here is a loud diagnostic, not automatic interop.
+
+The [node handshake](#node-identity-and-sealed-frames) is not an exception to this: it
+negotiates no version and no feature, it establishes WHICH machine is on the other end,
+and it is paid only by a machine joining the fleet, once per connection, never by a
+translation unit.
 
 ### Two independent version axes
 

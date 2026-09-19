@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
+#include <FastCache/Protocol/ProvenIdentity.hpp>
 
 #include <algorithm>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -57,7 +61,45 @@ class IMembershipOracle
     {
         return Explain(peerAddress).verdict;
     }
+
+    /// Classify an identity a connection PROVED, and say which participant decided (#178).
+    ///
+    /// **A second question, not a second door onto the first.** `Explain` answers about an
+    /// ADDRESS, which every connection from a host shares; this answers about a KEY one connection
+    /// proved it holds, which no other connection can borrow. `ExplainConnection` folds the two per
+    /// connection on one `PrecedenceOf`, so neither can be asked without the other being asked too.
+    ///
+    /// Pure virtual, because silence here is not safe in either direction: a composite that
+    /// inherited *no opinion* would admit no proven worker and, worse, honour no revoked key. Every
+    /// participant says what it knows -- a host list knows no keys and says so; the roster knows
+    /// which keys are live and which are revoked.
+    /// @param proven The id a connection claimed and the key its signature verified under.
+    /// @return `Member` naming `ProvenIdentity` when the key is live for that id, `Forgotten` naming
+    ///         `KeyTombstone` when it is revoked, and `Outsider` -- no opinion -- otherwise.
+    [[nodiscard]] virtual MembershipDecision ExplainKey(ProvenIdentity const& proven) const = 0;
 };
+
+/// Fold one participant's answer into a running decision, on `PrecedenceOf`.
+///
+/// **REPLACE on a higher precedence, UNION on a tie**, and the tie arm is the load-bearing one: two
+/// routes answering `Member` are BOTH right -- a host can sit in `--fleet-member` and in the
+/// committed set at once -- so keeping the first would report one true route and hide another. An
+/// operator told only `FleetMemberList` removes the host from `--fleet-member` and finds it still
+/// served (#1471).
+///
+/// An `Outsider` answer carries an empty set (`DecidedBy` refuses to attribute one), so the tie arm
+/// unions nothing and a refusal by ABSENCE stays distinguishable from one by row.
+/// @param decision The decision so far.
+/// @param answer One more participant's answer.
+constexpr void FoldMembership(MembershipDecision& decision, MembershipDecision const& answer) noexcept
+{
+    auto const rank = PrecedenceOf(answer.verdict);
+    auto const winning = PrecedenceOf(decision.verdict);
+    if (rank > winning)
+        decision = answer;
+    else if (rank == winning)
+        decision.decidedBy.Add(answer.decidedBy);
+}
 
 /// Everyone is a member.
 ///
@@ -73,6 +115,13 @@ class OpenMembership final: public IMembershipOracle
     [[nodiscard]] MembershipDecision Explain(std::string_view /*peerAddress*/) const override
     {
         return DecidedBy(Membership::Member, MembershipParticipant::OpenPolicy);
+    }
+
+    /// No opinion: an open policy admits by address, which `Explain` already answered for every
+    /// caller. Revoking a key is the roster's to say, and a composite asks it beside this.
+    [[nodiscard]] MembershipDecision ExplainKey(ProvenIdentity const& /*proven*/) const override
+    {
+        return {};
     }
 };
 
@@ -126,29 +175,23 @@ class AnyOfMembership final: public IMembershipOracle
         // only the verdict. The reported set is then by definition the routes whose answer won,
         // which is what makes the reported and the enforced answer one computation (#1471).
         //
-        // **REPLACE on a higher precedence, UNION on a tie**, and the tie arm is the load-bearing
-        // one. Two routes answering `Member` are BOTH right -- a host can sit in `--fleet-member`
-        // and in the committed set at once -- so keeping the first would report one true route and
-        // hide another. An operator told only `FleetMemberList` removes the host from
-        // `--fleet-member` and finds it still served, which is the scenario this ticket opens
-        // with: the fix would have reproduced the defect it exists to remove.
-        //
         // The initial value is `{Outsider, {}}` and stays so when every participant answers
         // `Outsider`: nobody decided, and the refusal is by ABSENCE rather than by row. Those are
-        // different facts and an operator asking why a host is refused needs the difference. An
-        // `Outsider` answer carries an empty set (`DecidedBy` refuses to attribute one), so the
-        // tie arm unions nothing and the distinction survives the fold.
+        // different facts and an operator asking why a host is refused needs the difference.
         auto decision = MembershipDecision {};
         for (auto const* participant: _participants)
-        {
-            auto const answer = participant->Explain(peerAddress);
-            auto const rank = PrecedenceOf(answer.verdict);
-            auto const winning = PrecedenceOf(decision.verdict);
-            if (rank > winning)
-                decision = answer;
-            else if (rank == winning)
-                decision.decidedBy.Add(answer.decidedBy);
-        }
+            FoldMembership(decision, participant->Explain(peerAddress));
+        return decision;
+    }
+
+    /// @param proven The identity one connection proved.
+    /// @return The participants' answers about it, folded exactly as `Explain` folds theirs --
+    ///         so a revoked key, `Forgotten`, outranks whatever else admits the connection.
+    [[nodiscard]] MembershipDecision ExplainKey(ProvenIdentity const& proven) const override
+    {
+        auto decision = MembershipDecision {};
+        for (auto const* participant: _participants)
+            FoldMembership(decision, participant->ExplainKey(proven));
         return decision;
     }
 
@@ -156,64 +199,79 @@ class AnyOfMembership final: public IMembershipOracle
     std::vector<IMembershipOracle const*> _participants;
 };
 
-/// The admission decision for one CONNECTION: the address routes, plus what this connection
-/// has PROVED.
+/// The admission decision for one CONNECTION: the address routes, plus the identity this
+/// connection PROVED.
 ///
-/// ## Why this is not a participant
+/// ## Why the identity is asked here and not as an address
 ///
 /// Every route in `AnyOfMembership` answers `Explain(peerAddress)`, and one oracle serves every
-/// connection a surface accepts. A cluster-key proof is a fact about ONE connection, so a
-/// participant carrying it would have to read state some other connection wrote -- which admits
-/// callers that proved nothing, on a seam whose whole contract is that the argument decides.
-/// There is nowhere in the participant list for a per-connection fact to live, so it is folded
-/// here, where the connection is.
+/// connection a surface accepts. An identity is a fact about ONE connection -- the key its
+/// signature verified under -- so it is asked separately, as `ExplainKey`, and folded here, where
+/// the connection is.
 ///
 /// ## Why it is the SAME fold
 ///
-/// `PrecedenceOf`, unchanged, which settles the one question this route raises: a
-/// `--cluster-forget-client` tombstone still outranks a proof. That is not a softening of what
-/// a proof means -- under a shared key a forget cannot revoke a key holder at all, and
-/// `Distributed::NodeProof`'s header says so and says what closing that needs (#178). It is the
-/// direction the composition already fails in, and the alternative would be a second precedence
-/// rule reachable only from a connection.
+/// `FoldMembership`, on `PrecedenceOf`, unchanged, which settles both directions the identity can
+/// move a verdict (#178):
 ///
-/// **It takes a `bool` and not the proven id, deliberately.** What the fold needs is *did this
-/// connection prove the key*; the id a proof carries is a LABEL the MAC covers so it cannot be
-/// swapped, it is legitimately empty on any node that has minted no identity, and admission must
-/// not turn on it. A parameter that carried the label would make an empty one indistinguishable
-/// from no proof at all.
+/// - a LIVE key admits a machine whose address is on no list -- a worker that joins over a VPN,
+///   with a different address each session -- and ties with any address route that admits it too;
+/// - a REVOKED key is `Forgotten`, which outranks every admission route: the machine a cluster
+///   forgot is refused although `--fleet-member` still names its host, on a node nobody
+///   reconfigured. And a `--cluster-forget-client` tombstone still outranks a live proof, so a
+///   proof cannot resurrect a forgotten host either.
 ///
-/// `false` is the ordinary case and the one every caller today is in: the fold then returns
-/// exactly what the oracle answered, so a surface that never establishes a proof is unaffected by
-/// construction.
+/// Asked on every call rather than cached at the handshake, so a key revoked while its connection
+/// is open refuses the next verb.
 ///
-/// @param oracle The address routes, composed.
+/// @param oracle The admission routes, composed.
 /// @param peerAddress The connecting peer's host, as the oracle takes it.
-/// @param provedClusterKey Whether this connection proved the cluster's pre-shared key.
-/// @return The folded decision, naming `ProvenKeyHolder` among the routes when the proof won or
-///         tied.
+/// @param proven The identity this connection proved, or nothing when it proved none -- the
+///        ordinary case, in which the fold returns exactly what the address routes answered.
+/// @return The folded decision, naming `ProvenIdentity` or `KeyTombstone` among the routes when the
+///         identity won or tied.
 [[nodiscard]] inline MembershipDecision ExplainConnection(IMembershipOracle const& oracle,
                                                           std::string_view peerAddress,
-                                                          bool provedClusterKey)
+                                                          std::optional<ProvenIdentity> const& proven)
 {
-    auto const byAddress = oracle.Explain(peerAddress);
-    if (!provedClusterKey)
-        return byAddress;
+    auto decision = oracle.Explain(peerAddress);
+    if (proven.has_value())
+        FoldMembership(decision, oracle.ExplainKey(*proven));
+    return decision;
+}
 
-    auto const proved = DecidedBy(Membership::Member, MembershipParticipant::ProvenKeyHolder);
-    auto const addressRank = PrecedenceOf(byAddress.verdict);
-    auto const provedRank = PrecedenceOf(proved.verdict);
-    if (provedRank > addressRank)
-        return proved;
-    if (provedRank < addressRank)
-        return byAddress;
+/// Whether @p decision rests on a LIVE proven identity: the one fact the verbs a joining machine
+/// sends require (`CompileCacheWire::IdentityRequirement::ProvenNodeOnly`).
+///
+/// Read off the fold rather than asked again, so the verb gate and the admission answer cannot
+/// disagree about one connection: the route is present exactly when the key is live and nothing
+/// that outranks it -- a tombstone of either kind -- decided instead.
+/// @param decision What `ExplainConnection` concluded.
+/// @return True when a live identity is among the routes that admitted the connection.
+[[nodiscard]] constexpr bool RestsOnProvenIdentity(MembershipDecision const& decision) noexcept
+{
+    return decision.verdict == Membership::Member && decision.decidedBy.Has(MembershipParticipant::ProvenIdentity);
+}
 
-    // A tie UNIONS, for `AnyOfMembership`'s reason: a host in `--fleet-member` that also proved
-    // the key is admitted by both, and reporting one hides the other -- which is exactly the
-    // operator question #1471 opens with, asked of a route an operator cannot see in any file.
-    auto tied = byAddress;
-    tied.decidedBy.Add(proved.decidedBy);
-    return tied;
+/// Who is asking, as a scheduler-side verb sees one connection: its admission verdict, its host,
+/// and the node id it proved when that identity is live.
+///
+/// **The one place a connection becomes a `CallerContext`**, so the door a surface asks before the
+/// payload and the gate a verb asks after it read one fold, and the identity a joining verb
+/// requires is read off the same decision that admitted the connection.
+/// @param oracle The admission routes, composed.
+/// @param host The kernel's peer host; taken over by the returned context.
+/// @param proven The identity this connection proved, if any.
+/// @return The context.
+[[nodiscard]] inline CallerContext CallerContextOf(IMembershipOracle const& oracle,
+                                                   std::string host,
+                                                   std::optional<ProvenIdentity> const& proven)
+{
+    auto const decision = ExplainConnection(oracle, host, proven);
+    auto provenNodeId = RestsOnProvenIdentity(decision) && proven.has_value() ? std::optional { proven->id } : std::nullopt;
+    return CallerContext { .membership = decision.verdict,
+                           .peerId = std::move(host),
+                           .provenNodeId = std::move(provenNodeId) };
 }
 
 /// What one set of hosts answers, per question the set is asked.
@@ -278,10 +336,9 @@ inline constexpr HostSetVerdicts ForgottenVerdicts { .onMatch = Membership::Forg
 /// failure mode is silent and looks like a healthy fleet.
 ///
 /// What that gives up is stated rather than hidden: two nodes behind one NAT, or two
-/// workers on one machine, are indistinguishable here. Both are already inside the
-/// trust boundary the pre-shared key establishes -- this refuses *strangers*, not
-/// co-located peers -- and separating them needs a credential in the frame, which is a
-/// different change with a different threat model.
+/// workers on one machine, are indistinguishable here. This refuses *strangers*, not
+/// co-located peers, and separating them is what a proven identity does: `ExplainKey`, which
+/// every connection that proved one is asked too (#178).
 class HostSetMembership: public IMembershipOracle
 {
   public:
@@ -404,6 +461,13 @@ class HostSetMembership: public IMembershipOracle
         return Decided(std::ranges::any_of(_hosts, admits) ? _verdicts.onMatch : Membership::Outsider);
     }
 
+    /// No opinion: a set of hosts knows no keys. A host listed here and a key revoked in the roster
+    /// meet in the fold, where the revocation wins.
+    [[nodiscard]] MembershipDecision ExplainKey(ProvenIdentity const& /*proven*/) const override
+    {
+        return {};
+    }
+
   protected:
     /// A verdict with this list named as its author -- EXCEPT `Outsider`.
     ///
@@ -437,7 +501,7 @@ class HostSetMembership: public IMembershipOracle
 ///
 /// The list is the cluster's *authenticated* peers, refreshed by whatever established
 /// them -- `Cluster::DiscoveryService` in this tree, which admits a peer only after it
-/// proves the pre-shared key over a nonce this node chose -- or, on the other route,
+/// proves its identity key over a nonce this node chose -- or, on the other route,
 /// what `--fleet-member` named. One list per question and composed, never one list
 /// answering both; see `AnyOfMembership` and #251.
 class ClusterMembership final: public HostSetMembership
@@ -479,6 +543,59 @@ class ForgottenMembership final: public HostSetMembership
         HostSetMembership { ForgottenVerdicts, MembershipParticipant::ClientTombstone, hosts }
     {
     }
+};
+
+/// Which identity keys the cluster holds LIVE, and which it has REVOKED -- the one participant with
+/// an opinion about a proved identity (#178).
+///
+/// Published from the applied `ClusterState` wholesale, exactly as the member and forgotten host
+/// sets are: members of either seat and enrolled principals are live under their ids, and every
+/// revoked key is revoked whatever id it was revoked under -- the key is the fact, and the id a
+/// revocation carries is a label.
+///
+/// It admits no ADDRESS. Composed into `AnyOfMembership` it answers `Explain` with silence, so
+/// adding it cannot widen who is admitted by where they dial from.
+class KeyRosterMembership final: public IMembershipOracle
+{
+  public:
+    /// Replace what is live and what is revoked.
+    ///
+    /// Built outside the lock and swapped in, for `HostSetMembership::Publish`'s reason: a reader
+    /// never sees half of one roster and half of the next.
+    /// @param live Every id's live key.
+    /// @param revoked Every revoked key.
+    void Publish(std::map<std::string, Ed25519PublicKey, std::less<>> live, std::vector<Ed25519PublicKey> revoked)
+    {
+        std::unique_lock const guard { _mutex };
+        _live = std::move(live);
+        _revoked = std::move(revoked);
+    }
+
+    /// No opinion: a key roster knows no addresses.
+    [[nodiscard]] MembershipDecision Explain(std::string_view /*peerAddress*/) const override
+    {
+        return {};
+    }
+
+    /// @param proven The identity a connection proved.
+    /// @return `Forgotten` by `KeyTombstone` for a revoked key -- asked FIRST, so a key that is both
+    ///         revoked and still recorded under some id is the removed machine -- `Member` by
+    ///         `ProvenIdentity` for the live key of that id, and no opinion otherwise.
+    [[nodiscard]] MembershipDecision ExplainKey(ProvenIdentity const& proven) const override
+    {
+        std::shared_lock const guard { _mutex };
+        if (std::ranges::contains(_revoked, proven.key))
+            return DecidedBy(Membership::Forgotten, MembershipParticipant::KeyTombstone);
+        if (auto const live = _live.find(proven.id); live != _live.end() && live->second == proven.key)
+            return DecidedBy(Membership::Member, MembershipParticipant::ProvenIdentity);
+        return {};
+    }
+
+  private:
+    /// Guards both sets. Mutable for `HostSetMembership::_mutex`'s reason.
+    mutable std::shared_mutex _mutex;
+    std::map<std::string, Ed25519PublicKey, std::less<>> _live;
+    std::vector<Ed25519PublicKey> _revoked;
 };
 
 } // namespace FastCache::Distributed

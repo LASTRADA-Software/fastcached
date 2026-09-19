@@ -3,11 +3,11 @@
 
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
-#include "ClusterKeySource.hpp"
 #include "CompileCapacity.hpp"
 #include "EndpointDialer.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
+#include "NodeProofClient.hpp"
 #include "SchedulerLink.hpp"
 
 #include <FastCache/Core/Logger.hpp>
@@ -204,21 +204,13 @@ struct HeartbeatRound
     /// once rather than once per verb.
     Cc::CredentialNotice& notice;
 
-    /// Where this node's cluster key is read from to PROVE membership, or null when it holds
-    /// none (#1428).
+    /// How this machine proves WHICH machine it is on every connection the round dials (#178),
+    /// or null where nothing proves -- a test whose scripted fleet serves no handshake.
     ///
-    /// A pointer rather than a reference because *this node has no cluster key* has to be
-    /// representable and a null reference is not -- and that is the ordinary state on a
-    /// single-machine install, which is this binary's default configuration.
-    ///
-    /// The SOURCE and never the bytes, for `credential` above's reason: a key read once when
-    /// the round was built is a key an operator's rotation cannot reach until a restart.
-    IClusterKeySource const* proofKey;
-
-    /// The label to bind inside a proof's tag. **Legitimately empty**: an identity is minted
-    /// only by a node that runs consensus, and a keyed worker without one still has a key to
-    /// prove. `NodeProofClient.hpp` says what an empty one costs.
-    std::string_view nodeId;
+    /// Never null on a node that announces itself for real: a node naming `--scheduler` with no
+    /// identity is a startup refusal (`SchedulerNeedsIdentityRefusal`), because every verb a
+    /// joining machine sends is refused without one.
+    NodeProofClient const* prover;
     /// Where the fleet this node was admitted to is recorded, so the lease check can
     /// read it. Registration is the only place that fact arrives (#401).
     Distributed::WorkerLeaseState& lease;
@@ -404,18 +396,34 @@ class IAnnouncement
     [[nodiscard]] virtual AnnounceOutcome Attempt(ISocket& client, std::string_view endpoint) = 0;
 };
 
-/// Dial a scheduler and make @p announcement, following a redirect and falling back.
+/// How a round proves this machine on each connection it dials (#178).
+///
+/// Pointers, because the proof is absent only where nothing proves -- a test's scripted fleet --
+/// and a null reference is not a thing.
+struct AnnounceProof
+{
+    NodeProofClient const* prover;       ///< Who this machine is; null where nothing proves.
+    ICredentialSource const* credential; ///< What the handshake presents where a credential gate asks.
+    Cc::CredentialNotice* notice;        ///< Where an unwanted credential is reported.
+};
+
+/// Dial a scheduler, prove this machine to it, and make @p announcement, following a redirect
+/// and falling back.
 ///
 /// The rules named on `IAnnouncement`, applied once. Callers differ only in what they say.
+///
+/// **The proof is part of reaching a scheduler, not of what is said**, so both announcements
+/// prove through the same lines (#178): a connection the proof did not seal is one on which no
+/// joining verb can be heard, and it is treated exactly as an endpoint that did not answer --
+/// the next `--scheduler` is tried in the same round.
 /// @param link Which endpoint to try, and what an answer teaches it.
 /// @param dialer How a connection is made.
-/// @param logger Where an unreachable endpoint and a redirect are named.
+/// @param logger Where an unreachable endpoint, a refused proof and a redirect are named.
 /// @param announcement What to say.
+/// @param proof How this machine proves itself on each connection.
 /// @return How many entries the endpoint that answered accepted.
-[[nodiscard]] std::size_t DialAndAnnounce(SchedulerLink& link,
-                                          IEndpointDialer& dialer,
-                                          ILogger& logger,
-                                          IAnnouncement& announcement);
+[[nodiscard]] std::size_t DialAndAnnounce(
+    SchedulerLink& link, IEndpointDialer& dialer, ILogger& logger, IAnnouncement& announcement, AnnounceProof const& proof);
 
 [[nodiscard]] std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEndpointDialer& dialer);
 

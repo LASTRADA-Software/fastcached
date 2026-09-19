@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include "ClusterKeySource.hpp"
 #include "FrameEndpoint.hpp"
 
 #include <FastCache/Auth/AuthPolicy.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
-#include <FastCache/Core/Nonce.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -24,43 +24,41 @@ namespace FastCache::Node
 {
 
 /// @file NodeProofResponder.hpp
-/// Where a caller shows it holds the cluster key, and is admitted for having shown it.
+/// Where a caller proves WHICH machine it is, and its connection is sealed for having done so
+/// (#178).
 ///
 /// ## The problem, in one sentence
 ///
-/// Node-to-node admission on the `0xFC` surface is decided by the caller's SOURCE ADDRESS --
-/// `ClusterMembership` against the committed endpoints, `--fleet-member` against a local list.
-/// An address is a stand-in for *this is one of our nodes*, and it stops being one the moment
-/// an address is not stable: a worker that joins over a VPN gets a different one each session
-/// and no literal host match can follow it
-/// ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178) item 1,
-/// [#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
-///
-/// Every caller that matters here already holds the cluster key -- #282 refuses a
-/// network-facing keyless worker at startup and #1308 refuses keyless consensus -- so it can
-/// PROVE membership rather than being inferred from where it dialled from.
+/// Node-to-node admission on the `0xFC` surface was decided by the caller's SOURCE ADDRESS, and
+/// then by a MAC under a key every member shared -- so an address that changes per session could
+/// not be followed, and a machine the cluster removed kept every byte it needed to prove itself
+/// ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178),
+/// [#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)). Each machine now signs
+/// with its own identity key, and a revocation is one roster entry. `Distributed::NodeProof`
+/// carries the handshake and why every frame after it is sealed.
 ///
 /// ## Why a component of its own
 ///
 /// `VerbFamily::NodeProof` carries that argument in full. The short of it: the credential the
-/// scheduler owns is `--scheduler-token-file`, an operator's token, and the cluster key is a
-/// different secret in a different file that every member holds -- so folding these verbs into
-/// the `Session` family would put the fleet's shared key in the component that owns the
-/// operator's, and would leave a pure worker, which is an ordinary deployment, unprovable.
+/// scheduler owns is `--scheduler-token-file`, an operator's token, and an identity is a different
+/// fact every machine in the fleet has -- so folding these verbs into the `Session` family would
+/// make identity a property of the component that owns the operator's token.
 ///
 /// ## What it does NOT decide
 ///
-/// Membership. It establishes one fact about one connection and writes it nowhere: the endpoint
-/// records the proven id on the connection, and `Node::RefuseUnlessMember` folds it into the
-/// admission answer through `Distributed::ExplainConnection`. So this component holds no state
-/// at all between requests, which is what lets one object serve every connection on the port.
+/// Admission. It establishes one fact about one connection and writes it nowhere: the endpoint
+/// records the proven identity on the connection, and `Node::RefuseUnlessMember` folds it into the
+/// admission answer through `Distributed::ExplainConnection` on every verb. So this component
+/// holds no state at all between requests, which is what lets one object serve every connection
+/// on the port.
 ///
-/// ## It is built only on a node that HOLDS a cluster key
+/// ## It is built only on a node that runs CONSENSUS
 ///
-/// A node with no `--cluster-key-file` has nothing to verify against, so `main` leaves the
-/// component null and `MergedResponder` answers the whole family `NoCluster` -- naming the flag,
-/// rather than `UnimplementedVerb`, which a caller reads as *this node's build is too old* and
-/// acts on by upgrading a machine that is already current.
+/// A proof is judged against the cluster's applied roster -- members, enrolled principals and
+/// revoked keys -- which only a node running consensus holds. Every other node leaves the component
+/// null and `MergedResponder` answers the whole family `NoCluster` -- never `UnimplementedVerb`,
+/// which a caller reads as *this node's build is too old* and acts on by upgrading a machine that
+/// is already current.
 
 /// Serves `NodeChallenge` and `ProveNode`.
 ///
@@ -70,21 +68,28 @@ namespace FastCache::Node
 class NodeProofResponder final: public IFrameResponder, public INodeProver
 {
   public:
-    /// @param key Where the cluster key is read from at each verification; must outlive this.
-    /// @param random Where a challenge's bytes come from; must outlive this. A test scripts it
-    ///        to fix the nonce, which is the only way a proof is reproducible at all -- or to
-    ///        fail, which is how a challenge this node cannot draw is shown to be refused.
+    /// @param nodeId This node's id, as it names itself in every reply.
+    /// @param identity This node's identity key pair, read once at startup; must outlive this.
+    /// @param roster Which identity keys the cluster holds live and which it revoked -- the node's
+    ///        admission oracle, whose `ExplainKey` is the one door to that answer; must outlive this.
+    /// @param random Where a handshake's nonce and ephemeral key come from; must outlive this. A
+    ///        test scripts it to fail, which is how a challenge this node cannot draw is shown to
+    ///        be refused.
     /// @param metrics Where every outcome of the exchange is recorded; must outlive this.
-    /// @param logger Where a key file that has stopped being readable is reported; must outlive
-    ///        this. That one condition is an operator's to fix and no counter can carry WHY.
+    /// @param logger Where a draw this node cannot make is reported; must outlive this. That one
+    ///        condition is this machine's to fix and no counter can carry WHY.
     /// @param policy The credential this surface requires, or nullptr for none. Shared rather
     ///        than referenced because "there is no credential" has to be representable.
-    NodeProofResponder(IClusterKeySource const& key,
+    NodeProofResponder(std::string nodeId,
+                       Ed25519KeyPair const& identity,
+                       Distributed::IMembershipOracle const& roster,
                        ISecureRandom& random,
                        IMetricsSink& metrics,
                        ILogger& logger,
                        std::shared_ptr<AuthPolicy const> policy = nullptr) noexcept:
-        _key { key },
+        _nodeId { std::move(nodeId) },
+        _identity { identity },
+        _roster { roster },
         _random { random },
         _metrics { metrics },
         _logger { logger },
@@ -107,9 +112,10 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
     /// by construction on no list -- being on none is the entire problem being solved -- so a
     /// membership test here would refuse exactly the population the verb exists for.
     ///
-    /// What stands in place of the list is the MAC: a caller that cannot produce a tag over this
-    /// connection's challenge under this cluster's key learns nothing and is admitted to nothing,
-    /// and its connection goes on being judged by its address exactly as before. The credential
+    /// What stands in place of the list is the signature and the roster: a caller that cannot
+    /// sign this connection's handshake under a key the cluster holds live learns nothing and is
+    /// admitted to nothing, and its connection goes on being judged by its address exactly as
+    /// before. The credential
     /// gate is untouched as well -- both verbs are `RequiresAuth` (`VerbFamily::NodeProof` says
     /// why), so a fleet with `--scheduler-token-file` set still requires the token here.
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
@@ -149,8 +155,8 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
 
     /// @copydoc IFrameResponder::RequestTimeout
     ///
-    /// The endpoint's own header window. Both verbs are answered from memory and one HMAC, so
-    /// what this bounds is a peer dribbling a payload it already has in hand.
+    /// The endpoint's own header window. Both verbs are answered from memory and one signature,
+    /// so what this bounds is a peer dribbling a payload it already has in hand.
     [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
     {
         return FrameServer::HeaderTimeout;
@@ -198,7 +204,7 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
 
     /// @copydoc IFrameResponder::PeerWatchCounter
     ///
-    /// None. A peer cannot realistically vanish inside one HMAC, and the write that would
+    /// None. A peer cannot realistically vanish inside one signature, and the write that would
     /// discover it is the next statement anyway.
     [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t /*opRaw*/) const noexcept override
     {
@@ -233,22 +239,23 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
         return this;
     }
 
-    /// @copydoc INodeProver::IssueChallenge
-    [[nodiscard]] std::expected<Nonce, std::vector<std::byte>> IssueChallenge() override;
+    /// @copydoc INodeProver::Challenge
+    [[nodiscard]] std::expected<NodeChallengeIssued, std::vector<std::byte>> Challenge(
+        std::span<std::byte const> payload) override;
 
     /// @copydoc INodeProver::Verify
-    [[nodiscard]] std::expected<std::string, std::vector<std::byte>> Verify(std::span<std::byte const> challenge,
-                                                                            std::span<std::byte const> payload) override;
+    [[nodiscard]] NodeProofVerdict Verify(NodeHandshake const& handshake, std::span<std::byte const> payload) override;
 
   private:
-    IClusterKeySource const& _key;
+    std::string _nodeId;
+    Ed25519KeyPair const& _identity;
+    Distributed::IMembershipOracle const& _roster;
     ISecureRandom& _random;
     IMetricsSink& _metrics;
 
-    /// Where the two conditions no counter can explain are said out loud: this node's own key
-    /// file has stopped being readable, or its generator cannot draw a challenge. A counter would
-    /// tell an operator that proofs are failing and not that the failure is on THIS machine, which
-    /// is the whole of the diagnosis.
+    /// Where the one condition no counter can explain is said out loud: this node's generator
+    /// cannot draw a handshake. A counter would tell an operator that proofs are failing and not
+    /// that the failure is on THIS machine, which is the whole of the diagnosis.
     ILogger& _logger;
 
     std::shared_ptr<AuthPolicy const> _policy;

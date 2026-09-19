@@ -56,7 +56,8 @@ constexpr EnumTable<MembershipParticipant, MembershipRouteRow> MembershipWireRou
     { .route = MembershipParticipant::ClusterMembers, .bit = CompileCacheWire::WireMembershipRoute::ClusterMembers },
     { .route = MembershipParticipant::ClientTombstone, .bit = CompileCacheWire::WireMembershipRoute::ClientTombstone },
     { .route = MembershipParticipant::OpenPolicy, .bit = CompileCacheWire::WireMembershipRoute::OpenPolicy },
-    { .route = MembershipParticipant::ProvenKeyHolder, .bit = CompileCacheWire::WireMembershipRoute::ProvenKeyHolder },
+    { .route = MembershipParticipant::ProvenIdentity, .bit = CompileCacheWire::WireMembershipRoute::ProvenIdentity },
+    { .route = MembershipParticipant::KeyTombstone, .bit = CompileCacheWire::WireMembershipRoute::KeyTombstone },
 } };
 
 static_assert(RowsInEnumeratorOrder(MembershipWireRoutes, &MembershipRouteRow::route),

@@ -6,8 +6,10 @@
 #include "NodeCredential.hpp"
 
 #include <FastCache/Core/BoundedDrain.hpp>
+#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
+#include <FastCache/Distributed/RosterStore.hpp>
 #include <FastCache/Net/IConnector.hpp>
 #include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -42,10 +44,9 @@ namespace FastCache::Node
 /// before it asks, against the key `--enroll-list` shows, and the roster's fingerprint once it
 /// is admitted, against the fingerprint `--enroll-list` shows beside this node's row.
 ///
-/// The cluster's pre-shared key is NOT handed over any more. Until #178 retires it, a node
-/// that serves leases or proves itself on the node port still needs `--cluster-key-file`,
-/// placed the way it was before enrollment existed; that is said in the next steps this mode
-/// prints, rather than discovered at the next start.
+/// An admitted WORKER keeps the cluster's certified roster as its trust root, when the leader
+/// has one to hand over: it then checks every grant against a roster its operator compared, and
+/// needs no `--voter-key` (#178).
 
 /// How long between two polls of a pending enrollment.
 ///
@@ -96,6 +97,11 @@ struct EnrollReading
     /// taken over the bytes: a re-encoding of a decoded value would be a second input the two
     /// ends could disagree about. No secret, so a plain vector (#178).
     std::vector<std::byte> roster;
+
+    /// The leader's CERTIFIED roster, exactly as sent: `Cluster::EncodeCertifiedRoster`'s bytes,
+    /// or empty -- for every outcome but `Admitted`, and on an admission while the leader holds no
+    /// certified roster yet (#178).
+    std::vector<std::byte> certificate {};
 };
 
 /// Read one `Enroll` reply.
@@ -191,11 +197,28 @@ struct JoinerIdentity
 /// through a dial loop.
 /// @param self Who this node asked to be admitted as.
 /// @param roster The roster's bytes, as received.
-/// @param keyFileNamed Whether this node already names a `--cluster-key-file`.
 /// @return The text to print, or why the roster is refused.
 [[nodiscard]] std::expected<std::string, std::string> DescribeAdmission(JoinerIdentity const& self,
-                                                                        std::span<std::byte const> roster,
-                                                                        bool keyFileNamed);
+                                                                        std::span<std::byte const> roster);
+
+/// Keep the leader's certified roster as an admitted worker's trust root, and say what happened.
+///
+/// **Certified against the roster the operator compared**, never taken on the leader's word: a
+/// strict majority of THAT roster's voters must endorse the certificate, unexpired, exactly as a
+/// worker certifies any roster it adopts -- the enrollment roster stands in for the `--voter-key`
+/// anchors, which is what makes those unnecessary. A certificate that does not certify is not
+/// kept, and the worker then roots its trust in `--voter-key` as before.
+///
+/// Pure but for the store, so what an admitted worker keeps is pinned by a test.
+/// @param roster The enrollment roster's bytes, which `DescribeAdmission` has already checked.
+/// @param certificate The leader's certified roster, or empty.
+/// @param now This machine's wall clock.
+/// @param store Where a worker's roster is kept.
+/// @return One sentence for the operator, ending in a newline.
+[[nodiscard]] std::string KeepEnrolledRoster(std::span<std::byte const> roster,
+                                             std::span<std::byte const> certificate,
+                                             std::chrono::system_clock::time_point now,
+                                             Distributed::IRosterStore& store);
 
 /// Render an enrollment report the way an operator reads it before deciding.
 ///
@@ -237,7 +260,7 @@ struct JoinerIdentity
 /// Run `--enroll-from` to completion.
 ///
 /// @param cfg The resolved configuration; `enrollFrom` and the state directory are the fields
-///        read, and `clusterKeyFile` only to say whether the next steps need one.
+///        read.
 /// @param credential What to present to the seed, read where it is presented.
 /// @param random Where a minted identity's bits come from, the id's and the key's alike.
 /// @param wait How the poll loop spends the gap between two asks, and how it measures
@@ -246,11 +269,14 @@ struct JoinerIdentity
 ///        enforces some multiple of it.
 /// @param dialer How each poll reaches the seed. Defaulted for the reason
 ///        `DefaultDrainWait` is: production never varies it, and a test always does.
+/// @param wallClock What an admitted worker certifies the leader's roster at.
 /// @return What to print on success, or what to print on failure.
-[[nodiscard]] std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
-                                                                      ICredentialSource const& credential,
-                                                                      ISecureRandom& random,
-                                                                      IDrainWait& wait = DefaultDrainWait(),
-                                                                      IEndpointDialer& dialer = DefaultOneShotDialer());
+[[nodiscard]] std::expected<std::string, std::string> RunEnrollClient(
+    NodeConfig const& cfg,
+    ICredentialSource const& credential,
+    ISecureRandom& random,
+    IDrainWait& wait = DefaultDrainWait(),
+    IEndpointDialer& dialer = DefaultOneShotDialer(),
+    IWallClock const& wallClock = DefaultSystemWallClock());
 
 } // namespace FastCache::Node

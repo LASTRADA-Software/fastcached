@@ -74,6 +74,7 @@ target_sources(FastCache
         Distributed/LeaseTable.cpp
         Distributed/WorkerRegistry.cpp
         Distributed/RosterStore.cpp
+        Distributed/NodeProof.cpp
         Distributed/RosterTrust.cpp
         Distributed/SchedulerService.cpp
         Distributed/SchedulerProtocol.cpp
@@ -128,6 +129,7 @@ target_sources(FastCache
         Protocol/ProtocolAutodetect.cpp
         Protocol/KeyspaceNotifier.cpp
         Protocol/PubSubRegistry.cpp
+        Protocol/SealedFrameSocket.cpp
         Protocol/RedisMutationObserver.cpp
         Protocol/RedisResp.cpp
         Protocol/RedisTransaction.cpp

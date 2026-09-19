@@ -205,8 +205,7 @@ fastcache-compile-node \
     --fleet-member=worker-02.internal \
     --fleet-member=dev-01.internal \
     --scheduler=127.0.0.1:6675 \
-    --advertise=scheduler.internal:6675 \
-    --cluster-key-file=/etc/fastcached/cluster.key
+    --advertise=scheduler.internal:6675
 ```
 
 **A scheduler is a cluster, even of one**
@@ -220,14 +219,12 @@ is minted into its state directory on first start, and the same command line wit
 `--print-identity` added prints it without serving — the `public-key` line is what
 every worker's `--voter-key` names.
 
-`--cluster-key-file` names one pre-shared key every consensus member holds, and
-consensus **will not start** without it — so provision it before you start anything,
-not after the first refusal. It is one file, made once per fleet and copied around;
-the recipe is
-[on the node's page](../tools/fastcache-compile-node.md#finding-peers-instead-of-typing-them),
-and what it buys is under [Security](#security). It no longer signs leases — each
-scheduler's own key does — but it still proves a member on the node port and is what
-an enrollment window hands a joiner.
+There is **no shared secret to provision**: the pre-shared `--cluster-key-file` a fleet
+used to copy to every member is gone
+([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). Every machine
+proves its own identity key instead -- a member to the other members, a worker to its
+scheduler -- and removing one machine is revoking that one key. What that buys is under
+[Security](#security).
 
 It used to be `fastcached --listen-dispatch=...`, and that flag is **gone** rather
 than deprecated. The two jobs have opposite deployment shapes: a cache is shared
@@ -266,7 +263,7 @@ its own history is not handed to a leader either ([#1440](https://github.com/LAS
 
 Once several nodes schedule, exactly one of them may at a time, which is what the
 same consensus decides once it has more than one member — `--raft-peer` naming each
-of them, with the same `--cluster-key-file` on every member. See
+of them, each with its identity key. See
 [a cluster, and who leads it](../tools/fastcache-compile-node.md#a-cluster-and-who-leads-it).
 
 #### Who may use the fleet
@@ -315,8 +312,28 @@ fastcache-compile-node \
     --advertise=worker-01.internal:6674 \
     --fleet-open \
     --voter-key=<scheduler-public-key> \
-    --cluster-key-file=/etc/fastcached/cluster.key
+    --cluster-dir=/var/lib/fastcache-node
 ```
+
+**`--cluster-dir` is where a worker keeps WHO IT IS**
+([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). On its first start
+it mints an identity key there, and from then on it proves that key on every connection
+to its scheduler; the scheduler refuses every verb a machine joins the fleet with --
+registering, announcing, heartbeating -- on a connection that proved nothing, so a worker
+started without `--cluster-dir` is refused at startup instead. The cluster admits the key
+once, and either way works:
+
+```sh
+# on the worker: ask a member to enrol it, then approve it there with --enroll-approve
+fastcache-compile-node --cluster-dir=/var/lib/fastcache-node --enroll-from=scheduler.internal:6675
+
+# or print the worker's identity, and admit it from anywhere
+fastcache-compile-node --cluster-dir=/var/lib/fastcache-node --print-identity
+fastcache-compile-node --scheduler=scheduler.internal:6675 --cluster-admit-worker=<id>@<key>
+```
+
+An address still admits a *client* -- a developer's `fastcache-cc` asking for a lease
+needs no identity -- but never a machine joining the fleet.
 
 **`--voter-key` is how a worker knows whose leases to honour**
 ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). Every lease is
@@ -327,9 +344,10 @@ for an hour at a time. `--voter-key` names the voters it trusts before it holds 
 paste each voter's `public-key` line from `--print-identity`, one flag per voter. The
 first roster a majority of them endorses is adopted from the scheduler's reply, and
 from then on only the roster held certifies its successor, so a key typed here never
-outvotes the cluster's own revocation. With `--cluster-dir` the roster is kept across
-restarts. A worker another machine can reach **will not start** with no way to check a
-lease; one reachable only from its own machine needs none.
+outvotes the cluster's own revocation. The roster is kept in `--cluster-dir` across
+restarts, and a worker enrolled with `--enroll-from` is handed one at admission -- it then
+needs no `--voter-key` at all. A worker another machine can reach **will not start** with
+no way to check a lease; one reachable only from its own machine needs none.
 
 A worker cut off from the leader goes on honouring grants for as long as its roster
 stays certified, and then refuses every one `roster-expired`: that is the bound on how
@@ -404,7 +422,8 @@ of it is on
 
 On Linux the package ships a socket-activated unit; put the settings in
 `/etc/fastcached/fastcache-compile-node.yaml` — every key is one flag, spelled
-with underscores — and enable the **socket**:
+with underscores, and a worker needs `cluster_dir: /var/lib/fastcache-node`, the
+state directory the unit creates for its identity key — and enable the **socket**:
 
 ```sh
 sudo systemctl enable --now fastcache-compile-node.socket
@@ -897,6 +916,13 @@ have — but it looks like a cold cache the first time a fleet upgrades past it.
 
 **Two things protect a fleet: who a node admits, and whether the job was granted.**
 
+**Every machine that joins the fleet proves which one it is.** A worker proves its own
+identity key on every connection to its scheduler, and every frame after that proof is
+sealed under a key only the two ends hold -- so something on the path can neither speak
+for a worker nor slip a verb into a connection the worker's proof admitted. A machine the
+cluster forgets with `--cluster-forget` is refused on its key, from any address. See
+[A node proves which machine it is](../tools/fastcache-compile-node.md#a-node-proves-which-machine-it-is-and-every-frame-after-it-is-sealed).
+
 A node is closed by default. Its compile port and its scheduler admit **this machine
 and `--fleet-member` peers only** (or every caller, once you say `--fleet-open`);
 once a cluster exists the agreed member set is **added** to that list rather than
@@ -927,18 +953,19 @@ scheduler the cluster removes stops being able to lease anything out the moment 
 workers hold the roster that revokes it — or, if one withholds that roster, once the
 roster they hold lapses.
 
-!!! warning "Give every worker `--voter-key`, and every consensus member `--cluster-key-file`"
+!!! warning "Give every worker a `--cluster-dir`, and a way to check a lease"
 
-    A worker that another machine could dial — anything with `--fleet-member` or
-    `--fleet-open` on a bind that is not loopback — **will not start** with no way to
-    check a lease: it runs consensus, or names the voters with `--voter-key`, or keeps
-    a roster in its `--cluster-dir`. And no node running consensus starts without
-    `--cluster-key-file`, whatever it binds. Both refusals are deliberate and both are
+    Every worker names a scheduler, so every worker **will not start** without
+    `--cluster-dir`: it has no identity to prove, and every verb it would join the fleet
+    with would be refused. And a worker another machine could dial — anything with
+    `--fleet-member` or `--fleet-open` on a bind that is not loopback — **will not start**
+    with no way to check a lease: it runs consensus, keeps a roster in its `--cluster-dir`,
+    or names the voters with `--voter-key`. Both refusals are deliberate and both are
     startup ones, not per-request fallbacks: a worker that quietly skipped the check
     would serve whoever reached its port while every refusal counter read zero, which
     is a fleet that looks healthy from both ends.
 
-    A node nothing else can dial — the ordinary one-machine install — needs neither
+    A node nothing else can dial — the ordinary one-machine install — needs no roster
     and logs a warning saying the check is off. A process on that host already has
     that host's compiler.
 

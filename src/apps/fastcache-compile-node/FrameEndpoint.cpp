@@ -13,6 +13,7 @@
 #include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
+#include <FastCache/Protocol/SealedFrameSocket.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
 
 #include <algorithm>
@@ -28,6 +29,7 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -782,51 +784,69 @@ namespace
                || opRaw == static_cast<std::uint8_t>(Wire::Op::ProveNode);
     }
 
-    /// Answer a node-proof frame and record what it established on this connection.
+    /// Answer a node-proof frame and record what it established on this connection (#178).
     ///
     /// Separated from `ServeConnection` for `AnswerAuth`'s reason, and it is the same shape for
-    /// the same cause: what these two verbs change is CONNECTION state -- the challenge
-    /// outstanding, and the id this connection has proved -- and the responder is shared by every
-    /// connection on the surface, so neither can live there.
+    /// the same cause: what these two verbs change is CONNECTION state -- the handshake
+    /// outstanding, the identity proved and the seal -- and the responder is shared by every
+    /// connection on the surface, so none of it can live there. It DECIDES and writes nothing:
+    /// the reply leaves by the loop's one write, which is what keeps the loop the only writer.
     ///
     /// Reached only when the surface OFFERS a prover. A surface that offers none never sees this:
     /// the frame goes on to `Answer`, where `MergedResponder` refuses the whole family with the
-    /// sentence a node holding no cluster key owes -- and that fallthrough is deliberate, because
-    /// an endpoint answering it here would be encoding a refusal whose wording and counter belong
-    /// to a surface (#447).
+    /// sentence a node running no cluster owes -- and that fallthrough is deliberate, because an
+    /// endpoint answering it here would be encoding a refusal whose wording and counter belong to
+    /// a surface (#447).
+    ///
+    /// **A connection proves ONCE.** One that is already sealed and asks again is closed, whatever
+    /// its proof concluded: a second handshake on a sealed connection would have to re-key it
+    /// mid-stream, a revoked machine re-proving under another key on the connection its tombstone
+    /// marks would be asking to be judged afresh by the one fact that condemns it, and a caller
+    /// refused for an unknown key redials, which costs it one connection and this node nothing.
+    ///
+    /// **Bytes the caller pipelined past `ProveNode` close the connection**, when the handshake
+    /// agreed a key: they were read in the clear, before the seal existed, so nothing can say
+    /// whether they are the caller's -- and a well-behaved caller waits for the sealed answer before
+    /// it sends anything.
     ///
     /// @param prover The surface's verifier.
     /// @param responder The surface, for the one refusal the ENDPOINT decides.
     /// @param payload The request body, already bounded by the verb's own cap.
     /// @param opRaw The verb as received, so a refusal reaches the surface that owns the counter.
-    /// @param challenge This connection's outstanding nonce; drawn, spent and cleared here.
-    /// @param provenNodeId This connection's proof; ENGAGED only by one that authenticated, and
-    ///        holding the label the caller gave, which may legitimately be empty.
-    /// @return The reply frame to write.
+    /// @param handshake This connection's outstanding handshake; drawn, spent and cleared here.
+    /// @param proven This connection's identity; engaged only by a proof that VERIFIED under a key
+    ///        the roster holds live or revoked.
+    /// @param sealing This connection's socket, which a live proof seals.
+    /// @param pipelined Whether the reader already holds bytes past this frame.
+    /// @return The reply frame to write, or empty to close the connection.
     [[nodiscard]] std::vector<std::byte> AnswerNodeProof(INodeProver& prover,
                                                          IFrameResponder const& responder,
                                                          std::span<std::byte const> payload,
                                                          std::uint8_t opRaw,
-                                                         std::optional<Nonce>& challenge,
-                                                         std::optional<std::string>& provenNodeId)
+                                                         std::optional<NodeHandshake>& handshake,
+                                                         std::optional<ProvenIdentity>& proven,
+                                                         SealedFrameSocket* sealing,
+                                                         bool pipelined)
     {
+        if (proven.has_value() || (sealing != nullptr && sealing->Sealed()))
+            return {};
+
         if (opRaw == static_cast<std::uint8_t>(Wire::Op::NodeChallenge))
         {
             // **Re-drawn on a second ask, and the old one is gone** -- gone BEFORE the draw, so a
             // draw that fails leaves none rather than the last. A caller that asks again has
-            // abandoned the first, and a server holding two live nonces would accept a proof over
-            // either -- a replay window opened by nothing but politeness. It also keeps *a
-            // challenge is spent whatever the outcome* true with no second rule beside it.
-            challenge.reset();
-            auto issued = prover.IssueChallenge();
+            // abandoned the first, and a server holding two live handshakes would accept a proof
+            // over either -- a replay window opened by nothing but politeness.
+            handshake.reset();
+            auto issued = prover.Challenge(payload);
             if (!issued.has_value())
                 return std::move(issued).error();
-            challenge = *issued;
-            return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeNodeChallengeReply(*challenge));
+            handshake = std::move(issued->handshake);
+            return std::move(issued->reply);
         }
 
-        if (!challenge.has_value())
-            // The ENDPOINT's own refusal, because the challenge is the endpoint's own state. The
+        if (!handshake.has_value())
+            // The ENDPOINT's own refusal, because the handshake is the endpoint's own state. The
             // surface encodes and counts it, as it does every other refusal this loop decides.
             return responder.EndpointRefusalReply(
                 EndpointRefusal::NodeProofUnchallenged,
@@ -834,21 +854,72 @@ namespace
                 "ask for a challenge first: one challenge answers exactly one proof, whatever that proof's outcome");
 
         // **Spent before anything is verified, whatever happens next**, which is discovery's rule
-        // and the Raft handshake's in the same words: a nonce that can answer twice is a nonce
-        // that can be replayed. A caller whose proof is refused may ask for another and try
-        // again, which costs it a round trip per attempt and gives it no nonce to grind against.
-        auto const spent = *challenge;
-        challenge.reset();
+        // and the Raft handshake's in the same words: a challenge that can answer twice is one that
+        // can be replayed.
+        auto const spent = std::move(*handshake);
+        handshake.reset();
 
-        auto proved = prover.Verify(spent, payload);
-        if (!proved.has_value())
-            return std::move(proved).error();
+        auto verdict = prover.Verify(spent, payload);
+        proven = std::move(verdict.identity);
+        if (verdict.keys.has_value())
+        {
+            if (pipelined || sealing == nullptr)
+                return {};
+            // Sealed BEFORE the reply is written, so the answer -- whichever it is -- is the first
+            // sealed frame, and the caller learns the two ends agree on the keys before it sends a
+            // verb.
+            sealing->SealReceiving(std::move(verdict.keys->callerToServer));
+            sealing->SealSending(std::move(verdict.keys->serverToCaller));
+        }
+        return std::move(verdict.reply);
+    }
 
-        // The one write, and the only thing on this connection that a later verb's membership
-        // answer reads. Disengaged until this line, which is what *nothing was proved* means --
-        // the label inside it may be empty, and `Verify` says why that is legal.
-        provenNodeId = *std::move(proved);
-        return Wire::EncodeReply(Wire::Status::Ok, {});
+    /// A connection's socket, and the sealing layer under it when the surface offers a prover.
+    struct ConnectionSocket
+    {
+        std::shared_ptr<ISocket> socket; ///< What the loop, the watch and the pulse all use.
+        SealedFrameSocket* sealing;      ///< The same object, typed; null on a surface with no prover.
+    };
+
+    /// Wrap an accepted connection so a proof can seal it (#178).
+    ///
+    /// **Wrapped from the start and engaged later**, rather than swapped at the proof: the loop's
+    /// reader, the sweeper's registration, the peer watch and the progress pulse all hold THIS
+    /// socket, and a swap would have to reach every one of them at the same instant. Until a proof
+    /// engages it the layer passes every byte straight through, so a launcher on the same port pays
+    /// one virtual call per operation and nothing else.
+    ///
+    /// Only on a surface that offers a prover: nothing on any other surface can ever seal.
+    /// @param state The server state.
+    /// @param owned The accepted connection.
+    /// @return The socket to serve, and the sealing layer when there is one.
+    [[nodiscard]] ConnectionSocket WrapForSealing(FrameServer::State& state, std::unique_ptr<ISocket> owned)
+    {
+        if (state.responder.NodeProver() == nullptr)
+            return ConnectionSocket { .socket = std::shared_ptr<ISocket> { std::move(owned) }, .sealing = nullptr };
+        auto sealed =
+            std::make_shared<SealedFrameSocket>(std::move(owned), SealedFrameEnd::Server, state.responder.MaxRequestBytes());
+        auto* const sealing = sealed.get();
+        return ConnectionSocket { .socket = std::move(sealed), .sealing = sealing };
+    }
+
+    /// Count and say why a sealed connection stopped, once, as it closes (#178).
+    ///
+    /// Counted by the ENDPOINT, which is where the seal lives; no surface was asked anything,
+    /// because the frame that broke it was never handed to one.
+    /// @param state The server state.
+    /// @param sealing The connection's sealing layer, or null.
+    /// @param peer Who it was.
+    void NoteSealFault(FrameServer::State& state, SealedFrameSocket const* sealing, std::string_view peer)
+    {
+        if (sealing == nullptr)
+            return;
+        auto const fault = sealing->Fault();
+        if (!fault.has_value())
+            return;
+        state.metrics.Increment(IMetricsSink::Counter::NodeSealedFramesRefused);
+        state.logger.Logf(
+            LogLevel::Warn, "{}: closed a proven connection from {}: {}", state.what, peer, DescribeSealFault(*fault));
     }
 
     /// Encode the refusal a connection owes its peer after a sweep deferred to it.
@@ -2025,7 +2096,10 @@ namespace
         // resumes the watcher onto a destroyed socket, which is verbatim the second
         // use-after-free `RedisResp`'s readable watcher records and fixes the same way.
         // Costs one control block per connection.
-        std::shared_ptr<ISocket> const socket { std::move(owned) };
+        //
+        // And wrapped so a proof can seal it, on a surface that offers one (#178) -- see
+        // `WrapForSealing`, which says why the layer is there from the start.
+        auto const [socket, sealing] = WrapForSealing(*state, std::move(owned));
         OpenConnectionSlot const slot { state };
 
         // Registered with its deadline BEFORE the first read, so a client that sends
@@ -2059,16 +2133,15 @@ namespace
             // below is and for the same reason -- the responder is shared by every connection on
             // this surface, so an id proved here must not admit anybody else (#1428).
             //
-            // `provenNodeId` starts DISENGAGED, which is what *nothing was proved* means
-            // everywhere that reads it, and is only ever engaged by a `ProveNode` frame this loop
-            // verified. The label inside it may be empty; see `NodeProofResponder::Verify`.
-            PeerIdentity identity { .host = peer, .provenNodeId = std::nullopt };
+            // `proven` starts DISENGAGED, which is what *nothing was proved* means everywhere that
+            // reads it, and is only ever engaged by a `ProveNode` this loop verified (#178).
+            PeerIdentity identity { .host = peer, .proven = std::nullopt };
 
-            // The challenge outstanding on this connection, or none. Drawn by the surface's
+            // The handshake outstanding on this connection, or none. Opened by the surface's
             // prover on request and SPENT by the next proof whatever its outcome, which is why
-            // it is an optional rather than a nonce plus a flag: two members that can disagree
+            // it is an optional rather than a record plus a flag: two members that can disagree
             // is a state nothing could describe.
-            std::optional<Nonce> challenge;
+            std::optional<NodeHandshake> handshake;
 
             auto const cap = state->responder.MaxRequestBytes();
 
@@ -2181,12 +2254,18 @@ namespace
                 // is the connection's IDENTITY rather than its credential. Asked of the surface
                 // whether it offers a prover at all -- a surface that offers none lets the frame
                 // fall through to `Answer`, where the family is refused with the sentence a node
-                // holding no cluster key owes, rather than to a refusal encoded here (#447).
+                // running no cluster owes, rather than to a refusal encoded here (#447).
                 if (auto* const prover = state->responder.NodeProver(); prover != nullptr && IsNodeProofVerb(decoded->opRaw))
                 {
-                    auto const answer = AnswerNodeProof(
-                        *prover, state->responder, *payload, decoded->opRaw, challenge, identity.provenNodeId);
-                    if (!co_await WriteAll(EndpointWriter::Loop, socket.get(), answer))
+                    auto const answer = AnswerNodeProof(*prover,
+                                                        state->responder,
+                                                        *payload,
+                                                        decoded->opRaw,
+                                                        handshake,
+                                                        identity.proven,
+                                                        sealing,
+                                                        !reader.Buffered().empty());
+                    if (answer.empty() || !co_await WriteAll(EndpointWriter::Loop, socket.get(), answer))
                         break;
                     continue;
                 }
@@ -2393,6 +2472,7 @@ namespace
         // Deregistered before the socket is destroyed, or the sweeper would hold a
         // pointer into a freed object.
         state->Untrack(socket.get());
+        NoteSealFault(*state, sealing, socket->PeerAddress());
         socket->Close();
         co_return;
     }

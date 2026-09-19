@@ -279,12 +279,10 @@ command -v "$compiler" >/dev/null 2>&1 || { echo "compiler not found: '$compiler
 
 workdir="$(mktemp -d)"
 
-# The cluster key every node in this fixture shares.
-#
-# It no longer makes the dispatch path the SIGNED one: since #178 every scheduler signs
-# with its own identity key, and what makes a worker CHECK the signature is the
-# `--voter-key` `start_node` hands it -- see there. A scheduler runs consensus, which
-# still needs this file, and a node proving the cluster key on the node port reads it.
+# No key file (#178 PR 6): every scheduler signs with its own identity key, what makes a
+# worker CHECK the signature is the `--voter-key` `start_node` hands it, and what lets a
+# worker join at all is an identity key of its own that the scheduler's cluster admitted --
+# see there.
 #
 # With both, every case below is a real client presenting a real signed grant to a real
 # worker over a real socket, checked against a roster that worker adopted from its
@@ -292,11 +290,6 @@ workdir="$(mktemp -d)"
 # worker advertising an address the scheduler did not grant fails every case rather
 # than none, which is the property no in-process test can show: the unit tests mint and
 # verify inside one process.
-#
-# Fixed text rather than /dev/urandom: nothing here turns on its value, and a per-run
-# secret would make a failure look like a flake. Sixteen bytes is the minimum.
-cluster_key="${workdir}/cluster.key"
-printf 'e2e-fixture-cluster-key-not-a-secret\n' > "$cluster_key"
 cleanup() {
     # Every spawned process, not just the ones a happy path reaps: a `fail`
     # anywhere exits the script, and a daemon or worker left holding a port makes
@@ -480,10 +473,10 @@ started_port=""
 # to one, which is fewer places to forget rather than none.
 #
 # The invariant flags are the three no case varies: the drain this fixture states
-# rather than inherits (#380), the cluster key that makes every dispatch here a
-# SIGNED one (#282), and the bind, which is also what is advertised -- a node that
-# advertised something else would be describing an endpoint the lease MAC then
-# covers and no client can reach.
+# rather than inherits (#380), and the bind, which is also what is advertised -- a node
+# that advertised something else would be describing an endpoint the lease signature
+# then covers and no client can reach. What makes every dispatch here a SIGNED and
+# CHECKED one (#282) is the `--voter-key` each worker is handed, below.
 #
 # Everything else is a flag the caller passes, INCLUDING the cache tier and the log
 # level. Neither gets a default here, because a default plus an override is the
@@ -519,7 +512,7 @@ started_port=""
 start_node() {
     local tag="$1" host="$2" port="$3"
     shift 3
-    local log="${workdir}/${tag}.log" pid="" arg="" identity="" key="" worker="yes" voterKeyFile=""
+    local log="${workdir}/${tag}.log" pid="" arg="" identity="" key="" worker="yes" voterKeyFile="" schedulerAt=""
     : > "$log"
     # The stated drain is a WORKER's setting, so a node running none (`--slots=0`,
     # #206) is not handed it: it refuses a worker-only setting by name, and it has no
@@ -542,6 +535,7 @@ start_node() {
                 ;;
             --scheduler=*)
                 voterKeyFile="${workdir}/scheduler-${arg##*:}.key"
+                schedulerAt="${arg#--scheduler=}"
                 ;;
         esac
     done
@@ -549,7 +543,7 @@ start_node() {
     # filed under the port its workers name; the start then reads the same files back
     # rather than minting a second identity.
     if [ -n "${consensus[*]+x}" ]; then
-        identity="$("$node" --print-identity --cluster-key-file="$cluster_key" "${consensus[@]}" 2>> "$log")" \
+        identity="$("$node" --print-identity "${consensus[@]}" 2>> "$log")" \
             || { cat "$log" >&2; fail "${tag}: --print-identity could not mint this scheduler's identity"; }
         key="$(sed -n 's/^public-key //p' <<< "$identity")"
         [ -n "$key" ] || fail "${tag}: --print-identity printed no public-key line: ${identity}"
@@ -565,9 +559,22 @@ start_node() {
     if [ -n "$worker" ] && [ -n "$voterKeyFile" ] && [ -f "$voterKeyFile" ]; then
         voter=(--voter-key="$(cat "$voterKeyFile")")
     fi
-    "$node" ${drain[@]+"${drain[@]}"} --cluster-key-file="$cluster_key" \
+    # And a node that names a scheduler and runs no consensus proves its OWN identity on every
+    # connection to it (#178 PR 6): the scheduler refuses registering, announcing and
+    # heartbeating from a machine that proved nothing, loopback included. So it keeps a state
+    # directory -- the start refuses one that names a scheduler without -- and, when this
+    # fixture started that scheduler, is admitted there BEFORE it starts, or its first rounds
+    # are refused and it registers a heartbeat interval late.
+    local state=()
+    if [ -n "$schedulerAt" ] && [ -z "${consensus[*]+x}" ]; then
+        state=(--cluster-dir="${workdir}/${tag}.state")
+        if [ -f "$voterKeyFile" ]; then
+            admit_worker "$tag" "$schedulerAt" "$log" "${state[@]}"
+        fi
+    fi
+    "$node" ${drain[@]+"${drain[@]}"} \
         --listen-node="${host}:${port}" --advertise="${host}:${port}" \
-        ${consensus[@]+"${consensus[@]}"} ${voter[@]+"${voter[@]}"} \
+        ${consensus[@]+"${consensus[@]}"} ${voter[@]+"${voter[@]}"} ${state[@]+"${state[@]}"} \
         ${@+"$@"} >> "$log" 2>&1 &
     pid=$!
     started_pid="$pid"
@@ -580,6 +587,53 @@ start_node() {
     if [ -n "${voter[*]+x}" ]; then
         wait_for_log "roster: adopted roster version" "$pid" "$tag" "$log"
     fi
+}
+
+# Admit a node that runs no consensus to the cluster its scheduler leads, under the identity
+# it will prove there (#178 PR 6), and wait until the admission is APPLIED.
+#
+# What an operator runs, in the order an operator runs it: `--print-identity` mints the
+# node's id and key into its state directory and prints the `--cluster-admit-worker` line,
+# and that line goes to the scheduler. The start then reads the same files back, so the
+# identity it proves is the one admitted.
+#
+# Applied rather than accepted, because the receipt says only that the leader APPENDED the
+# entry: a worker that dialled in before it was applied is refused `node-key-unknown`, and
+# its next round is a heartbeat interval away -- longer than the roster wait in
+# `start_node`. So the wait reads the key back out of `--cluster-status`, which is the
+# leader's applied state. Retried, because a scheduler that has just started may not lead
+# its cluster of one yet, and answers `not-leader` until it does.
+#
+# @param 1 tag: whose log the attempts are appended to, and every message about it
+# @param 2 the scheduler endpoint the node names
+# @param 3 its log
+# @param 4.. its state directory flag
+admit_worker() {
+    local tag="$1" scheduler="$2" log="$3"
+    shift 3
+    local identity=""
+    identity="$("$node" --print-identity "$@" 2>> "$log")" \
+        || { cat "$log" >&2; fail "${tag}: --print-identity could not mint this node's identity"; }
+    admitting_token="$(sed -n 's/^cluster-admit-worker //p' <<< "$identity")"
+    admitting_key="$(sed -n 's/^public-key //p' <<< "$identity")"
+    [ -n "$admitting_token" ] && [ -n "$admitting_key" ] \
+        || fail "${tag}: --print-identity printed no cluster-admit-worker line and key: ${identity}"
+    admitting_scheduler="$scheduler"
+    admitting_log="$log"
+    wait_until admission_recorded "the scheduler at ${scheduler} to admit ${tag}" - "$log" 30
+    wait_until admission_applied "the scheduler at ${scheduler} to apply ${tag}'s admission" - "$log" 30
+}
+
+# One attempt to record the admission `admit_worker` stated. A predicate for `wait_until`.
+admission_recorded() {
+    "$node" --scheduler="$admitting_scheduler" --cluster-admit-worker="$admitting_token" >> "$admitting_log" 2>&1
+}
+
+# Whether the leader's applied state holds the admitted key yet. A predicate for `wait_until`.
+admission_applied() {
+    local status=""
+    status="$("$node" --scheduler="$admitting_scheduler" --cluster-status 2>> "$admitting_log")" || return 1
+    grep -Fq "key=${admitting_key}" <<< "$status"
 }
 
 # Start one `fastcached` daemon, and wait for it to be ACCEPTING.
@@ -789,8 +843,8 @@ worker_slots="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || ec
 #
 # ## What binding on that address does and does not expose
 #
-# Both workers are started with the cluster key, so every grant is signed and
-# checked. Leg 1's worker admits exactly one host -- the address the machine
+# Both workers are started with their scheduler's `--voter-key`, so every grant is
+# signed and checked. Leg 1's worker admits exactly one host -- the address the machine
 # already answers on -- and leg 2's admits none but its own loopback, so for the
 # few seconds these ports are open the set of callers either would serve is
 # {this machine}. A peer address is the kernel's, not a claim in a frame, so

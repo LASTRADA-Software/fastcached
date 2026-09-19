@@ -40,7 +40,7 @@ enum class NodeCondition : std::uint8_t
     CounterTableSkew = 0,     ///< The metrics catalogue names counters this build's sink has no slot for (#1362).
     ScratchRootUnmappable,    ///< The worker's scratch root cannot be written into a debug-prefix-map rule (#810).
     GeneratedTlsCertificate,  ///< The admin surface serves a certificate generated at startup.
-    EnrollmentWindowOpen,     ///< A stranger that asks can be handed the cluster key (#1298).
+    EnrollmentWindowOpen,     ///< A stranger that asks can be admitted to the cluster (#1298).
     ForgottenFleetMember,     ///< `--fleet-member` names a host the cluster has forgotten (#1309).
     UnreadableLeaderSnapshot, ///< This build cannot read the snapshot its leader sends, so it stays behind (#1552).
     Last,                     ///< Not a condition.

@@ -161,7 +161,7 @@ determinism rests on.
   | `check-tsan-scope:109` | clean pass -> hard refusal, **LOUD** |
   | `check-node-config-reference:75` | clean pass -> hard refusal, **LOUD** |
   | `check-net-boundary:169` | passed over a REAL violation, **SILENT** |
-  | `check-psk-signing-seam:216` | 15 calls counted -> 14, still passed, **SILENT** |
+  | `check-psk-signing-seam:216` (retired at #178 with the key) | 15 calls counted -> 14, still passed, **SILENT** |
   | `check-vslang-probe-only:122,198` | unchanged — **by coincidence, not defence** |
   | `check-script-check-signals:256` | unchanged — `LIMIT_COUNT 1`, immune by construction |
 

@@ -84,8 +84,7 @@ void RetireParkedRead(Impl& impl) noexcept
 /// **Assignment and check are one expression on purpose.** Each call site used to
 /// spell the claim as a bare `awaitable = nullptr;`, which is a line to forget the
 /// guard on, at the seventh site as at the first. There is no such line left: the
-/// clear happens here or it does not happen, which is the same shape as
-/// `SigningDomain` leaving no argument to pass a bare label to.
+/// clear happens here or it does not happen.
 ///
 /// **Debug-only, deliberately.** In release this is one store, exactly as before:
 /// the alternative -- refusing the new operation -- would turn today's silent leak

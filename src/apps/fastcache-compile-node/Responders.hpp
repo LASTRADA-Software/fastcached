@@ -354,16 +354,18 @@ class SchedulerResponder final: public IFrameResponder
     /// make the scheduler allocate for a frame that was never going to be served (#285).
     ///
     /// It said *from the peer's host alone* until #1428, and that clause was the whole of why
-    /// a worker on a VPN could not be admitted.
+    /// a worker on a VPN could not be admitted. Since #178 it also refuses a verb a joining
+    /// machine sends -- the opcode is what says which -- on a connection that proved no live
+    /// identity, which is why the opcode is now read here rather than ignored.
     ///
     /// Delegated rather than reimplemented: `SchedulerService::RefuseUnlessMember` is
     /// the same function `Gate()` calls, so the early check and the authoritative one
     /// cannot disagree, and the `NotAMember` counter is incremented inside it exactly
     /// once per refused request.
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
-                                                                   std::uint8_t /*opRaw*/) const override
+                                                                   std::uint8_t opRaw) const override
     {
-        return _protocol.RefusePeer(Context(peer));
+        return _protocol.RefusePeer(Context(peer), opRaw);
     }
 
     /// @copydoc IFrameResponder::AuthRequired
@@ -529,7 +531,7 @@ class SchedulerResponder final: public IFrameResponder
 
     /// @copydoc IFrameResponder::NodeProver
     ///
-    /// **None.** The cluster key is not this surface's secret, and a proof could not widen this
+    /// **None.** An identity is not this surface's question, and a proof could not widen this
     /// gate even if one were verified here: a cache tier serves THIS MACHINE, which is a property
     /// of the verb rather than of a member list (#287). See `RefusePeer` above.
     [[nodiscard]] INodeProver* NodeProver() noexcept override
@@ -554,26 +556,18 @@ class SchedulerResponder final: public IFrameResponder
     /// context to point into, and a caller already holding a `std::string` hands it
     /// over rather than having it copied.
     ///
-    /// `Classify` is called before the move for READABILITY, not for correctness:
-    /// `[dcl.init.list]/4` sequences a braced-init-list's clauses in written order,
-    /// so `{ .membership = Classify(peer), .peerId = std::move(peer) }` would have
-    /// been well-defined too. Verified on gcc and clang rather than reasoned about,
-    /// because an earlier draft of this comment asserted the opposite. Do not carry
-    /// "aggregate initialisers are unsequenced" anywhere else -- it is false, and
-    /// function ARGUMENTS, which are indeterminately sequenced, are the rule that
-    /// gets misremembered into it.
-    ///
-    /// **The proof is folded through `Distributed::ExplainConnection`, since #1428.** It has to
-    /// happen HERE rather than at the two call sites, because this is the one place the peer
-    /// becomes a `CallerContext` -- and a fold at one of them would make the door and the
-    /// authoritative gate answer differently about one connection, which is a caller admitted
-    /// and then refused a line later.
+    /// **The identity is folded through `Distributed::CallerContextOf`, since #1428 and #178.**
+    /// It has to happen HERE rather than at the two call sites, because this is the one place the
+    /// peer becomes a `CallerContext` -- and a fold at one of them would make the door and the
+    /// authoritative gate answer differently about one connection, which is a caller admitted and
+    /// then refused a line later. The host is moved into the context only after the fold has read
+    /// it, inside that function, where the order is a statement sequence rather than an argument
+    /// list's.
     ///
     /// @param peer The caller, whose host is taken over by the returned context.
     [[nodiscard]] Distributed::CallerContext Context(PeerIdentity peer) const
     {
-        auto const decision = Distributed::ExplainConnection(_membership, peer.host, peer.provenNodeId.has_value());
-        return Distributed::CallerContext { .membership = decision.verdict, .peerId = std::move(peer.host) };
+        return Distributed::CallerContextOf(_membership, std::move(peer.host), peer.proven);
     }
 
     Distributed::SchedulerProtocol& _protocol;
@@ -662,13 +656,13 @@ class CacheResponder final: public IFrameResponder
     /// the same code and the counter moves exactly once per refused request whichever
     /// path reached it.
     ///
-    /// **A cluster-key proof widens nothing here, and that is the fix rather than an
-    /// oversight** (#287, #1428). This tier serves THIS MACHINE, always: locality is a
-    /// property of the verb, and a machine that holds the fleet's key is still not this one.
-    /// The proof establishes membership, and membership is the list this surface deliberately
-    /// does not consult -- a `--fleet-member` may spend this node's CPU, and it may not read
-    /// every object this machine has ever compiled. So the identity's `provenNodeId` is not
-    /// read, and a proven peer is refused exactly as it is today.
+    /// **A proven identity widens nothing here, and that is the fix rather than an
+    /// oversight** (#287, #1428, #178). This tier serves THIS MACHINE, always: locality is a
+    /// property of the verb, and a machine the fleet admitted is still not this one. The proof
+    /// establishes membership, and membership is the list this surface deliberately does not
+    /// consult -- a `--fleet-member` may spend this node's CPU, and it may not read every object
+    /// this machine has ever compiled. So the identity's `proven` is not read, and a proven peer
+    /// is refused exactly as it is today.
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                    std::uint8_t /*opRaw*/) const override
     {
@@ -949,17 +943,12 @@ struct SurfaceComponents
     /// not a family missing at the door.
     IFrameResponder* fleet { nullptr };
 
-    /// Verifies the cluster-key proof, or nullptr when this node holds no cluster key (#1428).
+    /// Verifies which machine a caller is, or nullptr when this node runs no consensus (#178).
     ///
-    /// Like `enrollment`, null is an ORDINARY state and the condition is a FILE rather than a
-    /// component: a node with no `--cluster-key-file` has nothing to verify a proof against, so
-    /// the family is refused at the door -- `NoCluster` rather than `UnimplementedVerb`, because
-    /// a caller told the latter goes off to upgrade a node that is already current.
-    ///
-    /// **Keyed on the KEY and not on consensus**, which is the distinction the enrollment
-    /// component does not have to draw: #1308 makes consensus imply a key, so every consensus
-    /// node has one, but a pure worker may hold one too -- it is what signs lease grants -- and
-    /// a proof presented to it must be verifiable there as well.
+    /// Like `enrollment`, null is an ORDINARY state: a proof is judged against the cluster's
+    /// applied roster, which only a consensus member holds, so every other node refuses the family
+    /// at the door -- `NoCluster` rather than `UnimplementedVerb`, because a caller told the latter
+    /// goes off to upgrade a node that is already current.
     IFrameResponder* nodeProof { nullptr };
 };
 
@@ -1052,7 +1041,7 @@ inline constexpr EnumTable<CompileCacheWire::VerbFamily, FamilyRoute> FamilyRout
       .owner = &SurfaceComponents::fleet,
       .presence = FamilyPresence::OnEveryBuiltNode,
       .ceilings = SessionCeilings::Folded },
-    // Legitimately null: a node with no `--cluster-key-file` has nothing to verify a proof
+    // Legitimately null: a node running no consensus holds no roster to verify a proof
     // against. Its ceilings are NOT read, for `Enrollment`'s reason -- the fold is a MAXIMUM
     // over connections and a SUM over every-node owners, so folding a small number in would
     // change nothing today and would put a later raise of it in front of every surface on the
@@ -1422,13 +1411,13 @@ class MergedResponder final: public IFrameResponder
                     "a node serves" },
         { .family = CompileCacheWire::VerbFamily::NodeProof,
           .refusal = { .code = CompileCacheWire::ErrorCode::NoCluster,
-                       .rationale = "what a node holding no cluster key answers every proof aimed at it, and a node "
-                                    "that dials a whole fleet tries the proof on each peer once per round; counted, "
-                                    "one keyless machine in a fleet would dominate the series that says whether a "
-                                    "key is WRONG somewhere" },
-          .detail = "this node holds no cluster key (--cluster-key-file), so there is nothing here to prove against; "
-                    "admission at this endpoint is decided by your address -- --node-status names the components a "
-                    "node serves" },
+                       .rationale = "what a node running no consensus answers every proof aimed at it: it is no "
+                                    "scheduler, so a proof here is a --scheduler naming the wrong machine; counted, "
+                                    "one misdirected node would dominate the series that says whether an identity is "
+                                    "WRONG somewhere" },
+          .detail = "this node runs no consensus, so it holds no roster to prove an identity against and is no "
+                    "scheduler of any fleet; admission at this endpoint is decided by your address -- --node-status "
+                    "names the components a node serves" },
     });
 
     // The compile row says `CompileCacheWire::NoCompileWorker`'s fact, which the daemon answers too, so

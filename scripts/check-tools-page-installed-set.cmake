@@ -80,8 +80,8 @@
 # `docs/tools/index.md` is full of `[` and `]` -- markdown links and tables -- and a
 # CMake list built by splitting its lines merges elements at every unbalanced bracket.
 # This repository has measured that class of reader going SILENTLY wrong twice
-# (`net-boundary` passed over a real cross-boundary include; `psk-signing-seam` counted
-# 15 calls as 14 and still passed).
+# (`net-boundary` passed over a real cross-boundary include; `psk-signing-seam`, retired
+# since, counted 15 calls as 14 and still passed).
 #
 # And the usual remedy is wrong here. Blanking `[`/`]` before splitting is what broke
 # `check-tsan-scope`, because a Catch2 tag IS `[async]` -- the brackets were the data.

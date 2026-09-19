@@ -374,8 +374,8 @@ class CompileResponder final: public IFrameResponder
     /// @copydoc IFrameResponder::NodeProver
     ///
     /// **None.** This surface verifies a per-job LEASE, which is the scheduler's signature over a
-    /// grant, and that is a different question from *does this caller hold the cluster key*. The
-    /// proof still reaches the membership half of this gate through `RefusePeer`.
+    /// grant, and that is a different question from *which machine is this caller*. A proven
+    /// identity still reaches the membership half of this gate through `RefusePeer`.
     [[nodiscard]] INodeProver* NodeProver() noexcept override
     {
         return nullptr;

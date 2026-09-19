@@ -296,7 +296,7 @@ fault.
   is refused rather than served without one.** `--requirepass` is what a node
   *presents* to the scheduler and every member of the fleet holds it, so reusing it
   would let any worker read every other node's fleet map -- wrong direction and
-  wrong grain. It is a file for the reason `--cluster-key-file` is one, and a
+  wrong grain. It is a file for the reason `--scheduler-token-file` is one, and a
   non-loopback `--admin-listen` with `--dashboard` and no token file is a **startup
   refusal**: the page lists every member's hostname, endpoint and capacity, and
   HTTPS does not substitute, because TLS authenticates the server to the browser

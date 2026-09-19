@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Protocol/ProvenIdentity.hpp>
+
+#include <optional>
 #include <string>
 
 namespace FastCache
@@ -8,19 +11,17 @@ namespace FastCache
 
 /// Who a live subscription belongs to, for as long as it streams.
 ///
-/// ## Why this is not the connection full identity
+/// ## The same two facts every membership gate folds
 ///
-/// A node knows more about its caller than this: `Node::PeerIdentity` carries the node id a
-/// caller PROVED with the cluster key, which the node logs and records. A gate may not have
-/// that, and should not: under a shared key every holder can mint any id tag, so the label
-/// authenticates nothing and a gate that read it would be deciding on a value it cannot check.
-/// What a gate acts on is the two facts below, and `Distributed::ExplainConnection` -- the one
-/// function every membership gate folds through -- takes exactly a host and a `bool` for the
-/// same reason ([#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428)).
+/// A host and, when the connection proved one, the identity it proved --
+/// `Distributed::ExplainConnection` takes exactly these, and the stream is re-gated on them every
+/// tick ([#1428](https://github.com/LASTRADA-Software/fastcached/issues/1428), #178). The identity
+/// is carried whole rather than as a `bool`, because the question asked of it on every tick is
+/// whether its KEY is still live in the roster: a key revoked while a dashboard watches ends that
+/// dashboard's stream on the next tick, as the forgotten machine's.
 ///
-/// So this is a NARROWING rather than a second spelling of the same thing, and the narrowing is
-/// what makes it shareable: `fastcached` implements `ILiveGate` too and holds no cluster key, so
-/// `provedClusterKey` is honestly `false` there rather than a plausible default it must invent.
+/// So this is shareable: `fastcached` implements `ILiveGate` too and runs no node handshake, so
+/// `proven` is honestly disengaged there rather than a plausible default it must invent.
 ///
 /// ## Why it OWNS its host
 ///
@@ -35,12 +36,8 @@ struct LiveWatcher
     /// The peer host, as the kernel reported it.
     std::string host {};
 
-    /// Whether this connection proved the cluster key.
-    ///
-    /// A `bool` and never the proven id: an id is legitimately EMPTY -- one is minted into
-    /// `--cluster-dir` only by a node that runs consensus -- so a field carrying the label
-    /// could not tell an ordinary keyed worker from a caller that proved nothing.
-    bool provedClusterKey = false;
+    /// The identity this connection proved, or nothing when it proved none.
+    std::optional<ProvenIdentity> proven {};
 };
 
 } // namespace FastCache

@@ -22,8 +22,8 @@ std::vector<SecretFileFinding> SecretFileExposures(std::span<std::filesystem::pa
             continue;
 
         // One finding per FILE, not per setting that named it. A single-machine
-        // deployment legitimately points two settings at one file -- the cluster key
-        // and the scheduler token, say -- and an operator handed the same remedy for
+        // deployment legitimately points two settings at one file -- the scheduler token
+        // and the dashboard token, say -- and an operator handed the same remedy for
         // the same path twice reads the second copy as a second problem, which is the
         // alarm-fatigue failure this whole check is trying not to be.
         //
