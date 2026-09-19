@@ -651,14 +651,19 @@ same on both — the same defect with no MSVC anywhere near it.
     `ShowIncludes` whichever stream carries the notes. What sharpens is #821's shape: a
     dispatch refusal fed from **stderr alone** is now known to be wrong for a COMPILE
     and right only for a `/EP` run — a firmer statement than "it may not fire for `cl`".
-  - **The note grammar is one rule, not one string, and it is anchored.** `SplitIncludeNotes`
-    and `ParseIncludePaths` both call `IncludeNotePath`, which matches after leading blanks
-    (`cl` indents by nesting depth) and **nowhere else**. Matching the marker anywhere in the
-    line is safe on a pure note stream and a mis-serve on the one that also carries
-    preprocessed *source*: it deletes an ordinary line that merely quotes the marker out of
-    the hashed bytes, so two revisions differing only in that string literal key identically
-    and the second is served the first's object. This repository's own sources contain the
-    literal, so it was reachable while building `fastcached` itself.
+  - **The note grammar is one rule, not one string, and it is anchored at COLUMN ZERO.**
+    `SplitIncludeNotes` and `ParseIncludePaths` both call `IncludeNotePath`, which is
+    `PathCanon::IncludeNoteMarkerEnd` — the same function the grammar and the marker rewrite
+    use, in the other binary — and it admits **nothing** in front of the marker, blanks
+    included. Anything in front is safe on a pure note stream and a mis-serve on the one that
+    also carries preprocessed *source*: it deletes an ordinary line out of the hashed bytes, so
+    two revisions differing only in that line key identically and the second is served the
+    first's object. Both shapes are reachable rather than hypothetical — a mid-line rule is
+    tripped by this repository's own sources, which contain the literal, and a leading-blank
+    rule by any indented raw string literal whose continuation line begins with the marker,
+    which is what a C++ line inside a function looks like ([#1270](https://github.com/LASTRADA-Software/fastcached/issues/1270)).
+    Inclusion depth is not a reason to loosen it: `cl` puts the depth AFTER the marker, and the
+    measurement is two sections down.
   - **A manifest that names no dependency is refused, not recorded.** A direct hit
     revalidates exactly what its manifest lists, so a manifest built from the source alone
     replays an object whose headers nobody re-checked — edit a header, leave the `.cpp`
@@ -1975,14 +1980,16 @@ were open to breaking it, and neither needed anybody's install to be stale.
     hold — the same defect with no version skew anywhere near it.
 - **A THIRD route, and it needed no disagreement at all: the grammar found no span
   to rewrite.** The two above are servers disagreeing about text they both recognise.
-  `Grammar::ShowIncludes` recognised a note only when the line began, at column zero,
-  with the literal English `Note: including file:` — so on a localized `cl`, and on any
-  note `cl` indented by inclusion depth, the region held nothing the canonicalizer
-  could see and was stored with the producing checkout's absolute paths in it. Every
-  server agreed perfectly, about nothing, and a replayed region becomes the object's
-  dependency record, so it never invalidates. Generation 3 closes both
-  ([#879](https://github.com/LASTRADA-Software/fastcached/issues/879),
-  [#891](https://github.com/LASTRADA-Software/fastcached/issues/891)).
+  `Grammar::ShowIncludes` recognised a note only when the line began with the literal
+  English `Note: including file:` — so on a localized `cl` the region held nothing the
+  canonicalizer could see and was stored with the producing checkout's absolute paths in
+  it. Every server agreed perfectly, about nothing, and a replayed region becomes the
+  object's dependency record, so it never invalidates. Generation 3 closes it
+  ([#879](https://github.com/LASTRADA-Software/fastcached/issues/879)).
+  [#891](https://github.com/LASTRADA-Software/fastcached/issues/891) rode along on a
+  reading of `cl`'s inclusion-depth indentation as preceding the marker, and generation 5
+  reverses it: see **The anchor is the load-bearing half** below, and the measurement in
+  the entry that closed [#1270](https://github.com/LASTRADA-Software/fastcached/issues/1270).
   - **The MARKER is a canonical form, exactly as `<SRCROOT>` is.** The launcher
     normalizes its own prefix to `PathCanon::IncludeNoteMarker` before a value is
     stored and restores this build's prefix after a hit is localized, so the stored
@@ -2009,14 +2016,47 @@ were open to breaking it, and neither needed anybody's install to be stale.
     worse, and [#878](https://github.com/LASTRADA-Software/fastcached/issues/878) is
     the remaining door. It needs **no further generation** — the stored form is
     already locale-free, so #878 only supplies a better value to normalize with.
-  - **The anchor is the load-bearing half of the recognition rule**, and it is what
-    made the indentation defect a fix rather than a loosening. Both regions a launcher
-    stores are tagged `ShowIncludes` and one of them is the DIAGNOSTIC stream, so a
-    marker matched anywhere in a line rewrites a path a compiler merely quoted — and
-    one layer up, where `SplitIncludeNotes` runs over text that is also preprocessed
-    SOURCE, it deletes an ordinary line from the bytes the key is hashed over. Leading
-    blanks only, nothing else, through one `IncludeNoteMarkerEnd` that all three
-    readers share.
+  - **The anchor is the load-bearing half of the recognition rule, and #891 gave half
+    of it away for a shape no driver emits.** Both regions a launcher stores are tagged
+    `ShowIncludes` and one of them is the DIAGNOSTIC stream, so a marker matched
+    anywhere in a line rewrites a path a compiler merely quoted — and one layer up,
+    where `SplitIncludeNotes` runs over text that is also preprocessed SOURCE, it
+    deletes an ordinary line from the bytes the key is hashed over. **COLUMN ZERO,
+    nothing in front of the marker at all**, through one `PathCanon::IncludeNoteMarkerEnd`
+    that all three readers now genuinely share rather than agreeing by hand.
+
+    What made the loosening look free was reading `cl`'s inclusion-depth indentation as
+    preceding the marker. It does not: the marker is at column zero on every note and the
+    depth is blanks BETWEEN marker and path, so it rides inside the run the path grammar
+    already skips and survives untouched without the anchor knowing it exists. Measured
+    2026-09-19 on Windows 11 Pro 10.0.26200, Visual Studio 18 Community, MSVC
+    14.44.35207 and 14.51.36231 plus that install's `clang-cl` as the control, under `/c`
+    and under `/EP`, at depths one to six — and reproduced the other way round: `cl /EP`
+    over two revisions of a file differing only inside an indented raw string literal
+    emits `  Note: including file: A` / `  Note: including file: B`, which the widened
+    rule deleted, keying the two identically
+    ([#1270](https://github.com/LASTRADA-Software/fastcached/issues/1270), generation 5).
+
+    **The general lesson is where the two facts live.** `<indent><marker>` and
+    `<marker><indent>` are one sentence apart in English and opposite rules in code, and
+    the ticket that fixed the wrong one cited the right shape in its own body. Nobody ran
+    the compiler. A claim about a tool is checked against the tool — and a claim about
+    a tool's TEXT is checked by printing column numbers, not by reading the text.
+
+  - **A `PathCanon` regression test whose fixture lies outside BOTH roots cannot fail.**
+    Its own rule, because AGENT.md's *a regression test can fail to reproduce its
+    regression* does not reach it and the next person writing one of these will meet it.
+    `Canonicalize` echoes a path under neither root verbatim — that is the contract, and
+    it is what lets a toolchain path survive a round trip — so `CanonicalizeRegion` returns
+    the input unchanged whether the grammar called the line a note or **passed over it**.
+    Recognition and pass-through are then one passing assertion.
+    Measured: #1270's first reproduction was `cl /EP` output for two revisions differing
+    only inside an indented raw string, asserted through `CanonicalizeRegion`, and it was
+    GREEN with the anchor neutered. Reading it finds nothing — the assertion is exactly
+    right. **Put the fixture's path UNDER a root**, so a rule that matched would produce
+    `<SRCROOT>/…` and asserting the input comes back IS asserting the refusal; and where
+    the defect is one layer up, pin it one layer up — `SplitIncludeNotes` DELETING the
+    line is the thing that mis-serves, and `DependencyProbe_test` is where that goes red.
 
 - **The reader could not tell a foreign value from a damaged one.**
   `CanonicalStoredValue` returned `std::optional`, and its `nullopt` meant both "these
@@ -2432,6 +2472,21 @@ nobody can account for.
   only, `CmdLine::PathValueFlags()`, and the drained over-cap frame — which the
   guard passes correctly, since its stated blind spot is that it does not judge
   whether a phrase is the RIGHT tripwire. The issue lists them.
+
+- **[#1568](https://github.com/LASTRADA-Software/fastcached/issues/1568)** — a
+  `GenerationBump`'s `changedRows` cannot name the behavioural subset of a bump, and the
+  first real bump is where that became visible. `AppendCoveredStages` digests
+  `trace.storedBytes`, whose LEADING BYTE is `CompileValueVersion`, so every row the two
+  generations share moves on every bump **by construction** — the 4-to-5 row therefore
+  lists all 21, which is honest and says nothing. The per-row table still earns its keep
+  for a change WITHIN a generation, which is the case it fires on; what is broken is only
+  the claim ACROSS one. Recorded rather than hand-pruned: a pruned list would be a second
+  source of truth that nothing checks, and the guard would still pass.
+  **It has a deadline, which is why it is here rather than in a comment.** Repairing it
+  means re-deriving `Generation4Rows` under a material layout that excludes the version
+  byte, and that can only be done while generation 4 is still the one this build
+  implements. Once generation 5 ships, gen 4's rows are a DATED RECORD that no tree can
+  reproduce — the same reason generations 1 to 3 keep only an aggregate digest.
 
 - **[#878](https://github.com/LASTRADA-Software/fastcached/issues/878)** — the
   localized `/showIncludes` prefix is NAMED by an operator

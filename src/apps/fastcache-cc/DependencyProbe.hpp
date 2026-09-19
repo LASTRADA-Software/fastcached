@@ -53,11 +53,16 @@ struct ProbeText
 /// is hashed, so a normalization here would be a silent re-keying.
 ///
 /// Recognises a note exactly as ParseIncludePaths does, because both call
-/// `IncludeNotePath` — the *rule*, not merely the marker, is what the two have
-/// to share. It is anchored after leading blanks (`cl` indents by nesting depth)
-/// and nowhere else: a rule matching the marker mid-line would delete an ordinary
-/// source line that merely contains the text from the hashed bytes, so two
-/// revisions differing only in such a string literal would key identically.
+/// `IncludeNotePath`, which is `PathCanon::IncludeNoteMarkerEnd` — the *rule*, not
+/// merely the marker, is what every reader has to share. It is anchored at COLUMN
+/// ZERO and admits nothing in front of the marker, blanks included, because THIS
+/// stream is the one that also carries preprocessed SOURCE: anything in front makes
+/// an ordinary source line vanish from the hashed bytes, so two revisions differing
+/// only in that line key identically. Measured, with `cl`, for both the mid-line
+/// shape and the leading-blank shape this admitted until
+/// [#1270](https://github.com/LASTRADA-Software/fastcached/issues/1270) — the latter
+/// being any indented raw string literal whose continuation line begins with the
+/// marker.
 ///
 /// Pure: touches no filesystem.
 ///

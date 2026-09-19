@@ -335,15 +335,13 @@ std::optional<std::string_view> IncludeNotePath(std::string_view line) noexcept
     if (!line.empty() && line.back() == '\r')
         line.remove_suffix(1);
 
-    auto const start = line.find_first_not_of(" \t");
-    if (start == std::string_view::npos)
+    // Recognition is PathCanon's, shared with the grammar and the marker rewrite --
+    // not a fourth spelling of it. See `PathCanon::IncludeNoteMarkerEnd`.
+    auto const markerEnd = PathCanon::IncludeNoteMarkerEnd(line, IncludeNoteMarker);
+    if (markerEnd == std::string_view::npos)
         return std::nullopt;
 
-    auto path = line.substr(start);
-    if (!path.starts_with(IncludeNoteMarker))
-        return std::nullopt;
-
-    path.remove_prefix(IncludeNoteMarker.size());
+    auto path = line.substr(markerEnd);
     while (!path.empty() && (path.front() == ' ' || path.front() == '\t'))
         path.remove_prefix(1);
     while (!path.empty() && (path.back() == ' ' || path.back() == '\t'))
