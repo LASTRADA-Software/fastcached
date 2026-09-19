@@ -1706,6 +1706,48 @@ set_tests_properties("repository-hygiene" PROPERTIES
     TIMEOUT 60
 )
 
+# ---------------------------------------------------------------------------
+# No tracked text file carries a C0 control byte other than TAB or LF (#595).
+#
+# #593 was one BEL in one shell script, from a `printf '\a'` that should have been
+# `printf '\\a'`. What made it expensive is that nothing could have found it: it is
+# not whitespace, so no formatter normalises it; not a comment introducer, so no
+# comment stripper sees it; valid UTF-8, so the text gates pass it. The instance is
+# gone and the class had no guard at all.
+#
+# In the default set for the reason test-name-hygiene gives: it reads tracked files
+# and reports, needs no daemon, socket or compiler, and finishes in well under a
+# second over 1,463 files.
+add_test(
+    NAME "control-bytes"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-control-bytes.cmake"
+)
+set_tests_properties("control-bytes" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# Its self-test. The accepting direction is load-bearing here rather than decoration:
+# this repository carries no control byte, so the check reports clean on the real tree
+# and a check that had stopped reading files would look exactly the same. The cases
+# that expect acceptance therefore assert the file COUNT.
+add_test(
+    NAME "control-bytes-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/control-bytes-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-control-bytes-selftest.cmake"
+)
+set_tests_properties("control-bytes-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 300
+)
+
 # The four ways that check can fail to have an index, driven apart (#1565).
 #
 # Two of them printed different sentences and returned 0 from both, so ctest scored
