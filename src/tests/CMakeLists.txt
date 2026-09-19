@@ -1707,6 +1707,46 @@ set_tests_properties("repository-hygiene" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# `.tsan-suppressions` says what it is for, and nothing checked it (#1266).
+#
+# The file's header states two rules -- every entry names the open issue it tracks,
+# and removing an entry is part of fixing that issue -- and both were prose. The
+# DATA has been on the gate's stdout the whole time: `tsan-gate.sh` prints TSan's
+# `Matched N suppressions` header and the per-entry lines beneath it, and nothing
+# anywhere read either. A suppression matching NOTHING is a rule that has stopped
+# applying, and no total can show it: 5 matches, and 5 matches with a dead entry
+# beside them, are the same number.
+#
+# This registration checks the ENTRY rules and reports the reconciliation as NOT RUN
+# (`NO-DATA`), because no sanitizer log exists in an ordinary build. The gate itself
+# calls the same script with `--log` once every target is green. On master the file
+# holds no entries at all, so what this prints today is `NOTHING-TO-RECONCILE` --
+# named rather than dressed up as a pass, since that is the state most easily
+# mistaken for one.
+add_test(
+    NAME "tsan-suppressions"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tsan-suppressions.sh" "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("tsan-suppressions" PROPERTIES
+    LABELS "hygiene"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+
+# Its self-test, and staging input is not a convenience: the tree supplies NONE of
+# the four outcomes. `.tsan-suppressions` is empty, so a self-test run against the
+# repository would exercise one arm of four and pass.
+add_test(
+    NAME "tsan-suppressions-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tsan-suppressions.sh" --self-test "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("tsan-suppressions-selftest" PROPERTIES
+    LABELS "hygiene"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+
+# ---------------------------------------------------------------------------
 # No tracked text file carries a C0 control byte other than TAB or LF (#595).
 #
 # #593 was one BEL in one shell script, from a `printf '\a'` that should have been
