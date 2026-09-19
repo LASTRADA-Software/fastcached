@@ -1962,9 +1962,14 @@ set_tests_properties("corrupt-store-diagnostics-selftest" PROPERTIES
 #
 # Not labelled "smoke", for the reason the two above are not: it reads source
 # files and reports, so it belongs in the default `ctest` set and must survive
-# `ctest -LE smoke`. It finishes in milliseconds and, like net-boundary, has no
-# skip path -- the source tree is present in an exported tarball exactly as it is
-# in a checkout.
+# `ctest -LE smoke`. It has no skip path -- the source tree is present in an
+# exported tarball exactly as it is in a checkout.
+#
+# The timeout is 120 rather than 60 because #1261 widened its glob from
+# `src/*_test.cpp` to every C++ source under `src/`: it now READS about four times
+# as many files, and walks the newlines of only the ~318 that hold a candidate. The
+# walk is what costs, so the measured move is small (3.4 s to 4.2 s here), but the
+# read count tripled and these are the file counts a Windows checkout is slowest at.
 add_test(
     NAME "test-name-hygiene"
     COMMAND ${CMAKE_COMMAND}
@@ -1974,7 +1979,28 @@ add_test(
 set_tests_properties("test-name-hygiene" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
-    TIMEOUT 60
+    TIMEOUT 120
+)
+
+# The check above, driven against staged trees in both directions (#1261).
+#
+# It had no self-test, and three holes sat in it: a case whose name wrapped to the
+# next line left the reader entirely, a case in a file not named `*_test.cpp` was
+# never globbed, and two of Catch2's case-declaring macros were missing from a
+# pattern whose own comment claimed completeness. None of them lowers a number
+# anybody compares -- a case that is never seen cannot -- so all three reported
+# clean. The accepting cases here assert the case COUNT for that reason.
+add_test(
+    NAME "test-name-hygiene-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-name-hygiene-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-test-names-selftest.cmake"
+)
+set_tests_properties("test-name-hygiene-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 300
 )
 
 # ---------------------------------------------------------------------------

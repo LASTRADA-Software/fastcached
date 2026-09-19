@@ -32,19 +32,78 @@ cmake_minimum_required(VERSION 3.28)
 # Usage:
 #   cmake -DFASTCACHED_SOURCE_DIR=<dir> -P scripts/check-test-names.cmake
 #
-# Exit codes: 0 = every case name survives the round trip. 1 = at least one does
-# not.
+# Exit codes: 0 = every case name was READ and survives the round trip. 1 = one
+# does not, OR one could not be read at all -- a case whose name this file cannot
+# extract is a case it does not check, which is not a pass (#1261).
 
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
 
 # ---------------------------------------------------------------------------
-# Every Catch2 macro that names a case. All four, not just the one this tree
-# happens to use today: a guard that covers the spelling in front of it and not
-# the neighbouring one is a guard somebody walks around without meaning to, and a
-# `TEMPLATE_TEST_CASE` would reintroduce exactly the failure below.
-set(FastCachedCaseMacroPattern "^[ \t]*(TEST_CASE|TEST_CASE_METHOD|TEMPLATE_TEST_CASE|SCENARIO)[ \t]*\\(")
+# Every Catch2 macro that names a case -- a TABLE, and a refusal for the ones it
+# does not name.
+#
+# This was four spellings in an alternation, under a comment saying "all four, not
+# just the one this tree happens to use today". Catch2 declares SIXTEEN, so the
+# sentence was true about the list and false about Catch2:
+# `TEMPLATE_TEST_CASE_METHOD` and `SCENARIO_METHOD` were both absent, and neither
+# is exotic. The list being short is not what made that a defect -- a list is
+# exact about what it knows and SILENT about what it does not, and silence here
+# reads identically to complete coverage (#1261).
+#
+# So the pattern captures the IDENTIFIER and membership is asked of this table,
+# which buys two things an alternation cannot:
+#
+#   * no prefix ordering to get right. `(TEST_CASE|TEST_CASE_METHOD)` against
+#     `TEST_CASE_METHOD(` depends on the regex engine backtracking out of the
+#     first alternative, which is a property of CMake's engine rather than of this
+#     rule. Capturing the whole identifier asks no such question.
+#   * a macro NOT in this table whose name still carries `TEST_CASE` or
+#     `SCENARIO` is refused BY NAME rather than skipped, so the next Catch2
+#     spelling -- or the next local wrapper around one -- arrives as a refusal
+#     that says what to do instead of as a case nobody checks.
+#
+# The name is the first string LITERAL of the invocation for every row: where the
+# case name is not the first argument (`TEST_CASE_METHOD` takes a fixture type,
+# `METHOD_AS_TEST_CASE` a method, `REGISTER_TEST_CASE` a function) the arguments
+# ahead of it are never string literals, so there is nothing for the match to
+# reach by mistake.
+set(FastCachedCaseMacros
+    TEST_CASE
+    TEST_CASE_METHOD
+    TEMPLATE_TEST_CASE
+    TEMPLATE_TEST_CASE_SIG
+    TEMPLATE_TEST_CASE_METHOD
+    TEMPLATE_TEST_CASE_METHOD_SIG
+    TEMPLATE_PRODUCT_TEST_CASE
+    TEMPLATE_PRODUCT_TEST_CASE_SIG
+    TEMPLATE_PRODUCT_TEST_CASE_METHOD
+    TEMPLATE_PRODUCT_TEST_CASE_METHOD_SIG
+    TEMPLATE_LIST_TEST_CASE
+    TEMPLATE_LIST_TEST_CASE_METHOD
+    METHOD_AS_TEST_CASE
+    REGISTER_TEST_CASE
+    SCENARIO
+    SCENARIO_METHOD
+)
+
+# Any all-caps identifier opening a call. The row lookup decides what it is; this
+# only has to find the candidate.
+set(FastCachedMacroOpenPattern "^[ \t]*([A-Z][A-Z0-9_]*)[ \t]*\\(")
+
+# A candidate this table does not name, but which is in the family: refused rather
+# than skipped. Deliberately NOT anchored on the whole identifier -- a wrapper
+# named `FASTCACHE_TEST_CASE` is exactly as invisible to the rows above as
+# `TEMPLATE_TEST_CASE_METHOD` was.
+set(FastCachedCaseMacroFamilyPattern "(TEST_CASE|SCENARIO)")
+
+# How many lines past the one a macro OPENS on this will look for the case name.
+# A wrapped invocation puts it on the next line; the bound is loose because the
+# cost of a miss is a case excluded from every check in this file, and tight
+# because running off into the body would start reading string literals that are
+# not names. Exceeding it is a REFUSAL (see `unreadable` below), never a skip.
+set(FastCachedCaseNameLookahead 8)
 
 # ---------------------------------------------------------------------------
 # Duplicated case names, and the ONE pair that is allowed (#729).
@@ -78,16 +137,74 @@ set(FastCachedDuplicateNameExemptions
 )
 
 # ---------------------------------------------------------------------------
-# Which files hold Catch2 cases. The suffix the whole tree uses; a file this does
-# not scan is a hole that reports green.
-file(GLOB_RECURSE testSources "${FASTCACHED_SOURCE_DIR}/src/*_test.cpp")
+# Which files hold Catch2 cases. EVERY C++ source under `src/`, not the
+# `*_test.cpp` suffix the convention uses.
+#
+# The suffix is a claim about where cases live, and it was wrong about eight files
+# carrying seventeen cases: the five `src/apps/fastcache-bench/*Bench.cpp`, and
+# `src/tests/`'s `CatchSkipCanary.cpp`, `ErrorPopupCanary.cpp` and
+# `OffThreadAssertionCanary.cpp`. Some of those sit outside the convention on
+# purpose -- a canary is not a test of the tree -- but a case in one is registered
+# by `catch_discover_tests` exactly like any other, so it can collide with a name
+# elsewhere and it can begin with a dash. Being deliberately outside the naming
+# convention is not being outside the round trip (#1261).
+#
+# Headers too: nothing stops a case being declared in one, and "nothing stops it"
+# is the whole argument -- the file set is not a place to bet on how this tree is
+# arranged.
+#
+# The cost is paid back by the pre-filter below: the widened set reads about four
+# times as many files and walks the newlines of only the ones that hold a
+# candidate, so the run time is within noise of the narrow glob's.
+#
+# Through `fastcached_tracked_files`, which is this tree's one answer to HOW a check
+# finds its file set, and not a raw `file(GLOB_RECURSE)`. The difference only became
+# load-bearing when the set widened: `*_test.cpp` was a name a stray file is unlikely
+# to carry, while every `.cpp` and `.hpp` under `src/` catches an untracked WIP file,
+# a generated header or an editor's copy -- so a raw glob would enforce one rule on a
+# developer's machine and another in CI. It also carries the MODE, which the vacuity
+# refusal below names.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
+    PATHSPECS "src/*.cpp" "src/*.hpp"
+    GLOBS "src/*.cpp" "src/*.hpp"
+    FILTER "\\.(cpp|hpp)$"
+    FILES_OUT testSources MODE_OUT fileSetMode)
+
+# Take the next line of `sourceRest` into `line`, advancing `sourceRest` and `lineNo`.
+#
+# A `macro()` and not a `function()`, deliberately: it has to write three variables in
+# the caller's scope, and CMake's function scoping would need three `PARENT_SCOPE`
+# writes per call in the hottest loop this check has. It takes NO arguments, which is
+# what keeps it clear of the textual-substitution hazard AGENT.md warns about -- there
+# is nothing for CMake to re-parse.
+#
+# One copy because there were two: the walk below and the wrapped-name lookahead both
+# split on a newline, and the second was the first with `set(line ...)` replaced by an
+# append.
+macro(TakeLine)
+    math(EXPR lineNo "${lineNo} + 1")
+    string(FIND "${sourceRest}" "\n" sourceNewline)
+    if(sourceNewline EQUAL -1)
+        set(line "${sourceRest}")
+        set(sourceRest "")
+    else()
+        string(SUBSTRING "${sourceRest}" 0 ${sourceNewline} line)
+        math(EXPR sourceNewline "${sourceNewline} + 1")
+        string(SUBSTRING "${sourceRest}" ${sourceNewline} -1 sourceRest)
+    endif()
+endmacro()
 
 set(violations "")
+set(unknownMacros "")
+set(unreadable "")
+set(missingFiles "")
+set(readCount 0)
 set(scannedCount 0)
 set(caseCount 0)
 
 foreach(source IN LISTS testSources)
-    math(EXPR scannedCount "${scannedCount} + 1")
+    math(EXPR readCount "${readCount} + 1")
     # Read the bytes and walk the newlines. Never build a CMake list from file
     # content, and never neutralise anything in it.
     #
@@ -105,36 +222,108 @@ foreach(source IN LISTS testSources)
     #
     # Walking newlines preserves the text exactly and costs nothing measurable --
     # 1s across all 192 sources against 1s for `file(STRINGS)`, same 2992 lines.
-    file(READ "${source}" sourceRest)
+    # `fastcached_tracked_files` answers in paths RELATIVE to the source directory,
+    # which is what a reported site wants anyway.
+    set(relative "${source}")
+    # A path the INDEX names and the tree does not have. Its own outcome, for the
+    # reason `check-control-bytes.cmake` and `check-bash32-parse.sh` grew the same
+    # arm: this file set comes from `git ls-files`, so a stale index, an interrupted
+    # checkout or a dangling symlink lands here -- and without the guard `file(READ)`
+    # aborts with a raw `CMake Error` naming CMake rather than this check, which sends
+    # whoever meets it to the wrong place. Counted nowhere, so `readCount` stays a
+    # count of files actually read.
+    # Its OWN list, not `unreadable`, which means "a case whose NAME could not be
+    # read". A file that is not there and a case whose name is unreachable are fixed
+    # in different places, and folding them would be this batch's own subject landing
+    # on this batch's own work.
+    if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${source}")
+        list(APPEND missingFiles "  ${source}")
+        continue()
+    endif()
+    file(READ "${FASTCACHED_SOURCE_DIR}/${source}" sourceRest)
     string(REPLACE "\r\n" "\n" sourceRest "${sourceRest}")
-    file(RELATIVE_PATH relative "${FASTCACHED_SOURCE_DIR}" "${source}")
+    # The pre-filter that pays for the widened file set. A strict SUPERSET of what
+    # the walk below can find -- no line anchor, and it sees mentions in comments and
+    # strings too -- so it fails toward doing the walk. `scannedCount` is what it
+    # leaves: the files this check actually read line by line, reported beside
+    # `readCount` so a pre-filter that stopped matching is visible as a number rather
+    # than as a clean run.
+    #
+    # Two `string(FIND)` calls rather than one `MATCHES` over the family pattern, and
+    # the reason is measured rather than stylistic: an alternation has no literal to
+    # prescan, so CMake attempts a match at every offset across all 19 MB this reads,
+    # while `FIND` is `std::string::find`. Ten paired runs: 5391 ms to 5093 ms, the
+    # FIND variant winning 9 of 10, same `5121 case(s) across 318 of 1004` summary.
+    # The predicate is identical because the pattern holds no metacharacter -- which
+    # is why the family pattern itself stays, for the per-line test further down where
+    # it is a real regex.
+    string(FIND "${sourceRest}" "TEST_CASE" familyAt)
+    if(familyAt EQUAL -1)
+        string(FIND "${sourceRest}" "SCENARIO" familyAt)
+    endif()
+    if(familyAt EQUAL -1)
+        continue()
+    endif()
+    math(EXPR scannedCount "${scannedCount} + 1")
     # Counted for every line, including the ones skipped below, so a reported
     # site is the line an editor jumps to rather than an index into the matches.
     set(lineNo 0)
     while(NOT sourceRest STREQUAL "")
-        math(EXPR lineNo "${lineNo} + 1")
-        string(FIND "${sourceRest}" "\n" sourceNewline)
-        if(sourceNewline EQUAL -1)
-            set(line "${sourceRest}")
-            set(sourceRest "")
-        else()
-            string(SUBSTRING "${sourceRest}" 0 ${sourceNewline} line)
-            math(EXPR sourceNewline "${sourceNewline} + 1")
-            string(SUBSTRING "${sourceRest}" ${sourceNewline} -1 sourceRest)
-        endif()
-    
+        TakeLine()
+
         # What the REGEX argument used to do, now that the reader cannot.
-        if(NOT line MATCHES "${FastCachedCaseMacroPattern}")
+        if(NOT line MATCHES "${FastCachedMacroOpenPattern}")
             continue()
         endif()
-        # The case name is the first string literal on the line. Taken that way
-        # rather than as "the first argument", which is what lets one expression
-        # cover TEST_CASE_METHOD too -- its name is the SECOND argument, and a
-        # fixture type is never a string literal, so there is nothing ahead of it
-        # to match by mistake.
-        if(NOT line MATCHES "\"([^\"]*)\"")
+        set(macroName "${CMAKE_MATCH_1}")
+        if(NOT macroName IN_LIST FastCachedCaseMacros)
+            # In the family and not in the table: a case-declaring macro this
+            # check has never heard of. Collected and refused below rather than
+            # skipped here, because a skip is indistinguishable from a file with
+            # no cases in it.
+            if(macroName MATCHES "${FastCachedCaseMacroFamilyPattern}")
+                list(APPEND unknownMacros "  ${relative}:${lineNo}: ${macroName}")
+            endif()
             continue()
         endif()
+
+        # The case name is the first string literal of the INVOCATION, which is
+        # not always on the line the macro opens.
+        #
+        # It used to be the first literal on that LINE, and a line carrying none
+        # `continue()`d -- so a `TEST_CASE(` whose name wraps to the next line was
+        # not a violation, not a duplicate, not counted, and not reported: it left
+        # the check entirely, in silence. One such case was live
+        # (`src/apps/fastcache-cli/LiveEventSource_test.cpp`, whose name is long
+        # enough that the formatter wraps it), and nothing in the summary could
+        # have said so -- a case that is never seen cannot lower a count anybody
+        # is comparing against (#1261).
+        #
+        # So the lines are accumulated until a COMPLETE literal is in hand. The
+        # reported site stays the line the macro OPENS on, which is where an
+        # editor should jump and what a reader would call the case's line.
+        set(macroLineNo "${lineNo}")
+        set(invocation "${line}")
+        # The bound as a line NUMBER rather than a second counter: `lookahead` and
+        # `lineNo` were incremented on adjacent lines and could never diverge.
+        math(EXPR lookaheadLimit "${lineNo} + ${FastCachedCaseNameLookahead}")
+        while(NOT invocation MATCHES "\"([^\"]*)\""
+              AND NOT sourceRest STREQUAL ""
+              AND lineNo LESS lookaheadLimit)
+            TakeLine()
+            string(APPEND invocation "\n${line}")
+        endwhile()
+        if(NOT invocation MATCHES "\"([^\"]*)\"")
+            # A case whose name this check cannot read is a case excluded from
+            # every check in this file. That is the defect above, so it is a
+            # refusal rather than the `continue()` it replaced.
+            list(APPEND unreadable "  ${relative}:${macroLineNo}: ${macroName}")
+            continue()
+        endif()
+        # NOT written back to `lineNo`: the lines consumed above are gone from
+        # `sourceRest`, so the counter has to stay where the walk is or every site
+        # reported after this one is short by the lookahead. `macroLineNo` is what
+        # a site is reported as; `lineNo` is where the file is.
         set(caseName "${CMAKE_MATCH_1}")
         math(EXPR caseCount "${caseCount} + 1")
         if(caseName MATCHES "^-")
@@ -149,11 +338,11 @@ foreach(source IN LISTS testSources)
         # one shape this file's reader comment says is safe to build.
         string(MD5 nameKey "${caseName}")
         if(DEFINED caseSites_${nameKey})
-            set(caseSites_${nameKey} "${caseSites_${nameKey}}\n      ${relative}:${lineNo}")
+            set(caseSites_${nameKey} "${caseSites_${nameKey}}\n      ${relative}:${macroLineNo}")
             math(EXPR caseSeen_${nameKey} "${caseSeen_${nameKey}} + 1")
         else()
             set(caseName_${nameKey} "${caseName}")
-            set(caseSites_${nameKey} "      ${relative}:${lineNo}")
+            set(caseSites_${nameKey} "      ${relative}:${macroLineNo}")
             set(caseSeen_${nameKey} 1)
             list(APPEND seenKeys "${nameKey}")
         endif()
@@ -166,13 +355,67 @@ endforeach()
 # Every check here reports by ACCUMULATING violations, so a scan that matched no
 # file and a tree with no defect produce byte-identical output: two empty lists
 # agree perfectly. Refused before any verdict is drawn from them.
-if(scannedCount EQUAL 0 OR caseCount EQUAL 0)
+if(readCount EQUAL 0 OR scannedCount EQUAL 0 OR caseCount EQUAL 0)
     message(FATAL_ERROR
-        "test-name hygiene scanned ${scannedCount} file(s) and found ${caseCount} case(s), "
-        "so it is reporting on nothing. Either the glob "
-        "(${FASTCACHED_SOURCE_DIR}/src/*_test.cpp) matches no file, or the macro "
-        "pattern no longer matches how this tree declares a case. Both make every "
+        "test-name hygiene read ${readCount} file(s) under ${FASTCACHED_SOURCE_DIR}/src "
+        "(file set from ${fileSetMode}), walked ${scannedCount} of them, and found "
+        "${caseCount} case(s), so it is reporting on nothing. Three independent ways to "
+        "get here and the numbers say which: the file set named no `.cpp` or `.hpp` "
+        "under src/; the pre-filter matched none of the files it did name; or the macro "
+        "table no longer names how this tree declares a case. All three make every "
         "check in this file pass vacuously.")
+endif()
+
+# ---------------------------------------------------------------------------
+# A case-declaring macro this check does not know, and a case whose name it could
+# not read. Two states, refused apart, and neither of them is "no defect found".
+#
+# Both are new refusals for what used to be a `continue()`, which is the whole of
+# #1261: a case the reader stepped over was not a case it had cleared.
+if(NOT unknownMacros STREQUAL "")
+    list(JOIN unknownMacros "\n" report)
+    message(FATAL_ERROR
+        "macro(s) naming a Catch2 case that FastCachedCaseMacros does not list:\n${report}\n\n"
+        "The identifier carries TEST_CASE or SCENARIO, so it declares cases that "
+        "`catch_discover_tests` will register -- and this check has no row for it, so "
+        "every one of those cases would go unchecked: not dash-checked, not counted, "
+        "and invisible to duplicate detection.\n"
+        "If it declares cases, add it to FastCachedCaseMacros in "
+        "${CMAKE_CURRENT_LIST_FILE}; the case name has to be the first string literal "
+        "of the invocation, as it is for every row there.\n"
+        "If it does NOT declare cases, rename it so it does not read as one -- this "
+        "check cannot tell the two apart from the call, and guessing in the other "
+        "direction is how a case stops being checked.")
+endif()
+
+if(NOT missingFiles STREQUAL "")
+    list(JOIN missingFiles "
+" report)
+    message(FATAL_ERROR
+        "file(s) the ${fileSetMode} file set names and this tree does not have:
+${report}
+
+"
+        "They were NOT read, so nothing here is a verdict about the cases in them. This "
+        "is not a finding about any case name -- do not go looking for one.
+"
+        "A stale index, an interrupted checkout, or a dangling symlink produces it. "
+        "`git status` will say which; a `git checkout -- <path>` or a re-clone fixes it.")
+endif()
+
+if(NOT unreadable STREQUAL "")
+    list(JOIN unreadable "\n" report)
+    message(FATAL_ERROR
+        "Catch2 case(s) whose name this check could not read:\n${report}\n\n"
+        "The macro opens and no complete string literal follows within "
+        "${FastCachedCaseNameLookahead} line(s), so there is no name to round-trip. A "
+        "case this check cannot read is a case it does not check at all -- which is "
+        "not a pass, and used to be silent.\n"
+        "If the name is genuinely further down, raise FastCachedCaseNameLookahead in "
+        "${CMAKE_CURRENT_LIST_FILE}. If the name is not a plain string literal (a "
+        "macro, a concatenation), make it one: `catch_discover_tests` has to pass the "
+        "expanded name back to the runner as an argument, so a name this file cannot "
+        "read is one nothing else can check either.")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -267,5 +510,7 @@ if(NOT violations STREQUAL "")
         "The rule lives in ${CMAKE_CURRENT_LIST_FILE}.")
 endif()
 
-message("test-name hygiene: ${caseCount} case(s) across ${scannedCount} file(s) survive the CTest round trip, "
-        "all names distinct (${exemptionCount} stated exemption(s))")
+list(LENGTH FastCachedCaseMacros caseMacroCount)
+message("test-name hygiene: ${caseCount} case(s) across ${scannedCount} of ${readCount} file(s) "
+        "survive the CTest round trip (file set from ${fileSetMode}), all names distinct "
+        "(${caseMacroCount} case macro(s) known, ${exemptionCount} stated exemption(s))")
