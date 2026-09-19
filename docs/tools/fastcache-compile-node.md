@@ -1823,37 +1823,62 @@ agreed it does not exist.
 
 **`--cluster-forget` is the one membership change nothing automatic makes.**
 Discovery only ever adds, for the reason below, so removing a machine that has left
-for good is a decision somebody makes on purpose. It takes the member out of the
-quorum as well as out of the fleet — but only a member that was **admitted at
-runtime**, which is what tells "the operator forgot it" apart from "nobody ever
-wrote it down". A member a machine names in its own `--raft-peer` list is a member
-by that operator's assertion: forgetting it removes the record every surface reads,
-and the quorum goes on counting it. Taking a *typed* member out of the quorum means
-dropping it from `--raft-peer` on the machines that name it and restarting them —
-a leader never proposes removing a member its own bootstrap list asserts. **The one
-exception is the leader itself**, below: every node names itself in its own list
-because it cannot start otherwise, so that entry asserts nothing.
+for good is a decision somebody makes on purpose.
+
+**It forgets a machine, not only a record**
+([#1555](https://github.com/LASTRADA-Software/fastcached/issues/1555)). The id leaves
+whichever list the cluster records it in — a member, or a worker `--enroll-from`
+admitted as a principal — and the identity key it was admitted under is **revoked** in
+the same committed entry.
+A revoked key is never admitted again, by any route. On the consensus wire it keeps
+its sessions only until the configuration stops counting it — a reconcile pass, since
+losing another voter before then must not leave a quorum nobody can reach — and then
+every connection it proved ends at its next frame and every redial is refused, even by
+a node whose `--raft-peer` still types `@<key>` for it. Discovery reports its beacon as revoked.
+Enrollment refuses it at the door (`fastcache_enrollment_requests_refused_revoked_key_total`),
+and an approval or a `--cluster-admit` naming it is refused by name. No verb revokes a
+key without forgetting its machine, or forgets one without revoking: the first would
+leave a member the quorum goes on counting, whose revocation therefore never reaches the
+consensus wire, and the second a machine every node typing its key goes on accepting.
+
+It takes the member out of the quorum as well as out of the fleet, **whoever typed
+it**. A member a machine names in its own `--raft-peer` list is a member by that
+operator's assertion, and a leader never removes one for being *absent* from the
+record — on a typed cluster every peer is absent from birth. A forget is not absence:
+a member still counted keeps its revoked key for itself, so one kept would go on voting,
+and whoever leads takes it out. Drop it from `--raft-peer` on the machines that name it
+when convenient; from then on that line names a key nobody accepts.
+
+**Bringing a forgotten machine back takes a new identity.** Move its `--cluster-dir`
+aside so its next start mints a new key, and admit it under that — `--enroll-from`, or
+`--cluster-admit=n3=10.0.0.3:6680@<new key>`, which also lifts the host tombstone
+below. Its old key stays revoked for good.
 
 **It sticks while the machine is still running**
 ([#1528](https://github.com/LASTRADA-Software/fastcached/issues/1528)). A forgotten
-machine keeps the cluster key, so discovery goes on proving it and the leader goes on
-seeing it — and the forget tombstones its host, which the leader will not record a
-member at again. It says so once:
+machine keeps running and keeps announcing itself, and the forget also tombstones its
+host, which the leader will not record a member at again. The tombstone names a
+**host**, so another node at that address is not recorded either. It says so once:
 
 ```
-cluster: not recording n3 at 10.0.0.3:6680: the cluster forgot host 10.0.0.3, and only --cluster-admit undoes a forget
+cluster: not recording n7 at 10.0.0.3:6680: the cluster forgot host 10.0.0.3, and only --cluster-admit undoes a forget
 ```
 
-Bringing it back is `--cluster-admit=n3=10.0.0.3:6680`, which lifts the tombstone.
-Two limits follow from the tombstone naming a **host**: another node at that address is
-not recorded either, and members that share one machine over loopback — a test rig —
-leave no tombstone at all, so a member forgotten there comes back at its next proof.
+Members that share one machine over loopback — a test rig — leave no tombstone, and
+there the revoked key does the refusing, naming the id:
+
+```
+cluster: not recording n3 at 127.0.0.1:6682: the cluster forgot n3 and revoked its key, and only --cluster-admit undoes a forget
+```
+
 **Forgetting the leader removes it too**
 ([#1539](https://github.com/LASTRADA-Software/fastcached/issues/1539)). A forget means
 the same thing whoever currently leads, so the forgotten leader stops recording itself
 and proposes its own removal — last, after any other change it still has to make — and
-steps down once that commits. The other voters elect a leader, and it never admits the
-forgotten machine again. It says so:
+steps down once that commits; its revoked key stays live for it until then. The other
+voters elect a leader, and it never admits the forgotten machine again. Should the
+forgotten leader be lost before its removal commits, whoever leads next removes it. It
+says so:
 
 ```
 cluster: the cluster forgot this node (n1), so it proposes its own removal and steps down once that commits
@@ -2983,6 +3008,7 @@ byte-budget refusal that fires in practice is a cache `STORE`.
 | `fastcache_enrollment_requests_refused_closed_total` | An `ENROLL` arrived while the window was shut. **This is the only series that sees a stranger asking**, and it is the one refusal here that is reachable pre-auth, so it doubles as the probe counter for that verb. A slow trickle is a joiner that was started before anybody opened the window and is polling; a burst from addresses nobody recognises is a scan, and the peer host is in the node's log beside it. | `ENROLL` |
 | `fastcache_enrollment_requests_refused_full_total` | The pending list already held every entry it will. Separate from the row above because the operator actions are opposite: *closed* means open the window, *full* means go and decide about the machines already in it. A fleet expansion larger than the list is the honest cause; anything else is a list nobody is draining. | `ENROLL` |
 | `fastcache_enrollment_requests_refused_malformed_total` | An `ENROLL` payload that would not decode, or one naming no id or no address. Flat at zero against this project's own client, so a rise is another implementation or a probe shaped like one. | `ENROLL` |
+| `fastcache_enrollment_requests_refused_revoked_key_total` | An `ENROLL` asked under a key the cluster has revoked: a machine an operator forgot with `--cluster-forget`, asking to come back as itself. Refused at the door rather than listed, because no approval could admit a revoked key, and the refusal tells the machine to mint a new identity. Expected once after forgetting a machine that is still running; a steady rate is a removed machine nobody stopped. | `ENROLL` |
 | `fastcache_enrollment_control_refused_not_a_member_total` | An `ENROLL-CONTROL` from a host this node does not admit. The decision half of the family is the one that admits a key to the cluster, so it is gated twice — membership here, and `AUTH` in the row below — and this counter is the outer gate reporting. | `ENROLL-CONTROL` |
 | `fastcache_enrollment_control_refused_unauthenticated_total` | An `ENROLL-CONTROL` from an admitted host that never presented a credential. Counted apart from the row above — and answered `unauthenticated` where that one answers `not-a-member` — because those are different machines with opposite remedies: one is a host to add to the membership policy, the other a host that is already trusted and whose operator tool is missing its token. A single "refused" tally would make the two indistinguishable at exactly the moment somebody is trying to work out why an approval will not go through. | `ENROLL-CONTROL` |
 
@@ -3694,8 +3720,9 @@ the node id a proof carries is a label the MAC covers — it cannot be swapped b
 rather than an identity. Two consequences worth knowing before you rely on it:
 
 - **Removing one machine still means rotating the key on all the others.** A proof cannot
-  be revoked, and `--cluster-forget` removes an address from the committed set, not a key
-  from a machine. Per-node identity is
+  be revoked: `--cluster-forget` revokes the machine's IDENTITY key, which ends its Raft
+  peer sessions, but this proof is made with the shared cluster key, which a forgotten
+  machine still holds. Moving this proof onto the identity key is the rest of
   [#178](https://github.com/LASTRADA-Software/fastcached/issues/178).
 - **A node that runs no consensus has no id to name**, because an identity is minted into
   `--cluster-dir` only where consensus runs. Such a node proves with an empty label, which

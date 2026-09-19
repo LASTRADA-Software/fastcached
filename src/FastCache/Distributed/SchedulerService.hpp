@@ -603,13 +603,16 @@ class SchedulerService
     /// @return `Ok` once the entry is appended, or a refusal.
     [[nodiscard]] SchedulerReply ClusterSet(CallerContext const& caller, std::string_view name, std::string_view value);
 
-    /// Remove a member from the cluster.
+    /// Forget a machine: remove the id wherever the cluster records it, as a member or as
+    /// an enrolled principal, and revoke the key it was admitted under (#1555).
     ///
     /// The one membership change nothing automatic makes: discovery only ever
     /// adds, because a peer vanishes from a broadcast far more often than it
     /// leaves. Removing is an operator's decision and this is where they make it.
+    /// One verb for both lists and for the key, because they are one intention --
+    /// see `Cluster::CommandKind::Forget`.
     /// @param caller Who is asking.
-    /// @param memberId Who to remove.
+    /// @param memberId Who to forget: a member's id or a principal's.
     /// @return `Ok` once the entry is appended, or a refusal.
     [[nodiscard]] SchedulerReply ClusterForget(CallerContext const& caller, std::string_view memberId);
 

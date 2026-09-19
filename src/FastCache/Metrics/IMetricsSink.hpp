@@ -1229,6 +1229,17 @@ class IMetricsSink
         /// software, and the peer had presented nothing when it sent it.
         EnrollmentRequestsRefusedMalformed,
 
+        /// ENROLL requests refused because the key they asked under is one the cluster has
+        /// REVOKED (#1555) -- a machine an operator forgot, asking to come back as itself.
+        ///
+        /// Refused at the door rather than recorded, because no approval could admit it: the
+        /// cluster refuses a revoked key by name, so a row for it is one the operator reading
+        /// the list cannot act on, and `Pending` would keep the machine polling for an answer
+        /// that cannot come. Expected once after a forget of a machine that is still running;
+        /// a steady rate is a removed machine nobody stopped, which is worth the same attention
+        /// as `fastcache_raft_peer_connections_refused_revoked_key_total` on the peer wire.
+        EnrollmentRequestsRefusedRevokedKey,
+
         /// ENROLL-CONTROL requests refused because the caller is not a fleet member.
         ///
         /// **Somebody trying to approve themselves.** The window admits strangers by

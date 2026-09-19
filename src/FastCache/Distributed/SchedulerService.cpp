@@ -596,7 +596,7 @@ SchedulerReply SchedulerService::ClusterForget(CallerContext const& caller, std:
     if (_admin == nullptr)
         return Refuse(Wire::ErrorCode::NoCluster);
 
-    return Offer(Cluster::Command { .kind = Cluster::CommandKind::RemoveMember,
+    return Offer(Cluster::Command { .kind = Cluster::CommandKind::Forget,
                                     .key = std::string { memberId },
                                     .value = {},
                                     .schedulerEndpoint = {},
@@ -730,7 +730,7 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
     // one ADDRESS on two machines disagreeing, and `AddMember` is the only command
     // that carries an address at all. `SetSetting` refuses an unknown key BY NAME
     // already, and its value is read back by CLUSTER-STATUS, a verb that exists for
-    // exactly that; `RemoveMember` names a member the cluster is already holding, so
+    // exactly that; `Forget` names a member the cluster is already holding, so
     // it has no second machine to disagree with.
     //
     // The third reason is about the verb after these three rather than about them: a

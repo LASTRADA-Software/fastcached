@@ -850,7 +850,7 @@ TEST_CASE("A frame whose tag does not verify ends the connection and is counted"
 TEST_CASE("A key revoked while its connection is open ends the connection at the next frame, counted",
           "[consensus][raft][peerserver][handshake][revocation]")
 {
-    // #178: an applied `RevokeKey` closes the sessions that key proved. The roster moves between
+    // #178: an applied forget closes the sessions the forgotten member's key proved. The roster moves between
     // the first frame and the second -- the sink revokes on delivery -- and the second, sealed
     // correctly in a session that was valid when it began, is refused rather than delivered.
     auto const roster = Roster();

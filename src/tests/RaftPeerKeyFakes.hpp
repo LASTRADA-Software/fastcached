@@ -73,7 +73,8 @@ class SharedRoster
     }
 
     /// Revoke @p id's live key: it is no longer the id's, and it is remembered as revoked --
-    /// `ClusterState`'s `RevokeKey`, in the one shape a verifier reads.
+    /// what an applied `Cluster::CommandKind::Forget` does to the key its record held, in the
+    /// one shape a verifier reads.
     /// @param id The member.
     void Revoke(Consensus::NodeId const& id)
     {

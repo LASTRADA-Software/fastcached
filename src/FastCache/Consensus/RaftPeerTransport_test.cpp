@@ -1257,7 +1257,7 @@ TEST_CASE("A signed verdict that this node's key was revoked is counted by name,
 TEST_CASE("A key revoked while its session is open ends the session before the next frame, counted",
           "[consensus][raft][transport][handshake][revocation]")
 {
-    // #178: an applied `RevokeKey` closes the sessions that key proved. The roster is asked
+    // #178: an applied forget closes the sessions the forgotten member's key proved. The roster is asked
     // before each frame is sealed, so the frame after the revocation is never written, and
     // the redial is judged against the roster as it is then.
     constexpr auto Backoff = 10ms;

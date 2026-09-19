@@ -104,9 +104,9 @@ namespace
     /// the layout is unchanged, and a build that lacks the verb refuses its byte by name
     /// as `UnknownMessageType` rather than as another encoding.
     ///
-    /// 3 added the key and the role every command carries (#178), for `AdmitPrincipal`,
-    /// `RevokeKey` and a member's key on `AddMember` -- two fields the layout had no room
-    /// for, which is the one case above that moves this.
+    /// 3 added the key and the role every command carries (#178), for `AdmitPrincipal` and a
+    /// member's key on `AddMember` -- two fields the layout had no room for, which is the one
+    /// case above that moves this.
     constexpr std::uint8_t CommandVersion = 3;
 
     /// Fields in an encoded command: the header, then key, value, scheduler endpoint,
@@ -688,7 +688,7 @@ void Apply(ClusterState& state, Command const& command)
                                                                 : SchedulerEndpointHistory::NeverAnnounced,
                                 .seat = SeatAdmittedBy(command.kind).value_or(MemberSeat::Voter),
                                 // No opinion keeps what is recorded: a machine that moves
-                                // keeps its identity, and only `RevokeKey` takes one away.
+                                // keeps its identity, and only `Forget` takes one away.
                                 .publicKey = command.publicKey.or_else(
                                     [&] { return it != state.members.end() ? it->publicKey : std::nullopt; }) };
             // Admitting a member at a host re-admits that host: a forget it carries is
@@ -707,20 +707,49 @@ void Apply(ClusterState& state, Command const& command)
             SortByKey(state.members, &ClusterMember::id);
             return;
         }
-        case CommandKind::RemoveMember: {
-            auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id);
-            if (it == state.members.end())
-                return;
-            // A forget is a positive act, so it leaves a TOMBSTONE for the member's host
-            // (#1309): a node whose own `--fleet-member` list still names that machine is
-            // then refused it, rather than serving a decommissioned member until every
-            // list is edited. Derived HERE, from the record being removed, so the command
-            // carries nothing new. Never for loopback, which is always this machine's own
-            // and a tombstone could never narrow.
-            auto host = std::string { HostOfEndpoint(it->raftEndpoint) };
-            state.members.erase(it);
-            if (!IsLoopbackHost(host))
-                InsertHost(state.forgotten, host);
+        case CommandKind::Forget: {
+            // Whatever record carries the id -- a member or a principal, never both, which
+            // `BrokenRosterRule` holds a decoded state to -- goes, and the key it held is
+            // revoked with it (#1555). Derived HERE, from the record being removed, so a key
+            // replaced between the proposal and the commit is the one revoked.
+            auto revoked = std::vector<Ed25519PublicKey> {};
+            if (auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id); it != state.members.end())
+            {
+                // A forget is a positive act, so it leaves a TOMBSTONE for the member's host
+                // (#1309): a node whose own `--fleet-member` list still names that machine is
+                // then refused it, rather than serving a decommissioned member until every
+                // list is edited. Never for loopback, which is always this machine's own and a
+                // tombstone could never narrow -- the key is what reaches a member there.
+                auto host = std::string { HostOfEndpoint(it->raftEndpoint) };
+                if (it->publicKey.has_value())
+                    revoked.push_back(*it->publicKey);
+                state.members.erase(it);
+                if (!IsLoopbackHost(host))
+                    InsertHost(state.forgotten, host);
+            }
+            else if (auto const principal = std::ranges::find(state.principals, command.key, &ClusterPrincipal::id);
+                     principal != state.principals.end())
+            {
+                revoked.push_back(principal->publicKey);
+                state.principals.erase(principal);
+            }
+
+            // And the key the proposing leader held live for the id (`PrepareForget`), which
+            // reaches a member the state records without one or not at all -- one a
+            // `--raft-peer` line typed with its key. Never a key another id now holds: that
+            // one was admitted since, and revoking it would forget a machine nobody named.
+            if (command.publicKey.has_value() && !state.HolderOf(*command.publicKey).has_value())
+                revoked.push_back(*command.publicKey);
+
+            // **Never dropped once there is a key to revoke**: every admitting verb is dropped
+            // at commit when its preconditions have stopped holding, and a revocation that
+            // could be lost is removal failing OPEN. A key already revoked is not recorded
+            // twice.
+            for (auto const& key: revoked)
+                if (!state.IsRevoked(key))
+                    state.revokedKeys.push_back(RevokedKey { .id = command.key, .publicKey = key });
+            std::ranges::sort(
+                state.revokedKeys, {}, [](RevokedKey const& entry) { return std::tie(entry.id, entry.publicKey); });
             return;
         }
 
@@ -740,8 +769,8 @@ void Apply(ClusterState& state, Command const& command)
 
         case CommandKind::AdmitPrincipal: {
             // Dropped rather than applied when any of `ValidateAgainst`'s rules has stopped
-            // holding since it was judged -- above all a revocation committed first, which
-            // this must never undo.
+            // holding since it was judged -- above all a forget committed first, whose
+            // revocation this must never undo.
             if (!command.publicKey.has_value() || !command.role.has_value() || IsMember(state, command.key)
                 || StandingOf(state, command.key, *command.publicKey) != KeyStanding::Available)
                 return;
@@ -756,28 +785,6 @@ void Apply(ClusterState& state, Command const& command)
             }
             state.principals.push_back(admitted);
             SortByKey(state.principals, &ClusterPrincipal::id);
-            return;
-        }
-
-        case CommandKind::RevokeKey: {
-            if (!command.publicKey.has_value())
-                return;
-            auto const& key = *command.publicKey;
-
-            // Taken from whatever holds it, whoever the command named: the label is a label,
-            // and a revocation dropped because it named the wrong holder would be a key left
-            // live that an operator was told is gone.
-            std::erase_if(state.principals,
-                          [&key](ClusterPrincipal const& principal) { return principal.publicKey == key; });
-            for (auto& member: state.members)
-                if (member.publicKey == key)
-                    member.publicKey.reset();
-
-            if (state.IsRevoked(key))
-                return;
-            state.revokedKeys.push_back(RevokedKey { .id = command.key, .publicKey = key });
-            std::ranges::sort(
-                state.revokedKeys, {}, [](RevokedKey const& revoked) { return std::tie(revoked.id, revoked.publicKey); });
             return;
         }
 
@@ -895,12 +902,12 @@ namespace
     ///
     /// **Private: never transmitted or persisted.** Three answers, because the two fields
     /// are three different facts across the verbs: a member's key is an opinion a proposal
-    /// may not have, a principal's and a revocation's is what the verb acts on, and every
-    /// other verb has no use for one -- where it is a field somebody misunderstood.
+    /// may not have, a principal's is what the verb acts on, and every other verb has no use
+    /// for one -- where it is a field somebody misunderstood.
     enum class FieldUse : std::uint8_t
     {
         Refused,  ///< The verb has no use for it; carrying one is refused.
-        Optional, ///< The verb reads it when present and keeps what is recorded when not.
+        Optional, ///< The verb reads it when present and does without it when not.
         Required, ///< The verb acts on it; one without it is refused.
     };
 
@@ -916,19 +923,19 @@ namespace
 
     /// One row per `CommandKind`, in enumerator order.
     ///
-    /// `RemoveMember`'s text row is empty **by name** rather than by an omission somebody
-    /// might tidy up, and so is `RevokeKey`'s, for the same reason: `Validate` states why,
-    /// and what belongs here is that an empty row is a decision and looks like one.
+    /// `Forget`'s text row is empty **by name** rather than by an omission somebody
+    /// might tidy up: `Validate` states why, and what belongs here is that an empty row is
+    /// a decision and looks like one.
     constexpr EnumTable<CommandKind, CommandShapeRow> CommandShapes { {
         { .kind = CommandKind::AddMember,
           .noun = "a member admission",
           .fields = AddMemberText,
           .publicKey = FieldUse::Optional,
           .role = FieldUse::Refused },
-        { .kind = CommandKind::RemoveMember,
-          .noun = "a removal",
+        { .kind = CommandKind::Forget,
+          .noun = "a forget",
           .fields = {},
-          .publicKey = FieldUse::Refused,
+          .publicKey = FieldUse::Optional,
           .role = FieldUse::Refused },
         { .kind = CommandKind::SetSetting,
           .noun = "a setting",
@@ -955,11 +962,6 @@ namespace
           .fields = PrincipalText,
           .publicKey = FieldUse::Required,
           .role = FieldUse::Required },
-        { .kind = CommandKind::RevokeKey,
-          .noun = "a revocation",
-          .fields = {},
-          .publicKey = FieldUse::Required,
-          .role = FieldUse::Refused },
     } };
 
     static_assert(RowsInEnumeratorOrder(CommandShapes, &CommandShapeRow::kind),
@@ -998,7 +1000,7 @@ std::expected<void, ConsensusError> Validate(Command const& command)
         return std::unexpected(InvalidConfiguration("a cluster command names nothing"));
 
     // Before the per-verb rules rather than inside them, because the answer is
-    // already per-verb: the table is indexed by the verb, and `RemoveMember`'s row is
+    // already per-verb: the table is indexed by the verb, and `Forget`'s row is
     // deliberately empty.
     auto const& shape = CommandShapes[verb];
     if (auto const field = FirstFieldNotText(command, shape.fields); field.has_value())
@@ -1024,9 +1026,9 @@ std::expected<void, ConsensusError> Validate(Command const& command)
                 return std::unexpected(InvalidConfiguration("a member must be admitted with an endpoint"));
             return {};
 
-        case CommandKind::RemoveMember:
+        case CommandKind::Forget:
             if (!command.schedulerEndpoint.empty())
-                return std::unexpected(InvalidConfiguration("a removal carries no scheduler endpoint"));
+                return std::unexpected(InvalidConfiguration("a forget carries no scheduler endpoint"));
             return {};
 
         case CommandKind::SetSetting:
@@ -1091,7 +1093,6 @@ std::expected<void, ConsensusError> Validate(Command const& command)
         // because consensus never dials it, and no scheduler endpoint, because it never
         // leads. Either one carried is a request for a member, sent through the wrong verb.
         case CommandKind::AdmitPrincipal:
-        case CommandKind::RevokeKey:
             if (!command.value.empty() || !command.schedulerEndpoint.empty())
                 return std::unexpected(
                     InvalidConfiguration(std::format("{} carries an id and a key and nothing else", shape.noun)));
@@ -1157,26 +1158,19 @@ std::expected<void, ConsensusError> ValidateAgainst(ClusterState const& state, C
                     std::format("{} is a member of this cluster; a principal is a machine that is not", command.key)));
             return refuseKey();
 
-        case CommandKind::RevokeKey: {
-            // The label must name the holder when there is one, or the record would say this
-            // key was somebody's it never was. Revoking a key nobody holds is allowed: that is
-            // refusing a machine BEFORE it is admitted, and the label is then the operator's.
-            // `Validate` has already required the key; asked again so the reading below is
-            // guarded where it is read.
-            if (!command.publicKey.has_value())
-                return {};
-            auto const& key = *command.publicKey;
-            auto const holder = state.HolderOf(key);
-            if (holder.has_value() && *holder != command.key)
-                return std::unexpected(
-                    InvalidConfiguration(std::format("{} is {}'s key, not {}'s; a revocation names whose key it is",
-                                                     FormatEd25519PublicKey(key),
-                                                     *holder,
-                                                     command.key)));
+        case CommandKind::Forget:
+            // The key the proposer holds live for the id must not be ANOTHER id's, or the
+            // forget would revoke a machine nobody named. Held by this id, or by nobody -- a
+            // member a `--raft-peer` line typed, recorded nowhere -- is the key it means.
+            if (command.publicKey.has_value())
+                if (auto const holder = state.HolderOf(*command.publicKey); holder.has_value() && *holder != command.key)
+                    return std::unexpected(InvalidConfiguration(
+                        std::format("{} is {}'s key, not {}'s; a forget revokes only the key of the machine it names",
+                                    FormatEd25519PublicKey(*command.publicKey),
+                                    *holder,
+                                    command.key)));
             return {};
-        }
 
-        case CommandKind::RemoveMember:
         case CommandKind::SetSetting:
         case CommandKind::AdmitClient:
         case CommandKind::ForgetClient:

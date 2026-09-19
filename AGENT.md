@@ -490,9 +490,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   `UnimplementedVerb`: a client reads the latter as *this seed's build is too old* and is sent to
   upgrade a node that is already current. Asserted as NOT `UnimplementedVerb`, since both refuse.
 - Rejecting an already-APPROVED joiner does NOT un-admit it. The reject still stops the roster
-  hand-over; the remedy is the ROLE's column (`EnrollRoleRow::removalFlag`) — `--cluster-forget` for
-  a member, and for a worker principal NOTHING yet (#1555), which the Warn says rather than naming
-  a flag that removes nothing. The silence on a PENDING reject is the control.
+  hand-over; the remedy is `--cluster-forget` for either role (#1555), which the Warn names. The
+  silence on a PENDING reject is the control.
 - **The key an operator compared is the key an approval admits.** A pending row keeps the FIRST key
   its id asked with; a later poll under that id with another key is another machine — counted in
   `claimsChanged`, answered `Pending`, never recorded — or a key is swapped between `--enroll-list`
@@ -567,7 +566,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   X25519 keys (`Core/SessionSeal.hpp`), over an implicit sequence number, and a verified message
   naming a sender other than the proven dialler closes the connection. The ids are bound and the
   ENDPOINT deliberately is not.
-- **An applied `RevokeKey` closes the sessions that key proved, at their next frame**: both ends
+- **An applied forget closes the sessions its revoked key proved, at their next frame once the
+  configuration no longer counts the member** — a member still counted keeps its OWN key for
+  itself, or a leader lost inside that pass leaves a quorum nobody can reach (#1555): both ends
   re-ask the roster per frame (`StillProves`) — PULLED, because a push would close a reactor's
   connection from the apply thread — and the redial is judged, and refused SIGNED, against the
   roster as it is then. The roster is `--raft-peer`'s `@<key>` until the replicated state says
@@ -615,15 +616,27 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   no voter majority at all. Relaxing the restriction on the commitment argument alone breaks a
   rule nothing would warn you about.
 - Absence from `ClusterState` is not removal: a member named in the bootstrap set is never
-  proposed for removal, and a node given no bootstrap set proposes none at all. **A learner is
-  never removed for being absent** — nothing in the policy asks whether a member answers. The
-  one exception is THIS node once FORGOTTEN — record gone AND host tombstoned, never either
-  alone: it proposes its own removal last and steps down (#1539). Forgetting the only voter
-  is refused by name (`ValidateForget`).
-- **A forget outranks an observation (#1528).** A forgotten machine keeps the key and discovery
-  proves it again, so `MembershipProposals` refuses a desire at a forgotten host BY NAME
-  (`MembershipPlan::forgotten`) — at the decision, never by pruning a desire the next proof
-  restores. Only `--cluster-admit` lifts a tombstone.
+  proposed for removal for being ABSENT, and a node given no bootstrap set removes nobody for it.
+  **A learner is never removed for being absent** — nothing in the policy asks whether a member
+  answers. **A FORGET is not absence**: a member recorded nowhere whose key `revokedKeys` holds
+  under its id leaves the quorum whoever typed it (#1555) — while counted it keeps its key for
+  itself, so one kept would go on voting. THIS node once FORGOTTEN —
+  record gone AND (host tombstoned OR key revoked), never the record alone — proposes its own
+  removal last and steps down (#1539). Forgetting the only voter is refused by name
+  (`PrepareForget`).
+- **A forget outranks an observation (#1528).** A forgotten machine keeps running and desires
+  its own record, so `MembershipProposals` refuses a desire at a forgotten host, or for an id
+  recorded nowhere whose key a forget revoked, BY NAME (`MembershipPlan::forgotten`) — at the
+  decision, never by pruning a desire the next pass restores. Only `--cluster-admit` lifts a
+  tombstone, and only a NEW key brings a forgotten machine back.
+- **`--cluster-forget=<id>` is ONE act (#1555)**: the id leaves whichever list records it — a
+  member or an enrolled principal — and the key it held is revoked in the same entry, taken from
+  the record at `Apply`, plus the key the proposing leader holds live for the id (`PrepareForget`
+  — a `--raft-peer` line's `@<key>`, never another id's). There is no verb for either half
+  alone: record gone with the key live fails OPEN on every node typing that key, and a key
+  revoked under a record that stays is a member still counted, whose revocation never reaches the
+  consensus wire. A revoked key is refused at the enrollment door, counted, rather than listed for
+  an approval that could not admit it.
 - The SEAT an operator chose is the record (`ClusterMember::seat`, written only by the verb:
   `AddMember` a voter, `AddLearner` a learner, `MemberSeatTable`). A desire carries NO seat
   (#1535): the reconciler keeps the recorded one, else the set the CONFIGURATION counts —
@@ -682,8 +695,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   DERIVED (`NodeKeyPath`), and a public key has one spelling, 43 characters of base64url.
 - **`ValidateAgainst` is the courtesy, `Apply` the guarantee**: the key rules need the state,
   so every proposer asks the former and `Apply` enforces the same rules on commit. A revoked
-  key is never admitted again (`KeyRevoked`, permanent), and `RevokeKey` is the one verb
-  `Apply` never drops -- a dropped revocation is removal failing OPEN.
+  key is never admitted again (`KeyRevoked`, permanent), and a forget's revocation is the one
+  thing `Apply` never drops -- a dropped revocation is removal failing OPEN.
 - **A flag that parses a key CARRIES it, never parses and drops it**: `--cluster-admit@<key>`
   rides CLUSTER-ADMIT's third field (0xFC 11), the leader parses it again before proposing, and
   the receipt echoes the key the COMMAND carries. An absent key keeps the recorded one.
@@ -1102,8 +1115,8 @@ converting a store. Before `Cache/CowTreeStorage`, `CowTree/`.
 - A SECOND carve-out: a row no writer in this PROCESS could move is absent, never zero. Which
   surface writes each catalogue row is `CounterSoleWriterTable`, complete and
   `static_assert`ed (**the count is not repeated here**, for the reason the loop ratchet's is
-  not: the table owns it) — a scan for `Increment(Counter::X)` finds 39 of them, because the rest are
-  written through a table. Its `size()` counts (counter, surface) PAIRS and is not a count of
+  not: the table owns it) — a scan for `Increment(Counter::X)` finds a minority of them, because the
+  rest are written through a table. Its `size()` counts (counter, surface) PAIRS and is not a count of
   counters; `AttributedCounterCount()` is. **Err unattributed**, and narrow a BINARY's set only
   from the flags that decide whether the component is CONSTRUCTED — `ServedSurfaces{}` means
   *not narrowed* and therefore every surface. `ctest -R counter-attribution`.

@@ -600,24 +600,31 @@ ConsensusTier::~ConsensusTier()
 
 std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluster::Command const& command)
 {
+    // A forget is PREPARED here first, by the one node that can (#1539, #1555): against
+    // the configuration consensus holds, so forgetting the only voter is refused by name
+    // while the operator who typed it is reading the answer; and with the key THIS node
+    // holds live for the id, so a member its own `--raft-peer` line typed with a key --
+    // recorded nowhere, or recorded without one -- has that key revoked too.
+    auto proposal = command;
+    if (command.kind == Cluster::CommandKind::Forget)
+    {
+        auto prepared =
+            Cluster::PrepareForget(_driver->CurrentProgress().configuration, command.key, _roster.KeysOf(command.key).live);
+        if (!prepared.has_value())
+            return std::unexpected { prepared.error() };
+        proposal = *std::move(prepared);
+    }
+
     // Validated BEFORE it is proposed, which is the only place a change can be
     // refused: an entry is applied after it is committed, when there is nobody left
     // to report a failure to and no way to un-commit it.
     //
     // Against the state this node has applied (#178), because the rules about keys are
     // rules about what the roster already holds: a revoked key, one held under another id.
-    if (auto const allowed = Cluster::ValidateAgainst(_application.State(), command); !allowed.has_value())
+    if (auto const allowed = Cluster::ValidateAgainst(_application.State(), proposal); !allowed.has_value())
         return std::unexpected { allowed.error() };
 
-    // And a forget against the configuration consensus holds (#1539): forgetting the
-    // only voter is a record no quorum could ever follow, so it is refused by name
-    // here, while the operator who typed it is reading the answer.
-    if (command.kind == Cluster::CommandKind::RemoveMember)
-        if (auto const allowed = Cluster::ValidateForget(_driver->CurrentProgress().configuration, command.key);
-            !allowed.has_value())
-            return std::unexpected { allowed.error() };
-
-    return _driver->Propose(Cluster::Encode(command), std::chrono::steady_clock::now());
+    return _driver->Propose(Cluster::Encode(proposal), std::chrono::steady_clock::now());
 }
 
 Cluster::ClusterState ConsensusTier::ClusterState() const
@@ -728,7 +735,7 @@ void ConsensusTier::Reconcile()
     // record may still be counted there -- every `--raft-peer` member is -- and
     // recording one as the newcomer it is not would demote it (#1535).
     auto const plan = Cluster::MembershipProposals(state, _driver->CurrentProgress().configuration, desired);
-    ReportForgottenDesires(plan.forgotten);
+    ReportForgottenDesires(state, plan.forgotten);
 
     for (auto const& command: plan.proposals)
     {
@@ -799,11 +806,12 @@ void ConsensusTier::Reconcile()
     ReconcileQuorum(state);
 }
 
-void ConsensusTier::ReportForgottenDesires(std::span<Cluster::DesiredMember const> refused)
+void ConsensusTier::ReportForgottenDesires(Cluster::ClusterState const& state,
+                                           std::span<Cluster::DesiredMember const> refused)
 {
-    // Once per member rather than once per pass (#1528). A forgotten machine that still
-    // holds the key is proved again at every beacon, so it is refused on every pass for
-    // as long as it runs -- a line per interval is a line an operator filters out, and
+    // Once per member rather than once per pass (#1528). A desire for a forgotten member
+    // comes back at every pass for as long as whatever holds it runs, so it is refused on
+    // every pass -- a line per interval is a line an operator filters out, and
     // the one fact worth saying is that the forget is being honoured while something
     // still asks for the member back.
     for (auto const& member: refused)
@@ -811,12 +819,14 @@ void ConsensusTier::ReportForgottenDesires(std::span<Cluster::DesiredMember cons
         if (std::ranges::find(_reportedForgotten, member.id) != _reportedForgotten.end())
             continue;
         _reportedForgotten.push_back(member.id);
+        auto const host = HostOfEndpoint(member.raftEndpoint);
+        auto const forgot =
+            state.HasForgotten(host) ? std::format("host {}", host) : std::format("{} and revoked its key", member.id);
         _logger.Logf(LogLevel::Info,
-                     "cluster: not recording {} at {}: the cluster forgot host {}, and only --cluster-admit undoes a "
-                     "forget",
+                     "cluster: not recording {} at {}: the cluster forgot {}, and only --cluster-admit undoes a forget",
                      member.id,
                      member.raftEndpoint,
-                     HostOfEndpoint(member.raftEndpoint));
+                     forgot);
     }
 
     // A member no longer refused is forgotten here too, so forgetting it a SECOND time --
@@ -882,6 +892,11 @@ void ConsensusTier::ReportQuorum()
     auto configuration = _driver->CurrentProgress().configuration;
     std::ranges::sort(configuration.voters);
     std::ranges::sort(configuration.learners);
+
+    // The roster learns what this node counts every pass, reported or not (#1555): a member a
+    // forget revoked keeps its key on this wire until the configuration drops it, or a cluster
+    // losing its leader inside that pass could be left with a quorum nobody can reach.
+    _roster.AdoptConfiguration(configuration);
 
     // The FIRST pass reports whatever it finds, changed or not, and that is the
     // point rather than an initialisation detail. A joiner starts with no members,
@@ -1084,8 +1099,9 @@ void ConsensusTier::PublishRole(Consensus::RaftDriver::RoleChange const& change)
 void ConsensusTier::OnStateChanged(Cluster::ClusterState const& state)
 {
     // The roster FIRST, so the keys every peer connection is judged by are the committed
-    // ones before anything else reacts to the change. An applied `RevokeKey` reaches every
-    // open session from here: each re-asks the roster before its next frame (#178).
+    // ones before anything else reacts to the change. An applied `Forget` reaches every
+    // open session its revoked key proved from here: each re-asks the roster before its next
+    // frame (#178, #1555).
     _roster.Adopt(state);
 
     // The member set reaches the fleet's oracle from here, so admitting a peer and

@@ -337,7 +337,7 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
     // #1539's refusal, at the door an operator's `--cluster-forget` reaches: a real tier's
     // `ProposeToCluster`, over a real listener, a real state directory and a driver that
     // elected itself -- because a refusal decided by a function nothing calls is the bug it
-    // was written to fix. The policy cases pin `ValidateForget`; this pins that `Propose`
+    // was written to fix. The policy cases pin `PrepareForget`; this pins that `Propose`
     // asks it before anything is appended.
     NullLogger logger;
     AtomicMetricsSink metrics;
@@ -394,7 +394,7 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
     // CHECK rather than REQUIRE, and the error read only when there is one: the log
     // assertion below has to be REACHED when the refusal is missing, or a tier that
     // appended the forget would stop this case before the half that measures it.
-    auto const refused = tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::RemoveMember,
+    auto const refused = tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::Forget,
                                                                    .key = "n1",
                                                                    .value = {},
                                                                    .schedulerEndpoint = {},
