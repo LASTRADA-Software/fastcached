@@ -482,7 +482,7 @@ struct CounterSoleWriter
 /// row ABSENT rather than as a plausible zero.
 ///
 /// **One row per (counter, surface) PAIR, and a counter may have several.** A set-valued field
-/// would be a fixed-size array carrying exactly one element for 162 of 163 counters, to serve
+/// would be a fixed-size array carrying exactly one element for 164 of 165 counters, to serve
 /// the single row -- `LiveSubscriptionsRevoked` -- written from two components. Two rows say
 /// the same thing with no arithmetic, and `CounterHasAWriterIn` folds them.
 ///
@@ -852,7 +852,7 @@ inline constexpr std::array CounterSoleWriterTable {
 /// says it does. A measurement of that moment, so it does not move with the catalogue.
 ///
 /// A `consteval` fold rather than a size comparison, because `CounterSoleWriterTable.size()`
-/// counts (counter, surface) PAIRS: it is 164 for 163 counters today, and a row duplicated
+/// counts (counter, surface) PAIRS: it is 166 for 165 counters today, and a row duplicated
 /// while another went missing would leave any arithmetic on the size perfectly consistent.
 ///
 /// @return True when no enumerator is missing from the table.
