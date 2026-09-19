@@ -91,7 +91,7 @@ struct OpenConnections
 /// ## A revoked key ends the connections it proved
 ///
 /// Every frame is re-checked against the roster (`IRaftPeerIdentity::StillProves`) before
-/// it is delivered, so an applied `RevokeKey` -- or a re-admission under another key --
+/// it is delivered, so an applied forget -- or a re-admission under another key --
 /// closes a connection that proved the old key at its next frame, and the redial is judged
 /// against the roster as it is then. Pulled per frame rather than pushed by the state
 /// machine, because the connection belongs to the reactor's thread and the roster moves on

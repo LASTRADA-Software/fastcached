@@ -46,12 +46,31 @@ namespace
         return !configuration.voters.empty();
     }
 
+    /// Whether the cluster FORGOT `id` rather than never recording it: a key revoked under
+    /// that id, which only `Forget` writes (#1555).
+    ///
+    /// The one forget fact that outlives the record it removed and names the id rather
+    /// than a host, so a leader can read it about a member it never recorded -- every
+    /// member a `--raft-peer` line put in the configuration. The caller asks whether the
+    /// id is recorded NOW: a machine admitted again under a new key is a member, whatever
+    /// its old key's entry says.
+    /// @param state The replicated state.
+    /// @param id A member id.
+    /// @return True when `revokedKeys` names it.
+    [[nodiscard]] bool ForgottenById(ClusterState const& state, Consensus::NodeId const& id)
+    {
+        return std::ranges::contains(state.revokedKeys, id, &RevokedKey::id);
+    }
+
     /// This node's own removal, once the operator has forgotten it (#1539).
     ///
-    /// FORGOTTEN is both facts `RemoveMember` writes: its record gone, and its host
-    /// tombstoned. Either alone is not a forget -- a fresh leader's first pass has
-    /// recorded nothing yet, and a client forget may name a member's host -- so
-    /// removing on the first would take every new cluster's only voter out of it.
+    /// FORGOTTEN is its record gone AND one of the two facts only `Forget` writes beside
+    /// that: its host tombstoned, or its key revoked (`ForgottenById`). The record alone is
+    /// not a forget -- a fresh leader's first pass has recorded nothing yet -- and a host
+    /// tombstone alone is not either, since a client forget may name a member's host; so
+    /// removing on either alone would take every new cluster's only voter out of it. The
+    /// revocation is what reaches a member that shares its machine over loopback, which
+    /// leaves no tombstone.
     /// @param state The replicated state.
     /// @param active The configuration consensus holds.
     /// @param self This node's own record, as it announces it.
@@ -62,7 +81,7 @@ namespace
                                                                      ClusterMember const& self)
     {
         auto const recorded = std::ranges::find(state.members, self.id, &ClusterMember::id) != state.members.end();
-        if (recorded || !state.HasForgotten(HostOfEndpoint(self.raftEndpoint)))
+        if (recorded || !(state.HasForgotten(HostOfEndpoint(self.raftEndpoint)) || ForgottenById(state, self.id)))
             return std::nullopt;
 
         for (auto const& row: MemberSeatTable)
@@ -70,7 +89,7 @@ namespace
             if (!Consensus::Membership::Contains(active.*row.set, self.id))
                 continue;
 
-            // Never the last voter. `ValidateForget` refuses that forget by name before
+            // Never the last voter. `PrepareForget` refuses that forget by name before
             // it is proposed, so arriving here means the voters changed after it
             // committed -- and the fail-closed answer is still to stay counted.
             auto proposed = active;
@@ -150,8 +169,11 @@ MembershipPlan MembershipProposals(ClusterState const& state,
         // lift the tombstone for and through the same comparison, so what is refused
         // here is exactly a proposal that would have undone the forget -- and only
         // once something would be proposed, since a record that already matches lifts
-        // nothing and is no refusal.
-        if (state.HasForgotten(HostOfEndpoint(member.raftEndpoint)))
+        // nothing and is no refusal. And by the id whose key the forget revoked
+        // (#1555), which reaches a member that shares its machine over loopback and
+        // left no tombstone -- an id recorded nowhere, since one admitted again under a
+        // new key is a member whatever its old key's entry says.
+        if (state.HasForgotten(HostOfEndpoint(member.raftEndpoint)) || (!known && ForgottenById(state, member.id)))
         {
             plan.forgotten.push_back(member);
             continue;
@@ -287,15 +309,6 @@ namespace
             }
         }
 
-        // A node that was given no bootstrap set has nothing to compare against, so
-        // every member is equally unexplained to it -- and a `--raft-join` node elected
-        // leader would remove all of them, one per commit, which is the failure the
-        // parameter exists to prevent reached through the one path with no baseline.
-        // It still removes ITSELF once forgotten, below: that question is answered by the
-        // tombstone, not by the bootstrap set.
-        if (bootstrap.empty())
-            return OwnRemoval(state, active, self);
-
         // Removals, from either set. A learner is removed on exactly the terms a voter is
         // -- forgotten by the operator, and never for being ABSENT: nothing here reads
         // whether a member answers, so a learner that has been offline for a week is as
@@ -317,14 +330,27 @@ namespace
                 if (std::ranges::find(state.members, id, &ClusterMember::id) != state.members.end())
                     continue;
 
-                // Absent, but was it ever meant to be there? `--raft-peer` puts a member in
-                // the configuration and nothing puts it in the state, so on a typed cluster
-                // every peer is absent from birth -- and reading that as "forgotten"
-                // proposes removing all of them, one per commit, until the leader is alone.
-                // A member an operator typed is a member by their assertion; only one
-                // admitted at runtime can be un-admitted at runtime.
-                if (std::ranges::find(bootstrap, id) != bootstrap.end())
-                    continue;
+                // FORGOTTEN outranks every reason below to keep it (#1555): a member the
+                // configuration counts keeps its revoked key for itself (`RosterKeys`), so one
+                // kept here would go on voting for as long as it runs -- the forget failing
+                // open on the consensus wire, which is the one it most concerns.
+                if (!ForgottenById(state, id))
+                {
+                    // Absent, but was it ever meant to be there? `--raft-peer` puts a member in
+                    // the configuration and nothing puts it in the state, so on a typed cluster
+                    // every peer is absent from birth -- and reading that as "forgotten"
+                    // proposes removing all of them, one per commit, until the leader is alone.
+                    // A member an operator typed is a member by their assertion; only one
+                    // admitted at runtime can be un-admitted at runtime.
+                    //
+                    // And a node that was given no bootstrap set has nothing to compare
+                    // against, so every member is equally unexplained to it -- a `--raft-join`
+                    // node elected leader would remove all of them, one per commit, which is
+                    // the failure the parameter exists to prevent reached through the one path
+                    // with no baseline.
+                    if (bootstrap.empty() || std::ranges::find(bootstrap, id) != bootstrap.end())
+                        continue;
+                }
 
                 auto proposed = active;
                 std::erase(proposed.*row.set, id);
@@ -354,20 +380,27 @@ QuorumPlan NextQuorumChange(ClusterState const& state,
                         .catchingUp = CatchingUp(state, active, self.id, replication) };
 }
 
-std::expected<void, ConsensusError> ValidateForget(Consensus::Configuration const& active, Consensus::NodeId const& id)
+std::expected<Command, ConsensusError> PrepareForget(Consensus::Configuration const& active,
+                                                     Consensus::NodeId const& id,
+                                                     std::optional<Ed25519PublicKey> const& liveKey)
 {
     // The one forget no quorum can follow: removing the only voter. Any other member --
     // a learner, one of several voters, one consensus does not count at all -- leaves a
     // configuration somebody is counted in.
-    if (active.voters.size() != 1 || active.voters.front() != id)
-        return {};
+    if (active.voters.size() == 1 && active.voters.front() == id)
+        return std::unexpected { ConsensusError {
+            .code = ConsensusErrorCode::InvalidConfiguration,
+            .context = std::format("cannot forget {}: it is the cluster's only voter, and a configuration with no "
+                                   "voter can commit nothing -- admit or promote another voter first",
+                                   id),
+            .knownLeader = std::nullopt } };
 
-    return std::unexpected { ConsensusError {
-        .code = ConsensusErrorCode::InvalidConfiguration,
-        .context = std::format("cannot forget {}: it is the cluster's only voter, and a configuration with no voter "
-                               "can commit nothing -- admit or promote another voter first",
-                               id),
-        .knownLeader = std::nullopt } };
+    return Command { .kind = CommandKind::Forget,
+                     .key = id,
+                     .value = {},
+                     .schedulerEndpoint = {},
+                     .publicKey = liveKey,
+                     .role = std::nullopt };
 }
 
 } // namespace FastCache::Cluster

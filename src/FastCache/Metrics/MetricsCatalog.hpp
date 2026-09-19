@@ -790,6 +790,14 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "anything else came from no version of this software -- and the peer had presented "
               "nothing when it sent it, which is what makes this one worth reading.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedRevokedKey,
+      .prometheusName = "fastcache_enrollment_requests_refused_revoked_key_total",
+      .help = "Enrollment requests refused because they asked under a key the cluster has revoked "
+              "-- a machine an operator forgot, asking to come back as itself. Refused at the door "
+              "rather than listed, because no approval could admit a revoked key. Expected once "
+              "after forgetting a machine that is still running; a steady rate is a removed "
+              "machine nobody stopped. It can come back only under a new identity.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::EnrollmentControlRefusedNotAMember,
       .prometheusName = "fastcache_enrollment_control_refused_not_a_member_total",
       .help = "Enrollment control verbs refused because the caller is not a fleet member -- "

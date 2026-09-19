@@ -547,9 +547,9 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // tracked its own subject would silently re-attribute a real measurement to conditions it
     // was never taken under. Drift is a red build, which is what the previous "106 of 144" --
     // a sentence with nothing watching it -- did not get.
-    CHECK(incremented.size() == 45);
-    CHECK(refusalRow.size() == 110);
-    CHECK(outcomeRow.size() == 10);
+    CHECK(incremented.size() == 42);
+    CHECK(refusalRow.size() == 111);
+    CHECK(outcomeRow.size() == 7);
     CHECK(returned.size() == 4);
 
     std::set<std::string> anyWriter;
@@ -559,9 +559,9 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // No catalogue row is written by none of the four. The check for that is the whole
     // catalogue, not a count: a row nobody writes is a row whose surface was guessed.
     CHECK(anyWriter.size() == spellings.size());
-    CHECK(spellings.size() - incremented.size() == 120);
+    CHECK(spellings.size() - incremented.size() == 118);
 
-    // 110 rows have a refusal row; 109 of them have no increment site. Two figures one apart
+    // 111 rows have a refusal row; 110 of them have no increment site. Two figures one apart
     // measuring different things is how a census gets quoted wrong -- the first draft of the
     // comment beside `CounterSoleWriterTable` said 101 for both -- so the REACH of a
     // SurfaceRefusal-only reading is asserted separately from the row count.
@@ -569,9 +569,9 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     for (auto const& name: refusalRow)
         if (!incremented.contains(name))
             reachedByRefusalRowsAlone.insert(name);
-    CHECK(reachedByRefusalRowsAlone.size() == 109);
+    CHECK(reachedByRefusalRowsAlone.size() == 110);
 
-    // And four rows are written two ways, which is why the column sums to 169 over 165 rows.
+    // And four rows are written two ways, which is why the column sums to 164 over 160 rows.
     CHECK(incremented.size() + refusalRow.size() + outcomeRow.size() + returned.size() == spellings.size() + 4);
 }
 

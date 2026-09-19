@@ -73,16 +73,6 @@ struct EnrollRoleRow
     /// The principal role an approval records, or absent for a member, which `ClusterAdmit`
     /// records instead.
     std::optional<Cluster::PrincipalRole> principal;
-
-    /// The flag that removes a machine an approval admitted in this role, or absent when no
-    /// operator verb does yet.
-    ///
-    /// **Absent for a worker, and that is a gap rather than a design**: `--cluster-forget` is
-    /// `RemoveMember`, which touches members only, and nothing an operator can type proposes
-    /// the `RevokeKey` that would take a principal's key away (#1555). A warning naming
-    /// `--cluster-forget` for a worker would send an operator to a command that removes
-    /// nothing and reports success.
-    std::optional<std::string_view> removalFlag;
 };
 
 /// One row per role this build implements.
@@ -90,16 +80,12 @@ struct EnrollRoleRow
 /// A plain array rather than an `EnumTable`, for `KnownEnrollmentDecisions`' reason: a WIRE enum
 /// carries no `Last`. Completeness is asserted against `KnownEnrollRoles` instead.
 inline constexpr std::array EnrollRoleTable {
-    EnrollRoleRow { .role = CompileCacheWire::EnrollRole::Member,
-                    .name = "member",
-                    .statesEndpoint = true,
-                    .principal = std::nullopt,
-                    .removalFlag = "--cluster-forget" },
+    EnrollRoleRow {
+        .role = CompileCacheWire::EnrollRole::Member, .name = "member", .statesEndpoint = true, .principal = std::nullopt },
     EnrollRoleRow { .role = CompileCacheWire::EnrollRole::Worker,
                     .name = "worker",
                     .statesEndpoint = false,
-                    .principal = Cluster::PrincipalRole::Worker,
-                    .removalFlag = std::nullopt },
+                    .principal = Cluster::PrincipalRole::Worker },
 };
 
 /// Whether every role this build knows has exactly one row.

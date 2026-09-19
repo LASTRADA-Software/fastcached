@@ -381,7 +381,7 @@ simpler design gets wrong.
 
 - **A revoked key ends the sessions it proved, at their next frame -- PULLED, not pushed.**
   Both ends re-ask the roster (`IRaftPeerIdentity::StillProves`) for every frame: the acceptor
-  after the tag verifies, the dialler before it seals. So an applied `RevokeKey` -- or a
+  after the tag verifies, the dialler before it seals. So an applied forget -- or a
   re-admission under another key -- closes the session at its next frame
   (`connections_ended_key_withdrawn`, `dials_ended_key_withdrawn`), and the redial is judged
   against the roster as it is then. A push from the state machine would be a close from the
@@ -1341,17 +1341,19 @@ and it is recorded here because the question will be asked again.
     `NextQuorumChange` skipped `id == self`, and a node's own bootstrap set always names
     it. Now a leader that is FORGOTTEN proposes its own removal, LAST -- after every
     change it can still make as the leader -- and steps down once it commits (`RaftNode`,
-    §4.2.2; #1449's demoted leader is the same rule). **Forgotten is BOTH facts
-    `RemoveMember` writes**, the record gone AND the host tombstoned: record absence
-    alone is every fresh leader's first pass, and a tombstone alone may be a client
-    forget naming a member's machine. Neutered to absence alone, five cases go red,
+    §4.2.2; #1449's demoted leader is the same rule). **Forgotten is the record gone
+    AND a fact only `Forget` writes beside it** -- the host tombstoned, or (#1555) the
+    key revoked under the id, which is what reaches a rig sharing one machine over
+    loopback: record absence alone is every fresh leader's first pass, and a tombstone
+    alone may be a client forget naming a member's machine. Neutered to absence alone, five cases go red,
     including the pre-existing *this node never proposes its own removal*. **Its own
     bootstrap entry does not protect it, and nobody else's is touched**: a node names
-    itself because it cannot start otherwise, so that one entry asserts nothing, while a
-    forgotten typed FOLLOWER stays counted exactly as before -- the control. Forgetting
-    the ONLY voter is refused BY NAME before it is proposed (`ValidateForget`, from
-    `ConsensusTier::Propose`, `InvalidConfiguration`): afterwards the record would say
-    forgotten while no configuration could ever drop it. Pinned in `RaftClusterHarness`
+    itself because it cannot start otherwise, so that one entry asserts nothing. A
+    forgotten typed FOLLOWER stayed counted -- the control -- until #1555 made the forget
+    revoke its key; see *A forget revokes*, below. Forgetting the ONLY voter is refused BY
+    NAME before it is proposed (`PrepareForget`, from `ConsensusTier::Propose`,
+    `InvalidConfiguration`): afterwards the record would say forgotten while no
+    configuration could ever drop it. Pinned in `RaftClusterHarness`
     (`MembershipCluster_test`): the configuration commits without the leader, it steps
     down, a successor is elected and refuses it by name; neutering the self-removal keeps
     it in the configuration and leading.
@@ -1568,11 +1570,50 @@ right, because the wire now trusts it.
   generic permanent wire code (`InvalidClusterChange`) -- a code of its own would claim a
   client acts differently, and none does. `revokedKeys` keeps the WHOLE key and is never
   shortened.
-- **`RevokeKey` is never dropped at `Apply`.** Every other verb is dropped when its
-  preconditions no longer hold; a revocation is applied whatever its label says, because a
-  dropped revocation is removal failing OPEN. It removes a principal outright and clears a
-  member's key while keeping the member -- removing a member is a quorum change, one at a
-  time, and that is `RemoveMember`'s decision.
+- **A forget revokes, in the same entry, and there is no verb that only revokes (#1555).**
+  `--cluster-forget=<id>` is `CommandKind::Forget` -- `RemoveMember`'s ordinal, widened: the id
+  leaves whichever list records it, a member or a principal, and the key that record held is
+  revoked. Two halves, one act, because each half alone is a state nobody asked for: the record
+  gone with its key live is a machine every node whose `--raft-peer` types that key goes on
+  accepting -- removal failing OPEN -- and a key revoked under a record that stays is a member
+  the configuration goes on counting, so on the consensus wire the revocation never takes
+  effect (next bullet but two). That second one is what the retired `RevokeKey` verb produced
+  for a member, which is why it went rather than gaining an operator verb.
+  - **The key is DERIVED at `Apply`**, from the record being removed, as the host tombstone is
+    (#1309), so a key replaced between the proposal and the commit is the one revoked.
+  - **Beside it, the key the proposing LEADER holds live for the id** (`PrepareForget`, from
+    `RosterKeys::KeysOf`). The state cannot derive it: a member a `--raft-peer` line typed with
+    its key is recorded without one or not at all, and its key lives on command lines. Revoked,
+    it outranks every one of them (`RosterKeys` drops a typed key the state revoked). Never
+    another id's -- `ValidateAgainst` refuses it by name and `Apply` skips it, or a forget of one
+    machine would revoke one nobody named.
+  - **Never dropped once there is a key to revoke.** Every admitting verb is dropped at commit
+    when its preconditions have stopped holding; a dropped revocation is removal failing OPEN.
+  - **On the Raft wire it takes effect when the CONFIGURATION drops the member, not at the
+    commit.** `RosterKeys` keeps a key revoked under an id live for that id alone while this
+    node's configuration counts it (`AdoptConfiguration`, fed every reconcile pass). Cut off at
+    the revocation, a forgotten voter still counted is a voter that cannot vote for a pass, and
+    a cluster losing its leader inside it can WEDGE for good -- four voters, one forgotten, the
+    leader lost: two of four, nobody elected, nobody to propose the removal. `cluster-e2e`
+    found it (forget n3, stop the leader) and `MembershipCluster_test` pins it with production
+    `RosterKeys` per node; neutered, three of four never elect. Raft's own rule for a removed
+    server, stated about keys. Everywhere else the revocation is immediate: the same key under
+    another id, the enrollment door, discovery, and a principal, which consensus never counts.
+  - **A forgotten member leaves the quorum whoever typed it.** The rule that a typed member is
+    never removed is about ABSENCE, and a revocation under the id is the forget's own record,
+    which a fresh leader's empty state cannot contain. It is load-bearing BECAUSE of the grace
+    above: a member still counted keeps its key for itself, so a forgotten member this rule did
+    not remove would go on voting for as long as it runs -- the forget failing open on the one
+    wire it most concerns. Neutered, `MembershipCluster_test`'s forgotten typed follower stays
+    counted. That fleet runs production `RosterKeys` per node, adopting each node's own state and
+    configuration: its first version shared one fake roster that never adopted a revocation,
+    which was more permissive than any node and could not reach the wedge the grace prevents.
+  - **The ordinal did not move and neither did `CommandVersion`.** Every entry a released build
+    wrote names a keyless member, which `Forget` applies exactly as `RemoveMember` did, and no
+    released build can join a cluster that has keys (`RaftWire::MinSupportedVersion`).
+  - A revoked key is refused at the ENROLLMENT door too, counted
+    (`EnrollmentRequestsRefusedRevokedKey`), rather than listed for an approval that could not
+    admit it -- see the distributed-compilation rules.
 - **Absent is no opinion, again.** A member admission with no key KEEPS the recorded one --
   unlike the scheduler endpoint, a machine that moves keeps its identity -- and discovery,
   which has no opinion about a peer's key, can therefore never clear one. A node asserts its

@@ -1842,7 +1842,7 @@ namespace
         return Answered(ClusterChangeAccepted());
     }
 
-    /// `cluster-forget <id>` -- remove a member.
+    /// `cluster-forget <id>` -- forget a member or an enrolled worker, revoking its key.
     /// @param context What to run against.
     /// @return The answer.
     [[nodiscard]] Answer ClusterForget(VerbContext const& context)
@@ -2454,8 +2454,8 @@ namespace
           .wire = Wire::Node,
           .minOperands = 1,
           .maxOperands = 1,
-          .operands = " <member-id>",
-          .summary = "remove a member from the agreed set",
+          .operands = " <id>",
+          .summary = "forget a member or an enrolled worker, revoking its key",
           .protocolCommand = "cluster-forget",
           .modifiers = Modifier::None,
           .handler = &ClusterForget,

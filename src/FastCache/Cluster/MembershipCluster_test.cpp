@@ -7,6 +7,7 @@
 // who is elected, what commits.
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/MembershipPolicy.hpp>
+#include <FastCache/Cluster/RosterKeys.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/RaftClusterHarness.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
@@ -14,9 +15,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <expected>
 #include <format>
+#include <map>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -34,25 +37,52 @@ using FastCache::Testing::Unwrap;
 
 namespace
 {
-/// Who every member is: itself, under its own key, over one roster naming every machine a case
-/// here starts -- a later joiner included, as an operator admitting it with its key makes it.
-/// @return The factory the harness requires.
-[[nodiscard]] Consensus::RaftClusterHarness::IdentityFactory Identities()
-{
-    auto roster =
-        std::shared_ptr<Testing::SharedRoster const> { Testing::SharedRoster::Of({ "n1", "n2", "n3", "n4", "n5" }) };
-    return
-        [roster = std::move(roster)](Consensus::NodeId const& who) -> std::unique_ptr<Consensus::IRaftPeerIdentity const> {
-            return Testing::TestPeerIdentity::Honest(who, roster);
-        };
-}
-
 /// Where member `n<k>` answers consensus: a machine of its own, `10.0.0.<k>`.
 /// @param id The member.
 /// @return Its consensus endpoint.
 [[nodiscard]] std::string EndpointOf(Consensus::NodeId const& id)
 {
     return std::format("10.0.0.{}:6680", id.substr(1));
+}
+
+/// Every machine a case here can start, a later joiner included.
+constexpr std::array<char const*, 5> EveryMachine { "n1", "n2", "n3", "n4", "n5" };
+
+/// One PRODUCTION roster per machine, each over every machine typed with its key -- what
+/// `--raft-peer id=host:port@<key>` on every command line gives each node's `RosterKeys`.
+///
+/// Production rather than `Testing::SharedRoster`, and that is the point (#1555): a roster
+/// that never adopts the state was MORE permissive than any node, so a forget that revoked
+/// a leader's key while its removal was still to commit was a case this harness could not
+/// reach. Each roster adopts its OWN node's applied state and configuration
+/// (`Fleet::AdoptRosters`), as `ConsensusTier` has its roster do.
+/// @return The rosters, by machine.
+[[nodiscard]] std::map<Consensus::NodeId, std::unique_ptr<RosterKeys>> Rosters()
+{
+    auto typed = std::vector<ClusterMember> {};
+    for (auto const* const id: EveryMachine)
+        typed.push_back(ClusterMember { .id = id,
+                                        .raftEndpoint = EndpointOf(id),
+                                        .schedulerEndpoint = {},
+                                        .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
+                                        .seat = MemberSeat::Voter,
+                                        .publicKey = Testing::TestKeyPair(id).PublicKey() });
+
+    auto rosters = std::map<Consensus::NodeId, std::unique_ptr<RosterKeys>> {};
+    for (auto const* const id: EveryMachine)
+        rosters.emplace(id, std::make_unique<RosterKeys>(Testing::TestKeyPair(id), typed));
+    return rosters;
+}
+
+/// Who every member is: itself, proved with its own key, judging every peer by its own roster.
+/// @param rosters Every machine's roster; must outlive the harness.
+/// @return The factory the harness requires.
+[[nodiscard]] Consensus::RaftClusterHarness::IdentityFactory Identities(
+    std::map<Consensus::NodeId, std::unique_ptr<RosterKeys>> const& rosters)
+{
+    return [&rosters](Consensus::NodeId const& who) -> std::unique_ptr<Consensus::IRaftPeerIdentity const> {
+        return std::make_unique<Consensus::RaftPeerIdentity const>(who, *rosters.at(who));
+    };
 }
 
 /// The host a forget of `id` tombstones.
@@ -84,15 +114,31 @@ class Fleet
     /// @param ids Every member, each a voter.
     explicit Fleet(std::vector<Consensus::NodeId> ids):
         _ids { ids },
-        _cluster { std::move(ids), Identities() }
+        _rosters { Rosters() },
+        _cluster { std::move(ids), Identities(_rosters) }
     {
     }
 
     /// @param configuration The voters and the learners, every one bootstrapped with both.
     explicit Fleet(Consensus::Configuration const& configuration):
         _ids { MembersOf(configuration) },
-        _cluster { configuration, Identities() }
+        _rosters { Rosters() },
+        _cluster { configuration, Identities(_rosters) }
     {
+    }
+
+    Fleet(Fleet const&) = delete;
+    Fleet(Fleet&&) = delete;
+    Fleet& operator=(Fleet const&) = delete;
+    Fleet& operator=(Fleet&&) = delete;
+    ~Fleet() = default;
+
+    /// Start @p id, a machine no member names yet, as `--raft-join` starts one.
+    /// @param id The machine.
+    void Join(Consensus::NodeId const& id)
+    {
+        _cluster.Join(id);
+        _ids.push_back(id);
     }
 
     /// @return The cluster underneath.
@@ -119,6 +165,8 @@ class Fleet
     /// @return What the pass refused because its host was forgotten.
     std::vector<DesiredMember> Pass()
     {
+        AdoptRosters();
+
         auto const leader = _cluster.Leader();
         if (!leader.has_value())
             return {};
@@ -160,16 +208,12 @@ class Fleet
             return std::unexpected { ConsensusError {
                 .code = ConsensusErrorCode::NotLeader, .context = "nobody leads", .knownLeader = std::nullopt } };
 
-        if (auto allowed = ValidateForget(_cluster.At(*leader).driver->CurrentProgress().configuration, id);
-            !allowed.has_value())
-            return allowed;
+        auto prepared = PrepareForget(
+            _cluster.At(*leader).driver->CurrentProgress().configuration, id, _rosters.at(*leader)->KeysOf(id).live);
+        if (!prepared.has_value())
+            return std::unexpected { prepared.error() };
 
-        std::ignore = _cluster.ProposeOnLeader(Encode(Command { .kind = CommandKind::RemoveMember,
-                                                                .key = id,
-                                                                .value = {},
-                                                                .schedulerEndpoint = {},
-                                                                .publicKey = std::nullopt,
-                                                                .role = std::nullopt }));
+        std::ignore = _cluster.ProposeOnLeader(Encode(*prepared));
         return {};
     }
 
@@ -186,6 +230,20 @@ class Fleet
                                               .publicKey = std::nullopt,
                                               .role = std::nullopt }))
             .has_value();
+    }
+
+    /// Every member's roster adopts its own node's applied state and configuration -- what
+    /// `ConsensusTier::OnStateChanged` and `ConsensusTier::ReportQuorum` have the tier's roster
+    /// adopt (#1555). Once per pass, where the tier adopts the state at every apply: the lag
+    /// keeps a revoked key live a little LONGER here, never shorter.
+    void AdoptRosters()
+    {
+        for (auto const& id: _ids)
+        {
+            auto& roster = *_rosters.at(id);
+            roster.Adopt(StateAt(id));
+            roster.AdoptConfiguration(_cluster.At(id).driver->Node().ActiveConfiguration());
+        }
     }
 
     /// Who the last pass said a promotion is waiting for (#1537).
@@ -227,6 +285,10 @@ class Fleet
     }
 
     std::vector<Consensus::NodeId> _ids;
+
+    /// Every machine's own roster. Before `_cluster`, whose identities read them.
+    std::map<Consensus::NodeId, std::unique_ptr<RosterKeys>> _rosters;
+
     Consensus::RaftClusterHarness _cluster;
     std::vector<Consensus::NodeId> _catchingUp;
 };
@@ -285,6 +347,11 @@ TEST_CASE("A cluster that forgets its leader commits a configuration without it,
 {
     // #1539. The leader is the one member whose forget no pass acted on: a leader never
     // proposed its own removal, and every leader's bootstrap set contains itself.
+    //
+    // And #1555: the forget revokes the leader's key, and every member's roster -- production
+    // `RosterKeys`, adopting each node's own state and configuration -- keeps that key live for
+    // the leader alone while its configuration still counts it. Cut off at the commit instead,
+    // it could not commit the removal it proposes for itself.
     Fleet fleet { { "n1", "n2", "n3" } };
     REQUIRE(SettleOnLeader(fleet.Cluster()));
     for ([[maybe_unused]] auto const pass: std::views::iota(0, 10))
@@ -343,6 +410,7 @@ TEST_CASE("A cluster that forgets its leader commits a configuration without it,
     auto const state = fleet.StateAt(successor);
     CHECK_FALSE(Records(state, forgotten));
     CHECK(state.HasForgotten(HostOf(forgotten)));
+    CHECK(std::ranges::contains(state.revokedKeys, forgotten, &RevokedKey::id));
     CHECK(refusedBySuccessor);
 
     // And the cluster that is left still commits.
@@ -359,13 +427,15 @@ TEST_CASE("A cluster that forgets its leader commits a configuration without it,
     RequireNoViolations(fleet.Cluster());
 }
 
-TEST_CASE("A cluster that forgets a follower keeps its leader and its quorum as before",
+TEST_CASE("A cluster that forgets a follower keeps its leader, and takes the follower out of its quorum",
           "[consensus][cluster][membership][forget]")
 {
-    // The control: the rule is about THIS node's own entry, so a forgotten follower is
-    // handled exactly as it always was. Every member here was typed into every other's
-    // `--raft-peer`, so the leader's bootstrap set names the follower -- an operator's
-    // assertion, and the quorum goes on counting it while its record goes.
+    // The control for the case above: the forgotten member is not the leader, so the leader
+    // stays. Every member here was typed into every other's `--raft-peer`, so the leader's
+    // bootstrap set names the follower -- an operator's assertion, which kept a forgotten
+    // follower counted until its forget revoked its key (#1555). Counted, it keeps that key
+    // for itself, so a forgotten follower nobody removed would go on voting: it leaves the
+    // quorum, and only then is it refused.
     Fleet fleet { { "n1", "n2", "n3" } };
     REQUIRE(SettleOnLeader(fleet.Cluster()));
     for ([[maybe_unused]] auto const pass: std::views::iota(0, 10))
@@ -389,7 +459,69 @@ TEST_CASE("A cluster that forgets a follower keeps its leader and its quorum as 
     auto const state = fleet.StateAt(leader);
     CHECK_FALSE(Records(state, follower));
     CHECK(state.HasForgotten(HostOf(follower)));
-    CHECK(fleet.Cluster().At(leader).driver->Node().ActiveConfiguration().voters.size() == 3);
+    CHECK(std::ranges::contains(state.revokedKeys, follower, &RevokedKey::id));
+    auto const& active = fleet.Cluster().At(leader).driver->Node().ActiveConfiguration();
+    CHECK_FALSE(Consensus::Membership::IsMember(active, follower));
+    CHECK(active.voters.size() == 2);
+    RequireNoViolations(fleet.Cluster());
+}
+
+TEST_CASE("Forgetting a running voter and losing the leader straight after does not wedge the cluster",
+          "[consensus][cluster][membership][forget]")
+{
+    // #1555. Four voters, each typed into every other's `--raft-peer`. An operator forgets a
+    // follower that is still running, and the leader is lost before any reconcile pass has
+    // taken the follower out of the configuration. Cut off at the revocation, the forgotten
+    // follower would leave two of four: no majority, so nobody could ever propose the removal
+    // that would make two a majority -- a cluster wedged for good by one command and one
+    // crash. Its key stays live FOR IT while the configuration counts it, so three of four
+    // elect, and the new leader takes it out.
+    Fleet fleet { { "n1", "n2", "n3", "n4" } };
+    REQUIRE(SettleOnLeader(fleet.Cluster()));
+    fleet.Reconcile(10);
+
+    auto const leader = Unwrap(fleet.Cluster().Leader());
+    auto survivors = std::vector<Consensus::NodeId> { "n1", "n2", "n3", "n4" };
+    std::erase(survivors, leader);
+    auto const forgotten = survivors.back();
+    REQUIRE(fleet.Forget(forgotten).has_value());
+
+    // The forget commits and every survivor applies it -- and ADOPTS it, which is the
+    // revocation taking effect -- with no pass run, so the configuration still counts it.
+    auto const appliedEverywhere = [&fleet, &survivors, &forgotten] {
+        return std::ranges::all_of(survivors, [&fleet, &forgotten](Consensus::NodeId const& id) {
+            return std::ranges::contains(fleet.StateAt(id).revokedKeys, forgotten, &RevokedKey::id);
+        });
+    };
+    for ([[maybe_unused]] auto const step: std::views::iota(0, 100))
+    {
+        if (appliedEverywhere())
+            break;
+        fleet.Cluster().Step();
+    }
+    REQUIRE(appliedEverywhere());
+    fleet.AdoptRosters();
+    for (auto const& id: survivors)
+    {
+        CAPTURE(id);
+        REQUIRE(Consensus::Membership::IsMember(fleet.Cluster().At(id).driver->Node().ActiveConfiguration(), forgotten));
+    }
+
+    // The leader is lost for good.
+    fleet.Cluster().Partition({ leader });
+    fleet.Reconcile(60);
+
+    // Three of four elected one of themselves, which took the forgotten member out of the
+    // configuration and goes on committing.
+    auto const successor = fleet.Cluster().Leader();
+    REQUIRE(successor.has_value());
+    CHECK(Unwrap(successor) != leader);
+    CHECK(Unwrap(successor) != forgotten);
+    CHECK_FALSE(Consensus::Membership::IsMember(fleet.Cluster().At(Unwrap(successor)).driver->Node().ActiveConfiguration(),
+                                                forgotten));
+    REQUIRE(fleet.Cluster().ProposeOnLeader(SettingWrite("20min")).has_value());
+    fleet.Reconcile(10);
+    CHECK(fleet.StateAt(Unwrap(successor)).SettingOf("lease-lifetime") == "20min");
     RequireNoViolations(fleet.Cluster());
 }
 
@@ -470,7 +602,7 @@ TEST_CASE("Admitting a voter that is not up does not stall the cluster's commits
     REQUIRE(SettleOnLeader(fleet.Cluster()));
     fleet.Reconcile(5);
 
-    fleet.Cluster().Join("n2");
+    fleet.Join("n2");
     fleet.Cluster().Partition({ "n2" });
     REQUIRE(fleet.Admit("n2"));
     fleet.Reconcile(10);

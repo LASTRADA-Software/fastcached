@@ -92,7 +92,7 @@ TEST_CASE("Re-applying a prefix reaches the same state", "[cluster][statemachine
         Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"),
         Cmd(CommandKind::SetSetting, "lease-lifetime", "20min"),
         Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"),
-        Cmd(CommandKind::RemoveMember, "n1"),
+        Cmd(CommandKind::Forget, "n1"),
     };
 
     std::uint64_t index = 0;

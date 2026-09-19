@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <vector>
@@ -90,11 +91,11 @@ TEST_CASE("A typed key the cluster revoked is revoked, whatever the command line
     ClusterState state;
     state.members = { Typed("n2", KeyOf("n2")) };
     Apply(state,
-          Command { .kind = CommandKind::RevokeKey,
+          Command { .kind = CommandKind::Forget,
                     .key = "n2",
                     .value = {},
                     .schedulerEndpoint = {},
-                    .publicKey = KeyOf("n2"),
+                    .publicKey = std::nullopt,
                     .role = std::nullopt });
     REQUIRE(state.IsRevoked(KeyOf("n2")));
     roster.Adopt(state);
@@ -109,13 +110,12 @@ TEST_CASE("A typed key the cluster revoked is revoked, whatever the command line
     CHECK(roster.KeysOf("n3").revoked == std::vector { KeyOf("n2") });
 }
 
-TEST_CASE("A revoked machine is reported as itself whatever the revocation's label and whatever id it claims",
-          "[cluster][roster][revocation]")
+TEST_CASE("A forgotten machine is reported as itself whatever id it claims", "[cluster][roster][revocation]")
 {
-    // `RevokeKey` takes the key from whatever holds it, and the id it names is a LABEL. So
-    // revoke n3's key under a label that is no member's id: a roster narrowing the revoked keys
-    // to the claimed id would call n3's proof a key nobody gave -- or a forgery of n2 -- when it
-    // is the removed machine, which is what the signed `KeyRevoked` verdict exists to tell it.
+    // The id a revocation carries is whose the key WAS, and the removed machine may claim any id
+    // it likes. A roster narrowing the revoked keys to the claimed id would call n3's proof a key
+    // nobody gave -- or a forgery of n2 -- when it is the removed machine, which is what the
+    // signed `KeyRevoked` verdict exists to tell it.
     auto const bootstrap = std::vector { Typed("n1", KeyOf("n1")), Typed("n2", KeyOf("n2")), Typed("n3", KeyOf("n3")) };
     RosterKeys roster { TestKeyPair("n1"), bootstrap };
     Consensus::RaftPeerIdentity const identity { "n1", roster };
@@ -123,11 +123,11 @@ TEST_CASE("A revoked machine is reported as itself whatever the revocation's lab
     ClusterState state;
     state.members = bootstrap;
     Apply(state,
-          Command { .kind = CommandKind::RevokeKey,
-                    .key = "rack-4-decommissioned",
+          Command { .kind = CommandKind::Forget,
+                    .key = "n3",
                     .value = {},
                     .schedulerEndpoint = {},
-                    .publicKey = KeyOf("n3"),
+                    .publicKey = std::nullopt,
                     .role = std::nullopt });
     REQUIRE(state.IsRevoked(KeyOf("n3")));
     roster.Adopt(state);
@@ -162,6 +162,49 @@ TEST_CASE("A revoked machine is reported as itself whatever the revocation's lab
     CHECK(verify("n1", byStranger).check == Consensus::SignerCheck::Forged);
 }
 
+TEST_CASE("A forgotten member keeps its own key here until the configuration drops it, and only for itself",
+          "[cluster][roster][revocation][forget]")
+{
+    // #1555. The forget revokes n3's key in the committed entry; the configuration drops n3 a
+    // reconcile pass later. In between n3 is still counted, so cutting it off would take a
+    // voter out of every quorum while nobody has yet proposed its removal -- and a cluster that
+    // then loses one more voter can be left unable to elect anyone who would.
+    auto const bootstrap = std::vector { Typed("n1", KeyOf("n1")), Typed("n2", KeyOf("n2")), Typed("n3", KeyOf("n3")) };
+    RosterKeys roster { TestKeyPair("n1"), bootstrap };
+    Consensus::RaftPeerIdentity const identity { "n1", roster };
+
+    ClusterState state;
+    state.members = bootstrap;
+    Apply(state,
+          Command { .kind = CommandKind::Forget,
+                    .key = "n3",
+                    .value = {},
+                    .schedulerEndpoint = {},
+                    .publicKey = std::nullopt,
+                    .role = std::nullopt });
+    REQUIRE(state.IsRevoked(KeyOf("n3")));
+    roster.Adopt(state);
+    roster.AdoptConfiguration(Consensus::Configuration { .voters = { "n1", "n2", "n3" }, .learners = {} });
+
+    // Counted: n3's own key is still n3's, and nothing reports it revoked FOR n3.
+    CHECK(identity.StillProves("n3", KeyOf("n3")));
+    CHECK(roster.KeysOf("n3").live == std::optional { KeyOf("n3") });
+    CHECK_FALSE(std::ranges::contains(roster.KeysOf("n3").revoked, KeyOf("n3")));
+
+    // Only for n3: the same key claiming another id is the revoked machine, as ever.
+    CHECK(std::ranges::contains(roster.KeysOf("n2").revoked, KeyOf("n3")));
+    CHECK_FALSE(identity.StillProves("n2", KeyOf("n3")));
+
+    // As a learner too -- a configuration counts both sets.
+    roster.AdoptConfiguration(Consensus::Configuration { .voters = { "n1", "n2" }, .learners = { "n3" } });
+    CHECK(identity.StillProves("n3", KeyOf("n3")));
+
+    // Dropped, and the key is refused at the next frame.
+    roster.AdoptConfiguration(Consensus::Configuration { .voters = { "n1", "n2" }, .learners = {} });
+    CHECK_FALSE(identity.StillProves("n3", KeyOf("n3")));
+    CHECK(std::ranges::contains(roster.KeysOf("n3").revoked, KeyOf("n3")));
+}
+
 TEST_CASE("A principal is a stranger on the Raft peer wire", "[cluster][roster]")
 {
     // A principal never joins consensus, so its admitted key proves nothing here.
@@ -187,10 +230,16 @@ TEST_CASE("A roster signs as its own key and nothing else", "[cluster][roster]")
     CHECK_FALSE(Ed25519Verify(KeyOf("n2"), message, signature));
 }
 
-TEST_CASE("An applied RevokeKey withdraws the key from every session it proved", "[cluster][roster][revocation]")
+TEST_CASE("An applied forget withdraws the key from every session it proved, though --raft-peer still types it",
+          "[cluster][roster][revocation][forget]")
 {
     // The whole chain a session re-asks before each frame: the replicated command, the roster
     // adopting the state it produced, and the identity answering from the roster.
+    //
+    // #1555: n3 is TYPED into this node's `--raft-peer` with its key, which is what makes the
+    // revocation load-bearing. Removing the record alone leaves the typed key standing -- the
+    // state states no key for n3 any more, so the roster falls back to the command line -- and
+    // the forgotten machine goes on proving itself here for as long as it runs.
     auto const bootstrap = std::vector { Typed("n1", KeyOf("n1")), Typed("n3", KeyOf("n3")) };
     RosterKeys roster { TestKeyPair("n1"), bootstrap };
     Consensus::RaftPeerIdentity const identity { "n1", roster };
@@ -201,15 +250,20 @@ TEST_CASE("An applied RevokeKey withdraws the key from every session it proved",
     REQUIRE(identity.StillProves("n3", KeyOf("n3")));
 
     Apply(state,
-          Command { .kind = CommandKind::RevokeKey,
+          Command { .kind = CommandKind::Forget,
                     .key = "n3",
                     .value = {},
                     .schedulerEndpoint = {},
-                    .publicKey = KeyOf("n3"),
+                    .publicKey = std::nullopt,
                     .role = std::nullopt });
+    REQUIRE(std::ranges::none_of(state.members, [](ClusterMember const& m) { return m.id == "n3"; }));
     roster.Adopt(state);
+    // And the configuration no longer counts n3 -- the removal the forget leads to, which the
+    // case below holds apart from the revocation.
+    roster.AdoptConfiguration(Consensus::Configuration { .voters = { "n1" }, .learners = {} });
 
     CHECK_FALSE(identity.StillProves("n3", KeyOf("n3")));
+    CHECK_FALSE(roster.KeysOf("n3").live.has_value());
 
     // And a signature n3 makes now -- through its own identity, with the key it always had --
     // is reported as the removed machine, not as a forgery.

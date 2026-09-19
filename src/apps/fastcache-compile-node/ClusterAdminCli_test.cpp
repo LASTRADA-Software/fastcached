@@ -293,7 +293,7 @@ TEST_CASE("A change reaches the cluster as the command it names", "[node][cluste
 
     REQUIRE(cluster.proposed.size() == 2);
     CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::SetSetting, "lease-lifetime", "20min"));
-    CHECK(cluster.proposed[1] == Cmd(Cluster::CommandKind::RemoveMember, "n3"));
+    CHECK(cluster.proposed[1] == Cmd(Cluster::CommandKind::Forget, "n3"));
 }
 
 TEST_CASE("A key this cluster refuses never reaches the log", "[node][clusteradmin]")
@@ -344,7 +344,7 @@ TEST_CASE("The operator's door refuses a member it could not name, and forgets o
     // id is the offending value itself.
     CHECK(StatusOf(fixture.Ask(Ask(ClusterAction::Forget, "n\x80"))) == Wire::Status::Ok);
     REQUIRE(cluster.proposed.size() == 1);
-    CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::RemoveMember, "n\x80"));
+    CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::Forget, "n\x80"));
 }
 
 TEST_CASE("A node with no cluster says so rather than pretending", "[node][clusteradmin]")
@@ -874,9 +874,11 @@ TEST_CASE("A status report shows each member's key, the principals and the revok
     principal.publicKey = Ed25519PublicKey {};
     principal.publicKey->fill(std::byte { 0x2C });
     principal.role = Cluster::PrincipalRole::Worker;
-    auto revoked = Cmd(Cluster::CommandKind::RevokeKey, "gone");
+    // Revoked the one way a key is: its holder was forgotten (#1555).
+    auto revoked = Cmd(Cluster::CommandKind::AdmitPrincipal, "gone");
     revoked.publicKey = Ed25519PublicKey {};
     revoked.publicKey->fill(std::byte { 0x2D });
+    revoked.role = Cluster::PrincipalRole::Worker;
 
     SECTION("an empty roster says so")
     {
@@ -894,6 +896,7 @@ TEST_CASE("A status report shows each member's key, the principals and the revok
         Apply(state, keyed);
         Apply(state, principal);
         Apply(state, revoked);
+        Apply(state, Cmd(Cluster::CommandKind::Forget, "gone"));
         auto const rendered = InterpretClusterReply(ClusterAction::Status, Cluster::Encode(state));
         REQUIRE(rendered.has_value());
         INFO(*rendered);

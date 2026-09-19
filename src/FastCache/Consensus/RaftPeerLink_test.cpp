@@ -67,7 +67,7 @@ struct LinkShape
     std::string diallerMachine {};
 
     /// What BOTH ends believe about everybody's keys: one cluster's replicated roster, so a
-    /// revocation reaches the two ends at once, as an applied `RevokeKey` does.
+    /// revocation reaches the two ends at once, as an applied forget does.
     std::shared_ptr<Testing::SharedRoster> roster { Testing::SharedRoster::Of({ "n1", "n2", "n3" }) };
 };
 

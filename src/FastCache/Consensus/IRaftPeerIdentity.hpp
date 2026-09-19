@@ -144,8 +144,8 @@ class IRaftPeerIdentity
 
     /// Whether @p key is still the key the roster holds for @p peer.
     ///
-    /// Asked of every frame of an open session, which is how an applied `RevokeKey` closes the
-    /// sessions that key proved: the next frame either way is refused, rather than a session
+    /// Asked of every frame of an open session, which is how an applied forget closes the
+    /// sessions the forgotten member's key proved: the next frame either way is refused, rather than a session
     /// outliving the decision that removed its member.
     /// @param peer The member the session proved.
     /// @param key The key it proved itself with.

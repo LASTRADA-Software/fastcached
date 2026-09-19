@@ -137,20 +137,20 @@ TEST_CASE("A member the cluster records has to be one it can name", "[cluster][s
 TEST_CASE("A member that cannot be named can still be forgotten", "[cluster][state]")
 {
     // The trap #159 exists to record, pinned open. `Validate` governs every verb, so
-    // a rule applied to all of them alike would also govern `RemoveMember` -- whose
+    // a rule applied to all of them alike would also govern `Forget` -- whose
     // key IS the offending id. A member that reached replicated state through a peer
     // built before any of this existed would then count towards quorum forever,
     // refused by the very check meant to keep it out, with `--cluster-forget` the
     // one thing that could have removed it.
     //
     // So the answer is a property of the VERB, and this is the case that says so.
-    CHECK(Validate(Cmd(CommandKind::RemoveMember, "n\x80")).has_value());
+    CHECK(Validate(Cmd(CommandKind::Forget, "n\x80")).has_value());
 
     // Which is only useful if it does what it says: the state has to lose it.
     ClusterState state;
     Apply(state, Cmd(CommandKind::AddMember, "n\x80", "10.0.0.1:6675"));
     REQUIRE(state.members.size() == 1);
-    Apply(state, Cmd(CommandKind::RemoveMember, "n\x80"));
+    Apply(state, Cmd(CommandKind::Forget, "n\x80"));
     CHECK(state.members.empty());
 }
 
@@ -286,13 +286,13 @@ TEST_CASE("Applying is total, and admitting a known member moves it", "[cluster]
     CHECK(state.members.size() == 2);
     CHECK(Unwrap(state.RaftEndpointOf("n1")) == "10.0.0.9:6675");
 
-    Apply(state, Cmd(CommandKind::RemoveMember, "n1"));
+    Apply(state, Cmd(CommandKind::Forget, "n1"));
     CHECK(state.members.size() == 1);
     CHECK_FALSE(state.RaftEndpointOf("n1").has_value());
 
     // Removing something that is not there is a no-op rather than a fault, for the
     // same reason: by the time this runs the cluster has already agreed to it.
-    Apply(state, Cmd(CommandKind::RemoveMember, "n1"));
+    Apply(state, Cmd(CommandKind::Forget, "n1"));
     CHECK(state.members.size() == 1);
 }
 
@@ -492,7 +492,7 @@ TEST_CASE("A member's scheduler endpoint says whether it was never announced or 
 
     // A forget is a positive act, so an id admitted from absence has announced nothing
     // -- whatever an earlier member of that name once did.
-    Apply(state, Cmd(CommandKind::RemoveMember, "led"));
+    Apply(state, Cmd(CommandKind::Forget, "led"));
     Apply(state, Cmd(CommandKind::AddMember, "led", "10.0.0.9:6675"));
     CHECK(stateOf("led") == SchedulerEndpointState::NeverAnnounced);
 
@@ -614,7 +614,7 @@ TEST_CASE("A verb that has no scheduler endpoint may not carry one", "[cluster][
     // A field a verb ignores is a field somebody misunderstood, and the refusal is at
     // the proposer because that is the only place anything can be refused.
     CHECK(Validate(Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000")).has_value());
-    CHECK_FALSE(Validate(Cmd(CommandKind::RemoveMember, "n1", {}, "10.0.0.1:7000")).has_value());
+    CHECK_FALSE(Validate(Cmd(CommandKind::Forget, "n1", {}, "10.0.0.1:7000")).has_value());
     CHECK_FALSE(Validate(Cmd(CommandKind::SetSetting, "lease-lifetime", "20min", "10.0.0.1:7000")).has_value());
 }
 
@@ -836,13 +836,13 @@ TEST_CASE("Forgetting a member records its host as forgotten, and admitting that
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
     Apply(state, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"));
 
-    Apply(state, Cmd(CommandKind::RemoveMember, "n1"));
+    Apply(state, Cmd(CommandKind::Forget, "n1"));
     CHECK(state.HasForgotten("10.0.0.1"));
     CHECK_FALSE(state.HasForgotten("10.0.0.2"));
 
     // Forgetting an id that is not a member leaves nothing: there is no host to derive,
     // and a tombstone for a guess would refuse a machine nobody forgot.
-    Apply(state, Cmd(CommandKind::RemoveMember, "nobody"));
+    Apply(state, Cmd(CommandKind::Forget, "nobody"));
     CHECK(state.forgotten.size() == 1);
 
     // Re-admitting a member at that host clears it; so would `AdmitClient`, the route a
@@ -850,7 +850,7 @@ TEST_CASE("Forgetting a member records its host as forgotten, and admitting that
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
     CHECK_FALSE(state.HasForgotten("10.0.0.1"));
 
-    Apply(state, Cmd(CommandKind::RemoveMember, "n2"));
+    Apply(state, Cmd(CommandKind::Forget, "n2"));
     Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.2"));
     CHECK_FALSE(state.HasForgotten("10.0.0.2"));
 
@@ -858,7 +858,7 @@ TEST_CASE("Forgetting a member records its host as forgotten, and admitting that
     // so a tombstone for it could narrow nothing -- and every member of a one-machine
     // cluster answers on loopback.
     Apply(state, Cmd(CommandKind::AddMember, "local", "127.0.0.1:6675"));
-    Apply(state, Cmd(CommandKind::RemoveMember, "local"));
+    Apply(state, Cmd(CommandKind::Forget, "local"));
     CHECK_FALSE(state.HasForgotten("127.0.0.1"));
 }
 
@@ -877,13 +877,15 @@ TEST_CASE("Each cluster verb keeps the byte a log entry already carries", "[clus
         return static_cast<unsigned>(bytes[5]);
     };
     CHECK(byteOf(CommandKind::AddMember) == 0U);
-    CHECK(byteOf(CommandKind::RemoveMember) == 1U);
+    CHECK(byteOf(CommandKind::Forget) == 1U);
     CHECK(byteOf(CommandKind::SetSetting) == 2U);
     CHECK(byteOf(CommandKind::AdmitClient) == 3U);
     CHECK(byteOf(CommandKind::ForgetClient) == 4U);
     CHECK(byteOf(CommandKind::AddLearner) == 5U);
     CHECK(byteOf(CommandKind::AdmitPrincipal) == 6U);
-    CHECK(byteOf(CommandKind::RevokeKey) == 7U);
+    // And nothing above it: the next verb is 7, and until then a 7 is a verb this build does
+    // not know, skipped by name rather than applied as something else.
+    CHECK(static_cast<unsigned>(CommandKind::Last) == 7U);
 }
 
 TEST_CASE("A client command names a machine that is not this one, and nothing else", "[cluster][state][forget]")
@@ -964,7 +966,7 @@ TEST_CASE("Every seat names the verb that records it and the set it means", "[cl
     // FACTS rather than as `MemberSeatTable` agreeing with itself.
     CHECK(SeatAdmittedBy(CommandKind::AddMember) == std::optional { MemberSeat::Voter });
     CHECK(SeatAdmittedBy(CommandKind::AddLearner) == std::optional { MemberSeat::Learner });
-    CHECK_FALSE(SeatAdmittedBy(CommandKind::RemoveMember).has_value());
+    CHECK_FALSE(SeatAdmittedBy(CommandKind::Forget).has_value());
     CHECK_FALSE(SeatAdmittedBy(CommandKind::AdmitClient).has_value());
 
     CHECK(MemberSeatName(MemberSeat::Voter) == "voter");
@@ -1027,8 +1029,9 @@ TEST_CASE("A member's key, the principals and the revoked keys survive a snapsho
     ClusterState state;
     Apply(state, Keyed(CommandKind::AddMember, "n1", KeyOf(0x11), "10.0.0.1:6675"));
     Apply(state, Cmd(CommandKind::AddLearner, "n2", "10.0.0.2:6675"));
+    Apply(state, Keyed(CommandKind::AdmitPrincipal, "w0", KeyOf(0x33)));
     Apply(state, Keyed(CommandKind::AdmitPrincipal, "w1", KeyOf(0x22)));
-    Apply(state, Keyed(CommandKind::RevokeKey, "w0", KeyOf(0x33)));
+    Apply(state, Cmd(CommandKind::Forget, "w0"));
     REQUIRE(state.principals.size() == 1);
     REQUIRE(state.revokedKeys.size() == 1);
 
@@ -1067,7 +1070,7 @@ TEST_CASE("A command carries its key and role, and a role this build cannot name
     CHECK(unknown.error().code == ConsensusErrorCode::UnknownMessageType);
 
     // A key field that is neither absent nor 32 bytes is damage, not a shorter key.
-    auto const header = std::array { std::byte { 3 }, static_cast<std::byte>(CommandKind::RevokeKey) };
+    auto const header = std::array { std::byte { 3 }, static_cast<std::byte>(CommandKind::AdmitPrincipal) };
     auto const shortKey = std::vector<std::byte>(31, std::byte { 0x55 });
     auto const malformed = DecodeCommand(WireFields::Encode({ std::span<std::byte const> { header },
                                                               WireFields::AsBytes(std::string_view { "w1" }),
@@ -1081,12 +1084,13 @@ TEST_CASE("A command carries its key and role, and a role this build cannot name
 
 TEST_CASE("A revoked key is never admitted again, and the refusal says it is permanent", "[cluster][state][identity]")
 {
-    // #178's acceptance: RevokeKey, then AdmitPrincipal of that key. BOTH halves, because they
-    // are two guards: the proposer refuses it where an operator reads the answer, and `Apply`
-    // drops it for the proposal that was judged against a state from before the revocation.
+    // #178's acceptance, through the verb an operator types (#1555): forget the machine, then
+    // AdmitPrincipal of its key. BOTH halves, because they are two guards: the proposer refuses
+    // it where an operator reads the answer, and `Apply` drops it for the proposal that was
+    // judged against a state from before the forget.
     ClusterState state;
     Apply(state, Keyed(CommandKind::AdmitPrincipal, "w1", KeyOf(0x66)));
-    Apply(state, Keyed(CommandKind::RevokeKey, "w1", KeyOf(0x66)));
+    Apply(state, Cmd(CommandKind::Forget, "w1"));
     REQUIRE(state.IsRevoked(KeyOf(0x66)));
     REQUIRE(state.principals.empty());
 
@@ -1116,37 +1120,105 @@ TEST_CASE("A revoked key is never admitted again, and the refusal says it is per
     CHECK(state == before);
 }
 
-TEST_CASE("A revocation takes the key from whoever holds it, keeps it whole, and is never dropped",
-          "[cluster][state][identity]")
+TEST_CASE("Forgetting an id removes it from whichever list records it and revokes the key it held",
+          "[cluster][state][identity][forget]")
 {
+    // #1555: `--cluster-forget` is ONE act. The acceptance the issue asked of a key verb -- it
+    // reaches members and principals alike, asserted on the applied state -- is asked of the
+    // forget instead, because there is no key verb.
     ClusterState state;
     Apply(state, Keyed(CommandKind::AdmitPrincipal, "w1", KeyOf(0x71)));
     Apply(state, Keyed(CommandKind::AddMember, "n1", KeyOf(0x72), "10.0.0.1:6675"));
+    Apply(state, Keyed(CommandKind::AddMember, "n2", KeyOf(0x74), "10.0.0.2:6675"));
 
-    // A principal IS its key, so revoking the key removes it.
-    Apply(state, Keyed(CommandKind::RevokeKey, "w1", KeyOf(0x71)));
+    // A principal: its record goes and its key is revoked, labelled with whose it was. No host
+    // is tombstoned, because a principal has none.
+    Apply(state, Cmd(CommandKind::Forget, "w1"));
     CHECK(state.principals.empty());
     REQUIRE(state.revokedKeys.size() == 1);
     CHECK(state.revokedKeys[0] == RevokedKey { .id = "w1", .publicKey = KeyOf(0x71) });
+    CHECK(state.forgotten.empty());
 
-    // A member keeps its record and loses the key: removing a member is a change to what
-    // consensus counts, and that is `RemoveMember`'s decision, one change at a time.
-    // The label must name the holder, and the proposer refuses one that does not...
-    auto const mislabelled = Keyed(CommandKind::RevokeKey, "somebody-else", KeyOf(0x72));
-    CHECK(RefusedAgainst(state, mislabelled).code == ConsensusErrorCode::InvalidConfiguration);
-    // ...but a revocation that was committed is APPLIED whatever its label says, because a
-    // dropped one is a key left live that an operator was told is gone.
-    Apply(state, mislabelled);
-    REQUIRE(state.members.size() == 1);
-    CHECK_FALSE(state.members[0].publicKey.has_value());
+    // A member: its record goes, its host is tombstoned as before (#1309), and the key it
+    // held is revoked in the same entry -- not cleared from a record that stays, which the
+    // configuration would go on counting, and a counted member keeps its key for itself.
+    Apply(state, Cmd(CommandKind::Forget, "n1"));
+    CHECK(std::ranges::none_of(state.members, [](ClusterMember const& m) { return m.id == "n1"; }));
+    CHECK(state.HasForgotten("10.0.0.1"));
     CHECK(state.IsRevoked(KeyOf(0x72)));
+    REQUIRE(state.revokedKeys.size() == 2);
+    CHECK(std::ranges::contains(state.revokedKeys, RevokedKey { .id = "n1", .publicKey = KeyOf(0x72) }));
 
-    // Idempotent: one entry per key, whatever the label on the second.
-    Apply(state, Keyed(CommandKind::RevokeKey, "n1", KeyOf(0x72)));
-    CHECK(state.revokedKeys.size() == 2);
+    // Nothing else moved: n2 is still recorded under its own key, which is not revoked.
+    REQUIRE(state.members.size() == 1);
+    CHECK(state.members[0].publicKey == std::optional { KeyOf(0x74) });
+    CHECK_FALSE(state.IsRevoked(KeyOf(0x74)));
 
-    // A key nobody holds may be revoked -- refusing a machine BEFORE it is admitted.
-    CHECK(ValidateAgainst(state, Keyed(CommandKind::RevokeKey, "not-yet", KeyOf(0x73))).has_value());
+    // Idempotent, and an id recorded nowhere is forgotten as nothing at all.
+    auto const before = state;
+    Apply(state, Cmd(CommandKind::Forget, "n1"));
+    Apply(state, Cmd(CommandKind::Forget, "never-admitted"));
+    CHECK(state == before);
+}
+
+TEST_CASE("A forget revokes the key the proposer holds for an id the state records without one, and never another's",
+          "[cluster][state][identity][forget]")
+{
+    // #1555: a member a `--raft-peer` line typed WITH its key is recorded without one, or not
+    // at all, so the record alone cannot say which key to revoke. The proposing leader states
+    // the key it holds live (`PrepareForget`), and that is revoked beside the record's.
+    ClusterState state;
+    Apply(state, Cmd(CommandKind::AddMember, "n3", "10.0.0.3:6675"));
+    Apply(state, Keyed(CommandKind::AddMember, "n4", KeyOf(0x78), "10.0.0.4:6675"));
+
+    auto typedKey = Cmd(CommandKind::Forget, "n3");
+    typedKey.publicKey = KeyOf(0x77);
+    REQUIRE(ValidateAgainst(state, typedKey).has_value());
+    Apply(state, typedKey);
+    CHECK(state.IsRevoked(KeyOf(0x77)));
+    CHECK(state.HasForgotten("10.0.0.3"));
+
+    // Recorded nowhere at all -- typed on the command line and never desired -- and still the
+    // key is revoked, which is what reaches every node that types it.
+    auto unrecorded = Cmd(CommandKind::Forget, "n5");
+    unrecorded.publicKey = KeyOf(0x79);
+    Apply(state, unrecorded);
+    CHECK(std::ranges::contains(state.revokedKeys, RevokedKey { .id = "n5", .publicKey = KeyOf(0x79) }));
+
+    // Never ANOTHER id's key: refused at the proposal, and skipped if it commits anyway, so a
+    // forget of n6 cannot take n4's key away.
+    auto borrowed = Cmd(CommandKind::Forget, "n6");
+    borrowed.publicKey = KeyOf(0x78);
+    CHECK(RefusedAgainst(state, borrowed).context.contains("a forget revokes only the key of the machine it names"));
+    Apply(state, borrowed);
+    CHECK_FALSE(state.IsRevoked(KeyOf(0x78)));
+    CHECK(std::ranges::any_of(state.members, [](ClusterMember const& m) { return m.id == "n4"; }));
+}
+
+TEST_CASE("A forget revokes the key its record holds when it COMMITS, not the one it was proposed against",
+          "[cluster][state][identity][forget]")
+{
+    // The key is derived at `Apply`, from the record being removed. A re-admission under a new
+    // key committed between the proposal and the forget is exactly the race a key carried in
+    // the command would lose: it would revoke the old key and leave the new one live.
+    ClusterState state;
+    Apply(state, Keyed(CommandKind::AddMember, "n1", KeyOf(0x75), "10.0.0.1:6675"));
+    auto const forget = Cmd(CommandKind::Forget, "n1");
+    REQUIRE(ValidateAgainst(state, forget).has_value());
+
+    Apply(state, Keyed(CommandKind::AddMember, "n1", KeyOf(0x76), "10.0.0.1:6675"));
+    Apply(state, forget);
+    CHECK(state.IsRevoked(KeyOf(0x76)));
+    CHECK(state.members.empty());
+
+    // And a member recorded WITHOUT a key has nothing to revoke: the forget removes it and
+    // tombstones its host, exactly as `RemoveMember` did before keys existed.
+    ClusterState keyless;
+    Apply(keyless, Cmd(CommandKind::AddMember, "n3", "10.0.0.3:6675"));
+    Apply(keyless, Cmd(CommandKind::Forget, "n3"));
+    CHECK(keyless.members.empty());
+    CHECK(keyless.revokedKeys.empty());
+    CHECK(keyless.HasForgotten("10.0.0.3"));
 }
 
 TEST_CASE("One key proves one identity, and an id is a member or a principal, never both", "[cluster][state][identity]")
@@ -1214,9 +1286,9 @@ TEST_CASE("Which verbs carry a key and a role is the verb's, and a stray one is 
     admitNoRole.role.reset();
     CHECK(Refused(admitNoRole).contains("must name a principal role"));
 
-    auto revokeWithRole = Keyed(CommandKind::RevokeKey, "w1", KeyOf(0xA3));
-    revokeWithRole.role = PrincipalRole::Worker;
-    CHECK(Refused(revokeWithRole).contains("carries no principal role"));
+    auto forgetWithRole = Cmd(CommandKind::Forget, "w1");
+    forgetWithRole.role = PrincipalRole::Worker;
+    CHECK(Refused(forgetWithRole).contains("carries no principal role"));
 
     auto memberWithRole = Keyed(CommandKind::AddMember, "n1", KeyOf(0xA4), "10.0.0.1:6675");
     memberWithRole.role = PrincipalRole::Worker;

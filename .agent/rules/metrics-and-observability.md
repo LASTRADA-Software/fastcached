@@ -877,7 +877,7 @@ outright rather than drawing with a gap.
   before that check existed or from a peer. A cluster entry is applied after it is
   committed, with nobody left to refuse it, so the surface that accepts the request
   is the last place anybody can be told.
-- **`Cluster::Validate` carries the rule per VERB, and `RemoveMember`'s row is
+- **`Cluster::Validate` carries the rule per VERB, and `Forget`'s row is
   empty.** One rule for every verb alike was written, verified and reverted once
   (#159), because `Validate` governs removal too and a removal's key *is* the
   offending id: a bad member already in replicated state could then never be
@@ -898,7 +898,7 @@ outright rather than drawing with a gap.
 - **Refused, not cleaned up, and the reason is per-field.** A fingerprint is
   matched byte for byte, so a worker admitted under a repaired name would match
   nothing and sit in the fleet never being picked. A member id is what every
-  later `RemoveMember` has to name, so a repaired one could never be removed by
+  later `Forget` has to name, so a repaired one could never be removed by
   the name its operator typed. A repair is the failure that is quiet.
 - **All the strings, from a table.** A fourth string added to
   `WorkerRegistration` or to `Cluster::Command` that nobody remembered to check
