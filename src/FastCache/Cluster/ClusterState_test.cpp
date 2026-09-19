@@ -1390,20 +1390,21 @@ TEST_CASE("The roster version moves with who may vouch for whom, and with nothin
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     CHECK(state.rosterVersion == 1);
 
-    // The roster: a second voter, a seat change, a principal, a revocation, a removal.
+    // The roster: a second voter, a seat change, a principal, and a forget of each -- which removes
+    // the record and revokes its key in ONE entry (#1555), so each moves the version once.
     Apply(state, Keyed(CommandKind::AddMember, "n2", KeyOf(0x22), "10.0.0.2:6675"));
     CHECK(state.rosterVersion == 2);
     Apply(state, Cmd(CommandKind::AddLearner, "n2", "10.0.0.2:6675"));
     CHECK(state.rosterVersion == 3);
     Apply(state, Keyed(CommandKind::AdmitPrincipal, "w1", KeyOf(0x31)));
     CHECK(state.rosterVersion == 4);
-    Apply(state, Keyed(CommandKind::RevokeKey, "w1", KeyOf(0x31)));
+    Apply(state, Cmd(CommandKind::Forget, "w1"));
     CHECK(state.rosterVersion == 5);
-    Apply(state, Cmd(CommandKind::RemoveMember, "n2"));
+    Apply(state, Cmd(CommandKind::Forget, "n2"));
     CHECK(state.rosterVersion == 6);
 
-    // A command dropped at apply -- removing a member that is not there -- changes nothing.
-    Apply(state, Cmd(CommandKind::RemoveMember, "n9"));
+    // A forget of an id nothing records, naming no key, changes nothing.
+    Apply(state, Cmd(CommandKind::Forget, "n9"));
     CHECK(state.rosterVersion == 6);
 
     // And it survives the state's own encoding: a restarted node endorses the version it had.
