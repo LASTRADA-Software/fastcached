@@ -267,11 +267,19 @@ argument for deciding it early, and drawing does that. The fixture draws from
 20000..32000 like every sibling now, and the four were CHECKED rather than assumed:
 `compile-cache-e2e.sh` and `dist-compile-e2e.sh` call `free_port`; `sccache-smoke.sh`
 does too, and `FASTCACHED_SMOKE_PORT` defaults to EMPTY so the registration passes no
-`--port` at all. `sccache-smoke.ps1` still fixes 11611, and that is the remainder of
-#183. The CMake half is worth naming separately from the script half, because for a
-while the script drew and the registration passed `--port 11611` unconditionally: the
-draw was live, unreachable from the only caller there is, and the diff showed a
-converted fixture.
+`--port` at all, on either platform since `sccache-smoke.ps1` drew too (#183). The
+CMake half is worth naming separately from the script half, because for a while the
+script drew and the registration passed `--port 11611` unconditionally: the draw was
+live, unreachable from the only caller there is, and the diff showed a converted
+fixture.
+
+**And the same shape survives OUTSIDE CMake, which is the half that survey missed.**
+`.github/workflows/build.yml` invokes three fixtures directly with an explicit
+`--port`, so those legs exercise the fixed-port path and never the draw. Measured on
+`08c68bdb`: three `sccache-smoke.sh` steps at `--port 11611`, and two
+`compile-cache-e2e.sh` steps at `11611` and `21713`. A per-job runner makes the
+constant harmless *there*, which is exactly why it reads as fine and stays: the cost
+is that the code path CI proves is not the one a developer runs.
 
 Three things worth keeping:
 

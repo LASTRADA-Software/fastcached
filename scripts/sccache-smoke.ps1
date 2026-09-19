@@ -33,15 +33,34 @@
 # one does, so without it a leg named for a dialect could exercise the other and go
 # on claiming coverage.
 #
-# STILL NOT DONE HERE, and tracked as #183: this driver fixes its port and waits
-# for readiness with a flat `Start-Sleep`. The POSIX half draws a port per run and
-# waits on the listener; this one does not yet. The bounded wait added below is for
-# the STORE, which the new assertions need, and is not that fix.
+# ## The port and the readiness wait (#183)
+#
+# Both halves now match the POSIX driver, which is what #183 was left open for.
+#
+# The port is DRAWN per run, through `scripts/lib/E2EPorts.psm1` rather than a
+# third copy of the draw: `RUN_SERIAL` stops these two smokes racing other ctest
+# tests and says nothing about the socket the PREVIOUS serial test just closed,
+# about a second worktree, or about a daemon a cancelled run left holding the
+# port. On Windows a listener claims its address with `SO_EXCLUSIVEADDRUSE`, so a
+# lingering bind fails outright rather than being quietly shared.
+#
+# The readiness wait is bounded and says what it waited for. The `Start-Sleep
+# -Seconds 1` it replaces was neither, and it is the better explanation of the
+# reported signature -- two failures in about five full `ctest` runs on one
+# Windows workstation, passing 100% of the time when run alone. That is the
+# difference between a loaded machine and an idle one, not between a colliding
+# port and a free one; with ~2400 Catch2 processes in flight one second frequently
+# is not enough, and the failure then surfaced as sccache being unable to reach a
+# backend that was merely not up yet.
 $ErrorActionPreference = 'Stop'
+
+Import-Module (Join-Path $PSScriptRoot 'lib/E2EPorts.psm1') -Force
 
 $fastcached = ''
 $protocol = 'memcached'
-$port = '11611'
+# 0 draws one per run. A port passed explicitly is honoured and PROBED first,
+# since the caller chose the collision risk.
+$port = 0
 $compiler = if ($env:CXX) { $env:CXX } else { 'cl' }
 # Exact dialect this caller expects. Optional: given, it must match exactly (the
 # caller pinned the sccache and therefore knows); omitted, only the protocol's
@@ -114,6 +133,11 @@ if ($help -notmatch "(?m)^\s+$($backend.Feature):\s+true\s*$") {
     exit $SKIP
 }
 
+# Settled BEFORE the backend URL is exported, which is the one ordering constraint
+# here: sccache's server reads that variable at ITS start, so the address has to be
+# final by now.
+$port = Get-E2EFixturePort ([int]$port) $fastcached "fastcached"
+
 Set-Item -Path "env:$($backend.Env)" -Value "$($backend.Scheme)://127.0.0.1:$port"
 $env:SCCACHE_NO_DAEMON = '0'
 
@@ -173,7 +197,10 @@ else {
 $server = Start-Process -FilePath $fastcached `
     -ArgumentList "--port=$port", '--log-level=trace', '--log-everything' `
     -PassThru -NoNewWindow -RedirectStandardOutput $daemonOut -RedirectStandardError $daemonErr
-Start-Sleep -Seconds 1
+# Waits on the LISTENER, bounded, and reports a daemon that DIED as a death rather
+# than as a timeout -- a third case beside slow and stuck, and the one the flat
+# sleep could never name. The POSIX half's `wait_for_port` is the same wait.
+Wait-E2EPortAnswers $port $server "fastcached" @($daemonOut, $daemonErr)
 
 & sccache --stop-server *> $null
 & sccache --start-server | Out-Null

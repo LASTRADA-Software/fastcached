@@ -5326,8 +5326,8 @@ elseif(SCCACHE)
     # every run still binds one constant, which is the shape a diff cannot show.
     # Kept as a cache entry so somebody who needs to pin it still can.
     #
-    # `sccache-smoke.ps1` is NOT yet converted and keeps its own `11611` default, so
-    # on Windows an empty value here changes nothing. That is #183's remaining half.
+    # Both drivers draw now, so an empty value here means "draw one" on either
+    # platform rather than only on POSIX (#183).
     set(FASTCACHED_SMOKE_PORT "" CACHE STRING
         "TCP port the sccache smoke tests bind fastcached to; empty draws one per run")
     set(_smoke_port_arg "")
