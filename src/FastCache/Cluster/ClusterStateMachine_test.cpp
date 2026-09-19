@@ -350,7 +350,7 @@ TEST_CASE("Whether a command can be applied is asked without applying it, in the
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
         CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterCommandVersion)));
-        CHECK(refused.error().context.contains("reads 3"));
+        CHECK(refused.error().context.contains("reads 4"));
     }
 
     SECTION("bytes that are no command at all are damage")

@@ -681,7 +681,9 @@ struct ClusterState
 /// the state as if that command had never been proposed -- which for #1309's two verbs
 /// means such a member admits no replicated client (closed, and healed by the upgrade)
 /// and ignores a client forget (OPEN for that host, until it is upgraded). #178's two
-/// verbs DID move it, because they brought two fields the layout had no room for.
+/// verbs DID move it, because they brought two fields the layout had no room for. #1555
+/// moved it again with the layout untouched, because it changed what a verb MEANS --
+/// `RemoveMember`'s ordinal became `Forget` -- which an older entry's byte cannot say.
 enum class CommandKind : std::uint8_t
 {
     /// Add a member, or update the endpoint of one already present.
@@ -715,7 +717,10 @@ enum class CommandKind : std::uint8_t
     /// one: every entry a RELEASED build wrote names a member with no key, which this
     /// applies exactly as `RemoveMember` did, and no released build can be a member of a
     /// cluster that has keys -- the Raft peer wire refuses its version
-    /// (`RaftWire::MinSupportedVersion`).
+    /// (`RaftWire::MinSupportedVersion`). And an entry ANY earlier build wrote, released or
+    /// not, is refused by `CommandVersion` before its verb is read: an unreleased build's
+    /// `RemoveMember` could name a keyed member, and replaying it as this verb would revoke a
+    /// key that build never revoked.
     Forget,
     SetSetting,
 
