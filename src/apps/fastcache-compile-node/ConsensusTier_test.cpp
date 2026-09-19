@@ -1037,7 +1037,7 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
         CHECK(row->detail.contains("leader n1"));
         CHECK(row->detail.contains("log entry 3"));
         CHECK(row->detail.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
-        CHECK(row->detail.contains("reads 6"));
+        CHECK(row->detail.contains("reads 7"));
 
         // Nothing taken on: not the previous build's member, not a moved commit index.
         CHECK_FALSE(tier->ClusterState().RaftEndpointOf("n1").has_value());

@@ -385,7 +385,7 @@ TEST_CASE("Whether a snapshot can be restored is asked without restoring it, in 
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
         CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
-        CHECK(refused.error().context.contains("reads 6"));
+        CHECK(refused.error().context.contains("reads 7"));
     }
 
     SECTION("bytes that are no state at all are damage")
