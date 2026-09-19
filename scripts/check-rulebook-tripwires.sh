@@ -276,7 +276,8 @@ NotCovered='  This check verifies the phrase the author nominated is PRESENT in 
   Its UNIT is the `##` heading, and a rule arrives as a BULLET under existing
   prose -- so a new rule in an already-marked section is invisible to it, and the
   files with the fewest headings are the ones it watches least. Read the counts
-  above as sections covered, never as rules covered.'
+  above as sections covered, never as rules covered. That gap is measured and
+  tracked as #1572.'
 
 # The body. Wrapped by `RunCheck` below so the haystack temp file has exactly one
 # removal site. Not a `trap ... RETURN`: a RETURN trap set inside a function also

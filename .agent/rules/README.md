@@ -156,3 +156,20 @@ the one place they cannot drift from the tree.
 An `@`-prefixed reference to a file in this directory, anywhere in `AGENT.md`,
 would pull every one of them back into every session and undo the entire point of
 the split. Link them as plain markdown.
+
+## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
+
+- **[#1572](https://github.com/LASTRADA-Software/fastcached/issues/1572)** — the
+  tripwire markers are required per `##` heading, and a rule arrives as a BULLET
+  under existing prose, so a rule added to an already-marked section is invisible
+  to `ctest -R rulebook-tripwires`. Measured: 137 sections watched against 391
+  rulebook bullets, and six files use nine headings or fewer for a thousand lines
+  or more — `distributed-compilation.md`'s first `## ` is at line 3023 of 3378,
+  so 89% of it has no attachment point and three phrases watch 74 tripwires. The
+  check says so in its own refusal text, because a guard's stated blind spot must
+  name the direction it fails in. The cheap fix is **sectioning those files**,
+  which needs no code and gives a 3,378-line rules file the table of contents it
+  lacks; a marker per rule would be ~600 markers and is recorded in the issue as
+  rejected rather than pending.
