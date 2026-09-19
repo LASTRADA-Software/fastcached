@@ -1058,15 +1058,18 @@ if [[ "$mode" == "membership" ]]; then
     # that gauge carried the whole counter table ahead of it, and a body without
     # it was cut short whatever the transport thinks.
     #
-    # The acquisition cannot report this for itself today, which is why the test
-    # is here rather than there. `http_get` returns 0 for a response its own read
-    # bound truncated -- it documents only *returns 1 if the connection was
-    # refused* -- and on macOS's bash 3.2 the drain cannot classify it either:
-    # `_e2e_read_ended_at_bound` needs the sticky-EOF probe to tell a timeout from
-    # a close, and `_http_drain_fd3` takes that probe ONLY when the body is empty.
-    # A partial body therefore reports `peer`, which means *the server answered*.
-    # Measured and reported rather than fixed in place: `scripts/lib/e2e-common.sh`
-    # is shared by seven fixtures and a change there is not this ticket.
+    # The acquisition CAN report this for itself now, and this test stays anyway.
+    # `http_get` returns `$E2eHttpTruncated` for a response its own read bound cut
+    # short, and `_http_drain_fd3` takes the sticky-EOF probe whenever the status
+    # cannot decide rather than only when the body is empty -- which is what made
+    # a partial body report `peer`, *the server answered*, on macOS's bash 3.2
+    # (#1257). The loop below reads that status and names it.
+    #
+    # The terminator test is KEPT because it answers a different question. The
+    # transport can only say whether OUR bound ended the read; it cannot say the
+    # exporter finished writing, and a body can be complete-on-the-wire and still
+    # be a body this fixture cannot conclude from. Two readings, two failures, and
+    # the one that fires says which.
     #
     # BOUNDED and retried, because a scrape that did not complete is a failure of
     # the instrument rather than evidence about the worker -- and the findings say
@@ -1084,8 +1087,14 @@ if [[ "$mode" == "membership" ]]; then
         _metrics_body_ready() {
             local body="" statusLine=""
             attempts=$(( attempts + 1 ))
-            if ! body="$(http_get "$host" "$port" /metrics 2>/dev/null)"; then
-                lastOutcome="the connection was refused"
+            local getStatus=0
+            body="$(http_get "$host" "$port" /metrics 2>/dev/null)" || getStatus=$?
+            if [ "$getStatus" -ne "$E2eHttpAnswered" ]; then
+                # NAMED, never "the connection was refused" for every non-zero.
+                # Refused and cut-short are facts about different machines, and
+                # this loop retries both -- so the one it reports has to be the
+                # one that happened (#1257).
+                lastOutcome="$(e2e_http_outcome "$getStatus" "the scrape")"
                 return 1
             fi
             lastBytes=${#body}
@@ -1479,8 +1488,13 @@ wait_for_registration "$worker_pid" "worker" "${workdir}/worker.log"
 # Recorded at this length because deleting the wait WITHOUT reading the comment
 # would look like the claim went with it, and the next reader might restore the
 # wait or -- worse -- delete the `http_get` as the apparently redundant one.
-health="$(http_get 127.0.0.1 "$worker_admin_port" /healthz)" \
-    || fail "worker admin endpoint refused a connection on ${worker_admin_port}"
+# NAMED. `|| fail "... refused a connection"` said the same thing for a refused
+# connection and for a response our own read bound cut short -- two facts about
+# two different machines, and only one of them was ever true (#1257).
+health_status=0
+health="$(http_get 127.0.0.1 "$worker_admin_port" /healthz)" || health_status=$?
+[ "$health_status" -eq "$E2eHttpAnswered" ] \
+    || fail "$(e2e_http_outcome "$health_status" "the worker admin endpoint's /healthz on ${worker_admin_port}")"
 [[ "$health" == *"200 OK"* ]] \
     || { printf '%s\n' "$health" >&2; fail "worker /healthz did not answer 200"; }
 
@@ -1488,7 +1502,10 @@ health="$(http_get 127.0.0.1 "$worker_admin_port" /healthz)" \
 # and zero -- `fastcached_items 0` states an empty unbounded cache as a fact, and
 # a dashboard reads it as one. This is the assertion that would fail if
 # `MetricsSnapshot::storage` stopped being optional.
-before="$(http_get 127.0.0.1 "$worker_admin_port" /metrics)"     || fail "worker admin endpoint refused a /metrics request"
+before_status=0
+before="$(http_get 127.0.0.1 "$worker_admin_port" /metrics)" || before_status=$?
+[ "$before_status" -eq "$E2eHttpAnswered" ] \
+    || fail "$(e2e_http_outcome "$before_status" "the worker admin endpoint's /metrics")"
 [[ "$before" == *"fastcache_worker_jobs_completed_total"* ]] \
     || { printf '%s\n' "$before" >&2; fail "worker /metrics carries no worker counters"; }
 [[ "$before" == *"fastcache_node_logical_cores"* ]] \
@@ -1558,7 +1575,10 @@ echo "   served from the cache on the second compile"
 # incremented in a unit test and by nothing on the real path is the defect the
 # catalog exists to prevent, one layer up: it exports a permanent zero, which
 # reads as "distribution is not happening" rather than as "nobody wired this".
-after="$(http_get 127.0.0.1 "$worker_admin_port" /metrics)"     || fail "worker admin endpoint stopped answering after serving a compile"
+after_status=0
+after="$(http_get 127.0.0.1 "$worker_admin_port" /metrics)" || after_status=$?
+[ "$after_status" -eq "$E2eHttpAnswered" ] \
+    || fail "$(e2e_http_outcome "$after_status" "the worker admin endpoint's /metrics after it served a compile")"
 completed="$(metric_value "$after" fastcache_worker_jobs_completed_total)"
 [[ -n "$completed" && "$completed" -ge 1 ]] \
     || { printf '%s\n' "$after" >&2; fail "worker completed a compile but its jobs counter did not move"; }
