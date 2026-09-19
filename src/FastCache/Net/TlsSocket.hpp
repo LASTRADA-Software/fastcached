@@ -6,6 +6,7 @@
 #include <FastCache/Net/TlsContext.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <expected>
 #include <memory>
@@ -156,6 +157,19 @@ class TlsSocket final: public ISocket
     [[nodiscard]] std::string PeerAddress() const override
     {
         return _raw ? _raw->PeerAddress() : std::string {};
+    }
+
+    /// Forward a read deadline to the wrapped transport, which is the socket a read
+    /// actually blocks on.
+    ///
+    /// Inherited as the base's no-op until #1557, so under TLS neither the admin
+    /// surface's preconnect budget (#828) nor a lingering close's per-read share ever
+    /// reached the raw socket, which kept whatever the listener gave it at accept.
+    /// @param deadline How long a read may block; non-positive leaves it alone.
+    void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
+    {
+        if (_raw)
+            _raw->SetReceiveDeadline(deadline);
     }
 
   private:

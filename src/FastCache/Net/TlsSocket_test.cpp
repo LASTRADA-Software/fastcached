@@ -12,6 +12,9 @@
 
     #include <FastCache/Async/Task.hpp>
     #include <FastCache/Core/Bytes.hpp>
+    #include <FastCache/Core/Clock.hpp>
+    #include <FastCache/Net/BlockingConnector.hpp>
+    #include <FastCache/Net/BlockingSocket.hpp>
     #include <FastCache/Net/ISocket.hpp>
     #include <FastCache/Net/InMemoryTransport.hpp>
     #include <FastCache/Net/TlsContext.hpp>
@@ -20,6 +23,7 @@
     #include <catch2/catch_test_macros.hpp>
 
     #include <array>
+    #include <chrono>
     #include <cstddef>
     #include <memory>
     #include <ranges>
@@ -27,10 +31,12 @@
     #include <string>
     #include <string_view>
     #include <utility>
+    #include <vector>
 
     #include <openssl/bio.h>
     #include <openssl/err.h>
     #include <openssl/ssl.h>
+    #include <tests/SocketDecorator.hpp>
 
 using namespace FastCache;
 
@@ -287,6 +293,76 @@ TEST_CASE("TlsSocket: handshake on non-TLS input fails cleanly instead of hangin
     auto server = std::make_unique<TlsSocket>(std::move(pair.server), **context);
     auto const handshake = SyncRun(server->HandshakeIfNeeded());
     CHECK_FALSE(handshake.has_value()); // resolves to an error — not a hang, not a crash
+}
+
+TEST_CASE("TlsSocket: a receive deadline reaches the socket a read blocks on", "[tls][net]")
+{
+    // #1557. Inherited as the base's no-op, so under TLS neither the admin surface's
+    // preconnect budget (#828) nor a lingering close's per-read share reached the raw socket.
+    auto context = TlsContext::Create(TlsFixture("server.crt"), TlsFixture("server.key"));
+    REQUIRE(context.has_value());
+
+    /// Records every deadline armed on it, and forwards nothing: the question is only
+    /// whether the TLS layer passes the call down.
+    class RecordingSocket final: public Testing::SocketDecorator
+    {
+      public:
+        using SocketDecorator::SocketDecorator;
+
+        void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
+        {
+            armed.push_back(deadline);
+        }
+
+        std::vector<std::chrono::milliseconds> armed;
+    };
+
+    auto pair = InMemorySocketPair::Create();
+    auto raw = std::make_unique<RecordingSocket>(*pair.server);
+    auto const* const recorder = raw.get();
+    TlsSocket server { std::move(raw), **context };
+
+    server.SetReceiveDeadline(std::chrono::milliseconds { 250 });
+
+    REQUIRE(recorder->armed.size() == 1);
+    CHECK(recorder->armed.front() == std::chrono::milliseconds { 250 });
+}
+
+TEST_CASE("TlsSocket: a silent peer is timed out within the deadline set through the TLS layer", "[tls][net][socket]")
+{
+    // #1557, over a real pair: the deadline is a property of the kernel's socket, so only a
+    // real one can show it reaching the socket a read blocks on. The peer connects and says
+    // nothing, so the handshake waits on a read. The raw socket's own deadline is LONG, so a
+    // TLS layer that does not pass the short one down is measured by it rather than hanging
+    // the case: five seconds against a fifth of one.
+    auto context = TlsContext::Create(TlsFixture("server.crt"), TlsFixture("server.key"));
+    REQUIRE(context.has_value());
+    auto listener = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(listener);
+    auto const port = listener->BoundPort();
+    REQUIRE(port != 0);
+
+    BlockingConnector connector;
+    auto silent =
+        SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    REQUIRE(silent.has_value());
+    auto accepted = SyncRun([](IListener* from) -> Task<AcceptResult> {
+        co_return co_await from->Accept();
+    }(listener.get()));
+    REQUIRE(accepted.has_value());
+    (*accepted)->SetReceiveDeadline(std::chrono::milliseconds { 5000 });
+
+    TlsSocket server { std::move(*accepted), **context };
+    server.SetReceiveDeadline(std::chrono::milliseconds { 200 });
+
+    SteadyClock clock;
+    auto const started = clock.Now();
+    auto const handshake = SyncRun(server.HandshakeIfNeeded());
+    auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - started);
+
+    INFO("the handshake gave up after " << waited.count() << " ms");
+    CHECK_FALSE(handshake.has_value());
+    CHECK(waited < std::chrono::milliseconds { 2500 });
 }
 
 TEST_CASE("TlsSocket: Read resolves (no re-entrant resume) when the pump completes synchronously", "[tls][net]")
