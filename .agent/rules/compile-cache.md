@@ -2488,10 +2488,63 @@ nobody can account for.
   implements. Once generation 5 ships, gen 4's rows are a DATED RECORD that no tree can
   reproduce — the same reason generations 1 to 3 keep only an aggregate digest.
 
-- **[#878](https://github.com/LASTRADA-Software/fastcached/issues/878)** — the
-  localized `/showIncludes` prefix is NAMED by an operator
-  (`FASTCACHE_MSVC_DEPS_PREFIX`) and not discovered from the compiler, so a build that
-  sets nothing gets the English marker on trust. Split from #700 on exercisability
+- **[#878](https://github.com/LASTRADA-Software/fastcached/issues/878)** — **the
+  mechanism now exists and its localized leg is still unexercised, which is what keeps
+  this entry open.** `Cc::ResolveIncludeNoteMarker` asks `MarkerSource`'s rows in
+  enumerator order, which IS the precedence —
+  operator, then a probe that ASKS the compiler, then the English default. Three sources
+  but **FOUR** provenances, because *asked and declined* and *never asked* carry the same
+  marker and differ only in the remedy: telling an operator to set
+  `FASTCACHE_MSVC_DEPS_PREFIX` is advice already taken by whoever wrote `auto`, so
+  collapsing the pair gives the one operator who opted in a confident wrong answer.
+  `MarkerSource::DiscoveryDeclined` is that fourth state, and a `static_assert` holds its
+  label distinct from `Default`'s — the two are equal in every other observable, so a
+  copy-paste between them passes every test. And
+  `Cc::ProbeIncludeNoteMarker` writes a one-header translation unit, preprocesses it
+  with `/EP /showIncludes` **in the build's own environment**, and reads the prefix off
+  the line ending in the header it just wrote. Four things about it are worth carrying
+  here rather than leaving in the header:
+    - **The probe must NOT be anglicized.** `RunCaptureSplitInEnglish` forces `VSLANG=1033`
+      on every spawn whose output only this launcher reads, and that is right for all of
+      them and exactly wrong for this one: the question is what the BUILD's own compiles
+      emit, and those run in the ordinary environment. A probe that anglicized itself
+      would answer English on every machine and report it with confidence — a confident
+      wrong signal, and the one this ticket exists to remove.
+    - **The answer is not cached anywhere, and THAT is why the probe is OPT-IN.** Installing
+      a language pack moves the prefix without moving anything a cache stamp covers, so a
+      remembered answer goes stale in the direction that produces a wrong result that looks
+      right — `DiscoverTargetTriple`'s argument, one field over. But a launcher process
+      serves ONE translation unit and `/showIncludes` sits on every compile line under
+      CMake + Ninja + MSVC, so *probe whenever nobody named a prefix* is a second compiler
+      spawn per FILE, paid on CACHE HITS too — where not running a compiler is the entire
+      value of the hit — to rediscover the English default on almost every machine. **A cost
+      that cannot be amortised cannot be a default.** So the operator asks, with
+      `FASTCACHE_MSVC_DEPS_PREFIX=auto` (`Cc::MarkerDiscoveryRequest`, read by the RESOLVER
+      so the one value that means *ask, do not tell* has one reading), and `WantsMarkerProbe`
+      adds only the three facts the resolver cannot know: a parsed compile, `/showIncludes`
+      in play, and an MSVC-family driver read off `DriverSpec::family` rather than by naming
+      the flavors.
+    - **A wrong prefix is worse than no prefix**, so the parser refuses rather than
+      guesses: a candidate line with blanks in front of the prefix is refused (the #1270
+      anchor, on the writing side), a bare path line teaches nothing, and two candidate
+      lines suggesting two different prefixes teach nothing at all — the `#pragma message`
+      hazard below is exactly what that last clause is for.
+    - **The probe matches a UTF-8 path against bytes the compiler wrote in the CONSOLE
+      CODE PAGE, and that is a KNOWN GAP rather than an oversight.** A `char` is UTF-8 in
+      this tree, so `files->header.string()` is UTF-8; `cl` writes `/showIncludes` in the
+      console code page, which is the reason `RootReconciler::Path` exists at all. So a
+      `%TEMP%` carrying one non-ASCII byte — a German user name, which is **the population
+      this ticket is for** — makes the suffix test miss and the probe silently learns
+      nothing. It fails OPEN, to English, reported as `DiscoveryDeclined` rather than as
+      the default, so the operator at least sees that the ask happened; a wrong prefix is
+      never produced. It is not fixed here because the marker must STAY in the compiler's
+      encoding — it is later matched against raw `run->out` — so the repair needs a
+      UTF-8 → tool-code-page direction that `Core/NarrowText.hpp` does not have, which is
+      a change to a `Platform/` seam rather than to the launcher. **Whoever runs the
+      localized leg must rule this out FIRST**, because it and a genuinely unlocalized
+      toolchain produce the identical observation: a probe that answered nothing.
+
+  **What is left is the leg no machine here can run.** Split from #700 on exercisability
   rather than cost: discovery's input is the compiler's output language, so an English
   `cl` discovers English and proves nothing, and a stub asserts its own premise. Two
   driver behaviours a stub cannot settle — `cl` indents nested notes, and a localized
@@ -2505,7 +2558,11 @@ nobody can account for.
   and cannot conjure one**, so it cannot be run backwards to synthesise the case: a
   localized `cl` is an INSTALLER choice, not an environment variable. Whoever picks this
   up needs a host with a non-English pack installed, and no arrangement of this one will
-  substitute.
+  substitute. **RE-DERIVED 2026-09-19 on the same host, independently and before the
+  mechanism above was built** — same two resource directories, same four `VSLANG`
+  values, same byte-identical English. That is recorded because the date is the claim: a
+  premise about an INSTALLATION is one an installer can change under you, and this one
+  is the premise the whole entry rests on.
   Both hazards were then measured anyway, because neither is localization-dependent and
   a stub was never needed for either.
   **The indent is AFTER the marker, not before it.** Measured on both toolsets at depths
