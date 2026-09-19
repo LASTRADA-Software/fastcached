@@ -291,9 +291,15 @@ The repository includes presets for:
 
   ```sh
   cmake --preset clang-tsan
-  cmake --build --preset clang-tsan --target FastCacheTest fastcache-compile-node-tests tsan-canary
-  scripts/tsan-gate.sh out/build/clang-tsan
+  cmake --build --preset clang-tsan --target <each binary in the gate's TARGETS table> tsan-canary
+  bash scripts/tsan-gate.sh out/build/clang-tsan
   ```
+
+  The binaries to build are the first field of each row of the `TARGETS` table in
+  `scripts/tsan-gate.sh`, plus `tsan-canary`. They are not copied here, because a
+  copy stops matching when the table grows. The gate stops at the first row whose
+  binary was not built, and names it.
+
 - `clangcl-debug` — clang-cl on Windows.
 
 See `CMakePresets.json` for the complete list.
