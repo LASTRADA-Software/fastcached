@@ -3649,19 +3649,87 @@ TEST_CASE("A SUBSCRIBE is answered with pushes for longer than any answer window
 
     Conversation client { port };
     REQUIRE(client.SendOnly(SubscribeToNode()));
-    CHECK(PushKindOf(client.ReadReply()) == Wire::PushKind::Subscribed);
+    auto const opened = client.ReadReply();
+    REQUIRE(PushKindOf(opened) == Wire::PushKind::Subscribed);
+    auto const openedPush = Wire::DecodePush(Testing::PayloadOf(opened));
+    REQUIRE(openedPush.has_value());
+    auto const grant = Wire::DecodeLiveSubscribed(Unwrap(openedPush).fields);
+    REQUIRE(grant.has_value());
 
-    auto const until = std::chrono::steady_clock::now() + FrameServer::HeaderTimeout + (FrameServer::SweepInterval * 2);
+    // **Measured on the PRODUCER's clock, never on the reader's (#1559).** Every snapshot names the
+    // server tick it belongs to, on the subject's floor grid, so the stream's age is a fact about
+    // the frames rather than about how fast this reader drains them. A reader that falls behind is
+    // told how many cadences it missed -- a `Gap` -- and handed the present snapshot, never a
+    // queue (`LiveStream.hpp`). A case that required every push to be a `Snapshot`, and counted
+    // them against the reader's wall clock, failed whenever this reader was slow: every run in the
+    // filter on a Windows Debug build checking its heap every 16 allocations, never alone.
+    //
+    // So the case reads, however slowly, until it holds a snapshot a whole window past the first
+    // one. The connection closing before that is exactly the defect: an endpoint that left the
+    // subscription armed with the window it had when the request arrived. Each frame is held to
+    // what the rule allows -- only snapshots and gaps, a gap always followed by the snapshot it owes
+    // -- and the ticks account for every cadence, delivered or reported, with none missing silently.
+    auto const* const subject = Wire::FindLiveSubject(static_cast<std::uint8_t>(Wire::LiveSubject::Node));
+    REQUIRE(subject != nullptr);
+    auto const tickLength = subject->floor;
+    REQUIRE(Unwrap(grant).grantedCadenceMillis == static_cast<std::uint32_t>(tickLength.count())); // one tick per cadence
+    auto const window = FrameServer::HeaderTimeout + (FrameServer::SweepInterval * 2);
+    auto const windowTicks = static_cast<std::uint64_t>(window / tickLength);
+    // A hang guard, not the measurement: it turns a stream that never reaches the tick into a
+    // failure, and it must leave a slow reader time to catch up. Generous on purpose -- the build
+    // that surfaced #1559 took 39 s over this loop, and failed a guard of four windows.
+    auto const giveUp = std::chrono::steady_clock::now() + (window * 10);
+
+    std::optional<std::uint64_t> firstTick;
+    std::uint64_t lastTick = 0;
     std::size_t snapshots = 0;
-    while (std::chrono::steady_clock::now() < until)
+    std::size_t gaps = 0;
+    std::uint64_t dropped = 0;
+    std::optional<std::uint64_t> owedAfter; // set by a Gap: the tick the owed snapshot must follow
+    while (!firstTick.has_value() || lastTick - Unwrap(firstTick) < windowTicks || owedAfter.has_value())
     {
+        REQUIRE(std::chrono::steady_clock::now() < giveUp);
         auto const reply = client.ReadReply();
         REQUIRE_FALSE(reply.empty()); // the connection is still there
-        REQUIRE(PushKindOf(reply) == Wire::PushKind::Snapshot);
+        REQUIRE(Testing::StatusOf(reply) == Wire::Status::Push);
+        auto const push = Wire::DecodePush(Testing::PayloadOf(reply));
+        REQUIRE(push.has_value());
+        auto const& view = Unwrap(push);
+        INFO("push kind " << static_cast<int>(view.kind) << " after " << snapshots << " snapshots");
+        if (view.kind == Wire::PushKind::Gap)
+        {
+            REQUIRE_FALSE(owedAfter.has_value()); // two gaps in a row: the snapshot the first one owed never came
+            REQUIRE(firstTick.has_value());       // a gap reports cadences missed SINCE a snapshot
+            auto const gap = Wire::DecodeLiveGap(view.fields);
+            REQUIRE(gap.has_value());
+            auto const& missed = Unwrap(gap);
+            REQUIRE(missed.dropped >= 1);
+            REQUIRE(missed.firstTick > lastTick);
+            REQUIRE(missed.firstTick <= missed.lastTick);
+            dropped += missed.dropped;
+            ++gaps;
+            owedAfter = missed.lastTick;
+            continue;
+        }
+        REQUIRE(view.kind == Wire::PushKind::Snapshot);
+        auto const snapshot = Wire::DecodeLiveSnapshot(view.fields);
+        REQUIRE(snapshot.has_value());
+        auto const tick = Unwrap(snapshot).tick;
+        if (firstTick.has_value())
+            REQUIRE(tick > lastTick);
+        if (owedAfter.has_value())
+            REQUIRE(tick > Unwrap(owedAfter));
+        if (!firstTick.has_value())
+            firstTick = tick;
+        lastTick = tick;
+        owedAfter.reset();
         ++snapshots;
     }
-    INFO("snapshots: " << snapshots);
-    CHECK(snapshots >= 10);
+    INFO("snapshots: " << snapshots << ", gaps: " << gaps << ", cadences reported missed: " << dropped
+                       << ", ticks spanned: " << (lastTick - Unwrap(firstTick)));
+    // Every cadence between the first snapshot and the last is accounted for: delivered, or counted
+    // in a gap. A cadence missing from both is a stream dropping readings silently.
+    REQUIRE(lastTick - Unwrap(firstTick) == (snapshots - 1) + dropped);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps) == 0);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps) == 0);
 }
