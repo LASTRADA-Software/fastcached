@@ -403,7 +403,7 @@ done
 
 # One node's command line, and there is exactly one of it.
 #
-# It was written out twice -- `start_node` for n1..n3 and the n4 launch below --
+# It was written out twice -- `start_cluster_node` for n1..n3 and the n4 launch below --
 # and this section adds three more starts, which would have made five copies of
 # fourteen flags differing in two of them. That is the shape the project's own
 # table rule is about, and it had already cost something here: `--advertise` was
@@ -484,7 +484,38 @@ launch_node() {
     wait_for_node_ready 127.0.0.1 "${scheduler_ports[$index]}" "$!" "${slot}" "$log"
 }
 
-start_node() {
+# n1..n3, by index. LOCAL to this fixture, and named for it.
+#
+# It was `start_node`, which `scripts/dist-compile-e2e.sh` also defines with an
+# INCOMPATIBLE contract -- `start_node <tag> <host> <port> <flags...>` there against
+# `<index>` here, neither able to stand in for the other for a single call. Harmless
+# while both are private, and a silent shadowing the day either is promoted into
+# `scripts/lib/e2e-common.sh`: the file that sources the library would then start
+# nodes with the other fixture's flag set, and the helper-copy scan in
+# `check-e2e-helpers.sh` would not notice, because after such a lift there is exactly
+# one definition in a `scripts/*.sh` and one in the library, which is the state that
+# scan exists to produce (#645).
+#
+# The two contracts are NOT reconciled: they do genuinely different jobs -- this one
+# derives an id, a slot and a log from one index, that one takes a tag, a host and a
+# port and appends whatever flags follow. A rename is what removes the collision; one
+# contract serving both would remove a distinction instead.
+#
+# `launch_node` underneath is this fixture's own too, and is left alone: it is not the
+# name at risk.
+#
+# AND NO SCAN GUARDS THIS, which is a decision rather than an omission. A blanket
+# refusal of a name two fixtures both define would fire on almost everything:
+# measured over `scripts/*.sh` excluding the library, **16** files define `SelfTest`,
+# **15** `Case`, **13** `cleanup` and **13** `Stage`, all of them fine, because those
+# contracts either agree or never meet. What made `start_node` different is a
+# CONJUNCTION no pattern can read -- two incompatible contracts AND a name a future
+# ticket would plausibly lift into the library -- so a check for it would arrive
+# needing an exemption list longer than its findings, which is a check somebody
+# disables.
+#
+# @param 1 index into the port arrays
+start_cluster_node() {
     local index="$1"
     launch_node "$index" "n$((index + 1))" "n$((index + 1))" "${peers[@]}"
 }
@@ -534,7 +565,7 @@ done
 echo "cluster E2E: --print-identity minted three identity keys, and every member names every other's"
 
 for index in 0 1 2; do
-    start_node "$index"
+    start_cluster_node "$index"
 done
 
 # The leader's scheduler endpoint, as this fixture will use it.
