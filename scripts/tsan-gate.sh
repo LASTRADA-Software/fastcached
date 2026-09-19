@@ -1969,6 +1969,45 @@ for row in "${TARGETS[@]}"; do
     RunTarget "$(RowName "$row")" "$(RowTags "$row")"
 done
 
+# The suppressions file, reconciled against what ThreadSanitizer actually matched
+# (#1266).
+#
+# This gate has printed TSan's `Matched N suppressions` header and, since it learned
+# to, the per-entry lines under it -- and nothing read either. A suppression that
+# matches NOTHING is a rule that has stopped applying: it costs nothing until the day
+# its race comes back, when it is suppressed and this gate is green. No number printed
+# here can show it, because a total of 5 and a total of 5 with a dead entry beside it
+# are the same total.
+#
+# AFTER the runs and only on a gate that got this far: every target that ran is green,
+# so a dead entry is the finding rather than noise beside a red one. Across ALL target
+# logs together, because an entry matching in one target is alive.
+RECONCILER="${REPO_ROOT}/scripts/check-tsan-suppressions.sh"
+[[ -f "$RECONCILER" ]] \
+    || fatal "the suppressions reconciler is missing: ${RECONCILER}
+    Every target ran clean, and whether ${SUPPRESSIONS} still describes anything is
+    unknown. That is not the same as nothing being wrong with it."
+SUPPRESSION_OUTPUT="${SCRATCH}/suppression-output.log"
+: > "$SUPPRESSION_OUTPUT"
+for row in "${TARGETS[@]}"; do
+    rowLog="${SCRATCH}/$(RowName "$row").log"
+    # An `if`, not `[[ ... ]] && cat`. This script is `set -e`, and an AND-list whose
+    # test is false returns 1 -- so a missing log on the LAST row would end the gate
+    # here, after every target had already run clean, with no message at all.
+    if [[ -f "$rowLog" ]]; then
+        cat "$rowLog" >> "$SUPPRESSION_OUTPUT"
+    fi
+done
+# The verdict is the reconciler's STATUS, and its report goes to this log whatever it
+# says -- NOTHING-TO-RECONCILE and RECONCILED are different facts and both belong
+# here, since the first is what an empty suppressions file looks like and reads
+# exactly like a pass.
+if ! bash "$RECONCILER" "$REPO_ROOT" --log "$SUPPRESSION_OUTPUT"; then
+    fatal "the suppressions file does not reconcile with what ThreadSanitizer matched.
+    Read the lines above. The gate's own targets were CLEAN -- this is a finding about
+    ${SUPPRESSIONS}, not about a race."
+fi
+
 # No literal here. The per-target table the EXIT trap prints IS the green
 # account, and it is derived from TARGETS -- so this line states only the thing
 # the table cannot: that the gate reached its end rather than stopping somewhere
