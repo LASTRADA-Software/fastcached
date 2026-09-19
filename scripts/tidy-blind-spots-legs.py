@@ -43,6 +43,8 @@ import re, sys
 # and take every row that names it down with it -- which is this defect again, one
 # release later. `--self-test` is the one mode that is deliberately not a sweep.
 SWEEPING = ("--ci", "--all", "--only=")
+# selftest-offer: this names `tidy-sweep.sh`'s mode, not one of its own -- this file
+# takes no arguments and offers no self-test.
 NOT_A_SWEEP = ("--self-test",)
 
 # A COMMENT IS NOT A CALL SITE. `build.yml` carries the string

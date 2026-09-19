@@ -39,8 +39,13 @@ include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 #   * a comparison against a POSITIONAL PARAMETER on the same line --
 #     `[ "${1:-}" = "--self-test" ]`, `[[ "${1:-}" == "--self-test" ]]`
 #   * PowerShell  --  `[switch]$SelfTest` in a param block
+#   * Python  --  the flag tested against `sys.argv`, or declared to `argparse`
 #
-# Those three cover every offering script here.
+# Those cover every offering script here. Python's is the one that most needed
+# saying: `tidy-blind-spots-legs.py` holds `NOT_A_SWEEP = ("--self-test",)`, a quoted
+# token on a CODE line naming ANOTHER script's mode, and it is not an offer. No
+# pattern can tell that from one, so it says so with a `selftest-offer:` marker -- the
+# same mechanism `check-tidy-blind-spots-selftest.sh` uses for the same reason.
 #
 # ## A spelling this table cannot read REFUSES
 #
@@ -192,6 +197,37 @@ file(READ "${registrationFile}" registrationRaw)
 fastcached_split_lines_verbatim("${registrationRaw}" registrationLines)
 set(registrationContent "")
 set(registeredCmakeNames "")
+set(registeredPythonNames "")
+# Python is registered ACROSS lines, so "the name and the flag on ONE line" -- the rule
+# every other language here is held to -- cannot express it (#1274). `add_test` puts the
+# interpreter on the COMMAND line, the script on the next and the flag on the one after:
+#
+#     COMMAND "${Python3_EXECUTABLE}"
+#         "${CMAKE_SOURCE_DIR}/scripts/check-fetch-transfer-bound.py"
+#         --self-test
+#
+# So both Python questions are asked of the joined content with a pattern that may cross
+# exactly ONE line break and nothing else:
+#
+#   * RUNS IT  --  the interpreter, then at most one newline and one line's worth of
+#     path, then the name. This is `-P`'s analogue: it is what separates a registration
+#     that executes the script from one that merely mentions it.
+#   * RUNS ITS SELF-TEST  --  the name, then whitespace that may include one newline,
+#     then the flag.
+#
+# Neither can span a registration boundary, which is what a plain "anywhere in the file"
+# match would have allowed: after the newline only blanks, a quote and non-quote
+# non-newline characters are permitted, so an intervening `)` or `add_test(` line breaks
+# the match. Three registrations -- one naming the interpreter, one the script and one
+# the flag -- run nothing, and must not read as one that does.
+# `(\r?\n)?` rather than `[\r\n]*` / `[ \t\r\n]+`, because the sentence above says
+# ONE line break and those two spell "any number of them". Unbounded, both could skip
+# blank lines -- `registrationContent` strips comments and keeps blanks -- so the
+# guarantee the comment makes was not the guarantee the pattern enforced. Latent: no
+# registration here has that shape. Corrected anyway, because a reason that does not
+# hold is the defect rather than the bound being loose.
+set(pythonRunsPrefix "Python3_EXECUTABLE[^\n]*(\r?\n)?[ \t]*\"?[^\"\n]*")
+set(pythonFlagSeparator "\"?([ \t]+|[ \t]*\r?\n[ \t]*)")
 foreach(registrationLine IN LISTS registrationLines)
     if(registrationLine MATCHES "^[ \t]*#")
         continue()
@@ -205,6 +241,14 @@ foreach(registrationLine IN LISTS registrationLines)
     # that runs a different script.
     if(registrationLine MATCHES "-P.*/([A-Za-z0-9_.+-]+\\.cmake)")
         list(APPEND registeredCmakeNames "${CMAKE_MATCH_1}")
+    endif()
+
+    # Every `.py` this table names at all, which is only ever used to ask whether the
+    # `*.py` GLOB has stopped matching. Whether a given script is RUN is a different
+    # question, asked below against the joined content -- a name here means the table
+    # mentions Python, nothing more.
+    if(registrationLine MATCHES "([A-Za-z0-9_.+-]+\\.py)")
+        list(APPEND registeredPythonNames "${CMAKE_MATCH_1}")
     endif()
 endforeach()
 if(registrationContent STREQUAL "")
@@ -230,7 +274,13 @@ endif()
 file(GLOB_RECURSE shScripts "${FASTCACHED_SOURCE_DIR}/scripts/*.sh")
 file(GLOB_RECURSE ps1Scripts "${FASTCACHED_SOURCE_DIR}/scripts/*.ps1")
 file(GLOB_RECURSE cmakeScripts "${FASTCACHED_SOURCE_DIR}/scripts/*.cmake")
-set(allScripts ${shScripts} ${ps1Scripts})
+# `.py` was absent from every one of these lines (#1274): the globs, the scanned set
+# and the cross-check pairs. `scripts/` holds eight Python files, one of which offers
+# `--self-test` and one of which IS a self-test by its name, so the language this
+# check reported on was two thirds of the tree's scripting and the missing third was
+# silent -- which is what an extension list does when it is short.
+file(GLOB_RECURSE pyScripts "${FASTCACHED_SOURCE_DIR}/scripts/*.py")
+set(allScripts ${shScripts} ${ps1Scripts} ${pyScripts})
 
 list(LENGTH allScripts scriptCount)
 if(scriptCount EQUAL 0)
@@ -265,6 +315,27 @@ foreach(pair "shScripts;--self-test;shell" "ps1Scripts;-SelfTest;PowerShell")
             "matching and this check would report clean over a population it never read.")
     endif()
 endforeach()
+
+# Python is NOT a row above, and the reason is worth stating because adding one looks
+# right: the needle there is the FLAG, and Python's flag is spelled `--self-test`
+# exactly as shell's is. A Python row would therefore fire on any tree whose table
+# registers a SHELL self-test and whose `scripts/` holds no Python -- which describes
+# every synthetic tree in this check's own self-test, and is the "claim about how this
+# tree is composed" the comment above says this guard must not make.
+#
+# So the independent source is the one that can only be about Python: a NAME the
+# registration hands to the interpreter. A table invoking `foo.py` while the glob finds
+# no `.py` at all is two sources disagreeing about the population, on any tree.
+list(LENGTH pyScripts pyCount)
+if(pyCount EQUAL 0 AND registeredPythonNames)
+    list(LENGTH registeredPythonNames registeredPythonCount)
+    message(FATAL_ERROR
+        "the registration table hands ${registeredPythonCount} Python script(s) to the "
+        "interpreter and the `pyScripts` glob matched nothing under "
+        "${FASTCACHED_SOURCE_DIR}/scripts. Two independent sources disagree about "
+        "whether this tree has any, so the glob has stopped matching and every "
+        "unregistered Python self-test would pass unseen.")
+endif()
 
 set(offeringCount 0)
 set(carryingCount 0)
@@ -302,6 +373,60 @@ if(cmakeSelftestCount EQUAL 0 AND registeredCmakeSelftests)
         "${FASTCACHED_SOURCE_DIR}/scripts. Two independent sources disagree about "
         "whether this tree has any, so the glob has stopped matching and every "
         "unregistered `.cmake` self-test would pass unseen.")
+endif()
+
+# --- `*-selftest.py`: the same offer, for the same reason --------------------
+#
+# Python uses BOTH shapes in this tree, which is why covering the extension alone
+# would have been silent about one of them (#1274):
+#
+#   * `check-fetch-transfer-bound.py --self-test` -- a FLAG, handled by the scan
+#     below like a shell script's;
+#   * `check-mutation-harness-selftest.py` -- the FILE is the mode, exactly as for
+#     `.cmake`, and it takes no flag at all.
+#
+# A check that learned only the flag would go on reporting nothing about the second,
+# and the second is the one that looks least like a self-test from the outside.
+#
+# What "invoked" means differs from `.cmake`'s `-P`: the name must appear inside an
+# `add_test` block that hands a script to the interpreter, which is what
+# `registeredPythonNames` holds.
+set(pySelftestCount 0)
+foreach(script IN LISTS pyScripts)
+    get_filename_component(scriptName "${script}" NAME)
+    if(NOT scriptName MATCHES "-selftest\\.py$")
+        continue()
+    endif()
+    math(EXPR pySelftestCount "${pySelftestCount} + 1")
+    string(REPLACE "." "\\." scriptNameRegex "${scriptName}")
+    if(NOT registrationContent MATCHES "${pythonRunsPrefix}${scriptNameRegex}")
+        list(APPEND unregistered "${scriptName}")
+    endif()
+endforeach()
+
+# The same cross-check, and NOT a bare `pySelftestCount EQUAL 0`, for the reason the
+# `.cmake` arm gives: a tree with no Python self-test is an ordinary tree.
+set(registeredPySelftests "")
+foreach(registeredName IN LISTS registeredPythonNames)
+    if(registeredName MATCHES "-selftest\\.py$")
+        list(APPEND registeredPySelftests "${registeredName}")
+    endif()
+endforeach()
+if(pySelftestCount EQUAL 0 AND registeredPySelftests)
+    list(LENGTH registeredPySelftests registeredPySelftestCount)
+    # The message states the condition that actually reaches here, which is NOT the
+    # `.cmake` arm's. `registeredPySelftests` is a subset of `registeredPythonNames`,
+    # so the guard above has already fired if the `*.py` glob found nothing at all --
+    # arriving here means the glob DID match and found no `*-selftest.py` among them.
+    # The `.cmake` sentence copied in here said "the glob found none", which is false
+    # on the only path that can print it.
+    message(FATAL_ERROR
+        "the registration table hands ${registeredPySelftestCount} `*-selftest.py` "
+        "file(s) to the interpreter (${registeredPySelftests}) and the `*.py` glob "
+        "found no file with that suffix under ${FASTCACHED_SOURCE_DIR}/scripts, though "
+        "it did find other Python. Two independent sources disagree about which files "
+        "this tree has: either the registration names one that was renamed or deleted, "
+        "or the suffix this check looks for has drifted from the one the tree uses.")
 endif()
 
 foreach(script IN LISTS allScripts)
@@ -355,6 +480,13 @@ foreach(script IN LISTS allScripts)
     set(prefilterPassed TRUE)
     if(scriptExt STREQUAL ".ps1")
         if(NOT scriptContent MATCHES "\\[switch\\][ \t]*\\$SelfTest")
+            set(prefilterPassed FALSE)
+        endif()
+    elseif(scriptExt STREQUAL ".py")
+        # Python has no `--self-test)` case arm to look for; both of its shapes put the
+        # flag in a QUOTED string, so this clause alone is the exact superset of the two
+        # per-line patterns below.
+        if(NOT scriptContent MATCHES "[\"']--self-test[\"']")
             set(prefilterPassed FALSE)
         endif()
     elseif(NOT scriptContent MATCHES "--self-test\\)"
@@ -459,6 +591,18 @@ foreach(script IN LISTS allScripts)
                 if(line MATCHES "\\[switch\\][ \t]*\\$SelfTest")
                     set(offerShape "param-switch")
                 endif()
+            elseif(scriptExt STREQUAL ".py")
+                # The two ways a Python script here can dispatch on the flag. Both are
+                # ARGUMENT DISPATCH, like every other row: a bare quoted `"--self-test"`
+                # in a tuple of strings is not an offer, and this tree has one of those
+                # (`tidy-blind-spots-legs.py`, which names another script's mode). It
+                # carries a `selftest-offer:` marker for exactly that reason.
+                if(line MATCHES "[\"']--self-test[\"']"
+                        AND line MATCHES "(sys\\.argv|argv)")
+                    set(offerShape "argv-membership")
+                elseif(line MATCHES "add_argument[ \t]*\\([ \t]*[\"']--self-test[\"']")
+                    set(offerShape "argparse-option")
+                endif()
             else()
                 if(line MATCHES "(^|[ \t(|])--self-test\\)")
                     set(offerShape "case-arm")
@@ -486,13 +630,21 @@ foreach(script IN LISTS allScripts)
 
     # The registration has to pass the FLAG. A plain registration of the same script
     # satisfies "appears in an add_test COMMAND" and still never runs a case.
+    #
+    # One claim for every language -- "this registration passes this script that flag"
+    # -- with two values selected per language rather than a branch and an early
+    # return. Python's SEPARATOR is what differs: `add_test` puts the name and the flag
+    # on separate lines (#1274), so its adjacency may cross one line break and the
+    # others' may not.
     string(REPLACE "." "\\." scriptNameRegex "${scriptName}")
+    set(flagSeparator "\"?[ \t]+")
+    set(flagRegex "--self-test")
     if(scriptExt STREQUAL ".ps1")
         set(flagRegex "-SelfTest")
-    else()
-        set(flagRegex "--self-test")
+    elseif(scriptExt STREQUAL ".py")
+        set(flagSeparator "${pythonFlagSeparator}")
     endif()
-    if(NOT registrationContent MATCHES "${scriptNameRegex}\"?[ \t]+${flagRegex}")
+    if(NOT registrationContent MATCHES "${scriptNameRegex}${flagSeparator}${flagRegex}")
         list(APPEND unregistered "${scriptName}")
     endif()
 endforeach()
@@ -523,10 +675,10 @@ if(unreadable)
 endif()
 
 message(STATUS
-    "check-selftest-registered: ${scriptCount} shell/PowerShell script(s) scanned, "
-    "${carryingCount} carrying the token, ${offeringCount} offering a self-test; "
-    "${cmakeSelftestCount} `*-selftest.cmake` file(s), each of which must be named by a "
-    "`-P` registration")
+    "check-selftest-registered: ${scriptCount} shell/PowerShell/Python script(s) "
+    "scanned, ${carryingCount} carrying the token, ${offeringCount} offering a "
+    "self-test; ${cmakeSelftestCount} `*-selftest.cmake` and ${pySelftestCount} "
+    "`*-selftest.py` file(s), each of which must be named by a registration that RUNS it")
 
 if(unregistered)
     list(LENGTH unregistered unregisteredCount)

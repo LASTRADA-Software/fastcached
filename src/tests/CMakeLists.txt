@@ -5330,6 +5330,30 @@ else()
         LABELS "hygiene"
         TIMEOUT 60
     )
+
+    # The MSVC ARM64 coroutine probe's own self-test (#1274).
+    #
+    # Found by extending `check-selftest-registered` to `.py`, which had never
+    # looked at Python at all: five cases judging the probe's control-flow model,
+    # written carefully, cited in the rules file, and run by nothing. That is
+    # #596's shape exactly -- an unrun self-test reads as coverage from every
+    # direction and is silent about being unrun.
+    #
+    # The PROBE still runs nowhere and the file says why: it wants `/FAs` listings
+    # from an ARM64 MSVC build. Its self-test wants none of that -- it builds
+    # synthetic listings and judges a pure function -- so it runs wherever Python
+    # does, which is the whole reason it could sit unregistered without anybody
+    # noticing a gap.
+    add_test(
+        NAME "msvc-arm64-coro-stack-slots-selftest"
+        COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_SOURCE_DIR}/scripts/probes/msvc-arm64-coro-stack-slots.py"
+            --self-test
+    )
+    set_tests_properties("msvc-arm64-coro-stack-slots-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
 endif()
 
 # ---------------------------------------------------------------------------
