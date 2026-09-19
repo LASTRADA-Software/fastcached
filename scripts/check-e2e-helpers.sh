@@ -692,12 +692,40 @@ run_case() {
         echo "BUG: the wait returned"
         ;;
 
-    # Alive, and still logging when the budget ran out. The distinction from the
-    # case above is the whole reason a total cannot answer this: growth spread
-    # over the whole wait and growth that stopped in the first tick are the same
-    # `logGrew=yes` and opposite findings, so the reading that decides is the
-    # STALL AGE.
-    wait-timeout-progressing)
+    # A LIVE process with a LIVE log, driven end to end through the real loop --
+    # and that is all this case asserts. It is the ACQUISITION half; the stall-age
+    # DECISION belongs to the pure table below, at `bound=20`, where both
+    # boundaries are pinned and no scheduler can move them.
+    #
+    # ## Why it no longer asserts `still making progress` (#608)
+    #
+    # It used to, and the threshold it was asserting is one machine load can cross.
+    # `_e2e_verdict` computes `recent=$(( bound / 4 ))` floored to 1, so at the
+    # `bound=2` this case runs with, `recent` is **1 second** against a writer whose
+    # period is **0.2 s** -- a 5x margin. One scheduling hiccup longer than a second
+    # and the stall age crosses `recent`, the verdict flips to *stalled*, and the
+    # assertion fails on a perfectly healthy writer. Observed exactly once, as
+    # `output lacks 'still making progress'`, then 3/3 alone and green on the next
+    # full gate.
+    #
+    # THE MARGIN IS PINNED HERE, not derived from the code beside it, and that is
+    # deliberate: it is a measurement of one instant -- DrvFs, `ctest --parallel 32`,
+    # ASan -- and a figure that TRACKS its source silently re-attributes a real
+    # reading to conditions it was never taken under. If `recent` or the writer's
+    # period changes, this paragraph is wrong and should be re-measured rather than
+    # updated to match.
+    #
+    # NO ARRANGEMENT OF THE WRITER FIXES IT. The stall age is the log's age at the
+    # moment the wait gives up, so a tighter writing loop does not help: a subshell
+    # descheduled for longer than `recent` is descheduled however often it intended
+    # to write. And widening the bound makes `recent` LARGER, so the case would pass
+    # by testing less -- which is what #354 refuses.
+    #
+    # So this asserts only what acquisition noise cannot flip: the process was
+    # watched and is ALIVE, the log was WATCHED (`logGrew` is `yes` or `no`, never
+    # `unknown`), the verdict was REACHED, and it is not INCONCLUSIVE. Which of the
+    # two progress findings it printed is not asserted anywhere in this case.
+    wait-live-readings)
         log="${scratch}/busy.log"
         : > "$log"
         ( n=0; while [ "$n" -lt 25 ]; do echo "line ${n}" >> "$log"; sleep 0.2; n=$(( n + 1 )); done ) >/dev/null 2>&1 &
@@ -2804,7 +2832,13 @@ cases=(
     "wait-success|0|the wait returned when the predicate became true|polls) for the staged marker"
     "wait-death-is-prompt|1|the process DIED|exit=3|of a 10s budget|!BUG:|!waited 9s|!waited 10s"
     "wait-timeout-silent|1|logged NOTHING for the whole 2s|!BUG:"
-    "wait-timeout-progressing|1|still making progress|!BUG:"
+    # Acquisition only, and every pattern here is one a scheduling stall cannot
+    # move (#608). `!logGrew=unknown` is the load-bearing one: it is satisfied by
+    # BOTH `yes` and `no`, so it says the log was watched without saying what it
+    # did -- which is the distinction between testing the plumbing and testing the
+    # threshold. The stall-age decision is `progressing-at-bound` and
+    # `stalled-one-second-past` below, and only there.
+    "wait-live-readings|1|alive=yes|of a 2s budget|FINDING:|!logGrew=unknown|!INCONCLUSIVE|!BUG:"
     "wait-timeout-no-pid|1|No process was watched|!BUG:"
     "wait-timeout-no-log|1|no log was watched|!BUG:"
     "wait-nothing-watched|1|No process was watched|to listen on 127.0.0.1:|!BUG:"
