@@ -177,6 +177,7 @@ set(_fc_cc_sources
     DependencyProbe.cpp
     DirectManifest.cpp
     HitVerification.cpp
+    MarkerDiscovery.cpp
     ObjectEquivalence.cpp
     ParallelFor.cpp
     PathResolve.cpp
@@ -292,6 +293,7 @@ if(FASTCACHED_BUILD_TESTS)
         CmdLine_test.cpp
         CompileJob_test.cpp
         LauncherCli_test.cpp
+        MarkerDiscovery_test.cpp
         CacheKey_test.cpp
         ParallelFor_test.cpp
         CacheProtocol_test.cpp
