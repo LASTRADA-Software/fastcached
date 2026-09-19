@@ -369,6 +369,126 @@ ExpectVerdict("case 13: a table naming .cmake self-tests the glob cannot find is
     "${cmakeGlobDir}" "refuse" "disagree")
 
 # ---------------------------------------------------------------------------
+# Cases 15-23 -- Python, which this check did not glob at all until #1274.
+#
+# Two OFFER SHAPES, and an extension-only fix would have been silent about one of
+# them, which is the same species of gap as the missing extension: a FLAG
+# (`check-fetch-transfer-bound.py --self-test`) and a NAME that is the mode
+# (`check-mutation-harness-selftest.py`, the `.cmake` analogue). Both arms get a case
+# in both directions.
+#
+# The registrations here are written ACROSS LINES on purpose. That is how `add_test`
+# spells a Python command, and it is the one thing the shell rule -- name and flag on
+# ONE line -- cannot express, so a case putting them on one line would pass under the
+# rule that does not work.
+set(PY_FLAG_BODY "import sys
+if '--self-test' in sys.argv[1:]:
+    sys.exit(0)
+")
+set(PY_ARGPARSE_BODY "import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument(\"--self-test\", action=\"store_true\")
+")
+set(PY_MODE_BODY "print('the file is the mode')
+")
+set(REG_PY_FLAG "add_test(NAME \"py\" COMMAND \"\${Python3_EXECUTABLE}\"
+        \"scripts/check-py.py\"
+        --self-test)
+")
+
+# Case 15 -- the flag arm, accepted. Multi-line, as the real table writes it.
+NewTree("py-ok" pyOkDir)
+file(WRITE "${pyOkDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${pyOkDir}/scripts/check-py.py" "${PY_FLAG_BODY}")
+file(WRITE "${pyOkDir}/src/tests/CMakeLists.txt" "${REG_ARM}${REG_PY_FLAG}")
+ExpectVerdict("case 15: a registered Python self-test is accepted" "${pyOkDir}" "pass" "")
+
+# Case 16 -- and an unregistered one is refused AND NAMED. The case the check could
+# not see at all before #1274, and the one that found a live instance: five cases in
+# `scripts/probes/msvc-arm64-coro-stack-slots.py` that nothing ran.
+NewTree("py-missing" pyMissingDir)
+file(WRITE "${pyMissingDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${pyMissingDir}/scripts/check-py.py" "${PY_FLAG_BODY}")
+file(WRITE "${pyMissingDir}/src/tests/CMakeLists.txt" "${REG_ARM}")
+ExpectVerdict("case 16: an unregistered Python self-test is refused and NAMED"
+    "${pyMissingDir}" "refuse" "check-py.py")
+
+# Case 17 -- the MODE, not merely the name, across a line break. Case 4's rule for a
+# registration that spans lines: naming the script and never passing the flag.
+NewTree("py-noflag" pyNoFlagDir)
+file(WRITE "${pyNoFlagDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${pyNoFlagDir}/scripts/check-py.py" "${PY_FLAG_BODY}")
+file(WRITE "${pyNoFlagDir}/src/tests/CMakeLists.txt" "${REG_ARM}add_test(NAME \"py\" COMMAND \"\${Python3_EXECUTABLE}\"
+        \"scripts/check-py.py\")
+")
+ExpectVerdict("case 17: a Python registration without the flag does not count"
+    "${pyNoFlagDir}" "refuse" "check-py.py")
+
+# Case 18 -- `argparse` is the second dispatch spelling, and it is recognised. Without
+# this the shape would be reported UNREADABLE rather than as an offer, which is a
+# refusal on a correct tree.
+NewTree("py-argparse" pyArgparseDir)
+file(WRITE "${pyArgparseDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${pyArgparseDir}/scripts/check-py.py" "${PY_ARGPARSE_BODY}")
+file(WRITE "${pyArgparseDir}/src/tests/CMakeLists.txt" "${REG_ARM}${REG_PY_FLAG}")
+ExpectVerdict("case 18: an argparse-declared self-test is read as an offer"
+    "${pyArgparseDir}" "pass" "")
+
+# Case 19 -- the NAME-is-the-mode arm, accepted. `*-selftest.py` takes no flag at all,
+# so it is the `.cmake` rule: the registration has to RUN it.
+NewTree("py-mode-ok" pyModeOkDir)
+file(WRITE "${pyModeOkDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${pyModeOkDir}/scripts/check-thing-selftest.py" "${PY_MODE_BODY}")
+file(WRITE "${pyModeOkDir}/src/tests/CMakeLists.txt" "${REG_ARM}add_test(NAME \"thing\" COMMAND \"\${Python3_EXECUTABLE}\"
+        \"scripts/check-thing-selftest.py\")
+")
+ExpectVerdict("case 19: a registered *-selftest.py is accepted" "${pyModeOkDir}" "pass" "")
+
+# Case 20 -- and an unregistered one is refused AND NAMED. A `*-selftest.py` carries no
+# `--self-test` token anywhere, so the token scan alone can never see it: covering the
+# extension without this arm would have left it exactly as invisible as before.
+NewTree("py-mode-missing" pyModeMissingDir)
+file(WRITE "${pyModeMissingDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${pyModeMissingDir}/scripts/check-thing-selftest.py" "${PY_MODE_BODY}")
+file(WRITE "${pyModeMissingDir}/src/tests/CMakeLists.txt" "${REG_ARM}")
+ExpectVerdict("case 20: an unregistered *-selftest.py is refused and NAMED"
+    "${pyModeMissingDir}" "refuse" "check-thing-selftest.py")
+
+# Case 21 -- a quoted `--self-test` on a Python CODE line that is not a dispatch. This
+# tree has one (`tidy-blind-spots-legs.py` names another script's mode in a tuple), and
+# no pattern can tell it from an offer -- so it is refused until the file says so.
+NewTree("py-not-an-offer" pyNotOfferDir)
+file(WRITE "${pyNotOfferDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${pyNotOfferDir}/scripts/legs.py" "NOT_A_SWEEP = (\"--self-test\",)
+")
+file(WRITE "${pyNotOfferDir}/src/tests/CMakeLists.txt" "${REG_ARM}")
+ExpectVerdict("case 21: a quoted flag that is not a Python dispatch is refused"
+    "${pyNotOfferDir}" "refuse" "legs.py")
+
+# Case 22 -- ... and accepted once the file states why, which is the direction that
+# keeps case 21 from being a rule nobody can satisfy.
+NewTree("py-marked" pyMarkedDir)
+file(WRITE "${pyMarkedDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${pyMarkedDir}/scripts/legs.py" "# selftest-offer: this names another script's mode
+NOT_A_SWEEP = (\"--self-test\",)
+")
+file(WRITE "${pyMarkedDir}/src/tests/CMakeLists.txt" "${REG_ARM}")
+ExpectVerdict("case 22: a marked non-offer in Python is accepted" "${pyMarkedDir}" "pass" "")
+
+# Case 23 -- the glob-breakage cross-check, and NOT the flag-shaped one case 13 uses.
+# Python spells its flag `--self-test` exactly as shell does, so a row keyed on the
+# FLAG would fire on every fixture above: each registers a shell self-test and stages
+# no Python at all. The signal that can only be about Python is a NAME the table hands
+# to the interpreter.
+NewTree("py-glob-broke" pyGlobDir)
+file(WRITE "${pyGlobDir}/scripts/check-arm.sh" "${ARM_BODY}")
+file(WRITE "${pyGlobDir}/src/tests/CMakeLists.txt" "${REG_ARM}add_test(NAME \"gone\" COMMAND \"\${Python3_EXECUTABLE}\"
+        \"scripts/check-gone.py\")
+")
+ExpectVerdict("case 23: a table naming Python the glob cannot find is refused"
+    "${pyGlobDir}" "refuse" "disagree")
+
+# ---------------------------------------------------------------------------
 if(failures)
     list(LENGTH failures failureCount)
     string(REPLACE ";" ", " failureList "${failures}")
