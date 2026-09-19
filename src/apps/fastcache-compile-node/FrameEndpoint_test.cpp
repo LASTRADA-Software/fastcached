@@ -31,6 +31,7 @@
 #include <format>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -1789,6 +1790,64 @@ TEST_CASE("A capacity refusal survives the close that follows it", "[node][frame
     // on the wire. An operator raises a connection ceiling for this one and looks at
     // request sizes for the other; summed, neither question can be answered.
     CHECK(responder.EndpointRefusals() == 0);
+}
+
+TEST_CASE("An oversize refusal past the drain bound survives the close that follows it", "[node][frame]")
+{
+    // The oversize step-over's other exit (#1554). A body declared past `OversizeDrainFactor`
+    // times the ceiling is never read: the endpoint writes its refusal and closes. The client
+    // has already sent part of that body, and whatever the endpoint's reader did not take is
+    // still in the kernel's receive queue -- so a BARE close is a reset. Measured on loopback
+    // (#1553), a reset destroys the refusal before a Windows client reads it, and on Linux and
+    // macOS hands the refusal over and then fails the next read where an EOF belonged. The
+    // lingering close half-closes first and drains, so the client reads the refusal and then
+    // EOF everywhere. The case above guards the at-capacity site; this is the other site that
+    // closes after refusing, and it had no case at all.
+    //
+    // Every assertion that decides the case is a `REQUIRE`: a case that fails exactly four
+    // assertions exits 4, which ctest scores as SKIPPED (#1152), and a guard for a refusal
+    // must not be able to fail silently.
+    Fleet fleet;
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), fleet.responder, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    auto const ceiling = fleet.responder.MaxRequestBytes();
+    auto const declared = (static_cast<std::uint64_t>(ceiling) * Wire::OversizeDrainFactor) + 1;
+    REQUIRE(declared <= std::numeric_limits<std::uint32_t>::max());
+
+    // The header and all but one byte of the ceiling. Whatever the endpoint's reader takes in
+    // its first read -- a chunk far smaller than the ceiling -- the rest stays queued, which is
+    // what makes a bare close a reset; and the linger, which discards at most the ceiling,
+    // still reaches the client's EOF rather than its byte cap.
+    std::vector<std::byte> request(Wire::RequestHeaderSize + ceiling - 1, std::byte { 0x5A });
+    WireFrame::PutHeader(request,
+                         Wire::Magic,
+                         Wire::CurrentVersion,
+                         static_cast<std::uint8_t>(Wire::Op::Register),
+                         static_cast<std::uint32_t>(declared));
+
+    BlockingConnector connector;
+    auto socket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    REQUIRE(socket.has_value());
+    // Bounded: a read the defect leaves waiting ends here rather than hanging the case.
+    (*socket)->SetReceiveDeadline(5s);
+    REQUIRE(SyncRun(SendRaw((*socket).get(), request)));
+
+    auto const refusal = SyncRun(ReadOneReply((*socket).get()));
+    REQUIRE(ErrorOf(refusal) == Wire::ErrorCode::PayloadTooLarge);
+
+    // And then the close was the half-close's FIN, not a reset.
+    auto const ending = SyncRun([](ISocket* peer) -> Task<IoResult> {
+        std::array<std::byte, 64> after {};
+        co_return co_await peer->Read(std::span<std::byte> { after });
+    }((*socket).get()));
+    INFO("after the refusal: " << (ending.has_value() ? std::format("{} bytes", *ending) : ending.error().ToString()));
+    REQUIRE(ending.has_value());
+    REQUIRE(*ending == 0);
+    (*socket)->Close();
 }
 
 TEST_CASE("The byte budget refuses on a connection it keeps", "[node][frame]")
