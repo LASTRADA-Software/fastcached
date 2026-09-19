@@ -2508,6 +2508,35 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# The ELF guard that keeps a vendored library out of what ships (#1538).
+#
+# The guard itself runs in the `Package (Linux .deb/.rpm)` job, over the binaries that
+# job is about to package -- there is no ELF here to point it at and no reason to build
+# one. What is registered is its DECISION, which is a pure function over a dynamic-section
+# dump and is driven in both directions plus the two ways of not concluding.
+#
+# Both directions, because the refusing one alone says nothing about a guard that refuses
+# everything: the self-test asserts a system-only NEEDED list is ACCEPTED, and a name that
+# merely CONTAINS a vendored prefix without starting with it is accepted too.
+#
+# Registered outside the WIN32 guard above but still skipped there: the script is POSIX and
+# the subject is ELF, so a green Windows run would answer a question nobody asked.
+if(NOT WIN32)
+    add_test(
+        NAME "vendored-libraries-static-selftest"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh"
+                "${CMAKE_SOURCE_DIR}/scripts/check-vendored-libraries-static.sh" --self-test
+    )
+    set_tests_properties("vendored-libraries-static-selftest" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 60
+    )
+else()
+    fastcached_register_skipped_test("vendored-libraries-static-selftest"
+        "the script is POSIX and its subject is ELF; Windows ships no shared yaml-cpp and the guard runs only in the Linux package job")
+endif()
+
+# ---------------------------------------------------------------------------
 # Target-file guard hygiene. Fails when a `$<TARGET_FILE:>` names an executable
 # the app table can gate off, without any enclosing condition asking whether
 # that target exists.
@@ -4348,6 +4377,36 @@ add_test(
         -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-daemon-staging.cmake"
 )
 set_tests_properties("compile-cache-daemon-staging" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    TIMEOUT 600
+)
+
+# ---------------------------------------------------------------------------
+# What the configure says when the daemon it just staged dies on startup (#1538).
+#
+# The staging test above is green whether or not that is explained: its stand-in exits 3
+# with nothing on either stream, so it reaches this very branch and asserts only that a
+# daemon was MENTIONED. `_fc_auto_start_fastcached` spawned under `OUTPUT_QUIET
+# ERROR_QUIET` and reported `(127)` -- a number that reads as *not found* for a binary
+# the module has just staged and knows the path of, while the sentence that explains it
+# sat on the child's stderr.
+#
+# Same mirror technique, and deliberately a separate registration rather than a section
+# of the staging test: what is under test here is the FAILURE path, and folding it in
+# would make one red answer two questions.
+add_test(
+    NAME "compile-cache-daemon-diagnostic"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/compile-cache-daemon-diagnostic"
+        "-DFASTCACHED_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DFASTCACHED_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DFASTCACHED_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-daemon-diagnostic.cmake"
+)
+set_tests_properties("compile-cache-daemon-diagnostic" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     SKIP_REGULAR_EXPRESSION "SKIP: "

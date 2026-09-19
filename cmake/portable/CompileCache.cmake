@@ -966,6 +966,34 @@ function(_fc_split_host_port addr hostVar portVar)
     endif()
 endfunction()
 
+# The first non-blank line of a captured stream, for a status message.
+#
+# One line rather than the whole capture, because a child that died noisily would
+# otherwise bury the configure's own output under something nobody asked for -- and
+# because the sentence that names the cause is the first one every loader, libc and
+# `main()` in question emits. A stream that is empty or entirely blank yields the
+# empty string, which callers read as "the child said nothing" and fall back on.
+#
+# @param text The captured stream.
+# @param outVar Set to its first non-blank line, stripped, or to the empty string.
+function(_fc_first_line text outVar)
+    set(${outVar} "" PARENT_SCOPE)
+    # A capture with no newline at all is one line; REPLACE then leaves it alone and
+    # the loop below sees the single element. Semicolons in the text would otherwise
+    # split a line into several list items, so they are escaped before the split and
+    # restored after -- a loader message naming a search path is full of them.
+    string(REPLACE ";" "\\;" _escaped "${text}")
+    string(REPLACE "\r\n" "\n" _escaped "${_escaped}")
+    string(REPLACE "\n" ";" _lines "${_escaped}")
+    foreach(_line IN LISTS _lines)
+        string(STRIP "${_line}" _line)
+        if(_line)
+            set(${outVar} "${_line}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+endfunction()
+
 # Is anything at all answering at FASTCACHE_ADDR? Deliberately cheaper and
 # less discerning than _fc_probe_fastcache_cc: that probe needs a real
 # compiler invocation and answers "does the CACHE work", which is not the
@@ -1125,7 +1153,8 @@ function(_fc_auto_start_fastcached)
             COMMAND "${CMAKE_COMMAND}" -E env "${_staged}" ${_daemonArgs}
             RESULT_VARIABLE _rc
             TIMEOUT 5
-            OUTPUT_QUIET ERROR_QUIET)
+            OUTPUT_VARIABLE _startOut
+            ERROR_VARIABLE _startErr)
     else()
         # --daemon double-forks and the parent exits immediately once the
         # child has detached, so execute_process returns right away with the
@@ -1145,10 +1174,28 @@ function(_fc_auto_start_fastcached)
             COMMAND "${_staged}" --daemon ${_daemonArgs} "--pidfile=${_pidfile}"
             RESULT_VARIABLE _rc
             TIMEOUT 5
-            OUTPUT_QUIET ERROR_QUIET)
+            OUTPUT_VARIABLE _startOut
+            ERROR_VARIABLE _startErr)
     endif()
     if(NOT _rc EQUAL 0)
-        message(STATUS "[cache] Not starting a daemon: fastcached exited immediately (${_rc})")
+        # The exit status alone is not a diagnosis, and for the commonest failure it
+        # is actively misleading: a dynamic loader that cannot resolve a library
+        # answers 127, which reads as "not found" for a binary this module has just
+        # staged and knows the path of. The daemon's own first line says which
+        # library, and it was captured by nobody until
+        # [#1538](https://github.com/LASTRADA-Software/fastcached/issues/1538) --
+        # `OUTPUT_QUIET ERROR_QUIET` here threw away the one sentence that explains
+        # the number. An empty capture degrades to the number alone, which is what
+        # this said before.
+        _fc_first_line("${_startErr}" _startWhy)
+        if(NOT _startWhy)
+            _fc_first_line("${_startOut}" _startWhy)
+        endif()
+        if(_startWhy)
+            message(STATUS "[cache] Not starting a daemon: fastcached exited immediately (${_rc}): ${_startWhy}")
+        else()
+            message(STATUS "[cache] Not starting a daemon: fastcached exited immediately (${_rc})")
+        endif()
         return()
     endif()
 

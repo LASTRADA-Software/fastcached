@@ -1790,8 +1790,14 @@ jobs:
           path: bin
       - name: "Make fastcached executable"
         run: chmod +x bin/fastcached
-      # `libyaml-cpp0.8` is the fastcached artefact's RUNTIME dependency, and without
-      # it `./bin/fastcached` dies at dynamic-link time before it binds anything.
+      # `libyaml-cpp0.8` is THIS artefact's runtime dependency, and without it
+      # `./bin/fastcached` dies at dynamic-link time before it binds anything.
+      # THIS artefact, not the released one: the `linux` job builds it with the
+      # project default (`CPM_USE_LOCAL_PACKAGES ON`) and a runner that has
+      # libyaml-cpp-dev, so it links the shared library. What SHIPS does not --
+      # `package-linux` passes `-DCPM_USE_LOCAL_PACKAGES=OFF` since #1538 and a
+      # step there reads the ELF to prove it. Do not read this apt line as a
+      # statement about the release.
       - name: "Install a C++ compiler + the libyaml-cpp runtime"
         run: |
           bash scripts/ci-apt-update.sh
@@ -1873,8 +1879,14 @@ jobs:
           path: bin
       - name: "Make fastcached executable"
         run: chmod +x bin/fastcached
-      # `libyaml-cpp0.8` is the fastcached artefact's RUNTIME dependency, and without
-      # it `./bin/fastcached` dies at dynamic-link time before it binds anything.
+      # `libyaml-cpp0.8` is THIS artefact's runtime dependency, and without it
+      # `./bin/fastcached` dies at dynamic-link time before it binds anything.
+      # THIS artefact, not the released one: the `linux` job builds it with the
+      # project default (`CPM_USE_LOCAL_PACKAGES ON`) and a runner that has
+      # libyaml-cpp-dev, so it links the shared library. What SHIPS does not --
+      # `package-linux` passes `-DCPM_USE_LOCAL_PACKAGES=OFF` since #1538 and a
+      # step there reads the ELF to prove it. Do not read this apt line as a
+      # statement about the release.
       - name: "Install a C++ compiler + the libyaml-cpp runtime"
         run: |
           bash scripts/ci-apt-update.sh
@@ -2460,6 +2472,11 @@ jobs:
       # systemd-analyze for the unit check below. g++-14 is symlinked as plain
       # `g++` because the gcc-release preset pins the bare name, which would
       # otherwise resolve to the runner's GCC 13 — no <print>, no build.
+      #
+      # `libyaml-cpp-dev` is deliberately STILL installed although the configure
+      # below now tells CPM to ignore it (#1538). Removing it would make the
+      # "nothing vendored is dynamic" step downstream pass vacuously: the hazard
+      # has to be present for the flag that defeats it to be worth asserting.
       - name: "Install build tools"
         run: |
           bash scripts/ci-apt-update.sh
@@ -2474,7 +2491,16 @@ jobs:
         # /etc) is opt-in and this is the job that opts in.
         # FASTCACHED_REQUIRE_EXACT_VERSION comes from the workflow-level env: block,
         # which is where the "only on a tag run" reasoning is written down.
-        run: cmake --preset gcc-release -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
+        #
+        # -DCPM_USE_LOCAL_PACKAGES=OFF is what makes the payload redistributable,
+        # for the same reason the macOS package job passes it (#1538). With it ON
+        # (the project default) CPM runs find_package(yaml-cpp) first, the runner's
+        # libyaml-cpp-dev answers, and `YAML_BUILD_SHARED_LIBS OFF` in CMakeLists
+        # is never read by anything — so the daemon links libyaml-cpp.so.0.8. The
+        # .deb and .rpm survive that through SHLIBDEPS/AUTOREQ; the TGZ carries no
+        # dependency metadata at all, and the TGZ is what FASTCACHE_AUTO_INSTALL
+        # unpacks onto a developer's machine, where the loader kills it with 127.
+        run: cmake --preset gcc-release -DCPM_USE_LOCAL_PACKAGES=OFF -DFASTCACHED_BUILD_TESTS=OFF -DFASTCACHED_PACKAGE_ROOT_PREFIX=ON -DFASTCACHED_REQUIRE_EXACT_VERSION=${{ env.FASTCACHED_REQUIRE_EXACT_VERSION }}
 
       # Why this step, why before Build, and why it gates the package but no merge: the header of
       # scripts/check-instruction-set-flags.sh (#1442).
@@ -2483,6 +2509,13 @@ jobs:
 
       - name: "Build"
         run: cmake --build --preset gcc-release --target fastcached fastcache-cc fastcache-compile-node fastcache-cli
+
+      # The flag above is not the fact. A configure line is a claim; what ships is
+      # the artefact, and the two have disagreed here for the whole life of this job.
+      # This reads the ELF (#1538). It gates the package and no merge, exactly as the
+      # instruction-set step above does and for the same reason.
+      - name: "Nothing this project vendors is linked dynamically"
+        run: bash scripts/run-check.sh scripts/check-vendored-libraries-static.sh out/build/gcc-release/target
 
       - name: "Package"
         working-directory: out/build/gcc-release
