@@ -1706,6 +1706,30 @@ set_tests_properties("repository-hygiene" PROPERTIES
     TIMEOUT 60
 )
 
+# The four ways that check can fail to have an index, driven apart (#1565).
+#
+# Two of them printed different sentences and returned 0 from both, so ctest scored
+# them identically -- and one of the two is a checkout whose `.git` this host cannot
+# follow, where a skip means the check reported NOTHING about a tree it was pointed
+# straight at. `git rev-parse` answers "not a git repository" to that and to an
+# exported tarball alike, so the cases here arrange all five states and assert which
+# sentence each one reached, never merely that it skipped.
+add_test(
+    NAME "repository-hygiene-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/repository-hygiene-selftest"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-repository-hygiene-selftest.cmake"
+)
+# No SKIP_REGULAR_EXPRESSION: this one drives the skip paths as SUBJECTS, so its own
+# output quotes `SKIP: ` and a skip marker here would score the driver as skipped on
+# the very run in which it judged them.
+set_tests_properties("repository-hygiene-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 # ---------------------------------------------------------------------------
 # The Net boundary. Fails when anything under Net/ or Async/ includes a FastCache
 # header from outside the standalone unit those two form, or when one of the
