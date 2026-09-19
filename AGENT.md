@@ -854,6 +854,8 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   every departure abortive PASSES the RESET case.
 - An AcceptEx socket takes `SO_UPDATE_ACCEPT_CONTEXT`, or `shutdown` fails on it and
   `ShutdownWrite` is a silent no-op on every socket the listener accepted.
+- A socket DECORATOR forwards `SetReceiveDeadline`, or the deadline lands on a layer that never
+  reads — `TlsSocket` inherited the base's no-op, and #828's bounds never applied under TLS.
 - An object a reactor OWNS is destroyed on that reactor's worker thread, or with that reactor
   stopped — `IReactor::TeardownIsSerialisedWithDispatch()`, asked of EVERY reactor. **Match the
   ASSERTION, never the case that happened to be running.** The defect is PORTABLE and only the

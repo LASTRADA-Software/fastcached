@@ -1161,6 +1161,15 @@ Every rule below has already been a bug.
     resolved before the peer acted is what separates "parked, then told EOF" from
     "never parked at all". Measured on Linux x86-64 (GCC 15 / libstdc++, OpenSSL
     3.5): 3 of 5 cases fail on the parent commit, `1 == 0`.
+- **`TlsSocket` forwards `SetReceiveDeadline` to the socket a read blocks on**
+  ([#1557](https://github.com/LASTRADA-Software/fastcached/issues/1557)). It inherited
+  the base's no-op, so under TLS #828's preconnect budget never reached the socket, which
+  kept the `RequestTimeout` its listener gave it at accept -- a silent TLS peer held the
+  admin thread for as long as that, whatever the surface asked for. `ISocket`'s no-op
+  defaults are for FAKES, which have nothing to forward to; a decorator always has
+  something, so an inherited default on one is a forwarding nobody wrote. The case over a
+  real pair gives the raw socket a LONG deadline of its own, so the defect is measured by
+  it rather than hanging the case.
 - **An AcceptEx socket is not a whole socket until `SO_UPDATE_ACCEPT_CONTEXT`**, the
   mirror of the `SO_UPDATE_CONNECT_CONTEXT` `IocpConnector` already sets. Without it
   `shutdown` fails `WSAENOTCONN`, and `ShutdownWrite` ignores its result, so until
