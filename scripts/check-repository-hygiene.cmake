@@ -79,13 +79,69 @@ endif()
 include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
 fastcached_work_tree_state("${FASTCACHED_SOURCE_DIR}" workTreeState)
 if(workTreeState STREQUAL "no-git")
-    message("SKIP: git could not answer here, so nothing can be shown to be tracked by it")
+    # THREE situations reach `no-git`, and only two of them are ordinary (#1565).
+    #
+    # `git rev-parse --is-inside-work-tree` exits 128 both for a directory that is in
+    # no repository and for a directory that IS a checkout whose `.git` cannot be
+    # followed -- a worktree pointer naming a gitdir this host cannot reach, which is
+    # what a `git worktree add` written with Windows paths looks like from WSL. The
+    # seam cannot tell them apart, because it asks git one question and git answers
+    # "not a git repository" to both.
+    #
+    # They are not the same fact and they are not fixed in the same place. An exported
+    # source tarball has no index and never will; that is what this check has always
+    # skipped for, and the registration in `src/tests/CMakeLists.txt` says so. A
+    # checkout git cannot read is a broken HOST, and skipping it means this check has
+    # reported nothing about a tree it was pointed straight at -- which is the failure
+    # a skip and a pass are indistinguishable for.
+    #
+    # What separates them is a fact the seam does not carry and this directory does: a
+    # `.git` entry. Present and unreadable is the fault; absent is the tarball.
+    #
+    # It stays in this check rather than becoming a fourth answer from
+    # `fastcached_work_tree_state`, because the two callers disagree about it: a check
+    # that falls back to a directory WALK is right to treat both alike, and this one
+    # has no fallback and must not grow one.
+    if(EXISTS "${FASTCACHED_SOURCE_DIR}/.git")
+        # `no-git` also covers "the binary could not be RUN", and only the seam can
+        # tell that from "it ran and refused" -- so this asks, rather than claiming
+        # the narrower fact. A refusal that names the wrong cause is the one thing
+        # every message here is written to avoid.
+        execute_process(COMMAND "${GIT_EXECUTABLE}" --version
+                        RESULT_VARIABLE gitRuns OUTPUT_QUIET ERROR_QUIET)
+        if(NOT gitRuns EQUAL 0)
+            message(FATAL_ERROR
+                "the git at ${GIT_EXECUTABLE} could not be RUN, so nothing here could be "
+                "shown to be tracked by it, and ${FASTCACHED_SOURCE_DIR} carries a `.git` "
+                "entry -- this is a checkout with a broken tool, not a tree without an "
+                "index.\n"
+                "       Nothing in this check ran. Fix the git on this host; there is "
+                "nothing to change in the tree.")
+        endif()
+        message(FATAL_ERROR
+            "git runs on this host and cannot read ${FASTCACHED_SOURCE_DIR}, which "
+            "carries a `.git` entry -- so this is a checkout whose git metadata is "
+            "unreachable from here, not a tree without one.\n"
+            "       Nothing in this check ran. It reports on what the INDEX holds and "
+            "has no directory-walk fallback, so a quiet exit here would be this check "
+            "saying nothing about a tree it was pointed straight at.\n"
+            "       This is the shape a git worktree takes when its pointer names a path "
+            "the running git cannot follow -- a `.git` file written with Windows paths, "
+            "read from WSL, or the reverse. Repair it with:\n"
+            "         bash scripts/repair-worktree-pointers.sh\n"
+            "       run from inside the worktree. If git itself is broken rather than "
+            "the pointer, `git -C ${FASTCACHED_SOURCE_DIR} rev-parse "
+            "--is-inside-work-tree` prints the reason.")
+    endif()
+    message("SKIP: ${FASTCACHED_SOURCE_DIR} carries no `.git` entry and git reports no "
+            "repository here (an exported source tarball, for instance), so there is no "
+            "index to inspect")
     return()
 endif()
 if(NOT workTreeState STREQUAL "work-tree")
-    message("SKIP: ${FASTCACHED_SOURCE_DIR} is not a git work tree "
-            "(an exported source tarball, for instance), so there is no index "
-            "to inspect")
+    message("SKIP: ${FASTCACHED_SOURCE_DIR} is inside a repository but outside its work "
+            "tree (a `.git` directory, or a bare repository), so there is no index to "
+            "inspect")
     return()
 endif()
 
