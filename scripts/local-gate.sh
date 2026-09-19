@@ -380,6 +380,25 @@ gate_lock_waiting_marker="== GATE LOCK WAITING"
 gate_lock_refused_marker="GATE NOT STARTED: the gate lock was held"
 gate_lock_unusable_marker="GATE NOT STARTED: the gate lock could not be taken"
 
+# The lines a run emits when a leg's tests did NOT fail and the gate still cannot
+# vouch for them (#1162). `states_reconcile` already answers in two words rather
+# than one -- an unreadable registered total and a state no reader here enumerates
+# send a reader to different places -- and both of them used to reach `fail`, which
+# prints `GATE FAILED:`. A reader then got "this is a verdict about your tree" for a
+# run in which nothing about the tree had gone wrong, which is the collapse that
+# function's own comment says must not happen one level up.
+#
+# Two markers rather than one, for the same reason the two lock lines are two: they
+# are fixed in different places. The first says the instrument could not read its
+# subject; the second says the subject is short and never which state is missing.
+#
+# They share a `GATE INCONCLUSIVE:` prefix -- one more prefix for a monitor to
+# watch, not two -- and neither is a prefix of the other, starts with
+# `GATE FAILED:`, or starts with the pass marker, so each is matched anchored like
+# the five above.
+gate_states_unreadable_marker="GATE INCONCLUSIVE: a leg's registered test total could not be read"
+gate_states_unaccounted_marker="GATE INCONCLUSIVE: a leg's per-test states do not account for every test"
+
 # The roots this repository TRACKS but does not OWN -- third-party source copied
 # verbatim from upstream (vendor/VENDOR.md) -- are READ from
 # `scripts/lib/third-party-roots.txt` (#1370) and named nowhere in this file. It has
@@ -428,18 +447,20 @@ gate_totals_pattern='^[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+'
 #
 # `0` and `1` are the gate's OWN statuses for those two outcomes, so classifying a
 # log answers with what the run itself answered -- and so are `7` and `8`, which a
-# run that never got the host lock exits with. `2` is skipped deliberately and is
-# the interesting one: it is this script's usage status, and `--classify=$LOG` with
-# an unset `LOG` is a usage error -- a caller reading only the status would take
-# "you typed that wrong" for "the run was killed". The two are not commensurable, so
-# no outcome may sit on it, and the self-test asserts that rather than trusting it.
+# run that never got the host lock exits with, and `9` and `10`, which a run whose
+# tests did not fail and cannot be vouched for exits with. `2` is skipped
+# deliberately and is the interesting one: it is this script's usage status, and
+# `--classify=$LOG` with an unset `LOG` is a usage error -- a caller reading only the
+# status would take "you typed that wrong" for "the run was killed". The two are not
+# commensurable, so no outcome may sit on it, and the self-test asserts that rather
+# than trusting it.
 #
-# EVERY status `--classify` can exit with, including the last two, which are not
-# verdicts about a log at all -- one says this gate has no row for an outcome, the
-# other that the log could not be read. They belong in the table for the reason
-# the table exists: a status spelled as a literal somewhere else is invisible to
-# the distinctness assertion below, so it can drift onto another one silently,
-# which is the whole failure being prevented.
+# EVERY status `--classify` can exit with, including `unrecognised` and
+# `unreadable-log`, which are not verdicts about a log at all -- one says this gate
+# has no row for an outcome, the other that the log could not be read. They belong
+# in the table for the reason the table exists: a status spelled as a literal
+# somewhere else is invisible to the distinctness assertion below, so it can drift
+# onto another one silently, which is the whole failure being prevented.
 #
 #   outcome|status|sentence
 gate_outcomes=(
@@ -451,6 +472,8 @@ gate_outcomes=(
     "unreadable-log|6|the log named could not be read, so there is nothing here to classify. That is a different fact from anything the log might have said."
     "lock-not-acquired|7|the gate did NOT START: another gate on this host held the lock for the whole wait. Nothing about your tree was checked. Re-run it when the host is free; this is not a verdict."
     "lock-unusable|8|the gate did NOT START: the host lock could not be taken at all -- an unwritable lock directory, a wait that is not a number, or a flock that refused its own options. Nothing about your tree was checked. Fix the host, not the branch."
+    "states-unreadable-total|9|the gate RAN, a leg's tests did not fail, and the gate still cannot vouch for that leg: the registered test total ctest prints could not be read, so the per-test states were reconciled against nothing. This is NOT a verdict about your tree, and it is not a clean run either. Open the leg log the gate named and find the '<N>% tests passed, <M> tests failed out of <T>' line; if it is absent the leg was cut off, and if it is present the gate's reader of it has broken."
+    "states-unaccounted|10|the gate RAN, a leg's tests did not fail, and the gate still cannot vouch for that leg: the per-test states seen account for fewer tests than that leg registered, so something did not report. This is NOT a verdict about your tree. Open the leg log the gate named, compare the numbers it printed, and find which test is missing -- a state no reader here enumerates and a run that stopped early look identical from here, so do not add a state to make it quiet until you know which one it is."
 )
 
 # What a gate LOG says about the run that produced it. PURE: log text on stdin,
@@ -482,6 +505,16 @@ gate_outcome() {
                 ;;
             "$gate_failed_marker"*)
                 [[ "$outcome" == "did-not-conclude" ]] && outcome="failed"
+                ;;
+            # Terminal like the two above and read the same way: a run that
+            # reached one of these lines had STARTED, so it counts only against a
+            # start marker. Two arms rather than one because the two words
+            # `states_reconcile` answers in are the whole point of it having two.
+            "$gate_states_unreadable_marker"*)
+                [[ "$outcome" == "did-not-conclude" ]] && outcome="states-unreadable-total"
+                ;;
+            "$gate_states_unaccounted_marker"*)
+                [[ "$outcome" == "did-not-conclude" ]] && outcome="states-unaccounted"
                 ;;
             # A refusal is the LAST event of the invocation that printed it, so it
             # wins over an earlier green run in a reused log -- the latest invocation
@@ -1382,16 +1415,51 @@ run_all_legs() {
 # `fail: command not found`, return 127, and with no `set -e` the script would CARRY
 # ON and exit 0. That fails open. Anything up there refuses with `echo >&2; exit`,
 # as the usage arm already does.
-fail() {
-    echo "GATE FAILED: $*" >&2
+# What EVERY terminal path out of this gate does: say the line, account for the legs,
+# say what neither configuration could reach, and exit with the outcome's status.
+#
+# One copy, because there were two. `gate_inconclusive` below was `fail` with the
+# prefix and the exit value changed, and the three middle lines were identical --
+# including the `|| true`, whose reason was documented on one of them only, so a
+# correction to it would have reached half the gate.
+#
+# @param 1 the terminal line, already spelled. @param 2 the exit status.
+gate_report_and_exit() {
+    echo "$1" >&2
     leg_summary $(leg_pairs) >&2
     # #877, and on THIS path as much as the green one: a red leg says nothing about
     # what the gate could not reach, and a reader looking at a failure is the reader
     # most likely to conclude the rest was covered. `|| true` because a refusal here
-    # must not change an exit that is already 1 -- and because the green path calls
-    # `fail` when it refuses, which would otherwise re-enter.
+    # must not change an exit that is already decided -- and because the green path
+    # calls `fail` when it refuses, which would otherwise re-enter.
     coverage_once >&2 || true
-    exit 1
+    exit "$2"
+}
+
+fail() {
+    gate_report_and_exit "GATE FAILED: $*" 1
+}
+
+# A run whose tests did NOT fail and which still cannot vouch for a leg (#1162).
+#
+# Everything `fail` does except the one thing that makes `fail` wrong here: the
+# terminal line is the caller's own marker rather than `GATE FAILED:`, and the exit
+# comes from the outcome's own row rather than the literal `1`. A reader met with
+# `GATE FAILED:` reads "this is a verdict about your tree" -- `--classify` says so
+# in as many words -- and for this run nothing about the tree has gone wrong: the
+# instrument cannot say whether it looked at all of it.
+#
+# The marker is passed rather than derived from the outcome so the terminal line
+# carries the leg and the log path with it, which is the whole of what the reader
+# has to go on. The status is NOT passed: it comes from `gate_outcome_status`, so a
+# row moving moves the run and the classifier together and the self-test's
+# distinctness assertion covers both.
+#
+# @param 1 outcome word, which must have a row. @param 2.. the terminal line.
+gate_inconclusive() {
+    local outcome="$1"
+    shift
+    gate_report_and_exit "$*" "$(gate_outcome_status "$outcome")"
 }
 
 # The value CMake actually cached for one entry of a build directory, or empty
@@ -3393,6 +3461,60 @@ $gate_passed_marker"
     expect "did-not-conclude and failed do not share a status" \
         "no" "$([[ "$(gate_outcome_status did-not-conclude)" == "$(gate_outcome_status failed)" ]] && echo yes || echo no)"
 
+    # ---- a run that cannot vouch for a leg whose tests passed (#1162) --------------
+    #
+    # Rows, asked directly, for the reason the lock block below asks it: the
+    # distinctness assertion above counts ROWS, so an outcome missing from the table
+    # passes it and renders as `unrecognised` instead.
+    expect "the two reconcile outcomes are rows, not the unrecognised fallback" "no no" \
+        "$([[ "$(gate_outcome_status states-unreadable-total)" == "$(gate_outcome_status unrecognised)" ]] && echo yes || echo no) $([[ "$(gate_outcome_status states-unaccounted)" == "$(gate_outcome_status unrecognised)" ]] && echo yes || echo no)"
+
+    # The whole ticket, in the direction that was broken: neither may come back as
+    # `failed`. Asked as a comparison of STATUSES rather than of words, because the
+    # status is what a caller reading only the exit acts on, and it is the exit that
+    # said "your tree is bad" about a run in which no test failed.
+    expect "neither reconcile outcome shares a status with failed" "no no" \
+        "$([[ "$(gate_outcome_status states-unreadable-total)" == "$(gate_outcome_status failed)" ]] && echo yes || echo no) $([[ "$(gate_outcome_status states-unaccounted)" == "$(gate_outcome_status failed)" ]] && echo yes || echo no)"
+
+    # ... and not with each other, which is the collapse `states_reconcile` answers
+    # in two words to prevent. The row-count assertion above covers this too; asked
+    # again here because that one is about the whole table and this pair is the
+    # reason the pair exists.
+    expect "the two reconcile outcomes do not share a status with each other" "no" \
+        "$([[ "$(gate_outcome_status states-unreadable-total)" == "$(gate_outcome_status states-unaccounted)" ]] && echo yes || echo no)"
+
+    outcome_case "a leg whose registered total could not be read is its own outcome" \
+        "states-unreadable-total" "$_started
+$_legs
+$gate_states_unreadable_marker: gate-clang-debug, so nothing was reconciled against it (full log: /t/x)"
+    outcome_case "a leg with unaccounted states is the other one" \
+        "states-unaccounted" "$_started
+$_legs
+$gate_states_unaccounted_marker it ran: gate-clang-debug (full log: /t/x)"
+
+    # The markers are terminal lines of a run that STARTED, so a log carrying one
+    # with no start marker is still no run to classify -- the same fail-closed
+    # reading the pass and fail markers get, and the half that gets skipped.
+    outcome_case "a reconcile marker with no start marker holds no run to classify" \
+        "no-gate-run" "$gate_states_unaccounted_marker it ran: gate-clang-debug"
+
+    # Neither may be read as a substring, for the reason all five others are
+    # anchored: this file quotes both, and a leg log dumped into a gate log through
+    # `outputOnFailure` can carry anything a test printed.
+    outcome_case "a quoted reconcile marker mid-line is not a verdict" \
+        "did-not-conclude" "$_started
+==   note: a run printing $gate_states_unaccounted_marker would not be red"
+
+    # `gate_inconclusive` takes the STATUS from the row rather than a literal, which
+    # is the property that keeps the run and the classifier from drifting apart. A
+    # subshell, because it exits.
+    expect "gate_inconclusive exits with the outcome's own status" \
+        "$(gate_outcome_status states-unaccounted)" \
+        "$( (gate_inconclusive states-unaccounted "$gate_states_unaccounted_marker x" >/dev/null 2>&1); echo $? )"
+    expect "... and prints the caller's marker line, not GATE FAILED" \
+        "$gate_states_unaccounted_marker x" \
+        "$( (gate_inconclusive states-unaccounted "$gate_states_unaccounted_marker x" 2>&1 >/dev/null) | sed -n '1p' )"
+
     # ---- the host gate lock (#1379) ------------------------------------------------
     #
     # The two lock outcomes are ROWS. The distinctness assertion above counts rows, so a
@@ -4588,20 +4710,39 @@ run_preset() {
     # defect this function exists to prevent, one level up: an unreadable total
     # and an unenumerated state send a reader to different places, and reporting
     # the second when the first happened sends them hunting for a state that is
-    # not there. `fail` also names the log, like every other refusal in this
-    # function -- it exits before the `rm` below, so the file survives, and a
-    # message telling somebody to read a log whose `mktemp` name it never prints
-    # is an instruction that cannot be followed.
+    # not there. Each names the log, like every other refusal in this function --
+    # the exit happens before the `rm` below, so the file survives, and a message
+    # telling somebody to read a log whose `mktemp` name it never prints is an
+    # instruction that cannot be followed.
+    #
+    # #1162: and NEITHER of them is `fail`. `fail` prints `GATE FAILED:`, which
+    # `--classify` reads back as "the gate ran and FAILED ... this is a verdict
+    # about your tree" -- and on this path the tests did not fail, so that sentence
+    # is a confident wrong signal about a tree in which nothing has gone wrong. The
+    # two words kept apart here were being kept apart all the way up to a verdict
+    # that collapsed them anyway, along with a third thing neither of them is.
+    #
+    # All three of `states_reconcile`'s words have an arm. The fourth arm is not a
+    # default for `unaccounted`, which is what it was: it is the word this caller
+    # has no arm for, which is a defect in this gate rather than an outcome, and
+    # saying so is the only advice that fits it -- there is nothing in a leg log for
+    # a reader to find.
     _reconcile="$(states_reconcile "$preset" < "$log")"
     case "${_reconcile%%$'\n'*}" in
         ok) ;;
         unreadable-total)
             printf '%s\n' "${_reconcile#*$'\n'}"
-            fail "$preset tests: the registered total could not be read, so nothing was reconciled (full log: $log)"
+            gate_inconclusive states-unreadable-total \
+                "${gate_states_unreadable_marker}: $preset, so nothing was reconciled against it (full log: $log)"
+            ;;
+        unaccounted)
+            printf '%s\n' "${_reconcile#*$'\n'}"
+            gate_inconclusive states-unaccounted \
+                "${gate_states_unaccounted_marker} it ran: $preset (full log: $log)"
             ;;
         *)
             printf '%s\n' "${_reconcile#*$'\n'}"
-            fail "$preset tests: the per-test states do not account for every test that ran (full log: $log)"
+            fail "$preset tests: the state reconciler answered '${_reconcile%%$'\n'*}', which this gate has no arm for. That is a bug in the gate, not a verdict about your tree, and there is nothing in the leg log to look for (full log: $log)"
             ;;
     esac
 
