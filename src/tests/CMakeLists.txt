@@ -3947,8 +3947,25 @@ endif()
 # the registration on macOS would put it back to a check that does not exist and
 # does not say so. Skipped, absent, unstarted and failed are four states.
 #
-# `if(NOT WIN32)` still applies for the reason its neighbours carry it: the
-# script is POSIX, and what it checks is platform-independent.
+# `if(NOT WIN32)` still applies, but NOT for the reason its neighbours carry
+# (#1259). Those say "the script is POSIX and what it checks is
+# platform-independent", which for this one is contradicted by the workflow:
+# `.github/workflows/build.yml:1116` runs `bash scripts/tidy-sweep.sh
+# --self-test` inside the `clang-tidy-windows` job, so the subject demonstrably
+# does run on Windows and is meant to.
+#
+# The real reason is the one at line 390: the bash 4.4 probe is deliberately not
+# asked on Windows (#1355), because PATH's `bash` there can be a WSL launcher --
+# measured, it printed `C:/Windows/System32/bash.exe is 5.2` for a Linux
+# interpreter. `FASTCACHED_BASH44` is therefore empty on Windows and there is no
+# interpreter to register with; registering PATH's `bash` anyway would run the
+# sweep's scope computation against a Linux view of a Windows checkout, which
+# answers a different question rather than the same one less well.
+#
+# So the workflow invocation IS this check's Windows home, and it is not a gap:
+# the property is covered on Windows by CI and on every other platform by ctest.
+# Said here because the two lines look like a contradiction until you know which
+# question each one answers.
 if(NOT WIN32)
     if(FASTCACHED_BASH44)
         # `${FASTCACHED_BASH44}` and not `${FASTCACHED_BASH}` -- see the derivation above
