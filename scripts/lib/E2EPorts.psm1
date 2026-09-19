@@ -424,6 +424,28 @@ $script:E2EPortConsumers = @(
               '-Port',       $port)
         }
     }
+    @{
+        Name  = 'sccache-smoke.ps1'
+        Path  = 'scripts/sccache-smoke.ps1'
+        Stage = @('fastcached.exe')
+        # The ONE row that may legitimately answer 77: it asks for `sccache` and
+        # for the backend to be COMPILED INTO that sccache, both of which are
+        # ordinary absences on a developer machine. See `MaySkip`.
+        MaySkip = $true
+        Argv  = {
+            param($stage, $port)
+            # `--compiler` names THIS interpreter, which certainly exists. The
+            # fixture only asks whether the compiler is resolvable, and it does so
+            # BEFORE the port pre-flight; it never spawns one here, because the
+            # pre-flight refuses first. Passing a real compiler name would make
+            # this row skip on every host without `cl` -- a case that did not run,
+            # reported as a host property rather than as the coverage gap it is.
+            @('--fastcached', (Join-Path $stage 'fastcached.exe'),
+              '--protocol',   'memcached',
+              '--compiler',   (Get-Process -Id $PID).Path,
+              '--port',       $port)
+        }
+    }
 )
 
 # ---------------------------------------------------------------------------
@@ -674,6 +696,21 @@ function Invoke-E2EPortSiteCases([int]$held) {
             # as a fixture that failed to refuse.
             $output = (& $pwshPath -NoProfile -File $scriptPath @argv 2>&1 | Out-String)
             $code = $LASTEXITCODE
+
+            # 77 is a SKIP -- a missing runtime prerequisite -- and which rows may
+            # answer it is a COLUMN, never a blanket tolerance. A row that may not
+            # skip and does has moved its pre-flight ABOVE its own guards, which is
+            # a real defect this case exists to catch; swallowing 77 everywhere
+            # would report that as a clean refusal. A row that may skip and does is
+            # reported as SKIPPED with the fixture's own reason, because absent and
+            # skipped are two states and neither is a pass.
+            $maySkip = $row.ContainsKey('MaySkip') -and $row.MaySkip
+            if ($maySkip -and $code -eq 77) {
+                Write-Host "  SKIP $($row.Name): it reported a missing prerequisite (77), so its"
+                Write-Host "       port pre-flight was not reached on this host. It said:"
+                Write-Host ("       " + ($output -replace '\s+', ' '))
+                continue
+            }
 
             $before = $script:SelfTestBad
 
