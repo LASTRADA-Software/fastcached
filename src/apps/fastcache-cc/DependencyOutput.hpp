@@ -63,10 +63,12 @@ namespace FastCache::Cc
 /// `deps = msvc`. Emitted on the stream the build expects them on by the caller;
 /// this only produces the text.
 ///
-/// No nesting indentation is reproduced. `cl` indents by inclusion depth, and the
-/// probe's flattened set no longer carries that structure — but nothing consumes
-/// it: Ninja's parser takes the path after the marker and ignores leading blanks,
-/// which is the same rule `IncludeNotePath` implements on the reading side.
+/// No nesting indentation is reproduced. `cl` renders inclusion depth as a run of
+/// blanks BETWEEN the marker and the path (see `PathCanon::IncludeNoteMarkerEnd`
+/// for the measurement), and the probe's flattened set no longer carries that
+/// structure — but nothing consumes it: Ninja's parser takes the path after the
+/// marker and ignores the blanks that separate them, which is the same rule
+/// `IncludeNotePath` implements on the reading side.
 ///
 /// ## Why the marker is a parameter and has no default
 ///
