@@ -363,7 +363,49 @@ class ISocket
     /// this library hands out that can park a read overrides this; a new one that can
     /// must too, and nothing but this sentence enforces that.
     ///
-    /// Idempotent, and not a `Close()`: the socket stays open, and a later `Read` works.
+    /// **It retires whatever is parked NOW. That is not the same as being idempotent,
+    /// and this declaration used to claim the stronger word**
+    /// ([#1233](https://github.com/LASTRADA-Software/fastcached/issues/1233)). A
+    /// retirement that completes its victim INLINE resumes that coroutine before this
+    /// call returns, so the caller's next statement is not the next thing that happens:
+    /// a coroutine that arms its next read there leaves a NEW read in the slot, and a
+    /// second call retires THAT one. What the caller then sees is `Cancelled` on an
+    /// operation nobody cancelled, at a call site that did ask for a cancellation a
+    /// moment earlier -- which is why no caller can notice.
+    ///
+    /// **Which retirements complete inline is a property of the OPERATION, not of the
+    /// platform**, and reading it as POSIX-versus-Windows is the mistake #1233 was filed
+    /// on. Both halves are already pinned by cases in this tree:
+    ///
+    ///  - a parked `WaitReadable` PROBE is retired inline on **every** transport --
+    ///    `EpollSocket` and `KqueueSocket` through `Detail::RetireParkedRead`, and
+    ///    `IocpSocket` through the `readPeekOnly` arm of its own `CancelRead`, because a
+    ///    zero-byte receive carries no data a settle could preserve. So for the only
+    ///    operation this tree ever parks and cancels in production -- a readability
+    ///    watch -- the three transports AGREE, and they agree on the surprising
+    ///    behaviour. `Net/CancelRead_test.cpp` asserts it on all three legs; on Windows
+    ///    `Net/IocpSocket_test.cpp`'s *"CancelRead retires a parked probe before it
+    ///    returns"* asserts the inline half directly.
+    ///  - a parked real `Read` is retired inline on epoll and kqueue and **settles** on
+    ///    IOCP, where the receive may already have taken bytes out of the stream.
+    ///    That one really does diverge, deliberately, and it is `IocpSocket_test.cpp`'s
+    ///    *"A real read retired by CancelRead settles rather than resolving inline"*
+    ///    that holds it there.
+    ///
+    /// **So a double call is a CALLER error wherever the resumed coroutine may re-arm,
+    /// and it cannot be made a no-op here.** At the second call a socket cannot tell a
+    /// read its own resumption armed from one the caller armed since -- the same
+    /// *"the site cannot tell, the caller can"* argument `Net/ReadSlot.hpp` makes about
+    /// arming -- and refusing on a guess is worse than the behaviour it replaces,
+    /// because it leaves parked the read this function's first promise says is gone.
+    /// Both callers in this tree retire once and silence their own watch first
+    /// (`RedisResp`'s `ScopedDisconnectWatch::Retire`, `CompileCacheHandler::HandleSubscribe`),
+    /// so neither resumption re-arms; that is the discipline rather than an accident.
+    ///
+    /// **What IS a no-op is a call with the slot EMPTY**, which is the arrangement every
+    /// retirement in this tree is actually in -- a watch retired by RAII as well as
+    /// explicitly reaches this the second time with nothing parked. And it is not a
+    /// `Close()`: the socket stays open, and a later `Read` works.
     virtual void CancelRead() noexcept {}
 
     /// The remote peer's address as a printable host string ("203.0.113.7" /
