@@ -178,6 +178,88 @@ TEST_CASE("A Read with no buffered bytes parks and completes on a later peer Wri
     REQUIRE(out == "hello");
 }
 
+TEST_CASE("A parked Read wakes to the reset, not to EOF, when its peer closes with bytes unread",
+          "[net][inmemory][closed-states]")
+{
+    // #1553. A close with bytes still unread is an RST on the wire, and a peer parked in a
+    // read meets it as an error. The fake used to deliver the FIN alone, so the parked
+    // reader woke to EOF -- the ordinary goodbye -- where a real socket reports the reset,
+    // the ending the compile surface counts apart from a goodbye. The sequential pin in
+    // `SocketClosedStates_test.cpp` cannot express this: nothing in it parks.
+    auto pair = FastCache::InMemorySocketPair::Create();
+    // Bytes the client never reads, which is what makes its close a reset.
+    REQUIRE(FastCache::SyncRun(WriteString(pair.server.get(), "unread")));
+
+    std::array<std::byte, 8> buffer {};
+    auto reader = [](FastCache::ISocket* socket, std::span<std::byte> into) -> FastCache::Task<FastCache::IoResult> {
+        co_return co_await socket->Read(into);
+    }(pair.server.get(), std::span<std::byte> { buffer });
+    auto handle = reader.Native();
+    handle.resume();
+    REQUIRE_FALSE(reader.IsReady());
+
+    pair.client->Close();
+
+    REQUIRE(reader.IsReady());
+    auto const got = std::get<1>(handle.promise().result);
+    REQUIRE_FALSE(got.has_value());
+    CHECK(got.error().code == FastCache::NetErrorCode::ConnReset);
+
+    // And the reset is what every later look at the socket reports.
+    auto const readable = FastCache::SyncRun([](FastCache::ISocket* socket) -> FastCache::Task<FastCache::IoResult> {
+        co_return co_await socket->WaitReadable();
+    }(pair.server.get()));
+    REQUIRE_FALSE(readable.has_value());
+    CHECK(readable.error().code == FastCache::NetErrorCode::ConnReset);
+}
+
+TEST_CASE("A close over unread bytes resets the peer and destroys the reply it had not read yet",
+          "[net][inmemory][closed-states]")
+{
+    // #1553, and the reason #1554 exists: a server refuses a request it did not finish
+    // reading and closes. The reset that close sends drops the refusal before the client
+    // reads it -- Windows's answer, which the fake gives. `CloseLingering`'s cases assert the
+    // lingering close delivering it; this is the bare close it replaces.
+    auto pair = FastCache::InMemorySocketPair::Create();
+    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "a request the server stopped reading")));
+    pair.client->ShutdownWrite();
+    REQUIRE(FastCache::SyncRun(WriteString(pair.server.get(), "refused")));
+
+    pair.server->Close();
+
+    std::array<std::byte, 16> buffer {};
+    auto const got = FastCache::SyncRun(
+        [](FastCache::ISocket* socket, std::span<std::byte> into) -> FastCache::Task<FastCache::IoResult> {
+            co_return co_await socket->Read(into);
+        }(pair.client.get(), std::span<std::byte> { buffer }));
+    REQUIRE_FALSE(got.has_value());
+    CHECK(got.error().code == FastCache::NetErrorCode::ConnReset);
+}
+
+TEST_CASE("A parked Read wakes to EOF when its peer closes having read everything", "[net][inmemory][closed-states]")
+{
+    // The control for the case above: the same parked read and the same close, with
+    // nothing left unread, is a FIN -- EOF, not an error. Without it, "a close wakes the
+    // reader with an error" and "a reset wakes the reader with an error" are one passing
+    // test.
+    auto pair = FastCache::InMemorySocketPair::Create();
+
+    std::array<std::byte, 8> buffer {};
+    auto reader = [](FastCache::ISocket* socket, std::span<std::byte> into) -> FastCache::Task<FastCache::IoResult> {
+        co_return co_await socket->Read(into);
+    }(pair.server.get(), std::span<std::byte> { buffer });
+    auto handle = reader.Native();
+    handle.resume();
+    REQUIRE_FALSE(reader.IsReady());
+
+    pair.client->Close();
+
+    REQUIRE(reader.IsReady());
+    auto const got = std::get<1>(handle.promise().result);
+    REQUIRE(got.has_value());
+    CHECK(*got == 0);
+}
+
 TEST_CASE("InMemoryPipe respects the backpressure cap", "[net][inmemory]")
 {
     auto pair = FastCache::InMemorySocketPair::Create(4);
