@@ -745,8 +745,8 @@ notes:
 !!! note "Why the invocation carries more than the surfaces it prints"
 
     `--print-surfaces` runs the **startup policy rules** before it prints, so the
-    command has to be one the node would actually accept. Six rules apply to the
-    flags above and each refuses a configuration that would start and silently not
+    command has to be one the node would actually accept. The rules that apply to the
+    flags above each refuse a configuration that would start and silently not
     work: `--serve-scheduler` needs `--listen-raft`, `--listen-raft` needs a `--raft-peer`
     **and** a `--cluster-key-file`, membership needs an `--advertise` peers can dial,
     and a worker needs a `--scheduler`. (`--discovery` had a key rule of its own until
