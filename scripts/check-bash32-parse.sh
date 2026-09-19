@@ -101,9 +101,10 @@ TrackedShellScripts() {
 }
 
 RunParseCheck() {
-    local mode scripts file parsed failed out firstParty declined
+    local mode scripts file parsed failed unreadable out firstParty declined
     parsed=0
     failed=0
+    unreadable=0
 
     # The MODE is part of the output and asserted by the self-test. A guard that reports
     # the same sentence whichever path it took is one whose cheap-to-construct path
@@ -130,7 +131,26 @@ RunParseCheck() {
 
     while IFS= read -r file; do
         [ -n "$file" ] || continue
-        [ -f "${root}/${file}" ] || continue
+        # A file the walk NAMED and this cannot read is its own outcome (#1564).
+        #
+        # This was `|| continue`, so the file left the run in silence and the summary
+        # counted it nowhere: a tracked script that is absent, unreadable, or a dangling
+        # symlink was scored exactly like one that parsed. `parsed` then answers a
+        # question nobody asked -- how many of the files I could open did I open -- while
+        # reading as how many of the tracked scripts were checked.
+        #
+        # It is not a parse failure either, and folding it into `failed` would send
+        # whoever met it looking for a syntax error in a file they cannot open. So it is
+        # a third number, each instance is NAMED, and a nonzero count refuses.
+        #
+        # `-r` rather than `-f`: a file that exists and cannot be opened is the case that
+        # matters on a checkout with wrong permissions, and `-f` calls that one readable.
+        if [ ! -r "${root}/${file}" ]; then
+            unreadable=$((unreadable + 1))
+            printf 'UNREADABLE %s was named by the %s file set and cannot be read here\n' \
+                "$file" "$mode" >&2
+            continue
+        fi
         parsed=$((parsed + 1))
         if out="$(bash -n "${root}/${file}" 2>&1)"; then
             continue
@@ -157,7 +177,18 @@ EOF
         return 1
     fi
 
-    printf 'check-bash32-parse: %d script(s) parsed, %d unparseable\n' "$parsed" "$failed"
+    printf 'check-bash32-parse: %d script(s) parsed, %d unparseable, %d unreadable\n' \
+        "$parsed" "$failed" "$unreadable"
+    if [ "$unreadable" -ne 0 ]; then
+        printf 'FAIL check-bash32-parse: %d script(s) named by the %s file set could not be\n' "$unreadable" "$mode" >&2
+        printf '     read, so they were NOT parsed and nothing here is a verdict about them.\n' >&2
+        printf '     They are listed above. This is not a parse failure -- do not go looking\n' >&2
+        printf '     for a syntax error in them. Either the file set names something the tree\n' >&2
+        printf '     no longer has (a stale index, a dangling symlink, a checkout that did not\n' >&2
+        printf '     complete), or this host cannot open it (permissions, or a worktree whose\n' >&2
+        printf '     pointers this git cannot follow -- `bash scripts/repair-worktree-pointers.sh`).\n' >&2
+        return 1
+    fi
     [ "$failed" -eq 0 ]
 }
 
@@ -307,6 +338,54 @@ RunSelfTest() {
         *) Bad "case 9: refused, but not for the roots file (rc=$rc)" "$out" ;;
     esac
     Ok "case 9: a roots file naming no root is refused, not read as an empty set"
+
+    # Case 10 -- a file the FILE SET names and this cannot read (#1564).
+    #
+    # Staged through git, because that is the mode where it happens: the index names
+    # what was committed, and the tree in front of you is what the checkout produced.
+    # A stale index, an interrupted checkout, a dangling symlink and a permissions
+    # problem all land here, and every one of them used to leave the run in silence --
+    # `[ -f ... ] || continue` counted the file nowhere at all.
+    #
+    # The accepting control is in the same tree: one script that parses, so the refusal
+    # is attributable to the unreadable file rather than to "this tree is odd", and the
+    # summary has a nonzero `parsed` beside the nonzero `unreadable`.
+    mkdir -p "$tmp/missing/scripts"
+    PlantRoots "$tmp/missing"
+    printf '%s\n' '#!/usr/bin/env bash' 'echo hello' > "$tmp/missing/scripts/fine.sh"
+    printf '%s\n' '#!/usr/bin/env bash' 'echo also fine' > "$tmp/missing/scripts/gone.sh"
+    ( cd "$tmp/missing" && git init -q . && git add -A ) >/dev/null 2>&1 \
+        || Bad "case 10: git could not stage the tree, so the index-names-it case was not built"
+    rm -f "$tmp/missing/scripts/gone.sh"
+    out=$(FASTCACHED_PARSE_ALLOW_MODERN_BASH=1 bash "$0" --root "$tmp/missing" 2>&1) && rc=0 || rc=$?
+    [ "$rc" -ne 0 ] || Bad "case 10: a file the index names and the tree does not have was reported clean" "$out"
+    case "$out" in
+        *"UNREADABLE scripts/gone.sh"*) : ;;
+        *) Bad "case 10: the unreadable file was not NAMED (rc=$rc)" "$out" ;;
+    esac
+    # THREE numbers, and the third is the point: folded into either of the others this
+    # case would still refuse, and the reader would be sent to the wrong place.
+    case "$out" in
+        *"1 script(s) parsed, 0 unparseable, 1 unreadable"*) : ;;
+        *) Bad "case 10: the summary did not report parsed/unparseable/unreadable apart" "$out" ;;
+    esac
+    case "$out" in
+        *"not a parse failure"*) : ;;
+        *) Bad "case 10: the refusal did not say it is NOT a parse failure" "$out" ;;
+    esac
+    Ok "case 10: a file the file set names and cannot be read is named, counted apart, and refused"
+
+    # Case 11 -- and the direction that keeps case 10 from being satisfied by a check
+    # that always refuses: an ordinary tree reports a zero in that same third column.
+    # The column has to be PRESENT on a clean run, or nobody reading a green ever learns
+    # it exists and a later regression to `|| continue` is invisible again.
+    out=$(FASTCACHED_PARSE_ALLOW_MODERN_BASH=1 bash "$0" --root "$tmp/a" 2>&1) && rc=0 || rc=$?
+    [ "$rc" -eq 0 ] || Bad "case 11: the clean tree was refused (rc=$rc)" "$out"
+    case "$out" in
+        *"1 script(s) parsed, 0 unparseable, 0 unreadable"*) : ;;
+        *) Bad "case 11: a clean run did not report the unreadable count" "$out" ;;
+    esac
+    Ok "case 11: a clean run reports the unreadable count as zero rather than omitting it"
 
     printf '\nself-test: %d case(s) ran, all passed (bash %s)\n' "$SelfTestCases" "$(BashDescription)"
 }
