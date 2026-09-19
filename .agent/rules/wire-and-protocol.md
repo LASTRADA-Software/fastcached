@@ -1161,6 +1161,16 @@ Every rule below has already been a bug.
     resolved before the peer acted is what separates "parked, then told EOF" from
     "never parked at all". Measured on Linux x86-64 (GCC 15 / libstdc++, OpenSSL
     3.5): 3 of 5 cases fail on the parent commit, `1 == 0`.
+- **An AcceptEx socket is not a whole socket until `SO_UPDATE_ACCEPT_CONTEXT`**, the
+  mirror of the `SO_UPDATE_CONNECT_CONTEXT` `IocpConnector` already sets. Without it
+  `shutdown` fails `WSAENOTCONN`, and `ShutdownWrite` ignores its result, so until
+  [#1556](https://github.com/LASTRADA-Software/fastcached/issues/1556) every socket
+  `IocpListener` accepted half-closed as a silent no-op: no FIN, and writes went on
+  succeeding. Best-effort rather than a failed accept, because a failed accept ends an
+  accept loop over a socket that still reads and writes. Found by pinning the in-memory
+  socket against a real pair (#1553), which no in-memory case and no Linux gate could do;
+  `AcceptedHalfClose_test.cpp` holds the accepted socket open until its peer has read,
+  because a close's own FIN would otherwise pass for the half-close's.
 
 ## Dialing, and the reactor underneath it
 
