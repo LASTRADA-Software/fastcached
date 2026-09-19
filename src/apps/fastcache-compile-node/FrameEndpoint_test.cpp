@@ -228,15 +228,28 @@ struct Fleet
     co_return written.has_value() && *written == bytes.size();
 }
 
-/// Send one frame to `port` and read the reply.
+/// Send one frame to `port` and read the reply, asserting NOTHING -- the form a helper thread calls.
+///
+/// **A Catch2 assertion belongs to the case's thread (#1211).** Catch2 is not thread-safe for
+/// assertions, and a reporter that reports every assertion -- JUnit and XML both do -- sends even a
+/// PASSING `REQUIRE` down the full reporting path, which writes the run's and the reporter's shared
+/// state. This helper asserted its own connect and was called from `std::async` threads, so JUnit
+/// runs of the node tests corrupted the heap about half the time on Windows, while the console
+/// reporter, which takes a fast path for a passing assertion, never showed it. A helper thread calls
+/// this form, and the case's thread asserts on its result through `ReplyFrom`.
+///
+/// A failed connect is `nullopt`, never an empty reply: an empty reply already means the peer closed
+/// without answering, and a connect that failed must not pass for that answer.
 /// @param port Where the endpoint is listening.
 /// @param frame The request, header included.
-/// @return The reply bytes, empty when the peer closed without answering.
-[[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port, std::span<std::byte const> frame)
+/// @return The reply bytes, empty when the peer closed without answering; `nullopt` when the
+///         connection could not be made.
+[[nodiscard]] std::optional<std::vector<std::byte>> TryExchange(std::uint16_t port, std::span<std::byte const> frame)
 {
     BlockingConnector connector;
     auto socket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
-    REQUIRE(socket.has_value());
+    if (!socket.has_value())
+        return std::nullopt;
 
     // One coroutine for the whole exchange: `SyncRun` drives a `Task`, so the awaits
     // have to live inside one rather than be called individually.
@@ -249,6 +262,30 @@ struct Fleet
 
     (*socket)->Close();
     return reply;
+}
+
+/// Send one frame to `port` and read the reply, on the case's own thread.
+/// @param port Where the endpoint is listening.
+/// @param frame The request, header included.
+/// @return The reply bytes, empty when the peer closed without answering.
+[[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port, std::span<std::byte const> frame)
+{
+    auto const reply = TryExchange(port, frame);
+    REQUIRE(reply.has_value()); // the connection could not be made
+    return Unwrap(reply);
+}
+
+/// Collect a helper thread's exchange ON THE CASE'S THREAD, asserting that it connected.
+///
+/// The one place a helper thread's result is asserted on, so no assertion runs where Catch2 cannot
+/// take it (#1211). Blocks until the helper has finished, as `get()` does.
+/// @param pending What the helper thread returns.
+/// @return The reply, empty when the peer closed without answering.
+[[nodiscard]] std::vector<std::byte> ReplyFrom(std::future<std::optional<std::vector<std::byte>>>& pending)
+{
+    auto const outcome = pending.get();
+    REQUIRE(outcome.has_value()); // the helper thread could not connect
+    return Unwrap(outcome);
 }
 
 /// The status of every whole frame in @p stream, in order.
@@ -1580,14 +1617,14 @@ TEST_CASE("A held answer does not stop another client being served", "[node][fra
     fleet.Serve();
 
     // First client: reaches the responder and is held there.
-    auto first = std::async(std::launch::async, [port] { return Exchange(port, Fetch("first")); });
+    auto first = std::async(std::launch::async, [port] { return TryExchange(port, Fetch("first")); });
     REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; })); // waited for: the answer to begin
     REQUIRE(responder.Entered() == 1);
     REQUIRE(responder.Answered() == 0);
 
     // Second client, while the first is still held. It must reach the responder --
     // which is what serialization made impossible.
-    auto second = std::async(std::launch::async, [port] { return Exchange(port, Fetch("second")); });
+    auto second = std::async(std::launch::async, [port] { return TryExchange(port, Fetch("second")); });
     REQUIRE(WaitFor([&responder] { return responder.Entered() >= 2; })); // waited for: the second answer to begin
     CHECK(responder.Entered() == 2);
 
@@ -1597,8 +1634,8 @@ TEST_CASE("A held answer does not stop another client being served", "[node][fra
     // timeout naming nothing.
     REQUIRE(first.wait_for(15s) == std::future_status::ready);
     REQUIRE(second.wait_for(15s) == std::future_status::ready);
-    CHECK_FALSE(first.get().empty());
-    CHECK_FALSE(second.get().empty());
+    CHECK_FALSE(ReplyFrom(first).empty());
+    CHECK_FALSE(ReplyFrom(second).empty());
 }
 
 TEST_CASE("Two requests on one connection are both answered", "[node][frame]")
@@ -1978,7 +2015,7 @@ TEST_CASE("A self-accounting surface stops holding the endpoint's budget while i
     auto const declared = Unwrap(Wire::DecodeRequestHeader(request)).payloadLength;
     REQUIRE(declared > 0); // Or the assertions below hold vacuously.
 
-    auto client = std::async(std::launch::async, [port, &request] { return Exchange(port, request); });
+    auto client = std::async(std::launch::async, [port, &request] { return TryExchange(port, request); });
     REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; })); // waited for: the answer to begin
     REQUIRE(responder.Entered() == 1);
 
@@ -1994,7 +2031,7 @@ TEST_CASE("A self-accounting surface stops holding the endpoint's budget while i
 
     responder.Release();
     REQUIRE(client.wait_for(15s) == std::future_status::ready);
-    CHECK_FALSE(client.get().empty());
+    CHECK_FALSE(ReplyFrom(client).empty());
 }
 
 TEST_CASE("A surface that does not account for itself keeps the endpoint's budget", "[node][frame]")
@@ -2025,7 +2062,7 @@ TEST_CASE("A surface that does not account for itself keeps the endpoint's budge
     auto const request = Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes");
     auto const declared = Unwrap(Wire::DecodeRequestHeader(request)).payloadLength;
 
-    auto client = std::async(std::launch::async, [port, &request] { return Exchange(port, request); });
+    auto client = std::async(std::launch::async, [port, &request] { return TryExchange(port, request); });
     REQUIRE(WaitFor([&responder] { return responder.Entered() >= 1; })); // waited for: the answer to begin
     REQUIRE(responder.Entered() == 1);
 
@@ -2036,7 +2073,7 @@ TEST_CASE("A surface that does not account for itself keeps the endpoint's budge
 
     responder.Release();
     REQUIRE(client.wait_for(15s) == std::future_status::ready);
-    CHECK_FALSE(client.get().empty());
+    CHECK_FALSE(ReplyFrom(client).empty());
 }
 
 TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing its listener", "[node][frame]")
@@ -2075,15 +2112,15 @@ TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing
     fleet.Serve();
 
     // Two long answers in flight, which under the defect is the whole budget spent.
-    auto firstBig = std::async(std::launch::async, [port, &big] { return Exchange(port, big); });
-    auto secondBig = std::async(std::launch::async, [port, &big] { return Exchange(port, big); });
+    auto firstBig = std::async(std::launch::async, [port, &big] { return TryExchange(port, big); });
+    auto secondBig = std::async(std::launch::async, [port, &big] { return TryExchange(port, big); });
     REQUIRE(WaitFor([&responder] { return responder.Entered() >= 2; })); // waited for: the second answer to begin
     REQUIRE(responder.Entered() == 2);
 
     // The small verb: a heartbeat's shape, arriving while both compiles run. It must
     // REACH the responder -- passing the budget gate is exactly what it could not do
     // under the defect, and a refusal is answered before `Answer` is entered at all.
-    auto small = std::async(std::launch::async, [port] { return Exchange(port, Fetch("k")); });
+    auto small = std::async(std::launch::async, [port] { return TryExchange(port, Fetch("k")); });
     REQUIRE(WaitFor([&responder] { return responder.Entered() >= 3; })); // waited for: the third answer to begin
     CHECK(responder.Entered() == 3);
 
@@ -2091,10 +2128,14 @@ TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing
     REQUIRE(firstBig.wait_for(15s) == std::future_status::ready);
     REQUIRE(secondBig.wait_for(15s) == std::future_status::ready);
     REQUIRE(small.wait_for(15s) == std::future_status::ready);
+    // Collected here, on the case's thread: a helper that failed to connect used to throw
+    // inside a future nobody read, so these two were never reported at all.
+    CHECK_FALSE(ReplyFrom(firstBig).empty());
+    CHECK_FALSE(ReplyFrom(secondBig).empty());
 
     // And it was SERVED, not refused: reaching the responder and being answered are
     // two facts, and only the pair rules out a busy signal encoded further along.
-    auto const reply = small.get();
+    auto const reply = ReplyFrom(small);
     REQUIRE_FALSE(reply.empty());
     CHECK(ErrorOf(reply) != Wire::ErrorCode::EndpointBusy);
 }
@@ -2895,13 +2936,13 @@ TEST_CASE("A watched answer to a client that simply waits is delivered whole", "
     fleet.Serve();
 
     auto const request = Fetch("a-key-long-enough-that-its-payload-is-not-zero-bytes");
-    auto client = std::async(std::launch::async, [port, &request] { return Exchange(port, request); });
+    auto client = std::async(std::launch::async, [port, &request] { return TryExchange(port, request); });
     REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
 
     responder.Release();
     REQUIRE(client.wait_for(WatchWait) == std::future_status::ready); // waited for: the reply
 
-    auto const reply = client.get();
+    auto const reply = ReplyFrom(client);
     REQUIRE_FALSE(reply.empty());
     CHECK(Unwrap(Wire::DecodeReplyHeader(reply)).status == Wire::Status::Miss);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == 0);
