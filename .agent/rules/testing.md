@@ -299,6 +299,54 @@ end-to-end refusal — while the accepting case, the three acquisition cases and
 two holder-detection cases stay green. The accepting case staying green under the
 mutation is the reason it cannot stand alone.
 
+### That fix was private to one fixture, so it fixed one fixture
+
+`tls-smoke.ps1` and `run-crossdepth.ps1` went on binding a constant and reaping
+nothing for as long as the three helpers lived inside `run-launcher-e2e.ps1` —
+#220's defect verbatim, with no failure history for the reason this file already
+gives: *a first failure MASKS its identical siblings*, and that one was simply the
+fixture that ran often enough to be observed. `scripts/lib/E2EPorts.psm1` is where
+they live now, and `tls-smoke.sh` — the arm Linux CI runs — drew the **same
+constant 11811**, so the two halves of one fixture could not run side by side
+(#1284).
+
+Three things the extraction turned up, and the first two are about the TEST rather
+than the port:
+
+- **The refusal named neither the port nor the holder, and had not since #220.**
+  PowerShell binds `-f` TIGHTER than `+`, so
+
+  ```powershell
+  ("port $p is held by {0} (pid {1})" + " and will not be adopted" -f $name, $id)
+  ```
+
+  formats the second fragment — which has no placeholders — and concatenates the
+  first with its `{0} {1}` intact. Measured on 7.6.6: `"a {0}" + "b" -f 1` is
+  `a {0}b`. The case covering it asserted **that a throw happened**, which is what
+  BOTH states produce, so it was green from the day it was written — inside the
+  very fix whose whole point was a message that names the holder.
+- **A test that builds its expectation from the same template it asserts is blind
+  to the template.** Routing both ends through one `Get-E2EPortRefusal` made the
+  site cases agree perfectly while the sentence was wrong; measured, restoring the
+  defect left all three green. So the RENDER has cases of its own, asserted against
+  the facts — port, name, pid, path — plus *no `{N}` survives*, which states the
+  defect class directly.
+- **The guard written to catch it was BACKWARDS and reported clean.** Tighter
+  binding means the `Format` node is the INNER one: the tree is
+  `Plus(left, Format(b, args))`, not `Format(Plus(a, b), args)`. Written as the
+  precedence reads when spoken, the predicate matched nothing, said the module was
+  clean, and was caught only by its own positive control. Reading the tree confirms
+  it in one line; reasoning about it produced the wrong answer.
+
+And the sites are proved rather than argued: `Invoke-E2EPortSelfTest` holds a real
+listener, drives **every** consuming fixture as a child process against that port,
+and requires the refusal sentence back — because a fixture that never meets a
+holder passes identically with the reaper deleted. Shown red: the decision neutered
+to `free` reddens the five staged records, the real refusal and all three site
+cases; `tls-smoke.ps1` alone made to skip its pre-flight reddens that one row and
+no other. The two weaker claims beside it — *exited non-zero* and *named the port* —
+both stayed GREEN under the neuter, because a fixture that proceeds fails downstream
+and announces its port on the accepting path too.
 
 ## A bounded wait must also say WHICH KIND of failure it was
 

@@ -22,7 +22,12 @@
 param(
     [string]$Fastcached  = "$PSScriptRoot/../../out/build/clangcl-debug/target/fastcached.exe",
     [string]$Client      = "$PSScriptRoot/../../out/build/clangcl-debug/target/compile-cache-testclient.exe",
-    [int]$Port           = 21713,
+    # Drawn per run when 0, for the reason `.agent/rules/testing.md` gives: a
+    # fixed port needs a reaper, and this file had neither -- #220's defect
+    # verbatim, with no failure history only because nothing registers this as a
+    # ctest, so it never ran often enough to be observed (#1284). A value passed
+    # explicitly is honoured and is then PROBED first.
+    [int]$Port           = 0,
     [switch]$Synthetic,
     [string[]]$CheckoutRoots = @(),
     [string]$DeepTemp    = "$env:TEMP/cc-deep",
@@ -31,6 +36,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 $exitCode = 0
+
+# Settled before the daemon starts, and before `$Port` reaches any child: the
+# refuse-or-reap decision and the draw both live in one module, so this fixture
+# cannot drift from its two siblings the way it did while each owned a copy.
+Import-Module (Join-Path $PSScriptRoot "../../../scripts/lib/E2EPorts.psm1") -Force
+$Port = Get-E2EFixturePort $Port $Fastcached "fastcached"
 
 function Start-Fastcached {
     Write-Host "starting fastcached on 127.0.0.1:$Port ..."
