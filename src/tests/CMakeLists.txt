@@ -3797,34 +3797,11 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Every `##` section of a rulebook file says whether `AGENT.md` tripwires it, and
-# names the phrase (#876).
-#
-# `AGENT.md` states the rule: "a rule landed in `.agent/rules/` without a bullet
-# here fires in no session that does not open its file -- which is the population
-# the rule was written for. It has shipped that way (#355), caught by a review
-# rather than by the author."
-#
-# The ticket's own acceptance clause is REFUTED by `.agent/rules/README.md`,
-# which worked the design out and recorded it rather than building it: the
-# correspondence cannot be heading text (README's worked example is a heading and
-# a tripwire stating one fact with no matchable text between them), a tripwire may
-# legitimately live under ANOTHER file's link or be a nested bullet, and the
-# rulebook's own rule is CONDITIONAL -- so a check written to the clause would
-# refuse correct trees confidently, in the file every session reads first. What
-# is registered here is README's recorded design instead, which is why the commit
-# closes #876 rather than implementing it as written.
-#
-# The claim travels in a MARKER the author writes and the check verifies it,
-# which makes *yes* something somebody can be WRONG about. `AGENT.md` is only ever
-# READ -- the property that makes this affordable in a file several sessions edit
-# at once.
-#
-# THREE spellings, because two collapse *decided-no* into *not-yet-decided*: a
-# phrase, `none:` with a reason, and `untriaged:` naming an issue. The third is
-# safe only because the check TALLIES it and prints the total per issue on EVERY
-# run, which is `RefuseUntriaged` from `.agent/rules/metrics-and-observability.md`
-# arriving in markdown. Its first seeding found SEVEN sections with no tripwire at
-# all (#1567) -- #876's premise, confirmed by the guard on its first run.
+# names the phrase (#876). Why a nominated phrase rather than a structural
+# correspondence, why the marker is mandatory, and why there are THREE spellings
+# are all in `scripts/check-rulebook-tripwires.sh`'s header and in
+# `.agent/rules/README.md` -- not restated here, which is the rule the branch that
+# added this check exists to enforce.
 #
 # Labelled `docs-subject`: its subject IS prose, so it must run on the change that
 # has no code in it. `ci-scope.sh` classifies `.agent/**` as docs-only and every
@@ -3871,32 +3848,10 @@ if(NOT WIN32)
     # ---------------------------------------------------------------------
     # `AGENT.md` stays within `scripts/agent-md-budget.txt` (#876's neighbour).
     #
-    # `AGENT.md` is loaded in FULL into every session -- `CLAUDE.md` is one line,
-    # `@AGENT.md` -- so every line is one every session pays for whether or not
-    # it needs the rule. It reached 2,411 lines while stating the rule that
-    # growth broke: *a tripwire that has acquired measurements, ticket
-    # archaeology or a counter-argument has stopped being one.* Prose did not
-    # hold it and re-reading did not hold it, which is the `RowsInEnumeratorOrder`
-    # argument arriving in markdown for a third time.
-    #
-    # TWO measures, because either alone is gameable. `max-bullet-lines` is the
-    # PRIMARY one and cannot be satisfied by deleting a rule -- a bare file-size
-    # limit scores dropping a bullet as an improvement, which is the one thing
-    # this must never encourage. `total-lines` is an EQUALITY rather than a
-    # ceiling: more is growth, FEWER is a number that has stopped describing the
-    # file, so a compression is recorded in the change that makes it and the
-    # slack is not room for the next arrival. A ceiling banks slack; an equality
-    # tightens. That is `check-test-loops-backlog.txt`'s ratchet on a new subject.
-    #
-    # The figures live in that one file and AGENT.md may never quote its own
-    # size, which the check enforces -- `check-test-loops-backlog.txt` records
-    # that defect by name against itself ("The count was spelled out here as
-    # `148 sites` and went stale the first time a batch landed").
-    #
-    # The budget covers AGENT.md ALONE. `.agent/rules/*.md` is deliberately not
-    # budgeted: AGENT.md says reasoning there can be as long as it needs to be,
-    # so budgeting those files would contradict the rule this enforces and push
-    # derivations back into the file it keeps small.
+    # The two measures, why either alone is gameable, why the figures live in one
+    # file and why `.agent/rules/*.md` is deliberately unbudgeted are all in
+    # `scripts/check-agent-md-budget.sh`'s header and in the budget file itself --
+    # not restated here, for the same reason the check above is not.
     #
     # `docs-subject` for its neighbours' reason: the subject IS prose, and
     # `ci-scope.sh` classifies a docs-only change as running no ctest at all, so
