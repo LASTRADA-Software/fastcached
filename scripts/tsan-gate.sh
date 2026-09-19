@@ -8,8 +8,16 @@
 # build directory configured with the `clang-tsan` preset:
 #
 #   cmake --preset clang-tsan
-#   cmake --build --preset clang-tsan --target FastCacheTest fastcache-compile-node-tests tsan-canary
-#   scripts/tsan-gate.sh out/build/clang-tsan
+#   cmake --build --preset clang-tsan --target <each TARGETS row's binary> tsan-canary
+#   bash scripts/tsan-gate.sh out/build/clang-tsan
+#
+# The binaries to build are the first field of each row of the TARGETS table
+# below, plus `tsan-canary`, and they are deliberately not listed here. This
+# line used to list them and did not grow when the table did, so whoever
+# followed it built too few and the gate stopped at the first missing one,
+# "not built". That refusal is the right way for a short list to fail, but a
+# copy of the table is a second source of truth, and the table is the one this
+# gate reads.
 #
 # ## Why this is a script rather than a `ctest` line
 #
