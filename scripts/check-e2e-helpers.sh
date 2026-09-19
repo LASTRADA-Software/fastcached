@@ -1923,12 +1923,114 @@ run_case() {
 
     # A refused connection is a RETURN, not a stop: a fixture asking whether a
     # surface is up wants to decide for itself what that means.
+    #
+    # The STATUS, not merely non-zero. Since #1257 a truncated read is also
+    # non-zero, so "it returned an error" would score this green against a server
+    # that answered and stalled -- the arm passing for a reason that is not its
+    # own, which is what `http-silence-refused` above already says about its pair.
     http-refused)
         p="$(free_port)"
-        if http_get 127.0.0.1 "$p" /healthz >/dev/null 2>&1; then
-            fail "http_get succeeded against the unbound port ${p}"
-        fi
+        http_get 127.0.0.1 "$p" /healthz >/dev/null 2>&1 && rc=0 || rc=$?
+        [ "$rc" -eq "$E2eHttpRefused" ] \
+            || fail "expected \$E2eHttpRefused (${E2eHttpRefused}) against the unbound port ${p}; got ${rc}"
         echo "http_get returned non-zero for a refused connection"
+        ;;
+
+    # `http_get` in an UNTESTED position, under `set -e`, must survive.
+    #
+    # Its own defect, found by #1257 widening the probe's gate. The drain's probe
+    # teardown ran `kill -KILL "$sleeper"` and `wait "$sleeper"` bare: `wait` on a
+    # job the previous line KILLED returns **137**, which under `set -e` ends the
+    # shell with a status nothing explains and no output at all.
+    #
+    # It was latent only because of WHERE the arm was reachable from. The gate took
+    # the probe solely for an empty body, and the one caller that met that is
+    # invoked as `... && rc=0 || rc=$?`, which suspends `set -e` through the whole
+    # function. Widening the gate makes an ordinary `http_get ... >/dev/null` reach
+    # it -- and on bash 3.2, where no status is decisive, EVERY probe does, so this
+    # would have fired on macOS on every scrape in an untested position.
+    #
+    # The assertion is that the script REACHES its own last line. A case whose
+    # subject is the shell dying cannot assert on output the shell never produced.
+    http-set-e-survives)
+        p="$(free_port)"
+        _selftest_listener "$p" 0 "${scratch}/sete.log" complete \
+            >/dev/null 2>>"${scratch}/sete.log" &
+        listener=$!
+        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/sete.log" 15
+        # Deliberately NOT `&& rc=0 || rc=$?` and NOT inside `$( )`: a tested
+        # position suspends `set -e` for the whole call and the case would pass
+        # under the defect. This is the one shape that does not.
+        http_get 127.0.0.1 "$p" /healthz >/dev/null
+        kill "$listener" 2>/dev/null || true
+        echo "http_get survived set -e in an untested position"
+        ;;
+
+    # A COMPLETE response, so the accepting arm of the pair below is watched too.
+    #
+    # It is first and deliberately: an `http_get` that answered `$E2eHttpTruncated`
+    # unconditionally would satisfy the truncation case while refusing every
+    # honest scrape, and nothing in that case alone could tell.
+    http-complete)
+        p="$(free_port)"
+        _selftest_listener "$p" 0 "${scratch}/complete.log" complete \
+            >/dev/null 2>>"${scratch}/complete.log" &
+        listener=$!
+        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/complete.log" 15
+        body="$(http_get 127.0.0.1 "$p" /metrics)" && rc=0 || rc=$?
+        kill "$listener" 2>/dev/null || true
+        [ "$rc" -eq "$E2eHttpAnswered" ] \
+            || fail "expected \$E2eHttpAnswered (${E2eHttpAnswered}) from a server that answered and closed; got ${rc}"
+        case "$body" in
+            *NO-TRAILING-NEWLINE*) ;;
+            *) fail "the staged listener's body did not arrive whole: '${body}'" ;;
+        esac
+        echo "http_get reported a complete response"
+        ;;
+
+    # ... and a response OUR OWN BOUND cut short is told apart from it.
+    #
+    # THE defect: `http_get` returned 0 here, documenting only *returns 1 if the
+    # connection was refused*, so a caller had no channel for the third outcome and
+    # reported a truncation as the endpoint having answered. #1184's fixture drew
+    # the conclusion *the refusing worker exports no
+    # `fastcache_worker_jobs_refused_not_a_member_total` series* from a scrape whose
+    # completeness nothing had established.
+    #
+    # The body is asserted to be a PREFIX as well as the status being truncated.
+    # The status alone would pass against a listener that died mid-answer, which is
+    # a different fact about a different machine; the two together say our bound
+    # ended a response the server had not finished.
+    #
+    # Costs `_e2e_http_read_bound`, which is what a HOLDING peer costs by
+    # construction -- there is no cheaper way to exhibit a peer that holds.
+    http-truncated)
+        p="$(free_port)"
+        _selftest_listener "$p" 0 "${scratch}/truncated.log" truncate \
+            >/dev/null 2>>"${scratch}/truncated.log" &
+        listener=$!
+        wait_for_port 127.0.0.1 "$p" "$listener" "the staged listener" "${scratch}/truncated.log" 15
+        body="$(http_get 127.0.0.1 "$p" /metrics)" && rc=0 || rc=$?
+        kill "$listener" 2>/dev/null || true
+        [ "$rc" -eq "$E2eHttpTruncated" ] \
+            || fail "expected \$E2eHttpTruncated (${E2eHttpTruncated}) from a server holding the socket mid-body; got ${rc}"
+        case "$body" in
+            *NO-TRAILING-NEWLINE*) fail "the truncating listener answered the COMPLETE body: '${body}'" ;;
+            *staged_counter_total*) ;;
+            *) fail "the truncating listener's prefix did not arrive at all: '${body}'" ;;
+        esac
+        # And the SENTENCE a caller will print. A status nobody can render is a
+        # status every caller renders as "refused", which is the half of this
+        # defect that reached the fixtures.
+        said="$(e2e_http_outcome "$rc" "the staged endpoint")"
+        case "$said" in
+            *"CUT SHORT"*) ;;
+            *) fail "e2e_http_outcome did not name the truncation: '${said}'" ;;
+        esac
+        case "$said" in
+            *REFUSED*) fail "e2e_http_outcome called a truncation a refusal: '${said}'" ;;
+        esac
+        echo "http_get reported the response CUT SHORT and said so"
         ;;
 
     # --- `ask_leader` asks whoever leads NOW ---------------------------------
@@ -2149,10 +2251,20 @@ _selftest_perl_lifetime=30
 # A listener that answers one request per connection with a body ending in NO
 # newline, and records the request headers it was sent.
 #
+# A MODE rather than a fifth stand-in. The `truncate` arm differs from the default
+# in the four bytes after the body and in what it does next -- it promises more
+# with `Content-Length` and then HOLDS -- and every other line of this program is
+# the request reader, the bound and the apostrophe rule, all of which are what the
+# existing comments are about. A fifth copy would be a fifth chance to get those
+# wrong, which is the argument `_selftest_metrics` below already lost once.
+#
 # @param 1 port
 # @param 2 seconds to wait before binding -- so a caller can prove the wait
 #          POLLS rather than happening to be called after the bind
 # @param 3 file to record request lines in
+# @param 4 mode: `complete` (the default) answers and closes; `truncate` answers
+#          headers and PART of a body, promises more, and then holds the socket
+#          open -- which is a response our own read bound must end
 _selftest_listener() {
     # `exec` and the `alarm` bound both come from `_selftest_bounded_perl`, which
     # is where the whole argument for them lives. What stays here is the one part
@@ -2172,7 +2284,8 @@ _selftest_listener() {
     # so this one is written down instead of pretended at.
     _selftest_bounded_perl "$_selftest_perl_lifetime" '
         use strict; use warnings; use IO::Socket::INET;
-        my ($port, $delay, $logfile) = @ARGV;
+        my ($port, $delay, $logfile, $mode) = @ARGV;
+        $mode = "complete" unless defined $mode and length $mode;
         # The delay is what lets a caller prove a wait POLLS rather than
         # happening to be called after the bind, so it runs BEFORE the listen.
         #
@@ -2203,12 +2316,42 @@ _selftest_listener() {
         open(my $log, ">>", $logfile) or die $!;
         $log->autoflush(1);
         while (my $c = $srv->accept()) {
-            while (defined(my $l = <$c>)) { print $log $l; last if $l =~ /^\r?\n?$/; }
+            my $lines = 0;
+            while (defined(my $l = <$c>)) { $lines++; print $log $l; last if $l =~ /^\r?\n?$/; }
+            # A CONNECT THAT SENT NOTHING IS NOT A REQUEST, which `_selftest_metrics`
+            # below has said since it was written and this one did not need until
+            # the `truncate` mode arrived. `port_answers` opens the socket and
+            # closes it, so every `free_port` draw and every `wait_for_port` poll
+            # reaches this accept -- and the truncate arm HOLDS for twenty seconds,
+            # so serving one of those holds the accept loop and the real request is
+            # never read at all. Measured: the case saw an EMPTY body.
+            if (!$lines) { close $c; next; }
+            if ($mode eq "truncate") {
+                # Headers that PROMISE a longer body, then a prefix of it, then
+                # nothing -- neither the rest nor a close. That is the shape a
+                # real stall produces: measured on a live node, /metrics is
+                # 41,637 bytes over 133 series drained line by line, so a stall
+                # anywhere in roughly a thousand reads leaves exactly this.
+                #
+                # The prefix ends in a newline on purpose: the drain reads LINES,
+                # so it takes this one cleanly and blocks on the next read. A
+                # prefix with no newline would leave the drain holding a partial
+                # line and would exercise the last-chunk path instead.
+                print $c "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                       . "Content-Length: 4096\r\nConnection: close\r\n\r\n"
+                       . "staged_counter_total 0\n";
+                $c->flush();
+                # HOLD. `select` rather than `sleep`, for the reason the delay
+                # above gives. The injected alarm ends this program regardless.
+                select(undef, undef, undef, 20);
+                close $c;
+                next;
+            }
             print $c "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                    . "Connection: close\r\n\r\n{\"tail\":\"NO-TRAILING-NEWLINE\"}";
             close $c;
         }
-    ' "$1" "$2" "$3"
+    ' "$1" "$2" "$3" "${4:-complete}"
 }
 
 # A listener that answers a client which has said NOTHING, or holds it open.
@@ -2657,6 +2800,91 @@ ran=$(( ran + 1 ))
 # The listener-backed arm of the same property is `http-silence-inconclusive`, which
 # spends the whole bound. These cost nothing and cover both branches on every
 # platform, which that case cannot.
+# Whether the probe is TAKEN at all is a second decision, and it had a second bug.
+#
+# The gate read `[ "$status" -le 128 ] && [ -z "$body" ]`, so a PARTIAL body skipped
+# the probe entirely -- and on bash 3.2, where the status cannot decide, the drain
+# then answered `peer`: *the server answered*, for a response our own bound had cut
+# short (#1257). The body is not a reading about who ended the read.
+#
+# ## What this table CANNOT reach, stated rather than left to look covered
+#
+# The defect is invisible on bash 4+, where a timeout carries 142 and the status
+# decides before the gate's second clause matters. It is reproducible only on a real
+# bash 3.2, and there was none available here -- Docker Desktop's daemon is not
+# running on this host and WSL has no podman, so `podman run docker.io/library/bash:3.2`
+# was NOT run and this arm has NOT been exercised end to end.
+#
+# What IS covered on every platform is the predicate, below, plus the shape scan
+# further down that refuses a second clause returning to the call site. Neither is
+# the live 3.2 case, and neither is claimed to be.
+echo "== whether the sticky-EOF probe is needed, against staged statuses"
+probe_needed_rows=(
+    "probe-status-decides|142|1|a status above 128 is a timeout and nothing else, so no probe is needed"
+    "probe-status-cannot|1|0|bash 3.2 answers 1 for a timeout AND for EOF, so the probe IS needed"
+)
+ran=$(( ran + 1 ))
+if [ "${#probe_needed_rows[@]}" -lt 1 ]; then
+    echo "FAIL probe-needed: the reading table is empty, so every row 'passed'." >&2
+    note_failure "probe-needed"
+fi
+probe_needed_answers=""
+for row in ${probe_needed_rows[@]+"${probe_needed_rows[@]}"}; do
+    old="$IFS"
+    IFS='|' read -r pname pstatus pwant pwhat <<< "$row"
+    IFS="$old"
+    ( . "$library"; _e2e_probe_needed "$pstatus" ) && pgot=0 || pgot=$?
+    ran=$(( ran + 1 ))
+    if [ "$pgot" -ne "$pwant" ]; then
+        echo "FAIL ${pname}: ${pwhat} -- status ${pstatus} returned ${pgot}, wanted ${pwant}" >&2
+        note_failure "${pname}"
+    fi
+    probe_needed_answers="${probe_needed_answers}${pgot}
+"
+done
+# Two rows that answer alike pass every assertion above while testing nothing.
+ran=$(( ran + 1 ))
+if [ "$(printf '%s' "$probe_needed_answers" | sort -u | grep -c .)" -lt 2 ]; then
+    echo "FAIL probe-needed-branches: every staged status got the same answer, so the" >&2
+    echo "     predicate has one branch and the table demonstrates nothing." >&2
+    note_failure "probe-needed-branches"
+fi
+
+# AND THE CALL SITE, because the table above cannot see it.
+#
+# The predicate being right says nothing about what the drain ANDs beside it, and
+# that conjunction is exactly where #1257 lived. A behavioural check is impossible
+# on bash 4+ for the reason stated above, so this is a shape check -- narrow, and
+# refusing in the safe direction: the line that arms the probe must call
+# `_e2e_probe_needed` and must mention nothing else.
+#
+# It is deliberately NOT a check that the line is byte-identical to an expected
+# one. That would refuse a reformat, which is a false red on a correct tree, and a
+# check that fails on arrival is a check somebody disables.
+ran=$(( ran + 1 ))
+probe_gate="$(grep -nE '^[[:space:]]*if .*_e2e_probe_needed' "$library" || true)"
+if [ -z "$probe_gate" ]; then
+    echo "FAIL probe-gate: no line in ${library##*/} arms the probe through _e2e_probe_needed." >&2
+    echo "     Either it was renamed, or the gate went back to an inline condition (#1257)." >&2
+    note_failure "probe-gate"
+elif grep -qE '_e2e_probe_needed.*(&&|\|\|)|(&&|\|\|).*_e2e_probe_needed' <<< "$probe_gate"; then
+    echo "FAIL probe-gate: the probe's gate carries a second clause." >&2
+    echo "     It read \`[ \"\$status\" -le 128 ] && [ -z \"\$body\" ]\`, and that body clause is" >&2
+    echo "     #1257: a PARTIAL body skipped the probe, so on bash 3.2 -- where the status" >&2
+    echo "     cannot decide -- a response OUR bound cut short was classified as the PEER" >&2
+    echo "     having answered. The status is the whole condition." >&2
+    printf '%s\n' "$probe_gate" | sed 's/^/     | /' >&2
+    note_failure "probe-gate"
+fi
+# A guard nobody has watched REFUSE is not known to work, and this one reads a
+# single line, which is the shape that quietly matches nothing.
+ran=$(( ran + 1 ))
+if ! grep -qE '_e2e_probe_needed.*&&' <<< 'if _e2e_probe_needed "$status" && [ -z "$body" ]; then'; then
+    echo "FAIL probe-gate-canary: the second-clause pattern does not match a staged violation," >&2
+    echo "     so the check above reports clean over a gate it cannot read." >&2
+    note_failure "probe-gate-canary"
+fi
+
 echo "== the drain's verdict, against staged readings"
 read_bound_rows=(
     "ended-timeout-status|142|-|0|a status above 128 is a timeout, so the bound's"
@@ -2900,6 +3128,13 @@ socket_cases=(
     "http-last-chunk|0|http_get kept the final chunk"
     "http-headers|0|both caller headers reached the server"
     "http-refused|0|http_get returned non-zero for a refused connection"
+    # Both directions of #1257, and the accepting one first: a `http_get` that
+    # answered `$E2eHttpTruncated` unconditionally would satisfy the second row
+    # while refusing every honest scrape.
+    "http-complete|0|http_get reported a complete response"
+    "http-truncated|0|http_get reported the response CUT SHORT and said so"
+    # The probe teardown's own `set -e` defect, which widening that gate exposed.
+    "http-set-e-survives|0|http_get survived set -e in an untested position"
     "http-silence|0|http_response_to_silence reported what the server volunteered"
     "http-silence-inconclusive|0|refused rather than reporting silence it never observed"
     "http-silence-refused|0|told a refused connection from an expired bound"
