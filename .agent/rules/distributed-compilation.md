@@ -1115,6 +1115,35 @@ Consequences that are each load-bearing:
   That is the residual the expiry is documented to bound, and it is not a regression —
   the term expectation had the identical hole for the identical duration, since a
   restarted worker had learned nothing and accepted every term.
+  - **Retention window and acceptance window are ONE window, and the way to keep them one
+    is ONE PREDICATE rather than one constant.** `VerifyLeaseToken` accepts a grant for
+    `LeaseTokenClockSkewSlack` past its own `expiresAt`, so a spent entry dropped at
+    `expiresAt` alone would leave that token acceptable AND unspent for the rest of the
+    slack — replayable again, five minutes at a time. **A spend that expires before the
+    thing it is spending is not a spend.** So `SpentLeases::Spend` prunes through
+    `Detail::WithinAcceptanceWindow`, the verifier's own function, and takes the same
+    `slack` the verifier was given: sharing the CONSTANT would leave both sites spelling
+    the comparison, and the comparison is the part that is easy to get wrong. The prune
+    runs BEFORE the lookup, and a token reaching there is inside the window by
+    construction, so nothing can be pruned by its own arrival.
+  - **And the comparison comes BEFORE the subtraction, because `expiresAt` is
+    attacker-chosen.** Not `now > expiresAt + slack`: that sum pushes an already-large
+    instant past the tick count's ceiling, and `expiresAt` decodes from the wire up to
+    `MaxExpiryMillis`. The difference is not unconditionally safe either — `now` is
+    whatever this host's wall clock says, including a pre-epoch instant on a machine with
+    a dead RTC — so the ordering is established with a comparison, which cannot overflow,
+    and the subtraction only ever runs on `now > expiresAt >= epoch`, where the result is
+    bounded by `now` and therefore representable.
+  - **A wall clock stepping BACKWARDS is a second residual, and not the restart case in
+    disguise.** Retention is re-evaluated only inside `Spend`, against the caller's `now`,
+    so "everything still acceptable is still remembered" holds exactly while the clock is
+    monotone. A worker whose clock is minutes AHEAD — a resumed VM, a container with no
+    time source, the population `LeaseTokenClockSkewSlack` exists for — prunes entries
+    whose window merely looks passed, and when NTP steps it back those tokens verify again
+    and are no longer remembered. One extra spend each, bounded by the same window and by
+    how far the clock moved. Two worker PROCESSES advertising one endpoint is a third, for
+    the same reason: each keeps its own set, and that one is a deployment mistake rather
+    than a property of this type.
 - **The learned term is a DIAGNOSTIC, not a gate — and the gate it replaced was exactly
   inverted.** #421 made a worker refuse any grant naming a term below the one it had
   learned, taking the maximum so a late message could not walk it backwards. Measured on

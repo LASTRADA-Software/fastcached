@@ -468,6 +468,13 @@ And it is tested, by `ctest -R node-scratch-isolation-e2e-selftest`. **A classif
 that cannot be made to say BLOCKED cannot report a hang**, and the original could
 not.
 
+**That selftest is in the DEFAULT `ctest` set**, labelled `hygiene` rather than `smoke`, because
+it needs no daemon, no socket and no compiler -- the whole point of splitting the decision out
+of the acquisition is that the decision can be exercised anywhere. Where no `pwsh` is found the
+row is REGISTERED and SKIPPED rather than omitted, for the reason `launcher-e2e-ports-selftest`
+is: absent and skipped are two states, and a classifier nobody ran reads exactly like one that
+had nothing to say.
+
 ## A fixture waits on what a line MEANS, and a rename is not what changes it
 
 <!-- agent-tripwire: A fixture waits on what a line MEANS, not on its wording -->
@@ -1208,6 +1215,15 @@ leaves open is stated rather than engineered away**: one site removed and anothe
 same file under the same rule is a wash, and a key that could see it would have to be the header
 text, which contains a `;`.
 
+**And `AGENT.md`'s bullet deliberately states NO count.** That is the same rule as the row key,
+read one level out: the backlog file owns the number, and a prose copy of a number a table owns
+is the second source of truth `ctest -R table-totals` refuses everywhere else. Recorded as
+history rather than as a figure to keep current -- the total has read 148, then 134, then 119,
+then 56, then 0 while one prose sentence in `AGENT.md` stood still through all five. Any one of
+those numbers would have been correct in `AGENT.md` for as long as it took the next conversion
+to land, and wrong and unnoticed afterwards, which is why the bullet there names the FILE and
+stops. Do not "helpfully" add the current figure back to it.
+
 **The census in #1452's body is 45 and the tree holds 169.** Not a miscount -- the ticket's
 pattern `\bfor \([^:)]*;[^;]*;` rejects any init containing a `:` or a `)`, so it misses every
 `std::`-qualified declaration and every init that calls a function. Measured per line:
@@ -1605,7 +1621,9 @@ shape repeats:
 **a fixture that has never completed has told you nothing, however carefully it
 was read.**
 
-**A flag spelling is checked against the table, not remembered.** The daemon was
+**A flag spelling is checked against the table -- `CliOptions()` in
+[`platform-service-and-config.md`](platform-service-and-config.md)'s one flag table, which drives
+parsing and help alike -- not remembered.** The daemon was
 started with `--memory-limit 2048mb`. There is no such option — the only
 occurrence of that spelling anywhere in the tree was the line that used it — and
 the byte suffix is a single character, so `2048mb` would be an unknown unit under

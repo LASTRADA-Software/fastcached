@@ -418,6 +418,26 @@ fault.
   series: the whole handover was filled, persisted, restored and never once drawn,
   while the merge function's own comment claimed a route could not reach past it.
   **Assert the wiring, through a route, not the merge.**
+- **Nothing a receiver can RECOMPUTE travels, and handed-over history is filed under the
+  MACHINE, never the worker id.** A handed-over bucket carries two instants and the
+  readings; the leader replays them to rebuild the fold and the coverage for itself, so a
+  transmitted fold would be a second answer to a question already answered and the one a
+  decoder trusted would be the one nothing kept correct. Filing under the machine is the
+  `NodeReports()` rule one layer down: a host with two `--toolchain` flags registers twice
+  and would otherwise hold one machine's series once per toolchain and sum it that many
+  times. The argument for both, with the leader's high-water mark and what it persists, is
+  in [`distributed-compilation.md`](distributed-compilation.md) — it is a property of the
+  handover wire rather than of the renderer, and it is stated there once.
+- **A handover cursor advances only on the verb that carried the batch, and exactly ONE
+  verb carries it — NODE-ANNOUNCE, which every node sends** (#1440). Forced rather than
+  chosen: a machine running no worker never sends `Register` at all, so a carrier riding
+  registration cannot serve a scheduler-only leader, whose own series is the one an
+  election is about to orphan; and it cannot ride both verbs, because `NextHistoryBatch`
+  advances a cursor and two callers in one process would each take a batch and each step
+  past it. The shape this closes — `accepted` counting a registration, which carries no
+  history — is now UNREACHABLE rather than fixed: `HeartbeatRound` has no sampler, so the
+  worker's round cannot obtain a batch to step over. The full derivation is in
+  [`distributed-compilation.md`](distributed-compilation.md).
 - **A retention cost is REPORTED, never estimated.** The rings are allocated in
   full at construction and do not grow, so `FleetHistoryBytes()` is the steady
   state rather than a ceiling -- 800 KiB a series, 1.6 MiB for a node's own two,
@@ -632,6 +652,22 @@ hunks in a merge just declared clean. `grep -c -i -F` had **aborted: exit 134,
 SIGABRT, no stdout** — and note it is not `2`, so a reader checking `status == 2` for
 "error" misses precisely this case. Treat anything that is neither `0` nor `1` as the
 instrument failing.
+
+**And the mirror of the must-find control, which is the half that gets acted on: a
+POSITIVE finding settles nothing when it is true under BOTH readings of the claim.**
+The control above guards a probe that found nothing; nobody guards a probe that found
+something, because finding something feels like the end of the investigation. It is
+the same defect from the other side, and it is worse in one respect: a zero prompts a
+second look, while a hit is carried straight into a commit message, a ticket comment
+or a handover. So before believing a match, ask what the NEGATION of the claim would
+have produced — if the answer is *the same output*, the probe discriminated nothing
+and the finding is not evidence. `grep`ping for a symbol to show a rule is enforced
+matches the rule's own definition, its tests and its documentation exactly as it
+matches a call site; a census of `Increment(Counter::X)` "confirms" a counter is
+written whether or not the file it lives in is ever constructed; a green run
+"confirms" a fix on a build where the fix is compiled out. `testing.md` states the
+matching obligation for a fix — *prove the test can fail* — and this is that
+obligation applied to a probe rather than to a test.
 
 Which signal survives depends on the invocation, and getting that wrong argues for
 throwing away the cheap one. A bare `grep` prints nothing whether it matched nothing
@@ -974,7 +1010,12 @@ The log lines stay.
   `not-evaluated` and hands back every row still `undecided`, which `main` logs as an error. A
   row whose component is PRESENT is left undecided on purpose -- filling it in would hide the
   wiring defect it reports. The `[conditions]` Catch2 tag holds a fully configured node to no
-  undecided row, through the one registry the components share.
+  undecided row, through the one registry the components share. **The tag spans THREE test
+  binaries** -- `FastCacheTest` for `Distributed/` and `Protocol/`, plus the node's and the
+  cli's own -- because a condition is produced on one machine, carried over two wires and
+  rendered by two readers, and a tag selecting only the producer's binary would assert the row
+  exists while saying nothing about whether either reader can draw it. Select by the TAG, never
+  by a binary, and assert how many cases RAN.
 - **"None raised" is SAID, and absent is ABSENT.** A node with nothing raised sends every row,
   each `clear` or `not-evaluated`, and every surface renders that as `none raised`; a node too
   old to carry conditions sends no list, which every surface renders at the cell as absent. An

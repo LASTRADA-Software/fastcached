@@ -259,6 +259,20 @@ same on both — the same defect with no MSVC anywhere near it.
   memoized against it goes stale in the one direction that yields a *wrong hit*
   rather than a miss. It costs a second driver spawn per invocation on a clang
   driver, beside the `--version` one already paid there.
+  - **This is the canonical instance of *expense is not the criterion*, and it is
+    expensive**: `DiscoverTargetTriple` has been recorded at **~40 ms per translation
+    unit** ([#188](https://github.com/LASTRADA-Software/fastcached/issues/188)), which
+    on a whole build is the kind of number that argues for a memo on its own. It is
+    deliberately not memoized anyway, because the triple goes into `compilerId` and a
+    stale one is a **wrong hit, not a miss**. What decides is what a stale answer
+    *does*, never what a fresh one costs — the rule stated in general under
+    *Prefer not needing the cache at all* below.
+    - That `~40 ms` figure arrived here from `AGENT.md` **with no conditions
+      recorded** — no host, no driver, no filesystem — so it is a magnitude and not a
+      measurement, and it must not be differenced against the per-unit rows above,
+      which were taken on named hosts and name their own spread. Pin conditions to it
+      before quoting it anywhere a decision turns on the number rather than on its
+      order of magnitude.
 
 ## What the key is a function of
 
@@ -2364,6 +2378,45 @@ Empty roots and an empty stamp are both ordinary answers, so neither can carry *
 no probe* -- which is the `exitCode == NotSpawned` guard from
 [`distributed-compilation.md`](distributed-compilation.md) moved out of the call site and
 into the type.
+
+### And where a cache IS needed, decide SAFETY first -- it decides whether to cache at all
+
+An answer that costs a spawn, a syscall or a walk, and is asked for more than once, is
+cached -- **but only where staleness degrades safely.** That second clause is the whole
+rule. Without it the principle is a licence to serve wrong answers quickly, and the
+expensive probes are exactly the ones somebody will reach for it to justify.
+
+So the safety question is asked FIRST, before the cost question, because it decides
+whether there is a cache at all rather than how long its interval is. There are two
+shapes and they are not a spectrum:
+
+- **Staleness that costs a refusal, a miss or a retry is safe to cache.** The
+  local-address set behind the node's cache gate is this shape: an address just gained
+  is refused for at most one interval, which fails **closed**, self-heals, and costs one
+  local compile. That design, with both staleness directions named in the header and the
+  probe counted rather than clocked, is derived in
+  [`distributed-compilation.md`](distributed-compilation.md) under *a node's cache tier
+  serves THIS MACHINE* -- along with the rest of the checklist a safe cache still owes:
+  **measure before choosing, on every platform** (`GetAdaptersAddresses` against
+  `getifaddrs`, two orders of magnitude apart, so a design that is free on the platform
+  you develop on can dominate a request on the one you ship to); **fast by construction
+  before fast by cache** (`IsLoopbackHost` first and lock-free, so the cache bounds only
+  the rare path -- a far weaker thing to get right); **refresh on an INTERVAL, never on a
+  miss** (a miss-triggered refresh hands a remote peer a free amplifier: one expensive
+  probe per request, just by asking); and **an injected seam with an injected clock**,
+  because a cache with a hidden clock is untestable by construction.
+- **Staleness that produces a wrong answer which LOOKS right is not cacheable**, however
+  expensive the probe. `DiscoverTargetTriple` is the instance, above: ~40 ms per
+  translation unit and deliberately not memoized, because the triple reaches `compilerId`
+  and a stale one is a wrong hit rather than a miss
+  ([#188](https://github.com/LASTRADA-Software/fastcached/issues/188)).
+
+**Expense is not the criterion; what a stale answer DOES is.** The two shapes are told
+apart by asking what the caller sees when the answer is one interval old -- not by asking
+how much the probe cost, which is the question that is already in the reader's head and
+which is uncorrelated with the answer. A wrong hit and a miss are not degrees of the same
+failure: one is recoverable by retrying and the other is a build that links an object
+nobody can account for.
 
 ## Open work
 

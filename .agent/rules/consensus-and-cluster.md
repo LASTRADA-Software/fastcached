@@ -802,6 +802,29 @@ and it is recorded here because the question will be asked again.
   `RaftPeerServer::Shutdown` closes the connections it accepted and not only its
   listener.
 
+- **`RaftNode` reads no clock, opens no socket and draws no randomness of its own**,
+  and all three clauses are load-bearing rather than one habit stated three ways. It
+  is a pure state machine: every instant it decides from arrives as a `now` argument,
+  every message it wants sent leaves through `RaftOutput`, and every random draw --
+  election jitter -- comes from the `IRandomSource` it was handed. That is what lets
+  `RaftClusterHarness` run a whole cluster in one process against a scripted partition
+  and a `ManualClock`, and what makes the six `ManualClock` cases pinning pre-vote and
+  CheckQuorum EXACT rather than approximate: a rule about a window cannot be pinned by
+  a test whose subject reads a clock the test does not control.
+  - **The driver is where all three re-enter**, which is why the split exists at all:
+    `RaftDriver` owns the reactor, the sleep, the sockets and the mutex, and `RaftNode`
+    owns the algorithm. A convenience that reached for `steady_clock::now()`,
+    `ISocket` or a seeded engine inside the node would not fail any existing case --
+    it would quietly make every future one inexact, which is the failure nothing
+    reports. The same sentence, one layer out, is the distributed rules' *a heartbeat
+    age is a duration on a report, never a `TimePoint` on `WorkerInfo`*.
+  - **A seeded draw is not an exception to the randomness clause**; it is how the
+    clause is satisfied. `SystemRandomSource`'s fixed-seed constructor and
+    `UniformInRange` exist so a harness schedule is reproducible, and they are reached
+    through the injected source like everything else -- see *A seeded draw must be the
+    same on every platform* below, and #1527's `ISecureRandom` for the draws whose
+    unpredictability is a security property rather than a reproducibility one.
+
 - **A snapshot is durable before it is acknowledged, and its configuration travels
   with it.** `IRaftStorage` had `SaveState` and `SaveLog` and nothing else, so
   `RaftLog::Compact`'s stated precondition — the caller has made a snapshot through
@@ -1314,6 +1337,25 @@ and it is recorded here because the question will be asked again.
     tombstone is the operator's: `--cluster-admit` commits `AddMember` directly. The
     tombstone is a HOST, so a loopback cluster -- which records none -- is not covered,
     and #178's per-node keys are what replace it with an identity.
+
+    **A HOST is one of the predicate's two arms, and after #1555 it is the weaker
+    one.** `--cluster-forget` revokes the record's key in the same entry (*A forget
+    revokes*, below), so the second arm is *an id recorded nowhere whose key
+    `revokedKeys` holds under it* -- which is the arm that answers on a rig sharing one
+    machine, where every member is loopback and no tombstone is ever written, and the
+    arm that survives a machine moving to a new address. Both are asked, because
+    neither covers the other: a tombstoned host may hold a member admitted afresh under
+    a key nobody revoked, and a revoked key may belong to a machine no tombstone ever
+    named. Asked with the same `MembershipPlan::forgotten` answer, at the same
+    decision.
+
+    **So only a NEW key brings a forgotten machine back.** `--cluster-admit` lifts the
+    tombstone, but `KeyRevoked` is PERMANENT (*A revoked key is never admitted again*,
+    below), so re-admitting the same machine under the key it still holds is refused by
+    name -- an operator re-keys it with `--print-identity` after wiping `node-key`, or
+    it stays out. That is the intended cost rather than an awkwardness: a forget is the
+    only removal this cluster has, and one an operator could undo by retyping the
+    original token would be removal failing open by the front door.
   - **A forget means the same thing whoever currently leads**
     ([#1539](https://github.com/LASTRADA-Software/fastcached/issues/1539)). After #1528 a
     forgotten LEADER stopped recording itself and still led, counted, indefinitely:
@@ -1490,6 +1532,16 @@ tick -- the scheduler answers `NotLeader` and the fleet page goes dark until it 
   `Moment`, mapped to `InvalidClusterChange` on the wire -- judged from the header before the
   CRC, so an intact store of another vintage never reads as damage. `CommandVersion` did NOT
   move: `AddLearner` is a verb, not a field, which is also why #144's trigger has not fired.
+  - **A log's FIRST record decides the store's format, and a foreign LATER record is a TORN
+    TAIL.** Per-record formats make both questions askable and make it possible to answer them
+    oppositely, which is the mistake: a log is written by one build at a time, so a record whose
+    format differs from the first record's cannot be *the store's* format arriving late -- it is
+    an interrupted write, or bytes from a run that was replaced, and the log ends there. Read the
+    other way round, a single torn record at the tail condemns a healthy store as
+    `UnsupportedFormatVersion` and an operator moves a log that only needed truncating; read as
+    damage, an entire store another build wrote reports `Corrupt` and somebody deletes it. The
+    storage rules' `UnsupportedFormatVersion` / `Corrupt` split, stated about the one file where
+    both answers are reachable from the same bytes.
 - **What the neuters showed.** Counting learners in `QuorumOf` reddens five cases, not one,
   because `QuorumOf` is the single author of commitment, elections and CheckQuorum alike -- the
   absent-learner cluster case (at committing alone and re-leading alone: the learner
