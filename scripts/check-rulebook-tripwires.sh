@@ -66,10 +66,13 @@
 # cannot spell *forgot* in the vocabulary of *decided*. An `untriaged` marker
 # must name an issue, or it is a backlog row with no owner.
 #
-# This spelling exists because the first seeding of these markers FOUND eight
-# sections with no `AGENT.md` tripwire at all -- which is #876 premise, confirmed
-# on its first run. Spelling those `none:` would have recorded *this section
-# needs no tripwire* for eight rules that do.
+# This spelling exists because the first seeding of these markers found sections
+# with no `AGENT.md` tripwire at all -- #876 premise, confirmed on its first run.
+# Spelling those `none:` would have recorded *this section needs no tripwire* for
+# rules that need one. The COUNT is not written here: the check prints it, per
+# issue, on every run, which is the one place it cannot drift. (It was written
+# here, as "eight", and disagreed with the ctest registration's "seven" and with
+# the live run before this sentence replaced it.)
 #
 # The marker carries no line number and no AGENT.md coordinate, deliberately:
 # `AGENT.md` is several hundred bullets that several sessions edit at once, and
@@ -165,6 +168,21 @@ function normalise(s) {
     sub(/^ /, "", s); sub(/ $/, "", s)
     return s
 }
+# Does this file `## Open work` section name this issue? An `untriaged:` marker
+# is deferred work, and deferred work in this rulebook lives as an `## Open work`
+# entry -- which `rulebook-open-work-state` RESOLVES, refusing one whose issue has
+# closed. Requiring the pairing is what puts these markers under that resolver:
+# without it, the issue closes, the entry is forced out, and the markers go on
+# printing a live-looking tally of a dead issue -- inside the guard whose whole
+# safety argument IS that tally.
+function inOpenWork(issue,   k, seen) {
+    seen = 0
+    for (k = 1; k <= NR; k++) {
+        if (lines[k] ~ /^## /) seen = (lines[k] == "## Open work")
+        else if (seen && lines[k] ~ ("#" issue "([^0-9]|$)")) return 1
+    }
+    return 0
+}
 { lines[NR] = $0 }
 END {
     fence = 0
@@ -223,8 +241,11 @@ END {
             issue = reason
             sub(/^.*#/, "", issue)
             sub(/[^0-9].*$/, "", issue)
+            if (!inOpenWork(issue)) {
+                refuse(markerLine, "section `" heading "` is `untriaged` against #" issue ", but this file `## Open work` section does not name that issue. Deferred work in this rulebook lives as an `## Open work` entry, which `ctest -R rulebook-open-work-state` resolves and refuses once the issue closes. Without the entry these markers outlive the issue and go on printing a live-looking tally of a dead one -- which is the tally this spelling is only safe because of. Add the entry, or decide the section with a phrase or `none:`.")
+                continue
+            }
             printf "UNTRIAGED #%s\n", issue
-            untriagedMarkers++
             continue
         }
 
@@ -240,7 +261,7 @@ END {
         }
         checked++
     }
-    printf "SUMMARY %d %d %d %d %d\n", headings, markers, noneMarkers, checked, untriagedMarkers
+    printf "SUMMARY %d %d %d %d\n", headings, markers, noneMarkers, checked
 }
 '
 
@@ -251,20 +272,33 @@ NotCovered='  This check verifies the phrase the author nominated is PRESENT in 
   It does NOT decide whether that phrase is the right tripwire for the section,
   it does NOT refuse an AGENT.md bullet with no rules-file section behind it
   (AGENT.md also tripwires rules that live in source comments and .agent/guides/),
-  and it says nothing about a rule that is in neither file.'
+  and it says nothing about a rule that is in neither file.
+  Its UNIT is the `##` heading, and a rule arrives as a BULLET under existing
+  prose -- so a new rule in an already-marked section is invisible to it, and the
+  files with the fewest headings are the ones it watches least. Read the counts
+  above as sections covered, never as rules covered.'
 
 # The body. Wrapped by `RunCheck` below so the haystack temp file has exactly one
-# removal site: a `trap ... RETURN` is the tidy spelling and needs `set -T` to be
-# reliable, and this runs on a 2007 `/bin/bash`.
+# removal site. Not a `trap ... RETURN`: a RETURN trap set inside a function also
+# fires when its CALLER returns, so it would need clearing inside its own handler
+# -- and this runs on a 2007 `/bin/bash`, where that behaviour is untested here.
+# (An earlier version of this comment blamed `set -T`, which governs a different
+# thing: whether a trap set in a caller is INHERITED. The decision is unchanged;
+# the reason was wrong, and a confidently wrong reason is worse than a narrow
+# one.)
 RunCheckImpl() {
-    # `files` is captured HERE and not read as `$3` below: the summary arm runs
-    # `set -- $line`, which replaces the positional parameters, so a later `$3`
-    # is whatever the last SUMMARY line held. Found by writing it that way.
-    local root="$1" hay="$2" files="$3" f out line
+    local root="$1" hay="$2" f out line files fileCount=0
     local headings=0 markers=0 none=0 checked=0 failures=0 untriaged=0 issues=""
+
+    files="$(find "$root/.agent/rules" -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)"
+    if [[ -z "$files" ]]; then
+        echo "check-rulebook-tripwires: no markdown under $root/.agent/rules -- refusing rather than reporting clean. A census that finds nothing has not passed, it has failed to look." >&2
+        return 1
+    fi
 
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
+        fileCount=$((fileCount + 1))
         # The status is CHECKED. An awk that refused to parse writes nothing, and
         # the `headings == 0` guard below would then name the wrong cause -- a
         # reader would go hunting for a missing heading.
@@ -281,15 +315,17 @@ RunCheckImpl() {
                     set -- $line
                     headings=$((headings + $2)); markers=$((markers + $3))
                     none=$((none + $4)); checked=$((checked + $5))
-                    untriaged=$((untriaged + $6))
                     ;;
+                # The untriaged TALLY is derived from these, not carried
+                # alongside them: a total stated beside a list is derived from
+                # it or it is a second claim, and the two could disagree.
                 UNTRIAGED\ *)
                     issues="$issues ${line#UNTRIAGED }"
+                    untriaged=$((untriaged + 1))
                     ;;
-                FATAL\ *)
-                    echo "check-rulebook-tripwires: $line" >&2
-                    return 1
-                    ;;
+                # No `FATAL` arm: the awk program `exit 1`s after printing it,
+                # so the `awkrc` guard above has already returned -- and it
+                # echoes the text. An arm here would be unreachable.
                 "") ;;
                 *) echo "  $line" >&2; failures=$((failures + 1)) ;;
             esac
@@ -307,7 +343,10 @@ RunCheckImpl() {
         return 1
     fi
 
-    echo "rulebook tripwires: $headings section(s) across $(printf '%s\n' "$files" | wc -l | tr -d ' ') rulebook file(s), $markers marked ($none stating none, $untriaged untriaged), $checked phrase(s) found in AGENT.md"
+    # `fileCount` from the loop, not a second `wc -l` over `$files`: the loop
+    # skips blank entries that a `wc` would count, so the two mechanisms could
+    # disagree about the same list.
+    echo "rulebook tripwires: $headings section(s) across $fileCount rulebook file(s), $markers marked ($none stating none, $untriaged untriaged), $checked phrase(s) found in AGENT.md"
 
     # The untriaged tally, per issue, on EVERY run. This is the whole reason a
     # third spelling is safe: a placeholder nobody counts is a permanent to-do
@@ -330,33 +369,36 @@ RunCheckImpl() {
 }
 
 RunCheck() {
-    local root="$1" hay rc=0 files
+    local root="$1" hay rc=0
 
     if [[ ! -f "$root/AGENT.md" ]]; then
         echo "check-rulebook-tripwires: no AGENT.md at $root -- refusing rather than reporting clean. The haystack being absent and every phrase being present are not the same green." >&2
         return 1
     fi
 
-    files="$(find "$root/.agent/rules" -maxdepth 1 -name '*.md' -type f 2>/dev/null | sort)"
-    if [[ -z "$files" ]]; then
-        echo "check-rulebook-tripwires: no markdown under $root/.agent/rules -- refusing rather than reporting clean. A census that finds nothing has not passed, it has failed to look." >&2
-        return 1
-    fi
-
-    # Flatten and strip ONCE, in the shell, rather than concatenating 2400 lines
-    # inside awk per file: the awks this runs on include BWK awk, where repeated
-    # string concatenation over a 200 KB file is quadratic.
+    # Flatten and strip ONCE here rather than per file: the design spawns one awk
+    # per rules file, so an in-awk flatten would run eleven times.
+    #
+    # (This comment used to quote AGENT.md at "2400 lines / 200 KB" and blame BWK
+    # awk's string concatenation being quadratic. The figures were falsified by
+    # the very next commit on the branch that wrote them -- in a change that also
+    # adds a check refusing AGENT.md to quote its own size BECAUSE such figures
+    # go stale -- and the quadratic clause was an unmeasured amplifier reading as
+    # the reason. The per-file repetition is the narrow true reason, so it is the
+    # one kept.)
     hay="$(mktemp)" || { echo "check-rulebook-tripwires: mktemp failed" >&2; return 2; }
     sed -e 's/[*`_]//g' "$root/AGENT.md" | tr '\n\t' '  ' | tr -s ' ' > "$hay"
     # Whitespace only is the same failure as empty, and `-s` cannot tell them
-    # apart: a one-line file of blanks is "not empty".
-    if [[ -z "$(tr -d ' ' < "$hay")" ]]; then
+    # apart: a one-line file of blanks is "not empty". `grep -q` short-circuits
+    # at the first non-blank byte, and nothing pipes INTO it, so `pipefail` has
+    # nothing to misreport.
+    if ! grep -q '[^ ]' "$hay"; then
         rm -f "$hay"
         echo "check-rulebook-tripwires: AGENT.md at $root normalised to nothing. The check cannot look, which is not the same as finding nothing wrong." >&2
         return 1
     fi
 
-    RunCheckImpl "$root" "$hay" "$files" || rc=$?
+    RunCheckImpl "$root" "$hay" || rc=$?
     rm -f "$hay"
     return "$rc"
 }
@@ -490,8 +532,45 @@ Prose.' \
 
 <!-- agent-tripwire: untriaged: #876 nobody has decided whether this needs one -->
 
-Prose.' \
+Prose.
+
+## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues -->
+
+- **[#876](https://github.com/LASTRADA-Software/fastcached/issues/876)** -- what is left.' \
         "1 untriaged" "untriaged: 1 section(s) awaiting #876"
+
+    # ... and the pairing is REQUIRED, or the marker outlives the issue that was
+    # meant to retire it.
+    Case "an untriaged issue with no Open work entry is refused" refused \
+"$_agent" \
+'# t
+
+## Sockets
+
+<!-- agent-tripwire: untriaged: #876 nobody has decided whether this needs one -->
+
+Prose.' \
+        "does not name that issue"
+
+    # A neighbouring issue number must not satisfy it -- `#8761` is not `#876`.
+    Case "a different issue in Open work does not satisfy the pairing" refused \
+"$_agent" \
+'# t
+
+## Sockets
+
+<!-- agent-tripwire: untriaged: #876 nobody has decided whether this needs one -->
+
+Prose.
+
+## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues -->
+
+- **[#8761](https://github.com/LASTRADA-Software/fastcached/issues/8761)** -- other.' \
+        "does not name that issue" "!carries no"
 
     # ... and it must name an OWNER. Without the issue it is a backlog row
     # nobody will ever close.

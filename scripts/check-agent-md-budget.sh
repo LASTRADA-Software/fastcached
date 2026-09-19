@@ -3,44 +3,23 @@
 #
 # `AGENT.md` stays within the budget in `scripts/agent-md-budget.txt`.
 #
-# ## Why
+# **The ARGUMENT lives in that file, not here** -- why there are two measures and
+# why either alone is gameable, why `max-bullet-lines` is the primary one, why
+# `total-lines` is an equality rather than a ceiling, and why `.agent/rules/*.md`
+# is deliberately unbudgeted. That is `check-test-loops-backlog.txt`'s split
+# between a ratchet's data file and the check that reads it, and stating it in
+# both places would be the second-source-of-truth defect this check exists to
+# refuse, committed by the check itself.
 #
-# `AGENT.md` is loaded in FULL into every session -- `CLAUDE.md` is one line,
-# `@AGENT.md` -- so every line is a line every session pays for whether or not it
-# needs the rule. It reached 2,411 lines, 1,878 of them its own rulebook index,
-# with 286 of 379 tripwire bullets running to three lines or more and the longest
-# to 36, while stating the rule that growth broke: *a tripwire that has acquired
-# measurements, ticket archaeology or a counter-argument has stopped being one.*
+# What is here is the MECHANISM, and the two things a reader of this file needs
+# that the budget file cannot give them: what a bullet's lines are, and what this
+# check cannot see.
 #
-# Prose did not hold it and re-reading did not hold it, which is the argument for
-# a derivation rather than a better sentence -- the same argument
-# `RowsInEnumeratorOrder` makes for enum tables and `check-table-totals.sh` makes
-# for a figure beside a table.
-#
-# ## Two measures, because either alone is gameable
-#
-# **`max-bullet-lines` is primary, because it cannot be satisfied by deleting a
-# rule.** A file-size limit can always be met by dropping a bullet, and that is
-# the one thing this budget must never encourage: *a rule landed in
-# `.agent/rules/` without a bullet here fires in no session that does not open its
-# file.* A per-bullet ceiling can only be met by moving the DERIVATION to the
-# matching rules file, where length is explicitly fine. A check with only the
-# total would score deleting a rule as an improvement.
-#
-# **`total-lines` is an EQUALITY, not a ceiling.** More is growth and is refused.
-# FEWER is a number that has stopped describing the file, refused as stale, so a
-# compression is recorded in the change that makes it and the slack it created is
-# not room for the next arrival. A ceiling banks slack; an equality tightens. That
-# is `check-test-loops-backlog.txt`'s ratchet on a different subject.
-#
-# ## The number lives in ONE file, and AGENT.md may not quote its own size
-#
-# `check-test-loops-backlog.txt` records this defect by name against itself: *"The
-# count was spelled out here as `148 sites` and went stale the first time a batch
-# landed."* So the figures live in `agent-md-budget.txt` alone, every run PRINTS
-# the measured ones, and this check REFUSES `total-lines` appearing in AGENT.md
-# other than behind a `#` -- a size claim in the file whose size it describes is a
-# second source of truth, and `#1605` is an issue reference rather than a claim.
+# One rule of the budget's is repeated here because the code below implements it
+# and would otherwise read as arbitrary: the figures live in `agent-md-budget.txt`
+# alone, so this check REFUSES `total-lines` appearing in `AGENT.md` other than
+# behind a `#`. A size claim in the file whose size it describes is a second
+# source of truth; `#1610` is an issue reference rather than a claim.
 #
 # ## What this does NOT cover, stated because a reader will over-apply it
 #
@@ -81,9 +60,10 @@ function extent(j,   n, k, l) {
     n = 1
     for (k = j + 1; k <= NR; k++) {
         l = lines[k]
-        if (l ~ /^- / || l ~ /^ +- /) break
-        if (l ~ /^[ \t]*$/) { n++; continue }
-        if (l ~ /^ /) { n++; continue }
+        # Only the NESTED spelling needs an early break -- a `^- ` line is
+        # neither blank nor indented, so it reaches the final break anyway.
+        if (l ~ /^ +- /) break
+        if (l ~ /^[ \t]*$/ || l ~ /^ /) { n++; continue }
         break
     }
     while (n > 1 && lines[j + n - 1] ~ /^[ \t]*$/) n--
@@ -97,15 +77,21 @@ END {
         if (fence) continue
         # The budget is about the RULEBOOK index, which is the part that grows.
         if (lines[i] ~ /^## /) { inRulebook = (lines[i] == "## The rulebook") }
-        if (!inRulebook) continue
+        if (!inRulebook) { other++; continue }
+        rulebookLines++
         if (lines[i] ~ /^- /)   { top++;    n = extent(i) }
         else if (lines[i] ~ /^ +- /) { nest++; n = extent(i) }
         else continue
-        if (n > MaxLines) printf "OVER %d %d %s\n", i, n, substr(lines[i], 1, 72)
+        # Formatted HERE, not handed to the shell as fields: the trailing field
+        # is the bullet text, these bullets open with `**`, and an unquoted
+        # shell expansion would glob it against the working directory. The
+        # sibling checks format their refusals in awk for the same reason.
+        if (n > MaxLines)
+            printf "AGENT.md:%d: this bullet is %d lines, over the %d-line ceiling: %s\n      Move the derivation to the matching .agent/rules/*.md, where length is fine. Do NOT delete the bullet and do NOT raise the ceiling: a rule with no bullet here fires in no session that does not open its file.\n", i, n, MaxLines, substr(lines[i], 1, 72)
         if (n > worst) worst = n
         hist[n]++
     }
-    printf "COUNTS %d %d %d\n", top, nest, worst
+    printf "COUNTS %d %d %d %d\n", top, nest, worst, rulebookLines
     # Formatted HERE rather than reassembled by the shell: an awk array has no
     # order, and the first version paired the lines up with `paste - -`, which
     # silently drops the last entry when the count is odd.
@@ -122,13 +108,16 @@ NotCovered='  This check measures HOW LONG a rulebook bullet is, nothing else.
   those files would push derivations back into the file this keeps small.
   It does NOT judge whether a bullet is a good tripwire (that is
   `ctest -R rulebook-tripwires`), and a bullet wrapped tighter can satisfy the
-  ceiling and still be derivation.'
+  ceiling and still be derivation -- nothing enforces AGENT.md`s wrap, so lines
+  are a proxy for words rather than a measure of them.
+  `max-bullet-lines` governs `## The rulebook` alone; `total-lines` ratchets the
+  WHOLE file, so growth outside the rulebook is refused by a measure the
+  per-bullet ceiling cannot help you meet.'
 
 RunCheck() {
-    local root="$1" budget agent out line rest
-    local overLine="" overCount="" overText=""
+    local root="$1" budget agent out line selfHits
     local maxLines="" totalLines="" key value
-    local top=0 nest=0 worst=0 measured=0 failures=0
+    local top=0 nest=0 worst=0 rulebookLines=0 measured failures=0
 
     budget="$root/scripts/agent-md-budget.txt"
     agent="$root/AGENT.md"
@@ -141,16 +130,16 @@ RunCheck() {
         return 1
     fi
 
-    # A row this reader cannot split is REFUSED, never skipped: a key read as
-    # empty waves the measure it governs straight through.
-    while IFS= read -r line; do
-        case "$line" in
+    # `IFS='|' read`, which is how this tree spells a pipe-delimited row in bash
+    # (about ten scripts, `check-write-slot-guard.sh` among them). A row this
+    # reader cannot split is REFUSED, never skipped: a key read as empty waves
+    # the measure it governs straight through.
+    while IFS='|' read -r key value; do
+        case "$key" in
             ''|'#'*) continue ;;
         esac
-        key="${line%%|*}"
-        value="${line#*|}"
-        if [[ "$key" == "$line" || -z "$key" || -z "$value" ]]; then
-            echo "check-agent-md-budget: cannot read budget row: $line" >&2
+        if [[ -z "$value" ]]; then
+            echo "check-agent-md-budget: cannot read budget row: $key" >&2
             return 1
         fi
         case "$key" in
@@ -179,24 +168,26 @@ RunCheck() {
     local hist=""
     while IFS= read -r line; do
         case "$line" in
-            COUNTS\ *) set -- $line; top="$2"; nest="$3"; worst="$4" ;;
+            COUNTS\ *) set -- $line; top="$2"; nest="$3"; worst="$4"; rulebookLines="$5" ;;
             HIST*)     hist="${line#HIST}" ;;
-            OVER\ *)
-                # Parameter expansion, NOT `set -- $line`: the trailing field is
-                # the bullet text and these bullets open with `**`, which an
-                # unquoted expansion would glob against the working directory.
-                rest="${line#OVER }"
-                overLine="${rest%% *}"; rest="${rest#* }"
-                overCount="${rest%% *}"; overText="${rest#* }"
-                echo "  AGENT.md:${overLine}: this bullet is ${overCount} lines, over the $maxLines-line ceiling: ${overText}" >&2
-                echo "      Move the derivation to the matching .agent/rules/*.md, where length is fine. Do NOT delete the bullet and do NOT raise the ceiling: a rule with no bullet here fires in no session that does not open its file." >&2
-                failures=$((failures + 1))
-                ;;
             '') ;;
+            # A refusal's continuation line, printed but NOT counted: awk words
+            # the over-ceiling refusal as a finding plus an indented remedy, and
+            # counting both would report two findings for one bullet. A count
+            # that OVERSTATES what is wrong is the same defect as one that
+            # understates it, and the over-report is the louder, misattributed
+            # one.
+            ' '*) echo "  $line" >&2 ;;
+            # Everything else awk wrote is a refusal it has already worded --
+            # including the over-ceiling one, which is formatted there so no
+            # shell expansion ever touches a bullet opening with `**`.
             *) echo "  $line" >&2; failures=$((failures + 1)) ;;
         esac
     done <<< "$out"
 
+    # `wc -l` and not awk's `NR`: they disagree by one on a file whose last line
+    # carries no newline, and `total-lines` means what `wc -l AGENT.md` says,
+    # which is the number a reader checking this by hand will get.
     measured="$(wc -l < "$agent" | tr -d ' ')"
 
     # Zero is not a verdict, it is the absence of one, and both of these read
@@ -206,15 +197,24 @@ RunCheck() {
         return 1
     fi
 
-    echo "AGENT.md budget: $measured line(s) against $totalLines; $top top-level and $nest nested rulebook bullet(s), longest $worst against a ceiling of $maxLines"
+    echo "AGENT.md budget: $measured line(s) against $totalLines; $rulebookLines of them in \`## The rulebook\`, carrying $top top-level and $nest nested bullet(s), longest $worst against a ceiling of $maxLines"
     echo "  bullet lines:${hist:- none}"
 
     # The ratchet. More is growth; fewer is a number that has stopped describing
     # the file. Both are refused, and the two messages differ because they are
     # fixed in different places.
+    #
+    # The growth message names BOTH remedies, and says which one applies where.
+    # An earlier wording said only *compress a bullet* -- but `total-lines`
+    # ratchets the WHOLE file while `max-bullet-lines` governs the rulebook
+    # alone, so adding one row to the architecture tree was answered with
+    # "compress a bullet", sending a reader to delete rulebook reasoning to pay
+    # for it. A guard's remedy text is part of the guard, and that one was
+    # confidently pointing at the wrong file.
     if [[ "$measured" -gt "$totalLines" ]]; then
-        echo "  AGENT.md has grown to $measured lines, over the recorded $totalLines." >&2
-        echo "      Compress a bullet -- move its derivation into the matching .agent/rules/*.md. Raising the number in scripts/agent-md-budget.txt is not the answer; the ratchet turns one way." >&2
+        echo "  AGENT.md has grown to $measured lines, over the recorded $totalLines ($rulebookLines of them in \`## The rulebook\`)." >&2
+        echo "      If the growth is a rulebook bullet: compress one, moving its derivation into the matching .agent/rules/*.md, where length is fine." >&2
+        echo "      If it is elsewhere, or the growth is warranted: record $measured in scripts/agent-md-budget.txt IN THIS CHANGE, so raising it is a decision visible in the diff rather than a number that drifted." >&2
         failures=$((failures + 1))
     elif [[ "$measured" -lt "$totalLines" ]]; then
         echo "  AGENT.md is $measured lines and scripts/agent-md-budget.txt still records $totalLines." >&2
@@ -227,10 +227,16 @@ RunCheck() {
     # Anchored at BOTH ends: `[^#0-9]N[^0-9]` cannot match the number at the start
     # or the end of a line, so a line reading `1610 lines of rules` would have
     # walked straight past -- a guard failing toward *nothing unusual here*.
-    local selfSize="(^|[^#0-9])${totalLines}([^0-9]|$)"
-    if grep -nE "$selfSize" "$agent" > /dev/null 2>&1; then
+    #
+    # Captured ONCE and reused as both the predicate and the evidence. Grepping
+    # twice is two places to keep in sync, and the two ways they can drift apart
+    # are a guard that refuses while printing nothing and one that prints
+    # evidence while passing. No pipe INTO grep, so `pipefail` has nothing to
+    # misreport.
+    selfHits="$(grep -nE "(^|[^#0-9])${totalLines}([^0-9]|$)" "$agent")"
+    if [[ -n "$selfHits" ]]; then
         echo "  AGENT.md contains the figure $totalLines outside an issue reference:" >&2
-        grep -nE "$selfSize" "$agent" | sed 's/^/        /' >&2
+        printf '%s\n' "$selfHits" | sed 's/^/        /' >&2
         echo "      AGENT.md must never quote its own size. The budget lives in scripts/agent-md-budget.txt and this check PRINTS the measured figures on every run; a number restated in prose goes stale the first time anybody edits the file." >&2
         failures=$((failures + 1))
     fi
@@ -263,17 +269,23 @@ SelfTest() {
 
     # @param 1 case name
     # @param 2 expected outcome: `clean` or `refused`
-    # @param 3 budget file body
-    # @param 4 AGENT.md body
+    # @param 3 budget file body, or `@@no-budget@@` to write none
+    # @param 4 AGENT.md body, or `@@no-agent@@` to write none
     # @param 5.. text the output must contain; a leading `!` means must NOT
+    #
+    # The sentinels are how a case says a file is ABSENT. The first version
+    # hand-rolled that case outside this helper and deleted the file from the
+    # PREVIOUS case's directory, so inserting a case silently changed what it
+    # tested -- and it re-implemented the verdict comparison more weakly on the
+    # way past.
     Case() {
         local name="$1" want="$2" budget="$3" agent="$4"; shift 4
         local dir out rc=0 pattern got
         ran=$((ran + 1))
         dir="$scratch/case-$ran"
         mkdir -p "$dir/scripts"
-        printf '%s\n' "$budget" > "$dir/scripts/agent-md-budget.txt"
-        printf '%s' "$agent" > "$dir/AGENT.md"
+        [[ "$budget" == "@@no-budget@@" ]] || printf '%s\n' "$budget" > "$dir/scripts/agent-md-budget.txt"
+        [[ "$agent" == "@@no-agent@@" ]] || printf '%s' "$agent" > "$dir/AGENT.md"
         out="$(RunCheck "$dir" 2>&1)" || rc=$?
         got="clean"; [[ "$rc" -eq 0 ]] || got="refused"
         if [[ "$got" != "$want" ]]; then
@@ -326,7 +338,9 @@ total-lines|7' "$_ok" \
     Case "a file that has grown is refused" refused \
 'max-bullet-lines|3
 total-lines|5' "$_ok" \
-        "has grown to 7 lines, over the recorded 5" "the ratchet turns one way"
+        "has grown to 7 lines, over the recorded 5" \
+        "If the growth is a rulebook bullet: compress one" \
+        "If it is elsewhere, or the growth is warranted: record 7"
 
     # ... and downward, which is what makes it tighten instead of bank slack.
     Case "a file that shrank without recording it is refused as stale" refused \
@@ -390,19 +404,17 @@ total-lines|4' '# T
     # it is what the fixture naturally produces.
     Case "an empty AGENT.md is refused as a failure to look" refused "$_budget" "" \
         "failed to look"
-    rm -f "$scratch/case-$ran/AGENT.md"
-    local out2 rc2=0
-    out2="$(RunCheck "$scratch/case-$ran" 2>&1)" || rc2=$?
-    ran=$((ran + 1))
-    if [[ "$rc2" -eq 0 ]]; then
-        echo "  FAIL a tree with no AGENT.md is refused: reported clean" >&2
-        failures=$((failures + 1))
-    elif [[ "$out2" != *"no "*"AGENT.md"* ]]; then
-        echo "  FAIL a tree with no AGENT.md: wrong reason: $out2" >&2
-        failures=$((failures + 1))
-    else
-        echo "  ok   a tree with no AGENT.md names that as the reason"
-    fi
+
+    Case "a tree with no AGENT.md is refused, and names that" refused \
+        "$_budget" "@@no-agent@@" \
+        "refusing rather than reporting clean" "!failed to look"
+
+    # The budget file's own absence. Until the sentinel existed this branch was
+    # untested -- one of the two "refusing rather than reporting clean" guards
+    # was watched and the other was not.
+    Case "a tree with no budget file is refused" refused \
+        "@@no-budget@@" "$_ok" \
+        "refusing rather than reporting clean"
 
     # A bullet is measured by ITS OWN lines. A standalone paragraph after it
     # belongs to no bullet -- the first version of this check ran a bullet to the
