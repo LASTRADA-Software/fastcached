@@ -23,6 +23,7 @@
     #include <span>
     #include <string>
     #include <string_view>
+    #include <tuple>
     #include <utility>
     #include <vector>
 
@@ -744,6 +745,21 @@ struct IocpListener::Impl
                 awaitable->Complete(std::unexpected(MakeWsaError(static_cast<int>(err), "AcceptEx")));
             return;
         }
+
+        // Without this the socket is connected and yet `shutdown` fails on it with
+        // `WSAENOTCONN`: AcceptEx leaves the handle's context unset until it is asked for,
+        // exactly as ConnectEx does on the dialling side, where `IocpConnector` asks. So
+        // until #1556 `ShutdownWrite` on every socket this listener accepted was a silent
+        // no-op -- a server that half-closed sent no FIN and went on accepting writes. Found
+        // by pinning the in-memory socket against a real pair (#1553); guarded by
+        // `AcceptedHalfClose_test.cpp`. Best-effort rather than a failed accept, because a
+        // failed accept ends an accept loop over a socket that still reads and writes.
+        auto const listenSock = keepAlive ? keepAlive->listenSock : INVALID_SOCKET;
+        std::ignore = ::setsockopt(op->acceptSock,
+                                   SOL_SOCKET,
+                                   SO_UPDATE_ACCEPT_CONTEXT,
+                                   reinterpret_cast<char const*>(&listenSock),
+                                   static_cast<int>(sizeof(listenSock)));
 
         // Hand the accepted SOCKET off into an IocpSocket wrapping it.
         Detail::ApplyHotSocketOptions(static_cast<Detail::NativeSocket>(op->acceptSock));

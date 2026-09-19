@@ -852,6 +852,8 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   diagnoses and only the first is worth an alert. Each arm names a `PeerDeparture` a table maps
   to its counter. Proved by neutering, and the FIN case is the load-bearing one — counting
   every departure abortive PASSES the RESET case.
+- An AcceptEx socket takes `SO_UPDATE_ACCEPT_CONTEXT`, or `shutdown` fails on it and
+  `ShutdownWrite` is a silent no-op on every socket the listener accepted.
 - An object a reactor OWNS is destroyed on that reactor's worker thread, or with that reactor
   stopped — `IReactor::TeardownIsSerialisedWithDispatch()`, asked of EVERY reactor. **Match the
   ASSERTION, never the case that happened to be running.** The defect is PORTABLE and only the
