@@ -262,13 +262,16 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
     auto const port = probe->BoundPort();
     probe.reset();
 
+    // Built HERE, on the case's thread: `AdminOn` asserts, and a Catch2 assertion on the
+    // helper thread below damages the reporter's state rather than failing the case (#1211).
+    auto const cfg = AdminOn(std::to_string(port));
+
     // Destroyed on another thread and waited for with a deadline, deliberately: a
     // test that HANGS when the order is wrong reports a defect as a suite timeout
     // naming nothing, which this repository has already paid for once. It fails in
     // seconds instead, saying what it waited for.
     auto stopped = std::async(std::launch::async, [&] {
-        auto started =
-            AdminEndpoint::Start(NodeSurface::Admin, AdminOn(std::to_string(port)), metrics, WorkerShapedSnapshot(), logger);
+        auto started = AdminEndpoint::Start(NodeSurface::Admin, cfg, metrics, WorkerShapedSnapshot(), logger);
         return started.has_value();
     });
 

@@ -1115,9 +1115,27 @@ hand-rolled deadline loops, and -- twice -- not bounding at all.
   with a case per reading). Catch2 clears that message at the next assertion, pass or fail, so
   **assert the wait that ran out first**.
 - **`OffThreadWaits` on a helper thread, never `WaitUntil`.** Catch2's assertions and messages
-  belong to the thread running the case; a message from another thread races its state, which
-  inside the TSan scope is a reported race. The helper keeps the account and the case asserts
-  `AllReached()` as its first assertion after the join.
+  belong to the thread running the case; a message from another thread races its state. The
+  helper keeps the account and the case asserts `AllReached()` as its first assertion after the
+  join.
+- **That race is NOT a reported race, inside the TSan scope or out of it, and this bullet said
+  it was until #1211.** Catch2 is built without the sanitizer here -- measured: a clang-tsan
+  build's `libCatch2d.a` references no `__tsan_func_entry` in any of its 106 objects -- so the
+  race is in code TSan never observes, and the TSan gate stayed clean over the binary that had
+  it. What it did instead: `FrameEndpoint_test`'s `Exchange` asserted on three `std::async`
+  threads, the cumulative JUnit reporter's node for that case was damaged, and the damage
+  surfaced at run end as a SIGSEGV in `JunitReporter::writeAssertion`, a `free(): invalid
+  pointer`, or glibc printing `malloc(): invalid size (unsorted)` and wedging inside `abort` --
+  5 of 18 `[frame]` runs on Linux and 10 of 20 on Windows, under JUnit only, and never under
+  the console reporter or ctest's one-case-per-process registration, which is how every gate
+  ran it. **So the rule is ENFORCED at run time now, not by the sanitizer:**
+  `src/tests/OffThreadAssertionGuard.cpp` is an INTERFACE source of the Catch2 target, so every
+  test binary compiles it through its link, and it ends the process at an assertion made off
+  the case's thread -- every run, every reporter, naming the line. Return what the helper
+  observed, or keep it with `OffThreadWaits::Keep`, and assert after `.get()` or `.join()`.
+  `ctest -R off-thread-assertion` watches it accept and refuse, and reads the link lines. **It
+  sees ASSERTIONS only**: `INFO`, `CAPTURE`, `UNSCOPED_INFO` and `SECTION` off the case's thread
+  race the same state through entry points it never hears, so its silence clears none of them.
 - **Two waits that give up together report the symptom, not the cause.** Measured on
   `DashboardSampler_test`: the pool thread's one-guard wait for a release and the case's
   one-guard wait for the frame ended within a millisecond, and the frame's won. The outer wait

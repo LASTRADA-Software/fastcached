@@ -760,17 +760,26 @@ class IdleListener final: public IListener
 /// Reads what the protocol declares rather than to EOF: this endpoint keeps the
 /// connection, so reading to EOF would wait for the sweeper -- and on a surface whose
 /// deadline is now ten minutes, that is a suite that never finishes.
+///
+/// **Asserts nothing, so any thread may call it.** The cases that hold a compile run this
+/// on a `std::async` thread, and a Catch2 assertion there damages the reporter's state
+/// rather than failing the case (#1211). A dial that failed is therefore REPORTED, as
+/// nullopt, and the case asserts it after `.get()`; `Exchange` below is the spelling for
+/// the case's own thread.
 /// @param port Where the endpoint listens.
 /// @param frame The request.
-/// @return The reply, or empty when the peer closed without answering.
-[[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port,
-                                              std::vector<std::byte> frame,
-                                              std::size_t* progressSeen = nullptr)
+/// @param progressSeen Where to count the progress pulses that preceded the answer; may be null.
+/// @return The reply -- empty when the peer closed without answering -- or nullopt when the
+///         dial itself failed.
+[[nodiscard]] std::optional<std::vector<std::byte>> TryExchange(std::uint16_t port,
+                                                                std::vector<std::byte> frame,
+                                                                std::size_t* progressSeen = nullptr)
 {
     BlockingConnector connector;
     auto socket =
         SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
-    REQUIRE(socket.has_value());
+    if (!socket.has_value())
+        return std::nullopt;
 
     std::size_t pulses = 0;
     auto reply =
@@ -820,6 +829,34 @@ class IdleListener final: public IListener
     return reply;
 }
 
+/// `TryExchange` on the case's own thread, where a dial that failed fails the case.
+/// @param port Where the endpoint listens.
+/// @param frame The request.
+/// @param progressSeen Where to count the progress pulses that preceded the answer; may be null.
+/// @return The reply, or empty when the peer closed without answering.
+[[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port,
+                                              std::vector<std::byte> frame,
+                                              std::size_t* progressSeen = nullptr)
+{
+    auto const reply = TryExchange(port, std::move(frame), progressSeen);
+    REQUIRE(reply.has_value());
+    return Unwrap(reply);
+}
+
+/// The reply a helper thread's `TryExchange` produced, asserted HERE, on the case's thread.
+///
+/// The one place a dial made off the case's thread is judged: the helper reports it and this
+/// asserts it, because a Catch2 assertion on the helper damages the reporter's state rather than
+/// failing the case (#1211). `FrameEndpoint_test` spells its own the same way.
+/// @param pending The helper's result.
+/// @return The reply -- empty when the peer closed without answering.
+[[nodiscard]] std::vector<std::byte> ReplyFrom(std::future<std::optional<std::vector<std::byte>>>& pending)
+{
+    auto const reply = pending.get();
+    REQUIRE(reply.has_value());
+    return Unwrap(reply);
+}
+
 /// Send @p frame and read the whole reply stream, right up to the peer's EOF.
 ///
 /// **The half `Exchange` cannot answer.** That helper stops at the first terminal
@@ -831,15 +868,18 @@ class IdleListener final: public IListener
 /// The write side is shut before reading, so the node sees the request is complete and
 /// this side is not the reason the connection stays open. The node closes after the
 /// reply, which is what ends the read loop.
+///
+/// Asserts nothing, for `TryExchange`'s reason: its one caller runs it on a helper thread.
 /// @param port The loopback port to dial.
 /// @param frame A complete request.
-/// @return Every byte the node wrote, in order.
-[[nodiscard]] std::vector<std::byte> ExchangeUntilEof(std::uint16_t port, std::vector<std::byte> frame)
+/// @return Every byte the node wrote, in order, or nullopt when the dial itself failed.
+[[nodiscard]] std::optional<std::vector<std::byte>> TryExchangeUntilEof(std::uint16_t port, std::vector<std::byte> frame)
 {
     BlockingConnector connector;
     auto socket =
         SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
-    REQUIRE(socket.has_value());
+    if (!socket.has_value())
+        return std::nullopt;
 
     auto stream = SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
         auto const written = co_await peer->Write(std::span<std::byte const> { request });
@@ -1133,7 +1173,7 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     REQUIRE(endpoint.has_value());
     io.Start();
 
-    auto pending = std::async(std::launch::async, [port] { return Exchange(port, CompileFrame()); });
+    auto pending = std::async(std::launch::async, [port] { return TryExchange(port, CompileFrame()); });
     REQUIRE(worker.runner.WaitForStarted(1));
 
     // Held until the sweep has actually HAPPENED, then let go.
@@ -1159,7 +1199,7 @@ TEST_CASE("The endpoint arms the responder's deadline, not its own", "[node][com
     // fact that was. Asserted on the CODE rather than on emptiness: empty is also what
     // a crash, a refused connect and an unrelated close produce, so it could never say
     // that this particular window was the one that governed.
-    auto const swept = pending.get();
+    auto const swept = ReplyFrom(pending);
     REQUIRE_FALSE(swept.empty());
     auto const header = Wire::DecodeReplyHeader(swept);
     REQUIRE(header.has_value());
@@ -1234,7 +1274,7 @@ TEST_CASE("A held compile pulses at its client, and the object still arrives beh
     io.Start();
 
     std::size_t pulses = 0;
-    auto pending = std::async(std::launch::async, [port, &pulses] { return Exchange(port, CompileFrame(), &pulses); });
+    auto pending = std::async(std::launch::async, [port, &pulses] { return TryExchange(port, CompileFrame(), &pulses); });
     REQUIRE(worker.runner.WaitForStarted(1));
 
     // Long enough for several intervals, so the assertion below is about a CADENCE and
@@ -1244,7 +1284,7 @@ TEST_CASE("A held compile pulses at its client, and the object still arrives beh
     std::this_thread::sleep_for(Interval * 6);
     worker.runner.Release();
 
-    auto const reply = pending.get();
+    auto const reply = ReplyFrom(pending);
     REQUIRE_FALSE(reply.empty());
     CHECK(StatusOf(reply) == Wire::Status::Ok);
 
@@ -1283,11 +1323,11 @@ TEST_CASE("A compile that finishes inside one interval pulses nothing", "[node][
     io.Start();
 
     std::size_t pulses = 0;
-    auto pending = std::async(std::launch::async, [port, &pulses] { return Exchange(port, CompileFrame(), &pulses); });
+    auto pending = std::async(std::launch::async, [port, &pulses] { return TryExchange(port, CompileFrame(), &pulses); });
     REQUIRE(worker.runner.WaitForStarted(1));
     worker.runner.Release();
 
-    auto const reply = pending.get();
+    auto const reply = ReplyFrom(pending);
     REQUIRE_FALSE(reply.empty());
     CHECK(StatusOf(reply) == Wire::Status::Ok);
     CHECK(pulses == 0);
@@ -1320,12 +1360,12 @@ TEST_CASE("The pulse stops before the reply, so the answer is the last thing on 
     REQUIRE(endpoint.has_value());
     io.Start();
 
-    auto pending = std::async(std::launch::async, [port] { return ExchangeUntilEof(port, CompileFrame()); });
+    auto pending = std::async(std::launch::async, [port] { return TryExchangeUntilEof(port, CompileFrame()); });
     REQUIRE(worker.runner.WaitForStarted(1));
     std::this_thread::sleep_for(Interval * 6);
     worker.runner.Release();
 
-    auto const stream = pending.get();
+    auto const stream = ReplyFrom(pending);
     auto const statuses = StatusSequence(stream);
     INFO("statuses: " << statuses.size());
 
@@ -1405,7 +1445,7 @@ TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][c
     REQUIRE(endpoint.has_value());
     io.Start();
 
-    auto pending = std::async(std::launch::async, [port] { return Exchange(port, CompileFrame()); });
+    auto pending = std::async(std::launch::async, [port] { return TryExchange(port, CompileFrame()); });
     REQUIRE(worker.runner.WaitForStarted(1));
 
     // Past the old ceiling, and then past a sweep -- an expired deadline does nothing
@@ -1414,7 +1454,7 @@ TEST_CASE("A compile outlives the five seconds that used to bound it", "[node][c
     std::this_thread::sleep_for(FrameServer::HeaderTimeout + FrameServer::SweepInterval * 2);
     worker.runner.Release();
 
-    auto const reply = pending.get();
+    auto const reply = ReplyFrom(pending);
     REQUIRE_FALSE(reply.empty());
     CHECK(StatusOf(reply) == Wire::Status::Ok);
 
@@ -1463,7 +1503,7 @@ TEST_CASE("A compile in flight is drained before anything can stop the reactor",
     REQUIRE(endpoint.has_value());
     io.Start();
 
-    auto pending = std::async(std::launch::async, [port] { return Exchange(port, CompileFrame()); });
+    auto pending = std::async(std::launch::async, [port] { return TryExchange(port, CompileFrame()); });
     REQUIRE(worker.runner.WaitForStarted(1));
 
     // The compile is on the pool and its slot is held, so the drain below has something
@@ -1497,7 +1537,7 @@ TEST_CASE("A compile in flight is drained before anything can stop the reactor",
 
     // 3. The client got its object. Under the defect this is empty: the answer is
     //    posted to a reactor nobody drains and never leaves the process.
-    auto const reply = pending.get();
+    auto const reply = ReplyFrom(pending);
     REQUIRE_FALSE(reply.empty());
     CHECK(StatusOf(reply) == Wire::Status::Ok);
 }
@@ -1677,7 +1717,7 @@ TEST_CASE("A cordoned worker refuses a new compile while the one it was running 
     REQUIRE(endpoint.has_value());
     io.Start();
 
-    auto running = std::async(std::launch::async, [port] { return Exchange(port, CompileFrame()); });
+    auto running = std::async(std::launch::async, [port] { return TryExchange(port, CompileFrame()); });
     REQUIRE(worker.runner.WaitForStarted(1));
     REQUIRE(worker.capacity.InFlight() == 1);
 
@@ -1695,7 +1735,7 @@ TEST_CASE("A cordoned worker refuses a new compile while the one it was running 
     CHECK(DrainedReports(fix.logger) == 0);
 
     worker.runner.Release();
-    auto const delivered = running.get();
+    auto const delivered = ReplyFrom(running);
     REQUIRE_FALSE(delivered.empty());
     CHECK(StatusOf(delivered) == Wire::Status::Ok);
     auto const result = Wire::DecodeCompileResult(std::span<std::byte const> { delivered }.subspan(Wire::ReplyHeaderSize));
@@ -1711,9 +1751,9 @@ TEST_CASE("A cordoned worker refuses a new compile while the one it was running 
 
     // Lifted over the same wire, and the worker takes compiles again.
     CHECK(CordonOver(port, Wire::CordonAction::Lift).state == Wire::WireCordonState::Serving);
-    auto again = std::async(std::launch::async, [port] { return Exchange(port, CompileFrame()); });
+    auto again = std::async(std::launch::async, [port] { return TryExchange(port, CompileFrame()); });
     REQUIRE(worker.runner.WaitForStarted(2));
-    CHECK(StatusOf(again.get()) == Wire::Status::Ok);
+    CHECK(StatusOf(ReplyFrom(again)) == Wire::Status::Ok);
 
     CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
     worker.capacity.Drain();

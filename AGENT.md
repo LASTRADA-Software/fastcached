@@ -1848,6 +1848,11 @@ and what they may assume.
   verdict is a place to ask somebody ELSE**: the next move is a different instrument, not a better
   reading of the same one — asked on the FAILURE PATH, every command `|| true`, because a
   diagnostic on an already-failed case must explain the verdict and never change it.
+- **A Catch2 assertion runs on its case's thread, never a helper's** — Catch2 is not
+  thread-safe and not TSan-instrumented here, so one off-thread `REQUIRE` damaged the heap and
+  the crash or hang landed somewhere else (#1211). `OffThreadAssertionGuard`
+  now ends the process at such an assertion in every test binary; return the observation and
+  assert after `.get()`/`.join()`. It cannot see `INFO`/`CAPTURE`/`SECTION`.
 - A C++ test waits through `src/tests/BoundedWait.hpp`: `WaitUntil` on the case's thread,
   `OffThreadWaits` on a helper thread (Catch2's messages belong to the case's thread),
   `AwaitUntil` in a coroutine on a reactor — and a coroutine whose wait ran out STOPS there —

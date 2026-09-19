@@ -328,6 +328,23 @@ if(FASTCACHED_BUILD_TESTS)
     elseif(Catch2_DIR)
         list(APPEND CMAKE_MODULE_PATH "${Catch2_DIR}")
     endif()
+
+    # Every executable that links Catch2 compiles `src/tests/OffThreadAssertionGuard.cpp`, a
+    # listener that ends the process at an assertion made off its test case's thread (#1211):
+    # Catch2 is not thread-safe, and here not TSan-instrumented either, so such an assertion
+    # damages the heap and the crash lands somewhere else, a few runs in a hundred.
+    #
+    # An INTERFACE source of the Catch2 target rather than a walk over executables: it arrives
+    # through the link itself, `Catch2WithMain` included, so no list can leave a test binary
+    # out. The CPM route's `Catch2::Catch2` is an ALIAS and the system route's an IMPORTED
+    # target, so the real one is resolved first. `ctest -R off-thread-assertion-guard-coverage`
+    # reads the generated link lines rather than trusting this.
+    set(_catch2Target Catch2::Catch2)
+    get_target_property(_catch2Aliased Catch2::Catch2 ALIASED_TARGET)
+    if(_catch2Aliased)
+        set(_catch2Target "${_catch2Aliased}")
+    endif()
+    target_sources(${_catch2Target} INTERFACE "${CMAKE_SOURCE_DIR}/src/tests/OffThreadAssertionGuard.cpp")
 endif()
 
 # Tracy is third-party, so (like yaml-cpp/Catch2) it is fetched BEFORE the
