@@ -57,21 +57,11 @@ if (-not $SelfTest) {
 # Ports allocated per RUN, from BELOW the kernel's ephemeral range, and remembered.
 # A connect probe cannot see a port already held as an outbound connection's local
 # endpoint, so a port handed out once is never handed out again in this process.
-$script:TakenPorts = @{}
-function Get-FreePort {
-    for ($attempt = 0; $attempt -lt 200; $attempt++) {
-        $candidate = Get-Random -Minimum 20000 -Maximum 30000
-        if ($script:TakenPorts.ContainsKey($candidate)) { continue }
-        $listener = $null
-        try {
-            $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $candidate)
-            $listener.Start()
-            $script:TakenPorts[$candidate] = $true
-            return $candidate
-        } catch { continue } finally { if ($listener) { $listener.Stop() } }
-    }
-    throw "could not allocate a free port below the ephemeral range"
-}
+#
+# This was a fifth private copy of that draw, and it HAD ALREADY DIVERGED: it drew
+# from 20000..30000 where the other four drew 20000..32000, which is the drift the
+# shared module exists to stop rather than a choice anybody made (#1284).
+Import-Module (Join-Path $PSScriptRoot "lib/E2EPorts.psm1") -Force
 
 # ---------------------------------------------------------------------------
 # The toolchain survey's two bounds, and the relation between them (#1157).
@@ -1224,11 +1214,11 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
     # One port per node: since #290 stage 3 the compile verbs arrive on
     # --listen-node beside the cache and scheduler verbs, so the scheduler's own
     # worker half answers on $schedPort and the separate $schedWork is gone.
-    $cachePort = Get-FreePort; $schedPort = Get-FreePort
-    $workerA   = Get-FreePort; $workerB   = Get-FreePort; $adminPort = Get-FreePort
+    $cachePort = New-E2EPort; $schedPort = New-E2EPort
+    $workerA   = New-E2EPort; $workerB   = New-E2EPort; $adminPort = New-E2EPort
     # The scheduler's consensus port (#178): a scheduler is a cluster of one, bound to
     # loopback where nothing dials it.
-    $schedRaft = Get-FreePort
+    $schedRaft = New-E2EPort
 
     $phaseDir = Join-Path $scratch $label
     $proj = Join-Path $phaseDir "proj"
