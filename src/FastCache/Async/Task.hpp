@@ -4,6 +4,7 @@
 #include <FastCache/Async/ParkedWork.hpp>
 
 #include <atomic>
+#include <concepts>
 #include <coroutine>
 #include <exception>
 #include <stdexcept>
@@ -445,6 +446,20 @@ namespace Detail
         return Task<void> { std::coroutine_handle<TaskPromise<void>>::from_promise(*this) };
     }
 
+    /// The result of a task `SyncRun` drove to its end, or its exception rethrown.
+    /// @tparam T Result type of the task.
+    /// @param handle The task; done.
+    /// @return Its result.
+    template <typename T>
+    T SyncResult(std::coroutine_handle<TaskPromise<T>> handle)
+    {
+        auto& promise = handle.promise();
+        if (promise.exception)
+            std::rethrow_exception(promise.exception);
+        if constexpr (!std::is_same_v<T, void>)
+            return std::move(std::get<1>(promise.result));
+    }
+
 } // namespace Detail
 
 /// Synchronously drive a coroutine to completion. Used by tests and the
@@ -477,18 +492,46 @@ T SyncRun(Task<T> task)
         throw std::logic_error { "SyncRun: the task is still suspended after resume(). It awaited something "
                                  "SyncRun cannot complete (a socket read with no data and no closed peer, "
                                  "typically). Reading its result would be undefined behaviour." };
-    if constexpr (std::is_same_v<T, void>)
-    {
-        if (auto const& exc = handle.promise().exception; exc)
-            std::rethrow_exception(exc);
-    }
-    else
-    {
-        auto& promise = handle.promise();
-        if (promise.exception)
-            std::rethrow_exception(promise.exception);
-        return std::move(std::get<1>(promise.result));
-    }
+    return Detail::SyncResult<T>(handle);
+}
+
+/// `SyncRun` for a task that may PARK on something whose owner can retrieve the park -- a socket
+/// read, which `ISocket::CancelRead` completes with `Cancelled` -- with @p retrieve being how.
+///
+/// **The plain overload's refusal is half of what such a task needs** (#178). It throws, and the
+/// throw is legible -- but `~Task()` then frees a frame the parked read still points into, the
+/// socket's next completion writes into freed memory, and the case ends in a SIGSEGV that names no
+/// assertion at all: a red turned into a crash, the family of a failing `REQUIRE` above an explicit
+/// `Stop()`. So this one retrieves the park FIRST, while the frame is alive, and throws after, when
+/// nothing points into it any more -- and the case fails on the throw, by name.
+///
+/// A callable rather than an `ISocket&` because `Async/` names no socket (`ctest -R net-boundary`).
+/// A park @p retrieve did not wake is one this function still cannot finish, and freeing it would
+/// be the defect this exists to remove, so its frame is deliberately LEAKED instead: a leak report
+/// names the coroutine that parked, and a use-after-free names nothing.
+/// @tparam T Result type of the task.
+/// @tparam Retrieve A callable taking nothing.
+/// @param task Task to drive; must not be empty.
+/// @param retrieve What completes the task's park; called only when the task parked.
+/// @return The task's result (or rethrows its exception).
+/// @throws std::logic_error if the task parked, whether or not @p retrieve woke it.
+template <typename T, std::invocable Retrieve>
+T SyncRun(Task<T> task, Retrieve&& retrieve)
+{
+    auto handle = task.Native();
+    handle.resume();
+    if (handle.done())
+        return Detail::SyncResult<T>(handle);
+
+    std::forward<Retrieve>(retrieve)();
+    if (handle.done())
+        throw std::logic_error { "SyncRun: the task parked on something SyncRun cannot complete (a socket read "
+                                 "with no data and no closed peer, typically). The park was retrieved and the "
+                                 "task ran to its end before it was freed, but its answer is not the one the "
+                                 "caller asked for." };
+    (void) task.Release();
+    throw std::logic_error { "SyncRun: the task parked, and what was to retrieve the park did not wake it. Its "
+                             "frame is leaked rather than freed while something still points into it." };
 }
 
 } // namespace FastCache

@@ -6,6 +6,7 @@
 #include <coroutine>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace
 {
@@ -24,9 +25,38 @@ struct NeverCompletes
     void await_resume() const noexcept {}
 };
 
+/// Awaitable that parks and remembers who, so a case can play the owner that retrieves the park --
+/// `ISocket::CancelRead` in miniature.
+struct Retrievable
+{
+    std::coroutine_handle<> parked {}; ///< Who parked here, until the owner retrieves it.
+
+    [[nodiscard]] bool await_ready() const noexcept
+    {
+        return false;
+    }
+    void await_suspend(std::coroutine_handle<> awaiting) noexcept
+    {
+        parked = awaiting;
+    }
+    void await_resume() const noexcept {}
+};
+
 FastCache::Task<int> ReturnFortyTwo()
 {
     co_return 42;
+}
+
+/// Parks on @p on, and records reaching its end, so a case can tell a frame that finished from
+/// one that was freed where it parked.
+/// @param on Where to park.
+/// @param finished Set once the body runs past the park.
+/// @return 1.
+FastCache::Task<int> ParksOn(Retrievable* on, bool* finished)
+{
+    co_await *on;
+    *finished = true;
+    co_return 1;
 }
 
 FastCache::Task<int> CallReturnFortyTwo()
@@ -119,4 +149,33 @@ TEST_CASE("SyncRun refuses a task that is still suspended (regression)", "[task]
     int sideEffect = 0;
     REQUIRE_THROWS_AS(FastCache::SyncRun(ParksForeverVoid(&sideEffect)), std::logic_error);
     REQUIRE(sideEffect == 0);
+}
+
+TEST_CASE("SyncRun retrieves a parked task before refusing it, so nothing is left pointing into a freed frame",
+          "[task][regression]")
+{
+    // #178: the plain overload throws and then frees a frame the parked read still points into.
+    // The socket's next completion wrote into freed memory, and a case whose seal was neutered
+    // ended in a SIGSEGV naming no assertion. Retrieving the park first is what makes the throw
+    // the whole of the failure: the frame runs to its end, THEN is freed.
+    Retrievable park;
+    auto finished = false;
+    auto retrievals = 0;
+    REQUIRE_THROWS_AS(FastCache::SyncRun(ParksOn(&park, &finished),
+                                         [&park, &retrievals] {
+                                             ++retrievals;
+                                             std::exchange(park.parked, {}).resume();
+                                         }),
+                      std::logic_error);
+    CHECK(retrievals == 1);
+    CHECK(finished);
+    CHECK_FALSE(park.parked);
+}
+
+TEST_CASE("SyncRun asks nothing of the retriever when the task never parks", "[task]")
+{
+    auto retrievals = 0;
+    auto const result = FastCache::SyncRun(ReturnFortyTwo(), [&retrievals] { ++retrievals; });
+    CHECK(result == 42);
+    CHECK(retrievals == 0);
 }

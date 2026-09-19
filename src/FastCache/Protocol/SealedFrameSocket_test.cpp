@@ -66,13 +66,16 @@ Task<IoResult> WriteOnce(ISocket* socket, std::vector<std::byte> bytes)
 /// Everything @p socket holds now, in one read.
 ///
 /// Every case writes before it reads, so the read completes at once: a read that would park is
-/// a case waiting for bytes nobody sends, and `SyncRun` says so rather than hanging.
+/// a case waiting for bytes nobody sends, and `SyncRun` says so rather than hanging. It retrieves
+/// that park through `CancelRead` BEFORE it says so (#178): the read parks inside the sealing
+/// layer, which holds the awaitable of the frame `SyncRun` is about to free, so without the
+/// retrieval a seal that stopped refusing ended the case in a SIGSEGV instead of a failure.
 /// @param socket The socket.
 /// @return The bytes, or what refused them.
 [[nodiscard]] std::expected<std::vector<std::byte>, NetError> ReadAvailable(ISocket& socket)
 {
     auto buffer = std::vector<std::byte>(4 * MaxPayload);
-    auto const got = SyncRun(ReadOnce(&socket, buffer));
+    auto const got = SyncRun(ReadOnce(&socket, buffer), [&socket] { socket.CancelRead(); });
     if (!got.has_value())
         return std::unexpected(got.error());
     buffer.resize(*got);
