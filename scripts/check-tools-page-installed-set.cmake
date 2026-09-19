@@ -68,9 +68,16 @@
 # to be rediscovered.
 #
 # `fastcached` is installed and has NO page of its own under `Tools` -- the overview's
-# section for it routes to the Quickstart. So the `Tools` nav in `mkdocs.yml` lists two
-# pages plus an overview, while the installed set is three. A nav-derived check computes
-# 2 != 3 and REFUSES A CORRECT TREE.
+# section for it routes to the Quickstart. So the `Tools` nav in `mkdocs.yml` lists three
+# pages plus an overview, while the installed set is four. A nav-derived check computes
+# 3 != 4 and REFUSES A CORRECT TREE.
+#
+# Those two figures were "two" and "three" until `fastcache-cli` joined both the app
+# table and the nav (#1439). The check reads both sides and was right throughout; only
+# this sentence rotted, which is what a hand-written number describing a derived set
+# does. The ARGUMENT is what this paragraph is for -- the nav will always be one short
+# of the installed set while `fastcached` has no page -- so read the figures as the
+# illustration and the inequality as the claim.
 #
 # The overview page's `##` sections are the thing that actually claims to enumerate the
 # product. Those are the subject.
