@@ -238,6 +238,28 @@ determinism rests on.
   pass the second for the wrong reason. **An injection is evidence only if the thing it is
   meant to hide is there to be hidden** — the STORE lane's *a green probe of the wrong
   shape is not a refutation*, met from the other direction.
+- **A census cannot falsify a premise — it can only produce a number consistent with it.**
+  A count is taken THROUGH a claim. The pattern, the file set, the exclusions and the
+  question itself are all chosen by somebody who already holds the premise, so whatever the
+  tree looks like the number that comes back is consistent with it. That is not a miscount
+  and no amount of counting more carefully reaches it: the instrument had no way to
+  disagree. The bullets above are the version where the pattern is wrong; this is the
+  version where the pattern is right and the premise behind it was never tested.
+
+  So **re-derive an inherited claim BEFORE the census, never after.** The ordering is the
+  whole rule, because afterwards the census has already told you what you expected to hear,
+  and the re-derivation collapses into confirming that the source says what the number
+  showed. Reading for confirmation stops at the first line that matches — the handoff rule
+  in `AGENT.md`'s *Caching an expensive repeated answer*, arriving in an audit.
+
+  And **agreement between a fresh measurement and a source you have not read is worth
+  nothing**, because the two readings are not independent: they share the premise, so they
+  cannot disagree about it. It nonetheless *feels* like corroboration, which is what makes
+  this worth a bullet rather than a sentence — the same tell as *three arms agreeing
+  perfectly is what a broken instrument looks like as well as what a real pattern looks
+  like*, one level up from the instrument and in the reasoning around it. The testing lane
+  carries the same rule where the subject is a model's arithmetic rather than a tree's
+  files ([`testing.md`](testing.md)).
 - **A census states its PATTERN, not only its number.** Two independent audits of the
   same file set differed by exactly one, and neither party had miscounted — they had
   counted through different patterns:
@@ -1997,6 +2019,37 @@ therefore never questioned — arriving in prose rather than in a test count. **
 search that returns nothing a positive control**: find one instance by other means and
 check the pattern sees it. On wrapped markdown, match a single distinctive word, or
 strip the wrapping first; never a phrase that spans a newline or a `**`.
+
+### A reason that generalises further than the fact it was drawn from is worse than the narrow one
+
+The section above is about a claim that was WRONG and did not get corrected everywhere.
+This is the sibling that is harder to see: **a claim that was RIGHT, and was then improved
+into a wider one that is false.**
+
+A reason recorded beside a decision is read as licence. A narrow reason licenses exactly
+the site it was measured at; a wider one licenses every site somebody can fit under it,
+including the ones nobody measured. So **a reason that generalises further than the fact it
+was drawn from is worse than the narrow one**, even when it is more elegant, and even when
+it happens to be true where it was written — because what it authorises is an edit
+somewhere else.
+
+**And it is introduced while TIDYING, which is when it is least likely to be re-checked.**
+Nobody re-derives a reason during a cleanup: the behaviour is unchanged, the tests stay
+green, and the diff reads as prose. Measured on `Net::IsDeadlineExpiry`, where a true
+REACHABILITY reason — *that listener arms no poll timeout, so `Timeout` cannot arrive
+there* — was rewritten during a `/simplify` into a semantic one that sounds better and is
+false, a later review faithfully propagated the replacement into two rulebook files, and
+the header then argued both sides. The full derivation, including what believing the wider
+reason invites somebody to delete, is in
+[`wire-and-protocol.md`](wire-and-protocol.md).
+
+Two consequences:
+
+- **A narrower rule with a stated reason is not the same finding as a narrower rule by
+  omission**, and the grep looks identical. Reading the first as the second is how a
+  correct site gets "fixed".
+- **A reason states what it does NOT cover**, at the site, or the next reader over-applies
+  it — the same clause the remedy-text rule carries for a guard's refusal message.
 
 ## A comment can be true in its premise and false in its conclusion
 
@@ -5613,6 +5666,45 @@ this tree -- `scripts/ci-scope.sh` twice and `scripts/tidy-sweep.sh` once -- are
 three-dot, and none needed changing. The census was run with a positive control, a
 planted two-dot range, because a grep that finds nothing has said nothing until it has
 been shown finding something.
+
+### After a revert, test for the REVERT and never for the defect
+
+**A revert leaves the reverted commit in the ancestry forever.** `git revert` writes a new
+commit that undoes a change; it does not remove the change from history. So
+`git merge-base --is-ancestor <fix> <branch>` answers **YES for every branch that has ever
+seen the fix**, including every branch that also carries the revert and therefore does not
+have the fix's behaviour at all. The predicate discriminates nothing, and it answers in the
+direction that reads as reassurance.
+
+**The only useful question is `--is-ancestor <revert>` coming back NO.** That is the one
+fact that distinguishes a tree where the change is in force from a tree where it has been
+taken out again, and it is asked of the revert commit rather than of the original.
+
+What makes this worth writing down is that **the instinct is to check for the thing that
+broke you**, and that is the one test that cannot work here. Somebody asking *does this
+branch have the fix* will reach for the fix's SHA, get YES, and stop — with a green answer,
+a correct command and a wrong conclusion. Same failure direction as every other entry in
+this file: the instrument answered honestly about something other than its subject.
+
+### A subject line is an abbreviated identifier with no prefix to disagree about
+
+**Two commits in this repository carried the identical subject line and opposite revert
+status.** Two people asked *which commit is this* by matching the subject, both measured
+correctly, and they reported contradictory answers — with nothing in either reading to say
+which commit had been looked at.
+
+A truncated SHA at least *looks* like an identifier, so it invites the comparison that
+catches the mistake: two prefixes that differ are visibly two objects. **A subject line
+looks like a description**, so nobody compares it against anything — it reads as a label
+for a change rather than as a name for one object among several that may share it. The
+abbreviation rule from [`testing.md`](testing.md) — *an abbreviated identifier is a DISPLAY
+form; the full one is read, never padded, truncated or re-derived* — covers this, and the
+subject line is the member of the family that does not announce itself as one.
+
+The same shape recurs wherever a display string is pressed into service as a key: a ctest
+index, two worktrees one token apart in their paths, and **a leg name without its
+compiler** — so **a leg travels with its compiler and its machine**, or two people
+comparing `Debug` against `Debug` are comparing different builds on different hosts.
 
 ## A rulebook entry that has gone false instructs the next person
 

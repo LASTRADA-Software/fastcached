@@ -69,6 +69,35 @@ Every rule below has already been a bug.
     forever is alive and never finishing, which is what the exchange's total budget has
     always been for, and a frame count beside it would be two ceilings on one thing
     that could never be converted into each other.
+  - **Silence is only measurable against something that would otherwise be said, so the
+    worker's cadence and the client's idle bound are ONE pair of numbers in
+    `CompileCacheWire` with the RELATION between them `static_assert`ed.**
+    `DefaultProgressInterval` is what a worker writes on while a compile runs;
+    `DefaultCompileIdleTimeout` is how long the client lets it go quiet. They bound one
+    silence from opposite sides, so neither end can retune its own without describing a
+    fleet the other end is not running -- and the launcher links none of the library, so
+    that header is the only place both can look. An idle bound at or below the cadence
+    refuses a healthy worker on the ordinary jitter of its own reactor, which reads as a
+    fleet that has stopped working; the assertion is what stops the next retune from
+    spelling that. The derivation, with the dead-worker figures it replaced, is in
+    [`distributed-compilation.md`](distributed-compilation.md).
+  - **A pulse is a SECOND writer on the socket for the length of the answer, so the
+    endpoint SETTLES it before it writes anything.** `ServeConnection` is the only writer
+    by construction; while the responder answers it writes nothing and the pulse takes
+    over, and `SettlePulse` (reached through `ReclaimFromPulse`) is where that stops being
+    true. A reply written over a pulse still suspended inside `Write` is two writes sharing
+    one write-op slot -- #663's read slot reached from the other direction -- and it does
+    not fail loudly, it splices five bytes into an object file. **A pulse still parked past
+    the bound ENDS the connection**, which is `SettleWatch`'s rule on the read side applied
+    to the write side, and the caller's `break` falling through to `socket->Close()` is the
+    only cancellation a parked write has. `Detail::ClaimWriteSlot` names the misuse in a
+    Debug build but does not SETTLE anything, so it does not replace `ReclaimFromPulse`.
+    - **A test that only watches the answer cannot see any of it.** Reading one framed
+      reply stops at the first terminal status, so a pulse emitted AFTER the reply --
+      exactly what a missing settle produces -- is invisible, and a case asserting "every
+      frame but the last is a pulse" passes VACUOUSLY on a build that pulses none, because
+      with one frame the run before the last is empty. So the ordering case reads to EOF,
+      requires at least two frames, and keeps a control on a surface that pulses nothing.
 - **`Status::Push` is the second exception: a `SUBSCRIBE` is answered by a stream of pushes
   and then exactly one terminal**
   ([#1399](https://github.com/LASTRADA-Software/fastcached/issues/1399)). `Ok` is an orderly
@@ -142,6 +171,13 @@ Every rule below has already been a bug.
   lives in `apps/fastcache-cc/CacheProtocol.cpp` rather than `main.cpp` for a
   related reason: `main.cpp` is in no test target, so while the framing sat there
   it had *no* unit coverage at all.
+  - **And being dependency-free is what makes it carry cache tiers POSITIONALLY, which
+    makes `StorageTier`'s enumerator order a wire contract.** The launcher cannot see the
+    enum -- it links nothing of `Cache/` -- so the INDEX is the whole agreement between
+    the two ends, and a mid-enum insertion re-attributes every tier a node reports. That
+    is the enum-declaration rule below, reached from the header's own constraint rather
+    than from a cast; see also
+    [`distributed-compilation.md`](distributed-compilation.md).
 - **A length a PEER declares sizes nothing until it has been checked against this
   side's own cap — and a codec envelope's `rawLen` is such a length.** The frame
   header's `payloadLength` was checked; the envelope's declared *decompressed*
@@ -603,6 +639,17 @@ Every rule below has already been a bug.
   and the lookup are shared for the same reason: four hand-written copies of
   `(op, code, why)` is the answer to "if a sixth case showed up tomorrow, how many
   places would I edit".
+
+  **And a row for a verb the surface DOES serve is dead, so it is `static_assert`ed that
+  one cannot be added.** The table is consulted only on the path a verb this surface does
+  NOT serve takes, so such a row is never read: it sits there looking like a decision and
+  changes nothing, which is worse than absent because the next reader counts it as one.
+  `SchedulerProtocol.cpp` refuses it at compile time --
+  `none_of(RefusedVerbs, IsSchedulerVerb, &Wire::RefusedVerb::op)` -- which is
+  `RowsInEnumeratorOrder`'s argument one layer over: a guard that can only fire when the
+  table is wrong. That scheduler's own table is now EMPTY and was kept rather than deleted,
+  because `AUTH` terminates in `FrameServer`'s loop there, and because the next verb this
+  surface refuses must be a ROW rather than a `case`.
 
   **A wire constant has TWO facts -- its name and its value -- and a symbol shared by
   both ends can only test the first.** This is the trap that "one name every party
@@ -2192,6 +2239,33 @@ Every rule below has already been a bug.
     inconsistent, and it would reject three existing call sites that use the
     spelling *safely* inside a single full expression. If it is ever added it should
     be added to all of them at once.
+
+- **No completion port is ever drained from several threads**, on Windows or anywhere
+  else. `IocpReactor.hpp` states the reason: a second thread dequeuing the same port
+  migrates a coroutine across threads mid-suspension, which every awaitable here is
+  written against. `RunMultiReactorWindows` therefore runs **one thread per reactor**,
+  exactly as the POSIX path does — `--threads N` is N independent single-threaded
+  reactors each owning its own port, never N threads sharing one.
+  - **`AGENT.md` claimed the opposite until
+    [#896](https://github.com/LASTRADA-Software/fastcached/issues/896), and that is the
+    reason this bullet exists rather than only the corrected sentence.** A wrong
+    sentence in `AGENT.md` is worse than a stale one, twice over: it is the document a
+    session reads FIRST and is told to obey, so it *licenses* the defect — a reader
+    writing a second drainer is following instructions — and it changes how a reader
+    **grades** a concurrency bug, because a race the top-level design document
+    describes as intended reads as a detail rather than as a violation. Neither cost
+    is paid by a stale sentence about something a reader can go and check.
+  - **The one `ThreadPoolExecutor { 1 }` on each of the three serving paths is the
+    EXPIRY SWEEP**, and stating that is load-bearing: it is the only second thread
+    visible near a reactor on those paths, so a reader counting threads finds it and
+    concludes the port is shared. It drains no completion port, and it overlaps no
+    `fsync` with anything — see `## The active expiry cycle` below for what it does do,
+    including the one-cycle-per-daemon, reactor-0 rule.
+  - **The claim is about the PORT, not about the process.** A daemon on a multi-core
+    host is multi-threaded by default (`--threads` unset is `hardware_concurrency()`,
+    which is what makes the `ShardedStorage` wrap the default rather than an opt-in —
+    `AGENT.md`'s `## Project Architecture`). Threads are not the hazard; two of them on
+    one `GetQueuedCompletionStatus` are.
 
 ## Keyspace events for what nobody asked for
 

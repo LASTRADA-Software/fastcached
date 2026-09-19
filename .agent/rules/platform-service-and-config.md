@@ -646,6 +646,25 @@ readable and silently ignored. Every rule below has already been one of them.
     `Node::NodeSecretFiles`) and **both moments read it**, so a row added there reaches
     the start and every reload for free. That is what makes the guard worth having: the
     thing an author must remember is a table row, not a call site.
+  - **Those two moments are ONE `SecretExposureWatcher`, and it re-asks the
+    FILESYSTEM.** A file's MODE is in no configuration, so an implementation reasoning
+    from the reloader's previous-and-current candidate pair covers half of #753 and
+    **looks right** while doing it: a `requirepass:` that never moved produces two
+    byte-identical snapshots, the diff concludes nothing changed, and the file is never
+    looked at — which is exactly the transition an accepted reload exists to catch,
+    somebody having widened the mode underneath a path that stayed the same. The other
+    transition, a secret appearing in a file whose mode was always loose, IS visible in
+    the snapshots, and that is what makes the snapshot-diffing version pass a review.
+    `Config/SecretExposureWatcher.hpp` states both halves at the type; the startup
+    observation and every accepted reload stat every row of the subject list, whether
+    or not a value moved.
+  - **What is remembered is `(path, exposure)`, not a rendered sentence**, so a file
+    whose exposure changes KIND — group-readable, then world-readable, two different
+    remedies — is a transition and is reported. A standing exposure is said ONCE, a
+    clearing one is silent, and a path that leaves the set is FORGOTTEN: this reports
+    what an operator must act on, never a status line. `Transitions` publishes the
+    memory rule alone so it is testable where `chmod` is not, which is the same
+    acquisition-versus-decision split `Platform/FileTrust` draws one level up.
 - **`ExecStart` still passes `--config` on Linux and macOS — by choice, not
   necessity.** It predates the lookup, where its absence made `ConfigReloader`
   have nothing to re-read and `systemctl reload` a silent no-op; the lookup now
