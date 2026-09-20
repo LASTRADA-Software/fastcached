@@ -182,6 +182,63 @@ else()
                     "NO interpreter token before it")
 endif()
 
+# ---------------------------------------------------------------------------
+# #1579: the WRAPPED command. This arm -- "a form this scan cannot classify" -- had no
+# case at all: four arms, three covered, and the uncovered one is the one that misled a
+# reader twice. The arm whose message is wrong is the arm nobody exercised.
+#
+# Two cases, and the second is what makes the first mean anything. Asserting only that
+# the refusal carries the remedy passes just as well if EVERY arm carries it, and a
+# remedy on the wrong arm is the defect this ticket is about, pointed somewhere else.
+fastcached_stage("wrapped" tree)
+fastcached_inject("${tree}" "${oneSite}"
+                  "COMMAND \${FASTCACHED_BASH}
+        \"\${CMAKE_SOURCE_DIR}/scripts/ci-scope-test.sh\"" staged)
+if(NOT staged)
+    fastcached_selftest_failed("wrapped" "the injection changed nothing, so the case stages no defect")
+else()
+    # The needle is the REMEDY, not the refusal: the refusal fired before this change too.
+    fastcached_case("a wrapped COMMAND is refused WITH a remedy, not a bare `cannot classify`" "${tree}"
+                    "put the interpreter and the checked script on ONE line")
+endif()
+
+fastcached_stage("wrappedshows" tree)
+fastcached_inject("${tree}" "${oneSite}"
+                  "COMMAND \${FASTCACHED_BASH}
+        \"\${CMAKE_SOURCE_DIR}/scripts/ci-scope-test.sh\"" staged)
+if(NOT staged)
+    fastcached_selftest_failed("wrappedshows" "the injection changed nothing, so the case stages no defect")
+else()
+    # And it must QUOTE THE WHOLE COMMAND. Showing the continuation line alone is what
+    # made a correct registration read as a bare invocation, so the line carrying the
+    # interpreter has to appear in the refusal.
+    fastcached_case("the refusal quotes the interpreter line, not the continuation alone" "${tree}"
+                    ". COMMAND ..FASTCACHED_BASH")
+endif()
+
+# The POSITIVE CONTROL for both: a DIFFERENT arm must not carry the wrapped-form remedy.
+# Without this, moving that sentence to every violation -- or to the shared trailer --
+# would pass both cases above while telling somebody with a genuinely token-less site to
+# go and join two lines that are already one.
+fastcached_stage("remedynotshared" tree)
+fastcached_inject("${tree}" "${oneSite}"
+                  "COMMAND \"\${CMAKE_SOURCE_DIR}/scripts/ci-scope-test.sh\"" staged)
+if(NOT staged)
+    fastcached_selftest_failed("remedynotshared" "the injection changed nothing, so the case stages no defect")
+else()
+    fastcached_run("${tree}" _objected _output)
+    math(EXPR caseCount "${caseCount} + 1")
+    if(NOT _objected)
+        fastcached_selftest_failed("remedynotshared" "expected a refusal and the check passed")
+    elseif(_output MATCHES "put the interpreter and the checked script on ONE line")
+        fastcached_selftest_failed("remedynotshared"
+            "a site that really has no interpreter token was given the WRAPPED-command remedy, which would send its author to join two lines that are already one")
+        message("${_output}")
+    else()
+        message(STATUS "  ok    (want-fail, remedy not on the wrong arm) a token-less site does not get the wrapped-form remedy")
+    endif()
+endif()
+
 fastcached_stage("nodef" tree)
 fastcached_inject("${tree}" "set(FASTCACHED_BASH " "set(FASTCACHED_BASH_RENAMED " staged)
 if(NOT staged)
