@@ -104,6 +104,37 @@ interpreter="${BASH:-bash}"
 CheckPattern='scripts/check-[a-z0-9-]*\.sh'
 WrapperName='scripts/run-check.sh'
 
+# The CMake command an offending line belongs to, with line numbers, for the refusal to QUOTE.
+#
+# **Quoting one line of a two-line command is what made a correct registration look like a
+# bare invocation** (#1579). A wrapped `COMMAND` leaves the checked script on a continuation
+# line; shown alone it is indistinguishable from a registration that really never names the
+# wrapper, and a reader acted on exactly that twice.
+#
+# DISPLAY ONLY. It is called after the verdict is decided and cannot change one: it looks
+# back for the line opening the command and stops there, and when it finds none inside the
+# bound it shows what it has. Both ways of being wrong show MORE context, never less.
+#
+# Matching is by whole-line EQUALITY rather than a pattern, because the needle is a line of
+# CMake full of characters a regex would read: `${...}`, `(`, `.`, `*`.
+#
+# $1 = the registration file, $2 = the offending line, verbatim
+CommandContext() {
+    awk -v needle="$2" '
+        { lines[NR] = $0 }
+        END {
+            for (n = 1; n <= NR; n++) {
+                if (lines[n] != needle) continue
+                first = n
+                for (b = 1; b <= 6 && n - b >= 1; b++) {
+                    first = n - b
+                    if (lines[first] ~ /COMMAND|add_test\(|set\(/) break
+                }
+                for (i = first; i <= n; i++) printf "    %5d | %s\n", i, lines[i]
+            }
+        }' "$1"
+}
+
 # Report which registered checks do not go through the wrapper.
 #
 # @param 1 The CMakeLists to read.
@@ -148,8 +179,20 @@ Audit() {
 
     if [ "$bad" -gt 0 ]; then
         echo "FAIL: ${bad} registration(s) invoke a check without ${WrapperName}:" >&2
-        printf '%s\n' "$unwrapped" | sed 's/^[[:space:]]*/    /' >&2
+        local offender
+        while IFS= read -r offender; do
+            [ -n "$offender" ] || continue
+            CommandContext "$list" "$offender" >&2
+        done <<< "$unwrapped"
         echo "  A check registered directly reports a KILLED run and a FAILING one identically (#1079)." >&2
+        echo "  This scan reads LINES, not CMake commands. A COMMAND that WRAPS leaves the checked script on a" >&2
+        echo "  continuation line, and ${WrapperName} may already be on the line above -- the whole command is printed" >&2
+        echo "  above for exactly that reason. Read it before changing anything (#1579)." >&2
+        echo "  REMEDY: put ${WrapperName} and the checked script on ONE line, as the other registrations do. Do not" >&2
+        echo "  add a second ${WrapperName} without checking whether the line above already carries one." >&2
+        echo "  This is the LOUD direction: a wrapped-but-correct registration is REFUSED, never a wrong one passed" >&2
+        echo "  silently. That trade is deliberate -- a scan that joined continuations could merge lines wrongly and" >&2
+        echo "  report an unwrapped check as covered, and silence reads identically to complete coverage." >&2
         return 1
     fi
 
@@ -316,6 +359,61 @@ if [ "${1:-}" = "--self-test" ]; then
     # The arm this whole file exists for.
     Case "an UNWRAPPED registration is refused" want-fail \
 'add_test(NAME "foo" COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-foo.sh")'
+
+    # Drive the audit and read its OUTPUT, which `Case` cannot: it folds every non-zero
+    # into "want-fail", so a refusal that said nothing useful would pass every case above.
+    # The message is the only part of a guard most people ever read, and nothing here read it.
+    # @param 1 What is being checked. @param 2 A fragment the output must hold.
+    # @param 3 A fragment it must NOT hold ("-" for none). @param 4 The file contents.
+    CaseSaying() {
+        local what="$1" must="$2" mustNot="$3" body="$4" got=0 out=""
+        selfTestCases=$((selfTestCases + 1))
+        printf '%s\n' "$body" > "${scratch}/CMakeLists.txt"
+        out="$("$interpreter" "$me" --audit "${scratch}/CMakeLists.txt" 2>&1)" || got=$?
+        if [ "$got" -eq 0 ]; then
+            echo "  FAIL  (want-fail) ${what}: it passed" >&2
+            selfTestStatus=1
+        elif ! grep -qF -- "$must" <<< "$out"; then
+            echo "  FAIL  (want-fail) ${what}: the refusal never says '${must}'" >&2
+            printf '%s\n' "$out" | sed 's/^/        /' >&2
+            selfTestStatus=1
+        elif [ "$mustNot" != "-" ] && grep -qF -- "$mustNot" <<< "$out"; then
+            echo "  FAIL  (want-fail) ${what}: the refusal says '${mustNot}', which it must not" >&2
+            printf '%s\n' "$out" | sed 's/^/        /' >&2
+            selfTestStatus=1
+        else
+            echo "  ok    (want-fail, and the refusal says so) ${what}"
+        fi
+    }
+
+    # #1579. A WRAPPED `COMMAND` puts the checked script on a continuation line, so this
+    # per-line scan refuses a registration that is correct. That is the safe direction and
+    # stays -- what was wrong is that the refusal quoted the continuation line ALONE, which
+    # reads exactly like a registration that never names the wrapper. A reader acted on that
+    # twice, telling a lane its registration lacked `run-check.sh` when the line above had it.
+    CaseSaying "a wrapped COMMAND is refused, and the refusal SHOWS the wrapper on the line above" \
+        'COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh"' "-" \
+'add_test(NAME "foo"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh"
+        "${CMAKE_SOURCE_DIR}/scripts/check-foo.sh")'
+
+    CaseSaying "and it names the remedy rather than leaving the reader to guess" \
+        "put scripts/run-check.sh and the checked script on ONE line" "-" \
+'add_test(NAME "foo"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh"
+        "${CMAKE_SOURCE_DIR}/scripts/check-foo.sh")'
+
+    # The DISCRIMINATION, and what makes the first case mean anything. This scan has ONE
+    # violation arm, so the two situations cannot be told apart by WHICH message fires --
+    # only by what the quoted command CONTAINS. A genuinely unwrapped registration must not
+    # show a `run-check.sh` it does not have, or the block is decoration and the first case
+    # would pass just as well on a walk that printed a fixed string.
+    CaseSaying "a genuinely unwrapped registration shows a command with NO wrapper in it" \
+        "put scripts/run-check.sh and the checked script on ONE line" \
+        'scripts/run-check.sh"' \
+'add_test(NAME "foo"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/check-foo.sh")'
+
 
     Case "one unwrapped among several wrapped is refused" want-fail \
 'add_test(NAME "a" COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-a.sh")
