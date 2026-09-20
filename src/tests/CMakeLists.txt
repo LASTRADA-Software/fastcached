@@ -5548,6 +5548,23 @@ if(NOT Python3_Interpreter_FOUND)
     message(WARNING
         "fetch-transfer-bound: no Python 3 interpreter found, so the dependency-fetch "
         "transfer bound (#526) is NOT guarded in this build tree")
+
+    # ...and the WARNING alone is what #1570 is about. It is written once, at
+    # configure, into a log nobody reads twice; the RUN then contains no row at
+    # all, so `ctest -N` returns a smaller total and every count derived from it
+    # is quietly about a different set. Absent and skipped are two states and the
+    # run could only express one of them.
+    #
+    # These three are registered here so the total does not move. That -- not the
+    # three tests -- is the subject: the assertion is that `ctest -N` returns the
+    # SAME number with and without a python3 on PATH, which is the only form of
+    # the claim a count cannot be wrong about.
+    fastcached_register_skipped_test("fetch-transfer-bound"
+        "no Python 3 interpreter found, so the dependency-fetch transfer bound (#526) is NOT guarded in this build tree")
+    fastcached_register_skipped_test("fetch-transfer-bound-selftest"
+        "no Python 3 interpreter found, so the transfer-bound verdict machinery (#1469) is NOT guarded in this build tree")
+    fastcached_register_skipped_test("msvc-arm64-coro-stack-slots-selftest"
+        "no Python 3 interpreter found, so the MSVC ARM64 coroutine probe's self-test (#1274) is NOT guarded in this build tree")
 else()
     add_test(
         NAME "fetch-transfer-bound"
@@ -7126,6 +7143,13 @@ if(NOT Python3_Interpreter_FOUND)
     message(WARNING
         "mutation-harness-selftest: no Python 3 interpreter found, so the tracked "
         "mutation harness (#1252) is NOT guarded in this build tree")
+
+    # Registered as a SKIP so the row exists either way (#1570). The WARNING above
+    # is kept rather than replaced: it is the louder of the two, and a configure
+    # warning and a skipped row answer different questions -- one is read once by
+    # whoever configured, the other by every count taken off `ctest -N` afterwards.
+    fastcached_register_skipped_test("mutation-harness-selftest"
+        "no Python 3 interpreter found, so the tracked mutation harness (#1252) is NOT guarded in this build tree")
 else()
     add_test(
         NAME "mutation-harness-selftest"
