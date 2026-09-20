@@ -399,6 +399,21 @@ gate_lock_unusable_marker="GATE NOT STARTED: the gate lock could not be taken"
 gate_states_unreadable_marker="GATE INCONCLUSIVE: a leg's registered test total could not be read"
 gate_states_unaccounted_marker="GATE INCONCLUSIVE: a leg's per-test states do not account for every test"
 
+# The third (#1574), and the first that is about this HOST rather than about a run: the
+# analyser resolved and cannot analyse anything here, so nothing it was asked was a
+# statement about the tree. Same prefix, same reason -- a reader met with `GATE FAILED:`
+# goes and reads their branch, and the branch is not what is wrong.
+gate_analyser_unusable_marker="GATE INCONCLUSIVE: the resolved clang-tidy cannot analyse anything on this host"
+
+# The status `check-clang-tidy-known-defects.sh` answers "the analyser cannot answer" with.
+# A CONSTANT here rather than a literal in the `case` below, and the self-test reads the
+# other script's own declaration and compares: the number is a contract between two files,
+# so it has the usual two facts and a symbol in one of them tests only its own. Renumbered
+# on that side alone, every check there stays green -- `Expect` folds all non-zero into
+# `refuse` -- while this gate falls to its `*)` arm and prints "the declared clang-tidy
+# does not behave as ... records", which is the confident wrong cause #1574 removed.
+gate_known_defects_unusable_status=77
+
 # The roots this repository TRACKS but does not OWN -- third-party source copied
 # verbatim from upstream (vendor/VENDOR.md) -- are READ from
 # `scripts/lib/third-party-roots.txt` (#1370) and named nowhere in this file. It has
@@ -447,8 +462,9 @@ gate_totals_pattern='^[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+'
 #
 # `0` and `1` are the gate's OWN statuses for those two outcomes, so classifying a
 # log answers with what the run itself answered -- and so are `7` and `8`, which a
-# run that never got the host lock exits with, and `9` and `10`, which a run whose
-# tests did not fail and cannot be vouched for exits with. `2` is skipped
+# run that never got the host lock exits with, `9` and `10`, which a run whose
+# tests did not fail and cannot be vouched for exits with, and `11`, which a run
+# whose analyser could not analyse anything exits with. `2` is skipped
 # deliberately and is the interesting one: it is this script's usage status, and
 # `--classify=$LOG` with an unset `LOG` is a usage error -- a caller reading only the
 # status would take "you typed that wrong" for "the run was killed". The two are not
@@ -474,6 +490,7 @@ gate_outcomes=(
     "lock-unusable|8|the gate did NOT START: the host lock could not be taken at all -- an unwritable lock directory, a wait that is not a number, or a flock that refused its own options. Nothing about your tree was checked. Fix the host, not the branch."
     "states-unreadable-total|9|the gate RAN, a leg's tests did not fail, and the gate still cannot vouch for that leg: the registered test total ctest prints could not be read, so the per-test states were reconciled against nothing. This is NOT a verdict about your tree, and it is not a clean run either. Open the leg log the gate named and find the '<N>% tests passed, <M> tests failed out of <T>' line; if it is absent the leg was cut off, and if it is present the gate's reader of it has broken."
     "states-unaccounted|10|the gate RAN, a leg's tests did not fail, and the gate still cannot vouch for that leg: the per-test states seen account for fewer tests than that leg registered, so something did not report. This is NOT a verdict about your tree. Open the leg log the gate named, compare the numbers it printed, and find which test is missing -- a state no reader here enumerates and a run that stopped early look identical from here, so do not add a state to make it quiet until you know which one it is."
+    "analyser-unusable|11|the gate did not JUDGE: the clang-tidy it resolved cannot analyse a trivial translation unit on this host, so the known-defect rows it was asked about said nothing about your tree and no sweep it ran would either. This is a finding about the ANALYSER BUILD and about this host. Measured: the Windows PyPI wheel ships no C++ standard library, and the same declared build under WSL is fine -- so run the gate from WSL, or install an analyser that has headers."
 )
 
 # What a gate LOG says about the run that produced it. PURE: log text on stdin,
@@ -515,6 +532,9 @@ gate_outcome() {
                 ;;
             "$gate_states_unaccounted_marker"*)
                 [[ "$outcome" == "did-not-conclude" ]] && outcome="states-unaccounted"
+                ;;
+            "$gate_analyser_unusable_marker"*)
+                [[ "$outcome" == "did-not-conclude" ]] && outcome="analyser-unusable"
                 ;;
             # A refusal is the LAST event of the invocation that printed it, so it
             # wins over an earlier green run in a reused log -- the latest invocation
@@ -3483,6 +3503,23 @@ $gate_passed_marker"
     expect "the two reconcile outcomes do not share a status with each other" "no" \
         "$([[ "$(gate_outcome_status states-unreadable-total)" == "$(gate_outcome_status states-unaccounted)" ]] && echo yes || echo no)"
 
+    # #1574: the host outcome, kept apart from both the tree outcomes and from `failed`.
+    expect "the unusable-analyser outcome is a row, not the unrecognised fallback" "no" \
+        "$([[ "$(gate_outcome_status analyser-unusable)" == "$(gate_outcome_status unrecognised)" ]] && echo yes || echo no)"
+    expect "an unusable analyser does not share a status with failed" "no" \
+        "$([[ "$(gate_outcome_status analyser-unusable)" == "$(gate_outcome_status failed)" ]] && echo yes || echo no)"
+    outcome_case "a run stopped by an analyser that cannot analyse is its own outcome" \
+        "analyser-unusable" "$_started
+$gate_analyser_unusable_marker: /x/clang-tidy (its own report is above)"
+    # The number is a contract with ANOTHER FILE, so it is read back from that file's own declaration rather than
+    # spelled twice and hoped about. A read that matches nothing yields the empty string and fails here, which is the
+    # direction this has to fail in: a renumbering on that side alone leaves every check there green (its `Expect`
+    # folds all non-zero into one word) while this gate silently starts blaming the tree.
+    expect "the known-defects unusable status is the one that script declares" \
+        "$gate_known_defects_unusable_status" \
+        "$(awk '/^UnusableAnalyser=[0-9]+$/ { sub(/^UnusableAnalyser=/, ""); print; exit }' \
+            "$(dirname "${BASH_SOURCE[0]}")/check-clang-tidy-known-defects.sh")"
+
     outcome_case "a leg whose registered total could not be read is its own outcome" \
         "states-unreadable-total" "$_started
 $_legs
@@ -4449,8 +4486,24 @@ for row in "${gate_presets[@]}"; do
         tidy="$tidy_path"
         # The crashes this build is KNOWN to have, asserted against it: a row, and the comments at the sites the
         # tree rewrote around it, stay exactly as long as the build still crashes there (#1410).
+        # THREE outcomes, not two (#1574). `$gate_known_defects_unusable_status` is the check saying the analyser it was handed cannot analyse
+        # anything here, which is a fact about this host; every other non-zero is a row whose status moved, which is
+        # a fact about the tree and the analyser together. Collapsing them printed `GATE FAILED:` and
+        # "the declared clang-tidy does not behave as ... records" for a Git Bash run whose analyser had simply
+        # never compiled a line -- a confident wrong cause, in the sentence a reader acts on.
+        _known_defects_status=0
         bash "$(dirname "${BASH_SOURCE[0]}")/check-clang-tidy-known-defects.sh" --installed "$tidy_path" "$repo_root" \
-            || fail "the declared clang-tidy does not behave as check-clang-tidy-known-defects.sh records (above), so the workarounds the tree carries for it no longer describe the analyser this gate would judge with"
+            || _known_defects_status=$?
+        case "$_known_defects_status" in
+            0) ;;
+            "$gate_known_defects_unusable_status")
+                gate_inconclusive analyser-unusable \
+                    "${gate_analyser_unusable_marker}: ${tidy_path} (its own report is above)"
+                ;;
+            *)
+                fail "the declared clang-tidy does not behave as check-clang-tidy-known-defects.sh records (above), so the workarounds the tree carries for it no longer describe the analyser this gate would judge with"
+                ;;
+        esac
 
         # Asked once and HERE, beside the tool it is about, rather than per preset:
         # the header filter is a property of `.clang-tidy` and of where this
