@@ -8376,3 +8376,32 @@ set_tests_properties("ci-install-clang-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# ---------------------------------------------------------------------------
+# `status/needs-triage` comes off again (#1563).
+#
+# The label had three writers and no remover, and reached 97 of 119 open issues --
+# at which point a query for it answers "almost everything", which is the same as
+# answering nothing.
+#
+# What is tested is the DECISION, a pure function of (event, labels, actor type).
+# The case that makes the actor a parameter at all is the auto-filer's: those
+# issues carry `type/bug area/build status/needs-triage` from birth, so by labels
+# alone they are indistinguishable from a human's triaged issue -- and a remover
+# reading labels only would strip the label off every CI-filed issue within
+# seconds, defeating the three writers this deliberately keeps.
+#
+# Two cases pin the substring anchors, on `opened` rather than `labeled`, because
+# that is the event where an unanchored match gives a DIFFERENT answer. On
+# `labeled` both readings answer `none` and the case proves nothing -- which is
+# what the first spelling of them did.
+#
+# Needs no compiler, no build, no daemon, no socket and no network.
+add_test(
+    NAME "ci-triage-label-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/ci-triage-label.sh" --self-test
+)
+set_tests_properties("ci-triage-label-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)

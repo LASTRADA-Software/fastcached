@@ -2,34 +2,130 @@
 name: Issue triage
 
 # `status/needs-triage` marks an issue nobody has typed or assigned an area to
-# yet. Nothing else in this repository sets it, so without this workflow it
-# would be a label that exists and never applies -- which is worse than not
-# having it at all, because an empty query then reads as "nothing is waiting"
-# rather than "nobody is looking".
+# yet.
 #
-# Only on `opened`. Reopening an issue that was already triaged does not make it
-# untriaged again, and re-adding the label there would quietly undo a decision
-# somebody had already made.
+# It had three writers and NO remover (#1563). `issue-triage.yml` applied it,
+# `build.yml` applied it at two sites and `merge-group-report.yml` at two more,
+# and nothing in the repository ever took it off. It reached 97 of 119 open
+# issues, at which point a query for it answered "almost everything" -- which is
+# the same as answering nothing. A label that only ever goes on is not a state,
+# it is a timestamp.
+#
+# TRIAGED means a `type/` label AND an `area/` label. That is the label's own
+# definition; a remover checking only `type/` would quietly redefine the word,
+# and `type/` is the one CI can derive, so that version would clear the label on
+# exactly the issues nobody had looked at.
+#
+# THE ACTOR IS PART OF THE DECISION, and this is the part that is not obvious.
+# The three auto-filers open issues carrying `type/bug area/build
+# status/needs-triage` in a single call, so by labels alone they are "triaged"
+# the instant they exist -- and a remover keyed on labels only would strip the
+# label from every CI-filed issue within seconds, defeating the three writers
+# this change deliberately keeps. A CI-filed issue genuinely is untriaged: a
+# machine guessed `type/bug` and `area/build` from the fact that a build broke,
+# which is not a person having read it. So labels a MACHINE applied do not count
+# as triage.
+#
+# AND THE BOT ARM IS A GUARD RATHER THAN THE MECHANISM, which is worth saying
+# because it reads like the mechanism. An issue opened or labelled with
+# `GITHUB_TOKEN` triggers NO workflow -- this repository states that in three
+# places, `build.yml` and `merge-group-report.yml` among them -- so the three
+# auto-filers' own labels never reach this workflow at all, and their
+# `status/needs-triage` survives because nothing here ever runs on it. The Bot
+# arm exists for the day a filer uses a PAT instead, where the run WOULD fire and
+# would otherwise strip the label seconds after it was applied. It is
+# belt-and-braces, and the actor is still the only thing that could tell those
+# two cases apart.
+#
+# The remover therefore fires on a HUMAN labelling an issue, which is the case
+# that matters: a person adds the missing `type/` or `area/` and the label goes.
+#
+# AND WHICH LABEL ARRIVED. This workflow fires on EVERY `labeled`, so a human
+# adding `priority/high` to an issue that already carries a type and an area
+# would otherwise read as the moment triage completed -- and the removal would
+# be attributed to whoever happened to touch the issue next. The label SET is
+# the same before and after such an event, so nothing in it can distinguish
+# them; the event has to.
+#
+# The decision is `scripts/ci-triage-label.sh --decide`, a pure function of
+# (event, labels, actor type, label name) with a 22-case self-test. What is
+# left here is acquisition: read the event, ask, act.
 #
 # `issues` is not a fork-sensitive event -- there is no head repository and no
 # code involved -- so the plain trigger suffices and the `pull_request_target`
 # reasoning in pr-labels.yml does not apply here.
+#
+# `opened` and `labeled`, and no others. Reopening an issue that was already
+# triaged does not make it untriaged again. `unlabeled` is deliberately absent:
+# a human removing a `type/` label is editing, not un-triaging, and re-stamping
+# there would fight whoever is mid-edit. Removing the label emits `unlabeled`
+# rather than `labeled`, so this cannot drive itself; the label this workflow
+# adds does emit `labeled`, and the Bot arm answers `none` to it.
 on:
   issues:
-    types: [opened]
+    types: [opened, labeled]
 
 permissions: {}
 
 jobs:
-  needs-triage:
-    name: "Mark as needing triage"
+  triage-label:
+    name: "Maintain status/needs-triage"
     runs-on: ubuntu-24.04
     permissions:
+      # `contents: read` is for the CHECKOUT, not for the labelling. The workflow
+      # declares `permissions: {}`, so a job gets only what it names -- and this job
+      # did not name `contents` until it grew a checkout step, at which point
+      # `actions/checkout` would have failed 403 on its very first run. The
+      # permission block and the step list are two halves of one change.
+      contents: read
       issues: write
     steps:
-      - name: "Apply status/needs-triage"
+      # The decision lives in `scripts/ci-triage-label.sh`, so the repository has to
+      # be on disk. A workflow that inlined the decision would need no checkout --
+      # and would put a 22-case decision table somewhere nothing can test it.
+      - name: "Check out"
+        uses: actions/checkout@v4
+
+      - name: "Apply or remove status/needs-triage"
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.issue.number }}
-        run: gh issue edit "$NUMBER" --repo "$REPO" --add-label status/needs-triage
+          EVENT: ${{ github.event.action }}
+          # `github.event.sender.type` is `Bot` for the auto-filers, which open
+          # their issues through `github.token`. Read from the event rather than
+          # matched against a login: a name is a string somebody can change and
+          # a second bot would need a second row.
+          ACTOR_TYPE: ${{ github.event.sender.type }}
+          # The labels as the EVENT saw them. Taken from the payload and not
+          # re-fetched: a `gh issue view` here would read the issue as it is
+          # NOW, which on a busy issue is a different set from the one that
+          # triggered this run, and the decision would then be about a state
+          # nobody observed.
+          LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
+          # WHICH label this event carried, empty on `opened` where none
+          # arrived. The label SET is identical before and after an unrelated
+          # `labeled` -- `priority/high` on an issue that already has a type
+          # and an area -- so nothing in LABELS can tell that event from the
+          # one where a human completed the triage. Only this can.
+          LABEL_NAME: ${{ github.event.label.name }}
+        run: |
+          set -o errexit
+          set -o nounset
+          set -o pipefail
+
+          decision="$(bash scripts/ci-triage-label.sh \
+              --event "$EVENT" --labels "$LABELS" --actor-type "$ACTOR_TYPE" \
+              --label "$LABEL_NAME")"
+          echo "issue #${NUMBER}: event=${EVENT} actor=${ACTOR_TYPE} label=[${LABEL_NAME}] labels=[${LABELS}] -> ${decision}"
+
+          case "$decision" in
+              add)    gh issue edit "$NUMBER" --repo "$REPO" --add-label status/needs-triage ;;
+              remove) gh issue edit "$NUMBER" --repo "$REPO" --remove-label status/needs-triage ;;
+              none)   echo "nothing to do" ;;
+              # A fourth answer means the decision function grew an outcome this
+              # step does not implement. Refusing is the only safe reading:
+              # falling through would silently do nothing, which is one of the
+              # three real answers and would be indistinguishable from it.
+              *)      echo "::error::ci-triage-label returned '${decision}', which this step does not implement"; exit 1 ;;
+          esac
