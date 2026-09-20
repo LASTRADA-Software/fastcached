@@ -169,6 +169,28 @@ TEST_CASE("The operator's value outranks a probe, and the probe is not even aske
     CHECK(discovery.calls() == 0);
 }
 
+TEST_CASE("The discovery request is an ASK, not a prefix")
+{
+    // `FASTCACHE_MSVC_DEPS_PREFIX=auto` is how an operator opts IN to the probe, and it
+    // names no prefix -- so the `Operator` row must decline it exactly as it declines an
+    // unset variable, or the build would emit notes prefixed with the literal `auto`.
+    //
+    // Read HERE rather than mapped at the call site: one value, one reading. A caller
+    // that turned the sentinel into an empty string itself would be a second place for
+    // the meaning to drift, and the drift is silent in the direction that matters.
+    ScriptedDiscovery discovery { std::string { "Hinweis: Einlesen der Datei:" } };
+    auto const resolved = ResolveIncludeNoteMarker(FastCache::Cc::MarkerDiscoveryRequest, &discovery);
+    CHECK(resolved.marker == "Hinweis: Einlesen der Datei:");
+    CHECK(resolved.source == MarkerSource::Discovered);
+    CHECK(discovery.calls() == 1);
+
+    // And with no probe handed in it is the DEFAULT, never the sentinel: an operator who
+    // asked for discovery on a build that cannot do it gets English, not `auto`.
+    auto const withoutProbe = ResolveIncludeNoteMarker(FastCache::Cc::MarkerDiscoveryRequest, nullptr);
+    CHECK(withoutProbe.marker == FastCache::PathCanon::IncludeNoteMarker);
+    CHECK(withoutProbe.source == MarkerSource::Default);
+}
+
 TEST_CASE("A probe answers when the operator named nothing")
 {
     ScriptedDiscovery discovery { std::string { "Hinweis: Einlesen der Datei:" } };

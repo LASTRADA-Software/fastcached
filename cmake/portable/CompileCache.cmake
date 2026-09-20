@@ -977,21 +977,18 @@ endfunction()
 # @param text The captured stream.
 # @param outVar Set to its first non-blank line, stripped, or to the empty string.
 function(_fc_first_line text outVar)
-    set(${outVar} "" PARENT_SCOPE)
-    # A capture with no newline at all is one line; REPLACE then leaves it alone and
-    # the loop below sees the single element. Semicolons in the text would otherwise
-    # split a line into several list items, so they are escaped before the split and
-    # restored after -- a loader message naming a search path is full of them.
-    string(REPLACE ";" "\\;" _escaped "${text}")
-    string(REPLACE "\r\n" "\n" _escaped "${_escaped}")
-    string(REPLACE "\n" ";" _lines "${_escaped}")
-    foreach(_line IN LISTS _lines)
-        string(STRIP "${_line}" _line)
-        if(_line)
-            set(${outVar} "${_line}" PARENT_SCOPE)
-            return()
-        endif()
-    endforeach()
+    # Deliberately NOT a split-into-a-list-and-walk-it. That form has to escape and
+    # restore semicolons, because a CMake list is semicolon-separated and a loader
+    # message naming a search path is full of them -- and it only ever wants the first
+    # element anyway. Two regexes ask the question directly: drop leading whitespace
+    # INCLUDING newlines, then take everything up to the next line break. A capture
+    # that is empty or entirely blank yields the empty string, which the caller reads
+    # as "the child said nothing". Verified against a capture carrying semicolons and
+    # a search path, against a blank-only capture, and against an empty one.
+    string(REGEX REPLACE "^[ \t\r\n]*" "" _rest "${text}")
+    string(REGEX MATCH "^[^\r\n]*" _line "${_rest}")
+    string(STRIP "${_line}" _line)
+    set(${outVar} "${_line}" PARENT_SCOPE)
 endfunction()
 
 # Is anything at all answering at FASTCACHE_ADDR? Deliberately cheaper and

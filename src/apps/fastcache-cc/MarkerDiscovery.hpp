@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "CmdLine.hpp"
 #include "IProcessRunner.hpp"
 
 #include <FastCache/CompileCache/PathCanon.hpp>
@@ -22,8 +23,12 @@ namespace FastCache::Cc
 /// the reason `AGENT.md` gives -- on a private enum the numbers are noise, and adding
 /// them would tell a later reader the ordinals mean something.
 ///
-/// The ORDER is the precedence, most authoritative first, and `ResolveIncludeNoteMarker`
-/// walks the table rather than branching. A fourth source is a row.
+/// The ORDER is the precedence, most authoritative first. That is a property of the
+/// ENUM, not of the table below: the table carries labels, and `ResolveIncludeNoteMarker`
+/// spells one arm per source. A fourth source is an enumerator, a row AND an arm --
+/// stated rather than dressed up as "a fourth source is a row", because each source asks
+/// a genuinely different question and a walk that pretended otherwise would be three
+/// `if`s wrapped in a loop.
 enum class MarkerSource : std::uint8_t
 {
     /// `FASTCACHE_MSVC_DEPS_PREFIX`. First because it is the only source that can be
@@ -50,9 +55,12 @@ struct MarkerSourceRow
     std::string_view label; ///< What a `--verbose` line and `--show-stats` call it.
 };
 
-/// The precedence table, in enumerator order -- which IS the precedence, most
-/// authoritative first, so `ResolveIncludeNoteMarker` walks it instead of branching
-/// and a source indexes its own label.
+/// How each source is named on a status line, in enumerator order so a source indexes
+/// its own label.
+///
+/// A table rather than a ternary because there are THREE answers and they send an
+/// operator to three different places: they already set the variable, the compiler was
+/// asked, or nobody said and this is English on trust. A bool carried two.
 inline constexpr EnumTable<MarkerSource, MarkerSourceRow> MarkerSourceTable { {
     { .source = MarkerSource::Operator, .label = "named by FASTCACHE_MSVC_DEPS_PREFIX" },
     { .source = MarkerSource::Discovered, .label = "discovered from the compiler" },
@@ -60,8 +68,8 @@ inline constexpr EnumTable<MarkerSource, MarkerSourceRow> MarkerSourceTable { {
 } };
 
 static_assert(RowsInEnumeratorOrder(MarkerSourceTable, &MarkerSourceRow::source),
-              "MarkerSourceTable must hold one row per MarkerSource, in enumerator order -- the order is the "
-              "PRECEDENCE as well as the index, so a row out of place silently reorders resolution");
+              "MarkerSourceTable must hold one row per MarkerSource, in enumerator order -- the order is what "
+              "lets a source index its own label");
 
 /// How a status line spells one source.
 ///
@@ -145,13 +153,25 @@ class IMarkerDiscovery
     [[nodiscard]] virtual std::optional<std::string> Discover() = 0;
 };
 
+/// What `FASTCACHE_MSVC_DEPS_PREFIX` is set to when it asks for discovery.
+///
+/// A sentinel VALUE rather than a second variable, because the two settings answer one
+/// question -- *what prefix do this build's notes carry* -- and a build has one answer.
+/// Safe as a sentinel by inspection: no driver emits `auto` as a note prefix, and an
+/// operator who somehow needed that literal is the operator who can spell it with a
+/// trailing colon as every real prefix has.
+inline constexpr std::string_view MarkerDiscoveryRequest = "auto";
+
 /// Resolve the one marker this invocation will emit with and match against.
 ///
-/// Walks `MarkerSourceTable` in order and takes the first row that answers, so the
-/// value stays ONE value with ONE place that decides it.
+/// The three sources in `MarkerSource`'s own order, first one that answers. The table is
+/// the LABELS and the enumerator order is the precedence; the arms are here, written out,
+/// because each source asks a different question and a loop over the table would only
+/// wrap three `if`s in an indirection.
 ///
 /// @param operatorNamed What `FASTCACHE_MSVC_DEPS_PREFIX` named; empty for unset, since
-///        an empty prefix is not one Ninja could match a note against.
+///        an empty prefix is not one Ninja could match a note against, and empty also for
+///        `MarkerDiscoveryRequest`, which names no prefix but asks for one.
 /// @param discovery The probe, or nullptr when this invocation must not spawn one.
 /// @return The marker and the row that supplied it; never empty.
 [[nodiscard]] ResolvedMarker ResolveIncludeNoteMarker(std::string_view operatorNamed, IMarkerDiscovery* discovery);
@@ -163,9 +183,17 @@ class IMarkerDiscovery
 /// wrong answer that looks right -- installing a language pack changes the notes'
 /// language without moving anything a cache stamp covers. That is the shape `AGENT.md`
 /// names as NOT cacheable however expensive the probe, and it is `DiscoverTargetTriple`'s
-/// own argument one field over. What keeps the cost down instead is asking rarely: the
-/// caller probes only when the operator named nothing AND this compile actually deals in
-/// `/showIncludes`.
+/// own argument one field over.
+///
+/// **That is exactly why it is OPT-IN**, and the cost is why the opt-in is not a default
+/// somebody can leave on by accident. A launcher process serves ONE translation unit, and
+/// under CMake + Ninja + MSVC `/showIncludes` is on every compile line -- so "probe
+/// whenever nobody named a prefix" is "spawn a second compiler for every file in the
+/// build", paid on CACHE HITS too, where the whole value of the hit is that no compiler
+/// ran. On an English install it would pay that to rediscover
+/// `PathCanon::IncludeNoteMarker`, which is what the default already says. So the
+/// operator asks for it, by setting `FASTCACHE_MSVC_DEPS_PREFIX` to
+/// `MarkerDiscoveryRequest`, and a build that does is one whose notes are not English.
 ///
 /// **Spawned in the build's OWN environment**, unlike every other probe in this
 /// launcher. `RunCaptureSplitInEnglish` exists because the launcher must be able to READ
@@ -180,7 +208,13 @@ class IMarkerDiscovery
 ///
 /// @param runner Process-spawning seam.
 /// @param compiler The compiler to interrogate.
+/// @param driver That compiler's table row; its `preprocessFlags` and
+///        `dependencyProbeFlags` are what the probe spawns with, so this function spells
+///        no driver flag of its own. `/EP` ALONE is a rule with a ticket behind it
+///        (`AGENT.md`), and a second literal would sit outside its reach.
 /// @return Its note prefix, or nullopt.
-[[nodiscard]] std::optional<std::string> ProbeIncludeNoteMarker(IProcessRunner& runner, std::string const& compiler);
+[[nodiscard]] std::optional<std::string> ProbeIncludeNoteMarker(IProcessRunner& runner,
+                                                                std::string const& compiler,
+                                                                DriverSpec const& driver);
 
 } // namespace FastCache::Cc

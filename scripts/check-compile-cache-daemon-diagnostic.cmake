@@ -118,8 +118,15 @@ file(MAKE_DIRECTORY "${FASTCACHED_SCRATCH_DIR}")
 # @param daemonBody The shell body the fake fastcached runs when it is NOT asked
 #                   --version; it must exit non-zero, which is what puts the module on
 #                   the branch under test.
+# @param addrPort A port nothing on this host listens on, so `_fc_daemon_answering`
+#                 finds nothing and the module proceeds to stage and spawn. PASSED
+#                 rather than derived: a first draft computed it from the length of
+#                 `case`, and both case names are six characters long -- so the two
+#                 runs shared one port, under a comment claiming the derivation kept
+#                 them apart. A derivation that derives nothing is worse than a
+#                 literal, because it reads as though somebody had thought about it.
 # @param outVar Receives the configure's combined output.
-function(RunFailingStart case daemonBody outVar)
+function(RunFailingStart case daemonBody addrPort outVar)
     set(root "${FASTCACHED_SCRATCH_DIR}/${case}")
     set(stem "fastcached-${mirrorVersion}-${platform}")
     set(payloadRoot "${root}/payload")
@@ -161,11 +168,6 @@ function(RunFailingStart case daemonBody outVar)
     file(MAKE_DIRECTORY "${sandbox}/usr/bin")
     file(CREATE_LINK "${hostUname}" "${sandbox}/usr/bin/uname" COPY_ON_ERROR SYMBOLIC)
 
-    # A port nothing on this host is listening on, so _fc_daemon_answering finds nothing
-    # and the module proceeds to stage and spawn. Per case, so two runs cannot collide.
-    string(LENGTH "${case}" caseLength)
-    math(EXPR addrPort "18700 + ${caseLength}")
-
     set(arguments
         "-DFASTCACHED_MODULE_DIR=${moduleDir}"
         "-DCMAKE_CXX_COMPILER=${FASTCACHED_CXX_COMPILER}"
@@ -206,6 +208,7 @@ set(violations "")
 # is not portable across /bin/sh implementations and the line under test is data.
 RunFailingStart("loader"
     "printf '%s\\n' '${loaderLine}' >&2\nexit 127"
+    18701
     loaderOutput)
 
 string(FIND "${loaderOutput}" "Not starting a daemon: fastcached exited immediately (127)" loaderStatusAt)
@@ -222,7 +225,7 @@ if(loaderLineAt EQUAL -1)
 endif()
 
 # --- And the shape that says the capture is READ rather than pasted -------------------
-RunFailingStart("silent" "exit 4" silentOutput)
+RunFailingStart("silent" "exit 4" 18702 silentOutput)
 
 string(FIND "${silentOutput}" "Not starting a daemon: fastcached exited immediately (4)" silentStatusAt)
 if(silentStatusAt EQUAL -1)

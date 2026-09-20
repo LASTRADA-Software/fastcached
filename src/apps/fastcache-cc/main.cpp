@@ -311,10 +311,12 @@ struct Config
 
 /// Read the environment into a `Config`.
 ///
+/// @param namedMarker What `FASTCACHE_MSVC_DEPS_PREFIX` holds, read once by `main` --
+///        which also has to ask about it, and must ask the same value.
 /// @param probe The `/showIncludes` marker probe, or nullptr when this invocation must
-///        not spawn one -- which is most of them. See `MarkerProbeFor` for who decides.
+///        not spawn one, which is almost all of them. `WantsMarkerProbe` decides.
 /// @return The configuration this invocation runs under.
-[[nodiscard]] Config LoadConfig(Cc::IMarkerDiscovery* probe)
+[[nodiscard]] Config LoadConfig(std::string_view namedMarker, Cc::IMarkerDiscovery* probe)
 {
     Config c;
     // Three-valued on purpose, unlike every other setting here. UNSET means "use
@@ -369,10 +371,11 @@ struct Config
     // reading of the empty value that is better than the default. The table's
     // `Operator` row asks exactly that question.
     //
-    // `probe` is null unless this invocation has a reason to spawn one; see
-    // `MarkerProbeFor`. That is where the cost is kept down, because the answer itself
-    // must NOT be remembered across invocations (#878).
-    auto resolved = Cc::ResolveIncludeNoteMarker(EnvOr(Cc::EnvName::MsvcDepsPrefix, ""), probe);
+    // `MarkerDiscoveryRequest` names no prefix -- it ASKS for one -- and the resolver is
+    // what knows that, so the value goes through unmapped. `probe` is null unless
+    // `WantsMarkerProbe` said this invocation should pay for one, which is where the cost
+    // is kept down: the answer itself must NOT be remembered across invocations (#878).
+    auto resolved = Cc::ResolveIncludeNoteMarker(namedMarker, probe);
     c.showIncludesMarker = std::move(resolved.marker);
     c.showIncludesMarkerSource = resolved.source;
     // Clamped, not merely cast: the reader is 64-bit and `std::size_t` need not
@@ -926,52 +929,54 @@ void NoteIfRootsDoNotDescribeCompile(InvocationRecord const& record,
 class CompilerMarkerProbe: public Cc::IMarkerDiscovery
 {
   public:
-    explicit CompilerMarkerProbe(std::string compiler):
-        _compiler { std::move(compiler) }
+    CompilerMarkerProbe(std::string compiler, Cc::Flavor flavor):
+        _compiler { std::move(compiler) },
+        _flavor { flavor }
     {
     }
 
     [[nodiscard]] std::optional<std::string> Discover() override
     {
-        return Cc::ProbeIncludeNoteMarker(ProcessRunner(), _compiler);
+        return Cc::ProbeIncludeNoteMarker(ProcessRunner(), _compiler, Cc::DriverOf(_flavor));
     }
 
   private:
     std::string _compiler;
+    Cc::Flavor _flavor;
 };
 
-/// Whether this invocation has any reason to ask the compiler for its note prefix.
+/// Whether this invocation should ask the compiler for its note prefix.
 ///
-/// **The whole cost control lives here**, because the ANSWER must not be remembered:
-/// the prefix decides how a stored value's notes are normalized and how a replayed
-/// one is re-spelled, and installing a language pack moves it without moving anything
-/// a cache stamp covers -- the shape `AGENT.md` names as not cacheable however
-/// expensive the probe. So instead of a cache, three clauses that make the question
-/// rare:
+/// **Opt-in, and that is the whole cost control.** A launcher process serves ONE
+/// translation unit, and under CMake + Ninja + MSVC `/showIncludes` sits on every compile
+/// line -- so "probe whenever nobody named a prefix" means spawning a second compiler for
+/// every file in the build, paid on CACHE HITS too, where the entire value of the hit is
+/// that no compiler ran. On an English install that buys a rediscovery of
+/// `Cc::IncludeNoteMarker`, which is exactly what the default already says.
 ///
-/// - the compile has to have PARSED, or there is no compiler to ask and no notes to
-///   write;
-/// - it has to deal in `/showIncludes`, which is the only thing the prefix is for --
-///   a GNU driver reports through a depfile and never reads this;
-/// - and the operator must have named nothing, since their value outranks a probe and
-///   spawning to produce something we would discard is pure cost.
+/// Nor can the answer be remembered to amortise it: installing a language pack moves the
+/// prefix without moving anything a cache stamp covers, which is `AGENT.md`'s
+/// not-cacheable shape -- a stale answer here is a wrong answer that looks right. So the
+/// cost is not paid by default and is not spread; an operator whose notes are not English
+/// asks for it, by setting `FASTCACHE_MSVC_DEPS_PREFIX` to `Cc::MarkerDiscoveryRequest`.
 ///
-/// The last clause is duplicated by `MarkerSourceTable`'s own `Operator` row and that
-/// is deliberate: the table decides what WINS, this decides whether to pay, and folding
-/// them would make a null probe mean two different things.
+/// The other three clauses are facts `ResolveIncludeNoteMarker` cannot know: whether the
+/// line parsed at all, whether this compile deals in `/showIncludes` (the only thing the
+/// prefix is for -- a GNU driver reports through a depfile and never reads it), and
+/// whether this driver can be asked. That last one reads `DriverSpec::family` rather than
+/// naming the two MSVC flavors, because the table's own comment says a second spelling of
+/// "this is an MSVC driver" is a second thing to keep in step.
 ///
 /// @param cmd The parsed command line.
+/// @param named What `FASTCACHE_MSVC_DEPS_PREFIX` holds, read once by the caller.
 /// @return True when a probe is worth spawning.
-[[nodiscard]] bool WantsMarkerProbe(Cc::ParsedCommand const& cmd) noexcept
+[[nodiscard]] bool WantsMarkerProbe(Cc::ParsedCommand const& cmd, std::string_view named) noexcept
 {
+    if (named != Cc::MarkerDiscoveryRequest)
+        return false;
     if (!cmd.parsedOk || !cmd.wantShowIncludes)
         return false;
-    if (!EnvOr(Cc::EnvName::MsvcDepsPrefix, "").empty())
-        return false;
-    // MSVC-family only. `/showIncludes` is an MSVC spelling, and the probe's own
-    // command line (`/nologo /EP /showIncludes`) is one a GNU driver would read as
-    // three paths.
-    return cmd.flavor == Cc::Flavor::Cl || cmd.flavor == Cc::Flavor::ClangCl;
+    return Cc::Overlaps(Cc::DriverOf(cmd.flavor).family, Cc::DriverFamily::Msvc);
 }
 
 /// The machine's filesystem, registry and environment, as the toolchain probe
@@ -3241,11 +3246,16 @@ int main(int argc, char** argv)
     // is why the `!parsedOk` block moved down with it rather than staying put.
     auto const cmd = Cc::ParseCommand(std::span<std::string const> { args });
 
-    // The probe object is a string; what costs anything is CALLING it, so the decision
-    // is which pointer `LoadConfig` gets rather than whether to construct one.
-    // `WantsMarkerProbe` owns that; `ResolveIncludeNoteMarker` owns what wins.
-    CompilerMarkerProbe markerProbe { cmd.compiler };
-    Config const cfg = LoadConfig(WantsMarkerProbe(cmd) ? &markerProbe : nullptr);
+    // Read ONCE and handed to both questions, because they are two questions about one
+    // value: `WantsMarkerProbe` decides whether to pay for a probe, `LoadConfig` decides
+    // what the marker ends up being. Two independent reads would be two places for the
+    // meaning of `auto` to drift apart.
+    //
+    // The probe object is a string and a flavor; what costs anything is CALLING it, so
+    // the decision is which pointer `LoadConfig` gets rather than whether to construct one.
+    auto const namedMarker = EnvOr(Cc::EnvName::MsvcDepsPrefix, "");
+    CompilerMarkerProbe markerProbe { cmd.compiler, cmd.flavor };
+    Config const cfg = LoadConfig(namedMarker, WantsMarkerProbe(cmd, namedMarker) ? &markerProbe : nullptr);
     record.verbose = cfg.verbose;
     // Seeded before anything can dispatch, so the axis always says something true.
     // `NotConfigured` is an ABSENCE, not a failure: a launcher with no scheduler

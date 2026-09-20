@@ -236,7 +236,7 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_TOKEN` | Shared secret presented to a **daemon** started with `--requirepass`. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe against a daemon that requires none: such a daemon accepts it and ignores it. **Not safe with `FASTCACHE_SCHEDULER`** — a compile node serves no `AUTH` verb, so the credential is refused and dispatch stops working entirely ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)). | unset — **no credential sent** |
 | `FASTCACHE_USER` | Username to accompany `FASTCACHE_TOKEN`. Unset (the usual case) authenticates against the secret alone, which is what `--requirepass` configures. Ignored without a token — a username on its own is a misconfiguration, not a request to authenticate, and sending an empty secret would be refused by every server that wants one. | unset |
 | `FASTCACHE_VERIFY` | Verify one hit in every N by compiling the translation unit again and comparing the objects — see [Verifying that a hit is the right object](#verifying-that-a-hit-is-the-right-object). Costs a whole compile per verified hit, so it is for CI, a nightly, or reproducing a report. `1` checks every hit. Which hits are sampled is decided by hashing the key rather than by chance, so the rate holds over a build and a translation unit that verified verifies again. A value that is not a whole number reads as **off** rather than as an error: this is a diagnostic set by hand, and refusing to compile over a typo in it would break the build it was brought in to investigate. | unset (off) |
-| `FASTCACHE_MSVC_DEPS_PREFIX` | The prefix a **dispatched** compile's synthesised `/showIncludes` notes carry — that is, this build's `msvc_deps_prefix`. Only dispatch needs it: a worker compiles preprocessed text and reports no dependencies, so the launcher writes the record itself, while a local compile emits the compiler's own notes and needs nothing here. Ninja matches the prefix **literally** and knows nothing about languages, so an English note against a localized `msvc_deps_prefix` records **no dependencies at all** for that translation unit and the next header edit does not rebuild it — see [A localized MSVC toolchain](#a-localized-msvc-toolchain). | unset — the launcher then ASKS the compiler, and falls back to the English `Note: including file:` when it will not say |
+| `FASTCACHE_MSVC_DEPS_PREFIX` | The prefix a **dispatched** compile's synthesised `/showIncludes` notes carry — that is, this build's `msvc_deps_prefix`. Only dispatch needs it: a worker compiles preprocessed text and reports no dependencies, so the launcher writes the record itself, while a local compile emits the compiler's own notes and needs nothing here. Ninja matches the prefix **literally** and knows nothing about languages, so an English note against a localized `msvc_deps_prefix` records **no dependencies at all** for that translation unit and the next header edit does not rebuild it — see [A localized MSVC toolchain](#a-localized-msvc-toolchain). | unset — the English `Note: including file:`. Set it to `auto` to have the launcher ASK the compiler instead; see [A localized MSVC toolchain](#a-localized-msvc-toolchain) for why that is opt-in |
 
 The statistics log is located from the usual per-user state variables rather than
 one of the launcher's own. These are read but never written:
@@ -333,22 +333,31 @@ property of the *string*, not of any compiler's UI language.
 holds and never exports, so there are three sources and the launcher takes the first
 that answers:
 
-| Source | When it answers |
+| `FASTCACHE_MSVC_DEPS_PREFIX` | What the launcher does |
 |---|---|
-| `FASTCACHE_MSVC_DEPS_PREFIX` | Whenever it is set to something non-empty. First because it is the only source that can be right about a build the launcher cannot see: you copied it out of `build.ninja`, so you are stating a fact. |
-| Asked of the compiler | When the variable is unset **and** this compile deals in `/showIncludes` **and** the driver is an MSVC one. The launcher writes a one-header translation unit somewhere temporary, preprocesses it with `/EP /showIncludes`, and reads the prefix back off the line that ends in the header it just wrote. |
-| The English `Note: including file:` | Everything else, including a compiler that would not answer. |
+| A prefix, e.g. `Hinweis: Einlesen der Datei:` | Uses it. This is the only source that can be right about a build the launcher cannot see: you copied it out of `build.ninja`, so you are stating a fact. |
+| `auto` | **Asks the compiler.** Writes a one-header translation unit somewhere temporary, preprocesses it with `/EP /showIncludes`, and reads the prefix back off the line that ends in the header it just wrote. Falls back to English if the compiler will not say. |
+| unset | The English `Note: including file:`, on trust. |
 
 With `FASTCACHE_VERBOSE` the launcher names the prefix it used and which of those
 three supplied it, on every dispatched compile that synthesises notes — the one line
 that answers *why did my build stop rebuilding this file*.
 
+**`auto` is opt-in because it costs a compiler spawn per file.** One `fastcache-cc`
+process serves one translation unit, and under CMake + Ninja + MSVC `/showIncludes` is
+on every compile line — so a probe that ran whenever nobody named a prefix would start a
+second compiler for every file in your build, including on **cache hits**, where not
+running a compiler is the entire point. On an English toolchain it would pay that to
+rediscover the default. And the answer cannot be remembered to spread the cost:
+installing a language pack changes what the notes say without changing anything a cache
+stamp covers, so a remembered answer goes stale in the direction that produces a wrong
+result which looks right.
+
+So `auto` is for the build that needs it — and if you already know the string, setting
+it directly is both cheaper and more certain.
+
 The probe runs in your build's **own** environment rather than the anglicized one the
-launcher uses for its other spawns, because the question is what *your* compiles
-print. It is asked afresh each time rather than remembered: installing a language pack
-changes what the notes say without changing anything a cache stamp covers, so a
-remembered answer would go stale in the direction that produces a wrong result which
-looks right. That is why it is asked only when it is actually needed.
+launcher uses for its other spawns, because the question is what *your* compiles print.
 
 Two things it will not do, both deliberate. It refuses a line with blanks in front of
 the prefix, because a note begins at column zero — `cl` puts the inclusion depth
