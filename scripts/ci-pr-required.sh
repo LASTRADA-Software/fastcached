@@ -98,6 +98,115 @@ Unavailable() {
     exit 3
 }
 
+# THE HEAD MOVED UNDER THE WAIT -- its own outcome, exit 4 (#1289).
+#
+# A fifth answer beside settled, running, absent and failed, and it is not a
+# failure of the pull request. Under `--wait` every poll re-reads the head SHA
+# from the SAME response that yields `mergeable_state`, so the two cannot
+# describe different moments. If it has moved, every verdict this tool could
+# print is about a commit that is no longer the head -- and the contexts of the
+# NEW head have their own states nobody has looked at.
+#
+# It REFUSES rather than silently re-basing onto the new head. A waiter that
+# follows the head is answering a question nobody asked: the caller asked about
+# the tree it pushed, and a force-push during the wait means somebody else's
+# tree is now under the same number. Reporting the new head's verdict under the
+# old head's question is how a green is attributed to the wrong commit.
+#
+# @param 1 the SHA the wait started on  @param 2 the SHA it found
+HeadMoved() {
+    echo "VERDICT: HEAD MOVED -- the wait started on $1 and #${PrNumber:-?} now points at $2."
+    echo "  Nothing above describes the current head. The contexts that were"
+    echo "  running belong to $1, and $2 has its own, which nothing here has read."
+    echo "  This is exit 4 so a caller cannot read it as a pass, a block, or an"
+    echo "  instrument failure. Re-run against the new head deliberately."
+    exit 4
+}
+
+# Has the head moved under the wait? Pure, and reachable from `--head-guard` for
+# the same reason `ListingVerdict` is reachable from `--listing-verdict`: a
+# decision reachable only through the network is one nobody has driven in either
+# direction. A real force-push mid-poll cannot be arranged in a fixture, and this
+# is the decision that force-push exists to trip.
+#
+# An EMPTY first SHA is the first poll, not a move -- there is nothing to have
+# moved from. An empty CURRENT SHA is not a comparison at all and refuses, rather
+# than reading as `same` and letting a wait continue against nothing.
+#
+# @param 1 the SHA the wait started on, empty on the first poll
+# @param 2 the SHA this poll read
+# @return prints `same`, `moved` or `refuse`
+HeadGuard() {
+    local first="$1" current="$2"
+    [[ -n "$current" ]] || { echo "refuse"; return; }
+    if [[ -z "$first" || "$first" == "$current" ]]; then echo "same"; else echo "moved"; fi
+}
+
+# Should the wait poll again? Pure, and reachable from `--wait-decision`.
+#
+# `stop-decided` is the clause the ticket names: a head that CONFLICTS does not
+# clean itself, so it exits on the refusal it already has rather than polling to
+# the timeout and printing the same thing. Only `merges` and `uncomputed` are
+# still open -- `behind`, `conflicts`, `history` and `refuse` have all decided
+# something waiting cannot change.
+#
+# **ABSENT IS NOT SETTLED, AND THAT IS WHY THIS TAKES FIVE INPUTS.** A required
+# context that has not been dispatched is RUNNING=0 and ABSENT=1, and keying
+# `stop-settled` on RUNNING alone read that as *everything concluded* -- so a
+# `--wait` on a pull request whose checks had not started yet returned on poll 1
+# announcing a settled verdict over contexts nothing had run. That is the
+# four-state collapse this file exists to refuse, in the wait loop rather than in
+# the tally. `absent` therefore holds the answer open exactly as `running` does.
+#
+# The three readings of ABSENT are three different facts, and the merge kind is
+# what separates them:
+#
+#   * absent while the head MERGES -- CI has not dispatched yet, or a matrix leg
+#     has not expanded. Open: `poll`, and `stop-timeout` once the ceiling is up.
+#   * absent while the head CONFLICTS -- GitHub computes no merge ref for a
+#     conflicting pull request and dispatches NOTHING, so these contexts will
+#     never arrive and no ceiling is long enough. `stop-decided`, and the caller
+#     says which of the two silences this was.
+#   * nothing absent and nothing running -- every required context reported.
+#     `stop-settled`, which is now a claim about both counts.
+#
+# @param 1 the merge kind from `MergeVerdict`
+# @param 2 how many required contexts are RUNNING
+# @param 3 how many required contexts are ABSENT
+# @param 4 seconds already spent  @param 5 the ceiling
+# @return prints `poll`, `stop-decided`, `stop-settled` or `stop-timeout`
+WaitDecision() {
+    local kind="$1" running="$2" absent="$3" waited="$4" ceiling="$5"
+    case "$kind" in
+        merges|uncomputed) ;;
+        *) echo "stop-decided"; return ;;
+    esac
+    if [[ "$running" -le 0 && "$absent" -le 0 ]]; then echo "stop-settled"; return; fi
+    [[ "$waited" -lt "$ceiling" ]] || { echo "stop-timeout"; return; }
+    echo "poll"
+}
+
+# How many required contexts are in a given state, read from the decision's own
+# TALLY line rather than recounted -- a second count of one thing is a second
+# thing that can be wrong.
+#
+# One reader taking the STATE as a parameter, not one function per state: the
+# tally prints seven and a second copy of this awk per state is seven chances to
+# spell a name that is never emitted, which reads back as `-1` and refuses on a
+# healthy tree. A state the tally does not carry is `-1`, the same answer as no
+# TALLY at all, because both mean *this file does not say*.
+#
+# @param 1 the decision file  @param 2 the state name, as the TALLY spells it
+TallyCount() {
+    awk -F'\t' -v want="$2" '
+        /^TALLY/ {
+            for (i = 2; i <= NF; i++)
+                if ($i ~ "^" want "=") { sub("^" want "=", "", $i); print $i + 0; found = 1 }
+        }
+        END { if (!found) print -1 }
+    ' "$1"
+}
+
 # Did the listing answer the question that was asked?
 #
 # Pure, and reachable from `--listing-verdict` so the self-test drives it without
@@ -564,7 +673,10 @@ Render() {
 usage() {
     echo "usage: $(basename "${BASH_SOURCE[0]}") --pr <number>" >&2
     echo "       $(basename "${BASH_SOURCE[0]}") --record <file> --merge-state <mergeable_state> --mergeable <true|false|null>" >&2
+    echo "       $(basename "${BASH_SOURCE[0]}") --pr <number> --wait [--wait-interval <s>] [--wait-timeout <s>]" >&2
     echo "       $(basename "${BASH_SOURCE[0]}") --listing-verdict <total_count> <rows-read>" >&2
+    echo "       $(basename "${BASH_SOURCE[0]}") --head-guard <first-sha> <current-sha>" >&2
+    echo "       $(basename "${BASH_SOURCE[0]}") --wait-decision <merge-kind> <running> <absent> <waited> <ceiling>" >&2
     echo "  the verdicts are driven by scripts/check-pr-required.sh --self-test" >&2
     echo "  exit 0 every required context is SUCCESS, and the head is neither behind nor conflicting" >&2
     echo "         (or the pull request is no longer open, and the verdict is a record)" >&2
@@ -572,6 +684,7 @@ usage() {
     echo "  exit 2 refusing to give a verdict about the pull request, including a merge state" >&2
     echo "         not yet computed or not named by MergeStates" >&2
     echo "  exit 3 the instrument could not ask -- nothing was measured" >&2
+    echo "  exit 4 the head moved under --wait, so no verdict describes the current head" >&2
     exit 2
 }
 
@@ -599,10 +712,54 @@ case "$1" in
         [[ $# -eq 3 ]] || usage
         ListingVerdict "$2" "$3"
         ;;
+    # Doors for the same reason `--listing-verdict` is one: these two decide what
+    # `--wait` does, and a real force-push mid-poll cannot be staged in a fixture.
+    --head-guard)
+        [[ $# -eq 3 ]] || usage
+        HeadGuard "$2" "$3"
+        ;;
+    --wait-decision)
+        [[ $# -eq 6 ]] || usage
+        WaitDecision "$2" "$3" "$4" "$5" "$6"
+        ;;
     --pr)
-        [[ $# -eq 2 ]] || usage
+        [[ $# -ge 2 ]] || usage
+        PrNumber="$2"
+        shift 2
+        # `--wait` wraps the decision below; it does not replace it. Every poll
+        # runs the SAME acquisition and the SAME `Decide`/`Render`, so a waiting
+        # run and a one-shot run cannot disagree about a settled head (#1289).
+        #
+        # It exists because this tool was one-shot and every lane hand-rolled its
+        # own waiter in a scratchpad -- each one a fresh chance to get the
+        # head-moved case wrong, and none of them ever did get it right.
+        Waiting=0
+        WaitInterval=20
+        WaitTimeout=1800
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --wait)          Waiting=1; shift ;;
+                --wait-interval) [[ $# -ge 2 ]] || usage; WaitInterval="$2"; shift 2 ;;
+                --wait-timeout)  [[ $# -ge 2 ]] || usage; WaitTimeout="$2"; shift 2 ;;
+                *) usage ;;
+            esac
+        done
+        case "$WaitInterval" in ''|*[!0-9]*) Fatal "--wait-interval takes whole seconds, not '$WaitInterval'" ;; esac
+        case "$WaitTimeout"  in ''|*[!0-9]*) Fatal "--wait-timeout takes whole seconds, not '$WaitTimeout'" ;; esac
+        [[ "$WaitInterval" -gt 0 ]] || Fatal "--wait-interval must be above zero, or the poll is a spin"
         command -v gh >/dev/null 2>&1 || Unavailable "gh is not on PATH"
         repo="${FASTCACHED_REPO:-LASTRADA-Software/fastcached}"
+        rec="$(mktemp)"; req="$(mktemp)"; dec="$(mktemp)"
+        # shellcheck disable=SC2064
+        trap "rm -f '$rec' '$req' '$dec'" EXIT
+        ReadRequiredContexts > "$req"
+        FirstSha=""
+        # The bound MEASURES itself by counting the sleep it ASKED for, never a
+        # wall clock: `SECONDS` and `date` read CLOCK_REALTIME, which a VM host
+        # steps in both directions, and a forward step SHORTENS the bound so a
+        # healthy wait gives up early and reads as a slow runner.
+        Waited=0
+        while :; do
         # REST throughout, deliberately, and it is not a preference.
         #
         # The GraphQL budget is per USER and every lane on this machine shares
@@ -619,12 +776,12 @@ case "$1" in
         # The head SHA and the merge state come from ONE response, so the two cannot describe
         # different moments. Split by expansion rather than `IFS=$'\t' read`, which collapses
         # an empty field and would shift `mergeable` into `mergeable_state`.
-        head="$(gh api "repos/$repo/pulls/$2" \
+        head="$(gh api "repos/$repo/pulls/$PrNumber" \
             --jq '[.head.sha, (.mergeable_state // ""), (if .mergeable == null then "null" else (.mergeable | tostring) end), (if .merged then "merged" elif .state == "closed" then "closed" else "open" end)] | @tsv')" \
-            || Unavailable "the API would not answer the head SHA of #$2 -- read gh's message above"
+            || Unavailable "the API would not answer the head SHA of #$PrNumber -- read gh's message above"
         case "$head" in
             *$'\t'*$'\t'*$'\t'*) ;;
-            *) Unavailable "the pull request response for #$2 did not carry four fields: '$head'" ;;
+            *) Unavailable "the pull request response for #$PrNumber did not carry four fields: '$head'" ;;
         esac
         sha="${head%%$'\t'*}"
         head="${head#*$'\t'}"
@@ -637,13 +794,18 @@ case "$1" in
         case "$openness" in
             open) ;;
             merged|closed) mergeState="$openness" ;;
-            *) Unavailable "#$2 came back neither open, merged nor closed: '$openness'" ;;
+            *) Unavailable "#$PrNumber came back neither open, merged nor closed: '$openness'" ;;
         esac
-        [[ -n "$sha" ]] || Unavailable "#$2 came back with no head SHA"
-        [[ -n "$mergeState" ]] || Unavailable "#$2 came back with no mergeable_state, so nothing says whether its head merges"
-        rec="$(mktemp)"; req="$(mktemp)"; dec="$(mktemp)"
-        # shellcheck disable=SC2064
-        trap "rm -f '$rec' '$req' '$dec'" EXIT
+        [[ -n "$sha" ]] || Unavailable "#$PrNumber came back with no head SHA"
+        [[ -n "$mergeState" ]] || Unavailable "#$PrNumber came back with no mergeable_state, so nothing says whether its head merges"
+        # The head, compared against the one this wait started on. Read from the
+        # SAME response as `mergeable_state` above, so the two cannot describe
+        # different moments -- which is the whole reason the guard can be trusted.
+        case "$(HeadGuard "$FirstSha" "$sha")" in
+            same)   [[ -n "$FirstSha" ]] || FirstSha="$sha" ;;
+            moved)  HeadMoved "$FirstSha" "$sha" ;;
+            *)      Unavailable "the head guard could not compare '$FirstSha' with '$sha'" ;;
+        esac
         # One page of 100, and the total is read back rather than assumed.
         #
         # Deliberately NOT `--paginate`: it emits one complete JSON document per
@@ -675,11 +837,62 @@ case "$1" in
                 Unavailable "ListingVerdict answered a word this script does not enumerate"
                 ;;
         esac
-        echo "#$2 at $sha -- $got check run(s)"
-        ReadRequiredContexts > "$req"
+        echo "#$PrNumber at $sha -- $got check run(s)"
         ApplyReaderControl "$rec" "$req"
         Decide "$rec" "$req" > "$dec" || true
-        Render "$dec" "$mergeState" "$mergeable"
+
+        status=0
+        Render "$dec" "$mergeState" "$mergeable" || status=$?
+
+        # One-shot is the default and behaves exactly as before.
+        [[ "$Waiting" -eq 1 ]] || exit "$status"
+
+        # Whether waiting could still change the answer is the MERGE half's
+        # question, and only two of its six kinds are still open. `conflicts`
+        # is the one the ticket names: a dirty head does not clean itself, so
+        # it exits on poll 1 on the refusal it already had rather than
+        # polling until the timeout and then printing the same thing.
+        mergeKind="$(MergeVerdict "$mergeState" "$mergeable")"
+        mergeKind="${mergeKind%%|*}"
+
+        running="$(TallyCount "$dec" RUNNING)"
+        absent="$(TallyCount "$dec" ABSENT)"
+        if [[ "$running" -lt 0 || "$absent" -lt 0 ]]; then
+            # The decision carried no TALLY, so nothing says how many contexts
+            # are in flight. Waiting on an unreadable count is waiting on
+            # nothing; this is the instrument, not the pull request.
+            Unavailable "the decision carried no TALLY line, so nothing says how many contexts are still running or absent"
+        fi
+
+        case "$(WaitDecision "$mergeKind" "$running" "$absent" "$Waited" "$WaitTimeout")" in
+            stop-settled) exit "$status" ;;
+            stop-decided)
+                # Absent contexts on a decided head are worth a sentence, because
+                # the two silences look identical in the tally and are opposite
+                # diagnoses. A conflicting pull request has no merge ref, so the
+                # workflows never dispatched; reading that as *CI is slow* is how
+                # a queued branch sits for an afternoon (#1352).
+                if [[ "$absent" -gt 0 && "$mergeKind" == "conflicts" ]]; then
+                    echo "  ${absent} required context(s) are ABSENT and will stay absent: a conflicting"
+                    echo "  pull request has no merge ref, so nothing was dispatched to report them."
+                    echo "  Waiting cannot produce them. Resolve the conflict and push."
+                fi
+                exit "$status"
+                ;;
+            stop-timeout)
+                echo "  the wait gave up after ${Waited}s with ${running} context(s) running and ${absent} absent."
+                echo "  That is the verdict above, not a separate outcome: they had not"
+                echo "  reported yet, which is what RUNNING and ABSENT already say."
+                exit "$status"
+                ;;
+            poll) ;;
+            *) Unavailable "WaitDecision answered a word this script does not enumerate" ;;
+        esac
+
+        echo "  waiting ${WaitInterval}s for ${running} running and ${absent} absent context(s) (${Waited}s of ${WaitTimeout}s spent)"
+        sleep "$WaitInterval"
+        Waited=$(( Waited + WaitInterval ))
+        done
         ;;
     *) usage ;;
 esac
