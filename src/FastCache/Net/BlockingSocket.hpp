@@ -217,9 +217,23 @@ namespace Detail
     ///   on an already-closed handle answers `WSAENOTSOCK` → `BadFileHandle`, so the
     ///   two situations are told apart by the code rather than guessed at.
     /// - **POSIX (Linux/glibc)**: `close` on the listening fd does not wake the parked
-    ///   `accept` at all — the thread was still parked 12.5 s later. There is no
+    ///   `accept` at all — the thread was still parked past a 12 s ceiling. There is no
     ///   cancellation here, so a POSIX caller that closes to stop an acceptor gets a
     ///   thread that never returns.
+    ///
+    /// **The measurement is `scripts/probes/accept-close-wakeup.cpp`, and it is committed
+    /// so this can be re-run rather than re-argued** (#1286). That matters more here than
+    /// for most claims: a reader is by construction on ONE of these two platforms and
+    /// cannot check the other half by reading anything. It carries arm A as the
+    /// discrimination control — without it, asserting a code cannot tell a woken parked
+    /// accept from one called after the close, which is something both sides produce —
+    /// and its own conditions, because a figure outlives the conditions it was taken
+    /// under. The 12 s above is that probe's ceiling, compared against a steady clock and
+    /// reported as the elapsed time actually observed; the "12.5 s" this paragraph used
+    /// to carry was the original throwaway program's 50 × 250 ms sleeps ADDED UP. On
+    /// Linux those are close, so that figure was not wrong — the point is that it was a
+    /// number nobody had observed, which is the one reading that can say whether the
+    /// thread was still parked.
     ///
     /// Nothing is broken by that today because the only caller is
     /// `RunMultiReactorWindows`, inside `#if defined(_WIN32)`; the POSIX server loop
