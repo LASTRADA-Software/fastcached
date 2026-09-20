@@ -6621,9 +6621,19 @@ endif()
 # is the reason to guard the registration, not a reason to loosen the control.
 #
 # The script's two SKIP arms -- no git, and a git that could not stage a linked
-# worktree -- exit 0 having said so on the tally line. That is a `SUCCEED` where a skip
-# belongs, and it is the script's own shape rather than this registration's; it is
-# noted here so the next reader does not mistake a skipped run for a covered one.
+# worktree -- return 77 and this registration reads it (#1231). They exited 0 having
+# said so on the tally line until then, which is a `SUCCEED` where a skip belongs: the
+# arm that fires is the one where the REAL repair, staged against real git, did not
+# run, so the green arrived exactly on the hosts with the least coverage.
+#
+# The two halves land together and neither works alone. A script returning 77 with no
+# `SKIP_RETURN_CODE` here is scored a FAILURE -- a false red, and whoever meets it
+# deletes the 77 rather than suspecting the registration (#1152's shape). A
+# `SKIP_RETURN_CODE` here with a script that still returns 0 changes nothing at all.
+#
+# A failure recorded BEFORE the skip point still fails: the arms return 1 in that
+# case, never 77, or a run that skipped the git half and failed the pure half would
+# report as skipped.
 #
 # Measured 2026-09-10 on this branch, WSL2/Ubuntu-24.04: 23 cases, 0.06 s wall, neither
 # skip arm taken. `TIMEOUT 60` is its neighbours' figure; the margin is enormous and
@@ -6636,6 +6646,7 @@ if(NOT WIN32)
     set_tests_properties("repair-worktree-pointers-selftest" PROPERTIES
         FAIL_REGULAR_EXPRESSION "REPAIR SELF-TEST FAILED:"
         LABELS "hygiene"
+        SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
 endif()
