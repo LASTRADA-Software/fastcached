@@ -363,7 +363,96 @@ class ISocket
     /// this library hands out that can park a read overrides this; a new one that can
     /// must too, and nothing but this sentence enforces that.
     ///
-    /// Idempotent, and not a `Close()`: the socket stays open, and a later `Read` works.
+    /// **It retires whatever is parked NOW. That is not the same as being idempotent,
+    /// and this declaration used to claim the stronger word**
+    /// ([#1233](https://github.com/LASTRADA-Software/fastcached/issues/1233)). A
+    /// retirement that completes its victim INLINE resumes that coroutine before this
+    /// call returns, so the caller's next statement is not the next thing that happens:
+    /// a coroutine that arms its next read there leaves a NEW read in the slot, and a
+    /// second call retires THAT one. What the caller then sees is `Cancelled` on an
+    /// operation nobody cancelled, at a call site that did ask for a cancellation a
+    /// moment earlier -- which is why no caller can notice.
+    ///
+    /// **Which retirements complete inline is a property of the OPERATION, not of the
+    /// platform**, and reading it as POSIX-versus-Windows is the mistake #1233 was filed
+    /// on. Both halves are already pinned by cases in this tree:
+    ///
+    ///  - a parked `WaitReadable` PROBE is retired inline on all three RAW reactor
+    ///    transports -- `EpollSocket` and `KqueueSocket` through
+    ///    `Detail::RetireParkedRead`, and `IocpSocket` through the `readPeekOnly` arm of
+    ///    its own `CancelRead`, because a zero-byte receive carries no data a settle
+    ///    could preserve. They AGREE, and they agree on the surprising behaviour.
+    ///    `Net/CancelRead_test.cpp` asserts it on all three legs; on Windows
+    ///    `Net/IocpSocket_test.cpp`'s *"CancelRead retires a parked probe before it
+    ///    returns"* asserts the inline half directly.
+    ///  - a parked real `Read` is retired inline on epoll and kqueue and **settles** on
+    ///    IOCP, where the receive may already have taken bytes out of the stream.
+    ///    That one really does diverge, deliberately, and it is `IocpSocket_test.cpp`'s
+    ///    *"A real read retired by CancelRead settles rather than resolving inline"*
+    ///    that holds it there.
+    ///
+    /// **RAW is load-bearing in that first bullet, and the exception is a DECORATOR
+    /// rather than a platform.** A `WaitReadable` on `TlsSocket` is not a probe at the
+    /// transport beneath it: it decrypts, and parks on a raw `Read` whenever OpenSSL
+    /// wants more bytes -- the chain is stated at `TlsSocket.hpp`'s own `CancelRead`.
+    /// So a readability watch over TLS falls under the SECOND bullet and SETTLES on
+    /// IOCP, and since `WrapTls` sits between the listener and the protocol handler,
+    /// that is the arrangement a RESP handler is in whenever TLS is configured. The
+    /// three transports agreeing is a fact about raw sockets, not about the socket a
+    /// handler holds, and `Net/CancelRead_test.cpp` drives plaintext only, so nothing
+    /// there would notice the difference. Said at this length because the sentence it
+    /// replaces -- *"retired inline on every transport"* -- was true of everything the
+    /// case exercises and false of a configuration this daemon ships.
+    ///
+    /// **And it was a contradiction of promise TWO, fifty lines above, in this same
+    /// declaration.** That is the shape to watch for rather than the wording: the two
+    /// promises are separate, and only ONE of them is unconditional. The SLOT is free
+    /// when this returns on every transport, with no exception -- which is what makes
+    /// *"synchronous everywhere"* feel safe to write, because it is true of the thing a
+    /// reader checks first. The WAITER is resolved inline except for a real `Read` on a
+    /// completion-based transport, where a receive that already took bytes out of the
+    /// stream cannot be un-received. Collapsing the two is how the over-broad claim gets
+    /// restored, so anyone tempted to shorten this should shorten the SLOT half, which
+    /// needs no exception, and leave the WAITER half its qualifier.
+    ///
+    /// **So a double call is a CALLER error wherever the resumed coroutine may re-arm,
+    /// and it cannot be made a no-op here.** At the second call a socket cannot tell a
+    /// read its own resumption armed from one the caller armed since.
+    ///
+    /// That is not a new finding. It is the conclusion this project already reached about
+    /// the ARM site and recorded in AGENT.md as an explicit retraction of an earlier,
+    /// overstated one: *"the hazard is the SITE, not ownership. At the ARM site a socket
+    /// cannot tell a stale parked wait from a live one, and cancelling a live one is a
+    /// false disconnect that drops a healthy client. **The CALLER can tell.**"* The same
+    /// sentence decides the cancel site, and `Net/ReadSlot.hpp` carries the long form.
+    /// Refusing on a guess is worse than the behaviour it replaces, because it leaves
+    /// parked the read this function's first promise says is gone -- and it was worked as
+    /// far as a real caller before being abandoned: `RedisResp`'s
+    /// `ScopedDisconnectWatch::Retire` retires a watch whose trampoline does NOT re-arm,
+    /// so any provenance mark survives onto the connection loop's next genuine read.
+    ///
+    /// Both callers in this tree retire once and silence their own watch first
+    /// (`RedisResp`'s `ScopedDisconnectWatch::Retire`, `CompileCacheHandler::HandleSubscribe`),
+    /// so neither resumption re-arms; that is the discipline rather than an accident.
+    ///
+    /// **What idempotence WOULD cost, recorded because the next reader deserves the price
+    /// rather than a prohibition.** The one implementation that keeps the first promise is
+    /// deferring the resumption to the reactor, the way IOCP already settles a real read --
+    /// and the work is at those two CALLERS rather than in a transport. Both write a reply
+    /// immediately after retiring, so a deferred retirement leaves the watcher parked
+    /// across that write, which is `Net/WriteSlot.hpp`'s one-writer property and the
+    /// `SettleWatch` rule in `.agent/rules/wire-and-protocol.md`. Whoever wants it starts
+    /// at those two sites with that collision, not at `Detail::RetireParkedRead`.
+    ///
+    /// **What IS a no-op is a call with the slot EMPTY**, and a transport must provide
+    /// that -- but no caller in this tree reaches it twice, so it is a property offered
+    /// rather than an arrangement relied on. `RedisResp`'s `ScopedDisconnectWatch::Retire`
+    /// returns at `if (!_watch)` and drops its watch BEFORE calling, so the RAII
+    /// destructor's retirement stops above the call; `CompileCacheHandler` guards on
+    /// `!watch->finished`. Worth stating precisely, because "the redundant call happens
+    /// harmlessly all the time" is the reading that makes a double call sound safe, and
+    /// the paragraph above is about the case where it is not. And it is not a `Close()`:
+    /// the socket stays open, and a later `Read` works.
     virtual void CancelRead() noexcept {}
 
     /// The remote peer's address as a printable host string ("203.0.113.7" /
