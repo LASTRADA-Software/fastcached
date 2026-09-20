@@ -282,6 +282,19 @@ if [[ "${1:-}" == "--self-test" ]]; then
     for candidate in "$scratch"/tree/.github/workflows/*.yml; do
         SameShaRetriggerTypes "$candidate" >/dev/null || continue
         CancelsRunsInProgress "$candidate" >/dev/null && continue
+        # AND it must carry the line this case is about to flip. The two conditions
+        # above are satisfied by a workflow with NO concurrency block at all, and the
+        # `sed` below then changes nothing -- the case stages no defect and reports
+        # that, which is honest but is a red over a tree with nothing wrong with it.
+        #
+        # Reached for real: `issue-triage.yml` grew a `labeled` trigger (#1563), which
+        # IS a same-SHA re-trigger type, and it sorts before `pr-labels.yml`. It has no
+        # concurrency group and needs none -- it produces no check run on a pull
+        # request at all, which is what its `NonBindingContexts` row already says -- so
+        # the fourth door cannot open there and there was nothing to fix in the
+        # workflow. What was incomplete was this predicate: it selected on the RULE and
+        # not on what the mutation needs.
+        grep -q '^  cancel-in-progress: false$' "$candidate" || continue
         victim="$candidate"
         break
     done
@@ -658,7 +671,7 @@ NonBindingContexts=(
     "Report a failure the merge queue did not gate on|NotBinding|#684 is explicit that this must gate NOTHING: a notifier that turns unrequired jobs into gates by the back door defeats the reason they are unrequired"
     "Decide what this change can affect|NotBinding|check-gated-jobs.sh rule A exists BECAUSE this job can fail without gating -- the fix for a dead classifier is that every reader compares != 'false', not that the classifier becomes a gate"
     "Draft GitHub release|NotBinding|tag-only (if: startsWith(github.ref, 'refs/tags/v')). A pull request can never produce this context, so requiring it would leave every branch waiting on a check that never reports"
-    "Mark as needing triage|NotBinding|triggered by an issues event, so it produces no check run on a pull request at all"
+    "Maintain status/needs-triage|NotBinding|triggered by an issues event, so it produces no check run on a pull request at all. Renamed from 'Mark as needing triage' when the job grew a remover (#1563) -- a workflow job's name IS the context string, so renaming one without moving its row here leaves the new context with no verdict AND a stale row excusing nothing"
     "Apply derivable labels|NotBinding|a pull_request_target job, and it MUTATES rather than checks. Its outcome is enforced by the required Require a type label"
     "Deploy to Pages|NotBinding|a deployment, not a check, and it runs only after a push to master has already merged"
     "Build site (strict)|NotBinding|docs.yml is not reachable from a code change; a docs break is caught on the push that lands it and blocks no unrelated work"
