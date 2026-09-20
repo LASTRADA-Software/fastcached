@@ -8158,3 +8158,85 @@ if(TARGET fastcache-bench)
         )
     endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# The `[wire]` tag reaches every case in a wholly-wire file (#1285).
+#
+# APPENDED AT THE END OF THIS FILE ON PURPOSE. Several lanes append registrations
+# here at once and an append-only conflict resolves by keeping both blocks, which
+# anybody can perform correctly; an interleaved insertion is one nobody can.
+#
+# TWO registrations, and they pin the population from opposite sides. Neither is
+# redundant and neither alone closes the ticket:
+#
+#   - `wire-tag-reach-count` RUNS the tag and pins how many cases ran. It catches a
+#     tag deleted, a case removed or renamed out of the selection, or the binary
+#     losing a translation unit -- the population shrinking.
+#   - `wire-tag-reach` SCANS the source. It catches a case ARRIVING without the tag,
+#     which the run cannot see: an untagged addition leaves the pinned count
+#     untouched and the run green. That is exactly how the tag came to reach 69 of
+#     119 cases in `CompileCacheWire_test.cpp` without anything going red.
+#
+# The measured drift, for whoever reads this next: the tag arrived partway through
+# that file's life at 94412fe7 and was added in 17 later commits, never backfilled.
+# 50 of the 119 cases carried no tag string at all, 43 of them below line 1200 --
+# the file's older band. Nothing was wrong with any of those cases; they were simply
+# unreachable by the selector everyone believed covered them.
+add_test(
+    NAME "wire-tag-reach"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-wire-tag-reach.sh" --root "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("wire-tag-reach" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# Four cases, and the ACCEPTING arm is first rather than last: a guard nobody has
+# watched accept is not known to work either, and one that refused every tree would
+# pass every refusing case. The third case pins the stated blind spot -- a `[wire]`
+# in a full-line comment must not be counted, or a comment could mask a missing tag.
+add_test(
+    NAME "wire-tag-reach-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-wire-tag-reach.sh" --self-test
+)
+set_tests_properties("wire-tag-reach-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+# The run, guarded on the TARGET as well as on anything else that makes it
+# interesting: a `$<TARGET_FILE:x>` naming a target that was not built is a hard
+# error at GENERATE time, which fails the whole configure and names CMake rather
+# than the option the operator set.
+if(TARGET FastCacheTest)
+    add_test(
+        NAME "wire-tag-reach-count"
+        COMMAND $<TARGET_FILE:FastCacheTest> "[wire]"
+    )
+    set_tests_properties("wire-tag-reach-count" PROPERTIES
+        # The count is PINNED, not merely non-zero. `[1-9][0-9]*` -- the idiom
+        # `bench-build-banner` uses -- passes over any population at all, which is
+        # the assertion that could not have failed while this ticket was open: 69
+        # cases ran, and 69 is non-zero.
+        #
+        # 169 = 119 (CompileCacheWire) + 23 (RaftWire) + 16 (ClusterState)
+        #     + 9 (DiscoveryWire) + 1 (RaftTypes) + 1 (SchedulerService).
+        # The first four files are wholly wire subject and are the scan's table; the
+        # last two carry wire cases among others, which is why the scan cannot cover
+        # them and why this number is the only thing that watches them.
+        #
+        # `[(]` rather than `\(`: CMake reads `\(` in a quoted argument as an escape
+        # and stores a bare `(`, which its regex engine then takes as a capture group
+        # -- so the pattern silently stops requiring the parenthesis Catch2 prints.
+        #
+        # `PASS_REGULAR_EXPRESSION` replaces the exit status as the verdict, which is
+        # why the pattern is anchored on `All tests passed`: Catch2 prints that only
+        # when every selected case passed, and a run that crashed before printing
+        # anything matches nothing. No `SKIP_RETURN_CODE` here -- Catch2's exit code
+        # is its failed-assertion count clamped at 255 (#1152), and the pattern has
+        # already replaced the status.
+        PASS_REGULAR_EXPRESSION "All tests passed [(][0-9]+ assertions in 169 test cases[)]"
+        LABELS "hygiene"
+        TIMEOUT 300
+    )
+endif()
