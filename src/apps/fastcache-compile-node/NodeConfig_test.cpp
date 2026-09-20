@@ -281,7 +281,7 @@ TEST_CASE("The node's credential is a secret and nothing else", "[node][config]"
     NodeConfig cfg;
     std::array const args { "--requirepass=hunter2" };
     REQUIRE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { args }, cfg).has_value());
-    CHECK(cfg.token == "hunter2");
+    CHECK(cfg.requirePass == "hunter2");
 
     for (auto const& spelling: { std::string_view { "--user" }, std::string_view { "--username" } })
     {
@@ -554,7 +554,7 @@ TEST_CASE("NodeConfig: the credential is never written into a registration", "[n
     // what the scheduler authenticates this worker by, so publishing it to every
     // local account would let any of them register as this worker.
     auto cfg = Installable();
-    cfg.token = "hunter2";
+    cfg.requirePass = "hunter2";
 
     auto const spec = MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg);
 
@@ -4461,7 +4461,7 @@ TEST_CASE("NodeSecretFiles: the configuration file is gated on provenance", "[no
     std::filesystem::path const configFile { "/etc/fastcached/fastcache-compile-node.yaml" };
 
     NodeConfig cfg;
-    cfg.token = "hunter2";
+    cfg.requirePass = "hunter2";
 
     SECTION("a secret out of the file is asked about")
     {

@@ -67,4 +67,4 @@
 # paragraphs below the sentence forbidding exactly that.
 
 max-bullet-lines|8
-total-lines|1618
+total-lines|1620

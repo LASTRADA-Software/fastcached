@@ -10,6 +10,8 @@
 #include <memory>
 #include <optional>
 #include <ranges>
+#include <span>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -358,4 +360,147 @@ TEST_CASE("the production credential buffer is a drop-in for a byte vector", "[s
     CHECK(std::ranges::equal(view, BytesView { SecretMaterial }));
 
     static_assert(std::is_same_v<SecureByteBuffer::value_type, std::byte>);
+}
+
+// ---------------------------------------------------------------------------
+// SecureString: the TEXT credential (#1125)
+// ---------------------------------------------------------------------------
+//
+// Same arena, same argument, one extra question. `SecureByteBuffer` covers a credential
+// that arrives as bytes; the ones that arrive as TEXT -- `--requirepass`, the dashboard
+// credential, the contents of every `*-token-file` -- were plain `std::string`s.
+//
+// **The extra question is the small-string optimisation, and it is what makes a
+// `std::string` unfixable by an allocator alone.** A `std::basic_string` keeps a short
+// value inside its own footprint and never calls an allocator for it, so a secret below
+// the threshold is released with its characters intact however the third template
+// parameter is spelled. The threshold belongs to the standard library rather than to the
+// program -- measured at 15 on libstdc++ 14 and 22 on libc++ 22 -- so the same source is
+// covered on one platform and not on another, which is precisely the shape that cannot be
+// found by reading.
+//
+// `SecureString` therefore keeps its characters in a `std::vector`, which has no such
+// optimisation, and the case below asserts that rather than asserting it in a comment:
+// a secret SHORT ENOUGH to have fit inline on either library is still found in arena
+// storage. Under a `std::basic_string`-backed implementation the arena would never be
+// touched at all, and `IndexOf` would answer nothing.
+
+namespace
+{
+
+using ObservableString = BasicSecureString<ArenaAllocator<char>>;
+
+/// Build a text credential drawing from @p arena.
+/// @param arena Storage to use.
+/// @param text  The secret to hold.
+/// @return The credential.
+[[nodiscard]] ObservableString MakeString(Arena& arena, std::string_view text)
+{
+    return ObservableString { text, ObservableString::allocator_type { ArenaAllocator<char> { &arena } } };
+}
+
+/// A recognisable stand-in for a text credential, and SHORT on purpose.
+///
+/// Eight characters, which is below BOTH measured inline thresholds, so on every platform
+/// this project builds for a `std::string` would have kept it inside its own footprint.
+/// That is what makes the arena assertion below discriminating rather than incidental.
+constexpr std::string_view ShortSecret = "s3cr3t!!";
+static_assert(ShortSecret.size() < 15,
+              "the point of this secret is that BOTH standard libraries would have stored it inline: "
+              "15 on libstdc++ 14, 22 on libc++ 22. Lengthen it and the case still passes, for the "
+              "uninteresting reason that a long string is on the heap everywhere");
+
+/// @param region Bytes to inspect. @param text What to look for. @return Whether the
+///         region begins with @p text.
+[[nodiscard]] bool BeginsWith(BytesView region, std::string_view text)
+{
+    return region.size() >= text.size()
+           && std::ranges::equal(region.first(text.size()), std::as_bytes(std::span<char const> { text }));
+}
+
+} // namespace
+
+TEST_CASE("a released text credential leaves zeroes in the storage it held", "[secure][securestring]")
+{
+    Arena arena;
+
+    // The same PAIR of observations the byte-buffer case is built on, and for the same
+    // reason: "all zero afterwards" is also what an arena nobody wrote to reports, so the
+    // secret has to be seen present at those exact offsets first.
+    std::size_t held = 0;
+    {
+        auto const secret = MakeString(arena, ShortSecret);
+        REQUIRE(secret.size() == ShortSecret.size());
+
+        auto const found = arena.IndexOf(secret.View().data());
+        REQUIRE(found.has_value());
+        held = Unwrap(found);
+
+        auto const region = arena.Region(held);
+        CHECK(BeginsWith(region, ShortSecret));
+        CHECK_FALSE(AllZero(region));
+    }
+
+    CHECK(AllZero(arena.Region(held)));
+}
+
+TEST_CASE("a text credential short enough to fit inline is still in allocator storage", "[secure][securestring]")
+{
+    // **The case that separates `SecureString` from `std::basic_string` with the secure
+    // allocator in its third slot**, which is the one-line implementation this ticket
+    // expected to be and which is covered only above the standard library's inline
+    // threshold.
+    //
+    // Nothing here is about the wipe. The claim is narrower and is the premise the wipe
+    // rests on: for a secret this short the allocator is REACHED. A string-backed
+    // implementation reaches it on no platform for eight characters, so `handouts` would
+    // be empty and `IndexOf` would answer nothing.
+    //
+    // **This case exists for the DIAGNOSIS, not for the coverage**, and the sentence it
+    // replaces claimed otherwise -- that the case above would pass vacuously because
+    // `Region(0)` of an untouched arena is all zero. Both halves were wrong: that case
+    // reads `Region(held)` with `held` taken from `IndexOf` behind a `REQUIRE`, so it
+    // FAILS under the same neuter rather than passing, and `Region` indexes `handouts`
+    // with `.at()`, so `Region(0)` on an untouched arena throws rather than answering
+    // zeroes. What that case cannot do is say WHY: it reds on a missing index inside a
+    // test about zeroing, which reads as a broken wipe. This one names the premise, and
+    // the `static_assert` above pins it.
+    //
+    // Asserted on every leg rather than under an `#if`: the threshold differs per standard
+    // library, so one platform cannot answer for another, and what is asserted here is
+    // that the answer no longer depends on which library is underneath.
+    Arena arena;
+    auto const secret = MakeString(arena, ShortSecret);
+
+    REQUIRE_FALSE(arena.handouts.empty());
+    auto const found = arena.IndexOf(secret.View().data());
+    INFO("a secret of " << ShortSecret.size() << " characters reached the allocator " << arena.handouts.size()
+                        << " time(s)");
+    REQUIRE(found.has_value());
+    CHECK(BeginsWith(arena.Region(Unwrap(found)), ShortSecret));
+}
+
+TEST_CASE("replacing a secret zeroes the characters it replaced", "[secure][securestring]")
+{
+    // The reload path, which is where this credential is multiplied: `--requirepass` is
+    // `Reloadable::Yes`, and `ConfigReloader` keeps a previous snapshot beside the current
+    // one for as long as a reader holds it. Every one of those copies is released, and a
+    // release is the only moment a wipe can happen.
+    Arena arena;
+
+    auto secret = MakeString(arena, ShortSecret);
+    auto const first = Unwrap(arena.IndexOf(secret.View().data()));
+    REQUIRE(BeginsWith(arena.Region(first), ShortSecret));
+
+    // A different value, long enough that the new characters cannot be mistaken for the
+    // old ones however the container decides to reuse storage.
+    constexpr std::string_view Replacement = "a-completely-different-credential";
+    secret = ObservableString { Replacement, ObservableString::allocator_type { ArenaAllocator<char> { &arena } } };
+
+    auto const second = Unwrap(arena.IndexOf(secret.View().data()));
+    REQUIRE(second != first);
+    CHECK(BeginsWith(arena.Region(second), Replacement));
+
+    // The block the first secret lived in, after it was released.
+    CHECK(AllZero(arena.Region(first)));
 }

@@ -24,15 +24,34 @@
 set -uo pipefail
 
 Root=""
+RootGiven=0
 SelfTest=0
 
+# `--root` is parsed in the long form for two reasons, both measured rather than foreseen.
+#
+#   - `shift 2` with one argument left SHIFTS NOTHING and returns 1. With `set -e` off --
+#     which it is, deliberately, four lines above -- the loop re-reads `--root` forever.
+#     `bash scripts/check-credential-containers.sh --root` never terminated. Under ctest
+#     that is a TIMEOUT, and a timeout is not a verdict about the tree: a hang here and a
+#     stalled runner are indistinguishable, which is the state collapse `run-check.sh`
+#     exists to prevent, reintroduced in the argument parser.
+#   - `Root="${2:-}"` made "no --root" and "--root with an empty value" the same state, so
+#     an empty one fell through to the default tree below and reported `ok` over THIS
+#     repository's `src/`. A caller whose `$(...)` came back empty was told its own tree
+#     was clean. Provenance, not a value test: `RootGiven` is what the default consults.
 while [ $# -gt 0 ]; do
     case "$1" in
-        --root) Root="${2:-}"; shift 2 ;;
+        --root)
+            [ $# -ge 2 ] || { printf 'option --root needs a directory\n' >&2; exit 2; }
+            Root="$2"
+            RootGiven=1
+            shift 2
+            ;;
         --self-test) SelfTest=1; shift ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
+[ "$RootGiven" -eq 0 ] || [ -n "$Root" ] || { printf 'option --root was given an empty value\n' >&2; exit 2; }
 
 # NOT named `fail`. That is the reserved name of the shared helper in
 # `scripts/lib/e2e-common.sh`, and `check-e2e-helpers.sh` refuses a second definition of it
@@ -62,6 +81,8 @@ pseudoRandomKey|the HKDF PRK, from which every output key is expanded (Core/Hkdf
 outputKeyMaterial|the HKDF output: the derived key itself (Core/Hkdf)
 identitySeed|the seed a node identity key is derived from, drawn when it is minted (NodeKey, #178)
 keyFileBytes|the contents of a node-key file, which carry that seed (NodeKey, #178)
+_secret|the shared secret a credential holder keeps -- AuthPolicy, AdminCredential, and the credential-source fakes that stand in for them (Auth/AuthPolicy, Server/AdminCredential, #1125)
+requirePass|the client-authentication secret of the daemon, which ConfigReloader multiplies by every retained snapshot (Config/Config, #1125)
 '
 # The rows are the per-node identity's (#178): the table's claim is "these names hold key
 # material", and a node's signing key and a session's derived keys are exactly that. Each name is
@@ -78,6 +99,37 @@ keyFileBytes|the contents of a node-key file, which carry that seed (NodeKey, #1
 # most of the tree, so that row would refuse hundreds of correct declarations, and a guard
 # that has to be suppressed everywhere is one somebody deletes. That is what forced the
 # RENAME rather than a wider vocabulary -- the holder is named for what it holds.
+#
+# `_secret` and `requirePass` are #1125's rows: the TEXT credentials, where the container is
+# `SecureString` rather than `SecureByteBuffer`. `\b`-anchored as everything here is, so
+# `_secret` does not reach `_secretKey` and `requirePass` does not reach
+# `requirePassExplicit` -- which is a provenance BIT and holds no secret.
+#
+# THREE names were considered for #1125 and are deliberately NOT rows, each for a different
+# reason, because an omission that looks like an oversight gets 'fixed' into a refusal
+# nobody can satisfy:
+#
+#   `secret`  -- reaches `Cc::Credential::secret` in `apps/fastcache-cc/CacheProtocol.hpp`.
+#                NOT a dependency wall: that header already includes `Net/ISocket.hpp` and
+#                `Core/SecureBytes.cpp` is already a `_fc_cc_core` row. The reason is that
+#                retyping it RELOCATES the plain copy rather than removing it -- to
+#                `Wire::AuthRequest`, to an `optional<std::string>` in `CredentialOrNone`,
+#                and to the RESP `AUTH` vector `SocketExchange.cpp` encodes. All three are
+#                heap residue, so that is #1125's OWN subject continued and not a larger
+#                one; it is filed as #1578. **That vector is NAMED `argv` and is not a
+#                process argument list** -- `fastcache-cli` spawns no process at all, and
+#                it is written here because the name produced exactly that misreading once.
+#   `dashboardToken`
+#             -- a real wall, and the reason differs: `Protocol/CompileCacheWire.hpp` is
+#                header-only because the launcher does not LINK `FastCache`, and
+#                `SecureBytes.hpp` needs `SecureBytes.cpp` for `SecureZero`.
+#   `token`   -- far too broad: `PathCanon`'s parser, `CpuFeatures`' banner reader and a
+#                lease's public identifier all spell it, and none is key material. This is
+#                the `key` argument again.
+#
+# Where those secrets LAND is therefore still plain storage, and that is a stated boundary
+# rather than a gap this table forgot -- `fastcache-cli`'s `main.cpp` writes the conversion
+# out longhand at the two sites where it happens.
 
 # Types that OWN bytes. A borrowing view (`std::span`, `BytesView`, `std::string_view`)
 # is deliberately absent: it owns no storage, so there is nothing for it to zero, and
@@ -122,8 +174,20 @@ SourceFiles() {
 # made the difference was running it once per FILE instead of once per (file, identifier),
 # and then not running it on files that cannot match at all (#1331).
 # reads a file path on $1
+# Three introducers, not two: `//`, a `/*` OPENING a block, and a `*` continuing one. The
+# opener was missing, so a one-line `/* ... std::string requirePass; ... */` was read as
+# code and reported as a violation -- the FALSE-POSITIVE direction, which case 6 below
+# already names as the one that gets acted on, because a finding looks like work. #1125
+# widened the exposure rather than creating it: `requirePass` and `_secret` are spelled in
+# explanatory prose all over this tree, where `pseudoRandomKey` never is.
+#
+# WHAT IS STILL NOT COVERED, and it is a property of every regex-shaped reader here: the
+# INTERIOR of a block comment whose lines begin with neither `*` nor `//` is read as code.
+# This tree's style puts a `*` on continuation lines, so the residue is narrow, and a prose
+# line has to look like a DECLARATION to produce a finding at all. Stated because a reader
+# who takes "comments are stripped" literally will over-trust it.
 CodeLines() {
-    awk '!/^[[:space:]]*(\/\/|\*)/ { print NR ":" $0 }' "$1" 2>/dev/null
+    awk '!/^[[:space:]]*(\/\/|\/\*|\*)/ { print NR ":" $0 }' "$1" 2>/dev/null
 }
 
 # $1: root. Prints "file:line:text" for every offending declaration; sets Matched counts.
@@ -304,6 +368,8 @@ SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
+SecureString _secret;
+SecureString requirePass;
 std::array<std::byte, 32> publicKey;
 
 EOF
@@ -339,6 +405,8 @@ SecureByteBuffer inputKeyMaterial;
 SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
+SecureString _secret;
+SecureString requirePass;
 EOF
     verdict=$(bash "$0" --root "$tmp/blind" 2>&1)
     if grep -q "identifier 'keyFileBytes' matches nothing" <<< "$verdict"; then
@@ -383,6 +451,8 @@ SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
+SecureString _secret;
+SecureString requirePass;
 inline std::string SealWith(std::span<std::byte const> sharedSecret, int claims);
 bool Authenticate(std::span<std::byte const> sharedSecret, std::string_view token);
 EOF
@@ -409,6 +479,56 @@ EOF
     fi
     cases=$((cases + 1))
 
+    # Case 8: a TEXT credential in a plain std::string. The #1125 rows, and the direction
+    # that matters: `SecureByteBuffer` covers a credential that arrives as bytes, and every
+    # one that arrives as text -- `--requirepass`, a dashboard token, the contents of a
+    # `*-token-file` -- was a plain `std::string` released with its characters intact. The
+    # clean tree above is the control that these rows are about the CONTAINER rather than
+    # about the names.
+    mkdir -p "$tmp/text"
+    cp "$tmp/clean/a.hpp" "$tmp/text/a.hpp"
+    printf 'std::string requirePass {};\n' >> "$tmp/text/a.hpp"
+    verdict=$(bash "$0" --root "$tmp/text" 2>&1)
+    if grep -q 'requirePass declared as std::string' <<< "$verdict"; then
+        printf 'ok   case 8: a text credential in a plain std::string is reported\n'
+    else
+        printf 'FAIL case 8: text credential not reported. Got: %s\n' "$verdict"; return 1
+    fi
+    cases=$((cases + 1))
+
+    # Case 9: the OTHER #1125 row. Case 8 proves `requirePass` is live; deleting the
+    # `_secret` row passed the whole suite AND the real tree, because case 3 proves only
+    # that SOME term refusing to match is caught, and the real tree proves only that
+    # `_secret` matches something. Neither asks whether a violation spelled `_secret` is
+    # REPORTED. Two rows added by one commit, one of them untested, and the suite green.
+    mkdir -p "$tmp/text2"
+    cp "$tmp/clean/a.hpp" "$tmp/text2/a.hpp"
+    printf 'std::string _secret {};\n' >> "$tmp/text2/a.hpp"
+    verdict=$(bash "$0" --root "$tmp/text2" 2>&1)
+    if grep -q '_secret declared as std::string' <<< "$verdict"; then
+        printf 'ok   case 9: the _secret row reports a plain std::string\n'
+    else
+        printf 'FAIL case 9: _secret violation not reported. Got: %s\n' "$verdict"; return 1
+    fi
+    cases=$((cases + 1))
+
+    # Case 10: a credential named only inside a BLOCK comment is not a declaration. The
+    # false-positive direction -- `/*` was missing from the three introducers, so a single
+    # line `/* ... std::string requirePass; ... */` was read as code. The clean tree is the
+    # control: this case can only pass because the mention was skipped, not because
+    # nothing matched, since `a.hpp` still holds the real holders.
+    mkdir -p "$tmp/blockcomment"
+    cp "$tmp/clean/a.hpp" "$tmp/blockcomment/a.hpp"
+    printf '/* was `std::string requirePass;` before #1125, and `std::string _secret;` */\n' \
+        >> "$tmp/blockcomment/a.hpp"
+    verdict=$(bash "$0" --root "$tmp/blockcomment" 2>&1)
+    if grep -q '^ok:' <<< "$verdict"; then
+        printf 'ok   case 10: a credential named in a block comment is not a declaration\n'
+    else
+        printf 'FAIL case 10: block-comment mention reported as a violation. Got: %s\n' "$verdict"; return 1
+    fi
+    cases=$((cases + 1))
+
     printf '\nself-test: %d case(s) run, all passed\n' "$cases"
     return 0
 }
@@ -420,7 +540,7 @@ if [ "$SelfTest" -eq 1 ]; then
     exit $?
 fi
 
-if [ -z "$Root" ]; then
+if [ "$RootGiven" -eq 0 ]; then
     ScriptDir=$(cd "$(dirname "$0")" && pwd)
     Root="${ScriptDir}/../src"
 fi
@@ -433,8 +553,10 @@ ScanRoot "$Root"
 if [ -n "$ScanFindings" ]; then
     printf 'A credential is held in a container that does not zero its storage.\n\n'
     printf '%s' "$ScanFindings"
-    printf '\nUse SecureByteBuffer (FastCache/Core/SecureBytes.hpp). It is a std::vector alias,\n'
-    printf 'so every span-taking interface keeps working; adopting it is a type change.\n'
+    printf '\nUse a zeroing container from FastCache/Core/SecureBytes.hpp: SecureByteBuffer for\n'
+    printf 'a credential that is BYTES, SecureString for one that is TEXT. Both are std::vector\n'
+    printf 'underneath, so every span-taking and string_view-taking interface keeps working,\n'
+    printf 'and adopting one is a type change rather than a rewrite.\n'
     exit 1
 fi
 

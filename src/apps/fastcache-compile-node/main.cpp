@@ -2143,24 +2143,24 @@ int main(int argc, char** argv)
     // one thing it can act on rather than that plus a list about files it never
     // reaches.
     //
-    // **`!cliOnly.token.empty()` is provenance, not a value comparison.** `cliOnly` is
+    // **`!cliOnly.requirePass.empty()` is provenance, not a value comparison.** `cliOnly` is
     // the command line ALONE -- parsed above, before any file was opened -- so a
     // non-empty token in it is argv having named one. The rulebook's clause is that a
     // flag whose default is EMPTY needs no explicit bit, there being nothing to arrive
     // at without asking; `--requirepass=` typed on purpose empties the merged value
     // too, and `secretInForce` is what answers it.
     //
-    // A `tokenExplicit` column would buy nothing here and would be a live hazard.
+    // A `requirePassExplicit` column would buy nothing here and would be a live hazard.
     // `ApplyFileSettings` sets a row's `explicitBit` for a key it read out of the FILE
     // (`Config/FileOptions.hpp` says so, and names this call site), and the worker
     // applies the file and argv into ONE `NodeConfig` -- so the bit read off `cfg`
     // means "named anywhere" and answers true for exactly the secret this warning
     // exists to report. Only a bit read off `cliOnly` would be right, which is the
     // same fact this expression already reads, one column and one bool later.
-    SecretSubjectFiles<NodeConfig> const secretFiles = [configFile = lookup.path,
-                                                        argvNamedSecret = !cliOnly.token.empty()](NodeConfig const& live) {
-        return NodeSecretFiles(live, configFile, argvNamedSecret);
-    };
+    SecretSubjectFiles<NodeConfig> const secretFiles =
+        [configFile = lookup.path, argvNamedSecret = !cliOnly.requirePass.empty()](NodeConfig const& live) {
+            return NodeSecretFiles(live, configFile, argvNamedSecret);
+        };
     SecretExposureReport report = [&logger](std::string_view warning) {
         logger.Logf(LogLevel::Warn, "{}", warning);
     };
