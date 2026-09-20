@@ -5,7 +5,6 @@
 #include <FastCache/Core/BoundedDrain.hpp>
 
 #include <chrono>
-#include <cstdlib>
 
 namespace FastCache::Node
 {
@@ -185,17 +184,30 @@ void CompileCapacity::Drain()
                              FormatDuration(_drainTimeout),
                              _inFlight.load(std::memory_order_acquire));
 
-                // NOT a return. A running compile holds a pointer into this object --
-                // the counter, the protocol, the metrics sink, the logger, the byte
-                // budget -- so unwinding out of here would free all of them underneath
-                // it, trading a stop that waits for a crash on the way out. Ending the
-                // process is the one exit that abandons those jobs without touching
-                // what they are still using, and each one's client resolves its own
-                // lease on every path out of a compile (#212).
+                // In production this does not come back. A running compile holds a
+                // pointer into this object -- the counter, the protocol, the metrics
+                // sink, the logger, the byte budget -- so unwinding out of here would
+                // free all of them underneath it, trading a stop that waits for a crash
+                // on the way out. `EndProcessOnAbandonedDrain` is the one exit that
+                // abandons those jobs without touching what they are still using, and
+                // each one's client resolves its own lease on every path out of a
+                // compile (#212). `_Exit`, not `exit`: static destructors would run the
+                // same teardown this is avoiding.
                 //
-                // `_Exit`, not `exit`: static destructors would run the same teardown
-                // this is avoiding.
-                std::_Exit(AbandonedDrainExitCode);
+                // Through the seam rather than calling `_Exit` here, because a branch
+                // whose only effect is ending the process is a branch no in-process case
+                // survives -- and one no case survives is one no case checks. That was
+                // written down as a property of the arm ("the interesting arm cannot be
+                // tested") when it was really a property of this line. `ExpiryReaper`
+                // had already taken the seam; `BoundedDrain.hpp` named THIS drain as the
+                // shape it modelled while this drain was the one that could not take it
+                // (#297).
+                _abandonment.Abandon();
+
+                // Reached only under a case's abandonment, which returns. `Drain`'s
+                // contract hands the caller the hazard at that point; what must not
+                // happen is looping back round to abandon the same compiles again.
+                return;
 
             case DrainAction::Last:
                 break;
