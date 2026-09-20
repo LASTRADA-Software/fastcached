@@ -44,7 +44,7 @@ namespace
 // current code happens to emit. A change to any byte position below is a wire
 // break and must be a deliberate version bump, not an accident.
 
-TEST_CASE("The wire constants have their specified byte values")
+TEST_CASE("The wire constants have their specified byte values", "[wire]")
 {
     CHECK(static_cast<std::uint8_t>(Magic) == 0xFC);
     // Version 12 puts enrollment on keys (#178 PR 4): ENROLL carries a role and the joiner's
@@ -124,7 +124,7 @@ TEST_CASE("The wire constants have their specified byte values")
     CHECK(static_cast<std::uint8_t>(ErrorCode::MalformedValue) == 0x05);
 }
 
-TEST_CASE("EncodeFetch emits the specified bytes exactly")
+TEST_CASE("EncodeFetch emits the specified bytes exactly", "[wire]")
 {
     auto const frame = EncodeFetch("ab");
 
@@ -142,7 +142,7 @@ TEST_CASE("EncodeFetch emits the specified bytes exactly")
     CHECK(frame == expected);
 }
 
-TEST_CASE("EncodeStore emits the specified bytes exactly")
+TEST_CASE("EncodeStore emits the specified bytes exactly", "[wire]")
 {
     auto const value = Bytes({ 0xAA, 0xBB });
     auto const frame = EncodeStore(StoreRequest {
@@ -163,7 +163,7 @@ TEST_CASE("EncodeStore emits the specified bytes exactly")
     CHECK(frame == expected);
 }
 
-TEST_CASE("EncodeErrorReply emits the specified bytes exactly")
+TEST_CASE("EncodeErrorReply emits the specified bytes exactly", "[wire]")
 {
     auto const reply = EncodeErrorReply(ErrorCode::UnsupportedVersion, "x");
 
@@ -179,7 +179,7 @@ TEST_CASE("EncodeErrorReply emits the specified bytes exactly")
     CHECK(reply == expected);
 }
 
-TEST_CASE("A miss reply is a zero-length payload, not an absent one")
+TEST_CASE("A miss reply is a zero-length payload, not an absent one", "[wire]")
 {
     // The pre-version format answered a miss with a bare 0x00 and no length,
     // which is why an error and a miss could not be told apart and why no reply
@@ -191,7 +191,7 @@ TEST_CASE("A miss reply is a zero-length payload, not an absent one")
 
 // --- header round-trips ----------------------------------------------------
 
-TEST_CASE("DecodeRequestHeader reads back what EncodeFetch wrote")
+TEST_CASE("DecodeRequestHeader reads back what EncodeFetch wrote", "[wire]")
 {
     auto const frame = EncodeFetch("ab");
     auto const header = DecodeRequestHeader(std::span<std::byte const> { frame }.first(RequestHeaderSize));
@@ -202,7 +202,7 @@ TEST_CASE("DecodeRequestHeader reads back what EncodeFetch wrote")
     CHECK(Unwrap(header).payloadLength == 6);
 }
 
-TEST_CASE("DecodeRequestHeader rejects a foreign magic but keeps an unknown opcode")
+TEST_CASE("DecodeRequestHeader rejects a foreign magic but keeps an unknown opcode", "[wire]")
 {
     auto frame = EncodeFetch("ab");
 
@@ -230,7 +230,7 @@ TEST_CASE("DecodeRequestHeader rejects a foreign magic but keeps an unknown opco
     }
 }
 
-TEST_CASE("DecodeReplyHeader round-trips and rejects an unknown status")
+TEST_CASE("DecodeReplyHeader round-trips and rejects an unknown status", "[wire]")
 {
     auto const payload = Bytes({ 0x01, 0x02, 0x03 });
     auto reply = EncodeReply(Status::Ok, payload);
@@ -244,7 +244,7 @@ TEST_CASE("DecodeReplyHeader round-trips and rejects an unknown status")
     CHECK_FALSE(DecodeReplyHeader(std::span<std::byte const> { reply }.first(ReplyHeaderSize)).has_value());
 }
 
-TEST_CASE("EncodeProgressReply emits the specified bytes exactly")
+TEST_CASE("EncodeProgressReply emits the specified bytes exactly", "[wire]")
 {
     // clang-format off: the grid IS the specification -- one wire field per row.
     auto const expected = Bytes({
@@ -265,7 +265,7 @@ TEST_CASE("EncodeProgressReply emits the specified bytes exactly")
     CHECK(Unwrap(header).payloadLength == 0);
 }
 
-TEST_CASE("A progress frame is a known status and is never a terminal one")
+TEST_CASE("A progress frame is a known status and is never a terminal one", "[wire]")
 {
     // Two facts a client reads separately, and collapsing them is the whole defect a
     // pre-#245 launcher has: `DecodeReplyHeader` refused `0x03` outright, so a
@@ -288,7 +288,7 @@ TEST_CASE("A progress frame is a known status and is never a terminal one")
     CHECK_FALSE(IsKnownStatus(0x05));
 }
 
-TEST_CASE("Only COMPILE may be answered with a progress pulse")
+TEST_CASE("Only COMPILE may be answered with a progress pulse", "[wire]")
 {
     // A pulse turns one verb's reply into a STREAM, and every client reading that verb
     // then has to loop for its answer. That is a decision per verb, so the table says
@@ -302,7 +302,7 @@ TEST_CASE("Only COMPILE may be answered with a progress pulse")
     }
 }
 
-TEST_CASE("The pulse cadence and the client's patience are one pair of numbers")
+TEST_CASE("The pulse cadence and the client's patience are one pair of numbers", "[wire]")
 {
     // They bound ONE silence from opposite sides: the worker's cadence is how often it
     // says something, the client's bound is how long it waits without hearing. Neither
@@ -320,7 +320,7 @@ TEST_CASE("The pulse cadence and the client's patience are one pair of numbers")
 
 // --- payload splitting -----------------------------------------------------
 
-TEST_CASE("DecodeStorePayload round-trips every field, including an empty one")
+TEST_CASE("DecodeStorePayload round-trips every field, including an empty one", "[wire]")
 {
     // An empty prefetch group is the routine case, not an edge one: the launcher stores
     // with no prefetch group whenever grouping is off, and the handler branches on it.
@@ -393,7 +393,7 @@ TEST_CASE("A cache drop is a Cache verb that may miss, needs the credential, and
     CHECK(OpPayloadCap(static_cast<std::uint8_t>(Op::CacheDrop), 256U * 1024U * 1024U) == MaxControlPayload);
 }
 
-TEST_CASE("DecodeFetchPayload round-trips the key")
+TEST_CASE("DecodeFetchPayload round-trips the key", "[wire]")
 {
     auto const frame = EncodeFetch("the-key");
     auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
@@ -403,7 +403,7 @@ TEST_CASE("DecodeFetchPayload round-trips the key")
     CHECK(AsStringView(Unwrap(key)) == "the-key");
 }
 
-TEST_CASE("SplitFields rejects a payload that disagrees with its field lengths")
+TEST_CASE("SplitFields rejects a payload that disagrees with its field lengths", "[wire]")
 {
     // The declared total and the per-field lengths are redundant by design.
     // Disagreement must be a typed rejection, never a silent reinterpretation.
@@ -454,7 +454,7 @@ TEST_CASE("SplitFields rejects a payload that disagrees with its field lengths")
     }
 }
 
-TEST_CASE("DecodeErrorPayload splits the code from the message")
+TEST_CASE("DecodeErrorPayload splits the code from the message", "[wire]")
 {
     auto const reply = EncodeErrorReply(ErrorCode::PayloadTooLarge, "too big");
     auto const payload = std::span<std::byte const> { reply }.subspan(ReplyHeaderSize);
@@ -467,7 +467,7 @@ TEST_CASE("DecodeErrorPayload splits the code from the message")
     CHECK_FALSE(DecodeErrorPayload({}).has_value());
 }
 
-TEST_CASE("EncodeErrorReply falls back to the table's default message")
+TEST_CASE("EncodeErrorReply falls back to the table's default message", "[wire]")
 {
     auto const reply = EncodeErrorReply(ErrorCode::StorageWriteFailed);
     auto const decoded = DecodeErrorPayload(std::span<std::byte const> { reply }.subspan(ReplyHeaderSize));
@@ -479,7 +479,7 @@ TEST_CASE("EncodeErrorReply falls back to the table's default message")
 
 // --- table integrity -------------------------------------------------------
 
-TEST_CASE("Every op descriptor is unique and well-formed")
+TEST_CASE("Every op descriptor is unique and well-formed", "[wire]")
 {
     for (auto const& row: OpTable)
     {
@@ -500,7 +500,7 @@ TEST_CASE("Every op descriptor is unique and well-formed")
     }
 }
 
-TEST_CASE("Every error descriptor is unique and carries a message")
+TEST_CASE("Every error descriptor is unique and carries a message", "[wire]")
 {
     for (auto const& row: ErrorTable)
     {
@@ -513,7 +513,7 @@ TEST_CASE("Every error descriptor is unique and carries a message")
     }
 }
 
-TEST_CASE("A FETCH may miss but a STORE may not")
+TEST_CASE("A FETCH may miss but a STORE may not", "[wire]")
 {
     // Encoded as table data rather than convention, so the asymmetry is
     // assertable instead of merely intended.
@@ -527,7 +527,7 @@ TEST_CASE("A FETCH may miss but a STORE may not")
     }
 }
 
-TEST_CASE("IsSupported admits exactly the declared range")
+TEST_CASE("IsSupported admits exactly the declared range", "[wire]")
 {
     CHECK(IsSupported(CurrentVersion));
     CHECK(IsSupported(MinSupportedVersion));
@@ -537,7 +537,7 @@ TEST_CASE("IsSupported admits exactly the declared range")
 
 // --- AUTH ------------------------------------------------------------------
 
-TEST_CASE("EncodeAuth emits the specified bytes exactly")
+TEST_CASE("EncodeAuth emits the specified bytes exactly", "[wire]")
 {
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
@@ -549,7 +549,7 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly")
     CHECK(frame == expected);
 }
 
-TEST_CASE("DecodeAuthPayload round-trips, including the empty-username form")
+TEST_CASE("DecodeAuthPayload round-trips, including the empty-username form", "[wire]")
 {
     // The empty username is the redis `requirepass` spelling and is a legitimate
     // credential, not a malformed one: a launcher configured with only a token
@@ -563,7 +563,7 @@ TEST_CASE("DecodeAuthPayload round-trips, including the empty-username form")
     CHECK(AsStringView(Unwrap(decoded).secret) == "s3cret");
 }
 
-TEST_CASE("DecodeAuthPayload rejects a payload with the wrong field count")
+TEST_CASE("DecodeAuthPayload rejects a payload with the wrong field count", "[wire]")
 {
     // A FETCH payload is one field; AUTH demands two. Decoding one as the other
     // must fail rather than silently read the key as a username with no secret.
@@ -572,7 +572,7 @@ TEST_CASE("DecodeAuthPayload rejects a payload with the wrong field count")
     CHECK_FALSE(DecodeAuthPayload(payload).has_value());
 }
 
-TEST_CASE("Exactly the verbs meant to be reachable before AUTH are reachable")
+TEST_CASE("Exactly the verbs meant to be reachable before AUTH are reachable", "[wire]")
 {
     // The whole point of `preAuth` being a table column is that this list is
     // assertable. If a future verb is added with `preAuth = true`, this case is
@@ -598,7 +598,7 @@ TEST_CASE("Exactly the verbs meant to be reachable before AUTH are reachable")
     CHECK(openVerbs == 2);
 }
 
-TEST_CASE("An unknown opcode is never reachable before AUTH")
+TEST_CASE("An unknown opcode is never reachable before AUTH", "[wire]")
 {
     // The gate has to fail CLOSED for a byte it does not recognise. A predicate
     // resolving the descriptor first and treating "no row" as permissive would
@@ -615,7 +615,7 @@ TEST_CASE("An unknown opcode is never reachable before AUTH")
 
 // --- distributed execution ---------------------------------------------------
 
-TEST_CASE("Every dispatch verb round-trips its fields")
+TEST_CASE("Every dispatch verb round-trips its fields", "[wire]")
 {
     SECTION("REGISTER")
     {
@@ -770,7 +770,7 @@ TEST_CASE("Every dispatch verb round-trips its fields")
     }
 }
 
-TEST_CASE("A capacity record tolerates a peer that says less, or more")
+TEST_CASE("A capacity record tolerates a peer that says less, or more", "[wire]")
 {
     // The whole reason it is NESTED rather than four more REGISTER fields.
     // `SplitFields` is exact by design, so a fact added at the top level would move
@@ -839,7 +839,7 @@ TEST_CASE("A capacity record tolerates a peer that says less, or more")
     }
 }
 
-TEST_CASE("A load record tells silence apart from a measured zero")
+TEST_CASE("A load record tells silence apart from a measured zero", "[wire]")
 {
     // The distinction the whole record is optional for, and it runs both ways: a
     // machine that could not read its CPU must be scheduled on its other
@@ -877,7 +877,7 @@ TEST_CASE("A load record tells silence apart from a measured zero")
     }
 }
 
-TEST_CASE("A u32 field of the wrong width is rejected, not read")
+TEST_CASE("A u32 field of the wrong width is rejected, not read", "[wire]")
 {
     // A short integer field is a sender speaking a shape this build does not know.
     // Reading the first four bytes of a longer one, or padding a shorter one, would
@@ -889,7 +889,7 @@ TEST_CASE("A u32 field of the wrong width is rejected, not read")
     CHECK(DecodeU32Field(Bytes({ 0x00, 0x00, 0x01, 0x00 })) == 256U);
 }
 
-TEST_CASE("A dispatch payload decoded as the wrong verb fails")
+TEST_CASE("A dispatch payload decoded as the wrong verb fails", "[wire]")
 {
     // Each verb has its own arity, and SplitFields is strict in both directions, so
     // one verb's payload cannot be silently reinterpreted as another's.
@@ -908,7 +908,7 @@ TEST_CASE("A dispatch payload decoded as the wrong verb fails")
     CHECK(DecodeReleasePayload(releasePayload).has_value());
 }
 
-TEST_CASE("A codec envelope round-trips its tag, raw size and bytes")
+TEST_CASE("A codec envelope round-trips its tag, raw size and bytes", "[wire]")
 {
     auto const payload = Bytes({ 0xDE, 0xAD, 0xBE, 0xEF });
     auto const envelope = EncodeCodecEnvelope(/*codec=*/2, /*rawLength=*/9999, payload);
@@ -922,14 +922,14 @@ TEST_CASE("A codec envelope round-trips its tag, raw size and bytes")
     CHECK(std::ranges::equal(Unwrap(decoded).bytes, payload));
 }
 
-TEST_CASE("An envelope too short to hold a header is rejected")
+TEST_CASE("An envelope too short to hold a header is rejected", "[wire]")
 {
     CHECK_FALSE(DecodeCodecEnvelope({}).has_value());
     CHECK_FALSE(DecodeCodecEnvelope(Bytes({ 0x00, 0x00, 0x00, 0x00 })).has_value());
     CHECK(DecodeCodecEnvelope(Bytes({ 0x00, 0x00, 0x00, 0x00, 0x00 })).has_value());
 }
 
-TEST_CASE("An empty payload still travels in a well-formed envelope")
+TEST_CASE("An empty payload still travels in a well-formed envelope", "[wire]")
 {
     // The zero-length case is the one an encoder is most likely to get wrong, and a
     // failed compile legitimately produces an empty object.
@@ -941,7 +941,7 @@ TEST_CASE("An empty payload still travels in a well-formed envelope")
     CHECK(Unwrap(decoded).bytes.empty());
 }
 
-TEST_CASE("Codec negotiation prefers the sender's order and falls back to Identity")
+TEST_CASE("Codec negotiation prefers the sender's order and falls back to Identity", "[wire]")
 {
     // The SENDER's order decides, because the sender has to decode the answer and
     // knows what is cheap for it.
@@ -956,7 +956,7 @@ TEST_CASE("Codec negotiation prefers the sender's order and falls back to Identi
     CHECK(ChooseCodec(/*accepted=*/ { 2 }, /*available=*/ {}) == IdentityCodec);
 }
 
-TEST_CASE("A build with compression disabled still interoperates")
+TEST_CASE("A build with compression disabled still interoperates", "[wire]")
 {
     // Such a build offers only Identity and can produce only Identity. Both
     // directions must still resolve, or enabling compression on one machine would
@@ -966,7 +966,7 @@ TEST_CASE("A build with compression disabled still interoperates")
     CHECK(ChooseCodec({ 2, 1 }, none) == IdentityCodec);
 }
 
-TEST_CASE("A decoder's result outlives the buffer it was decoded from")
+TEST_CASE("A decoder's result outlives the buffer it was decoded from", "[wire]")
 {
     // #366, and #355's acceptance criterion for it: `Decode(Encode(x))` must not
     // compile, or must be SAFE. This takes the second branch -- the spelling is made
@@ -1042,7 +1042,7 @@ TEST_CASE("A decoder's result outlives the buffer it was decoded from")
     }
 }
 
-TEST_CASE("A LEASE grant and a COMPILE result round-trip")
+TEST_CASE("A LEASE grant and a COMPILE result round-trip", "[wire]")
 {
     SECTION("grant")
     {
@@ -1101,7 +1101,7 @@ TEST_CASE("A LEASE grant and a COMPILE result round-trip")
     }
 }
 
-TEST_CASE("A WITHDRAW round-trips, and its byte is pinned")
+TEST_CASE("A WITHDRAW round-trips, and its byte is pinned", "[wire]")
 {
     // The value as well as the name. A symbol both ends spell can only test the first,
     // and this end is the only one that can be recompiled: a launcher or node already
@@ -1127,7 +1127,7 @@ TEST_CASE("A WITHDRAW round-trips, and its byte is pinned")
     CHECK_FALSE(DecodeWithdrawPayload(std::span<std::byte const> {}).has_value());
 }
 
-TEST_CASE("No distributed verb is reachable before authentication")
+TEST_CASE("No distributed verb is reachable before authentication", "[wire]")
 {
     // Causing a compiler to run on another machine is the last thing an
     // unauthenticated peer should reach.
@@ -1138,7 +1138,7 @@ TEST_CASE("No distributed verb is reachable before authentication")
     }
 }
 
-TEST_CASE("Every verb states which family it belongs to")
+TEST_CASE("Every verb states which family it belongs to", "[wire]")
 {
     // A grouping the `Op` enum has always carried as comment blocks, and which stopped
     // being enough the moment one listener served several families (#290): a merged
@@ -1178,7 +1178,7 @@ TEST_CASE("Every verb states which family it belongs to")
     CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Subscribe)) == VerbFamily::Live);
 }
 
-TEST_CASE("A byte that names no verb has no family")
+TEST_CASE("A byte that names no verb has no family", "[wire]")
 {
     // Total over every byte value, like every other predicate reading the third header
     // byte: what arrives is a byte, not an `Op`, and a lookup that assumed otherwise
@@ -1194,7 +1194,7 @@ TEST_CASE("A byte that names no verb has no family")
     }
 }
 
-TEST_CASE("The scheduler's control verbs are bounded well below the session cap")
+TEST_CASE("The scheduler's control verbs are bounded well below the session cap", "[wire]")
 {
     // These are answered on a listener a whole fleet is meant to reach. A scheduler
     // that can be made to allocate the full payload cap per frame by anything that
@@ -2207,7 +2207,7 @@ TEST_CASE("A pending row is read at ten facts, a surplus is skipped, and fewer a
     CHECK(reportWith(exact).has_value());
 }
 
-TEST_CASE("A node runtime record carries the enrollment window, and absent is not closed", "[wire][enrollment][nodestatus]")
+TEST_CASE("A node runtime record carries the enrollment window, and absent is not closed", "[wire][enrollment][node-status]")
 {
     // **Absent is not zero, and here absent is not CLOSED.** A node running no
     // consensus has no window to report on, and a `Closed` there is a reassuring claim
@@ -2239,7 +2239,7 @@ TEST_CASE("A node runtime record carries the enrollment window, and absent is no
 }
 
 TEST_CASE("An older peer's runtime record reads without the enrollment fields, and a newer one's surplus is skipped",
-          "[wire][enrollment][nodestatus]")
+          "[wire][enrollment][node-status]")
 {
     // **This is why the two fields cost no wire version.** The nested runtime record is
     // variable-arity by design: a sender that predates these fields is answered with
@@ -2272,7 +2272,7 @@ TEST_CASE("An older peer's runtime record reads without the enrollment fields, a
 
 // --- Live stats (#1399) -----------------------------------------------------
 
-TEST_CASE("Only SUBSCRIBE may be answered with a push frame")
+TEST_CASE("Only SUBSCRIBE may be answered with a push frame", "[wire]")
 {
     // `PushIsSubscribeOnly` is the compile-time half; this is what fails when a row's mask is
     // widened by hand, the same pair `Progress` has.
@@ -2287,7 +2287,7 @@ TEST_CASE("Only SUBSCRIBE may be answered with a push frame")
     CHECK(IsLegalStatus(Op::Subscribe, Status::Error));
 }
 
-TEST_CASE("The live-stats wire bytes are pinned")
+TEST_CASE("The live-stats wire bytes are pinned", "[wire]")
 {
     // The BYTE, not the symbol, for the reason the constants case above gives: a peer built from
     // another revision of this header agrees about the values and nothing else.
@@ -2302,7 +2302,7 @@ TEST_CASE("The live-stats wire bytes are pinned")
     CHECK(static_cast<std::uint8_t>(LiveEventKind::EnrollmentChanged) == 0x06);
 }
 
-TEST_CASE("A SUBSCRIBE request round-trips and refuses a subject this build does not know")
+TEST_CASE("A SUBSCRIBE request round-trips and refuses a subject this build does not know", "[wire]")
 {
     auto const request = SubscribeRequest { .subject = LiveSubject::Fleet, .cadenceMillis = 1500, .dashboardToken = "t0k" };
     auto const frame = EncodeSubscribeRequest(request);
@@ -2322,7 +2322,7 @@ TEST_CASE("A SUBSCRIBE request round-trips and refuses a subject this build does
     CHECK_FALSE(DecodeSubscribeRequest(unknown).has_value());
 }
 
-TEST_CASE("A granted cadence is the request clamped to the subject floor and the ceiling")
+TEST_CASE("A granted cadence is the request clamped to the subject floor and the ceiling", "[wire]")
 {
     CHECK(GrantLiveCadence(LiveSubject::Node, 0) == std::chrono::milliseconds { 500 });
     CHECK(GrantLiveCadence(LiveSubject::Fleet, 200) == std::chrono::milliseconds { 1000 });
@@ -2331,7 +2331,7 @@ TEST_CASE("A granted cadence is the request clamped to the subject floor and the
     CHECK(LiveIdleBound(std::chrono::milliseconds { 500 }) == std::chrono::milliseconds { 1500 });
 }
 
-TEST_CASE("Every push kind round-trips through its own decoder")
+TEST_CASE("Every push kind round-trips through its own decoder", "[wire]")
 {
     auto const subscribed = EncodeLiveSubscribed(LiveSubscribedFields { .subject = LiveSubject::Node,
                                                                         .grantedCadenceMillis = 500,
@@ -2477,7 +2477,7 @@ TEST_CASE("A heartbeat carries the cordon, and a record without it is a serving 
     CHECK_FALSE(DecodeLoad(WireFields::Encode(WireFields::FieldList { odd })).has_value());
 }
 
-TEST_CASE("A node runtime record carries the cordon state, and absent is not serving", "[wire][cordon][nodestatus]")
+TEST_CASE("A node runtime record carries the cordon state, and absent is not serving", "[wire][cordon][node-status]")
 {
     // Absent on a node that runs no worker, for the enrollment window's reason: `Serving`
     // there would be a reassuring answer about a worker that does not exist.
@@ -2497,7 +2497,7 @@ TEST_CASE("A node runtime record carries the cordon state, and absent is not ser
 
 // --- The fleet document, read once (#1391) -----------------------------------
 
-TEST_CASE("The fleet-text wire bytes are pinned and the verb is a request with a reply")
+TEST_CASE("The fleet-text wire bytes are pinned and the verb is a request with a reply", "[wire]")
 {
     // The BYTE, not the symbol, for the reason the constants case above gives.
     CHECK(static_cast<std::uint8_t>(Op::FleetText) == 0x14);
@@ -2516,7 +2516,7 @@ TEST_CASE("The fleet-text wire bytes are pinned and the verb is a request with a
     CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::FleetText)));
 }
 
-TEST_CASE("A FLEET-TEXT request carries its keys and its token as the words typed")
+TEST_CASE("A FLEET-TEXT request carries its keys and its token as the words typed", "[wire]")
 {
     auto const frame =
         EncodeFleetTextRequest(FleetTextRequest { .section = "series", .range = "7d", .dashboardToken = "t0k" });
@@ -2563,7 +2563,7 @@ TEST_CASE("A FLEET-TEXT request carries its keys and its token as the words type
 // --- The consensus dial address (#1328) -------------------------------------
 
 TEST_CASE("A node runtime record carries the consensus address peers dial, and absent is not empty",
-          "[wire][consensus][nodestatus]")
+          "[wire][consensus][node-status]")
 {
     // Absent on a node that runs no consensus. A zero-length field is how every optional in
     // this record says so, which is why an engaged endpoint is never empty.
@@ -2599,7 +2599,7 @@ TEST_CASE("The consensus endpoint has one name, spelled as prose and as a record
 }
 
 TEST_CASE("The consensus address rides the runtime record's variable arity, in both directions",
-          "[wire][consensus][nodestatus]")
+          "[wire][consensus][node-status]")
 {
     // **Why the field costs no wire version**, proved rather than inherited from the
     // enrollment case above: the decoder answers an index past the end as empty and ignores
@@ -2752,7 +2752,7 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
 }
 
 TEST_CASE("An identity key travels as its 32 bytes, absent as nothing, and any other width refuses the record",
-          "[wire][nodestatus][identity]")
+          "[wire][node-status][identity]")
 {
     // Absent is a zero-length field, as every optional here is -- a node that holds no key.
     auto const absent = DecodeNodeRuntime(EncodeNodeRuntime(NodeRuntimeFields {}));
@@ -2785,7 +2785,7 @@ TEST_CASE("An identity key travels as its 32 bytes, absent as nothing, and any o
 }
 
 TEST_CASE("A consensus standing travels as its pinned byte, and one this build cannot name is skipped",
-          "[wire][consensus][nodestatus][learner]")
+          "[wire][consensus][node-status][learner]")
 {
     // The BYTES, not only the names (#1449): a consistent renumbering keeps every in-tree
     // test agreeing while a deployed CLI reads a learner as a voter.
