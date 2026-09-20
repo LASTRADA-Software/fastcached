@@ -6,6 +6,7 @@
 #include <chrono>
 #include <concepts>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <thread>
 
@@ -175,12 +176,43 @@ class IDrainAbandonment
     virtual void Abandon() noexcept = 0;
 };
 
-/// Production `IDrainAbandonment`: ends the process with `AbandonedDrainExitCode`.
+/// Production `IDrainAbandonment`: says so on stderr, then ends the process with
+/// `AbandonedDrainExitCode`.
+///
+/// **The line is not duplicate logging, and deleting it as such is the hazard.** Its readers are
+/// two, and only one of them is served today:
+///
+///   * The OPERATOR gets the drain's own `ILogger` line, which names the outstanding count and the
+///     bound. That is the diagnostic #239 added.
+///   * The SUPERVISOR -- systemd, the SCM, `ctest`, a shell -- gets nothing. It sees status 75 and
+///     no text, which is the very shape #239 exists to remove: *an unbounded drain hands the ending
+///     to the supervisor, which answers `SIGKILL` with no diagnostic.* Ending ourselves with
+///     nothing on stderr is that defect wearing our own name.
+///
+/// The second reader is why this is here and why it stays in PRODUCTION rather than being a test
+/// affordance. It is also what makes an abandoned TEST binary legible at all: a test's `ILogger` is
+/// a `CapturingLogger` nobody reads, so before this line a case that reached the ceiling did not
+/// fail -- it vanished, taking every case after it in that process, with two lines of banner and no
+/// explanation anywhere a person looks (#297).
+///
+/// **The trailing newline is load-bearing.** `std::_Exit` runs no `atexit` handler and flushes
+/// nothing, deliberately -- that is the whole reason it is used here -- so delivery rests on a
+/// property of the stream rather than of this code. C11 7.21.3p7 requires stderr to be *not fully
+/// buffered*, which permits unbuffered OR line buffered, and a message ending in `\n` is delivered
+/// under either. Measured separately, and NOT the same claim: on glibc the text survives even
+/// without the newline, to a pipe and to a file, because glibc leaves stderr unbuffered -- that is
+/// this platform, not the guarantee. So do not drop the newline, do not "fix" this with an
+/// `fflush` that cannot matter, and do not move the write after the `_Exit` it precedes.
 class EndProcessOnAbandonedDrain final: public IDrainAbandonment
 {
   public:
     [[noreturn]] void Abandon() noexcept override
     {
+        std::fputs("fastcached: a bounded drain gave up with work still running and is ending this process "
+                   "(status 75). If this is a TEST binary, the case did not fail -- it vanished, and so did every "
+                   "case after it: construct with an IDrainAbandonment that RETURNS (see Core/BoundedDrain.hpp).\n",
+                   stderr);
+
         // `_Exit`, not `exit`: static destructors would run the same teardown this is avoiding.
         std::_Exit(AbandonedDrainExitCode);
     }

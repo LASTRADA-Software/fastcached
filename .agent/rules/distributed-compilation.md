@@ -682,13 +682,27 @@ Consequences that are each load-bearing:
     inside, and each one's client resolves its own lease on every path out of a
     compile (#212). `_Exit`, never `exit`: static destructors would run the very
     teardown being avoided.
-  - **The decision is a pure function because the interesting arm cannot be
-    tested.** A branch that calls `_Exit` is a side effect no in-process case
-    survives, and a side effect no test can survive is one no test will check. So
+  - **The decision is a pure function, and the arm that carries it out is injected.**
     `NextDrainAction` is arithmetic over (outstanding, waited, timeout), exhaustively
-    unit-tested, and the destructor is left with nothing but carrying it out.
-    `Finished` outranks an expired bound, or a stop that had already finished would
-    log a false abandonment at exactly the moment the thing worked.
+    unit-tested, and `Drain` is left with nothing but carrying it out. `Finished`
+    outranks an expired bound, or a stop that had already finished would log a false
+    abandonment at exactly the moment the thing worked.
+    - **This bullet used to end "because the interesting arm cannot be tested", and
+      that was a claim about a LINE recorded as a property of the ARM** (#297). A
+      branch that calls `_Exit` inline is indeed a side effect no in-process case
+      survives; a branch that calls `IDrainAbandonment::Abandon` is a virtual call a
+      case can substitute, and `ExpiryReaper` had been taking that seam while
+      `BoundedDrain.hpp` named THIS drain as the shape it modelled. The class the
+      comment pointed at was the one class that could not take it.
+    - **A rule saying something cannot be done instructs the next session not to
+      try**, which is the expensive shape — the same one `## Open work` entries are
+      checked for. Here it held from #239 until #297 was picked up, with the arm
+      carried by a pure-function proxy and by nothing else: `CompileCapacity_test.cpp`
+      had no case for `Drain` at all, and a case that reached the arm did not fail, it
+      took the test binary down with every case that would have run after it. So when an arm
+      is called untestable, say what makes it so — here, that the effect was written
+      inline rather than reached through a seam — because that sentence is the one a
+      later reader can check and refute.
   - **The bound is a flag, and zero still means forever.** How long a compile
     legitimately runs is a property of the site, not of this program, and a
     compile-time answer on a binary whose `--install-service` replays its command

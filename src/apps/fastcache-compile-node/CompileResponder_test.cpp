@@ -940,11 +940,17 @@ class IdleListener final: public IListener
 ///
 /// **This is the DIAGNOSTIC; the drain bound below it is only the net.** A case that
 /// ends with a compile still counted in flight does not fail -- `CompileCapacity::Drain`
-/// reaches `Abandon` and calls `std::_Exit`, so the case VANISHES: a nonzero exit, two
-/// lines of Catch2 banner, no assertion, and the one line that explains it written to a
-/// test logger nobody reads. Shortening the bound only makes that happen sooner; it is
-/// the same unreadable failure, which is #297's whole complaint. A `REQUIRE` on this
-/// gives a person a red case with a number instead.
+/// reaches `Abandon`, so the case VANISHES: a nonzero exit, two lines of Catch2 banner,
+/// no assertion, and the count that would have explained it written to a test logger
+/// nobody reads. Shortening the bound only makes that happen sooner; it is the same
+/// unreadable failure, which is #297's whole complaint. A `REQUIRE` on this gives a
+/// person a red case with a number instead.
+///
+/// **Since #297 the vanish is at least SIGNPOSTED, and that is not the same as fixed.**
+/// `EndProcessOnAbandonedDrain` prints one line to stderr before ending the process, so
+/// a reader is told what happened rather than left with a bare status 75. It still names
+/// no case and still costs every case that would have run afterwards, so this helper is
+/// what turns it into an ordinary red -- the stderr line is the floor, not the remedy.
 ///
 /// **Bounded rather than sampled once**, and that is not timidity: a compile released a
 /// moment earlier is legitimately still hopping back onto the reactor, so an instant
@@ -1058,9 +1064,8 @@ struct MergedWorker
         // diagnostic.** `DrainedWithin` above is what reports a slot that never came
         // back, as an ordinary red assertion with a number. This only bounds how long a
         // violation that got past it costs, and it cannot be made legible by shortening
-        // -- `Drain` still reaches `Abandon` and calls `std::_Exit`, so the case still
-        // vanishes into two lines of banner, just sooner (#297). Five over two for
-        // headroom on a loaded runner.
+        // -- `Drain` still reaches `Abandon`, so the case still vanishes into two lines
+        // of banner, just sooner (#297). Five over two for headroom on a loaded runner.
         //
         // **Whether a violation reports or vanishes is a race, and these are the three
         // numbers.** Measured, with the body-level release removed so the slot really
@@ -1068,6 +1073,16 @@ struct MergedWorker
         // `StopAndWait` began -- the holder's own 10 s self-release landing inside it --
         // and the case reported `exit 1` with a full summary. At a 1 s bound the same
         // violation abandoned and gave `exit 75` with no summary at all.
+        //
+        // **Those figures are PINNED to the tree they were taken on, and the last clause
+        // is now false by design -- do not re-measure them to agree with today.** Since
+        // #297 `EndProcessOnAbandonedDrain` prints one line to stderr before `_Exit`, so
+        // an abandoned run is no longer silent: status 75 now arrives with a sentence
+        // saying the case vanished rather than failed. The 5 s / 1 s / 2.5 s readings
+        // above predate that line and are kept as they were observed, because a
+        // measurement quietly re-attributed to conditions it was never taken under is
+        // worse than a stale one. What has NOT changed is the point they support: a
+        // shorter bound abandons sooner, so shortening still cannot buy a red.
         //
         // So reporting is NOT a property of using `CHECK`; it is this bound, checked at
         // `DrainReportInterval` granularity, being longer than however long the

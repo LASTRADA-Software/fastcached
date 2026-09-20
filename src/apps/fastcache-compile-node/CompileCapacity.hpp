@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -97,11 +98,31 @@ class CompileCapacity
     /// @param byteBudget How many bytes of in-flight request payload may be held.
     /// @param drainTimeout How long `Drain` waits before abandoning what is running.
     /// @param logger Where the drain reports progress; must outlive this.
-    CompileCapacity(std::size_t slots, std::size_t byteBudget, std::chrono::seconds drainTimeout, ILogger& logger) noexcept:
+    /// @param abandonment What `Drain` does with the compiles still running when the bound is
+    ///        spent. Production's ends the process, which is why the arm went untested for so
+    ///        long: a side effect no in-process case survives is one no case will check (#297).
+    ///        A case supplies one that RETURNS and counts. Must outlive this.
+    ///
+    /// **`abandonment` is DEFAULTED on purpose, and the alternative was considered and measured**
+    /// (#297). Requiring it would put the obligation at construction, which is not where the
+    /// hazard is: a capacity that is never drained cannot end anything. Counted at the time --
+    /// 18 construction sites, 17 of them tests, against 12 `Drain()` calls in the whole tree --
+    /// so roughly eleven sites would have to name an abandonment they can never reach, which is
+    /// *forgot* in the vocabulary of *decided* and teaches people to stop reading the argument.
+    /// What closes the hazard instead is that `EndProcessOnAbandonedDrain` now says on STDERR
+    /// what it is doing before it ends the process, so the default is legible rather than silent
+    /// -- see `Core/BoundedDrain.hpp`. That fix sits in the shared seam, so it covers
+    /// `ExpiryReaper`, the seam's other defaulted consumer, at the same time.
+    CompileCapacity(std::size_t slots,
+                    std::size_t byteBudget,
+                    std::chrono::seconds drainTimeout,
+                    ILogger& logger,
+                    IDrainAbandonment& abandonment = DefaultDrainAbandonment()) noexcept:
         _slots { slots },
         _byteBudget { byteBudget },
         _drainTimeout { drainTimeout },
-        _logger { logger }
+        _logger { logger },
+        _abandonment { abandonment }
     {
     }
 
@@ -288,10 +309,16 @@ class CompileCapacity
 
     /// Wait for the running compiles to finish, reporting and then abandoning.
     ///
-    /// Bounded, and it ENDS rather than returning to a caller that would free
-    /// members a running job is still inside. An unbounded drain does not avoid an
+    /// Bounded, and in production it ENDS rather than returning to a caller that would
+    /// free members a running job is still inside. An unbounded drain does not avoid an
     /// ending — it hands the choice to the supervisor, which answers `SIGKILL` with
     /// no diagnostic (#239).
+    ///
+    /// **It returns from an abandonment only when the injected `IDrainAbandonment`
+    /// returns, and then the hazard above is the CALLER's** — the seam's own contract.
+    /// A case that drives this past the ceiling therefore holds the in-flight count
+    /// without a running job (`TryTakeSlot` and no release), so there is nothing
+    /// borrowing this object for the return to free (#297).
     ///
     /// A condition variable, never `atomic::wait`: an atomic wait can return without
     /// the notify and free the object the notifier is still inside.
@@ -306,6 +333,7 @@ class CompileCapacity
     std::size_t _byteBudget;
     std::chrono::seconds _drainTimeout;
     ILogger& _logger;
+    IDrainAbandonment& _abandonment;
 
     /// Say that a cordoned worker has nothing running. Called under `_drainMutex`.
     void ReportDrained() const;
@@ -333,10 +361,18 @@ class CompileCapacity
 
 /// What a stop should do next about the compiles still running.
 ///
-/// Split out of `~WorkerServer` because the interesting branch **ends the process**,
-/// and a side effect no test can survive is one no test will check. The decision is
-/// arithmetic over three values and is exhaustively unit-tested here; the destructor
-/// is left with nothing but carrying it out.
+/// Split out of `~WorkerServer` -- now `WorkerTier::StopAndDrain` -- because the
+/// interesting branch **ends the process**. The decision is arithmetic over three
+/// values and is exhaustively unit-tested here; `Drain` is left with nothing but
+/// carrying it out.
+///
+/// **The reason recorded here used to be "a side effect no test can survive is one no
+/// test will check", and that has stopped being true** (#297): what ends the process is
+/// an injected `IDrainAbandonment`, so a case supplies one that returns and asserts the
+/// arm was reached. Splitting the arithmetic out is still right -- it is exhaustive
+/// where a timing case can only be a sample -- but it is no longer the ONLY thing
+/// covered, and a comment claiming an arm is untestable is a comment telling the next
+/// person not to try.
 enum class DrainAction : std::uint8_t
 {
     /// Nothing is running. Stop cleanly.
