@@ -89,5 +89,22 @@ resp="${raw:0:128}"
 echo "response: ${resp}"
 case "$resp" in
     *PONG*) echo "TLS smoke OK"; exit 0 ;;
-    *) echo "no PONG over TLS"; exit 1 ;;
+    *)
+        echo "no PONG over TLS"
+        # THE DAEMON'S OWN REASON, or this failure has none at all.
+        #
+        # Redirecting the daemon into `$workdir` is what made the bounded wait
+        # able to dump it -- and it took the diagnostic away from every OTHER
+        # failure path, because the EXIT trap removes that directory a moment
+        # later. Before the redirect the daemon inherited this script's stderr and
+        # ctest captured it, so a handshake refusal arrived with the reason
+        # attached; after it, a cert/key mismatch or an unsupported cipher ended
+        # the run with `response: ` and nothing else.
+        #
+        # `wait_for_port` returned green here by construction: the daemon BOUND.
+        # What failed is one layer up, which is exactly the case its log explains.
+        echo "--- ${workdir}/fastcached.log ---" >&2
+        cat "${workdir}/fastcached.log" >&2 || true
+        exit 1
+        ;;
 esac

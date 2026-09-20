@@ -254,6 +254,18 @@ function Measure-E2EFormatPrecedence([string]$path = "", [string]$text = "") {
     } else {
         [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$errors)
     }
+    # A FILE THAT WOULD NOT PARSE IS NOT A FILE WITH NO VIOLATIONS. The parser
+    # returns a best-effort AST plus its errors, and the AST is TRUNCATED at the
+    # first one -- so everything after a stray quote is invisible and this
+    # function answers 0. Measured on 7.6.6: `$q = "oops ; $x = "a {0}" + "b" -f 1`
+    # returns 0, and so does a path that does not exist.
+    #
+    # That is this guard's own named failure mode arriving by a second door: it
+    # exists because the first version "reported the module clean" while matching
+    # nothing. So an unparseable subject is -1, which no caller can mistake for a
+    # count, and the self-test refuses it by name.
+    if ($null -ne $errors -and $errors.Count -gt 0) { return -1 }
+    if ($null -eq $ast) { return -1 }
     $found = $ast.FindAll({
         param($node)
         ($node -is [System.Management.Automation.Language.BinaryExpressionAst]) -and
@@ -607,12 +619,17 @@ function Invoke-E2EPortSelfTest {
                      -ErrorAction SilentlyContinue |
                  Where-Object { $_.FullName -notmatch '[\\/](out|vendor|\.git)[\\/]' })
     $offenders = @()
+    $unreadable = @()
     foreach ($f in $psFiles) {
-        if ((Measure-E2EFormatPrecedence $f.FullName) -gt 0) { $offenders += $f.Name }
+        $n = Measure-E2EFormatPrecedence $f.FullName
+        if ($n -lt 0) { $unreadable += $f.Name; continue }
+        if ($n -gt 0) { $offenders += $f.Name }
     }
     # A walk that matched nothing reports every file clean, which reads exactly
     # like complete coverage.
     Expect "the PowerShell walk found files to read" $true ($psFiles.Count -ge 5)
+    # And a file it could not PARSE is a third state, not a clean one.
+    Expect "every tracked PowerShell file parsed" "" ($unreadable -join ', ')
     Expect "no tracked PowerShell file concatenates in front of -f" "" ($offenders -join ', ')
 
     # AND NO SIXTH PRIVATE PORT DRAW. Nothing in PowerShell makes a fixture reach
@@ -630,12 +647,20 @@ function Invoke-E2EPortSelfTest {
         'E2EPorts.psm1' = 'the module itself -- this is the draw every other file is meant to call'
         'dist-compile-e2e.ps1' = 'Get-FreePortBlock draws CONSECUTIVE ports with a CONNECT probe, which New-E2EPort cannot stand in for'
     }
+    # `Read-E2ELiveText` answers "" for a file it could not open, and "" does not
+    # match -- so an unreadable file would report as "does not draw its own port",
+    # which is the same clean-by-failure the parse guard above refuses. Emptiness
+    # is therefore checked against the file's own length rather than inferred.
     $drawOffenders = @()
+    $drawUnreadable = @()
     foreach ($f in $psFiles) {
-        if ((Read-E2ELiveText $f.FullName) -notmatch 'Get-Random\s+-Minimum\s+\d{4,5}') { continue }
+        $text = Read-E2ELiveText $f.FullName
+        if (-not $text -and $f.Length -gt 0) { $drawUnreadable += $f.Name; continue }
+        if ($text -notmatch 'Get-Random\s+-Minimum\s+\d{4,5}') { continue }
         if ($drawExempt.ContainsKey($f.Name)) { continue }
         $drawOffenders += $f.Name
     }
+    Expect "every tracked PowerShell file could be read" "" ($drawUnreadable -join ', ')
     Expect "no tracked PowerShell file draws its own port" "" ($drawOffenders -join ', ')
     # An exemption that has stopped describing a draw is a licence outliving its
     # argument, so a row naming a file that no longer draws is refused.
