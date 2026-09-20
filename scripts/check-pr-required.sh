@@ -116,6 +116,96 @@ TABLE
         fi
     }
 
+    # The two decisions `--wait` is made of, driven through their own doors for
+    # the same reason `Verdict` drives `--listing-verdict`: a real force-push
+    # mid-poll cannot be staged, and that is precisely the decision force-push
+    # exists to trip (#1289).
+    #
+    # The expected word comes SECOND, not last. `${!#}` plus `unset "args[N-1]"` reads
+    # more naturally and is the kind of construct bash 3.2 -- which macOS ships, and
+    # which every registered script here must parse under -- is not worth betting on.
+    #
+    # @param 1 what this case is about  @param 2 the expected word  @param 3..n the arguments
+    Pure() {
+        local what="$1" want="$2" out=""
+        shift 2
+        cases=$((cases + 1))
+        out="$(bash "$Tool" "$@" 2>&1)" || true
+        if [[ "$out" == "$want" ]]; then
+            echo "  ok    (pure)    $what"
+        else
+            failures=$((failures + 1))
+            echo "  FAIL  (pure)    $what -- said '$out', wanted '$want'" >&2
+        fi
+    }
+
+    # ---- #1289: the head guard, both directions --------------------------
+    #
+    # The ACCEPTING arm first: a guard that answered `moved` to everything
+    # would pass the refusing case below and break every wait.
+    Pure "the first poll has nothing to have moved from" same \
+        --head-guard "" "7d6ccd8f"
+    Pure "an unchanged head is not a move" same \
+        --head-guard "7d6ccd8f" "7d6ccd8f"
+    Pure "a head that moved under the wait is named MOVED" moved \
+        --head-guard "7d6ccd8f" "5a9dca04"
+    # An empty CURRENT sha is not a comparison. Reading it as `same` would let a
+    # wait run on against nothing at all, which is the silent direction.
+    Pure "an empty current SHA refuses rather than reading as unchanged" refuse \
+        --head-guard "7d6ccd8f" ""
+
+    # ---- #1289: whether to poll again ------------------------------------
+    #
+    # The arguments are <merge-kind> <running> <absent> <waited> <ceiling>.
+    Pure "a mergeable head with contexts running polls again" poll \
+        --wait-decision merges 2 0 0 100
+    Pure "a head GitHub has not computed yet polls too" poll \
+        --wait-decision uncomputed 1 0 5 100
+    Pure "nothing running and nothing absent is settled" stop-settled \
+        --wait-decision merges 0 0 0 100
+    # The ticket's own clause: a dirty head exits on poll 1 on the refusal it
+    # already has, rather than polling to the ceiling to print the same thing.
+    Pure "a CONFLICTING head stops on poll 1 rather than waiting" stop-decided \
+        --wait-decision conflicts 2 0 0 100
+    Pure "a head that is BEHIND stops too -- waiting cannot fix it" stop-decided \
+        --wait-decision behind 3 0 0 100
+    Pure "the ceiling is reached, so the wait stops with the verdict it has" stop-timeout \
+        --wait-decision merges 2 0 100 100
+
+    # ---- ABSENT IS NOT SETTLED -------------------------------------------
+    #
+    # A required context that was never dispatched is RUNNING=0 and ABSENT=1,
+    # and a `stop-settled` keyed on RUNNING alone answered *everything
+    # concluded* for it -- returning on poll 1 with a verdict about contexts
+    # nothing had run. The cases below are the readings of that one tally, and
+    # they differ ONLY in the merge kind and the ceiling, which is the point:
+    # the counts cannot tell them apart.
+    Pure "absent contexts on a mergeable head keep the wait open" poll \
+        --wait-decision merges 0 3 0 100
+    Pure "absent contexts on an uncomputed head keep it open too" poll \
+        --wait-decision uncomputed 0 3 0 100
+    # A conflicting pull request has no merge ref, so nothing was ever
+    # dispatched and no ceiling is long enough. Decided, not waited out.
+    Pure "absent contexts on a CONFLICTING head are permanent" stop-decided \
+        --wait-decision conflicts 0 3 0 100
+    # And the case that pins the ORDER of the two clauses, which nothing
+    # else can see: a decided head is decided even with NOTHING outstanding.
+    # Swap the kind switch and the count check and every other case here
+    # still passes -- measured, by making exactly that edit.
+    Pure "a CONFLICTING head is decided even with nothing outstanding" stop-decided \
+        --wait-decision conflicts 0 0 0 100
+    Pure "absent contexts still respect the ceiling" stop-timeout \
+        --wait-decision merges 0 3 100 100
+    # And the mixed tally, which is the ordinary state of a run that has
+    # started: some reported, some running, some not yet expanded.
+    Pure "running and absent together keep the wait open" poll \
+        --wait-decision merges 1 2 0 100
+    # The CONTROL on the group above: with both counts at zero the same inputs
+    # settle. Without it, a `WaitDecision` answering `poll` to everything would
+    # pass every case in this group.
+    Pure "the control: neither running nor absent still settles" stop-settled \
+        --wait-decision uncomputed 0 0 0 100
+
     All="Alpha	completed	success	2026-01-01T00:00:00Z
 Beta	completed	success	2026-01-01T00:00:00Z
 Gamma	completed	success	2026-01-01T00:00:00Z"
