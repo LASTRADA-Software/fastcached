@@ -8,6 +8,7 @@
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Net/IAsyncAddressResolver.hpp>
 #include <FastCache/Net/IConnector.hpp>
@@ -87,7 +88,9 @@ class RotatingCredential final: public ICredentialSource
     /// @copydoc ICredentialSource::Current
     [[nodiscard]] Cc::Credential Current() const override
     {
-        return Cc::Credential { .username = {}, .secret = _secret };
+        // `std::string` at the boundary: `Cc::Credential` lives in the launcher's
+        // dependency-free header and cannot name a `Core/` type (#1125).
+        return Cc::Credential { .username = {}, .secret = std::string { _secret.View() } };
     }
 
     /// Replace the secret, as an accepted reload does.
@@ -98,7 +101,10 @@ class RotatingCredential final: public ICredentialSource
     }
 
   private:
-    std::string _secret;
+    /// `SecureString` for the reason the production holders are: this fake stands in for a
+    /// credential source, and a test double spelling a credential the unsafe way is how the
+    /// unsafe spelling gets copied back into production (#1125).
+    FastCache::SecureString _secret;
 };
 
 /// The bytes a client sends when it presents @p secret before @p command.
@@ -445,7 +451,7 @@ TEST_CASE("The production source answers from the LIVE snapshot, not the startup
     NodeConfig initial;
     initial.schedulers = { "scheduler.example:6676" };
     initial.clusterDir = "node-state";
-    initial.token = std::string { FirstSecret };
+    initial.requirePass = std::string { FirstSecret };
 
     NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
     ConfiguredCredential const credential { initial, &reloader };
@@ -466,7 +472,7 @@ TEST_CASE("A worker with no configuration file presents what it was started with
     // presenting its credential rather than presenting none, which is what a source
     // that treated "no reloader" as "no configuration" would do.
     NodeConfig cfg;
-    cfg.token = std::string { FirstSecret };
+    cfg.requirePass = std::string { FirstSecret };
 
     ConfiguredCredential const credential { cfg, nullptr };
     CHECK(credential.Current().secret == FirstSecret);

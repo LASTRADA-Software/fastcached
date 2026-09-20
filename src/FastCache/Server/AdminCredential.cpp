@@ -80,7 +80,7 @@ bool AdminCredential::Accepts(std::string_view authorization) const
 
 bool AdminCredential::Matches(std::string_view presented) const
 {
-    return Required() && ConstantTimeEquals(presented, _secret);
+    return Required() && ConstantTimeEquals(presented, _secret.View());
 }
 
 } // namespace FastCache

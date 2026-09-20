@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -537,6 +538,46 @@ TEST_CASE("A dashboard credential is read from its file, newline and all", "[nod
     CHECK(credential->Required());
     CHECK(credential->Accepts("Bearer s3cret-token"));
     CHECK_FALSE(credential->Accepts("Bearer s3cret-token\n"));
+}
+
+TEST_CASE("A credential longer than one read chunk comes back whole", "[node][admin][dashboard]")
+{
+    // #1125 replaced a `tellg()`-sized single read with a chunked loop into zeroing
+    // storage, and every case here fitted in one 4096-byte chunk -- so the loop, the
+    // REALLOCATION it drives, and the chunk boundary were exercised by nothing. A
+    // reader that dropped or duplicated a chunk passed the whole suite.
+    //
+    // Three lengths rather than one, because the boundary is where a chunked loop goes
+    // wrong: one byte under a chunk, exactly a chunk (the read that leaves the stream
+    // good and the next one extracting nothing), and several chunks with a partial tail.
+    constexpr std::size_t chunk = 4096;
+    auto const lengths = std::array<std::size_t, 3> { chunk - 1, chunk, (chunk * 2) + 7 };
+
+    Testing::ScratchDirectory const scratch { "dashboard-token-long" };
+    for (auto const length: lengths)
+    {
+        CAPTURE(length);
+
+        // Not one repeated character: a loop that re-read the same chunk, or appended a
+        // chunk twice, produces the right LENGTH out of identical bytes and passes.
+        auto secret = std::string {};
+        secret.reserve(length);
+        for (auto const index: std::views::iota(std::size_t { 0 }, length))
+            secret.push_back(static_cast<char>('a' + (index % 26)));
+
+        auto const path = scratch.Path() / std::format("token-{}", length);
+        {
+            std::ofstream out { path, std::ios::binary };
+            out << secret << "\n";
+        }
+
+        auto const credential = Node::ReadDashboardToken(path);
+        REQUIRE(credential.has_value());
+        CHECK(credential->Accepts(std::format("Bearer {}", secret)));
+
+        // And nothing longer is accepted, which is what a duplicated tail would produce.
+        CHECK_FALSE(credential->Accepts(std::format("Bearer {}{}", secret, secret.back())));
+    }
 }
 
 TEST_CASE("A credential file that cannot be used is refused rather than ignored", "[node][admin][dashboard]")

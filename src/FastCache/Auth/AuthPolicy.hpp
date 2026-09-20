@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/SecureBytes.hpp>
+
 #include <memory>
 #include <mutex>
 #include <string>
@@ -34,7 +36,12 @@ class AuthPolicy
     /// @param username Expected username for the two-argument verify form
     ///                 (redis `AUTH <user> <pass>` / SASL PLAIN authcid).
     /// @param secret   Shared secret; an empty secret means "auth disabled".
-    AuthPolicy(std::string username, std::string secret) noexcept;
+    ///
+    /// **By value and `SecureString`, so the caller's copy is the last ordinary one.**
+    /// The secret is released through `SecureAllocator` from here on, at every copy and
+    /// at every reload snapshot `ConfigReloader` retains
+    /// ([#1125](https://github.com/LASTRADA-Software/fastcached/issues/1125)).
+    AuthPolicy(std::string username, SecureString secret) noexcept;
 
     /// @return True when a non-empty secret is configured (auth is required).
     [[nodiscard]] bool Enabled() const noexcept;
@@ -56,7 +63,10 @@ class AuthPolicy
 
   private:
     std::string _username;
-    std::string _secret;
+
+    /// The shared secret. `SecureString` rather than `std::string`: this is a credential,
+    /// so the storage it occupies is zeroed when it is released (#1125).
+    SecureString _secret;
 };
 
 /// Indirection over `AuthPolicy const*` that the protocol layer reads from on

@@ -23,7 +23,7 @@ bool ConstantTimeEquals(std::string_view a, std::string_view b) noexcept
     return diff == 0;
 }
 
-AuthPolicy::AuthPolicy(std::string username, std::string secret) noexcept:
+AuthPolicy::AuthPolicy(std::string username, SecureString secret) noexcept:
     _username { std::move(username) },
     _secret { std::move(secret) }
 {
@@ -36,7 +36,7 @@ bool AuthPolicy::Enabled() const noexcept
 
 bool AuthPolicy::Verify(std::string_view password) const noexcept
 {
-    return ConstantTimeEquals(password, _secret);
+    return ConstantTimeEquals(password, _secret.View());
 }
 
 bool AuthPolicy::Verify(std::string_view username, std::string_view password) const noexcept
@@ -44,7 +44,7 @@ bool AuthPolicy::Verify(std::string_view username, std::string_view password) co
     // Evaluate both comparisons unconditionally (no `&&` short-circuit) so a
     // username mismatch and a password mismatch take the same time.
     bool const userOk = ConstantTimeEquals(username, _username);
-    bool const passOk = ConstantTimeEquals(password, _secret);
+    bool const passOk = ConstantTimeEquals(password, _secret.View());
     return userOk && passOk;
 }
 
