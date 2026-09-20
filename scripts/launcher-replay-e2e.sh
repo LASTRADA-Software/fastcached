@@ -102,12 +102,21 @@ SKIP=77
 
 # `skip` stays private, and the library grows no equivalent for it here. Every
 # fixture under `scripts/` spells its own `SKIP=77` and its own message, because
-# 77 is a CONTRACT WITH THE CALLER rather than a fact about the library, and this
-# fixture's caller is not the one the others have: it is registered as no ctest
-# at all -- the only caller is `build.yml`'s "A real target, replayed from cache"
-# step, which reads 77 itself and turns it into `::error::replay E2E skipped,
-# nothing verified`. A library `skip` would put that number one indirection away
-# from the one file that agrees with it.
+# 77 is a CONTRACT WITH THE CALLER rather than a fact about the library.
+#
+# It now has TWO callers and they read the same number differently, which is the
+# reason to keep it spelled here rather than one indirection away. `build.yml`'s
+# "A real target, replayed from cache" step turns 77 into `::error::replay E2E
+# skipped, nothing verified` -- in CI a skip is a failure, because the whole point
+# of that leg is that it ran. The `launcher-replay-e2e` ctest registration reads
+# the same 77 through `SKIP_RETURN_CODE` and reports Skipped, because on a
+# developer's machine the prerequisites genuinely may not be there.
+#
+# Until #1254 there was one caller and no registration at all, so
+# `ctest -R launcher-replay-e2e` selected nothing and exited 0 -- while AGENT.md
+# and two rules files quoted this fixture as a live instrument. A name that
+# selects nothing is the worst shape a check can have: it answers, it answers
+# green, and it is not there.
 skip() { echo "launcher-replay-e2e: $* -- skipping"; exit "$SKIP"; }
 
 for pair in "fastcached:$fastcached" "launcher:$launcher"; do
@@ -115,7 +124,6 @@ for pair in "fastcached:$fastcached" "launcher:$launcher"; do
     [ -n "$path" ] && [ -x "$path" ] || skip "${pair%%:*} was not given an executable"
 done
 [ -n "$compiler" ] && command -v "$compiler" >/dev/null 2>&1 || skip "no usable compiler ($compiler)"
-[ -n "$port" ] || skip "no port given"
 command -v cmake  >/dev/null 2>&1 || skip "cmake is not on PATH"
 command -v ninja  >/dev/null 2>&1 || skip "ninja is not on PATH"
 command -v python3 >/dev/null 2>&1 || skip "python3 is not on PATH"
@@ -137,6 +145,21 @@ trap cleanup EXIT
 # goes. The label is what every `FAILED:` line is prefixed with, so it is the
 # spelling this fixture's own messages have always carried.
 e2e_begin "launcher-replay-e2e" "$workdir"
+
+# The port, DRAWN when the caller named none (#1254).
+#
+# It used to be `[ -n "$port" ] || skip "no port given"`, which was right while the
+# only caller was a `build.yml` step passing a constant. This fixture is a ctest now,
+# and a registration cannot name a port: a fixture CHOOSING one cannot see a port
+# already held as an outbound connection's local endpoint, and two lanes' suites run
+# at once on this machine. `free_port` is the tree's one answer and it needs the
+# workdir, which is why the draw is here rather than up with the other argument
+# checks. An explicitly passed port is still honoured untouched -- `build.yml` passes
+# 21717 and nothing about that step changes.
+if [ -z "$port" ]; then
+    port="$(free_port)"
+    e2e_note "no --port given; drew ${port}"
+fi
 
 # ---------------------------------------------------------------------------
 echo "== the daemon this build will cache through"

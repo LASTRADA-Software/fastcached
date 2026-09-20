@@ -1879,6 +1879,17 @@ if(NOT WIN32)
     )
 endif()
 
+# `find_package(Python3)` and not a `find_program`: it VALIDATES the interpreter by
+# running it, which is what screens out Windows' App Execution Alias -- a zero-byte
+# reparse point on PATH named `python3.exe` that a `find_program` returns happily and
+# that does not run Python. A third spelling of "find python" would also disagree with
+# `cmake/Coverage.cmake`'s about which interpreter it means.
+#
+# Resolved HERE rather than at the first registration that needed it, because that
+# registration is no longer the first: `tidy-blind-spots-table` below is. Every later
+# consumer reuses this result.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+
 # Which translation units the analyser never sees.
 #
 # The `clang-tidy` job runs on `ubuntu-24.04` and `scripts/local-gate.sh` tidies
@@ -1907,10 +1918,23 @@ endif()
 # `clang-debug` with TLS on and runs `ctest` -- the same configuration the `clang-tidy`
 # job sweeps, which is what makes its answer the one the sweep would give.
 #
-# KNOWN RESIDUAL: if that job's flags change, this stops being registered and reports
-# nothing, which reads like a pass. The selftest below runs everywhere and keeps the
-# check itself honest, but nothing yet asserts that some CI job still configures a
-# build this can run in.
+# That residual -- if the job's flags change, this stops being registered and reports
+# nothing, which reads like a pass -- is #589, and it is closed by two checks rather
+# than one, because it was two claims:
+#
+#   * `conditional-check-reach` derives the option-gated registrations in this file
+#     from the `if()` nesting around them and asks which `build.yml` job configures a
+#     build satisfying each one AND runs `ctest`. `tidy-blind-spots` is a row of its
+#     derived set, not a name written into it, so a flag change here or there refuses.
+#   * `tidy-blind-spots-table` below runs the half of this check that needs no build,
+#     everywhere, in the default set. A compiler is what the MEASUREMENT needs; the
+#     table's own rules are properties of two text files and the workflow, and gating
+#     those behind an ASan Linux build asserted them on one configuration and on none
+#     of the others.
+#
+# `--python3` is not passed here on purpose: this registration is Linux-only under a
+# configuration that has `python3` on PATH by construction, and the flag exists for the
+# registration below, which runs on Windows too.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ENABLE_SANITIZER_ADDRESS AND FASTCACHED_ENABLE_TLS)
     add_test(
         NAME "tidy-blind-spots"
@@ -1940,6 +1964,47 @@ if(NOT WIN32)
         COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-blind-spots-selftest.sh"
     )
     set_tests_properties("tidy-blind-spots-selftest" PROPERTIES
+        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+        LABELS "hygiene"
+        TIMEOUT 120
+    )
+endif()
+
+# The table's own rules, with no build (#589).
+#
+# `tidy-blind-spots` above needs a compile database, the objects and `nm`, so it is
+# registered on Linux with ASan and TLS on and NOWHERE else. Two of its rules need
+# none of that: every reached-by column must name a clang-tidy leg that still exists
+# in `.github/workflows/build.yml`, and every row -- a `none` row above all, where the
+# reason is the only account of why nothing reads the unit -- must carry a reason.
+# Those were enforced on exactly one configuration and on no other, so a row naming a
+# renamed leg, or a reason deleted in a tidy-up, went unremarked everywhere the
+# measuring registration does not exist.
+#
+# Registered UNCONDITIONALLY, which is the point rather than a convenience: the legs
+# come from the workflow and the rows from a text file, and neither is a property of
+# the host. A platform guard here would reintroduce the hole one level down.
+#
+# It does not measure, and it says so in its own verdict line. A mode that names its
+# set may not report clean over a member it could not cover -- `all accounted for in
+# scripts/tidy-blind-spots.txt` is a claim about the OBJECTS, and a run that opened
+# none must not borrow it.
+if(NOT Python3_Interpreter_FOUND)
+    # Absent is not passing, and a WARNING alone is written once into a log nobody
+    # reads twice while the RUN contains no row at all (#1570). The honest skip keeps
+    # `ctest -N` returning the same total with and without a python3 on PATH.
+    message(WARNING
+        "tidy-blind-spots-table: no Python 3 interpreter found, so the blind-spot table's "
+        "own rules (#589) are NOT guarded in this build tree")
+    fastcached_register_skipped_test("tidy-blind-spots-table"
+        "no Python 3 interpreter found, so the blind-spot table's own rules (#589) are NOT guarded in this build tree")
+else()
+    add_test(
+        NAME "tidy-blind-spots-table"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-blind-spots.sh"
+                --table-only --python3 "${Python3_EXECUTABLE}"
+    )
+    set_tests_properties("tidy-blind-spots-table" PROPERTIES
         FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
         LABELS "hygiene"
         TIMEOUT 120
@@ -5476,13 +5541,9 @@ endif()
 # connection's local endpoint, and letting the kernel choose sidesteps that
 # question rather than answering it.
 #
-# `find_package(Python3)` and not a `find_program`: it VALIDATES the interpreter
-# by running it, which is what screens out Windows' App Execution Alias -- a
-# zero-byte reparse point on PATH named `python3.exe` that a `find_program`
-# returns happily and that does not run Python. A third spelling of "find
-# python" would also disagree with `cmake/Coverage.cmake`'s about which
-# interpreter it means.
-find_package(Python3 COMPONENTS Interpreter QUIET)
+# Python3 is resolved once, above `tidy-blind-spots-table`, which is its first
+# consumer in this file; the argument for `find_package` over `find_program` lives
+# there. Reused here rather than asked again.
 if(NOT Python3_Interpreter_FOUND)
     # A WARNING and not a STATUS. The outcome here is that a guard standing
     # behind a rule which has already cost three lanes forty minutes each is
@@ -8175,3 +8236,118 @@ if(TARGET FastCacheTest)
         TIMEOUT 300
     )
 endif()
+
+# ---------------------------------------------------------------------------
+# `launcher-replay-e2e` exists as a ctest NAME (#1254, absorbing #1228).
+#
+# It was registered by nothing. `ctest -R launcher-replay-e2e` selected no tests
+# and exited **0**, which is the worst shape a check can have: it answers, it
+# answers green, and there is nothing there. AGENT.md and two rules files quote
+# this fixture as a live instrument -- "builds three times: cache-off control,
+# cold (stores), warm (REPLAYS), and runs the replayed binary" -- so a reader
+# checking that claim the obvious way was told it passed.
+#
+# Its single executor tree-wide was `build.yml`'s "A real target, replayed from
+# cache" step, which still runs it and is untouched by this block.
+#
+# WHY AN OPT-IN RATHER THAN AN UNCONDITIONAL RUN. The fixture configures and
+# builds three CMake trees of `fastcache-cc-tests`. This tree's `ctest` presets
+# carry no label filter, so a plain `ctest` runs `smoke` too -- registering it to
+# run by default would put three full builds into every developer's test run and
+# into every CI leg that calls `ctest`, none of which asked for them. The default
+# is therefore OFF, and the name is registered EITHER WAY: opted in it is the real
+# fixture, opted out it is a skip that says which flag turns it on. What it is
+# never again is absent.
+#
+# So `ctest -N` gains exactly one row and a `ctest` run gains zero builds. That is
+# measured rather than asserted -- see the commit -- because "it only registers a
+# skip" is precisely the kind of claim that is easy to believe and cheap to check.
+option(FASTCACHED_RUN_LAUNCHER_REPLAY_E2E
+    "Run the launcher replay end-to-end fixture as part of ctest. Costs three CMake builds." OFF)
+
+if(WIN32)
+    # POSIX shell throughout, and the Windows launcher path has its own fixture
+    # (`run-launcher-e2e.ps1`). Not a skip standing in for a pass: there is
+    # nothing here for this platform to answer.
+    fastcached_register_skipped_test("launcher-replay-e2e"
+        "this fixture is POSIX-shell only; the Windows launcher path is covered by run-launcher-e2e.ps1")
+elseif(NOT FASTCACHED_RUN_LAUNCHER_REPLAY_E2E)
+    fastcached_register_skipped_test("launcher-replay-e2e"
+        "not opted in -- it configures and builds three CMake trees, so it is off by default. Set -DFASTCACHED_RUN_LAUNCHER_REPLAY_E2E=ON to run it here; CI runs it from build.yml's 'A real target, replayed from cache' step regardless")
+elseif(NOT TARGET fastcached OR NOT TARGET fastcache-cc OR NOT TARGET fastcache-cc-tests)
+    fastcached_register_skipped_test("launcher-replay-e2e"
+        "opted in, but one of fastcached / fastcache-cc / fastcache-cc-tests is not built in this tree, and the fixture needs all three")
+else()
+    # No `--port`: the fixture draws one. A registration cannot name a port -- a
+    # fixture CHOOSING one cannot see a port already held as an outbound
+    # connection's local endpoint, and two lanes' suites run at once here.
+    # `build.yml` still passes its own, and that path is unchanged.
+    #
+    # `--canary` is not optional, in CI or here: it plants a deliberately wrong
+    # object into the replayed build and requires the suite to go red. Without it
+    # a green run is indistinguishable from a fixture that cannot fail.
+    add_test(
+        NAME "launcher-replay-e2e"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/launcher-replay-e2e.sh"
+            --fastcached "$<TARGET_FILE:fastcached>"
+            --launcher "$<TARGET_FILE:fastcache-cc>"
+            --compiler "${CMAKE_CXX_COMPILER}"
+            --target fastcache-cc-tests
+            --canary
+    )
+    # `SKIP_RETURN_CODE 77` reads the fixture's own `skip`, which is the same 77
+    # `build.yml` turns into `::error::replay E2E skipped, nothing verified`. The
+    # two callers read it differently ON PURPOSE: in CI a skip means the leg did
+    # not do its job, here it means a developer's machine lacks a prerequisite.
+    #
+    # `RUN_SERIAL` because it binds a port, spawns a daemon and runs three builds.
+    # The TIMEOUT is an outer supervisor, not a measurement.
+    set_tests_properties("launcher-replay-e2e" PROPERTIES
+        LABELS "smoke"
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        TIMEOUT 3600
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# A check registered only under a build OPTION is reachable by a CI job (#1254, #589).
+#
+# `tidy-blind-spots`' own registration block above states this residual in as many
+# words -- "nothing yet asserts that some CI job still configures a build this can
+# run in" -- and #589 asks the same question from the other side. One derived guard
+# answers both; two hand-written lists would be the defect twice.
+#
+# DERIVED, never restated. The population is walked out of THIS FILE's `if()`
+# nesting, so a conditional registration ARRIVING is covered on the day it lands. A
+# restated list would catch one going away and be blind to one arriving, which is the
+# direction that actually happens -- and a list reads identically whether it is
+# complete or merely confident.
+#
+# It reads `build.yml` through `scripts/lib/workflow-walk.awk`, this tree's one model
+# of workflow YAML. A private walk here would be refused by `workflow-walk-sole`.
+#
+# Needs no compiler, no build, no daemon, no socket and no network.
+add_test(
+    NAME "conditional-check-reach"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-conditional-check-reach.sh" --root "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("conditional-check-reach" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# Six cases. The ACCEPTING arm is first and is not decoration -- a guard that refused
+# every tree would pass every refusing case. Case 5 is the one that matters most: an
+# option ON by DEFAULT needs no job to name it, and a reader missing that route
+# reports three healthy `vendor-tui-*` rows as unreachable. An over-report is loud and
+# misattributed, which is worse to act on than a silent miss. Case 6 separates
+# configuring from RUNNING, which is the whole property.
+add_test(
+    NAME "conditional-check-reach-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-conditional-check-reach.sh" --self-test
+)
+set_tests_properties("conditional-check-reach-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
