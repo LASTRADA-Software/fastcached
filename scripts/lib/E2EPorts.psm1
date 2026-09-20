@@ -787,10 +787,20 @@ function Invoke-E2EPortSiteCases([int]$held) {
             $text = Get-Content -Raw $scriptPath
             Expect "$($row.Name) imports the shared port module" $true ($text -match 'E2EPorts\.psm1')
 
+            # STAGED, AND THEN ASSERTED. A fixture that quietly tested a different
+            # state than it believes it created is the failure mode that reads as
+            # a pass -- and here it would read as the WRONG failure: a staging
+            # that silently did nothing makes the fixture exit 77 on a missing
+            # binary, and the case below would report "refuses a held port with a
+            # failure, not a skip" while naming a subject that was never reached.
+            $missing = @()
             foreach ($leaf in $row.Stage) {
                 $staged = Join-Path $stageRoot $leaf
                 if (-not (Test-Path $staged)) { New-Item -ItemType File -Path $staged | Out-Null }
+                if (-not (Test-Path $staged)) { $missing += $leaf }
             }
+            Expect "$($row.Name)'s prerequisites were staged" "" ($missing -join ', ')
+            if ($missing.Count -gt 0) { continue }
 
             $argv = & $row.Argv $stageRoot $held
             # This process's own interpreter, never a bare `pwsh` off PATH: the
