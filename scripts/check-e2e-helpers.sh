@@ -2004,9 +2004,19 @@ run_case() {
     #
     # THE BOUNDS ARE LOWERED HERE, in the case body. Exhibiting a peer that holds
     # is free; waiting out the library's five-second default is what costs, and
-    # these 35 socket cases run serially. Measured: 5 s on bash 5, and 9 s on bash
-    # 3.2, where the status cannot decide and the probe burns its own bound too --
-    # against 44.3 s for this whole test, which is a tenth of it for one case.
+    # these socket cases run serially.
+    #
+    # MEASURED, and separately from what is INFERRED, because the two get lost
+    # apart. Measured on an idle host, Git Bash 5.2.37 on Windows, three runs
+    # each: **4.71-4.73 s** with these bounds against **7.70-7.71 s** without
+    # them. The 3.0 s difference is exactly the 3 s taken off the read bound,
+    # which is the cross-check that matters -- the readings come from a wall
+    # clock and the DECISION does not. The ~2.7 s that remains is this case's own
+    # setup: a port draw, a perl listener and `wait_for_port`.
+    #
+    # INFERRED, not measured here: on bash 3.2 the status cannot decide, so the
+    # probe runs too and burns `_e2e_http_probe_bound` on a holding peer -- which
+    # predicts about 4 s more again. No bash 3.2 was available to check it on.
     #
     # Nothing asserted below reads the numbers: the claims are the STATUS, that
     # the body is a prefix, and that the sentence says CUT SHORT. `wait_for_port`
