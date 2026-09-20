@@ -973,6 +973,10 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - An edit script asserts its anchor **matched** — `assert count == 1`, so "missing" and "not
   unique" both fire — and a generator that produced nothing fails rather than reporting success.
   Report what changed, not that the script finished.
+- Its mirror on the other side of the same pipe: **a `<<<` operand of 64 KiB or more
+  DEADLOCKS on Git Bash** — bash writes a herestring into a PIPE in full before starting the
+  reader. Measured to the byte, and it is SIZE rather than content, so feed a LISTING through
+  `< <(printf '%s\n' "$x")`. Master's tracked-file list sat 508 bytes short (#1591).
 - `producer | grep -q` is a false **negative** under `set -o pipefail`, and it fails on the
   SUCCESS path; it is a SCAN in `check-e2e-helpers.sh`, since a rule stated in the files that obey
   it reaches no file that does not. The remedy is a HERESTRING, which is not a pipe.
