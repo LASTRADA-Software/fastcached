@@ -428,8 +428,10 @@ namespace
         // `WSAEINTR` → `NetErrorCode::Cancelled`, the acceptor's `!raw.has_value()`
         // breaks its loop, and `~jthread` joins. It is NOT the hazard #1207 fixed on
         // `BlockingListener`: that remedy is *stop, JOIN, then close*, and it rests on
-        // POSIX NOT waking a parked `accept` (measured: still parked 12.5 s after the
-        // close), so closing early buys nothing there. Here the close is the wakeup, so
+        // POSIX NOT waking a parked `accept` (measured by `scripts/probes/accept-close-wakeup.cpp`:
+        // still parked past a 12 s ceiling after the close, 12002-12045 ms of MEASURED
+        // elapsed -- never the sum of the sleeps a wait asked for), so closing early buys
+        // nothing there. Here the close is the wakeup, so
         // joining first would hang forever. The POSIX sibling below can join-then-close
         // only because its acceptors are reactor-driven `PlatformListener`s. Pinned by
         // `ctest -R AcceptRaw`, which had no equivalent when #1238 was filed.
