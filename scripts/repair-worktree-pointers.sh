@@ -445,10 +445,16 @@ repair_self_test() {
     # because neither side names a root. That is the same reason two gits with
     # different roots both read it, and it is checked against real git rather than
     # argued.
+    # 77, never 0 (#1231). `[ "$failed" -eq 0 ]; return $?` reports **Passed** for a
+    # run that never staged the real repair -- the SUCCEED-standing-in-for-a-skip
+    # shape, arriving exactly on the hosts where coverage is thinnest. A failure
+    # already recorded OUTRANKS the skip: a run that skipped the git half and failed
+    # the pure half is a FAILURE, and returning 77 there would hide it behind a state
+    # ctest prints as green-ish.
     if ! command -v git >/dev/null 2>&1; then
         echo "repair-worktree-pointers --self-test: ${ran} checks ran, ${failed} failed -- SKIPPED: no git"
-        [ "$failed" -eq 0 ]
-        return $?
+        [ "$failed" -eq 0 ] || return 1
+        return 77
     fi
     local scratch repo wt
     scratch="$(mktemp -d)"
@@ -469,8 +475,8 @@ repair_self_test() {
     if [ ! -e "${wt}/.git" ]; then
         rm -rf "$scratch"
         echo "repair-worktree-pointers --self-test: ${ran} checks ran, ${failed} failed -- SKIPPED: git could not stage a linked worktree"
-        [ "$failed" -eq 0 ]
-        return $?
+        [ "$failed" -eq 0 ] || return 1
+        return 77
     fi
 
     # A positive control on the FIXTURE: git's own default really is absolute, so
