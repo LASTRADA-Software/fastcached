@@ -8470,3 +8470,55 @@ set_tests_properties("ci-triage-label-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# ---------------------------------------------------------------------------
+# `RequiredContexts` against the ruleset the SERVER enforces (#1562).
+#
+# Every check around that table reconciles it with the WORKFLOWS. Nothing
+# reconciled it with the RULESET, which is the only thing that actually blocks a
+# merge -- so the tree and the server could disagree indefinitely with every check
+# green, each correct about its own side. They DO disagree today.
+#
+# NEEDS THE NETWORK, so every way of not being able to ask is a SKIP that says
+# which way it was: gh absent (127), gh unauthenticated (4), the API unreachable
+# (exit 1 with a transport message). An HTTP error is NOT a skip -- that is GitHub
+# answering, and an unreachable API and an agreeing set are not the same green.
+#
+# Through `run-check.sh` like every other script check: a check registered
+# DIRECTLY reports a KILLED run and a FAILING one identically (#1079), and
+# `run-check-coverage` refuses the bypass. The wrapper forwards the status
+# untouched -- measured, a script exiting 77 through it still exits 77 and is
+# classified `skipped` on its own terminal line -- so the skip arms below still
+# reach `SKIP_RETURN_CODE`. Registering it directly to "protect" the 77 was
+# solving a problem that does not exist.
+#
+# `SKIP_RETURN_CODE 77` and `smoke`, since it reaches the network. The self-test
+# below needs none of that and runs in the DEFAULT set, which is what keeps the
+# decision covered on every machine.
+add_test(
+    NAME "required-context-ruleset"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-required-context-ruleset.sh" --root "${CMAKE_SOURCE_DIR}"
+)
+set_tests_properties("required-context-ruleset" PROPERTIES
+    LABELS "smoke"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 120
+)
+
+# Six cases, driven against a staged table and a staged ruleset. The staged table
+# is a real `RequiredContexts=(` block so the awk reader parses it rather than
+# being bypassed -- the first spelling handed the check a pre-parsed list and two
+# cases failed reporting context names with their quotes still attached, which is
+# the fixture testing itself rather than its subject.
+#
+# Case 4 is what makes the one recorded divergence EXPIRE rather than accumulate:
+# with #1562 resolved in either direction, the exemption row is refused as stale,
+# so deleting it is part of closing the ticket.
+add_test(
+    NAME "required-context-ruleset-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-required-context-ruleset.sh" --self-test
+)
+set_tests_properties("required-context-ruleset-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
