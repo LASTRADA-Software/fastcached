@@ -602,15 +602,49 @@ TEST_CASE("A lookup some Task owns is left alone by the reactor", "[net][resolve
         inner.Hold();
         reactor.Submit(lookup.Native());
         reactor.Drain();
+
+        // **WHICH settle path this case exercises, made a fact rather than a coin
+        // toss** ([#1163](https://github.com/LASTRADA-Software/fastcached/issues/1163)).
+        //
+        // `PendingSubmissions() == 1` is produced by BOTH paths -- `Stop()` settling a
+        // job still QUEUED on this thread, and a WORKER settling one it had already
+        // dequeued -- so the assertion below held whichever ran, and nobody could say
+        // which. That is the shape this repository records as *assert what
+        // distinguishes, not what both sides produce*: the worker-settles path is the
+        // one #1149 repaired, and until this wait it was exercised only by luck.
+        //
+        // Waiting for `Calls() != 0` inside the held window is what turns it into an
+        // ordering: the worker increments it on ENTRY to `Resolve` and then parks on
+        // the gate, so once it reads non-zero the job is out of the queue for good and
+        // `Stop()` cannot be the one that settles it. The idiom, and `ScriptedResolver::Calls()`
+        // with it, is the sibling case's one function up.
+        //
+        // **The wait may run here; its ASSERTION may not.** `WaitUntil` reports a wait
+        // that ran out through `UNSCOPED_INFO` and never asserts, so it cannot unwind --
+        // but a `REQUIRE` on its answer would, straight past `Release()`, and
+        // `~ThreadedAddressResolver` then joins a worker parked inside `Resolve`
+        // forever: one reportable failure becomes a suite timeout naming nothing, which
+        // this file's own `ScriptedResolver` comment says the project has already paid
+        // for once. So the answer is captured into a local and asserted after the gate
+        // is open, and the held window still contains no assertion at all.
+        auto const dequeued = WaitUntil(
+            "the worker to dequeue the lookup, so the WORKER settles it rather than Stop()",
+            [&inner] { return inner.Calls() != 0; },
+            [&inner] { return Describe(inner); });
+        auto const callsWhileHeld = inner.Calls();
+
         inner.Release();
 
-        // NO assertion inside the held window, deliberately. A `REQUIRE` firing
-        // while the gate is held unwinds straight past `Release()`, and
-        // `ThreadedAddressResolver`'s destructor then joins a worker parked inside
-        // `Resolve` forever -- a suite timeout naming nothing, which this file's own
-        // `ScriptedResolver` comment says the project has already paid for once.
-        // Removing the window is better than guarding it.
         resolver.Stop();
+
+        // First, and in this order: `Reached` attached any account through
+        // `UNSCOPED_INFO`, which Catch2 clears at the NEXT assertion whether it passes
+        // or fails. Asserting anything else first throws the account away.
+        REQUIRE(dequeued);
+
+        // Not folded into the wait's predicate: `!= 0` is what the wait can be satisfied
+        // by, and `== 1` is the stronger claim that exactly one job reached the worker.
+        REQUIRE(callsWhileHeld == 1);
 
         // `parked` is incremented at the top of the coroutine body, BEFORE the
         // `co_await`, so it reads 1 under either ordering and is evidence that the
