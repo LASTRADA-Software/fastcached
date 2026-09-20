@@ -1699,12 +1699,13 @@ backslash, an exit code disagreeing with its own log's last line, a finding
 reappearing that had supposedly been closed.
 
 
-### Four more, all from `wsl.exe`, and none settled by an exit status or a log
+### Five more, all from `wsl.exe`, and none settled by an exit status or a log
 
 These arrived in one evening from four lanes, and the property that ties them is that
 **NEITHER the wrapper's exit status NOR the presence of a log settles whether the gate
-ran**: two produce exit 0 with no work done, one produces no artefact at all, and one
-produces a status about the wrong process.
+ran**: two produce exit 0 with no work done, one produces no artefact at all, one
+produces a status about the wrong process, and the fifth produces a log whose body is
+perfect and whose opening lines have been overwritten.
 
 - **A BACKGROUND LAUNCH that started nothing and said so in the affirmative.**
   `A && B && nohup C & echo STARTED` binds the `&` to the WHOLE `&&` list, so the marker
@@ -1723,10 +1724,29 @@ produces a status about the wrong process.
   waiter keyed on that string then believed. It was caught because the line sat ABOVE the
   gate's own `LOCAL GATE STARTED` marker: an **ORDERING** check, where every value check
   agreed with it.
+- **A wrapper's `>` redirect OVERWRITES the gate's own markers, and the log that results
+  reads perfectly.** `wsl.exe -e bash wrapper.sh > gate.log` opens with `O_TRUNC` and
+  **without `O_APPEND`**, and the gate's `flock … env … /usr/bin/bash local-gate.sh`
+  re-exec reopens the same path — so later output is written from offset zero and eats
+  the opening lines. Observed: a 38-line log with **no `GATE LOCK WAITING` and no
+  `LOCAL GATE STARTED`**, and line 4 beginning mid-word (`mnt/d/...`, missing
+  `worktree: /`). Everything after was intact, which is the whole problem: the body is
+  the part a reader skims and it looked complete, so a green run would have been quoted
+  with no idea which commit it was about. **The truncated first line reads as a torn
+  cross-filesystem read** — the log was written by WSL and read from Git Bash, where that
+  is the likelier cause — and it was ruled out only by re-reading from the WRITER's own
+  filesystem, where the absence is identical. Remedy: `>>` onto a pre-truncated file, or
+  let the gate write its own log.
 
 So the wrapper writes an artefact **BEFORE** the gate starts, naming the commit it is
 about, which makes *the wrapper ran* checkable independently of *the gate produced output*
 — and the verdict itself is read from the tool's own terminal text, never from a status.
+
+**That rule has now been seen to pay, which is worth recording because a guard nobody has
+watched work is the one that gets dropped as belt-and-braces.** In the overwrite above the
+in-log `LOCAL GATE STARTED` marker was destroyed, so the run's subject was unrecoverable
+from the log itself; the wrapper's own pre-artefact still named `commit 6eed271d,
+2026-09-20T07:05:25Z`, and that is the only reason the run could be attributed at all.
 
 **`pgrep -f local-gate.sh` cannot settle which gate is whose.** It found three gates, none
 of them the asking lane's, and every one matched the same pattern; `readlink
