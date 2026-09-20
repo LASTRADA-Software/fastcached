@@ -622,15 +622,13 @@ jobs:
           bash scripts/ci-apt-update.sh
           sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev openssl
 
+      # Through `ci-install-clang.sh`, which says WHICH KIND of failure it was (#1566).
+      # Four bare commands here reported a DNS outage as "clang-tsan failed", sending a
+      # reader to the sanitizer and the source tree for a network fault. Not a retry:
+      # a blind one would make the instrument's own failures vanish unrecorded.
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
         if: ${{ needs.changes.outputs.code != 'false' && (startsWith(matrix.preset, 'clang')) }}
-        run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
-          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
-          sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
+        run: bash scripts/ci-install-clang.sh --version ${{ env.CLANG_TOOLS_VERSION }}
 
       - name: "Install GCC ${{ env.GCC_VERSION }}"
         if: ${{ needs.changes.outputs.code != 'false' && (startsWith(matrix.preset, 'gcc')) }}
@@ -793,13 +791,7 @@ jobs:
       # same `--version` banner, and two of them disagreed on 19 findings in one file
       # (#1198). The next step installs the build `.clang-tidy-version` declares (#1404).
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
-        run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
-          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
-          sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
+        run: bash scripts/ci-install-clang.sh --version ${{ env.CLANG_TOOLS_VERSION }}
 
       # The one analyser build, from the one place it is stated: `.clang-tidy-version` names
       # a PyPI release, which is immutable, and `--requirement` prints it so this step
@@ -1256,13 +1248,7 @@ jobs:
           sudo apt-get install -y ninja-build libyaml-cpp-dev libssl-dev openssl
 
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
-        run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
-          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
-          sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
+        run: bash scripts/ci-install-clang.sh --version ${{ env.CLANG_TOOLS_VERSION }}
 
       # CMAKE_CXX_SCAN_FOR_MODULES=OFF for the same reason the tidy job names it,
       # and here it is insurance rather than necessity: CompileCache.cmake turns
@@ -1425,12 +1411,10 @@ jobs:
 
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }}"
         run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
-          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
-          sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
+          # `llvm-${{ env.CLANG_TOOLS_VERSION }}` comes through the same script: that install is
+          # subject to the same two failures as the compiler's, and a bare `apt-get`
+          # after the script returned would be one call site back to guessing.
+          bash scripts/ci-install-clang.sh --version ${{ env.CLANG_TOOLS_VERSION }} --package llvm-${{ env.CLANG_TOOLS_VERSION }}
           # This job's green depends on a suppression MATCHING, and `race_top:`
           # matches a function name — which needs symbolization. Without a pinned
           # llvm-symbolizer the runtime falls back to whatever the image happens
@@ -1441,7 +1425,6 @@ jobs:
           # `ln -sf` onto a missing target succeeds and leaves a DANGLING link,
           # which is worse than no link at all — the runtime then execs something
           # that is not there. Fail here, where the message is the package name.
-          sudo apt-get install -y llvm-${{ env.CLANG_TOOLS_VERSION }}
           test -x /usr/bin/llvm-symbolizer-${{ env.CLANG_TOOLS_VERSION }}
           sudo ln -sf /usr/bin/llvm-symbolizer-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/llvm-symbolizer
 
@@ -1561,13 +1544,7 @@ jobs:
       # cmake/Coverage.cmake refuses to configure rather than let that surface
       # later as a complaint about the profile.
       - name: "Install Clang ${{ env.CLANG_TOOLS_VERSION }} and its LLVM tools"
-        run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh ${{ env.CLANG_TOOLS_VERSION }}
-          sudo apt-get install -y clang-${{ env.CLANG_TOOLS_VERSION }} llvm-${{ env.CLANG_TOOLS_VERSION }} libc++-${{ env.CLANG_TOOLS_VERSION }}-dev libc++abi-${{ env.CLANG_TOOLS_VERSION }}-dev
-          sudo ln -sf /usr/bin/clang-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-${{ env.CLANG_TOOLS_VERSION }} /usr/local/bin/clang++
+        run: bash scripts/ci-install-clang.sh --version ${{ env.CLANG_TOOLS_VERSION }} --package llvm-${{ env.CLANG_TOOLS_VERSION }}
 
       # TLS on, to match the surface the `linux` job tests. Benchmarks and the
       # test client deliberately off, unlike that job: it builds them so they
