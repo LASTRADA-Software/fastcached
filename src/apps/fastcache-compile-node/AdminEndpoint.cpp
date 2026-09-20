@@ -82,22 +82,37 @@ AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sou
     };
 }
 
-std::expected<std::string, std::string> ReadSecretFile(std::filesystem::path const& path)
+std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::filesystem::path const& path)
 {
     std::ifstream file { path, std::ios::binary };
     if (!file)
         return std::unexpected { std::format("cannot read '{}'", path.string()) };
 
-    // Via the stream buffer rather than `std::istreambuf_iterator`, which is the
-    // workaround this codebase has already had to reach for twice (see
-    // `Cc::ReadBytes` and `DefaultConfigPath_test`'s `ReadFile`): GCC at -O3
-    // inlines the iterator far enough to see a path where the buffer pointer
-    // could be null and rejects it under `-Werror=null-dereference`, which for an
-    // `ifstream` it never is. Inserting a `streambuf*` handles null by setting
-    // failbit, so there is nothing left for it to complain about.
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    auto secret = std::move(buffer).str();
+    // **Read into SECURE character storage rather than through `std::ostringstream`.**
+    // That is what this used to do, and `buffer.str()` is an ordinary `std::string` while
+    // the stream keeps one of its own -- so the secret existed in two containers nothing
+    // wipes, and changing only the RETURN type would have left both. A half-fix that looks
+    // complete is the shape this repository keeps finding
+    // ([#1125](https://github.com/LASTRADA-Software/fastcached/issues/1125)).
+    //
+    // Chunked rather than sized from `tellg()`: a credential file is not necessarily
+    // seekable -- a FIFO answers -1 -- and a reader that refuses one would be a new
+    // refusal smuggled in by a security change. The chunk is itself secure storage, so no
+    // stack buffer keeps a copy either.
+    //
+    // `std::istreambuf_iterator` stays avoided for the reason it always was: GCC at -O3
+    // inlines it far enough to see a path where the buffer pointer could be null and
+    // rejects it under `-Werror=null-dereference` (see `Cc::ReadBytes` and
+    // `DefaultConfigPath_test`'s `ReadFile`). A sized read has no iterator to inline.
+    constexpr std::size_t ReadChunkBytes = 4096;
+    FastCache::SecureCharBuffer secret;
+    FastCache::SecureCharBuffer chunk(ReadChunkBytes);
+    while (file.read(chunk.data(), static_cast<std::streamsize>(chunk.size())) || file.gcount() > 0)
+    {
+        secret.insert(secret.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(file.gcount()));
+        if (!file)
+            break;
+    }
 
     // Trailing whitespace is trimmed because every editor adds a newline, and an
     // operator should not have to know that a secret which looks right is one byte
@@ -112,7 +127,7 @@ std::expected<std::string, std::string> ReadSecretFile(std::filesystem::path con
                                              "worse than none, because the surface looks guarded",
                                              path.string()) };
 
-    return secret;
+    return FastCache::SecureString { std::string_view { secret.data(), secret.size() } };
 }
 
 std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path)
@@ -120,7 +135,8 @@ std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::
     // The reading is shared with `--scheduler-token-file` (#289); what differs is
     // only what the secret becomes. Written once, so the trailing-newline rule and
     // the empty-file refusal cannot hold for one credential and not the other.
-    return ReadSecretFile(path).transform([](std::string secret) { return AdminCredential { std::move(secret) }; });
+    return ReadSecretFile(path).transform(
+        [](FastCache::SecureString secret) { return AdminCredential { std::move(secret) }; });
 }
 
 namespace

@@ -3,6 +3,7 @@
 
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
 
 #include <array>
@@ -247,7 +248,15 @@ struct Config
     /// any data command: redis via `AUTH`, the memcached binary protocol via
     /// SASL PLAIN. The memcached text protocol has no auth handshake, so it
     /// then rejects data commands.
-    std::string requirePass {};
+    ///
+    /// **`SecureString`, and this is the largest credential holder in the tree**
+    /// ([#1125](https://github.com/LASTRADA-Software/fastcached/issues/1125)). It is
+    /// `Reloadable::Yes`, and `ConfigReloader` keeps `_current` alongside a `previous`
+    /// snapshot for as long as a reader still holds one -- so as a `std::string` this
+    /// secret was multiplied by every reload, each copy released to the general
+    /// allocator with its characters intact. Every one of those copies is now zeroed as
+    /// it dies, with no call site having to remember anything.
+    SecureString requirePass {};
 
     /// Expected username for the two-argument auth form (redis
     /// `AUTH <user> <pass>` and SASL PLAIN authcid). Defaults to "default",

@@ -23,13 +23,20 @@
 #   systemctl restart fastcached    apply any change
 #   systemctl reload fastcached     apply the reloadable subset only (see below)
 #
-# Reloadable on SIGHUP: log_level, max_memory, requirepass, auth_username,
-# notify_keyspace_events.
+# reloadable-for: fastcached
+#
+# FIVE settings are reloadable and the rest are read once at startup: log_level,
+# max_memory, requirepass, auth_username, notify_keyspace_events.
 #
 # EVERY OTHER setting in this file is NOT reloadable. Changing one and running
 # `systemctl reload` makes the daemon REJECT the whole reload and keep its
 # previous configuration, naming every setting that could not be applied (the
 # reason is logged to the journal). Use `systemctl restart` instead.
+#
+# That count is checked against `CliOptions()` by `ctest -R reloadable-docs`, which
+# is why it is spelled as a word before the phrase above rather than left as prose
+# (#1070) -- it used to read "the five above", agreeing with the table only because
+# nobody had changed either.
 #
 # The five above are the complete list rather than the interesting part of one:
 # they are exactly the settings something re-applies at runtime. Everything else

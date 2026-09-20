@@ -62,6 +62,8 @@ pseudoRandomKey|the HKDF PRK, from which every output key is expanded (Core/Hkdf
 outputKeyMaterial|the HKDF output: the derived key itself (Core/Hkdf)
 identitySeed|the seed a node identity key is derived from, drawn when it is minted (NodeKey, #178)
 keyFileBytes|the contents of a node-key file, which carry that seed (NodeKey, #178)
+_secret|the shared secret a credential holder keeps -- AuthPolicy, AdminCredential, and the credential-source fakes that stand in for them (Auth/AuthPolicy, Server/AdminCredential, #1125)
+requirePass|the client-authentication secret of the daemon, which ConfigReloader multiplies by every retained snapshot (Config/Config, #1125)
 '
 # The rows are the per-node identity's (#178): the table's claim is "these names hold key
 # material", and a node's signing key and a session's derived keys are exactly that. Each name is
@@ -78,6 +80,29 @@ keyFileBytes|the contents of a node-key file, which carry that seed (NodeKey, #1
 # most of the tree, so that row would refuse hundreds of correct declarations, and a guard
 # that has to be suppressed everywhere is one somebody deletes. That is what forced the
 # RENAME rather than a wider vocabulary -- the holder is named for what it holds.
+#
+# `_secret` and `requirePass` are #1125's rows: the TEXT credentials, where the container is
+# `SecureString` rather than `SecureByteBuffer`. ``-anchored as everything here is, so
+# `_secret` does not reach `_secretKey` and `requirePass` does not reach
+# `requirePassExplicit` -- which is a provenance BIT and holds no secret.
+#
+# THREE names were considered for #1125 and are deliberately NOT rows, each for a different
+# reason, because an omission that looks like an oversight gets 'fixed' into a refusal
+# nobody can satisfy:
+#
+#   `secret`  -- reaches `Cc::Credential::secret` in `apps/fastcache-cc/CacheProtocol.hpp`,
+#                which is shared verbatim with the launcher and MUST stay dependency-free
+#                (AGENT.md). A row demanding a `Core/` type there is one no tree can pass.
+#   `dashboardToken`
+#             -- the same wall, in `Protocol/CompileCacheWire.hpp`, which is header-only and
+#                dependency-free for the same reason.
+#   `token`   -- far too broad: `PathCanon`'s parser, `CpuFeatures`' banner reader and a
+#                lease's public identifier all spell it, and none is key material. This is
+#                the `key` argument again.
+#
+# Where those secrets LAND is therefore still plain storage, and that is a stated boundary
+# rather than a gap this table forgot -- `fastcache-cli`'s `main.cpp` writes the conversion
+# out longhand at the two sites where it happens.
 
 # Types that OWN bytes. A borrowing view (`std::span`, `BytesView`, `std::string_view`)
 # is deliberately absent: it owns no storage, so there is nothing for it to zero, and
@@ -304,6 +329,8 @@ SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
+SecureString _secret;
+SecureString requirePass;
 std::array<std::byte, 32> publicKey;
 
 EOF
@@ -339,6 +366,8 @@ SecureByteBuffer inputKeyMaterial;
 SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
+SecureString _secret;
+SecureString requirePass;
 EOF
     verdict=$(bash "$0" --root "$tmp/blind" 2>&1)
     if grep -q "identifier 'keyFileBytes' matches nothing" <<< "$verdict"; then
@@ -383,6 +412,8 @@ SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
+SecureString _secret;
+SecureString requirePass;
 inline std::string SealWith(std::span<std::byte const> sharedSecret, int claims);
 bool Authenticate(std::span<std::byte const> sharedSecret, std::string_view token);
 EOF
@@ -406,6 +437,23 @@ EOF
         printf 'ok   case 7: a secret held in a std::array is reported\n'
     else
         printf 'FAIL case 7: array-held secret not reported. Got: %s\n' "$verdict"; return 1
+    fi
+    cases=$((cases + 1))
+
+    # Case 8: a TEXT credential in a plain std::string. The #1125 rows, and the direction
+    # that matters: `SecureByteBuffer` covers a credential that arrives as bytes, and every
+    # one that arrives as text -- `--requirepass`, a dashboard token, the contents of a
+    # `*-token-file` -- was a plain `std::string` released with its characters intact. The
+    # clean tree above is the control that these rows are about the CONTAINER rather than
+    # about the names.
+    mkdir -p "$tmp/text"
+    cp "$tmp/clean/a.hpp" "$tmp/text/a.hpp"
+    printf 'std::string requirePass {};\n' >> "$tmp/text/a.hpp"
+    verdict=$(bash "$0" --root "$tmp/text" 2>&1)
+    if grep -q 'requirePass declared as std::string' <<< "$verdict"; then
+        printf 'ok   case 8: a text credential in a plain std::string is reported\n'
+    else
+        printf 'FAIL case 8: text credential not reported. Got: %s\n' "$verdict"; return 1
     fi
     cases=$((cases + 1))
 
@@ -433,8 +481,10 @@ ScanRoot "$Root"
 if [ -n "$ScanFindings" ]; then
     printf 'A credential is held in a container that does not zero its storage.\n\n'
     printf '%s' "$ScanFindings"
-    printf '\nUse SecureByteBuffer (FastCache/Core/SecureBytes.hpp). It is a std::vector alias,\n'
-    printf 'so every span-taking interface keeps working; adopting it is a type change.\n'
+    printf '\nUse a zeroing container from FastCache/Core/SecureBytes.hpp: SecureByteBuffer for\n'
+    printf 'a credential that is BYTES, SecureString for one that is TEXT. Both are std::vector\n'
+    printf 'underneath, so every span-taking and string_view-taking interface keeps working,\n'
+    printf 'and adopting one is a type change rather than a rewrite.\n'
     exit 1
 fi
 

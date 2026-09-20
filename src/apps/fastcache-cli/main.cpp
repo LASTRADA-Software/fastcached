@@ -74,20 +74,37 @@ constexpr std::string_view ProgramName = "fastcache-cli";
 /// this process's environment.
 /// @param path The file.
 /// @return The secret, or the reason it could not be read.
-[[nodiscard]] std::expected<std::string, std::string> ReadSecretFile(std::string const& path)
+[[nodiscard]] std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::string const& path)
 {
     std::ifstream file { path, std::ios::binary };
     if (!file.is_open())
         return std::unexpected(std::format("cannot read {}", path));
 
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    auto secret = buffer.str();
+    // **Read into SECURE character storage rather than through `std::ostringstream`.**
+    // That is what this used to do, and `buffer.str()` is an ordinary `std::string` while
+    // the stream keeps one of its own -- so the secret existed in two containers nothing
+    // wipes, and changing only the RETURN type would have left both. A half-fix that looks
+    // complete is the shape this repository keeps finding
+    // ([#1125](https://github.com/LASTRADA-Software/fastcached/issues/1125)).
+    //
+    // Chunked rather than sized from `tellg()`: a credential file is not necessarily
+    // seekable -- a FIFO answers -1 -- and a reader that refuses one would be a new
+    // refusal smuggled in by a security change. The chunk is itself secure storage, so no
+    // stack buffer keeps a copy either.
+    constexpr std::size_t ReadChunkBytes = 4096;
+    FastCache::SecureCharBuffer secret;
+    FastCache::SecureCharBuffer chunk(ReadChunkBytes);
+    while (file.read(chunk.data(), static_cast<std::streamsize>(chunk.size())) || file.gcount() > 0)
+    {
+        secret.insert(secret.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(file.gcount()));
+        if (!file)
+            break;
+    }
     while (!secret.empty() && (secret.back() == '\n' || secret.back() == '\r'))
         secret.pop_back();
     if (secret.empty())
         return std::unexpected(std::format("{} is empty", path));
-    return secret;
+    return FastCache::SecureString { std::string_view { secret.data(), secret.size() } };
 }
 
 /// Write bytes to stdout with no translation.
@@ -580,19 +597,28 @@ int main(int argc, char* argv[])
             break;
     }
 
+    // **The two conversions below are the boundary, and they are written out rather than
+    // hidden.** `ReadSecretFile` now keeps the file's bytes in storage that is zeroed when
+    // it is released, so the read itself leaves nothing behind (#1125). Where each secret
+    // LANDS is a different question and is not this ticket's to move:
+    // `Cc::Credential::secret` lives in `fastcache-cc/CacheProtocol.hpp` and
+    // `dashboardToken` in `Protocol/CompileCacheWire.hpp`, both of which are shared
+    // verbatim with the launcher and must stay dependency-free -- so neither can name a
+    // type from `Core/`. An explicit `std::string` here says exactly where the covered
+    // part stops, which an implicit conversion would not.
     if (!command.tokenFile.empty())
     {
         auto const secret = ReadSecretFile(command.tokenFile);
         if (!secret.has_value())
             return ReportUsageError(secret.error());
-        command.credential.secret = *secret;
+        command.credential.secret = std::string { secret->View() };
     }
     if (!command.dashboardTokenFile.empty())
     {
         auto const secret = ReadSecretFile(command.dashboardTokenFile);
         if (!secret.has_value())
             return ReportUsageError(secret.error());
-        command.dashboardToken = *secret;
+        command.dashboardToken = std::string { secret->View() };
     }
 
     auto const* const verb = FindVerb(command.verb);

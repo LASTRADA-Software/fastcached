@@ -8,6 +8,7 @@
 
 #include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -160,7 +161,7 @@ struct NodeScrapeSources
 ///
 /// @param path The file to read.
 /// @return The secret, or why it could not be used.
-[[nodiscard]] std::expected<std::string, std::string> ReadSecretFile(std::filesystem::path const& path);
+[[nodiscard]] std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::filesystem::path const& path);
 
 [[nodiscard]] std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path);
 

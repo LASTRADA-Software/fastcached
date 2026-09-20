@@ -104,7 +104,10 @@ class ConfiguredCredential final: public ICredentialSource
     ///        process has no configuration file and therefore no second moment.
     ///        Borrowed; must outlive this object.
     ConfiguredCredential(NodeConfig const& startup, NodeReloader const* reloader):
-        _startup { .username = {}, .secret = startup.token },
+        // `std::string` at the boundary: `Cc::Credential` lives in the launcher's
+        // dependency-free header and cannot name a `Core/` type, so the secret lands in
+        // plain storage HERE and is protected everywhere it is held (#1125).
+        _startup { .username = {}, .secret = std::string { startup.requirePass.View() } },
         _reloader { reloader }
     {
     }
@@ -116,10 +119,10 @@ class ConfiguredCredential final: public ICredentialSource
             return _startup;
 
         // One snapshot, read once. `Current()` on the reloader takes its swap lock and
-        // hands back an immutable `shared_ptr`, so the token cannot change underneath
+        // hands back an immutable `shared_ptr`, so the secret cannot change underneath
         // this expression however the reload races it.
         auto const live = _reloader->Current();
-        return Cc::Credential { .username = {}, .secret = live->token };
+        return Cc::Credential { .username = {}, .secret = std::string { live->requirePass.View() } };
     }
 
   private:

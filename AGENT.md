@@ -328,9 +328,10 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   RFC 8032 Ed25519, never Monocypher's default EdDSA over BLAKE2b. A missing primitive is added THERE,
   beside its RFC vectors.
 - A credential lives in `SecureByteBuffer`, and the wipe is an **allocator**, not a destructor.
-  Container-agnostic is not SUFFICIENT — SSO keeps a short secret where no allocator is called,
-  which makes **macOS the platform to write the failing test against**. Secret STRINGS need an
-  inline wipe too. Holders are found by NAME, so a row that has stopped matching is a refusal.
+  Container-agnostic is not SUFFICIENT -- SSO keeps a short secret where no allocator is
+  called. So a secret is never a `std::basic_string`: `SecureString` holds its characters in
+  a `std::vector`, which has no inline footprint to wipe and no INLINE-TO-HEAP transition to
+  miss. Holders are found by NAME, so a row that has stopped matching is a refusal.
 - A lease token is a credential, and its signature covers the granted **endpoint**. Fields
   length-prefixed, never joined.
 - **There is no pre-shared key** (#178): `--cluster-key-file`, `ClusterKeySource`,

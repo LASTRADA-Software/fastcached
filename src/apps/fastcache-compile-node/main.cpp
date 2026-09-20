@@ -2157,10 +2157,10 @@ int main(int argc, char** argv)
     // means "named anywhere" and answers true for exactly the secret this warning
     // exists to report. Only a bit read off `cliOnly` would be right, which is the
     // same fact this expression already reads, one column and one bool later.
-    SecretSubjectFiles<NodeConfig> const secretFiles = [configFile = lookup.path,
-                                                        argvNamedSecret = !cliOnly.token.empty()](NodeConfig const& live) {
-        return NodeSecretFiles(live, configFile, argvNamedSecret);
-    };
+    SecretSubjectFiles<NodeConfig> const secretFiles =
+        [configFile = lookup.path, argvNamedSecret = !cliOnly.requirePass.empty()](NodeConfig const& live) {
+            return NodeSecretFiles(live, configFile, argvNamedSecret);
+        };
     SecretExposureReport report = [&logger](std::string_view warning) {
         logger.Logf(LogLevel::Warn, "{}", warning);
     };
