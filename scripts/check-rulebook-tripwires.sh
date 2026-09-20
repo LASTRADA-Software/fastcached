@@ -198,7 +198,18 @@ function inOpenWork(issue,   k, seen) {
     for (k = 1; k <= NR; k++) {
         if (fenced[k]) continue
         if (lines[k] ~ /^## /) seen = (lines[k] == "## Open work")
-        else if (seen && lines[k] ~ ("^[ \t]*[-*+][ \t]+(\\*\\*)?\\[#" issue "\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[0-9]+\\)")) return 1
+        # `^ ? ? ?` and NOT `^[ \t]*`: CommonMark reads 0-3 leading spaces as top
+        # level and 4 as a nested item, and `check-rulebook-open-work.sh` filters
+        # its entry candidates with exactly this expression before applying its
+        # link pattern. Accepting any indentation here made the two disagree
+        # about the same text: a four-space sub-bullet carrying an issue link
+        # satisfied this pairing while the resolver read it as no entry at all,
+        # so the issue could close with nothing refusing -- the failure the
+        # pairing exists to prevent, one notch finer than the prose mention that
+        # motivated it. Spelled ` ? ? ?` rather than ` {0,3}` for the reason the
+        # resolver spells it that way: interval expressions are not portable
+        # across the awks this runs on.
+        else if (seen && lines[k] ~ ("^ ? ? ?[-*+][ \t]+(\\*\\*)?\\[#" issue "\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[0-9]+\\)")) return 1
     }
     return 0
 }
@@ -591,6 +602,50 @@ Prose.
 
 Prose.' \
         "does not name that issue"
+
+    # A NESTED entry must not satisfy it either. CommonMark reads four leading
+    # spaces as a sub-item, `check-rulebook-open-work.sh` filters on 0-3 before
+    # applying its link pattern, and a four-space link is therefore no entry to
+    # the resolver -- so accepting it here would let the issue close with nothing
+    # refusing. Verified against the resolver: on this shape it reports one
+    # entry, not two.
+    Case "an issue link nested under an entry does not satisfy the pairing" refused \
+"$_agent" \
+'# t
+
+## Sockets
+
+<!-- agent-tripwire: untriaged: #4242 nobody has decided whether this needs one -->
+
+Prose.
+
+## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues -->
+
+- **[#876](https://github.com/LASTRADA-Software/fastcached/issues/876)** -- a real entry.
+    - **[#4242](https://github.com/LASTRADA-Software/fastcached/issues/4242)** -- nested.' \
+        "does not name that issue as an ENTRY" "!carries no"
+
+    # ... and the 0-3 boundary is a boundary: three spaces is still top level, so
+    # a check tightened to `^-` alone would refuse a legal entry. Without this the
+    # fix above passes by refusing everything indented.
+    Case "an entry indented three spaces is still an entry" clean \
+"$_agent" \
+'# t
+
+## Sockets
+
+<!-- agent-tripwire: untriaged: #4242 nobody has decided whether this needs one -->
+
+Prose.
+
+## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues -->
+
+   - **[#4242](https://github.com/LASTRADA-Software/fastcached/issues/4242)** -- three spaces.' \
+        "1 untriaged"
 
     # A neighbouring issue number must not satisfy it -- `#8761` is not `#876`.
     Case "a different issue in Open work does not satisfy the pairing" refused \
