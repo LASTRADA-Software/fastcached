@@ -470,7 +470,8 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   well as for commitment**, because CheckQuorum reads the committed configuration.
 - Absence from `ClusterState` is not removal, and **a learner is never removed for being absent**.
   **A FORGET is not absence**: it leaves the quorum whoever typed the member (#1555), THIS node
-  once FORGOTTEN proposes its own removal last (#1539), and forgetting the only voter is refused
+  once FORGOTTEN — record gone AND (host tombstoned OR key revoked), never the record alone —
+  proposes its own removal last and steps down (#1539), and forgetting the only voter is refused
   by name (`PrepareForget`).
 - **A forget outranks an observation (#1528)**: `MembershipProposals` refuses a forgotten desire
   BY NAME (`MembershipPlan::forgotten`), at the decision rather than by pruning it.
@@ -642,7 +643,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - So a parked read is retrieved by `ISocket::CancelRead()` — the only spelling of *abandon* that is
   not `Close()`. ONE watch, re-TARGETED per pass, re-armed only once the previous has RESOLVED,
   retired by RAII AND explicitly before the reply write; what silences it is the RETIREMENT, never
-  the code. Synchronous everywhere, IOCP included; `Testing::ParkingReadableSocket` COUNTS orphans.
+  the code. Synchronous in the SLOT on every transport, IOCP included — the WAITER resolves inline
+  only for a zero-byte `WaitReadable` probe; a real read settles to the next turn, and promising
+  otherwise drops bytes. `Testing::ParkingReadableSocket` COUNTS orphans.
 - A wait nothing can cancel is a coroutine frame nobody frees: park through
   `Schedule`/`CancelPending`, and bound any sleep a peer can move the deadline of.
 - A reactor resumes what it parks or FREES it, and may free only what nothing else owns —
@@ -987,11 +990,12 @@ what differs between compilers, standard libraries, hosts and tool versions.
   `merge_group` in the scope classifier, add no JOB to `build.yml`;
   `ctest -R merge-queue-contexts`. **Neither the SET nor its COUNT is written in prose**, and
   nothing GUARDS this.
-- A **CONFLICTING** pull request is the fourth door: GitHub computes no merge ref, so required
-  contexts are ABSENT rather than pending. **Order matters more than the fact** — ask `mergeable`
-  BEFORE reading a workflow, on push `git merge-tree --write-tree`. **And it is TWO states**,
-  since one that BECAME conflicting keeps its old verdicts; `ci-pr-required.sh` says the merge
-  state on its own line (#1352).
+- A **CONFLICTING** pull request is the fourth door: GitHub computes no merge ref, so a
+  `pull_request` workflow dispatches NOTHING and ITS contexts are ABSENT rather than pending —
+  while `pull_request_target` ones report normally throughout, which is the tell pointing the wrong
+  way. **Order matters more than the fact** — ask `mergeable` BEFORE reading a workflow, on push
+  `git merge-tree --write-tree`. **And it is TWO states**, since one that BECAME conflicting keeps
+  its old verdicts; `ci-pr-required.sh` says the merge state on its own line (#1352).
 - A skipped job REPORTS, and a skipped REQUIRED context reads as PASSING. A skipped **matrix** job
   never expands, so nothing reports at all. Never let a dependency's failure skip a required gate:
   `if: ${{ !cancelled() }}`, not `always()`.
@@ -1184,9 +1188,10 @@ and what they may assume.
 - A C++ test waits through `src/tests/BoundedWait.hpp` — `WaitUntil` on the case's thread,
   `OffThreadWaits` on a helper thread, `AwaitUntil` in a coroutine, which STOPS when its wait runs
   out — never a counted or unbounded poll. `ctest -R test-loops` refuses an atomic-polling `while`
-  and a parking coroutine `while` **in tests**, and a C-style `for` **anywhere under `src/`**;
-  `scripts/check-test-loops-backlog.txt` is a RATCHET. **The count is not repeated here on
-  purpose.** **Neuter a new wait and watch the teardown.**
+  and a coroutine `while` that OPENS by parking **in tests** — it fails open on a park spelled any
+  other way — and a C-style `for` **anywhere under `src/`**; `scripts/check-test-loops-backlog.txt`
+  is a RATCHET. **The count is not repeated here on purpose.** **Neuter a new wait and watch the
+  teardown.**
 - A **cumulative** figure cannot answer a question about **now**, and a duty cycle over the same
   window is the same number divided by the same constant. Draw the verdict from a RECENT window;
   no magnitude bar calibrates but **zero does not vary**, so test presence over the process TREE.
@@ -1221,8 +1226,10 @@ and what they may assume.
   fail hard on what will not parse, say what was searched, and give a zero census a POSITIVE CONTROL.
 - Tests allocate their ports per run rather than fixing them — from **below** the kernel's ephemeral
   range, and remembered, since a connect probe cannot see a port held as an outbound connection's
-  local endpoint. **A fixed one needs a reaper**; a holder is **refused, never adopted**, and the
-  DECISION is what gets tested.
+  local endpoint. **A fixed one needs a reaper**; a holder is **refused, never adopted** — except
+  one whose image path is byte-for-byte this run's daemon, which is REAPED, and one whose path
+  cannot be READ, which is refused or the reap arm kills a process nothing knows. The DECISION is
+  what gets tested.
 - `Unwrap(x)` after `REQUIRE(x.has_value())` for `std::optional`; a bare `*x` is a build failure.
 - A Catch2 case name is an ARGUMENT, and that one fact has three consequences. It may not begin with
   `-`. A **COMMA** splits the spec, so such a name selects NOTHING and `No tests ran` exits
@@ -1240,10 +1247,11 @@ and what they may assume.
   GIT. The mode is part of the OUTPUT and asserted on both sides.
 - A Catch2 `SKIP(...)` exits **4**, and ctest must be told what that means or it scores a skip as a
   FAILURE. **And the mechanism that fixes that RED is itself broken**: Catch2's exit code **is** its
-  failed-assertion count, so `SKIP_RETURN_CODE 4` scores a four-failure case as *skipped*. It stays
-  because all three alternative channels are worse and **no Linux gate can reproduce any of that**;
-  the fix is a change of MECHANISM, open as #1152. `catch-skip-exit-collision` asserts the premises,
-  `src/tests/CatchSkipCanary.cpp` the shapes, and **adding shapes cannot make a pattern safe.**
+  failed-assertion count clamped at 255, so `SKIP_RETURN_CODE 4` scores a case failing exactly four
+  assertions as *skipped*. It stays because all three alternative channels are worse and **no Linux
+  gate can reproduce any of that**; the fix is a change of MECHANISM, open as #1152.
+  `catch-skip-exit-collision` asserts the premises, `src/tests/CatchSkipCanary.cpp` the shapes, and
+  **adding shapes cannot make a pattern safe.**
 - The converse, and the direction nobody investigates: `SUCCEED` is right when a case RAN and had
   nothing to assert, wrong when it could not run — a PASS for a property nothing established,
   exactly where coverage is thinnest. "Covered by another test" is a reason to SKIP, never to pass.
