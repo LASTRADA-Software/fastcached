@@ -93,7 +93,20 @@ _third_party_select() {
     local pattern selected status=0
     pattern="$(third_party_path_pattern "$2")" || return 2
     [ -n "$3" ] || return 0
-    selected="$(grep -E ${1:+"$1"} -- "$pattern" <<< "$3")" || status=$?
+    # Process substitution rather than a herestring, and that is a PLATFORM fact rather
+    # than a preference. Git Bash's bash implements `<<<` with a PIPE and writes the whole
+    # string before it starts the reader, so an operand of 65536 bytes or more deadlocks:
+    # the write blocks at the 64 KiB pipe buffer and nothing is draining it. Measured on
+    # bash 5.2.37 to the byte -- 65535 completes, 65536 hangs, deterministic 5/5 either way
+    # -- and it is SIZE, not content: this repository's own tracked-file list padded past
+    # the boundary hangs, and the larger list truncated below it does not.
+    #
+    # This helper takes the WHOLE tracked-file listing, which was 65028 bytes here when
+    # that was measured. Five hundred bytes of new files was the entire margin, so the
+    # next few additions would have hung every tracked-file enumerator on Windows and
+    # nowhere else. A pipe's reader runs CONCURRENTLY and drains it, so no size deadlocks;
+    # `grep`'s own status is still what `$?` reports, which a `producer | grep` would lose.
+    selected="$(grep -E ${1:+"$1"} -- "$pattern" < <(printf '%s\n' "$3"))" || status=$?
     # grep answers 1 for "selected nothing", which is an answer; anything above it is
     # the instrument failing, and must not read as an empty selection.
     [ "$status" -le 1 ] || return 2

@@ -383,7 +383,11 @@ files_carrying() {
             scripts/check-reloadable-docs.sh) continue ;;
         esac
         existing+=("$f")
-    done <<< "$tracked"
+    # Not a herestring: Git Bash writes a `<<<` operand into a PIPE in full before it
+    # starts the reader, so 65536 bytes or more deadlocks at the 64 KiB buffer. This is
+    # the whole tracked-file listing. Measured in `scripts/lib/third-party-roots.sh`.
+    done < <(printf '%s
+' "$tracked")
 
     # Guarded before expanding: `"${arr[@]}"` on an empty array is an error under
     # `set -u` on bash 3.2, and it would surface as this helper failing rather than as
@@ -448,7 +452,9 @@ check_tree() {
             || refuse "${f} declares subject '${subject}', which this check does not read -- it knows $(known_subjects). Add a SubjectTable row naming that binary's option table, or drop the marker; do not leave a declared claim unchecked"
         declared="${declared}${subject}|${f}
 "
-    done <<< "$declaring"
+    # Same boundary: this is the first-party half of that same listing.
+    done < <(printf '%s
+' "$declaring")
 
     # Then one pass per subject. Every row must find an artefact: a binary whose matrix has
     # been deleted is the coverage going away, and it looks exactly like a tree with
