@@ -4076,6 +4076,12 @@ while IFS= read -r script; do
         echo "     false negative on the SUCCESS path (#970, #1111, #1181)." >&2
         echo "     Use a herestring: grep -q PATTERN <<< \"\$text\"; head -1 <<< \"\$text\"; or" >&2
         echo "     capture, then match. For a first line, \${text%%\$'\\n'*} forks nothing at all." >&2
+        echo "     But NOT for an operand of 64 KiB or more: Git Bash writes a herestring into a" >&2
+        echo "     pipe IN FULL before it starts the reader, so it deadlocks at the buffer -- 65535" >&2
+        echo "     bytes completes and 65536 hangs, measured. A repository-wide listing is already" >&2
+        echo "     past it, so feed one through process substitution, whose reader drains" >&2
+        echo "     concurrently and which still reports the MATCHER's status:" >&2
+        echo "       grep -q PATTERN < <(printf '%s\\n' \"\$text\")        (#1591)" >&2
         printf '%s\n' "$hits" | sed 's/^/     | /' >&2
         note_failure "early-exit-scan"
     fi
