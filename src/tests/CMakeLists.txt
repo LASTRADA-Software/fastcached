@@ -6328,24 +6328,31 @@ set_tests_properties("hygiene-headroom-selftest" PROPERTIES
 # sibling's 81-96%, which is the whole of why one fired and the other did not
 # ([#1150](https://github.com/LASTRADA-Software/fastcached/issues/1150)).
 add_test(
-    NAME "node-reloadable-docs"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-node-reloadable-docs.sh" "${CMAKE_SOURCE_DIR}"
+    NAME "reloadable-docs"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-reloadable-docs.sh" "${CMAKE_SOURCE_DIR}"
 )
-set_tests_properties("node-reloadable-docs" PROPERTIES
+set_tests_properties("reloadable-docs" PROPERTIES
     LABELS "hygiene;docs-subject"
     TIMEOUT 120
 )
 
-# Eleven synthetic trees, including the three ways this check could pass while
-# guarding nothing: no reloadable row at all, no artefact declaring the subject, and an
-# artefact that declares one and states nothing. The subject marker earned its place
-# immediately -- scanning for the table header alone matched the DAEMON's reload matrix,
-# which carries the identical header for a different binary and a different set.
+# Synthetic trees, including the ways this check could pass while guarding nothing: no
+# reloadable row at all, no artefact declaring a subject the table has a row for, no
+# artefact declaring any subject at all, and an artefact that declares one and states
+# nothing. The subject marker earned its place immediately -- scanning for the table
+# header alone matched the DAEMON's reload matrix, which carries the identical header
+# for a different binary and a different set; since #1070 the daemon is a SubjectTable
+# row of its own and both binaries are checked in this one run.
+#
+# The case count is deliberately not written here. It was stated as `Eleven` while the
+# script carried thirteen, which is the second-source-of-truth defect `ctest -R
+# table-totals` refuses everywhere it can see one; the script prints its own total on
+# every run, and that is the number to read.
 add_test(
-    NAME "node-reloadable-docs-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-node-reloadable-docs.sh" --self-test
+    NAME "reloadable-docs-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-reloadable-docs.sh" --self-test
 )
-set_tests_properties("node-reloadable-docs-selftest" PROPERTIES
+set_tests_properties("reloadable-docs-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 180
 )
