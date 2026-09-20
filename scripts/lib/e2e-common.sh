@@ -2201,7 +2201,17 @@ _http_drain_fd3() {
         # marker -- which reads as "the peer is holding", a false PASS and the silent
         # direction. The C++ side has `src/tests/ScratchPath.hpp` for this and the
         # argument does not change for a shell fixture.
-        marker="$(mktemp "${_e2e_workdir}/.silence-probe.XXXXXX")"
+        # `|| fail`, for the reason the `kill`/`wait` pair below carries: this arm
+        # was nearly unreachable while the gate took the probe only for an EMPTY
+        # body, and #1257 made it run on every ambiguous status -- every scrape at
+        # all on bash 3.2. A bare `mktemp` here is the third command in this block
+        # that ends the shell under `set -e` with a status nothing explains, and
+        # `http_get ... >/dev/null` in an untested position is the shape that
+        # meets it. `_e2e_deadline_arm` above already spells it this way.
+        marker="$(mktemp "${_e2e_workdir}/.silence-probe.XXXXXX" 2>/dev/null)" || marker=""
+        [ -n "$marker" ] || fail "could not create a silence-probe marker in ${_e2e_workdir}.
+       The drain's sticky-EOF probe needs one to tell a peer that CLOSED from one that is
+       HOLDING, and without it the read cannot be classified at all."
         rm -f "$marker"
         # `>/dev/null 2>&1` IS LOAD BEARING, and it is not the redirection that looks
         # it. `_http_drain_fd3` echoes the body, so every caller runs it inside `$( )`,
@@ -2369,6 +2379,15 @@ http_response_to_silence() {
 # repair rather than an output variable. `_http_drain_fd3` echoes the body, so every
 # caller runs this inside `$( )`; `_http_drain_ended` is set correctly in that
 # subshell and dies with it. Measured: a caller reads `_http_drain_ended` as UNSET.
+# **AND THEY ARE NOT `E2eSilence*`'s VALUES.** Those live forty lines up and mean
+# the OPPOSITE at each number -- `E2eSilenceInconclusive=1` / `E2eSilenceRefused=2`
+# against `E2eHttpRefused=1` / `E2eHttpTruncated=2`. Both families are in scope in
+# every fixture that sources this file, so the two sets are silently
+# interchangeable: comparing an `http_get` status to `$E2eSilenceRefused` names a
+# refusal and gets a truncation, with no shell setting to catch it. The values are
+# what each family's own callers already compare against, so they are not moved;
+# what is added is this sentence, because the names exist precisely so a wrong one
+# is loud and here the wrongness is in the PAIRING rather than in either name.
 E2eHttpAnswered=0
 E2eHttpRefused=1
 E2eHttpTruncated=2
