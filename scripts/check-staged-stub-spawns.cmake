@@ -78,7 +78,7 @@ endmacro()
 #                     that cannot start it. `guard` must appear in the file, and
 #                     `reason` must be about the SUBJECT rather than the platform.
 #
-# TOTAL: 8 rows, which is the derived candidate count on this tree and is asserted
+# TOTAL: 9 rows, which is the derived candidate count on this tree and is asserted
 # against it below rather than restated as a number nobody re-derives.
 #
 # NO SEMICOLONS in a reason. CMake turns `;` into a list separator, so a reason
@@ -88,6 +88,7 @@ endmacro()
 set(StagedStubSpawns
     "scripts/check-compile-cache-install.cmake|guarded|CMAKE_HOST_WIN32|the launcher sandbox this needs has no Windows equivalent, so there is nothing here for that platform to answer"
     "scripts/check-compile-cache-daemon-staging.cmake|guarded|CMAKE_HOST_WIN32|the launcher sandbox this needs has no Windows equivalent, so there is nothing here for that platform to answer"
+    "scripts/check-compile-cache-daemon-diagnostic.cmake|guarded|CMAKE_HOST_WIN32|the launcher sandbox this needs has no Windows equivalent, so there is nothing here for that platform to answer"
     "scripts/reactor-teardown-gate-selftest.sh|adapted|MINGW|stages a .cmd stub where the spawner cannot start a shebang, so the fixture runs everywhere rather than skipping"
     "scripts/check-control-bytes-selftest.cmake|data|-|staged as bytes for the control-byte reader to scan -- nothing executes it"
     "scripts/check-repository-hygiene-selftest.cmake|data|-|staged so a hygiene scan and git have a tracked file to look at -- nothing executes it"
@@ -240,8 +241,8 @@ endforeach()
 
 # The table's stated length, asserted rather than written in prose.
 list(LENGTH StagedStubSpawns rowCount)
-if(NOT rowCount EQUAL 8)
-    Refuse("the table has ${rowCount} rows; the comment above says 8. Update both or neither -- a total stated beside a table is derived from it or it is a second claim.")
+if(NOT rowCount EQUAL 9)
+    Refuse("the table has ${rowCount} rows; the comment above says 9. Update both or neither -- a total stated beside a table is derived from it or it is a second claim.")
 endif()
 
 if(failures GREATER 0)
