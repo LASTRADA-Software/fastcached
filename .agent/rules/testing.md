@@ -2733,6 +2733,8 @@ Two rules fall out of the same fixture:
 
 ## Widening a gate makes the latent defects BEHIND it live, and they are in nobody's diff
 
+<!-- agent-tripwire: widening a gate makes the defects BEHIND it live, and none of them is -->
+
 `http_get` returned **0 for a response its own read bound cut short**, documenting only
 *returns 1 if the connection was refused* — so every caller reported a truncation as the
 endpoint having ANSWERED, and one of them concluded *the refusing worker exports no
