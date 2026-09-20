@@ -1872,6 +1872,37 @@ the subject.** An instrument that cannot express *I could not tell* will express
 as whatever its empty case means — and the empty case is usually the alarming one,
 because instruments are written to make absence visible.
 
+### Anything neither 0 nor 1 is the instrument failing, and a throwaway probe needs that arm too
+
+Second instance, and it is the cheaper shape: a probe written in four lines to
+settle one question. It asked whether `check-rulebook-open-work.sh` accepts a
+sub-bullet under an `## Open work` entry at two, four and eight spaces, and passed
+the tree as a positional argument. That script takes `--rules-dir`. It printed
+`unknown argument` and exited **2** — and the probe's verdict helper was
+`[ "$rc" -eq 0 ] && echo CLEAN || echo REFUSED`, which maps every non-zero to a
+finding.
+
+So **four confident verdicts came out of an instrument that had never run**, and
+three of them were wrong in the direction that contradicted the claim under test.
+That direction is the hazard: refuting somebody feels like diligence, so a refutation
+is the reading least likely to be re-checked. The rule the probe broke is one this
+repository already states about `cmake -P` checks and about `gh` — **anything neither
+0 nor 1 is the instrument failing** — and the reason it broke it is that nobody
+applies a rule about instruments to four lines they are about to delete.
+
+**What caught it was a control with no plausible failure, not care.** One arm of the
+probe was a continuation line with no bullet marker, which the grammar plainly allows;
+when *that* came back REFUSED alongside the others, the uniformity was the tell. A
+result that is implausible for an arm you understand is the only signal available when
+the instrument itself is what is broken — the subject cannot supply one, because the
+instrument is not reading the subject at all.
+
+So a probe gets three outcomes rather than two, and a positive control whose answer
+you already know. Re-run with `--rules-dir` and a control that must come back clean,
+the real answer is: **two spaces refused** (CommonMark reads 0–3 as top level, so it
+is a sibling and `unparsed-entry` fires), four and eight clean, continuation clean —
+which is the opposite of what the broken probe reported for two of the three.
+
 So a checker that can report *absent* must be able to report *I could not tell*, and
 must refuse to say anything about the subject while that state is set. Zero rows is
 not a verdict; it is the absence of one, and the **shape** of a response is checked
