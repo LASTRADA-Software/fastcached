@@ -66,7 +66,23 @@ An entry there is a top-level bullet whose **leading** reference is the issue:
 
 ```
 - **[#123](https://github.com/LASTRADA-Software/fastcached/issues/123)** — what is left.
+    - a sub-point, indented FOUR spaces.
 ```
+
+**Detail under an entry is indented four spaces, or it is read as a broken entry
+of its own.** CommonMark treats 0–3 leading spaces as still top level, so the two
+spaces that *look* nested make a sub-bullet a sibling — and a sibling in this
+section that does not open with an issue link is refused `unparsed-entry`. No
+entry in this directory had a sub-bullet until one was added, so there was no
+convention to copy and nothing on master exercised it; the first person to want
+one indented two spaces, because that is what looks nested. A continuation
+paragraph needs no marker and is unaffected at any indent.
+
+The same boundary binds `ctest -R rulebook-tripwires`, which requires an
+`untriaged:` marker to name an issue this section carries. It filters candidates
+with the resolver's own `^ ? ? ?[-*+]` rather than accepting any indentation,
+because the two must agree about the same text: a four-space link is no entry to
+the resolver, so accepting it would let the issue close with nothing refusing.
 
 `ctest -R rulebook-open-work` reads that grammar and `rulebook-open-work-state`
 resolves each one, because an entry whose issue has since closed is a rule that has
