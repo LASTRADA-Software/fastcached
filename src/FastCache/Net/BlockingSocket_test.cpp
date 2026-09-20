@@ -367,17 +367,23 @@ TEST_CASE("closing a listening socket unblocks a parked AcceptRaw, and says whic
     // error" would assert what both sides produce, which is no assertion at all.
     //
     // **POSIX skips, and the skip is the finding.** Measured on Linux (WSL2, glibc), 3
-    // runs: a thread in `accept()` was STILL PARKED 12.5 s after `close()` on its
-    // listening fd. So the contract quoted above holds on Windows and is false here --
-    // which costs nothing today, because `AcceptRaw`'s only caller is inside
+    // runs by `scripts/probes/accept-close-wakeup.cpp`: a thread in `accept()` was STILL
+    // PARKED past that probe's 12 s ceiling -- 12002-12045 ms of MEASURED elapsed time --
+    // after `close()` on its listening fd. The figure is the one a steady clock read, not
+    // the sum of the sleeps a wait asked for: an unobserved elapsed cannot say whether the
+    // thread was parked or the wait merely expired, which is why this sentence used to
+    // carry "12.5 s" (50 x 250 ms, added up) and no longer does. See `AcceptRaw`'s header
+    // for the pair and for the probe's own conditions. So the contract quoted above holds
+    // on Windows and is false here -- which costs nothing today, because `AcceptRaw`'s only caller is inside
     // `#if defined(_WIN32)`, and the header now says so. A `SKIP` rather than a
     // `SUCCEED`: the case did not run, and reporting a pass for a property nothing
     // established is #685. It is deliberately NOT `#if`-compiled away, so the body goes
     // on being compiled on the platform the local gate runs -- a platform arm that ships
     // uncompiled is one nobody has built.
 #if !defined(_WIN32)
-    SKIP("close() does not unblock a parked accept() on this platform -- measured, still parked "
-         "12.5s later, 3/3 on Linux -- and AcceptRaw has no caller outside _WIN32");
+    SKIP("close() does not unblock a parked accept() on this platform -- measured, still parked past a 12 s ceiling "
+         "(12002-12045 ms observed), 3/3 on Linux, by scripts/probes/accept-close-wakeup.cpp -- and AcceptRaw has no "
+         "caller outside _WIN32");
 #endif
 
     // The production spelling: `RunMultiReactorWindows` binds through exactly this call
