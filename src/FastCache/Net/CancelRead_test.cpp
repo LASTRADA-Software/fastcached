@@ -31,11 +31,12 @@ using FastCache::Testing::WaitRest;
 ///
 /// ## Why this file exists
 ///
-/// `CancelRead` is the only spelling of *abandon this read* that is not `Close()`, and
-/// its contract on `ISocket` is explicit: **idempotent, and not a `Close()` -- the
-/// socket stays open and a later `Read` works.** That header also says, of the
-/// transports that park, *"a new one that can must too, and nothing but this sentence
-/// enforces that"*.
+/// `CancelRead` is the only spelling of *abandon this read* that is not `Close()`. Its
+/// contract on `ISocket` used to open **"idempotent, and not a `Close()` -- the socket
+/// stays open and a later `Read` works"**; the first half of that was false and #1233
+/// replaced it, which is what the last case in this file now holds. That header also
+/// says, of the transports that park, *"a new one that can must too, and nothing but
+/// this sentence enforces that"*.
 ///
 /// Nothing enforced the BEHAVIOUR either, on the platforms the gate runs. Surveyed for
 /// [#778](https://github.com/LASTRADA-Software/fastcached/issues/778), the coverage was:
@@ -66,14 +67,37 @@ using FastCache::Testing::WaitRest;
 ///
 /// Measured here rather than reasoned about: the first draft of this file cancelled
 /// twice, and the read issued after the cancel came back `Cancelled` (code 2) instead
-/// of the two bytes the peer had sent. On IOCP the same two lines behave differently
-/// again, because there a completion is marshalled to a later turn rather than
-/// resumed inline -- so the reader has not re-armed when the second call runs.
+/// of the two bytes the peer had sent.
 ///
-/// What *is* idempotent is a cancel with **nothing parked**, which is the case below,
-/// and it is the shape the contract is actually about: `RunBlockingRead` retires by
-/// RAII as well as explicitly, so the redundant call happens with the slot already
-/// empty rather than with a fresh read in it.
+/// **That sentence used to continue "on IOCP the same two lines behave differently
+/// again", and the correction is the whole of
+/// [#1233](https://github.com/LASTRADA-Software/fastcached/issues/1233).** Marshalling
+/// is a property of the OPERATION rather than of the platform, and IOCP has both:
+///
+///   - a real `Read` settles on a later turn there, which is the claim that was true;
+///   - a `WaitReadable` PROBE is retired **inline**, by `IocpSocket::CancelRead`'s own
+///     `readPeekOnly` arm, because a zero-byte receive carries no data a settle could
+///     preserve. `Net/IocpSocket_test.cpp`'s *"CancelRead retires a parked probe before
+///     it returns"* asserts exactly that, with no drain between the call and the check.
+///
+/// A probe is what this tree parks and then cancels in production over a RAW socket -- a
+/// readability watch, retired by `RedisResp` and `CompileCacheHandler` -- so for that
+/// operation **all three transports agree, and they agree on the surprising behaviour.**
+/// The last case in this file is that one, asserted identically on every leg; the first
+/// case is the real-`Read` arrangement, where epoll and kqueue resume inline and IOCP
+/// does not.
+///
+/// **RAW is the load-bearing word, and this file cannot hold the other half.** A
+/// `WaitReadable` on `TlsSocket` decrypts and parks on a raw `Read` whenever OpenSSL
+/// wants more bytes, so over TLS the production watch is the FIRST arrangement and
+/// settles on IOCP -- `TlsSocket.hpp`'s `CancelRead` states the chain. Every case here
+/// drives `PlatformListener`/`PlatformReactor`, which is plaintext, so a claim about
+/// "every transport" would be one nothing in this file exercises.
+///
+/// What *is* idempotent is a cancel with **nothing parked**, which is the second case
+/// below. It is a property the transports must offer rather than one any caller here
+/// exercises: `ScopedDisconnectWatch::Retire` drops its watch before calling, so the
+/// RAII retirement returns above the call and the redundant cancel never happens.
 ///
 /// ## Why there is no timing race here
 ///
@@ -254,6 +278,195 @@ FastCache::DetachedTask CancelWithNothingParked(FastCache::PlatformReactor* reac
     co_return;
 }
 
+/// What one awaited operation came back as, published across the reactor and client
+/// threads.
+///
+/// One struct rather than a fresh triple of atomics per operation: the probe case below
+/// watches three, and three hand-written copies of *store the flag, store the code or
+/// the count* is the copy-paste the project's own rule calls a defect -- they diverge,
+/// and a case asserting on a field one of them forgot to publish passes for the wrong
+/// reason.
+struct OpOutcome
+{
+    std::atomic<bool> resolved { false }; ///< Set once the await has returned, whatever it returned.
+    std::atomic<bool> hasValue { false }; ///< Whether it returned a count rather than an error.
+    std::atomic<std::size_t> count { 0 }; ///< The count, when it returned one.
+    std::atomic<int> errorCode { -1 };    ///< The `NetErrorCode`, when it returned one.
+};
+
+/// Publish what an awaited operation returned.
+/// @param into   Where to publish it.
+/// @param result What the await came back as.
+void Record(OpOutcome& into, FastCache::IoResult const& result) noexcept
+{
+    into.hasValue.store(result.has_value(), std::memory_order_relaxed);
+    if (result.has_value())
+        into.count.store(*result, std::memory_order_relaxed);
+    else
+        into.errorCode.store(static_cast<int>(result.error().code), std::memory_order_relaxed);
+    // Last, and with a release: every field above must be visible to a reader that sees
+    // this one set.
+    into.resolved.store(true, std::memory_order_release);
+}
+
+/// What the probe reader observed across TWO cancels.
+struct ProbeObservation
+{
+    /// The accepted socket, for the canceller. A plain pointer, for the reason the
+    /// case above gives: both coroutines run on the reactor thread and the reader
+    /// outlives the canceller by construction.
+    FastCache::ISocket* socket { nullptr };
+
+    std::atomic<bool> arming { false }; ///< Set immediately before the probe that must park.
+
+    /// Whether the FIRST probe had already resolved when the canceller ran. **The
+    /// assertion that stops this case being vacuous**: a probe that resolved
+    /// synchronously was never parked, and everything below would hold for a reason
+    /// unrelated to cancellation.
+    std::atomic<bool> firstResolvedAtCancel { true };
+
+    /// Set by the reader immediately before the SECOND probe -- the one it arms while
+    /// the first `CancelRead` is still on the stack.
+    std::atomic<bool> secondArmed { false };
+
+    /// What the canceller saw BETWEEN its two calls. `secondArmedAtCancel` is the
+    /// inline-resumption premise itself: a transport that marshalled the first
+    /// retirement instead would leave it false, and then the second call is not a
+    /// double cancel at all but a first one, and the case must say so rather than pass.
+    std::atomic<bool> secondArmedAtCancel { false };
+    std::atomic<bool> secondResolvedAtCancel { true };
+
+    OpOutcome first;  ///< The probe parked before any cancel.
+    OpOutcome second; ///< The probe the FIRST cancel's own inline resumption armed.
+    OpOutcome after;  ///< A real read afterwards -- the half that separates this from `Close()`.
+
+    std::atomic<bool> finished { false }; ///< Set once the whole exchange is done.
+};
+
+/// What the probe exchange has reached, for a wait's account.
+/// @param observed The reader's observation.
+/// @return Its milestones, in words.
+[[nodiscard]] std::string Describe(ProbeObservation const& observed)
+{
+    return std::format("reader armed {}, first probe resolved {}, second probe armed {}, second resolved {}, "
+                       "exchange finished {}",
+                       observed.arming.load(std::memory_order_acquire),
+                       observed.first.resolved.load(std::memory_order_acquire),
+                       observed.secondArmed.load(std::memory_order_acquire),
+                       observed.second.resolved.load(std::memory_order_acquire),
+                       observed.finished.load(std::memory_order_acquire));
+}
+
+/// Accept, park a readability PROBE, park a second one when that is retired, then read.
+///
+/// The second probe is the subject: it is armed from inside the first `CancelRead`,
+/// because retiring a probe resumes this coroutine inline on every RAW transport -- which
+/// is what this fixture builds. By POINTER, never by reference, for the reason the reader
+/// above gives.
+/// @param reactor  Stopped once the exchange is complete, so `Run()` returns.
+/// @param listener Bound listener to accept on.
+/// @param out      Where the observation is published; must outlive the task.
+FastCache::DetachedTask ProbeTwiceThenRead(FastCache::PlatformReactor* reactor,
+                                           FastCache::IListener* listener,
+                                           ProbeObservation* out)
+{
+    auto accepted = co_await listener->Accept();
+    if (!accepted.has_value())
+    {
+        out->finished.store(true, std::memory_order_release);
+        reactor->Stop();
+        co_return;
+    }
+    auto socket = std::move(*accepted);
+    out->socket = socket.get();
+
+    out->arming.store(true, std::memory_order_release);
+    Record(out->first, co_await socket->WaitReadable());
+
+    // **Armed from INSIDE the first `CancelRead`**, which is the whole mechanism: the
+    // retirement completed this probe inline, so this statement runs before the
+    // canceller's next one does. This is the operation the second cancel takes.
+    out->secondArmed.store(true, std::memory_order_release);
+    Record(out->second, co_await socket->WaitReadable());
+
+    // And a real read, so the case can tell a cancel from a close. Legal only because
+    // both retirements released the socket's single read slot (#663); under an
+    // implementation that completed without detaching, this is the double-arm the slot
+    // guard aborts on.
+    std::array<std::byte, 8> buffer {};
+    Record(out->after, co_await socket->Read(std::span<std::byte> { buffer }));
+
+    out->finished.store(true, std::memory_order_release);
+    socket->Close();
+    reactor->Stop();
+    co_return;
+}
+
+/// Cancel the reader's parked probe TWICE, in one reactor turn, from the reactor thread.
+///
+/// Twice with no suspension between, which is what makes the two calls the caller's
+/// consecutive statements -- the arrangement #1233 is about. What the reader does
+/// between them happens inside the first call, not between the two.
+/// @param reactor The loop both tasks run on.
+/// @param out     The reader's observation; must outlive the task.
+/// @param waits   Keeps the wait's account for the case; must outlive the task.
+FastCache::DetachedTask CancelParkedProbeTwice(FastCache::PlatformReactor* reactor,
+                                               ProbeObservation* out,
+                                               OffThreadWaits* waits)
+{
+    if (!waits->Keep(co_await AwaitUntil(
+            reactor,
+            "the reader to arm its first readability probe",
+            [out] { return out->arming.load(std::memory_order_acquire); },
+            [out] { return Describe(*out); },
+            ReactorWaitOptions { .context = {}, .bound = WaitHangGuard, .rest = std::chrono::milliseconds { 1 } })))
+        co_return;
+
+    // Recorded BEFORE the cancel: the reader set `arming` and then suspended, and this
+    // task only runs because it did, so a resolved probe here would mean it never parked.
+    out->firstResolvedAtCancel.store(out->first.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
+
+    out->socket->CancelRead();
+
+    // Recorded BETWEEN the two calls, and these two are the case's premise rather than
+    // its conclusion: the first call resumed the reader inline, and the reader armed
+    // again and is parked. Neither is asserted here -- a `REQUIRE` on a reactor task is
+    // not this case's thread -- so both are published and asserted on the main thread.
+    out->secondArmedAtCancel.store(out->secondArmed.load(std::memory_order_acquire), std::memory_order_relaxed);
+    out->secondResolvedAtCancel.store(out->second.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
+
+    // **Not a second cancel once the reader has finished, and this guard was written by a
+    // neuter rather than foreseen.** Under a `CancelRead` spelled as `Close()` the reader
+    // runs to its END inside the first call -- every operation after the close resolves
+    // inline -- and destroys the socket this task holds by pointer. The case then died of
+    // an ASan heap-use-after-free instead of reporting the four assertions that were about
+    // to fail, and an abort is not a red: it names no property and says nothing about
+    // which one moved.
+    //
+    // **WHY SKIPPING CANNOT HIDE ANYTHING, which is the part that has to stay true when
+    // somebody edits this file.** A conditional skip inside a test is the shape that goes
+    // vacuous later, so the two assertions that make it safe are named here rather than
+    // left to be re-derived:
+    //
+    //   - `secondArmedAtCancel`, recorded immediately above, is CHECKed by the case. It
+    //     is true only because the first call resumed the reader inline and the reader
+    //     armed again.
+    //   - `secondResolvedAtCancel`, recorded immediately above, is CHECK_FALSEd by the
+    //     case. It is false only because that second probe is still PARKED.
+    //
+    // Both together say the reader is suspended on the second probe, and a suspended
+    // reader has not set `finished`. So under a correct implementation this branch cannot
+    // be taken at all; under a broken one it is taken and those two assertions fail. There
+    // is no state in which the guard fires and the case still passes. **Anyone weakening
+    // or removing either of those two checks is removing what makes this skip safe**, and
+    // the skip has to go with them.
+    if (out->finished.load(std::memory_order_acquire))
+        co_return;
+
+    out->socket->CancelRead();
+    co_return;
+}
+
 } // namespace
 
 TEST_CASE("CancelRead retrieves a parked read and leaves the socket usable", "[net][socket][cancelread]")
@@ -418,4 +631,138 @@ TEST_CASE("CancelRead with nothing parked disturbs nothing", "[net][socket][canc
     INFO("read after two empty cancels: error code " << observed.secondErrorCode.load(std::memory_order_relaxed));
     CHECK(observed.secondHasValue.load(std::memory_order_relaxed));
     CHECK(observed.secondCount.load(std::memory_order_relaxed) == 3);
+}
+
+TEST_CASE("A second CancelRead takes the probe the first one's resumption armed", "[net][socket][cancelread]")
+{
+    // **The case [#1233](https://github.com/LASTRADA-Software/fastcached/issues/1233)
+    // asked for, and the one that settles which behaviour the declaration may claim.**
+    //
+    // `ISocket::CancelRead` used to say *idempotent* without qualification. It is not,
+    // and the measurement is in this file's header: a retirement that completes its
+    // victim INLINE resumes the reader before the call returns, the reader arms again,
+    // and the second call retires the new operation. The header now says that instead --
+    // and a sentence in a header is exactly what produced the wrong claim in the first
+    // place, so this case is what holds the new one.
+    //
+    // **A PROBE rather than a real `Read`, and that choice is the finding.** #1233 was
+    // filed believing the divergence was POSIX-versus-Windows. It is not: marshalling is
+    // a property of the OPERATION. IOCP settles a real `Read` and retires a
+    // `WaitReadable` probe inline, so over a probe all three RAW transports behave the
+    // same way -- one set of assertions covers every leg, with no `#if` and no
+    // per-platform expectation. It is also the operation the verb exists for over a raw
+    // socket: production parks a readability watch and cancels that, never a real read.
+    // Over `TlsSocket` that watch is a raw `Read` one layer down and settles on IOCP,
+    // which this fixture cannot reach and does not claim to -- see the file header.
+    //
+    // **Five properties, and each fails under a different wrong implementation:**
+    //
+    //   1. the first probe was PARKED          -- otherwise the case is vacuous
+    //   2. the first cancel resumed INLINE     -- the premise; a transport that
+    //                                             marshalled would leave the reader
+    //                                             un-rearmed, and the second call would
+    //                                             not be a double cancel at all
+    //   3. the first probe resolved CANCELLED  -- not EOF, which is what a peer leaving
+    //                                             looks like
+    //   4. the SECOND probe resolved CANCELLED -- the statement itself: the second call
+    //                                             took an operation its caller never
+    //                                             armed. An implementation that made
+    //                                             `CancelRead` genuinely idempotent
+    //                                             fails 2 and 4, which is correct -- the
+    //                                             contract would have changed, and this
+    //                                             case is what would say so.
+    //   5. the socket still WORKS              -- an implementation spelled as `Close()`
+    //                                             passes 1 to 3 and fails 4 and 5
+    //
+    // The inherited no-op fails 2 and 3: nothing is ever retired, the client's bounded
+    // wait runs out, its close turns the still-parked probe into an EOF, and the case
+    // reports that rather than hanging.
+    FastCache::SteadyClock clock;
+    FastCache::PlatformReactor reactor { clock };
+    auto listener = FastCache::PlatformListener::Bind(reactor, "127.0.0.1", 0);
+    REQUIRE(listener);
+    REQUIRE(listener->IsBound());
+    auto const port = listener->BoundPort();
+    REQUIRE(port != 0);
+
+    // Declared before the reactor's tasks and the client, so it outlives both the
+    // coroutine and the thread that wait through it.
+    OffThreadWaits waits;
+    ProbeObservation observed;
+    ProbeTwiceThenRead(&reactor, listener.get(), &observed);
+    CancelParkedProbeTwice(&reactor, &observed, &waits);
+
+    // Recorded here and asserted on the main thread: a `REQUIRE` firing inside a
+    // `jthread` body is `std::terminate`, not a failed case.
+    std::atomic<bool> connected { false };
+
+    std::jthread client { [port, &observed, &connected, &waits] {
+        FastCache::BlockingConnector connector;
+        auto socket = FastCache::SyncRun(
+            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+        if (!socket.has_value())
+            return;
+        connected.store(true, std::memory_order_release);
+
+        // Nothing is sent until BOTH probes have been retired. A byte written earlier
+        // would SATISFY a probe rather than let it be cancelled, and the case would be
+        // measuring readability instead of cancellation -- green, and about nothing.
+        //
+        // Twice the guard, as the case above: this waits on the reactor task's own
+        // bounded wait, and two waits with one bound give up together and name the
+        // symptom rather than the cause.
+        if (!waits.WaitForFlag(
+                "both parked probes to be retired",
+                observed.second.resolved,
+                [&observed] { return Describe(observed); },
+                WaitOptions { .step = {}, .context = {}, .bound = 2 * WaitHangGuard, .rest = WaitRest }))
+            return;
+
+        std::array<std::byte, 2> const payload { std::byte { 'o' }, std::byte { 'k' } };
+        (void) FastCache::SyncRun([](FastCache::ISocket* s, std::array<std::byte, 2> p) -> FastCache::Task<bool> {
+            co_return (co_await s->Write(std::span<std::byte const> { p })).has_value();
+        }((*socket).get(), payload));
+
+        (void) waits.WaitForFlag("the exchange to finish", observed.finished, [&observed] { return Describe(observed); });
+        (*socket)->Close();
+    } };
+
+    reactor.Run();
+    client.join();
+
+    // First, while the accounts of any wait that ran out are still attached.
+    CHECK(waits.AllReached());
+    REQUIRE(connected.load(std::memory_order_acquire));
+    REQUIRE(observed.finished.load(std::memory_order_acquire));
+
+    auto const cancelled = static_cast<int>(FastCache::NetErrorCode::Cancelled);
+
+    // 1. The first probe really was parked when the canceller ran.
+    CHECK_FALSE(observed.firstResolvedAtCancel.load(std::memory_order_relaxed));
+
+    // 2. The premise: the first call resumed the reader INLINE, and the reader had armed
+    //    a second probe and parked on it before the second call ran.
+    CHECK(observed.secondArmedAtCancel.load(std::memory_order_relaxed));
+    CHECK_FALSE(observed.secondResolvedAtCancel.load(std::memory_order_relaxed));
+
+    // 3. The first probe resumed, as a cancellation rather than as EOF or readability.
+    INFO("first probe: error code " << observed.first.errorCode.load(std::memory_order_relaxed)
+                                    << " (Cancelled=" << cancelled << ")");
+    REQUIRE(observed.first.resolved.load(std::memory_order_acquire));
+    CHECK_FALSE(observed.first.hasValue.load(std::memory_order_relaxed));
+    CHECK(observed.first.errorCode.load(std::memory_order_relaxed) == cancelled);
+
+    // 4. **The statement.** The second call took the probe the first call's own
+    //    resumption armed -- an operation its caller never asked to cancel.
+    INFO("second probe: error code " << observed.second.errorCode.load(std::memory_order_relaxed)
+                                     << " (Cancelled=" << cancelled << ")");
+    REQUIRE(observed.second.resolved.load(std::memory_order_acquire));
+    CHECK_FALSE(observed.second.hasValue.load(std::memory_order_relaxed));
+    CHECK(observed.second.errorCode.load(std::memory_order_relaxed) == cancelled);
+
+    // 5. And the socket was still a socket afterwards, which is what separates two
+    //    cancels from a close.
+    INFO("read after both cancels: error code " << observed.after.errorCode.load(std::memory_order_relaxed));
+    CHECK(observed.after.hasValue.load(std::memory_order_relaxed));
+    CHECK(observed.after.count.load(std::memory_order_relaxed) == 2);
 }
