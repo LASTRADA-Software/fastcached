@@ -6,8 +6,12 @@
 # `@AGENT.md` -- so every line here is a line every session pays for, whether or
 # not it needs the rule. It had grown to 2,411 lines before the pass that created
 # this file, of which its own rulebook index was 1,878; 286 of its 379 tripwire
-# bullets ran to three lines or more and the longest to 36. AGENT.md states the
-# rule that growth broke:
+# bullets ran to three lines or more and the longest to 21 -- each figure as THIS
+# check measures it, run against that file. A draft said 36, taken with the
+# earlier bullet extent that ran a bullet to the NEXT bullet; it is corrected
+# rather than dropped because the ceiling below was argued from it, and a figure
+# nobody can reproduce reads as the check being broken. AGENT.md states the rule
+# that growth broke:
 #
 #   "what belongs here is the sentence that makes the rule fire and the pointer
 #    to where the argument lives. A tripwire that has acquired measurements,

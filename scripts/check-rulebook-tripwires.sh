@@ -56,6 +56,10 @@
 #   <!-- agent-tripwire: none: why this section needs no tripwire -->
 #   <!-- agent-tripwire: untriaged: #123 nobody has decided about this one yet -->
 #
+# One LINE each, and outside any fenced block: a marker split over two lines is
+# read to the break and refused by name, and a marker shown as an EXAMPLE inside a
+# ``` block does not answer for the section above it.
+#
 # THREE spellings, three claims, because two cannot carry this: a rise in the
 # first means the tripwire moved, `none` says *a rise would mean nothing, and
 # why*, and `untriaged` says *nobody has decided, and which issue will*. That is
@@ -137,9 +141,15 @@ set -uo pipefail
 MinPhraseWords=5
 
 # How many lines after a `## ` heading the marker may sit on. 4, so that the
-# conventional heading / blank / marker layout fits with room for a wrapped
-# marker, and no further: a marker twenty lines down is under a PARAGRAPH, not
-# under the heading, and which heading it belongs to stops being obvious.
+# conventional heading / blank / marker layout fits with a line or two of slack,
+# and no further: a marker twenty lines down is under a PARAGRAPH, not under the
+# heading, and which heading it belongs to stops being obvious.
+#
+# **The slack is not room for a WRAPPED marker.** The marker is read as one LINE,
+# so a `-->` on the next line means everything past the break is dropped -- and
+# that is refused by name rather than tolerated, because the silent half of it
+# (a truncated phrase that still happens to occur in AGENT.md) verifies part of a
+# claim while reporting the whole of it.
 MarkerWindow=4
 
 # The awk program is the whole check, one pass per rules file, no shell loop over
@@ -168,27 +178,45 @@ function normalise(s) {
     sub(/^ /, "", s); sub(/ $/, "", s)
     return s
 }
-# Does this file `## Open work` section name this issue? An `untriaged:` marker
-# is deferred work, and deferred work in this rulebook lives as an `## Open work`
-# entry -- which `rulebook-open-work-state` RESOLVES, refusing one whose issue has
-# closed. Requiring the pairing is what puts these markers under that resolver:
-# without it, the issue closes, the entry is forced out, and the markers go on
-# printing a live-looking tally of a dead issue -- inside the guard whose whole
-# safety argument IS that tally.
+# Does this file `## Open work` section carry this issue as an ENTRY? An
+# `untriaged:` marker is deferred work, and deferred work in this rulebook lives as
+# an `## Open work` entry -- which `rulebook-open-work-state` RESOLVES, refusing
+# one whose issue has closed. Requiring the pairing is what puts these markers
+# under that resolver: without it, the issue closes, the entry is forced out, and
+# the markers go on printing a live-looking tally of a dead issue -- inside the
+# guard whose whole safety argument IS that tally.
+#
+# So the shape asked for is the shape that resolver EXTRACTS, not a mention of the
+# number. `check-rulebook-open-work.sh` reads a list bullet opening with
+# `[#N](https://github.com/OWNER/REPO/issues/N)` and carries a self-test case for
+# a bare `#619` in prose being no entry at all -- so a reader keyed on the number
+# alone accepts exactly what the resolver ignores, and the pairing this function
+# exists to enforce silently does not hold. Fenced lines are skipped for the same
+# reason that check skips them: an EXAMPLE of the shape is not an entry.
 function inOpenWork(issue,   k, seen) {
     seen = 0
     for (k = 1; k <= NR; k++) {
+        if (fenced[k]) continue
         if (lines[k] ~ /^## /) seen = (lines[k] == "## Open work")
-        else if (seen && lines[k] ~ ("#" issue "([^0-9]|$)")) return 1
+        else if (seen && lines[k] ~ ("^[ \t]*[-*+][ \t]+(\\*\\*)?\\[#" issue "\\]\\(https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[0-9]+\\)")) return 1
     }
     return 0
 }
 { lines[NR] = $0 }
 END {
+    # Which lines are inside a fenced block, computed ONCE and consulted by every
+    # reader below. It used to be a running flag in the heading loop alone, which
+    # left the marker scan and `inOpenWork` blind to fences -- so a marker shown as
+    # an EXAMPLE inside a ``` block satisfied the section above it, which is the
+    # documentation section most likely to contain one.
     fence = 0
     for (i = 1; i <= NR; i++) {
-        if (lines[i] ~ /^[ \t]*(```|~~~)/) { fence = !fence; continue }
-        if (fence) continue
+        if (lines[i] ~ /^[ \t]*(```|~~~)/) { fence = !fence; fenced[i] = 1; continue }
+        fenced[i] = fence
+    }
+
+    for (i = 1; i <= NR; i++) {
+        if (fenced[i]) continue
         if (lines[i] !~ /^## /) continue
         headings++
         heading = substr(lines[i], 4)
@@ -197,14 +225,23 @@ END {
         # the next heading.
         marker = ""; markerLine = 0
         for (j = i + 1; j <= NR && j <= i + MarkerWindow; j++) {
+            if (fenced[j]) continue
             if (lines[j] ~ /^#/) break
             if (lines[j] ~ /<!--[ ]*agent-tripwire:/) { marker = lines[j]; markerLine = j; break }
         }
         if (marker == "") {
-            refuse(i, "section `" heading "` carries no `<!-- agent-tripwire: ... -->` marker. Every `##` section of a rulebook file must say whether AGENT.md tripwires it, because an opt-in marker is silent about a section that never opted in (#492). Name a phrase from the AGENT.md bullet, or say `<!-- agent-tripwire: none: <reason> -->`. It must sit within " MarkerWindow " lines below the heading.")
+            refuse(i, "section `" heading "` carries no `<!-- agent-tripwire: ... -->` marker. Every `##` section of a rulebook file must say whether AGENT.md tripwires it, because an opt-in marker is silent about a section that never opted in (#492). Name a phrase from the AGENT.md bullet, or say `<!-- agent-tripwire: none: <reason> -->`. It must sit within " MarkerWindow " lines below the heading, outside any fenced block.")
             continue
         }
         markers++
+        # The marker is ONE line, and a marker whose `-->` is on the NEXT line is
+        # not a wrapped marker, it is a truncated one: everything after the line
+        # break is silently dropped, so a nominated phrase gets verified in part
+        # and the refusal for the rest insists the fault is in AGENT.md.
+        if (index(marker, "-->") == 0) {
+            refuse(markerLine, "section `" heading "` has an `agent-tripwire` marker that is not closed on this line -- no `-->`. The marker is read as ONE line, so anything below the break is dropped: the phrase would be verified in part and the refusal would name AGENT.md for a fault that is here. Put the whole marker on one line, however long it is.")
+            continue
+        }
         sub(/^.*<!--[ ]*agent-tripwire:[ ]*/, "", marker)
         sub(/[ ]*-->.*$/, "", marker)
         marker = normalise(marker)
@@ -242,7 +279,7 @@ END {
             sub(/^.*#/, "", issue)
             sub(/[^0-9].*$/, "", issue)
             if (!inOpenWork(issue)) {
-                refuse(markerLine, "section `" heading "` is `untriaged` against #" issue ", but this file `## Open work` section does not name that issue. Deferred work in this rulebook lives as an `## Open work` entry, which `ctest -R rulebook-open-work-state` resolves and refuses once the issue closes. Without the entry these markers outlive the issue and go on printing a live-looking tally of a dead one -- which is the tally this spelling is only safe because of. Add the entry, or decide the section with a phrase or `none:`.")
+                refuse(markerLine, "section `" heading "` is `untriaged` against #" issue ", but this file `## Open work` section does not name that issue as an ENTRY. Write it as `- **[#" issue "](https://github.com/OWNER/REPO/issues/" issue ")** -- ...`, which is the shape `ctest -R rulebook-open-work` extracts; a bare mention in prose, or one inside a fenced example, is not an entry and is invisible to the resolver. Deferred work in this rulebook lives as an `## Open work` entry, which `ctest -R rulebook-open-work-state` resolves and refuses once the issue closes. Without the entry these markers outlive the issue and go on printing a live-looking tally of a dead one -- which is the tally this spelling is only safe because of. Add the entry, or decide the section with a phrase or `none:`.")
                 continue
             }
             printf "UNTRIAGED #%s\n", issue
@@ -573,6 +610,50 @@ Prose.
 - **[#8761](https://github.com/LASTRADA-Software/fastcached/issues/8761)** -- other.' \
         "does not name that issue" "!carries no"
 
+    # ... and a MENTION is not an entry. `check-rulebook-open-work.sh` extracts a
+    # list bullet opening with the issue LINK and carries its own case for a bare
+    # `#619` in prose being no entry -- so a reader keyed on the number alone
+    # accepts exactly what the resolver ignores, and the pairing is then a
+    # sentence rather than a property.
+    Case "a prose mention in Open work is not an entry and does not pair" refused \
+"$_agent" \
+'# t
+
+## Sockets
+
+<!-- agent-tripwire: untriaged: #876 nobody has decided whether this needs one -->
+
+Prose.
+
+## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues -->
+
+The #876 audit found these, and they are recorded in the issue.' \
+        "does not name that issue as an ENTRY"
+
+    # ... nor is an EXAMPLE of the shape inside a fenced block.
+    Case "a fenced example entry does not pair either" refused \
+"$_agent" \
+'# t
+
+## Sockets
+
+<!-- agent-tripwire: untriaged: #876 nobody has decided whether this needs one -->
+
+Prose.
+
+## Open work
+
+<!-- agent-tripwire: none: deferred work, tracked as GitHub issues -->
+
+An entry looks like this:
+
+```markdown
+- **[#876](https://github.com/LASTRADA-Software/fastcached/issues/876)** -- sample.
+```' \
+        "does not name that issue as an ENTRY"
+
     # ... and it must name an OWNER. Without the issue it is a backlog row
     # nobody will ever close.
     Case "an untriaged section naming no issue is refused" refused \
@@ -678,6 +759,49 @@ Yet more prose.
 
 <!-- agent-tripwire: A socket has ONE read operation -->' \
         "carries no"
+
+    # A marker is ONE line. A `-->` on the next line is not a wrapped marker, it
+    # is a truncated one -- and the silent half is the dangerous half: a head that
+    # still occurs in AGENT.md verifies part of a claim while reporting all of it.
+    # Both halves are watched, the SILENT one first.
+    Case "a marker split over two lines is refused, not truncated" refused \
+"$_agent" \
+'# t
+
+## Sockets
+
+<!-- agent-tripwire: A socket has ONE read operation and Read and
+     WaitReadable share it -->
+
+Prose.' \
+        "not closed on this line" "!1 phrase(s) found"
+
+    Case "a split marker whose tail would have failed is refused for the right reason" refused \
+"$_agent" \
+'# t
+
+## Sockets
+
+<!-- agent-tripwire: A socket has ONE read operation and something
+     that is definitely not in AGENT.md -->
+
+Prose.' \
+        "not closed on this line" "!does NOT appear in AGENT.md"
+
+    # A marker shown as an EXAMPLE inside a fenced block does not answer for the
+    # section above it -- the documentation sections are exactly where one lives.
+    Case "a marker inside a fenced block does not mark its section" refused \
+"$_agent" \
+'# t
+
+## How to write a marker
+
+```
+<!-- agent-tripwire: none: example only, this is documentation -->
+```
+
+Prose about a rule that nothing tripwires.' \
+        "carries no" "outside any fenced block"
 
     # A `## ` inside a fenced block is not a heading, and demanding a marker
     # inside one is a refusal a reader cannot act on.

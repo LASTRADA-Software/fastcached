@@ -224,16 +224,26 @@ RunCheck() {
 
     # The number lives in ONE file. `#1605` is an issue reference; a bare 1605 in
     # a file whose length it describes is a second source of truth.
-    # Anchored at BOTH ends: `[^#0-9]N[^0-9]` cannot match the number at the start
+    # Anchored at BOTH ends: `[^#/0-9]N[^0-9]` cannot match the number at the start
     # or the end of a line, so a line reading `1610 lines of rules` would have
     # walked straight past -- a guard failing toward *nothing unusual here*.
+    #
+    # `/` is exempt for the SAME reason `#` is, and leaving it out made the
+    # exemption half a rule: AGENT.md spells an issue reference as
+    # `[#N](https://github.com/OWNER/REPO/issues/N)`, so the digits appear TWICE
+    # and only the first sits behind a `#`. The second is behind a `/`, matched,
+    # and refused as a size claim -- a false refusal whose remedy text confidently
+    # names the wrong file. It bites the day a cited issue number equals the line
+    # count, which is not a remote coincidence: this repository's issues and this
+    # file's length are both in the fifteen hundreds. The self-test case for the
+    # exemption used the bare `(#8)` form and passed under exactly that.
     #
     # Captured ONCE and reused as both the predicate and the evidence. Grepping
     # twice is two places to keep in sync, and the two ways they can drift apart
     # are a guard that refuses while printing nothing and one that prints
     # evidence while passing. No pipe INTO grep, so `pipefail` has nothing to
     # misreport.
-    selfHits="$(grep -nE "(^|[^#0-9])${totalLines}([^0-9]|$)" "$agent")"
+    selfHits="$(grep -nE "(^|[^#/0-9])${totalLines}([^0-9]|$)" "$agent")"
     if [[ -n "$selfHits" ]]; then
         echo "  AGENT.md contains the figure $totalLines outside an issue reference:" >&2
         printf '%s\n' "$selfHits" | sed 's/^/        /' >&2
@@ -382,6 +392,23 @@ total-lines|8' '# T
 ## The rulebook
 
 - A short rule, stated once (#8).
+- Another one, also short.
+
+x
+' \
+        "!must never quote its own size"
+
+    # ... including the form AGENT.md actually uses, where the digits appear
+    # TWICE and only the first sits behind a `#`. The bare `(#8)` case above
+    # passes under a guard that refuses this one, which is how the exemption came
+    # to be half a rule with a green suite over it.
+    Case "an issue LINK with the same digits is not a size claim" clean \
+'max-bullet-lines|3
+total-lines|8' '# T
+
+## The rulebook
+
+- A short rule, see [#8](https://github.com/LASTRADA-Software/fastcached/issues/8).
 - Another one, also short.
 
 x
