@@ -98,10 +98,21 @@ coverage.
 The check verifies the quoted phrase appears in `AGENT.md`, which makes *yes* a
 claim somebody can be **wrong** about rather than a box ticked. `AGENT.md` is only
 ever READ, which is the property that makes this affordable in a file several
-sessions edit at once. **Three spellings and not two**, because *deliberately
-untripwired* must not be spelled like *forgot* — and the third is safe only
-because the check TALLIES untriaged markers and prints the total per issue on
-every run.
+sessions edit at once.
+
+**Three spellings and not two**, because *deliberately untripwired* must not be
+spelled like *forgot*. That is not a new idea here: it is
+[`metrics-and-observability.md`](metrics-and-observability.md)'s
+`Refuse` / `RefuseWithoutCounter` / `RefuseUntriaged` split arriving in markdown,
+one claim each — *a rise means something*, *a rise would mean nothing, and why*,
+*nobody has decided, and which issue will*. And the third is safe for the same
+reason it is safe there and nowhere else: the check TALLIES untriaged markers and
+prints the total per issue on **every** run, so a placeholder cannot sit
+unnoticed. It must also name an issue that the file's own `## Open work` section
+carries, which is what puts these markers under `rulebook-open-work-state` — the
+resolver that refuses an entry whose issue has closed. Without that pairing the
+issue closes, the entry is forced out, and the markers go on printing a
+live-looking tally of a dead one.
 
 **Why a nominated phrase rather than a structural correspondence.** #876 asked for
 a check over a unit this tree does not have, and each of these kills a cheaper
@@ -145,8 +156,22 @@ end-of-file and swallowed 36 bullets from `## Issues and pull requests` onward �
 and the reusable half is the tell: **a disagreement whose shape the patterns
 explain is a difference; one they do not is a defect.**
 
-Do not restate the live counts here. The check prints them on every run, which is
-the one place they cannot drift from the tree.
+**Do not restate the live counts here.** `ctest -R rulebook-tripwires` prints the
+section, marker and phrase totals on every run and `ctest -R agent-md-budget`
+prints AGENT.md's, which is the one place they cannot drift from the tree.
+
+That sentence replaced a census, and the removal is the point rather than a
+tidy-up. This file used to carry *"`^## ` over `.agent/rules/*.md` excluding
+`README.md`: **112** headings"* and *"**314** top-level bullets"*, measured on
+`abb530ed`. Both had gone stale — the tree measures **132** excluding README and
+**379** — and a manager relayed the 112 to a session as if it were an
+observation, which is how a stale figure does its damage: nothing about a number
+says whether it was measured, inferred, remembered or read. A census inside the
+document that DEFINES how censuses must be stated is the worst place for one,
+because it is the copy everybody quotes. The disagreement above keeps its figures
+because a measurement's conditions are the world at one instant and must not
+track their source; a live count has two copies meant to stay equal, so it gets
+one copy and everybody points at it.
 
 ## Do not `@`-import these
 

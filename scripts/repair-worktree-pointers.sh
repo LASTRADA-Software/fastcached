@@ -57,10 +57,27 @@
 # working. A lane did exactly that on this machine. Nothing here writes git CONFIG
 # at all; it writes two pointer FILES and nothing else.
 #
+# RUN IT UNDER THE GIT THAT CANNOT READ THE WORKTREE, which is the whole point
+# and is easy to get backwards. The absolute `D:/` pointer is unreadable to WSL's
+# git and perfectly readable to Windows git, so running this from Git Bash on a
+# worktree WSL cannot open prints
+#
+#     worktree: <path> is readable by this git (N tracked file(s))
+#
+# and repairs nothing. That sentence is TRUE -- it says *this* git -- and it reads
+# as success, so the next thing that runs under WSL fails for a reason the check
+# just appeared to rule out. Measured: a session lost a `ctest` run to exactly
+# that, diagnosing a registration defect that did not exist. A claim about a tool
+# is checked against THAT tool; here the tool is the git that is failing.
+#
 # Usage:
 #   scripts/repair-worktree-pointers.sh                 diagnose this worktree
 #   scripts/repair-worktree-pointers.sh --apply         and repair it
 #   scripts/repair-worktree-pointers.sh --self-test
+#
+#   wsl -e bash scripts/repair-worktree-pointers.sh --apply     from Windows, when
+#                                                               WSL is the git that
+#                                                               cannot read it
 #
 # Exit: 0 when the worktree is readable (already, or after `--apply`), 1 when it is
 # not and this could not fix it. Diagnosing a broken tree WITHOUT `--apply` is also
