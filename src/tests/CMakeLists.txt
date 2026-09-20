@@ -8416,3 +8416,28 @@ set_tests_properties("conditional-check-reach-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 120
 )
+
+# ---------------------------------------------------------------------------
+# The clang install says WHICH KIND of failure it was (#1566).
+#
+# Master run 35172062484 died 36 s in on `Temporary failure in name resolution` and
+# was reported as "clang-tsan failed" -- pointing whoever read it at the sanitizer
+# and then at the source tree, for a DNS outage on a runner.
+#
+# What is tested is the CLASSIFIER, a pure function of the failing command's output:
+# network-unreachable, package-absent, and a third outcome for a shape matching
+# neither, which exits loud rather than being folded into whichever neighbour is
+# closer. The acquisition around it needs a network and is not the part that was
+# wrong. The last case is a scan asserting no call site has gone back to a bare
+# `wget`, with a positive control on the file being read at all -- zero raw sites and
+# zero converted ones is also what reading the wrong file reports.
+#
+# Needs no compiler, no build, no daemon, no socket and no network.
+add_test(
+    NAME "ci-install-clang-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/ci-install-clang.sh" --self-test
+)
+set_tests_properties("ci-install-clang-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
