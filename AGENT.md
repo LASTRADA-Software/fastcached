@@ -1173,6 +1173,10 @@ and what they may assume.
   where the SUBTRACTION happens, never a clamp. The variable is the ENVIRONMENT, not the load.
 - **Adding an OUTCOME changes what an old condition does to every case that tolerated the wrong
   answer**: enumerate what was asserted about the output it replaces, and pin the input.
+- Its reachability twin: **widening a gate makes the defects BEHIND it live, and none of them is
+  in the diff** — which shows a condition relaxed, never the lines under it nobody had run. `wait`
+  on a job the previous line killed returns 137 and `set -e` then ends the shell explaining
+  nothing; it stayed latent only because the one caller reaching it ran under `&& rc=0 || rc=$?`.
 - **Assert what DISTINGUISHES, not what both sides produce.** A refusal test asserts WHICH
   refusal. **Prove the test can fail** — neuter the fix and check the failures are the ones you
   expect AND ONLY THOSE; the asymmetry is the evidence.
