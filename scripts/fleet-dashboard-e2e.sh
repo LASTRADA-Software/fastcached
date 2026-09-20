@@ -155,6 +155,9 @@ dash_get() {
         local args=(-sk -i -m 10)
         [[ -n "$auth" ]] && args+=(-H "Authorization: ${auth}")
         [[ -n "$etag" ]] && args+=(-H "If-None-Match: ${etag}")
+        # curl's own `-m 10` is this arm's bound, and it exits non-zero when it
+        # expires. The `return 0` keeps the two arms' contract identical for the
+        # callers below, which read the BODY and never the status.
         curl "${args[@]}" "https://127.0.0.1:${port}${path}"
         return 0
     fi
@@ -162,7 +165,28 @@ dash_get() {
     local headers=()
     [[ -n "$auth" ]] && headers+=("Authorization: ${auth}")
     [[ -n "$etag" ]] && headers+=("If-None-Match: ${etag}")
-    http_get 127.0.0.1 "$port" "$path" ${headers[@]+"${headers[@]}"}
+
+    # A CUT-SHORT BODY IS NOT AN ANSWER, and this is the caller #1257 is about.
+    #
+    # Every one of the twenty call sites below is `x="$(dash_get ...)"` with no
+    # status test, and this fixture runs `set -uo pipefail` WITHOUT `-e` -- so a
+    # non-zero here reaches nobody. That was harmless only while `http_get`
+    # returned 0 for a truncation: the prefix still carries `HTTP/1.1 200` and the
+    # first series, so the assertions pass on a response our own read bound ended.
+    # This fixture reads the largest bodies in the tree -- the `/fleet` document
+    # and a `/fleet.json` that is ONE line with no trailing newline -- which is
+    # where a stall truncates most and shows least.
+    #
+    # `fail` rather than a status nobody reads: a prefix makes every downstream
+    # assertion unsound, so there is nothing for a caller to decide. A REFUSED
+    # connection is left to the callers, several of which expect one.
+    local body="" status=0
+    body="$(http_get 127.0.0.1 "$port" "$path" ${headers[@]+"${headers[@]}"})" || status=$?
+    if [[ "$status" -eq "$E2eHttpTruncated" ]]; then
+        fail "$(e2e_http_outcome "$status" "the admin endpoint's ${path}")"
+    fi
+    printf '%s' "$body"
+    return "$status"
 }
 
 admin_port="$(free_port)"

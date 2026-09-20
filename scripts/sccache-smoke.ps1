@@ -200,7 +200,22 @@ $server = Start-Process -FilePath $fastcached `
 # Waits on the LISTENER, bounded, and reports a daemon that DIED as a death rather
 # than as a timeout -- a third case beside slow and stuck, and the one the flat
 # sleep could never name. The POSIX half's `wait_for_port` is the same wait.
-Wait-E2EPortAnswers $port $server "fastcached" @($daemonOut, $daemonErr)
+#
+# IT THROWS, AND THE SLEEP IT REPLACED COULD NOT. Every earlier path out of this
+# script reached `Invoke-Cleanup`, directly or through `Stop-Smoke`; a throw past
+# the end of the file reaches neither, so the daemon started two lines up would be
+# ORPHANED holding the port it just drew, and `$workdir` left behind -- on a
+# LOADED runner, which is the population the bounded wait exists for. That leftover
+# is precisely the "listener of unknown vintage" this module refuses or reaps, so
+# the fixture would have been manufacturing the condition it guards against.
+#
+# `Stop-Smoke` rather than letting it escape: it prints the reason, cleans up and
+# exits 1, which is what every other failure here does.
+try {
+    Wait-E2EPortAnswers $port $server "fastcached" @($daemonOut, $daemonErr)
+} catch {
+    Stop-Smoke 'fastcached never answered on its port' @("$_")
+}
 
 & sccache --stop-server *> $null
 & sccache --start-server | Out-Null
