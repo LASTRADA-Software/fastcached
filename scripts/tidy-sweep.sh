@@ -413,7 +413,11 @@ LoadNotOurRoots() {
 FirstPartyFiles() {
     local listed
     listed="$(git ls-files --cached --others --exclude-standard "$@")"
-    grep -vE "$NotOurPattern" <<< "$listed" || true
+    # Not a herestring: this is the whole `git ls-files` listing, which is past the
+    # 64 KiB pipe buffer where Git Bash's `<<<` deadlocks. See the measurement in
+    # `scripts/lib/third-party-roots.sh`.
+    grep -vE "$NotOurPattern" < <(printf '%s
+' "$listed") || true
 }
 
 # Every tracked-or-new file UNDER the roots: exactly what `FirstPartyFiles` declines.
@@ -424,7 +428,9 @@ FirstPartyFiles() {
 DeclinedThirdPartyFiles() {
     local listed
     listed="$(git ls-files --cached --others --exclude-standard "$@")"
-    grep -E "$NotOurPattern" <<< "$listed" || true
+    # Same listing, same boundary.
+    grep -E "$NotOurPattern" < <(printf '%s
+' "$listed") || true
 }
 
 # That the exclusion above still bites. Called once, from the top level, where a
@@ -441,8 +447,11 @@ AssertNotOurRootsExcluded() {
         [[ -d "$root" ]] || continue
         [[ -n "$(git ls-files "$root")" ]] || continue
         all="$(git ls-files --cached --others --exclude-standard)"
-        grep -q "^${root}/" <<< "$all" || continue
-        kept="$(grep -v "^${root}/" <<< "$all" || true)"
+        # Same listing, same boundary, twice.
+        grep -q "^${root}/" < <(printf '%s
+' "$all") || continue
+        kept="$(grep -v "^${root}/" < <(printf '%s
+' "$all") || true)"
         [[ "$kept" != "$all" ]] \
             || fatal "the '${root}/' exclusion matched nothing while ${root}/ holds tracked files, so this sweep would analyse code this repository does not own"
     done
