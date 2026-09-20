@@ -1080,6 +1080,14 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - And it must be configured with the same TARGET SET CI builds: a changed file with no compile
   command is dropped silently, and must be. Account for every file in the diff the sweep did not
   reach, before trusting its count.
+- **A registration that exists in ONE configuration reports nothing in every other, which reads
+  like a pass.** So the blind-spot table is TWO registrations — the MEASUREMENT
+  (`tidy-blind-spots`, Linux, ASan and TLS on) and the table's own rules
+  (`tidy-blind-spots-table`, default set, every platform, no build) — beside
+  `conditional-check-reach`, which DERIVES each option-gated registration from the `if()` nesting
+  and asserts some `build.yml` job configures a build it can run in AND runs `ctest`. Both DERIVE
+  their subject and never name it (#589). Still missing: a check over GUARDS rather than
+  platforms, unioned over (leg × configuration) and never over legs (#858).
 - **Running the launcher is not testing it.** The synthetic fixtures prove it RUNS and produces AN
   object; `scripts/launcher-replay-e2e.sh` builds three times and runs the replayed binary.
   Compare cold-against-warm, never control-against-warm, and staging a wrong object needs the LINK
