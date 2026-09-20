@@ -106,7 +106,7 @@ StartLine() {
 # WSL over DrvFs, in such a worktree, by running each entry alone:
 #
 #   * `workflow-script-invocations` exited 128 with no message at all;
-#   * `node-reloadable-docs` reported that no tracked file carries its marker;
+#   * `reloadable-docs` reported that no tracked file carries its marker;
 #   * `unguarded-prerequisites-selftest` said its positive control's commit is
 #     unreachable and that "a shallow clone must fetch depth 0" -- a remedy for a
 #     state this tree is not in;
