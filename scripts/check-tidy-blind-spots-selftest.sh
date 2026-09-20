@@ -32,12 +32,16 @@ cat "$obj" 2>/dev/null
 NM
 chmod 0755 "$work/nm"
 
-# @param 1 case name  @param 2 expect pass|refuse  @param 3 substring the output must carry
-run_case() {
-    name="$1"; want="$2"; wantMsg="$3"
-    cases=$((cases + 1))
-    out="$(NM="$work/nm" FASTCACHED_SOURCE_DIR="$work" bash "$check" "$work/build" 2>&1)"
-    rc=$?
+# The verdict, shared by both drivers below. Split out when `--table-only` arrived so
+# the two modes cannot drift into judging differently -- a fixture that judges one mode
+# more leniently than the other is the "fake more permissive than the thing it stands
+# for" shape, one level up.
+#
+# @param 1 case name  @param 2 expect pass|refuse  @param 3 substring the output must
+#          carry  @param 4 substring it must NOT carry, or empty  @param 5 exit status
+#          @param 6 output
+judge() {
+    name="$1"; want="$2"; wantMsg="$3"; banMsg="$4"; rc="$5"; out="$6"
     got=pass; [[ $rc -ne 0 ]] && got=refuse
     if [[ $got != "$want" ]]; then
         echo "CMake Error: check-tidy-blind-spots-selftest: case '$name' expected $want, got $got" >&2
@@ -50,6 +54,32 @@ run_case() {
         echo "$out" | sed 's/^/    /' >&2
         failures=$((failures + 1))
     fi
+    if [[ -n $banMsg ]] && grep -q -- "$banMsg" <<< "$out"; then
+        echo "CMake Error: check-tidy-blind-spots-selftest: case '$name' carried '$banMsg', which this mode cannot have established" >&2
+        echo "$out" | sed 's/^/    /' >&2
+        failures=$((failures + 1))
+    fi
+}
+
+# @param 1 case name  @param 2 expect pass|refuse  @param 3 substring the output must carry
+run_case() {
+    cases=$((cases + 1))
+    out="$(NM="$work/nm" FASTCACHED_SOURCE_DIR="$work" bash "$check" "$work/build" 2>&1)"
+    rc=$?
+    judge "$1" "$2" "$3" "" "$rc" "$out"
+}
+
+# The same, through `--table-only`: no build directory, no `nm`, no objects. It needs
+# none of the staging `run_case` needs, and is deliberately driven over the SAME staged
+# trees so a table that is well-formed for one mode is well-formed for the other.
+#
+# @param 1 case name  @param 2 expect pass|refuse  @param 3 substring the output must
+#          carry  @param 4 substring it must NOT carry, or empty
+run_table_case() {
+    cases=$((cases + 1))
+    out="$(FASTCACHED_SOURCE_DIR="$work" bash "$check" --table-only 2>&1)"
+    rc=$?
+    judge "$1" "$2" "$3" "${4:-}" "$rc" "$out"
 }
 
 # Stage a tree: $1 = table contents, then pairs of <relpath> <symbol-count>.
@@ -222,6 +252,66 @@ run_case leg_claimed_by_a_comment refuse "which is not a clang-tidy leg"
 # invocation, uncommented, IS a leg.
 stageWorkflow 'jobs:\n  clang-tidy:\n    steps:\n      - run: scripts/tidy-sweep.sh --ci\n  clang-tidy-windows:\n    steps:\n      - run: bash scripts/tidy-sweep.sh --only=x\n'
 run_case leg_sweeping_with_only pass "contribute nothing in this configuration"
+
+# --------------------------------------------------------------------------------
+# THE REASON COLUMN, and the build-free mode that carries it everywhere (#589).
+#
+# The two rules below were enforced on exactly one configuration -- Linux, ASan on,
+# TLS on -- because they sat behind a measurement that needs a build. On every other
+# platform they reported nothing, which reads like a pass. `--table-only` is the same
+# two rules with the measurement removed.
+
+# A `none` row with the reason deleted. The refusal names the `none` case specifically,
+# because on a row that names a leg the leg is itself an account and on a `none` row
+# there is none: the third column is the whole explanation of why nothing reads the
+# unit, and blanking it turns an exemption into a bare fact.
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\t\n')" \
+    "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
+run_case reason_missing_with_build refuse "carries no reason in its third column"
+run_table_case reason_missing_table_only refuse "the only account of why no analyser reads this unit"
+
+# Whitespace is not a reason. A column holding a space satisfies `-n` and says nothing,
+# so the rule tests for a non-blank character -- the shape that survives a tidy-up.
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\t   \n')" \
+    "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
+run_table_case reason_is_whitespace refuse "carries no reason in its third column"
+
+# A row that NAMES a leg still needs one: the format says three columns, and the leg
+# explains which analyser reads it, never what makes it empty on the ones that do not.
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tclang-tidy-windows\t\n')" \
+    "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
+run_table_case leg_row_without_reason refuse "carries no reason in its third column"
+
+# The passing direction, which is the half a refusal-only fixture never establishes.
+# And the CONTROL that makes this mode honest: it must not print the measuring mode's
+# sentence. `all accounted for in scripts/tidy-blind-spots.txt` is a claim about the
+# OBJECTS, and a run that opened none may not borrow it -- absence of the negative is
+# not the positive, and a mode that names its set may not report clean over the half it
+# could not cover.
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\tguarded\n')" \
+    "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
+run_table_case table_only_accepts pass "[table only, no build]" "all accounted for"
+
+# The OTHER half of that control: the measuring mode must not start borrowing the
+# table-only wording either. Same staged tree, same table, the other driver.
+run_case table_only_wording_is_not_borrowed pass "all accounted for"
+
+# `--table-only` still runs the legs scan, so a row naming a leg that does not exist is
+# refused with no build. Without this the mode could be checking the reason column and
+# nothing else while reading as the full table check.
+stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tclang-tidy-solaris\tguarded\n')" \
+    "$ctrl" 50 "src/FastCache/Net/IocpSocket.cpp" 2
+run_table_case table_only_absent_leg refuse "which is not a clang-tidy leg"
+
+# EITHER SCAN MATCHING NOTHING IS A REFUSAL. Both arms, because a scan that matches
+# nothing passes every rule downstream of it vacuously and prints what a healthy tree
+# prints. The table arm is scoped to this mode: with a build the table is not the
+# evidence, so an empty one is the ordinary expectation *nothing is blind*.
+stage "$(printf '# only a comment\n')" "$ctrl" 50
+run_table_case table_only_no_rows refuse "has no rows"
+
+stageWorkflow 'jobs:\n  build:\n    steps:\n      - run: echo nothing\n'
+run_table_case table_only_no_legs refuse "no clang-tidy leg found"
 
 echo "check-tidy-blind-spots-selftest: ran $cases case(s), $failures failure(s)"
 [[ $failures -eq 0 ]] || exit 1

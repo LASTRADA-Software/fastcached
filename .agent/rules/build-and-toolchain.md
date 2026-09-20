@@ -2912,6 +2912,30 @@ makes it anyway and says so there.
   guard active. That is a different instrument over the matrix, and it is the half
   with teeth: this one reports, and a green job's log is not read.
 
+  **The half with teeth is `scripts/tidy-blind-spots.txt` and the check over it, and
+  it is TWO registrations because it is two questions.** The MEASUREMENT reads the
+  compile database, the objects and `nm`, so `tidy-blind-spots` runs on Linux with
+  ASan and TLS on and nowhere else — and a registration that exists in one
+  configuration reports nothing in every other, which reads like a pass. So the
+  table's own rules — every reached-by column names a clang-tidy leg the workflow
+  still has, every row carries a REASON — are `tidy-blind-spots-table`, in the
+  default set, on every platform, needing no build; and `conditional-check-reach`
+  derives the option-gated registrations in `src/tests/CMakeLists.txt` from the
+  `if()` nesting around them and asserts some `build.yml` job still configures a
+  build each one can run in AND runs `ctest`. Neither names `tidy-blind-spots`: both
+  DERIVE it, so a flag change on either side refuses rather than silently shrinking
+  the set (#589).
+
+  **Two things about the shape of the instrument that is still missing, both of
+  which cost a wrong design once.** It is a check over **guards**, not over
+  platforms: `TlsContext_test.cpp` and `TlsSocket_test.cpp` are guarded out by a
+  build OPTION and not by an OS, so a platform-keyed check answers a question
+  narrower than the one asked. And its union is over **(leg × configuration)**,
+  never over legs — a leg that builds with an option OFF has run without covering
+  anything that option gates, so counting it as coverage is the same over-report one
+  level up. Which units are reached by no leg at all is a number this check prints on
+  every run, and closing it is [#858](https://github.com/LASTRADA-Software/fastcached/issues/858).
+
 - **The sanitizer test run moved to `clang-asan-ubsan`; it did not go.** The
   `clang-debug` preset is the only configuration in the workflow with ASan and
   UBSan on, so that job's `ctest` is the project's entire sanitizer coverage in CI.
@@ -6563,17 +6587,6 @@ pointer.
     the caution that made #682 sit still applies: the ticket's fifteen pre-existing
     diagnostics would land a permanently RED context, a worse instrument than the gap,
     and neither leg can be developed from a Linux host.
-- **[#589](https://github.com/LASTRADA-Software/fastcached/issues/589)** — the sweep
-  now reports which files produced no code (#466), and that is the half that only
-  *reports*: a green job's log is not read. Nothing asserts that a file guarded out
-  here is compiled with its guard **active** somewhere, so the syntax error that
-  started #466 could recur and every required check would still be green. The check
-  is over **guards**, not platforms — `TlsContext_test.cpp` and `TlsSocket_test.cpp`
-  are gated on a build OPTION, not an OS — and its union is over
-  **(leg × configuration)**, never over legs: a leg that builds with an option off
-  has run without covering anything that option gates. It is a different instrument
-  over the CI matrix, not a deeper `tidy-sweep.sh`, which by construction sees one
-  configuration and cannot know what the macOS or Windows legs compile.
 - **[#1234](https://github.com/LASTRADA-Software/fastcached/issues/1234)** —
   `PreprocessArgv` still parses the whole compile database once per translation
   unit: 14.1 s of CPU a sweep against 141 ms batched, ~0.3% of wall clock. #605
