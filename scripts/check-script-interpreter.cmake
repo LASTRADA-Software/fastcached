@@ -159,6 +159,51 @@ function(fastcached_add_violation text)
     list(APPEND _grown "${_escapedViolation}")
     set(violations "${_grown}" PARENT_SCOPE)
 endfunction()
+
+# The CMake command a line belongs to, rendered with line numbers, for a refusal to QUOTE.
+#
+# **Quoting one line of a two-line command is what made a correct registration look like a
+# bare invocation** (#1579): a wrapped `COMMAND` puts the checked script on a continuation
+# line with no token before it, and shown alone that line is indistinguishable from a site
+# that really does name no interpreter. A manager read exactly that and told a lane twice,
+# with confidence, that their registration was missing `${FASTCACHED_BASH}` and
+# `run-check.sh`. It had both, on the line above, which the message did not show.
+#
+# A DISPLAY walk and deliberately not a classifying one. It looks back for the line that
+# opens the command and stops there; when it finds none inside the bound it shows what it
+# has. Both failure modes show MORE context rather than less, so a bad guess costs a reader
+# a couple of irrelevant lines and can never turn an unclassifiable site into a classified
+# one -- which is the direction this check must not fail in (see "REFUSED, not skipped").
+#
+# @param allLines   every line of the file, in order
+# @param at         the 1-based number of the offending line
+# @param outBlock   receives the rendered block
+function(fastcached_command_block allLines at outBlock)
+    set(_first "${at}")
+    # Six is enough for every registration shape in this tree and bounds a file whose
+    # command openers have been renamed out from under this walk.
+    foreach(_back RANGE 1 6)
+        math(EXPR _candidate "${at} - ${_back}")
+        if(_candidate LESS 1)
+            break()
+        endif()
+        math(EXPR _index "${_candidate} - 1")
+        list(GET allLines "${_index}" _text)
+        set(_first "${_candidate}")
+        if(_text MATCHES "COMMAND|add_test\\(|set\\(")
+            break()
+        endif()
+    endforeach()
+
+    set(_rendered "")
+    foreach(_n RANGE "${_first}" "${at}")
+        math(EXPR _index "${_n} - 1")
+        list(GET allLines "${_index}" _text)
+        string(STRIP "${_text}" _text)
+        set(_rendered "${_rendered}\n      ${_n} | ${_text}")
+    endforeach()
+    set(${outBlock} "${_rendered}" PARENT_SCOPE)
+endfunction()
 set(lineNumber 0)
 set(sawDefinition FALSE)
 
@@ -189,9 +234,12 @@ foreach(line IN LISTS lines)
     # the tree actually uses are covered by that one rule: `COMMAND <tok> "x.sh"`
     # and `set(<var> <tok> "x.sh")`.
     if(NOT line MATCHES "([^ \t]+)[ \t]+\"[^\"]*scripts/[^\"]*\\.sh\"")
-        string(STRIP "${line}" shownLine)
+        fastcached_command_block("${lines}" "${lineNumber}" commandBlock)
         fastcached_add_violation(
-             "src/tests/CMakeLists.txt:${lineNumber} runs a shell script in a form this scan cannot classify, so it cannot say which interpreter it gets: ${shownLine}")
+             "src/tests/CMakeLists.txt:${lineNumber} runs a shell script in a form this scan cannot classify, so it cannot say which interpreter it gets:${commandBlock}
+      This scan reads LINES, not CMake commands. A `COMMAND` that WRAPS leaves the checked script on a continuation line with no token before it -- so if the interpreter is on a line above, this scan cannot see it and the registration may be perfectly correct. Read the whole command printed above before changing anything.
+      REMEDY: put the interpreter and the checked script on ONE line, as the other registrations here do. Do not add `\${FASTCACHED_BASH}` a second time -- check first whether the line above already carries it.
+      This is the LOUD direction: a wrapped-but-correct registration is REFUSED, never a wrong one passed silently. Widening the scan to join continuations is deliberately not done, because a join that merged lines wrongly could make an unclassifiable site look classified, and skipping one is what this check exists to prevent.")
         continue()
     endif()
 
