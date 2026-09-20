@@ -423,7 +423,11 @@ CompositeActions() {
                 refused=$((refused + 1))
                 ;;
         esac
-    done <<< "$listed"
+    # Not a herestring: this is the first-party tracked-file listing, ~58 KiB here against
+    # the 64 KiB pipe buffer that makes `<<<` deadlock on Git Bash. See the measurement in
+    # `scripts/lib/third-party-roots.sh`; this site is under the boundary today and is the
+    # next one to cross it.
+    done < <(printf '%s\n' "$listed")
     if [ "$tracked" -eq 0 ]; then
         echo "  FAIL: git ls-files listed no tracked file in ${root} -- a listing of nothing is not a repository without actions"
         return 1
