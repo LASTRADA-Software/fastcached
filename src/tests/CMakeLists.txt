@@ -8522,3 +8522,58 @@ set_tests_properties("required-context-ruleset-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
+
+# ---------------------------------------------------------------------------
+# A staged POSIX-shell stub that a NON-SHELL spawns (#871).
+#
+# The rule had three prose homes -- this file applies it BY HAND at the
+# `tidy-blind-spots-selftest` registration above, and both rules files restate it
+# -- and no executor, so it held exactly as far as whoever wrote the next fixture
+# had read. `execute_process`, `subprocess` and `CreateProcess` read no shebang;
+# Git Bash does, so a fixture that runs happily by hand is one the check cannot
+# start at all. That failure has landed here before (#668).
+#
+# RUNS ON WINDOWS, which is where the defect fires, and `cmake -P` is the portable
+# vehicle. The scan stages nothing executable, so it cannot trip its own rule --
+# though it IS a candidate by construction, since it carries every shebang it
+# matches on, and it carries its own `data` row saying so.
+#
+# THREE CLASSES, because collapsing them would be an over-report: `data` (never
+# executed -- bytes for a scan, or a file a probe must merely FIND), `adapted`
+# (stages a form the spawner can start, so it runs everywhere) and `guarded`
+# (kept off a platform, and then the REASON is the discriminator -- "Windows
+# cannot start a shebang" is a portability excuse that costs coverage, where
+# "the launcher sandbox this needs has no Windows equivalent" says there is
+# nothing there to answer).
+#
+# Needs no compiler, no build, no daemon, no socket and no network.
+add_test(
+    NAME "staged-stub-spawns"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-staged-stub-spawns.cmake"
+)
+set_tests_properties("staged-stub-spawns" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
+# Seven cases, the ACCEPTING arms first and one of them for each accepting class.
+# Each asserts WHICH refusal it got rather than merely that it refused.
+#
+# Its scratch trees go OUTSIDE the repository: staged inside, they would be
+# enumerated by every other scan while they exist, and a case that aborted would
+# leave artefacts under `scripts/`.
+add_test(
+    NAME "staged-stub-spawns-selftest"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-staged-stub-spawns-selftest.cmake"
+)
+set_tests_properties("staged-stub-spawns-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 180
+)
