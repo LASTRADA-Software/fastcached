@@ -53,6 +53,20 @@ set -uo pipefail
 
 UsageError=2
 
+# The analyser was found and CANNOT ANSWER (#1574) -- its own build is unusable here, so no row's outcome is a
+# statement about the tree or about the defect the row names.
+#
+# Its own status, and not a `FAIL` sharing 1 with "a row changed status", because those are opposite diagnoses sent
+# to opposite people. Measured on this repository's Windows host: the PyPI clang-tidy wheel `--resolve` finds under
+# Git Bash ships no C++ standard library, so every row's live unit failed on `#include <algorithm>` and this script
+# refused with *"modernize-min-max-use-initializer-list did not report the live unit ... whether the crashing shape
+# still crashes says nothing"* -- a confident, specific claim about #1410's status, from a run that had learned
+# nothing about it. The same script, same arguments, under WSL exits 0.
+#
+# 77, the number this tree already spells "the prerequisite was not there", so a consumer that wants to skip can and
+# one that wants to refuse can say WHY. `local-gate.sh` refuses, naming the analyser build rather than the tree.
+UnusableAnalyser=77
+
 # name|check|issue|crashes|named|live
 # The three units are `printf %b` text: `\n` separates lines, and no unit may contain a `|`.
 Rows=(
@@ -101,6 +115,22 @@ HasStackDump() {
         *"Stack dump:"*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# Whether the analyser can answer AT ALL, over what two trivial units produced (#1574).
+#
+# TWO probes and not one, because they are two facts and a reader acts on them differently: an analyser that cannot
+# analyse `int Preflight() { return 0; }` is broken or is not clang-tidy, while one that manages that and fails on
+# `#include <algorithm>` is a build shipped without a C++ standard library -- which is the shape the Windows PyPI
+# wheel has, and the one that produced #1574. Sniffing a `file not found` out of the output would collapse them into
+# one string match; an exit status per probe is a fact.
+#
+# $1 = the bare unit's exit, $2 = the standard-header unit's exit.
+# Prints exactly one of: usable, runs-nothing, no-standard-library.
+JudgePreflight() {
+    [ "$1" -eq 0 ] || { echo runs-nothing; return; }
+    [ "$2" -eq 0 ] || { echo no-standard-library; return; }
+    echo usable
 }
 
 # The DECISION, over what three runs produced, so `--self-test` drives every outcome without an analyser.
@@ -218,6 +248,17 @@ ListSitesForRemedy() {
     printf '%s' "$Sites" | sed 's/^/             /'
 }
 
+# The scratch directory this run planted its units in, removed. A FUNCTION because
+# `CheckInstalled` now has three exits and had one: the cleanup sat at the tail, so the
+# preflight refusals (#1574) would each have left a directory behind on every gate run of
+# a host whose analyser cannot answer -- which is exactly the host that re-runs the gate.
+# $1 = the directory.
+DropWork() {
+    find "$1" -depth -mindepth 1 -delete 2>/dev/null
+    rmdir "$1" 2>/dev/null
+    return 0
+}
+
 # $1 = the analyser. Every row's three units through it.
 CheckInstalled() {
     local exe="$1" dir="$2" row work unit rc out verdict bad=0 config
@@ -230,6 +271,58 @@ CheckInstalled() {
         return 0
     fi
     work="$(mktemp -d "${TMPDIR:-/tmp}/clang-tidy-known-defects.XXXXXX")" || { echo "FAIL: mktemp failed"; return 1; }
+
+    # BEFORE any row runs (#1574). A row's verdict is a claim about a named defect, and an analyser that cannot
+    # compile a trivial unit produces that claim without having learned anything -- so the question "can this build
+    # answer at all" is asked once, first, and answered in its own words.
+    #
+    # Under the FIRST row's own check, and not under `-*`: measured, `--config="{Checks: '-*'}"` makes clang-tidy
+    # refuse with *"Error: no checks enabled"* and exit 1, so a preflight written that way calls every analyser
+    # broken -- this instrument committing the misdiagnosis it exists to remove. A `clang-diagnostic-*` group does
+    # not count as a check either. Any row's check would do; the first one is the one that certainly exists, the
+    # empty table having returned above, and it is the config shape the rows themselves use.
+    SplitRow "${Rows[0]}" || { echo "FAIL: malformed first row; run the default mode"; DropWork "$work"; return 1; }
+    PreflightConfig="{Checks: '-*,$RowCheck', WarningsAsErrors: ''}"
+    printf 'int Preflight();\nint Preflight() { return 0; }\n' > "$work/preflight-bare.cpp"
+    # CAPTURED, not discarded. The bare probe's exit alone cannot say WHY, and this arm's
+    # remedy used to assert one cause ("check that it is a clang-tidy") that the exit does
+    # not establish: a config whose only check this build does not carry -- a row's check
+    # renamed or retired upstream -- makes clang-tidy answer *"Error: no checks enabled"*
+    # and exit 1, landing here. That is the row's own `not-live` finding wearing this
+    # arm's sentence, which is #1574's misdiagnosis relocated rather than removed. So the
+    # output is printed and the remedy names both causes.
+    PreflightBareOut="$(cd "$work" && "$exe" --config="$PreflightConfig" preflight-bare.cpp -- -std=c++20 2>&1)"
+    PreflightBareRc=$?
+    printf '#include <algorithm>\nint Preflight();\nint Preflight() { return 0; }\n' > "$work/preflight-std.cpp"
+    PreflightStdOut="$(cd "$work" && "$exe" --config="$PreflightConfig" preflight-std.cpp -- -std=c++20 2>&1)"
+    PreflightStdRc=$?
+    case "$(JudgePreflight "$PreflightBareRc" "$PreflightStdRc")" in
+        usable) ;;
+        runs-nothing)
+            echo "CANNOT JUDGE: '$exe' could not analyse a trivial translation unit (exit $PreflightBareRc), so it"
+            echo "      cannot be asked about any known defect and no row below would be a statement about this tree."
+            echo "      NOT a finding about your branch, and not about any issue a row names: nothing here was judged."
+            printf '%s\n' "$PreflightBareOut" | tail -4 | sed 's/^/      | /'
+            echo "      Two causes reach this, and the lines above are what tells them apart: '$exe' is not a clang-tidy or"
+            echo "      cannot run here at all, or it carries no check named '$RowCheck' -- 'Error: no checks enabled' -- in"
+            echo "      which case the finding is that the row's check was renamed or retired upstream, and the row is what"
+            echo "      moves, not the analyser."
+            DropWork "$work"
+            return "$UnusableAnalyser"
+            ;;
+        no-standard-library)
+            echo "CANNOT JUDGE: '$exe' runs, and cannot compile '#include <algorithm>' (exit $PreflightStdRc), so it"
+            echo "      ships no C++ standard library on its include path. Every row's units need one, so every row would"
+            echo "      fail and each failure would read as a claim about the defect that row names (#1574)."
+            echo "      NOT a finding about your branch, and not about any issue a row names: nothing here was judged."
+            printf '%s\n' "$PreflightStdOut" | tail -4 | sed 's/^/      | /'
+            echo "      Measured: the Windows PyPI wheel has this shape, and the same build under WSL does not -- so this"
+            echo "      check answers on Linux and macOS, and on Windows only where the analyser was installed with headers."
+            DropWork "$work"
+            return "$UnusableAnalyser"
+            ;;
+    esac
+
     for row in ${Rows[@]+"${Rows[@]}"}; do
         SplitRow "$row" || { echo "FAIL: malformed row '${row%%|*}'; run the default mode"; bad=1; continue; }
         # A config of its own, so neither `.clang-tidy` nor WarningsAsErrors decides an outcome here.
@@ -288,8 +381,7 @@ CheckInstalled() {
                 ;;
         esac
     done
-    find "$work" -depth -mindepth 1 -delete 2>/dev/null
-    rmdir "$work" 2>/dev/null
+    DropWork "$work"
     [ "$bad" -eq 0 ]
 }
 
@@ -314,6 +406,28 @@ if [ "$Mode" = "self-test" ]; then
     Warning="x.cpp:3:70: warning: do not use nested 'std::max' calls, use an initializer list instead [$RowCheck]"
 
     # $1 = label, $2 = wanted verdict, rest = Judge's arguments.
+    # The preflight decision, driven the same way and for the same reason (#1574): three outcomes, each reached
+    # without an analyser.
+    DecidesPreflight() {
+        local label="$1" want="$2" got
+        shift 2
+        Cases=$((Cases + 1))
+        got="$(JudgePreflight "$@")"
+        if [ "$got" = "$want" ]; then
+            echo "ok: self-test '$label' ($want)"
+        else
+            echo "FAIL: self-test '$label': wanted $want, got $got"
+            Failed=$((Failed + 1))
+        fi
+    }
+    DecidesPreflight "preflight: an analyser that parses both units is usable" usable 0 0
+    DecidesPreflight "preflight: one that cannot parse a bare unit runs nothing" runs-nothing 1 0
+    # The order matters and is asserted: a build that fails BOTH is reported as running nothing, which is the
+    # broader fact, rather than as one missing a standard library.
+    DecidesPreflight "preflight: one that fails both is reported as running nothing" runs-nothing 1 1
+    DecidesPreflight "preflight: one that parses a bare unit and not an include has no standard library" \
+        no-standard-library 0 1
+
     Decides() {
         local label="$1" want="$2" got
         shift 2
@@ -428,6 +542,26 @@ if [ "$Mode" = "self-test" ]; then
         echo "ok: self-test '$label' ($want)"
     }
 
+    # The EXIT STATUS, which `Expect` cannot see: it folds every non-zero into the one word `refuse`, so a run that
+    # answered 1 and a run that answered `$UnusableAnalyser` are the same case to it. That matters because the status
+    # is a contract with a SECOND file -- `local-gate.sh` keys a whole outcome on this number, and reads anything else
+    # as "a row changed status", which is the confident wrong cause #1574 exists to remove. A constant has two facts,
+    # its name and its value; `Expect` tests only the first.
+    # $1 = label, $2 = the status wanted, $3 = the script, rest = its arguments.
+    ExitsWith() {
+        local label="$1" want="$2" script="$3" status
+        shift 3
+        Cases=$((Cases + 1))
+        "${BASH:-bash}" "$script" "$@" >/dev/null 2>&1
+        status=$?
+        if [ "$status" -eq "$want" ]; then
+            echo "ok: self-test '$label' (exit $want)"
+        else
+            echo "FAIL: self-test '$label': wanted exit $want, got $status"
+            Failed=$((Failed + 1))
+        fi
+    }
+
     # Synthetic trees for the default mode. $1 = dir, $2 = the issue an `## Open work` entry leads (empty: an entry
     # for another issue only), rest = src/x.cpp lines (none: no source at all). The rulebook is written only so that
     # the "no Open work entry" case below can differ from its neighbour in that one fact.
@@ -474,6 +608,19 @@ if [ "$Mode" = "self-test" ]; then
     Stub "$Work/fixed" no
     printf '#!/usr/bin/env bash\necho "error: no such file" >&2\nexit 1\n' > "$Work/broken"
     chmod +x "$Work/broken"
+    # The shape #1574 came from: the analyser RUNS and has no C++ standard library, so a unit with no include
+    # passes and one with an include does not. A stub that failed everything (`broken`, above) cannot model it --
+    # which is why the only case here for years asserted the wrong diagnosis.
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'unit=""; for a in "$@"; do case "$a" in *.cpp) unit="$a" ;; esac; done'
+        echo '[ -f "$unit" ] || { echo "stub: no unit" >&2; exit 3; }'
+        echo 'case "$(cat "$unit")" in'
+        echo '    *"#include"*) echo "$unit:1:10: error: '"'"'algorithm'"'"' file not found [clang-diagnostic-error]"; echo "Found compiler error(s)."; exit 1 ;;'
+        echo 'esac'
+        echo 'exit 0'
+    } > "$Work/nostdlib"
+    chmod +x "$Work/nostdlib"
 
     # --installed, over the sample table.
     Expect "--installed: a build with the defect" "$Work/sample.sh" pass "still crashes on it" - \
@@ -486,10 +633,41 @@ delete the comment naming #$RowIssue
 src/x.cpp:2:$SiteComment
 keep the rewrites at those sites
 Nothing here needs #$RowIssue open" "Open work" --installed "$Work/fixed" "$Work/good"
-    Expect "--installed: an analyser that cannot parse anything" "$Work/sample.sh" refuse "did not report the live unit" - \
+    # #1574. This case asserted "did not report the live unit" -- a claim about the ROW's defect -- for an analyser
+    # that had answered nothing at all, so the self-test pinned the misdiagnosis as correct. The needle now names
+    # the analyser, and the absent-needle is what makes the case discriminate: the old sentence must be GONE, or a
+    # preflight that reported the environment and then ran the rows anyway would still pass.
+    Expect "--installed: an analyser that cannot parse anything names the ANALYSER, not a row's defect" \
+        "$Work/sample.sh" refuse "could not analyse a trivial translation unit" "did not report the live unit" \
         --installed "$Work/broken" "$Work/good"
+    # The shape the ticket came from, which no stub here could previously model.
+    Expect "--installed: an analyser with no standard library says so, and names no row" \
+        "$Work/sample.sh" refuse "ships no C++" "did not report the live unit" \
+        --installed "$Work/nostdlib" "$Work/good"
+    # And the STATUS, for both, because `local-gate.sh` routes on it (#1574). A renumbered `UnusableAnalyser` would
+    # keep every `Expect` above green while the gate fell to its `*)` arm and blamed the tree.
+    ExitsWith "--installed: an unusable analyser exits with UnusableAnalyser, not 1" "$UnusableAnalyser" \
+        "$Work/sample.sh" --installed "$Work/broken" "$Work/good"
+    ExitsWith "--installed: so does one with no standard library" "$UnusableAnalyser" \
+        "$Work/sample.sh" --installed "$Work/nostdlib" "$Work/good"
+    # The DISCRIMINATION: a row whose status moved is a fact about the tree and must NOT arrive on that status, or the
+    # gate would call a real finding a host problem and say nothing about the branch.
+    ExitsWith "--installed: a build carrying the fix exits 1, not UnusableAnalyser" 1 \
+        "$Work/sample.sh" --installed "$Work/fixed" "$Work/good"
     Expect "--installed: no such analyser" "$Work/sample.sh" refuse "is not an executable here" - \
         --installed "$Work/absent" "$Work/good"
+
+    # The PREFIX, which is remedy text and which nothing above can see: `Expect`'s verdict folds every non-zero into
+    # `refuse` and `ExitsWith` reads only the number, so both stay green whatever the first word of the message is.
+    # It matters because the two populations arrive on the same red and are read by different people: a statement
+    # about the CHECK ("this analyser cannot be asked") must not wear the same prefix as one about the SUBJECT ("this
+    # row's defect changed status"), or a reader takes the first for the second and goes looking in the tree. That is
+    # #1579, where a refusal accurate about its own limit sent somebody to the wrong file twice.
+    Expect "--installed: an unusable analyser says CANNOT JUDGE, never FAIL"         "$Work/sample.sh" refuse "CANNOT JUDGE:" "FAIL:" --installed "$Work/broken" "$Work/good"
+    Expect "--installed: and so does one with no standard library"         "$Work/sample.sh" refuse "CANNOT JUDGE:" "FAIL:" --installed "$Work/nostdlib" "$Work/good"
+    # The POSITIVE CONTROL, and the case that makes the two above mean anything: a row whose status really moved is a
+    # finding about the tree and keeps `FAIL:`. Without this, relabelling EVERY arm `CANNOT JUDGE:` would pass both.
+    Expect "--installed: a row whose status moved keeps FAIL, so the prefixes discriminate"         "$Work/sample.sh" refuse "FAIL:" "CANNOT JUDGE:" --installed "$Work/fixed" "$Work/good"
 
     # The default mode, over the sample table.
     Expect "a documented defect with one commented site" "$Work/sample.sh" pass "1 site line(s) naming" - "$Work/good"
