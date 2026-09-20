@@ -188,6 +188,63 @@ Gamma	completed	cancelled	2026-09-06T03:42:26Z
 Gamma	completed	success	2026-09-06T03:50:32Z" \
         0 "every required context reports SUCCESS"
 
+    # ---- #1236, which DOES NOT REPRODUCE -----------------------------------
+    #
+    # The claim: a latest row of `completed/cancelled` WITH a queued replacement
+    # returns RUNNING indefinitely, because the replacement never reaches a
+    # terminal state. The behaviour is real and is the case above; what the ticket
+    # adds is that it never clears.
+    #
+    # CENSUS, over 1000 workflow-run records spanning 2026-09-15T01:39:36Z to
+    # 2026-09-20T06:28:55Z (the repository holds 9792; this is a stated recent
+    # window, not the whole set):
+    #
+    #   cancelled runs                                          88
+    #   of those, cancelled BEFORE any job ran a step           26
+    #   successor runs at those 26 runs' 12 head SHAs           78
+    #   successors that never reached a terminal state           0
+    #
+    #   check runs at those same 12 SHAs                       377
+    #   of those, non-terminal                                   0
+    #   (sha, name) groups with more than one row                25
+    #   groups with >1 row AND a non-terminal sibling            0   <- the trigger
+    #
+    # Repo-wide, exactly ONE workflow run is stuck non-terminal (45 days, `queued`,
+    # zero jobs) and it is a first attempt rather than a replacement -- and it
+    # contributes ZERO check-run rows, so it never reaches this tool at all.
+    #
+    # The census pattern had a positive control on both halves, because a pattern
+    # that finds nothing for the wrong reason reports the same zero: two runs
+    # cancelled-while-pending were identified by hand from their own API records
+    # and both appear in the census's output, and 24 of the 26 have at least one
+    # successor, so the successor-finding half fires too.
+    #
+    # STRUCTURAL REASON, which is why the zero is not just this window's luck: a
+    # workflow run cancelled from a pending state emits NO CHECK RUN. `stateOf`
+    # reads check runs, so there is no `queued` row for it to see. The ticket's
+    # premise appears to be about workflow runs, one level above the object this
+    # tool consumes.
+    #
+    # So NOTHING SHIPPED -- no new state, and `WITHDRAWN`'s predicate is untouched.
+    # What lands is this case, which pins the property that makes the absence
+    # safe: the RUNNING above is TRANSIENT. Once the replacement completes, the
+    # queued row stops mattering because it never outranks a later conclusion.
+    # Were that ordering to regress, RUNNING really would become permanent, and
+    # this case is what goes red.
+    # The queued row is LAST on purpose. Written with the success last, this case is
+    # green under ANY row-selection rule -- including `take the last row` -- because
+    # the answer it wants IS the last row's. It was written that way first and
+    # survived a neuter of the ordering guard while proving nothing. A stale queued
+    # row arriving AFTER a conclusion is both the shape that discriminates and the
+    # realistic one: the API does not promise chronological order.
+    Case "#1236: a stale queued row after a conclusion does not reopen it, so the RUNNING above is transient" \
+        "Alpha	completed	success	2026-01-01T00:00:00Z
+Beta	completed	success	2026-01-01T00:00:00Z
+Gamma	completed	cancelled	2026-09-06T03:42:26Z
+Gamma	completed	success	2026-09-06T03:50:32Z
+Gamma	queued" \
+        0 "every required context reports SUCCESS"
+
     # ---- the sections and the refusals -----------------------------------
     Case "a non-required failure is reported and blocks NOTHING" \
         "$All
