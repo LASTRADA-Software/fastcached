@@ -1275,6 +1275,29 @@ determinism rests on.
     failed, the pipeline's STATUS did. It reddens correct branches, intermittently, and
     a re-run clears it, which is the shape #473 records as teaching people to re-run
     until a gate is disarmed.
+    - **And its mirror on the other side of the same pipe: a `<<<` operand of 64 KiB
+      or more DEADLOCKS on Git Bash.** bash writes a herestring into a PIPE in full
+      before it starts the reader, so past the 64 KiB buffer the write blocks with
+      nothing draining it. Measured on `bash 5.2.37(1)-release` to the byte -- 65535
+      completes, **65536 hangs** -- and it is SIZE rather than content: this
+      repository's own tracked-file listing PADDED past the boundary hangs 5/5, and the
+      larger one TRUNCATED below it hangs 0/5. A first probe over synthetic data said
+      65540 hung while 66000 and 70000 passed, which fits no mechanism and was one
+      sample per size; the arms have to be the real idiom over the real data.
+    - **The margin was 508 bytes.** `_third_party_select` takes the WHOLE listing and is
+      what every tracked-file enumerator reaches through; master's listing was 65028
+      bytes when this was found, so the next handful of tracked files would have hung
+      all of them, on Windows and nowhere else, whoever added them. A branch adding
+      sixteen got there first, and **the runner was ruled out before the tree**: the
+      suite's total was 583.63 s against 593.45 s and 576.26 s on passing runs of the
+      same leg, with 5260 of 5282 tests normal. **The two that timed out take 2.5 s and
+      5.5 s -- they were not slow, they were deadlocked, and raising a `TIMEOUT` would
+      have buried it** (#1515). The remedy is process substitution, whose reader drains
+      concurrently and which still reports `grep`'s own status rather than a producer's:
+      `< <(printf '%s
+' "$x")`. The audit of the sites still under the boundary, and
+      the scan that should refuse the next one, are
+      [#1591](https://github.com/LASTRADA-Software/fastcached/issues/1591).
     - So it is a **SCAN** now, in `check-e2e-helpers.sh` beside the `timeout` and
       bash-3.2 ones, off the same `_shell_scripts` enumeration. Five scripts already
       carried a comment explaining why they do NOT do this, and it spread anyway:
@@ -6533,6 +6556,16 @@ pointer.
 ## Open work
 
 <!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
+
+- **[#1591](https://github.com/LASTRADA-Software/fastcached/issues/1591)** — three sites
+  now feed a listing through process substitution, and the other herestrings are NOT
+  swept. 341 `<<<` sites exist under `scripts/` and nearly all take a line, a row or
+  one file's text; what is open is an audit of the ones that can take a LISTING, each
+  currently under the 64 KiB boundary and therefore silent, plus the scan that should
+  refuse the next one — a rule stated only in the files that obey it reaches no file
+  that does not. The issue names the candidate sites. It also wants the boundary
+  itself pinned by a case, so the bash or platform that moves it is a red rather than
+  a Windows leg that hangs with no diagnosis.
 
 - **[#1567](https://github.com/LASTRADA-Software/fastcached/issues/1567)** — `## A correction is a search,
   not a recollection` has no `AGENT.md` tripwire. The nearest bullet is `testing.md`'s
