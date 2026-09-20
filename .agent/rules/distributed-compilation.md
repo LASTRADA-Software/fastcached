@@ -1023,11 +1023,23 @@ Consequences that are each load-bearing:
     `--requirepass` and scheduler token is far inside all three — `hunter2` is 7 characters
     and allocates **0** times — so a string fix built on this seam alone is correct for
     long secrets, silently absent for short ones, and green under any test written with a
-    realistic value. Secret STRINGS need this allocator **and** an inline wipe, which is
-    #1125 — and the inline wipe has its own trap: a destructor-based one misses the
-    INLINE-TO-HEAP transition, where the contents are copied out and the inline buffer is
-    left holding the secret in the object's own storage, invisible to any test that
-    constructs at final size.
+    realistic value.
+
+    **So a secret does not live in a `std::basic_string` at all: `SecureString` puts the
+    characters in a `std::vector`, and that is #1125's answer rather than the inline wipe
+    this paragraph used to call for.** The wipe was the obvious repair and it cannot be
+    made correct: a destructor-based one misses the INLINE-TO-HEAP transition, where the
+    characters are copied out and the inline buffer is left holding the secret in the
+    object's own storage, at a moment no destructor and no allocator is told about. There
+    is no hook there, so that residue can only be avoided rather than cleaned. A
+    `std::vector` has no small-object optimisation, so every byte of a secret is in a
+    block the allocator releases, identically on all three libraries -- which also
+    retires the sentence above about macOS being the platform to write the failing test
+    against. The measurements stay because they are why the shape had to change; the
+    REMEDY they argued for did not survive being implemented.
+    `SecureBytes_test.cpp`'s *"a text credential short enough to fit inline is still in
+    allocator storage"* is what holds it, on every leg, with an eight-character secret
+    that both libraries would have kept inline.
   - The holders are found by NAME (`scripts/check-credential-containers.sh`), and the
     limits of that are on the script rather than implied: a credential under a name its
     table does not carry is invisible to it, `clusterKeyFile` is a PATH and not a row, and
@@ -3352,19 +3364,6 @@ surface folds by reaching the one function rather than by remembering to.
   listed have since been implemented rather than deferred (`ISocket::CancelRead`,
   `ISocket::ShutdownWrite`, and #663's read-slot rule), which is why it is one entry and
   not four.
-- **[#1125](https://github.com/LASTRADA-Software/fastcached/issues/1125)** — the same
-  defect #324 fixed for the since-retired cluster key is still live for the file-backed STRING
-  credentials (`--requirepass`, the two token files), and the seam #324 built does not
-  finish it. `SecureAllocator` instantiates for `std::basic_string` perfectly well, and
-  short-string optimisation means it is never CALLED for a short value — measured on
-  libstdc++ 14, a 7-character secret allocates **0** times. So a string fix built on the
-  allocator alone is correct for long secrets, absent for short ones, and green under any
-  test written with a realistic password. It also reaches further than a container swap:
-  `Config::requirePass` and `NodeConfig::token` are fields of the two central config
-  structs, which are copied, compared by `UnreloadableChanges`, and held as TWO live
-  snapshots by `ConfigReloader` — so a rotated secret survives in the previous snapshot
-  for as long as anything holds it. That reach is why it is a separate ticket rather than
-  the second half of #324.
 - **[#201](https://github.com/LASTRADA-Software/fastcached/issues/201)** — a node
   offers only the NATIVE MSVC target variant, on a reason that no longer holds: the
   variants shared a banner and so a fingerprint, and

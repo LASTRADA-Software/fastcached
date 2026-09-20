@@ -104,7 +104,15 @@ class ConfiguredCredential final: public ICredentialSource
     ///        process has no configuration file and therefore no second moment.
     ///        Borrowed; must outlive this object.
     ConfiguredCredential(NodeConfig const& startup, NodeReloader const* reloader):
-        _startup { .username = {}, .secret = startup.token },
+        // `std::string` at the boundary (#1125). NOT because `CacheProtocol.hpp` cannot
+        // name a `Core/` type -- it already includes `Net/ISocket.hpp`, and
+        // `Core/SecureBytes.cpp` is already a `_fc_cc_core` row -- but because retyping
+        // `Cc::Credential::secret` would RELOCATE this copy rather than remove it, to
+        // `Wire::AuthRequest` and into the RESP `AUTH` vector `SocketExchange` encodes
+        // -- both heap residue, so #1125's own subject (#1578). The secret is protected
+        // everywhere this process HOLDS it; `fastcache-cli/main.cpp` carries the full
+        // argument at the sibling boundary.
+        _startup { .username = {}, .secret = std::string { startup.requirePass.View() } },
         _reloader { reloader }
     {
     }
@@ -116,10 +124,10 @@ class ConfiguredCredential final: public ICredentialSource
             return _startup;
 
         // One snapshot, read once. `Current()` on the reloader takes its swap lock and
-        // hands back an immutable `shared_ptr`, so the token cannot change underneath
+        // hands back an immutable `shared_ptr`, so the secret cannot change underneath
         // this expression however the reload races it.
         auto const live = _reloader->Current();
-        return Cc::Credential { .username = {}, .secret = live->token };
+        return Cc::Credential { .username = {}, .secret = std::string { live->requirePass.View() } };
     }
 
   private:

@@ -34,7 +34,6 @@
 #include <iostream>
 #include <memory>
 #include <span>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -74,20 +73,47 @@ constexpr std::string_view ProgramName = "fastcache-cli";
 /// this process's environment.
 /// @param path The file.
 /// @return The secret, or the reason it could not be read.
-[[nodiscard]] std::expected<std::string, std::string> ReadSecretFile(std::string const& path)
+[[nodiscard]] std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::string const& path)
 {
     std::ifstream file { path, std::ios::binary };
     if (!file.is_open())
         return std::unexpected(std::format("cannot read {}", path));
 
-    std::ostringstream buffer;
-    buffer << file.rdbuf();
-    auto secret = buffer.str();
+    // **Read into SECURE character storage rather than through `std::ostringstream`.**
+    // That is what this used to do, and `buffer.str()` is an ordinary `std::string` while
+    // the stream keeps one of its own -- so the secret existed in two containers nothing
+    // wipes, and changing only the RETURN type would have left both. A half-fix that looks
+    // complete is the shape this repository keeps finding
+    // ([#1125](https://github.com/LASTRADA-Software/fastcached/issues/1125)).
+    //
+    // Chunked rather than sized from `tellg()`: a credential file is not necessarily
+    // seekable -- a FIFO answers -1 -- and a reader that refuses one would be a new
+    // refusal smuggled in by a security change. The chunk is itself secure storage, so no
+    // stack buffer keeps a copy either.
+    constexpr std::size_t ReadChunkBytes = 4096;
+    FastCache::SecureCharBuffer secret;
+    FastCache::SecureCharBuffer chunk(ReadChunkBytes);
+    while (file.read(chunk.data(), static_cast<std::streamsize>(chunk.size())) || file.gcount() > 0)
+    {
+        secret.insert(secret.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(file.gcount()));
+        if (!file)
+            break;
+    }
+
+    // **A stream ERROR is not end of file, and answering a truncated secret as a success
+    // is the worse half.** `!file` above fires for `badbit` exactly as for `eofbit`, so an
+    // EIO part way through a credential file -- a network mount, a FIFO whose writer died
+    // -- would return the prefix that arrived AS the credential: the process starts, every
+    // legitimate caller is rejected, and nothing anywhere says the file was read halfway.
+    // The `std::ostringstream` form this replaced had the same hole, so it is a carried
+    // gap rather than a regression, and the loop is where it became cheap to close.
+    if (file.bad())
+        return std::unexpected(std::format("could not read all of {}", path));
     while (!secret.empty() && (secret.back() == '\n' || secret.back() == '\r'))
         secret.pop_back();
     if (secret.empty())
         return std::unexpected(std::format("{} is empty", path));
-    return secret;
+    return FastCache::SecureString { std::string_view { secret.data(), secret.size() } };
 }
 
 /// Write bytes to stdout with no translation.
@@ -580,19 +606,48 @@ int main(int argc, char* argv[])
             break;
     }
 
+    // **The two conversions below are the boundary, and they are written out rather than
+    // hidden.** `ReadSecretFile` now keeps the file's bytes in storage that is zeroed when
+    // it is released, so the read itself leaves nothing behind (#1125). Where each secret
+    // LANDS is a different question, and the two destinations decline for DIFFERENT
+    // reasons -- which is why they are stated separately rather than under one:
+    //
+    //  - `Cc::Credential::secret` (`fastcache-cc/CacheProtocol.hpp`) COULD hold a
+    //    `SecureString`: that header already includes `Net/ISocket.hpp` and
+    //    `Async/Task.hpp`, and `Core/SecureBytes.cpp` is already a `_fc_cc_core` row. What
+    //    stops it is not a dependency wall but that retyping RELOCATES this boundary
+    //    instead of removing it -- the secret would still be copied out at
+    //    `Wire::AuthRequest`, at `std::optional<std::string>` in `CredentialOrNone`, and
+    //    into the RESP `AUTH` vector `SocketExchange.cpp` encodes. Every one of those is
+    //    heap residue, which makes this #1125's OWN subject continued rather than a
+    //    larger separate one; it is filed as #1578.
+    //
+    //    **That vector is NAMED `argv` and is not a process argument list.**
+    //    `fastcache-cli` spawns no process, and `Call` hands the vector to
+    //    `EncodeCommand` and a socket write. It is recorded because the name says
+    //    "process argument vector" everywhere else in this tree -- `main`'s own `argv`
+    //    is three hundred lines below -- and it has already been misread that way once,
+    //    which would have made a heap-residue follow-up read as a disclosure.
+    //  - `dashboardToken` (`Protocol/CompileCacheWire.hpp`) genuinely cannot: that header
+    //    is header-only because the launcher does not link `FastCache`, and
+    //    `SecureBytes.hpp` needs `SecureBytes.cpp` for `SecureZero`, so naming it there
+    //    would put a link requirement on every consumer of the wire grammar.
+    //
+    // An explicit `std::string` here says exactly where the covered part stops, which an
+    // implicit conversion would not.
     if (!command.tokenFile.empty())
     {
         auto const secret = ReadSecretFile(command.tokenFile);
         if (!secret.has_value())
             return ReportUsageError(secret.error());
-        command.credential.secret = *secret;
+        command.credential.secret = std::string { secret->View() };
     }
     if (!command.dashboardTokenFile.empty())
     {
         auto const secret = ReadSecretFile(command.dashboardTokenFile);
         if (!secret.has_value())
             return ReportUsageError(secret.error());
-        command.dashboardToken = *secret;
+        command.dashboardToken = std::string { secret->View() };
     }
 
     auto const* const verb = FindVerb(command.verb);

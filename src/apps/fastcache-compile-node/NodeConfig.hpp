@@ -9,6 +9,7 @@
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
@@ -470,7 +471,23 @@ struct NodeConfig
     /// worse than no username at all
     /// ([#385](https://github.com/LASTRADA-Software/fastcached/issues/385)). If one
     /// is ever wanted it arrives as a row in `NodeOptions()`, like everything else.
-    std::string token;
+    ///
+    /// **Renamed from `token` and retyped, together, at
+    /// [#1125](https://github.com/LASTRADA-Software/fastcached/issues/1125).** The type is
+    /// the fix: this is a credential held in a config struct, and `NodeConfig` is kept as
+    /// TWO live snapshots by `ConfigReloader`, so as a `std::string` a rotated secret
+    /// survived in the previous snapshot for as long as anything held it, released to the
+    /// general allocator with its characters intact.
+    ///
+    /// The name is what makes the fix hold. `scripts/check-credential-containers.sh` finds
+    /// credential holders by NAME, and `token` cannot be one of its rows: this tree spells
+    /// a parser token, a CPU-feature token and a lease's public identifier the same way, so
+    /// that row would refuse hundreds of correct declarations. `requirePass` names the flag
+    /// it comes from, matches the daemon's field for the same flag, and is a row -- which
+    /// is the script's own argument for renaming a holder rather than widening a
+    /// vocabulary. The old name also had to be explained away in the paragraph above,
+    /// because the node's OTHER credential is the one an operator calls a token.
+    SecureString requirePass;
 
     /// This node's identity in the cluster, or empty to run without consensus.
     ///

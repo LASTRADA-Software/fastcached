@@ -1507,7 +1507,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .primary = "--requirepass",
             .arity = Arity::Value,
             .operand = "=<secret>",
-            .apply = AssignFrom<&NodeConfig::token, ParseText>(),
+            .apply = AssignFrom<&NodeConfig::requirePass, ParseText>(),
             .description = "credential presented to the scheduler",
             .yamlKey = "requirepass",
             // Reloadable since #404, and the whole of what made it possible is that
@@ -1533,7 +1533,7 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             // Named by its TAG: this said `node-credential-seam`, a phrase that matches
             // nothing runnable, which reads as a guard that was never written.
             .reloadable = Reloadable::Yes,
-            .same = FieldEq<&NodeConfig::token>(),
+            .same = FieldEq<&NodeConfig::requirePass>(),
         },
         {
             .primary = "--log-level",
@@ -2483,7 +2483,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
                          // case anyway: a user agent runs as the invoking account.
                          .serviceAccount = "fastcache-node",
                          .ownedPaths = std::move(owned),
-                         .inlineCredential = cfg.token.empty() ? InlineCredential::Absent : InlineCredential::Present,
+                         .inlineCredential = cfg.requirePass.empty() ? InlineCredential::Absent : InlineCredential::Present,
                          // What the operator named, so InlineCredentialRejection can
                          // say where the secret belongs instead of merely that it
                          // may not go here. Absolute for the same reason the flag
@@ -3273,7 +3273,7 @@ std::vector<std::filesystem::path> NodeSecretFiles(NodeConfig const& cfg,
     // shared provenance rule rather than a second copy of it: `--requirepass` typed
     // in argv is a `ps` exposure, which is a different problem with a different owner.
     if (SecretCameFromConfigFile(SecretProvenanceFacts {
-            .secretInForce = !cfg.token.empty(),
+            .secretInForce = !cfg.requirePass.empty(),
             .namedOnCommandLine = secretNamedOnCommandLine,
             .fileWasRead = !configFile.empty(),
         }))

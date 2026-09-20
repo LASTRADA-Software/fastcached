@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/SecureBytes.hpp>
+
 #include <array>
 #include <optional>
 #include <string>
@@ -49,8 +51,12 @@ class AdminCredential
     AdminCredential() = default;
 
     /// Require @p secret.
+    ///
+    /// `SecureString` rather than `std::string`, so the dashboard credential is released
+    /// into zeroed storage like every other one
+    /// ([#1125](https://github.com/LASTRADA-Software/fastcached/issues/1125)).
     /// @param secret The shared secret; must not be empty.
-    explicit AdminCredential(std::string secret) noexcept:
+    explicit AdminCredential(SecureString secret) noexcept:
         _secret { std::move(secret) }
     {
     }
@@ -84,7 +90,9 @@ class AdminCredential
     [[nodiscard]] bool Matches(std::string_view presented) const;
 
   private:
-    std::string _secret;
+    /// The configured secret, or empty when the surface is unguarded. `SecureString`
+    /// rather than `std::string`: this is a credential (#1125).
+    SecureString _secret;
 };
 
 } // namespace FastCache
