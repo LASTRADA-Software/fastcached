@@ -58,6 +58,7 @@
 #include "HitVerification.hpp"
 #include "IProcessRunner.hpp"
 #include "LauncherCli.hpp"
+#include "NotePathCollapse.hpp"
 #include "ParallelFor.hpp"
 #include "PathResolve.hpp"
 #include "ReactorExchange.hpp"
@@ -949,10 +950,19 @@ void ReplayStreams(std::string_view out, std::string_view err)
 /// Run the real compiler with the given argv, streaming its combined output to
 /// our stdout, and return its exit code. Used for both fallback and miss when
 /// we do NOT need to capture (fallback) — the miss path uses RunCapture.
-[[nodiscard]] int RunPassthrough(std::span<std::string const> argv)
+///
+/// The notes are collapsed here too, and that is not belt-and-braces: the second caller is a
+/// fully PARSED compile that `RunCached` declined (a `__TIME__`, a drive-relative path, an
+/// over-size value, a dead daemon), which emits exactly the notes the cached path would have
+/// and fails the build the same way if one of them is over Ninja's limit.
+///
+/// @param argv    The compiler command line.
+/// @param grammar The grammar this driver's captured text carries.
+/// @param marker  The prefix this build's `/showIncludes` notes carry.
+[[nodiscard]] int RunPassthrough(std::span<std::string const> argv, PathCanon::Grammar grammar, std::string_view marker)
 {
     auto const run = RunCaptureSplit(argv);
-    ReplayStreams(run.out, run.err);
+    ReplayStreams(Cc::CollapseNotePaths(run.out, grammar, marker), Cc::CollapseNotePaths(run.err, grammar, marker));
     return run.exitCode == Cc::NotSpawned ? 1 : run.exitCode;
 }
 
@@ -1625,9 +1635,20 @@ struct MaterializedHit
     // This is also the half of #879 that closes #700's peer edge: two machines in
     // different UI languages now exchange values whose notes each of them can match,
     // because neither ever sees the other's prefix.
+    //
+    // The `..` collapse sits between the localization above and the marker restore below, and the
+    // order is forced from both ends. It has to follow localization, because a `<SRCROOT>` token is
+    // not a path and there is nothing to collapse until it is one. It has to precede the restore,
+    // because it finds notes by the CANONICAL marker -- which is exactly what the bytes carry at
+    // this point, and stops being true one line later. So the restore is still the last step; it
+    // simply is not the only one any more.
     std::array<std::string, ReplayRegionCount> replayed;
     for (std::size_t idx = 0; idx < localized.size() && idx < replayed.size(); ++idx)
-        replayed[idx] = PathCanon::RestoreIncludeNoteMarker(localized[idx].bytes, showIncludesMarker);
+    {
+        auto const collapsed =
+            Cc::CollapseNotePaths(localized[idx].bytes, localized[idx].grammar, PathCanon::IncludeNoteMarker);
+        replayed[idx] = PathCanon::RestoreIncludeNoteMarker(collapsed, showIncludesMarker);
+    }
     ReplayStreams(replayed[0], replayed[1]);
     return NotMaterialized(HitDisposition::Served);
 }
@@ -2716,7 +2737,15 @@ void RecordManifest(Config const& cfg,
     if (!run.has_value())
         run = RunCaptureSplit(argv);
     // Always surface the compiler's output on its true streams and its exit code.
-    ReplayStreams(run->out, run->err);
+    //
+    // These are COPIES, and deliberately so: the store below re-reads `run->out` and `run->err`
+    // untouched. What a build system reads has its note paths collapsed; what the cache stores does
+    // not, because collapsing on the way in would change a stored region's bytes and owe a
+    // `CompileValueVersion` bump.
+    auto const textGrammar = TextGrammar(cmd.flavor);
+    auto const replayOut = Cc::CollapseNotePaths(run->out, textGrammar, cfg.showIncludesMarker);
+    auto const replayErr = Cc::CollapseNotePaths(run->err, textGrammar, cfg.showIncludesMarker);
+    ReplayStreams(replayOut, replayErr);
     // A spawn failure reports `NotSpawned`, which a POSIX exit status truncates to 255 —
     // an arbitrary code no build system can interpret. Normalize it the same way
     // the fall-back path does.
@@ -2796,7 +2825,6 @@ void RecordManifest(Config const& cfg,
     // because an unmatched marker rewrites nothing.
     auto const storedOut = PathCanon::NormalizeIncludeNoteMarker(run->out, cfg.showIncludesMarker);
     auto const storedErr = PathCanon::NormalizeIncludeNoteMarker(run->err, cfg.showIncludesMarker);
-    auto const textGrammar = TextGrammar(cmd.flavor);
     auto const includeTextOut = reconciler.Region(storedOut, textGrammar);
     auto const includeTextErr = reconciler.Region(storedErr, textGrammar);
     value.textRegions.push_back({ .grammar = textGrammar, .bytes = includeTextOut });
@@ -3049,12 +3077,17 @@ int main(int argc, char** argv)
         if (cmd.sideArtefact)
             Note("the compile writes a second artefact (a BMI or a precompiled header) "
                  "that a cache hit cannot reproduce; not cached");
-        return RunPassthrough(std::span<std::string const> { args });
+        return RunPassthrough(std::span<std::string const> { args }, TextGrammar(cmd.flavor),
+                              cfg.showIncludesMarker);
     }
 
     auto const started = std::chrono::steady_clock::now();
     auto const handled = RunCached(cfg, cmd, std::span<std::string const> { args });
-    int const code = handled.has_value() ? *handled : RunPassthrough(std::span<std::string const> { args });
+    int const code =
+        handled.has_value()
+            ? *handled
+            : RunPassthrough(std::span<std::string const> { args }, TextGrammar(cmd.flavor),
+                             cfg.showIncludesMarker);
 
     if (cfg.stats)
     {

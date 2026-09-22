@@ -151,6 +151,17 @@ TEST_CASE("showIncludes notes are a dependency record too", "[replay-guard]")
     CHECK(paths == std::vector<std::string> { R"(D:\Project\src\a.hpp)" });
 }
 
+TEST_CASE("A note path carrying dot-dot is still a dependency this guard checks", "[replay-guard]")
+{
+    // The emit-side `..` collapse runs after this walk and over a separate copy, so the guard keeps
+    // reading the driver's own spelling. Worth pinning because the two now read one region for two
+    // purposes: an edit that collapsed in place would move this guard's input, and every other case
+    // here would stay green while it happened.
+    std::string const notes = std::string { R"(Note: including file: D:\Project\out\..\src\a.hpp)" } + "\r\n";
+    auto const paths = ReplayedDependencyPaths(Value("", notes), WindowsLayout());
+    CHECK(paths == std::vector<std::string> { R"(D:\Project\out\..\src\a.hpp)" });
+}
+
 TEST_CASE("A diagnostics region declares no dependencies", "[replay-guard]")
 {
     // Pins the deliberate omission from the grammar table: a diagnostic quotes a
