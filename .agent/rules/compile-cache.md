@@ -1384,6 +1384,61 @@ same on both — the same defect with no MSVC anywhere near it.
     one value differently under one `CompileValueVersion`, which is a fleet-wide
     generation bump plus a corpus row and must not hide inside a build-correctness fix.
 
+## The build system reads what we EMIT, and it refuses a path by LENGTH before it canonicalizes
+
+<!-- agent-tripwire: Ninja refuses a `/showIncludes` path longer than `_MAX_PATH` BEFORE it canonicalizes -->
+
+- **The limit is a fixed stack buffer in Ninja, not a filesystem rule, and nothing a
+  host is configured with reaches it.** `IncludesNormalize::Normalize()`
+  (`src/includes_normalize-win32.cc`) declares `char copy[_MAX_PATH + 1]`, compares
+  `input.size()` against `_MAX_PATH`, and fails with `path too long` — all before the
+  `GetFullPathNameA` that would have collapsed the path. No syscall happens, so
+  `LongPathsEnabled` cannot help, and Ninja already ships a `longPathAware` manifest,
+  so an operator who enables long paths has correctly configured something that was
+  never in the way. The build stops with **no compiler diagnostic at all**, which
+  reads as a toolchain fault rather than a path one.
+
+- **A driver's note path is a concatenation, not a resolved path.** MSVC and clang-cl
+  resolve a quoted `#include` against the TEXTUAL path of the including file and echo
+  the result verbatim, so a chain of nested relative includes ACCUMULATES `../..`
+  segments and grows without bound in the depth of the chain. Measured on the report
+  that prompted this, under Windows 11, VS 18, MSVC 14.51.36231, clang-cl, the
+  VS-bundled Ninja and a 60-byte build root: a **299-byte** note path collapsing to
+  **88**, with 28 translation units over the limit in one module. Object paths were
+  not the cause and are not the fix — the longest of those was 201, so
+  `CMAKE_OBJECT_PATH_MAX` is inert against this.
+
+- **Collapsing first is safe because Ninja does the same collapse one statement
+  later.** `Cc::CollapseNotePaths` is purely lexical and preserves everything it
+  cannot improve: a path with no `..` SEGMENT comes back byte-identical (`a..b` is not
+  one), and a path still carrying `..` afterwards comes back as the input rather than
+  as a re-separated spelling that gained nothing.
+
+- **Emit and store are different answers, and the split is the whole point.** Every
+  byte handed to a build system is collapsed; every byte handed to the cache is not.
+  Collapsing on the way IN would change what a stored `ShowIncludes` region looks
+  like, which is a `CompileValueVersion` bump, a conformance row and a
+  `GenerationBumps` entry — one cold compile cache for every fleet. That is
+  [#1593](https://github.com/LASTRADA-Software/fastcached/issues/1593), held back so
+  the bump is paid once with company, exactly as #879 and #891 were batched.
+
+- **The seam is the four emit sites, never `ReplayStreams`.** That function is a
+  byte-exact I/O primitive and holds neither the grammar nor the marker, and the hit
+  path has to collapse per region on that region's own grammar. The grammar comes
+  from `TextGrammar(cmd.flavor)` for the reason #825 already gives — the channel
+  follows the FLAG, not the driver — and only `Grammar::ShowIncludes` is gated,
+  because Ninja's depfile reader carries no length check.
+
+- **On the hit path the collapse sits between localization and the marker restore, and
+  both ends pin it there.** A `<SRCROOT>` token is not a path, so there is nothing to
+  collapse until localization has run; and the collapse finds notes by the canonical
+  marker, which the bytes carry only until the restore re-spells them. The restore is
+  still the last step, and the comment saying so has to account for all three.
+
+- **A path over the limit with no `..` to collapse is still refused**, and no lexical
+  rule can change that. The remedy there is a shorter build root, and it belongs in
+  the tool's `## Known limitations` rather than in a fix.
+
 ## An object file is not a byte string, and `FASTCACHE_VERIFY` is where that bites
 
 <!-- agent-tripwire: An object file is not a byte string. Every MSVC driver stamps the clock into the COFF `TimeDateStamp` -->

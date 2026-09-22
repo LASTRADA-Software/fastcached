@@ -203,6 +203,9 @@ launcher's cache key is made of. Before `apps/fastcache-cc/`, `CompileCache/`.
   `PathCanon::IncludeNoteMarkerEnd` all three readers share.
 - Reading `/showIncludes` and WRITING it are different questions and must not be consolidated:
   `RenderShowIncludes` takes the marker as a REQUIRED, undefaulted parameter and spells no literal.
+- Ninja refuses a `/showIncludes` path longer than `_MAX_PATH` BEFORE it canonicalizes — a
+  string-length check on a fixed buffer, which no long-path policy reaches. `Cc::CollapseNotePaths`
+  collapses `..` out of every note the launcher EMITS and out of none that it STORES.
 - A compiler with debug info on records the WORKING DIRECTORY, which is on no command line,
   so no key relativizes it; `-fdebug-prefix-map` closes it on ELF and on NEITHER COFF driver,
   an accepted cost rather than open work.

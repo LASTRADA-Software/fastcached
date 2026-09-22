@@ -38,6 +38,12 @@ namespace FastCache::Cc
 /// STORE carries, and Ninja cannot stat it. Canonicalization happens on the way
 /// into the cache, and localization on the way out — neither belongs on the local
 /// filesystem path this build is about to consume.
+///
+/// The `..` collapse Ninja's length limit needs does not belong here either, for a
+/// different reason: it is not about what a path MEANS, it is about what a consumer
+/// will accept, so it applies once at the emit seam over the rendered bytes rather
+/// than per renderer. This file stays a pure renderer and `NotePathCollapse.hpp`
+/// holds that rule for every path that reaches a build system, not just this one.
 
 /// Render a GNU-style depfile.
 ///

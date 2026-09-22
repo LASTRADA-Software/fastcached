@@ -928,6 +928,12 @@ Two things this is **not**:
   schema re-keys the cache: existing entries miss once and are rewritten.
 - Localized path separators may be normalized to `/` in some segments. Ninja
   matches dependencies separator-insensitively, so this is cosmetic.
+- `/showIncludes` note paths are emitted with their `..` segments collapsed,
+  because Ninja refuses a note path longer than `_MAX_PATH` (260) by **length**,
+  before it canonicalizes one — a fixed-buffer check no long-path policy reaches.
+  A note path that is over the limit with **nothing to collapse** is still
+  refused, and no lexical rule can change that; the remedy there is a shorter
+  build root. The bytes stored in the cache keep the driver's own spelling.
 - Non-C/C++ inputs (for example Windows `.rc` resource files) are correctly
   classified as non-cacheable and passed through.
 - `FASTCACHE_TIMEOUT` bounds one exchange, not a whole invocation. Direct mode
