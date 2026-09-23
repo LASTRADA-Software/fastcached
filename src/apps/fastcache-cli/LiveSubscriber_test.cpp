@@ -233,7 +233,7 @@ namespace
 /// @return Bytes read, `0` for EOF, or the failure.
 [[nodiscard]] Task<IoResult> ReadSome(ISocket* socket, std::span<std::byte> buffer)
 {
-    co_return co_await socket->Read(buffer);
+    co_return co_await socket->read(buffer);
 }
 
 /// What the stand-in node observed.
@@ -257,7 +257,7 @@ void ServeOneStream(BlockingListener* listener, ServerRecord* record)
     if (!accepted.has_value())
         return;
     auto const socket = *std::move(accepted);
-    socket->SetReceiveDeadline(5s);
+    socket->setReceiveDeadline(5s);
 
     auto const header = SyncRun(RecvExactly(socket.get(), Wire::RequestHeaderSize));
     auto const decoded = header.has_value() ? Wire::DecodeRequestHeader(*header) : std::nullopt;
@@ -283,7 +283,7 @@ void ServeOneStream(BlockingListener* listener, ServerRecord* record)
     auto const got = SyncRun(ReadSome(socket.get(), buffer));
     record->sawEof = got.has_value() && *got == 0;
     record->sawError = !got.has_value();
-    socket->Close();
+    socket->close();
 }
 
 } // namespace

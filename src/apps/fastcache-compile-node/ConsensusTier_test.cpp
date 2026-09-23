@@ -819,7 +819,7 @@ namespace
 /// @return How many bytes arrived; zero at the end or on an error.
 [[nodiscard]] Task<std::size_t> ReadOnce(ISocket* socket, std::span<std::byte> buffer)
 {
-    auto const read = co_await socket->Read(buffer);
+    auto const read = co_await socket->read(buffer);
     co_return read.has_value() ? *read : std::size_t { 0 };
 }
 
@@ -829,7 +829,7 @@ namespace
 /// @return How many bytes were accepted; zero on an error.
 [[nodiscard]] Task<std::size_t> WriteOnce(ISocket* socket, std::span<std::byte const> bytes)
 {
-    auto const written = co_await socket->Write(bytes);
+    auto const written = co_await socket->write(bytes);
     co_return written.has_value() ? *written : std::size_t { 0 };
 }
 
@@ -891,7 +891,7 @@ struct PeerFrame
 
     BlockingConnector connector { DefaultAddressResolver(),
                                   BlockingConnectorOptions { .ioTimeout = std::chrono::seconds { 10 } } };
-    auto dialled = SyncRun(connector.Connect(
+    auto dialled = SyncRun(connector.connect(
         "127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 }, .keepAlive = KeepAlive::No }));
     REQUIRE(dialled.has_value());
     auto socket = *std::move(dialled);
@@ -1010,7 +1010,7 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
             [&tier] { return tier->ClusterState().HasForgotten("10.0.0.7"); },
             commit));
         CHECK(conditions.StateOf(NodeCondition::UnreadableLeaderSnapshot) == CompileCacheWire::ConditionState::Clear);
-        connection->Close();
+        connection->close();
     }
 
     SECTION("the previous build's state is refused, raised by name, and nothing is taken on")
@@ -1036,6 +1036,6 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
         // Nothing taken on: not the previous build's member, not a moved commit index.
         CHECK_FALSE(tier->ClusterState().RaftEndpointOf("n1").has_value());
         CHECK(tier->Status().commitIndex == Consensus::LogIndex::BeforeFirst());
-        connection->Close();
+        connection->close();
     }
 }

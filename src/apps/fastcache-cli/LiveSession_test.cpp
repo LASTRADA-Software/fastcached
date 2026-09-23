@@ -412,7 +412,7 @@ struct Composition
             .views = rungViews
         };
         task = ComposeInto(std::move(parts), &source, &restore, &result, &threw);
-        rig.reactor.Submit(task.Native());
+        rig.reactor.submit(task.handle());
     }
 
     /// Run the rig through @p rounds re-subscription intervals.
@@ -422,7 +422,7 @@ struct Composition
         rig.Settle();
         for ([[maybe_unused]] auto const round: std::views::iota(0, rounds))
         {
-            rig.clock.Advance(Interval);
+            rig.clock.advance(Interval);
             rig.Settle();
         }
     }
@@ -791,7 +791,7 @@ namespace
     auto sink = CountSink {};
     auto exit = std::optional<DashboardExit> {};
     auto task = RunOver(&remarking, &view, &sink, DashboardLimits {}, &exit);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     reactor.Drain();
     REQUIRE(exit.has_value());
     return remarks.Lines();
@@ -1479,7 +1479,7 @@ struct RunningSeat
         streamsInteractive { streamsInteractive },
         stoppedFromDial { stoppedFromDial }
     {
-        thread = std::jthread { [this] { reactor.Run(); } };
+        thread = std::jthread { [this] { reactor.run(); } };
     }
 
     RunningSeat(RunningSeat const&) = delete;
@@ -1496,7 +1496,7 @@ struct RunningSeat
             auto wait = ThreadDrainWait {};
             CHECK_FALSE(DrainSession(*source, DrainBound {}, wait).has_value());
         }
-        reactor.Stop();
+        reactor.stop();
         thread.join();
         source.reset();
     }

@@ -55,7 +55,7 @@ namespace
     /// @return Whether every byte reached the socket.
     [[nodiscard]] Task<bool> WriteFrame(ISocket* socket, std::span<std::byte const> bytes)
     {
-        auto const written = co_await socket->Write(bytes);
+        auto const written = co_await socket->write(bytes);
         co_return written.has_value() && *written == bytes.size();
     }
 
@@ -244,7 +244,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     // next one reads the new address here.
     auto const where = self->AddressOf(*peer);
 
-    auto dialed = co_await self->_connector.Connect(
+    auto dialed = co_await self->_connector.connect(
         where.host, where.port, DialOptions { .connectTimeout = self->_options.dialTimeout });
     if (!dialed.has_value())
     {
@@ -264,7 +264,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     // produced is closed here.
     if (self->_stop.Token().IsCancelled())
     {
-        dialed.value()->Close();
+        dialed.value()->close();
         co_return Outcome::Stop;
     }
 
@@ -277,7 +277,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     // would be served at its old address until that connection happened to break.
     if (auto const current = self->AddressOf(*peer); current.host != where.host || current.port != where.port)
     {
-        peer->socket->Close();
+        peer->socket->close();
         peer->socket.reset();
         co_return Outcome::Retry;
     }
@@ -288,7 +288,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     auto proven = co_await Handshake(self, peer, where);
     if (!proven.has_value())
     {
-        peer->socket->Close();
+        peer->socket->close();
         peer->socket.reset();
         co_return Outcome::Retry;
     }
@@ -298,7 +298,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
 
     while (true)
     {
-        auto frame = co_await peer->outbox.Pop();
+        auto frame = co_await peer->outbox.pop();
         if (!frame.has_value())
             co_return Outcome::Stop; // the outbox was closed
 
@@ -309,7 +309,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
         {
             self->NoteDialRefusal(*peer, where, DiallerRefusal::KeyWithdrawn, "");
             self->_dropped.fetch_add(1, std::memory_order_relaxed);
-            peer->socket->Close();
+            peer->socket->close();
             peer->socket.reset();
             co_return Outcome::Retry;
         }
@@ -329,7 +329,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
         if (!co_await WriteFrame(peer->socket.get(), *frame))
         {
             self->_dropped.fetch_add(1, std::memory_order_relaxed);
-            peer->socket->Close();
+            peer->socket->close();
             peer->socket.reset();
             co_return Outcome::Retry;
         }
@@ -503,7 +503,7 @@ Task<void> PeerSenderAccess::RunSender(RaftPeerTransport* self, RaftPeerTranspor
         // failure this repository already has a name for.
         if (co_await InterruptibleSleepUntil(&self->_reactor,
                                              token,
-                                             self->_reactor.Clock().Now() + self->_options.reconnectBackoff,
+                                             self->_reactor.clock().now() + self->_options.reconnectBackoff,
                                              self->_options.stopWakeBound)
             == WakeReason::Cancelled)
             break;
@@ -548,7 +548,7 @@ DetachedTask PeerSenderAccess::CloseSockets(RaftPeerTransport* self, std::option
 
     for (auto* const socket: closing)
         if (socket != nullptr)
-            socket->Close();
+            socket->close();
     co_return;
 }
 
@@ -666,7 +666,7 @@ void RaftPeerTransport::StartSender(Peer& peer)
     // is lazy and what depends on it. Submitting under `_peersMutex` is safe for
     // exactly that reason -- the body's first instruction runs on the reactor
     // thread, so nothing here runs it inline.
-    _reactor.Submit(peer.sender.Native());
+    _reactor.submit(peer.sender.handle());
 }
 
 RaftPeerTransport::~RaftPeerTransport()
@@ -746,7 +746,7 @@ void RaftPeerTransport::Stop() noexcept
                                 DrainBound {}.ceiling.count()));
         auto const guard = std::unique_lock { _peersMutex };
         for (auto& [id, peer]: _peers)
-            std::ignore = peer->sender.Release();
+            std::ignore = peer->sender.release();
     }
 }
 
@@ -771,7 +771,7 @@ void RaftPeerTransport::NoteSenderThrew(NodeId const& peer) noexcept
 
 void RaftPeerTransport::NoteOwnFault(Peer& peer, PeerEndpoint const& where, std::string_view reason)
 {
-    auto const now = _reactor.Clock().Now();
+    auto const now = _reactor.clock().now();
     if (now < peer.nextRefusalReport)
         return;
     peer.nextRefusalReport = now + RefusalReportInterval;
@@ -787,7 +787,7 @@ void RaftPeerTransport::NoteDialRefusal(Peer& peer,
     auto const& row = RowFor(refusal);
     _metrics.Increment(row.counter);
 
-    auto const now = _reactor.Clock().Now();
+    auto const now = _reactor.clock().now();
     if (now < peer.nextRefusalReport)
         return;
     peer.nextRefusalReport = now + RefusalReportInterval;
@@ -849,7 +849,7 @@ void RaftPeerTransport::Send(NodeId const& to, RaftMessage message)
     // Never resumes the sender inline -- see `AsyncQueue`. This matters here
     // specifically because `Send` is reached from `RaftDriver::Deliver`, which
     // holds the driver's mutex.
-    auto const pushed = target->outbox.Push(std::move(frame));
+    auto const pushed = target->outbox.push(std::move(frame));
     _dropped.fetch_add(pushed.displaced, std::memory_order_relaxed);
 }
 

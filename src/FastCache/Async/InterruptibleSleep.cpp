@@ -21,7 +21,7 @@ Task<WakeReason> InterruptibleSleepUntil(IReactor* reactor, CancellationToken to
 
     while (true)
     {
-        auto const now = reactor->Clock().Now();
+        auto const now = reactor->clock().now();
         if (now >= deadline)
             co_return WakeReason::Deadline;
 

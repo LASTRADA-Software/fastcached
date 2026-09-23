@@ -25,7 +25,7 @@ Task<SocketResult> ConnectTcp(std::string host,
     // frame, not of the call expression -- which is the whole reason this is a
     // coroutine rather than a function returning the connector's task.
     BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = ioTimeout } };
-    co_return co_await connector.Connect(std::move(host), port, DialOptions { .connectTimeout = connectTimeout });
+    co_return co_await connector.connect(std::move(host), port, DialOptions { .connectTimeout = connectTimeout });
 }
 
 Task<bool> SendAll(ISocket* socket, std::span<std::byte const> bytes)
@@ -36,7 +36,7 @@ Task<bool> SendAll(ISocket* socket, std::span<std::byte const> bytes)
         // A peer that closed mid-transfer surfaces here as an error rather than as
         // a fatal signal, but only because the socket was armed when it was
         // constructed -- see Detail::ArmNoSigPipe.
-        auto const wrote = co_await socket->Write(bytes.subspan(sent));
+        auto const wrote = co_await socket->write(bytes.subspan(sent));
         if (!wrote.has_value() || *wrote == 0)
             co_return false;
         sent += *wrote;
@@ -56,7 +56,7 @@ Task<std::optional<std::vector<std::byte>>> RecvExactly(ISocket* socket, std::si
     std::size_t got = 0;
     while (got < count)
     {
-        auto const read = co_await socket->Read(std::span { out }.subspan(got));
+        auto const read = co_await socket->read(std::span { out }.subspan(got));
         // Zero is EOF for a read, which here means the peer closed before it had
         // sent everything it declared -- a short frame, not a short read to retry.
         if (!read.has_value() || *read == 0)

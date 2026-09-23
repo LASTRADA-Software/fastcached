@@ -112,14 +112,14 @@ class RecordingDialReactor final: public FastCache::IReactor
     {
     }
 
-    void Stop() noexcept override {}
+    void stop() noexcept override {}
 
-    void Submit(std::coroutine_handle<> handle) override
+    void submit(std::coroutine_handle<> handle) override
     {
         _borrowed.push_back(handle);
     }
 
-    void Submit(FastCache::ParkedWork work) override
+    void submit(FastCache::ParkedWork work) override
     {
         // Recorded separately, because `Detail::Parked` deliberately exposes only
         // the handle it would resume -- the root it may free is not something a
@@ -128,7 +128,7 @@ class RecordingDialReactor final: public FastCache::IReactor
         _handed.emplace_back(work);
     }
 
-    void Schedule(FastCache::TimePoint /*deadline*/, std::coroutine_handle<> handle) override
+    void schedule(FastCache::TimePoint /*deadline*/, std::coroutine_handle<> handle) override
     {
         // RECORDED rather than dropped, and that is the difference between a double
         // and a more permissive stand-in: a real reactor queues this, so a double
@@ -137,7 +137,7 @@ class RecordingDialReactor final: public FastCache::IReactor
         _borrowedTimers.push_back(handle);
     }
 
-    void Schedule(FastCache::TimePoint /*deadline*/, FastCache::ParkedWork work) override
+    void schedule(FastCache::TimePoint /*deadline*/, FastCache::ParkedWork work) override
     {
         _scheduled.emplace_back(work);
     }
@@ -152,16 +152,16 @@ class RecordingDialReactor final: public FastCache::IReactor
     /// resume or destroy the chain, so the entry must do neither on its way out.
     /// @param handle A handle previously submitted or scheduled here.
     /// @return Whether it was found and retracted.
-    [[nodiscard]] bool CancelPending(std::coroutine_handle<> handle) noexcept override
+    [[nodiscard]] bool cancelPending(std::coroutine_handle<> handle) noexcept override
     {
         if (!handle)
             return false;
         for (auto* container: { &_handed, &_scheduled })
         {
-            auto const found = std::ranges::find(*container, handle, &FastCache::Detail::Parked::Handle);
+            auto const found = std::ranges::find(*container, handle, &FastCache::Detail::Parked::handle);
             if (found != container->end())
             {
-                std::ignore = found->Take();
+                std::ignore = found->take();
                 container->erase(found);
                 return true;
             }
@@ -169,7 +169,7 @@ class RecordingDialReactor final: public FastCache::IReactor
         return false;
     }
 
-    [[nodiscard]] FastCache::IClock& Clock() noexcept override
+    [[nodiscard]] FastCache::IClock& clock() noexcept override
     {
         return _clock;
     }
@@ -235,23 +235,23 @@ class RecordingDialSocket final: public FastCache::ISocket
   public:
     RecordingDialSocket(RecordingDialReactor& /*reactor*/, int /*fd*/, std::string const& /*peer*/) noexcept {}
 
-    [[nodiscard]] FastCache::IoAwaitable Read(std::span<std::byte> /*buffer*/) override
+    [[nodiscard]] FastCache::IoAwaitable read(std::span<std::byte> /*buffer*/) override
     {
         return FastCache::IoAwaitable { FastCache::IoResult { 0 } };
     }
 
-    [[nodiscard]] FastCache::IoAwaitable Write(std::span<std::byte const> /*buffer*/) override
+    [[nodiscard]] FastCache::IoAwaitable write(std::span<std::byte const> /*buffer*/) override
     {
         return FastCache::IoAwaitable { FastCache::IoResult { 0 } };
     }
 
-    [[nodiscard]] FastCache::IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> /*segments*/,
+    [[nodiscard]] FastCache::IoAwaitable writeVectored(std::span<std::span<std::byte const> const> /*segments*/,
                                                        std::shared_ptr<void const> /*keepAlive*/) override
     {
         return FastCache::IoAwaitable { FastCache::IoResult { 0 } };
     }
 
-    void Close() noexcept override
+    void close() noexcept override
     {
         _closed = true;
     }
@@ -356,7 +356,7 @@ TEST_CASE("A detached dial handed back and never dequeued is freed at teardown",
         FastCache::ManualClock clock;
         RecordingDialReactor reactor { clock };
 
-        DialDetached(&reactor, endpoints.front(), clock.Now() + 30s, FrameSentinel { &counters }, &counters);
+        DialDetached(&reactor, endpoints.front(), clock.now() + 30s, FrameSentinel { &counters }, &counters);
         REQUIRE(counters.parked == 1);
 
         // The premise, asserted rather than assumed: the connect went to
@@ -408,8 +408,8 @@ TEST_CASE("A dial some Task owns is left alone by the reactor", "[net][connect][
         FastCache::ManualClock clock;
         RecordingDialReactor reactor { clock };
 
-        auto dial = DialOwned(&reactor, endpoints.front(), clock.Now() + 30s, FrameSentinel { &counters }, &counters);
-        dial.Native().resume();
+        auto dial = DialOwned(&reactor, endpoints.front(), clock.now() + 30s, FrameSentinel { &counters }, &counters);
+        dial.handle().resume();
         REQUIRE(counters.parked == 1);
         REQUIRE(reactor.Attached() != nullptr);
 

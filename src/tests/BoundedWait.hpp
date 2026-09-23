@@ -375,15 +375,15 @@ template <std::predicate Predicate, typename State>
 [[nodiscard]] Task<WaitOutcome> AwaitUntil(
     IReactor* reactor, std::string what, Predicate reached, State state, ReactorWaitOptions options = {})
 {
-    auto const& clock = reactor->Clock();
-    auto const started = clock.Now();
+    auto const& clock = reactor->clock();
+    auto const started = clock.now();
     std::string seen = state();
     auto lastChange = started;
     auto changes = 0;
     std::size_t turns = 0;
     while (!reached())
     {
-        auto const now = clock.Now();
+        auto const now = clock.now();
         if (now - started >= options.bound)
         {
             auto const readings = WaitReadings {
@@ -411,7 +411,7 @@ template <std::predicate Predicate, typename State>
     }
     co_return WaitOutcome {
         .reached = true,
-        .elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - started),
+        .elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock.now() - started),
         .account = {},
     };
 }

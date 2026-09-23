@@ -63,7 +63,7 @@ struct Peer
     /// @param roster Whose key every id is, as this node's replicated state says.
     Peer(DatagramBus& bus, std::string const& nodeId, std::shared_ptr<SharedRoster const> roster):
         Peer(bus.Open(DatagramAddress { .host = nodeId, .port = TestBeaconPort }),
-             DatagramBus::BroadcastAddress(),
+             DatagramBus::broadcastAddress(),
              nodeId,
              std::move(roster))
     {
@@ -277,7 +277,7 @@ TEST_CASE("Two nodes on one host find and prove each other", "[node][discovery]"
     // Driven step by step rather than by a settle loop, because each step here is
     // one leg of the handshake and a failure should name the leg.
     DatagramBus bus;
-    auto const beacon = DatagramBus::BroadcastAddressOn(TestBeaconPort);
+    auto const beacon = DatagramBus::broadcastAddressOn(TestBeaconPort);
 
     auto const roster = SharedRoster::Of({ "n1", "n2" });
     Peer first { CoHostedDatagramSocket(bus, "host", 40001), beacon, "n1", roster };
@@ -357,7 +357,7 @@ TEST_CASE("Two fleets on one segment ignore each other at the node's discovery t
     NullLogger otherLogger;
     AtomicMetricsSink otherMetrics;
     RosterPeerKeys otherKeys { TestKeyPair("n2"), roster };
-    auto otherConfig = ConfigFor("n2", DatagramBus::BroadcastAddress());
+    auto otherConfig = ConfigFor("n2", DatagramBus::broadcastAddress());
     otherConfig.clusterId = "somebody-elses";
     auto const theirs = DiscoveryTier::Over(bus.Open(DatagramAddress { .host = "n2", .port = TestBeaconPort }),
                                             std::move(otherConfig),

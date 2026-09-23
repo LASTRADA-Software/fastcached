@@ -57,7 +57,7 @@ class IReactor: public IExecutor
     /// unconditionally, and every guard built on it would stay green while checking
     /// nothing. The four reactors that exist today each claimed correctly by
     /// convention; a fifth is what conventions lose to.
-    void Run()
+    void run()
     {
         ReactorWorkerIdentity::Scope const onWorker { _worker };
         RunLoop();
@@ -65,7 +65,7 @@ class IReactor: public IExecutor
 
     /// Ask Run() to exit gracefully. Idempotent. May be called from any
     /// thread (including from inside the reactor's own thread).
-    virtual void Stop() noexcept = 0;
+    virtual void stop() noexcept = 0;
 
     /// Post a coroutine handle for resumption on the reactor's thread.
     /// Order between Submit() calls from a single thread is preserved
@@ -73,7 +73,7 @@ class IReactor: public IExecutor
     /// implementation (TestReactor: FIFO of arrival; production reactors:
     /// best-effort FIFO).
     /// @param handle Coroutine to resume. Must remain alive until resumed.
-    void Submit(std::coroutine_handle<> handle) override = 0;
+    void submit(std::coroutine_handle<> handle) override = 0;
 
     /// Post a coroutine, saying what may be freed if it is never resumed.
     ///
@@ -89,14 +89,14 @@ class IReactor: public IExecutor
     /// Deleting this as a duplicate of the base declaration reopens all seven, silently:
     /// the call still compiles, against the overload that drops what it is given.
     /// @param work The coroutine to resume, and the chain root to free if it is not.
-    void Submit(ParkedWork work) override = 0;
+    void submit(ParkedWork work) override = 0;
 
     /// Resume a coroutine handle when the reactor's clock advances to or
     /// past the given deadline. Ordering between concurrently-scheduled
     /// timers with the same deadline is FIFO.
     /// @param deadline Absolute time at which to resume.
     /// @param handle Coroutine to resume.
-    virtual void Schedule(TimePoint deadline, std::coroutine_handle<> handle) = 0;
+    virtual void schedule(TimePoint deadline, std::coroutine_handle<> handle) = 0;
 
     /// Schedule a coroutine, saying what may be freed if the deadline never arrives.
     ///
@@ -115,7 +115,7 @@ class IReactor: public IExecutor
     /// the safe answer and leaves teardown behaving exactly as it did.
     /// @param deadline Absolute time at which to resume.
     /// @param work The coroutine to resume, and the chain root to free if it is not.
-    virtual void Schedule(TimePoint deadline, ParkedWork work) = 0;
+    virtual void schedule(TimePoint deadline, ParkedWork work) = 0;
 
     /// Take a handle back off this reactor while it is still waiting to be resumed.
     ///
@@ -136,12 +136,12 @@ class IReactor: public IExecutor
     ///         take. An implementation that cannot retract a submission (IOCP posts
     ///         it to the kernel) answers false for that case and still cancels
     ///         timers.
-    [[nodiscard]] virtual bool CancelPending(std::coroutine_handle<> handle) noexcept = 0;
+    [[nodiscard]] virtual bool cancelPending(std::coroutine_handle<> handle) noexcept = 0;
 
     /// @return The clock used by this reactor for all deadline checks. Tests
     /// can downcast to ManualClock and Advance() to drive timers; production
     /// code uses SteadyClock.
-    [[nodiscard]] virtual IClock& Clock() noexcept = 0;
+    [[nodiscard]] virtual IClock& clock() noexcept = 0;
 
     /// Whether a thread is currently inside `Run()`.
     ///
@@ -151,13 +151,13 @@ class IReactor: public IExecutor
     /// implementations were the same delegation, and a fact the base already holds is
     /// not one a subclass should be trusted to restate.
     /// @return True between entry to and return from `Run()`.
-    [[nodiscard]] bool Running() const noexcept
+    [[nodiscard]] bool running() const noexcept
     {
         return _worker.Running();
     }
 
     /// @return True when the calling thread is the one currently inside `Run()`.
-    [[nodiscard]] bool IsOnWorkerThread() const noexcept
+    [[nodiscard]] bool isOnWorkerThread() const noexcept
     {
         return _worker.IsOnWorkerThread();
     }
@@ -184,9 +184,9 @@ class IReactor: public IExecutor
     /// Non-virtual on purpose: one rule derived from two facts, in one place, so a
     /// reactor can answer the facts and cannot restate the rule differently.
     /// @return True when destruction here is serialised against completion dispatch.
-    [[nodiscard]] bool TeardownIsSerialisedWithDispatch() const noexcept
+    [[nodiscard]] bool teardownIsSerialisedWithDispatch() const noexcept
     {
-        return !Running() || IsOnWorkerThread();
+        return !running() || isOnWorkerThread();
     }
 
   protected:

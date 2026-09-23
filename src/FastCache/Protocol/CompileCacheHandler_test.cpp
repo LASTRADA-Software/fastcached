@@ -73,7 +73,7 @@ struct CcFixture
 ///                reference parameter across a suspend point.
 Task<bool> WriteBytes(ISocket* socket, std::vector<std::byte> payload)
 {
-    auto const r = co_await socket->Write(std::span<std::byte const> { payload.data(), payload.size() });
+    auto const r = co_await socket->write(std::span<std::byte const> { payload.data(), payload.size() });
     co_return r.has_value();
 }
 
@@ -83,7 +83,7 @@ Task<std::vector<std::byte>> ReadAvailable(ISocket* socket)
     while (true)
     {
         std::vector<std::byte> chunk(512);
-        auto const r = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const r = co_await socket->read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!r.has_value() || *r == 0)
             break;
         out.insert(out.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*r));
@@ -110,7 +110,7 @@ Task<std::vector<std::byte>> ReadExactlyN(ISocket* socket, std::size_t count)
     while (out.size() < count)
     {
         std::vector<std::byte> chunk(count - out.size());
-        auto const r = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const r = co_await socket->read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!r.has_value() || *r == 0)
             break;
         out.insert(out.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*r));
@@ -127,13 +127,13 @@ Task<std::vector<std::byte>> ReadExactlyN(ISocket* socket, std::size_t count)
 std::vector<std::byte> ExchangeWith(CcFixture& fix, std::vector<std::byte> const& request, SessionContext session)
 {
     REQUIRE(SyncRun(WriteBytes(fix.pair.client.get(), request)));
-    fix.pair.client->ShutdownWrite();
+    fix.pair.client->shutdownWrite();
     SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primingBytes*/ {}, session));
     // Close the server side before draining, as Connection does once a handler
     // returns. Without it a rejection that closes WITHOUT replying — a foreign
     // magic, the one case that still cannot be answered — leaves the drain
     // parked on a read nothing will ever satisfy.
-    fix.pair.server->ShutdownWrite();
+    fix.pair.server->shutdownWrite();
     return SyncRun(ReadAvailable(fix.pair.client.get()));
 }
 
@@ -354,7 +354,7 @@ TEST_CASE("STORE canonicalizes showIncludes; FETCH returns the canonical form", 
     InMemorySocketPair pair2 = InMemorySocketPair::Create();
     CompileCacheHandler handler2;
     REQUIRE(SyncRun(WriteBytes(pair2.client.get(), FetchFrame("obj-hash"))));
-    pair2.client->ShutdownWrite();
+    pair2.client->shutdownWrite();
     SessionContext session {};
     SyncRun(handler2.Run(pair2.server.get(), &fix.engine, {}, session));
     auto const fetchReply = SyncRun(ReadAvailable(pair2.client.get()));
@@ -404,7 +404,7 @@ TEST_CASE("STORE/FETCH round-trips an object blob larger than 1 MiB", "[compile-
     InMemorySocketPair pair2 = InMemorySocketPair::Create();
     CompileCacheHandler handler2;
     REQUIRE(SyncRun(WriteBytes(pair2.client.get(), FetchFrame("big-obj"))));
-    pair2.client->ShutdownWrite();
+    pair2.client->shutdownWrite();
     SessionContext session {};
     SyncRun(handler2.Run(pair2.server.get(), &fix.engine, {}, session));
 
@@ -839,7 +839,7 @@ TEST_CASE("Cross-depth: value stored from a deep layout localizes for a shallow 
     InMemorySocketPair pair2 = InMemorySocketPair::Create();
     CompileCacheHandler handler2;
     REQUIRE(SyncRun(WriteBytes(pair2.client.get(), FetchFrame("k"))));
-    pair2.client->ShutdownWrite();
+    pair2.client->shutdownWrite();
     SessionContext session {};
     SyncRun(handler2.Run(pair2.server.get(), &fix.engine, {}, session));
     auto const reply = SyncRun(ReadAvailable(pair2.client.get()));
@@ -878,7 +878,7 @@ void StoreVia(CacheEngine& engine, std::string_view key, std::string_view prefet
     auto const frame = StoreFrame(
         { .key = key, .prefetchGroup = prefetchGroup, .srcRoot = R"(C:\src)", .buildTree = R"(C:\build)" }, SampleValue());
     REQUIRE(SyncRun(WriteBytes(pair.client.get(), frame)));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
     SessionContext session {};
     SyncRun(handler.Run(pair.server.get(), &engine, {}, session));
     (void) SyncRun(ReadAvailable(pair.client.get()));
@@ -904,21 +904,21 @@ TEST_CASE("FETCH of a prefetch group member warms the rest of the prefetch group
     layered.L1().EraseIfPresent("k1");
     layered.L1().EraseIfPresent("k2");
     layered.L1().EraseIfPresent("k3");
-    REQUIRE_FALSE(layered.L1().Peek("k2", clock.Now())->found);
-    REQUIRE_FALSE(layered.L1().Peek("k3", clock.Now())->found);
+    REQUIRE_FALSE(layered.L1().Peek("k2", clock.now())->found);
+    REQUIRE_FALSE(layered.L1().Peek("k3", clock.now())->found);
 
     // Fetch the leading key: triggers a group prefetch of k2/k3 into L1.
     InMemorySocketPair pair = InMemorySocketPair::Create();
     CompileCacheHandler handler;
     REQUIRE(SyncRun(WriteBytes(pair.client.get(), FetchFrame("k1"))));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
     SessionContext session {};
     SyncRun(handler.Run(pair.server.get(), &engine, {}, session));
     (void) SyncRun(ReadAvailable(pair.client.get()));
 
     // k2 and k3 are now warm in L1 (a direct L1 Peek finds them).
-    CHECK(layered.L1().Peek("k2", clock.Now())->found);
-    CHECK(layered.L1().Peek("k3", clock.Now())->found);
+    CHECK(layered.L1().Peek("k2", clock.now())->found);
+    CHECK(layered.L1().Peek("k3", clock.now())->found);
 }
 
 // --- authentication ---------------------------------------------------------
@@ -1557,7 +1557,7 @@ struct StreamingRig
     /// Move the clock on and let everything due run.
     void Advance(std::chrono::milliseconds by)
     {
-        fix.clock.Advance(by);
+        fix.clock.advance(by);
         reactor.Drain();
     }
 };
@@ -1651,7 +1651,7 @@ TEST_CASE("A stream on a connection that never authenticated ends when the daemo
 
     // Ended either way, so nothing is left parked on the rig's reactor when it goes.
     rig.server.ResolveReadable(0);
-    rig.fix.pair.client->ShutdownWrite();
+    rig.fix.pair.client->shutdownWrite();
     rig.Advance(500ms);
     CHECK(rig.returned);
 }
@@ -1678,7 +1678,7 @@ TEST_CASE("A request pipelined behind a daemon subscription ends the stream in o
     StreamingRig rig;
     REQUIRE(
         SyncRun(WriteBytes(rig.fix.pair.client.get(), Concat({ SubscribeTo(Wire::LiveSubject::Cache), FetchFrame("k") }))));
-    rig.fix.pair.client->ShutdownWrite();
+    rig.fix.pair.client->shutdownWrite();
     RunHandlerOn(&rig.fix.handler, &rig.writes, &rig.fix.engine, rig.Session(), &rig.returned);
     rig.Advance(500ms);
 
@@ -1767,9 +1767,9 @@ class CapturingPushes final: public ISubscriber
     InMemorySocketPair pair = InMemorySocketPair::Create();
     CompileCacheHandler handler;
     REQUIRE(SyncRun(WriteBytes(pair.client.get(), request)));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
     SyncRun(handler.Run(pair.server.get(), &engine, {}, session));
-    pair.server->ShutdownWrite();
+    pair.server->shutdownWrite();
     return SplitReplies(SyncRun(ReadAvailable(pair.client.get())));
 }
 

@@ -123,7 +123,7 @@ void ExpiryReaper::Start(IReactor& reactor, IExecutor& sweepOn)
 {
     _reactor = &reactor;
     _task = Run(&reactor, &sweepOn, _source.Token());
-    reactor.Submit(_task.Native());
+    reactor.submit(_task.handle());
 }
 
 void ExpiryReaper::Stop() noexcept
@@ -159,7 +159,7 @@ void ExpiryReaper::Stop() noexcept
         // Reached only through a seam that RETURNS, which only a test supplies. Released --
         // not destroyed, and not retracted, since the reactor never held it -- so `~Task`
         // cannot free it, and whoever supplied that seam now owns it.
-        std::ignore = _task.Release();
+        std::ignore = _task.release();
         return;
     }
 
@@ -181,7 +181,7 @@ void ExpiryReaper::Stop() noexcept
     // What is NOT optional is that the handle be this task's own, and it is
     // only because `Run` awaits `SleepUntil` directly rather than a nested
     // `Task` -- see the comment there.
-    std::ignore = reactor->CancelPending(_task.Native());
+    std::ignore = reactor->cancelPending(_task.handle());
 }
 
 PurgeOutcome ExpiryReaper::SweepOnce(TimePoint now)
@@ -269,10 +269,10 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
         // directly makes them the same frame, which is what lets the owner take
         // it back with `CancelPending` instead of leaking it. `DeadlineTimer`
         // inlines its wait for exactly this reason.
-        auto const deadline = reactor->Clock().Now() + _interval;
+        auto const deadline = reactor->clock().now() + _interval;
         while (!token.IsCancelled())
         {
-            auto const now = reactor->Clock().Now();
+            auto const now = reactor->clock().now();
             if (now >= deadline)
                 break;
             co_await SleepUntil { .reactor = reactor, .deadline = NextWakeStep(now, deadline, _options.stopWakeBound) };
@@ -284,7 +284,7 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
         // (#946). The reactor is held for the whole of `SweepOnce` -- it suspends
         // nowhere -- so this elapsed time IS how long this reactor was unavailable,
         // and it is the only quantity the ceiling can honestly be expressed in.
-        auto const startedAt = reactor->Clock().Now();
+        auto const startedAt = reactor->clock().now();
 
         // --- Off the reactor for the sweep body (#946). ---
         //
@@ -358,7 +358,7 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
             }
         }
 
-        AdaptScanBudget(reactor->Clock().Now() - startedAt);
+        AdaptScanBudget(reactor->clock().now() - startedAt);
         if (outcome.purged != 0)
             _logger.Logf(LogLevel::Debug,
                          "expiry: reclaimed {} lapsed entr{} ({} examined)",

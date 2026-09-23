@@ -127,11 +127,11 @@ FastCache::DetachedTask DriveVectoredWrite(FastCache::EpollReactor* reactor,
         value,
         FastCache::AsBytes(trailer),
     };
-    auto const r = co_await socket.WriteVectored(segments);
+    auto const r = co_await socket.writeVectored(segments);
     if (r.has_value())
         reported->store(*r);
-    socket.Close();
-    reactor->Stop();
+    socket.close();
+    reactor->stop();
     co_return;
 }
 
@@ -236,16 +236,16 @@ FastCache::DetachedTask DriveAdoptedAccept(FastCache::EpollReactor* reactor,
     {
         auto socket = std::move(*accepted);
         std::array<std::byte, 16> buf {};
-        auto const read = co_await socket->Read(std::span<std::byte> { buf });
+        auto const read = co_await socket->read(std::span<std::byte> { buf });
         if (read.has_value() && *read > 0)
         {
-            auto const written = co_await socket->Write(FastCache::AsBytes(std::string_view { "PONG" }));
+            auto const written = co_await socket->write(FastCache::AsBytes(std::string_view { "PONG" }));
             served->store(written.has_value() && *written == 4);
         }
-        socket->Close();
+        socket->close();
     }
     listener->Close();
-    reactor->Stop();
+    reactor->stop();
     co_return;
 }
 
@@ -260,7 +260,7 @@ TEST_CASE("EpollSocket::WriteVectored round-trips a small gathered reply", "[net
 
     std::string_view const value = "hello";
     DriveVectoredWrite(&reactor, pair.reactorSide, "VALUE k 0 5\r\n", FastCache::AsBytes(value), "\r\n", &reported);
-    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
+    std::jthread reactorThread { [&reactor] { reactor.run(); } };
 
     auto const received = RecvExactly(pair.peerSide, 20);
     reactorThread.join();
@@ -296,7 +296,7 @@ TEST_CASE("EpollSocket::WriteVectored streams a large value across partial write
 
     DriveVectoredWrite(
         &reactor, pair.reactorSide, header, std::span<std::byte const> { value.data(), value.size() }, trailer, &reported);
-    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
+    std::jthread reactorThread { [&reactor] { reactor.run(); } };
 
     // Drain on the test thread; the small SO_RCVBUF means the writer can only
     // make progress as we read, guaranteeing the partial-write path is hit.
@@ -377,14 +377,14 @@ TEST_CASE("EpollListener::Adopt accepts a connection through the reactor", "[net
     // registration nor a non-blocking descriptor -- so an `Adopt` that skipped
     // either would still pass a test that connected first.
     DriveAdoptedAccept(&reactor, listener.get(), &served);
-    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
+    std::jthread reactorThread { [&reactor] { reactor.run(); } };
 
     auto const reply = ExchangeOverLoopback(port, "PING", std::chrono::seconds { 10 });
 
     // Stop before joining: on the failing path the coroutine is still parked in
     // Accept(), so nothing else would ever end reactor.Run() and the join would
     // hang instead of reporting.
-    reactor.Stop();
+    reactor.stop();
     reactorThread.join();
 
     INFO("reply from the adopted listener: '" << reply << "'");

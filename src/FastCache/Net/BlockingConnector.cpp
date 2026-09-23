@@ -220,7 +220,7 @@ namespace
         auto remaining = std::chrono::milliseconds { 0 };
         if (dial.clock != nullptr && deadline != TimePoint::max())
         {
-            auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - dial.clock->Now());
+            auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - dial.clock->now());
             // Never zero: DialOne reads a non-positive timeout as "wait forever",
             // so handing it an exhausted budget would remove the bound entirely at
             // exactly the moment it matters most.
@@ -246,7 +246,7 @@ namespace
 
 } // namespace
 
-Task<SocketResult> BlockingConnector::Connect(std::string host, std::uint16_t port, DialOptions options)
+Task<SocketResult> BlockingConnector::connect(std::string host, std::uint16_t port, DialOptions options)
 {
     Detail::EnsureNetworkInitialised();
 

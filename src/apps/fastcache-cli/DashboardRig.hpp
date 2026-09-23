@@ -88,7 +88,7 @@ class CollectingSink final: public IFrameSink
     auto result = std::optional<DashboardExit> {};
     auto task = DriveOnce(&events, reader, &view, &sink, limits, &result);
 
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     reactor.Drain();
 
     REQUIRE(result.has_value());

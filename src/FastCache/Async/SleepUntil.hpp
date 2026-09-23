@@ -35,7 +35,7 @@ struct SleepUntil
     ///         so the coroutine need not suspend.
     [[nodiscard]] bool await_ready() const noexcept
     {
-        return reactor == nullptr || deadline <= reactor->Clock().Now();
+        return reactor == nullptr || deadline <= reactor->clock().now();
     }
 
     /// Park the handle on the reactor's timer wheel for the deadline.
@@ -57,7 +57,7 @@ struct SleepUntil
     void await_suspend(std::coroutine_handle<Promise> handle) const
     {
         assert(reactor != nullptr);
-        reactor->Schedule(deadline, Detail::ParkedWorkFor(handle));
+        reactor->schedule(deadline, Detail::ParkedWorkFor(handle));
     }
 
     void await_resume() const noexcept {}
@@ -114,7 +114,7 @@ struct SleepUntil
 /// @return An awaitable resuming at `reactor.Clock().Now() + delay`.
 [[nodiscard]] inline SleepUntil SleepFor(IReactor& reactor, Duration delay) noexcept
 {
-    return SleepUntil { .reactor = &reactor, .deadline = reactor.Clock().Now() + delay };
+    return SleepUntil { .reactor = &reactor, .deadline = reactor.clock().now() + delay };
 }
 
 } // namespace FastCache

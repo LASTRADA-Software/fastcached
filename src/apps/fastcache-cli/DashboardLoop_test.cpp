@@ -142,7 +142,7 @@ TEST_CASE("the dashboard's event source parks rather than resolving inline", "[c
     auto result = std::optional<DashboardExit> {};
     auto task = DriveOnce(&events, &ReadStatsSample, &view, &sink, DashboardLimits {}, &result);
 
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     CHECK(!result.has_value()); // nothing has run yet
 
     (void) reactor.Tick();

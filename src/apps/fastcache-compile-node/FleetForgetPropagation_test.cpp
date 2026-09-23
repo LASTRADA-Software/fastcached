@@ -96,7 +96,7 @@ struct Machine
             return c;
         }() },
         status {
-            cfg, clock, clock.Now(), "1.2.3", "node-x", NodeComponents {}, NodeRuntimeSources { .membership = &membership }
+            cfg, clock, clock.now(), "1.2.3", "node-x", NodeComponents {}, NodeRuntimeSources { .membership = &membership }
         }
     {
     }

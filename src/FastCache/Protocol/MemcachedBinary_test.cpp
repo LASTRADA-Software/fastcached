@@ -85,7 +85,7 @@ std::vector<std::byte> BuildBinaryFrame(std::uint8_t opcode,
 
 FastCache::Task<bool> Write(FastCache::ISocket* s, std::span<std::byte const> bytes)
 {
-    auto const r = co_await s->Write(bytes);
+    auto const r = co_await s->write(bytes);
     co_return r.has_value();
 }
 
@@ -95,7 +95,7 @@ FastCache::Task<std::vector<std::byte>> Drain(FastCache::ISocket* s)
     while (true)
     {
         std::vector<std::byte> chunk(512);
-        auto const r = co_await s->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const r = co_await s->read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!r.has_value() || *r == 0)
             break;
         out.insert(out.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*r));
@@ -110,7 +110,7 @@ std::vector<std::byte> Exchange(BinaryFixture& fix,
                                 FastCache::SessionContext session = {})
 {
     REQUIRE(FastCache::SyncRun(Write(fix.pair.client.get(), request)));
-    fix.pair.client->ShutdownWrite();
+    fix.pair.client->shutdownWrite();
     FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, session));
     return FastCache::SyncRun(Drain(fix.pair.client.get()));
 }
@@ -126,7 +126,7 @@ std::vector<FastCache::CapturingLogger::Record> DrivePrimedAndSnapshot(BinaryFix
     FastCache::SessionContext session;
     session.logger = &logger;
     std::vector<std::byte> priming { frame.begin(), frame.end() };
-    fix.pair.client->ShutdownWrite();
+    fix.pair.client->shutdownWrite();
     FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, std::move(priming), session));
     return logger.Snapshot();
 }

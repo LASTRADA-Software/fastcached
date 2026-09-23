@@ -41,14 +41,14 @@ std::size_t InMemoryPipe::Push(std::span<std::byte const> bytes)
     return accepted;
 }
 
-void InMemoryPipe::CloseWrite() noexcept
+void InMemoryPipe::closeWrite() noexcept
 {
     _writeClosed = true;
     if (_progressCallback)
         _progressCallback(_progressCallbackState);
 }
 
-bool InMemoryPipe::CloseRead() noexcept
+bool InMemoryPipe::closeRead() noexcept
 {
     _readClosed = true;
     return !_buffer.empty();
@@ -63,7 +63,7 @@ void InMemoryPipe::Reset(NetErrorCode code) noexcept
         _progressCallback(_progressCallbackState);
 }
 
-std::size_t InMemoryPipe::TryPull(std::span<std::byte> into) noexcept
+std::size_t InMemoryPipe::pull(std::span<std::byte> into) noexcept
 {
     auto const take = std::min(into.size(), _buffer.size());
     for (auto const i: std::views::iota(std::size_t { 0 }, take))
@@ -107,10 +107,10 @@ InMemorySocket::InMemorySocket(std::shared_ptr<InMemoryPipe> inbound,
 
 InMemorySocket::~InMemorySocket()
 {
-    InMemorySocket::Close();
+    InMemorySocket::close();
 }
 
-void InMemorySocket::Close() noexcept
+void InMemorySocket::close() noexcept
 {
     if (_closed)
         return;
@@ -125,13 +125,13 @@ void InMemorySocket::Close() noexcept
     // FIN, by every stack measured (#1553): the peer's writes fail from the next one on,
     // and its reads report the reset. Delivered before the FIN, so a peer parked on a
     // read wakes to the reset and not to an EOF that a real socket would never report.
-    if (_inbound && _inbound->CloseRead() && _outbound)
+    if (_inbound && _inbound->closeRead() && _outbound)
     {
         _inbound->Reset(ResetByPeersClose);
         _outbound->Reset(ResetByPeersClose);
     }
     if (_outbound)
-        _outbound->CloseWrite();
+        _outbound->closeWrite();
 
     // **A parked Read is retrieved here or it is never retrieved at all.** Clearing
     // the progress callback above is what makes that final: nothing else can complete
@@ -148,10 +148,10 @@ void InMemorySocket::Close() noexcept
     auto* const parked = std::exchange(_pendingRead, nullptr);
     _pendingReadBuffer = {};
     if (parked != nullptr)
-        parked->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+        parked->complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
 }
 
-void InMemorySocket::CancelRead() noexcept
+void InMemorySocket::cancelRead() noexcept
 {
     // Detached FIRST and completed LAST, exactly as `Close()` above does and for the
     // reason recorded there. Unlike `Close()` this leaves the socket usable: the
@@ -161,33 +161,33 @@ void InMemorySocket::CancelRead() noexcept
     if (parked == nullptr)
         return;
     _pendingReadBuffer = {};
-    parked->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+    parked->complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
 }
 
-void InMemorySocket::ShutdownWrite() noexcept
+void InMemorySocket::shutdownWrite() noexcept
 {
     // After `Close()` there is no write side left to shut, and each platform socket
     // checks `_closed` and returns; this one did the half-close a second time.
     if (_closed)
         return;
     if (_outbound)
-        _outbound->CloseWrite();
+        _outbound->closeWrite();
 }
 
-IoAwaitable InMemorySocket::WaitReadable()
+IoAwaitable InMemorySocket::waitReadable()
 {
     if (_closed)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
     // A reset is an error on every real reactor (#899), and not a readable byte.
-    if (_inbound && _inbound->IsReset())
-        return IoAwaitable { std::unexpected(ResetError(_inbound->ResetCode())) };
+    if (_inbound && _inbound->isReset())
+        return IoAwaitable { std::unexpected(ResetError(_inbound->resetCode())) };
 
     // EOF is drained AND write-closed, which is the same pair `Read` uses to decide it
     // has reached the end -- taken from the inbound pipe, since that is the direction
     // this socket reads from.
-    if (_inbound && _inbound->Buffered() == 0 && _inbound->IsWriteClosed())
+    if (_inbound && _inbound->buffered() == 0 && _inbound->isWriteClosed())
         return IoAwaitable { IoResult { std::size_t { 0 } } };
 
     // Anything else reports data, which is the default's answer and the fail-safe one:
@@ -196,25 +196,25 @@ IoAwaitable InMemorySocket::WaitReadable()
     return IoAwaitable { IoResult { std::size_t { 1 } } };
 }
 
-IoAwaitable InMemorySocket::Read(std::span<std::byte> buffer)
+IoAwaitable InMemorySocket::read(std::span<std::byte> buffer)
 {
     Detail::RequireReadBuffer(buffer);
     if (_closed)
         return IoAwaitable { std::unexpected(
             NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = {} }) };
 
-    if (_inbound->IsReset())
-        return IoAwaitable { std::unexpected(ResetError(_inbound->ResetCode())) };
+    if (_inbound->isReset())
+        return IoAwaitable { std::unexpected(ResetError(_inbound->resetCode())) };
 
     // Synchronous fast path: bytes already buffered.
-    if (_inbound->Buffered() > 0)
+    if (_inbound->buffered() > 0)
     {
-        auto const got = _inbound->TryPull(buffer);
+        auto const got = _inbound->pull(buffer);
         return IoAwaitable { IoResult { got } };
     }
 
     // EOF: peer closed and nothing left.
-    if (_inbound->IsWriteClosed())
+    if (_inbound->isWriteClosed())
         return IoAwaitable { IoResult { 0 } };
 
     // Park: install a callback so a future Push wakes us up. The awaitable
@@ -233,13 +233,13 @@ std::optional<IoResult> InMemorySocket::AnswerIfCannotWrite(std::size_t length) 
     // This end's own half-close is `EPIPE` on POSIX and `WSAESHUTDOWN` on Windows, both
     // `SystemError`. The pipe used to answer it as backpressure -- `WouldBlock`, the one
     // failure a caller is entitled to retry.
-    if (_outbound->IsWriteClosed())
+    if (_outbound->isWriteClosed())
         return std::unexpected(NetError { .code = NetErrorCode::SystemError,
                                           .systemCode = 0,
                                           .context = "InMemorySocket: a write after this end's ShutdownWrite" });
-    if (_outbound->IsReset())
-        return std::unexpected(ResetError(_outbound->ResetCode()));
-    if (!_outbound->IsReadClosed() || length == 0)
+    if (_outbound->isReset())
+        return std::unexpected(ResetError(_outbound->resetCode()));
+    if (!_outbound->isReadClosed() || length == 0)
         return std::nullopt;
 
     // The first write after a graceful close: the bytes reach a peer that has gone, and
@@ -251,7 +251,7 @@ std::optional<IoResult> InMemorySocket::AnswerIfCannotWrite(std::size_t length) 
     return IoResult { length };
 }
 
-IoAwaitable InMemorySocket::Write(std::span<std::byte const> buffer)
+IoAwaitable InMemorySocket::write(std::span<std::byte const> buffer)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(
@@ -266,7 +266,7 @@ IoAwaitable InMemorySocket::Write(std::span<std::byte const> buffer)
     return IoAwaitable { IoResult { accepted } };
 }
 
-IoAwaitable InMemorySocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+IoAwaitable InMemorySocket::writeVectored(std::span<std::span<std::byte const> const> segments,
                                           std::shared_ptr<void const> /*keepAlive*/)
 {
     if (_closed)
@@ -314,22 +314,22 @@ void InMemorySocket::OnInboundProgress(void* state) noexcept
     self->_pendingRead = nullptr;
     self->_pendingReadBuffer = {};
 
-    if (self->_inbound->IsReset())
+    if (self->_inbound->isReset())
     {
-        awaitable->Complete(std::unexpected(ResetError(self->_inbound->ResetCode())));
+        awaitable->complete(std::unexpected(ResetError(self->_inbound->resetCode())));
         return;
     }
 
-    if (self->_inbound->Buffered() > 0)
+    if (self->_inbound->buffered() > 0)
     {
-        auto const got = self->_inbound->TryPull(buffer);
-        awaitable->Complete(IoResult { got });
+        auto const got = self->_inbound->pull(buffer);
+        awaitable->complete(IoResult { got });
         return;
     }
 
-    if (self->_inbound->IsWriteClosed())
+    if (self->_inbound->isWriteClosed())
     {
-        awaitable->Complete(IoResult { 0 });
+        awaitable->complete(IoResult { 0 });
         return;
     }
 }
@@ -398,7 +398,7 @@ void InMemoryListener::Close() noexcept
     }
 }
 
-std::unique_ptr<InMemorySocket> InMemoryListener::ConnectClient(std::size_t maxBytesInFlight, std::string peerAddress)
+std::unique_ptr<InMemorySocket> InMemoryListener::connectClient(std::size_t maxBytesInFlight, std::string peerAddress)
 {
     auto pair = InMemorySocketPair::Create(maxBytesInFlight, std::move(peerAddress));
     _ready.push_back(Pending { .socket = std::move(pair.server) });

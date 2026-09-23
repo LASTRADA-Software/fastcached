@@ -126,11 +126,11 @@ class ScriptedPeer final: public ISocket
         _offset += 1;
         _pending = {};
         auto* const parked = std::exchange(_parked, nullptr);
-        parked->Complete(IoResult { 1 });
+        parked->complete(IoResult { 1 });
         return true;
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
     {
         _log->reads += 1;
 
@@ -143,7 +143,7 @@ class ScriptedPeer final: public ISocket
         // with that task still parked, and ASan reports the frame as leaked. The
         // clock has to move from something the exchange itself drives.
         if (_advanceOnRead > std::chrono::milliseconds::zero() && _log->reads == 1)
-            _clock->Advance(_advanceOnRead);
+            _clock->advance(_advanceOnRead);
 
         // A connection that DIED, as distinct from one this side closed. It is what
         // a keepalive probe that goes unanswered produces at the socket layer, and
@@ -193,13 +193,13 @@ class ScriptedPeer final: public ISocket
         return IoAwaitable { IoResult { n } };
     }
 
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override
     {
         _log->sent += buffer.size();
         return IoAwaitable { IoResult { buffer.size() } };
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
         std::size_t total = 0;
@@ -209,14 +209,14 @@ class ScriptedPeer final: public ISocket
         return IoAwaitable { IoResult { total } };
     }
 
-    void Close() noexcept override
+    void close() noexcept override
     {
         _closed = true;
         _log->closed = true;
         // Completing the parked read is what `Close` MEANS on a reactor socket, and
         // it is the whole mechanism the exchange budget relies on.
         if (auto* const parked = std::exchange(_parked, nullptr); parked != nullptr)
-            parked->Complete(
+            parked->complete(
                 std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = "socket closed" }));
     }
 
@@ -250,7 +250,7 @@ namespace
 class ScriptedConnector final: public IConnector
 {
   public:
-    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions /*options*/) override
+    [[nodiscard]] Task<SocketResult> connect(std::string host, std::uint16_t port, DialOptions /*options*/) override
     {
         _dials += 1;
         _lastHost = std::move(host);
@@ -422,12 +422,12 @@ TEST_CASE("A peer that accepts and then goes quiet is bounded by the total budge
     // failing on macOS, which is what a hidden dependency on step counting looks like.
     auto advance = [](TestReactor* loop, ManualClock* c, std::chrono::milliseconds past) -> DetachedTask {
         co_await ResumeOn { *loop };
-        c->Advance(past);
+        c->advance(past);
         co_return;
     };
 
     constexpr Cc::ExchangeBudget Budget {};
-    auto const start = clock.Now();
+    auto const start = clock.now();
     advance(&reactor, &clock, Budget.total * 4);
 
     auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, Budget);
@@ -439,11 +439,11 @@ TEST_CASE("A peer that accepts and then goes quiet is bounded by the total budge
     auto const& log = connector.Log();
     INFO("dials=" << connector.Dials() << " sent=" << log.sent << " reads=" << log.reads << " closed=" << log.closed
                   << " destroyed=" << log.destroyed << " advanced="
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count() << "ms"
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(clock.now() - start).count() << "ms"
                   << " pendingSubmissions=" << reactor.PendingSubmissions() << " pendingTimers=" << reactor.PendingTimers());
     CHECK(connector.Dials() == 1);
     // The reactor ran at all: the advance task is the first thing in its queue.
-    CHECK(clock.Now() > start);
+    CHECK(clock.now() > start);
     // The exchange got past the dial and wrote its request...
     CHECK(log.sent > 0);
     // ...and then parked on a read nobody was ever going to answer.
@@ -489,14 +489,14 @@ TEST_CASE("A peer that dribbles a byte at a time is bounded by the total budget"
         for ([[maybe_unused]] auto const turn: std::views::iota(0, turns))
         {
             co_await ResumeOn { *loop };
-            c->Advance(perByte);
+            c->advance(perByte);
             if (log->live == nullptr || !log->live->DeliverOneByte())
                 co_return;
         }
     };
 
     Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
-    auto const start = clock.Now();
+    auto const start = clock.now();
     dribble(&reactor, &clock, &connector.Log(), PerByte, Turns);
 
     auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, Budget);
@@ -509,7 +509,7 @@ TEST_CASE("A peer that dribbles a byte at a time is bounded by the total budget"
 
     auto const& log = connector.Log();
     INFO("reads=" << log.reads << " closed=" << log.closed << " destroyed=" << log.destroyed << " elapsed="
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count() << "ms");
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(clock.now() - start).count() << "ms");
     CHECK(outcome.kind == Cc::CacheOutcomeKind::Transport);
     // It really was making progress, over and over: this is not the quiet peer
     // wearing a different name.
@@ -517,8 +517,8 @@ TEST_CASE("A peer that dribbles a byte at a time is bounded by the total budget"
     // And it was abandoned at the budget rather than when the reply ran out.
     CHECK(log.closed);
     CHECK(log.destroyed);
-    CHECK(clock.Now() - start >= Budget.total);
-    CHECK(clock.Now() - start < PerByte * Turns);
+    CHECK(clock.now() - start >= Budget.total);
+    CHECK(clock.now() - start < PerByte * Turns);
 }
 
 TEST_CASE("A worker that goes quiet is abandoned at the idle bound, not at the total")
@@ -548,19 +548,19 @@ TEST_CASE("A worker that goes quiet is abandoned at the idle bound, not at the t
     // case has no business knowing.
     auto advance = [](TestReactor* loop, ManualClock* c, std::chrono::milliseconds past) -> DetachedTask {
         co_await ResumeOn { *loop };
-        c->Advance(past);
+        c->advance(past);
         co_return;
     };
 
     Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
-    auto const start = clock.Now();
+    auto const start = clock.now();
     advance(&reactor, &clock, Budget.idle * 4);
 
     auto const outcome = exchange.Run("127.0.0.1:6676", Wire::EncodeFetch("k"), {}, Budget);
 
     auto const& log = connector.Log();
     INFO("sent=" << log.sent << " reads=" << log.reads << " closed=" << log.closed << " destroyed=" << log.destroyed
-                 << " elapsed=" << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count()
+                 << " elapsed=" << std::chrono::duration_cast<std::chrono::milliseconds>(clock.now() - start).count()
                  << "ms");
     CHECK(outcome.kind == Cc::CacheOutcomeKind::Transport);
 
@@ -578,7 +578,7 @@ TEST_CASE("A worker that goes quiet is abandoned at the idle bound, not at the t
 
     // And it happened well inside the total, which is the improvement stated as a
     // measurement rather than as a claim.
-    CHECK(clock.Now() - start < Budget.total);
+    CHECK(clock.now() - start < Budget.total);
 }
 
 TEST_CASE("A pulse pushes the idle bound out, so a worker that keeps reporting is not abandoned")
@@ -626,14 +626,14 @@ TEST_CASE("A pulse pushes the idle bound out, so a worker that keeps reporting i
         for ([[maybe_unused]] auto const turn: std::views::iota(0, turns))
         {
             co_await ResumeOn { *loop };
-            c->Advance(perByte);
+            c->advance(perByte);
             if (log->live == nullptr || !log->live->DeliverOneByte())
                 co_return;
         }
     };
 
     Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
-    auto const start = clock.Now();
+    auto const start = clock.now();
     dribble(&reactor, &clock, &connector.Log(), PerByte, Turns);
 
     auto const outcome = exchange.Run("127.0.0.1:6676", Wire::EncodeFetch("k"), {}, Budget);
@@ -644,7 +644,7 @@ TEST_CASE("A pulse pushes the idle bound out, so a worker that keeps reporting i
 
     auto const& log = connector.Log();
     INFO("reads=" << log.reads << " closed=" << log.closed << " failure=" << static_cast<int>(outcome.transportFailure)
-                  << " elapsed=" << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count()
+                  << " elapsed=" << std::chrono::duration_cast<std::chrono::milliseconds>(clock.now() - start).count()
                   << "ms");
 
     // The answer arrived, which it cannot have if the idle deadline fired at 8s.
@@ -660,7 +660,7 @@ TEST_CASE("A pulse pushes the idle bound out, so a worker that keeps reporting i
 
     // And it really did outlive the bound rather than arriving early: without this the
     // case would also pass against a peer that answered in one byte.
-    CHECK(clock.Now() - start > Budget.idle);
+    CHECK(clock.now() - start > Budget.idle);
 }
 
 TEST_CASE("A budget of zero arms no deadline at all")
@@ -690,14 +690,14 @@ TEST_CASE("A budget of zero arms no deadline at all")
         for ([[maybe_unused]] auto const turn: std::views::iota(0, turns))
         {
             co_await ResumeOn { *loop };
-            c->Advance(1s);
+            c->advance(1s);
             if (log->live == nullptr || !log->live->DeliverOneByte())
                 co_return;
         }
     };
 
     Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
-    auto const start = clock.Now();
+    auto const start = clock.now();
     dribble(&reactor, &clock, &connector.Log(), Turns);
 
     auto const outcome = exchange.Run("127.0.0.1:6674", Wire::EncodeFetch("k"), {}, Cc::ExchangeBudget { .total = 0ms });
@@ -708,10 +708,10 @@ TEST_CASE("A budget of zero arms no deadline at all")
 
     auto const& log = connector.Log();
     INFO("reads=" << log.reads << " advanced="
-                  << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count() << "ms");
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(clock.now() - start).count() << "ms");
     // The reactor really did turn, and the clock really did move past where a
     // `Now() + 0` deadline would have sat -- which is the whole discriminator.
-    CHECK(clock.Now() > start);
+    CHECK(clock.now() > start);
     CHECK(log.reads > 1);
     // The daemon's own answer, not the transport failure a fired deadline produces.
     CHECK(outcome.kind == Cc::CacheOutcomeKind::Miss);

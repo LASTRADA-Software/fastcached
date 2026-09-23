@@ -24,19 +24,19 @@ ThreadPoolExecutor::ThreadPoolExecutor(std::size_t threads)
         // construction failing would HANG rather than propagate. No destructor runs
         // for an object whose constructor threw, so releasing them is this
         // handler's job.
-        Stop();
+        stop();
         throw;
     }
 }
 
 ThreadPoolExecutor::~ThreadPoolExecutor()
 {
-    Stop();
+    stop();
     // `_threads` are `jthread`s and join here, which is what makes the drain below
     // observable: by the time this returns, nothing is left holding a handle.
 }
 
-void ThreadPoolExecutor::Stop() noexcept
+void ThreadPoolExecutor::stop() noexcept
 {
     {
         auto const guard = std::scoped_lock { _mutex };
@@ -45,12 +45,12 @@ void ThreadPoolExecutor::Stop() noexcept
     _wake.notify_all();
 }
 
-void ThreadPoolExecutor::Submit(ParkedWork work)
+void ThreadPoolExecutor::submit(ParkedWork work)
 {
-    Submit(work.resume);
+    submit(work.resume);
 }
 
-void ThreadPoolExecutor::Submit(std::coroutine_handle<> handle)
+void ThreadPoolExecutor::submit(std::coroutine_handle<> handle)
 {
     {
         auto const guard = std::scoped_lock { _mutex };

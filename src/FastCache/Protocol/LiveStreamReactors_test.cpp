@@ -171,7 +171,7 @@ class RecordingSink final: public IPushSink
     [[nodiscard]] Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds /*hold*/) override
     {
         // The surface is the one writer, so every push reaches it on its connection's reactor.
-        if (!_reactor.IsOnWorkerThread())
+        if (!_reactor.isOnWorkerThread())
             _offReactor.fetch_add(1, std::memory_order_acq_rel);
         auto const snapshot = IsSnapshot(frame);
         {
@@ -179,7 +179,7 @@ class RecordingSink final: public IPushSink
             _frames.push_back(std::move(frame));
         }
         if (snapshot && _park > 0ms)
-            co_await SleepUntil { .reactor = &_reactor, .deadline = _reactor.Clock().Now() + _park };
+            co_await SleepUntil { .reactor = &_reactor, .deadline = _reactor.clock().now() + _park };
         co_return PushOutcome::Delivered;
     }
 
@@ -250,9 +250,9 @@ DetachedTask Beat(IReactor* reactor, Heartbeat* heartbeat, std::atomic<bool> con
     heartbeat->thread.store(std::this_thread::get_id(), std::memory_order_release);
     while (!stopping->load(std::memory_order_acquire))
     {
-        auto const deadline = reactor->Clock().Now() + HeartbeatStep;
+        auto const deadline = reactor->clock().now() + HeartbeatStep;
         co_await SleepUntil { .reactor = reactor, .deadline = deadline };
-        auto const late = std::chrono::duration_cast<std::chrono::microseconds>(reactor->Clock().Now() - deadline).count();
+        auto const late = std::chrono::duration_cast<std::chrono::microseconds>(reactor->clock().now() - deadline).count();
         auto worst = heartbeat->worstMicros.load(std::memory_order_acquire);
         while (late > worst && !heartbeat->worstMicros.compare_exchange_weak(worst, late))
         {
@@ -287,7 +287,7 @@ struct ReactorThread
 {
     SteadyClock clock;
     PlatformReactor reactor { clock };
-    std::thread worker { [this] { reactor.Run(); } };
+    std::thread worker { [this] { reactor.run(); } };
 
     ReactorThread() = default;
     ReactorThread(ReactorThread const&) = delete;
@@ -299,7 +299,7 @@ struct ReactorThread
     {
         // Joined before `reactor` goes, which member order alone would not give: this body runs
         // first. Anything still parked on it is freed with it, and owns what that touches.
-        reactor.Stop();
+        reactor.stop();
         worker.join();
     }
 };

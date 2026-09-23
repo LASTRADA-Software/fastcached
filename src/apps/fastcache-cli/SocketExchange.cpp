@@ -26,7 +26,7 @@ namespace
     /// @return Bytes read, `0` for EOF, or the failure.
     [[nodiscard]] Task<IoResult> ReadSome(ISocket* socket, std::span<std::byte> buffer)
     {
-        co_return co_await socket->Read(buffer);
+        co_return co_await socket->read(buffer);
     }
 
     /// Convert bytes to a string without reinterpreting them as text.
@@ -131,7 +131,7 @@ SocketExchange::~SocketExchange()
     // waiting for it would make closing able to block.
     auto const quit = std::vector<std::string> { "QUIT" };
     (void) SyncRun(SendAll(_socket.get(), EncodeCommand(quit)));
-    _socket->Close();
+    _socket->close();
 }
 
 std::expected<std::unique_ptr<SocketExchange>, ExchangeError> SocketExchange::Open(Endpoint const& endpoint,
@@ -223,7 +223,7 @@ MemcachedExchange::~MemcachedExchange()
     // not read, for the reason `~SocketExchange` gives: there is nothing to do with
     // one, and waiting would make closing able to block.
     (void) SyncRun(SendAll(_socket.get(), AsBytes(EncodeMemcachedCommand("quit", {}))));
-    _socket->Close();
+    _socket->close();
 }
 
 std::expected<std::unique_ptr<MemcachedExchange>, ExchangeError> MemcachedExchange::Open(Endpoint const& endpoint,
@@ -272,7 +272,7 @@ NodeExchange::NodeExchange(std::unique_ptr<ISocket> socket, std::string endpoint
 NodeExchange::~NodeExchange()
 {
     if (_socket != nullptr)
-        _socket->Close();
+        _socket->close();
 }
 
 std::expected<std::unique_ptr<NodeExchange>, ExchangeError> NodeExchange::Open(Endpoint const& endpoint,
@@ -330,12 +330,12 @@ std::expected<void, ExchangeError> NodeExchange::Post(std::span<std::byte const>
 
 void NodeExchange::SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept
 {
-    _socket->SetReceiveDeadline(deadline);
+    _socket->setReceiveDeadline(deadline);
 }
 
 void NodeExchange::ShutdownWrite() noexcept
 {
-    _socket->ShutdownWrite();
+    _socket->shutdownWrite();
 }
 
 std::expected<NodeReply, ExchangeError> NodeExchange::Send(std::span<std::byte const> request)

@@ -64,7 +64,7 @@ namespace
     [[nodiscard]] Task<bool> WriteAll(EndpointWriter writer, ISocket* socket, std::span<std::byte const> bytes)
     {
         (void) writer;
-        auto const written = co_await socket->Write(bytes);
+        auto const written = co_await socket->write(bytes);
         co_return written.has_value() && *written == bytes.size();
     }
 
@@ -544,7 +544,7 @@ struct FrameServer::State
             if (auto const& row = SweepPhaseTable[static_cast<std::size_t>(entry.phase)]; row.counter.has_value())
                 metrics.Increment(*row.counter);
             if (!entry.explainBy.has_value())
-                entry.socket->Close();
+                entry.socket->close();
         }
         return tally;
     }
@@ -598,7 +598,7 @@ struct FrameServer::State
                 }
         }
         for (auto* socket: expired)
-            socket->Close();
+            socket->close();
         return expired.size();
     }
 
@@ -617,7 +617,7 @@ struct FrameServer::State
             }
         }
         for (auto* socket: sockets)
-            socket->Close();
+            socket->close();
     }
 
     [[nodiscard]] std::size_t OpenCount() const
@@ -1197,7 +1197,7 @@ namespace
         // total is unchanged, so the misfiling is silent. The clean two-way split is
         // therefore a CONSEQUENCE of #1090 rather than a property of this function,
         // which is the opposite of what #1092 warned about and the same fact.
-        auto const readable = co_await socket->WaitReadable();
+        auto const readable = co_await socket->waitReadable();
         if (!readable.has_value())
         {
             // An ERROR is an abortive close -- the peer reset, or the socket was closed
@@ -1278,10 +1278,10 @@ namespace
         if (watch == nullptr)
             co_return; // Not watching: nothing is parked, so nothing has to be waited out.
 
-        auto const until = reactor->Clock().Now() + FrameServer::RefusalTimeout;
-        while (!watch->finished && reactor->Clock().Now() < until)
+        auto const until = reactor->clock().now() + FrameServer::RefusalTimeout;
+        while (!watch->finished && reactor->clock().now() < until)
             co_await SleepUntil { .reactor = reactor,
-                                  .deadline = NextWakeStep(reactor->Clock().Now(), until, FrameServer::GracefulCloseStep) };
+                                  .deadline = NextWakeStep(reactor->clock().now(), until, FrameServer::GracefulCloseStep) };
         co_return;
     }
 
@@ -1556,11 +1556,11 @@ namespace
     {
         while (!pulse->stopped)
         {
-            auto const until = reactor->Clock().Now() + interval;
-            while (!pulse->stopped && reactor->Clock().Now() < until)
+            auto const until = reactor->clock().now() + interval;
+            while (!pulse->stopped && reactor->clock().now() < until)
                 co_await SleepUntil { .reactor = reactor,
                                       .deadline =
-                                          NextWakeStep(reactor->Clock().Now(), until, FrameServer::GracefulCloseStep) };
+                                          NextWakeStep(reactor->clock().now(), until, FrameServer::GracefulCloseStep) };
 
             // Re-read AFTER the sleep and before the write, so a pulse that was told to
             // stop during its own interval never puts a frame in front of the reply it
@@ -1644,10 +1644,10 @@ namespace
             co_return true; // Not pulsing: nothing was ever armed, so nothing is held.
 
         pulse->stopped = true;
-        auto const until = reactor->Clock().Now() + FrameServer::RefusalTimeout;
-        while (!pulse->finished && reactor->Clock().Now() < until)
+        auto const until = reactor->clock().now() + FrameServer::RefusalTimeout;
+        while (!pulse->finished && reactor->clock().now() < until)
             co_await SleepUntil { .reactor = reactor,
-                                  .deadline = NextWakeStep(reactor->Clock().Now(), until, FrameServer::GracefulCloseStep) };
+                                  .deadline = NextWakeStep(reactor->clock().now(), until, FrameServer::GracefulCloseStep) };
         co_return pulse->finished;
     }
 
@@ -1939,10 +1939,10 @@ namespace
         [[nodiscard]] Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds hold) override
         {
             auto* const state = _state.get();
-            state->Rearm(_socket.get(), state->io.Reactor().Clock().Now() + hold, SweepPhase::Streaming, hold);
+            state->Rearm(_socket.get(), state->io.Reactor().clock().now() + hold, SweepPhase::Streaming, hold);
             if (co_await WriteAll(EndpointWriter::Stream, _socket.get(), frame))
             {
-                state->Rearm(_socket.get(), state->io.Reactor().Clock().Now() + hold, SweepPhase::Streaming, hold);
+                state->Rearm(_socket.get(), state->io.Reactor().clock().now() + hold, SweepPhase::Streaming, hold);
                 _tally.pushes += 1;
                 _tally.bytes += frame.size();
                 co_return PushOutcome::Delivered;
@@ -2047,7 +2047,7 @@ namespace
         // One small frame, so the header window rather than a push's hold: a peer that stopped
         // reading has already had a whole hold.
         state->Rearm(socket.get(),
-                     state->io.Reactor().Clock().Now() + FrameServer::HeaderTimeout,
+                     state->io.Reactor().clock().now() + FrameServer::HeaderTimeout,
                      SweepPhase::Streaming,
                      FrameServer::HeaderTimeout);
         if (!co_await WriteAll(EndpointWriter::Stream, socket.get(), terminal))
@@ -2114,7 +2114,7 @@ namespace
         // says how long ITS answer may take, because a cache exchange is a round trip
         // and a dispatched compile is however long a compiler runs (#223, #290).
         auto const deadlineFor = [state](std::chrono::milliseconds window) {
-            return state->io.Reactor().Clock().Now() + window;
+            return state->io.Reactor().clock().now() + window;
         };
         state->Track(
             socket.get(), deadlineFor(FrameServer::HeaderTimeout), SweepPhase::AwaitingRequest, FrameServer::HeaderTimeout);
@@ -2126,7 +2126,7 @@ namespace
             // The peer's HOST. A connection's source port is ephemeral and is not the
             // peer's endpoint, so for a surface whose policy needs an identity -- the
             // scheduler's -- this is all the kernel can supply.
-            auto const peer = socket->PeerAddress();
+            auto const peer = socket->peerAddress();
 
             // Who this connection IS, as an admission policy sees it: the address above, plus
             // whatever it goes on to PROVE. Per CONNECTION, exactly as `credentialAccepted`
@@ -2472,8 +2472,8 @@ namespace
         // Deregistered before the socket is destroyed, or the sweeper would hold a
         // pointer into a freed object.
         state->Untrack(socket.get());
-        NoteSealFault(*state, sealing, socket->PeerAddress());
-        socket->Close();
+        NoteSealFault(*state, sealing, socket->peerAddress());
+        socket->close();
         co_return;
     }
 
@@ -2502,7 +2502,7 @@ namespace
         // at capacity park a socket per attempt for five seconds each -- taking no
         // slot, and so counted by nothing. This is the one place where being polite
         // has to stay cheap.
-        auto const deadline = state->io.Reactor().Clock().Now() + FrameServer::RefusalTimeout;
+        auto const deadline = state->io.Reactor().clock().now() + FrameServer::RefusalTimeout;
         // `AwaitingRequest`, and it is the honest phase rather than the convenient
         // one: this peer was refused at accept, so it has named no verb and never
         // will. A sweep here means the refusal write did not drain, which belongs
@@ -2535,7 +2535,7 @@ namespace
             state->logger.Logf(LogLevel::Error, "{}: dropping a refusal that threw", state->what);
         }
         state->Untrack(socket.get());
-        socket->Close();
+        socket->close();
         co_return;
     }
 
@@ -2557,7 +2557,7 @@ namespace
             // and could not answer in time -- and a line carrying only their sum
             // cannot be read for either. The counters carry the same split for anyone
             // scraping rather than reading logs.
-            auto const now = state->io.Reactor().Clock().Now();
+            auto const now = state->io.Reactor().clock().now();
             if (auto const swept = state->CloseOverdue(now); swept.Total() != 0)
                 state->logger.Logf(LogLevel::Debug,
                                    "{}: swept {} connection(s): {} before a verb was named, {} with an answer owed, "

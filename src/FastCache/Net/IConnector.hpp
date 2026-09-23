@@ -154,7 +154,7 @@ class IConnector
     /// @param port TCP port in host byte order.
     /// @param options The budget, and whether the connection carries keepalive.
     /// @return The connected socket, or why the attempt did not succeed.
-    [[nodiscard]] virtual Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions options) = 0;
+    [[nodiscard]] virtual Task<SocketResult> connect(std::string host, std::uint16_t port, DialOptions options) = 0;
 };
 
 } // namespace FastCache

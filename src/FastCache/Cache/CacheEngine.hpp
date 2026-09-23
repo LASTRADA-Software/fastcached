@@ -603,7 +603,7 @@ class CacheEngine
     /// @return The clock this engine translates absolute timestamps against.
     [[nodiscard]] IWallClock const& WallClock() const noexcept
     {
-        return _wallClock.Get();
+        return _wallClock.get();
     }
 
     /// Where this layer's counters go, or null when nothing is counting.

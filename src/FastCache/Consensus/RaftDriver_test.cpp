@@ -491,21 +491,21 @@ TEST_CASE("Run ticks the node on the reactor's timer", "[consensus][raft][driver
     TestReactor reactor { clock };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.now())).value(), storage, transport, machine);
     auto& driver = *owned;
 
     // Started the way SleepUntil_test starts a root task: hand the handle to the
     // reactor rather than awaiting it, since there is no coroutine here to await
     // from.
     auto loop = driver.Run(&reactor);
-    reactor.Submit(loop.Native());
+    reactor.submit(loop.handle());
     (void) reactor.Drain();
 
     // Parked on the election deadline, having done nothing yet.
     CHECK(reactor.PendingTimers() == 1);
     CHECK(driver.Node().CurrentRole() == Role::Follower);
 
-    clock.Advance(150ms);
+    clock.advance(150ms);
     (void) reactor.Drain();
 
     // A pre-candidate, not a candidate: the loop drove the timeout, and nothing
@@ -514,7 +514,7 @@ TEST_CASE("Run ticks the node on the reactor's timer", "[consensus][raft][driver
     CHECK_FALSE(transport.Sent().empty());
 
     driver.Stop();
-    clock.Advance(400ms);
+    clock.advance(400ms);
     (void) reactor.Drain();
 }
 
@@ -542,16 +542,16 @@ TEST_CASE("A node elected between ticks still heartbeats on time", "[consensus][
     TestReactor reactor { clock };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.now())).value(), storage, transport, machine);
     auto& driver = *owned;
 
     auto loop = driver.Run(&reactor);
-    reactor.Submit(loop.Native());
+    reactor.submit(loop.handle());
     (void) reactor.Drain();
 
-    clock.Advance(150ms);
+    clock.advance(150ms);
     (void) reactor.Drain();
-    REQUIRE(CarryPreVote(driver, clock.Now()));
+    REQUIRE(CarryPreVote(driver, clock.now()));
     REQUIRE(driver.Node().CurrentRole() == Role::Candidate);
 
     // The vote that carries the election, delivered while the loop is parked --
@@ -559,7 +559,7 @@ TEST_CASE("A node elected between ticks still heartbeats on time", "[consensus][
     REQUIRE(
         driver
             .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
-                     clock.Now())
+                     clock.now())
             .has_value());
     REQUIRE(driver.Node().CurrentRole() == Role::Leader);
 
@@ -567,12 +567,12 @@ TEST_CASE("A node elected between ticks still heartbeats on time", "[consensus][
     // new leader sends immediately. What is asserted is the SECOND one.
     auto const afterElection = transport.Sent().size();
 
-    clock.Advance(50ms);
+    clock.advance(50ms);
     (void) reactor.Drain();
     CHECK(transport.Sent().size() > afterElection);
 
     driver.Stop();
-    clock.Advance(400ms);
+    clock.advance(400ms);
     (void) reactor.Drain();
 }
 
@@ -588,15 +588,15 @@ TEST_CASE("Stop ends the run loop", "[consensus][raft][driver]")
     TestReactor reactor { clock };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.now())).value(), storage, transport, machine);
     auto& driver = *owned;
 
     auto loop = driver.Run(&reactor);
-    reactor.Submit(loop.Native());
+    reactor.submit(loop.handle());
     (void) reactor.Drain();
     driver.Stop();
 
-    clock.Advance(400ms);
+    clock.advance(400ms);
     (void) reactor.Drain();
 
     // Nothing is left parked, so the loop actually finished rather than

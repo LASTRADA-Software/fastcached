@@ -106,7 +106,7 @@ class TimedSubscription final: public ILiveSubscription
 
     [[nodiscard]] std::expected<NodeReply, ExchangeError> Read() override
     {
-        _clock.Advance(_during);
+        _clock.advance(_during);
         return NodeReply { .status = CompileCacheWire::Status::Ok };
     }
 
@@ -133,16 +133,16 @@ class SlowQueue final: public IExecutor
     {
     }
 
-    void Submit(std::coroutine_handle<> handle) override
+    void submit(std::coroutine_handle<> handle) override
     {
-        _clock.Advance(_delay);
-        _inner.Submit(handle);
+        _clock.advance(_delay);
+        _inner.submit(handle);
     }
 
-    void Submit(ParkedWork work) override
+    void submit(ParkedWork work) override
     {
-        _clock.Advance(_delay);
-        _inner.Submit(work);
+        _clock.advance(_delay);
+        _inner.submit(work);
     }
 
   private:
@@ -184,7 +184,7 @@ TEST_CASE("a stream frame is read off the reactor and delivered back onto it", "
     auto result = std::optional<FrameOutcome> {};
     auto task = TakeOnce(&subscription, &clock, &pool, &reactor, &result);
 
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     reactor.Drain();
 
     // The read is now parked on the pool, blocking. The reactor has run out of work,
@@ -254,7 +254,7 @@ TEST_CASE("the sampler's thread identities are not equal by construction", "[cli
     auto marker = std::optional<Task<void>> {};
     auto pool = ThreadPoolExecutor { 1 };
 
-    pool.Submit(marker.emplace(MarkThread(&pool, &poolThread, &ran)).Native());
+    pool.submit(marker.emplace(MarkThread(&pool, &poolThread, &ran)).handle());
 
     REQUIRE(WaitUntil(
         "the marker to run on the pool thread",
@@ -279,7 +279,7 @@ TEST_CASE("a frame is stamped after its read returns and before the hop back", "
     constexpr auto InQueue = Duration { std::chrono::seconds { 7 } };
 
     auto clock = ManualClock {};
-    auto const start = clock.Now();
+    auto const start = clock.now();
     auto reactor = TestReactor { clock };
     auto pool = ThreadPoolExecutor { 1 };
     auto subscription = TimedSubscription { clock, InsideRead };
@@ -287,19 +287,19 @@ TEST_CASE("a frame is stamped after its read returns and before the hop back", "
 
     auto result = std::optional<FrameOutcome> {};
     auto task = TakeOnce(&subscription, &clock, &pool, &queue, &result);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     REQUIRE(DrainUntil(
         reactor,
         "the stamped frame to come back through the slow queue",
         [&result] { return result.has_value(); },
         [&clock, start] {
             return std::format("{} ms of manual time passed",
-                               std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count());
+                               std::chrono::duration_cast<std::chrono::milliseconds>(clock.now() - start).count());
         }));
 
     REQUIRE(result.has_value());
     CHECK(Unwrap(result).takenAt == start + InsideRead);
     // And the queue delay really happened, or the case above would pass on a line that
     // cannot tell "after the hop" from "before it".
-    CHECK(clock.Now() == start + InsideRead + InQueue);
+    CHECK(clock.now() == start + InsideRead + InQueue);
 }

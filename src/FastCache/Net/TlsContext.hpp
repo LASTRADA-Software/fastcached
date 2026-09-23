@@ -81,7 +81,7 @@ class TlsContext
     ~TlsContext();
 
     /// @return The underlying SSL_CTX (never null for a live context).
-    [[nodiscard]] ssl_ctx_st* Native() const noexcept
+    [[nodiscard]] ssl_ctx_st* handle() const noexcept
     {
         return _ctx;
     }

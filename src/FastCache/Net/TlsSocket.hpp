@@ -64,9 +64,9 @@ class TlsSocket final: public ISocket
     TlsSocket& operator=(TlsSocket&&) = delete;
     ~TlsSocket() override;
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override;
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override;
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override;
 
     /// @copydoc ISocket::WaitReadable
@@ -98,9 +98,9 @@ class TlsSocket final: public ISocket
     ///
     /// It occupies the single in-flight operation slot (see the class note above)
     /// for as long as it is parked, because it parks on a raw `Read`.
-    [[nodiscard]] IoAwaitable WaitReadable() override;
-    [[nodiscard]] Task<std::expected<void, NetError>> HandshakeIfNeeded() override;
-    void Close() noexcept override;
+    [[nodiscard]] IoAwaitable waitReadable() override;
+    [[nodiscard]] Task<std::expected<void, NetError>> handshakeIfNeeded() override;
+    void close() noexcept override;
 
     /// @copydoc ISocket::CancelRead
     ///
@@ -125,7 +125,7 @@ class TlsSocket final: public ISocket
     /// layer. There is no write-slot equivalent of `Detail::ClaimReadSlot` anywhere in
     /// this library, so nothing here can take that operation back:
     /// [#893](https://github.com/LASTRADA-Software/fastcached/issues/893).
-    void CancelRead() noexcept override;
+    void cancelRead() noexcept override;
 
     /// @copydoc ISocket::ShutdownWrite
     ///
@@ -148,15 +148,15 @@ class TlsSocket final: public ISocket
     /// flush error to make the shapes match would hide genuine write failures on
     /// every other read, which is a worse trade than a caller on the one encrypted
     /// transport having to expect an error it can already get.
-    void ShutdownWrite() noexcept override;
+    void shutdownWrite() noexcept override;
 
     [[nodiscard]] bool IsClosed() const noexcept override;
     /// Forward the peer address of the wrapped transport so `--log-source`
     /// works identically for TLS and plaintext connections.
     /// @return The underlying socket's peer host, or "" when unknown.
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
-        return _raw ? _raw->PeerAddress() : std::string {};
+        return _raw ? _raw->peerAddress() : std::string {};
     }
 
     /// Forward a read deadline to the wrapped transport, which is the socket a read
@@ -166,10 +166,10 @@ class TlsSocket final: public ISocket
     /// surface's preconnect budget (#828) nor a lingering close's per-read share ever
     /// reached the raw socket, which kept whatever the listener gave it at accept.
     /// @param deadline How long a read may block; non-positive leaves it alone.
-    void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
+    void setReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
     {
         if (_raw)
-            _raw->SetReceiveDeadline(deadline);
+            _raw->setReceiveDeadline(deadline);
     }
 
   private:

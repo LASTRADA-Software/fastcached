@@ -21,7 +21,7 @@ FastCache::Task<std::string> ReadAllAvailable(FastCache::ISocket* socket, std::s
     while (out.size() < expected)
     {
         std::vector<std::byte> chunk(expected - out.size());
-        auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const result = co_await socket->read(std::span<std::byte> { chunk.data(), chunk.size() });
         REQUIRE(result.has_value());
         if (*result == 0)
             break;
@@ -35,7 +35,7 @@ FastCache::Task<std::string> ReadAllAvailable(FastCache::ISocket* socket, std::s
 FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view payload)
 {
     auto const bytes = FastCache::AsBytes(payload);
-    auto const result = co_await socket->Write(bytes);
+    auto const result = co_await socket->write(bytes);
     co_return result.has_value() && *result == payload.size();
 }
 
@@ -81,7 +81,7 @@ FastCache::Task<bool> WriteThreeSegments(FastCache::ISocket* socket,
         FastCache::AsBytes(b),
         FastCache::AsBytes(c),
     };
-    auto const result = co_await socket->WriteVectored(segments);
+    auto const result = co_await socket->writeVectored(segments);
     co_return result.has_value() && *result == a.size() + b.size() + c.size();
 }
 
@@ -126,7 +126,7 @@ TEST_CASE("InMemorySocketPair surfaces EOF when one side closes", "[net][inmemor
 {
     auto pair = FastCache::InMemorySocketPair::Create();
     REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "ab")));
-    pair.client->Close();
+    pair.client->close();
 
     // Drain the two bytes, then expect EOF on the next read.
     auto received = FastCache::SyncRun(ReadAllAvailable(pair.server.get(), 4));
@@ -135,7 +135,7 @@ TEST_CASE("InMemorySocketPair surfaces EOF when one side closes", "[net][inmemor
     std::byte tail[1] {};
     auto const result =
         FastCache::SyncRun([](FastCache::ISocket* socket, std::span<std::byte> buffer) -> FastCache::Task<bool> {
-            auto const r = co_await socket->Read(buffer);
+            auto const r = co_await socket->read(buffer);
             REQUIRE(r.has_value());
             co_return *r == 0;
         }(pair.server.get(), std::span<std::byte> { tail, 1 }));
@@ -153,22 +153,22 @@ TEST_CASE("A Read with no buffered bytes parks and completes on a later peer Wri
 
     std::vector<std::byte> chunk(5);
     auto reader = [](FastCache::ISocket* socket, std::span<std::byte> buffer) -> FastCache::Task<std::size_t> {
-        auto const r = co_await socket->Read(buffer);
+        auto const r = co_await socket->read(buffer);
         REQUIRE(r.has_value());
         co_return *r;
     }(pair.server.get(), std::span<std::byte> { chunk.data(), chunk.size() });
 
     // Drive the reader until it parks inside Read(). Nothing is buffered yet,
     // so it must suspend rather than complete.
-    auto handle = reader.Native();
+    auto handle = reader.handle();
     handle.resume();
-    REQUIRE_FALSE(reader.IsReady());
+    REQUIRE_FALSE(reader.done());
 
     // The peer writes: this pushes into the pipe and fires the inbound
     // progress callback, which must resume the parked reader to completion.
     REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "hello")));
 
-    REQUIRE(reader.IsReady());
+    REQUIRE(reader.done());
     auto const got = std::get<1>(handle.promise().result);
     REQUIRE(got == 5);
 
@@ -192,22 +192,22 @@ TEST_CASE("A parked Read wakes to the reset, not to EOF, when its peer closes wi
 
     std::array<std::byte, 8> buffer {};
     auto reader = [](FastCache::ISocket* socket, std::span<std::byte> into) -> FastCache::Task<FastCache::IoResult> {
-        co_return co_await socket->Read(into);
+        co_return co_await socket->read(into);
     }(pair.server.get(), std::span<std::byte> { buffer });
-    auto handle = reader.Native();
+    auto handle = reader.handle();
     handle.resume();
-    REQUIRE_FALSE(reader.IsReady());
+    REQUIRE_FALSE(reader.done());
 
-    pair.client->Close();
+    pair.client->close();
 
-    REQUIRE(reader.IsReady());
+    REQUIRE(reader.done());
     auto const got = std::get<1>(handle.promise().result);
     REQUIRE_FALSE(got.has_value());
     CHECK(got.error().code == FastCache::NetErrorCode::ConnReset);
 
     // And the reset is what every later look at the socket reports.
     auto const readable = FastCache::SyncRun([](FastCache::ISocket* socket) -> FastCache::Task<FastCache::IoResult> {
-        co_return co_await socket->WaitReadable();
+        co_return co_await socket->waitReadable();
     }(pair.server.get()));
     REQUIRE_FALSE(readable.has_value());
     CHECK(readable.error().code == FastCache::NetErrorCode::ConnReset);
@@ -222,15 +222,15 @@ TEST_CASE("A close over unread bytes resets the peer and destroys the reply it h
     // lingering close delivering it; this is the bare close it replaces.
     auto pair = FastCache::InMemorySocketPair::Create();
     REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "a request the server stopped reading")));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
     REQUIRE(FastCache::SyncRun(WriteString(pair.server.get(), "refused")));
 
-    pair.server->Close();
+    pair.server->close();
 
     std::array<std::byte, 16> buffer {};
     auto const got = FastCache::SyncRun(
         [](FastCache::ISocket* socket, std::span<std::byte> into) -> FastCache::Task<FastCache::IoResult> {
-            co_return co_await socket->Read(into);
+            co_return co_await socket->read(into);
         }(pair.client.get(), std::span<std::byte> { buffer }));
     REQUIRE_FALSE(got.has_value());
     CHECK(got.error().code == FastCache::NetErrorCode::ConnReset);
@@ -246,15 +246,15 @@ TEST_CASE("A parked Read wakes to EOF when its peer closes having read everythin
 
     std::array<std::byte, 8> buffer {};
     auto reader = [](FastCache::ISocket* socket, std::span<std::byte> into) -> FastCache::Task<FastCache::IoResult> {
-        co_return co_await socket->Read(into);
+        co_return co_await socket->read(into);
     }(pair.server.get(), std::span<std::byte> { buffer });
-    auto handle = reader.Native();
+    auto handle = reader.handle();
     handle.resume();
-    REQUIRE_FALSE(reader.IsReady());
+    REQUIRE_FALSE(reader.done());
 
-    pair.client->Close();
+    pair.client->close();
 
-    REQUIRE(reader.IsReady());
+    REQUIRE(reader.done());
     auto const got = std::get<1>(handle.promise().result);
     REQUIRE(got.has_value());
     CHECK(*got == 0);
@@ -269,7 +269,7 @@ TEST_CASE("InMemoryPipe respects the backpressure cap", "[net][inmemory]")
     // Pipe is now full (4 buffered, cap=4). Next write should partial-fail.
     auto const second = FastCache::SyncRun([](FastCache::ISocket* socket) -> FastCache::Task<bool> {
         std::string_view const five = "EXTRA";
-        auto const result = co_await socket->Write(FastCache::AsBytes(five));
+        auto const result = co_await socket->write(FastCache::AsBytes(five));
         co_return !result.has_value();
     }(pair.client.get()));
     REQUIRE(second);
@@ -315,7 +315,7 @@ TEST_CASE("InMemoryListener: a connection completes an eagerly parked Accept", "
     ObserveAccept(&listener, &observed);
     REQUIRE_FALSE(observed.resolved);
 
-    auto client = listener.ConnectClient();
+    auto client = listener.connectClient();
     REQUIRE(client != nullptr);
 
     CHECK(observed.resolved);
@@ -330,7 +330,7 @@ TEST_CASE("InMemoryListener: a queued connection is accepted without parking", "
     // `Accept` must answer without suspending.
     FastCache::InMemoryListener listener;
 
-    auto client = listener.ConnectClient();
+    auto client = listener.connectClient();
     REQUIRE(client != nullptr);
 
     AcceptOutcome observed;

@@ -73,7 +73,7 @@ namespace
         {
             if (disarm.IsCancelled())
                 break;
-            auto const now = reactor->Clock().Now();
+            auto const now = reactor->clock().now();
             if (now >= deadline)
             {
                 expired = true;
@@ -105,10 +105,10 @@ DeadlineTimer::DeadlineTimer(IReactor& reactor, TimePoint deadline, Callback onE
 
 DeadlineTimer::~DeadlineTimer()
 {
-    Disarm();
+    disarm();
 }
 
-void DeadlineTimer::Disarm() noexcept
+void DeadlineTimer::disarm() noexcept
 {
     if (_shared->settled)
         return;
@@ -133,14 +133,14 @@ void DeadlineTimer::Disarm() noexcept
     // precisely because this coroutine awaits `SleepUntil` directly rather than a
     // nested `Task` -- the handle is the whole chain, and it is a `DetachedTask`, so
     // no awaiter is left holding it.
-    if (auto const handle = _shared->parked; handle && _reactor->CancelPending(handle))
+    if (auto const handle = _shared->parked; handle && _reactor->cancelPending(handle))
     {
         _shared->parked = {};
         handle.destroy();
     }
 }
 
-bool DeadlineTimer::IsSettled() const noexcept
+bool DeadlineTimer::settled() const noexcept
 {
     return _shared->settled;
 }

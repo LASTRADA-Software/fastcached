@@ -197,7 +197,7 @@ struct TwoReactors
     {
         first.stopping = true;
         second.stopping = true;
-        clock.Advance(2s);
+        clock.advance(2s);
         firstReactor.Drain();
         secondReactor.Drain();
     }
@@ -227,7 +227,7 @@ TEST_CASE("A subscriber whose first capture straddles a tick boundary sends that
     // had captured itself.
     TwoReactors rig;
     rig.sources.duringNextCapture = [&rig] {
-        rig.clock.Advance(500ms);
+        rig.clock.advance(500ms);
     };
     ServeCache(&rig.live, &rig.first, &rig.gate, &rig.firstReactor, &rig.firstReturned);
     rig.firstReactor.Drain();
@@ -256,14 +256,14 @@ TEST_CASE("A capture another reactor is taking is not waited for: the subscriber
         rig.secondReactor.Drain();
         CHECK(rig.second.snapshots.size() == 1); // Deferred: nothing sent from the capture in progress.
     };
-    rig.clock.Advance(500ms);
+    rig.clock.advance(500ms);
     rig.firstReactor.Drain();
     CHECK(rig.sources.captures == 2);
     REQUIRE(rig.first.snapshots.size() == 2);
     CHECK(rig.first.snapshots.back().first == 1);
 
     // One stop-check later it reads what the first reactor published: tick 1's body, not tick 0's.
-    rig.clock.Advance(LiveStopCheck);
+    rig.clock.advance(LiveStopCheck);
     rig.secondReactor.Drain();
     CHECK(rig.sources.captures == 2);
     REQUIRE(rig.second.snapshots.size() == 2);
@@ -291,7 +291,7 @@ TEST_CASE("A subscriber that finds the next capture claimed sends the newest one
     rig.sources.duringNextCapture = [&rig] {
         rig.secondReactor.Drain();
     };
-    rig.clock.Advance(500ms);
+    rig.clock.advance(500ms);
     rig.firstReactor.Drain();
     REQUIRE(rig.second.snapshots.size() == 1);
     REQUIRE(rig.first.snapshots.size() == 2);
@@ -303,12 +303,12 @@ TEST_CASE("A subscriber that finds the next capture claimed sends the newest one
         for (auto const& [tick, body]: rig.second.snapshots)
             sentInsideCapture.push_back(tick);
     };
-    rig.clock.Advance(500ms);
+    rig.clock.advance(500ms);
     rig.firstReactor.Drain();
     CHECK(sentInsideCapture == std::vector<std::uint64_t> { 0, 1 });
     CHECK(rig.sources.captures == 3);
 
-    rig.clock.Advance(LiveStopCheck);
+    rig.clock.advance(LiveStopCheck);
     rig.secondReactor.Drain();
     REQUIRE(rig.second.snapshots.size() == 3);
     CHECK(rig.second.snapshots[1].second == rig.first.snapshots[1].second);

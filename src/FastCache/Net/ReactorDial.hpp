@@ -117,7 +117,7 @@ void SettleDial(ReadinessDialOp<Traits>& op, std::expected<void, NetError> outco
     op.reactor->Detach(&op.handler);
 
     if (auto waiter = std::exchange(op.waiter, ParkedWork {}); waiter.resume)
-        op.reactor->Submit(waiter);
+        op.reactor->submit(waiter);
 }
 
 /// The readiness-based dial, shared verbatim by epoll and kqueue.

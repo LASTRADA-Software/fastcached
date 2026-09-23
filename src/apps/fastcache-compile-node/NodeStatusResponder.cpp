@@ -378,7 +378,7 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
                   "NodeStatus carries an Ed25519 public key, so the two widths are one fact");
     fields.runtime.identityPublicKey = _cfg.identityPublicKey;
     fields.uptimeSeconds =
-        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(_clock.Now() - _startedAt).count());
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(_clock.now() - _startedAt).count());
 
     namespace Bits = CompileCacheWire::NodeComponentBit;
     fields.components = (_components.cacheTier ? Bits::CacheTier : 0U) | (_components.worker ? Bits::Worker : 0U)
@@ -423,7 +423,7 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
             // ago*, and zero would report the healthy answer for both.
             if (registration->lastAccepted.has_value())
                 fields.runtime.lastRegistrationSecondsAgo = static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::seconds>(_clock.Now() - *registration->lastAccepted).count());
+                    std::chrono::duration_cast<std::chrono::seconds>(_clock.now() - *registration->lastAccepted).count());
         }
     }
 

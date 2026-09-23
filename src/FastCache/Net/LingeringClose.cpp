@@ -26,11 +26,11 @@ Task<LingerOutcome> CloseLingering(ISocket* socket, IReactor* reactor, LingerBou
     // `Close()` is idempotent, and a transport that answers true at EOF still owns a handle.
     if (socket->IsClosed())
     {
-        socket->Close();
+        socket->close();
         co_return LingerOutcome { .end = LingerEnd::AlreadyClosed, .reads = 0 };
     }
 
-    socket->ShutdownWrite();
+    socket->shutdownWrite();
 
     // Past every read without the peer finishing, unless a read below says otherwise.
     auto outcome = LingerOutcome { .end = LingerEnd::ReadCap, .reads = 0 };
@@ -45,14 +45,14 @@ Task<LingerOutcome> CloseLingering(ISocket* socket, IReactor* reactor, LingerBou
             // cannot divide it down to zero -- which `SetReceiveDeadline` reads as "leave the
             // current deadline alone".
             auto const shares = std::min<std::size_t>(bounds.reads, static_cast<std::size_t>(bounds.total.count()));
-            socket->SetReceiveDeadline(bounds.total / static_cast<std::chrono::milliseconds::rep>(shares));
+            socket->setReceiveDeadline(bounds.total / static_cast<std::chrono::milliseconds::rep>(shares));
         }
 
         std::array<std::byte, DrainChunkBytes> discard {};
         auto discarded = std::size_t { 0 };
         for (auto const read: std::views::iota(std::size_t { 0 }, bounds.reads))
         {
-            auto const got = co_await socket->Read(std::span<std::byte> { discard });
+            auto const got = co_await socket->read(std::span<std::byte> { discard });
             outcome.reads = read + 1;
             if (got.has_value() && *got > 0)
             {
@@ -71,7 +71,7 @@ Task<LingerOutcome> CloseLingering(ISocket* socket, IReactor* reactor, LingerBou
             break;
         }
     }
-    socket->Close();
+    socket->close();
     co_return outcome;
 }
 

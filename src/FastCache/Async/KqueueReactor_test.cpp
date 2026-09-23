@@ -61,7 +61,7 @@ void DestroyTheOtherPeer(KqueueFdHandler* self)
         peer->reactor->Detach(&(*peer->other)->handler);
         peer->other->reset();
     }
-    peer->reactor->Stop();
+    peer->reactor->stop();
 }
 
 } // namespace
@@ -114,7 +114,7 @@ TEST_CASE("A handler freed earlier in the same batch is not dispatched", "[kqueu
     REQUIRE(::write(first->writeFd, &byte, 1) == 1);
     REQUIRE(::write(second->writeFd, &byte, 1) == 1);
 
-    reactor.Run();
+    reactor.run();
 
     // Exactly one of them acted, and the other was destroyed from inside the
     // batch rather than dispatched.

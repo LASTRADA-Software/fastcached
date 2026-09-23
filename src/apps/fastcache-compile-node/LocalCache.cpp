@@ -61,7 +61,7 @@ LocalCache::LocalCache(IStorage& local, ICacheUpstream& upstream, IClock& clock,
 
 Task<std::optional<std::vector<std::byte>>> LocalCache::Fetch(std::string_view key)
 {
-    if (auto const hit = _local.Get(key, _clock.Now()); hit.has_value() && hit->found)
+    if (auto const hit = _local.Get(key, _clock.now()); hit.has_value() && hit->found)
     {
         // No upstream call at all. That is the whole point of this tier: an object
         // key is a digest over the preprocessed text, the arguments, the compiler
@@ -125,7 +125,7 @@ Task<bool> LocalCache::Store(std::string_view key, std::span<std::byte const> va
 
 CacheDropOutcome LocalCache::Drop(std::string_view key)
 {
-    auto const removed = _local.Delete(key, _clock.Now());
+    auto const removed = _local.Delete(key, _clock.now());
     if (removed.has_value())
         return CacheDropOutcome::Removed;
     return removed.error().code == StorageErrorCode::KeyNotFound ? CacheDropOutcome::Absent : CacheDropOutcome::Failed;

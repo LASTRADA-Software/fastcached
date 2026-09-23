@@ -17,9 +17,9 @@ using namespace std::chrono_literals;
 TEST_CASE("SteadyClock advances monotonically", "[clock]")
 {
     FastCache::SteadyClock clock;
-    auto const first = clock.Now();
+    auto const first = clock.now();
     std::this_thread::sleep_for(1ms);
-    auto const second = clock.Now();
+    auto const second = clock.now();
     REQUIRE(second >= first);
 }
 
@@ -27,33 +27,33 @@ TEST_CASE("ManualClock starts at the given time", "[clock]")
 {
     auto const start = FastCache::TimePoint { 1234ms };
     FastCache::ManualClock clock { start };
-    REQUIRE(clock.Now() == start);
+    REQUIRE(clock.now() == start);
 }
 
 TEST_CASE("ManualClock Advance moves the clock forward by the given duration", "[clock]")
 {
     FastCache::ManualClock clock;
-    auto const before = clock.Now();
-    clock.Advance(500ms);
-    REQUIRE(clock.Now() - before == 500ms);
+    auto const before = clock.now();
+    clock.advance(500ms);
+    REQUIRE(clock.now() - before == 500ms);
 }
 
 TEST_CASE("ManualClock SetNow hard-sets the clock", "[clock]")
 {
     FastCache::ManualClock clock;
     auto const target = FastCache::TimePoint { 99s };
-    clock.SetNow(target);
-    REQUIRE(clock.Now() == target);
+    clock.setNow(target);
+    REQUIRE(clock.now() == target);
 }
 
 TEST_CASE("ManualClock multiple Advances accumulate", "[clock]")
 {
     FastCache::ManualClock clock;
-    auto const before = clock.Now();
-    clock.Advance(100ms);
-    clock.Advance(200ms);
-    clock.Advance(50ms);
-    REQUIRE(clock.Now() - before == 350ms);
+    auto const before = clock.now();
+    clock.advance(100ms);
+    clock.advance(200ms);
+    clock.advance(50ms);
+    REQUIRE(clock.now() - before == 350ms);
 }
 
 TEST_CASE("CachedClock samples once at construction", "[clock]")
@@ -62,7 +62,7 @@ TEST_CASE("CachedClock samples once at construction", "[clock]")
     // logging and config reload read the clock long before the first refresh.
     FastCache::ManualClock source { FastCache::TimePoint { 5s } };
     FastCache::CachedClock const clock { source };
-    REQUIRE(clock.Now() == FastCache::TimePoint { 5s });
+    REQUIRE(clock.now() == FastCache::TimePoint { 5s });
 }
 
 TEST_CASE("CachedClock holds its value until refreshed", "[clock]")
@@ -72,11 +72,11 @@ TEST_CASE("CachedClock holds its value until refreshed", "[clock]")
     FastCache::ManualClock source { FastCache::TimePoint { 1s } };
     FastCache::CachedClock clock { source };
 
-    source.SetNow(FastCache::TimePoint { 60s });
-    REQUIRE(clock.Now() == FastCache::TimePoint { 1s });
+    source.setNow(FastCache::TimePoint { 60s });
+    REQUIRE(clock.now() == FastCache::TimePoint { 1s });
 
-    clock.Refresh();
-    REQUIRE(clock.Now() == FastCache::TimePoint { 60s });
+    clock.refresh();
+    REQUIRE(clock.now() == FastCache::TimePoint { 60s });
 }
 
 TEST_CASE("CachedClock never moves backwards", "[clock]")
@@ -86,11 +86,11 @@ TEST_CASE("CachedClock never moves backwards", "[clock]")
     // must not win. A backwards jump would make a live entry look expired.
     FastCache::ManualClock source { FastCache::TimePoint { 100s } };
     FastCache::CachedClock clock { source };
-    REQUIRE(clock.Now() == FastCache::TimePoint { 100s });
+    REQUIRE(clock.now() == FastCache::TimePoint { 100s });
 
-    source.SetNow(FastCache::TimePoint { 40s });
-    clock.Refresh();
-    REQUIRE(clock.Now() == FastCache::TimePoint { 100s });
+    source.setNow(FastCache::TimePoint { 40s });
+    clock.refresh();
+    REQUIRE(clock.now() == FastCache::TimePoint { 100s });
 }
 
 TEST_CASE("CachedClock concurrent refreshes converge on the newest sample", "[clock]")
@@ -114,11 +114,11 @@ TEST_CASE("CachedClock concurrent refreshes converge on the newest sample", "[cl
         workers.emplace_back([&] {
             if (!waits.WaitForFlag("the start gate to open", go, [] { return std::string { "the gate is shut" }; }))
                 return;
-            auto previous = clock.Now();
+            auto previous = clock.now();
             for ([[maybe_unused]] auto const i: std::views::iota(0, 20'000))
             {
-                clock.Refresh();
-                auto const observed = clock.Now();
+                clock.refresh();
+                auto const observed = clock.now();
                 if (observed < previous)
                     regressed.store(true, std::memory_order_relaxed);
                 previous = observed;
@@ -130,8 +130,8 @@ TEST_CASE("CachedClock concurrent refreshes converge on the newest sample", "[cl
 
     CHECK(waits.AllReached());
     CHECK_FALSE(regressed.load());
-    auto const published = clock.Now();
-    REQUIRE(published <= source.Now());
+    auto const published = clock.now();
+    REQUIRE(published <= source.now());
 }
 
 TEST_CASE("Refresh is a no-op for clocks that read their source directly", "[clock]")
@@ -143,12 +143,12 @@ TEST_CASE("Refresh is a no-op for clocks that read their source directly", "[clo
     // not sequenced, so comparing two Now() calls inline can read the later one
     // first and fail on a clock that is behaving perfectly.
     FastCache::SteadyClock steady;
-    auto const before = steady.Now();
-    steady.Refresh();
-    auto const after = steady.Now();
+    auto const before = steady.now();
+    steady.refresh();
+    auto const after = steady.now();
     REQUIRE(after >= before);
 
     FastCache::ManualClock manual { FastCache::TimePoint { 7s } };
-    manual.Refresh();
-    REQUIRE(manual.Now() == FastCache::TimePoint { 7s });
+    manual.refresh();
+    REQUIRE(manual.now() == FastCache::TimePoint { 7s });
 }

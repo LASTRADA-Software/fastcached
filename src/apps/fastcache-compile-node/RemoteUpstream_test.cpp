@@ -67,7 +67,7 @@ class CountingResolver final: public IAsyncAddressResolver
 class FailingConnector final: public IConnector
 {
   public:
-    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t /*port*/, DialOptions /*options*/) override
+    [[nodiscard]] Task<SocketResult> connect(std::string host, std::uint16_t /*port*/, DialOptions /*options*/) override
     {
         ++dials;
         lastHost = std::move(host);
@@ -148,12 +148,12 @@ TEST_CASE("RemoteUpstream re-resolves once the interval has passed")
     REQUIRE(fixture.resolver.calls == 1);
 
     // Just short of the interval is still the held address.
-    fixture.clock.Advance(RefreshInterval - std::chrono::milliseconds { 1 });
+    fixture.clock.advance(RefreshInterval - std::chrono::milliseconds { 1 });
     CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
     CHECK(fixture.resolver.calls == 1);
 
     // Reaching it re-resolves exactly once, however many operations follow.
-    fixture.clock.Advance(std::chrono::milliseconds { 1 });
+    fixture.clock.advance(std::chrono::milliseconds { 1 });
     CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
     CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
     CHECK(fixture.resolver.calls == 2);

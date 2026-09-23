@@ -116,7 +116,7 @@ Task<void> Server::Run()
                 if (_tls != nullptr)
                     _metrics->Increment(IMetricsSink::Counter::ConnectionsAdmissionRejectedTls);
             }
-            (*accepted)->Close();
+            (*accepted)->close();
             continue;
         }
 

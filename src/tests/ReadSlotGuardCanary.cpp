@@ -61,7 +61,7 @@ namespace
 /// @return The detached task holding the parked wait.
 FastCache::DetachedTask ParkOnReadable(FastCache::ISocket* socket)
 {
-    static_cast<void>(co_await socket->WaitReadable());
+    static_cast<void>(co_await socket->waitReadable());
 }
 
 /// Accept one connection, park a wait on it, then arm a `Read` over the top.
@@ -76,7 +76,7 @@ FastCache::DetachedTask DoubleArmTheReadSlot(FastCache::PlatformReactor* reactor
     auto accepted = co_await listener->Accept();
     if (!accepted.has_value())
     {
-        reactor->Stop();
+        reactor->stop();
         co_return;
     }
     auto socket = std::move(*accepted);
@@ -90,12 +90,12 @@ FastCache::DetachedTask DoubleArmTheReadSlot(FastCache::PlatformReactor* reactor
     // deliberately never awaited: there is nothing to read and we do not intend to
     // get here at all.
     std::array<std::byte, 8> buffer {};
-    auto const armed = socket->Read(std::span<std::byte> { buffer });
+    auto const armed = socket->read(std::span<std::byte> { buffer });
     static_cast<void>(armed);
 
     survived->store(true, std::memory_order_release);
-    socket->Close();
-    reactor->Stop();
+    socket->close();
+    reactor->stop();
 }
 
 } // namespace
@@ -119,16 +119,16 @@ int main()
     std::jthread client { [port] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
         // Silent, and held open: the server's `WaitReadable` must find nothing to
         // report and park, and its `Read` must find nothing and try to park too.
         std::this_thread::sleep_for(std::chrono::seconds { 2 });
-        (*socket)->Close();
+        (*socket)->close();
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
 
     if (survived.load(std::memory_order_acquire))

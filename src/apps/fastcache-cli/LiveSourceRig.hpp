@@ -361,25 +361,25 @@ class SpokenTerminal final: public IDashboardEventSource
         if (_release == nullptr)
             return;
         _release->released = true;
-        _release->closedFirst = _events.IsClosed();
+        _release->closedFirst = _events.isClosed();
     }
 
     /// The terminal goes away by itself: its reader gets `Detached` while nobody has closed it.
     void GoAway()
     {
-        (void) _events.Push(DashboardEvent { .kind = DashboardEventKind::Detached, .note = "the terminal went away" });
+        (void) _events.push(DashboardEvent { .kind = DashboardEventKind::Detached, .note = "the terminal went away" });
     }
 
     /// Say something at the terminal.
     /// @param event A Key or a Resize.
     void Say(DashboardEvent event)
     {
-        (void) _events.Push(std::move(event));
+        (void) _events.push(std::move(event));
     }
 
     [[nodiscard]] Task<DashboardEvent> Next() override
     {
-        auto const event = co_await _events.Pop();
+        auto const event = co_await _events.pop();
         if (!event.has_value())
             co_return DashboardEvent { .kind = DashboardEventKind::Detached, .note = "the terminal went away" };
         co_return Unwrap(event);
@@ -575,7 +575,7 @@ struct Rig
 {
     auto event = std::optional<DashboardEvent> {};
     auto task = TakeOne(&source, &event);
-    rig.reactor.Submit(task.Native());
+    rig.reactor.submit(task.handle());
     rig.reactor.Drain();
     if (!event.has_value())
     {
@@ -593,7 +593,7 @@ inline void CloseAndDrain(Rig& rig, LiveEventSource& source)
     source.Close();
     auto drained = false;
     auto task = AwaitDrained(&source, &drained);
-    rig.reactor.Submit(task.Native());
+    rig.reactor.submit(task.handle());
     rig.Settle();
     CHECK(drained);
     CHECK(rig.reactor.PendingTimers() == 0);

@@ -215,7 +215,7 @@ void DrainUntil(TestReactor& reactor, Condition done, char const* what)
     auto result = std::optional<DashboardEvent> {};
     auto deliveredOn = std::thread::id {};
     auto task = NextInto(&source, &result, &deliveredOn);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     DrainUntil(reactor, [&result] { return result.has_value(); }, "a Next() never resumed");
     return Unwrap(result);
 }
@@ -424,7 +424,7 @@ struct StartOutcome
 {
     auto outcome = StartOutcome {};
     auto task = StartInto(std::make_unique<FakeDevice>(script, &record), &pool, &reactor, &record, &outcome);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     DrainUntil(reactor, [&outcome] { return outcome.delivered; }, "a terminal start was never delivered");
     return outcome;
 }
@@ -492,7 +492,7 @@ TEST_CASE("the terminal wait runs on the pool and its event is delivered back on
     auto result = std::optional<DashboardEvent> {};
     auto deliveredOn = std::thread::id {};
     auto task = NextInto(stream.get(), &result, &deliveredOn);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     reactor.Drain();
 
     // Parked in the wait on the pool, and the reactor has run out of work while it is: the loop
@@ -531,7 +531,7 @@ TEST_CASE("closing the terminal stream wakes a parked wait, and it stays closed"
     auto result = std::optional<DashboardEvent> {};
     auto deliveredOn = std::thread::id {};
     auto task = NextInto(stream.get(), &result, &deliveredOn);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     reactor.Drain();
     DrainUntil(reactor, [&source] { return source.Entered(); }, "the stream never parked in the terminal wait");
 
@@ -828,7 +828,7 @@ TEST_CASE("restoring a started terminal now, from another thread while a read is
     auto result = std::optional<DashboardEvent> {};
     auto deliveredOn = std::thread::id {};
     auto task = NextInto(started.events.get(), &result, &deliveredOn);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     reactor.Drain();
     DrainUntil(reactor, [&source] { return source.Entered(); }, "the stream never parked in the terminal wait");
 

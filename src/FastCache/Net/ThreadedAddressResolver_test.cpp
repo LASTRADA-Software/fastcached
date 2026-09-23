@@ -275,12 +275,12 @@ TEST_CASE("A literal host never reaches the pool", "[net][resolve]")
 
     std::optional<FastCache::ResolveResult> out;
     auto task = Lookup(&resolver, "127.0.0.1", 6674, &reactor, &out);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     reactor.Drain();
 
     REQUIRE(out.has_value());
     CHECK(FastCache::Testing::Unwrap(out).has_value());
-    CHECK(resolver.Offloaded() == 0);
+    CHECK(resolver.offloaded() == 0);
     // Answered on the caller's own thread, so no thread was ever started.
     CHECK(inner.RanOn(std::this_thread::get_id()));
     CHECK(inner.DistinctThreads() == 1);
@@ -295,13 +295,13 @@ TEST_CASE("A name is resolved off the calling thread and handed back through the
 
     std::optional<FastCache::ResolveResult> out;
     auto task = Lookup(&resolver, "cache.example.com", 6674, &reactor, &out);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     reactor.Drain();
 
     REQUIRE(DrainUntil(reactor, out, "the lookup to be handed back"));
     REQUIRE(out.has_value());
     CHECK(FastCache::Testing::Unwrap(out).has_value());
-    CHECK(resolver.Offloaded() == 1);
+    CHECK(resolver.offloaded() == 1);
 
     // The whole point: the lookup did NOT run on the thread that asked for it.
     // A count alone would pass against an implementation that resolved inline.
@@ -322,7 +322,7 @@ TEST_CASE("A caller with no reactor is answered inline", "[net][resolve]")
 
     REQUIRE(out.has_value());
     CHECK(FastCache::Testing::Unwrap(out).has_value());
-    CHECK(resolver.Offloaded() == 0);
+    CHECK(resolver.offloaded() == 0);
     CHECK(inner.RanOn(std::this_thread::get_id()));
 }
 
@@ -347,7 +347,7 @@ TEST_CASE("A full queue is refused rather than waited on", "[net][resolve]")
     SettleBeforeUnwind const settle { inner, resolver, reactor }; // after every lookup, so destroyed before them
 
     // One lookup occupies the single worker; the next fills the single queue slot.
-    reactor.Submit(firstTask.emplace(Lookup(&resolver, "one.example.com", 1, &reactor, &first)).Native());
+    reactor.submit(firstTask.emplace(Lookup(&resolver, "one.example.com", 1, &reactor, &first)).handle());
     reactor.Drain();
 
     // Wait for the worker to actually DEQUEUE the first job before offering the
@@ -361,11 +361,11 @@ TEST_CASE("A full queue is refused rather than waited on", "[net][resolve]")
         [&inner] { return Describe(inner); }));
     REQUIRE(inner.Calls() == 1);
 
-    reactor.Submit(secondTask.emplace(Lookup(&resolver, "two.example.com", 2, &reactor, &second)).Native());
+    reactor.submit(secondTask.emplace(Lookup(&resolver, "two.example.com", 2, &reactor, &second)).handle());
     reactor.Drain();
     REQUIRE_FALSE(second.has_value()); // queued, not refused
 
-    reactor.Submit(thirdTask.emplace(Lookup(&resolver, "three.example.com", 3, &reactor, &third)).Native());
+    reactor.submit(thirdTask.emplace(Lookup(&resolver, "three.example.com", 3, &reactor, &third)).handle());
     reactor.Drain();
 
     REQUIRE(third.has_value());
@@ -373,7 +373,7 @@ TEST_CASE("A full queue is refused rather than waited on", "[net][resolve]")
     // WouldBlock and not SystemError: a caller can retry the first and can do
     // nothing at all with the second.
     CHECK(FastCache::Testing::Unwrap(third).error().code == FastCache::NetErrorCode::WouldBlock);
-    CHECK(resolver.Refused() == 1);
+    CHECK(resolver.refused() == 1);
 
     inner.Release();
     REQUIRE(DrainUntil(reactor, first, "the first lookup to be handed back"));
@@ -402,7 +402,7 @@ TEST_CASE("Stopping resumes a queued lookup rather than stranding it", "[net][re
     std::optional<FastCache::Task<void>> queuedTask;
     SettleBeforeUnwind const settle { inner, resolver, reactor }; // after every lookup, so destroyed before them
 
-    reactor.Submit(firstTask.emplace(Lookup(&resolver, "one.example.com", 1, &reactor, &first)).Native());
+    reactor.submit(firstTask.emplace(Lookup(&resolver, "one.example.com", 1, &reactor, &first)).handle());
     reactor.Drain();
     REQUIRE(WaitUntil(
         "the worker to dequeue the in-flight lookup",
@@ -410,7 +410,7 @@ TEST_CASE("Stopping resumes a queued lookup rather than stranding it", "[net][re
         [&inner] { return Describe(inner); }));
     REQUIRE(inner.Calls() == 1);
 
-    reactor.Submit(queuedTask.emplace(Lookup(&resolver, "two.example.com", 2, &reactor, &queued)).Native());
+    reactor.submit(queuedTask.emplace(Lookup(&resolver, "two.example.com", 2, &reactor, &queued)).handle());
     reactor.Drain();
     REQUIRE_FALSE(queued.has_value());
 
@@ -600,7 +600,7 @@ TEST_CASE("A lookup some Task owns is left alone by the reactor", "[net][resolve
         // show this because it never drains at all. Holding the resolver is what
         // turns the race into an ordering.
         inner.Hold();
-        reactor.Submit(lookup.Native());
+        reactor.submit(lookup.handle());
         reactor.Drain();
 
         // **WHICH settle path this case exercises, made a fact rather than a coin

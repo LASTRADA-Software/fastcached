@@ -45,7 +45,7 @@ struct TextFixture
 
 FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view payload)
 {
-    auto const result = co_await socket->Write(FastCache::AsBytes(payload));
+    auto const result = co_await socket->write(FastCache::AsBytes(payload));
     co_return result.has_value();
 }
 
@@ -55,7 +55,7 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
     while (true)
     {
         std::vector<std::byte> chunk(256);
-        auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const result = co_await socket->read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!result.has_value())
             break;
         if (*result == 0)
@@ -77,7 +77,7 @@ std::string Exchange(TextFixture& fix, std::string_view request, FastCache::Sess
     REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
     // Half-close: server will see EOF after consuming `request`, but the
     // client's read side stays open so we can read the response back.
-    fix.pair.client->ShutdownWrite();
+    fix.pair.client->shutdownWrite();
 
     FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primingBytes*/ {}, session));
     // Close the server side so ReadAvailable always observes EOF. The handler
@@ -88,7 +88,7 @@ std::string Exchange(TextFixture& fix, std::string_view request, FastCache::Sess
     // RedisResp_test.cpp. The handler has returned, so it has nothing left to
     // write; the bytes already in the pipe survive CloseWrite and are drained
     // before EOF is reported.
-    fix.pair.server->Close();
+    fix.pair.server->close();
     return FastCache::SyncRun(ReadAvailable(fix.pair.client.get()));
 }
 
@@ -156,7 +156,7 @@ void DriveWithPriming(TextFixture& fix, std::string_view request, FastCache::Ses
 {
     auto const bytes = FastCache::AsBytes(request);
     std::vector<std::byte> priming { bytes.begin(), bytes.end() };
-    fix.pair.client->ShutdownWrite();
+    fix.pair.client->shutdownWrite();
     FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, std::move(priming), session));
 }
 

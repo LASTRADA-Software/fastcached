@@ -95,12 +95,12 @@ class ThreadedAddressResolver final: public IAsyncAddressResolver
     /// @return How many lookups have been refused for want of queue room. For
     ///         tests and diagnostics; an operator seeing this move should raise
     ///         `maxQueueDepth` or find out what is provoking the dials.
-    [[nodiscard]] std::size_t Refused() const noexcept;
+    [[nodiscard]] std::size_t refused() const noexcept;
 
     /// @return How many lookups this resolver has handed to a thread. Zero for a
     ///         process that only ever dials literals, which is the property the
     ///         fast path exists to give and the one a test asserts.
-    [[nodiscard]] std::size_t Offloaded() const noexcept;
+    [[nodiscard]] std::size_t offloaded() const noexcept;
 
     /// Implementation detail; public so the .cpp's worker can name it.
     struct Impl;

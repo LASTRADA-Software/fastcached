@@ -55,9 +55,9 @@ FastCache::DetachedTask HalfCloseAccepted(FastCache::PlatformReactor* reactor, F
     if (accepted.has_value())
     {
         auto socket = std::move(*accepted);
-        socket->ShutdownWrite();
+        socket->shutdownWrite();
         std::array<std::byte, 1> const one { std::byte { 0x41 } };
-        out->writeAfter = co_await socket->Write(std::span<std::byte const> { one });
+        out->writeAfter = co_await socket->write(std::span<std::byte const> { one });
         auto const read = co_await FastCache::Testing::AwaitUntil(
             reactor,
             "the client to read after the half-close",
@@ -67,15 +67,15 @@ FastCache::DetachedTask HalfCloseAccepted(FastCache::PlatformReactor* reactor, F
                 .context = {}, .bound = FastCache::Testing::WaitHangGuard, .rest = std::chrono::milliseconds { 1 } });
         if (!read.reached)
             out->account = read.account;
-        socket->Close();
+        socket->close();
     }
     out->serverDone.store(true, std::memory_order_release);
-    reactor->Stop();
+    reactor->stop();
 }
 
 FastCache::Task<FastCache::IoResult> ReadOnce(FastCache::ISocket* socket, std::span<std::byte> into)
 {
-    co_return co_await socket->Read(into);
+    co_return co_await socket->read(into);
 }
 
 } // namespace
@@ -99,19 +99,19 @@ TEST_CASE("An accepted socket's ShutdownWrite reaches its peer as EOF, and its o
     std::jthread client { [port, &exchange, &clientRead] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (socket.has_value())
         {
             // Bounded: on the defect nothing ever arrives, and the read would otherwise block
             // until the server's close -- whose FIN would then pass for the half-close's.
-            (*socket)->SetReceiveDeadline(std::chrono::milliseconds { 2000 });
+            (*socket)->setReceiveDeadline(std::chrono::milliseconds { 2000 });
             std::array<std::byte, 8> buffer {};
             clientRead = FastCache::SyncRun(ReadOnce(socket->get(), std::span<std::byte> { buffer }));
         }
         exchange.clientRead.store(true, std::memory_order_release);
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
 
     CHECK(exchange.account.empty());

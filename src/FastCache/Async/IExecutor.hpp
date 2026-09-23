@@ -32,7 +32,7 @@ class IExecutor
 
     /// Post a coroutine handle for resumption.
     /// @param handle Coroutine to resume. Must remain alive until it is.
-    virtual void Submit(std::coroutine_handle<> handle) = 0;
+    virtual void submit(std::coroutine_handle<> handle) = 0;
 
     /// Post a coroutine for resumption, saying what may be freed if it never is.
     ///
@@ -48,7 +48,7 @@ class IExecutor
     /// new one answer *nothing* by omission
     /// ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
     /// @param work The coroutine to resume, and the chain root to free if it is not.
-    virtual void Submit(ParkedWork work) = 0;
+    virtual void submit(ParkedWork work) = 0;
 };
 
 } // namespace FastCache

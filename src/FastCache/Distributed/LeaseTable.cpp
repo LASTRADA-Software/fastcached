@@ -32,7 +32,7 @@ bool LeaseTable::IsLive(Entry const& entry, TimePoint now) const noexcept
 std::optional<Lease> LeaseTable::Acquire(std::string_view key, std::string_view workerId, std::chrono::milliseconds lifetime)
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     auto const keyStr = std::string { key };
 
     if (auto const existing = _tokenByKey.find(keyStr); existing != _tokenByKey.end())
@@ -61,7 +61,7 @@ std::optional<Lease> LeaseTable::Find(std::string_view token) const
 {
     std::scoped_lock const guard { _mutex };
     auto const it = _byToken.find(std::string { token });
-    if (it == _byToken.end() || !IsLive(it->second, _clock.Now()))
+    if (it == _byToken.end() || !IsLive(it->second, _clock.now()))
         return std::nullopt;
     return it->second.lease;
 }
@@ -99,7 +99,7 @@ std::expected<Lease, LeaseTable::ReleaseRefusal> LeaseTable::Release(std::string
     // the one fleet condition worth reporting -- a lease timeout shorter than the
     // slowest translation unit -- with nowhere to be observed.
     auto lease = it->second.lease;
-    bool const live = IsLive(it->second, _clock.Now());
+    bool const live = IsLive(it->second, _clock.now());
 
     // Dropped either way. Nothing else ever visits an expired token except an
     // `Acquire` for the same key, so answering without erasing would leave one
@@ -116,7 +116,7 @@ std::expected<Lease, LeaseTable::ReleaseRefusal> LeaseTable::Release(std::string
 std::size_t LeaseTable::ReleaseWorker(std::string_view workerId)
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     // Collected first, then erased: erasing while iterating the map invalidates the
     // iterator, and the key index has to be visited per lease anyway.
@@ -152,7 +152,7 @@ bool LeaseTable::IsInFlight(std::string_view key) const
     // `Acquire` for that key sweeps it, so reporting on the map alone would refuse
     // a key forever once one client had abandoned it.
     auto const entry = _byToken.find(held->second);
-    return entry != _byToken.end() && IsLive(entry->second, _clock.Now());
+    return entry != _byToken.end() && IsLive(entry->second, _clock.now());
 }
 
 LeaseListing LeaseTable::LiveLeases(std::size_t limit) const
@@ -162,7 +162,7 @@ LeaseListing LeaseTable::LiveLeases(std::size_t limit) const
     // let a single listing report ages measured against different instants, and
     // order rows by a clock that moved underneath the sort. `WorkerRegistry` states
     // the same rule where it takes `now` once for a report.
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     // A pointer and a duration per lease, not a `LeaseReport`: this runs under the
     // SAME lock `Acquire` and `Release` take, so against the thousands of leases a

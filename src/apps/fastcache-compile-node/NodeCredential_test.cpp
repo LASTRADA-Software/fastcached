@@ -161,25 +161,25 @@ class BorrowedSocket final: public ISocket
     {
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
     {
-        return _inner.Read(buffer);
+        return _inner.read(buffer);
     }
 
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override
     {
-        return _inner.Write(buffer);
+        return _inner.write(buffer);
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override
     {
-        return _inner.WriteVectored(segments, std::move(keepAlive));
+        return _inner.writeVectored(segments, std::move(keepAlive));
     }
 
-    void Close() noexcept override
+    void close() noexcept override
     {
-        _inner.Close();
+        _inner.close();
     }
 
     [[nodiscard]] bool IsClosed() const noexcept override
@@ -187,9 +187,9 @@ class BorrowedSocket final: public ISocket
         return _inner.IsClosed();
     }
 
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
-        return _inner.PeerAddress();
+        return _inner.peerAddress();
     }
 
   private:
@@ -211,7 +211,7 @@ class ScriptingConnector final: public IConnector
     {
     }
 
-    [[nodiscard]] Task<SocketResult> Connect(std::string /*host*/, std::uint16_t /*port*/, DialOptions /*options*/) override
+    [[nodiscard]] Task<SocketResult> connect(std::string /*host*/, std::uint16_t /*port*/, DialOptions /*options*/) override
     {
         _dialled.push_back(std::make_unique<Testing::ScriptedSocket>(_script));
         co_return SocketResult { std::make_unique<BorrowedSocket>(*_dialled.back()) };

@@ -148,7 +148,7 @@ void KqueueReactor::AbandonParkedWork() noexcept
     }
 }
 
-bool KqueueReactor::CancelPending(std::coroutine_handle<> handle) noexcept
+bool KqueueReactor::cancelPending(std::coroutine_handle<> handle) noexcept
 {
     if (!handle)
         return false;
@@ -306,12 +306,12 @@ void KqueueReactor::Detach(KqueueFdHandler* handler) const noexcept
         _kq, changes.data(), static_cast<int>(changes.size()), results.data(), static_cast<int>(results.size()), nullptr);
 }
 
-void KqueueReactor::Submit(std::coroutine_handle<> handle)
+void KqueueReactor::submit(std::coroutine_handle<> handle)
 {
-    Submit(ParkedWork { .resume = handle });
+    submit(ParkedWork { .resume = handle });
 }
 
-void KqueueReactor::Submit(ParkedWork work)
+void KqueueReactor::submit(ParkedWork work)
 {
     if (!work.resume)
         return;
@@ -323,12 +323,12 @@ void KqueueReactor::Submit(ParkedWork work)
     (void) ::write(_wakePipe[1], &one, 1);
 }
 
-void KqueueReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
+void KqueueReactor::schedule(TimePoint deadline, std::coroutine_handle<> handle)
 {
-    Schedule(deadline, ParkedWork { .resume = handle });
+    schedule(deadline, ParkedWork { .resume = handle });
 }
 
-void KqueueReactor::Schedule(TimePoint deadline, ParkedWork work)
+void KqueueReactor::schedule(TimePoint deadline, ParkedWork work)
 {
     if (!work.resume)
         return;
@@ -342,7 +342,7 @@ void KqueueReactor::Schedule(TimePoint deadline, ParkedWork work)
     (void) ::write(_wakePipe[1], &one, 1);
 }
 
-void KqueueReactor::Stop() noexcept
+void KqueueReactor::stop() noexcept
 {
     _stopped.store(true, std::memory_order_release);
     char one = 1;
@@ -351,7 +351,7 @@ void KqueueReactor::Stop() noexcept
 
 void KqueueReactor::FireExpiredTimers()
 {
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     std::vector<Detail::Parked> due;
     {
         std::scoped_lock const lock { _timerMutex };
@@ -365,7 +365,7 @@ void KqueueReactor::FireExpiredTimers()
     // `Resume()` disowns and resumes in one expression, so a timer that fires normally
     // is never also freed by the entry going out of scope here.
     for (auto& parked: due)
-        parked.Resume();
+        parked.resume();
 }
 
 void KqueueReactor::DrainPendingSubmits()
@@ -377,7 +377,7 @@ void KqueueReactor::DrainPendingSubmits()
     }
     while (!drained.empty())
     {
-        drained.front().Resume();
+        drained.front().resume();
         drained.pop_front();
     }
 }
@@ -409,7 +409,7 @@ void KqueueReactor::RunLoop()
         timespec* tsPtr = nullptr;
         if (nextDeadline != TimePoint::max())
         {
-            ts = DeadlineToTimespec(nextDeadline, _clock.Now());
+            ts = DeadlineToTimespec(nextDeadline, _clock.now());
             tsPtr = &ts;
         }
 

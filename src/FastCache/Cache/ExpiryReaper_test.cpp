@@ -212,15 +212,15 @@ class ParkingReactor final: public IReactor
         return _gate;
     }
 
-    void Stop() noexcept override
+    void stop() noexcept override
     {
-        _inner.Stop();
+        _inner.stop();
     }
-    void Submit(std::coroutine_handle<> handle) override
+    void submit(std::coroutine_handle<> handle) override
     {
-        _inner.Submit(handle);
+        _inner.submit(handle);
     }
-    void Submit(ParkedWork work) override
+    void submit(ParkedWork work) override
     {
         _submits.fetch_add(1, std::memory_order_acq_rel);
         if (_refuse.exchange(false, std::memory_order_acq_rel))
@@ -231,25 +231,25 @@ class ParkingReactor final: public IReactor
         auto const where = _park.exchange(Park::No, std::memory_order_acq_rel);
         if (where == Park::BeforeForwarding)
             _gate.ParkHere();
-        _inner.Submit(work);
+        _inner.submit(work);
         if (where == Park::AfterForwarding)
             _gate.ParkHere();
     }
-    void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override
+    void schedule(TimePoint deadline, std::coroutine_handle<> handle) override
     {
-        _inner.Schedule(deadline, handle);
+        _inner.schedule(deadline, handle);
     }
-    void Schedule(TimePoint deadline, ParkedWork work) override
+    void schedule(TimePoint deadline, ParkedWork work) override
     {
-        _inner.Schedule(deadline, work);
+        _inner.schedule(deadline, work);
     }
-    [[nodiscard]] bool CancelPending(std::coroutine_handle<> handle) noexcept override
+    [[nodiscard]] bool cancelPending(std::coroutine_handle<> handle) noexcept override
     {
-        return _inner.CancelPending(handle);
+        return _inner.cancelPending(handle);
     }
-    [[nodiscard]] IClock& Clock() noexcept override
+    [[nodiscard]] IClock& clock() noexcept override
     {
-        return _inner.Clock();
+        return _inner.clock();
     }
 
   protected:
@@ -349,14 +349,14 @@ class HoldingExecutor final: public IExecutor
     void ForwardHeld()
     {
         if (auto work = TakeHeld(); work.has_value())
-            _inner.Submit(*work);
+            _inner.submit(*work);
     }
 
-    void Submit(std::coroutine_handle<> handle) override
+    void submit(std::coroutine_handle<> handle) override
     {
-        _inner.Submit(handle);
+        _inner.submit(handle);
     }
-    void Submit(ParkedWork work) override
+    void submit(ParkedWork work) override
     {
         if (_refuse.exchange(false, std::memory_order_acq_rel))
         {
@@ -375,7 +375,7 @@ class HoldingExecutor final: public IExecutor
                 }
             }
         }
-        _inner.Submit(work);
+        _inner.submit(work);
         _forwarded.fetch_add(1, std::memory_order_acq_rel);
     }
 
@@ -513,7 +513,7 @@ template <std::predicate Predicate, typename State>
                      WaitOptions {
                          .step =
                              [&f] {
-                                 f.clock.Advance(1ms);
+                                 f.clock.advance(1ms);
                                  std::ignore = f.reactor.Tick();
                              },
                          .context =
@@ -652,18 +652,18 @@ TEST_CASE("The expiry cycle reclaims a lapsed key nobody touched, and says so", 
     // TTL, let it lapse, touch NOTHING. Before the cycle existed the entry
     // stayed resident and no `expired` event was ever published for it.
     Fixture f;
-    REQUIRE(f.storage.Set("gone", MakeBytes("v"), 0, f.clock.Now() + 1s).has_value());
+    REQUIRE(f.storage.Set("gone", MakeBytes("v"), 0, f.clock.now() + 1s).has_value());
     f.observer.events.clear(); // Drop the SET's own event.
 
     ExpiryReaper reaper {
         f.storage, f.logger, ExpiryReaperOptions { .interval = 100ms, .stopWakeBound = 25ms }, &f.metrics
     };
     auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
-    f.reactor.Submit(task.Native());
+    f.reactor.submit(task.handle());
     f.reactor.Drain();
     CHECK(f.storage.Snapshot().itemCount == 1U); // Still live; nothing to do yet.
 
-    f.clock.Advance(2s);
+    f.clock.advance(2s);
     f.reactor.Drain();
 
     CHECK(f.storage.Snapshot().itemCount == 0U);
@@ -672,7 +672,7 @@ TEST_CASE("The expiry cycle reclaims a lapsed key nobody touched, and says so", 
     CHECK(f.metrics.Read(IMetricsSink::Counter::ExpiryCycles) >= 1U);
 
     f.source.Cancel();
-    f.clock.Advance(25ms);
+    f.clock.advance(25ms);
     f.reactor.Drain();
 }
 
@@ -685,15 +685,15 @@ TEST_CASE("The expiry cycle stops promptly and leaves nothing parked", "[expiry]
     Fixture f;
     ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s, .stopWakeBound = 50ms } };
     auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
-    f.reactor.Submit(task.Native());
+    f.reactor.submit(task.handle());
     f.reactor.Drain();
 
-    auto const started = f.clock.Now();
+    auto const started = f.clock.now();
     f.source.Cancel();
-    f.clock.Advance(50ms);
+    f.clock.advance(50ms);
     f.reactor.Drain();
 
-    CHECK(f.clock.Now() - started == 50ms); // Not the 30s interval.
+    CHECK(f.clock.now() - started == 50ms); // Not the 30s interval.
     CHECK(f.reactor.PendingTimers() == 0);
     CHECK(f.reactor.PendingSubmissions() == 0);
     CHECK(reaper.Cycles() == 0U);
@@ -722,14 +722,14 @@ TEST_CASE("A zero interval disables the expiry cycle rather than parking it", "[
     // "Off" has to mean a coroutine that ended. One parked forever on a
     // deadline nothing will move is a frame the reactor has to outlive.
     Fixture f;
-    REQUIRE(f.storage.Set("gone", MakeBytes("v"), 0, f.clock.Now() + 1s).has_value());
+    REQUIRE(f.storage.Set("gone", MakeBytes("v"), 0, f.clock.now() + 1s).has_value());
 
     ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = Duration::zero() } };
     auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
-    f.reactor.Submit(task.Native());
+    f.reactor.submit(task.handle());
     f.reactor.Drain();
 
-    f.clock.Advance(1h);
+    f.clock.advance(1h);
     f.reactor.Drain();
 
     CHECK(reaper.Cycles() == 0U);
@@ -769,27 +769,27 @@ TEST_CASE("The expiry cycle actually backs off on a running reactor", "[expiry][
                           f.logger,
                           ExpiryReaperOptions { .interval = 100ms, .maxInterval = 400ms, .stopWakeBound = 100ms } };
     auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
-    f.reactor.Submit(task.Native());
+    f.reactor.submit(task.handle());
     f.reactor.Drain();
     CHECK(reaper.CurrentInterval() == 100ms);
 
     // Three idle sweeps: 100 -> 200 -> 400, then held at the ceiling.
     for (auto const expected: { 200ms, 400ms, 400ms })
     {
-        f.clock.Advance(500ms);
+        f.clock.advance(500ms);
         f.reactor.Drain();
         CHECK(reaper.CurrentInterval() == expected);
     }
 
     // Something to reclaim, and the very next sweep is back at the base.
-    REQUIRE(f.storage.Set("gone", MakeBytes("v"), 0, f.clock.Now() + 1s).has_value());
-    f.clock.Advance(2s);
+    REQUIRE(f.storage.Set("gone", MakeBytes("v"), 0, f.clock.now() + 1s).has_value());
+    f.clock.advance(2s);
     f.reactor.Drain();
     CHECK(reaper.CurrentInterval() == 100ms);
     CHECK(f.observer.Saw(MutationKind::Expire, "gone"));
 
     f.source.Cancel();
-    f.clock.Advance(100ms);
+    f.clock.advance(100ms);
     f.reactor.Drain();
 }
 
@@ -800,12 +800,12 @@ TEST_CASE("One expiry sweep spends no more than its budget", "[expiry][reaper]")
     // tier's exclusive lock.
     Fixture f;
     for (auto const i: std::views::iota(0, 10))
-        REQUIRE(f.storage.Set(std::format("k-{}", i), MakeBytes("v"), 0, f.clock.Now() + 1s).has_value());
-    f.clock.Advance(2s);
+        REQUIRE(f.storage.Set(std::format("k-{}", i), MakeBytes("v"), 0, f.clock.now() + 1s).has_value());
+    f.clock.advance(2s);
 
     ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .scanBudget = 4, .purgeBudget = 3 } };
 
-    auto const first = reaper.SweepOnce(f.clock.Now());
+    auto const first = reaper.SweepOnce(f.clock.now());
     CHECK(first.purged == 3U); // The reclaim ceiling bites before the scan one.
     CHECK_FALSE(first.completedPass);
     CHECK(f.storage.Snapshot().itemCount == 7U);
@@ -813,7 +813,7 @@ TEST_CASE("One expiry sweep spends no more than its budget", "[expiry][reaper]")
     // Three more clear the remaining seven -- three, three, one -- and a fourth
     // finds nothing, which is what the cycle would then back off on.
     for ([[maybe_unused]] auto const step: std::views::iota(0, 4))
-        std::ignore = reaper.SweepOnce(f.clock.Now());
+        std::ignore = reaper.SweepOnce(f.clock.now());
     CHECK(f.storage.Snapshot().itemCount == 0U);
     CHECK(reaper.Cycles() == 5U);
 }
@@ -896,8 +896,8 @@ TEST_CASE("The sweep body runs on the executor it was given and not on the react
     // same reactor. The property that decides #946 is WHICH THREAD ran the sweep, and
     // that needs no blocking to see.
     Fixture f;
-    REQUIRE(f.storage.Set("k", MakeBytes("v"), 0, f.clock.Now() + 1ms).has_value());
-    f.clock.Advance(10ms);
+    REQUIRE(f.storage.Set("k", MakeBytes("v"), 0, f.clock.now() + 1ms).has_value());
+    f.clock.advance(10ms);
 
     // **Reset AFTER the Set.** `NotifyingStorage::Set` notifies too, so without this
     // the observer records the store -- on the test thread -- and the case reads a
@@ -935,8 +935,8 @@ TEST_CASE("Passing the reactor as the sweep executor keeps the sweep on the loop
     // rather than a second code path -- and without this, "the sweep is elsewhere"
     // could be true because the hop always leaves, which would be a different defect.
     Fixture f;
-    REQUIRE(f.storage.Set("k", MakeBytes("v"), 0, f.clock.Now() + 1ms).has_value());
-    f.clock.Advance(10ms);
+    REQUIRE(f.storage.Set("k", MakeBytes("v"), 0, f.clock.now() + 1ms).has_value());
+    f.clock.advance(10ms);
 
     // **Reset AFTER the Set.** `NotifyingStorage::Set` notifies too, so without this
     // the observer records the store -- on the test thread -- and the case reads a

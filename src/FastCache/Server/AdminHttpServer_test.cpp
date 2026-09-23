@@ -31,7 +31,7 @@ namespace
 
 FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view payload)
 {
-    auto const result = co_await socket->Write(FastCache::AsBytes(payload));
+    auto const result = co_await socket->write(FastCache::AsBytes(payload));
     co_return result.has_value();
 }
 
@@ -59,7 +59,7 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
     while (true)
     {
         std::vector<std::byte> chunk(512);
-        auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const result = co_await socket->read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!result.has_value() || *result == 0)
             break;
         for (auto const i: std::views::iota(std::size_t { 0 }, *result))
@@ -112,7 +112,7 @@ std::string Exchange(std::string_view request, FastCache::IMetricsSink const& me
     // said nothing, and writing zero bytes is not the same as not writing.
     if (!request.empty())
         REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
     return ServeAndCollect(pair.server.get(), pair, metrics, stats);
 }
 
@@ -141,9 +141,9 @@ class ShortReadSocket final: public FastCache::Testing::SocketDecorator
     /// Hand up no more than `limit` bytes, whatever the caller asked for.
     /// @param buffer Where to put them.
     /// @return What the decorated socket delivered into the narrowed span.
-    [[nodiscard]] FastCache::IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] FastCache::IoAwaitable read(std::span<std::byte> buffer) override
     {
-        return SocketDecorator::Read(buffer.subspan(0, std::min(buffer.size(), _limit)));
+        return SocketDecorator::read(buffer.subspan(0, std::min(buffer.size(), _limit)));
     }
 
   private:
@@ -163,10 +163,10 @@ class DeadlineRecordingSocket final: public FastCache::Testing::SocketDecorator
     {
     }
 
-    void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
+    void setReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
     {
         armed.push_back(deadline);
-        SocketDecorator::SetReceiveDeadline(deadline);
+        SocketDecorator::setReceiveDeadline(deadline);
     }
 
     std::vector<std::chrono::milliseconds> armed;
@@ -190,10 +190,10 @@ class ClockAdvancingSocket final: public FastCache::Testing::SocketDecorator
     {
     }
 
-    [[nodiscard]] FastCache::IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] FastCache::IoAwaitable read(std::span<std::byte> buffer) override
     {
-        _clock.Advance(_perRead);
-        return SocketDecorator::Read(buffer.subspan(0, std::min(buffer.size(), _limit)));
+        _clock.advance(_perRead);
+        return SocketDecorator::read(buffer.subspan(0, std::min(buffer.size(), _limit)));
     }
 
   private:
@@ -282,7 +282,7 @@ TEST_CASE("AdminHttp: a request split across reads is consumed to the end", "[me
     auto pair = FastCache::InMemorySocketPair::Create();
     REQUIRE(
         FastCache::SyncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
 
     // One read can see no more than the request line, so the headers must be picked
     // up by a later one -- or left behind, which is the bug.
@@ -321,7 +321,7 @@ std::string ExchangeWithRoutes(std::string_view request, std::vector<FastCache::
     FastCache::AtomicMetricsSink metrics;
     auto pair = FastCache::InMemorySocketPair::Create();
     REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
     using namespace std::chrono_literals;
     auto provider = [] {
         return FastCache::MetricsSnapshot { .storage = std::nullopt,
@@ -580,7 +580,7 @@ TEST_CASE("AdminHttp: a silent peer gets the preconnect budget, and a started he
     // Behind a complete head, so the server answers before it could reach it. It is here
     // for the close: a served connection listens until its peer closes, and this
     // in-process pair has no clock to end the listening the way a real deadline does.
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
     DeadlineRecordingSocket recorder { *pair.server };
 
     FastCache::AtomicMetricsSink metrics;
@@ -613,7 +613,7 @@ TEST_CASE("AdminHttp: a head that dribbles past its total budget is refused 408"
     // out, so it cannot inform the refusal. It is here for the close that follows: the
     // server listens to a refused peer until that peer closes, and a real socket stops
     // listening at a deadline this in-process pair has no clock for.
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
     FastCache::ManualClock clock;
     // Each read costs time, which is what a dribbling client actually does -- the fake
     // advances the clock rather than the test doing it, because the reads happen inside
@@ -706,12 +706,12 @@ TEST_CASE("AdminHttp: a served connection's refusal over a head it did not finis
     FastCache::SteadyClock clock;
     FastCache::AdminHttpServer server { listener, metrics, [] { return FastCache::MetricsSnapshot {}; }, logger, clock };
 
-    auto client = listener.ConnectClient();
+    auto client = listener.connectClient();
     std::string request = "GET /healthz HTTP/1.1\r\nHost: x\r\n";
     request += "X-Pad: " + std::string(9000, 'p') + "\r\n";
     request += "\r\n";
     REQUIRE(FastCache::SyncRun(WriteString(client.get(), request)));
-    client->ShutdownWrite();
+    client->shutdownWrite();
     // Queued connections are accepted before the closed listener ends the loop.
     listener.Close();
     FastCache::SyncRun(server.Run());

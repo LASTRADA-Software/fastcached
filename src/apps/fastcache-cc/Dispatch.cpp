@@ -411,7 +411,7 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
     // over-states how much of the grant is gone rather than under-stating it, and
     // over-stating is the safe direction: the client gives up a little early instead
     // of waiting past a lease the scheduler has already reclaimed.
-    auto const askedAt = now.Now();
+    auto const askedAt = now.now();
     auto const lease = LeaseFromFleet(exchange, request.schedulerEndpoint, request, accepted, credential, budgets.control);
     auto const& leaseOutcome = lease.outcome;
     if (leaseOutcome.kind == CacheOutcomeKind::Transport)
@@ -453,7 +453,7 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
                     // argument for both halves.
                     .budget = UnderGrantedLease(budgets.compile,
                                                 grant->lifetime,
-                                                std::chrono::duration_cast<std::chrono::milliseconds>(now.Now() - askedAt)),
+                                                std::chrono::duration_cast<std::chrono::milliseconds>(now.now() - askedAt)),
                     .maxObjectBytes = budgets.maxDecompressedBytes });
 
     // --- and hand the lease back, however that went -------------------------

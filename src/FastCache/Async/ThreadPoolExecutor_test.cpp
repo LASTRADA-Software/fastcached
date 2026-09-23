@@ -162,7 +162,7 @@ TEST_CASE("A pool never abandons a coroutine it was handed", "[async][threadpool
     SECTION("submitted after it stopped")
     {
         ThreadPoolExecutor pool { 1 };
-        pool.Stop();
+        pool.stop();
         RunOn(Job { .pool = &pool, .arrived = &ran });
         // Resumed on this thread rather than dropped, so it still completed.
         CHECK(ran.Count() == 1);
@@ -175,7 +175,7 @@ TEST_CASE("A pool asked for no threads still runs its work", "[async][threadpool
     // a leak wearing the shape of an idle pool.
     Arrivals ran;
     ThreadPoolExecutor pool { 0 };
-    CHECK(pool.Threads() == 1);
+    CHECK(pool.threads() == 1);
 
     RunOn(Job { .pool = &pool, .arrived = &ran });
     CHECK(ran.WaitFor(1));

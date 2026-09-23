@@ -165,7 +165,7 @@ class NoIdentity final: public INodeStatusSource
 /// @return Whether every byte was taken.
 [[nodiscard]] Task<bool> WriteWhole(ISocket* socket, std::span<std::byte const> bytes)
 {
-    auto const written = co_await socket->Write(bytes);
+    auto const written = co_await socket->write(bytes);
     co_return written.has_value() && *written == bytes.size();
 }
 
@@ -178,7 +178,7 @@ class NoIdentity final: public INodeStatusSource
     std::vector<std::byte> chunk(64 * 1024);
     while (true)
     {
-        auto const read = co_await socket->Read(chunk);
+        auto const read = co_await socket->read(chunk);
         if (!read.has_value() || *read == 0)
             co_return text;
         for (auto const byte: std::span<std::byte const> { chunk }.first(*read))
@@ -232,14 +232,14 @@ class MetricsDoors
         auto pair = InMemorySocketPair::Create();
         auto const request = std::string_view { "GET /metrics HTTP/1.1\r\n\r\n" };
         REQUIRE(SyncRun(WriteWhole(pair.client.get(), Wire::AsBytes(request))));
-        pair.client->ShutdownWrite();
+        pair.client->shutdownWrite();
         SteadyClock clock;
         // `_served`, the SAME set the `node-metrics` door reads through `_sources` -- which is
         // the whole point of this fixture. The two doors are meant to differ in nothing but how
         // they are asked, so a surface set either one owns privately would make them disagree
         // about which rows are absent and read as a figure one door drops (#1484, #1501).
         SyncRun(ServeAdminHttp(pair.server.get(), &_metrics, _provider, &clock, {}, _served.Span()));
-        pair.server->Close();
+        pair.server->close();
 
         auto const response = SyncRun(ReadToEnd(pair.client.get()));
         REQUIRE(response.starts_with("HTTP/1.1 200 OK\r\n"));

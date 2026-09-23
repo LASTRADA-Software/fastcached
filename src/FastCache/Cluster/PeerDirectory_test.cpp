@@ -35,11 +35,11 @@ TEST_CASE("PeerDirectory records a peer and forgets it when its beacons stop", "
     // Still inside the window: a beacon may be lost without costing a peer its
     // place, which is the whole reason the expiry is generous relative to the
     // beacon interval.
-    clock.Advance(89s);
+    clock.advance(89s);
     CHECK(directory.ExpireStale() == 0);
     CHECK(directory.Size() == 1);
 
-    clock.Advance(2s);
+    clock.advance(2s);
     CHECK(directory.ExpireStale() == 1);
     CHECK(directory.Size() == 0);
 }

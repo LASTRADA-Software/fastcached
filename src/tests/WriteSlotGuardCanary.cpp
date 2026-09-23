@@ -82,7 +82,7 @@ constexpr std::size_t UnsendableBytes = 32UZ * 1024UZ * 1024UZ;
 /// @return The detached task holding the parked write.
 FastCache::DetachedTask ParkOnWrite(FastCache::ISocket* socket, std::span<std::byte const> buffer)
 {
-    static_cast<void>(co_await socket->Write(buffer));
+    static_cast<void>(co_await socket->write(buffer));
 }
 
 /// Read the control bytes the server sends, then stop reading.
@@ -104,7 +104,7 @@ FastCache::Task<void> DrainControlBytes(FastCache::ISocket* socket)
     std::size_t got = 0;
     while (got < 16)
     {
-        auto const read = co_await socket->Read(std::span<std::byte> { scratch });
+        auto const read = co_await socket->read(std::span<std::byte> { scratch });
         if (!read.has_value() || *read == 0)
             co_return;
         got += *read;
@@ -125,7 +125,7 @@ FastCache::DetachedTask DoubleArmTheWriteSlot(FastCache::PlatformReactor* reacto
     auto incoming = co_await listener->Accept();
     if (!incoming.has_value())
     {
-        reactor->Stop();
+        reactor->stop();
         co_return;
     }
     auto socket = std::move(*incoming);
@@ -138,11 +138,11 @@ FastCache::DetachedTask DoubleArmTheWriteSlot(FastCache::PlatformReactor* reacto
     std::array<std::byte, 8> const control {};
     for (auto const pass: { 1, 2 })
     {
-        auto const wrote = co_await socket->Write(std::span<std::byte const> { control });
+        auto const wrote = co_await socket->write(std::span<std::byte const> { control });
         if (!wrote.has_value())
         {
             std::println(std::cerr, "write-slot-guard-canary: the control write {} failed; nothing was watched", pass);
-            reactor->Stop();
+            reactor->stop();
             co_return;
         }
     }
@@ -158,12 +158,12 @@ FastCache::DetachedTask DoubleArmTheWriteSlot(FastCache::PlatformReactor* reacto
     // The claim happens when `Write` PARKS -- so the guard fires on this line only if
     // the first write is still parked, which is why the client must not be reading.
     // The awaitable is deliberately never awaited: we do not intend to get here.
-    auto const armed = socket->Write(std::span<std::byte const> { unsendable });
+    auto const armed = socket->write(std::span<std::byte const> { unsendable });
     static_cast<void>(armed);
 
     survived->store(true, std::memory_order_release);
-    socket->Close();
-    reactor->Stop();
+    socket->close();
+    reactor->stop();
 }
 
 } // namespace
@@ -188,7 +188,7 @@ int main()
     std::jthread client { [port] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
 
@@ -202,10 +202,10 @@ int main()
         FastCache::SyncRun(DrainControlBytes(socket->get()));
 
         std::this_thread::sleep_for(std::chrono::seconds { 3 });
-        (*socket)->Close();
+        (*socket)->close();
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
 
     if (!accepted.load(std::memory_order_acquire))

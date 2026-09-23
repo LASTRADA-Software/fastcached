@@ -25,7 +25,7 @@ namespace FastCache::Detail
 /// @param reactor The reactor owning the object about to be destroyed.
 inline void AssertTeardownIsSerialisedWithDispatch([[maybe_unused]] IReactor const& reactor) noexcept
 {
-    assert(reactor.TeardownIsSerialisedWithDispatch()
+    assert(reactor.teardownIsSerialisedWithDispatch()
            && "an object owned by a reactor must be destroyed on that reactor's worker thread, or with that "
               "reactor stopped -- otherwise clearing a pending awaitable races the completion dispatch");
 }

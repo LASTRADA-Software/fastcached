@@ -30,7 +30,7 @@ Task<void> Connection::Run()
     auto sourceTag = std::string {};
     if (_held.logSource == LogSource::Yes)
     {
-        if (auto const peer = _socket->PeerAddress(); !peer.empty())
+        if (auto const peer = _socket->peerAddress(); !peer.empty())
             sourceTag = std::format("[{}]", peer);
     }
     SourceLogger log { _held.logger, sourceTag };
@@ -46,10 +46,10 @@ Task<void> Connection::Run()
     // Drive any transport handshake (TLS) before reading application bytes.
     // No-op for plaintext sockets; runs on this per-connection coroutine so a
     // slow or stalled handshake never blocks the accept loop.
-    if (auto const handshake = co_await _socket->HandshakeIfNeeded(); !handshake.has_value())
+    if (auto const handshake = co_await _socket->handshakeIfNeeded(); !handshake.has_value())
     {
         log.Logf(LogLevel::Debug, "Connection: handshake failed: {}", handshake.error().ToString());
-        _socket->Close();
+        _socket->close();
         co_return;
     }
 
@@ -57,7 +57,7 @@ Task<void> Connection::Run()
     if (!detect.has_value())
     {
         log.Logf(LogLevel::Debug, "Connection: autodetect failed: {}", detect.error().ToString());
-        _socket->Close();
+        _socket->close();
         co_return;
     }
 

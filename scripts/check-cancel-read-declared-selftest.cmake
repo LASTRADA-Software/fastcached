@@ -7,16 +7,16 @@
 #
 # Eight cases:
 #
-#   1. compliant   -- a transport that declares `CancelRead` PASSES, and the report says
+#   1. compliant   -- a transport that declares `cancelRead` PASSES, and the report says
 #                     how much was looked at. A check that refuses everything is exactly
 #                     as useless as one that refuses nothing, and looks like rigour.
 #   2. missing     -- a transport that declares none is refused, NAMING the file and the
 #                     class. This is the real defect: two of six transports inherited
 #                     the default no-op and both parked (#710, #892).
-#   3. commented   -- a `CancelRead` that appears only inside a `//` comment is refused.
+#   3. commented   -- a `cancelRead` that appears only inside a `//` comment is refused.
 #                     A COMMENT IS NOT A DECLARATION (#720), and the check strips
 #                     comments before it measures anything.
-#   4. neighbour   -- TWO transports in one header where the FIRST omits `CancelRead`
+#   4. neighbour   -- TWO transports in one header where the FIRST omits `cancelRead`
 #                     and the SECOND declares it. This is the case a clean tree cannot
 #                     exhibit and the reason the scan bounds each class's region: without
 #                     the boundary the second's answer covers the first's silence, and
@@ -24,7 +24,7 @@
 #  4b. blockcommented -- the `/* */` spelling of case 3. Its own case because it was its
 #                     own hole: only `//` was stripped, so a Doxygen `/** ... */` block
 #                     answered for its class while case 3 went on passing.
-#  4c. trailinghelper -- a `CancelRead` CALL after the LAST class in the header. The
+#  4c. trailinghelper -- a `cancelRead` CALL after the LAST class in the header. The
 #                     region used to run to EOF, so an ordinary trailing helper covered
 #                     a transport that declared nothing -- and this needs no neighbour,
 #                     which is why case 4's boundary never reached it.
@@ -117,7 +117,7 @@ class ExampleSocket final: public ISocket
 {
   public:
     IoAwaitable Read(std::span<std::byte> buffer) override;
-    void CancelRead() noexcept override;
+    void cancelRead() noexcept override;
     void Close() noexcept override;
 };
 
@@ -130,7 +130,7 @@ math(EXPR caseCount "${caseCount} + 1")
 fastcached_make_tree("compliant" "ExampleSocket.hpp" "${compliantHeader}" tree)
 fastcached_run_check("${tree}" objected output)
 if(objected)
-    list(APPEND failures "compliant: a transport that declares CancelRead was refused -- the check refuses everything")
+    list(APPEND failures "compliant: a transport that declares cancelRead was refused -- the check refuses everything")
 else()
     string(FIND "${output}" "1 transport(s)" counted)
     if(counted EQUAL -1)
@@ -141,7 +141,7 @@ endif()
 # ---------------------------------------------------------------------------
 # 2. A transport that declares none is refused, and named.
 math(EXPR caseCount "${caseCount} + 1")
-string(REPLACE "    void CancelRead() noexcept override;\n" "" missingHeader "${compliantHeader}")
+string(REPLACE "    void cancelRead() noexcept override;\n" "" missingHeader "${compliantHeader}")
 fastcached_make_tree("missing" "ExampleSocket.hpp" "${missingHeader}" tree)
 fastcached_run_check("${tree}" objected output)
 if(NOT objected)
@@ -156,13 +156,13 @@ endif()
 # ---------------------------------------------------------------------------
 # 3. A declaration that exists only inside a comment is refused.
 math(EXPR caseCount "${caseCount} + 1")
-string(REPLACE "    void CancelRead() noexcept override;"
-               "    // CancelRead is inherited on purpose, honest"
+string(REPLACE "    void cancelRead() noexcept override;"
+               "    // cancelRead is inherited on purpose, honest"
                commentedHeader "${compliantHeader}")
 fastcached_make_tree("commented" "ExampleSocket.hpp" "${commentedHeader}" tree)
 fastcached_run_check("${tree}" objected output)
 if(NOT objected)
-    list(APPEND failures "commented: a CancelRead named only in a comment satisfied the check -- comments are not declarations")
+    list(APPEND failures "commented: a cancelRead named only in a comment satisfied the check -- comments are not declarations")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -185,7 +185,7 @@ class AnsweringSocket final: public ISocket
 {
   public:
     IoAwaitable Read(std::span<std::byte> buffer) override;
-    void CancelRead() noexcept override;
+    void cancelRead() noexcept override;
     void Close() noexcept override;
 };
 
@@ -195,7 +195,7 @@ fastcached_make_tree("neighbour" "TwoSockets.hpp" "${neighbourHeader}" tree)
 fastcached_run_check("${tree}" objected output)
 if(NOT objected)
     list(APPEND failures
-         "neighbour: the SECOND transport's CancelRead covered the FIRST one's silence -- the region boundary is not holding")
+         "neighbour: the SECOND transport's cancelRead covered the FIRST one's silence -- the region boundary is not holding")
 else()
     string(FIND "${output}" "SilentSocket derives from ISocket" namedFirst)
     if(namedFirst EQUAL -1)
@@ -203,25 +203,25 @@ else()
     endif()
     string(FIND "${output}" "AnsweringSocket derives from ISocket" namedSecond)
     if(NOT namedSecond EQUAL -1)
-        list(APPEND failures "neighbour: refused AnsweringSocket, which declares CancelRead -- the region is over-reaching")
+        list(APPEND failures "neighbour: refused AnsweringSocket, which declares cancelRead -- the region is over-reaching")
     endif()
 endif()
 
 # ---------------------------------------------------------------------------
 # 4b. The BLOCK-comment spelling of case 3, and it is a separate case because it was a
-# separate hole: stripping only `//` left `/* CancelRead */` and every `/** ... */`
+# separate hole: stripping only `//` left `/* cancelRead */` and every `/** ... */`
 # Doxygen block answering for the class that contains it. Case 3 passed throughout, so
 # "a comment is not a declaration" read as enforced while one of the two spellings of a
 # comment was not.
 math(EXPR caseCount "${caseCount} + 1")
-string(REPLACE "    void CancelRead() noexcept override;"
-               "    /** CancelRead is inherited on purpose, honest */"
+string(REPLACE "    void cancelRead() noexcept override;"
+               "    /** cancelRead is inherited on purpose, honest */"
                blockCommentedHeader "${compliantHeader}")
 fastcached_make_tree("blockcommented" "ExampleSocket.hpp" "${blockCommentedHeader}" tree)
 fastcached_run_check("${tree}" objected output)
 if(NOT objected)
     list(APPEND failures
-         "blockcommented: a CancelRead named only inside a /* */ comment satisfied the check -- only the // spelling is stripped")
+         "blockcommented: a cancelRead named only inside a /* */ comment satisfied the check -- only the // spelling is stripped")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -245,8 +245,8 @@ class SilentSocket final: public ISocket
 
 inline void RetireBoth(ISocket& a, ISocket& b) noexcept
 {
-    a.CancelRead();
-    b.CancelRead();
+    a.cancelRead();
+    b.cancelRead();
 }
 
 } // namespace FastCache
@@ -255,7 +255,7 @@ fastcached_make_tree("trailinghelper" "SilentSocket.hpp" "${trailingHelperHeader
 fastcached_run_check("${tree}" objected output)
 if(NOT objected)
     list(APPEND failures
-         "trailinghelper: a CancelRead CALL after the last class satisfied it -- the region runs past the closing brace")
+         "trailinghelper: a cancelRead CALL after the last class satisfied it -- the region runs past the closing brace")
 else()
     string(FIND "${output}" "SilentSocket derives from ISocket" namedTrailing)
     if(namedTrailing EQUAL -1)
@@ -284,7 +284,7 @@ namespace FastCache
 class ExampleSocket final: public ISomethingElse
 {
   public:
-    void CancelRead() noexcept override;
+    void cancelRead() noexcept override;
 };
 
 } // namespace FastCache

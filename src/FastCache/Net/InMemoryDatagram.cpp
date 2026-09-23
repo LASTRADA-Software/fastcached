@@ -53,13 +53,13 @@ class InMemoryDatagramSocket final: public IDatagramSocket
     InMemoryDatagramSocket& operator=(InMemoryDatagramSocket const&) = delete;
     InMemoryDatagramSocket& operator=(InMemoryDatagramSocket&&) = delete;
 
-    std::expected<void, NetError> Send(std::span<std::byte const> payload, DatagramAddress const& to) override
+    std::expected<void, NetError> send(std::span<std::byte const> payload, DatagramAddress const& to) override
     {
         _bus.Deliver(payload, to, _endpoint);
         return {};
     }
 
-    std::expected<ReceivedDatagram, DatagramWait> Receive(std::chrono::milliseconds timeout) override
+    std::expected<ReceivedDatagram, DatagramWait> receive(std::chrono::milliseconds timeout) override
     {
         std::unique_lock lock { _bus._mutex };
 
@@ -91,7 +91,7 @@ class InMemoryDatagramSocket final: public IDatagramSocket
         _bus._arrived.notify_all();
     }
 
-    [[nodiscard]] DatagramAddress BoundAddress() const override
+    [[nodiscard]] DatagramAddress boundAddress() const override
     {
         return _endpoint;
     }
@@ -127,7 +127,7 @@ void DatagramBus::Detach(std::size_t id)
     _inboxes.erase(id);
 }
 
-std::size_t DatagramBus::DropNext(DatagramAddress const& endpoint, std::size_t count)
+std::size_t DatagramBus::dropNext(DatagramAddress const& endpoint, std::size_t count)
 {
     std::scoped_lock const lock { _mutex };
     std::size_t starved = 0;
@@ -139,7 +139,7 @@ std::size_t DatagramBus::DropNext(DatagramAddress const& endpoint, std::size_t c
     return starved;
 }
 
-std::size_t DatagramBus::SendCount() const
+std::size_t DatagramBus::sendCount() const
 {
     std::scoped_lock const lock { _mutex };
     return _sendCount;
@@ -164,7 +164,7 @@ void DatagramBus::Deliver(std::span<std::byte const> payload, DatagramAddress co
             inbox.queue.push_back(ReceivedDatagram { .payload = { payload.begin(), payload.end() }, .from = from });
         };
 
-        if (to.host == BroadcastAddress().host)
+        if (to.host == broadcastAddress().host)
         {
             // Port zero is every inbox; any other port is the sockets bound to
             // it, which is what a broadcast to `255.255.255.255:P` reaches.

@@ -109,7 +109,7 @@ DetachedTask ParkOnTimerForever(IReactor* reactor, FrameSentinel sentinel, Count
 {
     (void) sentinel;
     counters->parked.fetch_add(1, std::memory_order_acq_rel);
-    co_await SleepUntil { .reactor = reactor, .deadline = reactor->Clock().Now() + 1h };
+    co_await SleepUntil { .reactor = reactor, .deadline = reactor->clock().now() + 1h };
     counters->completed.fetch_add(1, std::memory_order_acq_rel);
     co_return;
 }
@@ -123,7 +123,7 @@ DetachedTask ParkOnTimerBriefly(IReactor* reactor, FrameSentinel sentinel, Count
 {
     (void) sentinel;
     counters->parked.fetch_add(1, std::memory_order_acq_rel);
-    co_await SleepUntil { .reactor = reactor, .deadline = reactor->Clock().Now() + delay };
+    co_await SleepUntil { .reactor = reactor, .deadline = reactor->clock().now() + delay };
     counters->completed.fetch_add(1, std::memory_order_acq_rel);
     co_return;
 }
@@ -136,7 +136,7 @@ Task<void> ParkInner(IReactor* reactor, FrameSentinel sentinel, Counters* counte
 {
     (void) sentinel;
     counters->parked.fetch_add(1, std::memory_order_acq_rel);
-    co_await SleepUntil { .reactor = reactor, .deadline = reactor->Clock().Now() + 1h };
+    co_await SleepUntil { .reactor = reactor, .deadline = reactor->clock().now() + 1h };
     co_return;
 }
 
@@ -214,7 +214,7 @@ class ReentrantDisarm
     {
         if (_reactor == nullptr)
             return;
-        std::ignore = _reactor->CancelPending(_handle);
+        std::ignore = _reactor->cancelPending(_handle);
         _counters->reentered.fetch_add(1, std::memory_order_acq_rel);
     }
 
@@ -284,7 +284,7 @@ struct ManualDriver
         {
             if (predicate())
                 break;
-            clock.Advance(window / 10 + 1ms);
+            clock.advance(window / 10 + 1ms);
             std::ignore = reactor.Drain();
         }
         return predicate();
@@ -327,7 +327,7 @@ struct PlatformDriver
     template <typename Predicate>
     [[nodiscard]] bool RunUntil(Duration /*window*/, Predicate predicate)
     {
-        worker = std::thread { [this] { reactor.Run(); } };
+        worker = std::thread { [this] { reactor.run(); } };
 
         // Bounded, and generous rather than tuned: what is being waited for is one
         // timer on an idle reactor, so a slow runner is the only thing that can make
@@ -345,7 +345,7 @@ struct PlatformDriver
     {
         if (!worker.joinable())
             return;
-        reactor.Stop();
+        reactor.stop();
         worker.join();
     }
 };
@@ -366,7 +366,7 @@ void AbandonedTimerIsFreedExactlyOnce()
         REQUIRE(counters.completed.load() == 0);
         REQUIRE(counters.destroyed.load() == 0);
 
-        driver.Reactor().Stop();
+        driver.Reactor().stop();
         driver.Quiesce();
 
         // Stopping is not freeing, and that is the defect stated as an assertion:
@@ -416,7 +416,7 @@ void AnAbandonedChainIsFreedFromItsRoot()
         REQUIRE(counters.parked.load() == 1);
         REQUIRE(counters.destroyed.load() == 0);
 
-        driver.Reactor().Stop();
+        driver.Reactor().stop();
         driver.Quiesce();
         REQUIRE(counters.destroyed.load() == 0);
     }
@@ -488,7 +488,7 @@ void WorkSomebodyElseOwnsIsLeftAlone()
         auto owned = OwnedElsewhere(FrameSentinel { &counters }, &counters);
         {
             Driver driver;
-            driver.Reactor().Submit(owned.Native());
+            driver.Reactor().submit(owned.handle());
         }
 
         // The reactor was destroyed holding this handle and did not touch it. A
@@ -579,17 +579,17 @@ TEST_CASE("A parked entry that cannot resume frees the chain it owns", "[async][
 
     // Run to its final suspend, so it is a handle `Resume()` will decline.
     auto done = ImmediateWithSentinel(FrameSentinel { &spent }, &spent);
-    done.Native().resume();
-    REQUIRE(done.IsReady());
+    done.handle().resume();
+    REQUIRE(done.done());
 
     auto victim = ImmediateWithSentinel(FrameSentinel { &owned }, &owned);
     {
         // `Release()` is what makes this entry the chain's only owner, which is the
         // arrangement `ParkedWork::abandon` describes.
-        Detail::Parked parked { ParkedWork { .resume = done.Native(), .abandon = victim.Release() } };
+        Detail::Parked parked { ParkedWork { .resume = done.handle(), .abandon = victim.release() } };
         REQUIRE(owned.destroyed.load() == 0);
 
-        parked.Resume();
+        parked.resume();
         CHECK(owned.destroyed.load() == 1);
     }
 
@@ -628,7 +628,7 @@ TEST_CASE("A reactor frees parked chains while both its containers are still ali
         // dies second, so it is the one whose freeing would reach the other's corpse.
         ParkOnSubmitWithDisarm(&driver.Reactor(),
                                FrameSentinel { &counters },
-                               ReentrantDisarm { &driver.Reactor(), absent.Native(), &counters },
+                               ReentrantDisarm { &driver.Reactor(), absent.handle(), &counters },
                                &counters);
 
         REQUIRE(counters.parked.load() == 2);

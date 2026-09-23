@@ -113,7 +113,7 @@ endfunction()
 # A transport that complies: the guard is the first statement, ahead of the `_closed`
 # early return every real one opens with.
 set(compliantSource
-"IoAwaitable ExampleSocket::Read(std::span<std::byte> buffer)
+"IoAwaitable ExampleSocket::read(std::span<std::byte> buffer)
 {
     Detail::RequireReadBuffer(buffer);
     if (_closed)
@@ -140,7 +140,7 @@ endif()
 # 2. THE REGRESSION CASE. A transport with no guard is refused and NAMED.
 math(EXPR caseCount "${caseCount} + 1")
 set(missingSource
-"IoAwaitable ExampleSocket::Read(std::span<std::byte> buffer)
+"IoAwaitable ExampleSocket::read(std::span<std::byte> buffer)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(NetError {}) };
@@ -162,7 +162,7 @@ endif()
 # 3. A guard below the first return is refused, and for THAT reason.
 math(EXPR caseCount "${caseCount} + 1")
 set(lateSource
-"IoAwaitable ExampleSocket::Read(std::span<std::byte> buffer)
+"IoAwaitable ExampleSocket::read(std::span<std::byte> buffer)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(NetError {}) };
@@ -185,7 +185,7 @@ endif()
 # 4. A guard that exists only in a comment is refused. A comment is not a call site.
 math(EXPR caseCount "${caseCount} + 1")
 set(commentedSource
-"IoAwaitable ExampleSocket::Read(std::span<std::byte> buffer)
+"IoAwaitable ExampleSocket::read(std::span<std::byte> buffer)
 {
     // Detail::RequireReadBuffer(buffer);
     if (_closed)
@@ -260,7 +260,7 @@ foreach(i RANGE 1 200)
 endforeach()
 string(APPEND paddedPair
 "
-IoAwaitable AlphaSocket::Read(std::span<std::byte> buffer)
+IoAwaitable AlphaSocket::read(std::span<std::byte> buffer)
 {
     Detail::RequireReadBuffer(buffer);
     if (_closed)
@@ -268,7 +268,7 @@ IoAwaitable AlphaSocket::Read(std::span<std::byte> buffer)
     return IoAwaitable { IoResult { buffer.size() } };
 }
 
-IoAwaitable BetaSocket::Read(std::span<std::byte> buffer)
+IoAwaitable BetaSocket::read(std::span<std::byte> buffer)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(NetError {}) };

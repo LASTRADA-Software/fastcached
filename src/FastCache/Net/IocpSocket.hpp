@@ -71,24 +71,24 @@ class IocpSocket final: public ISocket
                IocpAttachment attachment = IocpAttachment::Attach) noexcept;
     ~IocpSocket() override;
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override;
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override;
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override;
-    [[nodiscard]] IoAwaitable WaitReadable() override;
-    void Close() noexcept override;
+    [[nodiscard]] IoAwaitable waitReadable() override;
+    void close() noexcept override;
 
     /// @copydoc ISocket::CancelRead
-    void CancelRead() noexcept override;
+    void cancelRead() noexcept override;
 
     /// @copydoc ISocket::ShutdownWrite
-    void ShutdownWrite() noexcept override;
+    void shutdownWrite() noexcept override;
 
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return _closed;
     }
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return _peerAddress;
     }

@@ -49,65 +49,65 @@ class SocketDecorator: public ISocket
     }
 
     /// @copydoc ISocket::Read
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
     {
-        return _inner.Read(buffer);
+        return _inner.read(buffer);
     }
 
     /// @copydoc ISocket::Write
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override
     {
-        return _inner.Write(buffer);
+        return _inner.write(buffer);
     }
 
     /// @copydoc ISocket::WriteVectored
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override
     {
-        return _inner.WriteVectored(segments, std::move(keepAlive));
+        return _inner.writeVectored(segments, std::move(keepAlive));
     }
 
     /// @copydoc ISocket::HandshakeIfNeeded
-    [[nodiscard]] Task<std::expected<void, NetError>> HandshakeIfNeeded() override
+    [[nodiscard]] Task<std::expected<void, NetError>> handshakeIfNeeded() override
     {
-        return _inner.HandshakeIfNeeded();
+        return _inner.handshakeIfNeeded();
     }
 
     /// @copydoc ISocket::WaitReadable
-    [[nodiscard]] IoAwaitable WaitReadable() override
+    [[nodiscard]] IoAwaitable waitReadable() override
     {
-        return _inner.WaitReadable();
+        return _inner.waitReadable();
     }
 
     /// @copydoc ISocket::PeerAddress
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
-        return _inner.PeerAddress();
+        return _inner.peerAddress();
     }
 
     /// @copydoc ISocket::Close
-    void Close() noexcept override
+    void close() noexcept override
     {
-        _inner.Close();
+        _inner.close();
     }
 
     /// @copydoc ISocket::CancelRead
-    void CancelRead() noexcept override
+    void cancelRead() noexcept override
     {
-        _inner.CancelRead();
+        _inner.cancelRead();
     }
 
     /// @copydoc ISocket::ShutdownWrite
-    void ShutdownWrite() noexcept override
+    void shutdownWrite() noexcept override
     {
-        _inner.ShutdownWrite();
+        _inner.shutdownWrite();
     }
 
     /// Forward the deadline to the decorated socket.
     /// @param deadline How long a read may block.
-    void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
+    void setReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
     {
-        _inner.SetReceiveDeadline(deadline);
+        _inner.setReceiveDeadline(deadline);
     }
 
     /// @copydoc ISocket::IsClosed
@@ -164,9 +164,9 @@ class FailingReadSocket final: public SocketDecorator
     /// Forward while the allowance lasts, then fail.
     /// @param buffer Where a forwarded read puts its bytes.
     /// @return The decorated socket's answer, or the configured failure.
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
     {
-        return TakeAllowance() ? SocketDecorator::Read(buffer) : Failure();
+        return TakeAllowance() ? SocketDecorator::read(buffer) : Failure();
     }
 
     /// The same answer `Read` would give.
@@ -177,9 +177,9 @@ class FailingReadSocket final: public SocketDecorator
     /// never going to resolve or retrieve it. Nothing calls it on this fake today;
     /// the pairing is a property of the type, not of its current callers.
     /// @return The decorated socket's answer, or the configured failure.
-    [[nodiscard]] IoAwaitable WaitReadable() override
+    [[nodiscard]] IoAwaitable waitReadable() override
     {
-        return TakeAllowance() ? SocketDecorator::WaitReadable() : Failure();
+        return TakeAllowance() ? SocketDecorator::waitReadable() : Failure();
     }
 
   private:
@@ -219,7 +219,7 @@ class FailingReadSocket final: public SocketDecorator
 /// @param parked The operation, already detached from its socket.
 inline void CompleteCancelled(IoAwaitable& parked) noexcept
 {
-    parked.Complete(
+    parked.complete(
         IoResult { std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }) });
 }
 
@@ -269,13 +269,13 @@ class ParkingReadableSocket final: public SocketDecorator
     /// defect against every build, including a fixed one.
     ~ParkingReadableSocket() override
     {
-        ParkingReadableSocket::Close();
+        ParkingReadableSocket::close();
     }
 
     /// Park, always -- there is no synchronous answer, which is the point.
     /// @return An awaitable the test resolves with `ResolveReadable`, or that
     ///         `CancelRead`/`Close` retires.
-    [[nodiscard]] IoAwaitable WaitReadable() override
+    [[nodiscard]] IoAwaitable waitReadable() override
     {
         ClaimSlot();
         ++_watchesArmed;
@@ -290,19 +290,19 @@ class ParkingReadableSocket final: public SocketDecorator
     /// Forward, having first claimed the shared read slot the way a real socket does.
     /// @param buffer Where the forwarded read puts its bytes.
     /// @return The decorated socket's answer.
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
     {
         ClaimSlot();
-        return SocketDecorator::Read(buffer);
+        return SocketDecorator::read(buffer);
     }
 
     /// @copydoc ISocket::CancelRead
     ///
     /// Completes last; see `CompleteCancelled`.
-    void CancelRead() noexcept override
+    void cancelRead() noexcept override
     {
         auto* const parked = std::exchange(_parked, nullptr);
-        SocketDecorator::CancelRead();
+        SocketDecorator::cancelRead();
         if (parked == nullptr)
             return;
         ++_watchesRetiredByCancel;
@@ -312,10 +312,10 @@ class ParkingReadableSocket final: public SocketDecorator
     /// @copydoc ISocket::Close
     ///
     /// Completes last; see `CompleteCancelled`.
-    void Close() noexcept override
+    void close() noexcept override
     {
         auto* const parked = std::exchange(_parked, nullptr);
-        SocketDecorator::Close();
+        SocketDecorator::close();
         if (parked == nullptr)
             return;
         ++_watchesRetiredByClose;
@@ -331,7 +331,7 @@ class ParkingReadableSocket final: public SocketDecorator
         if (parked == nullptr)
             return;
         ++_watchesResolved;
-        parked->Complete(IoResult { count });
+        parked->complete(IoResult { count });
     }
 
     /// @return How many readability watches were armed.
@@ -425,7 +425,7 @@ class ParkingWritableSocket final: public SocketDecorator
     /// never completed is a frame never freed.
     ~ParkingWritableSocket() override
     {
-        ParkingWritableSocket::Close();
+        ParkingWritableSocket::close();
     }
 
     /// From now on every write parks, as against a peer whose receive window has closed.
@@ -435,25 +435,25 @@ class ParkingWritableSocket final: public SocketDecorator
     }
 
     /// @copydoc ISocket::Write
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override
     {
-        return _stopped ? Park() : SocketDecorator::Write(buffer);
+        return _stopped ? Park() : SocketDecorator::write(buffer);
     }
 
     /// @copydoc ISocket::WriteVectored
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override
     {
-        return _stopped ? Park() : SocketDecorator::WriteVectored(segments, std::move(keepAlive));
+        return _stopped ? Park() : SocketDecorator::writeVectored(segments, std::move(keepAlive));
     }
 
     /// @copydoc ISocket::Close
     ///
     /// Completes last; see `CompleteCancelled`.
-    void Close() noexcept override
+    void close() noexcept override
     {
         auto* const parked = std::exchange(_parked, nullptr);
-        SocketDecorator::Close();
+        SocketDecorator::close();
         if (parked == nullptr)
             return;
         ++_writesRetiredByClose;

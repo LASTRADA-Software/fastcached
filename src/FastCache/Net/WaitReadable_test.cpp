@@ -96,13 +96,13 @@ FastCache::DetachedTask ObserveOne(FastCache::PlatformReactor* reactor,
     if (!accepted.has_value())
     {
         out->resolved.store(true, std::memory_order_release);
-        reactor->Stop();
+        reactor->stop();
         co_return;
     }
     auto socket = std::move(*accepted);
 
     out->arming.store(true, std::memory_order_release);
-    auto const readable = co_await socket->WaitReadable();
+    auto const readable = co_await socket->waitReadable();
 
     out->hasValue.store(readable.has_value(), std::memory_order_relaxed);
     if (readable.has_value())
@@ -111,7 +111,7 @@ FastCache::DetachedTask ObserveOne(FastCache::PlatformReactor* reactor,
     if (readAfter && readable.has_value())
     {
         std::array<std::byte, 8> buf {};
-        if (auto const got = co_await socket->Read(std::span<std::byte> { buf }); got.has_value())
+        if (auto const got = co_await socket->read(std::span<std::byte> { buf }); got.has_value())
             out->readBack.store(*got, std::memory_order_relaxed);
     }
 
@@ -121,13 +121,13 @@ FastCache::DetachedTask ObserveOne(FastCache::PlatformReactor* reactor,
     if (out->replyAfterEof)
     {
         std::array<std::byte, 3> const owed { std::byte { 'o' }, std::byte { 'w' }, std::byte { 'e' } };
-        if ((co_await socket->Write(std::span<std::byte const> { owed })).has_value())
+        if ((co_await socket->write(std::span<std::byte const> { owed })).has_value())
             out->replySent.store(true, std::memory_order_relaxed);
     }
 
     out->resolved.store(true, std::memory_order_release);
-    socket->Close();
-    reactor->Stop();
+    socket->close();
+    reactor->stop();
     co_return;
 }
 
@@ -170,7 +170,7 @@ TEST_CASE("WaitReadable reports zero when a parked peer closes gracefully", "[ne
     std::jthread client { [port, &observed, &unresolvedBeforeClose, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
 
@@ -182,10 +182,10 @@ TEST_CASE("WaitReadable reports zero when a parked peer closes gracefully", "[ne
         unresolvedBeforeClose.store(!observed.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
         // A full, graceful close: FIN, not RST.
-        (*socket)->Close();
+        (*socket)->close();
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
 
     // First, while the accounts of any wait that ran out are still attached.
@@ -220,7 +220,7 @@ TEST_CASE("WaitReadable reports non-zero for pending data and consumes none of i
     std::jthread client { [port, &observed, &unresolvedBeforeWrite, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
 
@@ -230,16 +230,16 @@ TEST_CASE("WaitReadable reports non-zero for pending data and consumes none of i
 
         std::array<std::byte, 1> const payload { std::byte { 0x7A } };
         (void) FastCache::SyncRun([](FastCache::ISocket* s, std::array<std::byte, 1> p) -> FastCache::Task<bool> {
-            co_return (co_await s->Write(std::span<std::byte const> { p })).has_value();
+            co_return (co_await s->write(std::span<std::byte const> { p })).has_value();
         }((*socket).get(), payload));
 
         // Held open until the server has finished, so the close cannot race the
         // observation and turn this into the EOF case.
         (void) waits.WaitForFlag("the observer to resolve", observed.resolved, [&observed] { return Describe(observed); });
-        (*socket)->Close();
+        (*socket)->close();
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
 
     // First, while the accounts of any wait that ran out are still attached.
@@ -275,15 +275,15 @@ TEST_CASE("WaitReadable reports zero when EOF is already pending before it is ca
     std::jthread client { [port, &closed] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (socket.has_value())
-            (*socket)->Close();
+            (*socket)->close();
         closed.store(true, std::memory_order_release);
     } };
 
     Observation observed;
     ObserveOne(&reactor, listener.get(), &observed, /*readAfter*/ false);
-    reactor.Run();
+    reactor.run();
     client.join();
 
     REQUIRE(closed.load(std::memory_order_acquire));
@@ -336,7 +336,7 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
     std::jthread client { [port, &observed, &received, &openAfterHalfClose, &unresolvedBeforeHalfClose, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
 
@@ -346,7 +346,7 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
 
         // **Half-close, not close.** The read half stays open, which is the whole
         // point: a `Close()` here would make the assertion below unreachable.
-        (*socket)->ShutdownWrite();
+        (*socket)->shutdownWrite();
         openAfterHalfClose.store(!(*socket)->IsClosed(), std::memory_order_relaxed);
 
         // **Bounded, and it is what keeps a missing fix a FAILURE rather than a
@@ -358,21 +358,21 @@ TEST_CASE("A half-closed peer still receives what it is owed", "[net][socket][wa
         if (!waits.WaitForFlag(
                 "the observer to see the half-close", observed.resolved, [&observed] { return Describe(observed); }))
         {
-            (*socket)->Close();
+            (*socket)->close();
             return;
         }
 
         received = FastCache::SyncRun([](FastCache::ISocket* s) -> FastCache::Task<std::vector<std::byte>> {
             std::array<std::byte, 8> buf {};
-            auto const got = co_await s->Read(std::span<std::byte> { buf });
+            auto const got = co_await s->read(std::span<std::byte> { buf });
             if (!got.has_value() || *got == 0)
                 co_return std::vector<std::byte> {};
             co_return std::vector<std::byte> { buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(*got) };
         }((*socket).get()));
-        (*socket)->Close();
+        (*socket)->close();
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
 
     // First, while the accounts of any wait that ran out are still attached.
@@ -446,7 +446,7 @@ TEST_CASE("MEASURED: WaitReadable on an abortive close", "[net][socket][waitread
         resetArmed.store(peer.Reset(), std::memory_order_relaxed);
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
 
     // First, while the accounts of any wait that ran out are still attached.

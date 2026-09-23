@@ -292,7 +292,7 @@ void EpollSocket::Impl::OnReadable(EpollFdHandler* base)
         auto const peeked = ::recv(impl->handler.fd, probe.data(), probe.size(), MSG_PEEK);
         if (peeked >= 0)
         {
-            peekAwaitable->Complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
+            peekAwaitable->complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
             return;
         }
 
@@ -318,10 +318,10 @@ void EpollSocket::Impl::OnReadable(EpollFdHandler* base)
         // `ArmDisconnect` is the second kind.
         if (errno == EAGAIN || errno == EINTR)
         {
-            peekAwaitable->Complete(IoResult { std::size_t { 1 } });
+            peekAwaitable->complete(IoResult { std::size_t { 1 } });
             return;
         }
-        peekAwaitable->Complete(std::unexpected(MakePosixError(errno, "recv")));
+        peekAwaitable->complete(std::unexpected(MakePosixError(errno, "recv")));
         return;
     }
 
@@ -333,7 +333,7 @@ void EpollSocket::Impl::OnReadable(EpollFdHandler* base)
         impl->readOp.awaitable = nullptr;
         impl->readOp.readBuffer = {};
         impl->UpdateInterest();
-        awaitable->Complete(IoResult { static_cast<std::size_t>(got) });
+        awaitable->complete(IoResult { static_cast<std::size_t>(got) });
         return;
     }
     if (errno == EAGAIN || errno == EINTR)
@@ -341,7 +341,7 @@ void EpollSocket::Impl::OnReadable(EpollFdHandler* base)
     impl->readOp.awaitable = nullptr;
     impl->readOp.readBuffer = {};
     impl->UpdateInterest();
-    awaitable->Complete(std::unexpected(MakePosixError(errno, "recv")));
+    awaitable->complete(std::unexpected(MakePosixError(errno, "recv")));
 }
 
 void EpollSocket::Impl::OnWritable(EpollFdHandler* base)
@@ -367,14 +367,14 @@ void EpollSocket::Impl::OnWritable(EpollFdHandler* base)
             impl->writeOp.awaitable = nullptr;
             impl->writeOp.ClearVectored();
             impl->UpdateInterest();
-            awaitable->Complete(std::unexpected(MakePosixError(errno, "sendmsg")));
+            awaitable->complete(std::unexpected(MakePosixError(errno, "sendmsg")));
             return;
         }
         auto const total = impl->writeOp.writeTotal;
         impl->writeOp.awaitable = nullptr;
         impl->writeOp.ClearVectored();
         impl->UpdateInterest();
-        awaitable->Complete(IoResult { total });
+        awaitable->complete(IoResult { total });
         return;
     }
 
@@ -392,14 +392,14 @@ void EpollSocket::Impl::OnWritable(EpollFdHandler* base)
         impl->writeOp.awaitable = nullptr;
         impl->writeOp.writeRemaining = {};
         impl->UpdateInterest();
-        awaitable->Complete(std::unexpected(MakePosixError(errno, "send")));
+        awaitable->complete(std::unexpected(MakePosixError(errno, "send")));
         return;
     }
     auto const total = impl->writeOp.writeTotal;
     impl->writeOp.awaitable = nullptr;
     impl->writeOp.writeTotal = 0;
     impl->UpdateInterest();
-    awaitable->Complete(IoResult { total });
+    awaitable->complete(IoResult { total });
 }
 
 EpollSocket::EpollSocket(EpollReactor& reactor, int fd, std::string peerAddress) noexcept:
@@ -441,16 +441,16 @@ EpollSocket::~EpollSocket()
 {
     if (_impl)
         Detail::AssertTeardownIsSerialisedWithDispatch(_impl->reactor);
-    EpollSocket::Close();
+    EpollSocket::close();
 }
 
-void EpollSocket::ShutdownWrite() noexcept
+void EpollSocket::shutdownWrite() noexcept
 {
     if (!_closed)
         Detail::HalfCloseWrite(static_cast<Detail::NativeSocket>(_fd));
 }
 
-void EpollSocket::Close() noexcept
+void EpollSocket::close() noexcept
 {
     if (_closed)
         return;
@@ -495,14 +495,14 @@ void EpollSocket::Close() noexcept
         // even once the first resume has taken the socket down.
         for (auto* awaitable: parked)
             if (awaitable != nullptr)
-                awaitable->Complete(
+                awaitable->complete(
                     std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
         return;
     }
     _fd = -1;
 }
 
-void EpollSocket::CancelRead() noexcept
+void EpollSocket::cancelRead() noexcept
 {
     if (_closed || !_impl)
         return;
@@ -537,7 +537,7 @@ namespace
 
 } // namespace
 
-IoAwaitable EpollSocket::Read(std::span<std::byte> buffer)
+IoAwaitable EpollSocket::read(std::span<std::byte> buffer)
 {
     Detail::RequireReadBuffer(buffer);
     if (_closed)
@@ -565,7 +565,7 @@ IoAwaitable EpollSocket::Read(std::span<std::byte> buffer)
     return a;
 }
 
-IoAwaitable EpollSocket::WaitReadable()
+IoAwaitable EpollSocket::waitReadable()
 {
     if (_closed)
         return IoAwaitable { std::unexpected(
@@ -598,7 +598,7 @@ IoAwaitable EpollSocket::WaitReadable()
     return a;
 }
 
-IoAwaitable EpollSocket::Write(std::span<std::byte const> buffer)
+IoAwaitable EpollSocket::write(std::span<std::byte const> buffer)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(
@@ -640,7 +640,7 @@ IoAwaitable EpollSocket::Write(std::span<std::byte const> buffer)
     return a;
 }
 
-IoAwaitable EpollSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+IoAwaitable EpollSocket::writeVectored(std::span<std::span<std::byte const> const> segments,
                                        std::shared_ptr<void const> keepAlive)
 {
     if (_closed)

@@ -39,13 +39,13 @@ TEST_CASE("A shared-port socket sends from the address only it holds", "[net][da
     auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
     auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = TestBeaconPort });
 
-    REQUIRE(node->Send(DatagramBytes("beacon"), peer->BoundAddress()).has_value());
+    REQUIRE(node->send(DatagramBytes("beacon"), peer->boundAddress()).has_value());
 
-    auto const received = peer->Receive(10ms);
+    auto const received = peer->receive(10ms);
     REQUIRE(received.has_value());
     CHECK(DatagramText(*received) == "beacon");
     CHECK(received->from == DatagramAddress { .host = "10.0.0.1", .port = 40001 });
-    CHECK(received->from == node->BoundAddress());
+    CHECK(received->from == node->boundAddress());
 }
 
 TEST_CASE("A shared-port socket receives on both of its halves", "[net][datagram][sharedport]")
@@ -57,13 +57,13 @@ TEST_CASE("A shared-port socket receives on both of its halves", "[net][datagram
     auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
     auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = TestBeaconPort });
 
-    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(TestBeaconPort)).has_value());
-    REQUIRE(peer->Send(DatagramBytes("proof"), node->BoundAddress()).has_value());
+    REQUIRE(peer->send(DatagramBytes("beacon"), DatagramBus::broadcastAddressOn(TestBeaconPort)).has_value());
+    REQUIRE(peer->send(DatagramBytes("proof"), node->boundAddress()).has_value());
 
     std::vector<std::string> heard;
     for ([[maybe_unused]] auto const attempt: std::views::iota(0, 2))
     {
-        auto const received = node->Receive(10ms);
+        auto const received = node->receive(10ms);
         REQUIRE(received.has_value());
         heard.push_back(DatagramText(*received));
     }
@@ -81,12 +81,12 @@ TEST_CASE("A broadcast reaches the shared half and not the private one", "[net][
     auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
     auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = TestBeaconPort });
 
-    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(TestBeaconPort)).has_value());
+    REQUIRE(peer->send(DatagramBytes("beacon"), DatagramBus::broadcastAddressOn(TestBeaconPort)).has_value());
 
-    auto const once = node->Receive(10ms);
+    auto const once = node->receive(10ms);
     REQUIRE(once.has_value());
     CHECK(DatagramText(*once) == "beacon");
-    CHECK_FALSE(node->Receive(10ms).has_value());
+    CHECK_FALSE(node->receive(10ms).has_value());
 }
 
 TEST_CASE("Two co-hosted shared-port sockets each get their own answers", "[net][datagram][sharedport]")
@@ -100,23 +100,23 @@ TEST_CASE("Two co-hosted shared-port sockets each get their own answers", "[net]
     auto second = CoHostedDatagramSocket(bus, "10.0.0.1", 40002);
     auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = TestBeaconPort });
 
-    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(TestBeaconPort)).has_value());
+    REQUIRE(peer->send(DatagramBytes("beacon"), DatagramBus::broadcastAddressOn(TestBeaconPort)).has_value());
 
     for (auto* const node: { first.get(), second.get() })
     {
-        auto const beacon = node->Receive(10ms);
+        auto const beacon = node->receive(10ms);
         REQUIRE(beacon.has_value());
         CHECK(DatagramText(*beacon) == "beacon");
     }
 
-    REQUIRE(peer->Send(DatagramBytes("for first"), first->BoundAddress()).has_value());
-    REQUIRE(peer->Send(DatagramBytes("for second"), second->BoundAddress()).has_value());
+    REQUIRE(peer->send(DatagramBytes("for first"), first->boundAddress()).has_value());
+    REQUIRE(peer->send(DatagramBytes("for second"), second->boundAddress()).has_value());
 
-    auto const atFirst = first->Receive(10ms);
+    auto const atFirst = first->receive(10ms);
     REQUIRE(atFirst.has_value());
     CHECK(DatagramText(*atFirst) == "for first");
 
-    auto const atSecond = second->Receive(10ms);
+    auto const atSecond = second->receive(10ms);
     REQUIRE(atSecond.has_value());
     CHECK(DatagramText(*atSecond) == "for second");
 }
@@ -134,7 +134,7 @@ TEST_CASE("Closing a shared-port socket stops its receive loop", "[net][datagram
 
     for ([[maybe_unused]] auto const attempt: std::views::iota(0, 2))
     {
-        auto const result = node->Receive(10ms);
+        auto const result = node->receive(10ms);
         REQUIRE_FALSE(result.has_value());
         CHECK(result.error() == DatagramWait::Closed);
     }
@@ -145,7 +145,7 @@ TEST_CASE("An idle shared-port socket times out rather than blocking", "[net][da
     DatagramBus bus;
     auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
 
-    auto const result = node->Receive(10ms);
+    auto const result = node->receive(10ms);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == DatagramWait::TimedOut);
 }
@@ -189,12 +189,12 @@ TEST_CASE("A shared-port socket drains a backlog as fast as it is asked", "[net]
     // the ceiling sits between them with room for a loaded runner on both sides.
     constexpr auto Backlog = 16;
     for ([[maybe_unused]] auto const sent: std::views::iota(0, Backlog))
-        REQUIRE(peer->Send(DatagramBytes("proof"), node->BoundAddress()).has_value());
+        REQUIRE(peer->send(DatagramBytes("proof"), node->boundAddress()).has_value());
 
     auto const startedAt = std::chrono::steady_clock::now();
     for ([[maybe_unused]] auto const drained: std::views::iota(0, Backlog))
     {
-        auto const received = node->Receive(2s);
+        auto const received = node->receive(2s);
         REQUIRE(received.has_value());
         CHECK(DatagramText(*received) == "proof");
     }
@@ -212,13 +212,13 @@ TEST_CASE("A shared-port socket polls each half however small the timeout", "[ne
     auto node = CoHostedDatagramSocket(bus, "10.0.0.1", 40001);
     auto peer = bus.Open(DatagramAddress { .host = "10.0.0.2", .port = TestBeaconPort });
 
-    REQUIRE(peer->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(TestBeaconPort)).has_value());
-    REQUIRE(peer->Send(DatagramBytes("proof"), node->BoundAddress()).has_value());
+    REQUIRE(peer->send(DatagramBytes("beacon"), DatagramBus::broadcastAddressOn(TestBeaconPort)).has_value());
+    REQUIRE(peer->send(DatagramBytes("proof"), node->boundAddress()).has_value());
 
     std::vector<std::string> heard;
     for ([[maybe_unused]] auto const attempt: std::views::iota(0, 2))
     {
-        auto const received = node->Receive(0ms);
+        auto const received = node->receive(0ms);
         REQUIRE(received.has_value());
         heard.push_back(DatagramText(*received));
     }
@@ -239,7 +239,7 @@ TEST_CASE("Two real nodes open a pair on one shared port", "[net][datagram][shar
     // collide with anything else on the machine -- this suite runs in parallel.
     auto probe = OpenUdpSocket("127.0.0.1", 0, BroadcastMode::Off, PortSharing::Shared);
     REQUIRE(probe != nullptr);
-    auto const sharedPort = probe->BoundAddress().port;
+    auto const sharedPort = probe->boundAddress().port;
     REQUIRE(sharedPort != 0);
     probe.reset();
 
@@ -253,19 +253,19 @@ TEST_CASE("Two real nodes open a pair on one shared port", "[net][datagram][shar
 
     // What each reports is where it is ANSWERED, which is never the port the
     // segment broadcasts to and never the other node's.
-    CHECK(first->BoundAddress().port != sharedPort);
-    CHECK(second->BoundAddress().port != sharedPort);
-    CHECK(first->BoundAddress().port != second->BoundAddress().port);
+    CHECK(first->boundAddress().port != sharedPort);
+    CHECK(second->boundAddress().port != sharedPort);
+    CHECK(first->boundAddress().port != second->boundAddress().port);
 
     // And they are answerable apart -- the whole point, over real sockets.
-    REQUIRE(first->Send(DatagramBytes("for second"), second->BoundAddress()).has_value());
+    REQUIRE(first->send(DatagramBytes("for second"), second->boundAddress()).has_value());
 
-    auto const atSecond = second->Receive(2s);
+    auto const atSecond = second->receive(2s);
     REQUIRE(atSecond.has_value());
     CHECK(DatagramText(*atSecond) == "for second");
-    CHECK(atSecond->from == first->BoundAddress());
+    CHECK(atSecond->from == first->boundAddress());
 
-    CHECK_FALSE(first->Receive(200ms).has_value());
+    CHECK_FALSE(first->receive(200ms).has_value());
 }
 
 TEST_CASE("A shared-port pair can be asked for a named answering port", "[net][datagram][sharedport][smoke]")
@@ -281,19 +281,19 @@ TEST_CASE("A shared-port pair can be asked for a named answering port", "[net][d
     // and it would present here as a bind failure nobody could explain.
     auto probe = OpenUdpSocket("127.0.0.1", 0, BroadcastMode::Off, PortSharing::Shared);
     REQUIRE(probe != nullptr);
-    auto const sharedPort = probe->BoundAddress().port;
+    auto const sharedPort = probe->boundAddress().port;
     REQUIRE(sharedPort != 0);
 
     auto namer = OpenUdpSocket("127.0.0.1", 0, BroadcastMode::Off, PortSharing::Exclusive);
     REQUIRE(namer != nullptr);
-    auto const ownPort = namer->BoundAddress().port;
+    auto const ownPort = namer->boundAddress().port;
     REQUIRE(ownPort != 0);
     REQUIRE(ownPort != sharedPort);
     namer.reset();
 
     auto node = OpenSharedPortUdpSocket("127.0.0.1", sharedPort, ownPort);
     REQUIRE(node != nullptr);
-    CHECK(node->BoundAddress().port == ownPort);
+    CHECK(node->boundAddress().port == ownPort);
 
     // And a second node cannot have that one, which is why it is a port per node
     // rather than a port per fleet. Asked for while the first still holds it, so

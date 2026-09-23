@@ -45,13 +45,13 @@ class ScriptedStopSignal final: public IStopSignal
     /// The operator asks to stop.
     void Fire()
     {
-        (void) _wakes.Push(StopWake::Stopped);
+        (void) _wakes.push(StopWake::Stopped);
     }
 
     /// The wait itself fails.
     void Fail()
     {
-        (void) _wakes.Push(StopWake::Failed);
+        (void) _wakes.push(StopWake::Failed);
     }
 
     [[nodiscard]] Task<StopWake> Stopped(IExecutor* waiter, IExecutor* resumeOn) override
@@ -59,7 +59,7 @@ class ScriptedStopSignal final: public IStopSignal
         static_cast<void>(waiter);
         static_cast<void>(resumeOn);
         ++_waits;
-        auto const wake = co_await _wakes.Pop();
+        auto const wake = co_await _wakes.pop();
         co_return wake.value_or(StopWake::Cancelled);
     }
 

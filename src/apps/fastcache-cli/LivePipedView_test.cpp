@@ -159,7 +159,7 @@ void AddFailure(std::vector<DashboardEvent>& script)
 
     auto result = std::optional<DashboardExit> {};
     auto task = DriveOnce(&events, &view, &sink, limits, &result);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     reactor.Drain();
 
     REQUIRE(result.has_value());

@@ -193,9 +193,9 @@ namespace
         //
         // `Stop()` is the one call that is safe from another thread: it sets a flag and
         // writes the wake fd, touching nothing the loop walks.
-        auto watchdog = MakeWatchdog(watchdogQuit, [&] { reactor.Stop(); });
+        auto watchdog = MakeWatchdog(watchdogQuit, [&] { reactor.stop(); });
 
-        reactor.Run();
+        reactor.run();
         watchdogQuit.store(true, std::memory_order_release);
 
         // **The other half, and REORDERING ALONE would not have been it.** Moving
@@ -450,7 +450,7 @@ namespace
             for (auto const sock: listenSocks)
                 Detail::CloseNativeSocket(sock);
             for (auto& reactor: reactors)
-                reactor->Stop();
+                reactor->stop();
         };
         auto watchdog = MakeWatchdog(watchdogQuit, stopAll);
 
@@ -474,11 +474,11 @@ namespace
                 [[maybe_unused]] auto const threadName = std::format("fc-reactor-{}", i);
                 FC_THREAD_NAME(threadName.c_str());
                 announcer.AcceptorArmed(std::format("reactor {}", i));
-                reactors[i]->Run();
+                reactors[i]->run();
             });
         FC_THREAD_NAME("fc-reactor-0");
         announcer.AcceptorArmed("reactor 0");
-        reactors[0]->Run();
+        reactors[0]->run();
         threads.clear();
 
         // Unconditional cleanup: if reactors[0]->Run() returned through any
@@ -580,7 +580,7 @@ namespace
         // down after every loop has returned, below.
         auto watchdog = MakeWatchdog(watchdogQuit, [&] {
             for (auto& reactor: reactors)
-                reactor->Stop();
+                reactor->stop();
         });
 
         auto const onlineCpus = OnlineCpuCount();
@@ -602,7 +602,7 @@ namespace
                 group,
                 announcer,
                 logger);
-            reactors[index]->Run();
+            reactors[index]->run();
         };
 
         // **Declared BEFORE the reaper, and that ordering is the mechanism.** Locals

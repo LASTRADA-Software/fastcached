@@ -51,13 +51,13 @@ namespace
 
 [[nodiscard]] Task<bool> WriteStr(ISocket* socket, std::string_view data)
 {
-    auto const result = co_await socket->Write(AsBytes(data));
+    auto const result = co_await socket->write(AsBytes(data));
     co_return result.has_value();
 }
 
 [[nodiscard]] Task<IoResult> ReadInto(ISocket* socket, std::span<std::byte> out)
 {
-    co_return co_await socket->Read(out);
+    co_return co_await socket->read(out);
 }
 
 /// A hand-driven TLS **client**, over the same pair of `InMemoryPipe`s the server's
@@ -105,7 +105,7 @@ class TlsPeer
     }
 
     /// @return The underlying OpenSSL client object.
-    [[nodiscard]] SSL* Native() const noexcept
+    [[nodiscard]] SSL* handle() const noexcept
     {
         return _ssl;
     }
@@ -132,7 +132,7 @@ class TlsPeer
         std::array<std::byte, 16384> staging {};
         while (true)
         {
-            auto const got = wire.TryPull(std::span<std::byte> { staging });
+            auto const got = wire.pull(std::span<std::byte> { staging });
             if (got == 0)
                 return;
             REQUIRE(BIO_write(_incoming, staging.data(), static_cast<int>(got)) == static_cast<int>(got));
@@ -202,7 +202,7 @@ struct ReadOutcome
 /// @return The detached task.
 DetachedTask DriveServerHandshake(TlsSocket* server, HandshakeOutcome* out)
 {
-    auto const result = co_await server->HandshakeIfNeeded();
+    auto const result = co_await server->handshakeIfNeeded();
     out->ok = result.has_value();
     out->done = true;
 }
@@ -213,7 +213,7 @@ DetachedTask DriveServerHandshake(TlsSocket* server, HandshakeOutcome* out)
 /// @return The detached task.
 DetachedTask ObserveReadable(TlsSocket* server, ReadableOutcome* out)
 {
-    auto const readable = co_await server->WaitReadable();
+    auto const readable = co_await server->waitReadable();
     out->hasValue = readable.has_value();
     if (readable.has_value())
         out->count = *readable;
@@ -227,7 +227,7 @@ DetachedTask ObserveReadable(TlsSocket* server, ReadableOutcome* out)
 /// @return The detached task.
 DetachedTask ObserveRead(TlsSocket* server, std::span<std::byte> into, ReadOutcome* out)
 {
-    auto const got = co_await server->Read(into);
+    auto const got = co_await server->read(into);
     out->hasValue = got.has_value();
     if (got.has_value())
         out->text.assign(reinterpret_cast<char const*>(into.data()), *got);
@@ -257,12 +257,12 @@ struct TlsConversation
             if (clientDone && outcome.done)
                 break;
             ERR_clear_error();
-            int const r = SSL_do_handshake(client.Native());
+            int const r = SSL_do_handshake(client.handle());
             if (r == 1)
                 clientDone = true;
             else
             {
-                auto const err = SSL_get_error(client.Native(), r);
+                auto const err = SSL_get_error(client.handle(), r);
                 REQUIRE((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE));
             }
             // Pushing resumes the server's parked raw read inline, so by the time
@@ -288,10 +288,10 @@ TEST_CASE("TlsSocket: handshake on non-TLS input fails cleanly instead of hangin
     // The peer sends garbage rather than a ClientHello, then half-closes so the
     // pump observes EOF rather than parking forever.
     REQUIRE(SyncRun(WriteStr(pair.client.get(), "this is definitely not a TLS ClientHello\r\n")));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
 
     auto server = std::make_unique<TlsSocket>(std::move(pair.server), **context);
-    auto const handshake = SyncRun(server->HandshakeIfNeeded());
+    auto const handshake = SyncRun(server->handshakeIfNeeded());
     CHECK_FALSE(handshake.has_value()); // resolves to an error — not a hang, not a crash
 }
 
@@ -309,7 +309,7 @@ TEST_CASE("TlsSocket: a receive deadline reaches the socket a read blocks on", "
       public:
         using SocketDecorator::SocketDecorator;
 
-        void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
+        void setReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
         {
             armed.push_back(deadline);
         }
@@ -322,7 +322,7 @@ TEST_CASE("TlsSocket: a receive deadline reaches the socket a read blocks on", "
     auto const* const recorder = raw.get();
     TlsSocket server { std::move(raw), **context };
 
-    server.SetReceiveDeadline(std::chrono::milliseconds { 250 });
+    server.setReceiveDeadline(std::chrono::milliseconds { 250 });
 
     REQUIRE(recorder->armed.size() == 1);
     CHECK(recorder->armed.front() == std::chrono::milliseconds { 250 });
@@ -344,21 +344,21 @@ TEST_CASE("TlsSocket: a silent peer is timed out within the deadline set through
 
     BlockingConnector connector;
     auto silent =
-        SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+        SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
     REQUIRE(silent.has_value());
     auto accepted = SyncRun([](IListener* from) -> Task<AcceptResult> {
         co_return co_await from->Accept();
     }(listener.get()));
     REQUIRE(accepted.has_value());
-    (*accepted)->SetReceiveDeadline(std::chrono::milliseconds { 5000 });
+    (*accepted)->setReceiveDeadline(std::chrono::milliseconds { 5000 });
 
     TlsSocket server { std::move(*accepted), **context };
-    server.SetReceiveDeadline(std::chrono::milliseconds { 200 });
+    server.setReceiveDeadline(std::chrono::milliseconds { 200 });
 
     SteadyClock clock;
-    auto const started = clock.Now();
-    auto const handshake = SyncRun(server.HandshakeIfNeeded());
-    auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - started);
+    auto const started = clock.now();
+    auto const handshake = SyncRun(server.handshakeIfNeeded());
+    auto const waited = std::chrono::duration_cast<std::chrono::milliseconds>(clock.now() - started);
 
     INFO("the handshake gave up after " << waited.count() << " ms");
     CHECK_FALSE(handshake.has_value());
@@ -376,7 +376,7 @@ TEST_CASE("TlsSocket: Read resolves (no re-entrant resume) when the pump complet
     // from within Read()'s await_suspend. Pre-fix this resumed re-entrantly; the
     // assertion here is simply that Read RESOLVES.
     REQUIRE(SyncRun(WriteStr(pair.client.get(), "not a valid TLS record")));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
 
     auto server = std::make_unique<TlsSocket>(std::move(pair.server), **context);
     std::array<std::byte, 64> buffer {};
@@ -414,8 +414,8 @@ TEST_CASE("TlsSocket: WaitReadable reports EOF for a close_notify record", "[tls
     TlsConversation talk { **context };
 
     talk.client.SendCloseNotify(*talk.toServer);
-    REQUIRE(talk.toServer->Buffered() > 0);        // there ARE bytes on the wire
-    REQUIRE_FALSE(talk.toServer->IsWriteClosed()); // and no transport FIN
+    REQUIRE(talk.toServer->buffered() > 0);        // there ARE bytes on the wire
+    REQUIRE_FALSE(talk.toServer->isWriteClosed()); // and no transport FIN
 
     ReadableOutcome observed;
     ObserveReadable(talk.server.get(), &observed);
@@ -437,8 +437,8 @@ TEST_CASE("TlsSocket: WaitReadable reports EOF for close_notify followed by FIN"
     TlsConversation talk { **context };
 
     talk.client.SendCloseNotify(*talk.toServer);
-    talk.toServer->CloseWrite();
-    REQUIRE(talk.toServer->Buffered() > 0);
+    talk.toServer->closeWrite();
+    REQUIRE(talk.toServer->buffered() > 0);
 
     ReadableOutcome observed;
     ObserveReadable(talk.server.get(), &observed);
@@ -467,7 +467,7 @@ TEST_CASE("TlsSocket: a PARKED WaitReadable resolves with EOF when the peer clos
     CHECK_FALSE(observed.resolved); // parked: nothing has happened on the wire yet
 
     talk.client.SendCloseNotify(*talk.toServer);
-    talk.toServer->CloseWrite();
+    talk.toServer->closeWrite();
 
     REQUIRE(observed.resolved);
     REQUIRE(observed.hasValue);
@@ -540,7 +540,7 @@ TEST_CASE("TlsSocket: WaitReadable reports EOF for a truncated stream", "[tls][n
     REQUIRE(context.has_value());
     TlsConversation talk { **context };
 
-    talk.toServer->CloseWrite();
+    talk.toServer->closeWrite();
 
     ReadableOutcome observed;
     ObserveReadable(talk.server.get(), &observed);

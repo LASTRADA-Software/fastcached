@@ -61,7 +61,7 @@ void RetireParkedRead(Impl& impl) noexcept
     // back down: the operation is gone and a readable edge would find nothing to
     // complete.
     impl.UpdateInterest();
-    parked->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+    parked->complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
 }
 
 /// Take a socket's single read-op slot for an operation that is about to park.

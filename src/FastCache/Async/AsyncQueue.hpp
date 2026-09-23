@@ -147,7 +147,7 @@ class AsyncQueue final
     /// much. A closed queue refuses.
     /// @param value The item; moved.
     /// @return Whether it was accepted, and what it displaced.
-    AsyncQueuePush Push(T value)
+    AsyncQueuePush push(T value)
     {
         ParkedWork waiter {};
         AsyncQueuePush outcome {};
@@ -183,7 +183,7 @@ class AsyncQueue final
         // producer holding a lock of its own across that would serialise its own
         // hot path behind it.
         if (waiter.resume)
-            _reactor.Submit(waiter);
+            _reactor.submit(waiter);
         return outcome;
     }
 
@@ -203,18 +203,18 @@ class AsyncQueue final
             waiter = std::exchange(_waiter, {});
         }
         if (waiter.resume)
-            _reactor.Submit(waiter);
+            _reactor.submit(waiter);
     }
 
     /// @return Whether `Close()` has been called.
-    [[nodiscard]] bool IsClosed() const noexcept
+    [[nodiscard]] bool isClosed() const noexcept
     {
         return _closed.load(std::memory_order_acquire);
     }
 
     /// @return How many items are held right now. For tests and metrics; racy by
     ///         nature and never a basis for a decision.
-    [[nodiscard]] std::size_t Size() const
+    [[nodiscard]] std::size_t size() const
     {
         std::scoped_lock const guard { _mutex };
         return _items.size();
@@ -225,14 +225,14 @@ class AsyncQueue final
     /// Exposed for one purpose: a teardown test asserting that no coroutine
     /// frame was left suspended. A production caller reading this is asking a
     /// question whose answer is stale before it returns.
-    [[nodiscard]] bool HasWaiter() const noexcept
+    [[nodiscard]] bool hasWaiter() const noexcept
     {
         std::scoped_lock const guard { _mutex };
         return static_cast<bool>(_waiter.resume);
     }
 
     /// @return Cumulative items displaced by overflow across this queue's life.
-    [[nodiscard]] std::uint64_t Displaced() const noexcept
+    [[nodiscard]] std::uint64_t displaced() const noexcept
     {
         return _displaced.load(std::memory_order_relaxed);
     }
@@ -299,7 +299,7 @@ class AsyncQueue final
     /// meaning the queue closed and the consumer should stop. Exactly one
     /// consumer may have an outstanding `Pop` at a time.
     /// @return An awaitable resolving to the next item or nullopt.
-    [[nodiscard]] PopAwaiter Pop() noexcept
+    [[nodiscard]] PopAwaiter pop() noexcept
     {
         return PopAwaiter { this };
     }

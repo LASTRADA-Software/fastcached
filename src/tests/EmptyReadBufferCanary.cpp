@@ -61,7 +61,7 @@ namespace
 /// @return True when every byte was accepted.
 FastCache::Task<bool> StagePendingBytes(FastCache::ISocket* client, std::span<std::byte const> bytes)
 {
-    auto const wrote = co_await client->Write(bytes);
+    auto const wrote = co_await client->write(bytes);
     co_return wrote.has_value() && *wrote == bytes.size();
 }
 
@@ -94,7 +94,7 @@ int main()
     // The check happens when `Read` is CALLED -- before any suspension -- so the guard
     // fires on this line in a build with assertions live. The awaitable is deliberately
     // never awaited: we do not intend to get here at all.
-    auto armed = pair.server->Read(std::span<std::byte> {});
+    auto armed = pair.server->read(std::span<std::byte> {});
     auto const answered = armed.await_resume();
 
     std::println(std::cerr,

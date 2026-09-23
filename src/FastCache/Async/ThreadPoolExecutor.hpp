@@ -57,7 +57,7 @@ class ThreadPoolExecutor final: public IExecutor
     /// leaked frame. A caller that must not run work on its own thread should stop
     /// submitting, which it can see by having called `Stop()`.
     /// @param handle Coroutine to resume; must remain alive until it is.
-    void Submit(std::coroutine_handle<> handle) override;
+    void submit(std::coroutine_handle<> handle) override;
 
     /// Post a coroutine, ignoring the chain root it names.
     ///
@@ -69,13 +69,13 @@ class ThreadPoolExecutor final: public IExecutor
     /// and that is where the whole question comes from
     /// ([#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025)).
     /// @param work The coroutine to resume; only `ParkedWork::resume` is used.
-    void Submit(ParkedWork work) override;
+    void submit(ParkedWork work) override;
 
     /// Ask the threads to finish and stop taking new work. Idempotent.
-    void Stop() noexcept;
+    void stop() noexcept;
 
     /// How many threads this pool runs work on.
-    [[nodiscard]] std::size_t Threads() const noexcept
+    [[nodiscard]] std::size_t threads() const noexcept
     {
         return _threads.size();
     }

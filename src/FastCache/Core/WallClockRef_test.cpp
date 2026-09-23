@@ -86,7 +86,7 @@ TEST_CASE("A borrowed wall clock answers as the clock it borrows", "[core][clock
     WallClockRef const borrowed { clock };
 
     CHECK(borrowed.Now() == clock.Now());
-    CHECK(&borrowed.Get() == &clock);
+    CHECK(&borrowed.get() == &clock);
 
     clock.Advance(std::chrono::seconds { 42 });
     CHECK(borrowed.Now() == clock.Now());

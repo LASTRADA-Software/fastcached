@@ -66,7 +66,7 @@ Task<std::string> RemoteUpstream::DialTarget()
     // INTERVAL, never miss-triggered. This is the whole guard: a refresh driven by a
     // failed dial or a cache miss lets a remote peer force one lookup per request
     // just by asking for keys this cache does not hold.
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     if (_lastLookupAt.has_value() && now - *_lastLookupAt < _addressRefreshInterval)
         co_return _resolved.value_or(_endpoint);
 

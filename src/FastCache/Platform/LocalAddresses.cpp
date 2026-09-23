@@ -212,7 +212,7 @@ bool CachedLocalityOracle::IsThisMachine(std::string_view host) const
     // On an interval, never because this call did not find the address. A refresh a
     // stranger can provoke is a probe a stranger can bill this machine for, once per
     // request, and on Windows that probe costs milliseconds.
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     if (now - _sampledAt >= _refreshInterval)
     {
         _addresses = _source.Addresses();

@@ -38,12 +38,12 @@ constexpr auto WakeBound = std::chrono::seconds { 10 };
 class InlineExecutor final: public IExecutor
 {
   public:
-    void Submit(std::coroutine_handle<> handle) override
+    void submit(std::coroutine_handle<> handle) override
     {
         handle.resume();
     }
 
-    void Submit(ParkedWork work) override
+    void submit(ParkedWork work) override
     {
         work.resume.resume();
     }
@@ -87,7 +87,7 @@ template <typename Meanwhile>
     {
         auto waiter = ThreadPoolExecutor { 1 };
         task = AwaitStop(&signal, &waiter, &resumeHere, &answer);
-        task.Native().resume();
+        task.handle().resume();
         meanwhile();
         if (answered.wait_for(bound) == std::future_status::ready)
             result = answered.get();

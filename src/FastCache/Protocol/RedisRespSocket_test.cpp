@@ -70,7 +70,7 @@ DetachedTask ServeOneRespSession(
     if (!accepted.has_value())
     {
         ended->store(true, std::memory_order_release);
-        reactor->Stop();
+        reactor->stop();
         co_return;
     }
     auto socket = std::move(*accepted);
@@ -78,7 +78,7 @@ DetachedTask ServeOneRespSession(
     RedisRespHandler handler;
     co_await handler.Run(socket.get(), engine, /*primer*/ {}, session);
 
-    socket->Close();
+    socket->close();
 
     // **Drain before stopping, the way a real server does by simply continuing to
     // run.** `Run`'s cleanup calls `ShutdownWatcher`, which wakes the readable
@@ -92,7 +92,7 @@ DetachedTask ServeOneRespSession(
     co_await ResumeOn { *reactor };
 
     ended->store(true, std::memory_order_release);
-    reactor->Stop();
+    reactor->stop();
 }
 
 /// A client speaking RESP over a real socket, from a thread of its own.
@@ -106,7 +106,7 @@ class RespClient
     /// @param port The loopback port to dial.
     explicit RespClient(std::uint16_t port)
     {
-        auto socket = SyncRun(_connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+        auto socket = SyncRun(_connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
         if (socket.has_value())
             _socket = std::move(*socket);
     }
@@ -124,7 +124,7 @@ class RespClient
     {
         return SyncRun([](ISocket* s, std::string_view w) -> Task<bool> {
             auto const bytes = std::span<std::byte const> { reinterpret_cast<std::byte const*>(w.data()), w.size() };
-            auto const r = co_await s->Write(bytes);
+            auto const r = co_await s->write(bytes);
             co_return r.has_value() && *r == w.size();
         }(_socket.get(), wire));
     }
@@ -135,7 +135,7 @@ class RespClient
     {
         return SyncRun([](ISocket* s) -> Task<std::string> {
             std::vector<std::byte> chunk(4096);
-            auto const r = co_await s->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+            auto const r = co_await s->read(std::span<std::byte> { chunk.data(), chunk.size() });
             if (!r.has_value() || *r == 0)
                 co_return std::string {};
             co_return std::string { reinterpret_cast<char const*>(chunk.data()), *r };
@@ -167,7 +167,7 @@ class RespClient
     void Close()
     {
         if (_socket)
-            _socket->Close();
+            _socket->close();
     }
 
   private:
@@ -268,7 +268,7 @@ TEST_CASE("RESP over a real socket: a command after UNSUBSCRIBE does not drop th
         survived.store(true, std::memory_order_relaxed);
     } };
 
-    fix.reactor.Run();
+    fix.reactor.run();
     client.join();
 
     // Reaching here at all is the assertion: under the defect a Debug build aborts
@@ -314,7 +314,7 @@ TEST_CASE("RESP over a real socket: a subscriber is still woken by a published m
         c.Close();
     } };
 
-    fix.reactor.Run();
+    fix.reactor.run();
     client.join();
 
     CHECK(subscribed.load(std::memory_order_acquire));

@@ -120,7 +120,7 @@ struct Link
     {
         transport->RequestStop();
         reactor.Drain();
-        clock.Advance(50ms);
+        clock.advance(50ms);
         reactor.Drain();
         transport.reset();
         listener.Close();
@@ -281,7 +281,7 @@ TEST_CASE("A key revoked mid-session closes that session, and the redial is refu
         // and lost -- it draws the reset -- and the one after it fails and ends the session.
         link.SendVote(3);
         link.SendVote(3);
-        link.clock.Advance(ReconnectBackoff);
+        link.clock.advance(ReconnectBackoff);
         link.reactor.Drain();
 
         CHECK(link.sink.received.size() == 1);
@@ -309,7 +309,7 @@ TEST_CASE("A key revoked mid-session closes that session, and the redial is refu
         CHECK(link.Refused(DiallerRefusal::KeyWithdrawn) == 1);
         CHECK(link.Connected() == 0);
 
-        link.clock.Advance(ReconnectBackoff);
+        link.clock.advance(ReconnectBackoff);
         link.reactor.Drain();
 
         // The redial: n3 still proves n3 with the key it always had, and that key is revoked.

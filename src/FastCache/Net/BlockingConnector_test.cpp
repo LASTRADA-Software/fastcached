@@ -96,7 +96,7 @@ TEST_CASE("A connector reaches a listener that is up", "[net][connector]")
         SKIP("no loopback listener available on this host");
 
     BlockingConnector connector;
-    auto const socket = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
+    auto const socket = SyncRun(connector.connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
     REQUIRE(socket.has_value());
     CHECK(*socket != nullptr);
     CHECK_FALSE((*socket)->IsClosed());
@@ -126,7 +126,7 @@ TEST_CASE("A dial that cannot succeed fails within its timeout", "[net][connecto
     BlockingConnector connector;
 
     auto const started = std::chrono::steady_clock::now();
-    auto const socket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = Timeout }));
+    auto const socket = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = Timeout }));
     auto const elapsed = std::chrono::steady_clock::now() - started;
 
     REQUIRE_FALSE(socket.has_value());
@@ -150,7 +150,7 @@ TEST_CASE("A resolution failure is reported without dialling", "[net][connector]
     resolver.FailWith("scripted resolution failure");
 
     BlockingConnector connector { resolver };
-    auto const socket = SyncRun(connector.Connect("example.invalid", 1, DialOptions { .connectTimeout = 2s }));
+    auto const socket = SyncRun(connector.connect("example.invalid", 1, DialOptions { .connectTimeout = 2s }));
     REQUIRE_FALSE(socket.has_value());
     CHECK(socket.error().code == NetErrorCode::AddressNotAvail);
 
@@ -179,7 +179,7 @@ TEST_CASE("A dead first candidate does not condemn the host", "[net][connector]"
     resolver.PrependCandidate("127.0.0.1", deadPort);
 
     BlockingConnector connector { resolver };
-    auto const socket = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
+    auto const socket = SyncRun(connector.connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
     // Report the reason rather than just "false": a dial has several ways to
     // fail and a bare assertion names none of them, which is the difference
     // between a diagnosis and an investigation.
@@ -194,7 +194,7 @@ TEST_CASE("A connector's failure carries the port it could not reach", "[net][co
     resolver.FailWith("nope");
 
     BlockingConnector connector { resolver };
-    auto const socket = SyncRun(connector.Connect("some-host", 6674, DialOptions { .connectTimeout = 1s }));
+    auto const socket = SyncRun(connector.connect("some-host", 6674, DialOptions { .connectTimeout = 1s }));
     REQUIRE_FALSE(socket.has_value());
     CHECK(socket.error().context.contains("some-host"));
     CHECK(socket.error().context.contains("6674"));

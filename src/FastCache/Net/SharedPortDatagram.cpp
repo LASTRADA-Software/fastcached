@@ -42,9 +42,9 @@ namespace
         /// @param to Destination; a broadcast address is fine, since it is this
         ///        socket that carries the broadcast capability.
         /// @return Nothing, or why the local stack refused it.
-        std::expected<void, NetError> Send(std::span<std::byte const> payload, DatagramAddress const& to) override
+        std::expected<void, NetError> send(std::span<std::byte const> payload, DatagramAddress const& to) override
         {
-            return _own->Send(payload, to);
+            return _own->send(payload, to);
         }
 
         /// Wait for one datagram, on either socket.
@@ -74,7 +74,7 @@ namespace
         /// `1ms` must not become a parked loop. Such a call costs 2ms.
         /// @param timeout How long to wait, across both.
         /// @return The datagram, or why none was returned.
-        std::expected<ReceivedDatagram, DatagramWait> Receive(std::chrono::milliseconds timeout) override
+        std::expected<ReceivedDatagram, DatagramWait> receive(std::chrono::milliseconds timeout) override
         {
             _ownFirst = !_ownFirst;
             auto* const glanced = _ownFirst ? _own.get() : _shared.get();
@@ -87,7 +87,7 @@ namespace
 
             for (auto const& [socket, slice]: order)
             {
-                auto received = socket->Receive(slice);
+                auto received = socket->receive(slice);
                 if (received.has_value())
                     return received;
 
@@ -113,9 +113,9 @@ namespace
         /// as: the shared one names a port, not a node, and telling a peer to
         /// answer there is the defect this class exists to remove.
         /// @return The address only this node holds.
-        [[nodiscard]] DatagramAddress BoundAddress() const override
+        [[nodiscard]] DatagramAddress boundAddress() const override
         {
-            return _own->BoundAddress();
+            return _own->boundAddress();
         }
 
       private:

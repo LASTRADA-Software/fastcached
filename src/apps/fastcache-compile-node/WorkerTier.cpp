@@ -84,7 +84,7 @@ namespace
             std::ranges::count_if(held, [](Cc::WorkerRegistrar const& registrar) { return !registrar.WorkerId().empty(); });
         state.PublishRegistration(static_cast<std::uint32_t>(registered),
                                   static_cast<std::uint32_t>(held.size()),
-                                  accepted > 0 ? std::optional { clock.Now() } : std::nullopt);
+                                  accepted > 0 ? std::optional { clock.now() } : std::nullopt);
     }
 
     /// Claim this worker's private scratch root, or say why the node must not start.

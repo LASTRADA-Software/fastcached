@@ -366,7 +366,7 @@ BlockingSocket::BlockingSocket(Detail::NativeSocket native, std::string peerAddr
 
 BlockingSocket::~BlockingSocket()
 {
-    BlockingSocket::Close();
+    BlockingSocket::close();
 }
 
 void Detail::HalfCloseWrite(Detail::NativeSocket socket) noexcept
@@ -380,13 +380,13 @@ void Detail::HalfCloseWrite(Detail::NativeSocket socket) noexcept
 #endif
 }
 
-void BlockingSocket::ShutdownWrite() noexcept
+void BlockingSocket::shutdownWrite() noexcept
 {
     if (!_closed)
         Detail::HalfCloseWrite(_native);
 }
 
-void BlockingSocket::Close() noexcept
+void BlockingSocket::close() noexcept
 {
     if (_closed)
         return;
@@ -398,7 +398,7 @@ void BlockingSocket::Close() noexcept
     }
 }
 
-IoAwaitable BlockingSocket::Read(std::span<std::byte> buffer)
+IoAwaitable BlockingSocket::read(std::span<std::byte> buffer)
 {
     FC_ZONE_SCOPED_N("socket.read");
     Detail::RequireReadBuffer(buffer);
@@ -413,7 +413,7 @@ IoAwaitable BlockingSocket::Read(std::span<std::byte> buffer)
     return IoAwaitable { IoResult { static_cast<std::size_t>(got) } };
 }
 
-IoAwaitable BlockingSocket::Write(std::span<std::byte const> buffer)
+IoAwaitable BlockingSocket::write(std::span<std::byte const> buffer)
 {
     FC_ZONE_SCOPED_N("socket.write");
     if (_closed)
@@ -434,7 +434,7 @@ IoAwaitable BlockingSocket::Write(std::span<std::byte const> buffer)
     return IoAwaitable { IoResult { written } };
 }
 
-IoAwaitable BlockingSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+IoAwaitable BlockingSocket::writeVectored(std::span<std::span<std::byte const> const> segments,
                                           std::shared_ptr<void const> /*keepAlive*/)
 {
     FC_ZONE_SCOPED_N("socket.writev");
@@ -512,7 +512,7 @@ std::uint16_t BlockingListener::BoundPort() const noexcept
     return Detail::BoundPortOf(_native);
 }
 
-void BlockingSocket::SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept
+void BlockingSocket::setReceiveDeadline(std::chrono::milliseconds deadline) noexcept
 {
     if (_closed)
         return;

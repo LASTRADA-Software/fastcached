@@ -122,7 +122,7 @@ TEST_CASE("a live source subscribes with the operator's interval and delivers ea
     CHECK(stream.Requests().front().dashboardToken.empty());
     CHECK(stream.Expected() == std::vector<std::chrono::milliseconds> { 3000ms });
 
-    rig.clock.Advance(700ms);
+    rig.clock.advance(700ms);
     rig.pool.Drain();
     rig.reactor.Drain();
     auto const one = NextDue(rig, source);
@@ -160,7 +160,7 @@ TEST_CASE("a live source stream keeps no timer: a push slower than the interval 
     Pump(rig, 2);
     REQUIRE(rig.subscription.Reads() == 1);
 
-    rig.clock.Advance(3 * Interval);
+    rig.clock.advance(3 * Interval);
     rig.reactor.Drain();
     CHECK(rig.pool.PendingSubmissions() == 1);
     CHECK(rig.reactor.PendingTimers() == 0);
@@ -219,7 +219,7 @@ TEST_CASE(
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
-    rig.reactor.Submit(run.Native());
+    rig.reactor.submit(run.handle());
     Pump(rig, 3);
     REQUIRE(rig.sink.frames == 1);
     CHECK(rig.pool.PendingSubmissions() == 1);
@@ -238,7 +238,7 @@ TEST_CASE(
     // subscription the caller must therefore not destroy yet.
     auto drained = false;
     auto wait = AwaitDrained(&source, &drained);
-    rig.reactor.Submit(wait.Native());
+    rig.reactor.submit(wait.handle());
     rig.reactor.Drain();
     CHECK_FALSE(drained);
 
@@ -281,7 +281,7 @@ TEST_CASE("a closed live source answers Detached, including to a read already wa
 
     auto waiting = std::optional<DashboardEvent> {};
     auto task = TakeOne(&source, &waiting);
-    rig.reactor.Submit(task.Native());
+    rig.reactor.submit(task.handle());
     rig.reactor.Drain();
     CHECK_FALSE(waiting.has_value());
 
@@ -323,11 +323,11 @@ TEST_CASE("a stream that ends is one gap and the next subscription is one interv
         CHECK(stream.Opens() == 1);
         CHECK(rig.reactor.PendingTimers() == 1);
 
-        rig.clock.Advance(Interval - 1ms);
+        rig.clock.advance(Interval - 1ms);
         rig.Settle();
         CHECK(stream.Opens() == 1);
 
-        rig.clock.Advance(1ms);
+        rig.clock.advance(1ms);
         rig.Settle();
         REQUIRE(stream.Opens() == 2);
         CHECK(DialledTexts(stream).back() == RigAddress());
@@ -354,10 +354,10 @@ TEST_CASE("a stream that ends is one gap and the next subscription is one interv
         CHECK(NoteOf(silent) == std::format("{}: {}", RigAddress(), SilentStream));
         CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
 
-        rig.clock.Advance(Interval - 1ms);
+        rig.clock.advance(Interval - 1ms);
         rig.Settle();
         CHECK(stream.Opens() == 1);
-        rig.clock.Advance(1ms);
+        rig.clock.advance(1ms);
         rig.Settle();
         CHECK(stream.Opens() == 2);
         CHECK(DialledTexts(stream).back() == RigAddress());
@@ -378,7 +378,7 @@ TEST_CASE("a dial that fails is a gap and is retried once per interval and never
     parts.subscription = &stream;
     LiveEventSource source { std::move(parts) };
     rig.reactor.Drain();
-    rig.clock.Advance(40ms);
+    rig.clock.advance(40ms);
     rig.Settle();
 
     CHECK(stream.Opens() == 1);
@@ -391,7 +391,7 @@ TEST_CASE("a dial that fails is a gap and is retried once per interval and never
     rig.Settle();
     CHECK(stream.Opens() == 1);
 
-    rig.clock.Advance(Interval);
+    rig.clock.advance(Interval);
     rig.Settle();
     CHECK(stream.Opens() == 2);
     rig.Settle();
@@ -423,7 +423,7 @@ TEST_CASE("a NotLeader naming the leader is followed at once and the reading nam
     CHECK(Unwrap(sample).where == "10.0.0.9:7071");
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
 
-    rig.clock.Advance(Interval);
+    rig.clock.advance(Interval);
     rig.Settle();
     REQUIRE(stream.Opens() >= 3);
     CHECK(DialledTexts(stream)[2] == RigAddress());
@@ -461,7 +461,7 @@ TEST_CASE("leader redirects are bounded and the count restarts with every subscr
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
     CHECK(rig.reactor.PendingTimers() == 1);
 
-    rig.clock.Advance(Interval);
+    rig.clock.advance(Interval);
     rig.Settle();
     REQUIRE(stream.Opens() >= 5);
     CHECK(DialledTexts(stream)[3] == RigAddress());
@@ -582,7 +582,7 @@ TEST_CASE("a refusal after a reading is a gap and a retry and does not end the s
     CHECK(rig.reactor.PendingTimers() == 1);
     CHECK(stream.Opens() == 1);
 
-    rig.clock.Advance(Interval);
+    rig.clock.advance(Interval);
     rig.Settle();
     CHECK(stream.Opens() == 2);
     auto const again = NextDue(rig, source);
@@ -613,7 +613,7 @@ TEST_CASE("a NotLeader naming nobody and a full node are gaps and retries even b
         CHECK(rig.reactor.PendingTimers() == 1);
         CHECK(stream.Opens() == 1);
 
-        rig.clock.Advance(Interval);
+        rig.clock.advance(Interval);
         rig.Settle();
         REQUIRE(stream.Opens() == 2);
         CHECK(DialledTexts(stream).back() == RigAddress());
@@ -832,7 +832,7 @@ TEST_CASE("events and gaps on a stream are not samples: only its readings are", 
 
     auto after = std::optional<DashboardEvent> {};
     auto task = TakeOne(&source, &after);
-    rig.reactor.Submit(task.Native());
+    rig.reactor.submit(task.handle());
     rig.reactor.Drain();
     CHECK_FALSE(after.has_value());
 
@@ -858,7 +858,7 @@ TEST_CASE("a resize is followed by a tick, so the frame is redrawn at the new si
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Key);
     auto after = std::optional<DashboardEvent> {};
     auto task = TakeOne(&source, &after);
-    rig.reactor.Submit(task.Native());
+    rig.reactor.submit(task.handle());
     rig.reactor.Drain();
     CHECK_FALSE(after.has_value());
 
@@ -872,7 +872,7 @@ TEST_CASE("a terminal that goes away ends the session", "[cli][live][source]")
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
-    rig.reactor.Submit(run.Native());
+    rig.reactor.submit(run.handle());
     rig.Settle();
     CHECK_FALSE(exit.has_value());
 
@@ -973,7 +973,7 @@ TEST_CASE("a run with no terminal takes its whole sample budget from one stream"
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits { .samples = 3 }, &exit);
-    rig.reactor.Submit(run.Native());
+    rig.reactor.submit(run.handle());
     rig.Settle();
 
     REQUIRE(exit.has_value());
@@ -991,7 +991,7 @@ TEST_CASE("a stop request after a sample ends a session with no terminal as answ
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
-    rig.reactor.Submit(run.Native());
+    rig.reactor.submit(run.handle());
     rig.Settle();
     CHECK(rig.subscription.Opens() == 1);
     CHECK_FALSE(exit.has_value());
@@ -1040,7 +1040,7 @@ TEST_CASE("a stop request before any sample does not end a session as answered",
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
-    rig.reactor.Submit(run.Native());
+    rig.reactor.submit(run.handle());
     rig.reactor.Drain();
 
     CHECK(StopOf(exit) == DashboardStop::Quit);
@@ -1057,9 +1057,9 @@ TEST_CASE("a session with a stop signal keeps reading until a stop arrives and d
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
-    rig.reactor.Submit(run.Native());
+    rig.reactor.submit(run.handle());
     rig.Settle();
-    rig.clock.Advance(Interval);
+    rig.clock.advance(Interval);
     rig.Settle();
 
     // Nothing fired: the watch is waiting, not ending the session and not asking twice, while the
@@ -1102,7 +1102,7 @@ TEST_CASE("a terminal is released once nothing reads it and not when a stuck rea
     rig.reactor.Drain();
     CHECK(rig.pool.PendingSubmissions() == 1);
 
-    rig.clock.Advance(5ms);
+    rig.clock.advance(5ms);
     source.Close();
     rig.reactor.Drain();
     CHECK(rig.terminalRelease.released);

@@ -100,11 +100,11 @@ FastCache::Task<FastCache::SocketResult> ScriptedDial(void* state,
                                                       FastCache::KeepAlive keepAlive)
 {
     auto& log = *static_cast<DialLog*>(state);
-    log.allowances.push_back(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - log.clock->Now()));
+    log.allowances.push_back(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - log.clock->now()));
     log.keepAlives.push_back(keepAlive);
 
     if (log.consume > 0ms)
-        log.clock->Advance(log.consume);
+        log.clock->advance(log.consume);
 
     if (log.allowances.size() - 1 == log.succeedAt)
         co_return FastCache::SocketResult { nullptr };

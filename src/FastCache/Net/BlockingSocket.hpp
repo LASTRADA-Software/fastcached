@@ -366,11 +366,11 @@ class BlockingSocket final: public ISocket
     BlockingSocket& operator=(BlockingSocket&&) = delete;
     ~BlockingSocket() override;
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override;
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override;
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override;
-    void Close() noexcept override;
+    void close() noexcept override;
 
     /// @copydoc ISocket::CancelRead
     ///
@@ -385,20 +385,20 @@ class BlockingSocket final: public ISocket
     /// a default that is correct for the transport you happen to be thinking about is
     /// the dangerous kind. Every transport this library hands out now answers this
     /// question in its own file.
-    void CancelRead() noexcept override {}
+    void cancelRead() noexcept override {}
 
     /// @copydoc ISocket::ShutdownWrite
-    void ShutdownWrite() noexcept override;
+    void shutdownWrite() noexcept override;
 
     /// Re-arm `SO_RCVTIMEO` on this socket.
     /// @param deadline How long a read may block; non-positive leaves it alone.
-    void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept override;
+    void setReceiveDeadline(std::chrono::milliseconds deadline) noexcept override;
 
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return _closed;
     }
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return _peerAddress;
     }

@@ -113,7 +113,7 @@ Detail::Parked IocpReactor::TakePosted(std::coroutine_handle<> handle) noexcept
         return Detail::Parked { ParkedWork { .resume = handle } };
 
     std::scoped_lock const guard { _postedMutex };
-    auto const found = std::ranges::find(_posted, handle, &Detail::Parked::Handle);
+    auto const found = std::ranges::find(_posted, handle, &Detail::Parked::handle);
     if (found == _posted.end())
         return Detail::Parked { ParkedWork { .resume = handle } };
     auto taken = std::move(*found);
@@ -122,7 +122,7 @@ Detail::Parked IocpReactor::TakePosted(std::coroutine_handle<> handle) noexcept
     return taken;
 }
 
-bool IocpReactor::CancelPending(std::coroutine_handle<> handle) noexcept
+bool IocpReactor::cancelPending(std::coroutine_handle<> handle) noexcept
 {
     if (!handle)
         return false;
@@ -134,10 +134,10 @@ bool IocpReactor::CancelPending(std::coroutine_handle<> handle) noexcept
     // the reactor is still going to.
     std::scoped_lock const guard { _timerMutex };
     auto const found =
-        std::ranges::find(_timers, handle, [](TimerEntry const& entry) noexcept { return entry.parked.Handle(); });
+        std::ranges::find(_timers, handle, [](TimerEntry const& entry) noexcept { return entry.parked.handle(); });
     if (found == _timers.end())
         return false;
-    std::ignore = found->parked.Take();
+    std::ignore = found->parked.take();
     // Erased and re-heaped rather than popped: this entry is somewhere in the
     // middle of the heap, not at its root.
     _timers.erase(found);
@@ -154,12 +154,12 @@ bool IocpReactor::AttachHandle(void* handle) noexcept
     return result == static_cast<HANDLE>(_iocp);
 }
 
-void IocpReactor::Submit(std::coroutine_handle<> handle)
+void IocpReactor::submit(std::coroutine_handle<> handle)
 {
-    Submit(ParkedWork { .resume = handle });
+    submit(ParkedWork { .resume = handle });
 }
 
-void IocpReactor::Submit(ParkedWork work)
+void IocpReactor::submit(ParkedWork work)
 {
     if (!work.resume || !_iocp)
         return;
@@ -178,12 +178,12 @@ void IocpReactor::Submit(ParkedWork work)
         static_cast<HANDLE>(_iocp), 0, KeyResumeCoroutine, reinterpret_cast<LPOVERLAPPED>(work.resume.address()));
 }
 
-void IocpReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
+void IocpReactor::schedule(TimePoint deadline, std::coroutine_handle<> handle)
 {
-    Schedule(deadline, ParkedWork { .resume = handle });
+    schedule(deadline, ParkedWork { .resume = handle });
 }
 
-void IocpReactor::Schedule(TimePoint deadline, ParkedWork work)
+void IocpReactor::schedule(TimePoint deadline, ParkedWork work)
 {
     if (!work.resume)
         return;
@@ -197,7 +197,7 @@ void IocpReactor::Schedule(TimePoint deadline, ParkedWork work)
     PostQueuedCompletionStatus(static_cast<HANDLE>(_iocp), 0, KeyResumeCoroutine, nullptr);
 }
 
-void IocpReactor::Stop() noexcept
+void IocpReactor::stop() noexcept
 {
     _stopped.store(true, std::memory_order_release);
     if (_iocp)
@@ -206,7 +206,7 @@ void IocpReactor::Stop() noexcept
 
 void IocpReactor::FireExpiredTimers()
 {
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     std::vector<Detail::Parked> due;
     {
         std::scoped_lock const lock { _timerMutex };
@@ -220,7 +220,7 @@ void IocpReactor::FireExpiredTimers()
     // `Resume()` disowns and resumes in one expression, so a timer that fires normally
     // is never also freed by the entry going out of scope here.
     for (auto& parked: due)
-        parked.Resume();
+        parked.resume();
 }
 
 void IocpReactor::RunLoop()
@@ -253,8 +253,8 @@ void IocpReactor::RunLoop()
         // timer fire a batch late. Both refreshes are needed and neither is
         // redundant: this one bounds the sleep, the one below the wait is what
         // makes the resumed handlers see the time the wait actually ended at.
-        _clock.Refresh();
-        auto const now = _clock.Now();
+        _clock.refresh();
+        auto const now = _clock.now();
         auto const timeout = nextDeadline == TimePoint::max() ? INFINITE : DeadlineToTimeout(nextDeadline, now);
 
         ULONG removed = 0;
@@ -264,7 +264,7 @@ void IocpReactor::RunLoop()
         // point in the loop where a cached clock has to re-sample. It comes
         // before the timeout branch below deliberately: that branch fires
         // timers, which must see the time the wait actually ended at.
-        _clock.Refresh();
+        _clock.refresh();
 
         if (!ok)
         {
@@ -300,7 +300,7 @@ void IocpReactor::RunLoop()
                 // Taken and resumed in one expression: `TakePosted` is what hands the
                 // chain back to itself, so there is no line for a future edit to forget
                 // it on and no window where both this and `_posted` claim the frame.
-                TakePosted(std::coroutine_handle<>::from_address(entry.lpOverlapped)).Resume();
+                TakePosted(std::coroutine_handle<>::from_address(entry.lpOverlapped)).resume();
                 continue;
             }
             // Socket / listener completion: lpOverlapped points to an

@@ -159,7 +159,7 @@ FastCache::DetachedTask ReadParkThenReadAgain(FastCache::PlatformReactor* reacto
     if (!accepted.has_value())
     {
         out->finished.store(true, std::memory_order_release);
-        reactor->Stop();
+        reactor->stop();
         co_return;
     }
     auto socket = std::move(*accepted);
@@ -167,7 +167,7 @@ FastCache::DetachedTask ReadParkThenReadAgain(FastCache::PlatformReactor* reacto
 
     std::array<std::byte, 8> first {};
     out->arming.store(true, std::memory_order_release);
-    auto const parked = co_await socket->Read(std::span<std::byte> { first });
+    auto const parked = co_await socket->read(std::span<std::byte> { first });
 
     out->firstHasValue.store(parked.has_value(), std::memory_order_relaxed);
     if (!parked.has_value())
@@ -180,7 +180,7 @@ FastCache::DetachedTask ReadParkThenReadAgain(FastCache::PlatformReactor* reacto
     // implementation that completed the awaitable without detaching it first, this is
     // the double-arm the slot guard aborts on.
     std::array<std::byte, 8> second {};
-    auto const after = co_await socket->Read(std::span<std::byte> { second });
+    auto const after = co_await socket->read(std::span<std::byte> { second });
     out->secondHasValue.store(after.has_value(), std::memory_order_relaxed);
     if (after.has_value())
         out->secondCount.store(*after, std::memory_order_relaxed);
@@ -188,8 +188,8 @@ FastCache::DetachedTask ReadParkThenReadAgain(FastCache::PlatformReactor* reacto
         out->secondErrorCode.store(static_cast<int>(after.error().code), std::memory_order_relaxed);
 
     out->finished.store(true, std::memory_order_release);
-    socket->Close();
-    reactor->Stop();
+    socket->close();
+    reactor->stop();
     co_return;
 }
 
@@ -233,7 +233,7 @@ FastCache::DetachedTask CancelWhenParked(FastCache::PlatformReactor* reactor, Ob
     // parked at all.
     out->firstResolvedAtCancel.store(out->firstResolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
-    out->socket->CancelRead();
+    out->socket->cancelRead();
     co_return;
 }
 
@@ -253,19 +253,19 @@ FastCache::DetachedTask CancelWithNothingParked(FastCache::PlatformReactor* reac
     if (!accepted.has_value())
     {
         out->finished.store(true, std::memory_order_release);
-        reactor->Stop();
+        reactor->stop();
         co_return;
     }
     auto socket = std::move(*accepted);
 
     // Twice, with the slot empty both times. Neither may throw, and neither may leave
     // the socket unable to read.
-    socket->CancelRead();
-    socket->CancelRead();
+    socket->cancelRead();
+    socket->cancelRead();
     out->arming.store(true, std::memory_order_release);
 
     std::array<std::byte, 8> buffer {};
-    auto const got = co_await socket->Read(std::span<std::byte> { buffer });
+    auto const got = co_await socket->read(std::span<std::byte> { buffer });
     out->secondHasValue.store(got.has_value(), std::memory_order_relaxed);
     if (got.has_value())
         out->secondCount.store(*got, std::memory_order_relaxed);
@@ -273,8 +273,8 @@ FastCache::DetachedTask CancelWithNothingParked(FastCache::PlatformReactor* reac
         out->secondErrorCode.store(static_cast<int>(got.error().code), std::memory_order_relaxed);
 
     out->finished.store(true, std::memory_order_release);
-    socket->Close();
-    reactor->Stop();
+    socket->close();
+    reactor->stop();
     co_return;
 }
 
@@ -374,31 +374,31 @@ FastCache::DetachedTask ProbeTwiceThenRead(FastCache::PlatformReactor* reactor,
     if (!accepted.has_value())
     {
         out->finished.store(true, std::memory_order_release);
-        reactor->Stop();
+        reactor->stop();
         co_return;
     }
     auto socket = std::move(*accepted);
     out->socket = socket.get();
 
     out->arming.store(true, std::memory_order_release);
-    Record(out->first, co_await socket->WaitReadable());
+    Record(out->first, co_await socket->waitReadable());
 
     // **Armed from INSIDE the first `CancelRead`**, which is the whole mechanism: the
     // retirement completed this probe inline, so this statement runs before the
     // canceller's next one does. This is the operation the second cancel takes.
     out->secondArmed.store(true, std::memory_order_release);
-    Record(out->second, co_await socket->WaitReadable());
+    Record(out->second, co_await socket->waitReadable());
 
     // And a real read, so the case can tell a cancel from a close. Legal only because
     // both retirements released the socket's single read slot (#663); under an
     // implementation that completed without detaching, this is the double-arm the slot
     // guard aborts on.
     std::array<std::byte, 8> buffer {};
-    Record(out->after, co_await socket->Read(std::span<std::byte> { buffer }));
+    Record(out->after, co_await socket->read(std::span<std::byte> { buffer }));
 
     out->finished.store(true, std::memory_order_release);
-    socket->Close();
-    reactor->Stop();
+    socket->close();
+    reactor->stop();
     co_return;
 }
 
@@ -426,7 +426,7 @@ FastCache::DetachedTask CancelParkedProbeTwice(FastCache::PlatformReactor* react
     // task only runs because it did, so a resolved probe here would mean it never parked.
     out->firstResolvedAtCancel.store(out->first.resolved.load(std::memory_order_acquire), std::memory_order_relaxed);
 
-    out->socket->CancelRead();
+    out->socket->cancelRead();
 
     // Recorded BETWEEN the two calls, and these two are the case's premise rather than
     // its conclusion: the first call resumed the reader inline, and the reader armed
@@ -463,7 +463,7 @@ FastCache::DetachedTask CancelParkedProbeTwice(FastCache::PlatformReactor* react
     if (out->finished.load(std::memory_order_acquire))
         co_return;
 
-    out->socket->CancelRead();
+    out->socket->cancelRead();
     co_return;
 }
 
@@ -517,7 +517,7 @@ TEST_CASE("CancelRead retrieves a parked read and leaves the socket usable", "[n
     std::jthread client { [port, &observed, &connected, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
         connected.store(true, std::memory_order_release);
@@ -538,14 +538,14 @@ TEST_CASE("CancelRead retrieves a parked read and leaves the socket usable", "[n
 
         std::array<std::byte, 2> const payload { std::byte { 'o' }, std::byte { 'k' } };
         (void) FastCache::SyncRun([](FastCache::ISocket* s, std::array<std::byte, 2> p) -> FastCache::Task<bool> {
-            co_return (co_await s->Write(std::span<std::byte const> { p })).has_value();
+            co_return (co_await s->write(std::span<std::byte const> { p })).has_value();
         }((*socket).get(), payload));
 
         (void) waits.WaitForFlag("the exchange to finish", observed.finished, [&observed] { return Describe(observed); });
-        (*socket)->Close();
+        (*socket)->close();
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
 
     // First, while the accounts of any wait that ran out are still attached.
@@ -599,7 +599,7 @@ TEST_CASE("CancelRead with nothing parked disturbs nothing", "[net][socket][canc
     std::jthread client { [port, &observed, &connected, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
         connected.store(true, std::memory_order_release);
@@ -613,14 +613,14 @@ TEST_CASE("CancelRead with nothing parked disturbs nothing", "[net][socket][canc
 
         std::array<std::byte, 3> const payload { std::byte { 'y' }, std::byte { 'e' }, std::byte { 's' } };
         (void) FastCache::SyncRun([](FastCache::ISocket* s, std::array<std::byte, 3> p) -> FastCache::Task<bool> {
-            co_return (co_await s->Write(std::span<std::byte const> { p })).has_value();
+            co_return (co_await s->write(std::span<std::byte const> { p })).has_value();
         }((*socket).get(), payload));
 
         (void) waits.WaitForFlag("the exchange to finish", observed.finished, [&observed] { return Describe(observed); });
-        (*socket)->Close();
+        (*socket)->close();
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
 
     // First, while the accounts of any wait that ran out are still attached.
@@ -699,7 +699,7 @@ TEST_CASE("A second CancelRead takes the probe the first one's resumption armed"
     std::jthread client { [port, &observed, &connected, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return;
         connected.store(true, std::memory_order_release);
@@ -720,14 +720,14 @@ TEST_CASE("A second CancelRead takes the probe the first one's resumption armed"
 
         std::array<std::byte, 2> const payload { std::byte { 'o' }, std::byte { 'k' } };
         (void) FastCache::SyncRun([](FastCache::ISocket* s, std::array<std::byte, 2> p) -> FastCache::Task<bool> {
-            co_return (co_await s->Write(std::span<std::byte const> { p })).has_value();
+            co_return (co_await s->write(std::span<std::byte const> { p })).has_value();
         }((*socket).get(), payload));
 
         (void) waits.WaitForFlag("the exchange to finish", observed.finished, [&observed] { return Describe(observed); });
-        (*socket)->Close();
+        (*socket)->close();
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
 
     // First, while the accounts of any wait that ran out are still attached.

@@ -33,7 +33,7 @@ TimePoint CacheEngine::ExpiryFromExptime(std::uint32_t exptime) const noexcept
     if (exptime == 0)
         return TimePoint::max();
 
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     if (std::chrono::seconds { exptime } <= MemcachedRelativeExptimeCeiling)
         return now + std::chrono::seconds { exptime };
 
@@ -53,25 +53,25 @@ TimePoint CacheEngine::ExpiryFromExptime(std::uint32_t exptime) const noexcept
 std::expected<GetResult, StorageError> CacheEngine::Get(std::string_view key)
 {
     FC_ZONE_SCOPED_N("CacheEngine::Get");
-    return _storage.Get(key, _clock.Now());
+    return _storage.Get(key, _clock.now());
 }
 
 std::expected<GetResult, StorageError> CacheEngine::Peek(std::string_view key)
 {
     FC_ZONE_SCOPED_N("CacheEngine::Peek");
-    return _storage.Peek(key, _clock.Now());
+    return _storage.Peek(key, _clock.now());
 }
 
 std::expected<bool, StorageError> CacheEngine::Prefetch(std::string_view key)
 {
     FC_ZONE_SCOPED_N("CacheEngine::Prefetch");
-    return _storage.Prefetch(key, _clock.Now());
+    return _storage.Prefetch(key, _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::PeekCas(std::string_view key)
 {
     FC_ZONE_SCOPED_N("CacheEngine::PeekCas");
-    auto const result = _storage.Peek(key, _clock.Now());
+    auto const result = _storage.Peek(key, _clock.now());
     if (!result.has_value())
         return std::unexpected(result.error());
     return result->found ? result->entry.cas : CasToken { 0 };
@@ -101,7 +101,7 @@ std::expected<CasToken, StorageError> CacheEngine::Add(std::string_view key,
                                                        std::uint32_t exptime)
 {
     FC_ZONE_SCOPED_N("CacheEngine::Add");
-    return _storage.Add(key, std::move(value), flags, ExpiryFromExptime(exptime), _clock.Now());
+    return _storage.Add(key, std::move(value), flags, ExpiryFromExptime(exptime), _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::AddWithDeadline(std::string_view key,
@@ -110,7 +110,7 @@ std::expected<CasToken, StorageError> CacheEngine::AddWithDeadline(std::string_v
                                                                    TimePoint deadline)
 {
     FC_ZONE_SCOPED_N("CacheEngine::AddWithDeadline");
-    return _storage.Add(key, std::move(value), flags, deadline, _clock.Now());
+    return _storage.Add(key, std::move(value), flags, deadline, _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::Replace(std::string_view key,
@@ -119,7 +119,7 @@ std::expected<CasToken, StorageError> CacheEngine::Replace(std::string_view key,
                                                            std::uint32_t exptime)
 {
     FC_ZONE_SCOPED_N("CacheEngine::Replace");
-    return _storage.Replace(key, std::move(value), flags, ExpiryFromExptime(exptime), _clock.Now());
+    return _storage.Replace(key, std::move(value), flags, ExpiryFromExptime(exptime), _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::ReplaceWithDeadline(std::string_view key,
@@ -128,7 +128,7 @@ std::expected<CasToken, StorageError> CacheEngine::ReplaceWithDeadline(std::stri
                                                                        TimePoint deadline)
 {
     FC_ZONE_SCOPED_N("CacheEngine::ReplaceWithDeadline");
-    return _storage.Replace(key, std::move(value), flags, deadline, _clock.Now());
+    return _storage.Replace(key, std::move(value), flags, deadline, _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::ConcatGuarded(std::string_view key,
@@ -171,7 +171,7 @@ std::expected<CasToken, StorageError> CacheEngine::ConcatGuarded(std::string_vie
                                              .flags = current.found ? current.entry.flags : 0U,
                                              .action = IStorage::UpdateAction::Store };
         },
-        _clock.Now());
+        _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::Append(std::string_view key,
@@ -194,7 +194,7 @@ std::expected<CasToken, StorageError> CacheEngine::CompareAndSwap(
     std::string_view key, CasToken expected, std::vector<std::byte> value, std::uint32_t flags, std::uint32_t exptime)
 {
     FC_ZONE_SCOPED_N("CacheEngine::CompareAndSwap");
-    return _storage.CompareAndSwap(key, expected, std::move(value), flags, ExpiryFromExptime(exptime), _clock.Now());
+    return _storage.CompareAndSwap(key, expected, std::move(value), flags, ExpiryFromExptime(exptime), _clock.now());
 }
 
 std::expected<IStorage::IncrResult, StorageError> CacheEngine::Increment(std::string_view key, std::uint64_t delta)
@@ -202,7 +202,7 @@ std::expected<IStorage::IncrResult, StorageError> CacheEngine::Increment(std::st
     FC_ZONE_SCOPED_N("CacheEngine::Increment");
     // The full uint64 delta is forwarded verbatim — memcached increments wrap
     // modulo 2^64, and a signed cast would alias deltas >= 2^63 to decrements.
-    return _storage.IncrementOrInitialize(key, delta, /*decrement=*/false, _clock.Now());
+    return _storage.IncrementOrInitialize(key, delta, /*decrement=*/false, _clock.now());
 }
 
 std::expected<IStorage::IncrResult, StorageError> CacheEngine::Decrement(std::string_view key, std::uint64_t delta)
@@ -210,31 +210,31 @@ std::expected<IStorage::IncrResult, StorageError> CacheEngine::Decrement(std::st
     FC_ZONE_SCOPED_N("CacheEngine::Decrement");
     // Pass the magnitude + direction rather than a negated signed delta:
     // negating INT64_MIN (delta == 2^63) would be signed-overflow UB.
-    return _storage.IncrementOrInitialize(key, delta, /*decrement=*/true, _clock.Now());
+    return _storage.IncrementOrInitialize(key, delta, /*decrement=*/true, _clock.now());
 }
 
 std::expected<void, StorageError> CacheEngine::Delete(std::string_view key)
 {
     FC_ZONE_SCOPED_N("CacheEngine::Delete");
-    return _storage.Delete(key, _clock.Now());
+    return _storage.Delete(key, _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::Touch(std::string_view key, std::uint32_t exptime)
 {
     FC_ZONE_SCOPED_N("CacheEngine::Touch");
-    return _storage.Touch(key, ExpiryFromExptime(exptime), _clock.Now());
+    return _storage.Touch(key, ExpiryFromExptime(exptime), _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::TouchAt(std::string_view key, TimePoint newExpiry)
 {
     FC_ZONE_SCOPED_N("CacheEngine::TouchAt");
-    return _storage.Touch(key, newExpiry, _clock.Now());
+    return _storage.Touch(key, newExpiry, _clock.now());
 }
 
 std::expected<std::optional<CacheEngine::TtlResult>, StorageError> CacheEngine::Ttl(std::string_view key)
 {
     FC_ZONE_SCOPED_N("CacheEngine::Ttl");
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     auto const expiry = _storage.PeekExpiry(key, now);
     if (!expiry.has_value())
         return std::unexpected(expiry.error());
@@ -250,19 +250,19 @@ std::expected<std::optional<CacheEngine::TtlResult>, StorageError> CacheEngine::
 std::expected<bool, StorageError> CacheEngine::ClearExpiry(std::string_view key)
 {
     FC_ZONE_SCOPED_N("CacheEngine::ClearExpiry");
-    return _storage.ClearExpiry(key, _clock.Now());
+    return _storage.ClearExpiry(key, _clock.now());
 }
 
 std::expected<GetResult, StorageError> CacheEngine::GetAndTouch(std::string_view key, std::uint32_t exptime)
 {
     FC_ZONE_SCOPED_N("CacheEngine::GetAndTouch");
-    return _storage.GetAndTouch(key, ExpiryFromExptime(exptime), _clock.Now());
+    return _storage.GetAndTouch(key, ExpiryFromExptime(exptime), _clock.now());
 }
 
 std::expected<void, StorageError> CacheEngine::CompareAndDelete(std::string_view key, CasToken expected)
 {
     FC_ZONE_SCOPED_N("CacheEngine::CompareAndDelete");
-    return _storage.CompareAndDelete(key, expected, _clock.Now());
+    return _storage.CompareAndDelete(key, expected, _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::MarkStale(std::string_view key, std::optional<std::uint32_t> newExptime)
@@ -271,12 +271,12 @@ std::expected<CasToken, StorageError> CacheEngine::MarkStale(std::string_view ke
     std::optional<TimePoint> newExpiry;
     if (newExptime.has_value())
         newExpiry = ExpiryFromExptime(*newExptime);
-    return _storage.MarkStale(key, newExpiry, _clock.Now());
+    return _storage.MarkStale(key, newExpiry, _clock.now());
 }
 
 void CacheEngine::FlushAll(std::uint32_t delaySeconds)
 {
-    auto const effectiveAt = delaySeconds == 0 ? _clock.Now() : _clock.Now() + std::chrono::seconds { delaySeconds };
+    auto const effectiveAt = delaySeconds == 0 ? _clock.now() : _clock.now() + std::chrono::seconds { delaySeconds };
     _storage.FlushWithGeneration(effectiveAt);
 }
 
@@ -284,7 +284,7 @@ std::expected<CasToken, StorageError> CacheEngine::Update(
     std::string_view key, std::function<std::expected<IStorage::UpdateOutcome, StorageError>(GetResult const&)> const& fn)
 {
     FC_ZONE_SCOPED_N("CacheEngine::Update");
-    return _storage.Update(key, fn, _clock.Now());
+    return _storage.Update(key, fn, _clock.now());
 }
 
 namespace

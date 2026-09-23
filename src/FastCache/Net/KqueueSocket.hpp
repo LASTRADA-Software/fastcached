@@ -36,29 +36,29 @@ class KqueueSocket final: public ISocket
     KqueueSocket(KqueueSocket&&) = delete;
     KqueueSocket& operator=(KqueueSocket&&) = delete;
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override;
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override;
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override;
-    [[nodiscard]] IoAwaitable WaitReadable() override;
-    void Close() noexcept override;
+    [[nodiscard]] IoAwaitable waitReadable() override;
+    void close() noexcept override;
 
     /// @copydoc ISocket::CancelRead
-    void CancelRead() noexcept override;
+    void cancelRead() noexcept override;
 
     /// @copydoc ISocket::ShutdownWrite
-    void ShutdownWrite() noexcept override;
+    void shutdownWrite() noexcept override;
 
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return _closed;
     }
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return _peerAddress;
     }
 
-    [[nodiscard]] int Native() const noexcept
+    [[nodiscard]] int handle() const noexcept
     {
         return _fd;
     }
@@ -140,7 +140,7 @@ class KqueueListener final: public IListener
     KqueueListener& operator=(KqueueListener&&) = delete;
 
     [[nodiscard]] AcceptAwaitable Accept() override;
-    void Close() noexcept override;
+    void close() noexcept override;
     [[nodiscard]] std::uint16_t BoundPort() const noexcept override;
 
     [[nodiscard]] bool IsBound() const noexcept;

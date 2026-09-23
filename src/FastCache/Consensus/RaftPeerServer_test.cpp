@@ -136,7 +136,7 @@ struct MirroredServer
 /// @return Whether all of it was accepted.
 [[nodiscard]] Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> bytes)
 {
-    auto const written = co_await socket->Write(bytes);
+    auto const written = co_await socket->write(bytes);
     co_return written.has_value() && *written == bytes.size();
 }
 
@@ -146,7 +146,7 @@ struct MirroredServer
 /// @return How many bytes arrived; zero at the end or on an error.
 [[nodiscard]] Task<std::size_t> ReadSome(ISocket* socket, std::span<std::byte> buffer)
 {
-    auto const read = co_await socket->Read(buffer);
+    auto const read = co_await socket->read(buffer);
     co_return read.has_value() ? *read : std::size_t { 0 };
 }
 
@@ -343,10 +343,10 @@ struct Served
     served.server =
         std::make_unique<RaftPeerServer>(listener, reactor, sink, logger, *served.metrics, identity, random, options);
 
-    auto client = listener.ConnectClient();
+    auto client = listener.connectClient();
     if (!wire.empty())
         REQUIRE(SyncRun(WriteAll(client.get(), wire)));
-    client->ShutdownWrite();
+    client->shutdownWrite();
 
     // The listener drains queued connections before reporting itself closed, so
     // closing here still delivers the one connection and then ends the loop.
@@ -939,18 +939,18 @@ TEST_CASE("A connection that does not prove an id within the bound is closed and
     };
     accepting(&server);
 
-    auto const client = listener.ConnectClient();
+    auto const client = listener.connectClient();
     reactor.Drain();
 
     auto const timedOut = [&metrics] {
         return metrics.Read(RowFor(AcceptorRefusal::HandshakeTimeout).counter);
     };
 
-    clock.Advance(Bound / 2);
+    clock.advance(Bound / 2);
     reactor.Drain();
     CHECK(timedOut() == 0);
 
-    clock.Advance(Bound);
+    clock.advance(Bound);
     reactor.Drain();
     CHECK(timedOut() == 1);
 
@@ -992,7 +992,7 @@ class RunningReactor
 {
   public:
     RunningReactor():
-        _thread { [this] { _reactor.Run(); } }
+        _thread { [this] { _reactor.run(); } }
     {
     }
 
@@ -1001,7 +1001,7 @@ class RunningReactor
         // Asked to stop BEFORE the member sweep, because `_thread` is declared last
         // and so is joined first -- a join without this would wait on a loop with no
         // reason to return.
-        _reactor.Stop();
+        _reactor.stop();
     }
 
     RunningReactor(RunningReactor const&) = delete;
@@ -1103,8 +1103,8 @@ TEST_CASE("Shutdown closes the peer listener on the reactor, not on the calling 
     // The arrangement, asserted rather than assumed: if the reactor were not running,
     // the closes would be posted where nothing runs them and the identity below would
     // be comparing two things that mean nothing.
-    REQUIRE(WaitFor([&loop] { return loop.Get().Running(); }));
-    REQUIRE_FALSE(loop.Get().IsOnWorkerThread());
+    REQUIRE(WaitFor([&loop] { return loop.Get().running(); }));
+    REQUIRE_FALSE(loop.Get().isOnWorkerThread());
 
     RaftPeerServer server { listener, loop.Get(), sink, logger, metrics, identity, random };
 

@@ -54,10 +54,10 @@ TEST_CASE("SleepUntil: an already-elapsed deadline resolves immediately", "[reac
     FastCache::ManualClock clock { FastCache::TimePoint {} + 1s };
     FastCache::TestReactor reactor { clock };
 
-    FastCache::SleepUntil const past { .reactor = &reactor, .deadline = clock.Now() - 1ms };
+    FastCache::SleepUntil const past { .reactor = &reactor, .deadline = clock.now() - 1ms };
     REQUIRE(past.await_ready());
 
-    FastCache::SleepUntil const exact { .reactor = &reactor, .deadline = clock.Now() };
+    FastCache::SleepUntil const exact { .reactor = &reactor, .deadline = clock.now() };
     REQUIRE(exact.await_ready());
 }
 
@@ -67,19 +67,19 @@ TEST_CASE("SleepUntil: suspends until the clock reaches the deadline", "[reactor
     FastCache::TestReactor reactor { clock };
 
     bool fired = false;
-    auto task = SleepThenFire(&reactor, clock.Now() + 100ms, &fired);
-    reactor.Submit(task.Native());
+    auto task = SleepThenFire(&reactor, clock.now() + 100ms, &fired);
+    reactor.submit(task.handle());
 
-    reactor.Run();
+    reactor.run();
     REQUIRE_FALSE(fired);
     REQUIRE(reactor.PendingTimers() == 1);
 
-    clock.Advance(99ms);
-    reactor.Run();
+    clock.advance(99ms);
+    reactor.run();
     REQUIRE_FALSE(fired);
 
-    clock.Advance(1ms);
-    reactor.Run();
+    clock.advance(1ms);
+    reactor.run();
     REQUIRE(fired);
     REQUIRE(reactor.PendingTimers() == 0);
 }
@@ -91,18 +91,18 @@ TEST_CASE("SleepFor: computes the deadline relative to the reactor's clock", "[r
 
     auto const awaitable = FastCache::SleepFor(reactor, 50ms);
     REQUIRE(awaitable.reactor == &reactor);
-    REQUIRE(awaitable.deadline == clock.Now() + 50ms);
+    REQUIRE(awaitable.deadline == clock.now() + 50ms);
     REQUIRE_FALSE(awaitable.await_ready());
 
     bool fired = false;
     auto task = SleepForThenFire(&reactor, 50ms, &fired);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
 
-    reactor.Run();
+    reactor.run();
     REQUIRE_FALSE(fired);
 
-    clock.Advance(50ms);
-    reactor.Run();
+    clock.advance(50ms);
+    reactor.run();
     REQUIRE(fired);
 }
 

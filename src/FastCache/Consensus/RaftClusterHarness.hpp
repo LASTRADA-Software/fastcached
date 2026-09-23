@@ -603,7 +603,7 @@ inline void RaftClusterHarness::AddNode(NodeId const& who,
     member->random = std::make_unique<SystemRandomSource>((_seedOffset * 1000) + _nodes.size());
     member->bootstrap = std::move(bootstrap);
 
-    auto node = RaftNode::Create(ConfigFor(member->identity->Self(), member->bootstrap), *member->random, _clock.Now());
+    auto node = RaftNode::Create(ConfigFor(member->identity->Self(), member->bootstrap), *member->random, _clock.now());
 
     // A node that has never run recovered nothing, so nothing can be refused; one that
     // was is this harness broken, not an outcome for a case to assert.
@@ -737,7 +737,7 @@ inline RaftClusterHarness::Member const& RaftClusterHarness::At(NodeId const& wh
 
 inline TimePoint RaftClusterHarness::Now() const noexcept
 {
-    return _clock.Now();
+    return _clock.now();
 }
 
 inline std::vector<std::string> const& RaftClusterHarness::Violations() const noexcept
@@ -839,7 +839,7 @@ inline void RaftClusterHarness::Enqueue(NodeId const& from, NodeId const& to, Ra
     _wire.push_back(InFlight { .from = from,
                                .to = to,
                                .message = std::move(message),
-                               .deliverAt = _clock.Now() + std::chrono::milliseconds { delay * 5 } });
+                               .deliverAt = _clock.now() + std::chrono::milliseconds { delay * 5 } });
 }
 
 inline void RaftClusterHarness::RecordApplied(NodeId const& who, AppliedEntry const& entry)
@@ -983,8 +983,8 @@ inline void RaftClusterHarness::CheckInvariants()
 
 inline void RaftClusterHarness::Step(std::chrono::milliseconds by)
 {
-    _clock.Advance(by);
-    auto const now = _clock.Now();
+    _clock.advance(by);
+    auto const now = _clock.now();
 
     auto due = std::vector<InFlight> {};
     auto waiting = std::vector<InFlight> {};
@@ -1094,7 +1094,7 @@ inline std::optional<LogIndex> RaftClusterHarness::ProposeOnLeader(std::vector<s
     if (!leader.has_value())
         return std::nullopt;
 
-    auto const proposed = Find(*leader).driver->Propose(std::move(payload), _clock.Now());
+    auto const proposed = Find(*leader).driver->Propose(std::move(payload), _clock.now());
     if (!proposed.has_value())
         return std::nullopt;
 
@@ -1107,7 +1107,7 @@ inline std::optional<LogIndex> RaftClusterHarness::ProposeMembershipOnLeader(Con
     if (!leader.has_value())
         return std::nullopt;
 
-    auto const proposed = Find(*leader).driver->ProposeMembership(std::move(configuration), _clock.Now());
+    auto const proposed = Find(*leader).driver->ProposeMembership(std::move(configuration), _clock.now());
     if (!proposed.has_value())
         return std::nullopt;
 
@@ -1133,7 +1133,7 @@ inline std::expected<void, ConsensusError> RaftClusterHarness::Restart(NodeId co
         return std::unexpected { std::move(recovered).error() };
 
     auto node = RaftNode::Create(
-        ConfigFor(member.identity->Self(), member.bootstrap), *member.random, _clock.Now(), std::move(recovered).value());
+        ConfigFor(member.identity->Self(), member.bootstrap), *member.random, _clock.now(), std::move(recovered).value());
     if (!node.has_value())
         return std::unexpected { std::move(node).error() };
     return BuildDriver(member, std::move(node).value());

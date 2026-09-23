@@ -35,7 +35,7 @@ namespace
 
 [[nodiscard]] Task<bool> WriteString(ISocket* socket, std::string_view payload)
 {
-    auto const result = co_await socket->Write(AsBytes(payload));
+    auto const result = co_await socket->write(AsBytes(payload));
     co_return result.has_value();
 }
 
@@ -45,7 +45,7 @@ namespace
     while (true)
     {
         std::vector<std::byte> chunk(256);
-        auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const result = co_await socket->read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!result.has_value() || *result == 0)
             break;
         for (auto const i: std::views::iota(std::size_t { 0 }, *result))
@@ -95,9 +95,9 @@ struct BothProtocols
     {
         auto pair = InMemorySocketPair::Create();
         REQUIRE(SyncRun(WriteString(pair.client.get(), request)));
-        pair.client->ShutdownWrite();
+        pair.client->shutdownWrite();
         SyncRun(handler.Run(pair.server.get(), &engine, /*primingBytes=*/ {}, SessionContext {}));
-        pair.server->Close();
+        pair.server->close();
         return SyncRun(ReadAvailable(pair.client.get()));
     }
 };
@@ -337,9 +337,9 @@ struct Observed
                              + "\r\n" + std::string { blob } + "\r\n";
         auto pair = InMemorySocketPair::Create();
         REQUIRE(SyncRun(WriteString(pair.client.get(), command)));
-        pair.client->ShutdownWrite();
+        pair.client->shutdownWrite();
         SyncRun(text.Run(pair.server.get(), &engine, /*primingBytes=*/ {}, SessionContext {}));
-        pair.server->Close();
+        pair.server->close();
         REQUIRE(SyncRun(ReadAvailable(pair.client.get())) == "STORED\r\n");
     }
 

@@ -98,7 +98,7 @@ class IoAwaitable
     /// completed inline), the resume is suppressed — await_suspend observes the
     /// published result and returns `false`, so the coroutine resumes without a
     /// re-entrant `resume()` call.
-    void Complete(IoResult result) noexcept
+    void complete(IoResult result) noexcept
     {
         _result = result;
         _ready = true;
@@ -187,13 +187,13 @@ class ISocket
     ///
     /// @param buffer Destination span; must outlive the awaitable.
     /// @return Awaitable resolving to IoResult.
-    [[nodiscard]] virtual IoAwaitable Read(std::span<std::byte> buffer) = 0;
+    [[nodiscard]] virtual IoAwaitable read(std::span<std::byte> buffer) = 0;
 
     /// Write all of buffer's bytes. Resolves with the byte count actually
     /// written (== buffer.size() on success), or a NetError on failure.
     /// @param buffer Source span; must outlive the awaitable.
     /// @return Awaitable resolving to IoResult.
-    [[nodiscard]] virtual IoAwaitable Write(std::span<std::byte const> buffer) = 0;
+    [[nodiscard]] virtual IoAwaitable write(std::span<std::byte const> buffer) = 0;
 
     /// Gather-write: send every segment in order as one logical write, using
     /// a single scattered syscall (`sendmsg`/`WSASend`) where the platform
@@ -216,7 +216,7 @@ class ISocket
     /// @param keepAlive Optional owner pinning the segments' backing storage
     ///        for the operation's lifetime.
     /// @return Awaitable resolving to IoResult (total bytes written).
-    [[nodiscard]] virtual IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] virtual IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                                     std::shared_ptr<void const> keepAlive = {}) = 0;
 
     /// Perform any transport-level handshake required before application I/O.
@@ -226,7 +226,7 @@ class ISocket
     /// transport-agnostic and a slow handshake runs on the per-connection
     /// coroutine rather than blocking the accept loop.
     /// @return Awaitable resolving to success, or a NetError on failure.
-    [[nodiscard]] virtual Task<std::expected<void, NetError>> HandshakeIfNeeded()
+    [[nodiscard]] virtual Task<std::expected<void, NetError>> handshakeIfNeeded()
     {
         co_return std::expected<void, NetError> {};
     }
@@ -276,7 +276,7 @@ class ISocket
     /// what the contract forbids is losing a byte the next `Read` would have
     /// returned.
     /// @return Awaitable resolving when readable; `0` means EOF, `>0` means data.
-    [[nodiscard]] virtual IoAwaitable WaitReadable()
+    [[nodiscard]] virtual IoAwaitable waitReadable()
     {
         return IoAwaitable { IoResult { std::size_t { 1 } } };
     }
@@ -453,14 +453,14 @@ class ISocket
     /// harmlessly all the time" is the reading that makes a double call sound safe, and
     /// the paragraph above is about the case where it is not. And it is not a `Close()`:
     /// the socket stays open, and a later `Read` works.
-    virtual void CancelRead() noexcept {}
+    virtual void cancelRead() noexcept {}
 
     /// The remote peer's address as a printable host string ("203.0.113.7" /
     /// "::1"), captured at accept time. Used by the `--log-source` connection
     /// log prefix. The default returns "" so transports that have no peer
     /// address (the in-memory test transport) need no override.
     /// @return Printable peer host, or "" when unknown.
-    [[nodiscard]] virtual std::string PeerAddress() const
+    [[nodiscard]] virtual std::string peerAddress() const
     {
         return {};
     }
@@ -479,7 +479,7 @@ class ISocket
     /// awaiting coroutine, and a coroutine that OWNS the socket runs to its end and
     /// destroys it before `Complete` returns -- which is a heap-use-after-free this
     /// tree has already had (see `EpollSocket::Close`).
-    virtual void Close() noexcept = 0;
+    virtual void close() noexcept = 0;
 
     /// Close this socket's WRITE half, leaving the read half open, so the peer
     /// observes EOF while this side can still receive.
@@ -515,7 +515,7 @@ class ISocket
     ///
     /// `TlsSocket` qualifies the "reads keep working" half and says why on its own
     /// override -- TLS reads write, so they are the one case a half-close can reach.
-    virtual void ShutdownWrite() noexcept {}
+    virtual void shutdownWrite() noexcept {}
 
     /// Re-arm how long a single read may block before it reports a deadline expiry.
     ///
@@ -536,7 +536,7 @@ class ISocket
     /// harmless there for the same reason.
     /// @param deadline How long a read may block. Non-positive leaves the current
     ///        setting alone, matching `SO_RCVTIMEO`'s own reading of zero.
-    virtual void SetReceiveDeadline(std::chrono::milliseconds /*deadline*/) noexcept {}
+    virtual void setReceiveDeadline(std::chrono::milliseconds /*deadline*/) noexcept {}
 
     /// @return true if Close() has been called or the peer has closed and a
     /// Read has observed EOF. Used by Connection to break its loop.

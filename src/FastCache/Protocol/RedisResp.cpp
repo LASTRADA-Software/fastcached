@@ -149,12 +149,12 @@ namespace
                     resolved = true;
                     toWake = Detail::Parked { std::exchange(handle, ParkedWork {}) };
                 }
-                if (toWake.Handle())
+                if (toWake.handle())
                 {
                     if (reactor != nullptr)
-                        reactor->Submit(toWake.Take());
+                        reactor->submit(toWake.take());
                     else
-                        toWake.Resume();
+                        toWake.resume();
                 }
             }
         };
@@ -263,7 +263,7 @@ namespace
             // completion. The connection's own Close on its way out is
             // redundant once we've done this, but harmless.
             if (socket != nullptr)
-                socket->Close();
+                socket->close();
         }
 
         /// Called by the command loop once it has drained the readable bytes, so
@@ -362,7 +362,7 @@ namespace
                     if (self->_shuttingDown)
                         co_return;
                 }
-                auto const readable = co_await socket->WaitReadable();
+                auto const readable = co_await socket->waitReadable();
                 if (!readable.has_value())
                     co_return; // socket closed/errored — the loop will observe it.
 
@@ -681,12 +681,12 @@ namespace
                 _disconnected = disconnected;
                 toWake = Detail::Parked { std::exchange(_handle, ParkedWork {}) };
             }
-            if (toWake.Handle())
+            if (toWake.handle())
             {
                 if (_reactor != nullptr)
-                    _reactor->Submit(toWake.Take());
+                    _reactor->submit(toWake.take());
                 else
-                    toWake.Resume();
+                    toWake.resume();
             }
         }
 
@@ -974,7 +974,7 @@ namespace
                 return;
             _watch->Retire();
             _watch.reset();
-            _socket->CancelRead();
+            _socket->cancelRead();
         }
 
       private:
@@ -1066,7 +1066,7 @@ namespace
     /// @param socket The connection socket to watch for closure.
     DetachedTask ArmDisconnect(std::shared_ptr<DisconnectWatch> watch, ISocket* socket)
     {
-        auto const readable = co_await socket->WaitReadable();
+        auto const readable = co_await socket->waitReadable();
         if (!readable.has_value() || *readable == 0)
             // `Disconnect` is a no-op once the watch is retired, which is what keeps the
             // `Cancelled` completion `ISocket::CancelRead` delivers from presenting as a
@@ -1168,7 +1168,7 @@ namespace
     {
         if (payload.empty())
             co_return true;
-        auto const r = co_await socket->Write(AsBytes(payload));
+        auto const r = co_await socket->write(AsBytes(payload));
         // Verify the byte count, not merely that the call succeeded: ISocket::Write
         // is a write-all contract, so a short count is a backend bug that must
         // surface as a failed reply rather than a silently truncated one.
@@ -1190,7 +1190,7 @@ namespace
             expected += seg.size();
         if (expected == 0)
             co_return true;
-        auto const r = co_await socket->WriteVectored(segments, std::move(keepAlive));
+        auto const r = co_await socket->writeVectored(segments, std::move(keepAlive));
         co_return r.has_value() && *r == expected;
     }
 
@@ -1533,7 +1533,7 @@ namespace
                 if (raw == 0 || raw > cap)
                     return std::unexpected(std::string { "invalid expire time in 'set'" });
                 opts.deadline =
-                    millis ? clock.Now() + std::chrono::milliseconds { raw } : clock.Now() + std::chrono::seconds { raw };
+                    millis ? clock.now() + std::chrono::milliseconds { raw } : clock.now() + std::chrono::seconds { raw };
                 ++i; // the value, consumed
             }
             else
@@ -1640,8 +1640,8 @@ namespace
         // wire-supplied millisecond precision (the prior path forced
         // ceiling-division to whole seconds, turning `PSETEX k 50 v`
         // into a 1-second TTL).
-        auto const deadline = millis ? engine->Clock().Now() + std::chrono::milliseconds { raw }
-                                     : engine->Clock().Now() + std::chrono::seconds { raw };
+        auto const deadline = millis ? engine->Clock().now() + std::chrono::milliseconds { raw }
+                                     : engine->Clock().now() + std::chrono::seconds { raw };
         auto const result = engine->SetWithDeadline(args[0], std::move(bytes), 0, deadline);
         if (!result.has_value())
             co_return co_await ReplyError(socket, "storage failure");
@@ -1740,7 +1740,7 @@ namespace
         // We achieve this by passing `now` to Touch, which sets the entry to
         // expire as soon as it is observed (the next operation purges it).
         auto& clock = engine->Clock();
-        auto const now = clock.Now();
+        auto const now = clock.now();
 
         TimePoint deadline;
         if (absolute)
@@ -3510,7 +3510,7 @@ namespace
         // registry wired in.
         bool const inExec = state != nullptr && state->inExecReplay;
         bool const blocking = req.blockMs.has_value() && session.streamWaiters != nullptr && !inExec;
-        auto const deadline = BlockDeadline(engine->Clock().Now(), req.blockMs);
+        auto const deadline = BlockDeadline(engine->Clock().now(), req.blockMs);
 
         std::vector<std::vector<StreamCodec::StreamEntry>> perKey;
         co_return co_await RunBlockingRead(
@@ -3723,7 +3723,7 @@ namespace
         bool const inExec = state != nullptr && state->inExecReplay;
         bool const isHistory = !allNewEntries;
         bool const blocking = req.blockMs.has_value() && session.streamWaiters != nullptr && allNewEntries && !inExec;
-        auto const deadline = BlockDeadline(engine->Clock().Now(), req.blockMs);
+        auto const deadline = BlockDeadline(engine->Clock().now(), req.blockMs);
 
         // The poll records which key failed so the NOGROUP reply can name it.
         std::vector<std::vector<StreamCodec::StreamEntry>> perKey;
@@ -5340,7 +5340,7 @@ namespace
         if (name == "QUIT")
         {
             (void) co_await ReplyOk(socket);
-            socket->Close();
+            socket->close();
             co_return false; // signal session end
         }
         if (name == "RESET")

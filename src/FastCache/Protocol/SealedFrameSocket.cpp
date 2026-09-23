@@ -180,7 +180,7 @@ Task<IoResult> SealedFrameSocket::PumpRead(std::span<std::byte> out)
     // byte, an error, a fault or EOF -- none of which a `for` head can state.
     while (true)
     {
-        auto const got = co_await _raw->Read(std::span<std::byte> { _inScratch });
+        auto const got = co_await _raw->read(std::span<std::byte> { _inScratch });
         if (!got.has_value())
             co_return std::unexpected(got.error());
         if (*got == 0)
@@ -203,15 +203,15 @@ Task<IoResult> SealedFrameSocket::PumpRead(std::span<std::byte> out)
 DetachedTask SealedFrameSocket::DriveRead(IoAwaitable* awaitable, std::span<std::byte> out)
 {
     auto const result = co_await PumpRead(out);
-    awaitable->Complete(result);
+    awaitable->complete(result);
     co_return;
 }
 
-IoAwaitable SealedFrameSocket::Read(std::span<std::byte> buffer)
+IoAwaitable SealedFrameSocket::read(std::span<std::byte> buffer)
 {
     Detail::RequireReadBuffer(buffer);
     if (!_opener.has_value())
-        return _raw->Read(buffer);
+        return _raw->read(buffer);
 
     if (auto const n = TakeReleased(buffer); n > 0)
         return IoAwaitable { IoResult { n } };
@@ -279,7 +279,7 @@ Task<IoResult> SealedFrameSocket::PumpWrite(std::size_t reported)
     // A `while`: the raw socket may take a part of what is ready, and each pass sends the rest.
     while (!_outReady.empty())
     {
-        auto const sent = co_await _raw->Write(std::span<std::byte const> { _outReady });
+        auto const sent = co_await _raw->write(std::span<std::byte const> { _outReady });
         if (!sent.has_value())
             co_return std::unexpected(sent.error());
         if (*sent == 0)
@@ -293,7 +293,7 @@ Task<IoResult> SealedFrameSocket::PumpWrite(std::size_t reported)
 DetachedTask SealedFrameSocket::DriveWrite(IoAwaitable* awaitable, std::size_t reported)
 {
     auto const result = co_await PumpWrite(reported);
-    awaitable->Complete(result);
+    awaitable->complete(result);
     co_return;
 }
 
@@ -315,10 +315,10 @@ IoAwaitable SealedFrameSocket::StartWrite(std::size_t reported)
     return awaitable;
 }
 
-IoAwaitable SealedFrameSocket::Write(std::span<std::byte const> buffer)
+IoAwaitable SealedFrameSocket::write(std::span<std::byte const> buffer)
 {
     if (!_sealer.has_value())
-        return _raw->Write(buffer);
+        return _raw->write(buffer);
     auto const segments = std::array { buffer };
     auto const taken = SealWhatIsWhole(segments);
     if (!taken.has_value())
@@ -326,11 +326,11 @@ IoAwaitable SealedFrameSocket::Write(std::span<std::byte const> buffer)
     return StartWrite(*taken);
 }
 
-IoAwaitable SealedFrameSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+IoAwaitable SealedFrameSocket::writeVectored(std::span<std::span<std::byte const> const> segments,
                                              std::shared_ptr<void const> keepAlive)
 {
     if (!_sealer.has_value())
-        return _raw->WriteVectored(segments, std::move(keepAlive));
+        return _raw->writeVectored(segments, std::move(keepAlive));
     // Copied synchronously into the frame being sealed, so neither the segments nor `keepAlive`
     // need outlive this call -- `TlsSocket`'s reason for the same.
     static_cast<void>(keepAlive);
@@ -340,45 +340,45 @@ IoAwaitable SealedFrameSocket::WriteVectored(std::span<std::span<std::byte const
     return StartWrite(*taken);
 }
 
-Task<std::expected<void, NetError>> SealedFrameSocket::HandshakeIfNeeded()
+Task<std::expected<void, NetError>> SealedFrameSocket::handshakeIfNeeded()
 {
-    co_return co_await _raw->HandshakeIfNeeded();
+    co_return co_await _raw->handshakeIfNeeded();
 }
 
-IoAwaitable SealedFrameSocket::WaitReadable()
+IoAwaitable SealedFrameSocket::waitReadable()
 {
     if (!_opener.has_value())
-        return _raw->WaitReadable();
+        return _raw->waitReadable();
     if (auto const available = ReleasedBytes(); available > 0)
         return IoAwaitable { IoResult { available } };
     if (_fault.has_value())
         return IoAwaitable { IoResult { std::unexpected(FaultError()) } };
-    return _raw->WaitReadable();
+    return _raw->waitReadable();
 }
 
-void SealedFrameSocket::CancelRead() noexcept
+void SealedFrameSocket::cancelRead() noexcept
 {
-    _raw->CancelRead();
+    _raw->cancelRead();
 }
 
-std::string SealedFrameSocket::PeerAddress() const
+std::string SealedFrameSocket::peerAddress() const
 {
-    return _raw->PeerAddress();
+    return _raw->peerAddress();
 }
 
-void SealedFrameSocket::Close() noexcept
+void SealedFrameSocket::close() noexcept
 {
-    _raw->Close();
+    _raw->close();
 }
 
-void SealedFrameSocket::ShutdownWrite() noexcept
+void SealedFrameSocket::shutdownWrite() noexcept
 {
-    _raw->ShutdownWrite();
+    _raw->shutdownWrite();
 }
 
-void SealedFrameSocket::SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept
+void SealedFrameSocket::setReceiveDeadline(std::chrono::milliseconds deadline) noexcept
 {
-    _raw->SetReceiveDeadline(deadline);
+    _raw->setReceiveDeadline(deadline);
 }
 
 bool SealedFrameSocket::IsClosed() const noexcept

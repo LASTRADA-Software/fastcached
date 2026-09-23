@@ -32,7 +32,7 @@ struct YieldAwaitable
     }
     void await_suspend(std::coroutine_handle<> handle) const
     {
-        reactor.Submit(handle);
+        reactor.submit(handle);
     }
     void await_resume() const noexcept {}
 };
@@ -59,7 +59,7 @@ FastCache::DetachedTask TimerWorker(FastCache::IReactor* reactor,
     co_await FastCache::SleepUntil { .reactor = reactor, .deadline = deadline };
     fired->store(true, std::memory_order_release);
     if (stopReactor)
-        stopReactor->Stop();
+        stopReactor->stop();
     co_return;
 }
 
@@ -84,10 +84,10 @@ TEST_CASE("IocpReactor::Submit resumes a coroutine on the reactor thread", "[rea
             "the worker to count to three",
             [&counter] { return counter.load(std::memory_order_relaxed) >= 3; },
             [&counter] { return std::format("counter {}", counter.load(std::memory_order_relaxed)); });
-        reactor.Stop();
+        reactor.stop();
     } };
 
-    reactor.Run();
+    reactor.run();
     stopper.join();
     CHECK(waits.AllReached());
     REQUIRE(counter.load(std::memory_order_relaxed) == 3);
@@ -101,8 +101,8 @@ TEST_CASE("IocpReactor::Schedule fires a timer", "[reactor][iocp]")
     FastCache::IocpReactor reactor { clock };
 
     std::atomic<bool> fired { false };
-    TimerWorker(&reactor, clock.Now() + 25ms, &fired, &reactor);
-    reactor.Run();
+    TimerWorker(&reactor, clock.now() + 25ms, &fired, &reactor);
+    reactor.run();
     REQUIRE(fired.load(std::memory_order_acquire));
 }
 

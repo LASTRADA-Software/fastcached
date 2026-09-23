@@ -31,7 +31,7 @@ Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector, std::string_v
     if (!target.has_value())
         co_return nullptr;
 
-    auto socket = co_await connector->Connect(target->first, target->second, options);
+    auto socket = co_await connector->connect(target->first, target->second, options);
     if (!socket.has_value())
         co_return nullptr;
     co_return std::move(*socket);

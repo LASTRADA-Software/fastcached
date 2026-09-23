@@ -29,7 +29,7 @@ DiscoveryTier::DiscoveryTier(std::unique_ptr<IDatagramSocket> socket,
     // Due immediately rather than one interval from now: a node that waited would be
     // invisible to a segment that is already up for as long as its own interval, and
     // the first beacon is the cheapest thing it will ever send.
-    _nextBeacon { _clock.Now() },
+    _nextBeacon { _clock.now() },
     _service { *_socket, _clock, *_random, _directory, std::move(config), keys, metrics, logger }
 {
 }
@@ -151,7 +151,7 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
 
 std::string DiscoveryTier::BoundEndpoint() const
 {
-    auto const bound = _socket->BoundAddress();
+    auto const bound = _socket->boundAddress();
     // An empty host is what `BoundAddress` reports for a socket it could not name,
     // and joining that yields `:0` -- which reads as an endpoint rather than as
     // the absence of one, in the log line an operator checks to see where
@@ -172,7 +172,7 @@ DiscoveryTier::~DiscoveryTier()
 
 bool DiscoveryTier::Step(std::chrono::milliseconds timeout)
 {
-    if (_clock.Now() >= _nextBeacon)
+    if (_clock.now() >= _nextBeacon)
     {
         if (!_service.SendBeacon())
             // Logged and carried on. A datagram the local stack refused is a
@@ -180,7 +180,7 @@ bool DiscoveryTier::Step(std::chrono::milliseconds timeout)
             // and beacons repeat by design, so stopping here would turn a recoverable
             // moment into a node that never announces again.
             _logger.Log(LogLevel::Warn, "discovery: a beacon could not be sent");
-        _nextBeacon = _clock.Now() + _beaconInterval;
+        _nextBeacon = _clock.now() + _beaconInterval;
     }
 
     auto const event = _service.PumpOnce(timeout);

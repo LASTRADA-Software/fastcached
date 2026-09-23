@@ -86,10 +86,10 @@ class DeadlineTimer
     ///
     /// Idempotent, and safe after the callback has already run. Only meaningful
     /// on the reactor thread, which is where every user of this type lives.
-    void Disarm() noexcept;
+    void disarm() noexcept;
 
     /// @return true once the callback has run or `Disarm()` has been called.
-    [[nodiscard]] bool IsSettled() const noexcept;
+    [[nodiscard]] bool settled() const noexcept;
 
     /// Shared with the timer coroutine so a late fire reads live memory even
     /// after the owning `DeadlineTimer` is gone.

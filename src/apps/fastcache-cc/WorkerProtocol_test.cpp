@@ -2069,13 +2069,13 @@ class AnsweringPeer final: public ISocket
     {
     }
 
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> bytes) override
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> bytes) override
     {
         _request.insert(_request.end(), bytes.begin(), bytes.end());
         return IoAwaitable { IoResult { bytes.size() } };
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
         std::size_t written = 0;
@@ -2087,7 +2087,7 @@ class AnsweringPeer final: public ISocket
         return IoAwaitable { IoResult { written } };
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
     {
         if (!_answered)
         {
@@ -2102,12 +2102,12 @@ class AnsweringPeer final: public ISocket
         return IoAwaitable { IoResult { take } };
     }
 
-    void Close() noexcept override {}
+    void close() noexcept override {}
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return false;
     }
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return "answering";
     }

@@ -63,7 +63,7 @@ cmake_minimum_required(VERSION 3.28)
 # needle omits the `final:` / `:` in front so both spellings in this tree match one
 # string, and it is matched literally rather than as a regex.
 set(FastCachedSocketBase "public ISocket")
-set(FastCachedCancelName "CancelRead")
+set(FastCachedCancelName "cancelRead")
 
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR

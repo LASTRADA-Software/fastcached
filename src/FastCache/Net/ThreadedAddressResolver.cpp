@@ -55,8 +55,8 @@ namespace
             slot.done = true;
             waiter = Detail::Parked { std::exchange(slot.waiter, ParkedWork {}) };
         }
-        if (waiter.Handle() && reactor != nullptr)
-            reactor->Submit(waiter.Take());
+        if (waiter.handle() && reactor != nullptr)
+            reactor->submit(waiter.take());
     }
 
     /// Suspends until a slot is filled.
@@ -182,12 +182,12 @@ ThreadedAddressResolver::~ThreadedAddressResolver()
     Stop();
 }
 
-std::size_t ThreadedAddressResolver::Refused() const noexcept
+std::size_t ThreadedAddressResolver::refused() const noexcept
 {
     return _impl->refused.load(std::memory_order_relaxed);
 }
 
-std::size_t ThreadedAddressResolver::Offloaded() const noexcept
+std::size_t ThreadedAddressResolver::offloaded() const noexcept
 {
     return _impl->offloaded.load(std::memory_order_relaxed);
 }

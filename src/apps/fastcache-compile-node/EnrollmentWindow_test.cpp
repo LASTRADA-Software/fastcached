@@ -113,7 +113,7 @@ TEST_CASE("Opening an open window changes nothing and says so, rather than resta
     EnrollmentWindow window { clock };
 
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
-    clock.Advance(std::chrono::seconds { 90 });
+    clock.advance(std::chrono::seconds { 90 });
 
     // `AlreadyInForce` rather than `Done`, and the AGE is what makes it matter: an
     // operator running the verb twice has not asked for the warning clock to be reset,
@@ -427,22 +427,22 @@ TEST_CASE("The open warning is due immediately and then once per interval, never
     // Consumed, so asking again immediately owes nothing.
     CHECK(!window.TakeDueWarning().has_value());
 
-    clock.Advance(EnrollmentWarningInterval - std::chrono::seconds { 1 });
+    clock.advance(EnrollmentWarningInterval - std::chrono::seconds { 1 });
     CHECK(!window.TakeDueWarning().has_value());
-    clock.Advance(std::chrono::seconds { 1 });
+    clock.advance(std::chrono::seconds { 1 });
     CHECK(window.TakeDueWarning().has_value());
 
     // A driver that was LATE, or a clock that jumped, must not then owe a burst for
     // every interval it slept through: the deadline advances from NOW. Ten intervals
     // pass and exactly one line is owed, which is the reading an operator wants --
     // *it is still open* -- rather than ten copies of it.
-    clock.Advance(EnrollmentWarningInterval * 10);
+    clock.advance(EnrollmentWarningInterval * 10);
     CHECK(window.TakeDueWarning().has_value());
     CHECK(!window.TakeDueWarning().has_value());
 
     // And closing stops it, rather than leaving a deadline that fires once more.
     REQUIRE(window.Close() == EnrollControlOutcome::Done);
-    clock.Advance(EnrollmentWarningInterval * 2);
+    clock.advance(EnrollmentWarningInterval * 2);
     CHECK(!window.TakeDueWarning().has_value());
 }
 
@@ -455,7 +455,7 @@ TEST_CASE("The warning states the age and how many are waiting, so a log line ca
     REQUIRE(Offer(window, "joiner-b") == EnrollDecision::Pending);
     REQUIRE(window.Decide("joiner-b", Wire::EnrollmentDecision::Rejected) == EnrollControlOutcome::Done);
 
-    clock.Advance(std::chrono::seconds { 120 });
+    clock.advance(std::chrono::seconds { 120 });
     auto const line = window.TakeDueWarning();
     REQUIRE(line.has_value());
 
@@ -483,9 +483,9 @@ TEST_CASE("A report carries ages as durations and the state the wire spells", "[
 
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
     REQUIRE(Offer(window, "joiner-a") == EnrollDecision::Pending);
-    clock.Advance(std::chrono::seconds { 45 });
+    clock.advance(std::chrono::seconds { 45 });
     REQUIRE(Offer(window, "joiner-b") == EnrollDecision::Pending);
-    clock.Advance(std::chrono::seconds { 15 });
+    clock.advance(std::chrono::seconds { 15 });
 
     auto const report = window.Report();
     REQUIRE(report.pending.size() == 2);

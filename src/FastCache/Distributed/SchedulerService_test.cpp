@@ -186,7 +186,7 @@ TEST_CASE("A granted lease reaches the fleet page as a row, with its holder's ad
     Leading fleet;
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
     REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "stuck-key")).status == Wire::Status::Ok);
-    fleet.clock.Advance(2s);
+    fleet.clock.advance(2s);
 
     auto const snapshot =
         CollectFleet(FleetSources { .scheduler = &fleet.service, .cluster = nullptr, .metrics = &fleet.metrics });
@@ -485,7 +485,7 @@ TEST_CASE("A worker that stops heartbeating leaves the fleet", "[distributed][sc
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
     REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "key-1")).status == Wire::Status::Ok);
 
-    fleet.clock.Advance(WorkerRegistry::DefaultHeartbeatTimeout + 1s);
+    fleet.clock.advance(WorkerRegistry::DefaultHeartbeatTimeout + 1s);
 
     CHECK(fleet.service.Workers().LiveWorkers().empty());
     CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).error == Wire::ErrorCode::NoWorker);
@@ -625,10 +625,10 @@ TEST_CASE("A withdrawal closes the dispatch window the heartbeat timeout leaves 
         // The window. `ReapExpiredWorkers()` runs before `Pick`, so an entry one tick
         // inside its timeout survives the reap and is still handed out -- a lease
         // granted to a worker that has stopped serving this fingerprint.
-        fleet.clock.Advance(WorkerRegistry::DefaultHeartbeatTimeout - 1s);
+        fleet.clock.advance(WorkerRegistry::DefaultHeartbeatTimeout - 1s);
         CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-1")).status == Wire::Status::Ok);
 
-        fleet.clock.Advance(2s);
+        fleet.clock.advance(2s);
         CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).error == Wire::ErrorCode::NoWorker);
     }
 
@@ -745,7 +745,7 @@ TEST_CASE("An expired lease stops suppressing its key", "[distributed][scheduler
     constexpr auto Steps = (LeaseTable::DefaultLeaseTimeout / Step) + 1;
     for ([[maybe_unused]] auto const tick: std::views::iota(0, static_cast<int>(Steps)))
     {
-        fleet.clock.Advance(Step);
+        fleet.clock.advance(Step);
         auto const workers = fleet.service.Workers().LiveWorkers();
         REQUIRE(workers.size() == 1);
         REQUIRE(fleet.service.Heartbeat(Insider, workers.front().id, NodeLoad {}).status == Wire::Status::Ok);
@@ -893,7 +893,7 @@ TEST_CASE("A machine that goes away takes its leases with it", "[distributed][sc
 
     // Past the heartbeat timeout but well inside the lease's own: expiry must not be
     // what frees this key, or the case is proving nothing.
-    fleet.clock.Advance(WorkerRegistry::DefaultHeartbeatTimeout + 1ms);
+    fleet.clock.advance(WorkerRegistry::DefaultHeartbeatTimeout + 1ms);
     static_assert(WorkerRegistry::DefaultHeartbeatTimeout < LeaseTable::DefaultLeaseTimeout);
 
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.3:7100")).status == Wire::Status::Ok);
@@ -975,7 +975,7 @@ TEST_CASE("A job that outlived its lease is told so", "[distributed][scheduler]"
     auto const slow = fleet.service.Lease(Insider, Ask("gcc-14", "slow-key"));
     REQUIRE(slow.status == Wire::Status::Ok);
 
-    fleet.clock.Advance(LeaseTable::DefaultLeaseTimeout + 1ms);
+    fleet.clock.advance(LeaseTable::DefaultLeaseTimeout + 1ms);
 
     CHECK(fleet.service.Release(Insider, TokenOf(slow), "slow-key").error == Wire::ErrorCode::UnknownLease);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 0);
@@ -1009,7 +1009,7 @@ TEST_CASE("Only a job that outlived its lease moves the late-release counter", "
     REQUIRE(outlived.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
     auto const slow = outlived.service.Lease(Insider, Ask("gcc-14", "slow-key"));
     REQUIRE(slow.status == Wire::Status::Ok);
-    outlived.clock.Advance(LeaseTable::DefaultLeaseTimeout + 1ms);
+    outlived.clock.advance(LeaseTable::DefaultLeaseTimeout + 1ms);
     auto const late = outlived.service.Release(Insider, TokenOf(slow), "slow-key");
 
     // (2) A second release of one token. The first erased the entry, so this one
@@ -1086,7 +1086,7 @@ TEST_CASE("A lease reclaimed with its worker is not counted as a job that outliv
 
     // Past the heartbeat timeout and well inside the lease's own, so the lease is
     // still live at the moment its worker is dropped.
-    fleet.clock.Advance(WorkerRegistry::DefaultHeartbeatTimeout + 1ms);
+    fleet.clock.advance(WorkerRegistry::DefaultHeartbeatTimeout + 1ms);
     static_assert(WorkerRegistry::DefaultHeartbeatTimeout < LeaseTable::DefaultLeaseTimeout);
 
     // A replacement machine, and then a request for UNRELATED work: the reap runs

@@ -339,11 +339,11 @@ std::expected<CasToken, StorageError> TracingStorage::Update(
 void TracingStorage::FlushWithGeneration(TimePoint effectiveAt)
 {
     bool const traceOn = _logger.MinLevel() <= LogLevel::Trace;
-    auto const startedAt = _clock.Now();
+    auto const startedAt = _clock.now();
     _inner.FlushWithGeneration(effectiveAt);
     if (traceOn)
     {
-        auto const took = _clock.Now() - startedAt;
+        auto const took = _clock.now() - startedAt;
         _logger.Logf(LogLevel::Trace,
                      "{}storage: FLUSH result=OK took={}us",
                      SourcePrefix(),

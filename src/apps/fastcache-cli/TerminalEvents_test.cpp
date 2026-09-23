@@ -74,7 +74,7 @@ TEST_CASE("a terminal is made without one, and starting it with none refuses by 
     auto started = std::expected<StartedTerminal, std::string> { std::unexpected(std::string { "never delivered" }) };
     auto delivered = false;
     auto task = StartInto(std::move(*made), &started, &delivered);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     DrainUntil(reactor, [&delivered] { return delivered; }, "StartTerminal never resumed");
 
     REQUIRE_FALSE(started.has_value());

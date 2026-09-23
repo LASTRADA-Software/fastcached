@@ -52,14 +52,14 @@ class ScriptedPeer final: public ISocket
     {
     }
 
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> bytes) override
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> bytes) override
     {
         if (_sent != nullptr)
             _sent->insert(_sent->end(), bytes.begin(), bytes.end());
         return IoAwaitable { IoResult { bytes.size() } };
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
     {
         // A read of zero is EOF, which is how a peer that ran out of script tells
         // RecvExactly the frame was short.
@@ -69,18 +69,18 @@ class ScriptedPeer final: public ISocket
         return IoAwaitable { IoResult { take } };
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> /*segments*/,
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> /*segments*/,
                                             std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
         return IoAwaitable { IoResult { 0 } };
     }
 
-    void Close() noexcept override {}
+    void close() noexcept override {}
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return false;
     }
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return "scripted";
     }
@@ -183,7 +183,7 @@ class ScriptedFleet final: public IEndpointExchange
         // duration actually falls relative to the mint it contains.
         if (_clock != nullptr)
             if (auto const cost = _costs.find(key); cost != _costs.end())
-                _clock->Advance(cost->second);
+                _clock->advance(cost->second);
         ScriptedPeer peer { it->second, &_sent[key] };
         return SyncRun(ExchangeFramed(&peer, &Unwatched(), std::move(frame), credential));
     }

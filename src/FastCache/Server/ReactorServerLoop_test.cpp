@@ -228,7 +228,7 @@ TEST_CASE("Detail::StartExpiryCycle reclaims an untouched lapsed key through the
     // place and invisible to every storage-level test.
     using namespace std::chrono_literals;
     DaemonChain chain;
-    REQUIRE(chain.engine.Storage().Set("gone", FastCache::Testing::MakeBytes("v"), 0, chain.clock.Now() + 1s).has_value());
+    REQUIRE(chain.engine.Storage().Set("gone", FastCache::Testing::MakeBytes("v"), 0, chain.clock.now() + 1s).has_value());
     chain.observer.expired.clear();
 
     FastCache::ReactorServerOptions options;
@@ -242,7 +242,7 @@ TEST_CASE("Detail::StartExpiryCycle reclaims an untouched lapsed key through the
 
     // Nothing touches the key. Before the cycle existed this is where it stayed
     // resident and unreported for the life of the process.
-    chain.clock.Advance(2s);
+    chain.clock.advance(2s);
     chain.reactor.Drain();
 
     CHECK(chain.engine.Storage().Snapshot().itemCount == 0U);
@@ -256,7 +256,7 @@ TEST_CASE("Detail::StartExpiryCycle honours a zero interval by starting nothing"
     // deadline nothing will move is a frame the reactor has to outlive.
     using namespace std::chrono_literals;
     DaemonChain chain;
-    REQUIRE(chain.engine.Storage().Set("gone", FastCache::Testing::MakeBytes("v"), 0, chain.clock.Now() + 1s).has_value());
+    REQUIRE(chain.engine.Storage().Set("gone", FastCache::Testing::MakeBytes("v"), 0, chain.clock.now() + 1s).has_value());
 
     FastCache::ReactorServerOptions options;
     options.expiry = FastCache::ExpiryReaperOptions { .interval = FastCache::Duration::zero() };
@@ -265,7 +265,7 @@ TEST_CASE("Detail::StartExpiryCycle honours a zero interval by starting nothing"
         FastCache::Detail::StartExpiryCycle(chain.reactor, chain.reactor, chain.engine, chain.logger, options, nullptr);
     REQUIRE(cycle != nullptr);
     chain.reactor.Drain();
-    chain.clock.Advance(1h);
+    chain.clock.advance(1h);
     chain.reactor.Drain();
 
     CHECK(cycle->Cycles() == 0U);

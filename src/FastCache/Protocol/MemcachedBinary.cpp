@@ -906,10 +906,10 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
                 break;
             case Opcode::Quit:
                 (void) co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, 0, {}, {}, {});
-                socket->Close();
+                socket->close();
                 co_return;
             case Opcode::QuitQ:
-                socket->Close();
+                socket->close();
                 co_return;
             case Opcode::NoOp:
                 keepGoing = co_await HandleNoOp(socket, header);

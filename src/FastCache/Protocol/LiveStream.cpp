@@ -398,10 +398,10 @@ Task<LiveStream::Observation> LiveStream::AwaitView(Wire::LiveSubject subject,
 {
     while (true)
     {
-        auto observation = Observe(subject, TickOf(reactor->Clock().Now(), floor), eventsFrom, seen);
+        auto observation = Observe(subject, TickOf(reactor->clock().now(), floor), eventsFrom, seen);
         if (observation.seen != Seen::Busy || sink->Stopping())
             co_return observation;
-        co_await SleepUntil { .reactor = reactor, .deadline = reactor->Clock().Now() + LiveStopCheck };
+        co_await SleepUntil { .reactor = reactor, .deadline = reactor->clock().now() + LiveStopCheck };
     }
 }
 
@@ -548,8 +548,8 @@ Task<std::vector<std::byte>> LiveStream::Serve(
 
         // In steps, so a stop is seen within one `LiveStopCheck` rather than one tick.
         auto const wake = NextTickAt(tick, floor);
-        while (!sink->Stopping() && reactor->Clock().Now() < wake)
-            co_await SleepUntil { .reactor = reactor, .deadline = std::min(wake, reactor->Clock().Now() + LiveStopCheck) };
+        while (!sink->Stopping() && reactor->clock().now() < wake)
+            co_await SleepUntil { .reactor = reactor, .deadline = std::min(wake, reactor->clock().now() + LiveStopCheck) };
     }
 }
 

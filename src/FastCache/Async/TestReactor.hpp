@@ -53,13 +53,13 @@ class TestReactor: public IReactor
     TestReactor& operator=(TestReactor const&) = delete;
     TestReactor& operator=(TestReactor&&) = delete;
 
-    void Stop() noexcept override;
-    void Submit(std::coroutine_handle<> handle) override;
-    void Submit(ParkedWork work) override;
-    void Schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
-    void Schedule(TimePoint deadline, ParkedWork work) override;
-    [[nodiscard]] bool CancelPending(std::coroutine_handle<> handle) noexcept override;
-    [[nodiscard]] IClock& Clock() noexcept override;
+    void stop() noexcept override;
+    void submit(std::coroutine_handle<> handle) override;
+    void submit(ParkedWork work) override;
+    void schedule(TimePoint deadline, std::coroutine_handle<> handle) override;
+    void schedule(TimePoint deadline, ParkedWork work) override;
+    [[nodiscard]] bool cancelPending(std::coroutine_handle<> handle) noexcept override;
+    [[nodiscard]] IClock& clock() noexcept override;
 
     /// Resume every ready submission and every timer whose deadline has
     /// elapsed exactly once; do not loop. Returns the number of resumes

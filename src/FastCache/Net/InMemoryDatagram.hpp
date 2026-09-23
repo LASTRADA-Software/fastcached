@@ -48,7 +48,7 @@ class DatagramBus
     /// would be noise around the half that matters. `BroadcastAddressOn` is for
     /// the tests that do.
     /// @return The sentinel destination.
-    [[nodiscard]] static DatagramAddress const& BroadcastAddress()
+    [[nodiscard]] static DatagramAddress const& broadcastAddress()
     {
         static DatagramAddress const address { .host = "broadcast", .port = 0 };
         return address;
@@ -63,9 +63,9 @@ class DatagramBus
     /// `Net/SharedPortDatagram` gives every node.
     /// @param port Which port's sockets hear it.
     /// @return The sentinel destination, scoped to @p port.
-    [[nodiscard]] static DatagramAddress BroadcastAddressOn(std::uint16_t port)
+    [[nodiscard]] static DatagramAddress broadcastAddressOn(std::uint16_t port)
     {
-        return DatagramAddress { .host = BroadcastAddress().host, .port = port };
+        return DatagramAddress { .host = broadcastAddress().host, .port = port };
     }
 
     /// Attach a socket at @p endpoint.
@@ -90,11 +90,11 @@ class DatagramBus
     /// @param endpoint Whose inbox to starve.
     /// @param count How many datagrams to discard.
     /// @return How many sockets were starved.
-    [[nodiscard]] std::size_t DropNext(DatagramAddress const& endpoint, std::size_t count);
+    [[nodiscard]] std::size_t dropNext(DatagramAddress const& endpoint, std::size_t count);
 
     /// How many datagrams have been placed on the bus, delivered or dropped.
     /// @return The count.
-    [[nodiscard]] std::size_t SendCount() const;
+    [[nodiscard]] std::size_t sendCount() const;
 
   private:
     friend class InMemoryDatagramSocket;

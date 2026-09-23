@@ -44,15 +44,15 @@ TEST_CASE("DatagramBus delivers a unicast to exactly one inbox", "[net][datagram
     auto bob = bus.Open(AtHost("10.0.0.2"));
     auto carol = bus.Open(AtHost("10.0.0.3"));
 
-    REQUIRE(alice->Send(DatagramBytes("hello"), AtHost("10.0.0.2")).has_value());
+    REQUIRE(alice->send(DatagramBytes("hello"), AtHost("10.0.0.2")).has_value());
 
-    auto const received = bob->Receive(10ms);
+    auto const received = bob->receive(10ms);
     REQUIRE(received.has_value());
     CHECK(DatagramText(*received) == "hello");
     CHECK(received->from == AtHost("10.0.0.1"));
 
     // Nobody else sees it.
-    CHECK_FALSE(carol->Receive(10ms).has_value());
+    CHECK_FALSE(carol->receive(10ms).has_value());
 }
 
 TEST_CASE("Two sockets sharing one address both hear a broadcast; one hears a unicast", "[net][datagram]")
@@ -66,26 +66,26 @@ TEST_CASE("Two sockets sharing one address both hear a broadcast; one hears a un
     auto second = bus.Open(AtHost("10.0.0.1"));
     auto sender = bus.Open(AtHost("10.0.0.9"));
 
-    REQUIRE(sender->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddress()).has_value());
+    REQUIRE(sender->send(DatagramBytes("beacon"), DatagramBus::broadcastAddress()).has_value());
 
     for (auto* socket: { first.get(), second.get() })
     {
-        auto const heard = socket->Receive(10ms);
+        auto const heard = socket->receive(10ms);
         REQUIRE(heard.has_value());
         CHECK(DatagramText(*heard) == "beacon");
     }
 
-    REQUIRE(sender->Send(DatagramBytes("challenge"), AtHost("10.0.0.1")).has_value());
+    REQUIRE(sender->send(DatagramBytes("challenge"), AtHost("10.0.0.1")).has_value());
 
     // The first to have attached, deterministically: a real kernel's answer
     // differs between platforms -- Windows 11 hands it to the first-bound socket
     // and Linux to the last -- so what is asserted is that exactly ONE of them
     // gets it, which is what every platform agrees on and what the layer above
     // has to survive.
-    auto const atFirst = first->Receive(10ms);
+    auto const atFirst = first->receive(10ms);
     REQUIRE(atFirst.has_value());
     CHECK(DatagramText(*atFirst) == "challenge");
-    CHECK_FALSE(second->Receive(10ms).has_value());
+    CHECK_FALSE(second->receive(10ms).has_value());
 }
 
 TEST_CASE("A broadcast to a port passes over a socket on another one", "[net][datagram]")
@@ -99,12 +99,12 @@ TEST_CASE("A broadcast to a port passes over a socket on another one", "[net][da
     auto listener = bus.Open(DatagramAddress { .host = "10.0.0.1", .port = 6681 });
     auto own = bus.Open(DatagramAddress { .host = "10.0.0.1", .port = 40001 });
 
-    REQUIRE(own->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddressOn(6681)).has_value());
+    REQUIRE(own->send(DatagramBytes("beacon"), DatagramBus::broadcastAddressOn(6681)).has_value());
 
-    auto const atListener = listener->Receive(10ms);
+    auto const atListener = listener->receive(10ms);
     REQUIRE(atListener.has_value());
     CHECK(DatagramText(*atListener) == "beacon");
-    CHECK_FALSE(own->Receive(10ms).has_value());
+    CHECK_FALSE(own->receive(10ms).has_value());
 }
 
 TEST_CASE("Closing one of two sockets on one address leaves the other serving", "[net][datagram]")
@@ -119,13 +119,13 @@ TEST_CASE("Closing one of two sockets on one address leaves the other serving", 
 
     first->Close();
 
-    auto const closed = first->Receive(10ms);
+    auto const closed = first->receive(10ms);
     REQUIRE_FALSE(closed.has_value());
     CHECK(closed.error() == DatagramWait::Closed);
 
-    REQUIRE(sender->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddress()).has_value());
+    REQUIRE(sender->send(DatagramBytes("beacon"), DatagramBus::broadcastAddress()).has_value());
 
-    auto const heard = second->Receive(10ms);
+    auto const heard = second->receive(10ms);
     REQUIRE(heard.has_value());
     CHECK(DatagramText(*heard) == "beacon");
 }
@@ -140,13 +140,13 @@ TEST_CASE("DatagramBus delivers a broadcast to everyone, sender included", "[net
     auto alice = bus.Open(AtHost("10.0.0.1"));
     auto bob = bus.Open(AtHost("10.0.0.2"));
 
-    REQUIRE(alice->Send(DatagramBytes("beacon"), DatagramBus::BroadcastAddress()).has_value());
+    REQUIRE(alice->send(DatagramBytes("beacon"), DatagramBus::broadcastAddress()).has_value());
 
-    auto const atBob = bob->Receive(10ms);
+    auto const atBob = bob->receive(10ms);
     REQUIRE(atBob.has_value());
     CHECK(DatagramText(*atBob) == "beacon");
 
-    auto const atAlice = alice->Receive(10ms);
+    auto const atAlice = alice->receive(10ms);
     REQUIRE(atAlice.has_value());
     CHECK(DatagramText(*atAlice) == "beacon");
     CHECK(atAlice->from == AtHost("10.0.0.1"));
@@ -165,13 +165,13 @@ TEST_CASE("DatagramBus loses what it is told to lose", "[net][datagram]")
     // Asserted, not discarded: starving an address nobody holds is a no-op, and
     // the case below would then be green because the datagram never arrived
     // rather than because it was dropped.
-    REQUIRE(bus.DropNext(AtHost("10.0.0.2"), 2) == 1);
+    REQUIRE(bus.dropNext(AtHost("10.0.0.2"), 2) == 1);
 
     for (auto const* const text: { "one", "two", "three" })
-        REQUIRE(alice->Send(DatagramBytes(text), DatagramBus::BroadcastAddress()).has_value());
+        REQUIRE(alice->send(DatagramBytes(text), DatagramBus::broadcastAddress()).has_value());
 
     // Bob lost the first two; the third gets through.
-    auto const atBob = bob->Receive(10ms);
+    auto const atBob = bob->receive(10ms);
     REQUIRE(atBob.has_value());
     CHECK(DatagramText(*atBob) == "three");
 
@@ -184,7 +184,7 @@ TEST_CASE("DatagramBus loses what it is told to lose", "[net][datagram]")
     // does not compile.
     for (auto const* const expected: { "one", "two", "three" })
     {
-        auto const next = carol->Receive(10ms);
+        auto const next = carol->receive(10ms);
         REQUIRE(next.has_value());
         CHECK(DatagramText(*next) == expected);
     }
@@ -197,8 +197,8 @@ TEST_CASE("A datagram to nobody is discarded, not reported", "[net][datagram]")
     DatagramBus bus;
     auto alice = bus.Open(AtHost("10.0.0.1"));
 
-    CHECK(alice->Send(DatagramBytes("into the void"), AtHost("10.0.0.9")).has_value());
-    CHECK(bus.SendCount() == 1);
+    CHECK(alice->send(DatagramBytes("into the void"), AtHost("10.0.0.9")).has_value());
+    CHECK(bus.sendCount() == 1);
 }
 
 TEST_CASE("A closed datagram socket stops its receive loop", "[net][datagram]")
@@ -212,7 +212,7 @@ TEST_CASE("A closed datagram socket stops its receive loop", "[net][datagram]")
 
     alice->Close();
 
-    auto const result = alice->Receive(10ms);
+    auto const result = alice->receive(10ms);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == DatagramWait::Closed);
 }
@@ -222,7 +222,7 @@ TEST_CASE("An idle datagram socket times out rather than blocking", "[net][datag
     DatagramBus bus;
     auto alice = bus.Open(AtHost("10.0.0.1"));
 
-    auto const result = alice->Receive(5ms);
+    auto const result = alice->receive(5ms);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == DatagramWait::TimedOut);
 }
@@ -239,19 +239,19 @@ TEST_CASE("A real UDP socket round-trips a datagram", "[net][datagram][smoke]")
     auto receiver = OpenUdpSocket("127.0.0.1", 0, BroadcastMode::Off);
     REQUIRE(receiver != nullptr);
 
-    auto const bound = receiver->BoundAddress();
+    auto const bound = receiver->boundAddress();
     REQUIRE_FALSE(bound.host.empty());
     REQUIRE(bound.port != 0);
 
     auto sender = OpenUdpSocket("127.0.0.1", 0, BroadcastMode::Off);
     REQUIRE(sender != nullptr);
 
-    REQUIRE(sender->Send(DatagramBytes("over the wire"), bound).has_value());
+    REQUIRE(sender->send(DatagramBytes("over the wire"), bound).has_value());
 
-    auto const received = receiver->Receive(2s);
+    auto const received = receiver->receive(2s);
     REQUIRE(received.has_value());
     CHECK(DatagramText(*received) == "over the wire");
-    CHECK(received->from == sender->BoundAddress());
+    CHECK(received->from == sender->boundAddress());
 }
 
 TEST_CASE("Two real UDP sockets on one port: only one is handed a unicast", "[net][datagram][smoke]")
@@ -277,22 +277,22 @@ TEST_CASE("Two real UDP sockets on one port: only one is handed a unicast", "[ne
     // runs in parallel.
     auto first = OpenUdpSocket("127.0.0.1", 0, BroadcastMode::Off, PortSharing::Shared);
     REQUIRE(first != nullptr);
-    auto const shared = first->BoundAddress();
+    auto const shared = first->boundAddress();
     REQUIRE(shared.port != 0);
 
     auto second = OpenUdpSocket("127.0.0.1", shared.port, BroadcastMode::Off, PortSharing::Shared);
     REQUIRE(second != nullptr);
-    CHECK(second->BoundAddress().port == shared.port);
+    CHECK(second->boundAddress().port == shared.port);
 
     auto sender = OpenUdpSocket("127.0.0.1", 0, BroadcastMode::Off);
     REQUIRE(sender != nullptr);
-    REQUIRE(sender->Send(DatagramBytes("challenge"), shared).has_value());
+    REQUIRE(sender->send(DatagramBytes("challenge"), shared).has_value());
 
     // A short wait on the second of the two, because the interesting outcome --
     // the one that breaks discovery -- is that it never arrives, and that answer
     // is only ever a timeout.
-    auto const atFirst = first->Receive(2s);
-    auto const atSecond = second->Receive(200ms);
+    auto const atFirst = first->receive(2s);
+    auto const atSecond = second->receive(200ms);
 
     CHECK(static_cast<int>(atFirst.has_value()) + static_cast<int>(atSecond.has_value()) == 1);
     if (atFirst.has_value())
@@ -310,7 +310,7 @@ TEST_CASE("An exclusive UDP socket keeps its address to itself", "[net][datagram
     // datagrams would simply go to the wrong process now and then.
     auto held = OpenUdpSocket("127.0.0.1", 0, BroadcastMode::Off, PortSharing::Exclusive);
     REQUIRE(held != nullptr);
-    auto const bound = held->BoundAddress();
+    auto const bound = held->boundAddress();
     REQUIRE(bound.port != 0);
 
     CHECK(OpenUdpSocket("127.0.0.1", bound.port, BroadcastMode::Off, PortSharing::Exclusive) == nullptr);
@@ -326,7 +326,7 @@ TEST_CASE("A real UDP socket reports an address it cannot use", "[net][datagram]
     // of this case now that a malformed `host:port` cannot reach this layer at
     // all: the halves arrive apart, so the only address a caller can still get
     // wrong is one that names nothing.
-    auto const result = sender->Send(DatagramBytes("x"), DatagramAddress { .host = "example.invalid", .port = 7000 });
+    auto const result = sender->send(DatagramBytes("x"), DatagramAddress { .host = "example.invalid", .port = 7000 });
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().code == NetErrorCode::AddressNotAvail);
 
@@ -336,7 +336,7 @@ TEST_CASE("A real UDP socket reports an address it cannot use", "[net][datagram]
     // datagram aimed at a sender this process could not render would be refused
     // on one platform and quietly sent to loopback on the other. It is what
     // `BoundAddress` reports for a socket it cannot name.
-    auto const nowhere = sender->Send(DatagramBytes("x"), DatagramAddress { .host = "", .port = 7000 });
+    auto const nowhere = sender->send(DatagramBytes("x"), DatagramAddress { .host = "", .port = 7000 });
     REQUIRE_FALSE(nowhere.has_value());
     CHECK(nowhere.error().code == NetErrorCode::AddressNotAvail);
 }

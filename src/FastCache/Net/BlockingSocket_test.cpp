@@ -69,7 +69,7 @@ namespace
 /// @return Bytes written, or the socket error.
 [[nodiscard]] Task<IoResult> WriteOnce(ISocket* socket, std::span<std::byte const> bytes)
 {
-    co_return co_await socket->Write(bytes);
+    co_return co_await socket->write(bytes);
 }
 
 } // namespace
@@ -126,7 +126,7 @@ TEST_CASE("A write to a peer that hung up fails instead of killing the process",
         SKIP("no loopback listener available on this host");
 
     BlockingConnector connector;
-    auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
+    auto client = SyncRun(connector.connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
     REQUIRE(client.has_value());
 
     auto accepted = SyncRun(AcceptOne(listener.get()));
@@ -134,7 +134,7 @@ TEST_CASE("A write to a peer that hung up fails instead of killing the process",
 
     // The hang-up. Closing rather than shutting down the write side, because
     // what a caller meets in production is a peer process that went away.
-    (*accepted)->Close();
+    (*accepted)->close();
 
     // Chunked rather than one enormous buffer: the first write after a hang-up is
     // routinely accepted -- it is the peer's RST, arriving in response, that
@@ -237,7 +237,7 @@ TEST_CASE("Using a socket leaves the process SIGPIPE disposition alone", "[net][
         SKIP("no loopback listener available on this host");
 
     BlockingConnector connector;
-    auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
+    auto client = SyncRun(connector.connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
     REQUIRE(client.has_value());
 
     auto const after = ReadSigPipeDisposition();
@@ -280,7 +280,7 @@ TEST_CASE("A connected pair still round-trips bytes", "[net][socket]")
         SKIP("no loopback listener available on this host");
 
     BlockingConnector connector;
-    auto client = SyncRun(connector.Connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
+    auto client = SyncRun(connector.connect("127.0.0.1", listener->BoundPort(), DialOptions { .connectTimeout = 2s }));
     REQUIRE(client.has_value());
 
     auto accepted = SyncRun(AcceptOne(listener.get()));

@@ -59,11 +59,11 @@ TEST_CASE("The address set is refreshed on an interval, never because a caller m
     CHECK(machine.Calls() == 1);
 
     // The interval, and not one call before it.
-    clock.Advance(Interval - 1ms);
+    clock.advance(Interval - 1ms);
     CHECK_FALSE(locality.IsThisMachine("10.9.9.9"));
     CHECK(machine.Calls() == 1);
 
-    clock.Advance(1ms);
+    clock.advance(1ms);
     CHECK_FALSE(locality.IsThisMachine("10.9.9.9"));
     CHECK(machine.Calls() == 2);
 }
@@ -81,7 +81,7 @@ TEST_CASE("An address this machine gains is refused until the next refresh, and 
     machine.Publish({ "10.0.0.7", "10.0.0.8" });
     CHECK_FALSE(locality.IsThisMachine("10.0.0.8"));
 
-    clock.Advance(Interval);
+    clock.advance(Interval);
     CHECK(locality.IsThisMachine("10.0.0.8"));
 }
 
@@ -99,7 +99,7 @@ TEST_CASE("An address this machine loses stays admitted for at most one interval
     machine.Publish({ "10.0.0.7" });
     CHECK(locality.IsThisMachine("10.0.0.8"));
 
-    clock.Advance(Interval);
+    clock.advance(Interval);
     CHECK_FALSE(locality.IsThisMachine("10.0.0.8"));
 }
 

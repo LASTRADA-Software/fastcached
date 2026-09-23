@@ -147,7 +147,7 @@ struct Fleet
     {
         std::array<std::byte, 4096> chunk {};
         auto const want = std::min(chunk.size(), count - received->size());
-        auto const read = co_await peer->Read(std::span<std::byte> { chunk.data(), want });
+        auto const read = co_await peer->read(std::span<std::byte> { chunk.data(), want });
         if (!read.has_value() || *read == 0)
             co_return false;
         received->insert(received->end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
@@ -199,7 +199,7 @@ struct Fleet
     while (received.size() <= limit)
     {
         std::array<std::byte, 4096> chunk {};
-        auto const read = co_await peer->Read(std::span<std::byte> { chunk });
+        auto const read = co_await peer->read(std::span<std::byte> { chunk });
         if (!read.has_value() || *read == 0)
             co_return received;
         received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
@@ -224,7 +224,7 @@ struct Fleet
 /// @return Whether the write was accepted.
 [[nodiscard]] Task<bool> SendRaw(ISocket* peer, std::vector<std::byte> bytes)
 {
-    auto const written = co_await peer->Write(std::span<std::byte const> { bytes });
+    auto const written = co_await peer->write(std::span<std::byte const> { bytes });
     co_return written.has_value() && *written == bytes.size();
 }
 
@@ -247,20 +247,20 @@ struct Fleet
 [[nodiscard]] std::optional<std::vector<std::byte>> TryExchange(std::uint16_t port, std::span<std::byte const> frame)
 {
     BlockingConnector connector;
-    auto socket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto socket = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     if (!socket.has_value())
         return std::nullopt;
 
     // One coroutine for the whole exchange: `SyncRun` drives a `Task`, so the awaits
     // have to live inside one rather than be called individually.
     auto reply = SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
-        auto const written = co_await peer->Write(std::span<std::byte const> { request });
+        auto const written = co_await peer->write(std::span<std::byte const> { request });
         if (!written.has_value())
             co_return std::vector<std::byte> {};
         co_return co_await ReadOneReply(peer);
     }((*socket).get(), std::vector<std::byte> { frame.begin(), frame.end() }));
 
-    (*socket)->Close();
+    (*socket)->close();
     return reply;
 }
 
@@ -370,7 +370,7 @@ class Conversation
   public:
     explicit Conversation(std::uint16_t port)
     {
-        auto socket = SyncRun(_connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+        auto socket = SyncRun(_connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
         REQUIRE(socket.has_value());
         _socket = std::move(*socket);
     }
@@ -381,7 +381,7 @@ class Conversation
     [[nodiscard]] std::vector<std::byte> Send(std::span<std::byte const> frame)
     {
         return SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
-            auto const written = co_await peer->Write(std::span<std::byte const> { request });
+            auto const written = co_await peer->write(std::span<std::byte const> { request });
             if (!written.has_value())
                 co_return std::vector<std::byte> {};
             co_return co_await ReadOneReply(peer);
@@ -433,7 +433,7 @@ class Conversation
     void CloseNow()
     {
         if (_socket)
-            _socket->Close();
+            _socket->close();
     }
 
     /// Say goodbye the orderly way: finish SENDING, then read whatever the server still owes.
@@ -443,14 +443,14 @@ class Conversation
     /// @return Every byte the server sent before it closed.
     [[nodiscard]] std::vector<std::byte> HalfCloseAndDrain()
     {
-        _socket->ShutdownWrite();
+        _socket->shutdownWrite();
         return ReadRest();
     }
 
     ~Conversation()
     {
         if (_socket)
-            _socket->Close();
+            _socket->close();
     }
 
     Conversation(Conversation const&) = delete;
@@ -1294,7 +1294,7 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
     fleet.Serve();
 
     BlockingConnector connector;
-    auto socket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto socket = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(socket.has_value());
     auto* const peer = (*socket).get();
 
@@ -1341,7 +1341,7 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
     // thread. The close below is then ordinary cleanup, after the reader has finished.
     endpoint->reset();
     (void) lingering.get();
-    (*socket)->Close();
+    (*socket)->close();
 
     INFO("the responder asked for 200ms and HeaderTimeout is "
          << FrameServer::HeaderTimeout.count() << "ms; observed for " << (FrameServer::SweepInterval * 2).count()
@@ -1810,10 +1810,10 @@ TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
     // sends its request before reading exercises whether the refusal survives the
     // close as well, and that is a separate defect with a case of its own below.
     BlockingConnector connector;
-    auto second = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto second = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(second.has_value());
     auto const refusal = SyncRun(ReadOneReply((*second).get()));
-    (*second)->Close();
+    (*second)->close();
     CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
 }
 
@@ -1899,10 +1899,10 @@ TEST_CASE("An oversize refusal past the drain bound survives the close that foll
                          static_cast<std::uint32_t>(declared));
 
     BlockingConnector connector;
-    auto socket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto socket = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(socket.has_value());
     // Bounded: a read the defect leaves waiting ends here rather than hanging the case.
-    (*socket)->SetReceiveDeadline(5s);
+    (*socket)->setReceiveDeadline(5s);
     REQUIRE(SyncRun(SendRaw((*socket).get(), request)));
 
     auto const refusal = SyncRun(ReadOneReply((*socket).get()));
@@ -1911,12 +1911,12 @@ TEST_CASE("An oversize refusal past the drain bound survives the close that foll
     // And then the close was the half-close's FIN, not a reset.
     auto const ending = SyncRun([](ISocket* peer) -> Task<IoResult> {
         std::array<std::byte, 64> after {};
-        co_return co_await peer->Read(std::span<std::byte> { after });
+        co_return co_await peer->read(std::span<std::byte> { after });
     }((*socket).get()));
     INFO("after the refusal: " << (ending.has_value() ? std::format("{} bytes", *ending) : ending.error().ToString()));
     REQUIRE(ending.has_value());
     REQUIRE(*ending == 0);
-    (*socket)->Close();
+    (*socket)->close();
 }
 
 TEST_CASE("The byte budget refuses on a connection it keeps", "[node][frame]")
@@ -2189,11 +2189,11 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
 
     // ARM ONE: connects and says nothing. It never names a verb, so it is swept on the
     // header window and belongs to the endpoint's own row.
-    auto silent = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto silent = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(silent.has_value());
 
     // ARM TWO: names a verb the responder then never answers. Swept owing an answer.
-    auto owed = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto owed = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(owed.has_value());
     REQUIRE(SyncRun(SendRaw((*owed).get(), Wire::EncodeFetch("k"))));
 
@@ -2221,8 +2221,8 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
     CHECK(requests == requestsBefore + 1);
     CHECK(answers == answersBefore + 1);
 
-    (*silent)->Close();
-    (*owed)->Close();
+    (*silent)->close();
+    (*owed)->close();
     responder.Release();
 }
 
@@ -2318,7 +2318,7 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
     // ARM ONE: a whole FETCH, so the connection reaches `Answer` and parks there. The
     // responder is held, so the sweep finds this connection inside the surface with
     // its write side idle.
-    auto inSurface = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto inSurface = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(inSurface.has_value());
     REQUIRE(SyncRun(SendRaw((*inSurface).get(), Wire::EncodeFetch("k"))));
 
@@ -2327,7 +2327,7 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
     // in the payload read -- on the socket, where nothing but the close can reach it.
     auto const truncated = Wire::EncodeFetch("dribbled");
     REQUIRE(truncated.size() > Wire::RequestHeaderSize);
-    auto onSocket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto onSocket = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(onSocket.has_value());
     REQUIRE(
         SyncRun(SendRaw((*onSocket).get(),
@@ -2399,8 +2399,8 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
     // peers, or neither, satisfies a `>`.
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::FrameDeadlineRefusalsSent) == toldBefore + 1);
 
-    (*inSurface)->Close();
-    (*onSocket)->Close();
+    (*inSurface)->close();
+    (*onSocket)->close();
 }
 
 TEST_CASE("A client that vanishes mid-answer is noticed, and its object is not written", "[node][frame][peerwatch]")
@@ -3208,9 +3208,9 @@ class WitnessListener final: public IListener
         // canary and not a test: `reactor-teardown-canary` already occupies that role
         // for the predicate, and what is missing -- and what #668 said was missing --
         // is a case that can go red and name the defect.
-        _witness->reactorRunning.store(_reactor.Running(), std::memory_order_relaxed);
-        _witness->onWorkerThread.store(_reactor.IsOnWorkerThread(), std::memory_order_relaxed);
-        _witness->ruleHeld.store(_reactor.TeardownIsSerialisedWithDispatch(), std::memory_order_relaxed);
+        _witness->reactorRunning.store(_reactor.running(), std::memory_order_relaxed);
+        _witness->onWorkerThread.store(_reactor.isOnWorkerThread(), std::memory_order_relaxed);
+        _witness->ruleHeld.store(_reactor.teardownIsSerialisedWithDispatch(), std::memory_order_relaxed);
         _witness->destroyed.store(true, std::memory_order_release);
     }
 
@@ -3326,9 +3326,9 @@ TEST_CASE("The listener an endpoint owns is freed with its reactor stopped, not 
         // rule, and the reason it exits 0 and complains when its own setup is wrong. If
         // the reactor were not running, or this thread were its worker, the checks below
         // would pass for a reason that has nothing to do with the defect.
-        REQUIRE(WaitFor([&fleet] { return fleet.io.Reactor().Running(); }));
-        REQUIRE_FALSE(fleet.io.Reactor().IsOnWorkerThread());
-        REQUIRE_FALSE(fleet.io.Reactor().TeardownIsSerialisedWithDispatch());
+        REQUIRE(WaitFor([&fleet] { return fleet.io.Reactor().running(); }));
+        REQUIRE_FALSE(fleet.io.Reactor().isOnWorkerThread());
+        REQUIRE_FALSE(fleet.io.Reactor().teardownIsSerialisedWithDispatch());
 
         endpoint.reset();
 
@@ -3531,10 +3531,10 @@ TEST_CASE("Every write on a framed endpoint names a sanctioned writer", "[node][
     auto const calls = CountOf(code, "WriteAll(EndpointWriter::");
     CHECK(calls >= EndpointWriterTable.size());
 
-    // ONE write primitive. `ISocket::Write` is reached from exactly one place -- the
+    // ONE write primitive. `ISocket::write` is reached from exactly one place -- the
     // definition of `WriteAll` itself -- so a second spelling of "put bytes on this
     // socket" cannot be added without this failing.
-    CHECK(CountOf(code, "->Write(") == 1);
+    CHECK(CountOf(code, "->write(") == 1);
 
     // And every use of that primitive declares which writer it is. Counting the bare
     // form against the declared form is what catches an overload creeping back in:
@@ -4066,7 +4066,7 @@ class FixedServerTrust final: public IServerTrust
 [[nodiscard]] std::unique_ptr<SealedFrameSocket> DialSealed(std::uint16_t port)
 {
     BlockingConnector connector;
-    auto socket = SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto socket = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
     REQUIRE(socket.has_value());
     return std::make_unique<SealedFrameSocket>(*std::move(socket), SealedFrameEnd::Caller, Wire::MaxSealedReplyPayload);
 }

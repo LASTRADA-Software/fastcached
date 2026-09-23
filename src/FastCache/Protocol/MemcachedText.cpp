@@ -770,7 +770,7 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket,
             ok = co_await MemcachedMeta::Dispatch(socket, engine, &reader, command, tail);
         else if (command == "quit")
         {
-            socket->Close();
+            socket->close();
             co_return;
         }
         else

@@ -493,7 +493,7 @@ namespace
         auto const key = args[0];
         auto const flagTokens = args.subspan(1);
         auto const f = ParseGetFlags(flagTokens);
-        auto const now = engine->Clock().Now();
+        auto const now = engine->Clock().now();
 
         // Pick the read primitive once: get-and-touch when refreshing the TTL
         // (`T`) so the touch and read form a single atomic step — rather than a
@@ -756,7 +756,7 @@ namespace
             co_return co_await WriteAll(socket, "CLIENT_ERROR missing key\r\n");
         auto const key = args[0];
         auto const f = ParseArithFlags(args.subspan(1));
-        auto const now = engine->Clock().Now();
+        auto const now = engine->Clock().now();
 
         auto result = f.mode == 'I' ? engine->Increment(key, f.delta) : engine->Decrement(key, f.delta);
 
@@ -843,7 +843,7 @@ namespace
         if (!got.has_value() || !got->found)
             co_return co_await WriteAll(socket, "EN\r\n");
         auto const& entry = got->entry;
-        auto const now = engine->Clock().Now();
+        auto const now = engine->Clock().now();
         auto line = std::format("ME {} exp={} la={} cas={} fetch=1 cls=1 size={}\r\n",
                                 key,
                                 TtlSecondsFromExpiry(entry.expiry, now),

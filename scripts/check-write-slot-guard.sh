@@ -58,7 +58,7 @@ run_scan() {
     # The CLASS name is derived from the definitions found, never from the filename.
     for f in "$tree"/src/FastCache/Net/*.cpp; do
         [ -f "$f" ] || continue
-        base="$(sed -n 's/^[A-Za-z_][A-Za-z0-9_:<>, ]*[ *&]\([A-Za-z]*Socket\)::Write.*/\1/p' "$f" | head -1)"
+        base="$(sed -n 's/^[A-Za-z_][A-Za-z0-9_:<>, ]*[ *&]\([A-Za-z]*Socket\)::write.*/\1/p' "$f" | head -1)"
         [ -n "$base" ] || continue
         seen=$((seen + 1))
         local why; why="$(reason_for "$base")"
@@ -66,7 +66,7 @@ run_scan() {
         # a call site, and checks in this tree have twice matched their own headers.
         body="$(awk -v N="$base" '
             { line = $0; sub(/^[ \t]*\/\/.*$/, "", line) }
-            line ~ (N "::Write") { inFn = 1 }
+            line ~ (N "::write") { inFn = 1 }
             inFn { print line; if (line ~ /^\}/) inFn = 0 }
         ' "$f")"
         local claims; claims="$(printf '%s' "$body" | grep -c 'ClaimWriteSlot' || true)"
@@ -108,7 +108,7 @@ if [ "$selftest" -eq 1 ]; then
     # write-slot-scan: data-begin
     mk guarded
     cat > "$tmp/guarded/src/FastCache/Net/EpollSocket.cpp" <<'SRC'
-IoAwaitable EpollSocket::Write(std::span<std::byte const> buffer)
+IoAwaitable EpollSocket::write(std::span<std::byte const> buffer)
 {
     Detail::ClaimWriteSlot(_impl->writeOp.awaitable);
 }
@@ -118,7 +118,7 @@ SRC
 
     mk bare
     cat > "$tmp/bare/src/FastCache/Net/EpollSocket.cpp" <<'SRC'
-IoAwaitable EpollSocket::Write(std::span<std::byte const> buffer)
+IoAwaitable EpollSocket::write(std::span<std::byte const> buffer)
 {
     _impl->writeOp.awaitable = nullptr;
 }
@@ -128,7 +128,7 @@ SRC
 
     mk newtransport
     cat > "$tmp/newtransport/src/FastCache/Net/SeventhSocket.cpp" <<'SRC'
-IoAwaitable SeventhSocket::Write(std::span<std::byte const> buffer)
+IoAwaitable SeventhSocket::write(std::span<std::byte const> buffer)
 {
     return IoAwaitable {};
 }
@@ -138,7 +138,7 @@ SRC
 
     mk exempt
     cat > "$tmp/exempt/src/FastCache/Net/InMemorySocket.cpp" <<'SRC'
-IoAwaitable InMemorySocket::Write(std::span<std::byte const> buffer)
+IoAwaitable InMemorySocket::write(std::span<std::byte const> buffer)
 {
     return IoAwaitable {};
 }
@@ -148,7 +148,7 @@ SRC
 
     mk contradiction
     cat > "$tmp/contradiction/src/FastCache/Net/InMemorySocket.cpp" <<'SRC'
-IoAwaitable InMemorySocket::Write(std::span<std::byte const> buffer)
+IoAwaitable InMemorySocket::write(std::span<std::byte const> buffer)
 {
     Detail::ClaimWriteSlot(_impl->writeOp.awaitable);
 }

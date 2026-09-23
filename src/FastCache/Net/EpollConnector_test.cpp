@@ -88,7 +88,7 @@ FastCache::DetachedTask DriveExchange(FastCache::EpollReactor* loop,
     // arrives rather than racing it.
     auto pending = server->Accept();
 
-    *out = co_await dialer->Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = 5s });
+    *out = co_await dialer->connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = 5s });
     auto& dialResult = out->value();
     if (dialResult.has_value() && dialResult.value() != nullptr)
     {
@@ -120,12 +120,12 @@ FastCache::DetachedTask DriveExchange(FastCache::EpollReactor* loop,
                 [done = &readDone, seen] { return std::format("read done {}, {} byte(s) seen", *done, seen->size()); },
                 ReactorWaitOptions { .context = {}, .bound = WaitHangGuard, .rest = FastCache::Duration::zero() }));
 
-            peer->Close();
+            peer->close();
         }
-        dialResult.value()->Close();
+        dialResult.value()->close();
     }
     server->Close();
-    loop->Stop();
+    loop->stop();
     co_return;
 }
 
@@ -163,10 +163,10 @@ TEST_CASE("A reactor dial connects and then actually transfers bytes", "[net][ep
     // without a watchdog it would report as a suite timeout naming nothing rather
     // than as this assertion. `DeadlineTimer` is the same mechanism the dial uses.
     FastCache::DeadlineTimer const watchdog {
-        reactor, clock.Now() + 15s, [](void* state) { static_cast<FastCache::EpollReactor*>(state)->Stop(); }, &reactor
+        reactor, clock.now() + 15s, [](void* state) { static_cast<FastCache::EpollReactor*>(state)->stop(); }, &reactor
     };
 
-    reactor.Run();
+    reactor.run();
 
     // First, while the account of a wait that ran out is still attached.
     CHECK(waits.AllReached());
@@ -235,30 +235,30 @@ TEST_CASE("A dial that must wait for readiness still ends on the reactor", "[net
                 auto accepted = co_await accepting->Accept();
                 if (!accepted.has_value())
                     break;
-                accepted.value()->Close();
+                accepted.value()->close();
             }
             co_return;
         };
         drain(server, 96);
 
-        *out = co_await dialer->Connect("127.0.0.1", target, FastCache::DialOptions { .connectTimeout = 20s });
+        *out = co_await dialer->connect("127.0.0.1", target, FastCache::DialOptions { .connectTimeout = 20s });
         if (out->has_value())
         {
             auto& result = out->value();
             if (result.has_value() && result.value() != nullptr)
-                result.value()->Close();
+                result.value()->close();
         }
         server->Close();
-        loop->Stop();
+        loop->stop();
         co_return;
     };
 
     driver(&reactor, &connector, listener.get(), port, &dialed);
 
     FastCache::DeadlineTimer const watchdog {
-        reactor, clock.Now() + 30s, [](void* state) { static_cast<FastCache::EpollReactor*>(state)->Stop(); }, &reactor
+        reactor, clock.now() + 30s, [](void* state) { static_cast<FastCache::EpollReactor*>(state)->stop(); }, &reactor
     };
-    reactor.Run();
+    reactor.run();
 
     REQUIRE(dialed.has_value());
     auto const& outcome = FastCache::Testing::Unwrap(dialed);

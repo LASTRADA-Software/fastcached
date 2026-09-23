@@ -85,7 +85,7 @@ namespace Detail
         }
 
         /// @return The handle this entry would resume; null once it has been taken.
-        [[nodiscard]] std::coroutine_handle<> Handle() const noexcept
+        [[nodiscard]] std::coroutine_handle<> handle() const noexcept
         {
             return _work.resume;
         }
@@ -103,7 +103,7 @@ namespace Detail
         /// resumed to completion by anything else; the branch is written for the
         /// contract rather than for a caller that exists, and the contract is *resumed
         /// or freed, never neither*.
-        void Resume()
+        void resume()
         {
             auto const work = std::exchange(_work, ParkedWork {});
             if (work.resume && !work.resume.done())
@@ -120,7 +120,7 @@ namespace Detail
         /// `IReactor::CancelPending`'s contract: after this the caller is the only one
         /// who may resume or destroy it, so this entry must do neither.
         /// @return What was parked here; empty afterwards.
-        [[nodiscard]] ParkedWork Take() noexcept
+        [[nodiscard]] ParkedWork take() noexcept
         {
             return std::exchange(_work, ParkedWork {});
         }

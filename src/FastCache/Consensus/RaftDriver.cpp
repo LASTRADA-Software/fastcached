@@ -396,8 +396,8 @@ Task<void> RaftDriver::Run(IReactor* reactor)
 {
     while (reactor != nullptr && !_stopped.load(std::memory_order_relaxed) && !Failure().has_value())
     {
-        reactor->Clock().Refresh();
-        auto const now = reactor->Clock().Now();
+        reactor->clock().refresh();
+        auto const now = reactor->clock().now();
         (void) Tick(now);
 
         // The loop condition is the stop check: `Stop` during the sleep is seen

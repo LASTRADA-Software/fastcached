@@ -77,7 +77,7 @@ struct SocketDeadlineTarget
 
     return std::optional<DeadlineTimer> { std::in_place,
                                           *reactor,
-                                          reactor->Clock().Now() + ceiling,
+                                          reactor->clock().now() + ceiling,
                                           [](void* state) {
                                               auto& fired = *static_cast<SocketDeadlineTarget*>(state);
                                               // Recorded BEFORE the close, so a
@@ -85,7 +85,7 @@ struct SocketDeadlineTarget
                                               // never observe a socket that shut
                                               // without a reason attached.
                                               fired.expired = true;
-                                              fired.socket->Close();
+                                              fired.socket->close();
                                           },
                                           target };
 }

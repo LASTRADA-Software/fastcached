@@ -594,7 +594,7 @@ TEST_CASE("The daemon and a node running no worker refuse a cordon with one code
     auto const pair = InMemorySocketPair::Create();
     CompileCacheHandler daemon;
     REQUIRE(SyncRun(SendAll(pair.client.get(), cordon)));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
     SyncRun(daemon.Run(pair.server.get(), &engine, {}, SessionContext {}));
     // One framed reply, read as the header declares it: the header, then its payload.
     auto const daemonHead = SyncRun(RecvExactly(pair.client.get(), Wire::ReplyHeaderSize));
@@ -881,7 +881,7 @@ TEST_CASE("A node running only consensus opens the 0xFC port it is watched throu
     // And it answers there: a NodeStatus frame reaches the operator verbs.
     BlockingConnector connector;
     auto socket =
-        SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+        SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
     REQUIRE(socket.has_value());
     auto const request = HeaderFor(Wire::Op::NodeStatus);
     REQUIRE(SyncRun(SendAll(socket->get(), request)));
@@ -932,7 +932,7 @@ TEST_CASE("A node running only consensus still answers its status with every liv
     auto const listenPort = port;
     auto const exchange = [&connector, listenPort](std::vector<std::unique_ptr<ISocket>>& held, Wire::Op op) {
         auto socket = SyncRun(
-            connector.Connect("127.0.0.1", listenPort, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", listenPort, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return std::string {};
         auto const request = HeaderFor(op);

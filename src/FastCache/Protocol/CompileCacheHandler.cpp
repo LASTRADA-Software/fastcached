@@ -222,7 +222,7 @@ namespace
     /// @return true on success, false on socket error.
     [[nodiscard]] Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> payload)
     {
-        auto const r = co_await socket->Write(payload);
+        auto const r = co_await socket->write(payload);
         // Verify the byte count, not merely that the call succeeded: ISocket::Write
         // is a write-all contract, so a short count is a backend bug that must
         // surface as a failed reply rather than a silently truncated one. A
@@ -450,7 +450,7 @@ namespace
         // Record prefetch group membership (best-effort: a manifest failure must not fail
         // the STORE — the value is already safely stored).
         if (!groupStr.empty())
-            (void) manifest->AddKey(groupStr, keyStr, engine->Clock().Now());
+            (void) manifest->AddKey(groupStr, keyStr, engine->Clock().now());
 
         co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
     }
@@ -582,7 +582,7 @@ namespace
                        std::string const& keyStr,
                        std::set<std::string, std::less<>>& primedGroups)
     {
-        auto const now = engine->Clock().Now();
+        auto const now = engine->Clock().now();
         auto const prefetchGroup = manifest->GroupOf(keyStr, now);
         if (!prefetchGroup.has_value() || !prefetchGroup->has_value() || primedGroups.contains(**prefetchGroup))
             return;
@@ -771,7 +771,7 @@ namespace
     /// @param watch Where the answer is left.
     DetachedTask WatchSubscriber(ISocket* socket, std::shared_ptr<SubscriberWatch> watch)
     {
-        auto const readable = co_await socket->WaitReadable();
+        auto const readable = co_await socket->waitReadable();
         if (!watch->retired)
         {
             watch->gone = !readable.has_value() || *readable == 0;
@@ -796,7 +796,7 @@ namespace
     {
         auto* const hold = static_cast<PushHold*>(state);
         hold->expired = true;
-        hold->socket->Close();
+        hold->socket->close();
     }
 
     /// The daemon's half of a stream: every push written here, bounded by a timer of its own.
@@ -820,7 +820,7 @@ namespace
         [[nodiscard]] Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds hold) override
         {
             PushHold state { .socket = _socket, .expired = false };
-            DeadlineTimer const timer { *_reactor, _reactor->Clock().Now() + hold, &ExpirePushHold, &state };
+            DeadlineTimer const timer { *_reactor, _reactor->clock().now() + hold, &ExpirePushHold, &state };
             if (co_await WriteAll(_socket, frame))
                 co_return PushOutcome::Delivered;
             co_return state.expired ? PushOutcome::Stalled : PushOutcome::Lost;
@@ -967,12 +967,12 @@ namespace
         // `proven` is left disengaged and that is the truth rather than a default: this daemon
         // runs no node handshake, so no connection it serves can ever have proved an identity.
         auto const terminal = co_await session->liveStats->Serve(
-            frame, LiveWatcher { .host = socket->PeerAddress() }, &sink, &gate, session->reactor);
+            frame, LiveWatcher { .host = socket->peerAddress() }, &sink, &gate, session->reactor);
 
         if (!watch->finished)
         {
             watch->retired = true;
-            socket->CancelRead();
+            socket->cancelRead();
         }
         if (terminal.empty())
             co_return Next::Abort;

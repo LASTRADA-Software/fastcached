@@ -59,7 +59,7 @@ struct ParkAwaiter
 
     void await_suspend(std::coroutine_handle<> handle) const
     {
-        reactor.Schedule(reactor.Clock().Now(), handle);
+        reactor.schedule(reactor.clock().now(), handle);
     }
 
     void await_resume() const noexcept {}

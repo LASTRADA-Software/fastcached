@@ -411,15 +411,15 @@ TEST_CASE("HttpHealthProbe rejects a non-200 response whose body contains \" 200
         if (!accepted.has_value())
             co_return false;
         std::array<char, 256> req {};
-        (void) co_await (*accepted)->Read(std::span<std::byte> { reinterpret_cast<std::byte*>(req.data()), req.size() });
+        (void) co_await (*accepted)->read(std::span<std::byte> { reinterpret_cast<std::byte*>(req.data()), req.size() });
         constexpr std::string_view Reply { "HTTP/1.1 500 Internal Server Error\r\n"
                                            "Content-Type: text/plain\r\n"
                                            "Content-Length: 27\r\n"
                                            "\r\n"
                                            "expected 200 OK got 5xx err" };
-        (void) co_await (*accepted)->Write(
+        (void) co_await (*accepted)->write(
             std::span<std::byte const> { reinterpret_cast<std::byte const*>(Reply.data()), Reply.size() });
-        (*accepted)->Close();
+        (*accepted)->close();
         co_return true;
     };
     // `answered` is what stops this case passing vacuously. The assertion below is a

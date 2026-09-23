@@ -70,9 +70,9 @@ class ToolchainHashProgress
         _interval { interval },
         _clock { clock },
         _logger { logger },
-        _startedAt { clock.Now() },
-        _windowAt { clock.Now() },
-        _nextAt { clock.Now() + interval }
+        _startedAt { clock.now() },
+        _windowAt { clock.now() },
+        _nextAt { clock.now() + interval }
     {
     }
 
@@ -92,7 +92,7 @@ class ToolchainHashProgress
     void Observe()
     {
         auto const done = _done.fetch_add(1, std::memory_order_acq_rel) + 1;
-        auto const now = _clock.Now();
+        auto const now = _clock.now();
         auto deadline = _nextAt.load(std::memory_order_acquire);
         if (now < deadline)
             return;

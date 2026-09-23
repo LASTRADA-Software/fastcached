@@ -101,7 +101,7 @@ namespace
         UdpSocket& operator=(UdpSocket const&) = delete;
         UdpSocket& operator=(UdpSocket&&) = delete;
 
-        std::expected<void, NetError> Send(std::span<std::byte const> payload, DatagramAddress const& to) override
+        std::expected<void, NetError> send(std::span<std::byte const> payload, DatagramAddress const& to) override
         {
             // An empty host names nothing, and the two platforms disagree about
             // that rather than both refusing it: `getaddrinfo("", ...)` is
@@ -155,7 +155,7 @@ namespace
             return {};
         }
 
-        std::expected<ReceivedDatagram, DatagramWait> Receive(std::chrono::milliseconds timeout) override
+        std::expected<ReceivedDatagram, DatagramWait> receive(std::chrono::milliseconds timeout) override
         {
             if (_closed.load(std::memory_order_acquire))
                 return std::unexpected { DatagramWait::Closed };
@@ -195,7 +195,7 @@ namespace
             _closed.store(true, std::memory_order_release);
         }
 
-        [[nodiscard]] DatagramAddress BoundAddress() const override
+        [[nodiscard]] DatagramAddress boundAddress() const override
         {
             return _bound;
         }

@@ -1146,7 +1146,7 @@ int DaemonBody(FastCache::Config const& effective,
     // cache. Uptime reads `steadyClock`, not the cached one the engine uses: the cached clock only
     // advances when a reactor completes a loop iteration, so a daemon sitting idle would report a
     // frozen uptime until the next request arrived.
-    auto const startedAt = steadyClock.Now();
+    auto const startedAt = steadyClock.now();
     FastCache::AdminHttpServer::SnapshotProvider const snapshotProvider = [&engine, &steadyClock, startedAt] {
         return FastCache::MetricsSnapshot {
             .storage = engine.Snapshot(),
@@ -1160,7 +1160,7 @@ int DaemonBody(FastCache::Config const& effective,
             // the field is also what keeps a field added to the middle of the struct from silently
             // defaulting here.
             .host = std::nullopt,
-            .uptime = FastCache::Uptime { std::chrono::duration_cast<std::chrono::seconds>(steadyClock.Now() - startedAt) },
+            .uptime = FastCache::Uptime { std::chrono::duration_cast<std::chrono::seconds>(steadyClock.now() - startedAt) },
         };
     };
 

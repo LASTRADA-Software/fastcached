@@ -601,7 +601,7 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     serve(_peerServer.get(), this);
     tick(_driver.get(), &_reactor, this);
 
-    _ioThread = std::jthread { [this] { _reactor.Run(); } };
+    _ioThread = std::jthread { [this] { _reactor.run(); } };
 
     // Third thread, and it is the one that can afford to be: it holds no socket and
     // does nothing at all in the ordinary case. What it may NOT do is run on either
@@ -752,7 +752,7 @@ void ConsensusTier::NoteLoopFinished() noexcept
     // nobody ever frees -- a leak a sanitizer reports and a long-lived process pays
     // for.
     if (_loopsRunning.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        _reactor.Stop();
+        _reactor.stop();
 }
 
 void ConsensusTier::Reconcile()

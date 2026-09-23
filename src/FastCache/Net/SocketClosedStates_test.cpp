@@ -388,21 +388,21 @@ FastCache::Task<Recorded> Perform(FastCache::ISocket* socket, Step step)
     switch (step.act)
     {
         case Act::Write:
-            co_return Classify(co_await socket->Write(bytes), step.act);
+            co_return Classify(co_await socket->write(bytes), step.act);
         case Act::WriteVectored: {
             auto const split = std::min<std::size_t>(1, bytes.size());
             std::array<std::span<std::byte const>, 2> const segments { bytes.first(split), bytes.subspan(split) };
-            co_return Classify(co_await socket->WriteVectored(segments), step.act);
+            co_return Classify(co_await socket->writeVectored(segments), step.act);
         }
         case Act::Read:
-            co_return Classify(co_await socket->Read(std::span<std::byte> { buffer }), step.act);
+            co_return Classify(co_await socket->read(std::span<std::byte> { buffer }), step.act);
         case Act::WaitReadable:
-            co_return Classify(co_await socket->WaitReadable(), step.act);
+            co_return Classify(co_await socket->waitReadable(), step.act);
         case Act::ShutdownWrite:
-            socket->ShutdownWrite();
+            socket->shutdownWrite();
             co_return Recorded { .answer = Answer::Done, .bytes = 0, .code = None, .detail = {} };
         case Act::Close:
-            socket->Close();
+            socket->close();
             co_return Recorded { .answer = Answer::Done, .bytes = 0, .code = None, .detail = {} };
         case Act::Last:
             break;
@@ -526,7 +526,7 @@ FastCache::DetachedTask Observe(FastCache::PlatformReactor* reactor,
     {
         run->observerAccount = "accept failed: " + accepted.error().ToString();
         run->abandoned.store(true);
-        reactor->Stop();
+        reactor->stop();
         co_return;
     }
     auto socket = std::move(*accepted);
@@ -575,8 +575,8 @@ FastCache::DetachedTask Observe(FastCache::PlatformReactor* reactor,
         [run, total = steps.size()] { return run->next.load() == total || run->abandoned.load(); },
         progress,
         ReactorWaitOptions { .context = {}, .bound = FastCache::Testing::WaitHangGuard, .rest = 1ms });
-    socket->Close();
-    reactor->Stop();
+    socket->close();
+    reactor->stop();
 }
 
 /// Run @p steps over a real loopback pair.
@@ -603,14 +603,14 @@ FastCache::DetachedTask Observe(FastCache::PlatformReactor* reactor,
     std::jthread peer { [port, steps, &run, &waits] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
         {
             run.abandoned.store(true);
             return;
         }
         // A blocking read the table did not expect to park is bounded rather than hung.
-        (*socket)->SetReceiveDeadline(OperationBound);
+        (*socket)->setReceiveDeadline(OperationBound);
         auto const progress = [&run] {
             return Progress(run);
         };
@@ -643,7 +643,7 @@ FastCache::DetachedTask Observe(FastCache::PlatformReactor* reactor,
             options);
     } };
 
-    reactor.Run();
+    reactor.run();
     peer.join();
     observerAccount = run.observerAccount;
     waitsReached = waits.AllReached();

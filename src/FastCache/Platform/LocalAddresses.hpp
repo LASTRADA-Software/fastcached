@@ -180,7 +180,7 @@ class CachedLocalityOracle final: public ILocalityOracle
         _clock { clock },
         _refreshInterval { refreshInterval },
         _addresses { source.Addresses() },
-        _sampledAt { clock.Now() }
+        _sampledAt { clock.now() }
     {
     }
 

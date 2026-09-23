@@ -67,7 +67,7 @@ void NodeIoLoop::Start()
     if (_loops.empty())
         return;
 
-    _thread = std::jthread { [this] { _reactor.Run(); } };
+    _thread = std::jthread { [this] { _reactor.run(); } };
 }
 
 void NodeIoLoop::Retire(std::unique_ptr<IListener> listener)
@@ -86,7 +86,7 @@ void NodeIoLoop::NoteLoopStarted() noexcept
 void NodeIoLoop::NoteLoopFinished() noexcept
 {
     if (_loopsRunning.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        _reactor.Stop();
+        _reactor.stop();
 }
 
 } // namespace FastCache::Node

@@ -47,7 +47,7 @@ namespace
 std::string WorkerRegistry::Register(WorkerRegistration const& registration)
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     // Keyed on (fingerprint, endpoint), not on a new id each time: a worker that
     // restarts has lost its id but is the same host running the same toolchain.
@@ -148,7 +148,7 @@ std::optional<std::string> WorkerRegistry::Heartbeat(std::string_view workerId, 
     // is actually running; a heartbeat is a correction as much as a liveness signal.
     it->second.info.inFlight = load.inFlight;
     it->second.info.load = load;
-    it->second.lastSeen = _clock.Now();
+    it->second.lastSeen = _clock.now();
     return it->second.info.endpoint;
 }
 
@@ -215,7 +215,7 @@ namespace
 std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view fingerprint)
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     // The ENTRY rather than its `info`, because the winner is stamped below and the
     // record lives beside the entry rather than on the value handed to a lease --
@@ -317,7 +317,7 @@ void WorkerRegistry::JobFinished(std::string_view workerId)
 std::vector<std::string> WorkerRegistry::ExpireStale()
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     // Collected first, then erased -- the idiom `LeaseTable::ReleaseWorker` uses and
     // for the same reason: erasing while iterating invalidates the iterator, and the
@@ -351,7 +351,7 @@ bool WorkerRegistry::Remove(std::string_view workerId)
 std::vector<WorkerInfo> WorkerRegistry::LiveWorkers() const
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     std::vector<WorkerInfo> out;
     out.reserve(_workers.size());
@@ -368,7 +368,7 @@ std::vector<WorkerInfo> WorkerRegistry::LiveWorkers() const
 std::vector<WorkerReport> WorkerRegistry::LiveWorkerReports() const
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     std::vector<WorkerReport> out;
     out.reserve(_workers.size());
@@ -437,13 +437,13 @@ void WorkerRegistry::NoteNodePresent(std::string endpoint,
     slot.load = load;
     slot.version = std::move(version);
     slot.conditions = std::move(conditions);
-    slot.lastSeen = _clock.Now();
+    slot.lastSeen = _clock.now();
 }
 
 std::vector<NodeReport> WorkerRegistry::NodeReports() const
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     // Keyed on endpoint, because that is what the entries of one machine share --
     // this registry keys workers on (fingerprint, endpoint), so a node with two

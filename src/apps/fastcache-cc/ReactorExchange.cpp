@@ -79,7 +79,7 @@ namespace
             // armed at once" from being a reading of the standard somebody has to do at
             // this call site.
             _timer.reset();
-            _timer.emplace(*_reactor, _reactor->Clock().Now() + _budget.idle, &OnSilence, _target);
+            _timer.emplace(*_reactor, _reactor->clock().now() + _budget.idle, &OnSilence, _target);
         }
 
       private:
@@ -93,7 +93,7 @@ namespace
         {
             auto& fired = *static_cast<SocketDeadlineTarget*>(state);
             fired.expired = true;
-            fired.socket->Close();
+            fired.socket->close();
         }
 
         IReactor* _reactor;
@@ -139,7 +139,7 @@ namespace
             // different headers.
             *out = CacheOutcome {};
             out->transportFailure = TransportFailure::Unreached;
-            reactor->Stop();
+            reactor->stop();
             co_return;
         }
 
@@ -191,8 +191,8 @@ namespace
             }
         }
 
-        client->Close();
-        reactor->Stop();
+        client->close();
+        reactor->stop();
         co_return;
     }
 
@@ -234,7 +234,7 @@ CacheOutcome ReactorExchange::Run(std::string_view hostPort,
                 std::move(credential),
                 budget,
                 &outcome);
-    _reactor.Run();
+    _reactor.run();
     return outcome;
 }
 

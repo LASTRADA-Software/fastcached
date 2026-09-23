@@ -40,14 +40,14 @@ using namespace std::chrono_literals;
 
 FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view payload)
 {
-    auto const result = co_await socket->Write(FastCache::AsBytes(payload));
+    auto const result = co_await socket->write(FastCache::AsBytes(payload));
     co_return result.has_value() && *result == payload.size();
 }
 
 /// One read, as it answered.
 FastCache::Task<FastCache::IoResult> ReadOnce(FastCache::ISocket* socket, std::span<std::byte> into)
 {
-    co_return co_await socket->Read(into);
+    co_return co_await socket->read(into);
 }
 
 /// What the peer reads back: the text, and what ended it.
@@ -64,7 +64,7 @@ FastCache::Task<Received> ReadToEnd(FastCache::ISocket* socket)
     std::array<std::byte, 256> chunk {};
     while (true)
     {
-        auto const got = co_await socket->Read(std::span<std::byte> { chunk });
+        auto const got = co_await socket->read(std::span<std::byte> { chunk });
         if (!got.has_value() || *got == 0)
         {
             out.ending = got;
@@ -122,15 +122,15 @@ FastCache::DetachedTask RefuseOnReactor(FastCache::PlatformReactor* reactor,
     {
         auto socket = std::move(*accepted);
         std::array<std::byte, ReadBeforeRefusing> head {};
-        (void) co_await socket->Read(std::span<std::byte> { head });
-        (void) co_await socket->Write(FastCache::AsBytes(Refusal));
+        (void) co_await socket->read(std::span<std::byte> { head });
+        (void) co_await socket->write(FastCache::AsBytes(Refusal));
         if (closing == Closing::Lingering)
             out->outcome = co_await FastCache::CloseLingering(socket.get(), reactor, Generous);
         else
-            socket->Close();
+            socket->close();
     }
     out->done.store(true, std::memory_order_release);
-    reactor->Stop();
+    reactor->stop();
 }
 
 /// Refuse a request over a real loopback pair, and return what the client read.
@@ -157,20 +157,20 @@ FastCache::DetachedTask RefuseOnReactor(FastCache::PlatformReactor* reactor,
     std::jthread client { [port, &received] {
         FastCache::BlockingConnector connector;
         auto socket = FastCache::SyncRun(
-            connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+            connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
         {
             received.ending = std::unexpected(socket.error());
             return;
         }
         // A read nothing answers is bounded rather than hung.
-        (*socket)->SetReceiveDeadline(std::chrono::milliseconds { 5000 });
+        (*socket)->setReceiveDeadline(std::chrono::milliseconds { 5000 });
         (void) FastCache::SyncRun(WriteString(socket->get(), Request));
         received = FastCache::SyncRun(ReadToEnd(socket->get()));
-        (*socket)->Close();
+        (*socket)->close();
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
     return received;
 }
@@ -183,7 +183,7 @@ TEST_CASE("CloseLingering over a peer that closed first reads once and closes", 
     // costs a single read, which answers EOF at once. A linger that waited here would turn
     // every ending into a delay.
     auto pair = FastCache::InMemorySocketPair::Create();
-    pair.client->Close();
+    pair.client->close();
 
     auto const outcome = FastCache::SyncRun(FastCache::CloseLingering(pair.server.get(), nullptr, Generous));
 
@@ -195,7 +195,7 @@ TEST_CASE("CloseLingering over a peer that closed first reads once and closes", 
 TEST_CASE("CloseLingering leaves an already closed socket closed, and reads nothing", "[net][linger]")
 {
     auto pair = FastCache::InMemorySocketPair::Create();
-    pair.server->Close();
+    pair.server->close();
 
     auto const outcome = FastCache::SyncRun(FastCache::CloseLingering(pair.server.get(), nullptr, Generous));
 
@@ -211,7 +211,7 @@ TEST_CASE("CloseLingering drains a refused request and closes on the peer's EOF"
     // linger reads the rest, meets the EOF, and the peer reads the reply and then EOF.
     auto pair = FastCache::InMemorySocketPair::Create();
     REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), Request)));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
     REQUIRE(FastCache::SyncRun(WriteString(pair.server.get(), Refusal)));
 
     auto const outcome = FastCache::SyncRun(FastCache::CloseLingering(pair.server.get(), nullptr, Generous));
@@ -232,7 +232,7 @@ TEST_CASE("CloseLingering stops at whichever cap a peer meets first", "[net][lin
     auto pair = FastCache::InMemorySocketPair::Create();
     std::string const large(64 * 1024, 'u');
     REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), large)));
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
 
     SECTION("the reads")
     {
@@ -267,18 +267,18 @@ TEST_CASE("CloseLingering on a reactor stops listening to a silent peer at its d
         pair.server.get(),
         &reactor,
         FastCache::LingerBounds { .total = std::chrono::milliseconds { 100 }, .maxBytes = 4096, .reads = 4 });
-    auto handle = linger.Native();
+    auto handle = linger.handle();
     handle.resume();
-    REQUIRE_FALSE(linger.IsReady());
+    REQUIRE_FALSE(linger.done());
     CHECK_FALSE(pair.server->IsClosed());
 
-    clock.Advance(std::chrono::milliseconds { 99 });
+    clock.advance(std::chrono::milliseconds { 99 });
     std::ignore = reactor.Drain();
-    CHECK_FALSE(linger.IsReady());
+    CHECK_FALSE(linger.done());
 
-    clock.Advance(std::chrono::milliseconds { 1 });
+    clock.advance(std::chrono::milliseconds { 1 });
     std::ignore = reactor.Drain();
-    REQUIRE(linger.IsReady());
+    REQUIRE(linger.done());
     auto const outcome = std::get<1>(handle.promise().result);
     CHECK(outcome.end == FastCache::LingerEnd::Expired);
     CHECK(outcome.reads == 1);
@@ -296,7 +296,7 @@ TEST_CASE("CloseLingering on a blocking socket stops listening to a silent peer"
     REQUIRE(port != 0);
 
     FastCache::BlockingConnector connector;
-    auto client = FastCache::SyncRun(connector.Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = 5s }));
+    auto client = FastCache::SyncRun(connector.connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = 5s }));
     REQUIRE(client.has_value());
     auto accepted = FastCache::SyncRun(AcceptOne(listener.get()));
     REQUIRE(accepted.has_value());

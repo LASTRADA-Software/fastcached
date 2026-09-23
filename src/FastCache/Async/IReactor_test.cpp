@@ -39,27 +39,27 @@ namespace
 class BareReactor: public IReactor
 {
   public:
-    void Stop() noexcept override
+    void stop() noexcept override
     {
         _stop.store(true, std::memory_order_release);
     }
 
-    void Submit(std::coroutine_handle<> /*handle*/) override {}
-    void Schedule(TimePoint /*deadline*/, std::coroutine_handle<> /*handle*/) override {}
+    void submit(std::coroutine_handle<> /*handle*/) override {}
+    void schedule(TimePoint /*deadline*/, std::coroutine_handle<> /*handle*/) override {}
 
     // The owning forms are pure on `IExecutor`/`IReactor`, so a fifth backend cannot
     // reach `Run()` without having been shown the question #1025 is about: what happens
     // to work it never resumes. This one parks nothing, so both are empty here -- and
     // that is a decision with a reason beside it rather than an omission.
-    void Submit(ParkedWork /*work*/) override {}
-    void Schedule(TimePoint /*deadline*/, ParkedWork /*work*/) override {}
+    void submit(ParkedWork /*work*/) override {}
+    void schedule(TimePoint /*deadline*/, ParkedWork /*work*/) override {}
 
-    [[nodiscard]] bool CancelPending(std::coroutine_handle<> /*handle*/) noexcept override
+    [[nodiscard]] bool cancelPending(std::coroutine_handle<> /*handle*/) noexcept override
     {
         return false;
     }
 
-    [[nodiscard]] IClock& Clock() noexcept override
+    [[nodiscard]] IClock& clock() noexcept override
     {
         return _clock;
     }
@@ -98,9 +98,9 @@ class BareReactor: public IReactor
     void RunLoop() override
     {
         // Asked from inside the loop, on the loop's own thread.
-        _sawRunning.store(Running(), std::memory_order_relaxed);
-        _sawOnWorker.store(IsOnWorkerThread(), std::memory_order_relaxed);
-        _sawTeardownSafe.store(TeardownIsSerialisedWithDispatch(), std::memory_order_relaxed);
+        _sawRunning.store(running(), std::memory_order_relaxed);
+        _sawOnWorker.store(isOnWorkerThread(), std::memory_order_relaxed);
+        _sawTeardownSafe.store(teardownIsSerialisedWithDispatch(), std::memory_order_relaxed);
         _entered.store(true, std::memory_order_release);
         // Bounded (#1446): a case that never stops the loop ends it red, not in a join that never returns.
         // Twice the guard, because the case's own wait for this loop to be entered is one guard long:
@@ -132,10 +132,10 @@ TEST_CASE("A reactor that implements only the loop still claims its worker threa
 
     // Before anything runs, nothing is running -- and teardown is therefore safe
     // from any thread, which is the legitimate "stopped" arm of the rule.
-    CHECK_FALSE(reactor.Running());
-    CHECK(reactor.TeardownIsSerialisedWithDispatch());
+    CHECK_FALSE(reactor.running());
+    CHECK(reactor.teardownIsSerialisedWithDispatch());
 
-    std::thread worker { [&reactor] { reactor.Run(); } };
+    std::thread worker { [&reactor] { reactor.run(); } };
     // A CHECK, so a loop that never entered still reaches the Stop and the join below.
     CHECK(Testing::WaitUntil(
         "the loop to be entered on its thread", [&reactor] { return reactor.Entered(); }, [] { return std::string {}; }));
@@ -149,16 +149,16 @@ TEST_CASE("A reactor that implements only the loop still claims its worker threa
     // And from THIS thread, with that loop alive, the rule refuses -- which is the
     // violation `reactor-teardown-canary` drives to an assert. A reactor that had
     // forgotten to claim would answer `true` here, and that is the false-safe.
-    CHECK(reactor.Running());
-    CHECK_FALSE(reactor.IsOnWorkerThread());
-    CHECK_FALSE(reactor.TeardownIsSerialisedWithDispatch());
+    CHECK(reactor.running());
+    CHECK_FALSE(reactor.isOnWorkerThread());
+    CHECK_FALSE(reactor.teardownIsSerialisedWithDispatch());
 
-    reactor.Stop();
+    reactor.stop();
     worker.join();
     CHECK(reactor.Waits().AllReached());
 
     // Claim released on the way out, or every later teardown would be refused
     // forever by a reactor that has finished.
-    CHECK_FALSE(reactor.Running());
-    CHECK(reactor.TeardownIsSerialisedWithDispatch());
+    CHECK_FALSE(reactor.running());
+    CHECK(reactor.teardownIsSerialisedWithDispatch());
 }

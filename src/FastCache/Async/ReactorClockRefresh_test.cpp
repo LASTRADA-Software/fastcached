@@ -65,12 +65,12 @@ FastCache::DetachedTask AdvanceThenObserve(FastCache::IReactor* reactor,
                                            std::atomic<FastCache::Duration::rep>* observed)
 {
     co_await FastCache::ResumeOn { *reactor };
-    source->SetNow(AdvancedTime);
+    source->setNow(AdvancedTime);
 
     co_await FastCache::ResumeOn { *reactor };
-    observed->store(reactor->Clock().Now().time_since_epoch().count(), std::memory_order_release);
+    observed->store(reactor->clock().now().time_since_epoch().count(), std::memory_order_release);
 
-    reactor->Stop();
+    reactor->stop();
     co_return;
 }
 
@@ -90,7 +90,7 @@ TEST_CASE("The platform reactor refreshes its clock every loop iteration", "[rea
     FastCache::CachedClock cached { source };
     PlatformReactor reactor { cached };
 
-    REQUIRE(cached.Now() == StartTime);
+    REQUIRE(cached.now() == StartTime);
 
     std::atomic<FastCache::Duration::rep> observed { 0 };
     AdvanceThenObserve(&reactor, &source, &observed);
@@ -98,10 +98,10 @@ TEST_CASE("The platform reactor refreshes its clock every loop iteration", "[rea
     // The coroutine ran to its first ResumeOn on this thread, so a submission is
     // already queued and the loop below has work waiting the moment it starts.
     // The coroutine stops the reactor itself, so Run() returns on its own.
-    reactor.Run();
+    reactor.run();
 
     REQUIRE(FastCache::TimePoint { FastCache::Duration { observed.load(std::memory_order_acquire) } } == AdvancedTime);
-    REQUIRE(cached.Now() == AdvancedTime);
+    REQUIRE(cached.now() == AdvancedTime);
 }
 
 TEST_CASE("A reactor given a plain SteadyClock is unaffected by the refresh call", "[reactor][clock][cached-clock]")
@@ -114,14 +114,14 @@ TEST_CASE("A reactor given a plain SteadyClock is unaffected by the refresh call
     FastCache::SteadyClock clock;
     PlatformReactor reactor { clock };
 
-    auto const before = clock.Now();
+    auto const before = clock.now();
 
     std::atomic<FastCache::Duration::rep> observed { 0 };
     FastCache::ManualClock unused { StartTime }; // not read by this reactor
     AdvanceThenObserve(&reactor, &unused, &observed);
-    reactor.Run();
+    reactor.run();
 
     auto const sampled = FastCache::TimePoint { FastCache::Duration { observed.load(std::memory_order_acquire) } };
     REQUIRE(sampled >= before);
-    REQUIRE(clock.Now() >= sampled);
+    REQUIRE(clock.now() >= sampled);
 }

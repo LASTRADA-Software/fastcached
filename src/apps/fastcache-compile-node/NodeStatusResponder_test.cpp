@@ -275,7 +275,7 @@ struct Fixture
         runtime { initial.value_or(UnwiredSentinel) },
         status { cfg,
                  clock,
-                 clock.Now(),
+                 clock.now(),
                  "1.2.3",
                  "node-a",
                  components,
@@ -394,9 +394,9 @@ TEST_CASE("Uptime is re-read per call, not captured once", "[node][node-status]"
     Fixture const fixture { {}, clock };
 
     CHECK(fixture.status.Describe().uptimeSeconds == 0);
-    clock.Advance(90s);
+    clock.advance(90s);
     CHECK(fixture.status.Describe().uptimeSeconds == 90);
-    clock.Advance(30s);
+    clock.advance(30s);
     CHECK(fixture.status.Describe().uptimeSeconds == 120);
 }
 
@@ -634,10 +634,10 @@ TEST_CASE("A round that accepted nothing does not erase when this node last regi
     ManualClock clock;
     Fixture fixture { {}, clock, { .worker = true }, ToolchainReading {} };
 
-    fixture.runtime.PublishRegistration(3, 3, clock.Now());
+    fixture.runtime.PublishRegistration(3, 3, clock.now());
     CHECK(fixture.status.Describe().runtime.lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 0 });
 
-    clock.Advance(30s);
+    clock.advance(30s);
     fixture.runtime.PublishRegistration(0, 3, std::nullopt);
 
     auto const fields = fixture.status.Describe();
@@ -646,11 +646,11 @@ TEST_CASE("A round that accepted nothing does not erase when this node last regi
 
     // And it keeps ageing without being republished -- a duration computed per call
     // rather than a number stamped once.
-    clock.Advance(45s);
+    clock.advance(45s);
     CHECK(fixture.status.Describe().runtime.lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 75 });
 
     // A round that DOES accept resets it.
-    fixture.runtime.PublishRegistration(3, 3, clock.Now());
+    fixture.runtime.PublishRegistration(3, 3, clock.now());
     CHECK(fixture.status.Describe().runtime.lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 0 });
 }
 
@@ -760,7 +760,7 @@ TEST_CASE("NodeStatus answers a member with what the node is", "[node][node-stat
     CapturedReadings const readings { metrics, {} };
     NodeStatusResponder responder { fixture.status, readings, membership, metrics };
 
-    clock.Advance(5s);
+    clock.advance(5s);
     auto const reply = AnswerNow(responder, HeaderFor(Wire::Op::NodeStatus));
     auto const header = Wire::DecodeReplyHeader(reply);
     REQUIRE(header.has_value());

@@ -111,29 +111,29 @@ class SealedFrameSocket final: public ISocket
     /// @return Why reading stopped, or nothing while it has not.
     [[nodiscard]] std::optional<SealFault> Fault() const noexcept;
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override;
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override;
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override;
-    [[nodiscard]] Task<std::expected<void, NetError>> HandshakeIfNeeded() override;
+    [[nodiscard]] Task<std::expected<void, NetError>> handshakeIfNeeded() override;
 
     /// @copydoc ISocket::WaitReadable
     ///
     /// Verified bytes not yet handed out answer at once; otherwise the raw socket answers. The tag
     /// changes nothing about how a peer says goodbye -- its FIN is the raw EOF -- so delegating
     /// does not reopen #712's TLS problem.
-    [[nodiscard]] IoAwaitable WaitReadable() override;
+    [[nodiscard]] IoAwaitable waitReadable() override;
 
     /// @copydoc ISocket::CancelRead
     ///
     /// Forwarded, which retires a parked pump too: its raw read completes `Cancelled`, and the
     /// pump hands that to whoever awaited this socket.
-    void CancelRead() noexcept override;
+    void cancelRead() noexcept override;
 
-    [[nodiscard]] std::string PeerAddress() const override;
-    void Close() noexcept override;
-    void ShutdownWrite() noexcept override;
-    void SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept override;
+    [[nodiscard]] std::string peerAddress() const override;
+    void close() noexcept override;
+    void shutdownWrite() noexcept override;
+    void setReceiveDeadline(std::chrono::milliseconds deadline) noexcept override;
     [[nodiscard]] bool IsClosed() const noexcept override;
 
   private:

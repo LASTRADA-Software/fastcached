@@ -122,7 +122,7 @@ TEST_CASE("A worker that stops heartbeating stops being dispatched to", "[distri
     (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
     REQUIRE(fix.registry.Pick(Gcc13).has_value());
 
-    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    fix.clock.advance(std::chrono::milliseconds { 1001 });
     auto const picked = fix.registry.Pick(Gcc13);
     REQUIRE_FALSE(picked.has_value());
     CHECK(picked.error() == PickError::NoWorker);
@@ -134,12 +134,12 @@ TEST_CASE("A heartbeat keeps a worker alive and corrects its load", "[distribute
     Fixture fix;
     auto const id = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
 
-    fix.clock.Advance(std::chrono::milliseconds { 900 });
+    fix.clock.advance(std::chrono::milliseconds { 900 });
     // The worker's own count is authoritative: the registry's drifts whenever a
     // client dies between leasing and compiling, and only the worker knows what it
     // is actually running.
     CHECK(fix.registry.Heartbeat(id, Busy(3)));
-    fix.clock.Advance(std::chrono::milliseconds { 900 });
+    fix.clock.advance(std::chrono::milliseconds { 900 });
 
     auto const picked = fix.registry.Pick(Gcc13);
     REQUIRE(picked.has_value());
@@ -212,7 +212,7 @@ TEST_CASE("Expiring the stale names what it dropped", "[distributed][registry]")
 
     CHECK(fix.registry.ExpireStale().empty()); // a live fleet drops nothing
 
-    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    fix.clock.advance(std::chrono::milliseconds { 1001 });
     REQUIRE(fix.registry.Heartbeat(alive, NodeLoad {}));
 
     CHECK(fix.registry.ExpireStale() == std::vector { dying });
@@ -229,10 +229,10 @@ TEST_CASE("A clock that moves backwards does not expire the fleet", "[distribute
     // Not paranoia about the steady clock: a ManualClock in a test can be set
     // backwards, and treating a negative age as enormous would expire everything.
     Fixture fix;
-    fix.clock.Advance(std::chrono::milliseconds { 5000 });
+    fix.clock.advance(std::chrono::milliseconds { 5000 });
     (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
 
-    fix.clock.Advance(std::chrono::milliseconds { -2000 });
+    fix.clock.advance(std::chrono::milliseconds { -2000 });
     CHECK(fix.registry.Pick(Gcc13).has_value());
 }
 
@@ -505,7 +505,7 @@ TEST_CASE("A node that stopped heartbeating stops reporting a cache", "[distribu
     (void) fixture.registry.Register(Announce("gcc-14", "10.0.0.2:7100", 4));
     CHECK(fixture.registry.NodeCaches().size() == 1);
 
-    fixture.clock.Advance(std::chrono::milliseconds { 2000 });
+    fixture.clock.advance(std::chrono::milliseconds { 2000 });
     CHECK(fixture.registry.NodeCaches().empty());
 }
 
@@ -553,7 +553,7 @@ TEST_CASE("A sibling that just re-registered does not blank the node's cache", "
 
     // One entry re-registers, and its load is reset. It is also now the most
     // recently seen, so "newest wins" alone would pick exactly the wrong one.
-    fixture.clock.Advance(std::chrono::milliseconds { 10 });
+    fixture.clock.advance(std::chrono::milliseconds { 10 });
     announce.fingerprint = "gcc-14";
     CHECK(fixture.registry.Register(announce) == gcc);
 
@@ -579,7 +579,7 @@ TEST_CASE("How long ago a worker was heard from is measured on the injected cloc
     CHECK(fresh[0].info.id == id);
     CHECK(fresh[0].heartbeatAge == std::chrono::milliseconds { 0 });
 
-    fix.clock.Advance(std::chrono::milliseconds { 400 });
+    fix.clock.advance(std::chrono::milliseconds { 400 });
     auto const aged = fix.registry.LiveWorkerReports();
     REQUIRE(aged.size() == 1);
     CHECK(aged[0].heartbeatAge == std::chrono::milliseconds { 400 });
@@ -597,7 +597,7 @@ TEST_CASE("A worker past its timeout is absent rather than very old", "[distribu
     Fixture fix;
     (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
 
-    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    fix.clock.advance(std::chrono::milliseconds { 1001 });
     CHECK(fix.registry.LiveWorkerReports().empty());
     CHECK(fix.registry.NodeReports().empty());
 }
@@ -607,10 +607,10 @@ TEST_CASE("A clock set backwards reports no age rather than an enormous one", "[
     // A `ManualClock` can legitimately go backwards in a test, and an unsigned
     // duration would then read as several hundred million years.
     Fixture fix;
-    fix.clock.Advance(std::chrono::milliseconds { 500 });
+    fix.clock.advance(std::chrono::milliseconds { 500 });
     (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
 
-    fix.clock.Advance(std::chrono::milliseconds { -200 });
+    fix.clock.advance(std::chrono::milliseconds { -200 });
     auto const reports = fix.registry.LiveWorkerReports();
     REQUIRE(reports.size() == 1);
     CHECK(reports[0].heartbeatAge == std::chrono::milliseconds { 0 });
@@ -739,7 +739,7 @@ TEST_CASE("A node cache report carries how stale its figures are", "[distributed
     load.cache.hits = 10;
     CHECK(fix.registry.Heartbeat(id, load));
 
-    fix.clock.Advance(std::chrono::milliseconds { 250 });
+    fix.clock.advance(std::chrono::milliseconds { 250 });
     auto const caches = fix.registry.NodeCaches();
     REQUIRE(caches.size() == 1);
     CHECK(caches[0].heartbeatAge == std::chrono::milliseconds { 250 });
@@ -851,7 +851,7 @@ TEST_CASE("A worker nothing has been sent to reports no last-picked age", "[dist
 {
     AgeFixture fix;
     (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
-    fix.clock.Advance(std::chrono::milliseconds { 2'400'000 });
+    fix.clock.advance(std::chrono::milliseconds { 2'400'000 });
 
     auto const reports = fix.registry.LiveWorkerReports();
     REQUIRE(reports.size() == 1);
@@ -869,9 +869,9 @@ TEST_CASE("Picking a worker records when it was picked", "[distributed][registry
 {
     AgeFixture fix;
     (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
-    fix.clock.Advance(std::chrono::milliseconds { 5'000 });
+    fix.clock.advance(std::chrono::milliseconds { 5'000 });
     REQUIRE(fix.registry.Pick(Gcc13).has_value());
-    fix.clock.Advance(std::chrono::milliseconds { 2'000 });
+    fix.clock.advance(std::chrono::milliseconds { 2'000 });
 
     auto const reports = fix.registry.LiveWorkerReports();
     REQUIRE(reports.size() == 1);
@@ -896,7 +896,7 @@ TEST_CASE("Choosing one of a machine's toolchains leaves the other never picked"
     auto const used = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
     auto const unused = fix.registry.Register(Announce(Gcc14, "10.0.0.1:6676", 4));
 
-    fix.clock.Advance(std::chrono::milliseconds { 1'000 });
+    fix.clock.advance(std::chrono::milliseconds { 1'000 });
     auto const picked = fix.registry.Pick(Gcc13);
     REQUIRE(picked.has_value());
     CHECK(picked->id == used);
@@ -971,7 +971,7 @@ TEST_CASE("Re-registering keeps a worker's pick record and its registration age"
     AgeFixture fix;
     (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
     REQUIRE(fix.registry.Pick(Gcc13).has_value());
-    fix.clock.Advance(std::chrono::milliseconds { 3'000 });
+    fix.clock.advance(std::chrono::milliseconds { 3'000 });
 
     auto const before = fix.registry.LiveWorkerReports();
     REQUIRE(before.size() == 1);
@@ -981,7 +981,7 @@ TEST_CASE("Re-registering keeps a worker's pick record and its registration age"
     REQUIRE(before[0].registeredAge == std::chrono::milliseconds { 3'000 });
 
     (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
-    fix.clock.Advance(std::chrono::milliseconds { 1'000 });
+    fix.clock.advance(std::chrono::milliseconds { 1'000 });
 
     auto const after = fix.registry.LiveWorkerReports();
     REQUIRE(after.size() == 1);
@@ -1005,7 +1005,7 @@ TEST_CASE("An entry that expires and comes back is a new registration", "[distri
     (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
     REQUIRE(fix.registry.Pick(Gcc13).has_value());
 
-    fix.clock.Advance(std::chrono::milliseconds { 5'000 });
+    fix.clock.advance(std::chrono::milliseconds { 5'000 });
     CHECK(fix.registry.ExpireStale().size() == 1);
 
     (void) fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
@@ -1025,9 +1025,9 @@ TEST_CASE("A registration age counts from the registration, not from the last he
     // an entry has been sitting unpicked for forty minutes or forty milliseconds.
     AgeFixture fix;
     auto const id = fix.registry.Register(Announce(Gcc13, "10.0.0.1:6676", 4));
-    fix.clock.Advance(std::chrono::milliseconds { 5'000 });
+    fix.clock.advance(std::chrono::milliseconds { 5'000 });
     CHECK(fix.registry.Heartbeat(id, Busy(0)).has_value());
-    fix.clock.Advance(std::chrono::milliseconds { 900 });
+    fix.clock.advance(std::chrono::milliseconds { 900 });
 
     auto const reports = fix.registry.LiveWorkerReports();
     REQUIRE(reports.size() == 1);

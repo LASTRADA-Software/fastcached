@@ -312,12 +312,12 @@ struct IocpSocket::Impl
         auto const err = Detail::WsaErrorOf(keepAlive->native, op->completion, status);
         if (err != 0)
         {
-            awaitable->Complete(std::unexpected(MakeWsaError(static_cast<int>(err), op->isWrite ? "WSASend" : "WSARecv")));
+            awaitable->complete(std::unexpected(MakeWsaError(static_cast<int>(err), op->isWrite ? "WSASend" : "WSARecv")));
             return;
         }
         if (!wasPeek)
         {
-            awaitable->Complete(IoResult { static_cast<std::size_t>(bytes) });
+            awaitable->complete(IoResult { static_cast<std::size_t>(bytes) });
             return;
         }
 
@@ -329,7 +329,7 @@ struct IocpSocket::Impl
         // keeps the old answer.
         char probe = 0;
         auto const peeked = ::recv(keepAlive->native, &probe, 1, MSG_PEEK);
-        awaitable->Complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
+        awaitable->complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
     }
 
     Impl(IocpReactor& r, SOCKET s):
@@ -412,16 +412,16 @@ IocpSocket::~IocpSocket()
     // Closing is the cancellation: it makes any outstanding operation complete
     // with ERROR_OPERATION_ABORTED. The completion still arrives afterwards, and
     // `Op::inFlight` is what it arrives into.
-    IocpSocket::Close();
+    IocpSocket::close();
 }
 
-void IocpSocket::ShutdownWrite() noexcept
+void IocpSocket::shutdownWrite() noexcept
 {
     if (!_closed && _impl)
         Detail::HalfCloseWrite(static_cast<Detail::NativeSocket>(_impl->native));
 }
 
-void IocpSocket::Close() noexcept
+void IocpSocket::close() noexcept
 {
     if (_closed)
         return;
@@ -433,7 +433,7 @@ void IocpSocket::Close() noexcept
     }
 }
 
-void IocpSocket::CancelRead() noexcept
+void IocpSocket::cancelRead() noexcept
 {
     if (_closed || !_impl || _impl->native == InvalidSocketValue)
         return;
@@ -496,7 +496,7 @@ void IocpSocket::CancelRead() noexcept
     // stream* (#677) -- a settled probe would be answered by that path and could report
     // an EOF nobody observed.
     auto* const awaitable = std::exchange(op.awaitable, nullptr);
-    awaitable->Complete(std::unexpected(NetError {
+    awaitable->complete(std::unexpected(NetError {
         .code = NetErrorCode::Cancelled,
         .systemCode = static_cast<int>(ERROR_OPERATION_ABORTED),
         .context = "CancelRead",
@@ -518,7 +518,7 @@ namespace
 
 } // namespace
 
-IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
+IoAwaitable IocpSocket::read(std::span<std::byte> buffer)
 {
     Detail::RequireReadBuffer(buffer);
     if (_closed)
@@ -549,7 +549,7 @@ IoAwaitable IocpSocket::Read(std::span<std::byte> buffer)
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSARecv")) };
 }
 
-IoAwaitable IocpSocket::WaitReadable()
+IoAwaitable IocpSocket::waitReadable()
 {
     if (_closed)
         return IoAwaitable { std::unexpected(
@@ -584,7 +584,7 @@ IoAwaitable IocpSocket::WaitReadable()
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSARecv")) };
 }
 
-IoAwaitable IocpSocket::Write(std::span<std::byte const> buffer)
+IoAwaitable IocpSocket::write(std::span<std::byte const> buffer)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(
@@ -617,7 +617,7 @@ IoAwaitable IocpSocket::Write(std::span<std::byte const> buffer)
     return IoAwaitable { std::unexpected(MakeWsaError(lastErr, "WSASend")) };
 }
 
-IoAwaitable IocpSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+IoAwaitable IocpSocket::writeVectored(std::span<std::span<std::byte const> const> segments,
                                       std::shared_ptr<void const> keepAlive)
 {
     if (_closed)

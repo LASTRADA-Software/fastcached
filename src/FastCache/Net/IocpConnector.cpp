@@ -282,7 +282,7 @@ IocpConnector::IocpConnector(IocpReactor& reactor, IAsyncAddressResolver& resolv
 {
 }
 
-Task<SocketResult> IocpConnector::Connect(std::string host, std::uint16_t port, DialOptions options)
+Task<SocketResult> IocpConnector::connect(std::string host, std::uint16_t port, DialOptions options)
 {
     Detail::EnsureNetworkInitialised();
     DialContext context { .reactor = &_reactor, .cache = &_connectEx };

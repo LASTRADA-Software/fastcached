@@ -97,14 +97,14 @@ int main()
         // 5-second wakeup into an instrument whose whole job is to sit still. Spelled
         // with the type rather than `{}` because `Schedule` now also takes a
         // `ParkedWork` and a braced empty is ambiguous between them.
-        reactor.Schedule(clock.Now() + 5s, std::coroutine_handle<> {});
+        reactor.schedule(clock.now() + 5s, std::coroutine_handle<> {});
         entered.store(true, std::memory_order_release);
-        reactor.Run();
+        reactor.run();
     } };
 
-    if (!WaitFor([&reactor] { return reactor.Running(); }, "the reactor to enter Run()"))
+    if (!WaitFor([&reactor] { return reactor.running(); }, "the reactor to enter Run()"))
     {
-        reactor.Stop();
+        reactor.stop();
         worker.join();
         std::println(stderr, "canary: the reactor never started; nothing was tested");
         return 0; // Not a pass. The gate refuses this by name.
@@ -116,16 +116,16 @@ int main()
     // false the assertion below could not fire for a reason that has nothing to do
     // with the guard, and reporting THAT as a pass is the failure this whole file
     // exists to avoid.
-    if (reactor.IsOnWorkerThread())
+    if (reactor.isOnWorkerThread())
     {
-        reactor.Stop();
+        reactor.stop();
         worker.join();
         std::println(stderr, "canary: main thread reports as the worker; the arrangement is wrong");
         return 0;
     }
-    if (reactor.TeardownIsSerialisedWithDispatch())
+    if (reactor.teardownIsSerialisedWithDispatch())
     {
-        reactor.Stop();
+        reactor.stop();
         worker.join();
         std::println(stderr, "canary: predicate answered SAFE with the reactor running off-thread");
         return 0;
@@ -140,7 +140,7 @@ int main()
     // Only reachable when the guard has been deleted, weakened, or compiled out of a
     // configuration this test should not have been registered for.
     std::println(stderr, "canary: SURVIVED -- the teardown guard did not refuse");
-    reactor.Stop();
+    reactor.stop();
     worker.join();
     return 0;
 }

@@ -31,7 +31,7 @@ class IClock
     virtual ~IClock() = default;
 
     /// @return Current steady-clock time. Must be monotonic and thread-safe.
-    [[nodiscard]] virtual TimePoint Now() const noexcept = 0;
+    [[nodiscard]] virtual TimePoint now() const noexcept = 0;
 
     /// Re-sample the underlying time source, if this clock caches one.
     ///
@@ -46,14 +46,14 @@ class IClock
     ///
     /// Must be safe to call from any thread and from several at once: reactors
     /// share one clock.
-    virtual void Refresh() noexcept {}
+    virtual void refresh() noexcept {}
 };
 
 /// Default IClock implementation wrapping std::chrono::steady_clock::now().
 class SteadyClock final: public IClock
 {
   public:
-    [[nodiscard]] TimePoint Now() const noexcept override
+    [[nodiscard]] TimePoint now() const noexcept override
     {
         return std::chrono::steady_clock::now();
     }
@@ -87,19 +87,19 @@ class CachedClock final: public IClock
     explicit CachedClock(IClock& source) noexcept:
         _source { source }
     {
-        Refresh();
+        refresh();
     }
 
-    [[nodiscard]] TimePoint Now() const noexcept override
+    [[nodiscard]] TimePoint now() const noexcept override
     {
         return TimePoint { Duration { _ticks.load(std::memory_order_relaxed) } };
     }
 
     /// Sample the upstream clock and publish it if it is newer than what is
     /// already there.
-    void Refresh() noexcept override
+    void refresh() noexcept override
     {
-        auto const sampled = _source.Now().time_since_epoch().count();
+        auto const sampled = _source.now().time_since_epoch().count();
         auto current = _ticks.load(std::memory_order_relaxed);
         while (sampled > current)
         {
@@ -129,7 +129,7 @@ class ManualClock final: public IClock
     {
     }
 
-    [[nodiscard]] TimePoint Now() const noexcept override
+    [[nodiscard]] TimePoint now() const noexcept override
     {
         std::scoped_lock const lock { _mutex };
         return _now;
@@ -137,7 +137,7 @@ class ManualClock final: public IClock
 
     /// Move the clock forward by the given duration.
     /// @param delta Non-negative duration to advance the clock by.
-    void Advance(Duration delta) noexcept
+    void advance(Duration delta) noexcept
     {
         std::scoped_lock const lock { _mutex };
         _now += delta;
@@ -145,7 +145,7 @@ class ManualClock final: public IClock
 
     /// Hard-set the clock to a specific value.
     /// @param when New value Now() will return.
-    void SetNow(TimePoint when) noexcept
+    void setNow(TimePoint when) noexcept
     {
         std::scoped_lock const lock { _mutex };
         _now = when;
@@ -291,7 +291,7 @@ class WallClockRef
     WallClockRef(IWallClock const&&) = delete;
 
     /// @return The borrowed clock, for a caller that needs the interface itself.
-    [[nodiscard]] IWallClock const& Get() const noexcept
+    [[nodiscard]] IWallClock const& get() const noexcept
     {
         return *_wall;
     }

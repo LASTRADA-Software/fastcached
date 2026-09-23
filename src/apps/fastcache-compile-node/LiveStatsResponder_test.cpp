@@ -244,7 +244,7 @@ struct Rig
     {
         for (auto const& stream: streams)
             stream->sink.stopping = true;
-        clock.Advance(2s);
+        clock.advance(2s);
         reactor.Drain();
     }
 
@@ -302,7 +302,7 @@ struct Rig
     /// Move the clock to @p at and let every stream due by then run.
     void RunTo(std::chrono::milliseconds at)
     {
-        clock.SetNow(TimePoint { std::chrono::duration_cast<Duration>(at) });
+        clock.setNow(TimePoint { std::chrono::duration_cast<Duration>(at) });
         reactor.Drain();
     }
 
@@ -718,7 +718,7 @@ TEST_CASE("Detaching the sources ends every stream in order at its next tick", "
         REQUIRE(stream.sink.SnapshotTicks() == std::vector<std::uint64_t> { 0 });
     }
 
-    clock.Advance(500ms);
+    clock.advance(500ms);
     reactor.Drain();
     REQUIRE(stream.finished);
     CHECK(Testing::StatusOf(stream.reply) == Wire::Status::Ok);

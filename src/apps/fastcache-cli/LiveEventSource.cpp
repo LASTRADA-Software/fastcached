@@ -140,14 +140,14 @@ struct LiveEventSource::State
     /// @return True once `Close()` has run.
     [[nodiscard]] bool Closed() const noexcept
     {
-        return events.IsClosed();
+        return events.isClosed();
     }
 
     /// Queue @p event for `Next()`.
     /// @param event What happened.
     void Deliver(DashboardEvent event)
     {
-        (void) events.Push(std::move(event));
+        (void) events.push(std::move(event));
     }
 
     /// Queue a sample outcome for `Next()`, and the frame it owes.
@@ -194,7 +194,7 @@ struct LiveEventSource::State
     /// Mark a dial or read as out, for `ReadOutstandingSince()`.
     void MarkOut() noexcept
     {
-        readSince.store(parts.clock->Now().time_since_epoch().count(), std::memory_order_release);
+        readSince.store(parts.clock->now().time_since_epoch().count(), std::memory_order_release);
     }
 
     /// Mark that nothing is out any more.
@@ -219,7 +219,7 @@ namespace
     /// @param due The source's `due` queue.
     void SubscriptionDue(void* due)
     {
-        (void) static_cast<AsyncQueue<std::monostate>*>(due)->Push(std::monostate {});
+        (void) static_cast<AsyncQueue<std::monostate>*>(due)->push(std::monostate {});
     }
 
     /// What a refusal of a subscription leaves the session to do.
@@ -390,7 +390,7 @@ namespace
             co_return StreamEnd::Closed;
         if (!opened.has_value())
         {
-            state->DeliverFailure(parts.clock->Now(), Outcome::Unreachable, opened.error().detail);
+            state->DeliverFailure(parts.clock->now(), Outcome::Unreachable, opened.error().detail);
             co_return StreamEnd::Retry;
         }
 
@@ -473,11 +473,11 @@ namespace
             // A zero poll interval: `Close()` wakes this through `due`, so the timer never needs to
             // look at anything before its deadline.
             auto const timer = DeadlineTimer { *parts.reactor,
-                                               parts.reactor->Clock().Now() + parts.interval,
+                                               parts.reactor->clock().now() + parts.interval,
                                                &SubscriptionDue,
                                                &shared->due,
                                                Duration::zero() };
-            if (!(co_await shared->due.Pop()).has_value())
+            if (!(co_await shared->due.pop()).has_value())
                 break;
         }
         shared->ProducerEnded();
@@ -585,7 +585,7 @@ LiveEventSource::~LiveEventSource()
 Task<DashboardEvent> LiveEventSource::Next()
 {
     auto const state = _state;
-    auto event = co_await state->events.Pop();
+    auto event = co_await state->events.pop();
     if (!event.has_value())
         co_return DashboardEvent { .kind = DashboardEventKind::Detached, .note = std::string { SessionClosedNote } };
     co_return *std::move(event);
@@ -635,7 +635,7 @@ Task<void> LiveEventSource::Drained()
 {
     auto const state = _state;
     // Nothing is ever pushed, so this resumes exactly when the last producer closes it.
-    (void) co_await state->finished.Pop();
+    (void) co_await state->finished.pop();
 }
 
 } // namespace FastCache::Cli

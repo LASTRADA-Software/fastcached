@@ -58,7 +58,7 @@ EpollConnector::EpollConnector(EpollReactor& reactor, IAsyncAddressResolver& res
 {
 }
 
-Task<SocketResult> EpollConnector::Connect(std::string host, std::uint16_t port, DialOptions options)
+Task<SocketResult> EpollConnector::connect(std::string host, std::uint16_t port, DialOptions options)
 {
     Detail::EnsureNetworkInitialised();
     co_return co_await Detail::RunConnectFlow(

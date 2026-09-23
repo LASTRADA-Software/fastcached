@@ -51,7 +51,7 @@ class ScriptedSocket final: public ISocket
     {
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
     {
         auto const n = Next();
         if (!n.has_value())
@@ -62,7 +62,7 @@ class ScriptedSocket final: public ISocket
         return IoAwaitable { IoResult { take } };
     }
 
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override
     {
         auto const n = Next();
         if (!n.has_value())
@@ -73,13 +73,13 @@ class ScriptedSocket final: public ISocket
         return IoAwaitable { IoResult { take } };
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> /*segments*/,
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> /*segments*/,
                                             std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
         return IoAwaitable { IoResult { 0 } };
     }
 
-    void Close() noexcept override
+    void close() noexcept override
     {
         _closed = true;
     }
@@ -87,7 +87,7 @@ class ScriptedSocket final: public ISocket
     {
         return _closed;
     }
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return "scripted";
     }

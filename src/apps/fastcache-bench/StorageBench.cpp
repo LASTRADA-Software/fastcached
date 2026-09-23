@@ -238,7 +238,7 @@ class Fixture
     /// Fill the storage with `EntryCount` entries keyed `test0`..`testN-1`.
     void Populate()
     {
-        auto const expiry = _clock.Now() + EntryTtl;
+        auto const expiry = _clock.now() + EntryTtl;
         for (auto const index: std::views::iota(std::size_t { 0 }, EntryCount))
         {
             std::vector<std::byte> value(ValueBytes, std::byte { 0 });
@@ -295,7 +295,7 @@ TEST_CASE("storage lookup, jitbit-equivalent workload", "[bench][lookup]")
             TimePoint latest {};
             for ([[maybe_unused]] auto const step: std::views::iota(std::size_t { 0 }, LookupsPerIteration))
             {
-                latest = injected.Now();
+                latest = injected.now();
                 DenyHoisting();
             }
             return latest;

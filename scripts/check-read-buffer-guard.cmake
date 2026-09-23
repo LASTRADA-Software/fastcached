@@ -67,7 +67,7 @@ cmake_minimum_required(VERSION 3.28)
 # The signature is matched WITHOUT its return type so a future `[[nodiscard]]` or a
 # reformat cannot silently shrink the set; the class name is recovered from the text
 # in front of it, purely so a refusal can name the transport.
-set(FastCachedReadSignature "::Read(std::span<std::byte> buffer)")
+set(FastCachedReadSignature "::read(std::span<std::byte> buffer)")
 set(FastCachedReadGuardCall "Detail::RequireReadBuffer(buffer)")
 
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)

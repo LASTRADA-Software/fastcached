@@ -187,7 +187,7 @@ class RecordingSocket final: public ISocket
         }
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
     {
         if (_closed)
             return IoAwaitable { std::unexpected {
@@ -220,7 +220,7 @@ class RecordingSocket final: public ISocket
         return IoAwaitable { IoResult { std::size_t { 0 } } };
     }
 
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override
     {
         // A closed socket refuses, as every real one does. Recording the write
         // instead would let the transport go on feeding a connection it has
@@ -272,7 +272,7 @@ class RecordingSocket final: public ISocket
         return IoAwaitable { IoResult { buffer.size() } };
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override
     {
         std::ignore = keepAlive;
@@ -282,7 +282,7 @@ class RecordingSocket final: public ISocket
         return IoAwaitable { IoResult { total } };
     }
 
-    void Close() noexcept override
+    void close() noexcept override
     {
         _closed = true;
         // Completing the parked operation is what `Close` MEANS on a reactor
@@ -299,7 +299,7 @@ class RecordingSocket final: public ISocket
         auto* const parkedRead = std::exchange(_parkedRead, nullptr);
         for (auto* const parked: { parkedWrite, parkedRead })
             if (parked != nullptr)
-                parked->Complete(std::unexpected {
+                parked->complete(std::unexpected {
                     NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = "socket closed" } });
     }
 
@@ -308,7 +308,7 @@ class RecordingSocket final: public ISocket
         return _closed;
     }
 
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return "scripted";
     }
@@ -419,7 +419,7 @@ class ScriptedConnector final: public IConnector
     /// cases that are not about dialling free of clock arithmetic. It *can* park,
     /// because `PlatformConnector` does: a dial in flight is a real state, and the
     /// transport has to behave when a peer moves during one.
-    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions options) override
+    [[nodiscard]] Task<SocketResult> connect(std::string host, std::uint16_t port, DialOptions options) override
     {
         std::ignore = options;
         _attempts.fetch_add(1, std::memory_order_relaxed);
@@ -429,7 +429,7 @@ class ScriptedConnector final: public IConnector
         }
 
         if (auto const delay = _delay.load(std::memory_order_relaxed); delay > 0)
-            co_await SleepUntil(&_reactor, _reactor.Clock().Now() + std::chrono::milliseconds { delay });
+            co_await SleepUntil(&_reactor, _reactor.clock().now() + std::chrono::milliseconds { delay });
 
         if (_refuse.load(std::memory_order_relaxed))
             co_return std::unexpected { NetError {
@@ -534,7 +534,7 @@ struct Harness
     {
         transport->RequestStop();
         reactor.Drain();
-        clock.Advance(wakeBound);
+        clock.advance(wakeBound);
         reactor.Drain();
     }
 
@@ -676,7 +676,7 @@ TEST_CASE("A message for this node itself is not sent anywhere", "[consensus][ra
     // on -- and in a test that thread is this one.
     transport.RequestStop();
     reactor.Drain();
-    clock.Advance(50ms);
+    clock.advance(50ms);
     reactor.Drain();
     REQUIRE(transport.SendersRunning() == 0);
 }
@@ -729,12 +729,12 @@ TEST_CASE("Stopping is prompt even while a peer is unreachable", "[consensus][ra
     harness.connector.Refuse(true);
     harness.Start(PeerTransportOptions { .dialTimeout = 10s, .reconnectBackoff = Backoff, .stopWakeBound = WakeBound });
 
-    auto const started = harness.clock.Now();
+    auto const started = harness.clock.now();
     harness.RequestStopAndDrain(WakeBound);
 
     CHECK(harness.transport->SendersRunning() == 0);
     // Woken within the bound, not after the backoff.
-    CHECK(harness.clock.Now() - started == WakeBound);
+    CHECK(harness.clock.now() - started == WakeBound);
     CHECK(harness.reactor.PendingTimers() == 0);
     CHECK(harness.reactor.PendingSubmissions() == 0);
 }
@@ -751,11 +751,11 @@ TEST_CASE("A refused dial is not retried faster than the backoff", "[consensus][
 
     REQUIRE(harness.connector.Attempts() == 1);
 
-    harness.clock.Advance(Backoff / 2);
+    harness.clock.advance(Backoff / 2);
     harness.reactor.Drain();
     CHECK(harness.connector.Attempts() == 1);
 
-    harness.clock.Advance(Backoff);
+    harness.clock.advance(Backoff);
     harness.reactor.Drain();
     CHECK(harness.connector.Attempts() == 2);
 
@@ -783,7 +783,7 @@ TEST_CASE("A connection that drops is also backed off", "[consensus][raft][trans
     // Still one: the redial waits for the backoff rather than happening at once.
     CHECK(harness.connector.Attempts() == 1);
 
-    harness.clock.Advance(Backoff);
+    harness.clock.advance(Backoff);
     harness.reactor.Drain();
     CHECK(harness.connector.Attempts() == 2);
 
@@ -836,7 +836,7 @@ TEST_CASE("A dropped connection is redialled", "[consensus][raft][transport]")
     harness.record->failWrites = true;
     harness.transport->Send("n2", Vote(2));
     harness.reactor.Drain();
-    harness.clock.Advance(Backoff);
+    harness.clock.advance(Backoff);
     harness.reactor.Drain();
 
     CHECK(harness.connector.Attempts() > firstAttempts);
@@ -870,7 +870,7 @@ TEST_CASE("ConnectedPeers is exact across a reconnect, and zero after teardown",
     CHECK(harness.transport->ConnectedPeers() == 0);
 
     harness.record->failWrites = false;
-    harness.clock.Advance(Backoff);
+    harness.clock.advance(Backoff);
     harness.reactor.Drain();
     CHECK(harness.transport->ConnectedPeers() == 1);
 
@@ -991,7 +991,7 @@ TEST_CASE("A peer that moved is redialled at its new address", "[consensus][raft
     CHECK(harness.Writes() == 0);
     CHECK(harness.transport->ConnectedPeers() == 0);
 
-    harness.clock.Advance(1s);
+    harness.clock.advance(1s);
     harness.reactor.Drain();
 
     // And the redial names the new address, which is the whole property.
@@ -1026,7 +1026,7 @@ TEST_CASE("A peer that moves during a dial is not served at its old address", "[
     harness.reactor.Drain();
     REQUIRE(harness.transport->ConnectedPeers() == 0);
 
-    harness.clock.Advance(1s);
+    harness.clock.advance(1s);
     harness.reactor.Drain();
 
     // In flight now: the dial has been made and has not resolved.
@@ -1040,12 +1040,12 @@ TEST_CASE("A peer that moves during a dial is not served at its old address", "[
     // because the session it would open never re-reads the address.
     harness.FailWrites(false);
     harness.connector.DelayDial(0ms);
-    harness.clock.Advance(DialTime);
+    harness.clock.advance(DialTime);
     harness.reactor.Drain();
     CHECK(harness.transport->ConnectedPeers() == 0);
     CHECK(harness.connector.Attempts() == dialing);
 
-    harness.clock.Advance(1s);
+    harness.clock.advance(1s);
     harness.reactor.Drain();
     CHECK(harness.connector.LastTarget() == "moved:5");
     CHECK(harness.transport->ConnectedPeers() == 1);
@@ -1277,7 +1277,7 @@ TEST_CASE("A key revoked while its session is open ends the session before the n
     CHECK(harness.Refused(DiallerRefusal::KeyWithdrawn) == 1);
     CHECK(harness.transport->ConnectedPeers() == 0);
 
-    harness.clock.Advance(Backoff);
+    harness.clock.advance(Backoff);
     harness.reactor.Drain();
     CHECK(harness.Refused(DiallerRefusal::AcceptorKeyRevoked) == 1);
     CHECK(harness.transport->ConnectedPeers() == 0);
@@ -1298,11 +1298,11 @@ TEST_CASE("An acceptor that never challenges is abandoned at the handshake bound
         PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = 10s, .stopWakeBound = 50ms, .handshakeBound = Bound });
 
     CHECK(harness.Refused(DiallerRefusal::Timeout) == 0);
-    harness.clock.Advance(Bound / 2);
+    harness.clock.advance(Bound / 2);
     harness.reactor.Drain();
     CHECK(harness.Refused(DiallerRefusal::Timeout) == 0);
 
-    harness.clock.Advance(Bound);
+    harness.clock.advance(Bound);
     harness.reactor.Drain();
     CHECK(harness.Refused(DiallerRefusal::Timeout) == 1);
     CHECK(harness.transport->ConnectedPeers() == 0);

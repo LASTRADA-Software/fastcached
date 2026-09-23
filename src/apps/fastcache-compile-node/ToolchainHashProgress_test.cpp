@@ -63,7 +63,7 @@ TEST_CASE("The hash reports one line per elapsed interval", "[node][toolchain][p
     progress.Observe();
     CHECK(RateLines(logger).empty());
 
-    clock.Advance(Interval);
+    clock.advance(Interval);
     progress.Observe();
     CHECK(RateLines(logger).size() == 1);
 
@@ -72,7 +72,7 @@ TEST_CASE("The hash reports one line per elapsed interval", "[node][toolchain][p
     progress.Observe();
     CHECK(RateLines(logger).size() == 1);
 
-    clock.Advance(Interval);
+    clock.advance(Interval);
     progress.Observe();
     CHECK(RateLines(logger).size() == 2);
 }
@@ -89,7 +89,7 @@ TEST_CASE("The reported rate is the window's, not the average", "[node][toolchai
 
     for ([[maybe_unused]] auto const i: std::views::iota(0, 900))
         progress.Observe();
-    clock.Advance(Interval);
+    clock.advance(Interval);
     progress.Observe();
 
     auto lines = RateLines(logger);
@@ -99,7 +99,7 @@ TEST_CASE("The reported rate is the window's, not the average", "[node][toolchai
 
     for ([[maybe_unused]] auto const i: std::views::iota(0, 9))
         progress.Observe();
-    clock.Advance(Interval);
+    clock.advance(Interval);
     progress.Observe();
 
     lines = RateLines(logger);
@@ -120,7 +120,7 @@ TEST_CASE("Concurrent observers produce one line per interval, not one per threa
     CapturingLogger logger;
     ToolchainHashProgress progress { 1'000, Interval, clock, logger };
 
-    clock.Advance(Interval);
+    clock.advance(Interval);
 
     std::vector<std::jthread> threads;
     threads.reserve(8);

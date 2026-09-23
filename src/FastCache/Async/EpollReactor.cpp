@@ -153,19 +153,19 @@ void EpollReactor::AbandonParkedWork() noexcept
     }
 }
 
-bool EpollReactor::CancelPending(std::coroutine_handle<> handle) noexcept
+bool EpollReactor::cancelPending(std::coroutine_handle<> handle) noexcept
 {
     if (!handle)
         return false;
 
     {
         std::scoped_lock const guard { _submitMutex };
-        if (auto const found = std::ranges::find(_pendingSubmits, handle, &Detail::Parked::Handle);
+        if (auto const found = std::ranges::find(_pendingSubmits, handle, &Detail::Parked::handle);
             found != _pendingSubmits.end())
         {
             // Taken rather than only erased: the caller becomes the only one who may
             // resume or destroy it, so this entry must do neither on its way out.
-            std::ignore = found->Take();
+            std::ignore = found->take();
             _pendingSubmits.erase(found);
             return true;
         }
@@ -173,10 +173,10 @@ bool EpollReactor::CancelPending(std::coroutine_handle<> handle) noexcept
 
     std::scoped_lock const guard { _timerMutex };
     auto const found =
-        std::ranges::find(_timers, handle, [](TimerEntry const& entry) noexcept { return entry.parked.Handle(); });
+        std::ranges::find(_timers, handle, [](TimerEntry const& entry) noexcept { return entry.parked.handle(); });
     if (found == _timers.end())
         return false;
-    std::ignore = found->parked.Take();
+    std::ignore = found->parked.take();
     // Erased and re-heaped rather than popped: this entry is somewhere in the
     // middle of the heap, not at its root.
     _timers.erase(found);
@@ -247,12 +247,12 @@ void EpollReactor::Detach(EpollFdHandler* handler) const noexcept
     }
 }
 
-void EpollReactor::Submit(std::coroutine_handle<> handle)
+void EpollReactor::submit(std::coroutine_handle<> handle)
 {
-    Submit(ParkedWork { .resume = handle });
+    submit(ParkedWork { .resume = handle });
 }
 
-void EpollReactor::Submit(ParkedWork work)
+void EpollReactor::submit(ParkedWork work)
 {
     if (!work.resume)
         return;
@@ -264,12 +264,12 @@ void EpollReactor::Submit(ParkedWork work)
     std::ignore = ::write(_wakeFd, &one, sizeof(one));
 }
 
-void EpollReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
+void EpollReactor::schedule(TimePoint deadline, std::coroutine_handle<> handle)
 {
-    Schedule(deadline, ParkedWork { .resume = handle });
+    schedule(deadline, ParkedWork { .resume = handle });
 }
 
-void EpollReactor::Schedule(TimePoint deadline, ParkedWork work)
+void EpollReactor::schedule(TimePoint deadline, ParkedWork work)
 {
     if (!work.resume)
         return;
@@ -283,7 +283,7 @@ void EpollReactor::Schedule(TimePoint deadline, ParkedWork work)
     std::ignore = ::write(_wakeFd, &one, sizeof(one));
 }
 
-void EpollReactor::Stop() noexcept
+void EpollReactor::stop() noexcept
 {
     _stopped.store(true, std::memory_order_release);
     std::uint64_t one = 1;
@@ -292,7 +292,7 @@ void EpollReactor::Stop() noexcept
 
 void EpollReactor::FireExpiredTimers()
 {
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     std::vector<Detail::Parked> due;
     {
         std::scoped_lock const lock { _timerMutex };
@@ -306,7 +306,7 @@ void EpollReactor::FireExpiredTimers()
     // `Resume()` disowns and resumes in one expression, so a timer that fires normally
     // is never also freed by the entry going out of scope here.
     for (auto& parked: due)
-        parked.Resume();
+        parked.resume();
 }
 
 void EpollReactor::DrainPendingSubmits()
@@ -318,7 +318,7 @@ void EpollReactor::DrainPendingSubmits()
     }
     while (!drained.empty())
     {
-        drained.front().Resume();
+        drained.front().resume();
         drained.pop_front();
     }
 }
@@ -343,15 +343,15 @@ void EpollReactor::RunLoop()
         // timer fire a batch late. Both refreshes are needed and neither is
         // redundant: this one bounds the sleep, the one below the wait is what
         // makes the resumed handlers see the time the wait actually ended at.
-        _clock.Refresh();
-        auto const timeout = DeadlineToMs(nextDeadline, _clock.Now());
+        _clock.refresh();
+        auto const timeout = DeadlineToMs(nextDeadline, _clock.now());
 
         auto const n = ::epoll_wait(_epollFd, events, Batch, timeout);
 
         // The wait above may have blocked for an arbitrary time, so this is the
         // point in the loop where a cached clock has to re-sample. Every handler
         // and timer resumed below then reads it for free.
-        _clock.Refresh();
+        _clock.refresh();
 
         if (n < 0)
         {

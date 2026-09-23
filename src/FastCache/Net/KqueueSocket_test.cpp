@@ -156,11 +156,11 @@ FastCache::DetachedTask DriveScalarWrite(FastCache::KqueueReactor* reactor,
                                          std::atomic<std::size_t>* reported)
 {
     FastCache::KqueueSocket socket { *reactor, fd };
-    auto const r = co_await socket.Write(payload);
+    auto const r = co_await socket.write(payload);
     if (r.has_value())
         reported->store(*r);
-    socket.Close();
-    reactor->Stop();
+    socket.close();
+    reactor->stop();
     co_return;
 }
 
@@ -184,11 +184,11 @@ FastCache::DetachedTask DriveVectoredWrite(FastCache::KqueueReactor* reactor,
         value,
         FastCache::AsBytes(trailer),
     };
-    auto const r = co_await socket.WriteVectored(segments);
+    auto const r = co_await socket.writeVectored(segments);
     if (r.has_value())
         reported->store(*r);
-    socket.Close();
-    reactor->Stop();
+    socket.close();
+    reactor->stop();
     co_return;
 }
 
@@ -224,7 +224,7 @@ struct InheritedListenFd
 
     /// Hand the descriptor to something that takes ownership of it.
     /// @return The descriptor; this fixture no longer closes it.
-    [[nodiscard]] int Release() noexcept
+    [[nodiscard]] int release() noexcept
     {
         auto const released = fd;
         fd = -1;
@@ -297,16 +297,16 @@ FastCache::DetachedTask DriveAdoptedAccept(FastCache::KqueueReactor* reactor,
     {
         auto socket = std::move(*accepted);
         std::array<std::byte, 16> buf {};
-        auto const read = co_await socket->Read(std::span<std::byte> { buf });
+        auto const read = co_await socket->read(std::span<std::byte> { buf });
         if (read.has_value() && *read > 0)
         {
-            auto const written = co_await socket->Write(FastCache::AsBytes(std::string_view { "PONG" }));
+            auto const written = co_await socket->write(FastCache::AsBytes(std::string_view { "PONG" }));
             served->store(written.has_value() && *written == 4);
         }
-        socket->Close();
+        socket->close();
     }
-    listener->Close();
-    reactor->Stop();
+    listener->close();
+    reactor->stop();
     co_return;
 }
 
@@ -333,7 +333,7 @@ TEST_CASE("KqueueSocket::Write completes a payload larger than the send buffer",
     std::atomic<std::size_t> reported { 0 };
 
     DriveScalarWrite(&reactor, pair.reactorSide, std::span<std::byte const> { value.data(), value.size() }, &reported);
-    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
+    std::jthread reactorThread { [&reactor] { reactor.run(); } };
 
     // Drain on the test thread; the small SO_RCVBUF means the writer can only
     // make progress as we read, guaranteeing the park path is hit.
@@ -341,7 +341,7 @@ TEST_CASE("KqueueSocket::Write completes a payload larger than the send buffer",
     // Stop explicitly rather than relying on the coroutine's own Stop(): if the
     // write never completed, the coroutine is still parked and would never
     // reach it, leaving this join to hang forever. Stopping twice is harmless.
-    reactor.Stop();
+    reactor.stop();
     reactorThread.join();
 
     REQUIRE(reported.load() == ValueByteCount);
@@ -368,13 +368,13 @@ TEST_CASE("KqueueSocket::WriteVectored streams a large value across partial writ
 
     DriveVectoredWrite(
         &reactor, pair.reactorSide, header, std::span<std::byte const> { value.data(), value.size() }, trailer, &reported);
-    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
+    std::jthread reactorThread { [&reactor] { reactor.run(); } };
 
     auto const received = RecvExactly(pair.peerSide, total);
     // Stop explicitly rather than relying on the coroutine's own Stop(): if the
     // write never completed, the coroutine is still parked and would never
     // reach it, leaving this join to hang forever. Stopping twice is harmless.
-    reactor.Stop();
+    reactor.stop();
     reactorThread.join();
 
     REQUIRE(reported.load() == total);
@@ -401,7 +401,7 @@ TEST_CASE("KqueueListener::Adopt corrects the two descriptor properties a handof
 
     FastCache::SteadyClock clock;
     FastCache::KqueueReactor reactor { clock };
-    auto const fd = inherited.Release();
+    auto const fd = inherited.release();
     auto const listener = FastCache::KqueueListener::Adopt(reactor, fd);
     REQUIRE(listener);
     INFO("BindError: " << listener->BindError());
@@ -422,7 +422,7 @@ TEST_CASE("KqueueListener::Adopt keeps the supervisor's port rather than binding
 
     FastCache::SteadyClock clock;
     FastCache::KqueueReactor reactor { clock };
-    auto const listener = FastCache::KqueueListener::Adopt(reactor, inherited.Release());
+    auto const listener = FastCache::KqueueListener::Adopt(reactor, inherited.release());
     REQUIRE(listener);
     INFO("BindError: " << listener->BindError());
     REQUIRE(listener->IsBound());
@@ -438,7 +438,7 @@ TEST_CASE("KqueueListener::Adopt accepts a connection through the reactor", "[ne
 
     FastCache::SteadyClock clock;
     FastCache::KqueueReactor reactor { clock };
-    auto const listener = FastCache::KqueueListener::Adopt(reactor, inherited.Release());
+    auto const listener = FastCache::KqueueListener::Adopt(reactor, inherited.release());
     REQUIRE(listener);
     INFO("BindError: " << listener->BindError());
     REQUIRE(listener->IsBound());
@@ -450,14 +450,14 @@ TEST_CASE("KqueueListener::Adopt accepts a connection through the reactor", "[ne
     // registration nor a non-blocking descriptor — so an `Adopt` that skipped
     // either would still pass a test that connected first.
     DriveAdoptedAccept(&reactor, listener.get(), &served);
-    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
+    std::jthread reactorThread { [&reactor] { reactor.run(); } };
 
     auto const reply = ExchangeOverLoopback(port, "PING", std::chrono::seconds { 10 });
 
     // Stop before joining: on the failing path the coroutine is still parked in
     // Accept(), so nothing else would ever end reactor.Run() and the join would
     // hang instead of reporting.
-    reactor.Stop();
+    reactor.stop();
     reactorThread.join();
 
     INFO("reply from the adopted listener: '" << reply << "'");
@@ -469,7 +469,7 @@ TEST_CASE("An adopted KqueueListener closes its descriptor when it is destroyed"
 {
     InheritedListenFd inherited;
     REQUIRE(inherited.fd >= 0);
-    auto const fd = inherited.Release();
+    auto const fd = inherited.release();
 
     FastCache::SteadyClock clock;
     FastCache::KqueueReactor reactor { clock };

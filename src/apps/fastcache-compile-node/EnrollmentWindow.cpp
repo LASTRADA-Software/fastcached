@@ -33,7 +33,7 @@ EnrollControlOutcome EnrollmentWindow::Open()
         return EnrollControlOutcome::AlreadyInForce;
 
     _open = true;
-    _openedAt = _clock.Now();
+    _openedAt = _clock.now();
     // Due NOW rather than one interval from now: the open is itself the thing worth
     // saying, and a driver that asks a moment later gets the first line immediately.
     _warnDueAt = _openedAt;
@@ -145,7 +145,7 @@ EnrollDecision EnrollmentWindow::Offer(JoinerClaim const& claim, std::string_vie
                                                       .role = claim.role,
                                                       .publicKey = claim.publicKey,
                                                       .rosterFingerprint = std::nullopt });
-    _firstSeen.push_back(_clock.Now());
+    _firstSeen.push_back(_clock.now());
     return EnrollDecision::Pending;
 }
 
@@ -215,7 +215,7 @@ std::optional<std::string> EnrollmentWindow::TakeDueWarning()
     if (!_open)
         return std::nullopt;
 
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     if (now < _warnDueAt)
         return std::nullopt;
 
@@ -245,7 +245,7 @@ Wire::EnrollmentPendingEntry* EnrollmentWindow::FindLocked(std::string_view node
 
 std::uint64_t EnrollmentWindow::SecondsSince(TimePoint since) const noexcept
 {
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     if (now <= since)
         return 0;
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(now - since).count());

@@ -163,11 +163,11 @@ class TracingStorage final: public IStorage
     auto TraceCall(std::string_view verb, std::string_view key, Op&& op, OutcomeFmt&& fmt) -> decltype(op())
     {
         bool const traceOn = _logger.MinLevel() <= LogLevel::Trace;
-        auto const startedAt = _clock.Now();
+        auto const startedAt = _clock.now();
         auto result = std::forward<Op>(op)();
         if (traceOn)
         {
-            auto const took = _clock.Now() - startedAt;
+            auto const took = _clock.now() - startedAt;
             // Prefix the client source (e.g. "[203.0.113.7] ") when a handler
             // published one for this call — see Detail::storageSourceTag. Empty
             // tag => the line is unprefixed, exactly as before --log-source.

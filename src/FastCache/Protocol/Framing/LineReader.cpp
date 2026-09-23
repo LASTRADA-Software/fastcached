@@ -94,7 +94,7 @@ Task<std::expected<std::size_t, ProtocolError>> ByteReader::PullChunk()
     Compact();
     if (_scratch.size() < _readChunkBytes)
         _scratch.resize(_readChunkBytes);
-    auto const result = co_await _socket.Read(std::span<std::byte> { _scratch.data(), _readChunkBytes });
+    auto const result = co_await _socket.read(std::span<std::byte> { _scratch.data(), _readChunkBytes });
     if (!result.has_value())
         co_return std::unexpected(MakeTruncated("socket read failed"));
 

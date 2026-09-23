@@ -36,7 +36,7 @@ TEST_CASE("TracingStorage emits one Trace line per Get with HIT outcome", "[trac
     REQUIRE(inner.Set("foo", MakeBytes("bar"), 0, FastCache::TimePoint::max()).has_value());
 
     FastCache::TracingStorage tracer { inner, logger, clock };
-    auto const got = tracer.Get("foo", clock.Now());
+    auto const got = tracer.Get("foo", clock.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
 
@@ -59,7 +59,7 @@ TEST_CASE("TracingStorage prefixes the line with the published source tag", "[tr
     // A handler publishes the client tag immediately before the (synchronous)
     // storage call; the trace line carries it. Restore to empty afterwards.
     FastCache::Detail::storageSourceTag = "[203.0.113.7]";
-    auto const got = tracer.Get("foo", clock.Now());
+    auto const got = tracer.Get("foo", clock.now());
     FastCache::Detail::storageSourceTag = {};
     REQUIRE(got.has_value());
 
@@ -94,7 +94,7 @@ TEST_CASE("TracingStorage's source tag survives the frame that published it", "[
         FastCache::Detail::storageSourceTag = *frame;
     } // the publishing frame is freed here, as Connection::Run()'s is
 
-    REQUIRE(tracer.Get("foo", clock.Now()).has_value());
+    REQUIRE(tracer.Get("foo", clock.now()).has_value());
     FastCache::Detail::storageSourceTag = {};
 
     auto const records = logger.Snapshot();
@@ -113,7 +113,7 @@ TEST_CASE("TracingStorage omits the prefix when no source tag is published", "[t
     FastCache::TracingStorage tracer { inner, logger, clock };
 
     FastCache::Detail::storageSourceTag = {}; // no source
-    REQUIRE(tracer.Get("foo", clock.Now()).has_value());
+    REQUIRE(tracer.Get("foo", clock.now()).has_value());
 
     auto const records = logger.Snapshot();
     REQUIRE(records.size() == 1);
@@ -127,7 +127,7 @@ TEST_CASE("TracingStorage emits MISS for missing key", "[tracing]")
     FastCache::ManualClock clock;
 
     FastCache::TracingStorage tracer { inner, logger, clock };
-    auto const got = tracer.Get("absent", clock.Now());
+    auto const got = tracer.Get("absent", clock.now());
     REQUIRE(got.has_value());
     REQUIRE_FALSE(got->found);
 
@@ -162,7 +162,7 @@ TEST_CASE("TracingStorage emits NOT_STORED for Add of existing key", "[tracing]"
     REQUIRE(inner.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     FastCache::TracingStorage tracer { inner, logger, clock };
-    auto const r = tracer.Add("k", MakeBytes("x"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto const r = tracer.Add("k", MakeBytes("x"), 0, FastCache::TimePoint::max(), clock.now());
     REQUIRE_FALSE(r.has_value());
 
     auto records = logger.Snapshot();
@@ -179,7 +179,7 @@ TEST_CASE("TracingStorage emits no records when MinLevel above Trace", "[tracing
 
     FastCache::TracingStorage tracer { inner, logger, clock };
     (void) tracer.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
-    (void) tracer.Get("k", clock.Now());
+    (void) tracer.Get("k", clock.now());
 
     REQUIRE(logger.Snapshot().empty());
 }
@@ -194,7 +194,7 @@ TEST_CASE("TracingStorage forwards values unchanged (pass-through)", "[tracing]"
     auto const setCas = tracer.Set("k", MakeBytes("hello"), 42, FastCache::TimePoint::max());
     REQUIRE(setCas.has_value());
 
-    auto const got = tracer.Get("k", clock.Now());
+    auto const got = tracer.Get("k", clock.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(got->entry.flags == 42U);
@@ -210,8 +210,8 @@ TEST_CASE("TracingStorage emits DELETED / NOT_FOUND for Delete", "[tracing]")
     REQUIRE(inner.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     FastCache::TracingStorage tracer { inner, logger, clock };
-    REQUIRE(tracer.Delete("k", clock.Now()).has_value());
-    auto const second = tracer.Delete("k", clock.Now());
+    REQUIRE(tracer.Delete("k", clock.now()).has_value());
+    auto const second = tracer.Delete("k", clock.now());
     REQUIRE_FALSE(second.has_value());
 
     auto records = logger.Snapshot();
@@ -243,7 +243,7 @@ TEST_CASE("TracingStorage emits VALUE_TOO_LARGE with bytes for Add", "[tracing]"
     FastCache::ManualClock clock;
 
     FastCache::TracingStorage tracer { inner, logger, clock };
-    auto const r = tracer.Add("k", MakeBytes("hello"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto const r = tracer.Add("k", MakeBytes("hello"), 0, FastCache::TimePoint::max(), clock.now());
     REQUIRE_FALSE(r.has_value());
 
     auto records = logger.Snapshot();
@@ -259,10 +259,10 @@ TEST_CASE("TracingStorage emits VALUE_TOO_LARGE with bytes for CAS", "[tracing]"
     FastCache::ManualClock clock;
 
     REQUIRE(inner.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
-    auto const casToken = inner.Get("k", clock.Now())->entry.cas;
+    auto const casToken = inner.Get("k", clock.now())->entry.cas;
 
     FastCache::TracingStorage tracer { inner, logger, clock };
-    auto const r = tracer.CompareAndSwap("k", casToken, MakeBytes("hello"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto const r = tracer.CompareAndSwap("k", casToken, MakeBytes("hello"), 0, FastCache::TimePoint::max(), clock.now());
     REQUIRE_FALSE(r.has_value());
 
     auto records = logger.Snapshot();
@@ -278,11 +278,11 @@ TEST_CASE("TracingStorage emits VALUE_TOO_LARGE with bytes for Append", "[tracin
     FastCache::ManualClock clock;
 
     REQUIRE(inner.Set("k", MakeBytes("ab"), 0, FastCache::TimePoint::max()).has_value());
-    auto const casToken = inner.Get("k", clock.Now())->entry.cas;
+    auto const casToken = inner.Get("k", clock.now())->entry.cas;
 
     FastCache::TracingStorage tracer { inner, logger, clock };
     auto const suffix = MakeBytes("cde");
-    auto const r = tracer.Append("k", suffix, casToken, clock.Now());
+    auto const r = tracer.Append("k", suffix, casToken, clock.now());
     REQUIRE_FALSE(r.has_value());
 
     auto records = logger.Snapshot();
@@ -298,11 +298,11 @@ TEST_CASE("TracingStorage emits VALUE_TOO_LARGE with bytes for Prepend", "[traci
     FastCache::ManualClock clock;
 
     REQUIRE(inner.Set("k", MakeBytes("ab"), 0, FastCache::TimePoint::max()).has_value());
-    auto const casToken = inner.Get("k", clock.Now())->entry.cas;
+    auto const casToken = inner.Get("k", clock.now())->entry.cas;
 
     FastCache::TracingStorage tracer { inner, logger, clock };
     auto const prefix = MakeBytes("cde");
-    auto const r = tracer.Prepend("k", prefix, casToken, clock.Now());
+    auto const r = tracer.Prepend("k", prefix, casToken, clock.now());
     REQUIRE_FALSE(r.has_value());
 
     auto records = logger.Snapshot();
@@ -319,9 +319,9 @@ TEST_CASE("TracingStorage forwards Touch and emits TOUCHED / NOT_FOUND", "[traci
     REQUIRE(inner.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     FastCache::TracingStorage tracer { inner, logger, clock };
-    auto const touched = tracer.Touch("k", FastCache::TimePoint::max(), clock.Now());
+    auto const touched = tracer.Touch("k", FastCache::TimePoint::max(), clock.now());
     REQUIRE(touched.has_value());
-    auto const missed = tracer.Touch("nope", FastCache::TimePoint::max(), clock.Now());
+    auto const missed = tracer.Touch("nope", FastCache::TimePoint::max(), clock.now());
     REQUIRE_FALSE(missed.has_value());
 
     auto records = logger.Snapshot();
@@ -341,11 +341,11 @@ TEST_CASE("TracingStorage::PeekExpiry emits its own verb (not PEEK)", "[tracing]
     FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
     FastCache::ManualClock clock;
 
-    auto const deadline = clock.Now() + std::chrono::seconds { 30 };
+    auto const deadline = clock.now() + std::chrono::seconds { 30 };
     REQUIRE(inner.Set("k", MakeBytes("v"), 0, deadline).has_value());
 
     FastCache::TracingStorage tracer { inner, logger, clock };
-    auto const exp = tracer.PeekExpiry("k", clock.Now());
+    auto const exp = tracer.PeekExpiry("k", clock.now());
     REQUIRE(exp.has_value());
     REQUIRE(exp->has_value());
     if (exp.has_value() && exp->has_value())
@@ -367,7 +367,7 @@ TEST_CASE("TracingStorage::PeekExpiry emits NO_TTL for keys without expiry", "[t
     REQUIRE(inner.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
     FastCache::TracingStorage tracer { inner, logger, clock };
-    auto const exp = tracer.PeekExpiry("k", clock.Now());
+    auto const exp = tracer.PeekExpiry("k", clock.now());
     REQUIRE(exp.has_value());
 
     auto records = logger.Snapshot();
@@ -385,7 +385,7 @@ TEST_CASE("TracingStorage::Update forwards to the inner atomic implementation an
     FastCache::InMemoryLruStorage inner;
     FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
     FastCache::ManualClock clock;
-    auto const deadline = clock.Now() + std::chrono::seconds { 60 };
+    auto const deadline = clock.now() + std::chrono::seconds { 60 };
     REQUIRE(inner.Set("k", MakeBytes("0"), 0, deadline).has_value());
 
     FastCache::TracingStorage tracer { inner, logger, clock };
@@ -398,7 +398,7 @@ TEST_CASE("TracingStorage::Update forwards to the inner atomic implementation an
                 .action = FastCache::IStorage::UpdateAction::Store,
             };
         },
-        clock.Now());
+        clock.now());
     REQUIRE(upd.has_value());
 
     // Exactly one trace line, under the UPDATE verb.
@@ -409,7 +409,7 @@ TEST_CASE("TracingStorage::Update forwards to the inner atomic implementation an
 
     // And the inner storage preserved the TTL (Phase 1 contract holds
     // through the decorator).
-    auto const after = inner.Peek("k", clock.Now());
+    auto const after = inner.Peek("k", clock.now());
     REQUIRE(after.has_value());
     REQUIRE(after->found);
     REQUIRE(after->entry.expiry == deadline);

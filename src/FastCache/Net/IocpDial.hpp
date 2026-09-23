@@ -133,7 +133,7 @@ void SettleConnect(ConnectOp<Reactor>& op, DWORD error) noexcept
     op.error = error;
 
     if (auto waiter = std::exchange(op.waiter, ParkedWork {}); waiter.resume)
-        op.reactor->Submit(waiter);
+        op.reactor->submit(waiter);
 }
 
 } // namespace FastCache::Detail

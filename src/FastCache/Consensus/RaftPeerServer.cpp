@@ -124,12 +124,12 @@ DetachedTask PeerServerAccess::ServePeer(RaftPeerServer* self, std::unique_ptr<I
     ByteReader reader { *socket,
                         /*maxLineBytes=*/1,
                         std::max(self->_options.maxFrameBytes + RaftWire::TagSize, RaftWire::MaxHandshakePayload) };
-    auto peer = socket->PeerAddress();
+    auto peer = socket->peerAddress();
 
     if (auto proven = co_await Handshake(self, socket.get(), &reader, peer); proven.has_value())
         co_await Serve(self, &reader, std::move(peer), *std::move(proven));
 
-    socket->Close();
+    socket->close();
     self->_active.fetch_sub(1, std::memory_order_acq_rel);
 }
 
@@ -166,7 +166,7 @@ Task<std::optional<ProvenPeer>> PeerServerAccess::Handshake(RaftPeerServer* self
     // FIRST, before a byte is read. The challenge is what makes a proof unreplayable,
     // and it costs a stranger nothing it could use: a nonce is not signed by anything.
     auto const challenge = RaftWire::EncodeChallenge(handshake.Challenge());
-    if (auto const written = co_await socket->Write(challenge); !written.has_value() || *written != challenge.size())
+    if (auto const written = co_await socket->write(challenge); !written.has_value() || *written != challenge.size())
         co_return ended();
 
     auto const headerBytes = co_await reader->ReadExactly(RaftWire::HeaderSize);
@@ -233,7 +233,7 @@ Task<std::optional<ProvenPeer>> PeerServerAccess::Handshake(RaftPeerServer* self
     // SIGNED -- including the refusals, which a bare close would leave the dialler to report as
     // its key being unknown here (#1308, A1).
     auto const verdict = RaftWire::EncodeVerdict(*judgement.verdict);
-    auto const written = co_await socket->Write(verdict);
+    auto const written = co_await socket->write(verdict);
     auto const sent = written.has_value() && *written == verdict.size();
 
     switch (judgement.outcome)
@@ -407,7 +407,7 @@ void RaftPeerServer::NotePreAuthRefusal(AcceptorRefusal refusal, std::string_vie
 
     {
         auto const guard = std::scoped_lock { _reportMutex };
-        auto const now = _reactor.Clock().Now();
+        auto const now = _reactor.clock().now();
         if (now < _nextPreAuthReport)
             return;
         _nextPreAuthReport = now + PreAuthReportInterval;
@@ -426,7 +426,7 @@ void RaftPeerServer::NoteNoNonce(std::string_view peer, SecureRandomError const&
 {
     {
         auto const guard = std::scoped_lock { _reportMutex };
-        auto const now = _reactor.Clock().Now();
+        auto const now = _reactor.clock().now();
         if (now < _nextNoNonceReport)
             return;
         _nextNoNonceReport = now + PreAuthReportInterval;
@@ -478,8 +478,8 @@ Task<void> RaftPeerServer::Run()
             // to sign a verdict for. A peer whose connection is refused redials on its
             // own backoff.
             _active.fetch_sub(1, std::memory_order_acq_rel);
-            NotePreAuthRefusal(AcceptorRefusal::Full, (*accepted)->PeerAddress(), "");
-            (*accepted)->Close();
+            NotePreAuthRefusal(AcceptorRefusal::Full, (*accepted)->peerAddress(), "");
+            (*accepted)->close();
             continue;
         }
 
@@ -504,7 +504,7 @@ void RaftPeerServer::CloseAll() noexcept
         sockets = _open.sockets;
     }
     for (auto* socket: sockets)
-        socket->Close();
+        socket->close();
 }
 
 void RaftPeerServer::Shutdown() noexcept

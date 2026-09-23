@@ -34,7 +34,7 @@ bool DiscoveryService::SendBeacon()
 {
     auto const datagram = DiscoveryWire::EncodeBeacon(
         { .clusterId = _config.clusterId, .nodeId = _config.nodeId, .raftEndpoint = _config.raftEndpoint });
-    return _socket.Send(datagram, _config.beaconAddress).has_value();
+    return _socket.send(datagram, _config.beaconAddress).has_value();
 }
 
 bool DiscoveryService::IssueChallenge(DiscoveryWire::Beacon const& peer, DatagramAddress const& replyTo)
@@ -49,7 +49,7 @@ bool DiscoveryService::IssueChallenge(DiscoveryWire::Beacon const& peer, Datagra
     {
         // Withheld rather than issued with a weak nonce (#1527), and said. The line names
         // no peer: nothing about the peer is wrong, and what it claimed is unproved.
-        if (auto const now = _clock.Now(); now >= _nextNoNonceReport)
+        if (auto const now = _clock.now(); now >= _nextNoNonceReport)
         {
             _nextNoNonceReport = now + NoNonceReportInterval;
             _logger.Logf(LogLevel::Error,
@@ -66,18 +66,18 @@ bool DiscoveryService::IssueChallenge(DiscoveryWire::Beacon const& peer, Datagra
     // a beacon is unauthenticated, so anything on the segment can send one, and a
     // table that grew per datagram would be a memory-exhaustion hole reachable
     // without holding the key.
-    _pending[peer.nodeId] = Pending { .challenge = challenge, .endpoint = peer.raftEndpoint, .issuedAt = _clock.Now() };
+    _pending[peer.nodeId] = Pending { .challenge = challenge, .endpoint = peer.raftEndpoint, .issuedAt = _clock.now() };
 
     // Unicast to where the datagram actually came from, not to what it claimed.
     // A beacon that lies about its endpoint should not be able to aim this
     // node's challenges at a third party.
-    (void) _socket.Send(DiscoveryWire::EncodeChallenge(challenge), replyTo);
+    (void) _socket.send(DiscoveryWire::EncodeChallenge(challenge), replyTo);
     return true;
 }
 
 DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
 {
-    auto const received = _socket.Receive(timeout);
+    auto const received = _socket.receive(timeout);
     if (!received.has_value())
         return received.error() == DatagramWait::Closed ? DiscoveryEvent::Closed : DiscoveryEvent::Nothing;
 
@@ -123,7 +123,7 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
                     // beacon that cannot be printed at all -- and the address is
                     // what says which machine to go and look at, which is where the
                     // identity was typed.
-                    if (auto const now = _clock.Now(); now >= _nextUnnameableReport)
+                    if (auto const now = _clock.now(); now >= _nextUnnameableReport)
                     {
                         _nextUnnameableReport = now + UnnameableReportInterval;
                         _logger.Logf(LogLevel::Warn,
@@ -156,7 +156,7 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
                                                 .signature = {} };
             proof.signature =
                 _keys.SignAsSelf(DiscoveryWire::ProofMessage(*challenge, proof.nodeId, proof.raftEndpoint, proof.publicKey));
-            (void) _socket.Send(DiscoveryWire::EncodeProof(proof), received->from);
+            (void) _socket.send(DiscoveryWire::EncodeProof(proof), received->from);
             return DiscoveryEvent::ChallengeAnswered;
         }
 
@@ -257,7 +257,7 @@ DiscoveryEvent DiscoveryService::JudgeProof(DiscoveryWire::Proof const& proof,
 void DiscoveryService::ReportUnacceptedKey(bool revoked, DiscoveryWire::Proof const& proof, DatagramAddress const& from)
 {
     ++_unacceptedSinceReport;
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     if (now < _nextUnacceptedKeyReport)
         return;
     _nextUnacceptedKeyReport = now + UnacceptedKeyReportInterval;
@@ -289,7 +289,7 @@ void DiscoveryService::Maintain()
 {
     _directory.ExpireStale();
 
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     std::erase_if(_pending,
                   [this, now](auto const& entry) { return now - entry.second.issuedAt >= _config.challengeLifetime; });
 }

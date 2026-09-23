@@ -38,12 +38,12 @@ TEST_CASE("InterruptibleSleepUntil wakes at its deadline", "[async][sleep]")
     FastCache::CancellationSource source;
 
     std::optional<FastCache::WakeReason> reason;
-    auto task = Sleeper(&reactor, source.Token(), clock.Now() + 100ms, 25ms, &reason);
-    reactor.Submit(task.Native());
+    auto task = Sleeper(&reactor, source.Token(), clock.now() + 100ms, 25ms, &reason);
+    reactor.submit(task.handle());
     reactor.Drain();
     CHECK_FALSE(reason.has_value());
 
-    clock.Advance(100ms);
+    clock.advance(100ms);
     reactor.Drain();
     REQUIRE(reason.has_value());
     CHECK(FastCache::Testing::Unwrap(reason) == FastCache::WakeReason::Deadline);
@@ -61,14 +61,14 @@ TEST_CASE("InterruptibleSleepUntil is interrupted well before its deadline", "[a
     FastCache::TestReactor reactor { clock };
     FastCache::CancellationSource source;
 
-    auto const started = clock.Now();
+    auto const started = clock.now();
     std::optional<FastCache::WakeReason> reason;
     auto task = Sleeper(&reactor, source.Token(), started + 30s, 50ms, &reason);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     reactor.Drain();
 
     source.Cancel();
-    clock.Advance(50ms);
+    clock.advance(50ms);
     reactor.Drain();
 
     REQUIRE(reason.has_value());
@@ -79,7 +79,7 @@ TEST_CASE("InterruptibleSleepUntil is interrupted well before its deadline", "[a
     // that merely happened to be fast would also satisfy, so the bound is what
     // is checked -- teardown lag must not depend on how long the caller asked to
     // wait, which is the whole property a plain SleepUntil cannot give.
-    CHECK(clock.Now() - started == 50ms);
+    CHECK(clock.now() - started == 50ms);
     CHECK(reactor.PendingTimers() == 0);
     CHECK(reactor.PendingSubmissions() == 0);
 }
@@ -92,8 +92,8 @@ TEST_CASE("An already-cancelled token never touches the reactor", "[async][sleep
     source.Cancel();
 
     std::optional<FastCache::WakeReason> reason;
-    auto task = Sleeper(&reactor, source.Token(), clock.Now() + 30s, 50ms, &reason);
-    reactor.Submit(task.Native());
+    auto task = Sleeper(&reactor, source.Token(), clock.now() + 30s, 50ms, &reason);
+    reactor.submit(task.handle());
     reactor.Drain();
 
     REQUIRE(reason.has_value());
@@ -110,8 +110,8 @@ TEST_CASE("A non-positive wake bound sleeps once rather than spinning", "[async]
     FastCache::CancellationSource source;
 
     std::optional<FastCache::WakeReason> reason;
-    auto task = Sleeper(&reactor, source.Token(), clock.Now() + 100ms, FastCache::Duration::zero(), &reason);
-    reactor.Submit(task.Native());
+    auto task = Sleeper(&reactor, source.Token(), clock.now() + 100ms, FastCache::Duration::zero(), &reason);
+    reactor.submit(task.handle());
     reactor.Drain();
 
     // Exactly one parked timer, not thousands: a zero-length step resolves as
@@ -119,7 +119,7 @@ TEST_CASE("A non-positive wake bound sleeps once rather than spinning", "[async]
     // reactor thread instead of waiting.
     CHECK(reactor.PendingTimers() == 1);
 
-    clock.Advance(100ms);
+    clock.advance(100ms);
     reactor.Drain();
     REQUIRE(reason.has_value());
     CHECK(FastCache::Testing::Unwrap(reason) == FastCache::WakeReason::Deadline);
@@ -133,7 +133,7 @@ TEST_CASE("A null reactor resolves immediately, as SleepUntil does", "[async][sl
     std::optional<FastCache::WakeReason> reason;
     // No reactor means no timer wheel -- the in-memory transport's case. Driven
     // with SyncRun precisely because nothing here may suspend.
-    FastCache::SyncRun(Sleeper(nullptr, source.Token(), clock.Now() + 30s, 50ms, &reason));
+    FastCache::SyncRun(Sleeper(nullptr, source.Token(), clock.now() + 30s, 50ms, &reason));
 
     REQUIRE(reason.has_value());
     CHECK(FastCache::Testing::Unwrap(reason) == FastCache::WakeReason::Deadline);

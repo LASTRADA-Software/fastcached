@@ -98,7 +98,7 @@ class IDatagramSocket
     /// @param payload The whole message.
     /// @param to Destination.
     /// @return Nothing, or why the local stack refused it.
-    [[nodiscard]] virtual std::expected<void, NetError> Send(std::span<std::byte const> payload,
+    [[nodiscard]] virtual std::expected<void, NetError> send(std::span<std::byte const> payload,
                                                              DatagramAddress const& to) = 0;
 
     /// Wait for one datagram.
@@ -111,7 +111,7 @@ class IDatagramSocket
     /// escalated to SIGKILL.
     /// @param timeout How long to wait.
     /// @return The datagram, or why none was returned.
-    [[nodiscard]] virtual std::expected<ReceivedDatagram, DatagramWait> Receive(std::chrono::milliseconds timeout) = 0;
+    [[nodiscard]] virtual std::expected<ReceivedDatagram, DatagramWait> receive(std::chrono::milliseconds timeout) = 0;
 
     /// Stop the socket, so a parked Receive returns Closed at its next poll.
     virtual void Close() noexcept = 0;
@@ -122,7 +122,7 @@ class IDatagramSocket
     /// bind to port 0 means "the kernel chooses", and a caller that has to tell a
     /// peer where to answer needs the answer.
     /// @return The bound address; an empty host when it is not bound.
-    [[nodiscard]] virtual DatagramAddress BoundAddress() const = 0;
+    [[nodiscard]] virtual DatagramAddress boundAddress() const = 0;
 };
 
 } // namespace FastCache

@@ -18,11 +18,11 @@ void PushAndClose(FastCache::ISocket* socket, std::string_view data)
 {
     auto const bytes = FastCache::AsBytes(data);
     auto const result = FastCache::SyncRun([](FastCache::ISocket* s, std::span<std::byte const> b) -> FastCache::Task<bool> {
-        auto const r = co_await s->Write(b);
+        auto const r = co_await s->write(b);
         co_return r.has_value();
     }(socket, bytes));
     REQUIRE(result);
-    socket->Close();
+    socket->close();
 }
 
 } // namespace
@@ -75,7 +75,7 @@ TEST_CASE("ByteReader rejects lines past the cap", "[net][linereader]")
 TEST_CASE("ByteReader reports truncation on EOF before line", "[net][linereader]")
 {
     auto pair = FastCache::InMemorySocketPair::Create();
-    pair.client->Close();
+    pair.client->close();
 
     FastCache::ByteReader reader { *pair.server, 1024, 1024 };
     auto const line = FastCache::SyncRun(reader.ReadLine());

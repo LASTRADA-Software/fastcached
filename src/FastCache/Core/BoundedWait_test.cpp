@@ -272,7 +272,7 @@ TEST_CASE("A reactor wait runs out on the reactor's clock and says what it found
     {
         if (outcome.has_value())
             break;
-        clock.Advance(100ms);
+        clock.advance(100ms);
         std::ignore = reactor.Tick();
     }
 

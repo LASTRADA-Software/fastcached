@@ -43,7 +43,7 @@ std::shared_ptr<Fake> SoleOwner(ISocket& inner)
 /// @param owner The socket's only owning reference, moved in; reset from inside the resumption.
 DetachedTask WatchThenDrop(std::shared_ptr<Testing::ParkingReadableSocket> owner)
 {
-    std::ignore = co_await owner->WaitReadable();
+    std::ignore = co_await owner->waitReadable();
     owner.reset();
 }
 
@@ -52,7 +52,7 @@ DetachedTask WatchThenDrop(std::shared_ptr<Testing::ParkingReadableSocket> owner
 DetachedTask WriteThenDrop(std::shared_ptr<Testing::ParkingWritableSocket> owner)
 {
     auto const bytes = std::array { std::byte { 0x2A } };
-    std::ignore = co_await owner->Write(bytes);
+    std::ignore = co_await owner->write(bytes);
     owner.reset();
 }
 
@@ -74,7 +74,7 @@ TEST_CASE("A parking fake lets the coroutine it resumes destroy it", "[net][sock
         REQUIRE(socket->IsWatchParked());
         REQUIRE_FALSE(watched.expired());
 
-        socket->Close();
+        socket->close();
         CHECK(watched.expired());
     }
 
@@ -87,7 +87,7 @@ TEST_CASE("A parking fake lets the coroutine it resumes destroy it", "[net][sock
         REQUIRE(socket->IsWatchParked());
         REQUIRE_FALSE(watched.expired());
 
-        socket->CancelRead();
+        socket->cancelRead();
         CHECK(watched.expired());
     }
 
@@ -101,7 +101,7 @@ TEST_CASE("A parking fake lets the coroutine it resumes destroy it", "[net][sock
         REQUIRE(socket->IsWriteParked());
         REQUIRE_FALSE(watched.expired());
 
-        socket->Close();
+        socket->close();
         CHECK(watched.expired());
     }
 }

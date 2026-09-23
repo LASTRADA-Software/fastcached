@@ -73,7 +73,7 @@ TEST_CASE("NotifyingStorage does NOT fire when inner storage returns an error", 
     REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max()).has_value());
     obs.records.clear();
 
-    auto const result = notifying.Add("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max(), clock.Now());
+    auto const result = notifying.Add("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max(), clock.now());
     REQUIRE_FALSE(result.has_value());
     REQUIRE(obs.records.empty());
 }
@@ -103,7 +103,7 @@ TEST_CASE("NotifyingStorage with a null observer forwards every call to the inne
     FastCache::NotifyingStorage notifying { inner, nullptr };
 
     REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max()).has_value());
-    REQUIRE(notifying.Delete("k", clock.Now()).has_value());
+    REQUIRE(notifying.Delete("k", clock.now()).has_value());
 }
 
 TEST_CASE("NotifyingStorage fires Delete on successful Delete", "[cache][notifying-storage]")
@@ -116,7 +116,7 @@ TEST_CASE("NotifyingStorage fires Delete on successful Delete", "[cache][notifyi
     REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max()).has_value());
     obs.records.clear();
 
-    REQUIRE(notifying.Delete("k", clock.Now()).has_value());
+    REQUIRE(notifying.Delete("k", clock.now()).has_value());
     REQUIRE(obs.records.size() == 1);
     REQUIRE(obs.records[0].kind == FastCache::MutationKind::Delete);
     REQUIRE(obs.records[0].key == "k");
@@ -132,7 +132,7 @@ TEST_CASE("NotifyingStorage fires FlushDb with an empty key on FlushWithGenerati
     REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max()).has_value());
     obs.records.clear();
 
-    notifying.FlushWithGeneration(clock.Now());
+    notifying.FlushWithGeneration(clock.now());
     REQUIRE(obs.records.size() == 1);
     REQUIRE(obs.records[0].kind == FastCache::MutationKind::FlushDb);
     REQUIRE(obs.records[0].key.empty()); // whole-database event
@@ -148,7 +148,7 @@ TEST_CASE("NotifyingStorage forwards Peek without firing an event", "[cache][not
     REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max()).has_value());
     obs.records.clear();
 
-    auto const peek = notifying.Peek("k", clock.Now());
+    auto const peek = notifying.Peek("k", clock.now());
     REQUIRE(peek.has_value());
     REQUIRE(peek->found);
     REQUIRE(obs.records.empty());
@@ -172,7 +172,7 @@ TEST_CASE("NotifyingStorage Update fires Update on Store, Delete on Delete, noth
                                                         .flags = 0,
                                                         .action = FastCache::IStorage::UpdateAction::Store };
         },
-        clock.Now());
+        clock.now());
     REQUIRE(stored.has_value());
     REQUIRE(obs.records.size() == 1);
     REQUIRE(obs.records[0].kind == FastCache::MutationKind::Update);
@@ -186,7 +186,7 @@ TEST_CASE("NotifyingStorage Update fires Update on Store, Delete on Delete, noth
                                                         .flags = 0,
                                                         .action = FastCache::IStorage::UpdateAction::Unchanged };
         },
-        clock.Now());
+        clock.now());
     REQUIRE(unchanged.has_value());
     REQUIRE(obs.records.empty());
 
@@ -198,7 +198,7 @@ TEST_CASE("NotifyingStorage Update fires Update on Store, Delete on Delete, noth
                                                         .flags = 0,
                                                         .action = FastCache::IStorage::UpdateAction::Delete };
         },
-        clock.Now());
+        clock.now());
     REQUIRE(deleted.has_value());
     REQUIRE(obs.records.size() == 1);
     REQUIRE(obs.records[0].kind == FastCache::MutationKind::Delete);

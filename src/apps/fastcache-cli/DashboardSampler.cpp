@@ -25,7 +25,7 @@ Task<FrameOutcome> TakeFrame(ILiveSubscription* subscription, IClock* clock, IEx
     // latency and not part of the reading, so a stamp taken one line lower would fold that latency into
     // every rate's denominator with nothing noticing -- which is why the case for this measures time
     // passing on BOTH sides of this line.
-    outcome.takenAt = clock->Now();
+    outcome.takenAt = clock->now();
 
     // And back, BEFORE the result is used. The caller touches dashboard state, which belongs to the
     // reactor thread; returning from the pool would hand it that state on the wrong thread with nothing

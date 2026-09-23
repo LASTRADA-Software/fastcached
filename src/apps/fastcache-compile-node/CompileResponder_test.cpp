@@ -777,14 +777,14 @@ class IdleListener final: public IListener
 {
     BlockingConnector connector;
     auto socket =
-        SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+        SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
     if (!socket.has_value())
         return std::nullopt;
 
     std::size_t pulses = 0;
     auto reply =
         SyncRun([](ISocket* peer, std::vector<std::byte> request, std::size_t* seen) -> Task<std::vector<std::byte>> {
-            auto const written = co_await peer->Write(std::span<std::byte const> { request });
+            auto const written = co_await peer->write(std::span<std::byte const> { request });
             if (!written.has_value())
                 co_return std::vector<std::byte> {};
 
@@ -801,7 +801,7 @@ class IdleListener final: public IListener
                 while (received.size() < want)
                 {
                     std::array<std::byte, 4096> chunk {};
-                    auto const read = co_await peer->Read(std::span<std::byte> { chunk });
+                    auto const read = co_await peer->read(std::span<std::byte> { chunk });
                     if (!read.has_value() || *read == 0)
                         co_return std::vector<std::byte> {};
                     received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
@@ -823,7 +823,7 @@ class IdleListener final: public IListener
             }
         }((*socket).get(), std::move(frame), &pulses));
 
-    (*socket)->Close();
+    (*socket)->close();
     if (progressSeen != nullptr)
         *progressSeen = pulses;
     return reply;
@@ -877,12 +877,12 @@ class IdleListener final: public IListener
 {
     BlockingConnector connector;
     auto socket =
-        SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+        SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
     if (!socket.has_value())
         return std::nullopt;
 
     auto stream = SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
-        auto const written = co_await peer->Write(std::span<std::byte const> { request });
+        auto const written = co_await peer->write(std::span<std::byte const> { request });
         if (!written.has_value())
             co_return std::vector<std::byte> {};
 
@@ -890,14 +890,14 @@ class IdleListener final: public IListener
         while (true)
         {
             std::array<std::byte, 4096> chunk {};
-            auto const read = co_await peer->Read(std::span<std::byte> { chunk });
+            auto const read = co_await peer->read(std::span<std::byte> { chunk });
             if (!read.has_value() || *read == 0)
                 co_return received;
             received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
         }
     }((*socket).get(), std::move(frame)));
 
-    (*socket)->Close();
+    (*socket)->close();
     return stream;
 }
 

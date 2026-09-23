@@ -139,7 +139,7 @@ void DestroyTheOtherPeer(EpollFdHandler* self)
         peer->reactor->Detach(&(*peer->other)->handler);
         peer->other->reset();
     }
-    peer->reactor->Stop();
+    peer->reactor->stop();
 }
 
 } // namespace
@@ -206,7 +206,7 @@ TEST_CASE("A handler freed earlier in the same batch is not dispatched", "[epoll
     REQUIRE(::write(first->fd, &one, sizeof(one)) == sizeof(one));
     REQUIRE(::write(second->fd, &one, sizeof(one)) == sizeof(one));
 
-    reactor.Run();
+    reactor.run();
 
     // Exactly one of them acted, and the other was destroyed from inside the
     // batch rather than dispatched.
@@ -359,7 +359,7 @@ class ReentrantPark
 DetachedTask ParkOnTimerThenRepark(EpollReactor* reactor, ReentrantPark park)
 {
     (void) park;
-    co_await SleepUntil { .reactor = reactor, .deadline = reactor->Clock().Now() + 1h };
+    co_await SleepUntil { .reactor = reactor, .deadline = reactor->clock().now() + 1h };
     co_return;
 }
 

@@ -51,7 +51,7 @@ namespace
     {
         if (data.empty())
             co_return true;
-        auto const result = co_await socket->Write(AsBytes(data));
+        auto const result = co_await socket->write(AsBytes(data));
         co_return result.has_value() && *result == data.size();
     }
 
@@ -381,12 +381,12 @@ namespace
         // whose reads suspend -- turns it into a CPU spin. `FailingReadSocket` made it
         // burn 10.00 s at 99% CPU. That is `waited += poll` inverted: refusing to COUNT
         // a sleep is the recorded rule; refusing to ASSUME one is the same rule.
-        socket->SetReceiveDeadline(AdminHttpServer::FirstByteTimeout);
-        auto started = clock->Now();
+        socket->setReceiveDeadline(AdminHttpServer::FirstByteTimeout);
+        auto started = clock->now();
         while (!sawHeadEnd && buffer.size() < MaxRequestBytes)
         {
             std::array<std::byte, 1024> chunk {};
-            auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+            auto const result = co_await socket->read(std::span<std::byte> { chunk.data(), chunk.size() });
             if (!result.has_value())
             {
                 // Answered here rather than remembered in a local the code after the
@@ -422,8 +422,8 @@ namespace
                 // bound that stops a slowloris, and start the total here rather than at
                 // accept -- a peer that thought for 20 s and then asked promptly is not
                 // slow, and charging it the wait would refuse the case #828 is about.
-                socket->SetReceiveDeadline(AdminHttpServer::RequestTimeout);
-                started = clock->Now();
+                socket->setReceiveDeadline(AdminHttpServer::RequestTimeout);
+                started = clock->now();
             }
             // Rescan from three bytes before the freshly-appended region: the
             // terminator is four bytes and may straddle a chunk boundary in any of
@@ -436,7 +436,7 @@ namespace
             // byte under each `RequestTimeout` never trips it and would otherwise hold a
             // slot for `MaxRequestBytes` reads. Checked after a SUCCESSFUL read, so it
             // costs nothing on the ordinary path and cannot spin.
-            if (!sawHeadEnd && clock->Now() - started >= AdminHttpServer::HeadTimeout)
+            if (!sawHeadEnd && clock->now() - started >= AdminHttpServer::HeadTimeout)
                 co_return RequestHead { .outcome = AdminHeadOutcome::Truncated };
         }
 
@@ -591,7 +591,7 @@ Task<void> ServeAdminHttp(ISocket* socket,
     // TLS terminates here rather than in the accept loop, so a handshake failure
     // costs the same detached task a slow request does and never the loop. A
     // plaintext socket's implementation is a no-op, so this is unconditional.
-    if (!co_await socket->HandshakeIfNeeded())
+    if (!co_await socket->handshakeIfNeeded())
         co_return;
 
     auto const request = co_await ReadRequestHead(socket, clock);

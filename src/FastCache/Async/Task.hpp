@@ -275,20 +275,20 @@ class Task
 
     /// @return true if this task has run to completion (or has never started
     /// and is in the empty / moved-from state).
-    [[nodiscard]] bool IsReady() const noexcept
+    [[nodiscard]] bool done() const noexcept
     {
         return !_handle || _handle.done();
     }
 
     /// Raw access to the underlying coroutine handle. Used by reactors to
     /// post the task onto their ready queue without going through co_await.
-    [[nodiscard]] Handle Native() const noexcept
+    [[nodiscard]] Handle handle() const noexcept
     {
         return _handle;
     }
 
     /// Release ownership of the handle — caller now owns destruction.
-    [[nodiscard]] Handle Release() noexcept
+    [[nodiscard]] Handle release() noexcept
     {
         return std::exchange(_handle, {});
     }
@@ -378,15 +378,15 @@ class Task<void>
             _handle.destroy();
     }
 
-    [[nodiscard]] bool IsReady() const noexcept
+    [[nodiscard]] bool done() const noexcept
     {
         return !_handle || _handle.done();
     }
-    [[nodiscard]] Handle Native() const noexcept
+    [[nodiscard]] Handle handle() const noexcept
     {
         return _handle;
     }
-    [[nodiscard]] Handle Release() noexcept
+    [[nodiscard]] Handle release() noexcept
     {
         return std::exchange(_handle, {});
     }
@@ -486,7 +486,7 @@ namespace Detail
 template <typename T>
 T SyncRun(Task<T> task)
 {
-    auto handle = task.Native();
+    auto handle = task.handle();
     handle.resume();
     if (!handle.done())
         throw std::logic_error { "SyncRun: the task is still suspended after resume(). It awaited something "
@@ -518,7 +518,7 @@ T SyncRun(Task<T> task)
 template <typename T, std::invocable Retrieve>
 T SyncRun(Task<T> task, Retrieve&& retrieve)
 {
-    auto handle = task.Native();
+    auto handle = task.handle();
     handle.resume();
     if (handle.done())
         return Detail::SyncResult<T>(handle);
@@ -529,7 +529,7 @@ T SyncRun(Task<T> task, Retrieve&& retrieve)
                                  "with no data and no closed peer, typically). The park was retrieved and the "
                                  "task ran to its end before it was freed, but its answer is not the one the "
                                  "caller asked for." };
-    (void) task.Release();
+    (void) task.release();
     throw std::logic_error { "SyncRun: the task parked, and what was to retrieve the park did not wake it. Its "
                              "frame is leaked rather than freed while something still points into it." };
 }

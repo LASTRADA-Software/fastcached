@@ -33,7 +33,7 @@ namespace
 
 TlsSocket::TlsSocket(std::unique_ptr<ISocket> raw, TlsContext& context):
     _raw { std::move(raw) },
-    _ssl { SSL_new(context.Native()) },
+    _ssl { SSL_new(context.handle()) },
     _incoming { BIO_new(BIO_s_mem()) },
     _outgoing { BIO_new(BIO_s_mem()) }
 {
@@ -84,7 +84,7 @@ Task<std::expected<void, NetError>> TlsSocket::FlushOutgoing()
         if (n <= 0)
             co_return std::expected<void, NetError> {}; // BIO drained (memory BIO returns <0 when empty)
         auto const written =
-            co_await _raw->Write(std::span<std::byte const> { _outScratch.data(), static_cast<std::size_t>(n) });
+            co_await _raw->write(std::span<std::byte const> { _outScratch.data(), static_cast<std::size_t>(n) });
         if (!written.has_value())
             co_return std::unexpected(written.error());
     }
@@ -92,7 +92,7 @@ Task<std::expected<void, NetError>> TlsSocket::FlushOutgoing()
 
 Task<IoResult> TlsSocket::FeedIncoming()
 {
-    auto const read = co_await _raw->Read(std::span<std::byte> { _inScratch.data(), _inScratch.size() });
+    auto const read = co_await _raw->read(std::span<std::byte> { _inScratch.data(), _inScratch.size() });
     if (!read.has_value())
         co_return std::unexpected(read.error());
     if (*read == 0)
@@ -184,7 +184,7 @@ Task<IoResult> TlsSocket::PumpWrite(std::span<std::byte const> in)
     co_return IoResult { in.size() };
 }
 
-Task<std::expected<void, NetError>> TlsSocket::HandshakeIfNeeded()
+Task<std::expected<void, NetError>> TlsSocket::handshakeIfNeeded()
 {
     if (_ssl == nullptr)
         co_return std::unexpected(SslFailure(NetErrorCode::SystemError, "TLS not initialised"));
@@ -222,18 +222,18 @@ Task<std::expected<void, NetError>> TlsSocket::HandshakeIfNeeded()
 DetachedTask TlsSocket::DriveRead(IoAwaitable* awaitable, std::span<std::byte> out)
 {
     auto const result = co_await PumpRead(out);
-    awaitable->Complete(result);
+    awaitable->complete(result);
     co_return;
 }
 
 DetachedTask TlsSocket::DriveWrite(IoAwaitable* awaitable, std::span<std::byte const> in)
 {
     auto const result = co_await PumpWrite(in);
-    awaitable->Complete(result);
+    awaitable->complete(result);
     co_return;
 }
 
-IoAwaitable TlsSocket::Read(std::span<std::byte> buffer)
+IoAwaitable TlsSocket::read(std::span<std::byte> buffer)
 {
     Detail::RequireReadBuffer(buffer);
     _readView = buffer;
@@ -296,16 +296,16 @@ Task<IoResult> TlsSocket::PumpWaitReadable()
 DetachedTask TlsSocket::DriveWaitReadable(IoAwaitable* awaitable)
 {
     auto const result = co_await PumpWaitReadable();
-    awaitable->Complete(result);
+    awaitable->complete(result);
     co_return;
 }
 
-IoAwaitable TlsSocket::WaitReadable()
+IoAwaitable TlsSocket::waitReadable()
 {
     // A dead instance (partial allocation in the constructor) has no SSL to ask, and
     // every Read on it fails anyway; delegating keeps that case exactly as it was.
     if (_ssl == nullptr)
-        return _raw->WaitReadable();
+        return _raw->waitReadable();
 
     // If OpenSSL already has decoded plaintext buffered (a previous record was
     // larger than the application's last read), report ready synchronously so
@@ -327,7 +327,7 @@ IoAwaitable TlsSocket::WaitReadable()
     return awaitable;
 }
 
-IoAwaitable TlsSocket::Write(std::span<std::byte const> buffer)
+IoAwaitable TlsSocket::write(std::span<std::byte const> buffer)
 {
     _writeView = buffer;
     IoAwaitable awaitable;
@@ -340,7 +340,7 @@ IoAwaitable TlsSocket::Write(std::span<std::byte const> buffer)
     return awaitable;
 }
 
-IoAwaitable TlsSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+IoAwaitable TlsSocket::writeVectored(std::span<std::span<std::byte const> const> segments,
                                      std::shared_ptr<void const> keepAlive)
 {
     // TLS cannot cheaply gather-encrypt arbitrary segments, so we copy them into
@@ -367,13 +367,13 @@ IoAwaitable TlsSocket::WriteVectored(std::span<std::span<std::byte const> const>
     return awaitable;
 }
 
-void TlsSocket::ShutdownWrite() noexcept
+void TlsSocket::shutdownWrite() noexcept
 {
     if (_raw)
-        _raw->ShutdownWrite();
+        _raw->shutdownWrite();
 }
 
-void TlsSocket::Close() noexcept
+void TlsSocket::close() noexcept
 {
     // Deliberately no SSL_shutdown / close_notify: Close() is a synchronous
     // noexcept teardown, but flushing a close_notify alert needs an *awaited*
@@ -385,15 +385,15 @@ void TlsSocket::Close() noexcept
     // only effect is that strict clients may log a truncation warning and cannot
     // resume the TLS session. Sending close_notify cleanly would require an
     // async Shutdown() coroutine, which is out of scope here.
-    _raw->Close();
+    _raw->close();
 }
 
-void TlsSocket::CancelRead() noexcept
+void TlsSocket::cancelRead() noexcept
 {
     // One forward retires both layers. See the override's documentation for the chain
     // and for why this transport needs the override at all -- its reads PARK, which is
     // the case `ISocket::CancelRead`'s default no-op is explicitly not for (#710).
-    _raw->CancelRead();
+    _raw->cancelRead();
 }
 
 bool TlsSocket::IsClosed() const noexcept

@@ -39,7 +39,7 @@ FastCache::Task<std::string> ReadResponse(FastCache::ISocket* socket)
     while (true)
     {
         std::vector<std::byte> chunk(256);
-        auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const result = co_await socket->read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!result.has_value() || *result == 0)
             break;
         for (auto const i: std::views::iota(std::size_t { 0 }, *result))
@@ -52,7 +52,7 @@ FastCache::Task<std::string> ReadResponse(FastCache::ISocket* socket)
 
 FastCache::Task<bool> Send(FastCache::ISocket* socket, std::string_view payload)
 {
-    auto const r = co_await socket->Write(FastCache::AsBytes(payload));
+    auto const r = co_await socket->write(FastCache::AsBytes(payload));
     co_return r.has_value();
 }
 
@@ -176,9 +176,9 @@ TEST_CASE("Server accepts and serves a memcached-text client end-to-end", "[serv
 
     // Stage a client BEFORE running the server so Accept resolves
     // synchronously on the first iteration.
-    auto client = listener.ConnectClient();
+    auto client = listener.connectClient();
     REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
-    client->ShutdownWrite();
+    client->shutdownWrite();
 
     // Close the listener — pre-queued connections drain before Accept
     // observes the closed state, so the staged client still gets served.
@@ -204,8 +204,8 @@ TEST_CASE("Server with LogSource::Yes prefixes connection logs with the client I
         listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
     };
 
-    auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
-    client->ShutdownWrite(); // EOF with no bytes -> autodetect fails -> Debug log
+    auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+    client->shutdownWrite(); // EOF with no bytes -> autodetect fails -> Debug log
     listener.Close();
     FastCache::SyncRun(server.Run());
 
@@ -230,9 +230,9 @@ TEST_CASE("Server with LogSource::Yes prefixes the storage trace line with the c
         listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
     };
 
-    auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+    auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
     REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
-    client->ShutdownWrite();
+    client->shutdownWrite();
     listener.Close();
     FastCache::SyncRun(server.Run());
 
@@ -258,9 +258,9 @@ TEST_CASE("Server without --log-source leaves the storage trace line unprefixed"
     FastCache::InMemoryListener listener;
     FastCache::Server server { listener, engine, logger }; // LogSource defaults to No
 
-    auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+    auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
     REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
-    client->ShutdownWrite();
+    client->shutdownWrite();
     listener.Close();
     FastCache::SyncRun(server.Run());
 
@@ -286,9 +286,9 @@ TEST_CASE("Server: non-data commands are logged only under --log-everything", "[
         session.logEverything = logEverything;
         FastCache::Server server { listener, engine, logger, nullptr, nullptr, session, nullptr, FastCache::LogSource::Yes };
 
-        auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+        auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
         REQUIRE(FastCache::SyncRun(Send(client.get(), "version\r\nset foo 0 0 5\r\nhello\r\n")));
-        client->ShutdownWrite();
+        client->shutdownWrite();
         listener.Close();
         FastCache::SyncRun(server.Run());
         return logger.Snapshot();
@@ -325,9 +325,9 @@ TEST_CASE("Server: command logging is silent at the default Info level", "[serve
         listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
     };
 
-    auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+    auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
     REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
-    client->ShutdownWrite();
+    client->shutdownWrite();
     listener.Close();
     FastCache::SyncRun(server.Run());
 
@@ -346,8 +346,8 @@ TEST_CASE("Server with LogSource::No leaves connection logs unprefixed", "[serve
     FastCache::InMemoryListener listener;
     FastCache::Server server { listener, engine, logger }; // LogSource defaults to No
 
-    auto client = listener.ConnectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
-    client->ShutdownWrite();
+    auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
+    client->shutdownWrite();
     listener.Close();
     FastCache::SyncRun(server.Run());
 
@@ -368,9 +368,9 @@ TEST_CASE("Server drops a connection whose handler throws instead of terminating
     FastCache::InMemoryListener listener;
     FastCache::Server server { listener, engine, logger };
 
-    auto client = listener.ConnectClient();
+    auto client = listener.connectClient();
     REQUIRE(FastCache::SyncRun(Send(client.get(), "get foo\r\n")));
-    client->ShutdownWrite();
+    client->shutdownWrite();
     listener.Close();
 
     // The Get throws std::bad_alloc. Without the firewall in RunConnectionDetached
@@ -399,10 +399,10 @@ TEST_CASE("Server: a refusal over a request the connection did not finish readin
     session.maxPayloadBytes = 1024;
     FastCache::Server server { listener, engine, logger, nullptr, nullptr, session };
 
-    auto client = listener.ConnectClient();
+    auto client = listener.connectClient();
     std::string const value(4096, 'x');
     REQUIRE(FastCache::SyncRun(Send(client.get(), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4096\r\n" + value + "\r\n")));
-    client->ShutdownWrite();
+    client->shutdownWrite();
     listener.Close();
     FastCache::SyncRun(server.Run());
 
@@ -430,7 +430,7 @@ TEST_CASE("Server: a lingering connection holds its admission slot until it clos
     session.reactor = &reactor;
     FastCache::Server server { listener, engine, logger, &admission, nullptr, session };
 
-    auto client = listener.ConnectClient();
+    auto client = listener.connectClient();
     std::string const value(4096, 'x');
     REQUIRE(FastCache::SyncRun(Send(client.get(), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4096\r\n" + value + "\r\n")));
     listener.Close();
@@ -438,15 +438,15 @@ TEST_CASE("Server: a lingering connection holds its admission slot until it clos
 
     // Refused -- the refusal and the half-close have reached the client -- and still open.
     CHECK(FastCache::SyncRun(ReadResponse(client.get())).starts_with("-ERR Protocol error:"));
-    CHECK(admission.InFlight() == 1);
+    CHECK(admission.inFlight() == 1);
 
-    clock.Advance(FastCache::Connection::Linger.total - std::chrono::milliseconds { 1 });
+    clock.advance(FastCache::Connection::Linger.total - std::chrono::milliseconds { 1 });
     std::ignore = reactor.Drain();
-    CHECK(admission.InFlight() == 1);
+    CHECK(admission.inFlight() == 1);
 
-    clock.Advance(std::chrono::milliseconds { 1 });
+    clock.advance(std::chrono::milliseconds { 1 });
     std::ignore = reactor.Drain();
-    CHECK(admission.InFlight() == 0);
+    CHECK(admission.inFlight() == 0);
 }
 
 TEST_CASE("Server::Shutdown closes the listener", "[server]")
@@ -494,10 +494,10 @@ TEST_CASE("Server rejects connections when admission denies", "[server][admissio
     FastCache::AtomicMetricsSink metrics;
     FastCache::Server server { listener, engine, logger, &admission, &metrics };
 
-    auto c1 = listener.ConnectClient();
-    auto c2 = listener.ConnectClient();
-    c1->ShutdownWrite();
-    c2->ShutdownWrite();
+    auto c1 = listener.connectClient();
+    auto c2 = listener.connectClient();
+    c1->shutdownWrite();
+    c2->shutdownWrite();
 
     listener.Close();
     FastCache::SyncRun(server.Run());
@@ -520,10 +520,10 @@ TEST_CASE("Server admits + tracks ConnectionsTotal", "[server][admission]")
     FastCache::AtomicMetricsSink metrics;
     FastCache::Server server { listener, engine, logger, &admission, &metrics };
 
-    auto c1 = listener.ConnectClient();
-    auto c2 = listener.ConnectClient();
-    c1->ShutdownWrite();
-    c2->ShutdownWrite();
+    auto c1 = listener.connectClient();
+    auto c2 = listener.connectClient();
+    c1->shutdownWrite();
+    c2->shutdownWrite();
 
     listener.Close();
     FastCache::SyncRun(server.Run());
@@ -567,10 +567,10 @@ TEST_CASE("Server: ConnectionsTotalTls / ConnectionsAdmissionRejectedTls bumped 
     FastCache::AtomicMetricsSink metrics;
     FastCache::Server server { listener, engine, logger, &admission, &metrics, /*session*/ {}, tlsContext.get() };
 
-    auto c1 = listener.ConnectClient();
-    auto c2 = listener.ConnectClient();
-    c1->ShutdownWrite();
-    c2->ShutdownWrite();
+    auto c1 = listener.connectClient();
+    auto c2 = listener.connectClient();
+    c1->shutdownWrite();
+    c2->shutdownWrite();
 
     listener.Close();
     FastCache::SyncRun(server.Run());

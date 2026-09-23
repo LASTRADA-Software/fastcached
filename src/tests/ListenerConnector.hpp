@@ -30,12 +30,12 @@ class ListenerConnector final: public IConnector
     }
 
     /// @copydoc IConnector::Connect
-    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions options) override
+    [[nodiscard]] Task<SocketResult> connect(std::string host, std::uint16_t port, DialOptions options) override
     {
         std::ignore = host;
         std::ignore = port;
         std::ignore = options;
-        co_return std::unique_ptr<ISocket> { _listener.ConnectClient() };
+        co_return std::unique_ptr<ISocket> { _listener.connectClient() };
     }
 
   private:

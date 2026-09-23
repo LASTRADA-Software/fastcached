@@ -216,7 +216,7 @@ struct Dialler
     {
         transport.RequestStop();
         net.reactor.Drain();
-        net.clock.Advance(50ms);
+        net.clock.advance(50ms);
         net.reactor.Drain();
     }
 
@@ -311,7 +311,7 @@ TEST_CASE("After --cluster-forget=n3, n3's session closes and its redial is refu
     // and the one after it fails and ends the session.
     fromN3.Vote(3, "n3");
     fromN3.Vote(3, "n3");
-    network.clock.Advance(ReconnectBackoff);
+    network.clock.advance(ReconnectBackoff);
     network.reactor.Drain();
     CHECK(network.sink.received.size() == 1);
     CHECK(fromN3.transport.ConnectedPeers() == 0);

@@ -22,7 +22,7 @@ namespace
     {
         if (clock == nullptr || connectTimeout <= std::chrono::milliseconds::zero())
             return TimePoint::max();
-        return clock->Now() + connectTimeout;
+        return clock->now() + connectTimeout;
     }
 
 } // namespace
@@ -66,7 +66,7 @@ Task<SocketResult> RunConnectFlow(IAsyncAddressResolver* resolver,
         // Checked per candidate rather than once, which is what makes the budget
         // a total: without this the second candidate would start a fresh attempt
         // after the first had already consumed the whole allowance.
-        if (clock != nullptr && clock->Now() >= deadline)
+        if (clock != nullptr && clock->now() >= deadline)
         {
             failure = NetError { .code = NetErrorCode::Timeout,
                                  .systemCode = 0,
@@ -98,8 +98,8 @@ Task<SocketResult> RunConnectFlow(IAsyncAddressResolver* resolver,
         auto candidateDeadline = deadline;
         if (clock != nullptr && deadline != TimePoint::max() && remainingCandidates > 1)
         {
-            auto const left = deadline - clock->Now();
-            candidateDeadline = clock->Now() + (left / static_cast<std::int64_t>(remainingCandidates));
+            auto const left = deadline - clock->now();
+            candidateDeadline = clock->now() + (left / static_cast<std::int64_t>(remainingCandidates));
         }
         --remainingCandidates;
 

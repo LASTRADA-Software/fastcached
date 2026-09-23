@@ -61,7 +61,7 @@ BeaconOutcome PeerDirectory::NoteBeacon(std::string_view clusterId, std::string_
     if (!CanBeNamed(nodeId, raftEndpoint))
         return BeaconOutcome::Unnameable;
 
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     auto const key = std::string { nodeId };
 
     if (auto found = _peers.find(key); found != _peers.end())
@@ -110,7 +110,7 @@ bool PeerDirectory::MarkAuthenticated(std::string_view nodeId, std::string_view 
 
 std::size_t PeerDirectory::ExpireStale()
 {
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     return std::erase_if(_peers, [this, now](auto const& entry) { return now - entry.second.lastSeen >= _expiry; });
 }
 

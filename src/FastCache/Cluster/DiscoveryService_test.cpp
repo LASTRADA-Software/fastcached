@@ -141,7 +141,7 @@ struct Node
         // is nothing here that could be moved from anyway; the copies happen
         // where they can be moved out of.
         Node(bus.Open(AtEndpoint(endpoint)),
-             DatagramBus::BroadcastAddress(),
+             DatagramBus::broadcastAddress(),
              clock,
              random,
              logger,
@@ -231,7 +231,7 @@ TEST_CASE("Two nodes on one host share a beacon port and still prove their keys"
     ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     NullLogger logger;
 
-    auto const beacon = DatagramBus::BroadcastAddressOn(TestBeaconPort);
+    auto const beacon = DatagramBus::broadcastAddressOn(TestBeaconPort);
     auto const roster = SharedRoster::Of({ "first", "second" });
 
     Node first { CoHostedDatagramSocket(bus, "10.0.0.1", 40001),
@@ -335,7 +335,7 @@ TEST_CASE("A peer that cannot name itself is never challenged", "[cluster][disco
     // Until the interval has passed. The fault is a STANDING one -- a peer whose
     // identity is not text stays that way -- so an operator who starts reading the
     // log an hour later must still find it.
-    clock.Advance(DiscoveryService::UnnameableReportInterval);
+    clock.advance(DiscoveryService::UnnameableReportInterval);
     REQUIRE(rogue.service.SendBeacon());
     CHECK(listener.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
     CHECK(reported() == 2);
@@ -364,7 +364,7 @@ TEST_CASE("A proof is refused before this node logs what it claimed", "[cluster]
     // And then answers for an endpoint that is not text. The signature is not even filled
     // in: this is refused long before anything is verified.
     REQUIRE(peer.socket
-                ->Send(DiscoveryWire::EncodeProof(DiscoveryWire::Proof {
+                ->send(DiscoveryWire::EncodeProof(DiscoveryWire::Proof {
                            .nodeId = "peer", .raftEndpoint = "10.0.0.2:7000\xFF", .publicKey = {}, .signature = {} }),
                        AtEndpoint("10.0.0.1:7000"))
                 .has_value());
@@ -548,7 +548,7 @@ TEST_CASE("A proof whose signature does not verify is counted as forged and name
     REQUIRE(alice.service.SendBeacon());
     REQUIRE(bob.service.PumpOnce(1ms) == DiscoveryEvent::PeerSeen);
     REQUIRE(alice.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
-    auto const captured = alice.socket->Receive(1ms);
+    auto const captured = alice.socket->receive(1ms);
     REQUIRE(captured.has_value());
     auto const challenge = DiscoveryWire::DecodeChallenge(captured->payload);
     REQUIRE(challenge.has_value());
@@ -560,7 +560,7 @@ TEST_CASE("A proof whose signature does not verify is counted as forged and name
     };
     proof.signature = TestKeyPair("mallory").Sign(
         DiscoveryWire::ProofMessage(Unwrap(challenge), proof.nodeId, proof.raftEndpoint, proof.publicKey));
-    REQUIRE(alice.socket->Send(DiscoveryWire::EncodeProof(proof), AtEndpoint("10.0.0.2:7000")).has_value());
+    REQUIRE(alice.socket->send(DiscoveryWire::EncodeProof(proof), AtEndpoint("10.0.0.2:7000")).has_value());
 
     CHECK(bob.service.PumpOnce(1ms) == DiscoveryEvent::ProofRejected);
     CHECK(bob.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedForged) == 1);
@@ -594,7 +594,7 @@ TEST_CASE("Proofs under keys the roster does not accept are all counted and repo
     CHECK(insider.metrics.Read(IMetricsSink::Counter::DiscoveryProofsRefusedUnknownKey) == 3);
     CHECK(Warned(logger, "outsider at 10.0.0.2:7000") == 1);
 
-    clock.Advance(DiscoveryService::UnacceptedKeyReportInterval);
+    clock.advance(DiscoveryService::UnacceptedKeyReportInterval);
     CHECK(Handshake(insider, outsider) == DiscoveryEvent::PeerUnknownKey);
     CHECK(Warned(logger, "outsider at 10.0.0.2:7000") == 2);
     CHECK(Warned(logger, "3 such proof(s) since the last report") == 1);
@@ -618,7 +618,7 @@ TEST_CASE("A proof nobody asked for is refused", "[cluster][discovery][service]"
     auto const ghost = TestKeyPair("ghost");
     auto const signature = ghost.Sign(DiscoveryWire::ProofMessage(invented, "ghost", "10.0.0.9:7000", ghost.PublicKey()));
     REQUIRE(intruder
-                ->Send(DiscoveryWire::EncodeProof({ .nodeId = "ghost",
+                ->send(DiscoveryWire::EncodeProof({ .nodeId = "ghost",
                                                     .raftEndpoint = "10.0.0.9:7000",
                                                     .publicKey = ghost.PublicKey(),
                                                     .signature = signature }),
@@ -650,7 +650,7 @@ TEST_CASE("A challenge is spent once", "[cluster][discovery][service]")
     REQUIRE(alice.service.PumpOnce(1ms) == DiscoveryEvent::Ignored);
 
     // Capture the proof before Bob consumes it, then deliver it twice.
-    auto const captured = alice.socket->Receive(1ms);
+    auto const captured = alice.socket->receive(1ms);
     REQUIRE(captured.has_value());
     auto const proofDatagram = DiscoveryWire::DecodeChallenge(captured->payload);
     REQUIRE(proofDatagram.has_value());
@@ -661,12 +661,12 @@ TEST_CASE("A challenge is spent once", "[cluster][discovery][service]")
     auto const proof = DiscoveryWire::EncodeProof(
         { .nodeId = "alice", .raftEndpoint = "10.0.0.1:7000", .publicKey = pair.PublicKey(), .signature = signature });
 
-    REQUIRE(alice.socket->Send(proof, AtEndpoint("10.0.0.2:7000")).has_value());
+    REQUIRE(alice.socket->send(proof, AtEndpoint("10.0.0.2:7000")).has_value());
     CHECK(bob.service.PumpOnce(1ms) == DiscoveryEvent::PeerAuthenticated);
     CHECK(bob.service.PendingChallenges() == 0);
 
     // The replay finds no outstanding challenge and is refused.
-    REQUIRE(alice.socket->Send(proof, AtEndpoint("10.0.0.2:7000")).has_value());
+    REQUIRE(alice.socket->send(proof, AtEndpoint("10.0.0.2:7000")).has_value());
     CHECK(bob.service.PumpOnce(1ms) == DiscoveryEvent::ProofRejected);
 }
 
@@ -705,7 +705,7 @@ TEST_CASE("Discovery survives a lost beacon", "[cluster][discovery][service]")
     Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", roster };
     Node bob { bus, clock, random, logger, "bob", "10.0.0.2:7000", "prod", roster };
 
-    REQUIRE(bus.DropNext(AtEndpoint("10.0.0.2:7000"), 1) == 1);
+    REQUIRE(bus.dropNext(AtEndpoint("10.0.0.2:7000"), 1) == 1);
 
     REQUIRE(alice.service.SendBeacon());
     CHECK(bob.service.PumpOnce(1ms) == DiscoveryEvent::Nothing); // lost
@@ -739,13 +739,13 @@ TEST_CASE("A challenge expires rather than accumulating", "[cluster][discovery][
     // adding to it.
     for ([[maybe_unused]] auto const attempt: std::views::iota(0, 5))
     {
-        REQUIRE(noisy->Send(beacon, AtEndpoint("10.0.0.1:7000")).has_value());
+        REQUIRE(noisy->send(beacon, AtEndpoint("10.0.0.1:7000")).has_value());
         REQUIRE(watcher.service.PumpOnce(1ms) == DiscoveryEvent::PeerSeen);
     }
     CHECK(watcher.service.PendingChallenges() == 1);
 
     // And an unanswered challenge does not live forever.
-    clock.Advance(31s);
+    clock.advance(31s);
     watcher.service.Maintain();
     CHECK(watcher.service.PendingChallenges() == 0);
 }

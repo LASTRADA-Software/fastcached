@@ -39,7 +39,7 @@ struct MetaFixture
 
 FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view payload)
 {
-    auto const result = co_await socket->Write(FastCache::AsBytes(payload));
+    auto const result = co_await socket->write(FastCache::AsBytes(payload));
     co_return result.has_value();
 }
 
@@ -60,7 +60,7 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
     while (true)
     {
         std::vector<std::byte> chunk(256);
-        auto const r = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const r = co_await socket->read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!r.has_value() || *r == 0)
             break;
         for (auto const i: std::views::iota(std::size_t { 0 }, *r))
@@ -74,12 +74,12 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
 std::string Exchange(MetaFixture& fix, std::string_view req)
 {
     REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), req)));
-    fix.pair.client->ShutdownWrite();
+    fix.pair.client->shutdownWrite();
     FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*priming*/ {}, /*session*/ {}));
     // Close the server side so ReadAvailable always observes EOF rather than
     // parking on a reply whose length is an exact multiple of the chunk size.
     // The handler has returned, so it has nothing left to write.
-    fix.pair.server->Close();
+    fix.pair.server->close();
     return FastCache::SyncRun(ReadAvailable(fix.pair.client.get()));
 }
 
@@ -534,16 +534,16 @@ TEST_CASE("meta mg l reports seconds since the previous read (regression)", "[pr
     auto runOnce = [&](std::string_view req) {
         auto pair = FastCache::InMemorySocketPair::Create();
         REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), req)));
-        pair.client->ShutdownWrite();
+        pair.client->shutdownWrite();
         FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*priming*/ {}, /*session*/ {}));
         // See Exchange above: close the server side so the drain sees EOF instead
         // of parking on an exact-multiple-of-chunk-size reply.
-        pair.server->Close();
+        pair.server->close();
         return FastCache::SyncRun(ReadAvailable(pair.client.get()));
     };
 
     std::ignore = runOnce("set k 0 0 1\r\nA\r\nmg k\r\n"); // first read stamps lastAccess at T0
-    clock.Advance(std::chrono::seconds { 10 });
+    clock.advance(std::chrono::seconds { 10 });
     auto const r = runOnce("mg k l\r\n"); // read at T0+10 -> l10, not l0
     REQUIRE(r.contains(" l10"));
 }

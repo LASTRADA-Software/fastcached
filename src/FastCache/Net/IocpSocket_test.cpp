@@ -133,7 +133,7 @@ struct ReadOutcome
 /// @param out Where the ending is recorded, owned by the caller.
 FastCache::DetachedTask ParkOnWaitReadable(FastCache::IocpSocket* sock, ReadOutcome* out)
 {
-    auto const r = co_await sock->WaitReadable();
+    auto const r = co_await sock->waitReadable();
     out->resumed = true;
     if (r.has_value())
         out->bytes = r.value();
@@ -147,7 +147,7 @@ FastCache::DetachedTask ParkOnWaitReadable(FastCache::IocpSocket* sock, ReadOutc
 
 FastCache::DetachedTask ParkOnRead(FastCache::IocpSocket* sock, std::array<std::byte, 64>* buf, ReadOutcome* out)
 {
-    auto const r = co_await sock->Read(std::span<std::byte> { buf->data(), buf->size() });
+    auto const r = co_await sock->read(std::span<std::byte> { buf->data(), buf->size() });
     out->resumed = true;
     if (r.has_value())
         out->bytes = r.value();
@@ -164,21 +164,21 @@ FastCache::DetachedTask Echo(FastCache::IocpReactor* reactor, FastCache::IocpLis
     auto accept = co_await listener->Accept();
     if (!accept.has_value())
     {
-        reactor->Stop();
+        reactor->stop();
         co_return;
     }
     auto socket = std::move(*accept);
     // AcceptEx wrote the peer sockaddr into its output buffer; the IOCP listener
     // parses it out via GetAcceptExSockaddrs so the socket can report it.
-    *peerOut = socket->PeerAddress();
+    *peerOut = socket->peerAddress();
 
     // Read up to 64 bytes, then echo them back.
     std::array<std::byte, 64> buf {};
-    auto const r = co_await socket->Read(std::span<std::byte> { buf.data(), buf.size() });
+    auto const r = co_await socket->read(std::span<std::byte> { buf.data(), buf.size() });
     if (r.has_value() && *r > 0)
-        (void) co_await socket->Write(std::span<std::byte const> { buf.data(), *r });
-    socket->Close();
-    reactor->Stop();
+        (void) co_await socket->write(std::span<std::byte const> { buf.data(), *r });
+    socket->close();
+    reactor->stop();
     co_return;
 }
 
@@ -208,7 +208,7 @@ TEST_CASE("IocpReactor + IocpListener + IocpSocket round-trip", "[reactor][iocp]
         {
             // Asserted below, on the case's thread. Stopped here, or the accept this reactor is
             // parked on never completes and the case hangs instead of failing.
-            reactor.Stop();
+            reactor.stop();
             return;
         }
         connected = true;
@@ -222,7 +222,7 @@ TEST_CASE("IocpReactor + IocpListener + IocpSocket round-trip", "[reactor][iocp]
         ::closesocket(raw);
     } };
 
-    reactor.Run();
+    reactor.run();
     client.join();
     REQUIRE(connected);
     REQUIRE(response == "ping!");
@@ -308,9 +308,9 @@ void DrainCompletions(FastCache::IocpReactor& reactor)
 {
     std::jthread const stopper { [&reactor] {
         std::this_thread::sleep_for(std::chrono::milliseconds { 250 });
-        reactor.Stop();
+        reactor.stop();
     } };
-    reactor.Run();
+    reactor.run();
 }
 
 /// A connected loopback pair made with plain Winsock, so nothing else is under
@@ -413,7 +413,7 @@ TEST_CASE("An IocpSocket destroyed with a WSARecv in flight survives the complet
     {
         FastCache::IocpSocket sock { reactor, static_cast<std::uintptr_t>(pair.served) };
         std::array<std::byte, 64> buf {};
-        auto const pending = sock.Read(std::span<std::byte> { buf.data(), buf.size() });
+        auto const pending = sock.read(std::span<std::byte> { buf.data(), buf.size() });
         // Nothing has been sent, so the receive is genuinely outstanding. Without
         // this the case could pass having tested a synchronous completion.
         REQUIRE_FALSE(pending.await_ready());
@@ -454,7 +454,7 @@ TEST_CASE("An IocpSocket destroyed mid-write holds the payload until the kernel 
 
     {
         FastCache::IocpSocket sock { reactor, static_cast<std::uintptr_t>(pair.served) };
-        auto const pending = sock.WriteVectored(segments, payload);
+        auto const pending = sock.writeVectored(segments, payload);
         // The write must be genuinely asynchronous, or this case proves nothing.
         REQUIRE_FALSE(pending.await_ready());
         payload.reset();
@@ -506,7 +506,7 @@ TEST_CASE("CancelRead retires a parked probe before it returns", "[net][iocp][so
     // resolved synchronously and was never cancelled at all.
     REQUIRE_FALSE(watch.resumed);
 
-    sock.CancelRead();
+    sock.cancelRead();
 
     // The assertion. No drain stands between this and the line above.
     CHECK(watch.resumed);
@@ -547,7 +547,7 @@ TEST_CASE("A real read retired by CancelRead settles rather than resolving inlin
     ParkOnRead(&sock, &buf, &read);
     REQUIRE_FALSE(read.resumed);
 
-    sock.CancelRead();
+    sock.cancelRead();
 
     // Not resolved inline -- the property this case is for.
     CHECK_FALSE(read.resumed);
@@ -587,7 +587,7 @@ TEST_CASE("An aborted IOCP read is reported as Cancelled", "[net][iocp][socket][
 
     // Closing is what aborts the pending `WSARecv`, and it is also what takes the
     // socket away from `WSAGetOverlappedResult` -- both halves of the branch under test.
-    sock.Close();
+    sock.close();
     DrainCompletions(reactor);
 
     REQUIRE(read.resumed);
@@ -709,7 +709,7 @@ TEST_CASE("A read armed in the same turn as CancelRead gets its own completion",
     ParkOnRead(&sock, &firstBuf, &first);
     REQUIRE_FALSE(first.resumed);
 
-    sock.CancelRead();
+    sock.cancelRead();
 
     // The double-arm. Same reactor turn: nothing has drained the port, so the aborted
     // completion for the first `WSARecv` cannot have been dequeued yet.
@@ -809,7 +809,7 @@ TEST_CASE("CancelRead over an already-completed receive keeps the bytes", "[net]
     std::this_thread::sleep_for(std::chrono::milliseconds { 300 });
     REQUIRE_FALSE(first.resumed);
 
-    sock.CancelRead();
+    sock.cancelRead();
 
     // Arming in the same turn, which is exactly what the contract invites.
     ParkOnRead(&sock, &secondBuf, &second);

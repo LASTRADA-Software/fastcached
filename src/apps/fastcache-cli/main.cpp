@@ -311,7 +311,7 @@ class StopReactorOnExit
 
     ~StopReactorOnExit()
     {
-        _reactor.Stop();
+        _reactor.stop();
     }
 
   private:
@@ -364,7 +364,7 @@ class StopReactorOnExit
     StandardRungViews views { render, &TerminalCellWidth, sixel.has_value() ? sixel->get() : nullptr };
     ThreadDrainWait drainWait;
     std::optional<LiveEventSource> source;
-    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
+    std::jthread reactorThread { [&reactor] { reactor.run(); } };
     auto const stopReactor = StopReactorOnExit { reactor };
 
     auto ending = verb.session(context,

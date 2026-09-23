@@ -52,7 +52,7 @@ FastCache::DetachedTask ReadInto(
     FastCache::ISocket* client, std::size_t want, std::vector<std::byte>* seen, bool* done, std::string* why)
 {
     std::vector<std::byte> buffer(want);
-    auto const read = co_await client->Read(buffer);
+    auto const read = co_await client->read(buffer);
     if (read.has_value())
     {
         buffer.resize(*read);
@@ -83,7 +83,7 @@ FastCache::DetachedTask AcceptAndSend(FastCache::IocpListener* server, std::span
     }
     if (!co_await FastCache::SendAll(accepted.value().get(), payload))
         *why = "send failed";
-    accepted.value()->Close();
+    accepted.value()->close();
     co_return;
 }
 
@@ -100,7 +100,7 @@ FastCache::DetachedTask DriveExchange(FastCache::IocpReactor* loop,
                                       std::string* why,
                                       OffThreadWaits* waits)
 {
-    *out = co_await dialer->Connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = 5s });
+    *out = co_await dialer->connect("127.0.0.1", port, FastCache::DialOptions { .connectTimeout = 5s });
     auto& dialResult = out->value();
     if (dialResult.has_value() && dialResult.value() != nullptr)
     {
@@ -120,10 +120,10 @@ FastCache::DetachedTask DriveExchange(FastCache::IocpReactor* loop,
             },
             ReactorWaitOptions { .context = {}, .bound = WaitHangGuard, .rest = FastCache::Duration::zero() }));
 
-        dialResult.value()->Close();
+        dialResult.value()->close();
     }
     server->Close();
-    loop->Stop();
+    loop->stop();
     co_return;
 }
 
@@ -161,9 +161,9 @@ TEST_CASE("A ConnectEx dial connects and then actually transfers bytes", "[net][
     // Bounded: a completion that never arrives -- the shape every mistake here
     // produces -- would otherwise report as a suite timeout naming nothing.
     FastCache::DeadlineTimer const watchdog {
-        reactor, clock.Now() + 15s, [](void* state) { static_cast<FastCache::IocpReactor*>(state)->Stop(); }, &reactor
+        reactor, clock.now() + 15s, [](void* state) { static_cast<FastCache::IocpReactor*>(state)->stop(); }, &reactor
     };
-    reactor.Run();
+    reactor.run();
 
     // First, while the account of a wait that ran out is still attached.
     CHECK(waits.AllReached());
@@ -231,14 +231,14 @@ class RecordingConnectReactor final: public FastCache::IReactor
     {
     }
 
-    void Stop() noexcept override {}
+    void stop() noexcept override {}
 
-    void Submit(std::coroutine_handle<> handle) override
+    void submit(std::coroutine_handle<> handle) override
     {
         _borrowed.push_back(handle);
     }
 
-    void Submit(FastCache::ParkedWork work) override
+    void submit(FastCache::ParkedWork work) override
     {
         // Recorded separately, because `Detail::Parked` deliberately exposes only
         // the handle it would resume -- the root it may free is not something a
@@ -247,7 +247,7 @@ class RecordingConnectReactor final: public FastCache::IReactor
         _handed.emplace_back(work);
     }
 
-    void Schedule(FastCache::TimePoint /*deadline*/, std::coroutine_handle<> handle) override
+    void schedule(FastCache::TimePoint /*deadline*/, std::coroutine_handle<> handle) override
     {
         // RECORDED rather than dropped, and that is the difference between a double
         // and a more permissive stand-in: a real reactor queues this, so a double
@@ -256,7 +256,7 @@ class RecordingConnectReactor final: public FastCache::IReactor
         _borrowedTimers.push_back(handle);
     }
 
-    void Schedule(FastCache::TimePoint /*deadline*/, FastCache::ParkedWork work) override
+    void schedule(FastCache::TimePoint /*deadline*/, FastCache::ParkedWork work) override
     {
         _scheduled.emplace_back(work);
     }
@@ -270,16 +270,16 @@ class RecordingConnectReactor final: public FastCache::IReactor
     /// chain, so the entry must do neither on its way out.
     /// @param handle A handle previously submitted or scheduled here.
     /// @return Whether it was found and retracted.
-    [[nodiscard]] bool CancelPending(std::coroutine_handle<> handle) noexcept override
+    [[nodiscard]] bool cancelPending(std::coroutine_handle<> handle) noexcept override
     {
         if (!handle)
             return false;
         for (auto* container: { &_handed, &_scheduled })
         {
-            auto const found = std::ranges::find(*container, handle, &FastCache::Detail::Parked::Handle);
+            auto const found = std::ranges::find(*container, handle, &FastCache::Detail::Parked::handle);
             if (found != container->end())
             {
-                std::ignore = found->Take();
+                std::ignore = found->take();
                 container->erase(found);
                 return true;
             }
@@ -287,7 +287,7 @@ class RecordingConnectReactor final: public FastCache::IReactor
         return false;
     }
 
-    [[nodiscard]] FastCache::IClock& Clock() noexcept override
+    [[nodiscard]] FastCache::IClock& clock() noexcept override
     {
         return _clock;
     }
@@ -419,7 +419,7 @@ TEST_CASE("A ConnectEx dial some Task owns is left alone by the reactor", "[net]
         op.reactor = &reactor;
 
         auto parked = ParkOwned(&op, FrameSentinel { &counters }, &counters);
-        parked.Native().resume();
+        parked.handle().resume();
 
         REQUIRE(counters.parked == 1);
         REQUIRE(op.waiter.resume);

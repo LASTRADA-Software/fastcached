@@ -29,7 +29,7 @@ TEST_CASE("TlsContext loads a valid certificate and key", "[tls]")
 {
     auto context = FastCache::TlsContext::Create(TlsFixture("server.crt"), TlsFixture("server.key"));
     REQUIRE(context.has_value());
-    REQUIRE((*context)->Native() != nullptr);
+    REQUIRE((*context)->handle() != nullptr);
 }
 
 TEST_CASE("TlsContext fails on missing files", "[tls]")
@@ -55,9 +55,9 @@ TEST_CASE("A generated self-signed certificate is valid for the names it was giv
 
     auto const context = FastCache::TlsContext::CreateSelfSigned(names);
     REQUIRE(context.has_value());
-    REQUIRE((*context)->Native() != nullptr);
+    REQUIRE((*context)->handle() != nullptr);
 
-    auto* const cert = SSL_CTX_get0_certificate((*context)->Native());
+    auto* const cert = SSL_CTX_get0_certificate((*context)->handle());
     REQUIRE(cert != nullptr);
 
     // Asked the way a client asks, rather than by reading the extension back: what
@@ -82,7 +82,7 @@ TEST_CASE("A name is classified by what it parses as, not by how it looks", "[ne
 
     auto const context = FastCache::TlsContext::CreateSelfSigned(names);
     REQUIRE(context.has_value());
-    auto* const cert = SSL_CTX_get0_certificate((*context)->Native());
+    auto* const cert = SSL_CTX_get0_certificate((*context)->handle());
     REQUIRE(cert != nullptr);
 
     CHECK(X509_check_host(cert, "10things", 0, 0, nullptr) == 1);

@@ -71,17 +71,17 @@ void TestReactor::RunLoop()
     }
 }
 
-void TestReactor::Stop() noexcept
+void TestReactor::stop() noexcept
 {
     _stopped.store(true, std::memory_order_release);
 }
 
-void TestReactor::Submit(std::coroutine_handle<> handle)
+void TestReactor::submit(std::coroutine_handle<> handle)
 {
-    Submit(ParkedWork { .resume = handle });
+    submit(ParkedWork { .resume = handle });
 }
 
-void TestReactor::Submit(ParkedWork work)
+void TestReactor::submit(ParkedWork work)
 {
     if (!work.resume)
         return;
@@ -89,12 +89,12 @@ void TestReactor::Submit(ParkedWork work)
     _ready.emplace_back(work);
 }
 
-void TestReactor::Schedule(TimePoint deadline, std::coroutine_handle<> handle)
+void TestReactor::schedule(TimePoint deadline, std::coroutine_handle<> handle)
 {
-    Schedule(deadline, ParkedWork { .resume = handle });
+    schedule(deadline, ParkedWork { .resume = handle });
 }
 
-void TestReactor::Schedule(TimePoint deadline, ParkedWork work)
+void TestReactor::schedule(TimePoint deadline, ParkedWork work)
 {
     if (!work.resume)
         return;
@@ -104,26 +104,26 @@ void TestReactor::Schedule(TimePoint deadline, ParkedWork work)
     std::ranges::push_heap(_timers, EntryGreater);
 }
 
-bool TestReactor::CancelPending(std::coroutine_handle<> handle) noexcept
+bool TestReactor::cancelPending(std::coroutine_handle<> handle) noexcept
 {
     if (!handle)
         return false;
     std::scoped_lock const guard { _mutex };
 
-    if (auto const found = std::ranges::find(_ready, handle, &Detail::Parked::Handle); found != _ready.end())
+    if (auto const found = std::ranges::find(_ready, handle, &Detail::Parked::handle); found != _ready.end())
     {
         // Taken rather than only erased: the caller becomes the only one who may resume
         // or destroy it, so this entry must do neither on its way out.
-        std::ignore = found->Take();
+        std::ignore = found->take();
         _ready.erase(found);
         return true;
     }
 
     auto const found =
-        std::ranges::find(_timers, handle, [](ScheduledEntry const& entry) noexcept { return entry.parked.Handle(); });
+        std::ranges::find(_timers, handle, [](ScheduledEntry const& entry) noexcept { return entry.parked.handle(); });
     if (found == _timers.end())
         return false;
-    std::ignore = found->parked.Take();
+    std::ignore = found->parked.take();
     // Erased and re-heaped rather than popped: this entry is somewhere in the
     // middle of the heap, not at its root.
     _timers.erase(found);
@@ -131,7 +131,7 @@ bool TestReactor::CancelPending(std::coroutine_handle<> handle) noexcept
     return true;
 }
 
-IClock& TestReactor::Clock() noexcept
+IClock& TestReactor::clock() noexcept
 {
     return _clock;
 }
@@ -139,7 +139,7 @@ IClock& TestReactor::Clock() noexcept
 void TestReactor::FireExpiredTimers()
 {
     // Caller holds `_mutex`.
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     while (!_timers.empty() && _timers.front().deadline <= now)
     {
         std::ranges::pop_heap(_timers, EntryGreater);
@@ -167,7 +167,7 @@ std::size_t TestReactor::Tick()
     // never also freed by the entry going out of scope here.
     while (!batch.empty())
     {
-        batch.front().Resume();
+        batch.front().resume();
         batch.pop_front();
     }
     return drained;

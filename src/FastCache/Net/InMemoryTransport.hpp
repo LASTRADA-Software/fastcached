@@ -36,7 +36,7 @@ class InMemoryPipe
     std::size_t Push(std::span<std::byte const> bytes);
 
     /// Mark the writing end as closed. Any blocked Read resumes with EOF.
-    void CloseWrite() noexcept;
+    void closeWrite() noexcept;
 
     /// Mark the READING end as closed: the socket that reads this pipe has gone.
     ///
@@ -45,10 +45,10 @@ class InMemoryPipe
     /// accepted and answered by an RST; a peer that closed with bytes still unread sent
     /// the RST at once. `InMemorySocket` reads the answer and does the rest.
     /// @return true when bytes were still unread, i.e. when the close was a RESET.
-    bool CloseRead() noexcept;
+    bool closeRead() noexcept;
 
     /// @return true once the reading end has closed.
-    [[nodiscard]] bool IsReadClosed() const noexcept
+    [[nodiscard]] bool isReadClosed() const noexcept
     {
         return _readClosed;
     }
@@ -65,13 +65,13 @@ class InMemoryPipe
     void Reset(NetErrorCode code) noexcept;
 
     /// @return true once a reset has been delivered in this direction.
-    [[nodiscard]] bool IsReset() const noexcept
+    [[nodiscard]] bool isReset() const noexcept
     {
         return _reset;
     }
 
     /// @return What a reset in this direction reports; meaningful once `IsReset()`.
-    [[nodiscard]] NetErrorCode ResetCode() const noexcept
+    [[nodiscard]] NetErrorCode resetCode() const noexcept
     {
         return _resetCode;
     }
@@ -80,16 +80,16 @@ class InMemoryPipe
     /// IsWriteClosed() means EOF.
     /// @param into Destination span.
     /// @return Bytes copied; <= into.size().
-    std::size_t TryPull(std::span<std::byte> into) noexcept;
+    std::size_t pull(std::span<std::byte> into) noexcept;
 
     /// @return true if the writing end has been closed.
-    [[nodiscard]] bool IsWriteClosed() const noexcept
+    [[nodiscard]] bool isWriteClosed() const noexcept
     {
         return _writeClosed;
     }
 
     /// @return Number of bytes currently buffered.
-    [[nodiscard]] std::size_t Buffered() const noexcept
+    [[nodiscard]] std::size_t buffered() const noexcept
     {
         return _buffer.size();
     }
@@ -165,11 +165,11 @@ class InMemorySocket: public ISocket
     InMemorySocket& operator=(InMemorySocket&&) = delete;
     ~InMemorySocket() override;
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override;
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override;
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override;
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override;
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> keepAlive = {}) override;
-    void Close() noexcept override;
+    void close() noexcept override;
 
     /// @copydoc ISocket::CancelRead
     ///
@@ -178,13 +178,13 @@ class InMemorySocket: public ISocket
     /// here and is not: a `Read` with nothing buffered and a peer that has not closed
     /// suspends, and the default would leave that frame for the caller's next read to
     /// drop -- #710's shape on the transport the whole suite runs through.
-    void CancelRead() noexcept override;
+    void cancelRead() noexcept override;
 
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return _closed;
     }
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return _peerAddress;
     }
@@ -196,7 +196,7 @@ class InMemorySocket: public ISocket
     /// is now an override of it: its ~45 callers are the tests that need to send a
     /// complete request, let the server consume it, and still read the response back,
     /// which is the wire's rule (*finished sending*, not *gone*) stated as a fixture.
-    void ShutdownWrite() noexcept override;
+    void shutdownWrite() noexcept override;
 
     /// @copydoc ISocket::WaitReadable
     ///
@@ -209,7 +209,7 @@ class InMemorySocket: public ISocket
     ///
     /// Resolves immediately in both directions, exactly as the default did, so no
     /// caller gains a suspension point it did not have.
-    [[nodiscard]] IoAwaitable WaitReadable() override;
+    [[nodiscard]] IoAwaitable waitReadable() override;
 
   private:
     static void OnInboundProgress(void* state) noexcept;
@@ -285,7 +285,7 @@ class InMemoryListener final: public IListener
     ///        reports via PeerAddress(); "" (the default) means none. Lets a
     ///        test assert the `--log-source` connection prefix.
     /// @return Client-side socket the test drives.
-    [[nodiscard]] std::unique_ptr<InMemorySocket> ConnectClient(std::size_t maxBytesInFlight = 0,
+    [[nodiscard]] std::unique_ptr<InMemorySocket> connectClient(std::size_t maxBytesInFlight = 0,
                                                                 std::string peerAddress = {});
 
   private:

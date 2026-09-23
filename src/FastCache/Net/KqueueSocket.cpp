@@ -273,7 +273,7 @@ void KqueueSocket::Impl::OnReadable(KqueueFdHandler* base)
         auto const peeked = ::recv(impl->handler.fd, probe.data(), probe.size(), MSG_PEEK);
         if (peeked >= 0)
         {
-            awaitable->Complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
+            awaitable->complete(IoResult { peeked == 0 ? std::size_t { 0 } : std::size_t { 1 } });
             return;
         }
 
@@ -290,10 +290,10 @@ void KqueueSocket::Impl::OnReadable(KqueueFdHandler* base)
         // with an error (#899).
         if (errno == EAGAIN || errno == EINTR)
         {
-            awaitable->Complete(IoResult { std::size_t { 1 } });
+            awaitable->complete(IoResult { std::size_t { 1 } });
             return;
         }
-        awaitable->Complete(std::unexpected(MakePosixError(errno, "recv")));
+        awaitable->complete(std::unexpected(MakePosixError(errno, "recv")));
         return;
     }
     auto buf = impl->readOp.readBuffer;
@@ -303,7 +303,7 @@ void KqueueSocket::Impl::OnReadable(KqueueFdHandler* base)
         impl->readOp.awaitable = nullptr;
         impl->readOp.readBuffer = {};
         impl->UpdateInterest();
-        awaitable->Complete(IoResult { static_cast<std::size_t>(got) });
+        awaitable->complete(IoResult { static_cast<std::size_t>(got) });
         return;
     }
     if (errno == EAGAIN || errno == EINTR)
@@ -311,7 +311,7 @@ void KqueueSocket::Impl::OnReadable(KqueueFdHandler* base)
     impl->readOp.awaitable = nullptr;
     impl->readOp.readBuffer = {};
     impl->UpdateInterest();
-    awaitable->Complete(std::unexpected(MakePosixError(errno, "recv")));
+    awaitable->complete(std::unexpected(MakePosixError(errno, "recv")));
 }
 
 void KqueueSocket::Impl::OnWritable(KqueueFdHandler* base)
@@ -336,14 +336,14 @@ void KqueueSocket::Impl::OnWritable(KqueueFdHandler* base)
             impl->writeOp.awaitable = nullptr;
             impl->writeOp.ClearVectored();
             impl->UpdateInterest();
-            awaitable->Complete(std::unexpected(MakePosixError(errno, "sendmsg")));
+            awaitable->complete(std::unexpected(MakePosixError(errno, "sendmsg")));
             return;
         }
         auto const total = impl->writeOp.writeTotal;
         impl->writeOp.awaitable = nullptr;
         impl->writeOp.ClearVectored();
         impl->UpdateInterest();
-        awaitable->Complete(IoResult { total });
+        awaitable->complete(IoResult { total });
         return;
     }
 
@@ -361,14 +361,14 @@ void KqueueSocket::Impl::OnWritable(KqueueFdHandler* base)
         impl->writeOp.awaitable = nullptr;
         impl->writeOp.writeRemaining = {};
         impl->UpdateInterest();
-        awaitable->Complete(std::unexpected(MakePosixError(errno, "send")));
+        awaitable->complete(std::unexpected(MakePosixError(errno, "send")));
         return;
     }
     auto const total = impl->writeOp.writeTotal;
     impl->writeOp.awaitable = nullptr;
     impl->writeOp.writeTotal = 0;
     impl->UpdateInterest();
-    awaitable->Complete(IoResult { total });
+    awaitable->complete(IoResult { total });
 }
 
 KqueueSocket::KqueueSocket(KqueueReactor& reactor, int fd, std::string peerAddress) noexcept:
@@ -416,16 +416,16 @@ KqueueSocket::~KqueueSocket()
 {
     if (_impl)
         Detail::AssertTeardownIsSerialisedWithDispatch(_impl->reactor);
-    KqueueSocket::Close();
+    KqueueSocket::close();
 }
 
-void KqueueSocket::ShutdownWrite() noexcept
+void KqueueSocket::shutdownWrite() noexcept
 {
     if (!_closed)
         Detail::HalfCloseWrite(static_cast<Detail::NativeSocket>(_fd));
 }
 
-void KqueueSocket::CancelRead() noexcept
+void KqueueSocket::cancelRead() noexcept
 {
     if (_closed || !_impl)
         return;
@@ -435,7 +435,7 @@ void KqueueSocket::CancelRead() noexcept
     Detail::RetireParkedRead(*_impl);
 }
 
-void KqueueSocket::Close() noexcept
+void KqueueSocket::close() noexcept
 {
     if (_closed)
         return;
@@ -480,7 +480,7 @@ void KqueueSocket::Close() noexcept
         // even once the first resume has taken the socket down.
         for (auto* awaitable: parked)
             if (awaitable != nullptr)
-                awaitable->Complete(
+                awaitable->complete(
                     std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
         return;
     }
@@ -512,7 +512,7 @@ namespace
 
 } // namespace
 
-IoAwaitable KqueueSocket::Read(std::span<std::byte> buffer)
+IoAwaitable KqueueSocket::read(std::span<std::byte> buffer)
 {
     Detail::RequireReadBuffer(buffer);
     if (_closed)
@@ -538,7 +538,7 @@ IoAwaitable KqueueSocket::Read(std::span<std::byte> buffer)
     return a;
 }
 
-IoAwaitable KqueueSocket::WaitReadable()
+IoAwaitable KqueueSocket::waitReadable()
 {
     if (_closed)
         return IoAwaitable { std::unexpected(
@@ -569,7 +569,7 @@ IoAwaitable KqueueSocket::WaitReadable()
     return a;
 }
 
-IoAwaitable KqueueSocket::Write(std::span<std::byte const> buffer)
+IoAwaitable KqueueSocket::write(std::span<std::byte const> buffer)
 {
     if (_closed)
         return IoAwaitable { std::unexpected(
@@ -611,7 +611,7 @@ IoAwaitable KqueueSocket::Write(std::span<std::byte const> buffer)
     return a;
 }
 
-IoAwaitable KqueueSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
+IoAwaitable KqueueSocket::writeVectored(std::span<std::span<std::byte const> const> segments,
                                         std::shared_ptr<void const> keepAlive)
 {
     if (_closed)
@@ -701,7 +701,7 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
         auto* awaitable = impl->pending;
         impl->pending = nullptr;
         std::ignore = impl->reactor.UpdateInterest(&impl->handler, false, false);
-        awaitable->Complete(std::unexpected(MakePosixError(errno, "accept")));
+        awaitable->complete(std::unexpected(MakePosixError(errno, "accept")));
         return;
     }
     PrepareOwnedFd(fd);
@@ -710,7 +710,7 @@ void KqueueListener::Impl::OnReadable(KqueueFdHandler* base)
     impl->pending = nullptr;
     std::ignore = impl->reactor.UpdateInterest(&impl->handler, false, false);
     auto peer = FormatPeerAddress(Detail::EndpointFromSockaddr(&client, static_cast<std::uint32_t>(len)));
-    awaitable->Complete(AcceptResult { std::make_unique<KqueueSocket>(impl->reactor, fd, std::move(peer)) });
+    awaitable->complete(AcceptResult { std::make_unique<KqueueSocket>(impl->reactor, fd, std::move(peer)) });
 }
 
 KqueueListener::KqueueListener() noexcept = default;
@@ -727,7 +727,7 @@ KqueueListener::~KqueueListener()
     if (_impl)
         Detail::AssertTeardownIsSerialisedWithDispatch(_impl->reactor);
 
-    KqueueListener::Close();
+    KqueueListener::close();
 }
 
 std::unique_ptr<KqueueListener> KqueueListener::Bind(KqueueReactor& reactor,
@@ -810,7 +810,7 @@ std::uint16_t KqueueListener::BoundPort() const noexcept
     return Detail::BoundPortOf(static_cast<Detail::NativeSocket>(_impl->handler.fd));
 }
 
-void KqueueListener::Close() noexcept
+void KqueueListener::close() noexcept
 {
     if (!_impl || _impl->handler.fd < 0)
         return;
@@ -821,7 +821,7 @@ void KqueueListener::Close() noexcept
     {
         auto* awaitable = _impl->pending;
         _impl->pending = nullptr;
-        awaitable->Complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
+        awaitable->complete(std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} }));
     }
 }
 

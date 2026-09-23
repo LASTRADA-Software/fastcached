@@ -262,14 +262,14 @@ TEST_CASE("ShardedStorage: a bounded sweep rotates across shards", "[sharded][pu
     // A ceiling of one entry reaches exactly one shard per call.
     for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, ShardCount))
     {
-        auto const outcome = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 1 });
+        auto const outcome = storage.PurgeExpired(clock.now(), FastCache::PurgeBudget { .maxScanned = 1 });
         CHECK_FALSE(outcome.completedPass); // Shards were left unvisited.
     }
     for (auto const* shard: raw)
         CHECK(shard->sweeps.load() == 1);
 
     // With no ceiling every shard is swept in the one call.
-    std::ignore = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded());
+    std::ignore = storage.PurgeExpired(clock.now(), FastCache::PurgeBudget::Unbounded());
     for (auto const* shard: raw)
         CHECK(shard->sweeps.load() == 2);
 }
@@ -286,7 +286,7 @@ TEST_CASE("ShardedStorage round-trips Set + Get through the right shard", "[shar
 
     REQUIRE(storage->Set("foo", MakeBytes("bar"), 0, FastCache::TimePoint::max()).has_value());
 
-    auto const got = storage->Get("foo", clock.Now());
+    auto const got = storage->Get("foo", clock.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(Decode(got->entry.ValueBytes()) == "bar");
@@ -298,14 +298,14 @@ TEST_CASE("ShardedStorage Touch routes to the owning shard", "[sharded][touch]")
     auto storage = MakeSharded(4);
     FastCache::ManualClock clock;
 
-    auto const setCas = storage->Set("hello", MakeBytes("v"), 0, clock.Now() + 1s);
+    auto const setCas = storage->Set("hello", MakeBytes("v"), 0, clock.now() + 1s);
     REQUIRE(setCas.has_value());
 
-    auto const touched = storage->Touch("hello", clock.Now() + 60s, clock.Now());
+    auto const touched = storage->Touch("hello", clock.now() + 60s, clock.now());
     REQUIRE(touched.has_value());
     REQUIRE(*touched != *setCas);
 
-    auto const got = storage->Get("hello", clock.Now() + 30s);
+    auto const got = storage->Get("hello", clock.now() + 30s);
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(got->entry.cas == *touched);
@@ -315,7 +315,7 @@ TEST_CASE("ShardedStorage Touch on absent key returns KeyNotFound", "[sharded][t
 {
     auto storage = MakeSharded(4);
     FastCache::ManualClock clock;
-    auto const r = storage->Touch("nope", FastCache::TimePoint::max(), clock.Now());
+    auto const r = storage->Touch("nope", FastCache::TimePoint::max(), clock.now());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -425,11 +425,11 @@ TEST_CASE("ShardedStorage FlushWithGeneration invalidates entries in every shard
     for (auto const i: std::views::iota(0, 16))
         REQUIRE(storage->Set(std::format("k-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
 
-    storage->FlushWithGeneration(clock.Now());
+    storage->FlushWithGeneration(clock.now());
 
     for (auto const i: std::views::iota(0, 16))
     {
-        auto const got = storage->Get(std::format("k-{}", i), clock.Now());
+        auto const got = storage->Get(std::format("k-{}", i), clock.now());
         REQUIRE(got.has_value());
         REQUIRE_FALSE(got->found);
     }
@@ -456,7 +456,7 @@ TEST_CASE("Concurrent same-shard Gets serialise for a non-shared-read backend", 
     ReleaseParksOnUnwind const release { { park } }; // after the threads, so it opens the park before they join
 
     // First reader: parks inside Get while holding the unique lock.
-    reader1 = std::jthread { [&] { (void) storage.Get("any-key", clock.Now()); } };
+    reader1 = std::jthread { [&] { (void) storage.Get("any-key", clock.now()); } };
     REQUIRE(WaitUntil(
         "the first reader to park inside Get",
         [&] { return park->readInFlight.load() == 1; },
@@ -465,7 +465,7 @@ TEST_CASE("Concurrent same-shard Gets serialise for a non-shared-read backend", 
     // Second reader on the same shard: must block on the unique lock
     // and therefore not reach the stub while reader1 is still parked
     // inside Get. We confirm with a brief grace window.
-    reader2 = std::jthread { [&] { (void) storage.Get("another-key", clock.Now()); } };
+    reader2 = std::jthread { [&] { (void) storage.Get("another-key", clock.now()); } };
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(50ms);
     REQUIRE(park->readInFlight.load() == 1);
@@ -495,8 +495,8 @@ TEST_CASE("Concurrent same-shard Gets run in parallel for a shared-read backend"
     std::jthread reader1;
     std::jthread reader2;
     ReleaseParksOnUnwind const release { { park } }; // after the threads, so it opens the park before they join
-    reader1 = std::jthread { [&] { (void) storage.Get("key-a", clock.Now()); } };
-    reader2 = std::jthread { [&] { (void) storage.Get("key-b", clock.Now()); } };
+    reader1 = std::jthread { [&] { (void) storage.Get("key-a", clock.now()); } };
+    reader2 = std::jthread { [&] { (void) storage.Get("key-b", clock.now()); } };
 
     // Both readers must reach the stub concurrently while parked — proving the
     // shared lock admits them simultaneously.
@@ -557,7 +557,7 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
                 }
                 else
                 {
-                    auto const got = storage->Get(keyOf(k), clock.Now());
+                    auto const got = storage->Get(keyOf(k), clock.now());
                     if (got.has_value() && got->found)
                     {
                         auto const text = Decode(got->entry.ValueBytes());
@@ -578,7 +578,7 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
     // Every key still resolves to a legal value after the storm.
     for (auto const k: std::views::iota(0, KeyCount))
     {
-        auto const got = storage->Get(keyOf(k), clock.Now());
+        auto const got = storage->Get(keyOf(k), clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
     }
@@ -618,8 +618,8 @@ TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism
     std::jthread reader0;
     std::jthread reader1;
     ReleaseParksOnUnwind const release { { park0, park1 } }; // after the threads, so it opens the parks before they join
-    reader0 = std::jthread { [&] { (void) storage.Get(keyShard0, clock.Now()); } };
-    reader1 = std::jthread { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
+    reader0 = std::jthread { [&] { (void) storage.Get(keyShard0, clock.now()); } };
+    reader1 = std::jthread { [&] { (void) storage.Get(keyShard1, clock.now()); } };
     REQUIRE(WaitUntil(
         "a reader inside Get on each shard",
         [&] { return park0->readInFlight.load() == 1 && park1->readInFlight.load() == 1; },
@@ -676,7 +676,7 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     // A reader on the same shard MUST block — until the writer releases,
     // readInFlight on shard 0 stays at 0.
     sameShardReader = std::jthread { [&] {
-        (void) storage.Get(keyShard0, clock.Now());
+        (void) storage.Get(keyShard0, clock.now());
         sameShardReadEntered = true;
     } };
 
@@ -688,7 +688,7 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     // A reader on a DIFFERENT shard must proceed immediately — it should
     // reach the inner stub (where parkGet=true holds it) without being
     // blocked by the unrelated writer on shard 0.
-    otherShardReader = std::jthread { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
+    otherShardReader = std::jthread { [&] { (void) storage.Get(keyShard1, clock.now()); } };
     REQUIRE(WaitUntil(
         "the other shard's reader to reach Get past the writer",
         [&] { return park1->readInFlight.load() == 1; },
@@ -746,7 +746,7 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
                     std::scoped_lock const lock { oracleMu };
                     oracle.erase(key);
                 }
-                (void) storage->Delete(key, clock.Now());
+                (void) storage->Delete(key, clock.now());
             }
         }
     };
@@ -783,7 +783,7 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
     for (auto const i: std::views::iota(0, 32))
     {
         auto const key = std::format("k-{:02d}", i);
-        auto const got = storage->Get(key, clock.Now());
+        auto const got = storage->Get(key, clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.ValueBytes()) == std::format("final-{}", i));
@@ -796,18 +796,18 @@ TEST_CASE("ShardedStorage GetAndTouch refreshes expiry and returns the post-touc
     auto storage = MakeSharded(4);
     FastCache::ManualClock clock;
 
-    auto const setCas = storage->Set("k", MakeBytes("v"), 0, clock.Now() + 1s);
+    auto const setCas = storage->Set("k", MakeBytes("v"), 0, clock.now() + 1s);
     REQUIRE(setCas.has_value());
 
-    auto const gat = storage->GetAndTouch("k", clock.Now() + 60s, clock.Now());
+    auto const gat = storage->GetAndTouch("k", clock.now() + 60s, clock.now());
     REQUIRE(gat.has_value());
     REQUIRE(gat->found);
     REQUIRE(Decode(gat->entry.ValueBytes()) == "v");
     REQUIRE(gat->entry.cas != *setCas);              // touch bumped CAS
-    REQUIRE(gat->entry.expiry == clock.Now() + 60s); // and refreshed expiry
+    REQUIRE(gat->entry.expiry == clock.now() + 60s); // and refreshed expiry
 
     // Miss propagates KeyNotFound.
-    auto const miss = storage->GetAndTouch("absent", clock.Now() + 60s, clock.Now());
+    auto const miss = storage->GetAndTouch("absent", clock.now() + 60s, clock.now());
     REQUIRE_FALSE(miss.has_value());
     REQUIRE(miss.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -821,17 +821,17 @@ TEST_CASE("ShardedStorage CompareAndDelete removes only on a CAS match", "[shard
     REQUIRE(setCas.has_value());
 
     // Wrong CAS: rejected, entry survives.
-    auto const mismatch = storage->CompareAndDelete("k", *setCas + 1, clock.Now());
+    auto const mismatch = storage->CompareAndDelete("k", *setCas + 1, clock.now());
     REQUIRE_FALSE(mismatch.has_value());
     REQUIRE(mismatch.error().code == FastCache::StorageErrorCode::CasMismatch);
-    REQUIRE(storage->Get("k", clock.Now())->found);
+    REQUIRE(storage->Get("k", clock.now())->found);
 
     // Right CAS: deleted.
-    REQUIRE(storage->CompareAndDelete("k", *setCas, clock.Now()).has_value());
-    REQUIRE_FALSE(storage->Get("k", clock.Now())->found);
+    REQUIRE(storage->CompareAndDelete("k", *setCas, clock.now()).has_value());
+    REQUIRE_FALSE(storage->Get("k", clock.now())->found);
 
     // Absent key: KeyNotFound.
-    auto const absent = storage->CompareAndDelete("nope", 1, clock.Now());
+    auto const absent = storage->CompareAndDelete("nope", 1, clock.now());
     REQUIRE_FALSE(absent.has_value());
     REQUIRE(absent.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -848,7 +848,7 @@ TEST_CASE("ShardedStorage::Update preserves prior expiry on Store", "[sharded][u
     using namespace std::chrono_literals;
     auto storage = MakeSharded(4);
     FastCache::ManualClock clock;
-    auto const deadline = clock.Now() + 60s;
+    auto const deadline = clock.now() + 60s;
 
     REQUIRE(storage->Set("k", MakeBytes("0"), 0, deadline).has_value());
 
@@ -864,10 +864,10 @@ TEST_CASE("ShardedStorage::Update preserves prior expiry on Store", "[sharded][u
                 // newExpiry left nullopt → preserve prior expiry
             };
         },
-        clock.Now());
+        clock.now());
     REQUIRE(upd.has_value());
 
-    auto const after = storage->Peek("k", clock.Now());
+    auto const after = storage->Peek("k", clock.now());
     REQUIRE(after.has_value());
     REQUIRE(after->found);
     REQUIRE(after->entry.expiry == deadline);

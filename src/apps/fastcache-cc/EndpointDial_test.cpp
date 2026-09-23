@@ -30,7 +30,7 @@ namespace
 class RecordingConnector final: public IConnector
 {
   public:
-    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions /*options*/) override
+    [[nodiscard]] Task<SocketResult> connect(std::string host, std::uint16_t port, DialOptions /*options*/) override
     {
         _dials.emplace_back(std::move(host), port);
         co_return std::unexpected(

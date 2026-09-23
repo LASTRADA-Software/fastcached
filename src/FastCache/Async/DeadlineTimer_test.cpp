@@ -37,19 +37,19 @@ TEST_CASE("A deadline fires exactly once, on the reactor", "[async][deadline]")
     FastCache::TestReactor reactor { clock };
     FireCount fired;
 
-    FastCache::DeadlineTimer timer { reactor, clock.Now() + 100ms, &CountFire, &fired, 25ms };
+    FastCache::DeadlineTimer timer { reactor, clock.now() + 100ms, &CountFire, &fired, 25ms };
     reactor.Drain();
     CHECK(fired.value == 0);
-    CHECK_FALSE(timer.IsSettled());
+    CHECK_FALSE(timer.settled());
 
-    clock.Advance(100ms);
+    clock.advance(100ms);
     reactor.Drain();
     CHECK(fired.value == 1);
-    CHECK(timer.IsSettled());
+    CHECK(timer.settled());
 
     // Advancing further must not fire it again: the settled flag is claimed
     // before the callback runs, so a late wake-up finds nothing to do.
-    clock.Advance(1s);
+    clock.advance(1s);
     reactor.Drain();
     CHECK(fired.value == 1);
 }
@@ -60,9 +60,9 @@ TEST_CASE("A disarmed deadline never fires, and its frame is reclaimed", "[async
     FastCache::TestReactor reactor { clock };
     FireCount fired;
 
-    FastCache::DeadlineTimer timer { reactor, clock.Now() + 30s, &CountFire, &fired, 50ms };
+    FastCache::DeadlineTimer timer { reactor, clock.now() + 30s, &CountFire, &fired, 50ms };
     reactor.Drain();
-    timer.Disarm();
+    timer.disarm();
 
     // Within ONE poll interval, not after the 30s deadline. This is the whole
     // reason the wait is bounded and re-armed instead of parked once: a dial that
@@ -70,13 +70,13 @@ TEST_CASE("A disarmed deadline never fires, and its frame is reclaimed", "[async
     // reactor's timer heap for the rest of the budget, and `IReactor::Run`
     // returns with that heap exactly as it was -- a coroutine nobody resumes and
     // nobody ever frees.
-    clock.Advance(50ms);
+    clock.advance(50ms);
     reactor.Drain();
     CHECK(fired.value == 0);
     CHECK(reactor.PendingTimers() == 0);
     CHECK(reactor.PendingSubmissions() == 0);
 
-    clock.Advance(30s);
+    clock.advance(30s);
     reactor.Drain();
     CHECK(fired.value == 0);
 }
@@ -87,17 +87,17 @@ TEST_CASE("Disarming after the fire is a no-op", "[async][deadline]")
     FastCache::TestReactor reactor { clock };
     FireCount fired;
 
-    FastCache::DeadlineTimer timer { reactor, clock.Now() + 10ms, &CountFire, &fired, 5ms };
-    clock.Advance(10ms);
+    FastCache::DeadlineTimer timer { reactor, clock.now() + 10ms, &CountFire, &fired, 5ms };
+    clock.advance(10ms);
     reactor.Drain();
     REQUIRE(fired.value == 1);
 
     // The ordinary shape at a call site: an operation completes, disarms
     // unconditionally, and neither knows nor cares whether it won the race.
-    timer.Disarm();
-    timer.Disarm();
+    timer.disarm();
+    timer.disarm();
     CHECK(fired.value == 1);
-    CHECK(timer.IsSettled());
+    CHECK(timer.settled());
 }
 
 TEST_CASE("Destroying a timer disarms it", "[async][deadline]")
@@ -107,7 +107,7 @@ TEST_CASE("Destroying a timer disarms it", "[async][deadline]")
     FireCount fired;
 
     {
-        FastCache::DeadlineTimer const timer { reactor, clock.Now() + 100ms, &CountFire, &fired, 25ms };
+        FastCache::DeadlineTimer const timer { reactor, clock.now() + 100ms, &CountFire, &fired, 25ms };
         reactor.Drain();
     }
 
@@ -116,7 +116,7 @@ TEST_CASE("Destroying a timer disarms it", "[async][deadline]")
     // after the owner has gone is a use-after-free. The shared state outliving
     // the owner is what makes the late wake-up safe; the disarm is what makes it
     // silent.
-    clock.Advance(100ms);
+    clock.advance(100ms);
     reactor.Drain();
     CHECK(fired.value == 0);
     CHECK(reactor.PendingTimers() == 0);
@@ -128,7 +128,7 @@ TEST_CASE("A deadline already in the past fires on the next turn, not inline", "
     FastCache::TestReactor reactor { clock };
     FireCount fired;
 
-    FastCache::DeadlineTimer const timer { reactor, clock.Now() - 1s, &CountFire, &fired, 25ms };
+    FastCache::DeadlineTimer const timer { reactor, clock.now() - 1s, &CountFire, &fired, 25ms };
 
     // Not during construction: a caller must never be re-entered from its own
     // constructor, because the object it is building does not exist yet.
@@ -156,7 +156,7 @@ TEST_CASE("A disarmed deadline leaves nothing parked on the reactor", "[async][d
     FireCount fired;
 
     {
-        FastCache::DeadlineTimer const timer { reactor, clock.Now() + 1h, &CountFire, &fired, 25ms };
+        FastCache::DeadlineTimer const timer { reactor, clock.now() + 1h, &CountFire, &fired, 25ms };
         reactor.Drain();
         CHECK(reactor.PendingTimers() == 1);
     }
@@ -181,19 +181,19 @@ TEST_CASE("CancelPending hands the handle back exactly once", "[async][reactor]"
     FastCache::TestReactor reactor { clock };
 
     // Nothing this reactor holds: a handle it never saw is not the caller's to take.
-    CHECK_FALSE(reactor.CancelPending(std::coroutine_handle<> {}));
+    CHECK_FALSE(reactor.cancelPending(std::coroutine_handle<> {}));
 
     FireCount fired;
-    FastCache::DeadlineTimer timer { reactor, clock.Now() + 1h, &CountFire, &fired, 25ms };
+    FastCache::DeadlineTimer timer { reactor, clock.now() + 1h, &CountFire, &fired, 25ms };
     reactor.Drain();
     REQUIRE(reactor.PendingTimers() == 1);
 
-    timer.Disarm();
+    timer.disarm();
     CHECK(reactor.PendingTimers() == 0);
     // Idempotent, and the second call must not reach the reactor at all: the frame
     // it would name has already been destroyed, so asking again with that handle is
     // exactly the double-free this contract exists to prevent.
-    timer.Disarm();
+    timer.disarm();
     reactor.Drain();
     CHECK(reactor.PendingSubmissions() == 0);
     CHECK(fired.value == 0);
@@ -214,17 +214,17 @@ TEST_CASE("A deadline fires when a task on the same reactor moves the clock past
 
     auto const advance = [](FastCache::TestReactor* loop, FastCache::ManualClock* moving) -> FastCache::DetachedTask {
         co_await FastCache::ResumeOn { *loop };
-        moving->Advance(10s);
+        moving->advance(10s);
         co_return;
     };
 
-    FastCache::DeadlineTimer const timer { reactor, clock.Now() + 1s, &CountFire, &fired, 25ms };
+    FastCache::DeadlineTimer const timer { reactor, clock.now() + 1s, &CountFire, &fired, 25ms };
     advance(&reactor, &clock);
-    reactor.Run();
+    reactor.run();
 
-    INFO("advanced=" << std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now().time_since_epoch()).count()
+    INFO("advanced=" << std::chrono::duration_cast<std::chrono::milliseconds>(clock.now().time_since_epoch()).count()
                      << "ms pendingSubmissions=" << reactor.PendingSubmissions()
                      << " pendingTimers=" << reactor.PendingTimers());
-    CHECK(clock.Now() > FastCache::TimePoint {});
+    CHECK(clock.now() > FastCache::TimePoint {});
     CHECK(fired.value == 1);
 }

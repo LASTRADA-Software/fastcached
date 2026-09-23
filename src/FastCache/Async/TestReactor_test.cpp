@@ -31,7 +31,7 @@ struct YieldAwaitable
     }
     void await_suspend(std::coroutine_handle<> handle) const
     {
-        reactor->Submit(handle);
+        reactor->submit(handle);
     }
     void await_resume() const noexcept {}
 };
@@ -44,11 +44,11 @@ struct SleepAwaitable
 
     [[nodiscard]] bool await_ready() const noexcept
     {
-        return reactor->Clock().Now() >= deadline;
+        return reactor->clock().now() >= deadline;
     }
     void await_suspend(std::coroutine_handle<> handle) const
     {
-        reactor->Schedule(deadline, handle);
+        reactor->schedule(deadline, handle);
     }
     void await_resume() const noexcept {}
 };
@@ -88,11 +88,11 @@ TEST_CASE("TestReactor::Submit resumes a single coroutine and drains", "[reactor
 
     int counter = 0;
     auto task = CountYields(&reactor, &counter, 3);
-    reactor.Submit(task.Native());
-    reactor.Run();
+    reactor.submit(task.handle());
+    reactor.run();
 
     REQUIRE(counter == 3);
-    REQUIRE(task.IsReady());
+    REQUIRE(task.done());
     REQUIRE(reactor.PendingSubmissions() == 0);
 }
 
@@ -105,9 +105,9 @@ TEST_CASE("TestReactor processes multiple coroutines in FIFO order", "[reactor]"
     int c2 = 0;
     auto t1 = CountYields(&reactor, &c1, 2);
     auto t2 = CountYields(&reactor, &c2, 2);
-    reactor.Submit(t1.Native());
-    reactor.Submit(t2.Native());
-    reactor.Run();
+    reactor.submit(t1.handle());
+    reactor.submit(t2.handle());
+    reactor.run();
 
     REQUIRE(c1 == 2);
     REQUIRE(c2 == 2);
@@ -119,19 +119,19 @@ TEST_CASE("TestReactor::Schedule fires a timer when the clock advances", "[react
     FastCache::TestReactor reactor { clock };
 
     bool fired = false;
-    auto task = WaitUntil(&reactor, clock.Now() + 100ms, &fired);
-    reactor.Submit(task.Native());
+    auto task = WaitUntil(&reactor, clock.now() + 100ms, &fired);
+    reactor.submit(task.handle());
 
-    reactor.Run();
+    reactor.run();
     REQUIRE_FALSE(fired);
     REQUIRE(reactor.PendingTimers() == 1);
 
-    clock.Advance(99ms);
-    reactor.Run();
+    clock.advance(99ms);
+    reactor.run();
     REQUIRE_FALSE(fired);
 
-    clock.Advance(1ms);
-    reactor.Run();
+    clock.advance(1ms);
+    reactor.run();
     REQUIRE(fired);
     REQUIRE(reactor.PendingTimers() == 0);
 }
@@ -146,20 +146,20 @@ TEST_CASE("TestReactor fires timers in deadline order with FIFO tiebreak", "[rea
     bool firedSame1 = false;
     bool firedSame2 = false;
 
-    auto const start = clock.Now();
+    auto const start = clock.now();
     auto early = WaitUntil(&reactor, start + 10ms, &firedEarly);
     auto late = WaitUntil(&reactor, start + 50ms, &firedLate);
     auto same1 = WaitUntil(&reactor, start + 25ms, &firedSame1);
     auto same2 = WaitUntil(&reactor, start + 25ms, &firedSame2);
 
-    reactor.Submit(early.Native());
-    reactor.Submit(late.Native());
-    reactor.Submit(same1.Native());
-    reactor.Submit(same2.Native());
-    reactor.Run();
+    reactor.submit(early.handle());
+    reactor.submit(late.handle());
+    reactor.submit(same1.handle());
+    reactor.submit(same2.handle());
+    reactor.run();
 
-    clock.Advance(100ms);
-    reactor.Run();
+    clock.advance(100ms);
+    reactor.run();
     REQUIRE(firedEarly);
     REQUIRE(firedLate);
     REQUIRE(firedSame1);
@@ -173,9 +173,9 @@ TEST_CASE("TestReactor::Stop short-circuits the loop", "[reactor]")
 
     int counter = 0;
     auto task = CountYields(&reactor, &counter, 10);
-    reactor.Submit(task.Native());
-    reactor.Stop();
-    reactor.Run();
+    reactor.submit(task.handle());
+    reactor.stop();
+    reactor.run();
 
     // Stop() requested before Run(): no ticks happen.
     REQUIRE(counter == 0);
@@ -221,9 +221,9 @@ TEST_CASE("TestReactor accepts Submit and Schedule from many threads", "[reactor
                 // because they are two containers and only one of them being
                 // guarded would still pass a test that used either alone.
                 if ((i % 2) == 0)
-                    reactor.Submit(task.Native());
+                    reactor.submit(task.handle());
                 else
-                    reactor.Schedule(clock.Now(), task.Native());
+                    reactor.schedule(clock.now(), task.handle());
             }
         });
     }

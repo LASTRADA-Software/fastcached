@@ -51,7 +51,7 @@ constexpr std::size_t MaxPayload = 4096;
 /// @return What the read answered.
 Task<IoResult> ReadOnce(ISocket* socket, std::span<std::byte> buffer)
 {
-    co_return co_await socket->Read(buffer);
+    co_return co_await socket->read(buffer);
 }
 
 /// One write to @p socket.
@@ -60,7 +60,7 @@ Task<IoResult> ReadOnce(ISocket* socket, std::span<std::byte> buffer)
 /// @return What the write answered.
 Task<IoResult> WriteOnce(ISocket* socket, std::vector<std::byte> bytes)
 {
-    co_return co_await socket->Write(std::span<std::byte const> { bytes });
+    co_return co_await socket->write(std::span<std::byte const> { bytes });
 }
 
 /// Everything @p socket holds now, in one read.
@@ -75,7 +75,7 @@ Task<IoResult> WriteOnce(ISocket* socket, std::vector<std::byte> bytes)
 [[nodiscard]] std::expected<std::vector<std::byte>, NetError> ReadAvailable(ISocket& socket)
 {
     auto buffer = std::vector<std::byte>(4 * MaxPayload);
-    auto const got = SyncRun(ReadOnce(&socket, buffer), [&socket] { socket.CancelRead(); });
+    auto const got = SyncRun(ReadOnce(&socket, buffer), [&socket] { socket.cancelRead(); });
     if (!got.has_value())
         return std::unexpected(got.error());
     buffer.resize(*got);
@@ -324,7 +324,7 @@ TEST_CASE("A peer that stops sending mid-frame has said goodbye, and the half fr
     auto pair = InMemorySocketPair::Create();
     auto const server = SealedServer(std::move(pair.server), "caller-to-server");
     REQUIRE(Written(*pair.client, std::span<std::byte const> { genuine }.first(genuine.size() - 1)) > 0);
-    pair.client->ShutdownWrite();
+    pair.client->shutdownWrite();
 
     auto const read = ReadAvailable(*server);
     REQUIRE(read.has_value());

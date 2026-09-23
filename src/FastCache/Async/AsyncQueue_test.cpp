@@ -28,7 +28,7 @@ FastCache::Task<void> Consume(Queue* queue, std::vector<int>* seen, bool* ended)
 {
     while (true)
     {
-        auto item = co_await queue->Pop();
+        auto item = co_await queue->pop();
         if (!item.has_value())
             break;
         seen->push_back(*item);
@@ -53,11 +53,11 @@ TEST_CASE("A push while the consumer is parked does not resume it inline", "[asy
     std::vector<int> seen;
     auto ended = false;
     auto consumer = Consume(&queue, &seen, &ended);
-    reactor.Submit(consumer.Native());
+    reactor.submit(consumer.handle());
     reactor.Drain();
-    REQUIRE(queue.HasWaiter());
+    REQUIRE(queue.hasWaiter());
 
-    auto const pushed = queue.Push(7);
+    auto const pushed = queue.push(7);
     CHECK(pushed.accepted);
     CHECK(pushed.displaced == 0);
 
@@ -71,7 +71,7 @@ TEST_CASE("A push while the consumer is parked does not resume it inline", "[asy
     queue.Close();
     reactor.Drain();
     CHECK(ended);
-    CHECK_FALSE(queue.HasWaiter());
+    CHECK_FALSE(queue.hasWaiter());
 }
 
 TEST_CASE("A pop with an item already queued does not suspend", "[async][queue]")
@@ -80,18 +80,18 @@ TEST_CASE("A pop with an item already queued does not suspend", "[async][queue]"
     FastCache::TestReactor reactor { clock };
     Queue queue { reactor, FastCache::AsyncQueueOptions {} };
 
-    CHECK(queue.Push(1).accepted);
-    CHECK(queue.Push(2).accepted);
+    CHECK(queue.push(1).accepted);
+    CHECK(queue.push(2).accepted);
 
     std::vector<int> seen;
     auto ended = false;
     auto consumer = Consume(&queue, &seen, &ended);
-    reactor.Submit(consumer.Native());
+    reactor.submit(consumer.handle());
     reactor.Drain();
 
     // Both taken without ever parking, and then parked on the empty queue.
     CHECK(seen == std::vector { 1, 2 });
-    CHECK(queue.HasWaiter());
+    CHECK(queue.hasWaiter());
 
     queue.Close();
     reactor.Drain();
@@ -107,11 +107,11 @@ TEST_CASE("Close wakes a parked consumer at once and discards what is held", "[a
     std::vector<int> seen;
     auto ended = false;
     auto consumer = Consume(&queue, &seen, &ended);
-    reactor.Submit(consumer.Native());
+    reactor.submit(consumer.handle());
     reactor.Drain();
 
-    CHECK(queue.Push(1).accepted);
-    CHECK(queue.Push(2).accepted);
+    CHECK(queue.push(1).accepted);
+    CHECK(queue.push(2).accepted);
     // Close before the consumer runs: what is queued is dropped rather than
     // drained, so teardown does not depend on the depth or on the consumer's
     // backpressure.
@@ -120,8 +120,8 @@ TEST_CASE("Close wakes a parked consumer at once and discards what is held", "[a
 
     CHECK(seen.empty());
     CHECK(ended);
-    CHECK(queue.Size() == 0);
-    CHECK(queue.IsClosed());
+    CHECK(queue.size() == 0);
+    CHECK(queue.isClosed());
 }
 
 TEST_CASE("A push after Close is refused and is not counted as displaced", "[async][queue]")
@@ -131,12 +131,12 @@ TEST_CASE("A push after Close is refused and is not counted as displaced", "[asy
     Queue queue { reactor, FastCache::AsyncQueueOptions {} };
 
     queue.Close();
-    auto const pushed = queue.Push(1);
+    auto const pushed = queue.push(1);
     CHECK_FALSE(pushed.accepted);
     // Refused is not the same fact as displaced: one says the queue is gone, the
     // other that it was full, and an operator does something different about each.
     CHECK(pushed.displaced == 0);
-    CHECK(queue.Displaced() == 0);
+    CHECK(queue.displaced() == 0);
 }
 
 TEST_CASE("DropOldest keeps the newest and reports what it displaced", "[async][queue]")
@@ -146,18 +146,18 @@ TEST_CASE("DropOldest keeps the newest and reports what it displaced", "[async][
     Queue queue { reactor,
                   FastCache::AsyncQueueOptions { .capacity = 2, .overflow = FastCache::AsyncQueueOverflow::DropOldest } };
 
-    CHECK(queue.Push(1).displaced == 0);
-    CHECK(queue.Push(2).displaced == 0);
-    auto const third = queue.Push(3);
+    CHECK(queue.push(1).displaced == 0);
+    CHECK(queue.push(2).displaced == 0);
+    auto const third = queue.push(3);
     CHECK(third.accepted);
     CHECK(third.displaced == 1);
-    CHECK(queue.Size() == 2);
-    CHECK(queue.Displaced() == 1);
+    CHECK(queue.size() == 2);
+    CHECK(queue.displaced() == 1);
 
     std::vector<int> seen;
     auto ended = false;
     auto consumer = Consume(&queue, &seen, &ended);
-    reactor.Submit(consumer.Native());
+    reactor.submit(consumer.handle());
     reactor.Drain();
     // The oldest went, and order is otherwise preserved.
     CHECK(seen == std::vector { 2, 3 });
@@ -175,17 +175,17 @@ TEST_CASE("DropNewest refuses the push instead", "[async][queue]")
     Queue queue { reactor,
                   FastCache::AsyncQueueOptions { .capacity = 2, .overflow = FastCache::AsyncQueueOverflow::DropNewest } };
 
-    CHECK(queue.Push(1).accepted);
-    CHECK(queue.Push(2).accepted);
-    auto const third = queue.Push(3);
+    CHECK(queue.push(1).accepted);
+    CHECK(queue.push(2).accepted);
+    auto const third = queue.push(3);
     CHECK_FALSE(third.accepted);
     CHECK(third.displaced == 1);
-    CHECK(queue.Size() == 2);
+    CHECK(queue.size() == 2);
 
     std::vector<int> seen;
     auto ended = false;
     auto consumer = Consume(&queue, &seen, &ended);
-    reactor.Submit(consumer.Native());
+    reactor.submit(consumer.handle());
     reactor.Drain();
     CHECK(seen == std::vector { 1, 2 });
 
@@ -204,14 +204,14 @@ TEST_CASE("A push landing between await_ready and await_suspend does not park", 
     FastCache::TestReactor reactor { clock };
     Queue queue { reactor, FastCache::AsyncQueueOptions {} };
 
-    auto awaiter = queue.Pop();
+    auto awaiter = queue.pop();
     REQUIRE_FALSE(awaiter.await_ready());
 
-    queue.Push(42);
+    queue.push(42);
 
     // false == "do not suspend, resume through the normal path".
     CHECK_FALSE(awaiter.await_suspend(std::noop_coroutine()));
-    CHECK_FALSE(queue.HasWaiter());
+    CHECK_FALSE(queue.hasWaiter());
 
     auto const item = awaiter.await_resume();
     REQUIRE(item.has_value());
@@ -230,15 +230,15 @@ TEST_CASE("A producer on another thread reaches a consumer on the reactor", "[as
     std::vector<int> seen;
     auto ended = false;
     auto consumer = Consume(&queue, &seen, &ended);
-    reactor.Submit(consumer.Native());
+    reactor.submit(consumer.handle());
     reactor.Drain();
-    REQUIRE(queue.HasWaiter());
+    REQUIRE(queue.hasWaiter());
 
     constexpr int Count = 256;
     {
         std::jthread const producer { [&] {
             for (auto const i: std::views::iota(0, Count))
-                queue.Push(i);
+                queue.push(i);
         } };
     }
 
@@ -252,7 +252,7 @@ TEST_CASE("A producer on another thread reaches a consumer on the reactor", "[as
     queue.Close();
     reactor.Drain();
     CHECK(ended);
-    CHECK_FALSE(queue.HasWaiter());
+    CHECK_FALSE(queue.hasWaiter());
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +278,7 @@ FastCache::DetachedTask ConsumeDetached(Queue* queue, FrameSentinel sentinel, Fr
 {
     (void) sentinel;
     counters->parked.fetch_add(1, std::memory_order_acq_rel);
-    auto item = co_await queue->Pop();
+    auto item = co_await queue->pop();
     (void) item;
     co_return;
 }
@@ -288,7 +288,7 @@ FastCache::Task<void> ConsumeOwned(Queue* queue, FrameSentinel sentinel, FrameCo
 {
     (void) sentinel;
     counters->parked.fetch_add(1, std::memory_order_acq_rel);
-    auto item = co_await queue->Pop();
+    auto item = co_await queue->pop();
     (void) item;
     co_return;
 }
@@ -305,12 +305,12 @@ TEST_CASE("A detached consumer submitted by Push and never dequeued is freed at 
 
         ConsumeDetached(&queue, FrameSentinel { &counters }, &counters);
         REQUIRE(counters.parked == 1);
-        REQUIRE(queue.HasWaiter());
+        REQUIRE(queue.hasWaiter());
 
         // AsyncQueue.hpp `Push`: exchanges the waiter out and submits it.
-        auto const pushed = queue.Push(7);
+        auto const pushed = queue.push(7);
         REQUIRE(pushed.accepted);
-        REQUIRE_FALSE(queue.HasWaiter());
+        REQUIRE_FALSE(queue.hasWaiter());
         // The reactor is destroyed WITHOUT draining, so the post is never dequeued.
     }
     CHECK(counters.destroyed == 1);
@@ -331,7 +331,7 @@ TEST_CASE("A detached consumer submitted by Close and never dequeued is freed at
         // hot one -- a queue closed while its consumer is parked is the ordinary way
         // a peer sender ends.
         queue.Close();
-        REQUIRE_FALSE(queue.HasWaiter());
+        REQUIRE_FALSE(queue.hasWaiter());
     }
     CHECK(counters.destroyed == 1);
 }
@@ -349,12 +349,12 @@ TEST_CASE("A consumer some Task owns is left alone by the reactor", "[async][que
         Queue queue { reactor, FastCache::AsyncQueueOptions {} };
 
         auto consumer = ConsumeOwned(&queue, FrameSentinel { &counters }, &counters);
-        reactor.Submit(consumer.Native());
+        reactor.submit(consumer.handle());
         reactor.Drain();
         REQUIRE(counters.parked == 1);
-        REQUIRE(queue.HasWaiter());
+        REQUIRE(queue.hasWaiter());
 
-        auto const pushed = queue.Push(7);
+        auto const pushed = queue.push(7);
         REQUIRE(pushed.accepted);
         // Reactor destroyed with the post undrained, exactly as above -- but this
         // frame has an owner, so it must survive until `consumer` goes out of scope.

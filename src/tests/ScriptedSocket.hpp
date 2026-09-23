@@ -61,7 +61,7 @@ class ScriptedSocket final: public ISocket
     /// Accept everything, and record it.
     /// @param bytes What the caller wrote.
     /// @return The full count; a scripted peer never applies back-pressure.
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> bytes) override
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> bytes) override
     {
         ++_sendCalls;
         _trace.push_back('S');
@@ -88,7 +88,7 @@ class ScriptedSocket final: public ISocket
         _onRead = std::move(hook);
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
     {
         if (_onRead)
             _onRead();
@@ -110,7 +110,7 @@ class ScriptedSocket final: public ISocket
     /// a test drove a vectored write through them. See the class comment.
     /// @param segments The buffers, in order.
     /// @return Their combined length.
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
                                             std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
         ++_sendCalls;
@@ -124,7 +124,7 @@ class ScriptedSocket final: public ISocket
         return IoAwaitable { IoResult { total } };
     }
 
-    void Close() noexcept override
+    void close() noexcept override
     {
         _closed = true;
     }
@@ -134,7 +134,7 @@ class ScriptedSocket final: public ISocket
         return _closed;
     }
 
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return "scripted";
     }
@@ -193,12 +193,12 @@ class ScriptedSocket final: public ISocket
 class FailingSocket final: public ISocket
 {
   public:
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> /*bytes*/) override
+    [[nodiscard]] IoAwaitable write(std::span<std::byte const> /*bytes*/) override
     {
         return IoAwaitable { std::unexpected(Reset("scripted write failure")) };
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> /*buffer*/) override
+    [[nodiscard]] IoAwaitable read(std::span<std::byte> /*buffer*/) override
     {
         return IoAwaitable { std::unexpected(Reset("scripted read failure")) };
     }
@@ -209,20 +209,20 @@ class FailingSocket final: public ISocket
     /// this class's whole contract is "every call fails", and a caller that asks
     /// `has_value()` (which is how a transport failure is told from a short write)
     /// would have been handed a success by the one method that did not honour it.
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> /*segments*/,
+    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> /*segments*/,
                                             std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
         return IoAwaitable { std::unexpected(Reset("scripted write failure")) };
     }
 
-    void Close() noexcept override {}
+    void close() noexcept override {}
 
     [[nodiscard]] bool IsClosed() const noexcept override
     {
         return false;
     }
 
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return "failing";
     }

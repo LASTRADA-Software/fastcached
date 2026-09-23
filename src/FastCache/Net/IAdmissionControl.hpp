@@ -60,7 +60,7 @@ class CountingAdmissionControl final: public IAdmissionControl
     }
 
     /// @return Current in-flight count.
-    [[nodiscard]] std::size_t InFlight() const noexcept
+    [[nodiscard]] std::size_t inFlight() const noexcept
     {
         return _in.load(std::memory_order_acquire);
     }

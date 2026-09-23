@@ -32,7 +32,7 @@ struct SyncCompleter
         awaitable.SetSuspendCallback(
             [](IoAwaitable* self, std::coroutine_handle<>) {
                 auto* const me = static_cast<SyncCompleter*>(self->CallbackState());
-                self->Complete(IoResult { me->value });
+                self->complete(IoResult { me->value });
             },
             this);
         return awaitable;
