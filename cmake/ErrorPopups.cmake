@@ -45,13 +45,13 @@ set(FASTCACHED_ERROR_DIALOG_VARIABLE "FASTCACHED_SUPPRESS_ERROR_DIALOGS")
 # whose generated registrations no walk at configure time can reach.
 set(FASTCACHED_ERROR_DIALOG_ENVIRONMENT "${FASTCACHED_ERROR_DIALOG_VARIABLE}=set:1")
 
-# Attach the suppression to every executable under src/ and vendor/.
+# Attach the suppression to every executable under src/.
 #
 # Call once, after every add_subdirectory() -- the walk reads the build system as it
 # stands, so a target added later is a target left out. That is not left to this
 # comment: the manifest the check reads is NOT taken by this walk.
 function(fastcached_suppress_error_popups)
-    fastcached_collect_executables("${CMAKE_SOURCE_DIR}" executables src vendor)
+    fastcached_collect_executables("${CMAKE_SOURCE_DIR}" executables src)
     set(source "${CMAKE_SOURCE_DIR}/src/tests/ErrorPopupsAtStartup.cpp")
 
     set(attached 0)
@@ -76,7 +76,8 @@ function(fastcached_suppress_error_popups)
     # rather than here over the walk's roots. Taken here, it would describe exactly what
     # the walk reached: a root left out of the walk and a target defined after this call
     # would both be absent from the manifest and therefore unchecked -- measured, dropping
-    # `vendor` from the roots above left the check green with fastcache-tui-tests unsuppressed.
+    # `vendor` from the roots above left the check green with the vendored TUI's test binary
+    # unsuppressed, while there was one (#1596 removed that copy, and with it the root).
     #
     # No argument is passed: a deferred call's arguments are evaluated when it RUNS, in the
     # top-level scope, where this function's `source` does not exist.

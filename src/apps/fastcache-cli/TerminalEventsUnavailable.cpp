@@ -5,7 +5,7 @@ namespace FastCache::Cli
 {
 
 /// @file TerminalEventsUnavailable.cpp
-/// The terminal contract for a build without the vendored TUI (`FASTCACHED_BUILD_TUI=OFF`).
+/// The terminal contract for a build without core-cpp's terminal UI (`FASTCACHED_BUILD_TUI=OFF`).
 ///
 /// It refuses rather than yielding an empty stream, for the header's reason: no events would read
 /// as a quiet operator, and the fact here is that this binary cannot open a terminal.

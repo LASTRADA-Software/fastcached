@@ -1804,7 +1804,7 @@ Canary() {
 
 # A compile database is not a tree that PARSES. clang-tidy reads each unit the way the
 # compiler would, so a header the build generates has to exist -- and the clang-tidy job
-# configures without building. libunicode, which the vendored TUI links, writes its
+# configures without building. libunicode, which core-cpp's terminal UI links, writes its
 # `ucd_enums.h` and eight more tables into its SOURCE directory at build time, so a CPM
 # cache that never saw a build has none of them. CI refused #1392 on exactly that
 # (`TerminalCellWidth.cpp`: 'libunicode/ucd_enums.h' file not found), where every local

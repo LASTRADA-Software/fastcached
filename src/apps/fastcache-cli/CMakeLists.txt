@@ -48,11 +48,11 @@ set(_fc_cli_sources
     FleetReading.cpp
 )
 
-# The terminal half of the dashboard's input (#1372) is the one place this binary meets the
-# vendored TUI, so it is built only where that library is. With `FASTCACHED_BUILD_TUI` off,
+# The terminal half of the dashboard's input (#1372) is the one place this binary meets core-cpp's
+# terminal UI, `core::tui`, so it is built only where that library is. With `FASTCACHED_BUILD_TUI` off,
 # `MakeTerminalEvents` still links, and refuses by saying why, so a caller asking for a
 # terminal gets a reason rather than a link error.
-if(TARGET fastcache-tui)
+if(TARGET core::tui)
     list(APPEND _fc_cli_sources TerminalEventStream.cpp TerminalEvents.cpp)
     set(_fc_cli_tui_tests TerminalEventStream_test.cpp TerminalEvents_test.cpp)
 else()
@@ -60,19 +60,19 @@ else()
     set(_fc_cli_tui_tests "")
 endif()
 
-# The Sixel rung's encoder follows the same split: `EndoSixelEncoder.cpp` is the one file that
-# includes the vendored `<tui/Sixel.hpp>`, and a build without it refuses by saying why.
-if(TARGET fastcache-tui)
-    list(APPEND _fc_cli_sources EndoSixelEncoder.cpp)
+# The Sixel rung's encoder follows the same split: `TuiSixelEncoder.cpp` is the one file that
+# includes `<core/tui/Sixel.hpp>`, and a build without it refuses by saying why.
+if(TARGET core::tui)
+    list(APPEND _fc_cli_sources TuiSixelEncoder.cpp)
     list(APPEND _fc_cli_tui_tests SixelEncoder_test.cpp)
 else()
     list(APPEND _fc_cli_sources SixelEncoderUnavailable.cpp)
 endif()
 
-# How many cells text takes on a terminal is the vendored `tui::stringWidth`, reached through
+# How many cells text takes on a terminal is core-cpp's `core::tui::stringWidth`, reached through
 # `TerminalCellWidth.cpp` alone. A build without the library has no terminal session to lay a frame
 # out for, so its twin measures nothing: it names the build and ends the process.
-if(TARGET fastcache-tui)
+if(TARGET core::tui)
     list(APPEND _fc_cli_sources TerminalCellWidth.cpp)
     list(APPEND _fc_cli_tui_tests TerminalCellWidth_test.cpp)
 else()
@@ -82,8 +82,8 @@ endif()
 add_executable(fastcache-cli main.cpp ${_fc_cli_sources})
 target_include_directories(fastcache-cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(fastcache-cli PRIVATE FastCache)
-if(TARGET fastcache-tui)
-    target_link_libraries(fastcache-cli PRIVATE fastcache-tui)
+if(TARGET core::tui)
+    target_link_libraries(fastcache-cli PRIVATE core::tui)
 endif()
 
 # The version is compiled in from the git tag rather than read at runtime, so
@@ -133,8 +133,8 @@ if(FASTCACHED_BUILD_TESTS)
     )
     target_include_directories(fastcache-cli-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(fastcache-cli-tests PRIVATE FastCache Catch2::Catch2WithMain)
-    if(TARGET fastcache-tui)
-        target_link_libraries(fastcache-cli-tests PRIVATE fastcache-tui)
+    if(TARGET core::tui)
+        target_link_libraries(fastcache-cli-tests PRIVATE core::tui)
     endif()
     target_compile_definitions(fastcache-cli-tests PRIVATE FASTCACHE_CLI_VERSION="${FASTCACHED_VERSION_STRING}")
     include(Catch)

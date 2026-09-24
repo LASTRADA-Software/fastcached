@@ -20,8 +20,8 @@ namespace FastCache::Cli
 /// The production producer of the dashboard's TERMINAL events: keystrokes, geometry and the
 /// terminal going away. And, beside them, what the terminal can draw.
 ///
-/// **This header names nothing from `vendor/`**, and that is the design rather than a tidiness
-/// preference. The endo types this is built on live in `TerminalEvents.cpp` and
+/// **This header names nothing from core-cpp**, and that is the design rather than a tidiness
+/// preference. The core-cpp types this is built on live in `TerminalEvents.cpp` and
 /// `TerminalEventStream.*`, which makes those the only place the two projects meet.
 ///
 /// **Two types, so "start before reading" is the only thing that compiles.** A terminal event
@@ -32,9 +32,9 @@ namespace FastCache::Cli
 /// the unstarted value has nothing to call, `StartTerminal` consumes it, and the event source
 /// exists only in what a successful start returns.
 ///
-/// **The events suspend on READINESS, never on a timer.** Each wait is endo's
-/// `TerminalEventSource::wait`: `::poll(2)` on POSIX, `WaitForMultipleObjects` on Windows. That
-/// wait BLOCKS, so it runs on the pool and the result is handed back: the same two-hop
+/// **The events suspend on READINESS, never on a timer.** Each wait is a core-cpp
+/// `core::net::IoBackend` watching the terminal's handles: epoll, kqueue or poll on POSIX, the
+/// completion port on Windows. That wait BLOCKS, so it runs on the pool and the result is handed back: the same two-hop
 /// `TakeFrame` uses, for the same reason. On the reactor it would stall ticks, samples and quit
 /// together.
 
@@ -137,8 +137,8 @@ struct StartedTerminal
 /// Give `pool` a thread of its own. The readiness wait parks there for as long as the operator
 /// types nothing, so a sampler sharing a one-thread pool would never run.
 ///
-/// Fails only for a reason unrelated to whether there is a terminal: the OS refusing a wakeup
-/// handle, or a build without the vendored TUI. Whether there IS a terminal is `StartTerminal`'s
+/// Fails only for a reason unrelated to whether there is a terminal: an allocation, or a build
+/// without core-cpp's terminal UI. Whether there IS a terminal is `StartTerminal`'s
 /// question.
 /// @param pool Where acquiring the terminal and each blocking wait run.
 /// @param resumeOn Where `StartTerminal` and `Next()` resume before they return.

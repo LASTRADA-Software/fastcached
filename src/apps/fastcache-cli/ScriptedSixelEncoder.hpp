@@ -20,7 +20,7 @@ namespace FastCache::Cli::Testing
 /// **Its body names the image rather than encoding it**, and that is deliberate: a view test asserts
 /// WHAT it asked to have drawn -- the dimensions, the pixels, the palette ceiling -- and this fake is
 /// what makes that the only thing it can assert. Real Sixel bytes are the quantizer's answer, so a
-/// view test comparing them would move with every change to the vendored encoder while saying nothing
+/// view test comparing them would move with every change to core-cpp's encoder while saying nothing
 /// about the view; the encoder's own bytes are pinned once, at the seam (`SixelEncoder_test.cpp`).
 
 /// One call the fake received.

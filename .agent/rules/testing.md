@@ -2092,43 +2092,24 @@ a rule that needs a check, not a better comment: `ctest -R target-file-guards`
 targets are optional from `src/apps/CMakeLists.txt`'s app table rather than
 restating them, so a new app comes under the guard by existing.
 
-**The app table is not the only place a target becomes optional**
-([#1369](https://github.com/LASTRADA-Software/fastcached/issues/1369)). The root adds
-`vendor/` only under `FASTCACHED_BUILD_TUI`, so every target `vendor/CMakeLists.txt`
-declares is as optional as an app. The check read neither file, and an unguarded
-`$<TARGET_FILE:fastcache-tui-linkprobe>` planted in `src/tests/CMakeLists.txt` passed.
-Its source set had stopped describing the tree, and a list is exact about the files it
-knows and silent about the ones it does not.
+**The app table was not always the only place a target became optional**
+([#1369](https://github.com/LASTRADA-Software/fastcached/issues/1369)). While the root added
+`vendor/` only under `FASTCACHED_BUILD_TUI`, every target `vendor/CMakeLists.txt` declared was
+as optional as an app, and an unguarded `$<TARGET_FILE:fastcache-tui-linkprobe>` planted in
+`src/tests/CMakeLists.txt` passed: the check's source set had stopped describing the tree, and
+a list is exact about the files it knows and silent about the ones it does not. #1369 added a
+SECOND reader for directories the root gates that way, as a parallel derivation with its own
+completeness argument -- never merged into the app table's counts, where a target found in
+`vendor/` could have masked a row lost from the table. #1596 moved that code to core-cpp, the
+gated directory went, and the reader and its floor went with it (its floor refused a tree that
+gates no such directory, and said to remove it then). A directory gated that way again brings
+it back from git history, not a hand-written variant.
 
-So there is a SECOND reader: every directory the root adds under a
-`FASTCACHED_BUILD_*` option outside `src/`, and the `add_library`/`add_executable` calls
-in its CMakeLists.txt. The reference scan reads those files and the root as well.
-
-**It is a parallel derivation, not a merged one.** The app table's equality between rows
-read and options counted stays over the app table alone. Folding a second source into
-that pair of counts would let a target found in `vendor/` mask a row lost from the table,
-and the equality would hold while proving nothing.
-
-The second reader has its own completeness argument, and each part is watched refuse:
-- every root `option(FASTCACHED_BUILD_...)` counted in the raw bytes must be seen
-  naming an `if()`;
-- each file's declarations read must equal the calls counted in its raw bytes;
-- a root that gates no such directory is a vacuous pass and is refused.
-
-A refusal names the source that made the target optional. It does not read a directory
-gated by a condition naming no `FASTCACHED_BUILD_*` option, a directory nested inside a
-gated one, or a target declared inside an `if()` within a file.
-
-Both readers follow `if()` chains through ONE walker, and a review of the first version
-found four ways a line-by-line `^if\((.*)\)$` goes blind. Each is now a selftest case:
-- `if(X)  # why` pushed nothing, and its `endif()` popped the frame enclosing it;
-- a condition spelled across lines was not a frame;
-- `IF(`/`ADD_EXECUTABLE(` went unread, and the raw count that should have caught it matched
-  lower case too, so 0 equalled 0 (two counts sharing an assumption are one);
-- a root-declared gated target was wrongly exempt in the root, which runs with the option
-  OFF as well.
-
-A walk that loses track now reports the line where it did.
+The frame walker it shared with the reference scan stays, and so do the cases that pin it: a
+review of the first version found ways a line-by-line `^if\((.*)\)$` goes blind -- `if(X)  #
+why` pushed nothing and its `endif()` popped the frame enclosing it, a condition spelled across
+lines was not a frame, `IF(` went unread -- and a walk that loses track now reports the line
+where it did.
 
 Three ways it refuses to pass vacuously, because each is how such a check reports
 success for work it did not do: an app table it could not read, a scan that found

@@ -12,7 +12,7 @@ namespace FastCache::Cli::Testing
 /// A cell-width function for tests that knows exactly the characters the tests use.
 ///
 /// **Not the width function, and deliberately not a general one.** Production measures text
-/// through the vendored terminal library, reached by the adapter layer; a panel test must not
+/// through core-cpp's terminal library, reached by the adapter layer; a panel test must not
 /// depend on that library's tables, and must still put WIDE and ZERO-width text through the layout
 /// -- a fixture of ASCII alone passes under a layout that counts bytes. So this names the ranges the
 /// tests draw from: CJK and fullwidth forms are two cells, combining diacritics are none, and

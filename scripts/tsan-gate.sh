@@ -742,7 +742,10 @@ ${offenders}    The BINARY may still carry a defined __tsan_init -- the link pul
 # Which archives are FIRST-PARTY is also derived: an archive this build produced is
 # third-party exactly when it sits under a dependency's binary directory as CPM
 # recorded it in `CMakeCache.txt` (`CPM_PACKAGE_<name>_BINARY_DIR`). Those stay
-# uninstrumented on purpose. A path this build did not produce -- an absolute one,
+# uninstrumented on purpose -- all but core-cpp's (#1596). The top-level CMakeLists.txt
+# instruments core-cpp's libraries target by target, because its event loop and sockets
+# are half of every race this gate exists to see, so its archives are asked about exactly
+# as this project's are: its row is left out of the dependency record by NAME below. A path this build did not produce -- an absolute one,
 # a system library -- is not asked about at all. So the classification is an
 # INCLUSION by the build's own record rather than a pattern like `_deps/`: an
 # archive nobody recorded as a dependency is treated as ours and checked, which
@@ -795,7 +798,7 @@ AssertLinkedLibrariesInstrumented() {
     build="$(cd "$BUILD_DIR" && pwd -P)"
     [[ -f "${BUILD_DIR}/CMakeCache.txt" ]] \
         || fatal "${name}: no ${BUILD_DIR}/CMakeCache.txt, so which linked archives are dependencies cannot be read."
-    recorded="$(sed -n 's/^CPM_PACKAGE_[A-Za-z0-9_]*_BINARY_DIR:INTERNAL=//p' "${BUILD_DIR}/CMakeCache.txt")"
+    recorded="$(sed -n '/^CPM_PACKAGE_core-cpp_BINARY_DIR:/d; s/^CPM_PACKAGE_[A-Za-z0-9_-]*_BINARY_DIR:INTERNAL=//p' "${BUILD_DIR}/CMakeCache.txt")"
 
     inputs="$(EdgeInputs "target/${name}")"
     if [[ -z "$inputs" ]]; then
@@ -843,7 +846,7 @@ AssertLinkedLibrariesInstrumented() {
 ${offenders}    The row's OWN objects passed, so this is a LIBRARY the sanitizer flags did not
     reach -- a target declared before \`include(Sanitizers)\` is the way the vendored
     TUI got here (#134). Give it the flags from the module's own variables, as the
-    top-level CMakeLists.txt does for \`vendor/\`, rather than exempting the library."
+    top-level CMakeLists.txt does for Monocypher and core-cpp, rather than exempting the library."
         fi
         libraries="${libraries} ${input} (${total})"
         count=$(( count + 1 ))

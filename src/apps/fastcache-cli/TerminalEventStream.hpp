@@ -18,84 +18,133 @@
 #include <utility>
 #include <vector>
 
-#include <tui/InputEvent.hpp>
-#include <tui/Terminal.hpp>
-#include <tui/runtime/EventSource.hpp>
+#include <core/net/IoBackend.hpp>
+#include <core/tui/InputEvent.hpp>
+#include <core/tui/Terminal.hpp>
+#include <core/tui/runtime/InputSource.hpp>
 
 namespace FastCache::Cli
 {
 
 /// @file TerminalEventStream.hpp
 /// The half of `TerminalEvents` that a test can drive: an `IDashboardEventSource` over any
-/// endo `EventSource`, plus the translation from endo's decoded input to dashboard events.
+/// `ITerminalInputWait`, the production wait over core-cpp's `core::tui` input and a
+/// `core::net::IoBackend`, and the translation from decoded input to dashboard events.
 ///
-/// **This header names endo's types, and `TerminalEvents.hpp` does not.** A caller composing
-/// the dashboard includes that one and meets only the dashboard's vocabulary. Only
-/// `TerminalEvents.cpp` and this stream's own test include this, so the two projects still
-/// meet in one adapter -- it is simply split so the part with no terminal in it can be tested
-/// with endo's scripted source rather than a real one.
-///
-/// It reaches `tui/runtime/EventSource.hpp` and `tui/InputEvent.hpp`, neither of which reaches
-/// `coro/` or `platform/Clock.hpp`, so `ctest -R vendor-vocabulary` needs no row for it.
+/// **This header names core-cpp's terminal types, and `TerminalEvents.hpp` does not.** A caller
+/// composing the dashboard includes that one and meets only the dashboard's vocabulary. Only
+/// `TerminalEvents.cpp` and this stream's own test include this, so the two projects still meet
+/// in one adapter -- it is simply split so the part with no terminal in it can be tested with a
+/// scripted input source rather than a real one.
 
 /// The bytes a keystroke would have arrived as, or empty when it has no byte spelling here.
 ///
-/// `DashboardEvent::keys` carries bytes, and endo hands over a DECODED key, so this spells it
+/// `DashboardEvent::keys` carries bytes, and core-cpp hands over a DECODED key, so this spells it
 /// back: a control chord as its control byte, Alt as an `ESC` prefix, a named key from a
 /// table, and anything else as the UTF-8 of its codepoint. A key with none of those (a
 /// function key, a lock key) answers empty and is not delivered, because the dashboard acts
 /// only on keys it can name and an empty `Key` would be a keystroke with nothing in it.
 /// @param key The decoded key.
 /// @return Its bytes, or empty.
-[[nodiscard]] std::string KeyBytes(tui::KeyEvent const& key);
+[[nodiscard]] std::string KeyBytes(core::tui::KeyEvent const& key);
 
-/// The dashboard events one endo wait produced, in the order it produced them.
+/// What one wait for terminal input produced.
+struct TerminalWaitOutcome
+{
+    /// The decoded input and resizes, in the order they arrived. Protocol reports are already
+    /// consumed: a query's reply never surfaces here as input.
+    std::vector<core::tui::InputEvent> events {};
+    /// The terminal's input is gone -- a hang-up with nothing left to read, or a wait the backend
+    /// could not perform. Nothing after this wait will deliver input.
+    bool inputClosed { false };
+};
+
+/// Where the stream waits for terminal input: what endo's `EventSource::wait` was to it before
+/// core-cpp moved all waiting into `core::net`.
 ///
-/// Keys and resizes are translated; everything else endo decodes (mouse, paste, focus) is not
-/// dashboard input and is dropped. An `interrupted` wait means the terminal's input is gone
-/// (EOF, hang-up, a failed wait), so it ends the stream with `Detached` after whatever came
-/// before it.
+/// `Wait` BLOCKS, which is why it has a seam of its own rather than being an `EventLoop` flow: the
+/// stream runs it on a pool thread, and the thread `Next()` resumes on never waits on a terminal.
+class ITerminalInputWait
+{
+  public:
+    ITerminalInputWait() = default;
+    ITerminalInputWait(ITerminalInputWait const&) = delete;
+    ITerminalInputWait(ITerminalInputWait&&) = delete;
+    ITerminalInputWait& operator=(ITerminalInputWait const&) = delete;
+    ITerminalInputWait& operator=(ITerminalInputWait&&) = delete;
+    virtual ~ITerminalInputWait() = default;
+
+    /// Wait for input, a resize or `Wake()`, and decode what arrived.
+    ///
+    /// Input a terminal query read but did not consume is delivered first, without waiting. A wait
+    /// with a timeout that ends with nothing ready completes a partial escape sequence: that is how a
+    /// lone `ESC` becomes the Escape key rather than the start of a sequence nobody is typing.
+    /// @param timeoutMs How long to wait in milliseconds, or a negative value for as long as it takes.
+    /// @return What arrived; empty after a timeout or a wake with nothing ready.
+    [[nodiscard]] virtual TerminalWaitOutcome Wait(int timeoutMs) = 0;
+
+    /// End a `Wait` parked on another thread, or make the next one return at once. Any thread.
+    virtual void Wake() noexcept = 0;
+};
+
+/// The production `ITerminalInputWait`: @p input's handles, watched by @p backend.
+///
+/// The input handle and the resize handle -- where there is one -- are attached once, here, so
+/// @p input must already be initialized: an uninitialized terminal has no handles to give. A hang-up
+/// on the input handle with nothing readable is `inputClosed`, never a readable handle that reads
+/// nothing, which would wake every wait at once for ever.
+/// @param input What to watch and decode (not owned; outlives the result).
+/// @param backend The readiness backend the wait blocks in; owned by the result.
+/// @return The wait, or why the backend refused a handle.
+[[nodiscard]] std::expected<std::unique_ptr<ITerminalInputWait>, std::string> MakeTerminalInputWait(
+    core::tui::runtime::InputSource& input, std::unique_ptr<core::net::IoBackend> backend);
+
+/// The dashboard events one wait produced, in the order it produced them.
+///
+/// Keys and resizes are translated; everything else the terminal decodes (mouse, paste, focus) is
+/// not dashboard input and is dropped. A wait whose input closed means the terminal is gone, so it
+/// ends the stream with `Detached` after whatever came before it.
 /// @param outcome What the wait returned.
 /// @param cellPixels The cell size every resize in @p outcome carries: what was read after this wait.
 /// @return The events, possibly none.
-[[nodiscard]] std::vector<DashboardEvent> ToDashboardEvents(tui::runtime::WaitOutcome const& outcome,
+[[nodiscard]] std::vector<DashboardEvent> ToDashboardEvents(TerminalWaitOutcome const& outcome,
                                                             std::optional<CellPixelSize> cellPixels);
 
-/// What endo's answer to `CSI 16 t` says about the cell size, in the dashboard's vocabulary.
+/// What core-cpp's answer to `CSI 16 t` says about the cell size, in the dashboard's vocabulary.
 ///
 /// **Only a size both of whose sides are positive is one.** A reply of `CSI 6 ; 0 ; 0 t` is a terminal
 /// saying it does not know, and an image sized from it would be empty; it is nullopt exactly as a
 /// terminal that stayed silent is, because the Sixel rung is decided on having a size, never on why
 /// there is none.
-/// @param answer endo's `queryCellSize` answer: width then height in pixels, or why there is none.
+/// @param answer core-cpp's `queryCellSize` answer: width then height in pixels, or why there is none.
 /// @return The size, or nullopt.
 [[nodiscard]] std::optional<CellPixelSize> ToCellPixelSize(
-    std::expected<std::pair<int, int>, tui::QueryUnanswered> const& answer) noexcept;
+    std::expected<std::pair<int, int>, core::tui::QueryUnanswered> const& answer) noexcept;
 
-/// What endo's DA1 answer says about Sixel, in the dashboard's vocabulary.
+/// What core-cpp's DA1 answer says about Sixel, in the dashboard's vocabulary.
 ///
 /// A reply without attribute 4 and no reply at all are different facts, and both draw no Sixel.
 /// @param attributes The DA1 reply, or why there is none.
 /// @return The answer.
 [[nodiscard]] SixelAnswer ToSixelAnswer(
-    std::expected<tui::DeviceAttributesReport, tui::QueryUnanswered> const& attributes) noexcept;
+    std::expected<core::tui::DeviceAttributesReport, core::tui::QueryUnanswered> const& attributes) noexcept;
 
-/// What endo's DECRQM answer for mode 2026 says about synchronized output.
+/// What core-cpp's DECRQM answer for mode 2026 says about synchronized output.
 ///
 /// Recognised and switchable -- set or reset -- is `Supported`. Not recognised, or permanently set
 /// or reset, is `NotSupported`: a mode that cannot be switched is not one a frame can bracket. A
 /// platform arm that cannot send the query is `NotAsked`, as is a terminal with no input to read.
 /// @param status The DECRQM answer.
 /// @return The answer.
-[[nodiscard]] SynchronizedOutputAnswer ToSynchronizedOutputAnswer(tui::DecModeStatus status) noexcept;
+[[nodiscard]] SynchronizedOutputAnswer ToSynchronizedOutputAnswer(core::tui::DecModeStatus status) noexcept;
 
 /// The bytes presentation is spelled with, composed once.
 ///
-/// **Spelled by endo, not here.** Each is captured from endo's own `TerminalOutput` -- its
+/// **Spelled by core-cpp, not here.** Each is captured from core-cpp's own `TerminalOutput` -- its
 /// `enterAltScreen`, `hideCursor`, `showCursor`, `leaveAltScreen` -- through the
-/// `writeToDestination` hook it provides for exactly that, so no sequence endo already writes is
+/// `writeToDestination` hook it provides for exactly that, so no sequence core-cpp already writes is
 /// restated in this project. `FrameBytes` spells a frame the same way. The two exceptions are
-/// synchronized output's begin and end: endo writes those only from inside `SyncGuard`, straight to
+/// synchronized output's begin and end: core-cpp writes those only from inside `SyncGuard`, straight to
 /// a native handle, so there is nothing to capture, and they are spelled once in
 /// `TerminalEventStream.cpp`.
 struct TerminalScreenBytes
@@ -123,7 +172,7 @@ struct TerminalScreenBytes
 /// **Every row is positioned absolutely -- `CSI <row>;1H`, `CSI K`, the row -- after the screen is
 /// cleared from the frame's last row down. A frame's `\n` never reaches the terminal.** A line feed moves the
 /// cursor DOWN; whether it also returns to the first column is the terminal's newline mode, a
-/// Windows console's DISABLE_NEWLINE_AUTO_RETURN (which endo's raw mode sets) and a POSIX tty's
+/// Windows console's DISABLE_NEWLINE_AUTO_RETURN (which core-cpp's raw mode sets) and a POSIX tty's
 /// output post-processing, none of it this process's to rely on. Measured in a 120x40 ConPTY: rows
 /// joined by bare line feeds after a full-width row all landed in the last column, and the screen
 /// showed the top border and one column. Positioning each row is also immune to a pending wrap and
@@ -145,7 +194,7 @@ struct TerminalScreenBytes
 /// **The images go on AFTER every row.** A row is erased and written over its whole width, and on a
 /// terminal that draws Sixel an erase or a character on a cell removes the image there, so an image
 /// written first would be taken off again by the row it sits in. Each is written as `CSI <row>;<column> H`
-/// and then the image, framed by endo's `writeSixel`, because a Sixel image is drawn from the cursor.
+/// and then the image, framed by core-cpp's `writeSixel`, because a Sixel image is drawn from the cursor.
 ///
 /// **A later frame without an image leaves none of it behind, with nothing remembered here.** Every
 /// frame erases each of its rows and everything below its last before writing, so the cells an earlier
@@ -170,8 +219,8 @@ struct TerminalScreenBytes
 /// What a terminal event stream is built from.
 struct TerminalStreamParts
 {
-    /// Where input is waited for. Its `wait` BLOCKS, so it is only ever called from `pool`.
-    tui::runtime::EventSource* source { nullptr };
+    /// Where input is waited for. Its `Wait` BLOCKS, so it is only ever called from `pool`.
+    ITerminalInputWait* source { nullptr };
     /// Where the blocking wait runs. Give it a thread of its own: a wait parks there for as long
     /// as the operator types nothing, and a sampler sharing a one-thread pool would starve.
     IExecutor* pool { nullptr };
@@ -218,7 +267,7 @@ struct TerminalStreamParts
 
 /// The terminal-facing half `StartTerminal` acquires, as a seam.
 ///
-/// Production is endo's `Terminal` with its event source and a wakeup. A test substitutes one that
+/// Production is core-cpp's `Terminal` with `MakeTerminalInputWait` over it. A test substitutes one that
 /// records which thread it was asked on and can fail at each step, which is the only way to watch a
 /// start that fails HALFWAY restore the terminal without having a terminal to break.
 class ITerminalDevice
@@ -268,7 +317,7 @@ class ITerminalDevice
     [[nodiscard]] virtual int Rows() const = 0;
 
     /// @return Where the acquired terminal's events are waited for.
-    [[nodiscard]] virtual tui::runtime::EventSource& Events() = 0;
+    [[nodiscard]] virtual ITerminalInputWait& Events() = 0;
 
     /// Wake a wait parked in `Events()`. Callable from any thread.
     virtual void Wake() = 0;

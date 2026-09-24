@@ -14,6 +14,7 @@
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
+#include <deque>
 #include <expected>
 #include <format>
 #include <memory>
@@ -28,10 +29,12 @@
 #include <utility>
 #include <vector>
 
+#include <core/net/IoBackend.hpp>
+#include <core/platform/SystemPipe.hpp>
+#include <core/tui/InputEvent.hpp>
+#include <core/tui/runtime/testing/ScriptedInputSource.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
-#include <tui/InputEvent.hpp>
-#include <tui/runtime/testing/MockEventSource.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cli;
@@ -40,36 +43,81 @@ using FastCache::Testing::Unwrap;
 namespace
 {
 
-/// An endo event source whose wait BLOCKS until it is woken, and records where it ran.
+/// A terminal wait that answers a script, one entry per `Wait`, and records every timeout asked.
+///
+/// What endo's `MockEventSource` was to these cases before core-cpp moved all waiting into
+/// `core::net`: an exhausted script answers `inputClosed`, so a case that reads one event too many
+/// ends its stream rather than hanging.
+class ScriptedTerminalInputWait final: public ITerminalInputWait
+{
+  public:
+    /// The next wait delivers @p events.
+    void PushEvents(std::vector<core::tui::InputEvent> events)
+    {
+        _scripted.push_back(TerminalWaitOutcome { .events = std::move(events) });
+    }
+
+    /// The next wait finds the terminal's input gone.
+    void PushInputClosed()
+    {
+        _scripted.push_back(TerminalWaitOutcome { .inputClosed = true });
+    }
+
+    /// The next wait times out with nothing.
+    void PushTimeout()
+    {
+        _scripted.push_back(TerminalWaitOutcome {});
+    }
+
+    /// @return Every timeout a wait was asked for, in order.
+    [[nodiscard]] std::vector<int> const& RecordedTimeouts() const noexcept
+    {
+        return _timeouts;
+    }
+
+    /// @return How many waits there were.
+    [[nodiscard]] std::size_t WaitCount() const noexcept
+    {
+        return _timeouts.size();
+    }
+
+    [[nodiscard]] TerminalWaitOutcome Wait(int timeoutMs) override
+    {
+        _timeouts.push_back(timeoutMs);
+        if (_scripted.empty())
+            return TerminalWaitOutcome { .inputClosed = true };
+        auto outcome = std::move(_scripted.front());
+        _scripted.pop_front();
+        return outcome;
+    }
+
+    void Wake() noexcept override {}
+
+  private:
+    std::deque<TerminalWaitOutcome> _scripted;
+    std::vector<int> _timeouts;
+};
+
+/// A terminal wait that BLOCKS until it is woken, and records where it ran.
 ///
 /// It blocks on purpose, for `TakeFrame`'s reason: a source that returned at once would let a
 /// stream that never left the reactor, or a `Close()` that never reached the wait, finish before
 /// anything could observe the difference.
-class BlockingEventSource final: public tui::runtime::EventSource
+class BlockingEventSource final: public ITerminalInputWait
 {
   public:
-    [[nodiscard]] tui::runtime::WaitOutcome wait(int /*timeoutMs*/) override
+    [[nodiscard]] TerminalWaitOutcome Wait(int /*timeoutMs*/) override
     {
         auto lock = std::unique_lock { _mutex };
         _waitedOn = std::this_thread::get_id();
         _entered.store(true, std::memory_order_release);
         _woken.wait(lock, [this] { return _wake; });
         _wake = false;
-        auto outcome = tui::runtime::WaitOutcome {};
-        outcome.agentReady = true;
-        return outcome;
+        return TerminalWaitOutcome {};
     }
-
-    [[nodiscard]] tui::runtime::FdToken attach(endo::platform::NativeHandle /*fd*/,
-                                               tui::runtime::FdInterest /*interest*/) override
-    {
-        return {};
-    }
-
-    void detach(tui::runtime::FdToken /*token*/) override {}
 
     /// Release the parked wait.
-    void Wake()
+    void Wake() noexcept override
     {
         {
             auto const lock = std::scoped_lock { _mutex };
@@ -173,9 +221,11 @@ void DrainUntil(TestReactor& reactor, Condition done, char const* what)
 }
 
 /// A key event carrying @p codepoint.
-[[nodiscard]] tui::KeyEvent Key(char32_t codepoint, tui::Modifier modifiers = tui::Modifier::None)
+[[nodiscard]] core::tui::KeyEvent Key(char32_t codepoint, core::tui::Modifier modifiers = core::tui::Modifier::None)
 {
-    return tui::KeyEvent { .key = static_cast<tui::KeyCode>(codepoint), .modifiers = modifiers, .codepoint = codepoint };
+    return core::tui::KeyEvent { .key = static_cast<core::tui::KeyCode>(codepoint),
+                                 .modifiers = modifiers,
+                                 .codepoint = codepoint };
 }
 
 /// What a `FakeDevice` was asked, readable after the device itself is gone.
@@ -239,7 +289,7 @@ struct DeviceScript
     BlockingEventSource* blocking { nullptr };
 
     /// What the scripted source's one wait delivers, when `blocking` is not set.
-    std::vector<tui::InputEvent> input {};
+    std::vector<core::tui::InputEvent> input {};
 };
 
 /// A terminal device that records where each step ran and can fail at each one.
@@ -254,7 +304,7 @@ class FakeDevice final: public ITerminalDevice
         _record { record }
     {
         if (!_script.input.empty())
-            _source.pushEvents(_script.input);
+            _source.PushEvents(_script.input);
     }
 
     [[nodiscard]] std::expected<void, std::string> Acquire() override
@@ -311,7 +361,7 @@ class FakeDevice final: public ITerminalDevice
         return 43;
     }
 
-    [[nodiscard]] tui::runtime::EventSource& Events() override
+    [[nodiscard]] ITerminalInputWait& Events() override
     {
         if (_script.blocking != nullptr)
             return *_script.blocking;
@@ -343,7 +393,7 @@ class FakeDevice final: public ITerminalDevice
   private:
     DeviceScript _script;
     DeviceRecord* _record;
-    tui::runtime::testing::MockEventSource _source;
+    ScriptedTerminalInputWait _source;
 };
 
 /// A start as the awaiting coroutine saw it.
@@ -386,7 +436,7 @@ TEST_CASE("the first terminal event is the geometry at open, before any wait", "
     auto clock = ManualClock {};
     auto reactor = TestReactor { clock };
     auto pool = ThreadPoolExecutor { 1 };
-    auto source = tui::runtime::testing::MockEventSource {};
+    auto source = ScriptedTerminalInputWait {};
     auto stream = MakeTerminalEventStream(
         { .source = &source, .pool = &pool, .resumeOn = &reactor, .wake = {}, .columns = 120, .rows = 40 });
 
@@ -395,7 +445,7 @@ TEST_CASE("the first terminal event is the geometry at open, before any wait", "
     CHECK(first.kind == DashboardEventKind::Resize);
     CHECK(first.columns == 120);
     CHECK(first.rows == 40);
-    CHECK(source.waitCount() == 0);
+    CHECK(source.WaitCount() == 0);
 }
 
 TEST_CASE("keys and resizes from one wait arrive in order, and other input is not dashboard input",
@@ -404,8 +454,8 @@ TEST_CASE("keys and resizes from one wait arrive in order, and other input is no
     auto clock = ManualClock {};
     auto reactor = TestReactor { clock };
     auto pool = ThreadPoolExecutor { 1 };
-    auto source = tui::runtime::testing::MockEventSource {};
-    source.pushEvents({ Key(U'q'), tui::MouseEvent {}, tui::ResizeEvent { .columns = 80, .rows = 24 } });
+    auto source = ScriptedTerminalInputWait {};
+    source.PushEvents({ Key(U'q'), core::tui::MouseEvent {}, core::tui::ResizeEvent { .columns = 80, .rows = 24 } });
     auto stream = MakeTerminalEventStream(
         { .source = &source, .pool = &pool, .resumeOn = &reactor, .wake = {}, .columns = 100, .rows = 30 });
 
@@ -418,7 +468,7 @@ TEST_CASE("keys and resizes from one wait arrive in order, and other input is no
     CHECK(resize.kind == DashboardEventKind::Resize);
     CHECK(resize.columns == 80);
     CHECK(resize.rows == 24);
-    CHECK(source.waitCount() == 1);
+    CHECK(source.WaitCount() == 1);
 }
 
 TEST_CASE("the terminal wait runs on the pool and its event is delivered back on the reactor", "[cli][dashboard][terminal]")
@@ -502,9 +552,9 @@ TEST_CASE("terminal input that closes ends the stream, and it stays ended", "[cl
     auto clock = ManualClock {};
     auto reactor = TestReactor { clock };
     auto pool = ThreadPoolExecutor { 1 };
-    auto source = tui::runtime::testing::MockEventSource {};
-    source.pushEvents({ Key(U'a') });
-    source.pushInterrupt();
+    auto source = ScriptedTerminalInputWait {};
+    source.PushEvents({ Key(U'a') });
+    source.PushInputClosed();
     auto stream = MakeTerminalEventStream(
         { .source = &source, .pool = &pool, .resumeOn = &reactor, .wake = {}, .columns = 80, .rows = 24 });
 
@@ -516,20 +566,20 @@ TEST_CASE("terminal input that closes ends the stream, and it stays ended", "[cl
     CHECK(ended.kind == DashboardEventKind::Detached);
     CHECK(ended.note == "the terminal's input closed");
     CHECK(again.kind == DashboardEventKind::Detached);
-    CHECK(source.waitCount() == 2);
+    CHECK(source.WaitCount() == 2);
 }
 
 TEST_CASE("the wait after terminal input is short, so a lone ESC is settled rather than held", "[cli][dashboard][terminal]")
 {
-    // endo decides a lone ESC is the Escape key only when a wait TIMES OUT. An unbounded wait
+    // core-cpp decides a lone ESC is the Escape key only when a wait TIMES OUT. An unbounded wait
     // never does, so a stream that always waited with -1 would hold an ESC until the next key.
     auto clock = ManualClock {};
     auto reactor = TestReactor { clock };
     auto pool = ThreadPoolExecutor { 1 };
-    auto source = tui::runtime::testing::MockEventSource {};
-    source.pushEvents({ Key(U'a') });
-    source.pushTimeout();
-    source.pushEvents({ Key(U'b') });
+    auto source = ScriptedTerminalInputWait {};
+    source.PushEvents({ Key(U'a') });
+    source.PushTimeout();
+    source.PushEvents({ Key(U'b') });
     auto stream = MakeTerminalEventStream(
         { .source = &source, .pool = &pool, .resumeOn = &reactor, .wake = {}, .columns = 80, .rows = 24 });
 
@@ -537,41 +587,128 @@ TEST_CASE("the wait after terminal input is short, so a lone ESC is settled rath
     std::ignore = TakeNext(*stream, reactor); // a, from an unbounded wait
     std::ignore = TakeNext(*stream, reactor); // b, after a short wait that timed out and an unbounded one
 
-    CHECK(source.recordedTimeouts() == std::vector<int> { -1, 50, -1 });
+    CHECK(source.RecordedTimeouts() == std::vector<int> { -1, 50, -1 });
 }
 
-TEST_CASE("the keys endo decodes spell the bytes the dashboard quits on", "[cli][dashboard][terminal]")
+/// The bound on a production terminal wait in a case: long enough never to be reached by a wait that
+/// works, so reaching it is the failure.
+constexpr auto WaitBoundMs = 30'000;
+
+TEST_CASE("the production terminal wait delivers what the input handle had ready", "[cli][dashboard][terminal]")
+{
+    // A real pipe and the platform's default backend, so the readiness is the kernel's. WHAT
+    // DISTINGUISHES: the events come from the source's READ, which only a readable input handle
+    // triggers -- a wait that returned without asking the backend would deliver nothing.
+    auto pipe = core::platform::createSystemPipe();
+    REQUIRE(pipe.has_value());
+    auto input = core::tui::runtime::testing::ScriptedInputSource { pipe->get() };
+    auto made = MakeTerminalInputWait(input, core::net::makeDefaultBackend());
+    REQUIRE(made.has_value());
+    auto& wait = *made;
+    input.pushEvents({ Key(U'q') });
+
+    // Bounded, so a wait that never saw the handle ready fails here rather than hanging.
+    auto const outcome = wait->Wait(WaitBoundMs);
+
+    REQUIRE(outcome.events.size() == 1);
+    CHECK(std::holds_alternative<core::tui::KeyEvent>(outcome.events.front()));
+    CHECK_FALSE(outcome.inputClosed);
+    CHECK(input.readCount() == 1);
+}
+
+TEST_CASE("the production terminal wait delivers held-back input without waiting", "[cli][dashboard][terminal]")
+{
+    // A key a terminal query read and did not consume, with nothing ready on the handle. WHAT
+    // DISTINGUISHES: neither a read nor a flush happened, so no wait on the handle did -- a wait that
+    // timed out first would have asked for the flush.
+    auto pipe = core::platform::createSystemPipe();
+    REQUIRE(pipe.has_value());
+    auto input = core::tui::runtime::testing::ScriptedInputSource { pipe->get() };
+    auto made = MakeTerminalInputWait(input, core::net::makeDefaultBackend());
+    REQUIRE(made.has_value());
+    auto& wait = *made;
+    input.pushPending({ Key(U'a') });
+
+    auto const outcome = wait->Wait(WaitBoundMs);
+
+    CHECK(outcome.events.size() == 1);
+    CHECK(input.readCount() == 0);
+    CHECK(input.flushCount() == 0);
+}
+
+TEST_CASE("a bounded production terminal wait with nothing ready completes a partial escape", "[cli][dashboard][terminal]")
+{
+    // A lone ESC is decoded only when its continuation does not come. WHAT DISTINGUISHES: the event
+    // comes from the source's FLUSH, which only a wait that timed out with nothing ready asks for.
+    auto pipe = core::platform::createSystemPipe();
+    REQUIRE(pipe.has_value());
+    auto input = core::tui::runtime::testing::ScriptedInputSource { pipe->get() };
+    auto made = MakeTerminalInputWait(input, core::net::makeDefaultBackend());
+    REQUIRE(made.has_value());
+    auto& wait = *made;
+    input.pushFlush({ core::tui::KeyEvent { .key = core::tui::KeyCode::Escape } });
+
+    auto const outcome = wait->Wait(1);
+
+    CHECK(outcome.events.size() == 1);
+    CHECK(input.flushCount() == 1);
+    CHECK(input.readCount() == 0);
+}
+
+TEST_CASE("waking the production terminal wait ends an unbounded wait with nothing", "[cli][dashboard][terminal]")
+{
+    // Nothing is ever ready: the only way out before the bound is the wake, which is how `Close()`
+    // reaches a wait parked on the pool. WHAT DISTINGUISHES: the time taken, far below the bound.
+    auto pipe = core::platform::createSystemPipe();
+    REQUIRE(pipe.has_value());
+    auto input = core::tui::runtime::testing::ScriptedInputSource { pipe->get() };
+    auto made = MakeTerminalInputWait(input, core::net::makeDefaultBackend());
+    REQUIRE(made.has_value());
+    auto& wait = *made;
+    auto waker = std::jthread { [&wait] { wait->Wake(); } };
+
+    auto const started = std::chrono::steady_clock::now();
+    auto const outcome = wait->Wait(WaitBoundMs);
+    auto const waited = std::chrono::steady_clock::now() - started;
+
+    CHECK(waited < std::chrono::milliseconds { WaitBoundMs / 2 });
+    CHECK(outcome.events.empty());
+    CHECK_FALSE(outcome.inputClosed);
+    CHECK(input.readCount() == 0);
+}
+
+TEST_CASE("the keys core-cpp decodes spell the bytes the dashboard quits on", "[cli][dashboard][terminal]")
 {
     // Asserted through `IsQuitKey`, the consumer, rather than against byte literals alone: the
-    // property is that the keys an operator presses to leave still leave once endo has decoded
+    // property is that the keys an operator presses to leave still leave once core-cpp has decoded
     // them, and a spelling that matched a literal while the loop compared something else would
     // pass a literal-only case.
     CHECK(IsQuitKey(KeyBytes(Key(U'q'))));
     CHECK(IsQuitKey(KeyBytes(Key(U'Q'))));
-    CHECK(IsQuitKey(KeyBytes(Key(U'c', tui::Modifier::Ctrl))));
-    CHECK(IsQuitKey(KeyBytes(tui::KeyEvent { .key = tui::KeyCode::Escape })));
+    CHECK(IsQuitKey(KeyBytes(Key(U'c', core::tui::Modifier::Ctrl))));
+    CHECK(IsQuitKey(KeyBytes(core::tui::KeyEvent { .key = core::tui::KeyCode::Escape })));
     CHECK_FALSE(IsQuitKey(KeyBytes(Key(U'c'))));
 }
 
 TEST_CASE("a decoded key is spelled as its bytes, or not at all", "[cli][dashboard][terminal]")
 {
-    CHECK(KeyBytes(Key(U'x', tui::Modifier::Alt)) == "\x1bx");
-    CHECK(KeyBytes(tui::KeyEvent { .key = tui::KeyCode::Up }) == "\x1b[A");
+    CHECK(KeyBytes(Key(U'x', core::tui::Modifier::Alt)) == "\x1bx");
+    CHECK(KeyBytes(core::tui::KeyEvent { .key = core::tui::KeyCode::Up }) == "\x1b[A");
     CHECK(KeyBytes(Key(U'é')) == "\xc3\xa9");
     CHECK(KeyBytes(Key(U'\U0001F600')) == "\xf0\x9f\x98\x80");
-    CHECK(KeyBytes(tui::KeyEvent { .key = tui::KeyCode::F5 }).empty());
+    CHECK(KeyBytes(core::tui::KeyEvent { .key = core::tui::KeyCode::F5 }).empty());
 }
 
 TEST_CASE("a DA1 answer, and each way of having none, keeps its meaning as a Sixel answer", "[cli][dashboard][terminal]")
 {
-    using Attributes = std::expected<tui::DeviceAttributesReport, tui::QueryUnanswered>;
+    using Attributes = std::expected<core::tui::DeviceAttributesReport, core::tui::QueryUnanswered>;
 
-    CHECK(ToSixelAnswer(Attributes { tui::DeviceAttributesReport { .attributes = { 62, 4, 22 } } })
+    CHECK(ToSixelAnswer(Attributes { core::tui::DeviceAttributesReport { .attributes = { 62, 4, 22 } } })
           == SixelAnswer::Advertised);
-    CHECK(ToSixelAnswer(Attributes { tui::DeviceAttributesReport { .attributes = { 62, 22 } } })
+    CHECK(ToSixelAnswer(Attributes { core::tui::DeviceAttributesReport { .attributes = { 62, 22 } } })
           == SixelAnswer::NotAdvertised);
-    CHECK(ToSixelAnswer(Attributes { std::unexpected(tui::QueryUnanswered::NoReply) }) == SixelAnswer::NoReply);
-    CHECK(ToSixelAnswer(Attributes { std::unexpected(tui::QueryUnanswered::NotAsked) }) == SixelAnswer::NotAsked);
+    CHECK(ToSixelAnswer(Attributes { std::unexpected(core::tui::QueryUnanswered::NoReply) }) == SixelAnswer::NoReply);
+    CHECK(ToSixelAnswer(Attributes { std::unexpected(core::tui::QueryUnanswered::NotAsked) }) == SixelAnswer::NotAsked);
 }
 
 TEST_CASE("a terminal is acquired on the pool and its start is delivered back on the reactor", "[cli][dashboard][terminal]")
@@ -743,9 +880,9 @@ TEST_CASE("a started terminal whose events were destroyed first is not restored 
     CHECK(record.restores.load() == 1);
 }
 
-TEST_CASE("presentation bytes are endo's own spellings", "[cli][dashboard][terminal]")
+TEST_CASE("presentation bytes are core-cpp's own spellings", "[cli][dashboard][terminal]")
 {
-    // Captured from endo's TerminalOutput rather than restated, so this asserts the capture caught
+    // Captured from core-cpp's TerminalOutput rather than restated, so this asserts the capture caught
     // what each call writes, in the order the steps call them -- a capture that flushed nothing
     // would leave every string empty and every presenter case below comparing empty strings.
     auto const& screen = ScreenBytes();
@@ -764,7 +901,7 @@ namespace
 /// A terminal screen as the frame presenter cannot assume it: a LINE FEED moves the cursor down
 /// and does NOT return it to the first column, and autowrap is off, so a character written in the
 /// last column overwrites that column. That is a Windows console with DISABLE_NEWLINE_AUTO_RETURN
-/// (endo's raw mode) or a POSIX tty with output post-processing off, and it is where rows joined
+/// (core-cpp's raw mode) or a POSIX tty with output post-processing off, and it is where rows joined
 /// by line feeds all landed in the last column.
 ///
 /// Reads UTF-8 one code point per cell -- every glyph the panels draw is one cell wide -- and the
@@ -1039,13 +1176,13 @@ TEST_CASE("a frame as tall as the screen that ends in a newline keeps its bottom
 
 TEST_CASE("a DECRQM answer for mode 2026 keeps its meaning as a synchronized-output answer", "[cli][dashboard][terminal]")
 {
-    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::Set) == SynchronizedOutputAnswer::Supported);
-    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::Reset) == SynchronizedOutputAnswer::Supported);
-    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::NotRecognized) == SynchronizedOutputAnswer::NotSupported);
-    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::PermanentlySet) == SynchronizedOutputAnswer::NotSupported);
-    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::PermanentlyReset) == SynchronizedOutputAnswer::NotSupported);
-    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::NoReply) == SynchronizedOutputAnswer::NoReply);
-    CHECK(ToSynchronizedOutputAnswer(tui::DecModeStatus::NotAsked) == SynchronizedOutputAnswer::NotAsked);
+    CHECK(ToSynchronizedOutputAnswer(core::tui::DecModeStatus::Set) == SynchronizedOutputAnswer::Supported);
+    CHECK(ToSynchronizedOutputAnswer(core::tui::DecModeStatus::Reset) == SynchronizedOutputAnswer::Supported);
+    CHECK(ToSynchronizedOutputAnswer(core::tui::DecModeStatus::NotRecognized) == SynchronizedOutputAnswer::NotSupported);
+    CHECK(ToSynchronizedOutputAnswer(core::tui::DecModeStatus::PermanentlySet) == SynchronizedOutputAnswer::NotSupported);
+    CHECK(ToSynchronizedOutputAnswer(core::tui::DecModeStatus::PermanentlyReset) == SynchronizedOutputAnswer::NotSupported);
+    CHECK(ToSynchronizedOutputAnswer(core::tui::DecModeStatus::NoReply) == SynchronizedOutputAnswer::NoReply);
+    CHECK(ToSynchronizedOutputAnswer(core::tui::DecModeStatus::NotAsked) == SynchronizedOutputAnswer::NotAsked);
 }
 
 TEST_CASE("a started terminal enters the alternate screen once and its destruction leaves it once",
@@ -1217,12 +1354,13 @@ TEST_CASE("a burst of resizes is delivered as the latest geometry, and a key bet
     auto clock = ManualClock {};
     auto reactor = TestReactor { clock };
     auto pool = ThreadPoolExecutor { 1 };
-    auto source = tui::runtime::testing::MockEventSource {};
-    source.pushEvents({ tui::ResizeEvent { .columns = 81, .rows = 25 },
-                        tui::ResizeEvent { .columns = 90, .rows = 30 },
-                        tui::ResizeEvent { .columns = 100, .rows = 35 } });
-    source.pushEvents(
-        { tui::ResizeEvent { .columns = 110, .rows = 40 }, Key(U'a'), tui::ResizeEvent { .columns = 120, .rows = 45 } });
+    auto source = ScriptedTerminalInputWait {};
+    source.PushEvents({ core::tui::ResizeEvent { .columns = 81, .rows = 25 },
+                        core::tui::ResizeEvent { .columns = 90, .rows = 30 },
+                        core::tui::ResizeEvent { .columns = 100, .rows = 35 } });
+    source.PushEvents({ core::tui::ResizeEvent { .columns = 110, .rows = 40 },
+                        Key(U'a'),
+                        core::tui::ResizeEvent { .columns = 120, .rows = 45 } });
     auto stream = MakeTerminalEventStream(
         { .source = &source, .pool = &pool, .resumeOn = &reactor, .wake = {}, .columns = 80, .rows = 24 });
 
@@ -1243,7 +1381,7 @@ TEST_CASE("a burst of resizes is delivered as the latest geometry, and a key bet
     CHECK(afterKey.kind == DashboardEventKind::Resize);
     CHECK(afterKey.columns == 120);
     CHECK(afterKey.rows == 45);
-    CHECK(source.waitCount() == 2);
+    CHECK(source.WaitCount() == 2);
 }
 
 namespace
@@ -1294,7 +1432,7 @@ TEST_CASE("an image placed in a frame is drawn on its cells after the rows, insi
         CHECK(terminal.Unknown().empty());
 
         // The rows exactly as a frame with no image, then the cursor placed on the image's first cell and
-        // the image framed by endo, and only then the end of the bracket.
+        // the image framed by core-cpp, and only then the end of the bracket.
         auto expected = std::string { synchronized ? screen.syncBegin : "" };
         expected.append(FrameBytes(frame.text, false));
         expected.append("\x1b[2;4H\x1bP0;1q");
@@ -1369,9 +1507,9 @@ TEST_CASE("a started terminal's frames draw the images placed in them", "[cli][d
 
 TEST_CASE("a CSI 16 t answer, and each way of having none, keeps its meaning as a cell size", "[cli][dashboard][terminal]")
 {
-    // endo answers width first; the reply on the wire is height first, and endo's own query test pins
+    // core-cpp answers width first; the reply on the wire is height first, and core-cpp's own query test pins
     // that `CSI 6 ; 20 ; 10 t` answers ten wide and twenty high.
-    using Answer = std::expected<std::pair<int, int>, tui::QueryUnanswered>;
+    using Answer = std::expected<std::pair<int, int>, core::tui::QueryUnanswered>;
 
     CHECK(Pixels(ToCellPixelSize(Answer { std::pair { 10, 20 } })) == std::pair<std::size_t, std::size_t> { 10, 20 });
     // A terminal answering zero is saying it does not know, and a size of zero draws nothing.
@@ -1379,8 +1517,8 @@ TEST_CASE("a CSI 16 t answer, and each way of having none, keeps its meaning as 
     CHECK_FALSE(ToCellPixelSize(Answer { std::pair { 10, 0 } }).has_value());
     CHECK_FALSE(ToCellPixelSize(Answer { std::pair { 0, 20 } }).has_value());
     CHECK_FALSE(ToCellPixelSize(Answer { std::pair { -10, 20 } }).has_value());
-    CHECK_FALSE(ToCellPixelSize(Answer { std::unexpected(tui::QueryUnanswered::NoReply) }).has_value());
-    CHECK_FALSE(ToCellPixelSize(Answer { std::unexpected(tui::QueryUnanswered::NotAsked) }).has_value());
+    CHECK_FALSE(ToCellPixelSize(Answer { std::unexpected(core::tui::QueryUnanswered::NoReply) }).has_value());
+    CHECK_FALSE(ToCellPixelSize(Answer { std::unexpected(core::tui::QueryUnanswered::NotAsked) }).has_value());
 }
 
 TEST_CASE("a terminal that reports its cell size starts on the Sixel rung and is asked again after each resize",
@@ -1393,7 +1531,7 @@ TEST_CASE("a terminal that reports its cell size starts on the Sixel rung and is
 
     auto outcome = StartFake({ .cellPixels = CellPixelSize { .width = 10, .height = 20 },
                                .reread = CellPixelSize { .width = 9, .height = 18 },
-                               .input = { tui::ResizeEvent { .columns = 100, .rows = 30 } } },
+                               .input = { core::tui::ResizeEvent { .columns = 100, .rows = 30 } } },
                              record,
                              pool,
                              reactor);
@@ -1427,7 +1565,7 @@ TEST_CASE("a terminal that does not report its cell size is not the Sixel rung a
     auto outcome = StartFake({ .sixel = SixelAnswer::Advertised,
                                .cellPixels = std::nullopt,
                                .reread = CellPixelSize { .width = 10, .height = 20 },
-                               .input = { tui::ResizeEvent { .columns = 100, .rows = 30 } } },
+                               .input = { core::tui::ResizeEvent { .columns = 100, .rows = 30 } } },
                              record,
                              pool,
                              reactor);
@@ -1451,9 +1589,10 @@ TEST_CASE("the cell size is re-read on the pool once per wait that resized, and 
     auto clock = ManualClock {};
     auto reactor = TestReactor { clock };
     auto pool = ThreadPoolExecutor { 1 };
-    auto source = tui::runtime::testing::MockEventSource {};
-    source.pushEvents({ tui::ResizeEvent { .columns = 100, .rows = 30 }, tui::ResizeEvent { .columns = 110, .rows = 35 } });
-    source.pushEvents({ Key(U'a') });
+    auto source = ScriptedTerminalInputWait {};
+    source.PushEvents(
+        { core::tui::ResizeEvent { .columns = 100, .rows = 30 }, core::tui::ResizeEvent { .columns = 110, .rows = 35 } });
+    source.PushEvents({ Key(U'a') });
     auto asked = std::atomic<int> { 0 };
     auto askedOn = std::atomic<std::thread::id> {};
     auto stream = MakeTerminalEventStream({ .source = &source,
@@ -1490,8 +1629,8 @@ TEST_CASE("a resize whose re-read gets no answer carries no cell size, never the
     auto clock = ManualClock {};
     auto reactor = TestReactor { clock };
     auto pool = ThreadPoolExecutor { 1 };
-    auto source = tui::runtime::testing::MockEventSource {};
-    source.pushEvents({ tui::ResizeEvent { .columns = 100, .rows = 30 } });
+    auto source = ScriptedTerminalInputWait {};
+    source.PushEvents({ core::tui::ResizeEvent { .columns = 100, .rows = 30 } });
     auto stream = MakeTerminalEventStream({ .source = &source,
                                             .pool = &pool,
                                             .resumeOn = &reactor,

@@ -42,7 +42,7 @@ struct FramePlacement
     std::size_t cellsHigh { 0 }; ///< Cells down; the image is `cellsHigh` times the cell height in pixels.
 
     /// The image, as `ISixelEncoder::Encode` returns it: the Sixel BODY, without the `DCS q`
-    /// introducer or the string terminator. The presenter frames it, through endo, as it spells
+    /// introducer or the string terminator. The presenter frames it, through core-cpp, as it spells
     /// every other sequence it writes.
     std::string sixel {};
 };

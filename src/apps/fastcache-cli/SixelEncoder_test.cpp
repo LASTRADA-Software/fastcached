@@ -95,10 +95,10 @@ TEST_CASE("the Sixel adapter answers with a body whose raster attributes are the
 
 TEST_CASE("an image encodes through the adapter to the same bytes on every standard library", "[cli][dashboard][sixel]")
 {
-    // The vendored quantizer orders pixels by a total order, so an encoding's bytes are a constant.
-    // WHAT DISTINGUISHES: the image is the vendored test's tie-shaped fixture -- many pixels share each
+    // Core-cpp's quantizer orders pixels by a total order, so an encoding's bytes are a constant.
+    // WHAT DISTINGUISHES: the image is core-cpp's test's tie-shaped fixture -- many pixels share each
     // channel's level -- on which a split left to a sort's tie order, a pixel dropped or moved, or a
-    // palette ceiling passed differently each gives another digest. The digest is the one the vendored
+    // palette ceiling passed differently each gives another digest. The digest is the one core-cpp's
     // `tui/Sixel_test.cpp` records for the same image and ceiling, measured identical on libstdc++,
     // libc++ and MSVC's library; this case says the adapter hands the encoder that image unchanged.
     constexpr auto Side = std::size_t { 48 };
@@ -122,7 +122,7 @@ TEST_CASE("an image encodes through the adapter to the same bytes on every stand
 
 TEST_CASE("a Sixel image with no width or one past what the encoder addresses is refused by name", "[cli][dashboard][sixel]")
 {
-    // A dimension past `int` would wrap into a size the vendored encoder then trusts. WHAT
+    // A dimension past `int` would wrap into a size core-cpp's encoder then trusts. WHAT
     // DISTINGUISHES: the refusal names the dimension -- the pixels here are far too few, and an
     // adapter that narrowed first would be refused for THAT instead.
     auto encoder = Production();

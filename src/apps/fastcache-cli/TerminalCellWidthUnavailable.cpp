@@ -8,7 +8,7 @@ namespace FastCache::Cli
 {
 
 /// @file TerminalCellWidthUnavailable.cpp
-/// The cell width for a build without the vendored TUI (`FASTCACHED_BUILD_TUI=OFF`).
+/// The cell width for a build without core-cpp's terminal UI (`FASTCACHED_BUILD_TUI=OFF`).
 ///
 /// **Unreachable, and it ends the process if that stops being true** rather than answering: a panel
 /// is laid out only for a terminal a session acquired, and `MakeTerminalEvents` refuses to start one

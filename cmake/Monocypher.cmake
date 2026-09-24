@@ -29,20 +29,18 @@
 # Included from the top-level CMakeLists.txt BEFORE `include(PedanticCompiler)` and
 # `include(ClangTidy)`, which install -Werror, -Wconversion and CMAKE_CXX_CLANG_TIDY
 # directory-wide and must not reach code that is not ours to fix -- the mechanism yaml-cpp,
-# Catch2 and the vendored TUI already rely on. The target also clears `CXX_CLANG_TIDY`
+# Catch2 and core-cpp already rely on. The target also clears `CXX_CLANG_TIDY`
 # itself, because an operator's `-DCMAKE_CXX_CLANG_TIDY=` on the command line is a cache
-# entry that exists before this file runs, and `vendor/CMakeLists.txt` says the same thing
-# for the same reason.
+# entry that exists before this file runs.
 #
 # The sanitizers are the opposite case: they must reach this code, and being declared before
 # `include(Sanitizers)` is exactly what keeps them off it. So the top-level CMakeLists.txt
 # applies them target by target after the includes, to the targets this file names in
-# `FASTCACHED_MONOCYPHER_TARGETS`, beside the ones `vendor/` declares. `ctest -R
-# vendor-sanitized` reads the result in the objects.
+# `FASTCACHED_MONOCYPHER_TARGETS`, beside core-cpp's. `ctest -R vendor-sanitized` reads the
+# result in the objects.
 #
-# NOT gated on `FASTCACHED_BUILD_TUI`, and not added through `vendor/CMakeLists.txt`, which
-# is: this is what every node's identity will be signed with (#178), so there is no build of
-# this project that can go without it.
+# NOT gated on any option: this is what every node's identity will be signed with (#178), so
+# there is no build of this project that can go without it.
 #
 # ## Dependency-free, and it must stay so
 #
@@ -86,8 +84,8 @@ target_compile_definitions(fastcache-monocypher PUBLIC MONOCYPHER_CPP_NAMESPACE=
 target_compile_features(fastcache-monocypher PUBLIC cxx_std_23)
 
 # Monocypher's sources are UTF-8: measured, three non-ASCII bytes in the four files, one U+2014 in
-# a comment in monocypher.c. Stated per TARGET, as vendor/CMakeLists.txt does for the TUI, so it
-# is a claim about this code and not about every third-party source in the build.
+# a comment in monocypher.c. Stated per TARGET, so it is a claim about this code and not about
+# every third-party source in the build.
 if(MSVC)
     target_compile_options(fastcache-monocypher PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8>)
 endif()

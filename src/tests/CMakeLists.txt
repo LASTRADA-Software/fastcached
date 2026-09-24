@@ -2775,30 +2775,12 @@ set_tests_properties("target-file-guards" PROPERTIES
 # nothing, and a build option the reader never turned into a target is refused as lost
 # rows rather than silently dropped.
 #
-# Eight more since #1369, for the SECOND source of optional targets -- a directory the
-# root adds only under a `FASTCACHED_BUILD_*` option outside `src/`, which is `vendor/`.
-# Before #1369 an unguarded `$<TARGET_FILE:fastcache-tui-linkprobe>` planted in this file
-# PASSED, because the check never read the file declaring that target. They assert:
-# - a planted violation in EACH source is refused and names the source that made the
-#   target optional (the app-table case above checks that too);
-# - the gated file's reference to its own target passes;
-# - the app table's own equality still refuses a dropped row with a gated target present;
-# - each of the second reader's own assertions refuses: a root option whose `if()` was
-#   not read, a declaration whose target name was not read, and no gated directory;
-# - a stray `]` in the gated file changes nothing.
-#
-# Seven more from the review of that first version, each of which it failed:
-# - a target the ROOT declares under an option is not exempt in the root, which runs with
-#   the option OFF too;
-# - a gated directory spelled quoted or under `${CMAKE_CURRENT_SOURCE_DIR}` keeps its
-#   targets, and one no path can be resolved from is refused by its spelling;
-# - `if(X)  # why`, a condition spelled across lines, and upper-case `IF`/`ADD_EXECUTABLE`
-#   are all followed;
-# - an `endif()` with no open `if()` is reported where it happened.
-#
-# The run states how many trees it built: 20. Shown to bite: against master's check 14
-# of the 20 fail, against the first #1369 version 7 do, and neutering each assertion or
-# fix fails exactly its own case.
+# Two more pin the frame walker the reference scan uses: a condition spelled across lines
+# is followed, and an `endif()` with no open `if()` is reported where it happened. They are
+# what is left of the fifteen #1369 added for a SECOND source of optional targets -- a
+# directory the root added only under a `FASTCACHED_BUILD_*` option outside `src/`, which
+# was `vendor/` -- and #1596 removed with that directory and its reader. The run states
+# how many trees it built: 7.
 #
 # The bracket sits on a ROW and not in a comment, which is the difference between a
 # regression test and the appearance of one: a REGEX-filtered `file(STRINGS)` discards
@@ -7440,9 +7422,9 @@ set_tests_properties("cli-ambient-reads-selftest" PROPERTIES
 # ----------------------------------------------------------------------------
 # vendor/ is still byte-for-byte what was imported (#134).
 #
-# The copy under vendor/ is third-party source taken verbatim from upstream, and
+# A copy under vendor/ is third-party source taken verbatim from upstream, and
 # it is only worth having while it stays diffable against upstream -- `git diff
-# <import>..HEAD -- vendor/endo` is the patch that gets contributed back. An edit
+# <import>..HEAD -- vendor/monocypher` is the patch that gets contributed back. An edit
 # applied in place breaks nothing here, which is exactly why nothing else would
 # catch it: the build stays green and the loss surfaces months later, when
 # somebody tries to upstream a fix and finds the diff full of local noise.
@@ -7461,103 +7443,6 @@ set_tests_properties("vendor-verbatim" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 300
-)
-
-# ----------------------------------------------------------------------------
-# The vendored TUI's source set is a LINK closure, not just an include closure (#134).
-#
-# `fastcache-tui-linkprobe` is an executable over the vendored objects whose `main`
-# does nothing: the LINK is the test, and it already fails the build when a symbol
-# does not resolve. This registration exists so the guard is visible to `ctest -N`
-# and so a `Not Run` stays distinguishable from a pass -- which is why it RUNS the
-# binary rather than merely naming it.
-#
-# What it defends, measured: the first source set was derived by reading `#include`
-# lines and left FIFTEEN unresolved `tui::` symbols. Everything compiled. A static
-# archive never resolves symbols, so `ninja` was green, the vendor partition
-# assertion was green and `vendor-verbatim` was green -- the wall of link errors
-# waits for the first consumer, which is the worst place to meet it because it looks
-# like the consumer is broken. Proved by deletion: dropping one source while
-# reclassifying it so the partition still passes leaves this the ONLY guard that
-# reddens, naming `tui::HyperlinkEmitter::HyperlinkEmitter(...)` at `Buffer.cpp:289`.
-#
-# Guarded on `TARGET` as well as on the option. `$<TARGET_FILE:>` naming a target
-# that was not built is a hard error at GENERATE time, which fails the whole
-# configure with a message blaming CMake rather than the option the operator set --
-# the two conditions are independent and both are owed.
-#
-# It needs no daemon, socket or compiler, so it is `hygiene`, in the default set.
-if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-linkprobe)
-    add_test(
-        NAME "vendor-tui-link-closure"
-        COMMAND $<TARGET_FILE:fastcache-tui-linkprobe>
-    )
-    set_tests_properties("vendor-tui-link-closure" PROPERTIES
-        LABELS "hygiene"
-        TIMEOUT 60
-    )
-endif()
-
-# ----------------------------------------------------------------------------
-# ...and the probe must be SEEN to refuse, on every run (#1376).
-#
-# `vendor-tui-link-closure` is the accepting direction. Its refusing direction was shown once, by
-# deletion, and the paragraph above recorded it -- which is a sentence, and a sentence cannot fail.
-# A linker told to allow undefined symbols, or objects that stopped reaching the link, would leave
-# that test green over a tree missing an implementation. So this builds
-# `fastcache-tui-linkprobe-canary` -- the same probe with `platform/SignalHandler.cpp` left out, the
-# one miss that shipped -- and requires the link to FAIL naming the definition it lacks. A canary
-# that links, and one that fails for another reason, are both refusals of the GUARD, by name.
-#
-# It runs `cmake --build` on this tree, for one link: the objects are the probe's own, already built.
-# Guarded on the canary TARGET as well as the option, for the reason the block above states.
-if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-linkprobe-canary)
-    add_test(
-        NAME "vendor-tui-link-closure-refuses"
-        COMMAND ${CMAKE_COMMAND}
-            "-DFASTCACHED_BUILD_DIR=${CMAKE_BINARY_DIR}"
-            "-DFASTCACHED_BUILD_CONFIG=$<CONFIG>"
-            "-DFASTCACHED_CANARY_TARGET=fastcache-tui-linkprobe-canary"
-            "-DFASTCACHED_CANARY_SYMBOL=SignalHandler::hasPendingSigint"
-            -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-link-canary.cmake"
-    )
-    set_tests_properties("vendor-tui-link-closure-refuses" PROPERTIES
-        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-        LABELS "hygiene"
-        TIMEOUT 300
-    )
-endif()
-
-# The canary check's three verdicts, driven by stand-in commands: a canary that linked, one that
-# failed without naming the symbol, and one that failed naming it -- the only accepting case.
-# Unconditional: it needs no build tree and no vendored target.
-add_test(
-    NAME "vendor-tui-link-canary-selftest"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-tui-link-canary-selftest"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-link-canary-selftest.cmake"
-)
-set_tests_properties("vendor-tui-link-canary-selftest" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
-)
-
-# The probe's ROOT is derived: the configure refuses a vendored `.cpp` that no link checks
-# (`cmake/VendorLinkRoots.cmake`, called from `vendor/CMakeLists.txt`). That call can only show the
-# verdict the real tree earns, which on a good tree is acceptance -- so every home a link checks, and
-# every home it does not, is driven here over synthetic records. Unconditional: pure `cmake -P`.
-add_test(
-    NAME "vendor-link-roots-selftest"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-link-roots-selftest.cmake"
-)
-set_tests_properties("vendor-link-roots-selftest" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
 )
 
 # ----------------------------------------------------------------------------
@@ -7594,50 +7479,6 @@ set_tests_properties("vendor-figures-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
-
-# The vendored TUI runtime's own tests (#1374). Declared in `vendor/CMakeLists.txt`,
-# registered HERE because `add_subdirectory(vendor)` runs before `enable_testing()`
-# -- an `add_test` in that file builds a binary that never runs and reports nothing,
-# which looks exactly like a registered test that passes.
-#
-# What it pins is the fact the mockable-dashboard plan rests on: `TuiRuntime` reads
-# time only through its injected `IClock`. It was claimed by a header comment and
-# measured by nothing. Two of the cases are the discrimination -- "An injected
-# ManualClock makes a delay's computed timeout exact" freezes the clock and requires
-# the delay NOT to fire, and "A delay fires deterministically once the ManualClock
-# crosses its deadline" advances a ManualClock 40ms per scripted wait and requires a
-# 100ms delay to resume on the THIRD wait, `REQUIRE(source.waitCount() == 3)`. A
-# hidden `steady_clock::now()` in any awaiter makes the first flake as real time
-# crosses the deadline and the second resume at the wrong wait. Neither is a test
-# that passes either way.
-#
-# A third pins the readiness half: "Runtime delivers a scripted input event to a
-# waiting flow" wakes on a pushed key with no clock advancing and no timer anywhere,
-# which is what fails against any `SleepUntil(now + interval)` implementation.
-#
-# The same binary carries endo's `TerminalQuery_test.cpp` (#1375, a declared local change):
-# queries keep the input they read, time out on an injected clock, and say NotAsked or NoReply
-# rather than returning a value that stands for both.
-#
-# ONE ctest entry running the whole binary rather than `catch_discover_tests`,
-# deliberately: per-case registration would put upstream's case names into this
-# repository's ctest namespace and under its Catch2 name hygiene, which vendored
-# tests have no reason to satisfy, and it would expose them to the SKIP_RETURN_CODE
-# collision (#1152). Catch2's exit status is its failed-assertion count, so a plain
-# non-zero is the failure signal this needs and nothing here maps 4 to "skipped".
-#
-# Guarded on `TARGET` as well as the option: `$<TARGET_FILE:>` on a target that was
-# not built is a hard error at generate time, and the two conditions are independent.
-if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-tests)
-    add_test(
-        NAME "vendor-tui-runtime-clock"
-        COMMAND $<TARGET_FILE:fastcache-tui-tests>
-    )
-    set_tests_properties("vendor-tui-runtime-clock" PROPERTIES
-        LABELS "hygiene"
-        TIMEOUT 120
-    )
-endif()
 
 # ---------------------------------------------------------------------------
 # cli-node-flags: `fastcache-cli --help` sends operators to flags that exist.
@@ -7871,50 +7712,6 @@ else()
         "only an MSVC Debug CRT has an assert report mode to route, and this build is not one")
 endif()
 
-# The vendored vocabulary stays in vendor/ (#1377). Building endo's `runtime/` (#1374) put
-# `coro::Task`, `coro::Cancellation` and `endo::platform::IClock` into the link beside our
-# own, and the vendored include root is exposed PUBLIC with `coro/` and `platform/` beside
-# `tui/`, so no arrangement of the target can keep first-party code out of them. Fails when
-# anything under src/, tests included, reaches `<coro/...>` or `<platform/Clock.hpp>`, by
-# spelling or through a vendored header, outside the adapter layer's exemption rows.
-# scripts/check-vendor-vocabulary.cmake carries the tables and says in its refusal what the
-# rule does not cover.
-#
-# Default set, for net-boundary's reason: no daemon, no socket, no compiler, and no skip path,
-# since the source tree and vendor/ are both present in an exported tarball. Its zero has a
-# positive control: a vendored header known to reach `coro/` is walked by the same reader and
-# must be seen to reach it, or the run refuses rather than reporting a clean src/.
-add_test(
-    NAME "vendor-vocabulary"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-vocabulary.cmake"
-)
-set_tests_properties("vendor-vocabulary" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
-)
-
-# The shipped tree reaches none of the vocabulary, so the real run only ever shows the
-# accepting direction. Everything about refusing is shown here, over synthesised trees
-# under a scratch directory: every forbidden spelling, the closure at one and two hops, a
-# first-party file shadowing a vendored one, both ways an exemption row goes stale, a dead
-# control, and a scan of nothing. Each case has been WATCHED to fail: every mutant of the check
-# tried reddens exactly the cases it should and no others, and the unmutated check reddens none.
-add_test(
-    NAME "vendor-vocabulary-selftest"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-vocabulary-selftest"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-vocabulary-selftest.cmake"
-)
-set_tests_properties("vendor-vocabulary-selftest" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
-)
-
 # `vendor-verbatim` told a declared local change from an accidental edit only in its refusal
 # TEXT: regenerating the manifest silenced it for any edit, declared or not (found landing
 # #1375, the first local change this tree carries). The manifest now records each file's
@@ -7963,22 +7760,26 @@ set_tests_properties("cli-exit-code-docs-selftest" PROPERTIES
     TIMEOUT 60
 )
 
-# The vendored TUI is sanitized in the OBJECTS, not only on a compile line (#134). Until the
-# target-by-target block after `include(Sanitizers)` in the top-level CMakeLists.txt, every
-# `vendor/` target was declared before the directory-scoped sanitizer options and built with none,
-# while the configure printed "Enabling". This reads the objects `fastcache-tui-objects` produced
-# for the undefined init reference each enabled sanitizer leaves, beside a CONTROL object compiled
-# in the same configuration with `-fno-sanitize=all`, which must come back without it -- so the
-# reader is watched saying "absent" as well as "present". ASan and TSan only: UBSan leaves no
-# per-object init to read, and MSVC has no `nm`.
+# Code this project does not build under its own directory-scoped flags is sanitized in the
+# OBJECTS, not only on a compile line (#134). Until the target-by-target block after
+# `include(Sanitizers)` in the top-level CMakeLists.txt, the vendored TUI was declared before the
+# directory-scoped sanitizer options and built with none, while the configure printed "Enabling".
+# This reads the objects of each such target for the undefined init reference each enabled
+# sanitizer leaves, beside a CONTROL object compiled in the same configuration with
+# `-fno-sanitize=all`, which must come back without it -- so the reader is watched saying "absent"
+# as well as "present". ASan and TSan only: UBSan leaves no per-object init to read, and MSVC has no
+# `nm`.
 #
-# Monocypher (#178) is read here too, from the targets cmake/Monocypher.cmake names, and it is
-# unconditional where the TUI is not -- so the check now runs in a sanitizer build with
-# `FASTCACHED_BUILD_TUI=OFF` as well, reading the one vendored copy that build compiles.
+# Two sources of such targets. Monocypher (#178), from the targets cmake/Monocypher.cmake names,
+# unconditionally. And core-cpp (#1596), whose libraries that block instruments from its
+# `CORE_CPP_TARGETS` property: read here through the ones this build is sure to compile. core-cpp's
+# targets are EXCLUDE_FROM_ALL, so a library nothing links has no objects to read, and `core::tui`
+# -- behind the terminal wait on the pool -- is the one `fastcache-cli` links.
 if((ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZER_THREAD) AND NOT MSVC AND CMAKE_NM)
     set(_fcVendoredObjectTargets ${FASTCACHED_MONOCYPHER_TARGETS})
-    if(TARGET fastcache-tui-objects)
-        list(APPEND _fcVendoredObjectTargets fastcache-tui-objects)
+    if(TARGET core::tui)
+        get_target_property(_fcCoreCppTui core::tui ALIASED_TARGET)
+        list(APPEND _fcVendoredObjectTargets ${_fcCoreCppTui})
     endif()
     set(_fcVendoredObjects "")
     foreach(_fcVendoredObjectTarget IN LISTS _fcVendoredObjectTargets)

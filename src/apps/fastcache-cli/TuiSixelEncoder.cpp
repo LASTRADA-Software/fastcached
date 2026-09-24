@@ -5,31 +5,31 @@
 #include <limits>
 #include <utility>
 
-#include <tui/Sixel.hpp>
+#include <core/tui/Sixel.hpp>
 
 namespace FastCache::Cli
 {
 
-/// @file EndoSixelEncoder.cpp
-/// The adapter from `ISixelEncoder` to the vendored `tui::encodeSixel`.
+/// @file TuiSixelEncoder.cpp
+/// The adapter from `ISixelEncoder` to core-cpp's `core::tui::encodeSixel`.
 ///
-/// **The only file of fastcache-cli that includes `<tui/Sixel.hpp>`.** Everything the vendored
+/// **The only file of fastcache-cli that includes `<core/tui/Sixel.hpp>`.** Everything core-cpp's
 /// signature needs that the first-party one does not say -- `int` dimensions, an `int` colour
-/// ceiling, `tui::Result` -- is converted here and nowhere else.
+/// ceiling, `core::tui::Result` -- is converted here and nowhere else.
 
 namespace
 {
     /// The widest palette a Sixel encoder here is asked for.
     constexpr auto MostColors = std::size_t { 256 };
 
-    /// The vendored encoder behind the first-party seam.
-    class EndoSixelEncoder final: public ISixelEncoder
+    /// Core-cpp's encoder behind the first-party seam.
+    class TuiSixelEncoder final: public ISixelEncoder
     {
       public:
         [[nodiscard]] std::expected<std::string, std::string> Encode(RgbaImage const& image, std::size_t maxColors) override
         {
             // Refused HERE rather than narrowed: a dimension past `int` would wrap into a size
-            // the vendored encoder then trusts, and a zero is a caller's mistake worth naming.
+            // core-cpp's encoder then trusts, and a zero is a caller's mistake worth naming.
             constexpr auto Widest = static_cast<std::size_t>(std::numeric_limits<int>::max());
             if (image.width == 0 || image.height == 0)
                 return std::unexpected(std::string { "a Sixel image needs a width and a height" });
@@ -37,10 +37,10 @@ namespace
                 return std::unexpected(std::string { "a Sixel image is wider or taller than the encoder can address" });
 
             auto const colors = static_cast<int>(std::clamp(maxColors, std::size_t { 1 }, MostColors));
-            auto encoded = tui::encodeSixel(tui::ImageData { .pixels = image.pixels,
-                                                             .width = static_cast<int>(image.width),
-                                                             .height = static_cast<int>(image.height) },
-                                            colors);
+            auto encoded = core::tui::encodeSixel(core::tui::ImageData { .pixels = image.pixels,
+                                                                         .width = static_cast<int>(image.width),
+                                                                         .height = static_cast<int>(image.height) },
+                                                  colors);
             if (!encoded.has_value())
                 return std::unexpected(std::move(encoded.error()));
             return std::move(*encoded);
@@ -51,7 +51,7 @@ namespace
 
 std::expected<std::unique_ptr<ISixelEncoder>, std::string> MakeSixelEncoder()
 {
-    return std::make_unique<EndoSixelEncoder>();
+    return std::make_unique<TuiSixelEncoder>();
 }
 
 } // namespace FastCache::Cli

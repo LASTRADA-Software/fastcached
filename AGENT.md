@@ -1066,7 +1066,7 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - **Which files are this project's own is ONE answer: `scripts/lib/third-party-roots.txt`.** A
   script listing the repository's files asks it (`first_party_paths`,
   `fastcached_decline_third_party`) and NAMES what it declined, or carries an exemption row with a
-  reason. `ctest -R third-party-roots`; a root is the upstream COPY (`vendor/endo`).
+  reason. `ctest -R third-party-roots`; a root is the upstream COPY (`vendor/monocypher`).
 - **And HOW a file set is found is one answer too: `fastcached_tracked_files`.** A `check-*.cmake`
   keeps its QUESTION and never its own work-tree probe, `ls-files` call, walk fallback or copy of
   the excluded names; `fastcached_first_party_cxx` is a CALLER, and the probe is

@@ -196,11 +196,11 @@ option(FASTCACHED_ENABLE_COMPRESSION "Enable on-disk value compression (zstd + l
 option(TRACY_ENABLE "Enable Tracy profiler instrumentation (fetches & links the Tracy client)" OFF)
 option(TRACY_ON_DEMAND "Tracy: only collect data while a profiler is connected" ON)
 
-# The vendored endo TUI, behind `fastcache-cli live-stats` (#134). ON, because a
-# view nobody builds is a view nobody runs and its tests would not report -- the
-# option exists so a build that wants neither the terminal view nor a libunicode
-# fetch can say so, not as a way to keep it out of CI. See vendor/VENDOR.md.
-option(FASTCACHED_BUILD_TUI "Build the vendored terminal UI (fastcache-cli live-stats)" ON)
+# core-cpp's terminal UI, `core::tui`, behind `fastcache-cli live-stats` (#134, #1596). ON,
+# because a view nobody builds is a view nobody runs and its tests would not report -- the
+# option exists so a build that wants neither the terminal view nor a libunicode fetch can
+# say so, not as a way to keep it out of CI. It is forwarded as `CORE_CPP_WITH_TUI`.
+option(FASTCACHED_BUILD_TUI "Build core-cpp's terminal UI (fastcache-cli live-stats)" ON)
 
 # ----------------------------------------------------------------------------
 # Compiler caching. Loaded before any compiler invocation so that CPM-fetched
@@ -412,7 +412,7 @@ if(FASTCACHED_ENABLE_COMPRESSION)
     )
 endif()
 
-# libunicode, for the vendored endo TUI's grapheme segmentation and character
+# libunicode, for core-cpp's terminal UI's grapheme segmentation and character
 # widths (#134). Fetched here with the other third-party code, BEFORE the
 # pedantic/clang-tidy includes below, for the same reason they are: those install
 # -Werror -Wconversion and CMAKE_CXX_CLANG_TIDY directory-wide and must not reach
@@ -422,7 +422,7 @@ endif()
 # a zero-width codepoint following an ASCII base: the scanner splits a run at the
 # ASCII/non-ASCII boundary, the zero-width codepoint arrives in the non-ASCII half
 # alone and joins the cluster the ASCII half left open without widening it, so the
-# reported end lags and those bytes are never emitted. The vendored TUI's width
+# reported end lags and those bytes are never emitted. The terminal UI's width
 # handling is downstream of that scanner, and a terminal view that mismeasures a
 # cluster corrupts every column to its right.
 #
@@ -462,8 +462,30 @@ if(FASTCACHED_BUILD_TUI)
             "PEDANTIC_COMPILER OFF"
             "PEDANTIC_COMPILER_WERROR OFF"
     )
-    add_subdirectory(vendor)
 endif()
+
+# core-cpp, the shared C++23 foundation of the Contour Terminal projects (#1596): the terminal UI
+# behind `fastcache-cli live-stats` is its `core::tui`. After libunicode, which `core::tui` links, so
+# core-cpp takes the target this project already declared rather than fetching a second copy; and
+# before the pedantic/clang-tidy includes below, for the reason every dependency above is -- a
+# subproject's code is not governed by this project's warning policy. core-cpp sets no global state
+# as a subproject, and its targets get the sanitizers from the block after `include(Sanitizers)`.
+#
+# The pin is a TAG. To iterate against a local checkout, configure with
+# `-DCPM_core-cpp_SOURCE=<path>`; never commit a branch.
+CPMAddPackage(
+    NAME core-cpp
+    GITHUB_REPOSITORY contour-terminal/core-cpp
+    GIT_TAG v0.5.0
+    VERSION 0.5.0
+    SYSTEM YES
+    EXCLUDE_FROM_ALL YES
+    OPTIONS
+        "CORE_CPP_WITH_TUI ${FASTCACHED_BUILD_TUI}"
+        "CORE_CPP_WITH_IMAGES OFF"
+        "CORE_CPP_WITH_TLS OFF"
+        "CORE_CPP_TESTING OFF"
+)
 
 # Monocypher, the vendored Ed25519 / X25519 implementation behind `Core/Ed25519`,
 # `Core/X25519` and `Core/Hkdf` (#178). Unconditional, and here with the other third-party
@@ -490,34 +512,33 @@ include(ErrorPopups)
 include(InstructionSetProbe)
 
 # ----------------------------------------------------------------------------
-# The vendored TUI gets the sanitizer flags TARGET BY TARGET, and that is not a style choice.
+# Code declared above these includes gets the sanitizer flags TARGET BY TARGET, and that is not a
+# style choice.
 #
 # `Sanitizers` instruments with directory-scoped `add_compile_options`, which reaches only
-# targets defined AFTER it -- and `add_subdirectory(vendor)` runs above, inside the
-# `FASTCACHED_BUILD_TUI` block that fetches libunicode. So until this block
-# the vendored code was built with no sanitizer at all in every sanitizer configuration: the
-# ASan/UBSan leg never covered endo, and a ThreadSanitizer run of `fastcache-cli-tests` reported
-# that binary's own objects instrumented while its endo half -- the terminal wait on the pool,
-# and the wakeup signalled to it from the reactor -- was not. Measured: a
-# `fastcache-tui-objects` object in the ASan build carried no `-fsanitize` and 0 `__asan`
-# symbols, beside a `FastCache` object carrying both.
+# targets defined AFTER it. So a dependency added above is built with no sanitizer at all in every
+# sanitizer configuration unless something hands it the flags. That was measured once, on the
+# vendored endo TUI this project carried before core-cpp (#134): an object of it in the ASan build
+# carried no `-fsanitize` and 0 `__asan` symbols, beside a `FastCache` object carrying both, and a
+# ThreadSanitizer run of `fastcache-cli-tests` reported that binary's own objects instrumented
+# while the terminal wait on the pool was not.
 #
-# Moving `add_subdirectory(vendor)` below these includes is the tidy-looking fix and the wrong
-# one: it would also put `PedanticCompiler`'s -Werror and clang-tidy on the verbatim copy, which
-# `vendor/VENDOR.md` says we do not govern. And folding this back into directory scope would
-# silently undo it, which is why it says so here.
+# Moving those dependencies below these includes is the tidy-looking fix and the wrong one: it
+# would also put `PedanticCompiler`'s -Werror and clang-tidy on code this project does not govern.
+# And folding this back into directory scope would silently undo it, which is why it says so here.
 #
-# Read from the module's OWN variables, so a sanitizer added there reaches the vendored code
-# too, and applied to every target the `vendor/` directory declares -- derived, not named, so a
-# vendored test binary added later is covered without an edit. Executables get the link flags as
-# well, or instrumented objects would not link. libunicode is a different directory and stays
-# uninstrumented, like every other third-party dependency. `ctest -R vendor-sanitized` asserts the
-# result in the OBJECTS, where a flag that never reached a compile line would show.
+# Read from the module's OWN variables, so a sanitizer added there reaches these targets too.
+# Executables get the link flags as well, or instrumented objects would not link. libunicode and
+# the other fetched dependencies stay uninstrumented. `ctest -R vendor-sanitized` asserts the result
+# in the OBJECTS, where a flag that never reached a compile line would show.
 #
-# Monocypher (#178) is the second vendored copy and the same case exactly: declared above the
-# includes, so the directory-scoped flags never reach it. It is built from cmake/Monocypher.cmake
-# in THIS directory rather than under `vendor/`, whose directory is added only with the TUI, so
-# its targets come from the list that module states beside them rather than from a directory walk.
+# Two sources, each a list its owner states rather than one derived here:
+# - Monocypher (#178), the vendored copy, built from cmake/Monocypher.cmake in THIS directory,
+#   which states its targets beside them;
+# - core-cpp (#1596), whose compiled libraries are its `CORE_CPP_TARGETS` global property. core-cpp
+#   refuses `CORE_CPP_SANITIZERS` in a subproject build, so this block is the only way its code is
+#   sanitized at all -- and a ThreadSanitizer run that instrumented this project's half of a race and
+#   not core-cpp's half would report the one and miss the other.
 if(SANITIZER_COMPILE_OPTIONS)
     set(_fcVendorTargets ${FASTCACHED_MONOCYPHER_TARGETS})
     if(NOT _fcVendorTargets)
@@ -526,20 +547,18 @@ if(SANITIZER_COMPILE_OPTIONS)
             "flags reached none of them. An empty list is this block having stopped working, not a "
             "cryptographic library that needs no instrumentation.")
     endif()
-    if(FASTCACHED_BUILD_TUI)
-        get_property(_fcTuiVendorTargets DIRECTORY "${CMAKE_SOURCE_DIR}/vendor" PROPERTY BUILDSYSTEM_TARGETS)
-        if(NOT _fcTuiVendorTargets)
-            message(FATAL_ERROR
-                "The vendor/ directory declares no targets, so the sanitizer flags reached none of them. "
-                "A derived set that comes back empty is this block having stopped working, not a vendored "
-                "library that needs no instrumentation.")
-        endif()
-        list(APPEND _fcVendorTargets ${_fcTuiVendorTargets})
+    get_property(_fcCoreCppTargets GLOBAL PROPERTY CORE_CPP_TARGETS)
+    if(NOT _fcCoreCppTargets)
+        message(FATAL_ERROR
+            "core-cpp published no targets in the CORE_CPP_TARGETS global property, so the sanitizer "
+            "flags reached none of them. An empty set is this block having stopped working, not a "
+            "library that needs no instrumentation.")
     endif()
+    list(APPEND _fcVendorTargets ${_fcCoreCppTargets})
     foreach(_fcVendorTarget IN LISTS _fcVendorTargets)
         if(NOT TARGET ${_fcVendorTarget})
             message(FATAL_ERROR
-                "The sanitizer block was handed `${_fcVendorTarget}` as a vendored target, and no such "
+                "The sanitizer block was handed `${_fcVendorTarget}` as a target to instrument, and no such "
                 "target exists. The list that named it has drifted from the targets it describes.")
         endif()
         get_target_property(_fcVendorTargetType ${_fcVendorTarget} TYPE)

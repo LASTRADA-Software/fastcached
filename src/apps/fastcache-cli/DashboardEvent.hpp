@@ -132,9 +132,9 @@ struct DashboardEvent
     /// delivers a real Ctrl-C here, and `IsQuitKey` still reads it.
     std::string keys {};
 
-    /// `Resize`: the new geometry, as endo reports it.
+    /// `Resize`: the new geometry, as core-cpp reports it.
     ///
-    /// Two ints rather than a geometry struct, because `tui::Terminal` answers
+    /// Two ints rather than a geometry struct, because `core::tui::Terminal` answers
     /// `columns()` and `rows()` and has no such struct. Wrapping them here would be
     /// a third spelling of something that already has two, which is the duplicate
     /// type this deliberately avoided the first time.
