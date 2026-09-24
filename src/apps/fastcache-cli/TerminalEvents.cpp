@@ -203,8 +203,8 @@ namespace
 struct UnstartedTerminal::Parts
 {
     std::unique_ptr<ITerminalDevice> device;
-    IExecutor* pool { nullptr };
-    IExecutor* resumeOn { nullptr };
+    core::async::IExecutor* pool { nullptr };
+    core::async::IExecutor* resumeOn { nullptr };
 };
 
 /// The one door to an `UnstartedTerminal`'s parts, so the type offers its holders nothing to call.
@@ -223,8 +223,8 @@ UnstartedTerminal::UnstartedTerminal(std::unique_ptr<Parts> parts) noexcept:
 
 UnstartedTerminal::~UnstartedTerminal() = default;
 
-std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(IExecutor* pool,
-                                                                                  IExecutor* resumeOn,
+std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(core::async::IExecutor* pool,
+                                                                                  core::async::IExecutor* resumeOn,
                                                                                   UsageColor colour)
 {
     try
@@ -243,7 +243,7 @@ std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvent
     }
 }
 
-Task<std::expected<StartedTerminal, std::string>> StartTerminal(std::unique_ptr<UnstartedTerminal> terminal)
+core::async::Task<std::expected<StartedTerminal, std::string>> StartTerminal(std::unique_ptr<UnstartedTerminal> terminal)
 {
     auto& parts = UnstartedTerminalAccess::Of(*terminal);
     co_return co_await StartTerminalDevice(std::move(parts.device), parts.pool, parts.resumeOn);

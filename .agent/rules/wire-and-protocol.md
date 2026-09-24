@@ -678,66 +678,26 @@ Every rule below has already been a bug.
 
 ## The Net boundary
 
-<!-- agent-tripwire: `Net/` must not depend on `Core/`. `Async/` travels with it, plus three named dependency-free leaf headers -->
+<!-- agent-tripwire: The coroutines, the event loop, the sockets and TLS are core-cpp's `core::async`, `core::net` and `core::net_tls` -->
 
-- **`Net/` is meant to be lifted out of this tree, so what it may include is a
-  table and a test rather than an intention.** The constraint was already written
-  down -- "`Net` must not depend on `Core`, so `ConnectTcp` takes host and port
-  separately" -- and honoured for *new* code, while ten edges that predated it sat
-  there untouched (issue #100). That is the shape the constraint will always fail
-  in: an include graph drifts in silence. Nothing fails, nothing warns, no test
-  goes red, and the edge is discovered by whoever finally attempts the lift.
-  `ctest -R net-boundary` is the answer, and four things about it are
-  load-bearing:
-  - **`Async/` travels WITH `Net/`, and that decision had to come first.**
-    `ISocket::Read`/`Write` return `Task<T>`, `IoAwaitable` is the reactor's
-    completion hook, and `EpollSocket`/`IocpSocket`/`KqueueSocket` are the
-    reactors' own I/O side -- there is no `Net` without the awaitable vocabulary.
-    Moving that vocabulary into `Net/` instead is the alternative, and it is worse
-    twice over: it leaves `Async/` -- a general coroutine and event-loop library --
-    unusable without `Net/`, or it duplicates `Task`.
-  - **Three `Core/` leaf headers travel too, each a row with a reason, and the
-    check verifies they are still leaves.** `Core/Clock.hpp` (`IClock` and
-    `TimePoint`, which every deadline in `Net/` and every timer in `Async/` is
-    expressed in -- carrying a second clock interface would fragment the one seam
-    the whole codebase injects), `Core/Ranges.hpp` (`FindOrNull`, a toolchain
-    shim rather than a domain type) and `Core/Profiling.hpp` (the `FC_ZONE_*`
-    macros, which expand to `(void) 0` and carry no code at all). The row is only
-    safe while the header depends on nothing, so the check reads each one and
-    fails if it has grown a `FastCache/` include: a leaf that quietly gained one
-    would drag the whole of `Core/` back across the boundary while still passing.
-  - **An edge is closed by moving the file to the layer that owns it, not by
-    widening the table.** `Core/Errors/NetError.hpp` became `Net/NetError.hpp` --
-    it is `Net`'s own taxonomy and sat in `Core/Errors/` only because that is
-    where the taxonomies were shelved. `Net/Framing/LineReader` became
-    `Protocol/Framing/LineReader`: it fails with `ProtocolError`, its caps are a
-    session's caps, and its own doc lists the protocol handlers as its callers.
-    `Net/InheritedListener` became `Platform/InheritedListener`: it reads the
-    environment and checks a pid, and handing back an `IListener` does not make
-    socket activation a network primitive. In all three the dependency was
-    pointing the wrong way round, and moving the file makes `Protocol -> Net` and
-    `Platform -> Net` the directions that were always intended.
-  - **The check is a scan of the include graph, deliberately, and not a target
-    that compiles the set.** Compiling it means a second full build of `Net/` +
-    `Async/` in every configuration on every platform, and a staged include root
-    copied at configure time goes stale exactly when a header changes -- which is
-    the moment the answer matters. The scan reads the same graph the compiler
-    would, from the sources, in milliseconds; combined with this project's
-    separate rule that public headers are self-contained, a set closed under
-    inclusion is a set that compiles standalone. It was verified by running it
-    against the tree as it stood before this work, where it names all ten edges.
-  - **Test sources are out of scope and that is a decision, not an oversight.**
-    What gets lifted is the library. `Net/HealthProbe_test.cpp` drives the
-    daemon's own `AdminHttpServer`, which is the entire point of that case;
-    gating it would force either a second `AdminHttpServer` fake inside `Net/` or
-    the loss of the one test that proves the probe works against the real thing.
-    (This is also why the issue's own edge count was high: it counted `_test.cpp`
-    files, so `Core/Bytes.hpp` and `Core/Logger.hpp` appeared on the list while
-    never being reachable from production `Net/` code at all.)
+- **The lift this section prepared for has happened.** `Net/` and `Async/` were kept free of
+  `Core/` -- a table of allowed edges and `ctest -R net-boundary` -- so they could leave this tree,
+  and they did: they are core-cpp's `core::net` and `core::async` since
+  [#1596](https://github.com/LASTRADA-Software/fastcached/issues/1596), with TLS as `core::net_tls`
+  and the three leaf headers the table let travel (`Clock`, `Ranges`, `Profiling`) as core-cpp's
+  `core::platform` clock and `core::` base headers. The check went with them, because the
+  boundary is now a CMake target edge: fastcached's code cannot reach into core-cpp's internals
+  except through its installed headers, and core-cpp's own module table refuses an include across
+  its modules that it does not list.
+- **What is left here is what core-cpp does not offer yet, in `Transport/`, and a defect in the
+  moved code is fixed in core-cpp and re-pinned, never patched around here.** `NativeListen` (a
+  port several loops share, an inherited descriptor adopted, and the admin endpoints'
+  `BlockingListener`) and `LingeringClose` are each a graduation candidate; the pull request that
+  moved the rest names them.
 
 ## Sockets
 
-<!-- agent-tripwire: There is exactly one TCP client, `Net/TcpClient`. Do not write a second -->
+<!-- agent-tripwire: There is exactly one TCP client, `core::net::TcpClient`. Do not write a second -->
 
 - **Three implementations of one TCP client, and the rot was in the one nobody
   built.** `Net/BlockingConnector` dialled non-blocking through `getaddrinfo` and

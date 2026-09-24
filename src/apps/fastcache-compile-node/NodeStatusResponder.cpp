@@ -249,7 +249,7 @@ std::optional<std::vector<std::byte>> NodeStatusResponder::RefusePeer(PeerIdenti
                               "this node reports its identity and counters to fleet members only");
 }
 
-Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
+core::async::Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
 {
     // The verb is read back out of the frame this call was handed rather than taken on
     // the endpoint's word: `Answer` is reachable directly, which is why the gate exists
@@ -324,8 +324,8 @@ Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, P
 }
 
 ConfiguredNodeStatus::ConfiguredNodeStatus(NodeConfig const& cfg,
-                                           IClock const& clock,
-                                           TimePoint startedAt,
+                                           core::platform::IClock const& clock,
+                                           core::platform::SteadyTimePoint startedAt,
                                            std::string version,
                                            std::string nodeId,
                                            NodeComponents components,

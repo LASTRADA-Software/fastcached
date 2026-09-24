@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+
 using namespace FastCache;
 using namespace std::chrono_literals;
 
@@ -27,14 +29,16 @@ namespace
 /// connector at all. A nullptr can also mean "dialled and failed", which is a
 /// different fact -- and asserting the weaker one let the old version of this
 /// file make a real 300ms network attempt inside a unit suite.
-class RecordingConnector final: public IConnector
+class RecordingConnector final: public core::net::IConnector
 {
   public:
-    [[nodiscard]] Task<SocketResult> connect(std::string host, std::uint16_t port, DialOptions /*options*/) override
+    [[nodiscard]] core::async::Task<core::net::SocketResult> connect(std::string host,
+                                                                     std::uint16_t port,
+                                                                     core::net::DialOptions /*options*/) override
     {
         _dials.emplace_back(std::move(host), port);
-        co_return std::unexpected(
-            NetError { .code = NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" });
+        co_return std::unexpected(core::net::NetError {
+            .code = core::net::NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" });
     }
 
     [[nodiscard]] std::size_t Dials() const noexcept
@@ -54,9 +58,9 @@ class RecordingConnector final: public IConnector
 /// Drive one dial synchronously. Sound because the connector above never
 /// suspends, which is the same precondition `DialEndpointBlocking` encodes in its
 /// parameter type.
-[[nodiscard]] std::unique_ptr<ISocket> Dial(RecordingConnector& connector, std::string_view hostPort)
+[[nodiscard]] std::unique_ptr<core::net::ISocket> Dial(RecordingConnector& connector, std::string_view hostPort)
 {
-    return SyncRun(Cc::DialEndpoint(&connector, hostPort, DialOptions { .connectTimeout = 100ms }));
+    return core::async::syncRun(Cc::DialEndpoint(&connector, hostPort, core::net::DialOptions { .connectTimeout = 100ms }));
 }
 
 } // namespace
@@ -89,7 +93,7 @@ TEST_CASE("DialEndpoint refuses a bare port rather than assuming this machine")
 TEST_CASE("DialEndpoint refuses an empty host, which is a bare port respelled")
 {
     // `:6674` and `[]:6674` split cleanly into an empty host and a valid port, so
-    // the bare-port case above does not cover them. `Detail::RunConnectFlow`
+    // the bare-port case above does not cover them. `core::net::detail::runConnectFlow`
     // refuses an empty host, so production is not reachable through this -- but
     // that makes the refusal a property of the connector, and this file's claim is
     // the stronger one: a malformed endpoint reaches no connector at all. Asserted

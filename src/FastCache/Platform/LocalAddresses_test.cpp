@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
@@ -12,6 +11,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 using namespace FastCache;
 using namespace std::chrono_literals;
@@ -29,7 +30,7 @@ TEST_CASE("Loopback is this machine without the platform being asked at all", "[
     // gets -- and it must not reach the address set, because a cache only the
     // unusual case touches is a far weaker thing to have to get right.
     Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CachedLocalityOracle const locality { machine, clock, Interval };
 
     // One call, at construction. Everything below is free.
@@ -50,7 +51,7 @@ TEST_CASE("The address set is refreshed on an interval, never because a caller m
     // -- so the probe count is the only thing that can tell them apart, which is why
     // `ScriptedHostAddresses` counts.
     Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CachedLocalityOracle const locality { machine, clock, Interval };
     REQUIRE(machine.Calls() == 1);
 
@@ -75,7 +76,7 @@ TEST_CASE("An address this machine gains is refused until the next refresh, and 
     // is one local client on a freshly-assigned address falling back to a local
     // compile -- a miss and a retry, never a wrong answer served confidently.
     Testing::ScriptedHostAddresses machine { { "10.0.0.7" } };
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CachedLocalityOracle const locality { machine, clock, Interval };
 
     machine.Publish({ "10.0.0.7", "10.0.0.8" });
@@ -93,7 +94,7 @@ TEST_CASE("An address this machine loses stays admitted for at most one interval
     // the window -- a DHCP reassignment racing the refresh -- and the machine that
     // gains it is on the segment the address came from.
     Testing::ScriptedHostAddresses machine { { "10.0.0.7", "10.0.0.8" } };
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CachedLocalityOracle const locality { machine, clock, Interval };
 
     machine.Publish({ "10.0.0.7" });
@@ -111,7 +112,7 @@ TEST_CASE("A dual-stack caller is folded against the interface list, both spelli
     // own clients on exactly the bind the locality rule exists for -- the failure
     // #180 already paid for once on the member list.
     Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CachedLocalityOracle const locality { machine, clock, Interval };
 
     CHECK(locality.IsThisMachine("10.0.0.7"));
@@ -130,7 +131,7 @@ TEST_CASE("A machine that would not say its addresses is loopback and nothing el
     // nothing must not become a wildcard, and a node whose own address it cannot
     // learn still has to serve the loopback clients that are the reason it runs.
     Testing::ScriptedHostAddresses const silent;
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CachedLocalityOracle const locality { silent, clock, Interval };
 
     CHECK(locality.IsThisMachine("127.0.0.1"));
@@ -139,12 +140,12 @@ TEST_CASE("A machine that would not say its addresses is loopback and nothing el
 
 TEST_CASE("A peer with no name matches nothing, an empty interface entry included", "[platform][locality]")
 {
-    // `FormatPeerAddress` answers empty for a peer whose family is unknown or whose
+    // `core::net::formatPeerAddress` answers empty for a peer whose family is unknown or whose
     // `getpeername` failed, and two unanswerable questions are not a match. The
     // guard is `SameHost`'s rather than this file's, and it is asserted here because
     // this is the surface where being wrong hands a stranger the tier.
     Testing::ScriptedHostAddresses const machine { { "", "10.0.0.7" } };
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CachedLocalityOracle const locality { machine, clock, Interval };
 
     CHECK_FALSE(locality.IsThisMachine(""));
@@ -170,7 +171,7 @@ TEST_CASE("The real machine reports addresses, and loopback is among them", "[pl
     CHECK(std::ranges::any_of(addresses, loopback));
 
     // And nothing it reports is a spelling a peer could never arrive in: no port, no
-    // brackets, no `%scope` suffix, because `FormatPeerAddress` produces none of
+    // brackets, no `%scope` suffix, because `core::net::formatPeerAddress` produces none of
     // those and a set the peers cannot match is a set that looks populated and is
     // not.
     auto const unmatchable = [](std::string const& address) {

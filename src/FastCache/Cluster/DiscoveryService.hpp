@@ -4,17 +4,18 @@
 #include <FastCache/Cluster/DiscoveryWire.hpp>
 #include <FastCache/Cluster/PeerDirectory.hpp>
 #include <FastCache/Consensus/IRaftPeerKeys.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/IDatagramSocket.hpp>
 
 #include <chrono>
 #include <cstddef>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include <core/net/IDatagramSocket.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Cluster
 {
@@ -29,15 +30,15 @@ struct DiscoveryConfig
     /// Where beacons are sent.
     ///
     /// A parameter rather than a constant so a test can point a whole segment at
-    /// `DatagramBus::BroadcastAddress()` and a deployment at a real broadcast or
+    /// `core::net::testing::DatagramBus::BroadcastAddress()` and a deployment at a real broadcast or
     /// multicast address -- which subnet to shout on is a site's decision and
     /// not this layer's.
     ///
     /// Host and port apart rather than `host:port` text, because that is the
-    /// shape `IDatagramSocket` takes -- see `DatagramAddress`. `--discovery` is
+    /// shape `core::net::IDatagramSocket` takes -- see `core::net::DatagramAddress`. `--discovery` is
     /// split in `DiscoveryTier::Start`, which is where that value is validated
     /// and where the two error messages it can produce are worth telling apart.
-    DatagramAddress beaconAddress;
+    core::net::DatagramAddress beaconAddress;
 
     /// How often this node announces itself.
     std::chrono::seconds beaconInterval { 15 };
@@ -71,7 +72,7 @@ enum class DiscoveryEvent : std::uint8_t
 /// The one piece of this feature that speaks to the network, and it is kept as
 /// thin as that allows: what a datagram means lives in `DiscoveryWire`, who is
 /// remembered lives in `PeerDirectory`, and this drives them over an
-/// `IDatagramSocket`. `PumpOnce` is the whole state machine and is synchronous,
+/// `core::net::IDatagramSocket`. `PumpOnce` is the whole state machine and is synchronous,
 /// so an entire segment forming a cluster is a loop in a unit test rather than
 /// several processes and a sleep.
 ///
@@ -128,8 +129,8 @@ class DiscoveryService
     /// @param keys This node's own key, which signs its proofs, and the roster that says
     ///        whose key every other id is; must outlive this.
     /// @param metrics Where proofs under keys the roster does not accept are counted.
-    DiscoveryService(IDatagramSocket& socket,
-                     IClock& clock,
+    DiscoveryService(core::net::IDatagramSocket& socket,
+                     core::platform::IClock& clock,
                      ISecureRandom& random,
                      PeerDirectory& directory,
                      DiscoveryConfig config,
@@ -160,9 +161,9 @@ class DiscoveryService
     /// A challenge this node issued and is waiting on.
     struct Pending
     {
-        DiscoveryWire::Challenge challenge; ///< What was asked.
-        std::string endpoint;               ///< Where the answer must come from.
-        TimePoint issuedAt {};              ///< When, so it can expire.
+        DiscoveryWire::Challenge challenge;          ///< What was asked.
+        std::string endpoint;                        ///< Where the answer must come from.
+        core::platform::SteadyTimePoint issuedAt {}; ///< When, so it can expire.
     };
 
     /// Ask a peer to prove it holds the key.
@@ -170,7 +171,7 @@ class DiscoveryService
     /// @param replyTo Where to send it.
     /// @return Whether a challenge went out: false when no nonce could be drawn, which is
     ///         reported here and leaves any earlier challenge to that peer as it was.
-    [[nodiscard]] bool IssueChallenge(DiscoveryWire::Beacon const& peer, DatagramAddress const& replyTo);
+    [[nodiscard]] bool IssueChallenge(DiscoveryWire::Beacon const& peer, core::net::DatagramAddress const& replyTo);
 
     /// Judge a proof that answered a challenge this node issued.
     /// @param proof What arrived.
@@ -179,16 +180,16 @@ class DiscoveryService
     /// @return What it proved.
     [[nodiscard]] DiscoveryEvent JudgeProof(DiscoveryWire::Proof const& proof,
                                             DiscoveryWire::Challenge const& challenge,
-                                            DatagramAddress const& from);
+                                            core::net::DatagramAddress const& from);
 
     /// Report a proof under a key the roster does not accept, throttled.
     /// @param revoked Whether the key is one the roster revoked, rather than one it never held.
     /// @param proof What arrived.
     /// @param from Where it came from.
-    void ReportUnacceptedKey(bool revoked, DiscoveryWire::Proof const& proof, DatagramAddress const& from);
+    void ReportUnacceptedKey(bool revoked, DiscoveryWire::Proof const& proof, core::net::DatagramAddress const& from);
 
-    IDatagramSocket& _socket;
-    IClock& _clock;
+    core::net::IDatagramSocket& _socket;
+    core::platform::IClock& _clock;
     ISecureRandom& _random;
     PeerDirectory& _directory;
     DiscoveryConfig _config;
@@ -209,17 +210,17 @@ class DiscoveryService
     /// When a beacon nobody can name may next be reported.
     ///
     /// Value-initialized so the first one always is: the epoch is behind any clock
-    /// this runs on, including a `ManualClock` that has never been advanced.
-    TimePoint _nextUnnameableReport {};
+    /// this runs on, including a `core::platform::ManualClock` that has never been advanced.
+    core::platform::SteadyTimePoint _nextUnnameableReport {};
 
     /// When a challenge withheld for want of a nonce may next be reported; value-initialized
     /// for the reason `_nextUnnameableReport` is.
-    TimePoint _nextNoNonceReport {};
+    core::platform::SteadyTimePoint _nextNoNonceReport {};
 
     /// When a proof under a key the roster does not accept may next be reported, and how many
     /// have arrived since the last one was; value-initialized for `_nextUnnameableReport`'s
     /// reason.
-    TimePoint _nextUnacceptedKeyReport {};
+    core::platform::SteadyTimePoint _nextUnacceptedKeyReport {};
     std::size_t _unacceptedSinceReport { 0 };
 };
 

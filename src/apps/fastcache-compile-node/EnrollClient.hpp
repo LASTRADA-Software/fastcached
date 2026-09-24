@@ -6,12 +6,9 @@
 #include "NodeCredential.hpp"
 
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Distributed/RosterStore.hpp>
-#include <FastCache/Net/IConnector.hpp>
-#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
@@ -23,6 +20,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/net/IConnector.hpp>
+#include <core/net/ISocket.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -277,6 +278,6 @@ struct JoinerIdentity
     ISecureRandom& random,
     IDrainWait& wait = DefaultDrainWait(),
     IEndpointDialer& dialer = DefaultOneShotDialer(),
-    IWallClock const& wallClock = DefaultSystemWallClock());
+    core::platform::IWallClock const& wallClock = core::platform::defaultSystemWallClock());
 
 } // namespace FastCache::Node

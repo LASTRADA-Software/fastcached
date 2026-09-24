@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ToolchainHashProgress.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -14,6 +13,8 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -43,7 +44,7 @@ TEST_CASE("The hash reports nothing until its interval has elapsed", "[node][too
     // ordinary case must produce no lines at all. An instrument that fills a CI log
     // on every healthy start is one an operator learns to scroll past, which is the
     // opposite of what #354 needs from it.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CapturingLogger logger;
     ToolchainHashProgress progress { 100, Interval, clock, logger };
 
@@ -56,7 +57,7 @@ TEST_CASE("The hash reports nothing until its interval has elapsed", "[node][too
 
 TEST_CASE("The hash reports one line per elapsed interval", "[node][toolchain][progress]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CapturingLogger logger;
     ToolchainHashProgress progress { 100, Interval, clock, logger };
 
@@ -83,7 +84,7 @@ TEST_CASE("The reported rate is the window's, not the average", "[node][toolchai
     // second and 10 in its second has an average that says 455 and a truth that says
     // it fell off a cliff -- and "fast then degrading" versus "flat and slow" is
     // exactly the distinction #354 needs, because they point at different causes.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CapturingLogger logger;
     ToolchainHashProgress progress { 2'000, Interval, clock, logger };
 
@@ -116,7 +117,7 @@ TEST_CASE("Concurrent observers produce one line per interval, not one per threa
     // per interval would be a log nobody reads, and -- worse -- fifteen of them would
     // report a window of zero length, which reads as a rate of zero and looks exactly
     // like the wedge the instrument is meant to rule out.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CapturingLogger logger;
     ToolchainHashProgress progress { 1'000, Interval, clock, logger };
 
@@ -137,10 +138,10 @@ TEST_CASE("Concurrent observers produce one line per interval, not one per threa
 
 TEST_CASE("A window of no elapsed time reports no rate rather than a huge one", "[node][toolchain][progress]")
 {
-    // A `ManualClock` that has not moved is an ordinary thing for a caller to present,
+    // A `core::platform::ManualClock` that has not moved is an ordinary thing for a caller to present,
     // and dividing by it would print a rate that is arithmetic rather than a
     // measurement. Zero is the honest answer to "how fast over no time".
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CapturingLogger logger;
     ToolchainHashProgress progress { 10, std::chrono::milliseconds { 0 }, clock, logger };
 

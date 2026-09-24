@@ -3,7 +3,6 @@
 
 #include "FrameEndpoint.hpp"
 
-#include <FastCache/Async/IReactor.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -18,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/net/EventLoop.hpp>
 
 namespace FastCache::Node
 {
@@ -48,14 +49,14 @@ class LiveStatsResponder final: public IFrameResponder, public IFrameStream, pri
     LiveStatsResponder(ILiveStatsSources const& sources,
                        Distributed::IMembershipOracle const& membership,
                        AdminCredential dashboard,
-                       IReactor& reactor,
+                       core::net::EventLoop& reactor,
                        IMetricsSink& metrics) noexcept;
 
     /// @copydoc IFrameResponder::Answer
     ///
     /// Reached only by a caller that does not stream, since the endpoint asks `StreamFor` first:
     /// such a caller cannot carry a subscription, so it is told the verb is not served that way.
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
@@ -164,9 +165,9 @@ class LiveStatsResponder final: public IFrameResponder, public IFrameStream, pri
     /// @copydoc IFrameStream::Serve
     ///
     /// The identity's HOST reaches `LiveStream` and its proof does not; see the definition.
-    [[nodiscard]] Task<std::vector<std::byte>> Serve(std::span<std::byte const> frame,
-                                                     PeerIdentity peer,
-                                                     IPushSink* sink) override;
+    [[nodiscard]] core::async::Task<std::vector<std::byte>> Serve(std::span<std::byte const> frame,
+                                                                  PeerIdentity peer,
+                                                                  IPushSink* sink) override;
 
     /// @return How many subscriptions are streaming right now. For tests.
     [[nodiscard]] std::size_t ActiveSubscriptions() const noexcept
@@ -200,7 +201,7 @@ class LiveStatsResponder final: public IFrameResponder, public IFrameStream, pri
     ILiveStatsSources const& _sources;
     Distributed::IMembershipOracle const& _membership;
     AdminCredential _dashboard;
-    IReactor& _reactor;
+    core::net::EventLoop& _reactor;
     IMetricsSink& _metrics;
     LiveStream _stream;
 };

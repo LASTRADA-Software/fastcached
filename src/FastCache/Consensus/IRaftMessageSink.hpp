@@ -14,7 +14,7 @@ namespace FastCache::Consensus
 /// enclosing scope built it and keep that alive for the server's lifetime.
 ///
 /// A header of its own, like every other seam here — `IRaftStorage`,
-/// `IRaftTransport`, `IRaftStateMachine`, `IConnector`. It began inside
+/// `IRaftTransport`, `IRaftStateMachine`, `core::net::IConnector`. It began inside
 /// `RaftPeerServer.hpp`, which made implementing it require including the one
 /// concrete class that consumes it: an edge pointing the wrong way, and the
 /// daemon that will implement this has no business knowing the server's frame

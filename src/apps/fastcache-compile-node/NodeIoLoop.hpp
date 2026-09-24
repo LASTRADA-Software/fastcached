@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/PlatformReactor.hpp>
-#include <FastCache/Core/Clock.hpp>
-#include <FastCache/Net/IListener.hpp>
-#include <FastCache/Net/PlatformConnector.hpp>
-#include <FastCache/Net/ThreadedAddressResolver.hpp>
-
 #include <atomic>
 #include <cstddef>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#include <core/net/IConnector.hpp>
+#include <core/net/IListener.hpp>
+#include <core/net/PlatformLoop.hpp>
+#include <core/net/ThreadedAddressResolver.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -63,7 +63,7 @@ class NodeIoLoop
     ~NodeIoLoop();
 
     /// @return The reactor every adopted loop and every socket here is pinned to.
-    [[nodiscard]] PlatformReactor& Reactor() noexcept
+    [[nodiscard]] core::net::PlatformLoop& Reactor() noexcept
     {
         return _reactor;
     }
@@ -73,7 +73,7 @@ class NodeIoLoop
     ///
     /// The same one `_connector` dials through, deliberately: two resolvers would be
     /// two thread pools and two answers to one question.
-    [[nodiscard]] IAsyncAddressResolver& Resolver() noexcept
+    [[nodiscard]] core::net::IAsyncAddressResolver& Resolver() noexcept
     {
         return _resolver;
     }
@@ -82,9 +82,9 @@ class NodeIoLoop
     ///
     /// Reactor-driven, so a dial from inside an answer suspends rather than
     /// stalling every other connection on the loop.
-    [[nodiscard]] IConnector& Connector() noexcept
+    [[nodiscard]] core::net::IConnector& Connector() noexcept
     {
-        return _connector;
+        return *_connector;
     }
 
     /// Register a server whose loop must finish before the reactor may stop.
@@ -106,7 +106,7 @@ class NodeIoLoop
     /// Take ownership of a listener this reactor owns, and free it once the
     /// reactor has stopped.
     ///
-    /// **The rule is `IReactor::TeardownIsSerialisedWithDispatch()`**: an object a
+    /// **The rule is `core::net::EventLoop::TeardownIsSerialisedWithDispatch()`**: an object a
     /// reactor owns is destroyed on that reactor's worker thread, or with that
     /// reactor stopped, because clearing a pending awaitable anywhere else races the
     /// completion dispatch
@@ -141,7 +141,7 @@ class NodeIoLoop
     /// Safe from any thread; an endpoint may be dropped from one that is not the
     /// owner's. @p listener may be null, which retires nothing.
     /// @param listener The listener to hold until the reactor has stopped.
-    void Retire(std::unique_ptr<IListener> listener);
+    void Retire(std::unique_ptr<core::net::IListener> listener);
 
     /// Note that one more loop is running.
     ///
@@ -154,7 +154,7 @@ class NodeIoLoop
     /// Note that one adopted loop has ended; the last one stops the reactor.
     ///
     /// The reactor is stopped by its loops rather than by a destructor, and that is
-    /// not tidiness: `IReactor::Run` returns with its timer heap and its parked work
+    /// not tidiness: `core::net::EventLoop::Run` returns with its timer heap and its parked work
     /// exactly where they were, so stopping it while any per-connection task or
     /// sweeper is still suspended leaves a coroutine frame nobody resumes and nobody
     /// frees.
@@ -170,8 +170,8 @@ class NodeIoLoop
   private:
     // Declaration order IS construction order and each is referenced by the one
     // below it, which is the ordering this class exists to make the language check.
-    SteadyClock _clock;
-    PlatformReactor _reactor { _clock };
+    core::platform::SteadyClock _clock;
+    core::net::PlatformLoop _reactor { _clock };
 
     /// Name resolution for the upstream dial, off this thread.
     ///
@@ -179,9 +179,9 @@ class NodeIoLoop
     /// cache named by hostname whose resolver is wedged would otherwise park the
     /// loop carrying every local client's connection. A literal address -- which is
     /// what `FASTCACHE_ADDR` almost always is -- never reaches a thread.
-    ThreadedAddressResolver _resolver;
+    core::net::ThreadedAddressResolver _resolver;
 
-    PlatformConnector _connector { _reactor, _resolver, _clock };
+    std::unique_ptr<core::net::IConnector> _connector { core::net::makeConnector(_reactor, _resolver) };
 
     std::vector<FrameServer*> _loops;
     std::atomic<std::size_t> _loopsRunning { 0 };
@@ -195,7 +195,7 @@ class NodeIoLoop
     /// `_reactor` and a listener outlives the reactor its destructor asks; below
     /// `_thread` and it is freed while the loop still turns, which is the defect.
     std::mutex _retiredMutex;
-    std::vector<std::unique_ptr<IListener>> _retired;
+    std::vector<std::unique_ptr<core::net::IListener>> _retired;
 
     std::jthread _thread;
 };

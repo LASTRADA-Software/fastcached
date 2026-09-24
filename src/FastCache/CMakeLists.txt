@@ -4,13 +4,6 @@
 
 target_sources(FastCache
     PRIVATE
-        Async/DeadlineTimer.cpp
-        Async/EpollReactor.cpp
-        Async/InterruptibleSleep.cpp
-        Async/IocpReactor.cpp
-        Async/KqueueReactor.cpp
-        Async/TestReactor.cpp
-        Async/ThreadPoolExecutor.cpp
         Auth/AuthPolicy.cpp
         Cache/CacheEngine.cpp
         Cache/CowTreeStorage.cpp
@@ -67,9 +60,6 @@ target_sources(FastCache
         Cluster/Roster.cpp
         Cluster/RosterCertificate.cpp
         Cluster/RosterKeys.cpp
-        Net/InMemoryDatagram.cpp
-        Net/SharedPortDatagram.cpp
-        Net/UdpSocket.cpp
         Core/Logger.cpp
         Distributed/LeaseTable.cpp
         Distributed/WorkerRegistry.cpp
@@ -88,20 +78,6 @@ target_sources(FastCache
         Metrics/PrometheusFormatter.cpp
         Metrics/StatsReading.cpp
         Metrics/StatsReadingCodec.cpp
-        Net/BlockingConnector.cpp
-        Net/BlockingSocket.cpp
-        Net/ConnectFlow.cpp
-        Net/HealthProbe.cpp
-        Net/EpollConnector.cpp
-        Net/EpollSocket.cpp
-        Net/IocpConnector.cpp
-        Net/IocpSocket.cpp
-        Net/KqueueConnector.cpp
-        Net/KqueueSocket.cpp
-        Net/LingeringClose.cpp
-        Net/SocketAddress.cpp
-        Net/TcpClient.cpp
-        Net/ThreadedAddressResolver.cpp
         Platform/CpuAffinity.cpp
         Platform/DaemonControls.cpp
         Platform/Environment.cpp
@@ -119,7 +95,6 @@ target_sources(FastCache
         Platform/Terminal.cpp
         Platform/WindowsEventLogger.cpp
         Platform/WindowsServiceHost.cpp
-        Net/InMemoryTransport.cpp
         Protocol/Framing/LineReader.cpp
         Protocol/CompileCacheHandler.cpp
         Protocol/LiveStream.cpp
@@ -139,6 +114,8 @@ target_sources(FastCache
         Server/ReactorServerLoop.cpp
         Server/ReadinessAnnouncer.cpp
         Server/Server.cpp
+        Transport/LingeringClose.cpp
+        Transport/NativeListen.cpp
 )
 
 # The macOS package prefix, handed to the code that has to agree with it.
@@ -173,12 +150,9 @@ endif()
 # symbol. FC_TLS_ENABLED is PUBLIC so dependents (the test binary) can guard
 # TLS-only tests behind the same macro.
 if(FASTCACHED_ENABLE_TLS)
-    target_sources(FastCache
-        PRIVATE
-            Net/TlsContext.cpp
-            Net/TlsSocket.cpp
-    )
-    target_link_libraries(FastCache PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    # The TLS socket is core-cpp's `core::net_tls` (#1596), configured with CORE_CPP_WITH_TLS by
+    # the top-level CMakeLists.txt; it links OpenSSL privately, and no OpenSSL type crosses its header.
+    target_link_libraries(FastCache PUBLIC core::net_tls)
     target_compile_definitions(FastCache PUBLIC FC_TLS_ENABLED=1)
 endif()
 
@@ -234,9 +208,6 @@ target_sources(FastCache
             Core/Markup.hpp
             Core/StringHash.hpp
             Core/Utf8.hpp
-            Core/Clock.hpp
             Core/Logger.hpp
             Core/BufferPool.hpp
-            Core/Profiling.hpp
-            Net/NetError.hpp
 )

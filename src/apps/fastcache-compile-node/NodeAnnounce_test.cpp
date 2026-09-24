@@ -16,7 +16,6 @@
 #include "EndpointDialerTestUtils.hpp"
 #include "NodeAnnounce.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
@@ -36,6 +35,7 @@
 #include <utility>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
 

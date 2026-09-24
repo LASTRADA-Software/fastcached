@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "TerminalEventStream.hpp"
 
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Core/Ranges.hpp>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -22,6 +19,8 @@
 #include <variant>
 #include <vector>
 
+#include <core/Ranges.hpp>
+#include <core/async/ResumeOn.hpp>
 #include <core/tui/KeyCode.hpp>
 #include <core/tui/Modifier.hpp>
 #include <core/tui/TerminalOutput.hpp>
@@ -124,7 +123,7 @@ namespace
                                               .cellPixels = parts.cellPixels });
         }
 
-        [[nodiscard]] Task<DashboardEvent> Next() override
+        [[nodiscard]] core::async::Task<DashboardEvent> Next() override
         {
             while (true)
             {
@@ -148,7 +147,7 @@ namespace
 
                 // The wait blocks, so it runs on the pool, and the result is used only after the
                 // hop back: the stream's state belongs to the thread `Next()` is awaited on.
-                co_await ResumeOn { *_pool };
+                co_await core::async::ResumeOn { *_pool };
                 auto outcome = _source->Wait(timeoutMs);
                 // Still on the pool, before the next wait: the query reads its reply from the input
                 // this wait just finished reading, and hands back anything else it reads there.
@@ -157,7 +156,7 @@ namespace
                         return std::holds_alternative<core::tui::ResizeEvent>(input);
                     });
                 auto const measured = reread ? _rereadCellPixels() : std::nullopt;
-                co_await ResumeOn { *_resumeOn };
+                co_await core::async::ResumeOn { *_resumeOn };
 
                 // A short wait that came back empty has had its chance to settle a lone ESC.
                 _inputJustArrived = !(timeoutMs >= 0 && outcome.events.empty());
@@ -188,8 +187,8 @@ namespace
         }
 
         ITerminalInputWait* _source;
-        IExecutor* _pool;
-        IExecutor* _resumeOn;
+        core::async::IExecutor* _pool;
+        core::async::IExecutor* _resumeOn;
         std::function<void()> _wake;
         std::function<std::optional<CellPixelSize>()> _rereadCellPixels;
         std::deque<DashboardEvent> _ready;
@@ -354,7 +353,7 @@ namespace
             _device->Restore();
         }
 
-        [[nodiscard]] Task<DashboardEvent> Next() override
+        [[nodiscard]] core::async::Task<DashboardEvent> Next() override
         {
             return _stream->Next();
         }
@@ -594,7 +593,7 @@ std::string KeyBytes(core::tui::KeyEvent const& key)
         return bytes;
     }
 
-    if (auto const* row = FindOrNull(NamedKeys, key.key, &NamedKeyRow::key))
+    if (auto const* row = core::findOrNull(NamedKeys, key.key, &NamedKeyRow::key))
         bytes = row->bytes;
     else if (key.codepoint != 0)
         bytes = EncodeUtf8(key.codepoint);
@@ -811,9 +810,9 @@ std::unique_ptr<IDashboardEventSource> MakeTerminalEventStream(TerminalStreamPar
     return std::make_unique<TerminalEventStream>(std::move(parts));
 }
 
-Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::unique_ptr<ITerminalDevice> device,
-                                                                      IExecutor* pool,
-                                                                      IExecutor* resumeOn)
+core::async::Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::unique_ptr<ITerminalDevice> device,
+                                                                                   core::async::IExecutor* pool,
+                                                                                   core::async::IExecutor* resumeOn)
 {
     // Declared first, so it is the last local destroyed: every way out of this coroutine -- a refused
     // acquisition, an exception after raw mode was entered, the task being destroyed between the
@@ -824,7 +823,7 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
     // The acquisition and both queries BLOCK, so they run on the pool; the record is used only
     // after the hop back. The screen is entered last of the terminal-facing steps, once the queries
     // have their answers, and the encoding -- which asks the environment, not the terminal -- after it.
-    co_await ResumeOn { *pool };
+    co_await core::async::ResumeOn { *pool };
     try
     {
         if (auto acquired = device->Acquire(); !acquired)
@@ -847,7 +846,7 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
     {
         capabilities = std::unexpected(std::string { "the terminal failed while being started: " } + failure.what());
     }
-    co_await ResumeOn { *resumeOn };
+    co_await core::async::ResumeOn { *resumeOn };
 
     if (!capabilities.has_value())
         co_return std::unexpected(std::move(capabilities).error());

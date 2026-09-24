@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "SocketExchange.hpp"
 
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Net/TcpClient.hpp>
-
 #include <array>
 #include <charconv>
 #include <format>
 #include <utility>
+
+#include <core/async/AsTask.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/TcpClient.hpp>
 
 namespace FastCache::Cli
 {
@@ -17,14 +19,14 @@ namespace
     /// How much to ask the socket for at a time.
     constexpr std::size_t ReadChunkBytes = 16U * 1024U;
 
-    /// One read from a socket, as a task `SyncRun` can drive.
+    /// One read from a socket, as a task `core::async::syncRun` can drive.
     ///
     /// @param socket The socket. A pointer, never a reference: a coroutine parameter
     ///        that is a reference dangles, because the frame outlives the call
     ///        expression that made it.
     /// @param buffer Destination. Must be non-empty and must outlive the awaitable.
     /// @return Bytes read, `0` for EOF, or the failure.
-    [[nodiscard]] Task<IoResult> ReadSome(ISocket* socket, std::span<std::byte> buffer)
+    [[nodiscard]] core::async::Task<core::net::IoResult> ReadSome(core::net::ISocket* socket, std::span<std::byte> buffer)
     {
         co_return co_await socket->read(buffer);
     }
@@ -85,10 +87,12 @@ namespace
     /// @param pending The buffer to append to; its emptiness is what the EOF arms read.
     /// @param words What the read is of, as its failure says it.
     /// @return Nothing on success, or why the read did not happen.
-    [[nodiscard]] std::expected<void, ExchangeError> FillMore(ISocket* socket, std::string& pending, ReadWords const& words)
+    [[nodiscard]] std::expected<void, ExchangeError> FillMore(core::net::ISocket* socket,
+                                                              std::string& pending,
+                                                              ReadWords const& words)
     {
         std::array<std::byte, ReadChunkBytes> chunk {};
-        auto const got = SyncRun(ReadSome(socket, chunk));
+        auto const got = core::async::syncRun(ReadSome(socket, chunk));
         if (!got.has_value())
             return std::unexpected(ExchangeError { .kind = ExchangeFailure::Transport,
                                                    .detail = std::format("{} ({})", words.failed, got.error().context) });
@@ -104,10 +108,11 @@ namespace
     /// @param endpoint Where.
     /// @param timeouts How long.
     /// @return The socket, or why there is none.
-    [[nodiscard]] std::expected<std::unique_ptr<ISocket>, ExchangeError> Dial(Endpoint const& endpoint,
-                                                                              DialTimeouts timeouts)
+    [[nodiscard]] std::expected<std::unique_ptr<core::net::ISocket>, ExchangeError> Dial(Endpoint const& endpoint,
+                                                                                         DialTimeouts timeouts)
     {
-        auto socket = SyncRun(ConnectTcp(endpoint.host, endpoint.port, timeouts.connect, timeouts.io));
+        auto socket =
+            core::async::syncRun(core::net::connectTcp(endpoint.host, endpoint.port, timeouts.connect, timeouts.io));
         if (!socket.has_value())
             return std::unexpected(ExchangeError {
                 .kind = ExchangeFailure::Unreachable,
@@ -116,7 +121,7 @@ namespace
     }
 } // namespace
 
-SocketExchange::SocketExchange(std::unique_ptr<ISocket> socket, ParseLimits limits) noexcept:
+SocketExchange::SocketExchange(std::unique_ptr<core::net::ISocket> socket, ParseLimits limits) noexcept:
     _socket { std::move(socket) },
     _limits { limits }
 {
@@ -130,7 +135,7 @@ SocketExchange::~SocketExchange()
     // Its reply is deliberately not read -- there is nothing to do with it, and
     // waiting for it would make closing able to block.
     auto const quit = std::vector<std::string> { "QUIT" };
-    (void) SyncRun(SendAll(_socket.get(), EncodeCommand(quit)));
+    (void) core::async::syncRun(core::net::sendAll(_socket.get(), EncodeCommand(quit)));
     _socket->close();
 }
 
@@ -179,7 +184,7 @@ std::span<std::string const> SocketExchange::Advisories() const noexcept
 
 std::expected<RespValue, ExchangeError> SocketExchange::Call(std::span<std::string const> argv)
 {
-    if (!SyncRun(SendAll(_socket.get(), EncodeCommand(argv))))
+    if (!core::async::syncRun(core::net::sendAll(_socket.get(), EncodeCommand(argv))))
         return std::unexpected(ExchangeError { .kind = ExchangeFailure::Transport,
                                                .detail = "the connection failed while sending the command" });
     return ReadReply();
@@ -208,7 +213,7 @@ std::expected<RespValue, ExchangeError> SocketExchange::ReadReply()
     }
 }
 
-MemcachedExchange::MemcachedExchange(std::unique_ptr<ISocket> socket, McParseLimits limits) noexcept:
+MemcachedExchange::MemcachedExchange(std::unique_ptr<core::net::ISocket> socket, McParseLimits limits) noexcept:
     _socket { std::move(socket) },
     _limits { limits }
 {
@@ -222,7 +227,7 @@ MemcachedExchange::~MemcachedExchange()
     // this courtesy works against a password-protected daemon as well. Its reply is
     // not read, for the reason `~SocketExchange` gives: there is nothing to do with
     // one, and waiting would make closing able to block.
-    (void) SyncRun(SendAll(_socket.get(), AsBytes(EncodeMemcachedCommand("quit", {}))));
+    (void) core::async::syncRun(core::net::sendAll(_socket.get(), AsBytes(EncodeMemcachedCommand("quit", {}))));
     _socket->close();
 }
 
@@ -238,7 +243,7 @@ std::expected<std::unique_ptr<MemcachedExchange>, ExchangeError> MemcachedExchan
 
 std::expected<McReply, ExchangeError> MemcachedExchange::Send(std::string_view request)
 {
-    if (!SyncRun(SendAll(_socket.get(), AsBytes(request))))
+    if (!core::async::syncRun(core::net::sendAll(_socket.get(), AsBytes(request))))
         return std::unexpected(ExchangeError { .kind = ExchangeFailure::Transport,
                                                .detail = "the connection failed while sending the command" });
 
@@ -263,7 +268,7 @@ std::expected<McReply, ExchangeError> MemcachedExchange::Send(std::string_view r
     }
 }
 
-NodeExchange::NodeExchange(std::unique_ptr<ISocket> socket, std::string endpoint) noexcept:
+NodeExchange::NodeExchange(std::unique_ptr<core::net::ISocket> socket, std::string endpoint) noexcept:
     _socket { std::move(socket) },
     _endpoint { std::move(endpoint) }
 {
@@ -321,7 +326,7 @@ std::span<std::string const> NodeExchange::Advisories() const noexcept
 
 std::expected<void, ExchangeError> NodeExchange::Post(std::span<std::byte const> request)
 {
-    if (!SyncRun(SendAll(_socket.get(), request)))
+    if (!core::async::syncRun(core::net::sendAll(_socket.get(), request)))
         return std::unexpected(
             ExchangeError { .kind = ExchangeFailure::Transport,
                             .detail = std::format("the connection to {} failed while sending the request", _endpoint) });
@@ -335,7 +340,9 @@ void NodeExchange::SetReceiveDeadline(std::chrono::milliseconds deadline) noexce
 
 void NodeExchange::ShutdownWrite() noexcept
 {
-    _socket->shutdownWrite();
+    // A blocking socket half-closes inline, so `syncRun` completes it. Its answer is not reported,
+    // as it never was: a peer that has gone is what the read after this finds out.
+    static_cast<void>(core::async::syncRun(core::async::asTask(_socket->shutdownWrite())));
 }
 
 std::expected<NodeReply, ExchangeError> NodeExchange::Send(std::span<std::byte const> request)
@@ -412,7 +419,7 @@ std::expected<HttpResponse, ExchangeError> HttpGet(Endpoint const& endpoint,
         request += std::format("Authorization: Bearer {}\r\n", *bearer);
     request += "\r\n";
 
-    if (!SyncRun(SendAll(socket->get(), AsBytes(request))))
+    if (!core::async::syncRun(core::net::sendAll(socket->get(), AsBytes(request))))
         return std::unexpected(ExchangeError { .kind = ExchangeFailure::Transport,
                                                .detail = "the connection failed while sending the request" });
 
@@ -420,7 +427,7 @@ std::expected<HttpResponse, ExchangeError> HttpGet(Endpoint const& endpoint,
     for (;;)
     {
         std::array<std::byte, ReadChunkBytes> chunk {};
-        auto const got = SyncRun(ReadSome(socket->get(), chunk));
+        auto const got = core::async::syncRun(ReadSome(socket->get(), chunk));
         if (!got.has_value())
             return std::unexpected(ExchangeError {
                 .kind = ExchangeFailure::Transport,

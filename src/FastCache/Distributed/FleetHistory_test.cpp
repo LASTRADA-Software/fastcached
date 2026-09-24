@@ -502,7 +502,7 @@ TEST_CASE("A version 1 history is inflated forward rather than discarded", "[dis
     auto const file = scratch.Path() / "v1.bin";
 
     PlacedWallClock clock;
-    auto const nowMillis = std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now().time_since_epoch()).count();
+    auto const nowMillis = std::chrono::duration_cast<std::chrono::milliseconds>(clock.now().time_since_epoch()).count();
     auto const minuteStart = (nowMillis / 60'000) * 60'000;
     auto const hourStart = (nowMillis / 3'600'000) * 3'600'000;
 

@@ -10,7 +10,6 @@
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/NumericText.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 
 #include <algorithm>
@@ -32,6 +31,8 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Cli
 {
@@ -89,8 +90,9 @@ namespace
     /// @return The tier.
     [[nodiscard]] std::optional<StorageTier> TierNamed(std::string_view name) noexcept
     {
-        auto const* row =
-            name.empty() ? nullptr : FindIfOrNull(StorageTierTable, [name](auto const& tier) { return tier.name == name; });
+        auto const* row = name.empty()
+                              ? nullptr
+                              : core::findIfOrNull(StorageTierTable, [name](auto const& tier) { return tier.name == name; });
         return row == nullptr ? std::nullopt : std::optional { row->tier };
     }
 
@@ -510,7 +512,7 @@ namespace
                                                                             CellWidth cellWidth)
     {
         auto order = std::vector<std::size_t>(pieces.size());
-        Ranges::Iota(order, std::size_t { 0 });
+        core::ranges::Iota(order, std::size_t { 0 });
         std::ranges::stable_sort(
             order, {}, [&pieces](std::size_t index) { return std::to_underlying(pieces[index].priority); });
 
@@ -1267,7 +1269,7 @@ namespace
     /// @return Its tone, or nullopt for an ordinary state.
     [[nodiscard]] std::optional<FrameTone> ToneOfState(std::string_view name) noexcept
     {
-        auto const* row = FindIfOrNull(StateTones, [name](StateTone const& one) { return one.name == name; });
+        auto const* row = core::findIfOrNull(StateTones, [name](StateTone const& one) { return one.name == name; });
         return row == nullptr ? std::nullopt : std::optional<FrameTone> { row->tone };
     }
 
@@ -1897,7 +1899,7 @@ namespace
                                .trend = kpi.sparkline && drawsTrend,
                                .worded = kpi.sparkline || !kpi.ofNoun.empty() || !kpi.note.empty() };
             auto const* row =
-                !readable ? nullptr : FindIfOrNull(table->rows, [&keyAt, &kpi](std::vector<Cell> const& cells) {
+                !readable ? nullptr : core::findIfOrNull(table->rows, [&keyAt, &kpi](std::vector<Cell> const& cells) {
                     return cells[*keyAt].lexical == kpi.key;
                 });
             if (row != nullptr && valueAt.has_value() && unitAt.has_value())
@@ -3346,11 +3348,12 @@ std::optional<FleetSection> SectionForKey(FleetSection active, std::string_view 
         return position < tabs.size() ? std::optional<FleetSection> { tabs[position] } : std::nullopt;
     }
 
-    auto const* named = FindIfOrNull(tabs, [keys](FleetSection tab) { return SectionHotkeyOf(tab) == keys; });
+    auto const* named = core::findIfOrNull(tabs, [keys](FleetSection tab) { return SectionHotkeyOf(tab) == keys; });
     if (named != nullptr)
         return *named;
 
-    auto const* stepping = FindIfOrNull(SectionStepKeys, [keys](SectionStepKey const& row) { return row.keys == keys; });
+    auto const* stepping =
+        core::findIfOrNull(SectionStepKeys, [keys](SectionStepKey const& row) { return row.keys == keys; });
     if (stepping == nullptr)
         return std::nullopt;
     auto const found = std::ranges::find(tabs, active);
@@ -3376,7 +3379,8 @@ bool PanelView::Key(std::string_view keys)
 
     if (_typingFilter)
     {
-        if (auto const* edit = FindIfOrNull(FilterEditKeys, [keys](FilterEditKey const& row) { return row.keys == keys; }))
+        if (auto const* edit =
+                core::findIfOrNull(FilterEditKeys, [keys](FilterEditKey const& row) { return row.keys == keys; }))
         {
             switch (edit->edit)
             {
@@ -3409,7 +3413,8 @@ bool PanelView::Key(std::string_view keys)
         return true;
     }
 
-    if (auto const* scroll = FindIfOrNull(TableScrollKeys, [keys](TableScrollKey const& row) { return row.keys == keys; }))
+    if (auto const* scroll =
+            core::findIfOrNull(TableScrollKeys, [keys](TableScrollKey const& row) { return row.keys == keys; }))
     {
         auto const before = _scroll;
         switch (scroll->scroll)

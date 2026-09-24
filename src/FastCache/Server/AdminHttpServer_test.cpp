@@ -1,14 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
-#include <FastCache/Net/LingeringClose.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
+#include <FastCache/Transport/LingeringClose.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -24,12 +21,18 @@
 #include <string_view>
 #include <vector>
 
-#include <tests/SocketDecorator.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/net/testing/ParkingReadableSocket.hpp>
+#include <core/platform/Clock.hpp>
+#include <tests/HalfClose.hpp>
+#include <tests/SocketDoubles.hpp>
 
 namespace
 {
 
-FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view payload)
+core::async::Task<bool> WriteString(core::net::ISocket* socket, std::string_view payload)
 {
     auto const result = co_await socket->write(FastCache::AsBytes(payload));
     co_return result.has_value();
@@ -48,12 +51,12 @@ FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view p
 /// closes it: a decorator whose reads fail ends the linger at once, where the pipe
 /// under it would wait for a peer that never closes.
 /// @param servedOn The socket the surface was driven on.
-void CloseAsServed(FastCache::ISocket* servedOn)
+void CloseAsServed(core::net::ISocket* servedOn)
 {
-    FastCache::SyncRun(FastCache::CloseLingering(servedOn, nullptr, FastCache::AdminHttpServer::Linger));
+    core::async::syncRun(FastCache::CloseLingering(servedOn, nullptr, FastCache::AdminHttpServer::Linger));
 }
 
-FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
+core::async::Task<std::string> ReadAvailable(core::net::ISocket* socket)
 {
     std::string out;
     while (true)
@@ -89,8 +92,8 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
 /// @param metrics The sink the surface renders from.
 /// @param stats The storage figures the snapshot carries.
 /// @return Everything the server wrote, which is empty when it wrote none.
-std::string ServeAndCollect(FastCache::ISocket* serveOn,
-                            FastCache::InMemorySocketPair& pair,
+std::string ServeAndCollect(core::net::ISocket* serveOn,
+                            core::net::testing::InMemorySocketPair& pair,
                             FastCache::IMetricsSink const& metrics,
                             FastCache::StorageStats stats)
 {
@@ -98,27 +101,27 @@ std::string ServeAndCollect(FastCache::ISocket* serveOn,
     auto provider = [&stats] {
         return FastCache::MetricsSnapshot { .storage = stats, .host = std::nullopt, .uptime = FastCache::Uptime { 7s } };
     };
-    FastCache::SteadyClock clock;
-    FastCache::SyncRun(FastCache::ServeAdminHttp(serveOn, &metrics, provider, &clock));
+    core::platform::SteadyClock clock;
+    core::async::syncRun(FastCache::ServeAdminHttp(serveOn, &metrics, provider, &clock));
     CloseAsServed(serveOn);
-    return FastCache::SyncRun(ReadAvailable(pair.client.get()));
+    return core::async::syncRun(ReadAvailable(pair.client.get()));
 }
 
 std::string Exchange(std::string_view request, FastCache::IMetricsSink const& metrics, FastCache::StorageStats stats)
 {
-    auto pair = FastCache::InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     // Guarded rather than unconditional, which is what lets `ExchangeMaybeSilent`
     // below be a wrapper instead of a second copy: an empty request is a peer that
     // said nothing, and writing zero bytes is not the same as not writing.
     if (!request.empty())
-        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
-    pair.client->shutdownWrite();
+        REQUIRE(core::async::syncRun(WriteString(pair.client.get(), request)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
     return ServeAndCollect(pair.server.get(), pair, metrics, stats);
 }
 
-/// An `ISocket` that never returns more than `limit` bytes from one `Read`.
+/// An `core::net::ISocket` that never returns more than `limit` bytes from one `Read`.
 ///
-/// The condition this exists for cannot be created over `InMemorySocketPair`,
+/// The condition this exists for cannot be created over `core::net::testing::InMemorySocketPair`,
 /// which is a byte pipe: two writes coalesce, so one 1024-byte read always gets
 /// the whole request. On a real socket the request routinely arrives in more than
 /// one segment, and a server that stops reading at the request line then leaves
@@ -127,12 +130,12 @@ std::string Exchange(std::string_view request, FastCache::IMetricsSink const& me
 /// launcher's fake `IPathResolver` uses for aliasing it cannot create on the host.
 ///
 /// Local because the CONDITION is this file's. The forwarding is not, and lives on
-/// `SocketDecorator` -- including the four defaulted `ISocket` virtuals this used
+/// `SocketDecorator` -- including the four defaulted `core::net::ISocket` virtuals this used
 /// to answer from the base rather than from the socket it decorates.
-class ShortReadSocket final: public FastCache::Testing::SocketDecorator
+class ShortReadSocket final: public core::net::testing::SocketDecorator
 {
   public:
-    ShortReadSocket(FastCache::ISocket& inner, std::size_t limit) noexcept:
+    ShortReadSocket(core::net::ISocket& inner, std::size_t limit) noexcept:
         SocketDecorator { inner },
         _limit { limit }
     {
@@ -141,7 +144,7 @@ class ShortReadSocket final: public FastCache::Testing::SocketDecorator
     /// Hand up no more than `limit` bytes, whatever the caller asked for.
     /// @param buffer Where to put them.
     /// @return What the decorated socket delivered into the narrowed span.
-    [[nodiscard]] FastCache::IoAwaitable read(std::span<std::byte> buffer) override
+    [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override
     {
         return SocketDecorator::read(buffer.subspan(0, std::min(buffer.size(), _limit)));
     }
@@ -155,10 +158,10 @@ class ShortReadSocket final: public FastCache::Testing::SocketDecorator
 /// The two deadlines are the whole of #828, and a test that cannot see WHICH was armed
 /// WHEN can only assert that "some deadline" exists -- which both the fixed and the
 /// broken tree produce.
-class DeadlineRecordingSocket final: public FastCache::Testing::SocketDecorator
+class DeadlineRecordingSocket final: public core::net::testing::SocketDecorator
 {
   public:
-    explicit DeadlineRecordingSocket(FastCache::ISocket& inner) noexcept:
+    explicit DeadlineRecordingSocket(core::net::ISocket& inner) noexcept:
         SocketDecorator { inner }
     {
     }
@@ -176,12 +179,12 @@ class DeadlineRecordingSocket final: public FastCache::Testing::SocketDecorator
 ///
 /// Models a client dribbling under the per-read deadline: every read succeeds, so the
 /// per-read bound never fires, and only a TOTAL can see it.
-class ClockAdvancingSocket final: public FastCache::Testing::SocketDecorator
+class ClockAdvancingSocket final: public core::net::testing::SocketDecorator
 {
   public:
-    ClockAdvancingSocket(FastCache::ISocket& inner,
+    ClockAdvancingSocket(core::net::ISocket& inner,
                          std::size_t limit,
-                         FastCache::ManualClock& clock,
+                         core::platform::ManualClock& clock,
                          std::chrono::milliseconds perRead) noexcept:
         SocketDecorator { inner },
         _limit { limit },
@@ -190,7 +193,7 @@ class ClockAdvancingSocket final: public FastCache::Testing::SocketDecorator
     {
     }
 
-    [[nodiscard]] FastCache::IoAwaitable read(std::span<std::byte> buffer) override
+    [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override
     {
         _clock.advance(_perRead);
         return SocketDecorator::read(buffer.subspan(0, std::min(buffer.size(), _limit)));
@@ -198,7 +201,7 @@ class ClockAdvancingSocket final: public FastCache::Testing::SocketDecorator
 
   private:
     std::size_t _limit;
-    FastCache::ManualClock& _clock;
+    core::platform::ManualClock& _clock;
     std::chrono::milliseconds _perRead;
 };
 
@@ -279,10 +282,10 @@ TEST_CASE("AdminHttp: a request split across reads is consumed to the end", "[me
     //
     // Observed here as leftover bytes, which is the same fact one layer up from the
     // reset: what is left unread is exactly what makes the kernel choose RST.
-    auto pair = FastCache::InMemorySocketPair::Create();
-    REQUIRE(
-        FastCache::SyncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")));
-    pair.client->shutdownWrite();
+    auto pair = core::net::testing::InMemorySocketPair::create();
+    REQUIRE(core::async::syncRun(
+        WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
 
     // One read can see no more than the request line, so the headers must be picked
     // up by a later one -- or left behind, which is the bug.
@@ -295,14 +298,14 @@ TEST_CASE("AdminHttp: a request split across reads is consumed to the end", "[me
                                             .host = std::nullopt,
                                             .uptime = FastCache::Uptime { 7s } };
     };
-    FastCache::SteadyClock clock;
-    FastCache::SyncRun(FastCache::ServeAdminHttp(&shortReads, &metrics, provider, &clock));
+    core::platform::SteadyClock clock;
+    core::async::syncRun(FastCache::ServeAdminHttp(&shortReads, &metrics, provider, &clock));
 
-    auto const response = FastCache::SyncRun(ReadAvailable(pair.client.get()));
+    auto const response = core::async::syncRun(ReadAvailable(pair.client.get()));
     CHECK(response.starts_with("HTTP/1.1 200 OK\r\n"));
 
     // Nothing of the request is left: the server read it to the end before answering.
-    CHECK(FastCache::SyncRun(ReadAvailable(pair.server.get())).empty());
+    CHECK(core::async::syncRun(ReadAvailable(pair.server.get())).empty());
 }
 
 namespace
@@ -319,19 +322,19 @@ namespace
 std::string ExchangeWithRoutes(std::string_view request, std::vector<FastCache::AdminRoute> const& routes)
 {
     FastCache::AtomicMetricsSink metrics;
-    auto pair = FastCache::InMemorySocketPair::Create();
-    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), request)));
-    pair.client->shutdownWrite();
+    auto pair = core::net::testing::InMemorySocketPair::create();
+    REQUIRE(core::async::syncRun(WriteString(pair.client.get(), request)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
     using namespace std::chrono_literals;
     auto provider = [] {
         return FastCache::MetricsSnapshot { .storage = std::nullopt,
                                             .host = std::nullopt,
                                             .uptime = FastCache::Uptime { 1s } };
     };
-    FastCache::SteadyClock clock;
-    FastCache::SyncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider, &clock, routes));
+    core::platform::SteadyClock clock;
+    core::async::syncRun(FastCache::ServeAdminHttp(pair.server.get(), &metrics, provider, &clock, routes));
     CloseAsServed(pair.server.get());
-    return FastCache::SyncRun(ReadAvailable(pair.client.get()));
+    return core::async::syncRun(ReadAvailable(pair.client.get()));
 }
 
 } // namespace
@@ -520,10 +523,10 @@ TEST_CASE("AdminHttp: a peer that sent nothing before its deadline is closed, no
     // nothing, and the request deadline expires. Nothing was asked, so nothing is
     // owed -- and the 400 this used to answer is what reached a real browser as a
     // broken dashboard.
-    auto const code = GENERATE(FastCache::NetErrorCode::WouldBlock, FastCache::NetErrorCode::Timeout);
+    auto const code = GENERATE(core::net::NetErrorCode::WouldBlock, core::net::NetErrorCode::Timeout);
     INFO("read failed with NetErrorCode " << static_cast<unsigned>(code));
 
-    auto pair = FastCache::InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     // Reads fail; writes still go through. So an empty response is the server
     // declining to answer, never the server failing to.
     FastCache::Testing::FailingReadSocket stalled { *pair.server, code };
@@ -552,12 +555,12 @@ TEST_CASE("AdminHttp: a head cut off by the deadline is refused 408, not served 
     // The credential is what makes it visible rather than merely wrong: served
     // truncated, this request is answered as though the client sent no
     // `Authorization` at all.
-    auto pair = FastCache::InMemorySocketPair::Create();
-    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\nAuthorization: Bearer x")));
+    auto pair = core::net::testing::InMemorySocketPair::create();
+    REQUIRE(core::async::syncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\nAuthorization: Bearer x")));
     // Deliberately NO ShutdownWrite: EOF would mean the peer had FINISHED sending,
     // which is a different fact and is still served on purpose. This peer has not
     // finished; this server gave up on it.
-    FastCache::Testing::FailingReadSocket stalled { *pair.server, FastCache::NetErrorCode::WouldBlock, 1 };
+    FastCache::Testing::FailingReadSocket stalled { *pair.server, core::net::NetErrorCode::WouldBlock, 1 };
 
     FastCache::AtomicMetricsSink metrics;
     auto const response = ServeAndCollect(&stalled, pair, metrics, {});
@@ -575,12 +578,12 @@ TEST_CASE("AdminHttp: a silent peer gets the preconnect budget, and a started he
     //
     // Asserted on WHICH deadline is armed and WHEN, because that is the whole change.
     // A test that only checked "a request is served" passes on the broken tree too.
-    auto pair = FastCache::InMemorySocketPair::Create();
-    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\n\r\n")));
+    auto pair = core::net::testing::InMemorySocketPair::create();
+    REQUIRE(core::async::syncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\n\r\n")));
     // Behind a complete head, so the server answers before it could reach it. It is here
     // for the close: a served connection listens until its peer closes, and this
     // in-process pair has no clock to end the listening the way a real deadline does.
-    pair.client->shutdownWrite();
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
     DeadlineRecordingSocket recorder { *pair.server };
 
     FastCache::AtomicMetricsSink metrics;
@@ -607,14 +610,14 @@ TEST_CASE("AdminHttp: a head that dribbles past its total budget is refused 408"
     // The control is the case above: an ordinary request served under the same total
     // must stay 200, or "enforces a total" and "refuses every request" are one passing
     // test.
-    auto pair = FastCache::InMemorySocketPair::Create();
-    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\nX: ")));
+    auto pair = core::net::testing::InMemorySocketPair::create();
+    REQUIRE(core::async::syncRun(WriteString(pair.client.get(), "GET /healthz HTTP/1.1\r\nX: ")));
     // The half-close sits BEHIND bytes the server never reaches before its budget runs
     // out, so it cannot inform the refusal. It is here for the close that follows: the
     // server listens to a refused peer until that peer closes, and a real socket stops
     // listening at a deadline this in-process pair has no clock for.
-    pair.client->shutdownWrite();
-    FastCache::ManualClock clock;
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+    core::platform::ManualClock clock;
     // Each read costs time, which is what a dribbling client actually does -- the fake
     // advances the clock rather than the test doing it, because the reads happen inside
     // one `ServeAdminHttp` call and there is no seam between them.
@@ -627,9 +630,9 @@ TEST_CASE("AdminHttp: a head that dribbles past its total budget is refused 408"
                                             .host = std::nullopt,
                                             .uptime = FastCache::Uptime { 1s } };
     };
-    FastCache::SyncRun(FastCache::ServeAdminHttp(&dribble, &metrics, provider, &clock));
+    core::async::syncRun(FastCache::ServeAdminHttp(&dribble, &metrics, provider, &clock));
     CloseAsServed(&dribble);
-    auto const response = FastCache::SyncRun(ReadAvailable(pair.client.get()));
+    auto const response = core::async::syncRun(ReadAvailable(pair.client.get()));
     CHECK(response.starts_with("HTTP/1.1 408 Request Timeout\r\n"));
 }
 
@@ -700,24 +703,24 @@ TEST_CASE("AdminHttp: a served connection's refusal over a head it did not finis
     // rest unread, and a bare close over unread bytes is a reset that destroys the
     // refusal before a Windows client reads it. The served connection lingers instead,
     // until this client closes.
-    FastCache::InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     FastCache::AtomicMetricsSink metrics;
     FastCache::NullLogger logger;
-    FastCache::SteadyClock clock;
+    core::platform::SteadyClock clock;
     FastCache::AdminHttpServer server { listener, metrics, [] { return FastCache::MetricsSnapshot {}; }, logger, clock };
 
     auto client = listener.connectClient();
     std::string request = "GET /healthz HTTP/1.1\r\nHost: x\r\n";
     request += "X-Pad: " + std::string(9000, 'p') + "\r\n";
     request += "\r\n";
-    REQUIRE(FastCache::SyncRun(WriteString(client.get(), request)));
-    client->shutdownWrite();
+    REQUIRE(core::async::syncRun(WriteString(client.get(), request)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
     // Queued connections are accepted before the closed listener ends the loop.
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    listener.close();
+    core::async::syncRun(server.Run());
     server.Shutdown();
 
-    auto const response = FastCache::SyncRun(ReadAvailable(client.get()));
+    auto const response = core::async::syncRun(ReadAvailable(client.get()));
     INFO("response was: " << response.substr(0, 64));
     REQUIRE(response.starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"));
 }

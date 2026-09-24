@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/IAdmissionControl.hpp>
-#include <FastCache/Net/IListener.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
 
 #include <atomic>
 #include <cstdint>
 #include <exception>
+
+#include <core/async/Task.hpp>
+#include <core/net/IAdmissionControl.hpp>
+#include <core/net/IListener.hpp>
+
+namespace core::net
+{
+class ITlsContext;
+} // namespace core::net
 
 namespace FastCache
 {
@@ -39,15 +45,14 @@ inline void LogConnectionFirewallException(ILogger& logger) noexcept
     }
 }
 
-class TlsContext; // defined in Net/TlsContext.hpp; only used when TLS is built in
-
 /// Top-level accept loop. Owns a listener, accepts connections, and spawns
 /// a Connection coroutine per client. Tears down cleanly on Shutdown().
 ///
 /// Optional collaborators (nullptr = disabled):
-///   - IAdmissionControl: consulted before each accept; if AllowAccept()
-///     returns false, the just-accepted socket is closed immediately and
-///     IMetricsSink::ConnectionsAdmissionRejected is bumped.
+///   - IAdmissionControl: asked after each accept; if `tryAdmit()` grants
+///     no lease, the just-accepted socket is closed immediately and
+///     IMetricsSink::ConnectionsAdmissionRejected is bumped. A granted lease
+///     lives as long as the connection's coroutine.
 ///   - IMetricsSink: tracks ConnectionsTotal and rejection counts.
 class Server
 {
@@ -60,18 +65,18 @@ class Server
     ///        plaintext. Only honoured in TLS-enabled builds.
     /// @param logSource When LogSource::Yes, every connection prefixes its log
     ///        lines with the client IP. Defaults to LogSource::No.
-    Server(IListener& listener,
+    Server(core::net::IListener& listener,
            CacheEngine& engine,
            ILogger& logger,
-           IAdmissionControl* admission = nullptr,
+           core::net::IAdmissionControl* admission = nullptr,
            IMetricsSink* metrics = nullptr,
            SessionContext session = {},
-           TlsContext* tls = nullptr,
+           core::net::ITlsContext* tls = nullptr,
            LogSource logSource = LogSource::No) noexcept;
 
     /// Run the accept loop until Shutdown() is called or the listener closes.
     /// @return Task that resolves when the accept loop exits.
-    [[nodiscard]] Task<void> Run();
+    [[nodiscard]] core::async::Task<void> Run();
 
     /// Ask the accept loop to stop. The next failed Accept() (closed
     /// listener) breaks the loop; current connections continue under their
@@ -101,13 +106,13 @@ class Server
     }
 
   private:
-    IListener& _listener;
+    core::net::IListener& _listener;
     CacheEngine& _engine;
     ILogger& _logger;
-    IAdmissionControl* _admission;
+    core::net::IAdmissionControl* _admission;
     IMetricsSink* _metrics;
     SessionContext _session;
-    TlsContext* _tls;
+    core::net::ITlsContext* _tls;
     LogSource _logSource;
     std::atomic<std::uint64_t> _accepted { 0 };
     std::atomic<bool> _shuttingDown { false };

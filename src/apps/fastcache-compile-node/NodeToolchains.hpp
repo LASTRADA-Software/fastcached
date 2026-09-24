@@ -3,7 +3,6 @@
 
 #include "NodeConfig.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 
 #include <cstdint>
@@ -19,6 +18,7 @@
 #include <ToolchainDiscovery.hpp>
 #include <ToolchainHost.hpp>
 #include <ToolchainProbe.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -269,7 +269,7 @@ struct ServedToolchain
     Cc::IToolchainDiscovery* discovery,
     Cc::IProcessRunner& runner,
     Cc::IToolchainHost& host,
-    IClock const& clock,
+    core::platform::IClock const& clock,
     ILogger& logger,
     SurveyVoice voice = SurveyVoice::Announce);
 
@@ -374,7 +374,7 @@ struct SurveyResult
 [[nodiscard]] SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
                                                  Cc::IProcessRunner& runner,
                                                  Cc::IToolchainHost& host,
-                                                 IClock const& clock,
+                                                 core::platform::IClock const& clock,
                                                  ILogger& logger,
                                                  std::stop_token const& stop,
                                                  SurveyVoice voice = SurveyVoice::Announce);
@@ -607,7 +607,7 @@ enum class ClaimsReloaded : std::uint8_t
                                                  Cc::IToolchainDiscovery* discovery,
                                                  Cc::IProcessRunner& runner,
                                                  Cc::IToolchainHost& host,
-                                                 IClock const& clock,
+                                                 core::platform::IClock const& clock,
                                                  ILogger& logger,
                                                  RecheckDepth depth = RecheckDepth::WhenEvidenceMoved,
                                                  SurveyVoice voice = SurveyVoice::Announce);

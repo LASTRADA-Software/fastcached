@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Net/SocketDeadline.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <algorithm>
@@ -19,6 +17,9 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <core/async/ResumeOn.hpp>
+#include <core/net/SocketDeadline.hpp>
 
 namespace FastCache::Consensus
 {
@@ -36,7 +37,7 @@ namespace
       public:
         /// @param open Where to register; must outlive this.
         /// @param socket The connection.
-        RegisteredConnection(OpenConnections* open, ISocket* socket) noexcept:
+        RegisteredConnection(OpenConnections* open, core::net::ISocket* socket) noexcept:
             _open { open },
             _socket { socket }
         {
@@ -57,7 +58,7 @@ namespace
 
       private:
         OpenConnections* _open;
-        ISocket* _socket;
+        core::net::ISocket* _socket;
     };
 
     /// A connection that has proved its id: who it proved, with which key, and the session
@@ -92,7 +93,7 @@ struct PeerServerAccess
     /// Serve one accepted connection: the handshake, then its frames.
     /// @param self The server; outlives this by `Shutdown`'s drain.
     /// @param socket The accepted connection; owned for its lifetime.
-    static DetachedTask ServePeer(RaftPeerServer* self, std::unique_ptr<ISocket> socket);
+    static core::async::DetachedTask ServePeer(RaftPeerServer* self, std::unique_ptr<core::net::ISocket> socket);
 
     /// Challenge, read one proof, judge it and answer, all within the handshake bound.
     /// @param self The server.
@@ -100,20 +101,20 @@ struct PeerServerAccess
     /// @param reader The connection's reader, which the session goes on using.
     /// @param peer The address the connection came from.
     /// @return The proven peer, or nothing when the connection is not to be served.
-    static Task<std::optional<ProvenPeer>> Handshake(RaftPeerServer* self,
-                                                     ISocket* socket,
-                                                     ByteReader* reader,
-                                                     std::string peer);
+    static core::async::Task<std::optional<ProvenPeer>> Handshake(RaftPeerServer* self,
+                                                                  core::net::ISocket* socket,
+                                                                  ByteReader* reader,
+                                                                  std::string peer);
 
     /// Read, check and deliver the frames of a connection that proved its id.
     /// @param self The server.
     /// @param reader The connection's reader.
     /// @param peer The address the connection came from.
     /// @param proven Who it proved, and its session.
-    static Task<void> Serve(RaftPeerServer* self, ByteReader* reader, std::string peer, ProvenPeer proven);
+    static core::async::Task<void> Serve(RaftPeerServer* self, ByteReader* reader, std::string peer, ProvenPeer proven);
 };
 
-DetachedTask PeerServerAccess::ServePeer(RaftPeerServer* self, std::unique_ptr<ISocket> socket)
+core::async::DetachedTask PeerServerAccess::ServePeer(RaftPeerServer* self, std::unique_ptr<core::net::ISocket> socket)
 {
     RegisteredConnection const registration { &self->_open, socket.get() };
 
@@ -133,18 +134,18 @@ DetachedTask PeerServerAccess::ServePeer(RaftPeerServer* self, std::unique_ptr<I
     self->_active.fetch_sub(1, std::memory_order_acq_rel);
 }
 
-Task<std::optional<ProvenPeer>> PeerServerAccess::Handshake(RaftPeerServer* self,
-                                                            ISocket* socket,
-                                                            ByteReader* reader,
-                                                            std::string peer)
+core::async::Task<std::optional<ProvenPeer>> PeerServerAccess::Handshake(RaftPeerServer* self,
+                                                                         core::net::ISocket* socket,
+                                                                         ByteReader* reader,
+                                                                         std::string peer)
 {
     // Armed before the first write, so the bound covers the whole exchange: a peer that
     // never reads the challenge stalls the write, and one that never proves stalls the
     // read, and both are the same stranger holding a slot. Expiry closes the socket,
     // which completes whichever of the two is parked -- and the flag is how an ending
     // is told apart from a peer that simply went away.
-    SocketDeadlineTarget expiry { .socket = socket };
-    auto deadline = ArmSocketDeadline(&self->_reactor, self->_options.handshakeBound, &expiry);
+    core::net::SocketDeadlineTarget expiry { .socket = socket };
+    auto deadline = core::net::armSocketDeadline(&self->_reactor, self->_options.handshakeBound, &expiry);
 
     // A connection that ended without refusing anything: gone, or out of time.
     auto const ended = [self, &expiry, &peer]() -> std::optional<ProvenPeer> {
@@ -274,7 +275,10 @@ Task<std::optional<ProvenPeer>> PeerServerAccess::Handshake(RaftPeerServer* self
                            .session = *std::move(judgement.session) };
 }
 
-Task<void> PeerServerAccess::Serve(RaftPeerServer* self, ByteReader* reader, std::string peer, ProvenPeer proven)
+core::async::Task<void> PeerServerAccess::Serve(RaftPeerServer* self,
+                                                ByteReader* reader,
+                                                std::string peer,
+                                                ProvenPeer proven)
 {
     FrameOpener opener { std::move(proven.session) };
 
@@ -381,8 +385,8 @@ Task<void> PeerServerAccess::Serve(RaftPeerServer* self, ByteReader* reader, std
     }
 }
 
-RaftPeerServer::RaftPeerServer(IListener& listener,
-                               IReactor& reactor,
+RaftPeerServer::RaftPeerServer(core::net::IListener& listener,
+                               core::net::EventLoop& reactor,
                                IRaftMessageSink& sink,
                                ILogger& logger,
                                IMetricsSink& metrics,
@@ -455,19 +459,19 @@ void RaftPeerServer::NoteProvenRefusal(AcceptorRefusal refusal,
             "raft: refused peer {} at {} because {}{}{}", dialler, peer, row.says, detail.empty() ? "" : ": ", detail));
 }
 
-Task<void> RaftPeerServer::Run()
+core::async::Task<void> RaftPeerServer::Run()
 {
     while (!_shuttingDown.load(std::memory_order_acquire))
     {
-        auto accepted = co_await _listener.Accept();
+        auto accepted = co_await _listener.accept();
         if (!accepted.has_value())
         {
             // A poll timeout is how this loop wakes to observe Shutdown() on
             // POSIX, where closing the listening socket does not unblock a
             // parked accept(). Not a failure.
-            if (IsDeadlineExpiry(accepted.error().code))
+            if (core::net::isDeadlineExpiry(accepted.error().code))
                 continue;
-            _logger.Log(LogLevel::Debug, std::format("raft: peer accept loop ended ({})", accepted.error().ToString()));
+            _logger.Log(LogLevel::Debug, std::format("raft: peer accept loop ended ({})", accepted.error().toString()));
             co_return;
         }
 
@@ -494,11 +498,11 @@ Task<void> RaftPeerServer::Run()
 
 void RaftPeerServer::CloseAll() noexcept
 {
-    _listener.Close();
+    _listener.close();
 
     // Copied out under the lock rather than closed under it, because a close
     // resumes the task that removes itself from this very vector.
-    auto sockets = std::vector<ISocket*> {};
+    auto sockets = std::vector<core::net::ISocket*> {};
     {
         auto const guard = std::scoped_lock { _open.mutex };
         sockets = _open.sockets;
@@ -520,8 +524,8 @@ void RaftPeerServer::Shutdown() noexcept
     //
     // Borrows `this` rather than sharing state, which is sound for the same reason
     // the connection tasks may: the drain below does not return until this has run.
-    [](RaftPeerServer* self) -> DetachedTask {
-        co_await ResumeOn { self->_reactor };
+    [](RaftPeerServer* self) -> core::async::DetachedTask {
+        co_await core::async::ResumeOn { self->_reactor };
         self->CloseAll();
         self->_closesRan.store(true, std::memory_order_release);
         co_return;

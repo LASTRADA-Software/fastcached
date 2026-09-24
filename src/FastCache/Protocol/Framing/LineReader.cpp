@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <cstddef>
@@ -8,6 +7,8 @@
 #include <ranges>
 #include <string>
 #include <utility>
+
+#include <core/Profiling.hpp>
 
 namespace FastCache
 {
@@ -36,7 +37,7 @@ namespace
 
 } // namespace
 
-ByteReader::ByteReader(ISocket& socket,
+ByteReader::ByteReader(core::net::ISocket& socket,
                        std::size_t maxLineBytes,
                        std::size_t maxPayloadBytes,
                        std::size_t readChunkBytes) noexcept:
@@ -60,7 +61,7 @@ void ByteReader::Compact()
 
 std::expected<std::string, ProtocolError> ByteReader::TryExtractLine()
 {
-    FC_ZONE_SCOPED_N("LineReader.TryExtractLine");
+    CORE_ZONE_SCOPED_N("LineReader.TryExtractLine");
     auto const* const base = _buffer.data() + _consumed;
     auto const avail = Available();
     if (avail < 2)
@@ -82,7 +83,7 @@ std::expected<std::string, ProtocolError> ByteReader::TryExtractLine()
     return std::unexpected(ProtocolError { .code = ProtocolErrorCode::MalformedFrame, .context = "no CRLF yet" });
 }
 
-Task<std::expected<std::size_t, ProtocolError>> ByteReader::PullChunk()
+core::async::Task<std::expected<std::size_t, ProtocolError>> ByteReader::PullChunk()
 {
     // Reuse a persistent scratch buffer across reads. Sizing it with resize()
     // only grows the allocation once (and the one-time zero-fill is irrelevant
@@ -108,7 +109,7 @@ Task<std::expected<std::size_t, ProtocolError>> ByteReader::PullChunk()
     co_return got;
 }
 
-Task<ByteReader::LineResult> ByteReader::ReadLine()
+core::async::Task<ByteReader::LineResult> ByteReader::ReadLine()
 {
     if (auto existing = TryExtractLine(); existing.has_value())
         co_return std::move(*existing);
@@ -147,7 +148,7 @@ void ByteReader::PrimeWith(std::span<std::byte const> bytes)
     _buffer.insert(_buffer.begin(), bytes.begin(), bytes.end());
 }
 
-Task<ByteReader::BytesResult> ByteReader::ReadExactly(std::size_t count)
+core::async::Task<ByteReader::BytesResult> ByteReader::ReadExactly(std::size_t count)
 {
     if (count > _maxPayloadBytes)
         co_return std::unexpected(MakePayloadTooLarge(count, _maxPayloadBytes));
@@ -167,7 +168,7 @@ Task<ByteReader::BytesResult> ByteReader::ReadExactly(std::size_t count)
     co_return out;
 }
 
-Task<std::expected<void, ProtocolError>> ByteReader::Skip(std::size_t count)
+core::async::Task<std::expected<void, ProtocolError>> ByteReader::Skip(std::size_t count)
 {
     // Drain `count` bytes WITHOUT materialising them all into a single
     // _maxPayloadBytes-bounded vector. This is used by the memcached binary

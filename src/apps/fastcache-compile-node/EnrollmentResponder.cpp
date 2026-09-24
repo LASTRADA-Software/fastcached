@@ -108,7 +108,7 @@ namespace
     };
 } // namespace
 
-Task<FrameReply> EnrollmentResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
+core::async::Task<FrameReply> EnrollmentResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
 {
     auto const header = Wire::DecodeRequestHeader(frame);
     if (!header.has_value())

@@ -5,7 +5,6 @@
 #include "NodeRoster.hpp"
 #include "SchedulerTier.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
@@ -18,8 +17,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/BlockingConnector.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -42,6 +40,10 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/BlockingConnector.hpp>
+#include <core/net/BlockingSocket.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/PreviousClusterState.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
@@ -214,7 +216,7 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
 
     // Never reached by either case: one returns before consensus exists, the other is
     // refused before anything is wired. A roster for a node that holds none.
-    auto const roster = NodeRoster::Build(NodeConfig {}, DefaultSystemWallClock(), metrics, logger);
+    auto const roster = NodeRoster::Build(NodeConfig {}, core::platform::defaultSystemWallClock(), metrics, logger);
     REQUIRE(roster.has_value());
 
     SECTION("--node-id with no --listen-raft builds no tier")
@@ -230,7 +232,7 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
                                                   std::nullopt,
                                                   membership,
                                                   *Unwrap(roster),
-                                                  DefaultSystemWallClock(),
+                                                  core::platform::defaultSystemWallClock(),
                                                   metrics,
                                                   logger);
         REQUIRE(tier.has_value());
@@ -252,7 +254,7 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
                                                   std::nullopt,
                                                   membership,
                                                   *Unwrap(roster),
-                                                  DefaultSystemWallClock(),
+                                                  core::platform::defaultSystemWallClock(),
                                                   metrics,
                                                   logger);
         REQUIRE_FALSE(tier.has_value());
@@ -279,7 +281,7 @@ TEST_CASE("A consensus tier refuses to start without an identity key", "[node][c
     cfg.raftListen = "6680";
     cfg.raftPeers = { Unwrap(Cluster::ParseMemberSpec("n1=10.0.0.1:6680")) };
     NodeMembership membership { cfg, membershipLog };
-    auto const roster = NodeRoster::Build(NodeConfig {}, DefaultSystemWallClock(), metrics, logger);
+    auto const roster = NodeRoster::Build(NodeConfig {}, core::platform::defaultSystemWallClock(), metrics, logger);
     REQUIRE(roster.has_value());
 
     auto const tier = StartConsensusOrExplain(cfg,
@@ -288,7 +290,7 @@ TEST_CASE("A consensus tier refuses to start without an identity key", "[node][c
                                               std::nullopt,
                                               membership,
                                               *Unwrap(roster),
-                                              DefaultSystemWallClock(),
+                                              core::platform::defaultSystemWallClock(),
                                               metrics,
                                               logger);
     REQUIRE_FALSE(tier.has_value());
@@ -389,7 +391,7 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
     REQUIRE(probe->IsBound());
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
 
     auto const scratch = Testing::UniqueScratchPath("consensus-forget-only-voter");
@@ -418,7 +420,7 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
         Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
-        DefaultSystemWallClock(),
+        core::platform::defaultSystemWallClock(),
         {},
         metrics,
         logger);
@@ -482,7 +484,7 @@ TEST_CASE("A lone voter endorses the roster it applied, under its own key, and r
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
     REQUIRE(probe->IsBound());
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
 
     auto const scratch = Testing::UniqueScratchPath("consensus-endorse");
@@ -512,7 +514,7 @@ TEST_CASE("A lone voter endorses the roster it applied, under its own key, and r
         Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
-        DefaultSystemWallClock(),
+        core::platform::defaultSystemWallClock(),
         [seen](Cluster::RosterEndorsement const& endorsement) {
             std::scoped_lock const guard { seen->lock };
             seen->endorsements.push_back(endorsement);
@@ -648,7 +650,7 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
     REQUIRE(probe->IsBound());
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
 
     auto const scratch = Testing::UniqueScratchPath("consensus-unreadable-state");
@@ -682,7 +684,7 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
             Testing::TestKeyPair("n1"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [published](Cluster::ClusterState const&) { published->fetch_add(1); },
-            DefaultSystemWallClock(),
+            core::platform::defaultSystemWallClock(),
             {},
             metrics,
             logger);
@@ -812,12 +814,12 @@ TEST_CASE("A node refusing its leader's snapshot says so as an Alert condition, 
 
 namespace
 {
-/// One read from @p socket. A `BlockingSocket` blocks rather than suspends, so `SyncRun`
+/// One read from @p socket. A `core::net::BlockingSocket` blocks rather than suspends, so `core::async::syncRun`
 /// completes this in one resume -- and the connector's `ioTimeout` bounds it.
 /// @param socket Source; never null.
 /// @param buffer Where to put what arrives.
 /// @return How many bytes arrived; zero at the end or on an error.
-[[nodiscard]] Task<std::size_t> ReadOnce(ISocket* socket, std::span<std::byte> buffer)
+[[nodiscard]] core::async::Task<std::size_t> ReadOnce(core::net::ISocket* socket, std::span<std::byte> buffer)
 {
     auto const read = co_await socket->read(buffer);
     co_return read.has_value() ? *read : std::size_t { 0 };
@@ -827,7 +829,7 @@ namespace
 /// @param socket Destination; never null.
 /// @param bytes What to send.
 /// @return How many bytes were accepted; zero on an error.
-[[nodiscard]] Task<std::size_t> WriteOnce(ISocket* socket, std::span<std::byte const> bytes)
+[[nodiscard]] core::async::Task<std::size_t> WriteOnce(core::net::ISocket* socket, std::span<std::byte const> bytes)
 {
     auto const written = co_await socket->write(bytes);
     co_return written.has_value() ? *written : std::size_t { 0 };
@@ -843,7 +845,7 @@ struct PeerFrame
 /// Read exactly one peer-wire frame from @p socket, and not a byte of the next.
 /// @param socket Where it arrives.
 /// @return The frame, or nullopt when the peer ended first or sent no frame.
-[[nodiscard]] std::optional<PeerFrame> ReadPeerFrame(ISocket& socket)
+[[nodiscard]] std::optional<PeerFrame> ReadPeerFrame(core::net::ISocket& socket)
 {
     auto bytes = std::vector<std::byte> {};
     auto const fill = [&socket, &bytes](std::size_t want) {
@@ -851,7 +853,7 @@ struct PeerFrame
         {
             auto chunk = std::array<std::byte, 512> {};
             auto const room = std::min(chunk.size(), want - bytes.size());
-            auto const got = SyncRun(ReadOnce(&socket, std::span { chunk }.first(room)));
+            auto const got = core::async::syncRun(ReadOnce(&socket, std::span { chunk }.first(room)));
             if (got == 0)
                 return false;
             bytes.insert(bytes.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(got));
@@ -882,17 +884,20 @@ struct PeerFrame
 /// @return The connection, open: the case holds it until it has seen what it waits for,
 ///         because a close with the tier's reply unread is a reset, which can reach the
 ///         tier before it has read the offer.
-[[nodiscard]] std::unique_ptr<ISocket> OfferAsLeader(std::uint16_t port, Consensus::RaftMessage const& offer)
+[[nodiscard]] std::unique_ptr<core::net::ISocket> OfferAsLeader(std::uint16_t port, Consensus::RaftMessage const& offer)
 {
     Testing::TestPeerIdentity const identity { "n1", Testing::TestKeyPair("n1"), Testing::SharedRoster::Of({ "n1", "n2" }) };
     SystemSecureRandom random;
     auto handshake = Consensus::DiallerHandshake::Create(identity, "n2", random);
     REQUIRE(handshake.has_value());
 
-    BlockingConnector connector { DefaultAddressResolver(),
-                                  BlockingConnectorOptions { .ioTimeout = std::chrono::seconds { 10 } } };
-    auto dialled = SyncRun(connector.connect(
-        "127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 }, .keepAlive = KeepAlive::No }));
+    core::net::BlockingConnector connector {
+        core::net::defaultAddressResolver(), core::net::BlockingConnectorOptions { .ioTimeout = std::chrono::seconds { 10 } }
+    };
+    auto dialled = core::async::syncRun(connector.connect(
+        "127.0.0.1",
+        port,
+        core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 }, .keepAlive = core::net::KeepAlive::No }));
     REQUIRE(dialled.has_value());
     auto socket = *std::move(dialled);
 
@@ -905,7 +910,7 @@ struct PeerFrame
     REQUIRE(proof.has_value());
 
     auto const proofWire = Consensus::RaftWire::EncodeProof(*proof);
-    REQUIRE(SyncRun(WriteOnce(socket.get(), proofWire)) == proofWire.size());
+    REQUIRE(core::async::syncRun(WriteOnce(socket.get(), proofWire)) == proofWire.size());
 
     auto const verdictFrame = ReadPeerFrame(*socket);
     REQUIRE(verdictFrame.has_value());
@@ -921,7 +926,7 @@ struct PeerFrame
     auto const tag =
         sealer.Seal(frame.first(Consensus::RaftWire::HeaderSize), frame.subspan(Consensus::RaftWire::HeaderSize));
     wire.insert(wire.end(), tag.begin(), tag.end());
-    REQUIRE(SyncRun(WriteOnce(socket.get(), wire)) == wire.size());
+    REQUIRE(core::async::syncRun(WriteOnce(socket.get(), wire)) == wire.size());
     return socket;
 }
 } // namespace
@@ -945,7 +950,7 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
         auto probe = BlockingListener::Bind("127.0.0.1", 0);
         REQUIRE(probe);
         REQUIRE(probe->IsBound());
-        auto const port = probe->BoundPort();
+        auto const port = probe->boundPort();
         probe.reset();
         return port;
     };
@@ -977,7 +982,7 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
         Testing::TestKeyPair("n2"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
-        DefaultSystemWallClock(),
+        core::platform::defaultSystemWallClock(),
         {},
         metrics,
         logger,

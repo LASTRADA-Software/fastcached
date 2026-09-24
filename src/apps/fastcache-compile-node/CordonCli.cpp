@@ -3,15 +3,17 @@
 #include "CordonCli.hpp"
 #include "EndpointDial.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Core/Ranges.hpp>
-#include <FastCache/Net/BlockingConnector.hpp>
 
 #include <array>
 #include <chrono>
 #include <format>
 #include <iostream>
+
+#include <core/Ranges.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/BlockingConnector.hpp>
 
 namespace FastCache::Node
 {
@@ -63,14 +65,14 @@ namespace
 std::string SelfDialEndpoint(SurfaceEndpoint const& bound)
 {
     auto const* const wildcard =
-        FindIfOrNull(WildcardRows, [&bound](WildcardRow const& row) { return row.bound == bound.host; });
+        core::findIfOrNull(WildcardRows, [&bound](WildcardRow const& row) { return row.bound == bound.host; });
     return FormatHostPort(wildcard != nullptr ? wildcard->loopback : std::string_view { bound.host }, bound.port);
 }
 
 std::string RenderCordonReply(Wire::CordonFields const& fields)
 {
     auto const* const row =
-        FindIfOrNull(CordonStateRows, [&fields](CordonStateRow const& r) { return r.state == fields.state; });
+        core::findIfOrNull(CordonStateRows, [&fields](CordonStateRow const& r) { return r.state == fields.state; });
     // `DecodeCordonFields` refuses a state this build does not name, so every decoded
     // reply has a row; the fallback is for a caller that built one by hand.
     auto const sentence = row != nullptr ? row->sentence : std::string_view { "in a state this build does not name" };
@@ -79,7 +81,7 @@ std::string RenderCordonReply(Wire::CordonFields const& fields)
     return std::format("worker {}\n", sentence);
 }
 
-std::expected<std::string, std::string> PutCordonRequest(ISocket& client,
+std::expected<std::string, std::string> PutCordonRequest(core::net::ISocket& client,
                                                          Cc::CredentialNotice& notice,
                                                          Wire::CordonAction action,
                                                          ICredentialSource const& credential,
@@ -88,7 +90,7 @@ std::expected<std::string, std::string> PutCordonRequest(ISocket& client,
     // Through the launcher's own exchange, for `PutClusterRequest`'s reason: the credential
     // pipelining is subtle enough that a second copy would differ.
     auto const outcome =
-        SyncRun(Cc::ExchangeFramed(&client, &notice, Wire::EncodeCordonRequest(action), credential.Current()));
+        core::async::syncRun(Cc::ExchangeFramed(&client, &notice, Wire::EncodeCordonRequest(action), credential.Current()));
 
     if (outcome.kind == Cc::CacheOutcomeKind::Transport)
         return std::unexpected { std::format("the node at {} did not answer", endpoint) };
@@ -112,8 +114,9 @@ std::expected<std::string, std::string> RunCordonAdmin(NodeConfig const& cfg,
 
     // A one-shot CLI on the process main thread: no reactor exists here, so this
     // legitimately blocks -- `RunClusterAdmin`'s idiom, for the same situation.
-    BlockingConnector connector { DefaultAddressResolver(), BlockingConnectorOptions { .ioTimeout = DialTimeout } };
-    auto client = Cc::DialEndpointBlocking(connector, endpoint, DialOptions { .connectTimeout = DialTimeout });
+    core::net::BlockingConnector connector { core::net::defaultAddressResolver(),
+                                             core::net::BlockingConnectorOptions { .ioTimeout = DialTimeout } };
+    auto client = Cc::DialEndpointBlocking(connector, endpoint, core::net::DialOptions { .connectTimeout = DialTimeout });
     if (client == nullptr)
         return std::unexpected { std::format(
             "cannot reach this machine's node at {}; a cordon is asked of the node running here", endpoint) };

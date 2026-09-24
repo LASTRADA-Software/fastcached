@@ -13,8 +13,8 @@
 #include <utility>
 #include <vector>
 
+#include <core/net/testing/ParkingReadableSocket.hpp>
 #include <tests/ScriptedSocket.hpp>
-#include <tests/SocketDecorator.hpp>
 
 namespace FastCache::Testing
 {
@@ -58,7 +58,8 @@ class ScriptedDialer final: public Node::IEndpointDialer
     }
 
     /// @copydoc Node::IEndpointDialer::Dial
-    [[nodiscard]] std::unique_ptr<ISocket> Dial(std::string_view endpoint, DialOptions /*options*/) override
+    [[nodiscard]] std::unique_ptr<core::net::ISocket> Dial(std::string_view endpoint,
+                                                           core::net::DialOptions /*options*/) override
     {
         _dialed.emplace_back(endpoint);
         if (_next >= _replies.size())
@@ -78,7 +79,7 @@ class ScriptedDialer final: public Node::IEndpointDialer
             return nullptr;
         }
         _sockets.push_back(std::make_unique<ScriptedSocket>(frame));
-        return std::make_unique<SocketDecorator>(*_sockets.back());
+        return std::make_unique<core::net::testing::SocketDecorator>(*_sockets.back());
     }
 
     /// @return Every endpoint dialled, in order.

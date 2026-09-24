@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Platform/StopSignal.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -12,6 +11,8 @@
 #include <future>
 #include <optional>
 #include <ranges>
+
+#include <core/async/ThreadPoolExecutor.hpp>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -35,7 +36,7 @@ constexpr auto WakeBound = std::chrono::seconds { 10 };
 ///
 /// The caller's side of the two hops, standing in for a reactor: these cases are about
 /// the WAIT, and a reactor would add a second thread nobody is asking about.
-class InlineExecutor final: public IExecutor
+class InlineExecutor final: public core::async::IExecutor
 {
   public:
     void submit(std::coroutine_handle<> handle) override
@@ -43,7 +44,7 @@ class InlineExecutor final: public IExecutor
         handle.resume();
     }
 
-    void submit(ParkedWork work) override
+    void submit(core::async::ParkedWork work) override
     {
         work.resume.resume();
     }
@@ -55,10 +56,10 @@ class InlineExecutor final: public IExecutor
 /// @param resumeOn Where the answer is delivered.
 /// @param answer Receives why the wait ended.
 /// @return The task to start.
-[[nodiscard]] Task<void> AwaitStop(IStopSignal* signal,
-                                   IExecutor* waiter,
-                                   IExecutor* resumeOn,
-                                   std::promise<StopWake>* answer)
+[[nodiscard]] core::async::Task<void> AwaitStop(IStopSignal* signal,
+                                                core::async::IExecutor* waiter,
+                                                core::async::IExecutor* resumeOn,
+                                                std::promise<StopWake>* answer)
 {
     answer->set_value(co_await signal->Stopped(waiter, resumeOn));
 }
@@ -82,10 +83,10 @@ template <typename Meanwhile>
     auto answer = std::promise<StopWake> {};
     auto answered = answer.get_future();
     auto resumeHere = InlineExecutor {};
-    auto task = Task<void> {};
+    auto task = core::async::Task<void> {};
     auto result = std::optional<StopWake> {};
     {
-        auto waiter = ThreadPoolExecutor { 1 };
+        auto waiter = core::async::ThreadPoolExecutor { 1 };
         task = AwaitStop(&signal, &waiter, &resumeHere, &answer);
         task.handle().resume();
         meanwhile();

@@ -38,7 +38,7 @@ namespace FastCache::Node
 /// ## What this table does, and what now enforces it
 ///
 /// The table itself is still a declaration: it names who may write and why. What
-/// changed is underneath it. `Detail::ClaimWriteSlot`
+/// changed is underneath it. `core::net::contract::claimWriteSlot`
 /// (`FastCache/Net/WriteSlot.hpp`, #893) is the write-side mirror of
 /// `ClaimReadSlot`, folded INTO the operation so no arm site has a line to forget it
 /// on -- which is the shape
@@ -46,7 +46,7 @@ namespace FastCache::Node
 /// somebody else built while answering a TLS pump bug.
 ///
 /// **It reaches the case this table is about, and the reason is `WriteAll`.** That
-/// helper sends a whole frame in ONE `ISocket::Write`, so a write that PARKS is a
+/// helper sends a whole frame in ONE `core::net::ISocket::Write`, so a write that PARKS is a
 /// half-sent frame -- and a second writer arming over it is precisely the interleaving
 /// named above: a client reading a length out of the middle of somebody else's frame.
 /// Arming a write over a parked one is what the claim refuses. A write that completes

@@ -26,14 +26,14 @@ namespace
     constexpr auto Unavailable = "this fastcache-cli was built without the terminal UI (FASTCACHED_BUILD_TUI=OFF)";
 } // namespace
 
-std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(IExecutor* /*pool*/,
-                                                                                  IExecutor* /*resumeOn*/,
+std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(core::async::IExecutor* /*pool*/,
+                                                                                  core::async::IExecutor* /*resumeOn*/,
                                                                                   UsageColor /*colour*/)
 {
     return std::unexpected(std::string { Unavailable });
 }
 
-Task<std::expected<StartedTerminal, std::string>> StartTerminal(std::unique_ptr<UnstartedTerminal> /*terminal*/)
+core::async::Task<std::expected<StartedTerminal, std::string>> StartTerminal(std::unique_ptr<UnstartedTerminal> /*terminal*/)
 {
     co_return std::unexpected(std::string { Unavailable });
 }

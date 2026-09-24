@@ -2,16 +2,11 @@
 //
 // The launcher's one exchange, driven on a reactor.
 //
-// Every case here uses a `TestReactor` and a scripted connector, so the rules --
+// Every case here uses a `core::net::testing::TestLoop` and a scripted connector, so the rules --
 // the budget, an unreachable endpoint, a peer that accepts and goes quiet -- are
 // asserted with no socket and no clock of the machine's.
 #include "ReactorExchange.hpp"
 
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Core/Clock.hpp>
-#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -28,6 +23,12 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <core/async/ResumeOn.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 
 using namespace FastCache;
 using namespace std::chrono_literals;
@@ -77,7 +78,7 @@ struct PeerLog
 };
 
 /// A socket that answers with scripted bytes, or never answers at all.
-class ScriptedPeer final: public ISocket
+class ScriptedPeer final: public core::net::ISocket
 {
   public:
     /// @param reply What a read should hand back, byte by byte. Empty means the
@@ -88,7 +89,7 @@ class ScriptedPeer final: public ISocket
                  PeerLog& log,
                  bool dribble,
                  bool die,
-                 ManualClock* clock,
+                 core::platform::ManualClock* clock,
                  std::chrono::milliseconds advanceOnRead) noexcept:
         _reply { std::move(reply) },
         _log { &log },
@@ -126,11 +127,11 @@ class ScriptedPeer final: public ISocket
         _offset += 1;
         _pending = {};
         auto* const parked = std::exchange(_parked, nullptr);
-        parked->complete(IoResult { 1 });
+        parked->complete(core::net::IoResult { 1 });
         return true;
     }
 
-    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
+    [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override
     {
         _log->reads += 1;
 
@@ -148,65 +149,53 @@ class ScriptedPeer final: public ISocket
         // A connection that DIED, as distinct from one this side closed. It is what
         // a keepalive probe that goes unanswered produces at the socket layer, and
         // the whole point of the distinction is that nothing here calls `Close()` --
-        // so `SocketDeadlineTarget::expired` stays false and the exchange can tell
+        // so `core::net::SocketDeadlineTarget::expired` stays false and the exchange can tell
         // the two apart (#247).
         if (_die)
-            return IoAwaitable { std::unexpected(
-                NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = "scripted peer died" }) };
+            return core::net::IoAwaitable { std::unexpected(core::net::NetError {
+                .code = core::net::NetErrorCode::ConnReset, .systemCode = 0, .context = "scripted peer died" }) };
 
         if (_closed)
-            return IoAwaitable { std::unexpected(
-                NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = "closed" }) };
+            return core::net::IoAwaitable { std::unexpected(
+                core::net::NetError { .code = core::net::NetErrorCode::Cancelled, .systemCode = 0, .context = "closed" }) };
 
         // A dribbler parks EVERY read, however much reply is left: it never says
         // nothing and it never finishes, which is the shape no per-call ceiling
-        // catches. The buffer stays live until the awaitable resumes -- `ISocket`'s
+        // catches. The buffer stays live until the awaitable resumes -- `core::net::ISocket`'s
         // own contract -- so `DeliverOneByte` may write into it later.
         if (_dribble && _offset < _reply.size())
         {
             _pending = buffer;
-            IoAwaitable parked;
-            parked.SetSuspendCallback(
-                [](IoAwaitable* self, std::coroutine_handle<>) {
-                    static_cast<ScriptedPeer*>(self->CallbackState())->_parked = self;
-                },
-                this);
-            return parked;
+            return Parked();
         }
 
         if (_offset >= _reply.size())
         {
             // Parked forever: nothing completes this but `Close()`, which is exactly
             // what a peer that accepted and then went quiet looks like.
-            IoAwaitable parked;
-            parked.SetSuspendCallback(
-                [](IoAwaitable* self, std::coroutine_handle<>) {
-                    static_cast<ScriptedPeer*>(self->CallbackState())->_parked = self;
-                },
-                this);
-            return parked;
+            return Parked();
         }
 
         auto const n = std::min(buffer.size(), _reply.size() - _offset);
         std::copy_n(_reply.begin() + static_cast<std::ptrdiff_t>(_offset), n, buffer.begin());
         _offset += n;
-        return IoAwaitable { IoResult { n } };
+        return core::net::IoAwaitable { core::net::IoResult { n } };
     }
 
-    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override
+    [[nodiscard]] core::net::IoAwaitable write(std::span<std::byte const> buffer) override
     {
         _log->sent += buffer.size();
-        return IoAwaitable { IoResult { buffer.size() } };
+        return core::net::IoAwaitable { core::net::IoResult { buffer.size() } };
     }
 
-    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
-                                            std::shared_ptr<void const> /*keepAlive*/ = {}) override
+    [[nodiscard]] core::net::IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
+                                                       std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
         std::size_t total = 0;
         for (auto const& segment: segments)
             total += segment.size();
         _log->sent += total;
-        return IoAwaitable { IoResult { total } };
+        return core::net::IoAwaitable { core::net::IoResult { total } };
     }
 
     void close() noexcept override
@@ -216,24 +205,39 @@ class ScriptedPeer final: public ISocket
         // Completing the parked read is what `Close` MEANS on a reactor socket, and
         // it is the whole mechanism the exchange budget relies on.
         if (auto* const parked = std::exchange(_parked, nullptr); parked != nullptr)
-            parked->complete(
-                std::unexpected(NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = "socket closed" }));
+            parked->complete(std::unexpected(core::net::NetError {
+                .code = core::net::NetErrorCode::Cancelled, .systemCode = 0, .context = "socket closed" }));
     }
 
-    [[nodiscard]] bool IsClosed() const noexcept override
+    [[nodiscard]] bool isClosed() const noexcept override
     {
         return _closed;
     }
 
   private:
+    /// A read nothing answers yet: armed, it becomes `_parked`, which `close()` or
+    /// `DeliverOneByte` completes; retired unanswered, it stops being `_parked`.
+    [[nodiscard]] core::net::IoAwaitable Parked()
+    {
+        return core::net::IoAwaitable {
+            [](void* owner, core::net::IoAwaitable& self) { static_cast<ScriptedPeer*>(owner)->_parked = &self; },
+            [](void* owner, void* awaitable) noexcept {
+                auto* const peer = static_cast<ScriptedPeer*>(owner);
+                if (peer->_parked == awaitable)
+                    peer->_parked = nullptr;
+            },
+            this,
+        };
+    }
+
     std::vector<std::byte> _reply;
     PeerLog* _log;
     /// The buffer of the currently parked read, valid until it resumes.
     std::span<std::byte> _pending;
     std::size_t _offset { 0 };
-    IoAwaitable* _parked { nullptr };
+    core::net::IoAwaitable* _parked { nullptr };
     /// Where the jump below lands; null when no case asked for one.
-    ManualClock* _clock { nullptr };
+    core::platform::ManualClock* _clock { nullptr };
     std::chrono::milliseconds _advanceOnRead { 0 };
     bool _dribble { false };
     /// The connection breaks on its own; see `ScriptedConnector::DieMidExchange`.
@@ -247,17 +251,19 @@ namespace
 {
 
 /// A connector that hands out a scripted peer, or refuses.
-class ScriptedConnector final: public IConnector
+class ScriptedConnector final: public core::net::IConnector
 {
   public:
-    [[nodiscard]] Task<SocketResult> connect(std::string host, std::uint16_t port, DialOptions /*options*/) override
+    [[nodiscard]] core::async::Task<core::net::SocketResult> connect(std::string host,
+                                                                     std::uint16_t port,
+                                                                     core::net::DialOptions /*options*/) override
     {
         _dials += 1;
         _lastHost = std::move(host);
         _lastPort = port;
         if (_refuse)
-            co_return std::unexpected(
-                NetError { .code = NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" });
+            co_return std::unexpected(core::net::NetError {
+                .code = core::net::NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" });
 
         auto peer = std::make_unique<ScriptedPeer>(_reply, _log, _dribble, _die, _clock, _advanceOnRead);
         co_return peer;
@@ -296,7 +302,7 @@ class ScriptedConnector final: public IConnector
     /// answers synchronously as well as one that parks. See `ScriptedPeer::Read`.
     /// @param clock The clock to move; must outlive the peer.
     /// @param past How far to jump.
-    void AdvanceOnFirstRead(ManualClock& clock, std::chrono::milliseconds past) noexcept
+    void AdvanceOnFirstRead(core::platform::ManualClock& clock, std::chrono::milliseconds past) noexcept
     {
         _clock = &clock;
         _advanceOnRead = past;
@@ -337,7 +343,7 @@ class ScriptedConnector final: public IConnector
     PeerLog _log;
     int _dials { 0 };
     std::uint16_t _lastPort { 0 };
-    ManualClock* _clock { nullptr };
+    core::platform::ManualClock* _clock { nullptr };
     std::chrono::milliseconds _advanceOnRead { 0 };
     bool _refuse { false };
     bool _dribble { false };
@@ -348,8 +354,8 @@ class ScriptedConnector final: public IConnector
 
 TEST_CASE("An exchange returns the daemon's answer")
 {
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector;
     connector.Reply(Wire::EncodeReply(Wire::Status::Miss, {}));
 
@@ -368,8 +374,8 @@ TEST_CASE("An unreachable endpoint is a transport failure, not a throw")
 {
     // Every caller answers a transport failure by compiling, which is the whole
     // reason an optional accelerator can never fail a build.
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector;
     connector.Refuse();
 
@@ -381,8 +387,8 @@ TEST_CASE("An unreachable endpoint is a transport failure, not a throw")
 
 TEST_CASE("Text that names no port is refused without dialling")
 {
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector;
 
     Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
@@ -401,27 +407,29 @@ TEST_CASE("A peer that accepts and then goes quiet is bounded by the total budge
     // nothing about whether it will ever answer -- and the old per-call socket
     // timeout bounded one `recv`, so a daemon dribbling a byte at a time could hold
     // a compile open indefinitely while never once exceeding it.
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector;
     connector.Reply({}); // accepts, answers nothing
 
     Cc::ReactorExchange exchange { reactor, connector, Unwatched() };
 
-    // The reactor is driven by `Run()`, and `TestReactor::Run` returns as soon as
+    // The reactor is driven by `Run()`, and `core::net::testing::TestLoop::Run` returns as soon as
     // both queues drain -- so the clock has to be advanced from a task ON the
     // reactor rather than from here. This one does nothing else.
     //
     // ONE jump well past the deadline, not a run of small ones. The deadline is a
-    // bounded poll (`IReactor::Schedule` cannot be cancelled, so `DeadlineTimer`
+    // bounded poll (`core::net::EventLoop::Schedule` cannot be cancelled, so `core::net::DeadlineTimer`
     // re-arms rather than parking once), which means a run of N advances only makes
     // N steps of progress toward it -- so how far the clock has to move depends on
     // the poll interval, a constant this test has no business knowing. Jumping past
     // the deadline in one go lets the timer chew through the remaining steps inline
     // and removes the dependency entirely. It also stopped this passing on Linux and
     // failing on macOS, which is what a hidden dependency on step counting looks like.
-    auto advance = [](TestReactor* loop, ManualClock* c, std::chrono::milliseconds past) -> DetachedTask {
-        co_await ResumeOn { *loop };
+    auto advance = [](core::net::testing::TestLoop* loop,
+                      core::platform::ManualClock* c,
+                      std::chrono::milliseconds past) -> core::async::DetachedTask {
+        co_await core::async::ResumeOn { *loop };
         c->advance(past);
         co_return;
     };
@@ -440,7 +448,7 @@ TEST_CASE("A peer that accepts and then goes quiet is bounded by the total budge
     INFO("dials=" << connector.Dials() << " sent=" << log.sent << " reads=" << log.reads << " closed=" << log.closed
                   << " destroyed=" << log.destroyed << " advanced="
                   << std::chrono::duration_cast<std::chrono::milliseconds>(clock.now() - start).count() << "ms"
-                  << " pendingSubmissions=" << reactor.PendingSubmissions() << " pendingTimers=" << reactor.PendingTimers());
+                  << " pendingSubmissions=" << reactor.pendingSubmissions() << " pendingTimers=" << reactor.pendingTimers());
     CHECK(connector.Dials() == 1);
     // The reactor ran at all: the advance task is the first thing in its queue.
     CHECK(clock.now() > start);
@@ -466,8 +474,8 @@ TEST_CASE("A peer that dribbles a byte at a time is bounded by the total budget"
     // second spelling of `SO_RCVTIMEO`. This peer is never silent and never
     // finished: every read is answered, so every per-call timer is reset, and the
     // reply is perfectly well-formed. Only a bound on the whole exchange stops it.
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector;
     connector.Reply(Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte>(4096, std::byte { 0x2A })));
     connector.DribbleReplies();
@@ -481,14 +489,17 @@ TEST_CASE("A peer that dribbles a byte at a time is bounded by the total budget"
     static_assert(PerByte * Turns > Budget.total);
 
     // One byte per turn, each costing `PerByte` on the reactor's clock. A task ON
-    // the reactor, for the reason the quiet-peer case gives: `TestReactor::Run`
+    // the reactor, for the reason the quiet-peer case gives: `core::net::testing::TestLoop::Run`
     // returns as soon as its queues drain, so nothing outside the loop gets to move
     // the clock while an exchange is in flight.
-    auto dribble =
-        [](TestReactor* loop, ManualClock* c, PeerLog* log, std::chrono::milliseconds perByte, int turns) -> DetachedTask {
+    auto dribble = [](core::net::testing::TestLoop* loop,
+                      core::platform::ManualClock* c,
+                      PeerLog* log,
+                      std::chrono::milliseconds perByte,
+                      int turns) -> core::async::DetachedTask {
         for ([[maybe_unused]] auto const turn: std::views::iota(0, turns))
         {
-            co_await ResumeOn { *loop };
+            co_await core::async::ResumeOn { *loop };
             c->advance(perByte);
             if (log->live == nullptr || !log->live->DeliverOneByte())
                 co_return;
@@ -505,7 +516,7 @@ TEST_CASE("A peer that dribbles a byte at a time is bounded by the total budget"
     // `co_return` and frees its frame. `Run()` breaks on `Stop()` and would leave a
     // queued handle behind, which is a leak a sanitizer build reports and a plain
     // one does not.
-    (void) reactor.Drain();
+    (void) reactor.drain();
 
     auto const& log = connector.Log();
     INFO("reads=" << log.reads << " closed=" << log.closed << " destroyed=" << log.destroyed << " elapsed="
@@ -533,8 +544,8 @@ TEST_CASE("A worker that goes quiet is abandoned at the idle bound, not at the t
     // SMALLER one only, so the case can only pass if the idle deadline is the one that
     // fired. Under a build with no idle bound the total never elapses, nothing closes
     // the socket, and the seeded outcome comes back naming nothing.
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector;
     connector.Reply({}); // accepts, answers nothing -- not even a pulse
 
@@ -546,8 +557,10 @@ TEST_CASE("A worker that goes quiet is abandoned at the idle bound, not at the t
     // the deadline is a bounded poll, so a run of small advances only makes a step of
     // progress each and how far the clock must move would depend on a poll interval this
     // case has no business knowing.
-    auto advance = [](TestReactor* loop, ManualClock* c, std::chrono::milliseconds past) -> DetachedTask {
-        co_await ResumeOn { *loop };
+    auto advance = [](core::net::testing::TestLoop* loop,
+                      core::platform::ManualClock* c,
+                      std::chrono::milliseconds past) -> core::async::DetachedTask {
+        co_await core::async::ResumeOn { *loop };
         c->advance(past);
         co_return;
     };
@@ -592,8 +605,8 @@ TEST_CASE("A pulse pushes the idle bound out, so a worker that keeps reporting i
     // exchange before `Run()` is ever entered, so the reactor never takes a turn and no
     // deadline of any kind gets to fire; such a case would pass against the very code it
     // exists to reject.
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector;
 
     // A pulse, then the answer. Five bytes each, handed over one byte per reactor turn.
@@ -621,11 +634,14 @@ TEST_CASE("A pulse pushes the idle bound out, so a worker that keeps reporting i
                   "and inside the window the pulse opens, or the fixed build would fail too");
 
     constexpr int Turns = 32; // comfortably more than the stream is long
-    auto dribble =
-        [](TestReactor* loop, ManualClock* c, PeerLog* log, std::chrono::milliseconds perByte, int turns) -> DetachedTask {
+    auto dribble = [](core::net::testing::TestLoop* loop,
+                      core::platform::ManualClock* c,
+                      PeerLog* log,
+                      std::chrono::milliseconds perByte,
+                      int turns) -> core::async::DetachedTask {
         for ([[maybe_unused]] auto const turn: std::views::iota(0, turns))
         {
-            co_await ResumeOn { *loop };
+            co_await core::async::ResumeOn { *loop };
             c->advance(perByte);
             if (log->live == nullptr || !log->live->DeliverOneByte())
                 co_return;
@@ -640,7 +656,7 @@ TEST_CASE("A pulse pushes the idle bound out, so a worker that keeps reporting i
 
     // Drained after the exchange stopped the reactor, so the driver reaches its own
     // `co_return` and frees its frame -- the same reason the dribble case above drains.
-    (void) reactor.Drain();
+    (void) reactor.drain();
 
     auto const& log = connector.Log();
     INFO("reads=" << log.reads << " closed=" << log.closed << " failure=" << static_cast<int>(outcome.transportFailure)
@@ -670,8 +686,8 @@ TEST_CASE("A budget of zero arms no deadline at all")
     // every exchange would be closed on the reactor's next turn. A knob that reads
     // as "turn the ceiling off" would have turned the cache off instead -- silently,
     // because every caller answers a transport failure by compiling.
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector;
     connector.Reply(Wire::EncodeReply(Wire::Status::Miss, {}));
     // Dribbled, and that is what makes this case mean anything. A peer whose reads
@@ -686,10 +702,13 @@ TEST_CASE("A budget of zero arms no deadline at all")
     // Comfortably more turns than `ReplyHeaderSize`, so the exchange stops because
     // it read a whole reply and not because the driver ran out of turns.
     constexpr int Turns = 32;
-    auto dribble = [](TestReactor* loop, ManualClock* c, PeerLog* log, int turns) -> DetachedTask {
+    auto dribble = [](core::net::testing::TestLoop* loop,
+                      core::platform::ManualClock* c,
+                      PeerLog* log,
+                      int turns) -> core::async::DetachedTask {
         for ([[maybe_unused]] auto const turn: std::views::iota(0, turns))
         {
-            co_await ResumeOn { *loop };
+            co_await core::async::ResumeOn { *loop };
             c->advance(1s);
             if (log->live == nullptr || !log->live->DeliverOneByte())
                 co_return;
@@ -704,7 +723,7 @@ TEST_CASE("A budget of zero arms no deadline at all")
 
     // Drained so the driver reaches its own `co_return` and frees its frame; see the
     // dribbling case above for why `Run()` cannot be relied on to do it.
-    (void) reactor.Drain();
+    (void) reactor.drain();
 
     auto const& log = connector.Log();
     INFO("reads=" << log.reads << " advanced="
@@ -719,12 +738,12 @@ TEST_CASE("A budget of zero arms no deadline at all")
 
 TEST_CASE("A reactor exchange runs once")
 {
-    // `IReactor::Run` returns only on `Stop()`, and no reactor here clears that
+    // `core::net::EventLoop::Run` returns only on `Stop()`, and no reactor here clears that
     // flag -- so a second `Run()` returns immediately and the exchange silently does
     // not happen. The launcher would answer that by compiling locally, every time,
     // with nothing anywhere saying why. Asserted rather than documented.
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector;
     connector.Reply(Wire::EncodeReply(Wire::Status::Miss, {}));
 
@@ -749,7 +768,7 @@ TEST_CASE("A peer that dies and a peer that is merely slow are recorded differen
     // The two are indistinguishable at the socket: expiry CLOSES the connection, so
     // a caller looking at the error alone sees a broken socket either way. Only the
     // deadline knows which, which is why it now records it
-    // (`SocketDeadlineTarget::expired`) instead of the caller inferring it from
+    // (`core::net::SocketDeadlineTarget::expired`) instead of the caller inferring it from
     // elapsed time.
     //
     // Both halves in one case, deliberately. Either assertion alone passes under a
@@ -761,8 +780,8 @@ TEST_CASE("A peer that dies and a peer that is merely slow are recorded differen
         // here would exist only to satisfy the compiler.
         constexpr Cc::ExchangeBudget Budget {};
 
-        ManualClock clock;
-        TestReactor reactor { clock };
+        core::platform::ManualClock clock;
+        core::net::testing::TestLoop reactor { clock };
         ScriptedConnector connector;
         connector.Reply({}); // accepts, and answers nothing on its own
         // The clock moves in BOTH arms, and by the same mechanism. A dead peer
@@ -804,8 +823,8 @@ TEST_CASE("An endpoint that was never reached is not reported as a lost peer")
     // machine is off" and "the machine was there and went away mid-compile" send an
     // operator to different places. `Unreached` is also the seeded default, so this
     // pins that an exchange which never ran cannot read as a peer that was contacted.
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector;
     connector.Refuse();
 

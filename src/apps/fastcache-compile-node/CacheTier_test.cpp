@@ -6,19 +6,16 @@
 #include "NodeStatusResponder.hpp"
 #include "StatsSource.hpp"
 
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReadingCodec.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -41,6 +38,12 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/BlockingSocket.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/platform/Clock.hpp>
+#include <tests/HalfClose.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedHostFacts.hpp>
 #include <tests/Unwrap.hpp>
@@ -66,7 +69,7 @@ namespace
 /// posted onto a reactor that has gone.
 struct Fixture
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     CapturingLogger logger;
 
@@ -93,7 +96,7 @@ struct Fixture
         // errored state rather than nothing, so a null check passes on a bind that
         // failed and the port below comes back 0.
         REQUIRE(probe->IsBound());
-        auto const port = probe->BoundPort();
+        auto const port = probe->boundPort();
         probe.reset();
 
         NodeConfig cfg;
@@ -163,7 +166,7 @@ class NoIdentity final: public INodeStatusSource
 /// @param socket Where; must outlive the task.
 /// @param bytes What; must outlive the task.
 /// @return Whether every byte was taken.
-[[nodiscard]] Task<bool> WriteWhole(ISocket* socket, std::span<std::byte const> bytes)
+[[nodiscard]] core::async::Task<bool> WriteWhole(core::net::ISocket* socket, std::span<std::byte const> bytes)
 {
     auto const written = co_await socket->write(bytes);
     co_return written.has_value() && *written == bytes.size();
@@ -172,7 +175,7 @@ class NoIdentity final: public INodeStatusSource
 /// Everything @p socket delivers until its peer has finished sending.
 /// @param socket Where; must outlive the task, and its peer must already be closed.
 /// @return The bytes, as text.
-[[nodiscard]] Task<std::string> ReadToEnd(ISocket* socket)
+[[nodiscard]] core::async::Task<std::string> ReadToEnd(core::net::ISocket* socket)
 {
     std::string text;
     std::vector<std::byte> chunk(64 * 1024);
@@ -229,19 +232,19 @@ class MetricsDoors
     /// @return The Prometheus text, headers stripped.
     [[nodiscard]] std::string MetricsRoute()
     {
-        auto pair = InMemorySocketPair::Create();
+        auto pair = core::net::testing::InMemorySocketPair::create();
         auto const request = std::string_view { "GET /metrics HTTP/1.1\r\n\r\n" };
-        REQUIRE(SyncRun(WriteWhole(pair.client.get(), Wire::AsBytes(request))));
-        pair.client->shutdownWrite();
-        SteadyClock clock;
+        REQUIRE(core::async::syncRun(WriteWhole(pair.client.get(), Wire::AsBytes(request))));
+        REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+        core::platform::SteadyClock clock;
         // `_served`, the SAME set the `node-metrics` door reads through `_sources` -- which is
         // the whole point of this fixture. The two doors are meant to differ in nothing but how
         // they are asked, so a surface set either one owns privately would make them disagree
         // about which rows are absent and read as a figure one door drops (#1484, #1501).
-        SyncRun(ServeAdminHttp(pair.server.get(), &_metrics, _provider, &clock, {}, _served.Span()));
+        core::async::syncRun(ServeAdminHttp(pair.server.get(), &_metrics, _provider, &clock, {}, _served.Span()));
         pair.server->close();
 
-        auto const response = SyncRun(ReadToEnd(pair.client.get()));
+        auto const response = core::async::syncRun(ReadToEnd(pair.client.get()));
         REQUIRE(response.starts_with("HTTP/1.1 200 OK\r\n"));
         auto const bodyAt = response.find("\r\n\r\n");
         REQUIRE(bodyAt != std::string::npos);
@@ -253,7 +256,8 @@ class MetricsDoors
     [[nodiscard]] std::vector<std::byte> NodeMetricsBody()
     {
         auto const reply =
-            SyncRun(_responder.Answer(Wire::EncodeNodeMetricsRequest(), PeerIdentity { .host = "127.0.0.1" })).bytes;
+            core::async::syncRun(_responder.Answer(Wire::EncodeNodeMetricsRequest(), PeerIdentity { .host = "127.0.0.1" }))
+                .bytes;
         REQUIRE(StatusOf(reply) == Wire::Status::Ok);
         auto const body = Testing::PayloadOf(reply);
         return { body.begin(), body.end() };
@@ -546,7 +550,7 @@ TEST_CASE("The memory tier compresses only when a codec is named", "[node][cache
         REQUIRE(tier != nullptr);
 
         auto const stored =
-            SyncRun(
+            core::async::syncRun(
                 tier->Responder().Answer(
                     Wire::EncodeStore(Wire::StoreRequest {
                         .key = "object", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = payload }),
@@ -557,7 +561,8 @@ TEST_CASE("The memory tier compresses only when a codec is named", "[node][cache
         // And it must still be READABLE: a tier that compressed and could not decode
         // would shrink exactly as convincingly.
         auto const fetched =
-            SyncRun(tier->Responder().Answer(Wire::EncodeFetch("object"), PeerIdentity { .host = "127.0.0.1" })).bytes;
+            core::async::syncRun(tier->Responder().Answer(Wire::EncodeFetch("object"), PeerIdentity { .host = "127.0.0.1" }))
+                .bytes;
         REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
 
         auto const tiers = tier->SnapshotTiers();
@@ -613,19 +618,20 @@ TEST_CASE("The disk tier compresses with the codec the node names", "[node][cach
             REQUIRE(tier != nullptr);
 
             auto const stored =
-                SyncRun(tier->Responder().Answer(Wire::EncodeStore(Wire::StoreRequest { .key = "object",
-                                                                                        .prefetchGroup = {},
-                                                                                        .srcRoot = "/src",
-                                                                                        .buildTree = "/build",
-                                                                                        .value = payload }),
-                                                 PeerIdentity { .host = "127.0.0.1" }))
+                core::async::syncRun(tier->Responder().Answer(Wire::EncodeStore(Wire::StoreRequest { .key = "object",
+                                                                                                     .prefetchGroup = {},
+                                                                                                     .srcRoot = "/src",
+                                                                                                     .buildTree = "/build",
+                                                                                                     .value = payload }),
+                                                              PeerIdentity { .host = "127.0.0.1" }))
                     .bytes;
             REQUIRE(StatusOf(stored) == Wire::Status::Ok);
 
             // Still readable: a tier that compressed and could not decode would
             // shrink the file exactly as convincingly.
-            auto const fetched =
-                SyncRun(tier->Responder().Answer(Wire::EncodeFetch("object"), PeerIdentity { .host = "127.0.0.1" })).bytes;
+            auto const fetched = core::async::syncRun(tier->Responder().Answer(Wire::EncodeFetch("object"),
+                                                                               PeerIdentity { .host = "127.0.0.1" }))
+                                     .bytes;
             REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
 
             // The budget is denominated in logical bytes whatever the codec, which is
@@ -775,7 +781,7 @@ TEST_CASE("A dropped key is gone from every tier a fetch consults, and stays gon
     cfg.cacheDir = scratch.Path();
 
     auto const ask = [](CacheTier& tier, std::vector<std::byte> const& frame) {
-        return StatusOf(SyncRun(tier.Responder().Answer(frame, PeerIdentity { .host = "127.0.0.1" })).bytes);
+        return StatusOf(core::async::syncRun(tier.Responder().Answer(frame, PeerIdentity { .host = "127.0.0.1" })).bytes);
     };
 
     {
@@ -898,7 +904,7 @@ TEST_CASE("A dropped key moves the delete figures NodeMetrics reads, with no adm
         return std::pair { reading->snapshot.storage->deleteHits, reading->snapshot.storage->deleteMisses };
     };
     auto const ask = [&tier](std::vector<std::byte> const& frame) {
-        return StatusOf(SyncRun(tier->Responder().Answer(frame, PeerIdentity { .host = "127.0.0.1" })).bytes);
+        return StatusOf(core::async::syncRun(tier->Responder().Answer(frame, PeerIdentity { .host = "127.0.0.1" })).bytes);
     };
 
     // The control: nothing dropped yet reads zero, so the figures below are the drops' and not a

@@ -2,7 +2,6 @@
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/IReclaimLog.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Core/Profiling.hpp>
 
 #include <algorithm>
 #include <array>
@@ -31,6 +30,7 @@
 #include <CowTree/Errors.hpp>
 #include <CowTree/FilePageStore.hpp>
 #include <CowTree/PageId.hpp>
+#include <core/Profiling.hpp>
 
 namespace FastCache
 {
@@ -89,7 +89,7 @@ namespace
     /// makes cannot be checked. With the code present, `InUse` is falsifiable from the log.
     ///
     /// **The disengaged/zero distinction ends here, deliberately.** `StorageError::systemCode`
-    /// is an `int` whose 0 has meant *no system error* across this tree and `NetError` since
+    /// is an `int` whose 0 has meant *no system error* across this tree and `core::net::NetError` since
     /// long before this, so projecting onto it is the boundary's existing convention rather
     /// than a loss this change introduces. Nothing #1507 asks for needs the distinction ABOVE
     /// this line: a lock refusal always has a code now, and the paths that carry none are the
@@ -165,22 +165,22 @@ namespace
     }
 
     /// Convert a steady-clock TimePoint to a microsecond count for storage.
-    /// `TimePoint::max()` (never expires) is stored as INT64_MAX.
-    [[nodiscard]] std::int64_t TimePointToMicros(TimePoint tp)
+    /// `core::platform::SteadyTimePoint::max()` (never expires) is stored as INT64_MAX.
+    [[nodiscard]] std::int64_t TimePointToMicros(core::platform::SteadyTimePoint tp)
     {
-        if (tp == TimePoint::max())
+        if (tp == core::platform::SteadyTimePoint::max())
             return std::numeric_limits<std::int64_t>::max();
-        if (tp == TimePoint::min())
+        if (tp == core::platform::SteadyTimePoint::min())
             return std::numeric_limits<std::int64_t>::min();
         return std::chrono::duration_cast<std::chrono::microseconds>(tp.time_since_epoch()).count();
     }
 
-    [[nodiscard]] TimePoint MicrosToTimePoint(std::int64_t v)
+    [[nodiscard]] core::platform::SteadyTimePoint MicrosToTimePoint(std::int64_t v)
     {
         if (v == std::numeric_limits<std::int64_t>::max())
-            return TimePoint::max();
+            return core::platform::SteadyTimePoint::max();
         if (v == std::numeric_limits<std::int64_t>::min())
-            return TimePoint::min();
+            return core::platform::SteadyTimePoint::min();
 
         // Clamped, because this number comes off DISK and the clock counts in
         // nanoseconds: constructing the time point multiplies by a thousand, and
@@ -193,13 +193,15 @@ namespace
         // The sentinels above are the only values that MEAN anything at the
         // extremes, so anything else out there is a damaged field, and the
         // nearest representable instant is a better answer than a trap.
-        constexpr auto MaxMicros = std::chrono::duration_cast<std::chrono::microseconds>(TimePoint::duration::max()).count();
-        constexpr auto MinMicros = std::chrono::duration_cast<std::chrono::microseconds>(TimePoint::duration::min()).count();
+        constexpr auto MaxMicros =
+            std::chrono::duration_cast<std::chrono::microseconds>(core::platform::SteadyTimePoint::duration::max()).count();
+        constexpr auto MinMicros =
+            std::chrono::duration_cast<std::chrono::microseconds>(core::platform::SteadyTimePoint::duration::min()).count();
         if (v >= MaxMicros)
-            return TimePoint::max();
+            return core::platform::SteadyTimePoint::max();
         if (v <= MinMicros)
-            return TimePoint::min();
-        return TimePoint { std::chrono::microseconds { v } };
+            return core::platform::SteadyTimePoint::min();
+        return core::platform::SteadyTimePoint { std::chrono::microseconds { v } };
     }
 
     [[nodiscard]] CowTree::BytesView KeyView(std::string_view sv) noexcept
@@ -1545,7 +1547,7 @@ void CowTreeStorage::EraseNode(Iterator it)
     _lru.erase(it);
 }
 
-void CowTreeStorage::ReclaimDeadRecord(std::string_view key, CacheEntry const& entry, TimePoint now)
+void CowTreeStorage::ReclaimDeadRecord(std::string_view key, CacheEntry const& entry, core::platform::SteadyTimePoint now)
 {
     // Recorded BEFORE the erase, not after. `key` is a caller's view at every
     // site today, but the erase drops the LRU node that owns the only other
@@ -1564,7 +1566,9 @@ void CowTreeStorage::ReclaimDeadRecord(std::string_view key, CacheEntry const& e
     EraseFromLru(key);
 }
 
-CacheEntry* CowTreeStorage::AcceptLiveRecord(std::string_view key, std::optional<LoadedEntry>& loaded, TimePoint now)
+CacheEntry* CowTreeStorage::AcceptLiveRecord(std::string_view key,
+                                             std::optional<LoadedEntry>& loaded,
+                                             core::platform::SteadyTimePoint now)
 {
     if (!loaded.has_value())
         return nullptr; // Nothing on disk; nothing to reclaim either.
@@ -1577,7 +1581,7 @@ CacheEntry* CowTreeStorage::AcceptLiveRecord(std::string_view key, std::optional
 
 bool CowTreeStorage::EvictColdSlice()
 {
-    FC_ZONE_SCOPED_N("CowTreeStorage::EvictColdSlice");
+    CORE_ZONE_SCOPED_N("CowTreeStorage::EvictColdSlice");
     if (_coldExhausted)
         return false;
 
@@ -1644,7 +1648,7 @@ bool CowTreeStorage::EvictColdSlice()
 
 void CowTreeStorage::EvictToFit()
 {
-    FC_ZONE_SCOPED_N("CowTreeStorage::EvictToFit");
+    CORE_ZONE_SCOPED_N("CowTreeStorage::EvictToFit");
     if (_options.maxBytes == 0)
         return;
     // Track remaining attempts so a stuck disk (e.g. ENOSPC on every
@@ -1689,9 +1693,9 @@ void CowTreeStorage::EvictToFit()
     }
 }
 
-std::expected<GetResult, StorageError> CowTreeStorage::Get(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> CowTreeStorage::Get(std::string_view key, core::platform::SteadyTimePoint now)
 {
-    FC_ZONE_SCOPED_N("CowTreeStorage::Get");
+    CORE_ZONE_SCOPED_N("CowTreeStorage::Get");
     ++_stats.cmdGet;
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
@@ -1729,7 +1733,7 @@ std::expected<GetResult, StorageError> CowTreeStorage::Get(std::string_view key,
 }
 
 std::expected<CasToken, StorageError> CowTreeStorage::UpdateRecordMetadata(std::string_view key,
-                                                                           TimePoint now,
+                                                                           core::platform::SteadyTimePoint now,
                                                                            std::function<void(CacheEntry&)> const& mutate)
 {
     if (_tree == nullptr)
@@ -1797,7 +1801,9 @@ std::expected<CasToken, StorageError> CowTreeStorage::UpdateRecordMetadata(std::
     return entry.cas;
 }
 
-std::expected<CasToken, StorageError> CowTreeStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
+std::expected<CasToken, StorageError> CowTreeStorage::Touch(std::string_view key,
+                                                            core::platform::SteadyTimePoint newExpiry,
+                                                            core::platform::SteadyTimePoint now)
 {
     ++_stats.cmdTouch;
     auto const cas = UpdateRecordMetadata(key, now, [&](CacheEntry& entry) {
@@ -1813,7 +1819,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Touch(std::string_view key
     return *cas;
 }
 
-std::expected<GetResult, StorageError> CowTreeStorage::Peek(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> CowTreeStorage::Peek(std::string_view key, core::platform::SteadyTimePoint now)
 {
     // Non-mutating: no LRU promotion, no lastAccess advance, no stats, and
     // crucially no write transaction. Expired / flushed entries read as a
@@ -1833,8 +1839,8 @@ std::expected<GetResult, StorageError> CowTreeStorage::Peek(std::string_view key
 }
 
 std::expected<CasToken, StorageError> CowTreeStorage::MarkStale(std::string_view key,
-                                                                std::optional<TimePoint> newExpiry,
-                                                                TimePoint now)
+                                                                std::optional<core::platform::SteadyTimePoint> newExpiry,
+                                                                core::platform::SteadyTimePoint now)
 {
     // Marking stale rewrites no value bytes — reuse any overflow chain in place
     // and rewrite only the descriptor (preserving the LRU `fetched` bit).
@@ -1845,7 +1851,9 @@ std::expected<CasToken, StorageError> CowTreeStorage::MarkStale(std::string_view
     });
 }
 
-std::expected<GetResult, StorageError> CowTreeStorage::GetAndTouch(std::string_view key, TimePoint newExpiry, TimePoint now)
+std::expected<GetResult, StorageError> CowTreeStorage::GetAndTouch(std::string_view key,
+                                                                   core::platform::SteadyTimePoint newExpiry,
+                                                                   core::platform::SteadyTimePoint now)
 {
     // Refresh the expiry, then read the refreshed entry back. The atomicity
     // boundary is the enclosing ShardedStorage's per-shard lock (this tier
@@ -1857,7 +1865,9 @@ std::expected<GetResult, StorageError> CowTreeStorage::GetAndTouch(std::string_v
     return Get(key, now);
 }
 
-std::expected<void, StorageError> CowTreeStorage::CompareAndDelete(std::string_view key, CasToken expected, TimePoint now)
+std::expected<void, StorageError> CowTreeStorage::CompareAndDelete(std::string_view key,
+                                                                   CasToken expected,
+                                                                   core::platform::SteadyTimePoint now)
 {
     auto const peeked = Peek(key, now);
     if (!peeked.has_value())
@@ -1872,9 +1882,9 @@ std::expected<void, StorageError> CowTreeStorage::CompareAndDelete(std::string_v
 std::expected<CasToken, StorageError> CowTreeStorage::Set(std::string_view key,
                                                           std::vector<std::byte> value,
                                                           std::uint32_t flags,
-                                                          TimePoint expiry)
+                                                          core::platform::SteadyTimePoint expiry)
 {
-    FC_ZONE_SCOPED_N("CowTreeStorage::Set");
+    CORE_ZONE_SCOPED_N("CowTreeStorage::Set");
     ++_stats.cmdSet;
     if (value.size() > _options.maxValueBytes)
         return std::unexpected(MakeError(StorageErrorCode::ValueTooLarge));
@@ -1892,8 +1902,11 @@ std::expected<CasToken, StorageError> CowTreeStorage::Set(std::string_view key,
     return e.cas;
 }
 
-std::expected<CasToken, StorageError> CowTreeStorage::Add(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> CowTreeStorage::Add(std::string_view key,
+                                                          std::vector<std::byte> value,
+                                                          std::uint32_t flags,
+                                                          core::platform::SteadyTimePoint expiry,
+                                                          core::platform::SteadyTimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
@@ -1908,8 +1921,11 @@ std::expected<CasToken, StorageError> CowTreeStorage::Add(
     return Set(key, std::move(value), flags, expiry);
 }
 
-std::expected<CasToken, StorageError> CowTreeStorage::Replace(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> CowTreeStorage::Replace(std::string_view key,
+                                                              std::vector<std::byte> value,
+                                                              std::uint32_t flags,
+                                                              core::platform::SteadyTimePoint expiry,
+                                                              core::platform::SteadyTimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
@@ -1922,7 +1938,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Replace(
 std::expected<CasToken, StorageError> CowTreeStorage::Append(std::string_view key,
                                                              std::span<std::byte const> suffix,
                                                              CasToken expected,
-                                                             TimePoint now)
+                                                             core::platform::SteadyTimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
@@ -1955,7 +1971,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::Append(std::string_view ke
 std::expected<CasToken, StorageError> CowTreeStorage::Prepend(std::string_view key,
                                                               std::span<std::byte const> prefix,
                                                               CasToken expected,
-                                                              TimePoint now)
+                                                              core::platform::SteadyTimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
@@ -1989,8 +2005,8 @@ std::expected<CasToken, StorageError> CowTreeStorage::CompareAndSwap(std::string
                                                                      CasToken expected,
                                                                      std::vector<std::byte> value,
                                                                      std::uint32_t flags,
-                                                                     TimePoint expiry,
-                                                                     TimePoint now)
+                                                                     core::platform::SteadyTimePoint expiry,
+                                                                     core::platform::SteadyTimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
@@ -2016,7 +2032,7 @@ std::expected<CasToken, StorageError> CowTreeStorage::CompareAndSwap(std::string
 std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrInitialize(std::string_view key,
                                                                                         std::uint64_t magnitude,
                                                                                         bool decrement,
-                                                                                        TimePoint now)
+                                                                                        core::platform::SteadyTimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
@@ -2081,7 +2097,7 @@ std::expected<IStorage::IncrResult, StorageError> CowTreeStorage::IncrementOrIni
     return IStorage::IncrResult { .value = next, .cas = *cas };
 }
 
-std::expected<void, StorageError> CowTreeStorage::Delete(std::string_view key, TimePoint now)
+std::expected<void, StorageError> CowTreeStorage::Delete(std::string_view key, core::platform::SteadyTimePoint now)
 {
     auto loaded = LoadEntry(key);
     if (!loaded.has_value())
@@ -2113,16 +2129,16 @@ std::expected<void, StorageError> CowTreeStorage::Delete(std::string_view key, T
     return {};
 }
 
-void CowTreeStorage::FlushWithGeneration(TimePoint effectiveAt)
+void CowTreeStorage::FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt)
 {
     ++_liveGeneration;
     _flushEffectiveAt = effectiveAt;
     ++_stats.cmdFlush;
 }
 
-PurgeOutcome CowTreeStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
+PurgeOutcome CowTreeStorage::PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget)
 {
-    FC_ZONE_SCOPED_N("CowTreeStorage::PurgeExpired");
+    CORE_ZONE_SCOPED_N("CowTreeStorage::PurgeExpired");
 
     // Walk the LRU mirror from wherever the last sweep stopped, collect keys
     // whose stored entry is expired or stale-generation, then erase them on

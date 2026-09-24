@@ -3,7 +3,6 @@
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/NotifyingStorage.hpp>
 #include <FastCache/Cache/ReclaimLog.hpp>
-#include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -13,6 +12,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace
 {
@@ -47,12 +48,12 @@ class RecordingObserver final: public FastCache::IStorageMutationObserver
 
 TEST_CASE("NotifyingStorage fires Set on successful Set", "[cache][notifying-storage]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage inner;
     RecordingObserver obs;
     FastCache::NotifyingStorage notifying { inner, &obs };
 
-    auto const cas = notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max());
+    auto const cas = notifying.Set("k", std::vector<std::byte>(8), 0, core::platform::SteadyTimePoint::max());
     REQUIRE(cas.has_value());
     REQUIRE(obs.records.size() == 1);
     REQUIRE(obs.records[0].kind == FastCache::MutationKind::Set);
@@ -63,17 +64,18 @@ TEST_CASE("NotifyingStorage does NOT fire when inner storage returns an error", 
 {
     // Add against a key that already exists -> StorageError(KeyExists).
     // The observer must NOT see a Set event for a failed mutation.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage inner;
     RecordingObserver obs;
     FastCache::NotifyingStorage notifying { inner, &obs };
 
     // Pre-populate via the decorator so the first record is a Set; clear
     // and then attempt the duplicate Add.
-    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, core::platform::SteadyTimePoint::max()).has_value());
     obs.records.clear();
 
-    auto const result = notifying.Add("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max(), clock.now());
+    auto const result =
+        notifying.Add("k", std::vector<std::byte>(8), 0, core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE_FALSE(result.has_value());
     REQUIRE(obs.records.empty());
 }
@@ -81,13 +83,13 @@ TEST_CASE("NotifyingStorage does NOT fire when inner storage returns an error", 
 TEST_CASE("NotifyingStorage HasObservers fast probe skips OnMutation when nothing is listening",
           "[cache][notifying-storage]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage inner;
     RecordingObserver obs;
     obs.hasObservers.store(false, std::memory_order_relaxed);
     FastCache::NotifyingStorage notifying { inner, &obs };
 
-    auto const result = notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max());
+    auto const result = notifying.Set("k", std::vector<std::byte>(8), 0, core::platform::SteadyTimePoint::max());
     REQUIRE(result.has_value());
     // Even though the inner mutation succeeded, the observer's HasObservers
     // probe returned false, so OnMutation was skipped.
@@ -98,22 +100,22 @@ TEST_CASE("NotifyingStorage with a null observer forwards every call to the inne
 {
     // Defensive shape: a daemon that never wires an observer (e.g. tests
     // that just want a passthrough) must not crash on Notify.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage inner;
     FastCache::NotifyingStorage notifying { inner, nullptr };
 
-    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE(notifying.Delete("k", clock.now()).has_value());
 }
 
 TEST_CASE("NotifyingStorage fires Delete on successful Delete", "[cache][notifying-storage]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage inner;
     RecordingObserver obs;
     FastCache::NotifyingStorage notifying { inner, &obs };
 
-    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, core::platform::SteadyTimePoint::max()).has_value());
     obs.records.clear();
 
     REQUIRE(notifying.Delete("k", clock.now()).has_value());
@@ -124,12 +126,12 @@ TEST_CASE("NotifyingStorage fires Delete on successful Delete", "[cache][notifyi
 
 TEST_CASE("NotifyingStorage fires FlushDb with an empty key on FlushWithGeneration", "[cache][notifying-storage][flushdb]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage inner;
     RecordingObserver obs;
     FastCache::NotifyingStorage notifying { inner, &obs };
 
-    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, core::platform::SteadyTimePoint::max()).has_value());
     obs.records.clear();
 
     notifying.FlushWithGeneration(clock.now());
@@ -141,11 +143,11 @@ TEST_CASE("NotifyingStorage fires FlushDb with an empty key on FlushWithGenerati
 TEST_CASE("NotifyingStorage forwards Peek without firing an event", "[cache][notifying-storage]")
 {
     // Peek is non-mutating; the observer must not be invoked.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage inner;
     RecordingObserver obs;
     FastCache::NotifyingStorage notifying { inner, &obs };
-    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, core::platform::SteadyTimePoint::max()).has_value());
     obs.records.clear();
 
     auto const peek = notifying.Peek("k", clock.now());
@@ -157,11 +159,11 @@ TEST_CASE("NotifyingStorage forwards Peek without firing an event", "[cache][not
 TEST_CASE("NotifyingStorage Update fires Update on Store, Delete on Delete, nothing on Unchanged",
           "[cache][notifying-storage]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage inner;
     RecordingObserver obs;
     FastCache::NotifyingStorage notifying { inner, &obs };
-    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, core::platform::SteadyTimePoint::max()).has_value());
     obs.records.clear();
 
     // Store outcome -> Update event.
@@ -215,7 +217,7 @@ TEST_CASE("NotifyingStorage fires Expire for a TTL the tier consumed", "[cache][
     FastCache::ReclaimLog log { &obs };
     notifying.SetReclaimLog(&log);
 
-    auto const expiry = FastCache::TimePoint {} + std::chrono::seconds { 5 };
+    auto const expiry = core::platform::SteadyTimePoint {} + std::chrono::seconds { 5 };
     REQUIRE(notifying.Set("doomed", std::vector<std::byte>(8), 0, expiry).has_value());
     obs.records.clear();
 
@@ -235,9 +237,9 @@ TEST_CASE("NotifyingStorage fires Evict for the tail memory pressure took", "[ca
     FastCache::ReclaimLog log { &obs };
     notifying.SetReclaimLog(&log);
 
-    REQUIRE(notifying.Set("a", std::vector<std::byte>(80), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(notifying.Set("a", std::vector<std::byte>(80), 0, core::platform::SteadyTimePoint::max()).has_value());
     obs.records.clear();
-    REQUIRE(notifying.Set("b", std::vector<std::byte>(80), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(notifying.Set("b", std::vector<std::byte>(80), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     // Two events, and the eviction comes first: it happened first, and redis
     // orders them the same way.
@@ -253,19 +255,19 @@ TEST_CASE("A reclaim is reported before the call that caused it, on the same key
     // `ADD k` on a lapsed TTL reclaims k inside the lookup and then re-creates
     // it. Reported the other way round, a subscriber sees `set k` followed by
     // `expired k` and concludes a key that is very much alive has gone.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage inner;
     RecordingObserver obs;
     FastCache::NotifyingStorage notifying { inner, &obs };
     FastCache::ReclaimLog log { &obs };
     notifying.SetReclaimLog(&log);
 
-    auto const expiry = FastCache::TimePoint {} + std::chrono::seconds { 5 };
+    auto const expiry = core::platform::SteadyTimePoint {} + std::chrono::seconds { 5 };
     REQUIRE(notifying.Set("k", std::vector<std::byte>(8), 0, expiry).has_value());
     obs.records.clear();
 
     auto const later = expiry + std::chrono::seconds { 1 };
-    REQUIRE(notifying.Add("k", std::vector<std::byte>(8), 0, FastCache::TimePoint::max(), later).has_value());
+    REQUIRE(notifying.Add("k", std::vector<std::byte>(8), 0, core::platform::SteadyTimePoint::max(), later).has_value());
 
     REQUIRE(obs.records.size() == 2);
     REQUIRE(obs.records[0].kind == FastCache::MutationKind::Expire);
@@ -285,7 +287,7 @@ TEST_CASE("NotifyingStorage fires Expire even when the call it rode in on failed
     FastCache::ReclaimLog log { &obs };
     notifying.SetReclaimLog(&log);
 
-    auto const expiry = FastCache::TimePoint {} + std::chrono::seconds { 5 };
+    auto const expiry = core::platform::SteadyTimePoint {} + std::chrono::seconds { 5 };
     REQUIRE(notifying.Set("doomed", std::vector<std::byte>(8), 0, expiry).has_value());
     obs.records.clear();
 
@@ -308,7 +310,7 @@ TEST_CASE("A key that expires under a WATCH now dirties the handle", "[cache][no
     FastCache::ReclaimLog log { &obs };
     notifying.SetReclaimLog(&log);
 
-    auto const expiry = FastCache::TimePoint {} + std::chrono::seconds { 5 };
+    auto const expiry = core::platform::SteadyTimePoint {} + std::chrono::seconds { 5 };
     REQUIRE(notifying.Set("watched", std::vector<std::byte>(8), 0, expiry).has_value());
     obs.records.clear();
 

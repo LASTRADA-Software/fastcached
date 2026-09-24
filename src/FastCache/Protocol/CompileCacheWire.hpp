@@ -5375,7 +5375,7 @@ struct NodeRuntimeFields
     /// tell apart, and a bare `0` reports the healthy one for both.
     ///
     /// A duration rather than an instant, for the reason a heartbeat age is: a raw
-    /// `TimePoint` on the wire invites the receiver to difference it against its OWN
+    /// `core::platform::SteadyTimePoint` on the wire invites the receiver to difference it against its OWN
     /// clock, which is a different clock.
     std::optional<std::uint64_t> lastRegistrationSecondsAgo {};
 
@@ -6518,7 +6518,7 @@ struct EnrollmentPendingEntry
     /// How long ago this id first asked, in seconds.
     ///
     /// A duration rather than an instant, for the reason a heartbeat age is one: a raw
-    /// `TimePoint` invites the receiver to difference it against its own clock, which is
+    /// `core::platform::SteadyTimePoint` invites the receiver to difference it against its own clock, which is
     /// a different clock.
     std::uint64_t firstSeenSecondsAgo { 0 };
 

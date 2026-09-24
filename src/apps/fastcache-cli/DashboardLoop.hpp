@@ -6,9 +6,7 @@
 #include "DashboardEvent.hpp"
 #include "DashboardFrame.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 
 #include <chrono>
@@ -20,6 +18,9 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Cli
 {
@@ -45,11 +46,11 @@ inline constexpr std::string_view LeaderRole = "leader";
 /// When a reading was taken and where it came from: what decides whether it continues a run.
 struct ReadingStamp
 {
-    TimePoint at {};       ///< When it was taken, on the steady clock.
-    std::string source {}; ///< Which source produced it, by stable name.
-    std::string route {};  ///< What was asked there, as the source line names it; see `SampleReading::route`.
-    std::string where {};  ///< The `host:port` that answered; a change of it breaks a run.
-    std::string role {};   ///< What the answering endpoint is to its subject, such as `leader`; usually empty.
+    core::platform::SteadyTimePoint at {}; ///< When it was taken, on the steady clock.
+    std::string source {};                 ///< Which source produced it, by stable name.
+    std::string route {}; ///< What was asked there, as the source line names it; see `SampleReading::route`.
+    std::string where {}; ///< The `host:port` that answered; a change of it breaks a run.
+    std::string role {};  ///< What the answering endpoint is to its subject, such as `leader`; usually empty.
 };
 
 /// One per-subject figure a sample read, kept in the history for a chart to draw.
@@ -186,7 +187,7 @@ struct HistoryEntry
     /// so a first reading, a failure, a change of source or of endpoint, and a stamp no later than the
     /// one before all leave it disengaged. A series that re-applied the run rule to stored stamps would be a
     /// second copy of that rule, free to disagree with the first.
-    std::optional<Duration> elapsed {};
+    std::optional<core::platform::SteadyDuration> elapsed {};
 
     /// The per-subject figures this sample read, for a chart; empty for a failure or a reader that
     /// reads none. A subject absent here is a gap in its series at this entry.
@@ -593,7 +594,7 @@ struct DashboardLimits
 /// @param sink Where a frame goes.
 /// @param limits What bounds the run.
 /// @return How it ended, and what it knew when it did.
-[[nodiscard]] Task<DashboardExit> RunDashboard(
+[[nodiscard]] core::async::Task<DashboardExit> RunDashboard(
     IDashboardEventSource* events, SampleReader reader, IDashboardView* view, IFrameSink* sink, DashboardLimits limits);
 
 /// Whether @p keys asks the dashboard to quit.

@@ -42,7 +42,7 @@ namespace
 
 std::expected<RaftNode, ConsensusError> RaftNode::Create(RaftConfig config,
                                                          IRandomSource& random,
-                                                         TimePoint now,
+                                                         core::platform::SteadyTimePoint now,
                                                          RecoveredState recovered)
 {
     if (auto valid = config.Validate(); !valid.has_value())
@@ -51,7 +51,7 @@ std::expected<RaftNode, ConsensusError> RaftNode::Create(RaftConfig config,
     return RaftNode { std::move(config), random, now, std::move(recovered) };
 }
 
-RaftNode::RaftNode(RaftConfig config, IRandomSource& random, TimePoint now, RecoveredState recovered):
+RaftNode::RaftNode(RaftConfig config, IRandomSource& random, core::platform::SteadyTimePoint now, RecoveredState recovered):
     _config { std::move(config) },
     _random { random },
     _currentTerm { recovered.state.currentTerm },
@@ -155,7 +155,7 @@ TimerKind RaftNode::CurrentTimer() const
     return timer == TimerKind::Election ? TraitsOf(CurrentStanding()).timer : timer;
 }
 
-TimePoint RaftNode::NextDeadline() const
+core::platform::SteadyTimePoint RaftNode::NextDeadline() const
 {
     // Nothing ever falls due on a node whose standing never stands, so it says so
     // rather than naming a deadline `Tick` would then have to decline to act on.
@@ -176,10 +176,10 @@ TimePoint RaftNode::NextDeadline() const
         case TimerKind::None:
             break;
     }
-    return TimePoint::max();
+    return core::platform::SteadyTimePoint::max();
 }
 
-void RaftNode::NoteLeaderContact(TimePoint now)
+void RaftNode::NoteLeaderContact(core::platform::SteadyTimePoint now)
 {
     // Arming the timer IS the record now: since issue #117 a node answers a
     // pre-vote from the deadline it would campaign on, so pushing that deadline
@@ -189,7 +189,7 @@ void RaftNode::NoteLeaderContact(TimePoint now)
     ArmElectionTimer(now);
 }
 
-void RaftNode::NoteFollowerContact(NodeId const& follower, TimePoint now)
+void RaftNode::NoteFollowerContact(NodeId const& follower, core::platform::SteadyTimePoint now)
 {
     _followerContact[follower] = now;
 }
@@ -244,7 +244,7 @@ Configuration RaftNode::QuorumContactConfiguration() const
     return Membership::IsEmpty(_snapshotConfiguration) ? _config.Bootstrap() : _snapshotConfiguration;
 }
 
-bool RaftNode::HasQuorumContact(TimePoint now) const
+bool RaftNode::HasQuorumContact(core::platform::SteadyTimePoint now) const
 {
     // While a configuration change is UNCOMMITTED, this asks about the COMMITTED
     // configuration (#1095).
@@ -330,7 +330,7 @@ bool RaftNode::HasQuorumContact(TimePoint now) const
     return live >= Membership::QuorumOf(configuration);
 }
 
-bool RaftNode::HasLiveLeader(TimePoint now) const
+bool RaftNode::HasLiveLeader(core::platform::SteadyTimePoint now) const
 {
     // Two roles, two kinds of evidence, and the split is not a refinement: a
     // leader never hears from a leader, so the evidence every other role reads is
@@ -389,7 +389,7 @@ bool RaftNode::HasLiveLeader(TimePoint now) const
     return _knownLeader.has_value() && now < _electionDeadline;
 }
 
-void RaftNode::ArmElectionTimer(TimePoint now)
+void RaftNode::ArmElectionTimer(core::platform::SteadyTimePoint now)
 {
     auto const low = static_cast<std::uint64_t>(_config.electionTimeoutMin.count());
     auto const high = static_cast<std::uint64_t>(_config.electionTimeoutMax.count());
@@ -721,7 +721,7 @@ void RaftNode::RefreshConfiguration()
     AdoptConfiguration(Membership::IsEmpty(_snapshotConfiguration) ? _config.Bootstrap() : _snapshotConfiguration);
 }
 
-void RaftNode::StepDown(Term term, NodeId const& from, TimePoint now, RaftOutput& output)
+void RaftNode::StepDown(Term term, NodeId const& from, core::platform::SteadyTimePoint now, RaftOutput& output)
 {
     // Reported BEFORE anything is overwritten, which is the only moment both
     // halves exist: the term and role being left behind are about to be gone, and
@@ -771,7 +771,7 @@ void RaftNode::StepDown(Term term, NodeId const& from, TimePoint now, RaftOutput
     MarkPersist(output);
 }
 
-void RaftNode::StartPreVote(TimePoint now, RaftOutput& output)
+void RaftNode::StartPreVote(core::platform::SteadyTimePoint now, RaftOutput& output)
 {
     // Nothing durable changes here, and that is the entire point: no term
     // increment, no vote recorded, no `MarkPersist`. A round that wrote anything
@@ -804,7 +804,7 @@ void RaftNode::StartPreVote(TimePoint now, RaftOutput& output)
                                        .lastLogTerm = _log.LastTerm() });
 }
 
-void RaftNode::StartElection(TimePoint now, RaftOutput& output)
+void RaftNode::StartElection(core::platform::SteadyTimePoint now, RaftOutput& output)
 {
     _currentTerm = _currentTerm.Next();
     _role = Role::Candidate;
@@ -839,7 +839,7 @@ void RaftNode::StartElection(TimePoint now, RaftOutput& output)
                                            .lastLogTerm = _log.LastTerm() });
 }
 
-void RaftNode::BecomeLeader(TimePoint now, RaftOutput& output)
+void RaftNode::BecomeLeader(core::platform::SteadyTimePoint now, RaftOutput& output)
 {
     _role = Role::Leader;
     _knownLeader = _config.self;
@@ -907,13 +907,13 @@ void RaftNode::BecomeLeader(TimePoint now, RaftOutput& output)
     ApplyCommitted(output);
 }
 
-RaftOutput RaftNode::Tick(TimePoint now)
+RaftOutput RaftNode::Tick(core::platform::SteadyTimePoint now)
 {
     auto output = RaftOutput {};
 
     // A node waiting on nothing has nothing to do at ANY instant, including the one
     // `NextDeadline` answers with; asked explicitly rather than left to the
-    // comparison below, which `TimePoint::max()` itself would pass.
+    // comparison below, which `core::platform::SteadyTimePoint::max()` itself would pass.
     auto const timer = CurrentTimer();
     if (timer == TimerKind::None || now < NextDeadline())
         return output;
@@ -953,7 +953,7 @@ RaftOutput RaftNode::Tick(TimePoint now)
     return output;
 }
 
-void RaftNode::RelinquishLeadership(TimePoint now, RaftOutput& output)
+void RaftNode::RelinquishLeadership(core::platform::SteadyTimePoint now, RaftOutput& output)
 {
     // The term is deliberately UNTOUCHED, and so is `_votedFor`. This is not
     // `StepDown`, which exists for a higher term arriving and resets both: staying
@@ -1008,7 +1008,8 @@ bool RaftNode::HasUncommittedConfiguration() const
     return LatestConfigurationIndex() > _commitIndex;
 }
 
-std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(Configuration configuration, TimePoint now)
+std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(Configuration configuration,
+                                                                              core::platform::SteadyTimePoint now)
 {
     if (_role != Role::Leader)
         return std::unexpected { FastCache::NotLeader(_knownLeader) };
@@ -1058,7 +1059,8 @@ std::expected<RaftNode::Proposal, ConsensusError> RaftNode::ProposeMembership(Co
     return Proposal { .index = index, .output = std::move(output) };
 }
 
-std::expected<RaftNode::Proposal, ConsensusError> RaftNode::Propose(std::vector<std::byte> payload, TimePoint now)
+std::expected<RaftNode::Proposal, ConsensusError> RaftNode::Propose(std::vector<std::byte> payload,
+                                                                    core::platform::SteadyTimePoint now)
 {
     if (_role != Role::Leader)
         return std::unexpected { FastCache::NotLeader(_knownLeader) };
@@ -1088,7 +1090,9 @@ std::expected<RaftNode::Proposal, ConsensusError> RaftNode::Propose(std::vector<
     return Proposal { .index = index, .output = std::move(output) };
 }
 
-RaftOutput RaftNode::Receive(RaftMessage const& message, TimePoint now, SnapshotReadability readability)
+RaftOutput RaftNode::Receive(RaftMessage const& message,
+                             core::platform::SteadyTimePoint now,
+                             SnapshotReadability readability)
 {
     auto output = RaftOutput {};
 
@@ -1140,7 +1144,7 @@ bool RaftNode::IsPreVoteExempt(RaftMessage const& message) noexcept
 }
 
 void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request,
-                                 TimePoint now,
+                                 core::platform::SteadyTimePoint now,
                                  SnapshotReadability readability,
                                  RaftOutput& output)
 {
@@ -1244,7 +1248,9 @@ void RaftNode::OnInstallSnapshot(InstallSnapshotRequest const& request,
     reply(AppendResult::Accepted, request.lastIncludedIndex);
 }
 
-void RaftNode::OnInstallSnapshotResponse(InstallSnapshotResponse const& response, TimePoint now, RaftOutput& output)
+void RaftNode::OnInstallSnapshotResponse(InstallSnapshotResponse const& response,
+                                         core::platform::SteadyTimePoint now,
+                                         RaftOutput& output)
 {
     if (_role != Role::Leader || response.term != _currentTerm || !IsMember(response.followerId))
         return;
@@ -1267,7 +1273,7 @@ void RaftNode::OnInstallSnapshotResponse(InstallSnapshotResponse const& response
     ApplyCommitted(output);
 }
 
-void RaftNode::OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutput& output)
+void RaftNode::OnPreVote(PreVoteRequest const& request, core::platform::SteadyTimePoint now, RaftOutput& output)
 {
     // A refusal carries THIS node's term so a sender that is behind learns it.
     // A grant echoes the request's term, so the sender is not demoted by the very
@@ -1288,7 +1294,7 @@ void RaftNode::OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutpu
     reply(output.voteRefusal.has_value() ? VoteDecision::Denied : VoteDecision::Granted);
 }
 
-std::optional<VoteRefusal> RaftNode::PreVoteRefusal(PreVoteRequest const& request, TimePoint now) const
+std::optional<VoteRefusal> RaftNode::PreVoteRefusal(PreVoteRequest const& request, core::platform::SteadyTimePoint now) const
 {
     // The ROW first (#1449): a node whose standing casts no vote refuses whatever
     // else the request says, and says so by name. A learner answering by silence
@@ -1326,7 +1332,7 @@ std::optional<VoteRefusal> RaftNode::PreVoteRefusal(PreVoteRequest const& reques
     return std::nullopt;
 }
 
-void RaftNode::OnPreVoteResponse(PreVoteResponse const& response, TimePoint now, RaftOutput& output)
+void RaftNode::OnPreVoteResponse(PreVoteResponse const& response, core::platform::SteadyTimePoint now, RaftOutput& output)
 {
     // An answer to a question this node is no longer asking decides nothing. The
     // term compared against is the one that was ASKED about -- one above this
@@ -1347,7 +1353,7 @@ void RaftNode::OnPreVoteResponse(PreVoteResponse const& response, TimePoint now,
         StartElection(now, output);
 }
 
-void RaftNode::OnRequestVote(RequestVoteRequest const& request, TimePoint now, RaftOutput& output)
+void RaftNode::OnRequestVote(RequestVoteRequest const& request, core::platform::SteadyTimePoint now, RaftOutput& output)
 {
     auto const reply = [&](VoteDecision decision) {
         output.messages.push_back(OutboundMessage {
@@ -1406,7 +1412,9 @@ std::optional<VoteRefusal> RaftNode::VoteRefusalFor(RequestVoteRequest const& re
     return std::nullopt;
 }
 
-void RaftNode::OnRequestVoteResponse(RequestVoteResponse const& response, TimePoint now, RaftOutput& output)
+void RaftNode::OnRequestVoteResponse(RequestVoteResponse const& response,
+                                     core::platform::SteadyTimePoint now,
+                                     RaftOutput& output)
 {
     // A response from an earlier term, or one addressed to an election this node
     // is no longer running, decides nothing.
@@ -1437,7 +1445,7 @@ void RaftNode::OnRequestVoteResponse(RequestVoteResponse const& response, TimePo
         BecomeLeader(now, output);
 }
 
-void RaftNode::OnAppendEntries(AppendEntriesRequest const& request, TimePoint now, RaftOutput& output)
+void RaftNode::OnAppendEntries(AppendEntriesRequest const& request, core::platform::SteadyTimePoint now, RaftOutput& output)
 {
     auto const reply = [&](AppendResult result, LogIndex matchIndex) {
         output.messages.push_back(OutboundMessage {
@@ -1531,7 +1539,9 @@ void RaftNode::OnAppendEntries(AppendEntriesRequest const& request, TimePoint no
     ApplyCommitted(output);
 }
 
-void RaftNode::OnAppendEntriesResponse(AppendEntriesResponse const& response, TimePoint now, RaftOutput& output)
+void RaftNode::OnAppendEntriesResponse(AppendEntriesResponse const& response,
+                                       core::platform::SteadyTimePoint now,
+                                       RaftOutput& output)
 {
     // The §5.1 term check in `Receive` has already demoted this node if the
     // responder knew a higher term. What is left matters only to a leader still

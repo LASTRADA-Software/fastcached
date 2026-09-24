@@ -8,27 +8,30 @@
 #include "NodeSurfaces.hpp"
 #include "Responders.hpp"
 
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/BlockingConnector.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
-#include <FastCache/Net/TcpClient.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/async/ThreadPoolExecutor.hpp>
+#include <core/net/BlockingConnector.hpp>
+#include <core/net/BlockingSocket.hpp>
+#include <core/net/TcpClient.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/platform/Clock.hpp>
 
 #if !defined(_WIN32)
     #include <sys/socket.h>
@@ -54,6 +57,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/HalfClose.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
@@ -87,7 +91,7 @@ class NamedResponder final: public IFrameResponder
     {
     }
 
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> /*frame*/, PeerIdentity /*peer*/) override
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> /*frame*/, PeerIdentity /*peer*/) override
     {
         _answered.push_back(_name);
         co_return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedValue, _name);
@@ -314,7 +318,7 @@ class NamedResponder final: public IFrameResponder
 /// @return The reply.
 [[nodiscard]] std::vector<std::byte> AnswerNow(MergedResponder& responder, std::span<std::byte const> frame)
 {
-    return SyncRun(responder.Answer(frame, PeerIdentity { .host = "127.0.0.1" })).bytes;
+    return core::async::syncRun(responder.Answer(frame, PeerIdentity { .host = "127.0.0.1" })).bytes;
 }
 
 /// A config naming a free loopback port, and that port.
@@ -332,7 +336,7 @@ class NamedResponder final: public IFrameResponder
     // state rather than nothing, so a null check passes on a bind that failed and the
     // port below comes back 0.
     REQUIRE(probe->IsBound());
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
 
     NodeConfig cfg;
@@ -473,7 +477,7 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
 
     InMemoryLruStorage local { 64 * 1024 };
     NoUpstream upstream;
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     LocalCache cache { local, upstream, clock, metrics };
     CacheProxy proxy { cache, metrics };
@@ -498,7 +502,7 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     FastCache::Testing::ScratchDirectory const scratch { "fc-290-acceptance" };
     Cc::CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() };
     Cc::WorkerProtocol protocol { jobs, Cc::UncheckedLeaseValidator(), { Wire::IdentityCodec }, metrics };
-    ThreadPoolExecutor pool { 1 };
+    core::async::ThreadPoolExecutor pool { 1 };
     CompileCapacity capacity { 1, WorkerMaxRequestBytes, std::chrono::seconds { 5 }, logger };
 
     CacheResponder cacheResponder { proxy, locality, metrics };
@@ -588,20 +592,21 @@ TEST_CASE("The daemon and a node running no worker refuse a cordon with one code
     auto const cordon = Wire::EncodeCordonRequest(Wire::CordonAction::Cordon);
 
     // The daemon, which is a cache.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     InMemoryLruStorage storage { 0 };
     CacheEngine engine { storage, clock };
-    auto const pair = InMemorySocketPair::Create();
+    auto const pair = core::net::testing::InMemorySocketPair::create();
     CompileCacheHandler daemon;
-    REQUIRE(SyncRun(SendAll(pair.client.get(), cordon)));
-    pair.client->shutdownWrite();
-    SyncRun(daemon.Run(pair.server.get(), &engine, {}, SessionContext {}));
+    REQUIRE(core::async::syncRun(core::net::sendAll(pair.client.get(), cordon)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+    core::async::syncRun(daemon.Run(pair.server.get(), &engine, {}, SessionContext {}));
     // One framed reply, read as the header declares it: the header, then its payload.
-    auto const daemonHead = SyncRun(RecvExactly(pair.client.get(), Wire::ReplyHeaderSize));
+    auto const daemonHead = core::async::syncRun(core::net::receiveExactly(pair.client.get(), Wire::ReplyHeaderSize));
     REQUIRE(daemonHead.has_value());
     auto const daemonHeader = Wire::DecodeReplyHeader(Unwrap(daemonHead));
     REQUIRE(daemonHeader.has_value());
-    auto const daemonPayload = SyncRun(RecvExactly(pair.client.get(), Unwrap(daemonHeader).payloadLength));
+    auto const daemonPayload =
+        core::async::syncRun(core::net::receiveExactly(pair.client.get(), Unwrap(daemonHeader).payloadLength));
     REQUIRE(daemonPayload.has_value());
     auto daemonReply = Unwrap(daemonHead);
     daemonReply.insert(daemonReply.end(), Unwrap(daemonPayload).begin(), Unwrap(daemonPayload).end());
@@ -879,17 +884,17 @@ TEST_CASE("A node running only consensus opens the 0xFC port it is watched throu
     io.Start();
 
     // And it answers there: a NodeStatus frame reaches the operator verbs.
-    BlockingConnector connector;
-    auto socket =
-        SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    core::net::BlockingConnector connector;
+    auto socket = core::async::syncRun(
+        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
     REQUIRE(socket.has_value());
     auto const request = HeaderFor(Wire::Op::NodeStatus);
-    REQUIRE(SyncRun(SendAll(socket->get(), request)));
-    auto const head = SyncRun(RecvExactly(socket->get(), Wire::ReplyHeaderSize));
+    REQUIRE(core::async::syncRun(core::net::sendAll(socket->get(), request)));
+    auto const head = core::async::syncRun(core::net::receiveExactly(socket->get(), Wire::ReplyHeaderSize));
     REQUIRE(head.has_value());
     auto const header = Wire::DecodeReplyHeader(Unwrap(head));
     REQUIRE(header.has_value());
-    auto const payload = SyncRun(RecvExactly(socket->get(), Unwrap(header).payloadLength));
+    auto const payload = core::async::syncRun(core::net::receiveExactly(socket->get(), Unwrap(header).payloadLength));
     REQUIRE(payload.has_value());
     auto reply = Unwrap(head);
     reply.insert(reply.end(), Unwrap(payload).begin(), Unwrap(payload).end());
@@ -928,23 +933,23 @@ TEST_CASE("A node running only consensus still answers its status with every liv
     REQUIRE(*surface != nullptr);
     io.Start();
 
-    BlockingConnector connector;
+    core::net::BlockingConnector connector;
     auto const listenPort = port;
-    auto const exchange = [&connector, listenPort](std::vector<std::unique_ptr<ISocket>>& held, Wire::Op op) {
-        auto socket = SyncRun(
-            connector.connect("127.0.0.1", listenPort, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    auto const exchange = [&connector, listenPort](std::vector<std::unique_ptr<core::net::ISocket>>& held, Wire::Op op) {
+        auto socket = core::async::syncRun(connector.connect(
+            "127.0.0.1", listenPort, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
         if (!socket.has_value())
             return std::string {};
         auto const request = HeaderFor(op);
-        if (!SyncRun(SendAll(socket->get(), request)))
+        if (!core::async::syncRun(core::net::sendAll(socket->get(), request)))
             return std::string {};
-        auto head = SyncRun(RecvExactly(socket->get(), Wire::ReplyHeaderSize));
+        auto head = core::async::syncRun(core::net::receiveExactly(socket->get(), Wire::ReplyHeaderSize));
         if (!head.has_value())
             return std::string {};
         auto const header = Wire::DecodeReplyHeader(Unwrap(head));
         if (!header.has_value())
             return std::string {};
-        auto const payload = SyncRun(RecvExactly(socket->get(), Unwrap(header).payloadLength));
+        auto const payload = core::async::syncRun(core::net::receiveExactly(socket->get(), Unwrap(header).payloadLength));
         if (!payload.has_value())
             return std::string {};
         auto reply = Unwrap(head);
@@ -953,15 +958,15 @@ TEST_CASE("A node running only consensus still answers its status with every liv
         return MessageOf(reply);
     };
 
-    std::vector<std::unique_ptr<ISocket>> subscriptions;
+    std::vector<std::unique_ptr<core::net::ISocket>> subscriptions;
     for ([[maybe_unused]] auto const index: std::views::iota(std::size_t { 0 }, LiveOpen))
         REQUIRE(exchange(subscriptions, Wire::Op::Subscribe) == "live");
 
-    std::vector<std::unique_ptr<ISocket>> status;
+    std::vector<std::unique_ptr<core::net::ISocket>> status;
     for ([[maybe_unused]] auto const index: std::views::iota(std::size_t { 0 }, NodeOpen))
         REQUIRE(exchange(status, Wire::Op::NodeStatus) == "node");
 
-    std::vector<std::unique_ptr<ISocket>> reads;
+    std::vector<std::unique_ptr<core::net::ISocket>> reads;
     CHECK(exchange(reads, Wire::Op::FleetText) == "fleet");
 }
 
@@ -1039,7 +1044,7 @@ TEST_CASE("A socket-activated node serves the descriptor it was handed", "[node]
     // and the reactor listeners could not adopt, an activated worker was refused at
     // startup: the merged 0xFC surface runs on the reactor and socket activation
     // handed back a BLOCKING listener, so there was nothing that could join the two.
-    // #464 added `PlatformListener::Adopt` and this closes over it.
+    // #464 added `AdoptInheritedListener` and this closes over it.
     //
     // The two facts asserted here are the ones no unit of either change can see on
     // its own: that the node reaches `Adopt` at all rather than binding, and that the

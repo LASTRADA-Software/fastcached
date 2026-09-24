@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Cache/ExpiryReaper.hpp>
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Core/Profiling.hpp>
 
 #include <coroutine>
 #include <format>
 #include <thread>
 #include <tuple>
 #include <utility>
+
+#include <core/Profiling.hpp>
+#include <core/async/ResumeOn.hpp>
+#include <core/net/SleepUntil.hpp>
 
 namespace FastCache
 {
@@ -31,7 +32,7 @@ namespace
     /// was never handed over, so reading the local is all it does.
     struct HopOffReactor
     {
-        IExecutor& executor;
+        core::async::IExecutor& executor;
         /// The count to raise for the trip, or null when the executor is the reactor.
         std::atomic<std::uint32_t>* away;
 
@@ -48,7 +49,7 @@ namespace
                 count->fetch_add(1, std::memory_order_acq_rel);
             try
             {
-                ResumeOn { executor }.await_suspend(handle);
+                core::async::ResumeOn { executor }.await_suspend(handle);
             }
             catch (...)
             {
@@ -63,7 +64,7 @@ namespace
 
     /// The hop back to the reactor, closing the trip `AwayFromReactor()` measures.
     ///
-    /// `ResumeOn` plus one statement, and the statement's POSITION is the fix (#1397): the
+    /// `core::async::ResumeOn` plus one statement, and the statement's POSITION is the fix (#1397): the
     /// count falls only once the hand-over has returned, so while it is raised the frame is
     /// on the executor or still being handed back -- never on neither side with the count down.
     ///
@@ -79,7 +80,7 @@ namespace
     /// `Run` tries the hop again instead, which is what eventually lowers it.
     struct HopBackToReactor
     {
-        IReactor& reactor;
+        core::net::EventLoop& reactor;
         /// The count to lower after the hand-over, or null when the frame never left.
         std::atomic<std::uint32_t>* away;
 
@@ -92,7 +93,7 @@ namespace
         void await_suspend(std::coroutine_handle<Promise> handle) const
         {
             auto* const count = away;
-            ResumeOn { reactor }.await_suspend(handle);
+            core::async::ResumeOn { reactor }.await_suspend(handle);
             if (count != nullptr)
                 count->fetch_sub(1, std::memory_order_acq_rel);
         }
@@ -119,10 +120,10 @@ ExpiryReaper::ExpiryReaper(IStorage& storage,
 {
 }
 
-void ExpiryReaper::Start(IReactor& reactor, IExecutor& sweepOn)
+void ExpiryReaper::Start(core::net::EventLoop& reactor, core::async::IExecutor& sweepOn)
 {
     _reactor = &reactor;
-    _task = Run(&reactor, &sweepOn, _source.Token());
+    _task = Run(&reactor, &sweepOn, _source.get_token());
     reactor.submit(_task.handle());
 }
 
@@ -131,7 +132,7 @@ void ExpiryReaper::Stop() noexcept
     auto* const reactor = std::exchange(_reactor, nullptr);
     if (reactor == nullptr)
         return;
-    _source.Cancel();
+    _source.request_stop();
 
     // **Waited for BEFORE anything is reclaimed**, because a frame away from the reactor
     // is one the reactor does not hold: `CancelPending` would answer false and `~Task`
@@ -139,7 +140,7 @@ void ExpiryReaper::Stop() noexcept
     // Cancelling the token does not end the trip -- `PurgeExpired` does not observe it --
     // so this waits for the whole of it, which needs no reactor: the count falls on the
     // executor thread when the hop back's `Submit` returns, so this stays safe after
-    // `IReactor::Run` has returned (#1397). Once it is down the frame is queued or parked
+    // `core::net::EventLoop::Run` has returned (#1397). Once it is down the frame is queued or parked
     // on the reactor, done, or never started, and the retraction below covers all three.
     //
     // Bounded, and it says what it abandoned: an unbounded wait here hands the
@@ -180,13 +181,13 @@ void ExpiryReaper::Stop() noexcept
     //
     // What is NOT optional is that the handle be this task's own, and it is
     // only because `Run` awaits `SleepUntil` directly rather than a nested
-    // `Task` -- see the comment there.
+    // `core::async::Task` -- see the comment there.
     std::ignore = reactor->cancelPending(_task.handle());
 }
 
-PurgeOutcome ExpiryReaper::SweepOnce(TimePoint now)
+PurgeOutcome ExpiryReaper::SweepOnce(core::platform::SteadyTimePoint now)
 {
-    FC_ZONE_SCOPED_N("ExpiryReaper::SweepOnce");
+    CORE_ZONE_SCOPED_N("ExpiryReaper::SweepOnce");
     auto const outcome =
         _storage.PurgeExpired(now, PurgeBudget { .maxScanned = _scanBudget, .maxPurged = _options.purgeBudget });
     ++_cycles;
@@ -217,9 +218,9 @@ PurgeOutcome ExpiryReaper::SweepOnce(TimePoint now)
 /// instantly whatever the budget, and treating that as headroom would grow the budget
 /// on a cache that has told us nothing.
 /// @param elapsed How long the sweep held the reactor.
-void ExpiryReaper::AdaptScanBudget(Duration elapsed) noexcept
+void ExpiryReaper::AdaptScanBudget(core::platform::SteadyDuration elapsed) noexcept
 {
-    if (_options.sweepStallCeiling <= Duration::zero())
+    if (_options.sweepStallCeiling <= core::platform::SteadyDuration::zero())
         return; // Adaptation disabled; the configured budget stands.
 
     if (elapsed > _options.sweepStallCeiling)
@@ -234,15 +235,17 @@ void ExpiryReaper::AdaptScanBudget(Duration elapsed) noexcept
     _scanBudget = grown > _options.scanBudget ? _options.scanBudget : grown;
 }
 
-Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, CancellationToken token)
+core::async::Task<void> ExpiryReaper::Run(core::net::EventLoop* reactor,
+                                          core::async::IExecutor* sweepOn,
+                                          core::async::StopToken token)
 {
     // Whether the sweep LEAVES the reactor, decided once, by the identity of the executor
     // object -- see `AwayFromReactor()` for why that is the safe side of the question.
-    auto* const away = sweepOn == static_cast<IExecutor*>(reactor) ? nullptr : &_awayFromReactor;
+    auto* const away = sweepOn == static_cast<core::async::IExecutor*>(reactor) ? nullptr : &_awayFromReactor;
 
     // A disabled cycle ends rather than parking forever: a coroutine asleep on
     // a deadline nobody will move is a frame the reactor has to outlive.
-    if (_options.interval <= Duration::zero())
+    if (_options.interval <= core::platform::SteadyDuration::zero())
     {
         _logger.Log(LogLevel::Debug, "expiry: active cycle disabled");
         co_return;
@@ -256,7 +259,7 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
                  _options.scanBudget,
                  _options.purgeBudget);
 
-    while (!token.IsCancelled())
+    while (!token.stop_requested())
     {
         // Bounded steps rather than one sleep straight to the deadline, so a
         // stop is noticed within `stopWakeBound` rather than after a whole
@@ -264,20 +267,20 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
         //
         // Written out here rather than delegated to `InterruptibleSleepUntil`,
         // and the reason is WHICH frame the reactor ends up holding: awaiting a
-        // nested `Task` parks the INNER coroutine's handle, so the handle a
+        // nested `core::async::Task` parks the INNER coroutine's handle, so the handle a
         // shutdown has to name would not be this task's. Awaiting `SleepUntil`
         // directly makes them the same frame, which is what lets the owner take
-        // it back with `CancelPending` instead of leaking it. `DeadlineTimer`
+        // it back with `CancelPending` instead of leaking it. `core::net::DeadlineTimer`
         // inlines its wait for exactly this reason.
         auto const deadline = reactor->clock().now() + _interval;
-        while (!token.IsCancelled())
+        while (!token.stop_requested())
         {
             auto const now = reactor->clock().now();
             if (now >= deadline)
                 break;
-            co_await SleepUntil { .reactor = reactor, .deadline = NextWakeStep(now, deadline, _options.stopWakeBound) };
+            co_await core::net::sleepUntil(reactor, core::net::nextWakeStep(now, deadline, _options.stopWakeBound));
         }
-        if (token.IsCancelled())
+        if (token.stop_requested())
             break;
 
         // Timed, because `scanBudget` counts ENTRIES and entries are not work
@@ -292,7 +295,7 @@ Task<void> ExpiryReaper::Run(IReactor* reactor, IExecutor* sweepOn, Cancellation
         // whole duration and every connection pinned there is unserved. #964 bounded
         // how long that is; this is what stops it being the reactor's time at all.
         //
-        // The same two-hop the compile surface uses, and `IReactor` IS an `IExecutor`
+        // The same two-hop the compile surface uses, and `core::net::EventLoop` IS an `core::async::IExecutor`
         // -- so a caller that passes the reactor gets exactly the previous behaviour
         // through the same statements, rather than through a second code path.
         //

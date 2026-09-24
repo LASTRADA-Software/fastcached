@@ -43,7 +43,7 @@ namespace
         {
         }
 
-        [[nodiscard]] AnnounceOutcome Attempt(ISocket& client, std::string_view endpoint) override
+        [[nodiscard]] AnnounceOutcome Attempt(core::net::ISocket& client, std::string_view endpoint) override
         {
             auto sent =
                 Cc::AnnounceNodePresence(client, _notice, _endpoint, _capacity, _load, _endorsement, _credential.Current());

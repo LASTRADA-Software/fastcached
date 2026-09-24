@@ -9,14 +9,13 @@
 #include "WorkerTierTestFixture.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -30,6 +29,8 @@
 #include <string_view>
 #include <vector>
 
+#include <core/net/BlockingSocket.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SkewedMetricsSink.hpp>
@@ -74,7 +75,7 @@ constexpr PresentComponents NoComponent {
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
     REQUIRE(probe->IsBound());
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
     return port;
 }
@@ -295,8 +296,8 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     NodeConfig scheduling;
     scheduling.serveScheduler = true;
     scheduling.nodeId = "n1";
-    ManualClock schedulerClock;
-    ManualWallClock wallClock;
+    core::platform::ManualClock schedulerClock;
+    core::platform::ManualWallClock wallClock;
     auto scheduler = SchedulerTier::Start(
         scheduling, membership.Oracle(), schedulerClock, wallClock, metrics, logger, FastCache::Testing::TestKeyPair("n1"));
     REQUIRE(scheduler.has_value());
@@ -307,7 +308,7 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     REQUIRE(*workerTier != nullptr);
 
     // The enrollment scope.
-    ManualClock windowClock;
+    core::platform::ManualClock windowClock;
     EnrollmentWindow window { windowClock, &conditions };
 
     // The consensus scope's own tier (#1552): one voter over a state directory of its own,
@@ -326,7 +327,7 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
         FastCache::Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
-        DefaultSystemWallClock(),
+        core::platform::defaultSystemWallClock(),
         {},
         metrics,
         logger,

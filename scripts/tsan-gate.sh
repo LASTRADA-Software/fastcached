@@ -283,8 +283,13 @@ SUPPRESSIONS="${REPO_ROOT}/.tsan-suppressions"
 # executable whose translation units carried no `-fsanitize=` at all (#472). It is
 # the OBJECTS that answer, and the reading was controlled in both directions -- a
 # plain TU compiled without the flag reads 0 and the same TU with it reads 1.
+# **`[async]` and `[task]` left the first row with #1596**, because the cases they selected --
+# the coroutine vocabulary and the reactors in `Async/` and `Net/` -- left for core-cpp, and a
+# tag that matches nothing is exactly what this gate refuses below. The code they exercised is
+# still under this gate: it is linked here as core-cpp's archives, which the instrumentation
+# check above reads by name, and its own tests are core-cpp's to run under its `clang-tsan`.
 TARGETS=(
-    "FastCacheTest|[async],[consensus],[distributed],[reactor],[task],[net],[tls],[sharded],[expiry],[clock],[wait],[pubsub],[server]|first-party"
+    "FastCacheTest|[consensus],[distributed],[reactor],[net],[tls],[sharded],[expiry],[clock],[wait],[pubsub],[server]|first-party"
     "fastcache-compile-node-tests||first-party"
     "fastcache-cc-tests||first-party"
     "fastcache-cli-tests||first-party"

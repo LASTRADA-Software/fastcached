@@ -29,7 +29,7 @@ enum class WaitEnd : std::uint8_t
 /// stops being a teardown cost at all (#1339).
 ///
 /// For a thread holding a `std::stop_token`. A coroutine waits through `InterruptibleSleepUntil`
-/// (`Async/InterruptibleSleep.hpp`) instead, which answers the same two outcomes as `WakeReason`.
+/// (`Async/InterruptibleSleep.hpp`) instead, which answers the same two outcomes as `core::net::WakeReason`.
 ///
 /// The mutex and the variable are locals: nothing else can notify them, and nothing else should.
 /// The stop token is the one wakeup, which is also why the predicate is constant -- a spurious wakeup

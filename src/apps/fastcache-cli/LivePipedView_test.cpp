@@ -3,12 +3,9 @@
 #include "LivePipedView.hpp"
 #include "ScriptedDashboardEvents.hpp"
 
-#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/MachineName.hpp>
 #include <FastCache/Core/NumericText.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
@@ -29,6 +26,9 @@
 #include <utility>
 #include <vector>
 
+#include <core/Ranges.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -88,7 +88,7 @@ constexpr auto CaseCounters = std::to_array<std::pair<std::string_view, IMetrics
     auto reading = StatsReading {};
     for (auto const& [name, value]: counts)
     {
-        auto const* const row = FindIfOrNull(CaseCounters, [name](auto const& one) { return one.first == name; });
+        auto const* const row = core::findIfOrNull(CaseCounters, [name](auto const& one) { return one.first == name; });
         REQUIRE(row != nullptr);
         auto* const cell = reading.counters.Find(row->second);
         REQUIRE(cell != nullptr);
@@ -112,7 +112,7 @@ constexpr auto CaseCounters = std::to_array<std::pair<std::string_view, IMetrics
 void AddSample(std::vector<DashboardEvent>& script, int seconds, StatsReading reading)
 {
     script.push_back(DashboardEvent { .kind = DashboardEventKind::Sample,
-                                      .at = TimePoint { std::chrono::seconds { seconds } },
+                                      .at = core::platform::SteadyTimePoint { std::chrono::seconds { seconds } },
                                       .reading = std::move(reading),
                                       .where = "127.0.0.1:6674" });
     script.push_back(DashboardEvent { .kind = DashboardEventKind::Tick });
@@ -129,11 +129,11 @@ void AddFailure(std::vector<DashboardEvent>& script)
 
 /// Run the loop once; a named coroutine over pointers, for the reason `DashboardLoop_test` gives.
 /// @return The task.
-[[nodiscard]] Task<void> DriveOnce(IDashboardEventSource* events,
-                                   IDashboardView* view,
-                                   IFrameSink* sink,
-                                   DashboardLimits limits,
-                                   std::optional<DashboardExit>* out)
+[[nodiscard]] core::async::Task<void> DriveOnce(IDashboardEventSource* events,
+                                                IDashboardView* view,
+                                                IFrameSink* sink,
+                                                DashboardLimits limits,
+                                                std::optional<DashboardExit>* out)
 {
     *out = co_await RunDashboard(events, &ReadStatsSample, view, sink, limits);
 }
@@ -151,8 +151,8 @@ void AddFailure(std::vector<DashboardEvent>& script)
                                  std::optional<std::string> absent = std::nullopt,
                                  FigureProjection project = &CaseCountersOf)
 {
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
     auto events = ScriptedDashboardEvents { reactor, std::move(script) };
     auto view = PipedRecordView { format, std::move(absent), project };
     auto sink = StreamSink {};
@@ -160,7 +160,7 @@ void AddFailure(std::vector<DashboardEvent>& script)
     auto result = std::optional<DashboardExit> {};
     auto task = DriveOnce(&events, &view, &sink, limits, &result);
     reactor.submit(task.handle());
-    reactor.Drain();
+    reactor.drain();
 
     REQUIRE(result.has_value());
     return sink.stream;
@@ -390,7 +390,7 @@ namespace
     reading.snapshot.storage = StorageStats { .itemCount = static_cast<std::size_t>(items) };
     for (auto const tier: tiers)
     {
-        auto const* row = FindIfOrNull(StorageTierTable, [tier](auto const& one) { return one.name == tier; });
+        auto const* row = core::findIfOrNull(StorageTierTable, [tier](auto const& one) { return one.name == tier; });
         REQUIRE(row != nullptr);
         reading.snapshot.storageTiers[static_cast<std::size_t>(row->tier)] =
             StorageStats { .itemCount = static_cast<std::size_t>(items),

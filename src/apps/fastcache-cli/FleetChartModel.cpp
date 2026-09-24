@@ -3,7 +3,6 @@
 #include "FleetDocument.hpp"
 
 #include <FastCache/Core/NumericText.hpp>
-#include <FastCache/Core/Ranges.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -14,6 +13,8 @@
 #include <span>
 #include <string>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Cli
 {
@@ -96,7 +97,7 @@ std::vector<ChartTrack> FleetChartTracks(std::deque<HistoryEntry> const& history
         values.reserve(shown);
         for (auto const index: std::views::iota(history.size() - shown, history.size()))
         {
-            auto const* const point = FindIfOrNull(history[index].points, [&](SeriesPoint const& candidate) {
+            auto const* const point = core::findIfOrNull(history[index].points, [&](SeriesPoint const& candidate) {
                 return candidate.series == metric.key && candidate.subject == band.subject;
             });
             values.push_back(point == nullptr ? std::nullopt : std::optional { point->value });

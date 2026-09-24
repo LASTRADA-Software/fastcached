@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
-#include <FastCache/Net/ISocket.hpp>
-#include <FastCache/Net/NetError.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
@@ -13,6 +10,10 @@
 #include <span>
 #include <string_view>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
+#include <core/net/NetError.hpp>
 
 namespace FastCache
 {
@@ -76,6 +77,7 @@ struct AutodetectResult
 /// On EOF before any byte arrives, returns NetErrorCode::Eof.
 /// @param socket Source socket; bytes peeked are returned in the primer.
 /// @return Task resolving to the detected flavor + primer bytes.
-[[nodiscard]] Task<std::expected<AutodetectResult, NetError>> DetectProtocol(ISocket* socket);
+[[nodiscard]] core::async::Task<std::expected<AutodetectResult, core::net::NetError>> DetectProtocol(
+    core::net::ISocket* socket);
 
 } // namespace FastCache

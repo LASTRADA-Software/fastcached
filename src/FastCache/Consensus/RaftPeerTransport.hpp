@@ -1,20 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/AsyncQueue.hpp>
-#include <FastCache/Async/Cancellation.hpp>
-#include <FastCache/Async/IReactor.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/IRaftTransport.hpp>
 #include <FastCache/Consensus/RaftPeerRefusals.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/IConnector.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -28,6 +22,13 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include <core/async/AsyncQueue.hpp>
+#include <core/async/StopToken.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/EventLoop.hpp>
+#include <core/net/IConnector.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Consensus
 {
@@ -102,7 +103,7 @@ struct PeerTransportOptions
 
     /// Longest a sender may sit in a backoff it cannot be woken from.
     ///
-    /// Teardown lag, in one number. `IReactor::Schedule` cannot be cancelled, so
+    /// Teardown lag, in one number. `core::net::EventLoop::Schedule` cannot be cancelled, so
     /// a backoff is slept in steps of this length with the stop re-read at each
     /// one: a stop is observed within this bound rather than after
     /// `reconnectBackoff`, which is what keeps shutdown independent of how
@@ -130,15 +131,15 @@ struct PeerTransportOptions
 /// the cost in the wrong currency". Three things were wrong with that.
 ///
 /// The seam is not hypothetical and consensus is not paying for it:
-/// `IConnector` is coroutine-shaped and `PlatformConnector` implements it on all
+/// `core::net::IConnector` is coroutine-shaped and `core::net::makeConnector`'s connector implements it on all
 /// three backends, built for the launcher and the health probe.
 ///
 /// It was never about saving threads. Thread-per-peer is only *expressible* over
-/// a blocking socket, because the write was driven by `SyncRun` -- and this
+/// a blocking socket, because the write was driven by `core::async::syncRun` -- and this
 /// codebase already records, as the first of five defects found the first time
-/// consensus was run, that `SyncRun` throws the instant its task really
+/// consensus was run, that `core::async::syncRun` throws the instant its task really
 /// suspends. So the decision pinned the outbound half of this component to
-/// `BlockingSocket` for good while the inbound half was already on the reactor:
+/// `core::net::BlockingSocket` for good while the inbound half was already on the reactor:
 /// two socket implementations in one class, chosen by direction.
 ///
 /// And it hid a hang. The transport passes no I/O timeout, deliberately -- see
@@ -183,7 +184,7 @@ struct PeerTransportOptions
 /// It also never resumes the sender inline. `Send` is reached from
 /// `RaftDriver::Deliver`, which holds the driver's mutex, and a queue that
 /// resumed its consumer there would run the sender's next step inside that lock
-/// -- see `AsyncQueue`, where that invariant lives.
+/// -- see `core::async::AsyncQueue`, where that invariant lives.
 class RaftPeerTransport final: public IRaftTransport
 {
   public:
@@ -208,8 +209,8 @@ class RaftPeerTransport final: public IRaftTransport
     ///        this node cannot draw them for is abandoned before it proves anything (#1527).
     /// @param options Timeouts and queue bound.
     RaftPeerTransport(std::vector<PeerEndpoint> peers,
-                      IReactor& reactor,
-                      IConnector& connector,
+                      core::net::EventLoop& reactor,
+                      core::net::IConnector& connector,
                       ILogger& logger,
                       IMetricsSink& metrics,
                       IRaftPeerIdentity const& identity,
@@ -226,8 +227,8 @@ class RaftPeerTransport final: public IRaftTransport
 
     /// Begin dialling peers. Idempotent.
     ///
-    /// Each sender is a **lazy** `Task` submitted to the reactor rather than a
-    /// `DetachedTask`, and that is not a style choice: a detached task starts
+    /// Each sender is a **lazy** `core::async::Task` submitted to the reactor rather than a
+    /// `core::async::DetachedTask`, and that is not a style choice: a detached task starts
     /// eagerly on whichever thread constructed it, which here is whatever calls
     /// `Start()` -- typically before the reactor's own thread exists. Submitting
     /// a lazy task means the body's first instruction runs on the reactor thread,
@@ -282,7 +283,7 @@ class RaftPeerTransport final: public IRaftTransport
     /// `Pop` at once), and close every live socket **on the reactor's thread**
     /// (which is the only thing that completes a parked write, since no I/O
     /// timeout is armed). The last must be on that thread because on epoll and
-    /// kqueue `ISocket::Close` completes a parked awaitable by resuming its
+    /// kqueue `core::net::ISocket::Close` completes a parked awaitable by resuming its
     /// coroutine inline -- so closing from elsewhere would run a sender on the
     /// wrong thread. IOCP routes cancellation back through the port and does
     /// not, which is exactly what would make that a bug visible only on POSIX.
@@ -327,8 +328,8 @@ class RaftPeerTransport final: public IRaftTransport
   private:
     /// One peer's outbox and the coroutine that drains it.
     ///
-    /// Non-movable, because it owns an `AsyncQueue` (which holds a mutex) and a
-    /// `Task`. The `unique_ptr` indirection in `_peers` is therefore
+    /// Non-movable, because it owns an `core::async::AsyncQueue` (which holds a mutex) and a
+    /// `core::async::Task`. The `unique_ptr` indirection in `_peers` is therefore
     /// load-bearing rather than incidental -- worth saying, because flattening
     /// the map to hold `Peer` by value is the obvious tidy-up and it does not
     /// compile.
@@ -343,19 +344,19 @@ class RaftPeerTransport final: public IRaftTransport
         /// is taken under that lock and the `co_await` is not.
         PeerEndpoint endpoint;
 
-        AsyncQueue<std::vector<std::byte>> outbox; ///< Framed messages awaiting the wire.
+        core::async::AsyncQueue<std::vector<std::byte>> outbox; ///< Framed messages awaiting the wire.
 
         /// The live connection, or null.
         ///
         /// **Reactor-thread only.** Written by this peer's sender and read by the
         /// shutdown closer, which hops onto the reactor before touching it -- so
         /// there is nothing here to synchronise. That is the property the lazy
-        /// `Task` in `Start()` buys.
-        std::unique_ptr<ISocket> socket;
+        /// `core::async::Task` in `Start()` buys.
+        std::unique_ptr<core::net::ISocket> socket;
 
         /// The sender. Lazy, so it cannot start on whichever thread called
         /// `Start()`.
-        Task<void> sender;
+        core::async::Task<void> sender;
 
         /// When a refused dial to this peer may next be logged. Reactor-thread only,
         /// like `socket`.
@@ -364,12 +365,12 @@ class RaftPeerTransport final: public IRaftTransport
         /// that answers without the key would otherwise write a Warn four times a second
         /// for as long as it stays wrong, burying every other line. The counter moves
         /// on every refusal regardless.
-        TimePoint nextRefusalReport {};
+        core::platform::SteadyTimePoint nextRefusalReport {};
 
         /// @param where Where to dial.
         /// @param reactor Loop the outbox posts wake-ups to.
         /// @param options Queue bound and overflow policy.
-        Peer(PeerEndpoint where, IReactor& reactor, AsyncQueueOptions options):
+        Peer(PeerEndpoint where, core::net::EventLoop& reactor, core::async::AsyncQueueOptions options):
             endpoint { std::move(where) },
             outbox { reactor, options }
         {
@@ -421,15 +422,15 @@ class RaftPeerTransport final: public IRaftTransport
 
     IRaftPeerIdentity const& _identity;
     NodeId _self;
-    IReactor& _reactor;
-    IConnector& _connector;
+    core::net::EventLoop& _reactor;
+    core::net::IConnector& _connector;
     ILogger& _logger;
     IMetricsSink& _metrics;
     ISecureRandom& _random;
     PeerTransportOptions _options;
 
     /// Cancelled by `RequestStop`; observed by every backoff and loop condition.
-    CancellationSource _stop;
+    core::async::StopSource _stop;
 
     /// Guards `_peers`, each peer's `host`/`port`, and `_lifecycle`.
     ///
@@ -449,7 +450,7 @@ class RaftPeerTransport final: public IRaftTransport
     /// reason at all.
     ///
     /// Held only across the map operation, and never across a push, a dial, a write
-    /// or a socket close: `ISocket::Close` resumes a parked sender *inline* on epoll
+    /// or a socket close: `core::net::ISocket::Close` resumes a parked sender *inline* on epoll
     /// and kqueue, so a lock held across it would be held across arbitrary sender
     /// code — with `Send`, and therefore the driver's mutex, waiting behind it.
     /// Taking a `Peer*` under the lock and using it outside is safe because a peer
@@ -480,7 +481,7 @@ class RaftPeerTransport final: public IRaftTransport
     std::atomic<std::size_t> _connected { 0 };
 
     /// How many senders are still running. The cross-thread view of the same
-    /// question `Task::IsReady` answers, which cannot be asked from another
+    /// question `core::async::Task::IsReady` answers, which cannot be asked from another
     /// thread while the reactor may be resuming it.
     std::atomic<std::size_t> _sendersRunning { 0 };
 

@@ -30,7 +30,7 @@ namespace FastCache
 /// operator was trying to *reduce* memory. Past the cap, entries are dropped and
 /// counted: keyspace notifications are best-effort in redis too, and a bounded
 /// loss the daemon can account for beats an unbounded buffer it cannot. Which end
-/// goes is the same choice `AsyncQueueOverflow::DropNewest` names — the entries
+/// goes is the same choice `core::async::AsyncQueueOverflow::DropNewest` names — the entries
 /// already queued are the ones a subscriber is closest to receiving.
 class ReclaimLog final: public IReclaimLog
 {

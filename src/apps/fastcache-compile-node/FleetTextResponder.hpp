@@ -52,7 +52,7 @@ class FleetTextResponder final: public IFrameResponder
                        IMetricsSink& metrics) noexcept;
 
     /// @copydoc IFrameResponder::Answer
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///

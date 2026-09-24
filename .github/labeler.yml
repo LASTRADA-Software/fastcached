@@ -69,8 +69,7 @@ area/protocol:
 area/net:
   - changed-files:
       - any-glob-to-any-file:
-          - 'src/FastCache/Net/**'
-          - 'src/FastCache/Async/**'
+          - 'src/FastCache/Transport/**'
           - 'src/FastCache/Server/**'
 
 area/storage:

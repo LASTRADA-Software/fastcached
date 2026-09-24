@@ -76,7 +76,7 @@ namespace
     /// @param held Every registration this node is trying to hold.
     /// @param accepted How many entries a scheduler took this round.
     void PublishRegistration(NodeRuntimeState& state,
-                             IClock const& clock,
+                             core::platform::IClock const& clock,
                              std::vector<Cc::WorkerRegistrar> const& held,
                              std::size_t accepted)
     {
@@ -277,7 +277,7 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
                                               parts.leaseRoster,
                                               parts.announced,
                                               parts.activation,
-                                              DefaultSystemWallClock(),
+                                              core::platform::defaultSystemWallClock(),
                                               *leaseState,
                                               parts.metrics,
                                               parts.logger);
@@ -424,13 +424,13 @@ void WorkerTier::AnnounceAs(std::string endpoint)
     PublishToolchains(_runtime, _toolchains.size(), _discovered.entries.size());
 }
 
-WorkerHeartbeat WorkerTier::Launch(IClock const& statusClock)
+WorkerHeartbeat WorkerTier::Launch(core::platform::IClock const& statusClock)
 {
     return WorkerHeartbeat { std::jthread {
         [this, &statusClock](std::stop_token const& stop) { Heartbeat(stop, statusClock); } } };
 }
 
-void WorkerTier::Heartbeat(std::stop_token const& stop, IClock const& statusClock)
+void WorkerTier::Heartbeat(std::stop_token const& stop, core::platform::IClock const& statusClock)
 {
     // One sampler for the whole loop, not one per heartbeat: CPU utilization is a
     // difference between two readings, so a sampler per beat would report nothing,

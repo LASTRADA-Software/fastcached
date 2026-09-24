@@ -7,7 +7,6 @@
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Errors/ConsensusError.hpp>
 #include <FastCache/Core/Nonce.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Core/WireFields.hpp>
@@ -28,6 +27,8 @@
 #include <type_traits>
 #include <variant>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Consensus::RaftWire
 {
@@ -298,7 +299,7 @@ namespace Detail
     /// @return The ceiling, length prefixes included.
     [[nodiscard]] constexpr std::size_t HandshakeCeiling(std::initializer_list<std::size_t> fieldBytes) noexcept
     {
-        return Ranges::FoldLeft(fieldBytes, std::size_t { 0 }, [](std::size_t total, std::size_t bytes) {
+        return core::ranges::FoldLeft(fieldBytes, std::size_t { 0 }, [](std::size_t total, std::size_t bytes) {
             return total + WireFields::FieldPrefixSize + bytes;
         });
     }
@@ -368,7 +369,7 @@ inline constexpr std::size_t LogEntryFieldCount = 3;
 /// @return The descriptor, or nullptr when this build does not know the type.
 [[nodiscard]] constexpr MessageDescriptor const* FindMessage(std::uint8_t kindRaw) noexcept
 {
-    return FindOrNull(
+    return core::findOrNull(
         MessageTable, kindRaw, [](MessageDescriptor const& row) { return static_cast<std::uint8_t>(row.type); });
 }
 

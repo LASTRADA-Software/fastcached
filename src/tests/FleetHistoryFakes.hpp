@@ -17,10 +17,10 @@ namespace FastCache::Testing
 
 /// A wall clock a case can place, so a bucket boundary is a decision rather than a
 /// race with the machine this runs on.
-class PlacedWallClock final: public IWallClock
+class PlacedWallClock final: public core::platform::IWallClock
 {
   public:
-    [[nodiscard]] std::chrono::system_clock::time_point Now() const noexcept override
+    [[nodiscard]] std::chrono::system_clock::time_point now() const noexcept override
     {
         std::scoped_lock const lock { _mutex };
         return _now;
@@ -41,7 +41,7 @@ class PlacedWallClock final: public IWallClock
     }
 
   private:
-    /// Guarded like `ManualClock`, and for the same reason: a placed clock is driven
+    /// Guarded like `core::platform::ManualClock`, and for the same reason: a placed clock is driven
     /// by the case's own thread while a production component reads it from one of
     /// its own. `FleetSampler`'s constructor starts a thread that samples
     /// immediately, so every case that injects this fake and then moves it races the

@@ -40,8 +40,9 @@
 #     whose init-statement or range holds one is still quiet;
 #   * a `while (` whose condition calls `.load(` or `->load(`;
 #   * a `while (` whose body STARTS with `co_await` of `SleepFor`, `SleepUntil` or `ResumeOn`,
-#     braced or not, whatever its condition reads. A site both rules match is one site,
-#     reported by this rule.
+#     or of core-cpp's spellings of the same parks since #1596 -- `core::net::sleepUntil` and a
+#     loop's `delay` member, reached through `::`, `->` or `.` -- braced or not, whatever its
+#     condition reads. A site both rules match is one site, reported by this rule.
 #
 # ## What it does NOT cover, said here so nobody over-applies it
 #
@@ -172,9 +173,6 @@ set(FastCachedTestLoopExemptions
     "loop|src/apps/fastcache-compile-node/NodeToolchains.cpp|index = next.fetch_add(1)|The toolchain survey's work-stealing walk, and the same fact as ParallelFor.cpp above: the indices this thread sees are the ones no sibling claimed first. A fingerprint probe spawns a compiler, so the durations are wildly uneven and a fixed slice per thread is measurably worse -- which is why the shape is what it is rather than an oversight."
     "loop|src/FastCache/Cli/UsageDoc.cpp|auto at = out.find(token)|A find-and-replace walk, and it is not merely a scan: the body calls out.replace, so each search runs over a string the previous iteration rewrote. The resume offset is at + value.size() rather than at + token.size() for exactly that reason -- it steps past the REPLACEMENT, so a token whose value contains it does not expand forever. No range over the original text can express a walk whose subject changes underneath it."
     "loop|src/apps/fastcache-cli/DashboardPanel.cpp|at = note.find(DeltaMark)|The same shape as UsageDoc.cpp above, with the mutation on the other side: the body calls note.remove_prefix, so the view being searched shrinks each iteration and the unqualified find always looks from the start of what is left. A range over the original note would walk bytes this loop has already consumed."
-    "loop|src/FastCache/Net/HealthProbe.cpp|addrinfo const* it = results|getaddrinfo answers with a C singly-linked list: no size and no iterator, so the ai_next step in the head IS the sequence and nullptr is its end. C++23 has no standard view over a nullptr-terminated list -- the gap the ProcessRunner.cpp rows above record for the environment -- and the head's step is a constant one, so a `for` states it honestly. A `while` would move it to the foot of a body whose `continue`, taken for a candidate that yields no socket, would then skip it and never end."
-    "loop|src/FastCache/Net/SocketAddress.cpp|addrinfo const* ai = head|The getaddrinfo result list again, walked as HealthProbe.cpp's is and for the same reason: the ai_next step in the head is the only way to the next entry, no standard view walks a nullptr-terminated C list, and the body's `continue` for an address too long for the endpoint storage would skip that step in a `while`."
-    "loop|src/FastCache/Net/UdpSocket.cpp|auto const* candidate = resolved|The getaddrinfo result list, as in HealthProbe.cpp: the ai_next step is the sequence, no standard view walks it, and the body continues past a candidate that yields no socket, which a `while` would turn into a loop that never ends."
     "loop|src/FastCache/Platform/LocalAddresses.cpp|auto const* adapter = head|GetAdaptersAddresses answers with a C linked list of adapters, each holding a C linked list of unicast addresses: no size and no iterator at either level, so each head's Next step IS the sequence and nullptr its end. No standard view walks a nullptr-terminated list -- the gap the ProcessRunner.cpp rows record -- and a `while` would move a constant step from the head to a foot that the next `continue` anybody writes skips."
     "loop|src/FastCache/Platform/LocalAddresses.cpp|auto const* unicast = adapter->FirstUnicastAddress|The inner half of the adapter walk the row above describes: one adapter's unicast addresses, the same nullptr-terminated Next list, exempt for the same reason."
     "loop|src/FastCache/Platform/LocalAddresses.cpp|auto const* entry = head|getifaddrs answers with a C linked list threaded through ifa_next -- the POSIX twin of the adapter walk above, and exempt for the same reason: the head's step is the sequence, and no standard view walks a nullptr-terminated list."
@@ -206,9 +204,9 @@ set(spinPattern "(^|[^A-Za-z0-9_])while[ \t\r\n]*\\(${whileCondition}(\\.|->)loa
 set(loopPatternAnchored "^for[ \t\r\n]*\\(${headerElement}*;${headerElement}*;")
 set(spinPatternAnchored "^while[ \t\r\n]*\\(${whileCondition}(\\.|->)load[ \t\r\n]*\\(")
 set(pollPattern
-    "(^|[^A-Za-z0-9_])while[ \t\r\n]*\\(${whileCondition}\\)[ \t\r\n]*\\{?[ \t\r\n]*co_await[ \t\r\n]+([A-Za-z_][A-Za-z0-9_]*[ \t\r\n]*::[ \t\r\n]*)*(SleepFor|SleepUntil|ResumeOn)[^A-Za-z0-9_]")
+    "(^|[^A-Za-z0-9_])while[ \t\r\n]*\\(${whileCondition}\\)[ \t\r\n]*\\{?[ \t\r\n]*co_await[ \t\r\n]+([A-Za-z_][A-Za-z0-9_]*[ \t\r\n]*(::|->|\\.)[ \t\r\n]*)*(SleepFor|SleepUntil|ResumeOn|sleepUntil|delay)[^A-Za-z0-9_]")
 set(pollPatternAnchored
-    "^while[ \t\r\n]*\\(${whileCondition}\\)[ \t\r\n]*\\{?[ \t\r\n]*co_await[ \t\r\n]+([A-Za-z_][A-Za-z0-9_]*[ \t\r\n]*::[ \t\r\n]*)*(SleepFor|SleepUntil|ResumeOn)[^A-Za-z0-9_]")
+    "^while[ \t\r\n]*\\(${whileCondition}\\)[ \t\r\n]*\\{?[ \t\r\n]*co_await[ \t\r\n]+([A-Za-z_][A-Za-z0-9_]*[ \t\r\n]*(::|->|\\.)[ \t\r\n]*)*(SleepFor|SleepUntil|ResumeOn|sleepUntil|delay)[^A-Za-z0-9_]")
 
 # ---------------------------------------------------------------------------
 # Exemption rows, checked for shape before anything is decided from them.

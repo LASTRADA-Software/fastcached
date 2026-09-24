@@ -7,14 +7,13 @@
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/Ed25519.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/MembershipWire.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 #include <FastCache/Metrics/StatsReadingCodec.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -34,6 +33,8 @@
 #include <utility>
 #include <vector>
 
+#include <core/Ranges.hpp>
+#include <core/net/BlockingSocket.hpp>
 #include <tests/HexBytes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -1744,7 +1745,7 @@ namespace
 {
     auto const attempts = gatherer.Gather();
     auto const* const metrics =
-        FindIfOrNull(attempts, [](StatsAttempt const& attempt) { return attempt.origin == StatsOrigin::Metrics; });
+        core::findIfOrNull(attempts, [](StatsAttempt const& attempt) { return attempt.origin == StatsOrigin::Metrics; });
     REQUIRE(metrics != nullptr);
     REQUIRE_FALSE(metrics->asked);
     return metrics->note;
@@ -1849,7 +1850,8 @@ TEST_CASE("the stats ladder records where it asked each source, and no address f
 
     auto const attempts = gatherer.Gather();
     auto const whereOf = [&attempts](StatsOrigin origin) {
-        auto const* attempt = FindIfOrNull(attempts, [origin](StatsAttempt const& one) { return one.origin == origin; });
+        auto const* attempt =
+            core::findIfOrNull(attempts, [origin](StatsAttempt const& one) { return one.origin == origin; });
         return attempt == nullptr ? std::optional<std::string> {} : std::optional<std::string> { attempt->where };
     };
     CHECK(whereOf(StatsOrigin::Metrics) == std::string {});
@@ -1865,9 +1867,9 @@ TEST_CASE("the stats ladder records where it asked /metrics, whatever the scrape
     // DISTINGUISHES: the attempt was asked and failed, and still says where; nothing about the address comes
     // from the reply, because there is none.
     auto listener = BlockingListener::Bind("127.0.0.1", 0);
-    if (listener == nullptr || !listener->IsBound() || listener->BoundPort() == 0)
+    if (listener == nullptr || !listener->IsBound() || listener->boundPort() == 0)
         SKIP("this host would not bind a loopback listener on any port; the /metrics rung cannot be dialled here");
-    auto const admin = Endpoint { .host = "127.0.0.1", .port = listener->BoundPort() };
+    auto const admin = Endpoint { .host = "127.0.0.1", .port = listener->boundPort() };
     auto gatherer =
         LadderGatherer { admin,
                          Endpoint { .host = "10.0.0.4", .port = 6674 },
@@ -1877,7 +1879,8 @@ TEST_CASE("the stats ladder records where it asked /metrics, whatever the scrape
                          nullptr };
 
     auto const attempts = gatherer.Gather();
-    auto const* metrics = FindIfOrNull(attempts, [](StatsAttempt const& one) { return one.origin == StatsOrigin::Metrics; });
+    auto const* metrics =
+        core::findIfOrNull(attempts, [](StatsAttempt const& one) { return one.origin == StatsOrigin::Metrics; });
     REQUIRE(metrics != nullptr);
     CHECK(metrics->asked);
     CHECK_FALSE(metrics->record.has_value());

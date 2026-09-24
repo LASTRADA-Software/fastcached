@@ -15,7 +15,7 @@ TEST_CASE("What a connection is handed is destructible without touching anything
     // that stops with a connection chain parked on it frees that chain from its own
     // destructor (#1025), and a destructor body runs before the members declared beside
     // it -- so an abandoned connection frame unwinds AFTER the listeners, the servers,
-    // the expiry pool, the reaper and the per-bind `TlsContext` are gone. A destroyed
+    // the expiry pool, the reaper and the per-bind `core::net::ITlsContext` are gone. A destroyed
     // coroutine frame runs no user code except destructors, which is what makes trivial
     // destructibility the exact test rather than a stand-in for one.
     //

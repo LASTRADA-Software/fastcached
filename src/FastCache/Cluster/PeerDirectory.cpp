@@ -24,7 +24,10 @@ namespace
     }
 } // namespace
 
-PeerDirectory::PeerDirectory(IClock& clock, std::string clusterId, std::string selfNodeId, std::chrono::seconds expiry):
+PeerDirectory::PeerDirectory(core::platform::IClock& clock,
+                             std::string clusterId,
+                             std::string selfNodeId,
+                             std::chrono::seconds expiry):
     _clock { clock },
     _clusterId { std::move(clusterId) },
     _selfNodeId { std::move(selfNodeId) },

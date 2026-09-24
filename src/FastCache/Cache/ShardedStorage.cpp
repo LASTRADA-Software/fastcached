@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/ShardedStorage.hpp>
-#include <FastCache/Core/Profiling.hpp>
 
 #include <cstddef>
 #include <functional>
@@ -11,6 +10,8 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <utility>
+
+#include <core/Profiling.hpp>
 
 namespace FastCache
 {
@@ -75,9 +76,9 @@ std::size_t ShardedStorage::ShardIndexFor(std::string_view key) const noexcept
     return static_cast<std::size_t>((mixed * _shards.size()) >> 32);
 }
 
-std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key, core::platform::SteadyTimePoint now)
 {
-    FC_ZONE_SCOPED_N("ShardedStorage::Get");
+    CORE_ZONE_SCOPED_N("ShardedStorage::Get");
     auto& shard = *_shards[ShardIndexFor(key)];
 
     // Backends whose Get mutates shared state on read (Strict-mode LRU splice,
@@ -170,24 +171,30 @@ std::expected<GetResult, StorageError> ShardedStorage::Get(std::string_view key,
 std::expected<CasToken, StorageError> ShardedStorage::Set(std::string_view key,
                                                           std::vector<std::byte> value,
                                                           std::uint32_t flags,
-                                                          TimePoint expiry)
+                                                          core::platform::SteadyTimePoint expiry)
 {
-    FC_ZONE_SCOPED_N("ShardedStorage::Set");
+    CORE_ZONE_SCOPED_N("ShardedStorage::Set");
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
     return shard.storage->Set(key, std::move(value), flags, expiry);
 }
 
-std::expected<CasToken, StorageError> ShardedStorage::Add(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> ShardedStorage::Add(std::string_view key,
+                                                          std::vector<std::byte> value,
+                                                          std::uint32_t flags,
+                                                          core::platform::SteadyTimePoint expiry,
+                                                          core::platform::SteadyTimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
     return shard.storage->Add(key, std::move(value), flags, expiry, now);
 }
 
-std::expected<CasToken, StorageError> ShardedStorage::Replace(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> ShardedStorage::Replace(std::string_view key,
+                                                              std::vector<std::byte> value,
+                                                              std::uint32_t flags,
+                                                              core::platform::SteadyTimePoint expiry,
+                                                              core::platform::SteadyTimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
@@ -197,7 +204,7 @@ std::expected<CasToken, StorageError> ShardedStorage::Replace(
 std::expected<CasToken, StorageError> ShardedStorage::Append(std::string_view key,
                                                              std::span<std::byte const> suffix,
                                                              CasToken expected,
-                                                             TimePoint now)
+                                                             core::platform::SteadyTimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
@@ -207,7 +214,7 @@ std::expected<CasToken, StorageError> ShardedStorage::Append(std::string_view ke
 std::expected<CasToken, StorageError> ShardedStorage::Prepend(std::string_view key,
                                                               std::span<std::byte const> prefix,
                                                               CasToken expected,
-                                                              TimePoint now)
+                                                              core::platform::SteadyTimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
@@ -218,8 +225,8 @@ std::expected<CasToken, StorageError> ShardedStorage::CompareAndSwap(std::string
                                                                      CasToken expected,
                                                                      std::vector<std::byte> value,
                                                                      std::uint32_t flags,
-                                                                     TimePoint expiry,
-                                                                     TimePoint now)
+                                                                     core::platform::SteadyTimePoint expiry,
+                                                                     core::platform::SteadyTimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
@@ -229,35 +236,37 @@ std::expected<CasToken, StorageError> ShardedStorage::CompareAndSwap(std::string
 std::expected<IStorage::IncrResult, StorageError> ShardedStorage::IncrementOrInitialize(std::string_view key,
                                                                                         std::uint64_t magnitude,
                                                                                         bool decrement,
-                                                                                        TimePoint now)
+                                                                                        core::platform::SteadyTimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
     return shard.storage->IncrementOrInitialize(key, magnitude, decrement, now);
 }
 
-std::expected<void, StorageError> ShardedStorage::Delete(std::string_view key, TimePoint now)
+std::expected<void, StorageError> ShardedStorage::Delete(std::string_view key, core::platform::SteadyTimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
     return shard.storage->Delete(key, now);
 }
 
-std::expected<CasToken, StorageError> ShardedStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
+std::expected<CasToken, StorageError> ShardedStorage::Touch(std::string_view key,
+                                                            core::platform::SteadyTimePoint newExpiry,
+                                                            core::platform::SteadyTimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
     return shard.storage->Touch(key, newExpiry, now);
 }
 
-std::expected<GetResult, StorageError> ShardedStorage::Peek(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> ShardedStorage::Peek(std::string_view key, core::platform::SteadyTimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
     return shard.storage->Peek(key, now);
 }
 
-std::expected<bool, StorageError> ShardedStorage::Prefetch(std::string_view key, TimePoint now)
+std::expected<bool, StorageError> ShardedStorage::Prefetch(std::string_view key, core::platform::SteadyTimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
@@ -265,15 +274,17 @@ std::expected<bool, StorageError> ShardedStorage::Prefetch(std::string_view key,
 }
 
 std::expected<CasToken, StorageError> ShardedStorage::MarkStale(std::string_view key,
-                                                                std::optional<TimePoint> newExpiry,
-                                                                TimePoint now)
+                                                                std::optional<core::platform::SteadyTimePoint> newExpiry,
+                                                                core::platform::SteadyTimePoint now)
 {
     auto& shard = *_shards[ShardIndexFor(key)];
     std::unique_lock const lock { shard.mu };
     return shard.storage->MarkStale(key, newExpiry, now);
 }
 
-std::expected<GetResult, StorageError> ShardedStorage::GetAndTouch(std::string_view key, TimePoint newExpiry, TimePoint now)
+std::expected<GetResult, StorageError> ShardedStorage::GetAndTouch(std::string_view key,
+                                                                   core::platform::SteadyTimePoint newExpiry,
+                                                                   core::platform::SteadyTimePoint now)
 {
     // Hold the shard lock across both inner calls so the touch and the
     // read form a single atomic critical section — no concurrent writer
@@ -286,7 +297,9 @@ std::expected<GetResult, StorageError> ShardedStorage::GetAndTouch(std::string_v
     return shard.storage->Get(key, now);
 }
 
-std::expected<void, StorageError> ShardedStorage::CompareAndDelete(std::string_view key, CasToken expected, TimePoint now)
+std::expected<void, StorageError> ShardedStorage::CompareAndDelete(std::string_view key,
+                                                                   CasToken expected,
+                                                                   core::platform::SteadyTimePoint now)
 {
     // Compare and delete under one shard-lock acquisition so a concurrent
     // writer cannot replace the value between the CAS check and the erase.
@@ -302,7 +315,7 @@ std::expected<void, StorageError> ShardedStorage::CompareAndDelete(std::string_v
     return shard.storage->Delete(key, now);
 }
 
-std::expected<bool, StorageError> ShardedStorage::ClearExpiry(std::string_view key, TimePoint now)
+std::expected<bool, StorageError> ShardedStorage::ClearExpiry(std::string_view key, core::platform::SteadyTimePoint now)
 {
     // Peek + Touch under one shard-lock acquisition so a concurrent
     // SETEX cannot slip a new TTL in between (the TOCTOU window the
@@ -314,9 +327,9 @@ std::expected<bool, StorageError> ShardedStorage::ClearExpiry(std::string_view k
         return std::unexpected(peeked.error());
     if (!peeked->found)
         return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
-    if (peeked->entry.expiry == TimePoint::max())
+    if (peeked->entry.expiry == core::platform::SteadyTimePoint::max())
         return false; // present but had no TTL
-    auto const touched = shard.storage->Touch(key, TimePoint::max(), now);
+    auto const touched = shard.storage->Touch(key, core::platform::SteadyTimePoint::max(), now);
     if (!touched.has_value())
         return std::unexpected(touched.error());
     return true;
@@ -325,7 +338,7 @@ std::expected<bool, StorageError> ShardedStorage::ClearExpiry(std::string_view k
 std::expected<CasToken, StorageError> ShardedStorage::Update(
     std::string_view key,
     std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
-    TimePoint now)
+    core::platform::SteadyTimePoint now)
 {
     // Hold the shard's exclusive lock across the whole read-modify-write so the
     // decode → mutate → re-encode → store sequence is one atomic critical
@@ -345,7 +358,8 @@ std::expected<CasToken, StorageError> ShardedStorage::Update(
             // Preserve the prior entry's expiry unless the callback
             // explicitly overrides via outcome->newExpiry (redis INCR/
             // SADD semantics: TTL survives the read-modify-write).
-            auto const expiry = outcome->newExpiry.value_or(current->found ? current->entry.expiry : TimePoint::max());
+            auto const expiry =
+                outcome->newExpiry.value_or(current->found ? current->entry.expiry : core::platform::SteadyTimePoint::max());
             return shard.storage->Set(key, std::move(outcome->value), outcome->flags, expiry);
         }
         case UpdateAction::Delete:
@@ -358,7 +372,7 @@ std::expected<CasToken, StorageError> ShardedStorage::Update(
     return CasToken { 0 };
 }
 
-void ShardedStorage::FlushWithGeneration(TimePoint effectiveAt)
+void ShardedStorage::FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt)
 {
     // Hold every shard's exclusive lock so the generation bump is
     // atomic from any observer's perspective.
@@ -369,7 +383,7 @@ void ShardedStorage::FlushWithGeneration(TimePoint effectiveAt)
     }
 }
 
-PurgeOutcome ShardedStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
+PurgeOutcome ShardedStorage::PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget)
 {
     PurgeOutcome total {};
     auto const shardCount = _shards.size();

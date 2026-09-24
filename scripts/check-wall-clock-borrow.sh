@@ -147,7 +147,10 @@ refuse()
     exit 1
 }
 
-# The one file allowed to hold the raw pointer: `WallClockRef` itself is what stores it.
+# The one file allowed to hold the raw pointer: `WallClockRef` itself is what stores it. That
+# is core-cpp's `<core/platform/Clock.hpp>` since #1596, outside this tree, so the exemption
+# matches nothing here -- and a member may be spelled with its namespace, which the patterns
+# below accept, since outside core-cpp that is how the type is named.
 exempt="src/FastCache/Core/Clock.hpp"
 
 # File set, with the MODE stated in the output and asserted on both sides -- a
@@ -223,9 +226,9 @@ scan_sources()
             out = out line
             line = ""
         }
-        if (FILENAME != exempt && out ~ /^[[:space:]]*IWallClock[[:space:]]*(const[[:space:]]*)?[*&][[:space:]]*_[A-Za-z]/)
+        if (FILENAME != exempt && out ~ /^[[:space:]]*(core::platform::)?IWallClock[[:space:]]*(const[[:space:]]*)?[*&][[:space:]]*_[A-Za-z]/)
             printf "R %s:%d:%s\n", FILENAME, FNR, out
-        if (out ~ /^[[:space:]]*WallClockRef[[:space:]]+_[A-Za-z]/)
+        if (out ~ /^[[:space:]]*(core::platform::)?WallClockRef[[:space:]]+_[A-Za-z]/)
             guarded = guarded + 1
     }
     END { printf "G %d\n", guarded + 0 }

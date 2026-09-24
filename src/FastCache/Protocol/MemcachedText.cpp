@@ -3,7 +3,6 @@
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
-#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 #include <FastCache/Protocol/MemcachedMeta.hpp>
@@ -23,6 +22,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <core/Profiling.hpp>
 
 namespace FastCache
 {
@@ -103,7 +104,7 @@ namespace
         return token == "noreply";
     }
 
-    Task<bool> WriteError(ISocket* socket, std::string_view code, std::string_view detail = {})
+    core::async::Task<bool> WriteError(core::net::ISocket* socket, std::string_view code, std::string_view detail = {})
     {
         std::string line { code };
         if (!detail.empty())
@@ -115,7 +116,7 @@ namespace
         co_return co_await WriteAll(socket, line);
     }
 
-    Task<bool> WriteLine(ISocket* socket, std::string_view text)
+    core::async::Task<bool> WriteLine(core::net::ISocket* socket, std::string_view text)
     {
         std::string line { text };
         line.append(Crlf);
@@ -218,7 +219,7 @@ namespace
     /// @param socket Destination socket.
     /// @param state  Collected hits + formatted headers (moved in; kept alive).
     /// @return True if the full reply was written.
-    Task<bool> WriteGatheredValues(ISocket* socket, std::shared_ptr<GatherState> state)
+    core::async::Task<bool> WriteGatheredValues(core::net::ISocket* socket, std::shared_ptr<GatherState> state)
     {
         std::vector<std::span<std::byte const>> segments;
         segments.reserve((state->hits.size() * 3) + 1);
@@ -232,7 +233,10 @@ namespace
         co_return co_await WriteAllVectored(socket, segments, std::move(state));
     }
 
-    Task<bool> HandleGet(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> keys, bool includeCas)
+    core::async::Task<bool> HandleGet(core::net::ISocket* socket,
+                                      CacheEngine* engine,
+                                      std::span<std::string_view const> keys,
+                                      bool includeCas)
     {
         // Fast path for the overwhelmingly common single-key `get`: assemble
         // the reply with frame-local state and no heap allocation beyond the
@@ -262,7 +266,7 @@ namespace
         {
             // Synchronous lookup loop — scoped so the zone ends before the
             // co_await below (a zone must never straddle a suspension point).
-            FC_ZONE_SCOPED_N("memcached.HandleGet.lookup");
+            CORE_ZONE_SCOPED_N("memcached.HandleGet.lookup");
             state->hits.reserve(keys.size());
             state->headers.reserve(keys.size());
             for (auto const key: keys)
@@ -278,12 +282,12 @@ namespace
         co_return co_await WriteGatheredValues(socket, std::move(state));
     }
 
-    Task<bool> HandleStorage(ISocket* socket,
-                             CacheEngine* engine,
-                             ByteReader* reader,
-                             std::string_view commandName,
-                             std::span<std::string_view const> args,
-                             SessionContext session)
+    core::async::Task<bool> HandleStorage(core::net::ISocket* socket,
+                                          CacheEngine* engine,
+                                          ByteReader* reader,
+                                          std::string_view commandName,
+                                          std::span<std::string_view const> args,
+                                          SessionContext session)
     {
         auto const isCas = commandName == "cas";
         StorageArgs parsed {};
@@ -315,7 +319,7 @@ namespace
         {
             // Synchronous storage dispatch — scoped so the zone closes before
             // any co_await below (a zone must not straddle a suspension point).
-            FC_ZONE_SCOPED_N("memcached.HandleStorage.dispatch");
+            CORE_ZONE_SCOPED_N("memcached.HandleStorage.dispatch");
             // Re-publish the source tag here: the payload read above is a
             // co_await that may have let another connection run and overwrite
             // the thread-local. This block is co_await-free, so the tag stays
@@ -367,14 +371,16 @@ namespace
         }
     }
 
-    Task<bool> HandleDelete(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
+    core::async::Task<bool> HandleDelete(core::net::ISocket* socket,
+                                         CacheEngine* engine,
+                                         std::span<std::string_view const> args)
     {
         if (args.empty())
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing key");
 
         bool const noreply = args.size() > 1 && IsNoReply(args.back());
         auto const result = [&] {
-            FC_ZONE_SCOPED_N("memcached.HandleDelete.dispatch");
+            CORE_ZONE_SCOPED_N("memcached.HandleDelete.dispatch");
             return engine->Delete(args[0]);
         }();
         if (noreply)
@@ -384,7 +390,10 @@ namespace
         co_return co_await WriteLine(socket, "NOT_FOUND");
     }
 
-    Task<bool> HandleIncrDecr(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args, bool isIncr)
+    core::async::Task<bool> HandleIncrDecr(core::net::ISocket* socket,
+                                           CacheEngine* engine,
+                                           std::span<std::string_view const> args,
+                                           bool isIncr)
     {
         if (args.size() < 2)
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing args");
@@ -395,7 +404,7 @@ namespace
 
         bool const noreply = args.size() > 2 && IsNoReply(args.back());
         auto const result = [&] {
-            FC_ZONE_SCOPED_N("memcached.HandleIncrDecr.dispatch");
+            CORE_ZONE_SCOPED_N("memcached.HandleIncrDecr.dispatch");
             return isIncr ? engine->Increment(args[0], delta) : engine->Decrement(args[0], delta);
         }();
         if (noreply)
@@ -413,7 +422,9 @@ namespace
         }
     }
 
-    Task<bool> HandleFlushAll(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
+    core::async::Task<bool> HandleFlushAll(core::net::ISocket* socket,
+                                           CacheEngine* engine,
+                                           std::span<std::string_view const> args)
     {
         std::uint32_t delay = 0;
         bool noreply = false;
@@ -536,7 +547,9 @@ namespace
         out.append(Crlf);
     }
 
-    Task<bool> HandleStats(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
+    core::async::Task<bool> HandleStats(core::net::ISocket* socket,
+                                        CacheEngine* engine,
+                                        std::span<std::string_view const> args)
     {
         auto const stats = engine->Snapshot();
         std::string out;
@@ -585,7 +598,9 @@ namespace
     }
 
     /// `touch <key> <exptime> [noreply]`.
-    Task<bool> HandleTouch(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
+    core::async::Task<bool> HandleTouch(core::net::ISocket* socket,
+                                        CacheEngine* engine,
+                                        std::span<std::string_view const> args)
     {
         if (args.size() < 2)
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing args");
@@ -603,7 +618,10 @@ namespace
     }
 
     /// `gat <exptime> <key>...` and `gats <exptime> <key>...`.
-    Task<bool> HandleGat(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args, bool includeCas)
+    core::async::Task<bool> HandleGat(core::net::ISocket* socket,
+                                      CacheEngine* engine,
+                                      std::span<std::string_view const> args,
+                                      bool includeCas)
     {
         if (args.size() < 2)
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing args");
@@ -632,7 +650,9 @@ namespace
     }
 
     /// `cache_memlimit <megabytes> [noreply]`.
-    Task<bool> HandleCacheMemlimit(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
+    core::async::Task<bool> HandleCacheMemlimit(core::net::ISocket* socket,
+                                                CacheEngine* engine,
+                                                std::span<std::string_view const> args)
     {
         if (args.empty())
             co_return co_await WriteError(socket, "CLIENT_ERROR", "missing megabytes argument");
@@ -658,10 +678,10 @@ std::string_view MemcachedTextHandler::ServerVersion() noexcept
     return ServerVersionBanner;
 }
 
-Task<void> MemcachedTextHandler::Run(ISocket* socket,
-                                     CacheEngine* engine,
-                                     std::vector<std::byte> primingBytes,
-                                     SessionContext session)
+core::async::Task<void> MemcachedTextHandler::Run(core::net::ISocket* socket,
+                                                  CacheEngine* engine,
+                                                  std::vector<std::byte> primingBytes,
+                                                  SessionContext session)
 {
     ByteReader reader { *socket, MaxLineBytes, MaxPayloadBytes };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
@@ -782,7 +802,7 @@ Task<void> MemcachedTextHandler::Run(ISocket* socket,
         // One command fully handled and its response written — mark the frame
         // so the Tracy viewer renders per-request timing. FrameMark is a
         // stackless timeline event, so it is safe inside this coroutine.
-        FC_FRAME_MARK;
+        CORE_FRAME_MARK;
     }
 }
 

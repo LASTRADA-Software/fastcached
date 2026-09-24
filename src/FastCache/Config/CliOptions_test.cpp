@@ -10,7 +10,6 @@
 #include <FastCache/Cli/UsageTestUtils.hpp>
 #include <FastCache/Config/CliParser.hpp>
 #include <FastCache/Config/ConfigMerge.hpp>
-#include <FastCache/Core/Ranges.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -27,6 +26,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <tests/ScratchPath.hpp>
 
 using namespace FastCache;
@@ -489,7 +489,7 @@ TEST_CASE("every spelling above names a row a file can carry", "[config][cli][op
     for (auto const& spelling: FileSpellings)
     {
         INFO("flag: " << spelling.flag);
-        auto const* const row = FindIfOrNull(
+        auto const* const row = core::findIfOrNull(
             CliOptions(), [&spelling](OptionSpec<CliResult> const& spec) { return spec.primary == spelling.flag; });
         REQUIRE(row != nullptr);
         CHECK_FALSE(row->yamlKey.empty());

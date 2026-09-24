@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Net/IConnector.hpp>
-#include <FastCache/Net/ISocket.hpp>
-
 #include <chrono>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+
+#include <core/net/IConnector.hpp>
+#include <core/net/ISocket.hpp>
 
 namespace FastCache::Node
 {
@@ -24,7 +24,7 @@ namespace FastCache::Node
 /// connector seam would let a test vary HOW the dial happens while the property is
 /// about WHAT the other end answered.
 ///
-/// Deliberately **not** an `IConnector`. `Cc::DialEndpointBlocking` takes a
+/// Deliberately **not** an `core::net::IConnector`. `Cc::DialEndpointBlocking` takes a
 /// `BlockingConnector&` by concrete type because its soundness rests on the connector
 /// resolving inline and never leaving its task suspended -- there the type IS the
 /// rule, and relaxing that parameter would delete a guard rather than widen one
@@ -47,10 +47,11 @@ class IEndpointDialer
     /// @param endpoint `host:port`; a bare port names no machine and is refused.
     /// @param options Ceiling on the dial.
     /// @return The connected socket, or nullptr when it could not be reached.
-    [[nodiscard]] virtual std::unique_ptr<ISocket> Dial(std::string_view endpoint, DialOptions options) = 0;
+    [[nodiscard]] virtual std::unique_ptr<core::net::ISocket> Dial(std::string_view endpoint,
+                                                                   core::net::DialOptions options) = 0;
 };
 
-/// The dialer production uses: a real `BlockingConnector`, constructed per dial.
+/// The dialer production uses: a real `core::net::BlockingConnector`, constructed per dial.
 ///
 /// Per dial rather than once: a redirect or a fallback moves the endpoint, and a
 /// connector carries socket-level timeouts for the dial it is about.
@@ -62,7 +63,8 @@ class BlockingEndpointDialer final: public IEndpointDialer
     explicit BlockingEndpointDialer(std::chrono::milliseconds ioTimeout) noexcept;
 
     /// @copydoc IEndpointDialer::Dial
-    [[nodiscard]] std::unique_ptr<ISocket> Dial(std::string_view endpoint, DialOptions options) override;
+    [[nodiscard]] std::unique_ptr<core::net::ISocket> Dial(std::string_view endpoint,
+                                                           core::net::DialOptions options) override;
 
   private:
     std::chrono::milliseconds _ioTimeout;
@@ -84,8 +86,8 @@ inline constexpr std::chrono::milliseconds OneShotIoTimeout { 10'000 };
 /// A connection, and which of several endpoints it reached.
 struct ReachedEndpoint
 {
-    std::unique_ptr<ISocket> socket; ///< Connected; never null.
-    std::string endpoint;            ///< Which endpoint answered, for every later diagnostic.
+    std::unique_ptr<core::net::ISocket> socket; ///< Connected; never null.
+    std::string endpoint;                       ///< Which endpoint answered, for every later diagnostic.
 };
 
 /// Dial @p endpoints in order and hand back the first that connects.
@@ -101,7 +103,7 @@ struct ReachedEndpoint
 /// @return The first connection and its endpoint, or nothing when none connected.
 [[nodiscard]] std::optional<ReachedEndpoint> DialFirstReachable(IEndpointDialer& dialer,
                                                                 std::span<std::string const> endpoints,
-                                                                DialOptions options);
+                                                                core::net::DialOptions options);
 
 /// Render a list of endpoints for a sentence an operator reads.
 /// @param endpoints The endpoints, in the order they were tried.

@@ -5,11 +5,9 @@
 #include "CodecEnvelope.hpp"
 #include "CompileJob.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
@@ -21,6 +19,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/net/ISocket.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Cc
 {
@@ -110,7 +111,7 @@ struct LeaseDecision
     /// How long this job may still usefully run, measured when the grant was checked.
     ///
     /// **A duration rather than the `expiresAt` instant it is derived from**, which is
-    /// this repository's standing rule and not a preference: a raw `TimePoint` on a
+    /// this repository's standing rule and not a preference: a raw `core::platform::SteadyTimePoint` on a
     /// report invites the consumer to subtract `now()` from it, which is right in
     /// production and silently wrong under every manual clock, because the two clocks
     /// agree about nothing. `WorkerInfo`'s heartbeat age is a duration for that reason
@@ -237,7 +238,7 @@ using LeaseValidator = std::function<LeaseDecision(std::string_view leaseToken, 
 ///        request, borrowed, and must outlive the validator -- as @p advertisedEndpoint must.
 [[nodiscard]] LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
                                                   IAdvertisedEndpointSource const& advertisedEndpoint,
-                                                  WallClockRef clock,
+                                                  core::platform::WallClockRef clock,
                                                   Distributed::WorkerLeaseState& lease,
                                                   IMetricsSink& metrics,
                                                   std::chrono::seconds slack = Distributed::LeaseTokenClockSkewSlack);
@@ -369,7 +370,7 @@ class WorkerProtocol
 ///
 /// Separate from `WorkerProtocol` because it is the one part of a worker that
 /// *initiates*: everything else answers. Split out so the answering half stays pure
-/// and this half can be driven against a scripted `ISocket`.
+/// and this half can be driven against a scripted `core::net::ISocket`.
 /// Why an announcement did not land, and where to take it instead.
 ///
 /// Two fields because they answer two different questions and a caller acts on
@@ -433,7 +434,8 @@ class WorkerRegistrar
     ///         internally; otherwise the refusal, carrying both the phrase to log
     ///         and -- when this was a `NotLeader` naming somewhere else -- the
     ///         endpoint to announce to instead.
-    [[nodiscard]] std::expected<void, AnnounceRefusal> Register(ISocket& scheduler, Credential const& credential = {});
+    [[nodiscard]] std::expected<void, AnnounceRefusal> Register(core::net::ISocket& scheduler,
+                                                                Credential const& credential = {});
 
     /// Report liveness and current load.
     ///
@@ -454,7 +456,7 @@ class WorkerRegistrar
     /// @return Nothing when accepted; otherwise the refusal. An empty `WorkerId()`
     ///         afterwards is the "register again" signal; a set `leader` is the
     ///         "announce somewhere else" one, and the two are independent.
-    [[nodiscard]] std::expected<void, AnnounceRefusal> Heartbeat(ISocket& scheduler,
+    [[nodiscard]] std::expected<void, AnnounceRefusal> Heartbeat(core::net::ISocket& scheduler,
                                                                  std::uint32_t inFlight,
                                                                  CompileCacheWire::LoadFields const& load = {},
                                                                  Credential const& credential = {});
@@ -482,7 +484,8 @@ class WorkerRegistrar
     /// @return Nothing when the scheduler accepted -- which includes it answering
     ///         `Ok` for an id it does not know, since that is the same end state --
     ///         otherwise the refusal, to be logged rather than acted on.
-    [[nodiscard]] std::expected<void, AnnounceRefusal> Withdraw(ISocket& scheduler, Credential const& credential = {});
+    [[nodiscard]] std::expected<void, AnnounceRefusal> Withdraw(core::net::ISocket& scheduler,
+                                                                Credential const& credential = {});
 
     /// The id the scheduler assigned, empty until a successful `Register`.
     [[nodiscard]] std::string const& WorkerId() const noexcept
@@ -582,7 +585,7 @@ class WorkerRegistrar
 /// @return The reply's payload on acceptance -- an encoded certified roster, or empty when the
 ///         scheduler has none to hand out -- or why it was refused and where the leader is.
 [[nodiscard]] std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(
-    ISocket& scheduler,
+    core::net::ISocket& scheduler,
     CredentialNotice& notice,
     std::string_view endpoint,
     CompileCacheWire::CapacityFields const& capacity,

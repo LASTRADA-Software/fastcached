@@ -2,7 +2,6 @@
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
@@ -19,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <tests/DeclaredCountBlob.hpp>
 #include <tests/ForeignGenerationValue.hpp>
 #include <tests/RetiredGenerations.hpp>
@@ -1272,14 +1272,14 @@ struct RowSetDelta
     RowSetDelta delta;
     for (auto const& row: after)
     {
-        auto const* const earlier = FindOrNull(before, row.row, &RowDigest::row);
+        auto const* const earlier = core::findOrNull(before, row.row, &RowDigest::row);
         if (earlier == nullptr)
             delta.added.push_back(row.row);
         else if (earlier->digest != row.digest)
             delta.changed.push_back(row.row);
     }
     for (auto const& row: before)
-        if (FindOrNull(after, row.row, &RowDigest::row) == nullptr)
+        if (core::findOrNull(after, row.row, &RowDigest::row) == nullptr)
             delta.removed.push_back(row.row);
     return delta;
 }
@@ -1379,11 +1379,11 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
 
     auto const live = ConformanceDigest();
 
-    // `FindOrNull` rather than an iterator: a `std::array` iterator is a raw pointer
+    // `core::findOrNull` rather than an iterator: a `std::array` iterator is a raw pointer
     // on libstdc++ and libc++ and a class type on MSVC's, so the spelling the
     // analyser asks for on one host does not compile on another. That argument is
     // the helper's own, which is why this calls it instead of restating it.
-    auto const* const pinnedRow = FindOrNull(StoredValueGenerations, CompileValueVersion, &StoredValueGeneration::key);
+    auto const* const pinnedRow = core::findOrNull(StoredValueGenerations, CompileValueVersion, &StoredValueGeneration::key);
     {
         // Scoped, so this note appears only when it is the thing that failed.
         INFO("CompileValueVersion is " << static_cast<unsigned>(CompileValueVersion)
@@ -1437,7 +1437,7 @@ TEST_CASE("The canonicalization spec is pinned to the generation byte that names
 
 TEST_CASE("Every corpus row is frozen under the live generation")
 {
-    auto const* const frozen = FindOrNull(FrozenGenerations, CompileValueVersion, &FrozenGeneration::generation);
+    auto const* const frozen = core::findOrNull(FrozenGenerations, CompileValueVersion, &FrozenGeneration::generation);
     {
         INFO("CompileValueVersion is " << static_cast<unsigned>(CompileValueVersion)
                                        << " and no frozen row table names it. A bump freezes the new "
@@ -1522,8 +1522,8 @@ TEST_CASE("A generation bump names the rows it moved")
     // generation is frozen.
     for (auto const& bump: GenerationBumps)
     {
-        auto const* const before = FindOrNull(FrozenGenerations, bump.from, &FrozenGeneration::generation);
-        auto const* const after = FindOrNull(FrozenGenerations, bump.to, &FrozenGeneration::generation);
+        auto const* const before = core::findOrNull(FrozenGenerations, bump.from, &FrozenGeneration::generation);
+        auto const* const after = core::findOrNull(FrozenGenerations, bump.to, &FrozenGeneration::generation);
         INFO("bump " << static_cast<unsigned>(bump.from) << " to " << static_cast<unsigned>(bump.to)
                      << " names a generation with no frozen rows");
         REQUIRE(before != nullptr);

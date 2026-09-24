@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -64,7 +65,7 @@ class ToolchainHashProgress
     /// @param logger Where the lines go; must outlive this.
     ToolchainHashProgress(std::size_t total,
                           std::chrono::milliseconds interval,
-                          IClock const& clock,
+                          core::platform::IClock const& clock,
                           ILogger& logger) noexcept:
         _total { total },
         _interval { interval },
@@ -128,12 +129,12 @@ class ToolchainHashProgress
     /// Whole numbers because the question is an order of magnitude -- "20 file/s or
     /// 2000" -- and a rate printed to two decimals invites a reader to compare two
     /// runs that were never comparable. Zero elapsed answers 0 rather than dividing:
-    /// a `ManualClock` that has not been advanced is an ordinary thing for a test to
+    /// a `core::platform::ManualClock` that has not been advanced is an ordinary thing for a test to
     /// present, and a rate over no time is not a large rate.
     /// @param count How many files in the window.
     /// @param elapsed How long the window was.
     /// @return Files per second.
-    [[nodiscard]] static std::uint64_t RatePerSecond(std::size_t count, Duration elapsed) noexcept
+    [[nodiscard]] static std::uint64_t RatePerSecond(std::size_t count, core::platform::SteadyDuration elapsed) noexcept
     {
         auto const ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
         if (ms <= 0)
@@ -143,18 +144,18 @@ class ToolchainHashProgress
 
     std::size_t _total;
     std::chrono::milliseconds _interval;
-    IClock const& _clock;
+    core::platform::IClock const& _clock;
     ILogger& _logger;
-    TimePoint _startedAt;
+    core::platform::SteadyTimePoint _startedAt;
 
     std::atomic<std::size_t> _done { 0 };
     // The start of the window the next line will report on, and how many files were
     // done then. Written only by the thread that won the exchange below, which is
     // what makes plain atomics enough: the next winner cannot run until the clock has
     // passed a deadline this one already published.
-    std::atomic<TimePoint> _windowAt;
+    std::atomic<core::platform::SteadyTimePoint> _windowAt;
     std::atomic<std::size_t> _windowDone { 0 };
-    std::atomic<TimePoint> _nextAt;
+    std::atomic<core::platform::SteadyTimePoint> _nextAt;
 };
 
 } // namespace FastCache::Node

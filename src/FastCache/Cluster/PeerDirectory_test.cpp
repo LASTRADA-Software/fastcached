@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/PeerDirectory.hpp>
-#include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
 #include <cstddef>
 #include <string>
+
+#include <core/platform/Clock.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cluster;
@@ -26,7 +27,7 @@ namespace
 
 TEST_CASE("PeerDirectory records a peer and forgets it when its beacons stop", "[cluster][discovery]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     PeerDirectory directory { clock, "prod", "self", 90s };
 
     CHECK(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
@@ -46,7 +47,7 @@ TEST_CASE("PeerDirectory records a peer and forgets it when its beacons stop", "
 
 TEST_CASE("PeerDirectory ignores another cluster and its own beacons", "[cluster][discovery]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     PeerDirectory directory { clock, "prod", "self" };
 
     // Two unrelated fleets on one segment must not disturb each other.
@@ -69,7 +70,7 @@ TEST_CASE("PeerDirectory remembers only a peer it could name", "[cluster][discov
     // The regression for #159, at the door it enters by -- `BeaconOutcome` carries
     // why it is this door and not the proposer. One fixture for the rule and its two
     // edges, because that is what they are.
-    ManualClock clock;
+    core::platform::ManualClock clock;
 
     SECTION("a peer whose claim is not text")
     {
@@ -120,7 +121,7 @@ TEST_CASE("PeerDirectory keeps a peer it can name when the next beacon is one it
     // loses its authenticated bit. Letting an unrecordable claim take that path
     // would let anything on the segment un-admit a proved peer by beaconing
     // garbage in its name once per interval.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     PeerDirectory directory { clock, "prod", "self" };
 
     REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
@@ -140,7 +141,7 @@ TEST_CASE("PeerDirectory keeps 'seen' and 'proved' apart", "[cluster][discovery]
     // construction -- anybody on the segment can send one -- and a node that is
     // admitted gets compile jobs and returns objects cached fleet-wide. So being
     // seen must never imply being trusted.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     PeerDirectory directory { clock, "prod", "self" };
 
     REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
@@ -159,7 +160,7 @@ TEST_CASE("PeerDirectory keeps 'seen' and 'proved' apart", "[cluster][discovery]
 
 TEST_CASE("PeerDirectory will not authenticate an endpoint nobody proved", "[cluster][discovery]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     PeerDirectory directory { clock, "prod", "self" };
     REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
 
@@ -181,7 +182,7 @@ TEST_CASE("PeerDirectory drops authentication when a peer moves", "[cluster][dis
     // property of the node at an endpoint: carrying it across a move would admit
     // an address nobody proved, which is exactly what putting the endpoint inside
     // the signature exists to prevent.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     PeerDirectory directory { clock, "prod", "self" };
 
     REQUIRE(directory.NoteBeacon("prod", "worker-a", "10.0.0.5:6677") == BeaconOutcome::Recorded);
@@ -209,7 +210,7 @@ TEST_CASE("PeerDirectory answers in a stable order", "[cluster][discovery]")
     // The backing container is unordered, and its iteration order varies between
     // runs and standard libraries. A caller proposing a membership change from an
     // unordered snapshot would produce a different proposal on each node.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     PeerDirectory directory { clock, "prod", "self" };
 
     for (auto const* const id: { "worker-c", "worker-a", "worker-b" })

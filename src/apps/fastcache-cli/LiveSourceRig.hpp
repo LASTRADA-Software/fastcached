@@ -14,9 +14,6 @@
 #include "LiveSubscriber.hpp"
 #include "ScriptedStopSignal.hpp"
 
-#include <FastCache/Async/AsyncQueue.hpp>
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
@@ -40,6 +37,9 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/AsyncQueue.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/Unwrap.hpp>
 
 namespace FastCache::Cli::Testing
@@ -345,8 +345,8 @@ class SpokenTerminal final: public IDashboardEventSource
     /// @param reactor Where a parked read is resumed.
     /// @param release Where to record this terminal's destruction, which is when production
     ///        restores one; null when the case does not ask.
-    explicit SpokenTerminal(IReactor& reactor, TerminalRelease* release = nullptr):
-        _events { reactor, AsyncQueueOptions {} },
+    explicit SpokenTerminal(core::net::EventLoop& reactor, TerminalRelease* release = nullptr):
+        _events { reactor, core::async::AsyncQueueOptions {} },
         _release { release }
     {
     }
@@ -377,7 +377,7 @@ class SpokenTerminal final: public IDashboardEventSource
         (void) _events.push(std::move(event));
     }
 
-    [[nodiscard]] Task<DashboardEvent> Next() override
+    [[nodiscard]] core::async::Task<DashboardEvent> Next() override
     {
         auto const event = co_await _events.pop();
         if (!event.has_value())
@@ -387,11 +387,11 @@ class SpokenTerminal final: public IDashboardEventSource
 
     void Close() noexcept override
     {
-        _events.Close();
+        _events.close();
     }
 
   private:
-    AsyncQueue<DashboardEvent> _events;
+    core::async::AsyncQueue<DashboardEvent> _events;
     TerminalRelease* _release;
 };
 
@@ -419,15 +419,15 @@ class CountSink final: public IFrameSink
 
 /// A reactor for the session, one more standing in for each pool, one clock for all of them.
 ///
-/// **The pool is a `TestReactor` so a case decides when a dial or a read RUNS.** A real pool
+/// **The pool is a `core::net::testing::TestLoop` so a case decides when a dial or a read RUNS.** A real pool
 /// would run it at once, and "a keystroke arrives while a read is outstanding" would then be a
 /// race rather than an input.
 struct Rig
 {
-    ManualClock clock {};
-    TestReactor reactor { clock };
-    TestReactor pool { clock };
-    TestReactor stopWaiter { clock };
+    core::platform::ManualClock clock {};
+    core::net::testing::TestLoop reactor { clock };
+    core::net::testing::TestLoop pool { clock };
+    core::net::testing::TestLoop stopWaiter { clock };
     ScriptedSubscription subscription { { CacheStream({ ReadingOpened(1) }) } };
     CountView view {};
     CountSink sink {};
@@ -496,7 +496,7 @@ struct Rig
     {
         auto progressed = true;
         while (progressed)
-            progressed = reactor.Drain() + pool.Drain() != 0;
+            progressed = reactor.drain() + pool.drain() != 0;
     }
 };
 
@@ -504,7 +504,7 @@ struct Rig
 /// @param source What to ask.
 /// @param into Where the answer goes.
 /// @return The task to submit.
-[[nodiscard]] inline Task<void> TakeOne(IDashboardEventSource* source, std::optional<DashboardEvent>* into)
+[[nodiscard]] inline core::async::Task<void> TakeOne(IDashboardEventSource* source, std::optional<DashboardEvent>* into)
 {
     *into = co_await source->Next();
 }
@@ -513,7 +513,7 @@ struct Rig
 /// @param source What to wait for.
 /// @param drained Set once it has.
 /// @return The task to submit.
-[[nodiscard]] inline Task<void> AwaitDrained(LiveEventSource* source, bool* drained)
+[[nodiscard]] inline core::async::Task<void> AwaitDrained(LiveEventSource* source, bool* drained)
 {
     co_await source->Drained();
     *drained = true;
@@ -526,11 +526,11 @@ struct Rig
 /// @param limits The budget.
 /// @param out How it ended.
 /// @return The task to submit.
-[[nodiscard]] inline Task<void> RunOver(IDashboardEventSource* source,
-                                        IDashboardView* view,
-                                        IFrameSink* sink,
-                                        DashboardLimits limits,
-                                        std::optional<DashboardExit>* out)
+[[nodiscard]] inline core::async::Task<void> RunOver(IDashboardEventSource* source,
+                                                     IDashboardView* view,
+                                                     IFrameSink* sink,
+                                                     DashboardLimits limits,
+                                                     std::optional<DashboardExit>* out)
 {
     *out = co_await RunDashboard(source, &ReadStatsSample, view, sink, limits);
 }
@@ -565,7 +565,7 @@ struct Rig
 
 /// The next event, when one is already due without running a dial or a read.
 ///
-/// **Never returns with a read still parked**: a `Task` destroyed while suspended is
+/// **Never returns with a read still parked**: a `core::async::Task` destroyed while suspended is
 /// undefined, so an event that did not arrive closes the source and settles, and the
 /// case sees `Detached` -- a failed expectation rather than a crash.
 /// @param rig The rig.
@@ -576,7 +576,7 @@ struct Rig
     auto event = std::optional<DashboardEvent> {};
     auto task = TakeOne(&source, &event);
     rig.reactor.submit(task.handle());
-    rig.reactor.Drain();
+    rig.reactor.drain();
     if (!event.has_value())
     {
         source.Close();
@@ -596,9 +596,9 @@ inline void CloseAndDrain(Rig& rig, LiveEventSource& source)
     rig.reactor.submit(task.handle());
     rig.Settle();
     CHECK(drained);
-    CHECK(rig.reactor.PendingTimers() == 0);
-    CHECK(rig.reactor.PendingSubmissions() == 0);
-    CHECK(rig.pool.PendingSubmissions() == 0);
+    CHECK(rig.reactor.pendingTimers() == 0);
+    CHECK(rig.reactor.pendingSubmissions() == 0);
+    CHECK(rig.pool.pendingSubmissions() == 0);
 }
 
 } // namespace FastCache::Cli::Testing

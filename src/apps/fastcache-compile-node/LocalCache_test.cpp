@@ -2,7 +2,6 @@
 #include "LocalCache.hpp"
 
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -14,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -44,7 +45,7 @@ class ScriptedUpstream final: public ICacheUpstream
     std::size_t stores { 0 };
     bool reachable { true };
 
-    [[nodiscard]] Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) override
+    [[nodiscard]] core::async::Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) override
     {
         ++fetches;
         if (!reachable)
@@ -53,7 +54,7 @@ class ScriptedUpstream final: public ICacheUpstream
         co_return it == entries.end() ? std::nullopt : std::optional { it->second };
     }
 
-    [[nodiscard]] Task<UpstreamStore> Store(std::string_view key, std::span<std::byte const> value) override
+    [[nodiscard]] core::async::Task<UpstreamStore> Store(std::string_view key, std::span<std::byte const> value) override
     {
         ++stores;
         if (!reachable)
@@ -78,7 +79,7 @@ struct Fixture
     // large and alignment-sensitive, and putting the small members first left 64
     // bytes of padding in a struct every test instantiates.
     InMemoryLruStorage local { 64 * 1024 };
-    ManualClock clock;
+    core::platform::ManualClock clock;
     ScriptedUpstream upstream;
     AtomicMetricsSink metrics;
     LocalCache cache { local, upstream, clock, metrics };
@@ -101,10 +102,10 @@ TEST_CASE("A local hit never touches the network", "[node][cache]")
     // names the same object by construction, so there is nothing the shared cache
     // could tell us that we do not already know.
     Fixture fix;
-    REQUIRE(SyncRun(fix.cache.Store("k1", Bytes("object-one"))));
+    REQUIRE(core::async::syncRun(fix.cache.Store("k1", Bytes("object-one"))));
     auto const storesAfterWrite = fix.upstream.stores;
 
-    auto const hit = SyncRun(fix.cache.Fetch("k1"));
+    auto const hit = core::async::syncRun(fix.cache.Fetch("k1"));
     REQUIRE(hit.has_value());
     CHECK(Unwrap(hit) == Bytes("object-one"));
 
@@ -121,14 +122,14 @@ TEST_CASE("A local miss reads through and fills the local tier", "[node][cache]"
     Fixture fix;
     fix.upstream.entries["k2"] = Bytes("object-two");
 
-    auto const first = SyncRun(fix.cache.Fetch("k2"));
+    auto const first = core::async::syncRun(fix.cache.Fetch("k2"));
     REQUIRE(first.has_value());
     CHECK(Unwrap(first) == Bytes("object-two"));
     CHECK(fix.upstream.fetches == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamHits) == 1);
 
     // The second lookup is local, which is the whole point of having filled it.
-    auto const second = SyncRun(fix.cache.Fetch("k2"));
+    auto const second = core::async::syncRun(fix.cache.Fetch("k2"));
     REQUIRE(second.has_value());
     CHECK(Unwrap(second) == Bytes("object-two"));
     CHECK(fix.upstream.fetches == 1);
@@ -144,7 +145,7 @@ TEST_CASE("An unreachable shared cache is a miss, not a failure", "[node][cache]
     fix.upstream.entries["k3"] = Bytes("object-three");
     fix.upstream.reachable = false;
 
-    CHECK_FALSE(SyncRun(fix.cache.Fetch("k3")).has_value());
+    CHECK_FALSE(core::async::syncRun(fix.cache.Fetch("k3")).has_value());
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheMisses) == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamHits) == 0);
 }
@@ -156,12 +157,12 @@ TEST_CASE("A store writes locally first, then offers upstream", "[node][cache]")
     // best-effort by contract.
     Fixture fix;
 
-    REQUIRE(SyncRun(fix.cache.Store("k4", Bytes("object-four"))));
+    REQUIRE(core::async::syncRun(fix.cache.Store("k4", Bytes("object-four"))));
     CHECK(fix.upstream.stores == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStores) == 1);
 
     // Readable locally with no network call.
-    auto const hit = SyncRun(fix.cache.Fetch("k4"));
+    auto const hit = core::async::syncRun(fix.cache.Fetch("k4"));
     REQUIRE(hit.has_value());
     CHECK(fix.upstream.fetches == 0);
 }
@@ -174,12 +175,12 @@ TEST_CASE("A store survives a shared cache that will not take it", "[node][cache
     Fixture fix;
     fix.upstream.reachable = false;
 
-    CHECK(SyncRun(fix.cache.Store("k5", Bytes("object-five"))));
+    CHECK(core::async::syncRun(fix.cache.Store("k5", Bytes("object-five"))));
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStoreFailures) == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheStoreFailures) == 0);
 
     // And it is still served locally, which is what "costs this machine nothing" means.
-    auto const hit = SyncRun(fix.cache.Fetch("k5"));
+    auto const hit = core::async::syncRun(fix.cache.Fetch("k5"));
     REQUIRE(hit.has_value());
     CHECK(Unwrap(hit) == Bytes("object-five"));
 }
@@ -190,19 +191,19 @@ TEST_CASE("A node with no shared cache still caches locally", "[node][cache]")
     // given a shared cache yet. `NoUpstream` is a named type rather than a null
     // pointer so every call site is spared a branch and "there is no upstream" is a
     // decision somebody made.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     InMemoryLruStorage local { 64 * 1024 };
     NoUpstream none;
     LocalCache cache { local, none, clock, metrics };
 
-    CHECK(SyncRun(cache.Store("k6", Bytes("object-six"))));
-    auto const hit = SyncRun(cache.Fetch("k6"));
+    CHECK(core::async::syncRun(cache.Store("k6", Bytes("object-six"))));
+    auto const hit = core::async::syncRun(cache.Fetch("k6"));
     REQUIRE(hit.has_value());
     CHECK(Unwrap(hit) == Bytes("object-six"));
 
     // A key nobody stored is simply a miss -- not an error, and not a hang.
-    CHECK_FALSE(SyncRun(cache.Fetch("never-stored")).has_value());
+    CHECK_FALSE(core::async::syncRun(cache.Fetch("never-stored")).has_value());
 }
 
 TEST_CASE("A node with no shared cache reports no upstream stores and no failures", "[node][cache]")
@@ -215,14 +216,14 @@ TEST_CASE("A node with no shared cache reports no upstream stores and no failure
     //
     // An operator alerting on that counter alerts permanently on every
     // single-machine install, which is how a counter stops being read at all.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     InMemoryLruStorage local { 64 * 1024 };
     NoUpstream none;
     LocalCache cache { local, none, clock, metrics };
 
     for (auto const index: std::views::iota(0, 5))
-        CHECK(SyncRun(cache.Store(std::format("k{}", index), Bytes("object"))));
+        CHECK(core::async::syncRun(cache.Store(std::format("k{}", index), Bytes("object"))));
 
     // Neither counter moves. Not "failures is zero" alone: the way to get this
     // wrong in the other direction is to count the non-event as a success.
@@ -243,7 +244,7 @@ TEST_CASE("A shared cache that declines is still counted as a failure", "[node][
     Fixture fix;
     fix.upstream.reachable = false;
 
-    CHECK(SyncRun(fix.cache.Store("k7", Bytes("object-seven"))));
+    CHECK(core::async::syncRun(fix.cache.Store("k7", Bytes("object-seven"))));
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStoreFailures) == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStores) == 0);
     CHECK(fix.upstream.Configured());
@@ -253,7 +254,7 @@ TEST_CASE("A shared cache that takes the object is counted as a store", "[node][
 {
     Fixture fix;
 
-    CHECK(SyncRun(fix.cache.Store("k8", Bytes("object-eight"))));
+    CHECK(core::async::syncRun(fix.cache.Store("k8", Bytes("object-eight"))));
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStores) == 1);
     CHECK(fix.Count(IMetricsSink::Counter::NodeCacheUpstreamStoreFailures) == 0);
 }
@@ -266,10 +267,10 @@ TEST_CASE("A drop removes the key from this tier, and a second drop finds nothin
     // nothing to remove is an answer, not a failure.
     Fixture fix;
     fix.upstream.reachable = false;
-    REQUIRE(SyncRun(fix.cache.Store("k9", Bytes("object-nine"))));
+    REQUIRE(core::async::syncRun(fix.cache.Store("k9", Bytes("object-nine"))));
 
     CHECK(fix.cache.Drop("k9") == CacheDropOutcome::Removed);
-    CHECK_FALSE(SyncRun(fix.cache.Fetch("k9")).has_value());
+    CHECK_FALSE(core::async::syncRun(fix.cache.Fetch("k9")).has_value());
     CHECK(fix.cache.Drop("k9") == CacheDropOutcome::Absent);
 
     // Counted by the storage, not by a second tally beside it.
@@ -285,13 +286,13 @@ TEST_CASE("A drop reaches this tier only, so a shared cache holding the key refi
     // named -- and it is why the operator is told to drop the key upstream as well.
     Fixture fix;
     fix.upstream.entries["k10"] = Bytes("object-ten");
-    REQUIRE(SyncRun(fix.cache.Fetch("k10")).has_value()); // fills the local tier
+    REQUIRE(core::async::syncRun(fix.cache.Fetch("k10")).has_value()); // fills the local tier
     REQUIRE(fix.upstream.fetches == 1);
 
     CHECK(fix.cache.Drop("k10") == CacheDropOutcome::Removed);
     CHECK(fix.upstream.entries.contains("k10"));
 
-    auto const refilled = SyncRun(fix.cache.Fetch("k10"));
+    auto const refilled = core::async::syncRun(fix.cache.Fetch("k10"));
     REQUIRE(refilled.has_value());
     CHECK(Unwrap(refilled) == Bytes("object-ten"));
     CHECK(fix.upstream.fetches == 2);

@@ -2,7 +2,6 @@
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/StreamCodec.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -17,6 +16,8 @@
 #include <utility>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
+
 using namespace FastCache;
 using StreamCodec::StreamId;
 
@@ -28,16 +29,17 @@ namespace
 struct StreamEngineFixture
 {
     InMemoryLruStorage storage;
-    ManualClock clock;
+    core::platform::ManualClock clock;
     /// Start the wall clock at 1000ms past the epoch so generated IDs read as
     /// `1000-0`, `1000-1`, ... — small, readable, and stable across runs.
-    ManualWallClock wallClock { std::chrono::system_clock::time_point { std::chrono::milliseconds { 1000 } } };
+    core::platform::ManualWallClock wallClock { std::chrono::system_clock::time_point {
+        std::chrono::milliseconds { 1000 } } };
     CacheEngine engine { storage, clock, wallClock };
 
     /// Advance the wall clock by `ms` milliseconds.
     void AdvanceMs(std::uint64_t ms)
     {
-        wallClock.Advance(std::chrono::milliseconds { ms });
+        wallClock.advance(std::chrono::milliseconds { ms });
     }
 };
 

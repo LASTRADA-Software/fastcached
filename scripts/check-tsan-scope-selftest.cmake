@@ -330,7 +330,7 @@ endfunction()
 # DIRECTORY, so an added case can be shown to leave the scope while the file
 # around it stays covered. That arrangement IS #317 -- a per-file check
 # passes on it.
-set(victim "src/FastCache/Async/Baseline_test.cpp")
+set(victim "src/FastCache/Consensus/Baseline_test.cpp")
 
 message("== check-tsan-scope-selftest")
 
@@ -426,7 +426,7 @@ FastCachedSelftestCase("a-scope-that-holds-no-case-at-all" refuse "found no Catc
 FastCachedRemove("${victim}")
 FastCachedSelftestCase("a-directory-row-with-no-test-files" refuse "contains no ..test.cpp files")
 
-FastCachedRemove("src/FastCache/Core/Clock_test.cpp")
+FastCachedRemove("src/FastCache/Core/BoundedWait_test.cpp")
 FastCachedSelftestCase("a-file-row-that-does-not-exist" refuse "names neither a directory nor a file")
 
 # -- the Catch2 watermark (#312) ------------------------------------------

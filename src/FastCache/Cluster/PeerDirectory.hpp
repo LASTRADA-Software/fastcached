@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 
 #include <chrono>
@@ -12,6 +11,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Cluster
 {
@@ -62,9 +63,9 @@ struct KnownPeer
 
 /// What this node has heard on the segment, and what it may act on.
 ///
-/// Pure with respect to I/O: time arrives through `IClock` and datagrams arrive
+/// Pure with respect to I/O: time arrives through `core::platform::IClock` and datagrams arrive
 /// as already-decoded values, which is what lets every expiry and admission rule
-/// be a `ManualClock` unit test rather than a sleep -- the same split
+/// be a `core::platform::ManualClock` unit test rather than a sleep -- the same split
 /// `WorkerRegistry` and `LeaseTable` are built on, and for the reason recorded
 /// there.
 ///
@@ -91,7 +92,10 @@ class PeerDirectory
     ///        are ignored.
     /// @param selfNodeId This node's own id, so its own beacons are ignored.
     /// @param expiry How long a peer is remembered after its last beacon.
-    PeerDirectory(IClock& clock, std::string clusterId, std::string selfNodeId, std::chrono::seconds expiry = DefaultExpiry);
+    PeerDirectory(core::platform::IClock& clock,
+                  std::string clusterId,
+                  std::string selfNodeId,
+                  std::chrono::seconds expiry = DefaultExpiry);
 
     /// Record a beacon.
     ///
@@ -153,7 +157,7 @@ class PeerDirectory
     }
 
   private:
-    IClock& _clock;
+    core::platform::IClock& _clock;
     std::string _clusterId;
     std::string _selfNodeId;
     std::chrono::seconds _expiry;

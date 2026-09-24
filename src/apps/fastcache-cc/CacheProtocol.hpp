@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Net/ISocket.hpp>
-#include <FastCache/Net/KeepAlive.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
@@ -14,6 +11,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
+#include <core/net/KeepAlive.hpp>
 
 namespace FastCache::Cc
 {
@@ -377,7 +378,7 @@ struct ExchangeBudget
     /// @return True when `idle` bounds this exchange's silence.
     ///
     /// The rule lives on the type for the reason `BoundsTotal` gives, and the value is
-    /// spelled the same way `ArmSocketDeadline` spells it: non-positive is *no bound*,
+    /// spelled the same way `core::net::armSocketDeadline` spells it: non-positive is *no bound*,
     /// never *a bound of zero*, which would expire on the reactor's next turn and turn
     /// the cache off while reading as a knob that turns a ceiling off.
     [[nodiscard]] bool BoundsIdle() const noexcept
@@ -404,7 +405,7 @@ struct ExchangeBudget
     ///
     /// It detects a dead connection or host, never a peer that is alive and merely
     /// silent -- that is what `idle` below now measures. See `Net/KeepAlive.hpp`.
-    KeepAlive keepAlive { KeepAlive::No };
+    core::net::KeepAlive keepAlive { core::net::KeepAlive::No };
 
     /// Field-by-field equality, so a `static_assert` can hold two independently
     /// written budgets against each other.
@@ -430,11 +431,11 @@ struct ExchangeBudget
 /// @param credential Credential to present; default-constructed sends none.
 /// @param liveness Told each time the exchange moves forward; null for none.
 /// @return The outcome.
-[[nodiscard]] Task<CacheOutcome> ExchangeFramed(ISocket* client,
-                                                CredentialNotice* notice,
-                                                std::vector<std::byte> frame,
-                                                Credential credential = {},
-                                                IExchangeLiveness* liveness = nullptr);
+[[nodiscard]] core::async::Task<CacheOutcome> ExchangeFramed(core::net::ISocket* client,
+                                                             CredentialNotice* notice,
+                                                             std::vector<std::byte> frame,
+                                                             Credential credential = {},
+                                                             IExchangeLiveness* liveness = nullptr);
 
 /// Where a refusal says to ask instead, when it says so.
 ///
@@ -485,10 +486,10 @@ struct ExchangeBudget
 /// @param key The key to look up.
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome; `value` holds the stored bytes on a hit.
-[[nodiscard]] Task<CacheOutcome> CacheFetch(ISocket* client,
-                                            CredentialNotice* notice,
-                                            std::string_view key,
-                                            Credential credential = {});
+[[nodiscard]] core::async::Task<CacheOutcome> CacheFetch(core::net::ISocket* client,
+                                                         CredentialNotice* notice,
+                                                         std::string_view key,
+                                                         Credential credential = {});
 
 /// STORE one entry over an already-connected client.
 ///
@@ -497,10 +498,10 @@ struct ExchangeBudget
 /// @param request The fields to send.
 /// @param credential Credential to present; default-constructed sends none.
 /// @return The outcome; `kind == Hit` means the daemon acknowledged the write.
-[[nodiscard]] Task<CacheOutcome> CacheStore(ISocket* client,
-                                            CredentialNotice* notice,
-                                            CompileCacheWire::StoreRequest request,
-                                            Credential credential = {});
+[[nodiscard]] core::async::Task<CacheOutcome> CacheStore(core::net::ISocket* client,
+                                                         CredentialNotice* notice,
+                                                         CompileCacheWire::StoreRequest request,
+                                                         Credential credential = {});
 
 /// Default ceiling on a value the launcher will offer to the daemon.
 ///

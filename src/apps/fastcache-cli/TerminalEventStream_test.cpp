@@ -2,9 +2,6 @@
 #include "DashboardLoop.hpp"
 #include "TerminalEventStream.hpp"
 
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Utf8.hpp>
 
@@ -29,7 +26,10 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/ThreadPoolExecutor.hpp>
 #include <core/net/IoBackend.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <core/platform/SystemPipe.hpp>
 #include <core/tui/InputEvent.hpp>
 #include <core/tui/runtime/testing/ScriptedInputSource.hpp>
@@ -180,14 +180,14 @@ struct WakeOnExit
 /// @param done The condition waited for.
 /// @param what What it means if it never becomes true.
 template <std::predicate Condition>
-void DrainUntil(TestReactor& reactor, Condition done, char const* what)
+void DrainUntil(core::net::testing::TestLoop& reactor, Condition done, char const* what)
 {
     // Out of the REQUIRE: its macro spells the expression twice, so a move inside it reads as a use after move.
     auto const reached = FastCache::Testing::DrainUntil(
         reactor,
         what,
         std::move(done),
-        [&reactor] { return std::format("{} submission(s) pending on the reactor", reactor.PendingSubmissions()); },
+        [&reactor] { return std::format("{} submission(s) pending on the reactor", reactor.pendingSubmissions()); },
         std::chrono::seconds { 30 });
     REQUIRE(reached);
 }
@@ -199,9 +199,9 @@ void DrainUntil(TestReactor& reactor, Condition done, char const* what)
 /// @param out Where to put the event.
 /// @param deliveredOn Where to record the thread the event was delivered on.
 /// @return The task to submit.
-[[nodiscard]] Task<void> NextInto(IDashboardEventSource* source,
-                                  std::optional<DashboardEvent>* out,
-                                  std::thread::id* deliveredOn)
+[[nodiscard]] core::async::Task<void> NextInto(IDashboardEventSource* source,
+                                               std::optional<DashboardEvent>* out,
+                                               std::thread::id* deliveredOn)
 {
     auto event = co_await source->Next();
     *deliveredOn = std::this_thread::get_id();
@@ -210,7 +210,7 @@ void DrainUntil(TestReactor& reactor, Condition done, char const* what)
 
 /// Drive one `Next()` to completion on @p reactor.
 /// @return The event.
-[[nodiscard]] DashboardEvent TakeNext(IDashboardEventSource& source, TestReactor& reactor)
+[[nodiscard]] DashboardEvent TakeNext(IDashboardEventSource& source, core::net::testing::TestLoop& reactor)
 {
     auto result = std::optional<DashboardEvent> {};
     auto deliveredOn = std::thread::id {};
@@ -409,8 +409,11 @@ struct StartOutcome
 };
 
 /// Await a start of @p device, recording what the awaiter saw on resumption.
-[[nodiscard]] Task<void> StartInto(
-    std::unique_ptr<ITerminalDevice> device, IExecutor* pool, IExecutor* resumeOn, DeviceRecord* record, StartOutcome* out)
+[[nodiscard]] core::async::Task<void> StartInto(std::unique_ptr<ITerminalDevice> device,
+                                                core::async::IExecutor* pool,
+                                                core::async::IExecutor* resumeOn,
+                                                DeviceRecord* record,
+                                                StartOutcome* out)
 {
     auto started = co_await StartTerminalDevice(std::move(device), pool, resumeOn);
     out->deliveredOn = std::this_thread::get_id();
@@ -420,7 +423,10 @@ struct StartOutcome
 }
 
 /// Start a `FakeDevice` following @p script, driving @p reactor until the start is delivered.
-[[nodiscard]] StartOutcome StartFake(DeviceScript const& script, DeviceRecord& record, IExecutor& pool, TestReactor& reactor)
+[[nodiscard]] StartOutcome StartFake(DeviceScript const& script,
+                                     DeviceRecord& record,
+                                     core::async::IExecutor& pool,
+                                     core::net::testing::TestLoop& reactor)
 {
     auto outcome = StartOutcome {};
     auto task = StartInto(std::make_unique<FakeDevice>(script, &record), &pool, &reactor, &record, &outcome);
@@ -433,9 +439,9 @@ struct StartOutcome
 
 TEST_CASE("the first terminal event is the geometry at open, before any wait", "[cli][dashboard][terminal]")
 {
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto source = ScriptedTerminalInputWait {};
     auto stream = MakeTerminalEventStream(
         { .source = &source, .pool = &pool, .resumeOn = &reactor, .wake = {}, .columns = 120, .rows = 40 });
@@ -451,9 +457,9 @@ TEST_CASE("the first terminal event is the geometry at open, before any wait", "
 TEST_CASE("keys and resizes from one wait arrive in order, and other input is not dashboard input",
           "[cli][dashboard][terminal]")
 {
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto source = ScriptedTerminalInputWait {};
     source.PushEvents({ Key(U'q'), core::tui::MouseEvent {}, core::tui::ResizeEvent { .columns = 80, .rows = 24 } });
     auto stream = MakeTerminalEventStream(
@@ -475,9 +481,9 @@ TEST_CASE("the terminal wait runs on the pool and its event is delivered back on
 {
     // WHAT DISTINGUISHES: the thread identities. An event arriving proves nothing, since a
     // stream that waited inline on the reactor would deliver the same one.
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto source = BlockingEventSource {};
     auto stream = MakeTerminalEventStream({ .source = &source,
                                             .pool = &pool,
@@ -493,7 +499,7 @@ TEST_CASE("the terminal wait runs on the pool and its event is delivered back on
     auto deliveredOn = std::thread::id {};
     auto task = NextInto(stream.get(), &result, &deliveredOn);
     reactor.submit(task.handle());
-    reactor.Drain();
+    reactor.drain();
 
     // Parked in the wait on the pool, and the reactor has run out of work while it is: the loop
     // is FREE while the terminal is quiet.
@@ -515,9 +521,9 @@ TEST_CASE("closing the terminal stream wakes a parked wait, and it stays closed"
 {
     // The positive control is `Entered()`: the case only means something once the wait is seen
     // PARKED before the close, or a close that never reached the wait would pass as well.
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto source = BlockingEventSource {};
     auto stream = MakeTerminalEventStream({ .source = &source,
                                             .pool = &pool,
@@ -532,7 +538,7 @@ TEST_CASE("closing the terminal stream wakes a parked wait, and it stays closed"
     auto deliveredOn = std::thread::id {};
     auto task = NextInto(stream.get(), &result, &deliveredOn);
     reactor.submit(task.handle());
-    reactor.Drain();
+    reactor.drain();
     DrainUntil(reactor, [&source] { return source.Entered(); }, "the stream never parked in the terminal wait");
 
     stream->Close();
@@ -549,9 +555,9 @@ TEST_CASE("closing the terminal stream wakes a parked wait, and it stays closed"
 
 TEST_CASE("terminal input that closes ends the stream, and it stays ended", "[cli][dashboard][terminal]")
 {
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto source = ScriptedTerminalInputWait {};
     source.PushEvents({ Key(U'a') });
     source.PushInputClosed();
@@ -573,9 +579,9 @@ TEST_CASE("the wait after terminal input is short, so a lone ESC is settled rath
 {
     // core-cpp decides a lone ESC is the Escape key only when a wait TIMES OUT. An unbounded wait
     // never does, so a stream that always waited with -1 would hold an ESC until the next key.
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto source = ScriptedTerminalInputWait {};
     source.PushEvents({ Key(U'a') });
     source.PushTimeout();
@@ -716,9 +722,9 @@ TEST_CASE("a terminal is acquired on the pool and its start is delivered back on
     // WHAT DISTINGUISHES: the thread identities. A start that acquired inline on the reactor, or
     // never hopped back, delivers the same record.
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto const driverThread = std::this_thread::get_id();
 
     auto outcome = StartFake({}, record, pool, reactor);
@@ -734,9 +740,9 @@ TEST_CASE("a started terminal stays acquired until its events are destroyed, and
           "[cli][dashboard][terminal]")
 {
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
 
     auto outcome = StartFake({}, record, pool, reactor);
     REQUIRE(outcome.started.has_value());
@@ -759,9 +765,9 @@ TEST_CASE("a terminal that never answers DA1 still starts, and the rung falls ba
     // No DA1 reply is an ANSWER about the terminal, not a failure to acquire it: the dashboard
     // draws on the next rung rather than refusing to draw.
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
 
     auto outcome =
         StartFake({ .sixel = SixelAnswer::NoReply, .encoding = TerminalTextEncoding::Utf8 }, record, pool, reactor);
@@ -775,9 +781,9 @@ TEST_CASE("a terminal that never answers DA1 still starts, and the rung falls ba
 TEST_CASE("a refused terminal acquisition is restored before the refusal is delivered", "[cli][dashboard][terminal]")
 {
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
 
     auto const outcome = StartFake({ .refuseAcquire = true }, record, pool, reactor);
 
@@ -793,9 +799,9 @@ TEST_CASE("a terminal start that throws after acquiring is restored and reported
     // The halfway failure: the terminal is acquired, and the query after it throws. Nothing on
     // this path calls a restore by hand, so only the guard can.
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
 
     auto const outcome = StartFake({ .throwOnAsk = true }, record, pool, reactor);
 
@@ -814,9 +820,9 @@ TEST_CASE("restoring a started terminal now, from another thread while a read is
     // can go on to show that a later destruction does not restore through this handle again.
     auto source = BlockingEventSource {};
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
 
     auto outcome = StartFake({ .blocking = &source }, record, pool, reactor);
     auto const wakeOnExit = WakeOnExit { source };
@@ -829,7 +835,7 @@ TEST_CASE("restoring a started terminal now, from another thread while a read is
     auto deliveredOn = std::thread::id {};
     auto task = NextInto(started.events.get(), &result, &deliveredOn);
     reactor.submit(task.handle());
-    reactor.Drain();
+    reactor.drain();
     DrainUntil(reactor, [&source] { return source.Entered(); }, "the stream never parked in the terminal wait");
 
     {
@@ -862,9 +868,9 @@ TEST_CASE("a started terminal whose events were destroyed first is not restored 
     // The other order. Destroying the events restored the terminal and tore the device down, so a
     // restore-now after it must reach nothing -- the device it would reach no longer exists.
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
 
     auto outcome = StartFake({}, record, pool, reactor);
     REQUIRE(outcome.started.has_value());
@@ -1189,9 +1195,9 @@ TEST_CASE("a started terminal enters the alternate screen once and its destructi
           "[cli][dashboard][terminal]")
 {
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto const& screen = ScreenBytes();
 
     auto outcome = StartFake({}, record, pool, reactor);
@@ -1213,9 +1219,9 @@ TEST_CASE("a start that fails after entering the alternate screen leaves it befo
 {
     // The encoding is read after the screen is entered, so its failure is the halfway point.
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto const& screen = ScreenBytes();
 
     auto const outcome = StartFake({ .throwOnEncoding = true }, record, pool, reactor);
@@ -1233,9 +1239,9 @@ TEST_CASE("a start that fails before entering the alternate screen writes neithe
 {
     // The control on the case above: a guard that left the screen unconditionally would pass that one
     // and write a leave here, onto a screen nobody entered.
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
 
     auto refusedRecord = DeviceRecord {};
     auto const refused = StartFake({ .refuseAcquire = true }, refusedRecord, pool, reactor);
@@ -1253,9 +1259,9 @@ TEST_CASE("restoring a started terminal now leaves the alternate screen, and a l
           "[cli][dashboard][terminal]")
 {
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto const& screen = ScreenBytes();
 
     auto outcome = StartFake({}, record, pool, reactor);
@@ -1281,9 +1287,9 @@ TEST_CASE("a started terminal destroyed before a restore-now leaves the alternat
           "[cli][dashboard][terminal]")
 {
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto const& screen = ScreenBytes();
 
     auto outcome = StartFake({}, record, pool, reactor);
@@ -1301,9 +1307,9 @@ TEST_CASE("a started terminal destroyed before a restore-now leaves the alternat
 TEST_CASE("a frame on a terminal that reported synchronized output is bracketed in it", "[cli][dashboard][terminal]")
 {
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto const& screen = ScreenBytes();
 
     auto outcome = StartFake({ .synchronizedOutput = SynchronizedOutputAnswer::Supported }, record, pool, reactor);
@@ -1331,9 +1337,9 @@ TEST_CASE("a frame on a terminal that did not report synchronized output is neve
          { SynchronizedOutputAnswer::NotSupported, SynchronizedOutputAnswer::NoReply, SynchronizedOutputAnswer::NotAsked })
     {
         auto record = DeviceRecord {};
-        auto clock = ManualClock {};
-        auto reactor = TestReactor { clock };
-        auto pool = ThreadPoolExecutor { 1 };
+        auto clock = core::platform::ManualClock {};
+        auto reactor = core::net::testing::TestLoop { clock };
+        auto pool = core::async::ThreadPoolExecutor { 1 };
 
         auto outcome = StartFake({ .synchronizedOutput = answer }, record, pool, reactor);
         REQUIRE(outcome.started.has_value());
@@ -1351,9 +1357,9 @@ TEST_CASE("a frame on a terminal that did not report synchronized output is neve
 TEST_CASE("a burst of resizes is delivered as the latest geometry, and a key between them keeps them apart",
           "[cli][dashboard][terminal]")
 {
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto source = ScriptedTerminalInputWait {};
     source.PushEvents({ core::tui::ResizeEvent { .columns = 81, .rows = 25 },
                         core::tui::ResizeEvent { .columns = 90, .rows = 30 },
@@ -1489,9 +1495,9 @@ TEST_CASE("a started terminal's frames draw the images placed in them", "[cli][d
     for (auto const answer: { SynchronizedOutputAnswer::Supported, SynchronizedOutputAnswer::NoReply })
     {
         auto record = DeviceRecord {};
-        auto clock = ManualClock {};
-        auto reactor = TestReactor { clock };
-        auto pool = ThreadPoolExecutor { 1 };
+        auto clock = core::platform::ManualClock {};
+        auto reactor = core::net::testing::TestLoop { clock };
+        auto pool = core::async::ThreadPoolExecutor { 1 };
 
         auto outcome = StartFake({ .synchronizedOutput = answer }, record, pool, reactor);
         REQUIRE(outcome.started.has_value());
@@ -1525,9 +1531,9 @@ TEST_CASE("a terminal that reports its cell size starts on the Sixel rung and is
           "[cli][dashboard][terminal]")
 {
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
 
     auto outcome = StartFake({ .cellPixels = CellPixelSize { .width = 10, .height = 20 },
                                .reread = CellPixelSize { .width = 9, .height = 18 },
@@ -1558,9 +1564,9 @@ TEST_CASE("a terminal that does not report its cell size is not the Sixel rung a
 {
     // It advertised Sixel, so the missing size is the only thing keeping it off the Sixel rung.
     auto record = DeviceRecord {};
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
 
     auto outcome = StartFake({ .sixel = SixelAnswer::Advertised,
                                .cellPixels = std::nullopt,
@@ -1586,9 +1592,9 @@ TEST_CASE("a terminal that does not report its cell size is not the Sixel rung a
 TEST_CASE("the cell size is re-read on the pool once per wait that resized, and a wait without a resize asks nothing",
           "[cli][dashboard][terminal]")
 {
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto source = ScriptedTerminalInputWait {};
     source.PushEvents(
         { core::tui::ResizeEvent { .columns = 100, .rows = 30 }, core::tui::ResizeEvent { .columns = 110, .rows = 35 } });
@@ -1626,9 +1632,9 @@ TEST_CASE("the cell size is re-read on the pool once per wait that resized, and 
 TEST_CASE("a resize whose re-read gets no answer carries no cell size, never the one from before it",
           "[cli][dashboard][terminal]")
 {
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto source = ScriptedTerminalInputWait {};
     source.PushEvents({ core::tui::ResizeEvent { .columns = 100, .rows = 30 } });
     auto stream = MakeTerminalEventStream({ .source = &source,
@@ -1762,9 +1768,9 @@ TEST_CASE("a started terminal records its colour answer and its frames are dress
     for (auto const answer: { ColourAnswer::Supported, ColourAnswer::Suppressed })
     {
         auto record = DeviceRecord {};
-        auto clock = ManualClock {};
-        auto reactor = TestReactor { clock };
-        auto pool = ThreadPoolExecutor { 1 };
+        auto clock = core::platform::ManualClock {};
+        auto reactor = core::net::testing::TestLoop { clock };
+        auto pool = core::async::ThreadPoolExecutor { 1 };
 
         auto outcome = StartFake({ .colour = answer }, record, pool, reactor);
         REQUIRE(outcome.started.has_value());

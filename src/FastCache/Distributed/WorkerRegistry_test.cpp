@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/StorageTier.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/NodeLoadTestUtils.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
 
@@ -14,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -28,7 +28,7 @@ namespace
 /// rather than a race against wall time.
 struct Fixture
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     WorkerRegistry registry { clock, std::chrono::milliseconds { 1000 } };
 };
 
@@ -568,7 +568,7 @@ TEST_CASE("A sibling that just re-registered does not blank the node's cache", "
 TEST_CASE("How long ago a worker was heard from is measured on the injected clock", "[distributed][registry][heartbeat-age]")
 {
     // The age has to come from the clock the registry was given, not from
-    // `steady_clock::now()`. Handed a raw `TimePoint`, a consumer would reach for
+    // `steady_clock::now()`. Handed a raw `core::platform::SteadyTimePoint`, a consumer would reach for
     // the latter -- right in production and wrong under every one of these cases,
     // silently, because the two clocks agree about nothing.
     Fixture fix;
@@ -604,7 +604,7 @@ TEST_CASE("A worker past its timeout is absent rather than very old", "[distribu
 
 TEST_CASE("A clock set backwards reports no age rather than an enormous one", "[distributed][registry][heartbeat-age]")
 {
-    // A `ManualClock` can legitimately go backwards in a test, and an unsigned
+    // A `core::platform::ManualClock` can legitimately go backwards in a test, and an unsigned
     // duration would then read as several hundred million years.
     Fixture fix;
     fix.clock.advance(std::chrono::milliseconds { 500 });
@@ -748,7 +748,7 @@ TEST_CASE("A node cache report carries how stale its figures are", "[distributed
 
 TEST_CASE("A machine's software version reaches its report, and a restart refreshes it", "[distributed][registry][version]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     WorkerRegistry registry { clock };
 
     (void) registry.Register(WorkerRegistration { .fingerprint = "gcc-14",
@@ -780,7 +780,7 @@ TEST_CASE("A machine's software version reaches its report, and a restart refres
 
 TEST_CASE("One machine serving two toolchains reports one version", "[distributed][registry][version]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     WorkerRegistry registry { clock };
 
     // Two registry entries, one process. They cannot disagree about the version, and
@@ -802,7 +802,7 @@ TEST_CASE("One machine serving two toolchains reports one version", "[distribute
 
 TEST_CASE("A node too old to report a version leaves it empty", "[distributed][registry][version]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     WorkerRegistry registry { clock };
 
     (void) registry.Register(WorkerRegistration { .fingerprint = "gcc-14",
@@ -841,7 +841,7 @@ namespace
 /// assertions are about a worker that is no longer there.
 struct AgeFixture
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     WorkerRegistry registry { clock, std::chrono::hours { 1 } };
 };
 

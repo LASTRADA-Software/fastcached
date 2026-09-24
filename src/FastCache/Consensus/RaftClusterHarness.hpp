@@ -7,7 +7,6 @@
 #include <FastCache/Consensus/RaftOutput.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
@@ -32,6 +31,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Consensus
 {
@@ -242,7 +243,7 @@ class RaftClusterHarness
     [[nodiscard]] Member const& At(NodeId const& who) const;
 
     /// The current instant.
-    [[nodiscard]] TimePoint Now() const noexcept;
+    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept;
 
     /// Whether every safety property has held at every step so far.
     /// @return Empty when all is well, else what broke and when.
@@ -308,7 +309,7 @@ class RaftClusterHarness
         NodeId from;
         NodeId to;
         RaftMessage message;
-        TimePoint deliverAt;
+        core::platform::SteadyTimePoint deliverAt;
     };
 
     /// Collects sends into the harness's own queue.
@@ -483,7 +484,7 @@ class RaftClusterHarness
         return member->driver != nullptr;
     }
 
-    ManualClock _clock;
+    core::platform::ManualClock _clock;
 
     /// Drives delay and loss decisions. Seeded fixed, so a failure is replayable
     /// from the same seed rather than being a flake to re-run.
@@ -735,7 +736,7 @@ inline RaftClusterHarness::Member const& RaftClusterHarness::At(NodeId const& wh
     throw std::out_of_range { "no such cluster member: " + who };
 }
 
-inline TimePoint RaftClusterHarness::Now() const noexcept
+inline core::platform::SteadyTimePoint RaftClusterHarness::Now() const noexcept
 {
     return _clock.now();
 }

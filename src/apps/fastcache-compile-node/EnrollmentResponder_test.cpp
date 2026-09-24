@@ -2,10 +2,8 @@
 #include "EnrollmentResponder.hpp"
 #include "Responders.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Core/Base64.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
@@ -28,6 +26,9 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -171,8 +172,8 @@ struct Seed
         cluster.SetState(std::move(state));
     }
 
-    ManualClock clock;
-    ManualWallClock wallClock;
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wallClock;
     AtomicMetricsSink metrics;
     NullLogger logger;
     Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
@@ -199,7 +200,7 @@ struct Seed
 {
     // Nothing PROVED, which is what every case here is about: the enrollment pair is for a
     // machine the cluster has not admitted yet, so a proof is not a state a joiner can be in.
-    return SyncRun(responder.Answer(frame, PeerIdentity { .host = std::string { peer } })).bytes;
+    return core::async::syncRun(responder.Answer(frame, PeerIdentity { .host = std::string { peer } })).bytes;
 }
 
 /// The payload of a reply.

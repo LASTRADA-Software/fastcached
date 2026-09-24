@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
-#include <FastCache/Net/ISocket.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -15,6 +13,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
 
 namespace FastCache
 {
@@ -47,7 +48,7 @@ enum class SealFault : std::uint8_t
 /// @return What an operator reads about it.
 [[nodiscard]] std::string_view DescribeSealFault(SealFault fault) noexcept;
 
-/// An `ISocket` that seals every `0xFC` frame it writes and checks every one it reads, once a
+/// An `core::net::ISocket` that seals every `0xFC` frame it writes and checks every one it reads, once a
 /// connection has proved its identity (#178).
 ///
 /// ## Why a decorator
@@ -78,18 +79,18 @@ enum class SealFault : std::uint8_t
 ///
 /// ## Contracts it keeps
 ///
-/// `Read`'s buffer must be non-empty (`Detail::RequireReadBuffer`, first statement). `Read` and
+/// `Read`'s buffer must be non-empty (`core::net::contract::requireReadBuffer`, first statement). `Read` and
 /// `WaitReadable` share the raw socket's one read operation, as every transport's do, and
 /// `CancelRead` retires a parked read by forwarding, exactly as `TlsSocket`'s does. At most one
 /// read and one write may be in flight at once, which the endpoint's one-reader and one-writer
 /// rules already guarantee.
-class SealedFrameSocket final: public ISocket
+class SealedFrameSocket final: public core::net::ISocket
 {
   public:
     /// @param raw The connection; owned.
     /// @param end Which end this is, which decides the header shape read and written.
     /// @param maxPayload The largest payload a sealed frame read here may declare.
-    SealedFrameSocket(std::unique_ptr<ISocket> raw, SealedFrameEnd end, std::size_t maxPayload);
+    SealedFrameSocket(std::unique_ptr<core::net::ISocket> raw, SealedFrameEnd end, std::size_t maxPayload);
 
     SealedFrameSocket(SealedFrameSocket const&) = delete;
     SealedFrameSocket(SealedFrameSocket&&) = delete;
@@ -111,18 +112,18 @@ class SealedFrameSocket final: public ISocket
     /// @return Why reading stopped, or nothing while it has not.
     [[nodiscard]] std::optional<SealFault> Fault() const noexcept;
 
-    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override;
-    [[nodiscard]] IoAwaitable write(std::span<std::byte const> buffer) override;
-    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
-                                            std::shared_ptr<void const> keepAlive = {}) override;
-    [[nodiscard]] Task<std::expected<void, NetError>> handshakeIfNeeded() override;
+    [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override;
+    [[nodiscard]] core::net::IoAwaitable write(std::span<std::byte const> buffer) override;
+    [[nodiscard]] core::net::IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
+                                                       std::shared_ptr<void const> keepAlive = {}) override;
+    [[nodiscard]] core::net::ResultAwaitable<void> handshakeIfNeeded() override;
 
     /// @copydoc ISocket::WaitReadable
     ///
     /// Verified bytes not yet handed out answer at once; otherwise the raw socket answers. The tag
     /// changes nothing about how a peer says goodbye -- its FIN is the raw EOF -- so delegating
     /// does not reopen #712's TLS problem.
-    [[nodiscard]] IoAwaitable waitReadable() override;
+    [[nodiscard]] core::net::IoAwaitable waitReadable() override;
 
     /// @copydoc ISocket::CancelRead
     ///
@@ -132,9 +133,9 @@ class SealedFrameSocket final: public ISocket
 
     [[nodiscard]] std::string peerAddress() const override;
     void close() noexcept override;
-    void shutdownWrite() noexcept override;
+    [[nodiscard]] core::net::ResultAwaitable<void> shutdownWrite() override;
     void setReceiveDeadline(std::chrono::milliseconds deadline) noexcept override;
-    [[nodiscard]] bool IsClosed() const noexcept override;
+    [[nodiscard]] bool isClosed() const noexcept override;
 
   private:
     /// Move every whole, verified frame out of `_pending` into `_released`.
@@ -152,23 +153,21 @@ class SealedFrameSocket final: public ISocket
     /// Append @p segments to what this end has written, and seal every frame now whole.
     /// @param segments What the caller wrote.
     /// @return How many bytes that was, or the error when a header this end wrote is not a frame.
-    [[nodiscard]] IoResult SealWhatIsWhole(std::span<std::span<std::byte const> const> segments);
+    [[nodiscard]] core::net::IoResult SealWhatIsWhole(std::span<std::span<std::byte const> const> segments);
 
     /// The error every read reports once a fault has stopped the stream.
     /// @return It.
-    [[nodiscard]] NetError FaultError() const;
+    [[nodiscard]] core::net::NetError FaultError() const;
 
-    Task<IoResult> PumpRead(std::span<std::byte> out);
-    Task<IoResult> PumpWrite(std::size_t reported);
-    DetachedTask DriveRead(IoAwaitable* awaitable, std::span<std::byte> out);
-    DetachedTask DriveWrite(IoAwaitable* awaitable, std::size_t reported);
+    core::async::Task<core::net::IoResult> PumpRead(std::span<std::byte> out);
+    core::async::Task<core::net::IoResult> PumpWrite(std::size_t reported);
 
     /// Start a pump for a sealed write of @p reported caller bytes whose frames wait in `_outReady`.
     /// @param reported What the caller is told was written.
     /// @return The awaitable.
-    [[nodiscard]] IoAwaitable StartWrite(std::size_t reported);
+    [[nodiscard]] core::net::IoAwaitable StartWrite(std::size_t reported);
 
-    std::unique_ptr<ISocket> _raw;
+    std::unique_ptr<core::net::ISocket> _raw;
     SealedFrameEnd _end;
     std::size_t _maxPayload;
 
@@ -180,11 +179,9 @@ class SealedFrameSocket final: public ISocket
     std::vector<std::byte> _released;  ///< Verified header and payload bytes not yet handed out.
     std::size_t _releasedOffset { 0 }; ///< How much of `_released` has been handed out.
     std::optional<SealFault> _fault;   ///< Why reading stopped.
-    std::span<std::byte> _readView;    ///< The parked read's destination.
 
     std::vector<std::byte> _outPending; ///< Bytes written that do not yet make a whole frame.
     std::vector<std::byte> _outReady;   ///< Sealed frames not yet on the wire.
-    std::size_t _writeReported { 0 };   ///< What the parked write reports.
 };
 
 } // namespace FastCache

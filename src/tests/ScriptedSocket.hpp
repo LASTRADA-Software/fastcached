@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Net/ISocket.hpp>
-
 #include <algorithm>
 #include <cstddef>
 #include <functional>
@@ -13,10 +11,12 @@
 #include <utility>
 #include <vector>
 
+#include <core/net/ISocket.hpp>
+
 namespace FastCache::Testing
 {
 
-/// An `ISocket` that replays a fixed reply stream and records what was written.
+/// An `core::net::ISocket` that replays a fixed reply stream and records what was written.
 ///
 /// ## Why this is one file rather than three
 ///
@@ -24,7 +24,7 @@ namespace FastCache::Testing
 /// `ScriptedScheduler` in `WorkerProtocol_test.cpp` and `ScriptedSocket` in
 /// `AuthRefusalContract_test.cpp` — and **the same defect was live in two of
 /// them**: `WriteVectored` answering `0`, which is a short write and which
-/// `SendAll` correctly treats as a failure. Nothing had ever tripped on it,
+/// `core::net::sendAll` correctly treats as a failure. Nothing had ever tripped on it,
 /// because `CacheProtocol::Exchange` is the first caller to send a vectored write
 /// and no case reached it. The second copy was found and fixed while writing
 /// #340; the first was still carrying the identical defect a day later and was
@@ -49,7 +49,7 @@ namespace FastCache::Testing
 /// A script, not a server. It answers with bytes decided before the call, so it
 /// cannot model a peer whose reply depends on what it was sent. Where a *live*
 /// responder is wanted, `Net/InMemoryTransport` is the tool.
-class ScriptedSocket final: public ISocket
+class ScriptedSocket final: public core::net::ISocket
 {
   public:
     /// @param replies The bytes the peer returns, in order. Running out is EOF.
@@ -61,12 +61,12 @@ class ScriptedSocket final: public ISocket
     /// Accept everything, and record it.
     /// @param bytes What the caller wrote.
     /// @return The full count; a scripted peer never applies back-pressure.
-    [[nodiscard]] IoAwaitable write(std::span<std::byte const> bytes) override
+    [[nodiscard]] core::net::IoAwaitable write(std::span<std::byte const> bytes) override
     {
         ++_sendCalls;
         _trace.push_back('S');
         _sent.insert(_sent.end(), bytes.begin(), bytes.end());
-        return IoAwaitable { IoResult { bytes.size() } };
+        return core::net::IoAwaitable { core::net::IoResult { bytes.size() } };
     }
 
     /// Hand back the next slice of the script.
@@ -88,7 +88,7 @@ class ScriptedSocket final: public ISocket
         _onRead = std::move(hook);
     }
 
-    [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
+    [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override
     {
         if (_onRead)
             _onRead();
@@ -97,10 +97,10 @@ class ScriptedSocket final: public ISocket
         if (_trace.empty() || _trace.back() != 'R')
             _trace.push_back('R');
         auto const take = std::min(_replies.size() - _cursor, buffer.size());
-        // Zero is EOF, which is how `RecvExactly` learns the peer ran out.
+        // Zero is EOF, which is how `core::net::receiveExactly` learns the peer ran out.
         std::copy_n(_replies.begin() + static_cast<std::ptrdiff_t>(_cursor), take, buffer.begin());
         _cursor += take;
-        return IoAwaitable { IoResult { take } };
+        return core::net::IoAwaitable { core::net::IoResult { take } };
     }
 
     /// Accept every segment, and report the total.
@@ -110,8 +110,8 @@ class ScriptedSocket final: public ISocket
     /// a test drove a vectored write through them. See the class comment.
     /// @param segments The buffers, in order.
     /// @return Their combined length.
-    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
-                                            std::shared_ptr<void const> /*keepAlive*/ = {}) override
+    [[nodiscard]] core::net::IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
+                                                       std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
         ++_sendCalls;
         _trace.push_back('S');
@@ -121,7 +121,7 @@ class ScriptedSocket final: public ISocket
             _sent.insert(_sent.end(), segment.begin(), segment.end());
             total += segment.size();
         }
-        return IoAwaitable { IoResult { total } };
+        return core::net::IoAwaitable { core::net::IoResult { total } };
     }
 
     void close() noexcept override
@@ -129,7 +129,7 @@ class ScriptedSocket final: public ISocket
         _closed = true;
     }
 
-    [[nodiscard]] bool IsClosed() const noexcept override
+    [[nodiscard]] bool isClosed() const noexcept override
     {
         return _closed;
     }
@@ -164,7 +164,7 @@ class ScriptedSocket final: public ISocket
     /// per run: `"SSRR"` is two writes then two reads, `"SRSR"` a round trip
     /// between them.
     ///
-    /// This, not the write count, is what pipelining actually means. Two `SendAll`
+    /// This, not the write count, is what pipelining actually means. Two `core::net::sendAll`
     /// calls back to back are exactly as pipelined as one concatenated buffer —
     /// neither waits for a reply — and demanding a single write would force the
     /// caller to COPY a frame carrying a whole object file just to satisfy a test.
@@ -190,34 +190,34 @@ class ScriptedSocket final: public ISocket
 /// fails" is a different contract and not a script with no entries — and because
 /// the version this replaces got that exactly wrong, returning *success* from the
 /// one method whose whole purpose is to fail.
-class FailingSocket final: public ISocket
+class FailingSocket final: public core::net::ISocket
 {
   public:
-    [[nodiscard]] IoAwaitable write(std::span<std::byte const> /*bytes*/) override
+    [[nodiscard]] core::net::IoAwaitable write(std::span<std::byte const> /*bytes*/) override
     {
-        return IoAwaitable { std::unexpected(Reset("scripted write failure")) };
+        return core::net::IoAwaitable { std::unexpected(Reset("scripted write failure")) };
     }
 
-    [[nodiscard]] IoAwaitable read(std::span<std::byte> /*buffer*/) override
+    [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> /*buffer*/) override
     {
-        return IoAwaitable { std::unexpected(Reset("scripted read failure")) };
+        return core::net::IoAwaitable { std::unexpected(Reset("scripted read failure")) };
     }
 
     /// Fails the way the other two do, rather than reporting a zero-byte success.
     ///
-    /// `SendAll` reads both as failure, so today the two are indistinguishable — but
+    /// `core::net::sendAll` reads both as failure, so today the two are indistinguishable — but
     /// this class's whole contract is "every call fails", and a caller that asks
     /// `has_value()` (which is how a transport failure is told from a short write)
     /// would have been handed a success by the one method that did not honour it.
-    [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> /*segments*/,
-                                            std::shared_ptr<void const> /*keepAlive*/ = {}) override
+    [[nodiscard]] core::net::IoAwaitable writeVectored(std::span<std::span<std::byte const> const> /*segments*/,
+                                                       std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
-        return IoAwaitable { std::unexpected(Reset("scripted write failure")) };
+        return core::net::IoAwaitable { std::unexpected(Reset("scripted write failure")) };
     }
 
     void close() noexcept override {}
 
-    [[nodiscard]] bool IsClosed() const noexcept override
+    [[nodiscard]] bool isClosed() const noexcept override
     {
         return false;
     }
@@ -231,9 +231,11 @@ class FailingSocket final: public ISocket
     /// The one failure this fake reports, named once.
     /// @param context What the caller was attempting.
     /// @return A connection-reset error carrying that context.
-    [[nodiscard]] static NetError Reset(std::string context)
+    [[nodiscard]] static core::net::NetError Reset(std::string context)
     {
-        return NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = std::move(context) };
+        return core::net::NetError { .code = core::net::NetErrorCode::ConnReset,
+                                     .systemCode = 0,
+                                     .context = std::move(context) };
     }
 };
 

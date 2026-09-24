@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Net/ISocket.hpp>
-#include <FastCache/Net/NetError.hpp>
 #include <FastCache/Protocol/ProtocolAutodetect.hpp>
 
 #include <cstddef>
 #include <expected>
 #include <span>
+
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
+#include <core/net/NetError.hpp>
 
 namespace FastCache
 {
@@ -38,7 +39,7 @@ ProtocolFlavor ClassifyFirstByte(std::byte first) noexcept
     }
 }
 
-Task<std::expected<AutodetectResult, NetError>> DetectProtocol(ISocket* socket)
+core::async::Task<std::expected<AutodetectResult, core::net::NetError>> DetectProtocol(core::net::ISocket* socket)
 {
     std::byte peekBuffer[1] {};
     auto const result = co_await socket->read(std::span<std::byte> { peekBuffer, 1 });
@@ -46,7 +47,8 @@ Task<std::expected<AutodetectResult, NetError>> DetectProtocol(ISocket* socket)
         co_return std::unexpected(result.error());
 
     if (*result == 0)
-        co_return std::unexpected(NetError { .code = NetErrorCode::Eof, .systemCode = 0, .context = {} });
+        co_return std::unexpected(
+            core::net::NetError { .code = core::net::NetErrorCode::Eof, .systemCode = 0, .context = {} });
 
     AutodetectResult outcome;
     outcome.flavor = ClassifyFirstByte(peekBuffer[0]);

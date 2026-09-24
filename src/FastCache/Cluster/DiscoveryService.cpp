@@ -11,8 +11,8 @@
 namespace FastCache::Cluster
 {
 
-DiscoveryService::DiscoveryService(IDatagramSocket& socket,
-                                   IClock& clock,
+DiscoveryService::DiscoveryService(core::net::IDatagramSocket& socket,
+                                   core::platform::IClock& clock,
                                    ISecureRandom& random,
                                    PeerDirectory& directory,
                                    DiscoveryConfig config,
@@ -37,7 +37,7 @@ bool DiscoveryService::SendBeacon()
     return _socket.send(datagram, _config.beaconAddress).has_value();
 }
 
-bool DiscoveryService::IssueChallenge(DiscoveryWire::Beacon const& peer, DatagramAddress const& replyTo)
+bool DiscoveryService::IssueChallenge(DiscoveryWire::Beacon const& peer, core::net::DatagramAddress const& replyTo)
 {
     // Drawn through the randomness seam rather than a local engine: a nonce this
     // node chose is the only thing making a proof unreplayable, so a test has to be
@@ -79,7 +79,7 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
 {
     auto const received = _socket.receive(timeout);
     if (!received.has_value())
-        return received.error() == DatagramWait::Closed ? DiscoveryEvent::Closed : DiscoveryEvent::Nothing;
+        return received.error() == core::net::DatagramWait::Closed ? DiscoveryEvent::Closed : DiscoveryEvent::Nothing;
 
     auto const kind = DiscoveryWire::ClassifyDatagram(received->payload);
     if (!kind.has_value())
@@ -215,7 +215,7 @@ DiscoveryEvent DiscoveryService::PumpOnce(std::chrono::milliseconds timeout)
 
 DiscoveryEvent DiscoveryService::JudgeProof(DiscoveryWire::Proof const& proof,
                                             DiscoveryWire::Challenge const& challenge,
-                                            DatagramAddress const& from)
+                                            core::net::DatagramAddress const& from)
 {
     // The SIGNATURE first, under the key the proof carries, before anything the proof claims
     // is looked up or reported: until it verifies, the key is a claim too, and naming it would
@@ -254,7 +254,9 @@ DiscoveryEvent DiscoveryService::JudgeProof(DiscoveryWire::Proof const& proof,
     return DiscoveryEvent::PeerAuthenticated;
 }
 
-void DiscoveryService::ReportUnacceptedKey(bool revoked, DiscoveryWire::Proof const& proof, DatagramAddress const& from)
+void DiscoveryService::ReportUnacceptedKey(bool revoked,
+                                           DiscoveryWire::Proof const& proof,
+                                           core::net::DatagramAddress const& from)
 {
     ++_unacceptedSinceReport;
     auto const now = _clock.now();

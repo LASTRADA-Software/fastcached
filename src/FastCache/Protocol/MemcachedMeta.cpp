@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Protocol/MemcachedMeta.hpp>
@@ -19,6 +18,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -466,9 +467,10 @@ namespace
         return out;
     }
 
-    [[nodiscard]] std::int64_t TtlSecondsFromExpiry(TimePoint expiry, TimePoint now)
+    [[nodiscard]] std::int64_t TtlSecondsFromExpiry(core::platform::SteadyTimePoint expiry,
+                                                    core::platform::SteadyTimePoint now)
     {
-        if (expiry == TimePoint::max())
+        if (expiry == core::platform::SteadyTimePoint::max())
             return -1;
         auto const diff = std::chrono::duration_cast<std::chrono::seconds>(expiry - now).count();
         return diff;
@@ -476,14 +478,15 @@ namespace
 
     /// Seconds since the entry was last read (meta `l` flag / `ME la=`).
     /// A never-accessed entry (sentinel `lastAccess`) reports 0.
-    [[nodiscard]] std::int64_t LastAccessSeconds(TimePoint lastAccess, TimePoint now)
+    [[nodiscard]] std::int64_t LastAccessSeconds(core::platform::SteadyTimePoint lastAccess,
+                                                 core::platform::SteadyTimePoint now)
     {
-        if (lastAccess == TimePoint::min())
+        if (lastAccess == core::platform::SteadyTimePoint::min())
             return 0;
         return std::chrono::duration_cast<std::chrono::seconds>(now - lastAccess).count();
     }
 
-    Task<bool> HandleMg(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
+    core::async::Task<bool> HandleMg(core::net::ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
     {
         // mg <key> <flags...>
         if (args.empty())
@@ -583,7 +586,10 @@ namespace
         co_return co_await WriteAll(socket, line);
     }
 
-    Task<bool> HandleMs(ISocket* socket, CacheEngine* engine, ByteReader* reader, std::span<std::string_view const> args)
+    core::async::Task<bool> HandleMs(core::net::ISocket* socket,
+                                     CacheEngine* engine,
+                                     ByteReader* reader,
+                                     std::span<std::string_view const> args)
     {
         // ms <key> <datalen> <flags...>
         if (args.size() < 2)
@@ -712,7 +718,7 @@ namespace
         co_return co_await WriteAll(socket, line);
     }
 
-    Task<bool> HandleMd(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
+    core::async::Task<bool> HandleMd(core::net::ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
     {
         // md <key> <flags...>
         if (args.empty())
@@ -749,7 +755,7 @@ namespace
         co_return co_await WriteAll(socket, line);
     }
 
-    Task<bool> HandleMa(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
+    core::async::Task<bool> HandleMa(core::net::ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
     {
         // ma <key> <flags...>
         if (args.empty())
@@ -833,7 +839,7 @@ namespace
         co_return co_await WriteAll(socket, line);
     }
 
-    Task<bool> HandleMe(ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
+    core::async::Task<bool> HandleMe(core::net::ISocket* socket, CacheEngine* engine, std::span<std::string_view const> args)
     {
         // me <key> [b]
         if (args.empty())
@@ -855,11 +861,11 @@ namespace
 
 } // namespace
 
-Task<bool> MemcachedMeta::Dispatch(ISocket* socket,
-                                   CacheEngine* engine,
-                                   ByteReader* reader,
-                                   std::string_view command,
-                                   std::span<std::string_view const> args)
+core::async::Task<bool> MemcachedMeta::Dispatch(core::net::ISocket* socket,
+                                                CacheEngine* engine,
+                                                ByteReader* reader,
+                                                std::string_view command,
+                                                std::span<std::string_view const> args)
 {
     if (command == "mg")
         co_return co_await HandleMg(socket, engine, args);

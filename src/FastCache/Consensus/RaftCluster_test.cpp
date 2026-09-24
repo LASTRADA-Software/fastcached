@@ -596,7 +596,7 @@ TEST_CASE("A cluster that admitted a member re-elects after losing the leader", 
     //
     // The failure this is written against (#388) is a cluster that formed, admitted,
     // served -- and then could not re-elect, because the admitted node never fell
-    // due. `NextDeadline()` answers `TimePoint::max()` while `HasCluster()` is
+    // due. `NextDeadline()` answers `core::platform::SteadyTimePoint::max()` while `HasCluster()` is
     // false, so a joiner that lost its configuration neither campaigns nor answers,
     // and a four-member quorum with one node dead and one silent can never reach
     // three.
@@ -804,7 +804,7 @@ TEST_CASE("A healthy cluster never changes term", "[consensus][raft][cluster][pr
     // against the next heartbeat -- arithmetic over the step size and the
     // per-message delay, which this rulebook already records paying for as a case
     // that reports future regressions as flakes. The exact form of the rule is
-    // pinned by the `ManualClock` cases on `RaftNode`; this is the end-to-end
+    // pinned by the `core::platform::ManualClock` cases on `RaftNode`; this is the end-to-end
     // statement that nothing perturbs a cluster nobody is perturbing.
     RaftClusterHarness cluster { { "n1", "n2", "n3" }, Members() };
     REQUIRE(SettleOnLeader(cluster));

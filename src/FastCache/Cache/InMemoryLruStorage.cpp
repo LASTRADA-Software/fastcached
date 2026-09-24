@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/IReclaimLog.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
-#include <FastCache/Core/Profiling.hpp>
 
 #include <algorithm>
 #include <charconv>
@@ -11,6 +10,8 @@
 #include <string>
 #include <string_view>
 #include <utility>
+
+#include <core/Profiling.hpp>
 
 namespace FastCache
 {
@@ -39,7 +40,7 @@ namespace
     }
 
     /// True if the entry is alive at `now` given the current liveGeneration.
-    [[nodiscard]] bool IsAlive(CacheEntry const& entry, std::uint64_t liveGen, TimePoint now) noexcept
+    [[nodiscard]] bool IsAlive(CacheEntry const& entry, std::uint64_t liveGen, core::platform::SteadyTimePoint now) noexcept
     {
         if (entry.generation < liveGen)
             return false;
@@ -57,7 +58,7 @@ InMemoryLruStorage::InMemoryLruStorage(std::size_t maxBytes, std::size_t maxValu
 {
 }
 
-InMemoryLruStorage::Iterator InMemoryLruStorage::FindAlive(std::string_view key, TimePoint now)
+InMemoryLruStorage::Iterator InMemoryLruStorage::FindAlive(std::string_view key, core::platform::SteadyTimePoint now)
 {
     auto const indexIt = _index.find(key);
     if (indexIt == _index.end())
@@ -89,7 +90,7 @@ InMemoryLruStorage::Iterator InMemoryLruStorage::FindAlive(std::string_view key,
     return nodeIt;
 }
 
-CacheEntry const* InMemoryLruStorage::FindAliveReadOnly(std::string_view key, TimePoint now) const
+CacheEntry const* InMemoryLruStorage::FindAliveReadOnly(std::string_view key, core::platform::SteadyTimePoint now) const
 {
     auto const indexIt = _index.find(key);
     if (indexIt == _index.end())
@@ -117,7 +118,7 @@ void InMemoryLruStorage::EraseAt(Iterator it)
 
 void InMemoryLruStorage::EvictToFit()
 {
-    FC_ZONE_SCOPED_N("LruStorage::EvictToFit");
+    CORE_ZONE_SCOPED_N("LruStorage::EvictToFit");
     if (_maxBytes == 0)
         return;
     while (_bytesUsed > _maxBytes && !_lru.empty())
@@ -140,15 +141,15 @@ void InMemoryLruStorage::EvictToFit()
     }
     // Memory-pressure timeline so the Tracy viewer shows how close the cache
     // runs to its byte cap over the course of a workload.
-    FC_PLOT("lru.bytesUsed", static_cast<std::int64_t>(_bytesUsed));
+    CORE_PLOT("lru.bytesUsed", static_cast<std::int64_t>(_bytesUsed));
 }
 
 CasToken InMemoryLruStorage::InsertNew(std::string key,
                                        std::span<std::byte const> value,
                                        std::uint32_t flags,
-                                       TimePoint expiry)
+                                       core::platform::SteadyTimePoint expiry)
 {
-    FC_ZONE_SCOPED_N("LruStorage::InsertNew");
+    CORE_ZONE_SCOPED_N("LruStorage::InsertNew");
     auto const cas = _nextCas++;
 
     Node node;
@@ -175,9 +176,9 @@ CasToken InMemoryLruStorage::InsertNew(std::string key,
 CasToken InMemoryLruStorage::MutateExisting(Iterator it,
                                             std::span<std::byte const> value,
                                             std::uint32_t flags,
-                                            TimePoint expiry)
+                                            core::platform::SteadyTimePoint expiry)
 {
-    FC_ZONE_SCOPED_N("LruStorage::MutateExisting");
+    CORE_ZONE_SCOPED_N("LruStorage::MutateExisting");
     _bytesUsed -= it->entry.ValueSize();
     // Rebind to a fresh immutable buffer (copy-on-write): any reader still
     // holding the previous SharedValue keeps a valid, unchanged payload. Re-encode
@@ -254,7 +255,8 @@ CacheEntry InMemoryLruStorage::PlaintextEntry(Node const& node) const
     return entry;
 }
 
-InMemoryLruStorage::Node const* InMemoryLruStorage::FindNodeReadOnly(std::string_view key, TimePoint now) const
+InMemoryLruStorage::Node const* InMemoryLruStorage::FindNodeReadOnly(std::string_view key,
+                                                                     core::platform::SteadyTimePoint now) const
 {
     auto const it = _index.find(key);
     if (it == _index.end())
@@ -265,9 +267,9 @@ InMemoryLruStorage::Node const* InMemoryLruStorage::FindNodeReadOnly(std::string
     return &node;
 }
 
-std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view key, core::platform::SteadyTimePoint now)
 {
-    FC_ZONE_SCOPED_N("LruStorage::Get");
+    CORE_ZONE_SCOPED_N("LruStorage::Get");
 
     if (_lruMode == LruMode::Approximate)
     {
@@ -313,7 +315,7 @@ std::expected<GetResult, StorageError> InMemoryLruStorage::Get(std::string_view 
     return result;
 }
 
-void InMemoryLruStorage::PromoteOnRead(std::string_view key, TimePoint now)
+void InMemoryLruStorage::PromoteOnRead(std::string_view key, core::platform::SteadyTimePoint now)
 {
     // Called under an exclusive lock on a sampled fraction of Approximate-mode
     // reads. Promote the entry to most-recently-used and advance its access
@@ -333,9 +335,9 @@ void InMemoryLruStorage::PromoteOnRead(std::string_view key, TimePoint now)
 std::expected<CasToken, StorageError> InMemoryLruStorage::Set(std::string_view key,
                                                               std::vector<std::byte> value,
                                                               std::uint32_t flags,
-                                                              TimePoint expiry)
+                                                              core::platform::SteadyTimePoint expiry)
 {
-    FC_ZONE_SCOPED_N("LruStorage::Set");
+    CORE_ZONE_SCOPED_N("LruStorage::Set");
     ++_stats.cmdSet;
     if (ExceedsValueLimit(value.size()))
         return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
@@ -345,8 +347,11 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Set(std::string_view k
     return InsertNew(std::string { key }, std::move(value), flags, expiry);
 }
 
-std::expected<CasToken, StorageError> InMemoryLruStorage::Add(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> InMemoryLruStorage::Add(std::string_view key,
+                                                              std::vector<std::byte> value,
+                                                              std::uint32_t flags,
+                                                              core::platform::SteadyTimePoint expiry,
+                                                              core::platform::SteadyTimePoint now)
 {
     if (ExceedsValueLimit(value.size()))
         return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
@@ -356,8 +361,11 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Add(
     return InsertNew(std::string { key }, std::move(value), flags, expiry);
 }
 
-std::expected<CasToken, StorageError> InMemoryLruStorage::Replace(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> InMemoryLruStorage::Replace(std::string_view key,
+                                                                  std::vector<std::byte> value,
+                                                                  std::uint32_t flags,
+                                                                  core::platform::SteadyTimePoint expiry,
+                                                                  core::platform::SteadyTimePoint now)
 {
     if (ExceedsValueLimit(value.size()))
         return std::unexpected(MakeStorageError(StorageErrorCode::ValueTooLarge));
@@ -370,7 +378,7 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Replace(
 std::expected<CasToken, StorageError> InMemoryLruStorage::Append(std::string_view key,
                                                                  std::span<std::byte const> suffix,
                                                                  CasToken expected,
-                                                                 TimePoint now)
+                                                                 core::platform::SteadyTimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
@@ -393,7 +401,7 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Append(std::string_vie
 std::expected<CasToken, StorageError> InMemoryLruStorage::Prepend(std::string_view key,
                                                                   std::span<std::byte const> prefix,
                                                                   CasToken expected,
-                                                                  TimePoint now)
+                                                                  core::platform::SteadyTimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
@@ -415,8 +423,8 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::CompareAndSwap(std::st
                                                                          CasToken expected,
                                                                          std::vector<std::byte> value,
                                                                          std::uint32_t flags,
-                                                                         TimePoint expiry,
-                                                                         TimePoint now)
+                                                                         core::platform::SteadyTimePoint expiry,
+                                                                         core::platform::SteadyTimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
@@ -435,10 +443,8 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::CompareAndSwap(std::st
     return MutateExisting(it, std::move(value), flags, expiry);
 }
 
-std::expected<IStorage::IncrResult, StorageError> InMemoryLruStorage::IncrementOrInitialize(std::string_view key,
-                                                                                            std::uint64_t magnitude,
-                                                                                            bool decrement,
-                                                                                            TimePoint now)
+std::expected<IStorage::IncrResult, StorageError> InMemoryLruStorage::IncrementOrInitialize(
+    std::string_view key, std::uint64_t magnitude, bool decrement, core::platform::SteadyTimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
@@ -487,7 +493,7 @@ std::expected<IStorage::IncrResult, StorageError> InMemoryLruStorage::IncrementO
     return IStorage::IncrResult { .value = updated, .cas = cas };
 }
 
-std::expected<void, StorageError> InMemoryLruStorage::Delete(std::string_view key, TimePoint now)
+std::expected<void, StorageError> InMemoryLruStorage::Delete(std::string_view key, core::platform::SteadyTimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
@@ -500,7 +506,9 @@ std::expected<void, StorageError> InMemoryLruStorage::Delete(std::string_view ke
     return {};
 }
 
-std::expected<CasToken, StorageError> InMemoryLruStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
+std::expected<CasToken, StorageError> InMemoryLruStorage::Touch(std::string_view key,
+                                                                core::platform::SteadyTimePoint newExpiry,
+                                                                core::platform::SteadyTimePoint now)
 {
     ++_stats.cmdTouch;
     auto const it = FindAlive(key, now);
@@ -516,7 +524,7 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::Touch(std::string_view
     return it->entry.cas;
 }
 
-std::expected<GetResult, StorageError> InMemoryLruStorage::Peek(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> InMemoryLruStorage::Peek(std::string_view key, core::platform::SteadyTimePoint now)
 {
     // Non-mutating: no LRU promotion, no lastAccess/fetched update, no
     // stats. Expired / flushed entries read as a miss but are left in
@@ -531,8 +539,8 @@ std::expected<GetResult, StorageError> InMemoryLruStorage::Peek(std::string_view
 }
 
 std::expected<CasToken, StorageError> InMemoryLruStorage::MarkStale(std::string_view key,
-                                                                    std::optional<TimePoint> newExpiry,
-                                                                    TimePoint now)
+                                                                    std::optional<core::platform::SteadyTimePoint> newExpiry,
+                                                                    core::platform::SteadyTimePoint now)
 {
     auto const it = FindAlive(key, now);
     if (it == _lru.end())
@@ -544,7 +552,7 @@ std::expected<CasToken, StorageError> InMemoryLruStorage::MarkStale(std::string_
     return it->entry.cas;
 }
 
-void InMemoryLruStorage::FlushWithGeneration(TimePoint effectiveAt)
+void InMemoryLruStorage::FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt)
 {
     // For an immediate flush (now or in the past), bump the generation
     // right away so all current entries become invisible. For a delayed
@@ -558,9 +566,9 @@ void InMemoryLruStorage::FlushWithGeneration(TimePoint effectiveAt)
     ++_stats.cmdFlush;
 }
 
-PurgeOutcome InMemoryLruStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
+PurgeOutcome InMemoryLruStorage::PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget)
 {
-    FC_ZONE_SCOPED_N("LruStorage::PurgeExpired");
+    CORE_ZONE_SCOPED_N("LruStorage::PurgeExpired");
 
     // A full pass is `startSize` steps from wherever the last one stopped,
     // wrapping once at the end -- which examines every entry that was here when

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/IStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <cstddef>
@@ -12,6 +10,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -77,7 +78,7 @@ class ICacheUpstream
     /// them apart would have nothing useful to do with the distinction. Whether the
     /// upstream was *reachable* is reported separately, as a counter, because that
     /// is an operator's question rather than a build's.
-    [[nodiscard]] virtual Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) = 0;
+    [[nodiscard]] virtual core::async::Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) = 0;
 
     /// Offer one object to the shared cache.
     ///
@@ -88,7 +89,7 @@ class ICacheUpstream
     /// @return Which of the three outcomes it was. An implementation that has no
     ///         shared cache answers `NotConfigured` and is never counted as having
     ///         failed at something it did not attempt.
-    [[nodiscard]] virtual Task<UpstreamStore> Store(std::string_view key, std::span<std::byte const> value) = 0;
+    [[nodiscard]] virtual core::async::Task<UpstreamStore> Store(std::string_view key, std::span<std::byte const> value) = 0;
 
     /// Whether there is a shared cache behind this at all.
     ///
@@ -119,7 +120,7 @@ class NoUpstream final: public ICacheUpstream
     /// implementation rather than reverting to a null pointer, for the reason
     /// this class exists: "there is no upstream" should be a decision somebody
     /// made, not a pointer nobody set.
-    [[nodiscard]] Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view /*key*/) override
+    [[nodiscard]] core::async::Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view /*key*/) override
     {
         co_return std::nullopt;
     }
@@ -128,7 +129,8 @@ class NoUpstream final: public ICacheUpstream
     ///
     /// `NotConfigured`, which is the whole point of the enum: this used to answer
     /// `false` and be counted as a failed store on every single local write.
-    [[nodiscard]] Task<UpstreamStore> Store(std::string_view /*key*/, std::span<std::byte const> /*value*/) override
+    [[nodiscard]] core::async::Task<UpstreamStore> Store(std::string_view /*key*/,
+                                                         std::span<std::byte const> /*value*/) override
     {
         co_return UpstreamStore::NotConfigured;
     }
@@ -181,12 +183,12 @@ class LocalCache
     /// @param upstream The shared cache; must outlive this.
     /// @param clock Time source for the local tier's expiry; must outlive this.
     /// @param metrics Where hits, misses and upstream outcomes are counted.
-    LocalCache(IStorage& local, ICacheUpstream& upstream, IClock& clock, IMetricsSink& metrics) noexcept;
+    LocalCache(IStorage& local, ICacheUpstream& upstream, core::platform::IClock& clock, IMetricsSink& metrics) noexcept;
 
     /// Look one key up, reading through to the shared cache on a local miss.
     /// @param key The object key.
     /// @return The value, or nullopt when neither tier has it.
-    [[nodiscard]] Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key);
+    [[nodiscard]] core::async::Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key);
 
     /// Store one object locally, then offer it to the shared cache.
     /// @param key The object key.
@@ -194,7 +196,7 @@ class LocalCache
     /// @return Whether the LOCAL write succeeded. The upstream's answer is counted,
     ///         not returned: a client that retried on it would be retrying something
     ///         that is already durable where it matters.
-    [[nodiscard]] Task<bool> Store(std::string_view key, std::span<std::byte const> value);
+    [[nodiscard]] core::async::Task<bool> Store(std::string_view key, std::span<std::byte const> value);
 
     /// Remove one key from this node's own tier, and from nowhere else.
     ///
@@ -214,7 +216,7 @@ class LocalCache
   private:
     IStorage& _local;
     ICacheUpstream& _upstream;
-    IClock& _clock;
+    core::platform::IClock& _clock;
     IMetricsSink& _metrics;
 };
 

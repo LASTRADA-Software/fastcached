@@ -4,11 +4,8 @@
 // bytes reach the wire, which a reader is handed, and what ends a sealed connection. Where the
 // keys come from is `Distributed::NodeProof`'s; the endpoint's use of this layer, a relayed
 // handshake included, is `FrameEndpoint_test`'s.
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Core/WireFields.hpp>
-#include <FastCache/Net/ISocket.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/SealedFrameSocket.hpp>
 
@@ -23,6 +20,12 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <tests/HalfClose.hpp>
 
 using namespace FastCache;
 
@@ -49,7 +52,7 @@ constexpr std::size_t MaxPayload = 4096;
 /// @param socket The socket.
 /// @param buffer Where the bytes go.
 /// @return What the read answered.
-Task<IoResult> ReadOnce(ISocket* socket, std::span<std::byte> buffer)
+core::async::Task<core::net::IoResult> ReadOnce(core::net::ISocket* socket, std::span<std::byte> buffer)
 {
     co_return co_await socket->read(buffer);
 }
@@ -58,7 +61,7 @@ Task<IoResult> ReadOnce(ISocket* socket, std::span<std::byte> buffer)
 /// @param socket The socket.
 /// @param bytes What to write; owned, so the coroutine holds nothing it does not own.
 /// @return What the write answered.
-Task<IoResult> WriteOnce(ISocket* socket, std::vector<std::byte> bytes)
+core::async::Task<core::net::IoResult> WriteOnce(core::net::ISocket* socket, std::vector<std::byte> bytes)
 {
     co_return co_await socket->write(std::span<std::byte const> { bytes });
 }
@@ -66,16 +69,16 @@ Task<IoResult> WriteOnce(ISocket* socket, std::vector<std::byte> bytes)
 /// Everything @p socket holds now, in one read.
 ///
 /// Every case writes before it reads, so the read completes at once: a read that would park is
-/// a case waiting for bytes nobody sends, and `SyncRun` says so rather than hanging. It retrieves
+/// a case waiting for bytes nobody sends, and `core::async::syncRun` says so rather than hanging. It retrieves
 /// that park through `CancelRead` BEFORE it says so (#178): the read parks inside the sealing
-/// layer, which holds the awaitable of the frame `SyncRun` is about to free, so without the
+/// layer, which holds the awaitable of the frame `core::async::syncRun` is about to free, so without the
 /// retrieval a seal that stopped refusing ended the case in a SIGSEGV instead of a failure.
 /// @param socket The socket.
 /// @return The bytes, or what refused them.
-[[nodiscard]] std::expected<std::vector<std::byte>, NetError> ReadAvailable(ISocket& socket)
+[[nodiscard]] std::expected<std::vector<std::byte>, core::net::NetError> ReadAvailable(core::net::ISocket& socket)
 {
     auto buffer = std::vector<std::byte>(4 * MaxPayload);
-    auto const got = SyncRun(ReadOnce(&socket, buffer), [&socket] { socket.cancelRead(); });
+    auto const got = core::async::syncRunWith(ReadOnce(&socket, buffer), [&socket] { socket.cancelRead(); });
     if (!got.has_value())
         return std::unexpected(got.error());
     buffer.resize(*got);
@@ -86,9 +89,9 @@ Task<IoResult> WriteOnce(ISocket* socket, std::vector<std::byte> bytes)
 /// @param socket The socket.
 /// @param bytes What to write.
 /// @return How many bytes the write reported.
-[[nodiscard]] std::size_t Written(ISocket& socket, std::span<std::byte const> bytes)
+[[nodiscard]] std::size_t Written(core::net::ISocket& socket, std::span<std::byte const> bytes)
 {
-    auto const wrote = SyncRun(WriteOnce(&socket, std::vector<std::byte> { bytes.begin(), bytes.end() }));
+    auto const wrote = core::async::syncRun(WriteOnce(&socket, std::vector<std::byte> { bytes.begin(), bytes.end() }));
     REQUIRE(wrote.has_value());
     return *wrote;
 }
@@ -127,7 +130,8 @@ Task<IoResult> WriteOnce(ISocket* socket, std::vector<std::byte> bytes)
 /// @param raw The accepted socket.
 /// @param secret Whose key.
 /// @return The end.
-[[nodiscard]] std::unique_ptr<SealedFrameSocket> SealedServer(std::unique_ptr<ISocket> raw, std::string_view secret)
+[[nodiscard]] std::unique_ptr<SealedFrameSocket> SealedServer(std::unique_ptr<core::net::ISocket> raw,
+                                                              std::string_view secret)
 {
     auto server = std::make_unique<SealedFrameSocket>(std::move(raw), SealedFrameEnd::Server, MaxPayload);
     server->SealReceiving(Key(secret));
@@ -140,7 +144,7 @@ TEST_CASE("Before a key is agreed a sealing layer passes every byte through unto
 {
     // Every connection on a surface that offers a proof is wrapped from accept, and a launcher on
     // that port never proves anything: it must see exactly the bytes it would have seen unwrapped.
-    auto pair = InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload };
     SealedFrameSocket server { std::move(pair.server), SealedFrameEnd::Server, MaxPayload };
 
@@ -162,7 +166,7 @@ TEST_CASE("A sealed frame reaches the wire with its tag and the reader without i
 
     SECTION("on the wire, the frame and then the tag for its position")
     {
-        auto pair = InMemorySocketPair::Create();
+        auto pair = core::net::testing::InMemorySocketPair::create();
         SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload };
         caller.SealSending(Key("caller-to-server"));
 
@@ -182,7 +186,7 @@ TEST_CASE("A sealed frame reaches the wire with its tag and the reader without i
 
     SECTION("at the reader, the frame alone")
     {
-        auto pair = InMemorySocketPair::Create();
+        auto pair = core::net::testing::InMemorySocketPair::create();
         SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload };
         caller.SealSending(Key("caller-to-server"));
         auto const server = SealedServer(std::move(pair.server), "caller-to-server");
@@ -197,7 +201,7 @@ TEST_CASE("A frame written in pieces is sealed once, when it is whole", "[protoc
 {
     // The endpoint writes a header and a payload as it has them; the tag is over both, so the
     // layer holds the first piece until the second arrives and reports every byte as taken.
-    auto pair = InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload };
     caller.SealSending(Key("caller-to-server"));
     auto const server = SealedServer(std::move(pair.server), "caller-to-server");
@@ -215,7 +219,7 @@ TEST_CASE("A reply is sealed by the server's end and opened by the caller's", "[
 {
     // The two ends read DIFFERENT grammars -- a request header is seven bytes, a reply's five --
     // so a layer that framed replies as requests would locate the tag in the wrong place.
-    auto pair = InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     SealedFrameSocket caller { std::move(pair.client), SealedFrameEnd::Caller, MaxPayload };
     SealedFrameSocket server { std::move(pair.server), SealedFrameEnd::Server, MaxPayload };
     caller.SealReceiving(Key("server-to-caller"));
@@ -230,7 +234,7 @@ TEST_CASE("A reply is sealed by the server's end and opened by the caller's", "[
 TEST_CASE("A frame whose tag nobody computed ends the connection and says why", "[protocol][seal]")
 {
     // What a relay can send: a well-formed frame behind a tag it made up, having no session key.
-    auto pair = InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     auto const server = SealedServer(std::move(pair.server), "caller-to-server");
 
     REQUIRE(Written(*pair.client, ForgedRequest(RequestFrame())) > 0);
@@ -250,7 +254,7 @@ TEST_CASE("A sealed frame replayed inside its session fails its tag", "[protocol
     FrameSealer sealer { Key("caller-to-server") };
     auto const genuine = SealedRequest(sealer, RequestFrame());
 
-    auto pair = InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     auto const server = SealedServer(std::move(pair.server), "caller-to-server");
     REQUIRE(Written(*pair.client, genuine) == genuine.size());
     CHECK(ReadAvailable(*server) == RequestFrame());
@@ -265,7 +269,7 @@ TEST_CASE("A frame sealed under the other direction's key is refused", "[protoco
     // One key per direction: a reply reflected back at the server as if it were a request, or a
     // derivation that swapped the two, must not verify.
     FrameSealer wrongDirection { Key("server-to-caller") };
-    auto pair = InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     auto const server = SealedServer(std::move(pair.server), "caller-to-server");
     REQUIRE(Written(*pair.client, SealedRequest(wrongDirection, RequestFrame())) > 0);
     CHECK_FALSE(ReadAvailable(*server).has_value());
@@ -281,7 +285,7 @@ TEST_CASE("Frames verified before a forged one are still handed out, and the for
     auto const injected = ForgedRequest(RequestFrame("injected"));
     bytes.insert(bytes.end(), injected.begin(), injected.end());
 
-    auto pair = InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     auto const server = SealedServer(std::move(pair.server), "caller-to-server");
     REQUIRE(Written(*pair.client, bytes) == bytes.size());
 
@@ -294,7 +298,7 @@ TEST_CASE("A sealed frame larger than the end holds is refused before its tag co
 {
     // The tag follows the payload, so a declared length is a promise to buffer that much first;
     // a ceiling is what stops a peer that cannot seal from making this end hold it.
-    auto pair = InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     auto const server = SealedServer(std::move(pair.server), "caller-to-server");
     auto const oversized = RequestFrame(std::string(MaxPayload + 1, 'k'));
     REQUIRE(Written(*pair.client, std::span<std::byte const> { oversized }.first(Wire::RequestHeaderSize)) > 0);
@@ -305,7 +309,7 @@ TEST_CASE("A sealed frame larger than the end holds is refused before its tag co
 
 TEST_CASE("Bytes that are not a frame end a sealed connection as unframed", "[protocol][seal]")
 {
-    auto pair = InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     auto const server = SealedServer(std::move(pair.server), "caller-to-server");
     auto const noise = std::vector<std::byte>(Wire::RequestHeaderSize, std::byte { 0 });
     REQUIRE(Written(*pair.client, noise) == noise.size());
@@ -321,10 +325,10 @@ TEST_CASE("A peer that stops sending mid-frame has said goodbye, and the half fr
     FrameSealer sealer { Key("caller-to-server") };
     auto const genuine = SealedRequest(sealer, RequestFrame());
 
-    auto pair = InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     auto const server = SealedServer(std::move(pair.server), "caller-to-server");
     REQUIRE(Written(*pair.client, std::span<std::byte const> { genuine }.first(genuine.size() - 1)) > 0);
-    pair.client->shutdownWrite();
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
 
     auto const read = ReadAvailable(*server);
     REQUIRE(read.has_value());

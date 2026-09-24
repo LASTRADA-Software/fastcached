@@ -3,7 +3,6 @@
 
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/IStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 
 #include <atomic>
@@ -18,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -57,79 +58,88 @@ class ShardedStorage final: public IStorage
     ShardedStorage& operator=(ShardedStorage&&) = delete;
     ~ShardedStorage() override = default;
 
-    [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key,
+                                                             core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Set(std::string_view key,
                                                             std::vector<std::byte> value,
                                                             std::uint32_t flags,
-                                                            TimePoint expiry) override;
+                                                            core::platform::SteadyTimePoint expiry) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Add(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Add(std::string_view key,
+                                                            std::vector<std::byte> value,
+                                                            std::uint32_t flags,
+                                                            core::platform::SteadyTimePoint expiry,
+                                                            core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Replace(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Replace(std::string_view key,
+                                                                std::vector<std::byte> value,
+                                                                std::uint32_t flags,
+                                                                core::platform::SteadyTimePoint expiry,
+                                                                core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Append(std::string_view key,
                                                                std::span<std::byte const> suffix,
                                                                CasToken expected,
-                                                               TimePoint now) override;
+                                                               core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Prepend(std::string_view key,
                                                                 std::span<std::byte const> prefix,
                                                                 CasToken expected,
-                                                                TimePoint now) override;
+                                                                core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> CompareAndSwap(std::string_view key,
                                                                        CasToken expected,
                                                                        std::vector<std::byte> value,
                                                                        std::uint32_t flags,
-                                                                       TimePoint expiry,
-                                                                       TimePoint now) override;
+                                                                       core::platform::SteadyTimePoint expiry,
+                                                                       core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(std::string_view key,
-                                                                                          std::uint64_t magnitude,
-                                                                                          bool decrement,
-                                                                                          TimePoint now) override;
+    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(
+        std::string_view key, std::uint64_t magnitude, bool decrement, core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key,
+                                                           core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Touch(std::string_view key,
-                                                              TimePoint newExpiry,
-                                                              TimePoint now) override;
+                                                              core::platform::SteadyTimePoint newExpiry,
+                                                              core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key,
+                                                              core::platform::SteadyTimePoint now) override;
 
     /// Warm `key` into its owning shard's in-memory tier under that shard's
     /// exclusive lock. Forwards to the shard storage's Prefetch. See
     /// IStorage::Prefetch.
-    [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key,
+                                                             core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> MarkStale(std::string_view key,
-                                                                  std::optional<TimePoint> newExpiry,
-                                                                  TimePoint now) override;
+                                                                  std::optional<core::platform::SteadyTimePoint> newExpiry,
+                                                                  core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<GetResult, StorageError> GetAndTouch(std::string_view key,
-                                                                     TimePoint newExpiry,
-                                                                     TimePoint now) override;
+                                                                     core::platform::SteadyTimePoint newExpiry,
+                                                                     core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<void, StorageError> CompareAndDelete(std::string_view key,
                                                                      CasToken expected,
-                                                                     TimePoint now) override;
+                                                                     core::platform::SteadyTimePoint now) override;
 
     /// PERSIST primitive — clear the entry's TTL atomically under the
     /// shard lock. Holds the shard's exclusive lock across the Peek +
     /// Touch sequence so a concurrent SETEX cannot slip in between.
     /// See IStorage::ClearExpiry for the return-value contract.
-    [[nodiscard]] std::expected<bool, StorageError> ClearExpiry(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<bool, StorageError> ClearExpiry(std::string_view key,
+                                                                core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Update(
         std::string_view key,
         std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
-        TimePoint now) override;
+        core::platform::SteadyTimePoint now) override;
 
-    void FlushWithGeneration(TimePoint effectiveAt) override;
-    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
+    void FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt) override;
+    PurgeOutcome PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget) override;
 
     /// Hand `log` to every shard, each under its own exclusive lock.
     ///

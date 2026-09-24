@@ -192,7 +192,7 @@ namespace
 CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
                      std::unique_ptr<ICacheUpstream> upstream,
                      ILocalityOracle const& locality,
-                     IClock& clock,
+                     core::platform::IClock& clock,
                      IMetricsSink& metrics):
     _storage { std::move(storage) },
     _upstream { std::move(upstream) },
@@ -207,7 +207,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
                                                                         std::unique_ptr<IStorage> storage,
                                                                         ICredentialSource const& credential,
                                                                         ILocalityOracle const& locality,
-                                                                        IClock& clock,
+                                                                        core::platform::IClock& clock,
                                                                         IMetricsSink& metrics,
                                                                         ILogger& logger)
 {
@@ -224,7 +224,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
         // five seconds held every local `fastcache-cc` behind it.
         //
         // The reactor is passed too, because with a reactor socket `SO_RCVTIMEO`
-        // is inert: the per-operation ceiling is a `DeadlineTimer` that closes the
+        // is inert: the per-operation ceiling is a `core::net::DeadlineTimer` that closes the
         // socket, which bounds the whole exchange rather than one call.
         upstream = std::make_unique<RemoteUpstream>(
             cfg.upstream,
@@ -394,7 +394,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(N
                                                                                NodeConfig const& cfg,
                                                                                ICredentialSource const& credential,
                                                                                ILocalityOracle const& locality,
-                                                                               IClock& clock,
+                                                                               core::platform::IClock& clock,
                                                                                IMetricsSink& metrics,
                                                                                ILogger& logger)
 {

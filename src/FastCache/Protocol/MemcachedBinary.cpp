@@ -4,7 +4,6 @@
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Errors/ProtocolError.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
-#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 #include <FastCache/Protocol/MemcachedBinary.hpp>
@@ -21,6 +20,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <core/Profiling.hpp>
 
 namespace FastCache
 {
@@ -243,15 +244,15 @@ namespace
         return true;
     }
 
-    Task<bool> WriteResponse(ISocket* socket,
-                             Opcode opcode,
-                             Status status,
-                             std::uint32_t opaque,
-                             std::uint64_t cas,
-                             std::span<std::byte const> extras,
-                             std::span<std::byte const> key,
-                             std::span<std::byte const> value,
-                             std::shared_ptr<void const> keepAlive = {})
+    core::async::Task<bool> WriteResponse(core::net::ISocket* socket,
+                                          Opcode opcode,
+                                          Status status,
+                                          std::uint32_t opaque,
+                                          std::uint64_t cas,
+                                          std::span<std::byte const> extras,
+                                          std::span<std::byte const> key,
+                                          std::span<std::byte const> value,
+                                          std::shared_ptr<void const> keepAlive = {})
     {
         std::array<std::byte, HeaderSize> hdr {};
         hdr[0] = ResponseMagic;
@@ -315,7 +316,7 @@ namespace
         }
     }
 
-    Task<bool> ReplyError(ISocket* socket, Opcode opcode, Status status, std::uint32_t opaque)
+    core::async::Task<bool> ReplyError(core::net::ISocket* socket, Opcode opcode, Status status, std::uint32_t opaque)
     {
         co_return co_await WriteResponse(socket, opcode, status, opaque, 0, {}, {}, AsBytes(ErrorMessage(status)));
     }
@@ -346,13 +347,13 @@ namespace
         }
     }
 
-    Task<bool> HandleStorage(ISocket* socket,
-                             CacheEngine* engine,
-                             Opcode opcode,
-                             RequestHeader header,
-                             std::span<std::byte const> extras,
-                             std::span<std::byte const> key,
-                             std::span<std::byte const> value)
+    core::async::Task<bool> HandleStorage(core::net::ISocket* socket,
+                                          CacheEngine* engine,
+                                          Opcode opcode,
+                                          RequestHeader header,
+                                          std::span<std::byte const> extras,
+                                          std::span<std::byte const> key,
+                                          std::span<std::byte const> value)
     {
         if (extras.size() < 8)
             co_return co_await ReplyError(socket, opcode, Status::InvalidArguments, header.opaque);
@@ -451,8 +452,8 @@ namespace
         co_return co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, *result, {}, {}, {});
     }
 
-    Task<bool> HandleGet(
-        ISocket* socket, CacheEngine* engine, Opcode opcode, RequestHeader header, std::span<std::byte const> key)
+    core::async::Task<bool> HandleGet(
+        core::net::ISocket* socket, CacheEngine* engine, Opcode opcode, RequestHeader header, std::span<std::byte const> key)
     {
         auto const result = engine->Get(AsStringView(key));
         bool const includeKey = opcode == Opcode::GetK || opcode == Opcode::GetKQ;
@@ -482,8 +483,8 @@ namespace
                                          entry.value.AsKeepAlive());
     }
 
-    Task<bool> HandleDelete(
-        ISocket* socket, CacheEngine* engine, Opcode opcode, RequestHeader header, std::span<std::byte const> key)
+    core::async::Task<bool> HandleDelete(
+        core::net::ISocket* socket, CacheEngine* engine, Opcode opcode, RequestHeader header, std::span<std::byte const> key)
     {
         auto const result = engine->Delete(AsStringView(key));
         bool const quiet = opcode == Opcode::DeleteQ;
@@ -497,18 +498,18 @@ namespace
         co_return co_await WriteResponse(socket, opcode, Status::Ok, header.opaque, 0, {}, {}, {});
     }
 
-    Task<bool> HandleVersion(ISocket* socket, RequestHeader header)
+    core::async::Task<bool> HandleVersion(core::net::ISocket* socket, RequestHeader header)
     {
         auto const ver = ServerVersionBanner;
         co_return co_await WriteResponse(socket, Opcode::Version, Status::Ok, header.opaque, 0, {}, {}, AsBytes(ver));
     }
 
-    Task<bool> HandleNoOp(ISocket* socket, RequestHeader header)
+    core::async::Task<bool> HandleNoOp(core::net::ISocket* socket, RequestHeader header)
     {
         co_return co_await WriteResponse(socket, Opcode::NoOp, Status::Ok, header.opaque, 0, {}, {}, {});
     }
 
-    Task<bool> HandleFlush(ISocket* socket, CacheEngine* engine, Opcode opcode, RequestHeader header)
+    core::async::Task<bool> HandleFlush(core::net::ISocket* socket, CacheEngine* engine, Opcode opcode, RequestHeader header)
     {
         engine->FlushAll(0);
         if (opcode == Opcode::FlushQ)
@@ -518,12 +519,12 @@ namespace
 
     /// memcached binary `touch` and `gat` / `gat*` family. The shared
     /// branch (touch vs gat) is captured by `withValue`.
-    Task<bool> HandleTouchFamily(ISocket* socket,
-                                 CacheEngine* engine,
-                                 Opcode opcode,
-                                 RequestHeader header,
-                                 std::span<std::byte const> extras,
-                                 std::span<std::byte const> key)
+    core::async::Task<bool> HandleTouchFamily(core::net::ISocket* socket,
+                                              CacheEngine* engine,
+                                              Opcode opcode,
+                                              RequestHeader header,
+                                              std::span<std::byte const> extras,
+                                              std::span<std::byte const> key)
     {
         if (extras.size() < 4)
             co_return co_await ReplyError(socket, opcode, Status::InvalidArguments, header.opaque);
@@ -578,12 +579,12 @@ namespace
     /// memcached binary increment / decrement, including auto-vivify on
     /// miss when expiration != 0xffffffff (the spec's sentinel for "fail
     /// rather than create").
-    Task<bool> HandleArithmetic(ISocket* socket,
-                                CacheEngine* engine,
-                                Opcode opcode,
-                                RequestHeader header,
-                                std::span<std::byte const> extras,
-                                std::span<std::byte const> key)
+    core::async::Task<bool> HandleArithmetic(core::net::ISocket* socket,
+                                             CacheEngine* engine,
+                                             Opcode opcode,
+                                             RequestHeader header,
+                                             std::span<std::byte const> extras,
+                                             std::span<std::byte const> key)
     {
         if (extras.size() < 20)
             co_return co_await ReplyError(socket, opcode, Status::InvalidArguments, header.opaque);
@@ -637,12 +638,18 @@ namespace
     }
 
     /// Render one `STAT key value` packet for the binary Stat command.
-    Task<bool> WriteStatLine(ISocket* socket, std::uint32_t opaque, std::string_view name, std::string value)
+    core::async::Task<bool> WriteStatLine(core::net::ISocket* socket,
+                                          std::uint32_t opaque,
+                                          std::string_view name,
+                                          std::string value)
     {
         co_return co_await WriteResponse(socket, Opcode::Stat, Status::Ok, opaque, 0, {}, AsBytes(name), AsBytes(value));
     }
 
-    Task<bool> HandleStat(ISocket* socket, CacheEngine* engine, RequestHeader header, std::span<std::byte const> key)
+    core::async::Task<bool> HandleStat(core::net::ISocket* socket,
+                                       CacheEngine* engine,
+                                       RequestHeader header,
+                                       std::span<std::byte const> key)
     {
         auto const stats = engine->Snapshot();
         auto const subkey = AsStringView(key);
@@ -719,13 +726,13 @@ namespace
     /// `authzid\0authcid\0passwd` payload and flips `authenticated`, and SaslStep
     /// (PLAIN is single-step) replies AuthError.
     /// @param authenticated Per-connection flag, set true on a successful auth.
-    Task<bool> HandleSasl(ISocket* socket,
-                          Opcode opcode,
-                          RequestHeader header,
-                          std::span<std::byte const> key,
-                          std::span<std::byte const> value,
-                          SessionContext session,
-                          bool* authenticated)
+    core::async::Task<bool> HandleSasl(core::net::ISocket* socket,
+                                       Opcode opcode,
+                                       RequestHeader header,
+                                       std::span<std::byte const> key,
+                                       std::span<std::byte const> value,
+                                       SessionContext session,
+                                       bool* authenticated)
     {
         auto const auth = session.CurrentAuth();
         bool const authEnabled = auth != nullptr && auth->Enabled();
@@ -771,10 +778,10 @@ namespace
 
 } // namespace
 
-Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
-                                       CacheEngine* engine,
-                                       std::vector<std::byte> primingBytes,
-                                       SessionContext session)
+core::async::Task<void> MemcachedBinaryHandler::Run(core::net::ISocket* socket,
+                                                    CacheEngine* engine,
+                                                    std::vector<std::byte> primingBytes,
+                                                    SessionContext session)
 {
     constexpr std::size_t MaxBodyBytes = 16 * 1024 * 1024;
     ByteReader reader { *socket, /*maxLineBytes*/ 1, /*maxPayloadBytes*/ MaxBodyBytes + HeaderSize };
@@ -841,7 +848,7 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
                 co_return;
             if (!co_await ReplyError(socket, opcode, Status::AuthError, header.opaque))
                 co_return;
-            FC_FRAME_MARK;
+            CORE_FRAME_MARK;
             continue;
         }
 
@@ -956,7 +963,7 @@ Task<void> MemcachedBinaryHandler::Run(ISocket* socket,
             co_return;
 
         // One binary command handled and replied — mark the request frame.
-        FC_FRAME_MARK;
+        CORE_FRAME_MARK;
     }
 }
 

@@ -2,7 +2,6 @@
 #include "NodeAnnounce.hpp"
 #include "WorkerLease.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseSigner.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
@@ -15,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -44,7 +44,8 @@ inline constexpr std::uint64_t DeposedTerm = 4;
 
 /// A fixed clock, because what these cases turn on is the TERM a grant names and an
 /// expiry that moved per run would make a failure look like a flake.
-ManualWallClock const LeaseClock { std::chrono::system_clock::time_point { std::chrono::seconds { 1704067200 } } };
+core::platform::ManualWallClock const LeaseClock { std::chrono::system_clock::time_point {
+    std::chrono::seconds { 1704067200 } } };
 
 /// The scheduler that signs every grant here. Its key is derived from its name, constant
 /// for the reason the clock is.
@@ -95,7 +96,7 @@ ManualWallClock const LeaseClock { std::chrono::system_clock::time_point { std::
                                    .endpoint = std::string { endpoint },
                                    .fingerprint = "gcc-13",
                                    .key = "obj-abc",
-                                   .expiresAt = LeaseClock.Now() + std::chrono::minutes { 10 },
+                                   .expiresAt = LeaseClock.now() + std::chrono::minutes { 10 },
                                    .clusterId = std::string { ThisCluster },
                                    .epoch = epoch,
                                    .signer = {} });
@@ -117,7 +118,7 @@ ManualWallClock const LeaseClock { std::chrono::system_clock::time_point { std::
                                    .endpoint = std::string { ThisWorker },
                                    .fingerprint = "gcc-13",
                                    .key = "obj-abc",
-                                   .expiresAt = LeaseClock.Now() + std::chrono::minutes { 10 },
+                                   .expiresAt = LeaseClock.now() + std::chrono::minutes { 10 },
                                    .clusterId = "fleet-b",
                                    .epoch = epoch,
                                    .signer = {} });

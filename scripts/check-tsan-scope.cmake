@@ -111,21 +111,21 @@ endif()
 # replacing that directory row with the file rows that belong -- not by an
 # opt-out somebody can spell without saying what they are opting out of.
 #
-# Each row and what it is here for. `Net/` is a directory because every file in
-# it carries `[net]`, because six of its tests spawn threads, and because it is
-# where `BlockingListener` lives -- the class the tree's one observed race (#260)
-# was in, which this gate reached only through the node binary being run whole.
+# Each row and what it is here for. `Transport/` is a directory because every file
+# in it carries `[net]`, because its tests spawn threads, and because it is where
+# `BlockingListener` lives -- the class the tree's one observed race (#260) was in,
+# which this gate reached only through the node binary being run whole. The event
+# loop and the sockets that were `Async/` and `Net/` are core-cpp's since #1596, and
+# the gate instruments them as core-cpp's archives (`tsan-gate.sh`).
 set(FastCachedTsanScope
     # Directories: everything here is concurrency-bearing.
-    "src/FastCache/Async"
     "src/FastCache/Consensus"
     "src/FastCache/Distributed"
-    "src/FastCache/Net"
+    "src/FastCache/Transport"
     # Files: one threaded test in a directory that is otherwise not.
     "src/FastCache/Cache/ExpiryReaper_test.cpp"
     "src/FastCache/Cache/ShardedStorage_test.cpp"
     "src/FastCache/Core/BoundedWait_test.cpp"
-    "src/FastCache/Core/Clock_test.cpp"
     "src/FastCache/Protocol/LiveStreamReactors_test.cpp"
     "src/FastCache/Protocol/RedisRespSocket_test.cpp"
     "src/FastCache/Server/ReactorServerLoop_test.cpp"

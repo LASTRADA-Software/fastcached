@@ -46,8 +46,6 @@
 #include "WorkerLease.hpp"
 #include "WorkerTier.hpp"
 
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
@@ -68,7 +66,6 @@
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/CpuAffinity.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/Environment.hpp>
@@ -108,6 +105,9 @@
 #include <ToolchainDiscovery.hpp>
 #include <ToolchainHost.hpp>
 #include <WorkerProtocol.hpp>
+#include <core/async/Task.hpp>
+#include <core/async/ThreadPoolExecutor.hpp>
+#include <core/net/BlockingSocket.hpp>
 
 namespace
 {
@@ -383,7 +383,7 @@ constexpr std::chrono::seconds EnrollmentWarningTick { 1 };
 /// more behaviour than belongs in the one translation unit no test reaches.
 ///
 /// It owns no rule. The DECISION is `EnrollmentWindow::TakeDueWarning`, which is pure
-/// over an injected clock and is tested against a `ManualClock`; this is the driver.
+/// over an injected clock and is tested against a `core::platform::ManualClock`; this is the driver.
 ///
 /// The stop token is IN the wait rather than checked between sleeps (`WaitForStopOr`),
 /// so a stop ends this loop at once. `EnrollmentWarningTick` therefore bounds only how
@@ -566,7 +566,7 @@ using Node::NodeReloader;
     // there. It used to be refused here, for the two months between the surfaces
     // merging and the reactor listeners learning to adopt: `AdoptInheritedListeners`
     // handed back a BLOCKING listener, the merged surface runs on the reactor, and
-    // there was nothing that could join the two. #464 added `PlatformListener::Adopt`
+    // there was nothing that could join the two. #464 added `AdoptInheritedListener`
     // and this is the last stitch of #290 stage 3 closing over it.
     //
     // The interim was a refusal rather than an adoption left unserved, and that shape
@@ -622,7 +622,7 @@ using Node::NodeReloader;
     // Refusing here is where `RosterlessWorkerRefusal` is answered, since only the state
     // directory knows whether it holds a roster, and a kept roster this build cannot use -- never
     // a quiet fall back to the `--voter-key` anchors, which may name a voter revoked since.
-    SystemWallClock const rosterWallClock;
+    core::platform::SystemWallClock const rosterWallClock;
     auto rosterOrRefusal = Node::NodeRoster::Build(cfg, rosterWallClock, metrics, logger);
     if (!rosterOrRefusal.has_value())
     {
@@ -666,14 +666,14 @@ using Node::NodeReloader;
     // opened below once both exist, and neither binds anything of its own. The order
     // here is therefore load-bearing in a new way -- the listener holds a reference to
     // each, so it is declared after both and destroyed before them.
-    SteadyClock schedulerClock;
-    SteadyClock cacheClock;
+    core::platform::SteadyClock schedulerClock;
+    core::platform::SteadyClock cacheClock;
 
     // Wall-clock, and separate from the steady clocks beside it, because a lease
     // grant's expiry is checked on ANOTHER machine: a steady instant is meaningless
     // off the host that read it, while a system-clock instant is comparable anywhere
     // -- which is also why the check that reads it carries skew slack.
-    SystemWallClock const schedulerWallClock;
+    core::platform::SystemWallClock const schedulerWallClock;
 
     std::unique_ptr<Node::SchedulerTier> schedulerTier;
     if (cfg.serveScheduler)
@@ -818,7 +818,7 @@ using Node::NodeReloader;
     // advertises for the scheduler is what this BOUND.
     // What this node IS, for the operator verbs below. Its own clock, because uptime is
     // the one field that moves between requests and `Describe()` is asked per request.
-    SteadyClock const statusClock;
+    core::platform::SteadyClock const statusClock;
 
     // **Observed, never inferred from a flag** -- with one deliberate exception, below.
     // A `--cache-dir` that would not open has already stopped startup, so a tier read off
@@ -1071,7 +1071,7 @@ using Node::NodeReloader;
     // starts no thread.
     //
     // The DECISION is `TakeDueWarning`, which is pure over an injected clock and is
-    // tested against a `ManualClock`. The driver is `WarnWhileWindowIsOpen` above,
+    // tested against a `core::platform::ManualClock`. The driver is `WarnWhileWindowIsOpen` above,
     // split out of this function exactly as `AnnounceOnce` was and for the same two
     // reasons -- it took `WorkerBody` past the cognitive-complexity ceiling the build
     // enforces, and a loop with a decision in it is more behaviour than belongs in the
@@ -1214,7 +1214,7 @@ using Node::NodeReloader;
     //
     // Declared AFTER the tiers it reads and BEFORE the surface that reads it, which
     // is what makes both sets of pointers safe: locals are destroyed in reverse.
-    static SystemWallClock const wall;
+    static core::platform::SystemWallClock const wall;
     Node::FleetSampler sampler { fleetSources, metrics, snapshotProvider, wall, Node::HistoryPaths::For(cfg), logger };
 
     // Wired here because this is the one scope holding both: the scheduler tier is
@@ -1351,7 +1351,7 @@ using Node::NodeReloader;
                 Node::AdmissionSummary(cfg));
 
     // **Main waits here now, and there is no accept loop to interrupt.** This was
-    // `SyncRun(server.Run())` -- the dedicated listener's accept loop, which blocked
+    // `core::async::syncRun(server.Run())` -- the dedicated listener's accept loop, which blocked
     // this thread until a stop closed it, and which needed a watcher thread to notice
     // the stop at all. The merged surface's loops run on `nodeIo`'s own thread, so what
     // is left for main to do is wait for the stop and then drain.

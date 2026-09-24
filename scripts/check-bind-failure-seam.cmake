@@ -86,15 +86,15 @@ set(nodeDirectory "src/apps/fastcache-compile-node")
 set(bindPrimitives
     "FrameEndpoint::Start"
     "FrameEndpoint::StartAdopted"
-    "PlatformListener::Bind"
+    "core::net::listen"
     "BlockingListener::Bind"
-    "OpenSharedPortUdpSocket")
+    "core::net::openSharedPortUdpSocket")
 set(bindReasons
     "the 0xFC surface, bound on the reactor"
     "the same surface under socket activation"
-    "the reactor TCP listener consensus uses"
+    "core-cpp's loop TCP listener, which consensus uses"
     "the blocking TCP listener the admin surface uses"
-    "discovery's UDP pair, the one non-TCP surface")
+    "discovery's UDP pair, the one non-TCP surface (core-cpp's)")
 
 list(LENGTH bindPrimitives primitiveCount)
 list(LENGTH bindReasons reasonCount)

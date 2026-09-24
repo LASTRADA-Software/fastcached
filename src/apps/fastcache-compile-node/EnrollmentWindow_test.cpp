@@ -65,7 +65,7 @@ namespace
 
 TEST_CASE("A window is closed until somebody opens it, and a restart is what closes it again", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
 
     // The DEFAULT is the case worth pinning: the window is a runtime decision and a
@@ -91,7 +91,7 @@ TEST_CASE("A window is closed until somebody opens it, and a restart is what clo
 
 TEST_CASE("Closing forgets what was waiting, so a later window cannot approve an older request", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
 
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
@@ -109,7 +109,7 @@ TEST_CASE("Closing forgets what was waiting, so a later window cannot approve an
 
 TEST_CASE("Opening an open window changes nothing and says so, rather than restarting its age", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
 
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
@@ -128,7 +128,7 @@ TEST_CASE("Opening an open window changes nothing and says so, rather than resta
 
 TEST_CASE("The pending list refuses past its bound and keeps the machine that arrived first", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
 
@@ -164,7 +164,7 @@ TEST_CASE("A flooder fills the list and the genuine joiner is refused and RECORD
     // than evicting -- evicting would let the flooder push the real joiner OFF the list
     // the operator is reading, which is silent from both ends, where this is visible as
     // sixty-four rows nobody recognises and a counter that moved.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
 
@@ -194,7 +194,7 @@ TEST_CASE("A flooder fills the list and the genuine joiner is refused and RECORD
 
 TEST_CASE("A joiner polls, so repeat offers count attempts and refresh what it claims", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
 
@@ -218,7 +218,7 @@ TEST_CASE("A joiner polls, so repeat offers count attempts and refresh what it c
 
 TEST_CASE("A decided row stops tracking the machine, so what was approved is what travels", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
     REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey()), "10.0.0.9") == EnrollDecision::Pending);
@@ -245,7 +245,7 @@ TEST_CASE("A decided row stops tracking the machine, so what was approved is wha
 
 TEST_CASE("An approval is answered on every poll, because what it leads to is no secret", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
     REQUIRE(Offer(window, "joiner-a") == EnrollDecision::Pending);
@@ -265,7 +265,7 @@ TEST_CASE("An approval is answered on every poll, because what it leads to is no
 
 TEST_CASE("A poll under another KEY is another machine: counted, held, and never recorded", "[enrollment][window][security]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
     REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey()), "10.0.0.9") == EnrollDecision::Pending);
@@ -300,7 +300,7 @@ TEST_CASE("A poll under another KEY is another machine: counted, held, and never
 
 TEST_CASE("The roster fingerprint a joiner was handed is recorded on its row", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
     REQUIRE(Offer(window, "joiner-a") == EnrollDecision::Pending);
@@ -373,7 +373,7 @@ TEST_CASE("Each enrollment role says whether it states an endpoint and what an a
 
 TEST_CASE("A second decision about a settled id is refused rather than repeated", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
     REQUIRE(Offer(window, "joiner-a") == EnrollDecision::Pending);
@@ -397,7 +397,7 @@ TEST_CASE("A second decision about a settled id is refused rather than repeated"
 
 TEST_CASE("Deciding about a machine nobody has heard of, or while shut, is refused by name", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
 
     // Two refusals that a `bool` would render alike, and they send an operator to
@@ -409,7 +409,7 @@ TEST_CASE("Deciding about a machine nobody has heard of, or while shut, is refus
 
 TEST_CASE("The open warning is due immediately and then once per interval, never in a burst", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
 
     // Nothing is owed by a shut window, which is the reading that would otherwise make
@@ -448,7 +448,7 @@ TEST_CASE("The open warning is due immediately and then once per interval, never
 
 TEST_CASE("The warning states the age and how many are waiting, so a log line can be acted on", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);
     REQUIRE(Offer(window, "joiner-a") == EnrollDecision::Pending);
@@ -471,7 +471,7 @@ TEST_CASE("The warning states the age and how many are waiting, so a log line ca
 
 TEST_CASE("A report carries ages as durations and the state the wire spells", "[enrollment][window]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
 
     // A closed window reports a zero age rather than an age since some instant that
@@ -507,7 +507,7 @@ TEST_CASE("An open window is a LIVE condition: raised on open, clear on close, r
     // #1364. The repeating Warn reaches only whoever reads this node's log; the row reaches the
     // leader's page and `node-conditions`. LIVE, because watching it clear is the progress an
     // operator is waiting for -- so the case drives it round twice, which a latched row cannot do.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     NodeConditions conditions;
     EnrollmentWindow window { clock, &conditions };
 
@@ -527,7 +527,7 @@ TEST_CASE("A window on a node that serves none reports nothing about itself", "[
     // Handed no registry -- `main`'s `AddressWhen(servesEnrollment, ...)` on a node with no cluster
     // -- the window touches nothing, so its row is left for the scope to answer `not-evaluated`
     // rather than a reassuring `clear` about a window nothing can open.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     NodeConditions conditions;
     EnrollmentWindow window { clock, nullptr };
     REQUIRE(window.Open() == EnrollControlOutcome::Done);

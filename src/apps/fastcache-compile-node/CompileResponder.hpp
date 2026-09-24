@@ -4,8 +4,6 @@
 #include "CompileCapacity.hpp"
 #include "FrameEndpoint.hpp"
 
-#include <FastCache/Async/IExecutor.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -22,6 +20,8 @@
 #include <vector>
 
 #include <WorkerProtocol.hpp>
+#include <core/async/IExecutor.hpp>
+#include <core/async/Task.hpp>
 
 namespace FastCache::Node
 {
@@ -37,7 +37,7 @@ namespace FastCache::Node
 ///
 /// `WorkerServer` serves its own port over a **blocking** listener, so one hop suffices
 /// there: `Serve` steps onto the executor before it reads anything, and nothing after
-/// that line suspends -- `BlockingSocket::Read` does its `recv` eagerly and hands back
+/// that line suspends -- `core::net::BlockingSocket::Read` does its `recv` eagerly and hands back
 /// an already-ready awaitable, so the whole request stays on the pool thread.
 ///
 /// This surface is a **reactor**. A frame arrives on the reactor thread, and:
@@ -113,8 +113,8 @@ class CompileResponder final: public IFrameResponder
                      CompileCapacity& capacity,
                      Distributed::IMembershipOracle const& membership,
                      ILocalityOracle const& locality,
-                     IExecutor& jobs,
-                     IExecutor& home,
+                     core::async::IExecutor& jobs,
+                     core::async::IExecutor& home,
                      IMetricsSink& metrics,
                      ILogger& logger,
                      std::chrono::milliseconds progressInterval = CompileCacheWire::DefaultProgressInterval) noexcept:
@@ -134,7 +134,7 @@ class CompileResponder final: public IFrameResponder
     ///
     /// Admits, hops to the pool, compiles, hops back, answers. The two hops are the
     /// point; see the class comment for why each one is invisible when it is missing.
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///
@@ -398,8 +398,8 @@ class CompileResponder final: public IFrameResponder
     CompileCapacity& _capacity;
     Distributed::IMembershipOracle const& _membership;
     ILocalityOracle const& _locality;
-    IExecutor& _jobs;
-    IExecutor& _home;
+    core::async::IExecutor& _jobs;
+    core::async::IExecutor& _home;
     IMetricsSink& _metrics;
     ILogger& _logger;
     /// How often a running compile says it is still there; see the constructor.

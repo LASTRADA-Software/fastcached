@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Core/EnumTable.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/FileTrust.hpp>
 
@@ -11,6 +10,8 @@
 #include <fstream>
 #include <system_error>
 #include <utility>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache
 {
@@ -94,7 +95,7 @@ namespace
     /// readability-identifier-naming classifies a reference as a *variable*
     /// whatever its constness — which would demand a name that says this is
     /// mutable state when it is a constant.
-    constexpr ConfigCandidate SystemRow = *FindOrNull(Candidates, ConfigScope::System, &ConfigCandidate::scope);
+    constexpr ConfigCandidate SystemRow = *core::findOrNull(Candidates, ConfigScope::System, &ConfigCandidate::scope);
 
     /// Build a ConfigError for a failure in this module.
     /// @param code Error category.

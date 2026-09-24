@@ -2,7 +2,6 @@
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
@@ -23,6 +22,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/FleetHistoryFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -99,13 +99,13 @@ struct Leading
         service.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
     }
 
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
 
     /// Capturing rather than null, so the one line this service writes is readable
     /// from any case that cares and costs the rest nothing.
     CapturingLogger logger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
     SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
 };
@@ -134,10 +134,10 @@ struct Signing
     /// What a worker verifies this scheduler's grants against: it, as a voter.
     Testing::FixedLeaseRoster roster { { "scheduler" } };
 
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     CapturingLogger logger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     KeyPairLeaseSigner const signer = Testing::TestLeaseSigner("scheduler");
     SchedulerService service { clock, wallClock, metrics, logger, signer, TestCluster };
 };
@@ -207,10 +207,10 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
     // worker here would put it in a fleet nothing schedules onto -- and it would
     // heartbeat into that void forever. The refusal carries the leader's address so
     // the caller can redirect instead.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
 
@@ -301,10 +301,10 @@ TEST_CASE("Membership is checked after leadership", "[distributed][scheduler]")
     // know the cluster's membership any better than it knows the fleet, so
     // answering `NotAMember` there would send an operator looking at a policy that
     // was never consulted. Cheapest and most certain fact first.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
     service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000", StandaloneSchedulerTerm);
@@ -615,7 +615,7 @@ TEST_CASE("Withdrawing an id the scheduler does not know succeeds", "[distribute
 TEST_CASE("A withdrawal closes the dispatch window the heartbeat timeout leaves open", "[distributed][scheduler]")
 {
     // The before/after #573 asks for, as a number rather than an argument, and on a
-    // `ManualClock` rather than wall time -- which is the only kind of clock a verdict
+    // `core::platform::ManualClock` rather than wall time -- which is the only kind of clock a verdict
     // can rest on here.
     SECTION("without one, dispatch continues until the timeout")
     {
@@ -1425,7 +1425,7 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
     // worker's validator was `[](...){ return true; }`. Anyone who could reach a
     // compile port and present any string got a compile.
     Signing fleet;
-    fleet.wallClock.SetNow(Noon);
+    fleet.wallClock.setNow(Noon);
 
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "peer-1:7100")).status == Wire::Status::Ok);
     auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "obj-1"));
@@ -1487,7 +1487,7 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
 TEST_CASE("A release names a lease this scheduler actually signed", "[distributed][scheduler][lease]")
 {
     Signing fleet;
-    fleet.wallClock.SetNow(Noon);
+    fleet.wallClock.setNow(Noon);
 
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "peer-1:7100")).status == Wire::Status::Ok);
     auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "obj-1"));
@@ -1596,7 +1596,7 @@ TEST_CASE("Every grant is signed by the scheduler that issued it, and says nothi
     // which this service has a warning to write about it. The token is not the lease table's
     // bare handle, and the one line the old unsigned path wrote is never written.
     Signing fleet;
-    fleet.wallClock.SetNow(Noon);
+    fleet.wallClock.setNow(Noon);
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "peer-1:7100")).status == Wire::Status::Ok);
     fleet.logger.Clear();
 
@@ -2344,7 +2344,7 @@ TEST_CASE("A scheduler takes only a current voter's endorsement of the roster it
     // verifies under it; a verified endorsement of another roster is ordinary during a change
     // and kept out, never counted; a node with no cluster certifies nothing.
     Signing fleet;
-    fleet.wallClock.SetNow(Noon);
+    fleet.wallClock.setNow(Noon);
     auto const state = VotersState({ "n1", "n2", "n3" }, 4);
 
     CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n1", state, Noon + 1h))
@@ -2376,7 +2376,7 @@ TEST_CASE("A scheduler hands out a roster only once a strict majority of its vot
     // have endorsed the roster this state holds, unexpired -- a worker refuses anything less,
     // so anything less is bytes on every announcement for nobody.
     Signing fleet;
-    fleet.wallClock.SetNow(Noon);
+    fleet.wallClock.setNow(Noon);
     StubCluster cluster;
     cluster.state = VotersState({ "n1", "n2", "n3" }, 4);
     fleet.service.AdministerWith(cluster);

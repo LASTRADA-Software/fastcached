@@ -130,7 +130,7 @@ stage() {
     printf '[%s]' "$entries" > "$work/build/compile_commands.json"
 }
 
-ctrl="src/FastCache/Net/EpollSocket.cpp"
+ctrl="src/FastCache/Server/Server.cpp"
 
 # Everything blind is listed, and the control is analysed: the only passing shape.
 stage "$(printf 'src/FastCache/Net/IocpSocket.cpp\tnone\tguarded\n')" \

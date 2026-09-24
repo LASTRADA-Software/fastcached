@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/StorageTier.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
@@ -19,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/FleetHistoryFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -63,10 +63,10 @@ struct Fixture
         service.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
     }
 
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
     SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, FleetIdentity };
     SchedulerProtocol protocol { service, metrics };

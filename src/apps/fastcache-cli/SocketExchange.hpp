@@ -6,8 +6,6 @@
 #include "NodeClient.hpp"
 #include "RespClient.hpp"
 
-#include <FastCache/Net/ISocket.hpp>
-
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -19,12 +17,14 @@
 #include <string_view>
 #include <vector>
 
+#include <core/net/ISocket.hpp>
+
 namespace FastCache::Cli
 {
 
 /// A RESP connection over one blocking TCP socket.
 ///
-/// **Blocking by type, driven by `SyncRun`.** That is sound only over a blocking
+/// **Blocking by type, driven by `core::async::syncRun`.** That is sound only over a blocking
 /// socket, which resolves every awaitable inline -- `Net/TcpClient`'s header says so,
 /// and a reactor socket here would suspend with nothing to resume it. One connection
 /// per invocation, held for the life of the command, which is what later lets the REPL
@@ -71,13 +71,13 @@ class SocketExchange final: public IExchange
   private:
     /// @param socket The connected socket.
     /// @param limits Caps this side imposes.
-    SocketExchange(std::unique_ptr<ISocket> socket, ParseLimits limits) noexcept;
+    SocketExchange(std::unique_ptr<core::net::ISocket> socket, ParseLimits limits) noexcept;
 
     /// Read until one whole reply is available, then consume it.
     /// @return The reply, or why there is none.
     [[nodiscard]] std::expected<RespValue, ExchangeError> ReadReply();
 
-    std::unique_ptr<ISocket> _socket;
+    std::unique_ptr<core::net::ISocket> _socket;
     ParseLimits _limits;
     /// Bytes read from the socket and not yet consumed by a reply.
     ///
@@ -127,9 +127,9 @@ class MemcachedExchange final: public IMemcachedExchange
   private:
     /// @param socket The connected socket.
     /// @param limits Caps this side imposes.
-    MemcachedExchange(std::unique_ptr<ISocket> socket, McParseLimits limits) noexcept;
+    MemcachedExchange(std::unique_ptr<core::net::ISocket> socket, McParseLimits limits) noexcept;
 
-    std::unique_ptr<ISocket> _socket;
+    std::unique_ptr<core::net::ISocket> _socket;
     McParseLimits _limits;
     /// Bytes read and not yet consumed by a reply; held across calls for the reason
     /// `SocketExchange::_pending` is.
@@ -216,7 +216,7 @@ class NodeExchange final: public INodeExchange
   private:
     /// @param socket The connected socket.
     /// @param endpoint What to call this connection in a diagnostic.
-    NodeExchange(std::unique_ptr<ISocket> socket, std::string endpoint) noexcept;
+    NodeExchange(std::unique_ptr<core::net::ISocket> socket, std::string endpoint) noexcept;
 
     /// What one read is of, for the words its failure is told in. Private to this class; never transmitted.
     enum class Reading : std::uint8_t
@@ -230,7 +230,7 @@ class NodeExchange final: public INodeExchange
     /// @return The frame, or why there is none.
     [[nodiscard]] std::expected<NodeReply, ExchangeError> ReadOne(Reading reading);
 
-    std::unique_ptr<ISocket> _socket;
+    std::unique_ptr<core::net::ISocket> _socket;
     std::string _endpoint;
     /// Bytes read and not yet consumed by a reply; held across calls for the reason
     /// `SocketExchange::_pending` is.

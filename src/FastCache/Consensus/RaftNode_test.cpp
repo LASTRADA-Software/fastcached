@@ -26,12 +26,12 @@ namespace
 constexpr auto ElectionMin = 150ms;
 
 /// The instant every test starts at.
-constexpr auto Start = TimePoint {};
+constexpr auto Start = core::platform::SteadyTimePoint {};
 
 /// `Start` plus a number of milliseconds.
 /// @param milliseconds How far past the start.
 /// @return The instant.
-[[nodiscard]] TimePoint At(std::int64_t milliseconds)
+[[nodiscard]] core::platform::SteadyTimePoint At(std::int64_t milliseconds)
 {
     return Start + std::chrono::milliseconds { milliseconds };
 }
@@ -75,8 +75,11 @@ constexpr auto Start = TimePoint {};
 /// @param term The leader's term.
 /// @param at When it arrives.
 /// @return What the node answered.
-[[nodiscard]] RaftOutput AdmitBy(
-    RaftNode& node, NodeId const& leaderId, Configuration const& configuration, Term term, TimePoint at)
+[[nodiscard]] RaftOutput AdmitBy(RaftNode& node,
+                                 NodeId const& leaderId,
+                                 Configuration const& configuration,
+                                 Term term,
+                                 core::platform::SteadyTimePoint at)
 {
     return node.Receive(AppendEntriesRequest { .term = term,
                                                .leaderId = leaderId,
@@ -98,7 +101,7 @@ constexpr auto Start = TimePoint {};
 /// @param random Source for election-timeout jitter.
 /// @param now When the node starts.
 /// @return The constructed node.
-[[nodiscard]] RaftNode MakeNode(RaftConfig config, IRandomSource& random, TimePoint now = Start)
+[[nodiscard]] RaftNode MakeNode(RaftConfig config, IRandomSource& random, core::platform::SteadyTimePoint now = Start)
 {
     return std::move(RaftNode::Create(std::move(config), random, now)).value();
 }
@@ -133,7 +136,7 @@ template <typename Message>
 /// the configuration is ignored too, which is what makes one list serve both.
 /// @param node The node to drive.
 /// @param at When the timeout falls due.
-void DriveToCandidate(RaftNode& node, TimePoint at)
+void DriveToCandidate(RaftNode& node, core::platform::SteadyTimePoint at)
 {
     auto const standingFor = node.CurrentTerm().Next();
     (void) node.Tick(at);
@@ -1301,7 +1304,7 @@ TEST_CASE("Standing for election does not make a node refuse its peers' pre-vote
     // one, which reads as a livelock in a cluster test and as nothing at all in a
     // unit test that only ever has one candidate.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, core::platform::SteadyTimePoint {})).value();
 
     // Time out and start a pre-vote round of its own, which re-arms the deadline.
     auto const own = node.Tick(At(ElectionMin.count()));
@@ -1327,7 +1330,7 @@ TEST_CASE("A node that has just heard from a leader refuses a pre-vote", "[conse
     // rejoining must not be able to depose a healthy leader. Losing this while
     // fixing the case above would trade a slow election for an unstable cluster.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, core::platform::SteadyTimePoint {})).value();
 
     (void) node.Receive(AppendEntriesRequest { .term = Term { .value = 1 },
                                                .leaderId = "n1",
@@ -1985,7 +1988,7 @@ TEST_CASE("A learner refuses a vote by its row, and never stands", "[consensus][
         // nobody advanced.
         auto const late = At(100 * ElectionMin.count());
 
-        CHECK(learner.NextDeadline() == TimePoint::max());
+        CHECK(learner.NextDeadline() == core::platform::SteadyTimePoint::max());
         auto const quiet = learner.Tick(late);
         CHECK(quiet.messages.empty());
         CHECK_FALSE(quiet.persist.has_value());
@@ -2045,7 +2048,7 @@ TEST_CASE("A learner promoted in its log begins to stand", "[consensus][raft][le
     // restarts, and no role moves.
     ScriptedRandomSource random { { 0 } };
     auto node = MakeNode(ThreeVotersAndALearner("n4"), random);
-    REQUIRE(node.NextDeadline() == TimePoint::max());
+    REQUIRE(node.NextDeadline() == core::platform::SteadyTimePoint::max());
 
     (void) AdmitBy(
         node, "n1", Configuration { .voters = { "n1", "n2", "n3", "n4" }, .learners = {} }, Term { .value = 2 }, At(10));

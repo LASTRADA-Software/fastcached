@@ -7,7 +7,6 @@
 #include <FastCache/Cache/StorageTestUtils.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cache/TracingStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -25,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -135,7 +135,7 @@ TEST_CASE("Folding a tiered snapshot never invents a tier", "[storage-tier]")
 TEST_CASE("An in-memory store reports exactly one memory tier", "[storage-tier]")
 {
     FastCache::InMemoryLruStorage storage { 4096 };
-    REQUIRE(storage.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage.Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     auto const tiers = storage.SnapshotTiers();
     REQUIRE(At(tiers, StorageTier::Memory).has_value());
@@ -151,7 +151,7 @@ TEST_CASE("A CoW tree reports itself as the disk tier", "[storage-tier]")
 {
     FastCache::Testing::ScratchDirectory const scratch { "storage-tier-cow" };
     auto const storage = OpenCowTree(scratch);
-    REQUIRE(storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     auto const tiers = storage->SnapshotTiers();
     // The interface default would have called this memory. A node's whole on-disk
@@ -169,7 +169,7 @@ TEST_CASE("LayeredStorage keeps its two tiers apart", "[storage-tier][layered]")
     // a test that reported one where the other belongs cannot pass by coincidence.
     constexpr std::size_t L1Budget = 64 * 1024;
     FastCache::LayeredStorage storage { std::make_unique<FastCache::InMemoryLruStorage>(L1Budget), OpenCowTree(scratch) };
-    REQUIRE(storage.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage.Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     auto const tiers = storage.SnapshotTiers();
     REQUIRE(At(tiers, StorageTier::Memory).has_value());
@@ -192,7 +192,7 @@ TEST_CASE("A memory-only LayeredStorage reports no disk tier", "[storage-tier][l
     // itself, so neither is mislabelled by the composite above it.
     FastCache::LayeredStorage storage { std::make_unique<FastCache::InMemoryLruStorage>(4096),
                                         std::make_unique<FastCache::InMemoryLruStorage>(0) };
-    REQUIRE(storage.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage.Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     auto const tiers = storage.SnapshotTiers();
     REQUIRE(At(tiers, StorageTier::Memory).has_value());
@@ -214,7 +214,7 @@ TEST_CASE("ShardedStorage sums its shards tier by tier", "[storage-tier][sharded
 
     constexpr std::size_t Keys = 32;
     for (auto const i: std::views::iota(std::size_t { 0 }, Keys))
-        REQUIRE(storage.Set(std::format("k{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set(std::format("k{}", i), MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     auto const tiers = storage.SnapshotTiers();
     REQUIRE(At(tiers, StorageTier::Memory).has_value());
@@ -239,7 +239,7 @@ TEST_CASE("A sharded layered cache reports both tiers", "[storage-tier][sharded]
                                                                     OpenCowTree(scratch)));
     FastCache::ShardedStorage storage { std::move(inners) };
 
-    REQUIRE(storage.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage.Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     auto const tiers = storage.SnapshotTiers();
     REQUIRE(At(tiers, StorageTier::Memory).has_value());
@@ -255,7 +255,7 @@ TEST_CASE("A decorator forwards the tiers of what it wraps", "[storage-tier]")
     // cache in a tracer silently deletes its disk tier from every dashboard.
     FastCache::Testing::ScratchDirectory const scratch { "storage-tier-decorated" };
     FastCache::NullLogger logger;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::LayeredStorage layered { std::make_unique<FastCache::InMemoryLruStorage>(4096), OpenCowTree(scratch) };
     FastCache::TracingStorage traced { layered, logger, clock };
 

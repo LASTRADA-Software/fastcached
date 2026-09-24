@@ -1,13 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Cancellation.hpp>
-#include <FastCache/Async/IReactor.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/ReclaimLog.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -15,6 +11,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+
+#include <core/async/StopToken.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/EventLoop.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -42,7 +43,7 @@ struct ExpiryReaperOptions
     /// Interval between sweeps while there is work to do. Zero disables the
     /// cycle entirely, which is what an operator who wants expiry to stay
     /// purely access-driven asks for.
-    Duration interval { std::chrono::seconds { 1 } };
+    core::platform::SteadyDuration interval { std::chrono::seconds { 1 } };
 
     /// Interval the cycle backs off to while there is nothing to do.
     ///
@@ -51,7 +52,7 @@ struct ExpiryReaperOptions
     /// need a live count of entries carrying a finite TTL, maintained across
     /// every mutation path in every tier, where the one site that forgot to
     /// maintain it is a cache that silently never expires again.
-    Duration maxInterval { std::chrono::seconds { 30 } };
+    core::platform::SteadyDuration maxInterval { std::chrono::seconds { 30 } };
 
     /// Entries one sweep may examine. See `DefaultScanBudget`.
     std::size_t scanBudget { DefaultScanBudget };
@@ -66,7 +67,7 @@ struct ExpiryReaperOptions
     /// A non-positive value means one sleep straight through, which is a
     /// legitimate thing to ask for and is spelled rather than defaulted -- the
     /// same rule `InterruptibleSleepUntil` states.
-    Duration stopWakeBound { std::chrono::milliseconds { 50 } };
+    core::platform::SteadyDuration stopWakeBound { std::chrono::milliseconds { 50 } };
 
     /// How long one sweep may hold the reactor before the scan budget is cut.
     ///
@@ -86,7 +87,7 @@ struct ExpiryReaperOptions
     ///
     /// This does NOT move the sweep off the reactor, which is the other half of
     /// #946 and a decision of its own.
-    Duration sweepStallCeiling { std::chrono::milliseconds { 50 } };
+    core::platform::SteadyDuration sweepStallCeiling { std::chrono::milliseconds { 50 } };
 
     /// How long `ExpiryReaper::Stop` waits for the frame to come back from its executor.
     ///
@@ -113,9 +114,9 @@ static_assert(ExpiryReaperOptions::DefaultPurgeBudget <= ReclaimLog::DefaultCapa
 /// @param current The interval that was just waited.
 /// @param outcome What the sweep at the end of that wait did.
 /// @return The interval to wait next.
-[[nodiscard]] constexpr Duration NextExpiryInterval(ExpiryReaperOptions const& options,
-                                                    Duration current,
-                                                    PurgeOutcome const& outcome) noexcept
+[[nodiscard]] constexpr core::platform::SteadyDuration NextExpiryInterval(ExpiryReaperOptions const& options,
+                                                                          core::platform::SteadyDuration current,
+                                                                          PurgeOutcome const& outcome) noexcept
 {
     if (outcome.purged != 0 || !outcome.completedPass)
         return options.interval;
@@ -183,15 +184,15 @@ class ExpiryReaper
     /// @param reactor Reactor whose clock paces the cycle. Must outlive this reaper.
     /// @param sweepOn Where `SweepOnce` runs. Pass the reactor itself to keep the
     ///        sweep on the loop, which is what every test and every in-memory
-    ///        deployment wants; pass a pool to take it off (#946). `IReactor` IS an
-    ///        `IExecutor`, so there is ONE code path and no null to branch on.
+    ///        deployment wants; pass a pool to take it off (#946). `core::net::EventLoop` IS an
+    ///        `core::async::IExecutor`, so there is ONE code path and no null to branch on.
     ///        Must outlive this reaper -- see `Stop`, which is what makes that
     ///        orderable.
-    void Start(IReactor& reactor, IExecutor& sweepOn);
+    void Start(core::net::EventLoop& reactor, core::async::IExecutor& sweepOn);
 
     /// Stop the cycle and reclaim its coroutine frame.
     ///
-    /// Deliberately safe to call **after** `IReactor::Run` has returned, which
+    /// Deliberately safe to call **after** `core::net::EventLoop::Run` has returned, which
     /// is the case that matters: a loop that has stopped will never resume a
     /// frame still parked on its timer wheel, and never free it either.
     /// `CancelPending` is what makes taking it back decidable rather than a
@@ -209,7 +210,7 @@ class ExpiryReaper
     /// Returns immediately when `options.interval` is zero -- a disabled cycle
     /// is a coroutine that ends, not one that parks forever.
     ///
-    /// Public so a test can drive the loop against a `TestReactor` without
+    /// Public so a test can drive the loop against a `core::net::testing::TestLoop` without
     /// going through `Start`; production uses `Start`.
     ///
     /// A pointer rather than a reference, and a token rather than a reference
@@ -221,13 +222,15 @@ class ExpiryReaper
     /// @param sweepOn Where the sweep body runs; see `Start`. Must not be null.
     /// @param token  Observed at every wake; cancelling it ends the loop.
     /// @return A task that completes when the cycle stops.
-    [[nodiscard]] Task<void> Run(IReactor* reactor, IExecutor* sweepOn, CancellationToken token);
+    [[nodiscard]] core::async::Task<void> Run(core::net::EventLoop* reactor,
+                                              core::async::IExecutor* sweepOn,
+                                              core::async::StopToken token);
 
     /// One sweep, with this reaper's budget. Exposed so the sweep can be
     /// exercised without a reactor.
     /// @param now Current clock value.
     /// @return What the sweep did.
-    PurgeOutcome SweepOnce(TimePoint now);
+    PurgeOutcome SweepOnce(core::platform::SteadyTimePoint now);
 
     /// Whether the task's frame is away from the reactor right now.
     ///
@@ -298,9 +301,9 @@ class ExpiryReaper
     /// rule. Testing the rule where it lives is the honest trade; what that leaves
     /// unasserted is the WIRING, which is stated on the definition.
     /// @param elapsed How long the sweep took.
-    void AdaptScanBudget(Duration elapsed) noexcept;
+    void AdaptScanBudget(core::platform::SteadyDuration elapsed) noexcept;
 
-    [[nodiscard]] Duration CurrentInterval() const noexcept
+    [[nodiscard]] core::platform::SteadyDuration CurrentInterval() const noexcept
     {
         return _interval;
     }
@@ -312,7 +315,7 @@ class ExpiryReaper
     IDrainAbandonment& _abandonment;
     IDrainWait& _drainWait;
     ExpiryReaperOptions _options;
-    Duration _interval;
+    core::platform::SteadyDuration _interval;
 
     /// Floor for the adapted scan budget. Not zero: zero is `PurgeBudget`'s
     /// spelling of *no ceiling*, so a budget that decayed to it would become an
@@ -325,12 +328,12 @@ class ExpiryReaper
     std::uint64_t _cycles { 0 };
 
     /// Set by `Start`; the reactor `Stop` reclaims the frame from.
-    IReactor* _reactor { nullptr };
+    core::net::EventLoop* _reactor { nullptr };
     /// See `AwayFromReactor()`. Atomic because the executor lowers it and `Stop` reads it,
     /// each from its own thread.
     std::atomic<std::uint32_t> _awayFromReactor { 0 };
-    CancellationSource _source;
-    Task<void> _task;
+    core::async::StopSource _source;
+    core::async::Task<void> _task;
 };
 
 } // namespace FastCache

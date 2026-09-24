@@ -4,7 +4,6 @@
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/StreamCodec.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -18,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -37,10 +38,10 @@ class CacheEngine
 {
   public:
     /// Construct over an IStorage and IClock; both must outlive the engine.
-    /// An optional `WallClockRef` injects wall-time access for the
+    /// An optional `core::platform::WallClockRef` injects wall-time access for the
     /// EXPIREAT/PEXPIREAT family and the memcached absolute-exptime
     /// translation. Production callers omit the third argument (defaults
-    /// to `DefaultSystemWallClock()`); tests pass a ManualWallClock so
+    /// to `core::platform::defaultSystemWallClock()`); tests pass a ManualWallClock so
     /// the wire path through HandleExpire's absolute branch is
     /// deterministic.
     /// An optional `IMetricsSink*` receives the counters this layer owns -- today
@@ -54,11 +55,11 @@ class CacheEngine
     /// @param storage   Backing storage.
     /// @param clock     Monotonic clock for TTL/timeout semantics.
     /// @param wallClock Wall clock for absolute-UNIX-time translations. Borrowed through
-    ///                  `WallClockRef`, so a temporary is refused rather than dangling.
+    ///                  `core::platform::WallClockRef`, so a temporary is refused rather than dangling.
     /// @param metrics   Where this layer's counters go; null to count nothing.
     CacheEngine(IStorage& storage,
-                IClock& clock,
-                WallClockRef wallClock = DefaultSystemWallClock(),
+                core::platform::IClock& clock,
+                core::platform::WallClockRef wallClock = core::platform::defaultSystemWallClock(),
                 IMetricsSink* metrics = nullptr) noexcept;
 
     // -- memcached-flavoured operations -------------------------------------
@@ -71,7 +72,7 @@ class CacheEngine
     ///                 enough for sccache cache TTLs)
     /// @param exptime Wire-format expiry word.
     /// @return Absolute steady-clock deadline.
-    [[nodiscard]] TimePoint ExpiryFromExptime(std::uint32_t exptime) const noexcept;
+    [[nodiscard]] core::platform::SteadyTimePoint ExpiryFromExptime(std::uint32_t exptime) const noexcept;
 
     [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key);
 
@@ -120,7 +121,7 @@ class CacheEngine
     /// PSETEX takes to preserve sub-second TTL precision (which the
     /// `uint32_t exptime` overload above cannot represent, since it
     /// translates milliseconds to whole seconds before reaching the
-    /// storage). `TimePoint::max()` clears any TTL.
+    /// storage). `core::platform::SteadyTimePoint::max()` clears any TTL.
     /// @param key       Lookup key.
     /// @param value     Value bytes.
     /// @param flags     Memcached "flags" word.
@@ -129,7 +130,7 @@ class CacheEngine
     [[nodiscard]] std::expected<CasToken, StorageError> SetWithDeadline(std::string_view key,
                                                                         std::vector<std::byte> value,
                                                                         std::uint32_t flags,
-                                                                        TimePoint deadline);
+                                                                        core::platform::SteadyTimePoint deadline);
 
     [[nodiscard]] std::expected<CasToken, StorageError> Add(std::string_view key,
                                                             std::vector<std::byte> value,
@@ -140,7 +141,7 @@ class CacheEngine
     [[nodiscard]] std::expected<CasToken, StorageError> AddWithDeadline(std::string_view key,
                                                                         std::vector<std::byte> value,
                                                                         std::uint32_t flags,
-                                                                        TimePoint deadline);
+                                                                        core::platform::SteadyTimePoint deadline);
 
     [[nodiscard]] std::expected<CasToken, StorageError> Replace(std::string_view key,
                                                                 std::vector<std::byte> value,
@@ -151,7 +152,7 @@ class CacheEngine
     [[nodiscard]] std::expected<CasToken, StorageError> ReplaceWithDeadline(std::string_view key,
                                                                             std::vector<std::byte> value,
                                                                             std::uint32_t flags,
-                                                                            TimePoint deadline);
+                                                                            core::platform::SteadyTimePoint deadline);
 
     /// Append `suffix` to the existing value. `expected` is an optional CAS
     /// precondition (0 = unconditional; drives meta `ms ... MA C(token)`).
@@ -504,17 +505,18 @@ class CacheEngine
     /// fully resolved wall-clock instant rather than a relative offset
     /// (so passing them through `Touch(uint32 exptime)` would lose
     /// precision and the absolute-vs-relative distinction).
-    /// `TimePoint::max()` clears the expiry (the `PERSIST` semantics).
+    /// `core::platform::SteadyTimePoint::max()` clears the expiry (the `PERSIST` semantics).
     /// @param key       Lookup key.
     /// @param newExpiry Absolute deadline on the steady clock.
     /// @return New CAS token, or StorageError(KeyNotFound).
-    [[nodiscard]] std::expected<CasToken, StorageError> TouchAt(std::string_view key, TimePoint newExpiry);
+    [[nodiscard]] std::expected<CasToken, StorageError> TouchAt(std::string_view key,
+                                                                core::platform::SteadyTimePoint newExpiry);
 
     /// Read the remaining time-to-live on the entry under `key`.
     /// `std::nullopt` means "key absent or already expired" (the redis
     /// `-2` return); a non-zero duration is the remaining time; a
     /// zero duration is returned when the entry exists with no TTL
-    /// (`TimePoint::max()`), which the redis handler then renders as
+    /// (`core::platform::SteadyTimePoint::max()`), which the redis handler then renders as
     /// `-1`. The distinction between "no TTL" and "has TTL of N" is
     /// signalled via the returned variant in the protocol layer.
     /// @param key Lookup key.
@@ -523,7 +525,7 @@ class CacheEngine
     struct TtlResult
     {
         bool hasExpiry { false };
-        Duration remaining { 0 };
+        core::platform::SteadyDuration remaining { 0 };
     };
     [[nodiscard]] std::expected<std::optional<TtlResult>, StorageError> Ttl(std::string_view key);
 
@@ -589,7 +591,7 @@ class CacheEngine
         return _storage.SnapshotTiers();
     }
 
-    [[nodiscard]] IClock& Clock() noexcept
+    [[nodiscard]] core::platform::IClock& Clock() noexcept
     {
         return _clock;
     }
@@ -601,7 +603,7 @@ class CacheEngine
     /// caller and it asks `Now()`, which is `const` -- so the mutability was reach nobody
     /// used, and stating that is the decision rather than an oversight.
     /// @return The clock this engine translates absolute timestamps against.
-    [[nodiscard]] IWallClock const& WallClock() const noexcept
+    [[nodiscard]] core::platform::IWallClock const& WallClock() const noexcept
     {
         return _wallClock.get();
     }
@@ -618,8 +620,8 @@ class CacheEngine
     }
 
     /// Current wall-clock time in milliseconds since the UNIX epoch, taken from
-    /// the injected `IWallClock`. Drives stream entry-ID timestamps and the
-    /// PEL idle-time accounting; deterministic under `ManualWallClock`.
+    /// the injected `core::platform::IWallClock`. Drives stream entry-ID timestamps and the
+    /// PEL idle-time accounting; deterministic under `core::platform::ManualWallClock`.
     /// @return Milliseconds since the epoch.
     [[nodiscard]] std::uint64_t WallNowMs() const noexcept;
 
@@ -639,8 +641,8 @@ class CacheEngine
                                                                       bool atFront);
 
     IStorage& _storage;
-    IClock& _clock;
-    WallClockRef _wallClock;
+    core::platform::IClock& _clock;
+    core::platform::WallClockRef _wallClock;
     IMetricsSink* _metrics { nullptr };
 };
 

@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "RemoteUpstream.hpp"
 
-#include <FastCache/Core/Clock.hpp>
-#include <FastCache/Net/IAsyncAddressResolver.hpp>
-#include <FastCache/Net/IConnector.hpp>
-#include <FastCache/Net/SocketAddress.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -13,6 +8,12 @@
 #include <ranges>
 #include <string>
 #include <vector>
+
+#include <core/async/SyncRun.hpp>
+#include <core/net/IAsyncAddressResolver.hpp>
+#include <core/net/IConnector.hpp>
+#include <core/net/SocketAddress.hpp>
+#include <core/platform/Clock.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -29,21 +30,23 @@ constexpr std::chrono::milliseconds IoTimeout { 5'000 };
 /// The count IS the subject of every case here: the defect was one `getaddrinfo`
 /// per cache operation, so what has to be observed is how many lookups a run of
 /// operations costs -- not whether an operation succeeded, which it does either way.
-class CountingResolver final: public IAsyncAddressResolver
+class CountingResolver final: public core::net::IAsyncAddressResolver
 {
   public:
-    explicit CountingResolver(std::vector<ResolvedEndpoint> resolved) noexcept:
+    explicit CountingResolver(std::vector<core::net::ResolvedEndpoint> resolved) noexcept:
         answer { std::move(resolved) }
     {
     }
 
-    [[nodiscard]] Task<ResolveResult> Resolve(std::string host, std::uint16_t port, IReactor* /*reactor*/) override
+    [[nodiscard]] core::async::Task<core::net::ResolveResult> resolve(std::string host,
+                                                                      std::uint16_t port,
+                                                                      core::net::EventLoop* /*loop*/) override
     {
         ++calls;
         lastHost = std::move(host);
         lastPort = port;
         if (fail)
-            co_return std::unexpected(ResolveFailure(lastHost, port, "scripted failure"));
+            co_return std::unexpected(core::net::resolveFailure(lastHost, port, "scripted failure"));
         co_return answer;
     }
 
@@ -55,7 +58,7 @@ class CountingResolver final: public IAsyncAddressResolver
     bool fail { false };
     std::string lastHost;
     std::uint16_t lastPort { 0 };
-    std::vector<ResolvedEndpoint> answer;
+    std::vector<core::net::ResolvedEndpoint> answer;
 };
 
 /// A connector whose dial always fails.
@@ -64,14 +67,17 @@ class CountingResolver final: public IAsyncAddressResolver
 /// operation below therefore ends in the failure path -- `Fetch` reports a miss,
 /// `Store` declines -- which is exactly the condition a miss-triggered refresh would
 /// re-resolve on. A connector that succeeded would leave that path unexercised.
-class FailingConnector final: public IConnector
+class FailingConnector final: public core::net::IConnector
 {
   public:
-    [[nodiscard]] Task<SocketResult> connect(std::string host, std::uint16_t /*port*/, DialOptions /*options*/) override
+    [[nodiscard]] core::async::Task<core::net::SocketResult> connect(std::string host,
+                                                                     std::uint16_t /*port*/,
+                                                                     core::net::DialOptions /*options*/) override
     {
         ++dials;
         lastHost = std::move(host);
-        co_return std::unexpected(NetError { .code = NetErrorCode::ConnRefused, .context = "scripted" });
+        co_return std::unexpected(
+            core::net::NetError { .code = core::net::NetErrorCode::ConnRefused, .context = "scripted" });
     }
 
     int dials { 0 };
@@ -79,12 +85,12 @@ class FailingConnector final: public IConnector
 };
 
 /// Resolve a literal through the real seam, so the fake answers with a genuine
-/// `ResolvedEndpoint` rather than hand-built sockaddr bytes.
+/// `core::net::ResolvedEndpoint` rather than hand-built sockaddr bytes.
 /// @return One endpoint for 127.0.0.1, or empty when the platform refused.
-[[nodiscard]] std::vector<ResolvedEndpoint> LoopbackEndpoint()
+[[nodiscard]] std::vector<core::net::ResolvedEndpoint> LoopbackEndpoint()
 {
-    SystemAddressResolver resolver;
-    auto resolved = resolver.Resolve("127.0.0.1", 6674);
+    core::net::SystemAddressResolver resolver;
+    auto resolved = resolver.resolve("127.0.0.1", 6674);
     if (!resolved.has_value())
         return {};
     return *resolved;
@@ -92,10 +98,10 @@ class FailingConnector final: public IConnector
 
 struct Fixture
 {
-    std::vector<ResolvedEndpoint> answer { LoopbackEndpoint() };
+    std::vector<core::net::ResolvedEndpoint> answer { LoopbackEndpoint() };
     CountingResolver resolver { answer };
     FailingConnector connector;
-    ManualClock clock;
+    core::platform::ManualClock clock;
 
     /// A node with no `--requirepass`, which is what every case here is about: these
     /// are the address-holding cases, and the credential is `NodeCredential_test`'s
@@ -125,8 +131,8 @@ TEST_CASE("RemoteUpstream resolves once per interval, not once per operation")
 
     for ([[maybe_unused]] auto const _: std::views::iota(0, 5))
     {
-        CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
-        CHECK(SyncRun(upstream.Store("k", {})) == UpstreamStore::Declined);
+        CHECK_FALSE(core::async::syncRun(upstream.Fetch("k")).has_value());
+        CHECK(core::async::syncRun(upstream.Store("k", {})) == UpstreamStore::Declined);
     }
 
     INFO("ten operations inside one interval");
@@ -144,18 +150,18 @@ TEST_CASE("RemoteUpstream re-resolves once the interval has passed")
 
     auto upstream = fixture.Make();
 
-    CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
+    CHECK_FALSE(core::async::syncRun(upstream.Fetch("k")).has_value());
     REQUIRE(fixture.resolver.calls == 1);
 
     // Just short of the interval is still the held address.
     fixture.clock.advance(RefreshInterval - std::chrono::milliseconds { 1 });
-    CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
+    CHECK_FALSE(core::async::syncRun(upstream.Fetch("k")).has_value());
     CHECK(fixture.resolver.calls == 1);
 
     // Reaching it re-resolves exactly once, however many operations follow.
     fixture.clock.advance(std::chrono::milliseconds { 1 });
-    CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
-    CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
+    CHECK_FALSE(core::async::syncRun(upstream.Fetch("k")).has_value());
+    CHECK_FALSE(core::async::syncRun(upstream.Fetch("k")).has_value());
     CHECK(fixture.resolver.calls == 2);
 }
 
@@ -173,7 +179,7 @@ TEST_CASE("RemoteUpstream does not re-resolve because a dial failed")
     auto upstream = fixture.Make();
 
     for ([[maybe_unused]] auto const _: std::views::iota(0, 20))
-        CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
+        CHECK_FALSE(core::async::syncRun(upstream.Fetch("k")).has_value());
 
     CHECK(fixture.resolver.calls == 1);
     CHECK(fixture.connector.dials == 20);
@@ -191,7 +197,7 @@ TEST_CASE("RemoteUpstream keeps serving while resolution is failing, and retries
     // A failed lookup must not reset the timer either, or a resolver that is down is
     // retried once per operation -- the amplifier again, by the other door.
     for ([[maybe_unused]] auto const _: std::views::iota(0, 5))
-        CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
+        CHECK_FALSE(core::async::syncRun(upstream.Fetch("k")).has_value());
     CHECK(fixture.resolver.calls == 1);
 
     // It still dialled: a failed lookup falls back to the configured name, which is
@@ -204,7 +210,7 @@ TEST_CASE("RemoteUpstream resolves nothing for an endpoint that does not parse")
     Fixture fixture;
     auto upstream = fixture.Make("not-an-endpoint");
 
-    CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
+    CHECK_FALSE(core::async::syncRun(upstream.Fetch("k")).has_value());
 
     // Nothing to hold an address for, so the name goes to the dial exactly as before
     // and the resolver is never consulted.
@@ -213,7 +219,7 @@ TEST_CASE("RemoteUpstream resolves nothing for an endpoint that does not parse")
 
 TEST_CASE("RemoteUpstream holds only a unique address, so a multi-answer name keeps its fallback")
 {
-    // `Detail::RunConnectFlow` tries EVERY candidate a name resolves to, and its own
+    // `core::net::detail::runConnectFlow` tries EVERY candidate a name resolves to, and its own
     // comment names the case it exists for: an AAAA on a machine with no IPv6 route.
     // Handing the connector one pinned literal would destroy that for a whole refresh
     // interval -- and silently, since an unreachable upstream is reported as a cache
@@ -226,7 +232,7 @@ TEST_CASE("RemoteUpstream holds only a unique address, so a multi-answer name ke
     SECTION("one answer is held, and the dial goes to the address")
     {
         auto upstream = fixture.Make();
-        CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
+        CHECK_FALSE(core::async::syncRun(upstream.Fetch("k")).has_value());
         CHECK(fixture.connector.lastHost == "127.0.0.1");
     }
 
@@ -246,12 +252,12 @@ TEST_CASE("RemoteUpstream holds only a unique address, so a multi-answer name ke
                                   IoTimeout,
                                   RefreshInterval };
 
-        CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
+        CHECK_FALSE(core::async::syncRun(upstream.Fetch("k")).has_value());
         CHECK(fixture.connector.lastHost == "cache.example");
 
         // Still only one lookup per interval: the name is dialled, but this class does
         // not ask the resolver again inside the window.
-        CHECK_FALSE(SyncRun(upstream.Fetch("k")).has_value());
+        CHECK_FALSE(core::async::syncRun(upstream.Fetch("k")).has_value());
         CHECK(multi.calls == 1);
     }
 }

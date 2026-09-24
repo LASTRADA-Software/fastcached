@@ -4,7 +4,6 @@
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/RosterStore.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -18,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
@@ -99,7 +99,7 @@ TEST_CASE("A consensus member verifies grants against the state it applies, whic
 {
     auto cfg = Worker();
     cfg.raftListen = "127.0.0.1:6680";
-    ManualWallClock const clock { Noon };
+    core::platform::ManualWallClock const clock { Noon };
     AtomicMetricsSink metrics;
     NullLogger logger;
     auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
@@ -137,7 +137,7 @@ TEST_CASE("A consensus member places a server only once its applied state names 
     // itself to itself until a heartbeat round after that commit, with a warning at every start.
     auto cfg = Worker();
     cfg.raftListen = "127.0.0.1:6680";
-    ManualWallClock const clock { Noon };
+    core::platform::ManualWallClock const clock { Noon };
     AtomicMetricsSink metrics;
     NullLogger logger;
     auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
@@ -169,7 +169,7 @@ TEST_CASE("A consensus member names a revoked server as revoked before it knows 
     // machine the state it applied says was forgotten.
     auto cfg = Worker();
     cfg.raftListen = "127.0.0.1:6680";
-    ManualWallClock const clock { Noon };
+    core::platform::ManualWallClock const clock { Noon };
     AtomicMetricsSink metrics;
     NullLogger logger;
     auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
@@ -186,7 +186,7 @@ TEST_CASE("A consensus member names a revoked server as revoked before it knows 
 
 TEST_CASE("A worker no other machine can reach holds no roster and checks no grant", "[node][roster]")
 {
-    ManualWallClock const clock { Noon };
+    core::platform::ManualWallClock const clock { Noon };
     AtomicMetricsSink metrics;
     NullLogger logger;
     auto const roster = NodeRoster::Build(Worker(), clock, metrics, logger);
@@ -203,7 +203,7 @@ TEST_CASE("A worker adopts the roster its anchors certify, keeps it, and starts 
     auto cfg = Worker();
     cfg.voterKeys = Anchors();
     cfg.clusterDir = scratch.Path();
-    ManualWallClock clock { Noon };
+    core::platform::ManualWallClock clock { Noon };
     AtomicMetricsSink metrics;
     NullLogger logger;
 
@@ -228,7 +228,7 @@ TEST_CASE("A worker adopts the roster its anchors certify, keeps it, and starts 
     }
 
     // A restart reads what it kept -- lapse included, which a restart must not reset.
-    clock.SetNow(Noon + 30min);
+    clock.setNow(Noon + 30min);
     auto const again = NodeRoster::Build(cfg, clock, metrics, logger);
     REQUIRE(again.has_value());
     auto& restarted = *Testing::Unwrap(again);
@@ -243,7 +243,7 @@ TEST_CASE("A kept roster this machine cannot use refuses the start, never falls 
     auto cfg = Worker();
     cfg.voterKeys = Anchors();
     cfg.clusterDir = scratch.Path();
-    ManualWallClock const clock { Noon };
+    core::platform::ManualWallClock const clock { Noon };
     AtomicMetricsSink metrics;
     NullLogger logger;
 
@@ -280,7 +280,7 @@ TEST_CASE("A worker other machines can reach refuses to start holding no roster 
     auto const scratch = Testing::ScratchDirectory { "node-roster-none" };
     auto cfg = NetworkFacingWorker();
     cfg.clusterDir = scratch.Path();
-    ManualWallClock const clock { Noon };
+    core::platform::ManualWallClock const clock { Noon };
     AtomicMetricsSink metrics;
     NullLogger logger;
 
@@ -298,7 +298,7 @@ TEST_CASE("A node carries the endorsement it last signed, and counts a roster it
 {
     auto cfg = Worker();
     cfg.voterKeys = Anchors();
-    ManualWallClock const clock { Noon };
+    core::platform::ManualWallClock const clock { Noon };
     AtomicMetricsSink metrics;
     NullLogger logger;
     auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);

@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/CowTreeStorage.hpp>
@@ -12,14 +10,12 @@
 #include <FastCache/Cache/WriteErrorReportingStorage.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReadingCodec.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
@@ -45,8 +41,15 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/net/testing/ParkingReadableSocket.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/ForeignGenerationValue.hpp>
-#include <tests/SocketDecorator.hpp>
+#include <tests/HalfClose.hpp>
+#include <tests/SocketDoubles.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -62,22 +65,22 @@ namespace
 /// the compile-cache handler driving the server end.
 struct CcFixture
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     InMemoryLruStorage storage { 0 };
     CacheEngine engine { storage, clock };
-    InMemorySocketPair pair = InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     CompileCacheHandler handler;
 };
 
 /// @param payload Bytes to write. Taken by value: a coroutine must not hold a
 ///                reference parameter across a suspend point.
-Task<bool> WriteBytes(ISocket* socket, std::vector<std::byte> payload)
+core::async::Task<bool> WriteBytes(core::net::ISocket* socket, std::vector<std::byte> payload)
 {
     auto const r = co_await socket->write(std::span<std::byte const> { payload.data(), payload.size() });
     co_return r.has_value();
 }
 
-Task<std::vector<std::byte>> ReadAvailable(ISocket* socket)
+core::async::Task<std::vector<std::byte>> ReadAvailable(core::net::ISocket* socket)
 {
     std::vector<std::byte> out;
     while (true)
@@ -103,7 +106,7 @@ Task<std::vector<std::byte>> ReadAvailable(ISocket* socket)
 /// @param socket Socket to read from.
 /// @param count Exact byte count expected.
 /// @return The bytes read; shorter than `count` if the peer stopped early.
-Task<std::vector<std::byte>> ReadExactlyN(ISocket* socket, std::size_t count)
+core::async::Task<std::vector<std::byte>> ReadExactlyN(core::net::ISocket* socket, std::size_t count)
 {
     std::vector<std::byte> out;
     out.reserve(count);
@@ -126,15 +129,15 @@ Task<std::vector<std::byte>> ReadExactlyN(ISocket* socket, std::size_t count)
 /// @return Everything the handler wrote back.
 std::vector<std::byte> ExchangeWith(CcFixture& fix, std::vector<std::byte> const& request, SessionContext session)
 {
-    REQUIRE(SyncRun(WriteBytes(fix.pair.client.get(), request)));
-    fix.pair.client->shutdownWrite();
-    SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primingBytes*/ {}, session));
+    REQUIRE(core::async::syncRun(WriteBytes(fix.pair.client.get(), request)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*fix.pair.client).has_value());
+    core::async::syncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primingBytes*/ {}, session));
     // Close the server side before draining, as Connection does once a handler
     // returns. Without it a rejection that closes WITHOUT replying — a foreign
     // magic, the one case that still cannot be answered — leaves the drain
     // parked on a read nothing will ever satisfy.
-    fix.pair.server->shutdownWrite();
-    return SyncRun(ReadAvailable(fix.pair.client.get()));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*fix.pair.server).has_value());
+    return core::async::syncRun(ReadAvailable(fix.pair.client.get()));
 }
 
 /// Drive one batch of request bytes through the handler with default session
@@ -351,13 +354,13 @@ TEST_CASE("STORE canonicalizes showIncludes; FETCH returns the canonical form", 
     // FETCH: the value must be canonical (no machine path), object blob intact.
     // The first handler consumed EOF and returned, so drive a fresh handler
     // over the SAME engine (same storage) for the fetch.
-    InMemorySocketPair pair2 = InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair2 = core::net::testing::InMemorySocketPair::create();
     CompileCacheHandler handler2;
-    REQUIRE(SyncRun(WriteBytes(pair2.client.get(), FetchFrame("obj-hash"))));
-    pair2.client->shutdownWrite();
+    REQUIRE(core::async::syncRun(WriteBytes(pair2.client.get(), FetchFrame("obj-hash"))));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair2.client).has_value());
     SessionContext session {};
-    SyncRun(handler2.Run(pair2.server.get(), &fix.engine, {}, session));
-    auto const fetchReply = SyncRun(ReadAvailable(pair2.client.get()));
+    core::async::syncRun(handler2.Run(pair2.server.get(), &fix.engine, {}, session));
+    auto const fetchReply = core::async::syncRun(ReadAvailable(pair2.client.get()));
 
     auto const decoded = DecodeFetchHit(fetchReply);
     REQUIRE(decoded.present);
@@ -401,17 +404,17 @@ TEST_CASE("STORE/FETCH round-trips an object blob larger than 1 MiB", "[compile-
     REQUIRE(storeFrame.present);
     REQUIRE(storeFrame.status == Wire::Status::Ok);
 
-    InMemorySocketPair pair2 = InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair2 = core::net::testing::InMemorySocketPair::create();
     CompileCacheHandler handler2;
-    REQUIRE(SyncRun(WriteBytes(pair2.client.get(), FetchFrame("big-obj"))));
-    pair2.client->shutdownWrite();
+    REQUIRE(core::async::syncRun(WriteBytes(pair2.client.get(), FetchFrame("big-obj"))));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair2.client).has_value());
     SessionContext session {};
-    SyncRun(handler2.Run(pair2.server.get(), &fix.engine, {}, session));
+    core::async::syncRun(handler2.Run(pair2.server.get(), &fix.engine, {}, session));
 
     // Read the 5-byte header first so the declared length drives the rest: that
     // is exactly what a real client does, so a truncated reply shows up here as
     // a short read instead of as a hang.
-    auto const headerBytes = SyncRun(ReadExactlyN(pair2.client.get(), Wire::ReplyHeaderSize));
+    auto const headerBytes = core::async::syncRun(ReadExactlyN(pair2.client.get(), Wire::ReplyHeaderSize));
     REQUIRE(headerBytes.size() == Wire::ReplyHeaderSize);
     auto const header = Wire::DecodeReplyHeader(headerBytes);
     REQUIRE(header.has_value());
@@ -419,7 +422,7 @@ TEST_CASE("STORE/FETCH round-trips an object blob larger than 1 MiB", "[compile-
     auto const declared = Unwrap(header).payloadLength;
     REQUIRE(declared > 1024U * 1024U);
 
-    auto const payload = SyncRun(ReadExactlyN(pair2.client.get(), declared));
+    auto const payload = core::async::syncRun(ReadExactlyN(pair2.client.get(), declared));
     REQUIRE(payload.size() == declared);
 
     // value_or keeps the access unguarded-safe: static analysis cannot see a
@@ -836,13 +839,13 @@ TEST_CASE("Cross-depth: value stored from a deep layout localizes for a shallow 
     REQUIRE(storeFrame.status == Wire::Status::Ok);
 
     // Fetch the canonical value and localize it as a SHALLOW consumer would.
-    InMemorySocketPair pair2 = InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair2 = core::net::testing::InMemorySocketPair::create();
     CompileCacheHandler handler2;
-    REQUIRE(SyncRun(WriteBytes(pair2.client.get(), FetchFrame("k"))));
-    pair2.client->shutdownWrite();
+    REQUIRE(core::async::syncRun(WriteBytes(pair2.client.get(), FetchFrame("k"))));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair2.client).has_value());
     SessionContext session {};
-    SyncRun(handler2.Run(pair2.server.get(), &fix.engine, {}, session));
-    auto const reply = SyncRun(ReadAvailable(pair2.client.get()));
+    core::async::syncRun(handler2.Run(pair2.server.get(), &fix.engine, {}, session));
+    auto const reply = core::async::syncRun(ReadAvailable(pair2.client.get()));
 
     auto const decoded = DecodeFetchHit(reply);
     REQUIRE(decoded.present);
@@ -873,15 +876,15 @@ CompileValue SampleValue()
 /// Store `key` under `prefetch group` via a fresh handler over `engine`.
 void StoreVia(CacheEngine& engine, std::string_view key, std::string_view prefetchGroup)
 {
-    InMemorySocketPair pair = InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     CompileCacheHandler handler;
     auto const frame = StoreFrame(
         { .key = key, .prefetchGroup = prefetchGroup, .srcRoot = R"(C:\src)", .buildTree = R"(C:\build)" }, SampleValue());
-    REQUIRE(SyncRun(WriteBytes(pair.client.get(), frame)));
-    pair.client->shutdownWrite();
+    REQUIRE(core::async::syncRun(WriteBytes(pair.client.get(), frame)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
     SessionContext session {};
-    SyncRun(handler.Run(pair.server.get(), &engine, {}, session));
-    (void) SyncRun(ReadAvailable(pair.client.get()));
+    core::async::syncRun(handler.Run(pair.server.get(), &engine, {}, session));
+    (void) core::async::syncRun(ReadAvailable(pair.client.get()));
 }
 
 } // namespace
@@ -889,7 +892,7 @@ void StoreVia(CacheEngine& engine, std::string_view key, std::string_view prefet
 TEST_CASE("FETCH of a prefetch group member warms the rest of the prefetch group into L1",
           "[compile-cache][handler][prefetch]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     auto l1 = std::make_unique<InMemoryLruStorage>(0);
     auto l2 = std::make_unique<InMemoryLruStorage>(0);
     LayeredStorage layered { std::move(l1), std::move(l2) };
@@ -908,13 +911,13 @@ TEST_CASE("FETCH of a prefetch group member warms the rest of the prefetch group
     REQUIRE_FALSE(layered.L1().Peek("k3", clock.now())->found);
 
     // Fetch the leading key: triggers a group prefetch of k2/k3 into L1.
-    InMemorySocketPair pair = InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     CompileCacheHandler handler;
-    REQUIRE(SyncRun(WriteBytes(pair.client.get(), FetchFrame("k1"))));
-    pair.client->shutdownWrite();
+    REQUIRE(core::async::syncRun(WriteBytes(pair.client.get(), FetchFrame("k1"))));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
     SessionContext session {};
-    SyncRun(handler.Run(pair.server.get(), &engine, {}, session));
-    (void) SyncRun(ReadAvailable(pair.client.get()));
+    core::async::syncRun(handler.Run(pair.server.get(), &engine, {}, session));
+    (void) core::async::syncRun(ReadAvailable(pair.client.get()));
 
     // k2 and k3 are now warm in L1 (a direct L1 Peek finds them).
     CHECK(layered.L1().Peek("k2", clock.now())->found);
@@ -1481,8 +1484,8 @@ namespace
 {
 
 /// Run the handler to completion on the reactor, recording that it returned.
-DetachedTask RunHandlerOn(
-    CompileCacheHandler* handler, ISocket* socket, CacheEngine* engine, SessionContext session, bool* returned)
+core::async::DetachedTask RunHandlerOn(
+    CompileCacheHandler* handler, core::net::ISocket* socket, CacheEngine* engine, SessionContext session, bool* returned)
 {
     co_await handler->Run(socket, engine, {}, session);
     *returned = true;
@@ -1491,7 +1494,7 @@ DetachedTask RunHandlerOn(
 /// Read exactly one reply frame the handler is known to have written.
 /// @param socket The client end.
 /// @return The frame, header included.
-Task<std::vector<std::byte>> ReadOneFrame(ISocket* socket)
+core::async::Task<std::vector<std::byte>> ReadOneFrame(core::net::ISocket* socket)
 {
     auto frame = co_await ReadExactlyN(socket, Wire::ReplyHeaderSize);
     auto const header = Wire::DecodeReplyHeader(frame);
@@ -1536,10 +1539,10 @@ Task<std::vector<std::byte>> ReadOneFrame(ISocket* socket)
 struct StreamingRig
 {
     CcFixture fix;
-    Testing::ParkingReadableSocket server { *fix.pair.server };
-    Testing::ParkingWritableSocket writes { server }; ///< What the handler runs on.
+    core::net::testing::ParkingReadableSocket server { *fix.pair.server };
+    FastCache::Testing::ParkingWritableSocket writes { server }; ///< What the handler runs on.
     CacheLiveStatsSources const sources { metrics, [] { return MetricsSnapshot {}; }, "cache.test:6380" };
-    TestReactor reactor { fix.clock };
+    core::net::testing::TestLoop reactor { fix.clock };
     AtomicMetricsSink metrics;
     LiveStream live { sources, metrics };
     bool returned { false };
@@ -1558,7 +1561,7 @@ struct StreamingRig
     void Advance(std::chrono::milliseconds by)
     {
         fix.clock.advance(by);
-        reactor.Drain();
+        reactor.drain();
     }
 };
 
@@ -1567,11 +1570,11 @@ struct StreamingRig
 TEST_CASE("The daemon streams the cache subject, and a goodbye ends the stream", "[compile-cache][handler][livestats]")
 {
     StreamingRig rig;
-    REQUIRE(SyncRun(WriteBytes(rig.fix.pair.client.get(), SubscribeTo(Wire::LiveSubject::Cache))));
+    REQUIRE(core::async::syncRun(WriteBytes(rig.fix.pair.client.get(), SubscribeTo(Wire::LiveSubject::Cache))));
     RunHandlerOn(&rig.fix.handler, &rig.writes, &rig.fix.engine, rig.Session(), &rig.returned);
-    rig.reactor.Drain();
+    rig.reactor.drain();
 
-    auto const subscribed = SyncRun(ReadOneFrame(rig.fix.pair.client.get()));
+    auto const subscribed = core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()));
     auto const grant = PushOf(subscribed);
     REQUIRE(grant.has_value());
     REQUIRE(Unwrap(grant).kind == Wire::PushKind::Subscribed);
@@ -1581,7 +1584,7 @@ TEST_CASE("The daemon streams the cache subject, and a goodbye ends the stream",
     CHECK(Unwrap(granted).endpoint == "cache.test:6380");
 
     // The body is the daemon's own reading, in the binary a client decodes.
-    auto const first = SyncRun(ReadOneFrame(rig.fix.pair.client.get()));
+    auto const first = core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()));
     auto const push = PushOf(first);
     REQUIRE(push.has_value());
     REQUIRE(Unwrap(push).kind == Wire::PushKind::Snapshot);
@@ -1590,17 +1593,17 @@ TEST_CASE("The daemon streams the cache subject, and a goodbye ends the stream",
     CHECK(DecodeStatsReading(Unwrap(snapshot).body).has_value());
 
     rig.Advance(500ms);
-    CHECK(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
+    CHECK(PushKindOf(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
     REQUIRE_FALSE(rig.returned);
 
     // The watcher is parked on the server end, as a subscriber's always is; EOF resolves it.
-    REQUIRE(rig.server.IsWatchParked());
-    rig.server.ResolveReadable(0);
+    REQUIRE(rig.server.isWatchParked());
+    rig.server.resolveReadable(0);
     rig.Advance(500ms);
 
     CHECK(rig.returned);
     CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsEndedByClient) == 1);
-    CHECK(rig.server.WatchesOrphaned() == 0);
+    CHECK(rig.server.watchesOrphaned() == 0);
 }
 
 TEST_CASE("A stream on a connection that never authenticated ends when the daemon starts requiring one",
@@ -1613,45 +1616,45 @@ TEST_CASE("A stream on a connection that never authenticated ends when the daemo
 
     SECTION("a connection that proved nothing is revoked, named and counted")
     {
-        REQUIRE(SyncRun(WriteBytes(rig.fix.pair.client.get(), SubscribeTo(Wire::LiveSubject::Cache))));
+        REQUIRE(core::async::syncRun(WriteBytes(rig.fix.pair.client.get(), SubscribeTo(Wire::LiveSubject::Cache))));
         RunHandlerOn(&rig.fix.handler, &rig.writes, &rig.fix.engine, session, &rig.returned);
-        rig.reactor.Drain();
-        REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
-        REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
+        rig.reactor.drain();
+        REQUIRE(PushKindOf(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
+        REQUIRE(PushKindOf(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
 
         source.Store(std::make_shared<AuthPolicy const>(std::string {}, std::string { "s3cret" }));
         rig.Advance(500ms);
 
-        auto const terminal = SoleReply(SyncRun(ReadOneFrame(rig.fix.pair.client.get())));
+        auto const terminal = SoleReply(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get())));
         REQUIRE(terminal.present);
         CHECK(terminal.status == Wire::Status::Error);
         CHECK(ErrorOf(terminal).code == Wire::ErrorCode::Unauthenticated);
         CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsRevoked) == 1);
         // Retired by the handler, not left for the connection's close.
-        CHECK(rig.server.WatchesRetiredByCancel() == 1);
-        CHECK(rig.server.WatchesOrphaned() == 0);
+        CHECK(rig.server.watchesRetiredByCancel() == 1);
+        CHECK(rig.server.watchesOrphaned() == 0);
     }
 
     SECTION("a connection that proved a secret keeps its stream when the secret rotates")
     {
         source.Store(std::make_shared<AuthPolicy const>(std::string {}, std::string { "old-secret" }));
-        REQUIRE(SyncRun(WriteBytes(rig.fix.pair.client.get(),
-                                   Concat({ AuthFrame("", "old-secret"), SubscribeTo(Wire::LiveSubject::Cache) }))));
+        REQUIRE(core::async::syncRun(WriteBytes(
+            rig.fix.pair.client.get(), Concat({ AuthFrame("", "old-secret"), SubscribeTo(Wire::LiveSubject::Cache) }))));
         RunHandlerOn(&rig.fix.handler, &rig.writes, &rig.fix.engine, session, &rig.returned);
-        rig.reactor.Drain();
-        REQUIRE(SoleReply(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))).status == Wire::Status::Ok);
-        REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
-        REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
+        rig.reactor.drain();
+        REQUIRE(SoleReply(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()))).status == Wire::Status::Ok);
+        REQUIRE(PushKindOf(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
+        REQUIRE(PushKindOf(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
 
         source.Store(std::make_shared<AuthPolicy const>(std::string {}, std::string { "new-secret" }));
         rig.Advance(500ms);
-        CHECK(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
+        CHECK(PushKindOf(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
         CHECK(rig.metrics.Read(IMetricsSink::Counter::LiveSubscriptionsRevoked) == 0);
     }
 
     // Ended either way, so nothing is left parked on the rig's reactor when it goes.
-    rig.server.ResolveReadable(0);
-    rig.fix.pair.client->shutdownWrite();
+    rig.server.resolveReadable(0);
+    REQUIRE(FastCache::Testing::ShutdownWrite(*rig.fix.pair.client).has_value());
     rig.Advance(500ms);
     CHECK(rig.returned);
 }
@@ -1676,31 +1679,31 @@ TEST_CASE("A request pipelined behind a daemon subscription ends the stream in o
     // Written together, so the reader holds the FETCH before the stream begins -- where a read
     // watch would park on bytes already taken off the socket and never learn of them.
     StreamingRig rig;
-    REQUIRE(
-        SyncRun(WriteBytes(rig.fix.pair.client.get(), Concat({ SubscribeTo(Wire::LiveSubject::Cache), FetchFrame("k") }))));
-    rig.fix.pair.client->shutdownWrite();
+    REQUIRE(core::async::syncRun(
+        WriteBytes(rig.fix.pair.client.get(), Concat({ SubscribeTo(Wire::LiveSubject::Cache), FetchFrame("k") }))));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*rig.fix.pair.client).has_value());
     RunHandlerOn(&rig.fix.handler, &rig.writes, &rig.fix.engine, rig.Session(), &rig.returned);
     rig.Advance(500ms);
 
-    CHECK(rig.server.WatchesArmed() == 0);
+    CHECK(rig.server.watchesArmed() == 0);
     REQUIRE(rig.returned);
-    REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
-    auto frame = SyncRun(ReadOneFrame(rig.fix.pair.client.get()));
+    REQUIRE(PushKindOf(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
+    auto frame = core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()));
     while (PushKindOf(frame).has_value())
-        frame = SyncRun(ReadOneFrame(rig.fix.pair.client.get()));
+        frame = core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()));
     CHECK(SoleReply(frame).status == Wire::Status::Ok);
-    CHECK(SoleReply(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))).status == Wire::Status::Miss);
+    CHECK(SoleReply(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()))).status == Wire::Status::Miss);
 }
 
 TEST_CASE("A daemon subscriber that stops reading is cut off at its hold and counted as a stall",
           "[compile-cache][handler][livestats]")
 {
     StreamingRig rig;
-    REQUIRE(SyncRun(WriteBytes(rig.fix.pair.client.get(), SubscribeTo(Wire::LiveSubject::Cache))));
+    REQUIRE(core::async::syncRun(WriteBytes(rig.fix.pair.client.get(), SubscribeTo(Wire::LiveSubject::Cache))));
     RunHandlerOn(&rig.fix.handler, &rig.writes, &rig.fix.engine, rig.Session(), &rig.returned);
-    rig.reactor.Drain();
-    REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
-    REQUIRE(PushKindOf(SyncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
+    rig.reactor.drain();
+    REQUIRE(PushKindOf(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Subscribed);
+    REQUIRE(PushKindOf(core::async::syncRun(ReadOneFrame(rig.fix.pair.client.get()))) == Wire::PushKind::Snapshot);
 
     // The next tick's push parks at 500 ms. Its hold is the stream's, which at the cache floor is
     // the write-stall floor itself.
@@ -1764,13 +1767,13 @@ class CapturingPushes final: public ISubscriber
                                                  std::vector<std::byte> const& request,
                                                  SessionContext session = {})
 {
-    InMemorySocketPair pair = InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     CompileCacheHandler handler;
-    REQUIRE(SyncRun(WriteBytes(pair.client.get(), request)));
-    pair.client->shutdownWrite();
-    SyncRun(handler.Run(pair.server.get(), &engine, {}, session));
-    pair.server->shutdownWrite();
-    return SplitReplies(SyncRun(ReadAvailable(pair.client.get())));
+    REQUIRE(core::async::syncRun(WriteBytes(pair.client.get(), request)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+    core::async::syncRun(handler.Run(pair.server.get(), &engine, {}, session));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.server).has_value());
+    return SplitReplies(core::async::syncRun(ReadAvailable(pair.client.get())));
 }
 
 } // namespace
@@ -1827,7 +1830,7 @@ TEST_CASE("A dropped key is gone from what a FETCH consults through the daemon's
     // asks. Two copies are made to exist before the drop -- the L2 record and an L1 mirror --
     // and a group warm runs AFTER it, which is the one path that reads the key without anybody
     // asking for it.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     Testing::TempFile shard0;
     Testing::TempFile shard1;
     std::vector<std::unique_ptr<IStorage>> shards;
@@ -1866,7 +1869,7 @@ TEST_CASE("A CACHE-DROP dirties a WATCH on the key and publishes no keyspace eve
     // Neutered by handing the handler an engine ONE LAYER DOWN, below `NotifyingStorage`: the
     // key is removed exactly the same and the WATCH stays clean. That arm is kept as a SECTION
     // rather than run once by hand, so the distinction it proves is on every run.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     InMemoryLruStorage inner { 0 };
     PubSubRegistry registry;
     auto const delEvents = std::make_shared<CapturingPushes>();

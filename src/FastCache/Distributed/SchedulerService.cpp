@@ -444,8 +444,8 @@ namespace
     };
 } // namespace
 
-SchedulerService::SchedulerService(IClock& clock,
-                                   WallClockRef wallClock,
+SchedulerService::SchedulerService(core::platform::IClock& clock,
+                                   core::platform::WallClockRef wallClock,
                                    IMetricsSink& metrics,
                                    ILogger& logger,
                                    ILeaseSigner const& signer,
@@ -478,7 +478,7 @@ std::string SchedulerService::MintGrantToken(Distributed::Lease const& lease,
                                         .endpoint = std::string { endpoint },
                                         .fingerprint = std::string { fingerprint },
                                         .key = lease.key,
-                                        .expiresAt = _wallClock.Now() + lease.lifetime,
+                                        .expiresAt = _wallClock.now() + lease.lifetime,
                                         .clusterId = _clusterId,
                                         .epoch = _epoch.load(std::memory_order_acquire),
                                         .signer = {} });
@@ -1024,7 +1024,7 @@ SchedulerReply SchedulerService::AnnounceNode(CallerContext const& caller,
             std::ignore = AcceptEndorsement(*endorsement);
     }
 
-    auto const certified = CertifiedRosterNow(_wallClock.Now());
+    auto const certified = CertifiedRosterNow(_wallClock.now());
     return SchedulerReply::Success(certified.has_value() ? Cluster::EncodeCertifiedRoster(*certified)
                                                          : std::vector<std::byte> {});
 }
@@ -1061,7 +1061,7 @@ SchedulerService::EndorsementOutcome SchedulerService::AcceptEndorsement(Cluster
 
 std::optional<Cluster::CertifiedRoster> SchedulerService::CurrentCertifiedRoster() const
 {
-    return CertifiedRosterNow(_wallClock.Now());
+    return CertifiedRosterNow(_wallClock.now());
 }
 
 std::optional<Cluster::CertifiedRoster> SchedulerService::CertifiedRosterNow(std::chrono::system_clock::time_point now) const

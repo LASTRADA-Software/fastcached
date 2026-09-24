@@ -16,8 +16,8 @@ namespace FastCache::Node
 {
 
 SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
-                             IClock& clock,
-                             WallClockRef wallClock,
+                             core::platform::IClock& clock,
+                             core::platform::WallClockRef wallClock,
                              IMetricsSink& metrics,
                              ILogger& logger,
                              std::string signerId,
@@ -50,8 +50,8 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
 std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     NodeConfig const& cfg,
     Distributed::IMembershipOracle const& membership,
-    IClock& clock,
-    WallClockRef wallClock,
+    core::platform::IClock& clock,
+    core::platform::WallClockRef wallClock,
     IMetricsSink& metrics,
     ILogger& logger,
     std::optional<Ed25519KeyPair> const& identityKey)

@@ -5,13 +5,14 @@
 #include "DashboardLoop.hpp"
 #include "TerminalCapabilities.hpp"
 
-#include <FastCache/Async/IExecutor.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
 
 #include <expected>
 #include <memory>
 #include <string>
+
+#include <core/async/IExecutor.hpp>
+#include <core/async/Task.hpp>
 
 namespace FastCache::Cli
 {
@@ -144,9 +145,8 @@ struct StartedTerminal
 /// @param resumeOn Where `StartTerminal` and `Next()` resume before they return.
 /// @param colour `--color` as this program resolved it, which the capability record's `colour` answers.
 /// @return The unstarted terminal, or why none could be made.
-[[nodiscard]] std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(IExecutor* pool,
-                                                                                                IExecutor* resumeOn,
-                                                                                                UsageColor colour);
+[[nodiscard]] std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(
+    core::async::IExecutor* pool, core::async::IExecutor* resumeOn, UsageColor colour);
 
 /// Acquire @p terminal and learn what it can draw.
 ///
@@ -164,6 +164,7 @@ struct StartedTerminal
 /// returns, however far the acquisition got.
 /// @param terminal The terminal to start; consumed.
 /// @return The started terminal, or why it could not be acquired.
-[[nodiscard]] Task<std::expected<StartedTerminal, std::string>> StartTerminal(std::unique_ptr<UnstartedTerminal> terminal);
+[[nodiscard]] core::async::Task<std::expected<StartedTerminal, std::string>> StartTerminal(
+    std::unique_ptr<UnstartedTerminal> terminal);
 
 } // namespace FastCache::Cli

@@ -6,7 +6,6 @@
 #include <FastCache/Config/Config.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/IAdmissionControl.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
 #include <FastCache/Server/ReadinessAnnouncer.hpp>
 #include <FastCache/Server/Server.hpp>
@@ -20,10 +19,15 @@
 #include <string_view>
 #include <vector>
 
+#include <core/net/IAdmissionControl.hpp>
+
+namespace core::net
+{
+class ITlsContext;
+} // namespace core::net
+
 namespace FastCache
 {
-
-class TlsContext; // defined in Net/TlsContext.hpp; only used when TLS is built in
 
 /// Options for the reactor-driven server loop. Bundled so we can pass the
 /// same options across the three platform-specific implementations.
@@ -59,7 +63,7 @@ struct ReactorServerOptions
 
     /// TLS context for terminating TLS on accepted connections, or nullptr for
     /// plaintext. Only honoured in TLS-enabled builds; must outlive the run.
-    TlsContext* tlsContext { nullptr };
+    core::net::ITlsContext* tlsContext { nullptr };
 
     /// Pacing and ceilings for the active expiry cycle.
     ///
@@ -70,17 +74,17 @@ struct ReactorServerOptions
     ExpiryReaperOptions expiry {};
 
     /// Clock the reactors drive and read, or nullptr to let the loop own a
-    /// plain `SteadyClock`.
+    /// plain `core::platform::SteadyClock`.
     ///
     /// Pass the same clock the `CacheEngine` was built with to make it a
-    /// `CachedClock`: the reactor refreshes it once per loop iteration, and
+    /// `core::platform::CachedClock`: the reactor refreshes it once per loop iteration, and
     /// every command served in between reads a stored value instead of calling
     /// `QueryPerformanceCounter`. Only the loop iterates, so only the loop can
     /// refresh it — which is why the two have to be the same object rather than
-    /// two `SteadyClock` instances as they were before.
+    /// two `core::platform::SteadyClock` instances as they were before.
     ///
     /// Must outlive the run.
-    IClock* clock { nullptr };
+    core::platform::IClock* clock { nullptr };
 };
 
 /// Run the reactor-driven server loop using the platform's native
@@ -96,7 +100,7 @@ struct ReactorServerOptions
 int RunReactorServer(ReactorServerOptions const& options,
                      CacheEngine& engine,
                      ILogger& logger,
-                     IAdmissionControl* admission = nullptr,
+                     core::net::IAdmissionControl* admission = nullptr,
                      IMetricsSink* metrics = nullptr);
 
 namespace Detail
@@ -140,8 +144,8 @@ namespace Detail
     /// @param options Server options; only `expiry` is read.
     /// @param metrics Counter sink, or nullptr.
     /// @return The running cycle. Stops when destroyed.
-    [[nodiscard]] std::unique_ptr<ExpiryReaper> StartExpiryCycle(IReactor& reactor,
-                                                                 IExecutor& sweepOn,
+    [[nodiscard]] std::unique_ptr<ExpiryReaper> StartExpiryCycle(core::net::EventLoop& reactor,
+                                                                 core::async::IExecutor& sweepOn,
                                                                  CacheEngine& engine,
                                                                  ILogger& logger,
                                                                  ReactorServerOptions const& options,

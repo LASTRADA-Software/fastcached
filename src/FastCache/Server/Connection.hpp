@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Net/ISocket.hpp>
-#include <FastCache/Net/LingeringClose.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
+#include <FastCache/Transport/LingeringClose.hpp>
 
 #include <chrono>
 #include <memory>
 #include <type_traits>
+
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
 
 namespace FastCache
 {
@@ -27,7 +28,7 @@ namespace FastCache
 /// destructor (#1025), and a destructor body runs before the members declared beside
 /// it -- so by the time such a frame unwinds, every local declared after the reactor
 /// in `ReactorServerLoop`'s serving functions is already gone. The listeners, the
-/// servers, the expiry pool, the reaper and the per-bind `TlsContext` are all in that
+/// servers, the expiry pool, the reaper and the per-bind `core::net::ITlsContext` are all in that
 /// set.
 ///
 /// **A destroyed coroutine frame runs no user code except destructors.** That is what
@@ -91,11 +92,11 @@ class Connection
     /// @param socket Owned socket; closed on connection end. The one collaborator whose
     ///        destructor does something, exempted with its reason on `ConnectionHoldings`.
     /// @param held Everything else this connection is given, as one checked bundle.
-    Connection(std::unique_ptr<ISocket> socket, ConnectionHoldings held) noexcept;
+    Connection(std::unique_ptr<core::net::ISocket> socket, ConnectionHoldings held) noexcept;
 
     /// Run the connection's protocol loop to completion.
     /// @return Task that resolves when the connection closes.
-    [[nodiscard]] Task<void> Run();
+    [[nodiscard]] core::async::Task<void> Run();
 
     /// How long a connection whose handler has returned listens to its client before
     /// closing, and how much (#1554). A handler that refuses a request it did not finish
@@ -107,7 +108,7 @@ class Connection
                                            .reads = 64 };
 
   private:
-    std::unique_ptr<ISocket> _socket;
+    std::unique_ptr<core::net::ISocket> _socket;
     ConnectionHoldings _held;
 };
 

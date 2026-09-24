@@ -207,7 +207,7 @@ TEST_CASE("Two hosts name one machine across the spellings a listener imposes", 
     CHECK_FALSE(SameHost("10.0.0.1", "10.0.0.2"));
 
     // An empty host matches nothing, the empty host included: it is what
-    // `FormatPeerAddress` answers for a peer it could not identify, and two
+    // `core::net::formatPeerAddress` answers for a peer it could not identify, and two
     // unanswerable questions are not a match.
     CHECK_FALSE(SameHost("", "10.0.0.1"));
     CHECK_FALSE(SameHost("10.0.0.1", ""));

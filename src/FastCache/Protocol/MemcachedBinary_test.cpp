@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/MemcachedBinary.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
 
@@ -24,15 +21,21 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/platform/Clock.hpp>
+#include <tests/HalfClose.hpp>
+
 namespace
 {
 
 struct BinaryFixture
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
-    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     FastCache::MemcachedBinaryHandler handler;
 };
 
@@ -83,13 +86,13 @@ std::vector<std::byte> BuildBinaryFrame(std::uint8_t opcode,
     return frame;
 }
 
-FastCache::Task<bool> Write(FastCache::ISocket* s, std::span<std::byte const> bytes)
+core::async::Task<bool> Write(core::net::ISocket* s, std::span<std::byte const> bytes)
 {
     auto const r = co_await s->write(bytes);
     co_return r.has_value();
 }
 
-FastCache::Task<std::vector<std::byte>> Drain(FastCache::ISocket* s)
+core::async::Task<std::vector<std::byte>> Drain(core::net::ISocket* s)
 {
     std::vector<std::byte> out;
     while (true)
@@ -109,10 +112,10 @@ std::vector<std::byte> Exchange(BinaryFixture& fix,
                                 std::span<std::byte const> request,
                                 FastCache::SessionContext session = {})
 {
-    REQUIRE(FastCache::SyncRun(Write(fix.pair.client.get(), request)));
-    fix.pair.client->shutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, session));
-    return FastCache::SyncRun(Drain(fix.pair.client.get()));
+    REQUIRE(core::async::syncRun(Write(fix.pair.client.get(), request)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*fix.pair.client).has_value());
+    core::async::syncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, session));
+    return core::async::syncRun(Drain(fix.pair.client.get()));
 }
 
 /// Drive Run with `frame` as priming bytes and a half-closed client, then
@@ -126,8 +129,8 @@ std::vector<FastCache::CapturingLogger::Record> DrivePrimedAndSnapshot(BinaryFix
     FastCache::SessionContext session;
     session.logger = &logger;
     std::vector<std::byte> priming { frame.begin(), frame.end() };
-    fix.pair.client->shutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, std::move(priming), session));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*fix.pair.client).has_value());
+    core::async::syncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, std::move(priming), session));
     return logger.Snapshot();
 }
 

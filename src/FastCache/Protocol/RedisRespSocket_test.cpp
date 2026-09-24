@@ -3,7 +3,7 @@
 // RESP over a REAL reactor socket.
 //
 // **Why this file exists at all.** Every other RESP case in this tree runs on
-// `InMemoryTransport`, whose `WaitReadable` resolves synchronously and never parks.
+// `core::net::testing::InMemorySocketPair`, whose `WaitReadable` resolves synchronously and never parks.
 // The pub/sub readable watcher is built entirely around parking on that call, so the
 // question it exists to answer -- who owns the socket's single read-op slot, and when
 // -- is exercised by nothing. That is not a gap in the coverage of a corner: it is the
@@ -12,21 +12,12 @@
 // this code behind a green suite.
 //
 // So these cases drive `RedisRespHandler::Run` over a socket accepted on a real
-// `PlatformReactor`, with a real client on a thread of its own. That is the only
+// `core::net::PlatformLoop`, with a real client on a thread of its own. That is the only
 // arrangement in which the watcher parks, and therefore the only one in which dropping
 // it can be observed.
 
-#include <FastCache/Async/PlatformReactor.hpp>
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
-#include <FastCache/Net/BlockingConnector.hpp>
-#include <FastCache/Net/IConnector.hpp>
-#include <FastCache/Net/IListener.hpp>
-#include <FastCache/Net/ISocket.hpp>
-#include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Protocol/PubSubRegistry.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
@@ -46,6 +37,17 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/ResumeOn.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/BlockingConnector.hpp>
+#include <core/net/IConnector.hpp>
+#include <core/net/IListener.hpp>
+#include <core/net/ISocket.hpp>
+#include <core/net/PlatformLoop.hpp>
+#include <core/net/Sockets.hpp>
+#include <core/platform/Clock.hpp>
+
 using namespace FastCache;
 using namespace std::chrono_literals;
 
@@ -63,10 +65,13 @@ namespace
 /// @param session Session context, carrying the reactor and the pub/sub registry.
 /// @param ended Set when the handler returned; must outlive the task.
 /// @return The detached task.
-DetachedTask ServeOneRespSession(
-    PlatformReactor* reactor, IListener* listener, CacheEngine* engine, SessionContext session, std::atomic<bool>* ended)
+core::async::DetachedTask ServeOneRespSession(core::net::PlatformLoop* reactor,
+                                              core::net::IListener* listener,
+                                              CacheEngine* engine,
+                                              SessionContext session,
+                                              std::atomic<bool>* ended)
 {
-    auto accepted = co_await listener->Accept();
+    auto accepted = co_await listener->accept();
     if (!accepted.has_value())
     {
         ended->store(true, std::memory_order_release);
@@ -82,14 +87,14 @@ DetachedTask ServeOneRespSession(
 
     // **Drain before stopping, the way a real server does by simply continuing to
     // run.** `Run`'s cleanup calls `ShutdownWatcher`, which wakes the readable
-    // watcher through `IReactor::Submit` -- and a submitted handle on a reactor that
+    // watcher through `core::net::EventLoop::Submit` -- and a submitted handle on a reactor that
     // has already stopped is never resumed, so the watcher's coroutine frame leaks.
     // LeakSanitizer reported exactly that (1120 bytes in 6 allocations) the first
     // time this fixture ran under the ASan gate, and it is the FIXTURE's defect
     // rather than the session's: a daemon's reactor keeps running, so the same
     // resumption lands. One hop puts this continuation behind whatever cleanup
     // queued, so those run first.
-    co_await ResumeOn { *reactor };
+    co_await core::async::ResumeOn { *reactor };
 
     ended->store(true, std::memory_order_release);
     reactor->stop();
@@ -97,16 +102,17 @@ DetachedTask ServeOneRespSession(
 
 /// A client speaking RESP over a real socket, from a thread of its own.
 ///
-/// Blocking on purpose: it runs on a `jthread`, never on the reactor, so `SyncRun`
+/// Blocking on purpose: it runs on a `jthread`, never on the reactor, so `core::async::syncRun`
 /// over a blocking socket is the right driver -- every awaitable resolves inline and
-/// nothing is left suspended, which is the one thing `SyncRun` refuses to read from.
+/// nothing is left suspended, which is the one thing `core::async::syncRun` refuses to read from.
 class RespClient
 {
   public:
     /// @param port The loopback port to dial.
     explicit RespClient(std::uint16_t port)
     {
-        auto socket = SyncRun(_connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+        auto socket =
+            core::async::syncRun(_connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
         if (socket.has_value())
             _socket = std::move(*socket);
     }
@@ -122,7 +128,7 @@ class RespClient
     /// @return True when the whole payload was accepted.
     [[nodiscard]] bool Send(std::string_view wire)
     {
-        return SyncRun([](ISocket* s, std::string_view w) -> Task<bool> {
+        return core::async::syncRun([](core::net::ISocket* s, std::string_view w) -> core::async::Task<bool> {
             auto const bytes = std::span<std::byte const> { reinterpret_cast<std::byte const*>(w.data()), w.size() };
             auto const r = co_await s->write(bytes);
             co_return r.has_value() && *r == w.size();
@@ -133,7 +139,7 @@ class RespClient
     /// @return The bytes as text; empty on EOF or error.
     [[nodiscard]] std::string ReadSome()
     {
-        return SyncRun([](ISocket* s) -> Task<std::string> {
+        return core::async::syncRun([](core::net::ISocket* s) -> core::async::Task<std::string> {
             std::vector<std::byte> chunk(4096);
             auto const r = co_await s->read(std::span<std::byte> { chunk.data(), chunk.size() });
             if (!r.has_value() || *r == 0)
@@ -171,19 +177,19 @@ class RespClient
     }
 
   private:
-    BlockingConnector _connector;
-    std::unique_ptr<ISocket> _socket;
+    core::net::BlockingConnector _connector;
+    std::unique_ptr<core::net::ISocket> _socket;
 };
 
 /// Everything one real-socket RESP session needs, wired together.
 struct RespOverSocket
 {
     InMemoryLruStorage storage;
-    SteadyClock clock;
+    core::platform::SteadyClock clock;
     CacheEngine engine { storage, clock };
     PubSubRegistry pubsub;
-    PlatformReactor reactor { clock };
-    std::unique_ptr<PlatformListener> listener;
+    core::net::PlatformLoop reactor { clock };
+    std::unique_ptr<core::net::IListener> listener;
     std::atomic<bool> ended { false };
 
     /// Bind a per-run loopback port.
@@ -194,14 +200,17 @@ struct RespOverSocket
     /// @return True when the listener bound.
     [[nodiscard]] bool Bind()
     {
-        listener = PlatformListener::Bind(reactor, "127.0.0.1", 0);
-        return listener != nullptr && listener->IsBound() && listener->BoundPort() != 0;
+        auto listened = core::net::listen(reactor, core::net::ListenOptions { .host = "127.0.0.1", .port = 0 });
+        if (!listened.has_value())
+            return false;
+        listener = std::move(*listened);
+        return listener->boundPort() != 0;
     }
 
     /// @return The port the kernel chose.
     [[nodiscard]] std::uint16_t Port() const
     {
-        return listener->BoundPort();
+        return listener->boundPort();
     }
 
     /// @return A session carrying the reactor and the pub/sub registry, which is what
@@ -227,7 +236,7 @@ TEST_CASE("RESP over a real socket: a command after UNSUBSCRIBE does not drop th
     // a leak -- which is what makes it observable here at all. A release build leaks
     // the watcher's coroutine frame instead.
     //
-    // Reachable only over a real socket: `InMemorySocket::WaitReadable` answers
+    // Reachable only over a real socket: `core::net::testing::InMemorySocket::WaitReadable` answers
     // synchronously, so the watcher never parks and the slot is never contended.
     RespOverSocket fix;
     if (!fix.Bind())

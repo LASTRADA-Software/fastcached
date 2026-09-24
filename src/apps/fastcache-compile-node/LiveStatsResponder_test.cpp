@@ -2,10 +2,6 @@
 #include "LiveStatsResponder.hpp"
 #include "LiveStatsSources.hpp"
 
-#include <FastCache/Async/SleepUntil.hpp>
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReadingCodec.hpp>
@@ -28,6 +24,10 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/Task.hpp>
+#include <core/net/SleepUntil.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/MembershipFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -90,20 +90,20 @@ class RecordingSink final: public IPushSink
 {
   public:
     /// @param loop Where a parked push sleeps.
-    explicit RecordingSink(IReactor& loop) noexcept:
+    explicit RecordingSink(core::net::EventLoop& loop) noexcept:
         reactor { &loop }
     {
     }
 
     /// @copydoc IPushSink::Push
-    [[nodiscard]] Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds hold) override
+    [[nodiscard]] core::async::Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds hold) override
     {
         holds.push_back(hold);
         if (parkNextUntil.has_value())
         {
             auto const until = *parkNextUntil;
             parkNextUntil.reset();
-            co_await SleepUntil { .reactor = reactor, .deadline = until };
+            co_await core::net::sleepUntil(reactor, until);
         }
         if (nextOutcome != PushOutcome::Delivered)
             co_return std::exchange(nextOutcome, PushOutcome::Delivered);
@@ -162,15 +162,15 @@ class RecordingSink final: public IPushSink
         return ticks;
     }
 
-    std::vector<std::vector<std::byte>> frames;         ///< Every delivered push.
-    std::vector<std::chrono::milliseconds> holds;       ///< The hold every push asked for.
-    std::optional<TimePoint> parkNextUntil {};          ///< Park the next push until then.
-    PushOutcome nextOutcome { PushOutcome::Delivered }; ///< What the next push answers.
-    PeerActivity activity { PeerActivity::Quiet };      ///< What the read watch saw.
-    bool stopping { false };                            ///< Whether the endpoint is stopping.
+    std::vector<std::vector<std::byte>> frames;                      ///< Every delivered push.
+    std::vector<std::chrono::milliseconds> holds;                    ///< The hold every push asked for.
+    std::optional<core::platform::SteadyTimePoint> parkNextUntil {}; ///< Park the next push until then.
+    PushOutcome nextOutcome { PushOutcome::Delivered };              ///< What the next push answers.
+    PeerActivity activity { PeerActivity::Quiet };                   ///< What the read watch saw.
+    bool stopping { false };                                         ///< Whether the endpoint is stopping.
 
     /// Where a parked push sleeps. Public with the rest: this fake is its state.
-    IReactor* reactor;
+    core::net::EventLoop* reactor;
 };
 
 /// A SUBSCRIBE frame.
@@ -185,7 +185,7 @@ class RecordingSink final: public IPushSink
 /// One subscription a case opened: what it pushed, and how it ended.
 struct Stream
 {
-    explicit Stream(IReactor& reactor) noexcept:
+    explicit Stream(core::net::EventLoop& reactor) noexcept:
         sink { reactor }
     {
     }
@@ -211,7 +211,7 @@ constexpr std::string_view ProvenMachine = "watcher-node";
 /// @param proved Whether this CONNECTION proved an identity the rig's roster admits, which the
 ///        endpoint records on the identity it hands down (#1428, #178). Since #1512 this surface
 ///        folds it, so a case can ask either question.
-DetachedTask RunStream(
+core::async::DetachedTask RunStream(
     LiveStatsResponder* responder, std::vector<std::byte> frame, std::string peer, bool proved, Stream* stream)
 {
     auto identity = PeerIdentity { .host = std::move(peer) };
@@ -245,11 +245,11 @@ struct Rig
         for (auto const& stream: streams)
             stream->sink.stopping = true;
         clock.advance(2s);
-        reactor.Drain();
+        reactor.drain();
     }
 
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     AtomicMetricsSink metrics;
     ScriptedSources sources;
     // MUTABLE, and bound once by reference like the production oracle: the removal case
@@ -295,15 +295,15 @@ struct Rig
     {
         streams.push_back(std::make_unique<Stream>(reactor));
         RunStream(&on, std::move(frame), std::move(peer), proved, streams.back().get());
-        reactor.Drain();
+        reactor.drain();
         return *streams.back();
     }
 
     /// Move the clock to @p at and let every stream due by then run.
     void RunTo(std::chrono::milliseconds at)
     {
-        clock.setNow(TimePoint { std::chrono::duration_cast<Duration>(at) });
-        reactor.Drain();
+        clock.setNow(core::platform::SteadyTimePoint { std::chrono::duration_cast<core::platform::SteadyDuration>(at) });
+        reactor.drain();
     }
 
     /// @return What @p counter reads.
@@ -382,7 +382,8 @@ TEST_CASE("A watcher whose push parks is told what it missed, and nobody else wa
     auto& quick = rig.Open(SubscribeFrame(Wire::LiveSubject::Cache, 500), "10.0.0.8");
 
     // The slow watcher's tick-1 snapshot parks until 2000 ms: a reader that stopped for four ticks.
-    slow.sink.parkNextUntil = TimePoint { std::chrono::duration_cast<Duration>(2000ms) };
+    slow.sink.parkNextUntil =
+        core::platform::SteadyTimePoint { std::chrono::duration_cast<core::platform::SteadyDuration>(2000ms) };
     for (auto const at: { 500ms, 1000ms, 1500ms, 2000ms })
         rig.RunTo(at);
 
@@ -702,8 +703,8 @@ TEST_CASE("An event is pushed as it is observed, with the state it describes on 
 
 TEST_CASE("Detaching the sources ends every stream in order at its next tick", "[node][livestats]")
 {
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     AtomicMetricsSink metrics;
     ScriptedSources sources;
     LiveStatsSourceSlot slot;
@@ -714,12 +715,12 @@ TEST_CASE("Detaching the sources ends every stream in order at its next tick", "
     {
         auto const attached = slot.Attach(sources);
         RunStream(&responder, SubscribeFrame(Wire::LiveSubject::Cache, 500), std::string { Watcher }, false, &stream);
-        reactor.Drain();
+        reactor.drain();
         REQUIRE(stream.sink.SnapshotTicks() == std::vector<std::uint64_t> { 0 });
     }
 
     clock.advance(500ms);
-    reactor.Drain();
+    reactor.drain();
     REQUIRE(stream.finished);
     CHECK(Testing::StatusOf(stream.reply) == Wire::Status::Ok);
     CHECK(sources.captures == 1);

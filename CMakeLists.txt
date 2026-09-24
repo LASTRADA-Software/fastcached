@@ -190,9 +190,9 @@ option(FASTCACHED_ENABLE_COMPRESSION "Enable on-disk value compression (zstd + l
 
 # Tracy profiler. TRACY_ENABLE is Tracy's own gate; reusing the name means the
 # fetched client library actually emits instrumentation rather than its no-op
-# stub. Our code keys off the separate FC_TRACY_ENABLED compile definition
-# (set below) so Core/Profiling.hpp stays decoupled from Tracy's macro surface
-# and pulls in no Tracy header when the profiler is off.
+# stub. The profiling macros are core-cpp's `<core/Profiling.hpp>` (#1596), which
+# this forwards as CORE_CPP_WITH_TRACY, so they pull in no Tracy header when the
+# profiler is off.
 option(TRACY_ENABLE "Enable Tracy profiler instrumentation (fetches & links the Tracy client)" OFF)
 option(TRACY_ON_DEMAND "Tracy: only collect data while a profiler is connected" ON)
 
@@ -464,8 +464,12 @@ if(FASTCACHED_BUILD_TUI)
     )
 endif()
 
-# core-cpp, the shared C++23 foundation of the Contour Terminal projects (#1596): the terminal UI
-# behind `fastcache-cli live-stats` is its `core::tui`. After libunicode, which `core::tui` links, so
+# core-cpp, the shared C++23 foundation of the Contour Terminal projects (#1596): the coroutines,
+# the event loop, the sockets and TLS every tier here serves on (`core::async`, `core::net`,
+# `core::net_tls`), the clock seam, the profiling macros, and the terminal UI behind
+# `fastcache-cli live-stats` (`core::tui`). `FASTCACHED_ENABLE_TLS` and `TRACY_ENABLE` are
+# forwarded, so core-cpp builds TLS exactly when this project asks for it and records zones into the
+# same Tracy client. After libunicode, which `core::tui` links, so
 # core-cpp takes the target this project already declared rather than fetching a second copy; and
 # before the pedantic/clang-tidy includes below, for the reason every dependency above is -- a
 # subproject's code is not governed by this project's warning policy. core-cpp sets no global state
@@ -473,6 +477,16 @@ endif()
 #
 # The pin is a TAG. To iterate against a local checkout, configure with
 # `-DCPM_core-cpp_SOURCE=<path>`; never commit a branch.
+#
+# **The /MT twins, on MSVC only.** `fastcache-cc` links the static CRT in Release (its
+# FASTCACHED_STATIC_LAUNCHER) and the daemon the DLL one, so one build of core-cpp's compiled modules
+# cannot serve both: MSVC refuses to link /MT and /MD objects together. core-cpp builds a
+# `core::*_mt` twin of each compiled module when asked, and the launcher links those
+# (`src/apps/fastcache-cc/CMakeLists.txt`).
+set(_fcCoreCppStaticRuntimeVariants OFF)
+if(MSVC)
+    set(_fcCoreCppStaticRuntimeVariants ON)
+endif()
 CPMAddPackage(
     NAME core-cpp
     GITHUB_REPOSITORY contour-terminal/core-cpp
@@ -483,8 +497,10 @@ CPMAddPackage(
     OPTIONS
         "CORE_CPP_WITH_TUI ${FASTCACHED_BUILD_TUI}"
         "CORE_CPP_WITH_IMAGES OFF"
-        "CORE_CPP_WITH_TLS OFF"
+        "CORE_CPP_WITH_TLS ${FASTCACHED_ENABLE_TLS}"
+        "CORE_CPP_WITH_TRACY ${TRACY_ENABLE}"
         "CORE_CPP_TESTING OFF"
+        "CORE_CPP_MSVC_STATIC_RUNTIME_VARIANTS ${_fcCoreCppStaticRuntimeVariants}"
 )
 
 # Monocypher, the vendored Ed25519 / X25519 implementation behind `Core/Ed25519`,
@@ -642,19 +658,22 @@ target_compile_features(FastCache PUBLIC cxx_std_23)
 target_link_libraries(FastCache PUBLIC yaml-cpp::yaml-cpp)
 target_link_libraries(FastCache PUBLIC CowTree)
 
+# The coroutine vocabulary and the event loop, sockets and clock every layer is written against:
+# core-cpp's (#1596). PUBLIC, because FastCache's headers name their types.
+target_link_libraries(FastCache PUBLIC core::async core::net)
+
 # PRIVATE: no FastCache header includes a Monocypher header, so nothing that links FastCache
 # compiles against it -- `Core/Ed25519.hpp` and its siblings are the seam, and `ctest -R
 # crypto-seam` refuses any other first-party file reaching past them.
 target_link_libraries(FastCache PRIVATE fastcache-monocypher)
 
-# Tracy is linked PUBLIC so FC_TRACY_ENABLED and the Tracy include dirs
-# propagate transitively to the fastcached executable (thread naming in
-# main.cpp) and to the FastCacheTest binary (so Profiling_test sees the same
-# mode). When TRACY_ENABLE is OFF nothing is linked or defined and every
-# Core/Profiling.hpp macro compiles to (void)0 — a strictly zero-cost build.
+# Tracy is linked PUBLIC so the Tracy include dirs propagate transitively to the
+# fastcached executable (thread naming in main.cpp). core-cpp's `core::base` links
+# the same client when CORE_CPP_WITH_TRACY is on. When TRACY_ENABLE is OFF nothing
+# is linked and every `<core/Profiling.hpp>` macro compiles to nothing -- a
+# strictly zero-cost build.
 if(TRACY_ENABLE)
     target_link_libraries(FastCache PUBLIC Tracy::TracyClient)
-    target_compile_definitions(FastCache PUBLIC FC_TRACY_ENABLED=1)
 endif()
 
 # Substitute the version triple/string into Core/Version.hpp at configure

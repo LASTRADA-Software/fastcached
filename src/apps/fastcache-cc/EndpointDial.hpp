@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Net/BlockingConnector.hpp>
-#include <FastCache/Net/IConnector.hpp>
-#include <FastCache/Net/ISocket.hpp>
-
 #include <chrono>
 #include <memory>
 #include <string_view>
+
+#include <core/async/Task.hpp>
+#include <core/net/BlockingConnector.hpp>
+#include <core/net/IConnector.hpp>
+#include <core/net/ISocket.hpp>
 
 namespace FastCache::Cc
 {
@@ -24,16 +24,16 @@ namespace FastCache::Cc
 /// one parser, since `rfind(':')` picks the wrong colon in `[::1]:7000`.
 ///
 /// The same timeout bounds each blocking send and recv as bounds the dial. They
-/// are separate parameters on `FastCache::ConnectTcp` because they answer
+/// are separate parameters on `core::net::connectTcp` because they answer
 /// different questions, but every caller up here wants the same answer to both:
 /// "give up rather than hold up the build".
 ///
 /// @param hostPort Endpoint text; a hostname, an IPv4 literal, or `[v6]:port`.
 /// @param connector How to dial. Injected rather than constructed here, because
 ///        which connector this is decides whether the caller's thread blocks: a
-///        component on a reactor passes `PlatformConnector`, one on a thread that
-///        may block passes `BlockingConnector` and drives the result with
-///        `SyncRun`.
+///        component on a reactor passes `core::net::makeConnector`'s connector, one on a thread that
+///        may block passes `core::net::BlockingConnector` and drives the result with
+///        `core::async::syncRun`.
 /// @param options Ceiling on the dial, name resolution included, and whether the
 ///        connection probes a peer that has stopped answering.
 ///
@@ -46,21 +46,21 @@ namespace FastCache::Cc
 /// resolve-plus-connect budget. And a reactor socket has no `SO_RCVTIMEO` to set
 /// -- its reads suspend rather than block, so the option is inert.
 ///
-/// A caller that needs the transfer bounded arms a `DeadlineTimer` that closes
+/// A caller that needs the transfer bounded arms a `core::net::DeadlineTimer` that closes
 /// the socket, which is strictly more than the option offered: `SO_RCVTIMEO`
 /// bounds a single call, so a peer dribbling one byte at a time could still take
 /// forever. `RemoteUpstream` does exactly that.
 /// @return The connected socket, or nullptr when the endpoint could not be
 ///         parsed or reached.
-[[nodiscard]] Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector,
-                                                          std::string_view hostPort,
-                                                          DialOptions options);
+[[nodiscard]] core::async::Task<std::unique_ptr<core::net::ISocket>> DialEndpoint(core::net::IConnector* connector,
+                                                                                  std::string_view hostPort,
+                                                                                  core::net::DialOptions options);
 
 /// Dial and hand back a socket synchronously, for a thread that may block.
 ///
 /// `BlockingConnector&` and NOT `IConnector&`, deliberately: this function's
 /// soundness rests entirely on the connector resolving inline and never leaving
-/// its task suspended, which is what `SyncRun` requires. A comment saying so is a
+/// its task suspended, which is what `core::async::syncRun` requires. A comment saying so is a
 /// rule somebody breaks; the type is the rule, and the failure it prevents is a
 /// `std::logic_error` thrown from inside a heartbeat thread.
 ///
@@ -70,8 +70,8 @@ namespace FastCache::Cc
 /// @param options Ceiling on the dial, name resolution included, and whether the
 ///        connection probes a peer that has stopped answering.
 /// @return The connected socket, or nullptr.
-[[nodiscard]] std::unique_ptr<ISocket> DialEndpointBlocking(BlockingConnector& connector,
-                                                            std::string_view hostPort,
-                                                            DialOptions options);
+[[nodiscard]] std::unique_ptr<core::net::ISocket> DialEndpointBlocking(core::net::BlockingConnector& connector,
+                                                                       std::string_view hostPort,
+                                                                       core::net::DialOptions options);
 
 } // namespace FastCache::Cc

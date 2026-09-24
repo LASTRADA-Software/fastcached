@@ -83,7 +83,8 @@ void WriteErrorReportingStorage::ReportWriteFailure(std::string_view verb,
                  error.context);
 }
 
-std::expected<GetResult, StorageError> WriteErrorReportingStorage::Get(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> WriteErrorReportingStorage::Get(std::string_view key,
+                                                                       core::platform::SteadyTimePoint now)
 {
     return _inner.Get(key, now);
 }
@@ -91,7 +92,7 @@ std::expected<GetResult, StorageError> WriteErrorReportingStorage::Get(std::stri
 std::expected<CasToken, StorageError> WriteErrorReportingStorage::Set(std::string_view key,
                                                                       std::vector<std::byte> value,
                                                                       std::uint32_t flags,
-                                                                      TimePoint expiry)
+                                                                      core::platform::SteadyTimePoint expiry)
 {
     auto result = _inner.Set(key, std::move(value), flags, expiry);
     if (!result.has_value())
@@ -99,8 +100,11 @@ std::expected<CasToken, StorageError> WriteErrorReportingStorage::Set(std::strin
     return result;
 }
 
-std::expected<CasToken, StorageError> WriteErrorReportingStorage::Add(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> WriteErrorReportingStorage::Add(std::string_view key,
+                                                                      std::vector<std::byte> value,
+                                                                      std::uint32_t flags,
+                                                                      core::platform::SteadyTimePoint expiry,
+                                                                      core::platform::SteadyTimePoint now)
 {
     auto result = _inner.Add(key, std::move(value), flags, expiry, now);
     if (!result.has_value())
@@ -108,8 +112,11 @@ std::expected<CasToken, StorageError> WriteErrorReportingStorage::Add(
     return result;
 }
 
-std::expected<CasToken, StorageError> WriteErrorReportingStorage::Replace(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> WriteErrorReportingStorage::Replace(std::string_view key,
+                                                                          std::vector<std::byte> value,
+                                                                          std::uint32_t flags,
+                                                                          core::platform::SteadyTimePoint expiry,
+                                                                          core::platform::SteadyTimePoint now)
 {
     auto result = _inner.Replace(key, std::move(value), flags, expiry, now);
     if (!result.has_value())
@@ -120,7 +127,7 @@ std::expected<CasToken, StorageError> WriteErrorReportingStorage::Replace(
 std::expected<CasToken, StorageError> WriteErrorReportingStorage::Append(std::string_view key,
                                                                          std::span<std::byte const> suffix,
                                                                          CasToken expected,
-                                                                         TimePoint now)
+                                                                         core::platform::SteadyTimePoint now)
 {
     auto result = _inner.Append(key, suffix, expected, now);
     if (!result.has_value())
@@ -131,7 +138,7 @@ std::expected<CasToken, StorageError> WriteErrorReportingStorage::Append(std::st
 std::expected<CasToken, StorageError> WriteErrorReportingStorage::Prepend(std::string_view key,
                                                                           std::span<std::byte const> prefix,
                                                                           CasToken expected,
-                                                                          TimePoint now)
+                                                                          core::platform::SteadyTimePoint now)
 {
     auto result = _inner.Prepend(key, prefix, expected, now);
     if (!result.has_value())
@@ -143,8 +150,8 @@ std::expected<CasToken, StorageError> WriteErrorReportingStorage::CompareAndSwap
                                                                                  CasToken expected,
                                                                                  std::vector<std::byte> value,
                                                                                  std::uint32_t flags,
-                                                                                 TimePoint expiry,
-                                                                                 TimePoint now)
+                                                                                 core::platform::SteadyTimePoint expiry,
+                                                                                 core::platform::SteadyTimePoint now)
 {
     auto result = _inner.CompareAndSwap(key, expected, std::move(value), flags, expiry, now);
     if (!result.has_value())
@@ -152,10 +159,8 @@ std::expected<CasToken, StorageError> WriteErrorReportingStorage::CompareAndSwap
     return result;
 }
 
-std::expected<IStorage::IncrResult, StorageError> WriteErrorReportingStorage::IncrementOrInitialize(std::string_view key,
-                                                                                                    std::uint64_t magnitude,
-                                                                                                    bool decrement,
-                                                                                                    TimePoint now)
+std::expected<IStorage::IncrResult, StorageError> WriteErrorReportingStorage::IncrementOrInitialize(
+    std::string_view key, std::uint64_t magnitude, bool decrement, core::platform::SteadyTimePoint now)
 {
     auto result = _inner.IncrementOrInitialize(key, magnitude, decrement, now);
     if (!result.has_value())
@@ -166,7 +171,7 @@ std::expected<IStorage::IncrResult, StorageError> WriteErrorReportingStorage::In
 std::expected<CasToken, StorageError> WriteErrorReportingStorage::Update(
     std::string_view key,
     std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
-    TimePoint now)
+    core::platform::SteadyTimePoint now)
 {
     auto result = _inner.Update(key, fn, now);
     if (!result.has_value())
@@ -174,7 +179,8 @@ std::expected<CasToken, StorageError> WriteErrorReportingStorage::Update(
     return result;
 }
 
-std::expected<void, StorageError> WriteErrorReportingStorage::Delete(std::string_view key, TimePoint now)
+std::expected<void, StorageError> WriteErrorReportingStorage::Delete(std::string_view key,
+                                                                     core::platform::SteadyTimePoint now)
 {
     // A removal is a write to the store, and one a disk can fail to persist exactly as it
     // can a SET: forwarded unreported, a `DEL` or a `cache-drop` that did not happen was
@@ -187,44 +193,45 @@ std::expected<void, StorageError> WriteErrorReportingStorage::Delete(std::string
 }
 
 std::expected<CasToken, StorageError> WriteErrorReportingStorage::Touch(std::string_view key,
-                                                                        TimePoint newExpiry,
-                                                                        TimePoint now)
+                                                                        core::platform::SteadyTimePoint newExpiry,
+                                                                        core::platform::SteadyTimePoint now)
 {
     return _inner.Touch(key, newExpiry, now);
 }
 
-std::expected<GetResult, StorageError> WriteErrorReportingStorage::Peek(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> WriteErrorReportingStorage::Peek(std::string_view key,
+                                                                        core::platform::SteadyTimePoint now)
 {
     return _inner.Peek(key, now);
 }
 
-std::expected<std::optional<TimePoint>, StorageError> WriteErrorReportingStorage::PeekExpiry(std::string_view key,
-                                                                                             TimePoint now)
+std::expected<std::optional<core::platform::SteadyTimePoint>, StorageError> WriteErrorReportingStorage::PeekExpiry(
+    std::string_view key, core::platform::SteadyTimePoint now)
 {
     return _inner.PeekExpiry(key, now);
 }
-std::expected<bool, StorageError> WriteErrorReportingStorage::Prefetch(std::string_view key, TimePoint now)
+std::expected<bool, StorageError> WriteErrorReportingStorage::Prefetch(std::string_view key,
+                                                                       core::platform::SteadyTimePoint now)
 {
     return _inner.Prefetch(key, now);
 }
 
-std::expected<CasToken, StorageError> WriteErrorReportingStorage::MarkStale(std::string_view key,
-                                                                            std::optional<TimePoint> newExpiry,
-                                                                            TimePoint now)
+std::expected<CasToken, StorageError> WriteErrorReportingStorage::MarkStale(
+    std::string_view key, std::optional<core::platform::SteadyTimePoint> newExpiry, core::platform::SteadyTimePoint now)
 {
     return _inner.MarkStale(key, newExpiry, now);
 }
 
 std::expected<GetResult, StorageError> WriteErrorReportingStorage::GetAndTouch(std::string_view key,
-                                                                               TimePoint newExpiry,
-                                                                               TimePoint now)
+                                                                               core::platform::SteadyTimePoint newExpiry,
+                                                                               core::platform::SteadyTimePoint now)
 {
     return _inner.GetAndTouch(key, newExpiry, now);
 }
 
 std::expected<void, StorageError> WriteErrorReportingStorage::CompareAndDelete(std::string_view key,
                                                                                CasToken expected,
-                                                                               TimePoint now)
+                                                                               core::platform::SteadyTimePoint now)
 {
     auto result = _inner.CompareAndDelete(key, expected, now);
     if (!result.has_value())
@@ -232,17 +239,18 @@ std::expected<void, StorageError> WriteErrorReportingStorage::CompareAndDelete(s
     return result;
 }
 
-std::expected<bool, StorageError> WriteErrorReportingStorage::ClearExpiry(std::string_view key, TimePoint now)
+std::expected<bool, StorageError> WriteErrorReportingStorage::ClearExpiry(std::string_view key,
+                                                                          core::platform::SteadyTimePoint now)
 {
     return _inner.ClearExpiry(key, now);
 }
 
-void WriteErrorReportingStorage::FlushWithGeneration(TimePoint effectiveAt)
+void WriteErrorReportingStorage::FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt)
 {
     _inner.FlushWithGeneration(effectiveAt);
 }
 
-PurgeOutcome WriteErrorReportingStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
+PurgeOutcome WriteErrorReportingStorage::PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget)
 {
     return _inner.PurgeExpired(now, budget);
 }

@@ -2,13 +2,14 @@
 #include "LiveStats.hpp"
 
 #include <FastCache/Cli/Duration.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <format>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Cli
 {
@@ -77,13 +78,13 @@ namespace
     /// @return The row, or nullptr when no subject is inferred at that kind.
     [[nodiscard]] LiveSubjectSpec const* InferredSubject(RemoteKind kind) noexcept
     {
-        return FindOrNull(LiveSubjectTable, std::optional { kind }, &LiveSubjectSpec::inferredAt);
+        return core::findOrNull(LiveSubjectTable, std::optional { kind }, &LiveSubjectSpec::inferredAt);
     }
 } // namespace
 
 LiveSubjectSpec const* FindLiveSubject(std::string_view key) noexcept
 {
-    return FindOrNull(LiveSubjectTable, key, &LiveSubjectSpec::key);
+    return core::findOrNull(LiveSubjectTable, key, &LiveSubjectSpec::key);
 }
 
 std::expected<LivePlan, Answer> AdmitLiveStats(VerbContext const& context)

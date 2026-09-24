@@ -132,8 +132,9 @@ set(FastCachedCaseNameLookahead 8)
 # rather than left as a comment nothing reads.
 #
 # name|reason
+# Empty since #1596: its one row was the epoll and kqueue reactors' shared case name, and
+# both reactors left for core-cpp.
 set(FastCachedDuplicateNameExemptions
-    "A handler freed earlier in the same batch is not dispatched|EpollReactor_test.cpp is wholly inside `#if defined(__linux__)` and KqueueReactor_test.cpp wholly inside `#if defined(__APPLE__)`, so the two cases never co-exist in one build and never register as two ctest entries. The parallel naming is deliberate: it is what makes the same property greppable across the two platform reactors."
 )
 
 # ---------------------------------------------------------------------------

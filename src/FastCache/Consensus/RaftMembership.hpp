@@ -3,7 +3,6 @@
 
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Core/Errors/ConsensusError.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/WireFields.hpp>
 
 #include <algorithm>
@@ -17,6 +16,8 @@
 #include <span>
 #include <string>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Consensus::Membership
 {
@@ -303,14 +304,14 @@ enum class ChangeShape : std::uint8_t
         Move { .count = demoted, .shape = ChangeShape::DemotedOne },
     };
 
-    auto const total = Ranges::FoldLeft(moves | std::views::transform(&Move::count), std::size_t { 0 }, std::plus {});
+    auto const total = core::ranges::FoldLeft(moves | std::views::transform(&Move::count), std::size_t { 0 }, std::plus {});
     if (total == 0)
         return ChangeShape::Unchanged;
     if (total != 1)
         return ChangeShape::Unsafe;
 
     // Exactly one move in total, so exactly one row holds it.
-    auto const* const only = FindIfOrNull(moves, [](Move const& move) { return move.count == 1; });
+    auto const* const only = core::findIfOrNull(moves, [](Move const& move) { return move.count == 1; });
     return only != nullptr ? only->shape : ChangeShape::Unsafe;
 }
 

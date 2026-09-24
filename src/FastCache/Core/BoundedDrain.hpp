@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Core/Clock.hpp>
-
 #include <chrono>
 #include <concepts>
 #include <cstdint>
@@ -10,13 +8,15 @@
 #include <cstdlib>
 #include <thread>
 
+#include <core/platform/Clock.hpp>
+
 namespace FastCache
 {
 
 /// How a bounded drain spends the gap between two tests of its predicate.
 ///
 /// Two operations rather than one, and both of them ambient: the wait has to
-/// *block* (so an `IClock` alone cannot serve), and it has to know how much
+/// *block* (so an `core::platform::IClock` alone cannot serve), and it has to know how much
 /// real time that blocking actually cost (so a bare `sleep_for` cannot either).
 /// Keeping them on one seam is what makes the bound testable — see
 /// `DrainWithin` for why a test that cannot separate the two is a test that
@@ -32,7 +32,7 @@ class IDrainWait
     virtual ~IDrainWait() = default;
 
     /// @return Current steady-clock time. Must be monotonic and thread-safe.
-    [[nodiscard]] virtual TimePoint Now() const noexcept = 0;
+    [[nodiscard]] virtual core::platform::SteadyTimePoint Now() const noexcept = 0;
 
     /// Block the calling thread for approximately @p requested.
     ///
@@ -51,7 +51,7 @@ class IDrainWait
 class ThreadDrainWait final: public IDrainWait
 {
   public:
-    [[nodiscard]] TimePoint Now() const noexcept override
+    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
     {
         return std::chrono::steady_clock::now();
     }
@@ -64,7 +64,7 @@ class ThreadDrainWait final: public IDrainWait
 
 /// Process-singleton `ThreadDrainWait`, so a production shutdown path does not
 /// have to carry a seam it has no reason to vary. Mirrors
-/// `DefaultSystemWallClock()` in `Clock.hpp`; tests pass their own.
+/// `core::platform::defaultSystemWallClock()` in `Clock.hpp`; tests pass their own.
 /// @return Reference to a singleton ThreadDrainWait with static storage.
 [[nodiscard]] inline IDrainWait& DefaultDrainWait() noexcept
 {

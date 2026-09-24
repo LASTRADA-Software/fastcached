@@ -104,7 +104,7 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
     /// It refuses without a counter: a rise would say something about this process's own wiring
     /// and nothing about the fleet, and `LiveStatsResponder` answers the same way for the same
     /// reason about the verb IT does not terminate here.
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///

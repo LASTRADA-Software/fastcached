@@ -6,7 +6,6 @@
 
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/EnumTable.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -25,6 +24,7 @@
 #include <vector>
 
 #include <WorkerProtocol.hpp>
+#include <core/Ranges.hpp>
 
 namespace FastCache::Node
 {
@@ -339,10 +339,10 @@ class SchedulerResponder final: public IFrameResponder
     /// @copydoc IFrameResponder::Answer
     ///
     /// Never suspends. The scheduler answers from its own tables -- a decision
-    /// layer kept pure so every capacity and expiry rule is a `ManualClock` unit
+    /// layer kept pure so every capacity and expiry rule is a `core::platform::ManualClock` unit
     /// test -- so this is a one-line adapter, and a responder that costs a frame
     /// allocation and no round trip is a legitimate thing to be.
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
     {
         co_return _protocol.Answer(frame, Context(std::move(peer)));
     }
@@ -618,7 +618,7 @@ class CacheResponder final: public IFrameResponder
     }
 
     /// @copydoc IFrameResponder::Answer
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
     {
         // Refused as a *reply*, never by closing: a client that cannot tell a policy
         // refusal from a dead host retries forever and reports a flaky network, which
@@ -1150,7 +1150,7 @@ class MergedResponder final: public IFrameResponder
     /// Reachable directly as well as through the endpoint, so it decodes the header
     /// itself rather than taking anybody's word for the verb -- the same reason
     /// `CacheResponder::Answer` re-asks its own gate.
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
     {
         auto const header = CompileCacheWire::DecodeRequestHeader(frame);
         if (!header.has_value())
@@ -1423,8 +1423,8 @@ class MergedResponder final: public IFrameResponder
     // The compile row says `CompileCacheWire::NoCompileWorker`'s fact, which the daemon answers too, so
     // neither endpoint can reword it or move its code without the other (#206).
     static_assert(CompileCacheWire::SaysNoCompileWorker(
-        FindOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->refusal.code,
-        FindOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->detail));
+        core::findOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->refusal.code,
+        core::findOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->detail));
 
     /// What a verb this node serves nowhere is answered with.
     ///
@@ -1484,7 +1484,7 @@ class MergedResponder final: public IFrameResponder
     [[nodiscard]] static std::vector<std::byte> UnservedReply(std::uint8_t opRaw)
     {
         auto const family = CompileCacheWire::FamilyOf(opRaw);
-        if (auto const* const row = FindOrNull(UnservedFamilies, family, &UnservedFamily::family))
+        if (auto const* const row = core::findOrNull(UnservedFamilies, family, &UnservedFamily::family))
             return Cc::RefuseWithoutCounter(row->refusal, row->detail);
 
         return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::UnimplementedVerb,

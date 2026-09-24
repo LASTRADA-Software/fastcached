@@ -6,9 +6,6 @@
 #include "TerminalCapabilities.hpp"
 #include "TerminalEvents.hpp"
 
-#include <FastCache/Async/IExecutor.hpp>
-#include <FastCache/Async/Task.hpp>
-
 #include <expected>
 #include <functional>
 #include <memory>
@@ -18,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/IExecutor.hpp>
+#include <core/async/Task.hpp>
 #include <core/net/IoBackend.hpp>
 #include <core/tui/InputEvent.hpp>
 #include <core/tui/Terminal.hpp>
@@ -223,9 +222,9 @@ struct TerminalStreamParts
     ITerminalInputWait* source { nullptr };
     /// Where the blocking wait runs. Give it a thread of its own: a wait parks there for as long
     /// as the operator types nothing, and a sampler sharing a one-thread pool would starve.
-    IExecutor* pool { nullptr };
+    core::async::IExecutor* pool { nullptr };
     /// Where `Next()` resumes before it returns an event.
-    IExecutor* resumeOn { nullptr };
+    core::async::IExecutor* resumeOn { nullptr };
     /// Wakes a wait parked in `source`, so `Close()` ends it rather than waiting for a key.
     std::function<void()> wake;
     /// The geometry at open, delivered as the first event.
@@ -358,8 +357,7 @@ class ITerminalDevice
 /// @param pool Where the blocking steps run.
 /// @param resumeOn Where the start and the events resume.
 /// @return The started terminal, or why it could not be acquired.
-[[nodiscard]] Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::unique_ptr<ITerminalDevice> device,
-                                                                                    IExecutor* pool,
-                                                                                    IExecutor* resumeOn);
+[[nodiscard]] core::async::Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(
+    std::unique_ptr<ITerminalDevice> device, core::async::IExecutor* pool, core::async::IExecutor* resumeOn);
 
 } // namespace FastCache::Cli

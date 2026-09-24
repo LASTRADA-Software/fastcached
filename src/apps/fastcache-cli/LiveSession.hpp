@@ -14,11 +14,7 @@
 #include "SixelEncoder.hpp"
 #include "TerminalEvents.hpp"
 
-#include <FastCache/Async/IExecutor.hpp>
-#include <FastCache/Async/IReactor.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Platform/StopSignal.hpp>
 
 #include <cstdint>
@@ -28,6 +24,11 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/async/IExecutor.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/EventLoop.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Cli
 {
@@ -54,8 +55,8 @@ class ITerminalAcquisition
     /// @param pool Where acquiring and each blocking read run: a thread of its own.
     /// @param resumeOn Where the caller resumes.
     /// @return The started terminal, or why it could not be acquired.
-    [[nodiscard]] virtual Task<std::expected<StartedTerminal, std::string>> Acquire(IExecutor* pool,
-                                                                                    IExecutor* resumeOn) = 0;
+    [[nodiscard]] virtual core::async::Task<std::expected<StartedTerminal, std::string>> Acquire(
+        core::async::IExecutor* pool, core::async::IExecutor* resumeOn) = 0;
 };
 
 /// Installs the stop request a session with no terminal ends on.
@@ -139,7 +140,7 @@ class FailureRemarks final: public IDashboardEventSource
     /// @param sink Where a remark goes; outlives this.
     FailureRemarks(IDashboardEventSource* events, SampleReader reader, IRemarkSink* sink) noexcept;
 
-    [[nodiscard]] Task<DashboardEvent> Next() override;
+    [[nodiscard]] core::async::Task<DashboardEvent> Next() override;
     void Close() noexcept override;
 
   private:
@@ -158,22 +159,22 @@ class FailureRemarks final: public IDashboardEventSource
 /// Everything a session is composed from. `main` acquires each part; nothing here does.
 struct LiveSessionParts
 {
-    LivePlan plan {};                            ///< What was admitted.
-    Endpoint endpoint {};                        ///< Where the session subscribes: `--addr`.
-    std::string dashboardToken {};               ///< What a fleet subscription presents; empty for none.
-    IReactor* reactor { nullptr };               ///< Where the session runs.
-    ILiveSubscription* subscription { nullptr }; ///< The stream every reading arrives on.
-    SampleReader reader { nullptr };             ///< What a sample says: the subject's reader.
-    IClock* clock { nullptr };                   ///< What readings are stamped with: `SteadyClock`.
-    IExecutor* streamPool { nullptr };           ///< Where a dial or a stream read blocks.
-    IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks: its own thread.
-    IExecutor* terminalPool { nullptr };         ///< Where terminal reads block: its own thread.
-    IFrameSink* sink { nullptr };                ///< Where a piped session's frames go; never an interactive one's.
-    IRemarkSink* remarks { nullptr };            ///< Where a piped session's remarks go as they happen.
-    bool interactive { false };                  ///< `StandardStreamsAreInteractive()`, asked by `main`.
-    ITerminalAcquisition* terminals { nullptr }; ///< Asked only when interactive.
-    IStopSignalInstaller* stops { nullptr };     ///< Asked only when not.
-    IRungViews* views { nullptr };               ///< What each rung draws through.
+    LivePlan plan {};                                 ///< What was admitted.
+    Endpoint endpoint {};                             ///< Where the session subscribes: `--addr`.
+    std::string dashboardToken {};                    ///< What a fleet subscription presents; empty for none.
+    core::net::EventLoop* reactor { nullptr };        ///< Where the session runs.
+    ILiveSubscription* subscription { nullptr };      ///< The stream every reading arrives on.
+    SampleReader reader { nullptr };                  ///< What a sample says: the subject's reader.
+    core::platform::IClock* clock { nullptr };        ///< What readings are stamped with: `core::platform::SteadyClock`.
+    core::async::IExecutor* streamPool { nullptr };   ///< Where a dial or a stream read blocks.
+    core::async::IExecutor* stopWaiter { nullptr };   ///< Where the stop wait blocks: its own thread.
+    core::async::IExecutor* terminalPool { nullptr }; ///< Where terminal reads block: its own thread.
+    IFrameSink* sink { nullptr };                     ///< Where a piped session's frames go; never an interactive one's.
+    IRemarkSink* remarks { nullptr };                 ///< Where a piped session's remarks go as they happen.
+    bool interactive { false };                       ///< `StandardStreamsAreInteractive()`, asked by `main`.
+    ITerminalAcquisition* terminals { nullptr };      ///< Asked only when interactive.
+    IStopSignalInstaller* stops { nullptr };          ///< Asked only when not.
+    IRungViews* views { nullptr };                    ///< What each rung draws through.
 };
 
 /// How a composed session ended, when it ran at all.
@@ -208,9 +209,8 @@ struct LiveSessionRun
 ///        has returned, and a loop that threw returned nothing to carry it in. Left null when
 ///        no terminal was acquired.
 /// @return How the session ended, or the refusal that kept it from starting.
-[[nodiscard]] Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts parts,
-                                                                             std::optional<LiveEventSource>* source,
-                                                                             std::shared_ptr<ITerminalRestore>* restore);
+[[nodiscard]] core::async::Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(
+    LiveSessionParts parts, std::optional<LiveEventSource>* source, std::shared_ptr<ITerminalRestore>* restore);
 
 /// The stderr line for a closed session whose source did not drain within its bound.
 ///
@@ -222,7 +222,8 @@ struct LiveSessionRun
 /// @param endpoint Where the stream was read.
 /// @param readAge How long the dial or read still out had been out, or nullopt when none was.
 /// @return The line, naming what is being abandoned.
-[[nodiscard]] std::string DescribeAbandonment(std::string_view endpoint, std::optional<Duration> readAge);
+[[nodiscard]] std::string DescribeAbandonment(std::string_view endpoint,
+                                              std::optional<core::platform::SteadyDuration> readAge);
 
 /// Wait for a closed session's source to drain, within @p bound.
 ///
@@ -277,23 +278,23 @@ class StandardRungViews final: public IRungViews
 /// a drain on the reactor's own thread would stall the read it is waiting for.
 struct LiveSessionSeat
 {
-    IReactor* reactor { nullptr };               ///< Running on a thread of its own.
-    Endpoint endpoint {};                        ///< Where the session subscribes: `--addr`.
-    std::string dashboardToken {};               ///< From `--dashboard-token-file`; empty for none.
-    IClock* clock { nullptr };                   ///< What readings are stamped with: `SteadyClock`.
-    ILiveSubscription* subscription { nullptr }; ///< The stream, dialled with this invocation's credential.
-    IExecutor* streamPool { nullptr };           ///< Where a dial or a stream read blocks.
-    IExecutor* stopWaiter { nullptr };           ///< Where the stop wait blocks.
-    IExecutor* terminalPool { nullptr };         ///< Where terminal reads block.
-    IFrameSink* sink { nullptr };                ///< Where a piped session's frames go: stdout.
-    IRemarkSink* remarks { nullptr };            ///< Where a piped session's remarks go as they happen: stderr.
-    bool streamsInteractive { false };           ///< `StandardStreamsAreInteractive()`.
-    RenderOptions render {};                     ///< The `--format` and `--absent` asked for.
-    ITerminalAcquisition* terminals { nullptr }; ///< Asked only for an interactive session.
-    IStopSignalInstaller* stops { nullptr };     ///< Asked only for a piped one.
-    IRungViews* views { nullptr };               ///< What each rung draws through.
-    IDrainWait* drainWait { nullptr };           ///< The drain's clock and sleep.
-    DrainBound drainBound {};                    ///< How long a closed session may take to drain.
+    core::net::EventLoop* reactor { nullptr };        ///< Running on a thread of its own.
+    Endpoint endpoint {};                             ///< Where the session subscribes: `--addr`.
+    std::string dashboardToken {};                    ///< From `--dashboard-token-file`; empty for none.
+    core::platform::IClock* clock { nullptr };        ///< What readings are stamped with: `core::platform::SteadyClock`.
+    ILiveSubscription* subscription { nullptr };      ///< The stream, dialled with this invocation's credential.
+    core::async::IExecutor* streamPool { nullptr };   ///< Where a dial or a stream read blocks.
+    core::async::IExecutor* stopWaiter { nullptr };   ///< Where the stop wait blocks.
+    core::async::IExecutor* terminalPool { nullptr }; ///< Where terminal reads block.
+    IFrameSink* sink { nullptr };                     ///< Where a piped session's frames go: stdout.
+    IRemarkSink* remarks { nullptr };                 ///< Where a piped session's remarks go as they happen: stderr.
+    bool streamsInteractive { false };                ///< `StandardStreamsAreInteractive()`.
+    RenderOptions render {};                          ///< The `--format` and `--absent` asked for.
+    ITerminalAcquisition* terminals { nullptr };      ///< Asked only for an interactive session.
+    IStopSignalInstaller* stops { nullptr };          ///< Asked only for a piped one.
+    IRungViews* views { nullptr };                    ///< What each rung draws through.
+    IDrainWait* drainWait { nullptr };                ///< The drain's clock and sleep.
+    DrainBound drainBound {};                         ///< How long a closed session may take to drain.
 
     /// Where the running source is kept: the caller's.
     ///

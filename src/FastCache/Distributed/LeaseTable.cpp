@@ -10,13 +10,13 @@
 namespace FastCache::Distributed
 {
 
-LeaseTable::LeaseTable(IClock& clock, std::chrono::milliseconds leaseTimeout) noexcept:
+LeaseTable::LeaseTable(core::platform::IClock& clock, std::chrono::milliseconds leaseTimeout) noexcept:
     _clock { clock },
     _leaseTimeout { leaseTimeout }
 {
 }
 
-bool LeaseTable::IsLive(Entry const& entry, TimePoint now) const noexcept
+bool LeaseTable::IsLive(Entry const& entry, core::platform::SteadyTimePoint now) const noexcept
 {
     // Same clamp as WorkerRegistry::IsLive, and for the same reason: a clock moved
     // backwards in a test must not read as an enormous age and expire everything.
@@ -180,9 +180,10 @@ LeaseListing LeaseTable::LiveLeases(std::size_t limit) const
     {
         if (!IsLive(entry, now))
             continue;
-        live.push_back(Candidate { .entry = &entry,
-                                   .age = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                       now < entry.issuedAt ? Duration::zero() : now - entry.issuedAt) });
+        live.push_back(
+            Candidate { .entry = &entry,
+                        .age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now < entry.issuedAt ? core::platform::SteadyDuration::zero() : now - entry.issuedAt) });
     }
 
     // The total is taken from the same walk under the same lock as the listing.

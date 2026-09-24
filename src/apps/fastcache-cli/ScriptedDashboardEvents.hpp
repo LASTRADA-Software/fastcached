@@ -3,13 +3,13 @@
 
 #include "DashboardEvent.hpp"
 
-#include <FastCache/Async/IReactor.hpp>
-#include <FastCache/Async/Task.hpp>
-
 #include <coroutine>
 #include <cstddef>
 #include <utility>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/net/EventLoop.hpp>
 
 namespace FastCache::Cli::Testing
 {
@@ -28,8 +28,8 @@ namespace FastCache::Cli::Testing
 /// same reason and it is the one this file exists to honour: **a fake that resolves
 /// what production suspends on cannot exercise a suspension protocol.**
 ///
-/// It parks through `IReactor::Schedule` -- the same door production parks through --
-/// so under `TestReactor` the resumption is still placed by the test rather than raced.
+/// It parks through `core::net::EventLoop::Schedule` -- the same door production parks through --
+/// so under `core::net::testing::TestLoop` the resumption is still placed by the test rather than raced.
 /// Determinism comes from the reactor being deterministic, not from the fake being
 /// synchronous, which is the distinction that makes this honest.
 ///
@@ -40,17 +40,17 @@ namespace FastCache::Cli::Testing
 /// Suspend and be resumed by the reactor, with no delay.
 ///
 /// A zero delay rather than a real one: the point is that resumption goes through the
-/// reactor's queue, not that time passes. `TestReactor` therefore PLACES it, and a
+/// reactor's queue, not that time passes. `core::net::testing::TestLoop` therefore PLACES it, and a
 /// production reactor costs one turn of its loop.
 ///
-/// It borrows the handle rather than taking `ParkedWork`, which is correct here and
+/// It borrows the handle rather than taking `core::async::ParkedWork`, which is correct here and
 /// worth saying because the choice looks arbitrary: the awaiting chain is rooted in the
-/// task the caller owns and awaits, not in a `DetachedTask`, so nothing but that caller
-/// may free it -- which is exactly when `IReactor::Schedule`'s borrowing overload is the
+/// task the caller owns and awaits, not in a `core::async::DetachedTask`, so nothing but that caller
+/// may free it -- which is exactly when `core::net::EventLoop::Schedule`'s borrowing overload is the
 /// right one.
 struct ParkAwaiter
 {
-    IReactor& reactor;
+    core::net::EventLoop& reactor;
 
     [[nodiscard]] bool await_ready() const noexcept
     {
@@ -71,13 +71,13 @@ class ScriptedDashboardEvents final: public IDashboardEventSource
     /// Answer from @p script, in order.
     /// @param reactor Where each answer parks before it is delivered.
     /// @param script The events, in the order they happen.
-    ScriptedDashboardEvents(IReactor& reactor, std::vector<DashboardEvent> script):
+    ScriptedDashboardEvents(core::net::EventLoop& reactor, std::vector<DashboardEvent> script):
         _reactor { reactor },
         _script { std::move(script) }
     {
     }
 
-    [[nodiscard]] Task<DashboardEvent> Next() override
+    [[nodiscard]] core::async::Task<DashboardEvent> Next() override
     {
         // Park FIRST, unconditionally, including for the end-of-script answer. Parking
         // only when there is something to deliver would make the exhausted case the one
@@ -109,7 +109,7 @@ class ScriptedDashboardEvents final: public IDashboardEventSource
     }
 
   private:
-    IReactor& _reactor;
+    core::net::EventLoop& _reactor;
     std::vector<DashboardEvent> _script;
     std::size_t _at { 0 };
     bool _closed { false };

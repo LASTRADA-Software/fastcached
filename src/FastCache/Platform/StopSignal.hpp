@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/IExecutor.hpp>
-#include <FastCache/Async/Task.hpp>
-
 #include <cstdint>
 #include <expected>
 #include <memory>
 #include <string>
+
+#include <core/async/IExecutor.hpp>
+#include <core/async/Task.hpp>
 
 namespace FastCache
 {
@@ -58,7 +58,8 @@ class IStopSignal
     ///        pool lent to it would never sample again.
     /// @param resumeOn Where the caller is resumed with the answer.
     /// @return Why the wait ended.
-    [[nodiscard]] virtual Task<StopWake> Stopped(IExecutor* waiter, IExecutor* resumeOn) = 0;
+    [[nodiscard]] virtual core::async::Task<StopWake> Stopped(core::async::IExecutor* waiter,
+                                                              core::async::IExecutor* resumeOn) = 0;
 
     /// End an outstanding or future `Stopped()` with `Cancelled`.
     ///

@@ -389,10 +389,10 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
                         DispatchBudgets const& budgets,
                         Credential const& credential,
                         Wire::CodecList const& acceptedCodecs,
-                        IClock* clock)
+                        core::platform::IClock* clock)
 {
-    SteadyClock ownClock;
-    IClock& now = clock != nullptr ? *clock : ownClock;
+    core::platform::SteadyClock ownClock;
+    core::platform::IClock& now = clock != nullptr ? *clock : ownClock;
 
     // Derived ONCE. `available` is what this build can produce; `accepted` is what
     // this client will read back, which a caller may narrow and which therefore is

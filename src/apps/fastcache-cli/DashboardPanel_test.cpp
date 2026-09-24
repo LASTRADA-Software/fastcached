@@ -11,7 +11,6 @@
 #include "ScriptedSixelEncoder.hpp"
 
 #include <FastCache/Cache/StorageTier.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -38,6 +37,7 @@
 #include <utility>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -63,7 +63,7 @@ constexpr std::string_view Absent = "n/a";
 [[nodiscard]] DashboardEvent SampleOf(StatsReading reading, int seconds, std::string where = {})
 {
     return DashboardEvent { .kind = DashboardEventKind::Sample,
-                            .at = TimePoint { std::chrono::seconds { seconds } },
+                            .at = core::platform::SteadyTimePoint { std::chrono::seconds { seconds } },
                             .reading = std::move(reading),
                             .where = std::move(where) };
 }
@@ -114,7 +114,7 @@ constexpr std::string_view Absent = "n/a";
                                               .expirations = 4 * step };
     for (auto const tier: tiers)
     {
-        auto const* row = FindIfOrNull(StorageTierTable, [tier](auto const& one) { return one.name == tier; });
+        auto const* row = core::findIfOrNull(StorageTierTable, [tier](auto const& one) { return one.name == tier; });
         REQUIRE(row != nullptr);
         reading.snapshot.storageTiers[static_cast<std::size_t>(row->tier)] =
             StorageStats { .itemCount = 412003,
@@ -797,7 +797,8 @@ TEST_CASE("every figure a panel names reads the same number off the reading a su
     auto const check = [&](ReadingField field, std::string_view tierName) {
         if (!field.Names())
             return;
-        auto const* row = FindIfOrNull(StorageTierTable, [tierName](auto const& tier) { return tier.name == tierName; });
+        auto const* row =
+            core::findIfOrNull(StorageTierTable, [tierName](auto const& tier) { return tier.name == tierName; });
         auto const tier = row == nullptr ? std::optional<StorageTier> {} : std::optional { row->tier };
         auto const expected = field.read(original, tier);
         INFO("figure " << checked << " tier " << tierName);
@@ -875,10 +876,11 @@ TEST_CASE("a newest sample that failed shows the marker rather than the last val
         return std::string {};
     };
 
-    auto const failed = CacheFrames({ SampleOf(CacheReading(1, { "memory" }), 1),
-                                      DashboardEvent { .kind = DashboardEventKind::SampleFailed, .at = TimePoint { 2s } },
-                                      Tick },
-                                    RenderRung::Unicode);
+    auto const failed = CacheFrames(
+        { SampleOf(CacheReading(1, { "memory" }), 1),
+          DashboardEvent { .kind = DashboardEventKind::SampleFailed, .at = core::platform::SteadyTimePoint { 2s } },
+          Tick },
+        RenderRung::Unicode);
     auto const answered = CacheFrames({ SampleOf(CacheReading(1, { "memory" }), 1), Tick }, RenderRung::Unicode);
     REQUIRE(failed.size() == 1);
     REQUIRE(answered.size() == 1);
@@ -1289,7 +1291,7 @@ constexpr auto FleetMachines = std::size_t { 12 };
 [[nodiscard]] DashboardEvent FleetSampleOf(int seconds, std::string document, std::string where = {})
 {
     return DashboardEvent { .kind = DashboardEventKind::Sample,
-                            .at = TimePoint { std::chrono::seconds { seconds } },
+                            .at = core::platform::SteadyTimePoint { std::chrono::seconds { seconds } },
                             .document = std::move(document),
                             .where = std::move(where) };
 }
@@ -1643,7 +1645,7 @@ TEST_CASE("a fleet panel drawn after a failed sample shows no table from before 
     auto const frames = FleetFramesAt({ FleetSampleOf(1, FleetText(FleetMachines)),
                                         Tick,
                                         DashboardEvent { .kind = DashboardEventKind::SampleFailed,
-                                                         .at = TimePoint { 2s },
+                                                         .at = core::platform::SteadyTimePoint { 2s },
                                                          .outcome = Outcome::Refused,
                                                          .note = "not the leader" },
                                         Tick },
@@ -2258,7 +2260,7 @@ TEST_CASE("at 80x24 the fleet panel reads as the mockup draws it", "[cli][dashbo
     auto const kpis = Distributed::FleetKpis();
     auto const first = LineStarting(frame, kpis[0].label);
     REQUIRE(first.has_value());
-    auto const* const beside = FindIfOrNull(
+    auto const* const beside = core::findIfOrNull(
         kpis, [](Distributed::FleetKpiText const& kpi) { return kpi.ofNoun.empty() && kpi.note.empty() && !kpi.sparkline; });
     REQUIRE(beside != nullptr);
     CHECK(Unwrap(first).contains(beside->label));
@@ -2460,7 +2462,11 @@ TEST_CASE("a panel's title states the cadence the server granted and the asked i
     auto granted = CacheChromeSample();
     granted.cadence = std::chrono::milliseconds { 5000 };
     auto const frames = CacheChromeFrames(
-        { granted, Tick, DashboardEvent { .kind = DashboardEventKind::SampleFailed, .at = TimePoint { 3s } }, Tick }, 80);
+        { granted,
+          Tick,
+          DashboardEvent { .kind = DashboardEventKind::SampleFailed, .at = core::platform::SteadyTimePoint { 3s } },
+          Tick },
+        80);
     REQUIRE(frames.size() == 2);
     auto const whileGranted = TopEdge(frames[0]);
     CHECK(whileGranted.ends_with(TopEnd("127.0.0.1:6379  up 6d04:12  every 5s  q quit")));
@@ -2790,13 +2796,13 @@ TEST_CASE("a title bar states no uptime and no leader beside a gap, and both aga
     // gap the reading's own zero would stand in for it, so the node is asked as well as the cache.
     auto const failedAt = [](std::chrono::seconds at) {
         return DashboardEvent { .kind = DashboardEventKind::SampleFailed,
-                                .at = TimePoint { at },
+                                .at = core::platform::SteadyTimePoint { at },
                                 .outcome = Outcome::Unreachable,
                                 .note = "127.0.0.1:6674: the stream was lost (recv)" };
     };
 
     auto later = CacheChromeSample();
-    later.at = TimePoint { 3s };
+    later.at = core::platform::SteadyTimePoint { 3s };
     auto const cache = CacheChromeFrames({ CacheChromeSample(), Tick, failedAt(2s), Tick, std::move(later), Tick }, 80);
     REQUIRE(cache.size() == 3);
     CHECK(TopEdge(cache[0]).ends_with(TopEnd("127.0.0.1:6379  up 6d04:12  every 2s  q quit")));
@@ -3082,7 +3088,7 @@ namespace
         if (index == failAt)
         {
             script.push_back(DashboardEvent { .kind = DashboardEventKind::SampleFailed,
-                                              .at = TimePoint { std::chrono::seconds { seconds } } });
+                                              .at = core::platform::SteadyTimePoint { std::chrono::seconds { seconds } } });
             continue;
         }
         step += index == stillAt ? 0U : static_cast<std::uint64_t>(1 + (index % 4));
@@ -3482,7 +3488,7 @@ namespace
         if (index == failAt)
         {
             script.push_back(DashboardEvent { .kind = DashboardEventKind::SampleFailed,
-                                              .at = TimePoint { std::chrono::seconds { seconds } } });
+                                              .at = core::platform::SteadyTimePoint { std::chrono::seconds { seconds } } });
             continue;
         }
         step += index == stillAt ? 0U : static_cast<std::uint64_t>(1 + (index % 3));
@@ -3821,7 +3827,7 @@ TEST_CASE("a node panel keeps the lines its node said apply beside a gap, their 
                                      NodeSampleOf(2, 3, status),
                                      Tick,
                                      DashboardEvent { .kind = DashboardEventKind::SampleFailed,
-                                                      .at = TimePoint { 5s },
+                                                      .at = core::platform::SteadyTimePoint { 5s },
                                                       .outcome = Outcome::Unreachable,
                                                       .note = "build-07:7070: the stream was lost (recv)" },
                                      Tick },
@@ -4037,7 +4043,7 @@ TEST_CASE("a node's states worth a look are dressed: a survey not done, an elect
         std::ranges::find_if(freeLines, [](std::string const& line) { return line.contains("limited-by"); });
     REQUIRE(gaugeRow != freeLines.end());
     auto const row = static_cast<std::size_t>(std::ranges::distance(freeLines.begin(), gaugeRow)) + 1;
-    auto const* const limit = FindIfOrNull(free.spans.back(), [&](FrameSpan const& span) {
+    auto const* const limit = core::findIfOrNull(free.spans.back(), [&](FrameSpan const& span) {
         return span.row == row && freeLines[row - 1].substr(span.byte, span.length) == "registered";
     });
     REQUIRE(limit != nullptr);
@@ -4246,7 +4252,7 @@ TEST_CASE("the Dispatched tile draws its trend across the samples, and no trend 
     // blank passes every label check -- and on the ASCII rung, which draws no sparkline anywhere (§10), there
     // are none.
     auto const kpis = Distributed::FleetKpis();
-    auto const* const trended = FindIfOrNull(kpis, [](Distributed::FleetKpiText const& kpi) { return kpi.sparkline; });
+    auto const* const trended = core::findIfOrNull(kpis, [](Distributed::FleetKpiText const& kpi) { return kpi.sparkline; });
     REQUIRE(trended != nullptr);
     auto script = std::vector<DashboardEvent> {
         FleetSampleOf(1, FleetText(3)), FleetSampleOf(2, FleetText(3)), FleetSampleOf(3, FleetText(3)), Tick

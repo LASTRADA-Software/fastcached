@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProtocol.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Net/TcpClient.hpp>
 #include <FastCache/Protocol/LeaderRedirect.hpp>
 
 #include <format>
 #include <utility>
+
+#include <core/async/Task.hpp>
+#include <core/net/TcpClient.hpp>
 
 namespace FastCache::Cc
 {
@@ -101,11 +102,11 @@ namespace
     /// @param client Connected transport.
     /// @param liveness Told about each progress frame; may be null.
     /// @return The outcome, with the payload attached.
-    [[nodiscard]] Task<CacheOutcome> RecvReply(ISocket* client, IExchangeLiveness* liveness)
+    [[nodiscard]] core::async::Task<CacheOutcome> RecvReply(core::net::ISocket* client, IExchangeLiveness* liveness)
     {
         while (true)
         {
-            auto const headerBytes = co_await FastCache::RecvExactly(client, Wire::ReplyHeaderSize);
+            auto const headerBytes = co_await core::net::receiveExactly(client, Wire::ReplyHeaderSize);
             if (!headerBytes.has_value())
                 co_return Plain(CacheOutcomeKind::Transport);
 
@@ -116,7 +117,7 @@ namespace
             std::vector<std::byte> payload;
             if (header->payloadLength > 0)
             {
-                auto received = co_await FastCache::RecvExactly(client, header->payloadLength);
+                auto received = co_await core::net::receiveExactly(client, header->payloadLength);
                 if (!received.has_value())
                     co_return Plain(CacheOutcomeKind::Transport);
                 payload = std::move(*received);
@@ -195,15 +196,15 @@ namespace
     /// It costs nothing here because every caller moves into it -- a STORE frame
     /// carries a whole object file, and copying it would double the peak
     /// footprint on the hot path of a parallel build.
-    [[nodiscard]] Task<CacheOutcome> Exchange(ISocket* client,
-                                              CredentialNotice* notice,
-                                              std::vector<std::byte> frame,
-                                              Credential credential,
-                                              IExchangeLiveness* liveness)
+    [[nodiscard]] core::async::Task<CacheOutcome> Exchange(core::net::ISocket* client,
+                                                           CredentialNotice* notice,
+                                                           std::vector<std::byte> frame,
+                                                           Credential credential,
+                                                           IExchangeLiveness* liveness)
     {
         if (!credential.Configured())
         {
-            if (!co_await FastCache::SendAll(client, frame))
+            if (!co_await core::net::sendAll(client, frame))
                 co_return Plain(CacheOutcomeKind::Transport);
             NoteRequestSent(liveness);
             co_return co_await RecvReply(client, liveness);
@@ -211,7 +212,7 @@ namespace
 
         auto const authFrame =
             Wire::EncodeAuth(Wire::AuthRequest { .username = credential.username, .secret = credential.secret });
-        if (!co_await FastCache::SendAll(client, authFrame) || !co_await FastCache::SendAll(client, frame))
+        if (!co_await core::net::sendAll(client, authFrame) || !co_await core::net::sendAll(client, frame))
             co_return Plain(CacheOutcomeKind::Transport);
         NoteRequestSent(liveness);
 
@@ -267,11 +268,11 @@ namespace
 
 } // namespace
 
-Task<CacheOutcome> ExchangeFramed(ISocket* client,
-                                  CredentialNotice* notice,
-                                  std::vector<std::byte> frame,
-                                  Credential credential,
-                                  IExchangeLiveness* liveness)
+core::async::Task<CacheOutcome> ExchangeFramed(core::net::ISocket* client,
+                                               CredentialNotice* notice,
+                                               std::vector<std::byte> frame,
+                                               Credential credential,
+                                               IExchangeLiveness* liveness)
 {
     co_return co_await Exchange(client, notice, std::move(frame), std::move(credential), liveness);
 }
@@ -309,12 +310,18 @@ std::string DescribeOutcome(CacheOutcome const& outcome)
     return "unknown outcome";
 }
 
-Task<CacheOutcome> CacheFetch(ISocket* client, CredentialNotice* notice, std::string_view key, Credential credential)
+core::async::Task<CacheOutcome> CacheFetch(core::net::ISocket* client,
+                                           CredentialNotice* notice,
+                                           std::string_view key,
+                                           Credential credential)
 {
     co_return co_await Exchange(client, notice, Wire::EncodeFetch(key), std::move(credential), nullptr);
 }
 
-Task<CacheOutcome> CacheStore(ISocket* client, CredentialNotice* notice, Wire::StoreRequest request, Credential credential)
+core::async::Task<CacheOutcome> CacheStore(core::net::ISocket* client,
+                                           CredentialNotice* notice,
+                                           Wire::StoreRequest request,
+                                           Credential credential)
 {
     co_return co_await Exchange(client, notice, Wire::EncodeStore(request), std::move(credential), nullptr);
 }

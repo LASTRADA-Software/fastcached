@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Net/ISocket.hpp>
 
 #include <charconv>
 #include <cstddef>
@@ -11,6 +9,9 @@
 #include <span>
 #include <string_view>
 #include <system_error>
+
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
 
 namespace FastCache
 {
@@ -35,7 +36,7 @@ template <typename T>
 /// @param socket  Destination socket.
 /// @param payload Bytes to send (interpreted as raw bytes).
 /// @return True if the write succeeded (or the payload was empty).
-inline Task<bool> WriteAll(ISocket* socket, std::string_view payload)
+inline core::async::Task<bool> WriteAll(core::net::ISocket* socket, std::string_view payload)
 {
     if (payload.empty())
         co_return true;
@@ -55,9 +56,9 @@ inline Task<bool> WriteAll(ISocket* socket, std::string_view payload)
 /// @param keepAlive Optional owner pinning the segments' backing storage for
 ///        the operation's lifetime (e.g. the GetResult holding the value).
 /// @return True if every byte of every segment was written.
-inline Task<bool> WriteAllVectored(ISocket* socket,
-                                   std::span<std::span<std::byte const> const> segments,
-                                   std::shared_ptr<void const> keepAlive = {})
+inline core::async::Task<bool> WriteAllVectored(core::net::ISocket* socket,
+                                                std::span<std::span<std::byte const> const> segments,
+                                                std::shared_ptr<void const> keepAlive = {})
 {
     std::size_t expected = 0;
     for (auto const seg: segments)

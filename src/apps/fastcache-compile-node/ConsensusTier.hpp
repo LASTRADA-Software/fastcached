@@ -8,7 +8,6 @@
 #include "NodeRoster.hpp"
 #include "SchedulerTier.hpp"
 
-#include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/ClusterStateMachine.hpp>
 #include <FastCache/Cluster/MembershipPolicy.hpp>
@@ -19,20 +18,20 @@
 #include <FastCache/Consensus/RaftDriver.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
+
+#include <core/net/PlatformLoop.hpp>
+#include <core/platform/Clock.hpp>
 // For `ConsensusStatus`, which is the shape a scrape reports this node's own quorum
 // in. Defined beside `MetricsSnapshot` rather than here because the renderer is what
 // has to know its shape, and `/metrics` is the one surface every node already serves.
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
-#include <FastCache/Net/PlatformListener.hpp>
-#include <FastCache/Net/ThreadedAddressResolver.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -49,6 +48,9 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <core/net/Sockets.hpp>
+#include <core/net/ThreadedAddressResolver.hpp>
 
 namespace FastCache::Node
 {
@@ -244,7 +246,7 @@ void ReportInstallRefusal(std::optional<Consensus::RaftDriver::InstallRefusal> c
 /// timer wheel while `RaftPeerServer::Run` blocks in `accept` -- and both halves
 /// of that were wrong in a way nothing reported.
 ///
-/// `SyncRun` cannot drive a reactor: it resumes a coroutine once and throws if it
+/// `core::async::syncRun` cannot drive a reactor: it resumes a coroutine once and throws if it
 /// is still suspended, so a driver awaiting `SleepUntil` aborted the process the
 /// first time three nodes were started. And a *blocking* listener makes every
 /// `co_await` inside `RaftPeerServer` complete synchronously, so its
@@ -253,10 +255,10 @@ void ReportInstallRefusal(std::optional<Consensus::RaftDriver::InstallRefusal> c
 /// peers and nobody is ever elected, with nothing crashing and nothing logging a
 /// fault.
 ///
-/// So both loops are detached tasks on one `PlatformReactor`, which is what
+/// So both loops are detached tasks on one `core::net::PlatformLoop`, which is what
 /// `RaftPeerServer`'s own documentation always said it wanted. The reactor stops
 /// when BOTH have finished rather than when somebody outside decides to:
-/// `IReactor::Run` returns with its timer heap and its parked work exactly where
+/// `core::net::EventLoop::Run` returns with its timer heap and its parked work exactly where
 /// they were, so a loop still suspended at that moment is a coroutine frame nobody
 /// ever resumes and nobody ever frees.
 class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusStandingSource
@@ -357,7 +359,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
         std::optional<Ed25519KeyPair> const& identityKey,
         RoleObserver onRole,
         MembersObserver onMembers,
-        WallClockRef wallClock,
+        core::platform::WallClockRef wallClock,
         EndorsementObserver onEndorsement,
         IMetricsSink& metrics,
         ILogger& logger,
@@ -468,7 +470,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
                   std::string boundEndpoint,
                   RoleObserver onRole,
                   MembersObserver onMembers,
-                  WallClockRef wallClock,
+                  core::platform::WallClockRef wallClock,
                   std::string clusterId,
                   EndorsementObserver onEndorsement,
                   IMetricsSink& metrics,
@@ -618,12 +620,12 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// They have to be the same kind: `DriverSink` reads `steady_clock` directly,
     /// so a reactor on a wall clock would put a received message and a fired timer
     /// on two timelines, and an NTP step would look like an election timeout.
-    SteadyClock _clock;
+    core::platform::SteadyClock _clock;
 
     /// Constructed here and RUN on `_ioThread`, which is allowed and is what the
     /// daemon's multi-reactor path already does: the descriptor is made in the
     /// constructor and the loop is a separate call.
-    PlatformReactor _reactor { _clock };
+    core::net::PlatformLoop _reactor { _clock };
 
     Consensus::FileRaftStorage _storage;
 
@@ -656,16 +658,16 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// this reactor also carries the election timers and every peer reader, so
     /// that is the whole cluster's liveness. A peer named by literal address,
     /// which is the ordinary case, never reaches a thread at all.
-    ThreadedAddressResolver _resolver;
+    core::net::ThreadedAddressResolver _resolver;
 
     /// Reactor-driven, so a dial suspends rather than blocking the loop that
     /// carries the election timers. Declared after `_reactor` and `_resolver`
     /// because it references both.
-    std::unique_ptr<IConnector> _connector;
+    std::unique_ptr<core::net::IConnector> _connector;
     std::unique_ptr<Consensus::RaftPeerTransport> _transport;
     Cluster::ClusterStateMachine _application;
     std::unique_ptr<Consensus::RaftDriver> _driver;
-    std::unique_ptr<PlatformListener> _listener;
+    std::unique_ptr<core::net::IListener> _listener;
     std::unique_ptr<Consensus::IRaftMessageSink> _sink;
     std::unique_ptr<Consensus::RaftPeerServer> _peerServer;
 
@@ -687,7 +689,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     NodeConditions* _conditions;
 
     /// What an endorsement's lapse is read from.
-    WallClockRef _wallClock;
+    core::platform::WallClockRef _wallClock;
 
     /// The fleet every endorsement names: `--cluster-id`.
     std::string _clusterId;
@@ -876,7 +878,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
     NodeRoster& roster,
-    WallClockRef wallClock,
+    core::platform::WallClockRef wallClock,
     IMetricsSink& metrics,
     ILogger& logger,
     NodeConditions* conditions = nullptr);

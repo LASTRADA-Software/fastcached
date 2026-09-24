@@ -5,17 +5,12 @@
 // other reclamation path in this codebase is driven by a call naming the key,
 // so without a timer that key is never freed and its `expired` event is never
 // published -- which is precisely the case a subscriber subscribes for.
-#include <FastCache/Async/Cancellation.hpp>
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Cache/ExpiryReaper.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/NotifyingStorage.hpp>
 #include <FastCache/Cache/ReclaimLog.hpp>
 #include <FastCache/Cache/StorageTestUtils.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -26,6 +21,7 @@
 #include <chrono>
 #include <concepts>
 #include <condition_variable>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -42,6 +38,13 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/StopToken.hpp>
+#include <core/async/Task.hpp>
+#include <core/async/ThreadPoolExecutor.hpp>
+#include <core/net/EventLoop.hpp>
+#include <core/net/testing/NullBackend.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -105,17 +108,33 @@ struct Fixture
     // precedes `storage`, `clock` precedes `reactor`.
     InMemoryLruStorage lru;
     NullLogger logger;
-    CancellationSource source;
+    core::async::StopSource source;
     RecordingObserver observer;
     NotifyingStorage storage { lru, &observer };
-    ManualClock clock;
+    core::platform::ManualClock clock;
     ReclaimLog log { &observer };
-    TestReactor reactor { clock };
+    core::net::testing::TestLoop reactor { clock };
     AtomicMetricsSink metrics;
+
+    /// The loop the case drives: `reactor`, unless a `ParkingReactor` has taken its place.
+    core::net::EventLoop* loop { &reactor };
 
     Fixture()
     {
         storage.SetReclaimLog(&log);
+    }
+
+    /// Run one turn of the loop the case drives.
+    /// @return How much it drained.
+    std::size_t Tick() const
+    {
+        return loop->runOnce(core::platform::SteadyDuration::zero()).drained;
+    }
+
+    /// @return How many coroutines wait on the loop the case drives.
+    [[nodiscard]] std::size_t Pending() const noexcept
+    {
+        return loop->readyCount();
     }
 };
 
@@ -155,20 +174,32 @@ class ParkGate
     bool _open { false };
 };
 
-/// A reactor that forwards to a `TestReactor` and can PARK the thread handing it work.
+/// Owns the backend a `ParkingReactor` runs over, as a base so it is built before the loop.
+struct ParkingReactorBackend
+{
+    core::net::testing::NullBackend backend; ///< Accepts registrations, reports nothing.
+};
+
+/// A loop driven by hand, like `core::net::testing::TestLoop`, that can PARK the thread handing it
+/// work.
 ///
 /// **This is what makes #1397's window deterministic.** The sweep's hop back to the reactor
-/// is `IExecutor::Submit(ParkedWork)` called on the POOL thread, and the defect is that the
+/// is `core::async::IExecutor::submit(ParkedWork)` called on the POOL thread, and the defect is that the
 /// frame's owner could destroy it while that call was still in progress. Parking inside the
 /// call holds the pool thread exactly there for as long as the case needs, instead of
 /// waiting for a scheduler to produce the interleaving.
 ///
-/// Parks either BEFORE forwarding (the frame is on neither side) or AFTER it (the frame is
-/// already queued on the inner reactor while the pool thread has not returned).
-class ParkingReactor final: public IReactor
+/// Parks either BEFORE queueing (the frame is on neither side) or AFTER it (the frame is
+/// already queued on this loop while the pool thread has not returned).
+///
+/// **It takes the fixture's loop's place** for as long as it lives, so `TickUntil`, `Fixture::Tick`
+/// and `Fixture::Pending` drive this loop. core-cpp's `EventLoop` keeps its timers and its ready
+/// queue itself, so a loop that forwarded its work to another -- what this was over fastcached's
+/// `IReactor` -- would leave the reaper's `cancelPending` nothing to take back.
+class ParkingReactor final: private ParkingReactorBackend, public core::net::EventLoop
 {
   public:
-    /// Where `Submit(ParkedWork)` parks. Private to this fixture: never stored or sent.
+    /// Where `submit(ParkedWork)` parks. Private to this fixture: never stored or sent.
     enum class Park : std::uint8_t
     {
         No,
@@ -176,31 +207,50 @@ class ParkingReactor final: public IReactor
         AfterForwarding,
     };
 
-    explicit ParkingReactor(TestReactor& inner) noexcept:
-        _inner { inner }
+    /// @param fixture The fixture whose clock this loop reads, and whose driven loop it becomes.
+    ///
+    /// **One coroutine per turn** (`dispatchBatch = 1`), so a case can stop between a submission
+    /// and its resumption: core-cpp's turn resumes what is queued DURING it as well, up to its
+    /// batch, where fastcached's `TestReactor` swapped the batch out first.
+    explicit ParkingReactor(Fixture& fixture):
+        core::net::EventLoop { backend,
+                               fixture.clock,
+                               core::net::EventLoopOptions { .idle = core::net::IdlePolicy::Return, .dispatchBatch = 1 } },
+        _fixture { fixture }
     {
+        _fixture.loop = this;
     }
 
-    /// Park the next `Submit(ParkedWork)` at @p where.
+    ParkingReactor(ParkingReactor const&) = delete;
+    ParkingReactor(ParkingReactor&&) = delete;
+    ParkingReactor& operator=(ParkingReactor const&) = delete;
+    ParkingReactor& operator=(ParkingReactor&&) = delete;
+
+    ~ParkingReactor() override
+    {
+        _fixture.loop = &_fixture.reactor;
+    }
+
+    /// Park the next `submit(ParkedWork)` at @p where.
     void ParkNextSubmit(Park where) noexcept
     {
         _park.store(where, std::memory_order_release);
     }
 
-    /// Make the next `Submit(ParkedWork)` throw `std::bad_alloc` without forwarding, the way
-    /// an allocating `Submit` fails.
+    /// Make the next `submit(ParkedWork)` throw `std::bad_alloc` without queueing, the way
+    /// an allocating `submit` fails.
     void RefuseNextSubmit() noexcept
     {
         _refuse.store(true, std::memory_order_release);
     }
 
-    /// @return How many `Submit(ParkedWork)` calls threw.
+    /// @return How many `submit(ParkedWork)` calls threw.
     [[nodiscard]] std::size_t Refused() const noexcept
     {
         return _refused.load(std::memory_order_acquire);
     }
 
-    /// @return How many `Submit(ParkedWork)` calls have arrived.
+    /// @return How many `submit(ParkedWork)` calls have arrived.
     [[nodiscard]] std::size_t ParkedWorkSubmits() const noexcept
     {
         return _submits.load(std::memory_order_acquire);
@@ -212,15 +262,14 @@ class ParkingReactor final: public IReactor
         return _gate;
     }
 
-    void stop() noexcept override
-    {
-        _inner.stop();
-    }
+    /// A bare handle is not a hop: `EventLoop::submit(handle)` forwards to the `ParkedWork`
+    /// overload, so without this the reaper's own start would park the CASE's thread.
     void submit(std::coroutine_handle<> handle) override
     {
-        _inner.submit(handle);
+        core::net::EventLoop::submit(core::async::ParkedWork { .resume = handle });
     }
-    void submit(ParkedWork work) override
+
+    void submit(core::async::ParkedWork work) override
     {
         _submits.fetch_add(1, std::memory_order_acq_rel);
         if (_refuse.exchange(false, std::memory_order_acq_rel))
@@ -231,35 +280,13 @@ class ParkingReactor final: public IReactor
         auto const where = _park.exchange(Park::No, std::memory_order_acq_rel);
         if (where == Park::BeforeForwarding)
             _gate.ParkHere();
-        _inner.submit(work);
+        core::net::EventLoop::submit(work);
         if (where == Park::AfterForwarding)
             _gate.ParkHere();
     }
-    void schedule(TimePoint deadline, std::coroutine_handle<> handle) override
-    {
-        _inner.schedule(deadline, handle);
-    }
-    void schedule(TimePoint deadline, ParkedWork work) override
-    {
-        _inner.schedule(deadline, work);
-    }
-    [[nodiscard]] bool cancelPending(std::coroutine_handle<> handle) noexcept override
-    {
-        return _inner.cancelPending(handle);
-    }
-    [[nodiscard]] IClock& clock() noexcept override
-    {
-        return _inner.clock();
-    }
-
-  protected:
-    void RunLoop() override
-    {
-        std::ignore = _inner.Drain();
-    }
 
   private:
-    TestReactor& _inner;
+    Fixture& _fixture;
     ParkGate _gate;
     std::atomic<Park> _park { Park::No };
     std::atomic<bool> _refuse { false };
@@ -273,10 +300,10 @@ class ParkingReactor final: public IReactor
 /// The mirror of `ParkingReactor`, for the hop OUT: the reactor thread has handed the frame
 /// to the pool and gone back to its loop, and the pool has not yet resumed it. Held here,
 /// that interval lasts until the case says otherwise.
-class HoldingExecutor final: public IExecutor
+class HoldingExecutor final: public core::async::IExecutor
 {
   public:
-    explicit HoldingExecutor(IExecutor& inner) noexcept:
+    explicit HoldingExecutor(core::async::IExecutor& inner) noexcept:
         _inner { inner }
     {
     }
@@ -327,7 +354,7 @@ class HoldingExecutor final: public IExecutor
 
     /// Take the held work, leaving nothing held.
     /// @return The held work, or nothing if none was held.
-    [[nodiscard]] std::optional<ParkedWork> TakeHeld()
+    [[nodiscard]] std::optional<core::async::ParkedWork> TakeHeld()
     {
         std::scoped_lock const lock { _mutex };
         return std::exchange(_held, std::nullopt);
@@ -356,7 +383,7 @@ class HoldingExecutor final: public IExecutor
     {
         _inner.submit(handle);
     }
-    void submit(ParkedWork work) override
+    void submit(core::async::ParkedWork work) override
     {
         if (_refuse.exchange(false, std::memory_order_acq_rel))
         {
@@ -380,13 +407,13 @@ class HoldingExecutor final: public IExecutor
     }
 
   private:
-    IExecutor& _inner;
+    core::async::IExecutor& _inner;
     std::atomic<bool> _refuse { false };
     std::atomic<std::size_t> _refused { 0 };
     std::atomic<std::size_t> _forwarded { 0 };
     mutable std::mutex _mutex;
     std::size_t _holdCountdown { 0 }; ///< Submits until the one held; 0 holds none. Under `_mutex`.
-    std::optional<ParkedWork> _held;
+    std::optional<core::async::ParkedWork> _held;
 };
 
 /// @return What @p reactor has seen, in words, for a fixture wait that ran out.
@@ -472,14 +499,14 @@ static_assert(StopLook > FastCycleHeldDrain.stopDrain.ceiling);
 class HeldCeilingDrainWait final: public IDrainWait
 {
   public:
-    [[nodiscard]] TimePoint Now() const noexcept override
+    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
     {
         auto const real = DefaultDrainWait().Now();
         // The first look claims the slot; a later one reads it back from the failed exchange.
-        auto firstRep = TimePoint::rep { 0 };
+        auto firstRep = core::platform::SteadyTimePoint::rep { 0 };
         if (_firstLook.compare_exchange_strong(firstRep, real.time_since_epoch().count(), std::memory_order_acq_rel))
             firstRep = real.time_since_epoch().count();
-        auto const first = TimePoint { TimePoint::duration { firstRep } };
+        auto const first = core::platform::SteadyTimePoint { core::platform::SteadyTimePoint::duration { firstRep } };
         // Monotonic both sides of the guard: frozen at `first`, then real time a day ahead.
         return real - first < WaitHangGuard ? first : real + std::chrono::hours { 24 };
     }
@@ -490,7 +517,7 @@ class HeldCeilingDrainWait final: public IDrainWait
     }
 
   private:
-    mutable std::atomic<TimePoint::rep> _firstLook { 0 };
+    mutable std::atomic<core::platform::SteadyTimePoint::rep> _firstLook { 0 };
 };
 
 /// Tick the case's reactor until @p reached holds, for at most `WaitHangGuard` of real time.
@@ -514,13 +541,13 @@ template <std::predicate Predicate, typename State>
                          .step =
                              [&f] {
                                  f.clock.advance(1ms);
-                                 std::ignore = f.reactor.Tick();
+                                 std::ignore = f.Tick();
                              },
                          .context =
                              [&f] {
                                  return std::format("the reactor holds {} submission(s) and {} timer(s)",
-                                                    f.reactor.PendingSubmissions(),
-                                                    f.reactor.PendingTimers());
+                                                    f.Pending(),
+                                                    f.loop->pendingTimerCount());
                              },
                          .bound = WaitHangGuard,
                          .rest = WaitRest,
@@ -658,22 +685,22 @@ TEST_CASE("The expiry cycle reclaims a lapsed key nobody touched, and says so", 
     ExpiryReaper reaper {
         f.storage, f.logger, ExpiryReaperOptions { .interval = 100ms, .stopWakeBound = 25ms }, &f.metrics
     };
-    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
+    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.get_token());
     f.reactor.submit(task.handle());
-    f.reactor.Drain();
+    f.reactor.drain();
     CHECK(f.storage.Snapshot().itemCount == 1U); // Still live; nothing to do yet.
 
     f.clock.advance(2s);
-    f.reactor.Drain();
+    f.reactor.drain();
 
     CHECK(f.storage.Snapshot().itemCount == 0U);
     CHECK(f.observer.Saw(MutationKind::Expire, "gone"));
     CHECK(f.metrics.Read(IMetricsSink::Counter::ExpiryKeysReclaimed) == 1U);
     CHECK(f.metrics.Read(IMetricsSink::Counter::ExpiryCycles) >= 1U);
 
-    f.source.Cancel();
+    f.source.request_stop();
     f.clock.advance(25ms);
-    f.reactor.Drain();
+    f.reactor.drain();
 }
 
 TEST_CASE("The expiry cycle stops promptly and leaves nothing parked", "[expiry][reaper]")
@@ -684,18 +711,18 @@ TEST_CASE("The expiry cycle stops promptly and leaves nothing parked", "[expiry]
     // ever resume and nobody will ever free.
     Fixture f;
     ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s, .stopWakeBound = 50ms } };
-    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
+    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.get_token());
     f.reactor.submit(task.handle());
-    f.reactor.Drain();
+    f.reactor.drain();
 
     auto const started = f.clock.now();
-    f.source.Cancel();
+    f.source.request_stop();
     f.clock.advance(50ms);
-    f.reactor.Drain();
+    f.reactor.drain();
 
     CHECK(f.clock.now() - started == 50ms); // Not the 30s interval.
-    CHECK(f.reactor.PendingTimers() == 0);
-    CHECK(f.reactor.PendingSubmissions() == 0);
+    CHECK(f.reactor.pendingTimers() == 0);
+    CHECK(f.reactor.pendingSubmissions() == 0);
     CHECK(reaper.Cycles() == 0U);
 }
 
@@ -709,12 +736,12 @@ TEST_CASE("Stopping the expiry cycle reclaims a frame still parked on the reacto
     {
         ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s, .stopWakeBound = 50ms } };
         reaper.Start(f.reactor, f.reactor);
-        f.reactor.Drain();
-        REQUIRE(f.reactor.PendingTimers() == 1); // Parked mid-interval.
+        f.reactor.drain();
+        REQUIRE(f.reactor.pendingTimers() == 1); // Parked mid-interval.
     } // ~ExpiryReaper -> Stop() -> CancelPending, then the frame is destroyed.
 
-    CHECK(f.reactor.PendingTimers() == 0);
-    CHECK(f.reactor.PendingSubmissions() == 0);
+    CHECK(f.reactor.pendingTimers() == 0);
+    CHECK(f.reactor.pendingSubmissions() == 0);
 }
 
 TEST_CASE("A zero interval disables the expiry cycle rather than parking it", "[expiry][reaper]")
@@ -724,16 +751,16 @@ TEST_CASE("A zero interval disables the expiry cycle rather than parking it", "[
     Fixture f;
     REQUIRE(f.storage.Set("gone", MakeBytes("v"), 0, f.clock.now() + 1s).has_value());
 
-    ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = Duration::zero() } };
-    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
+    ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = core::platform::SteadyDuration::zero() } };
+    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.get_token());
     f.reactor.submit(task.handle());
-    f.reactor.Drain();
+    f.reactor.drain();
 
     f.clock.advance(1h);
-    f.reactor.Drain();
+    f.reactor.drain();
 
     CHECK(reaper.Cycles() == 0U);
-    CHECK(f.reactor.PendingTimers() == 0);
+    CHECK(f.reactor.pendingTimers() == 0);
     CHECK(f.storage.Snapshot().itemCount == 1U); // Expiry stays purely access-driven.
 }
 
@@ -768,29 +795,29 @@ TEST_CASE("The expiry cycle actually backs off on a running reactor", "[expiry][
     ExpiryReaper reaper { f.storage,
                           f.logger,
                           ExpiryReaperOptions { .interval = 100ms, .maxInterval = 400ms, .stopWakeBound = 100ms } };
-    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.Token());
+    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.get_token());
     f.reactor.submit(task.handle());
-    f.reactor.Drain();
+    f.reactor.drain();
     CHECK(reaper.CurrentInterval() == 100ms);
 
     // Three idle sweeps: 100 -> 200 -> 400, then held at the ceiling.
     for (auto const expected: { 200ms, 400ms, 400ms })
     {
         f.clock.advance(500ms);
-        f.reactor.Drain();
+        f.reactor.drain();
         CHECK(reaper.CurrentInterval() == expected);
     }
 
     // Something to reclaim, and the very next sweep is back at the base.
     REQUIRE(f.storage.Set("gone", MakeBytes("v"), 0, f.clock.now() + 1s).has_value());
     f.clock.advance(2s);
-    f.reactor.Drain();
+    f.reactor.drain();
     CHECK(reaper.CurrentInterval() == 100ms);
     CHECK(f.observer.Saw(MutationKind::Expire, "gone"));
 
-    f.source.Cancel();
+    f.source.request_stop();
     f.clock.advance(100ms);
-    f.reactor.Drain();
+    f.reactor.drain();
 }
 
 TEST_CASE("One expiry sweep spends no more than its budget", "[expiry][reaper]")
@@ -875,7 +902,7 @@ TEST_CASE("The scan budget is adapted from measured sweep cost, not trusted", "[
     {
         ExpiryReaperOptions off;
         off.scanBudget = 512;
-        off.sweepStallCeiling = Duration::zero();
+        off.sweepStallCeiling = core::platform::SteadyDuration::zero();
         ExpiryReaper fixed { lru, logger, off, nullptr };
         fixed.AdaptScanBudget(std::chrono::seconds { 30 });
         CHECK(fixed.CurrentScanBudget() == 512);
@@ -906,7 +933,7 @@ TEST_CASE("The sweep body runs on the executor it was given and not on the react
     f.observer.entered.store(false, std::memory_order_release);
     f.observer.sweptOn.store(std::thread::id {}, std::memory_order_release);
 
-    ThreadPoolExecutor pool { 1 };
+    core::async::ThreadPoolExecutor pool { 1 };
     auto const reactorThread = std::this_thread::get_id();
     // Owned through `ReaperOnceBack`: the sweep may still be on the pool when the case stops it,
     // and a stop measured on the host's clock would race it (#1433).
@@ -931,7 +958,7 @@ TEST_CASE("Passing the reactor as the sweep executor keeps the sweep on the loop
 {
     // The control, and it is what makes the case above mean something: with the
     // reactor passed as its own executor the sweep runs on the loop, exactly as it
-    // did before #946. `IReactor` IS an `IExecutor`, so this is the same statements
+    // did before #946. `core::net::EventLoop` IS an `core::async::IExecutor`, so this is the same statements
     // rather than a second code path -- and without this, "the sweep is elsewhere"
     // could be true because the hop always leaves, which would be a different defect.
     Fixture f;
@@ -972,8 +999,8 @@ TEST_CASE("Stopping the expiry cycle waits until the hop back has reached the re
     // the tick after it is where the defect shows as ASan's heap-use-after-free -- the inner
     // reactor resumes a handle whose frame the destructor already freed.
     Fixture f;
-    ThreadPoolExecutor pool { 1 };
-    ParkingReactor reactor { f.reactor };
+    core::async::ThreadPoolExecutor pool { 1 };
+    ParkingReactor reactor { f };
     ReaperOnceBack reaper { f.storage, f.logger };
     reactor.ParkNextSubmit(ParkingReactor::Park::BeforeForwarding);
     reaper->Start(reactor, pool);
@@ -991,8 +1018,8 @@ TEST_CASE("Stopping the expiry cycle waits until the hop back has reached the re
     // The wait ended because the frame came back, never at the ceiling: see `FastCycleHeldDrain`.
     CHECK(reaper.Abandonments() == 0);
     // Taken back off the reactor rather than left for it: nothing may resume it now.
-    CHECK(f.reactor.PendingSubmissions() == 0);
-    CHECK(f.reactor.Tick() == 0);
+    CHECK(f.Pending() == 0);
+    CHECK(f.Tick() == 0);
 }
 
 TEST_CASE("Stopping the expiry cycle waits for a frame handed to its executor and not yet resumed",
@@ -1004,7 +1031,7 @@ TEST_CASE("Stopping the expiry cycle waits for a frame handed to its executor an
     // sweeping", `CancelPending` could not find the frame, and `~Task` freed it. Held here
     // instead of raced, and the release is what the pool then resumes.
     Fixture f;
-    ThreadPoolExecutor pool { 1 };
+    core::async::ThreadPoolExecutor pool { 1 };
     HoldingExecutor executor { pool };
     ReaperOnceBack reaper { f.storage, f.logger };
     executor.HoldNextSubmit();
@@ -1021,8 +1048,8 @@ TEST_CASE("Stopping the expiry cycle waits for a frame handed to its executor an
     CHECK_FALSE(stop.returnedBeforeRelease);
     CHECK(stop.finished);
     CHECK(reaper.Abandonments() == 0);
-    CHECK(f.reactor.PendingSubmissions() == 0);
-    CHECK(f.reactor.Tick() == 0);
+    CHECK(f.Pending() == 0);
+    CHECK(f.Tick() == 0);
 }
 
 TEST_CASE("A late return from one hop back does not end the wait for the next trip off the reactor",
@@ -1042,8 +1069,8 @@ TEST_CASE("A late return from one hop back does not end the wait for the next tr
     // to park after forwarding lets those ticks run the frame into its second hop out before
     // a hold armed afterwards could catch it.
     Fixture f;
-    ThreadPoolExecutor pool { 1 };
-    ParkingReactor reactor { f.reactor };
+    core::async::ThreadPoolExecutor pool { 1 };
+    ParkingReactor reactor { f };
     HoldingExecutor executor { pool };
     ReaperOnceBack reaper { f.storage, f.logger };
     reactor.ParkNextSubmit(ParkingReactor::Park::AfterForwarding);
@@ -1076,8 +1103,8 @@ TEST_CASE("A late return from one hop back does not end the wait for the next tr
     CHECK_FALSE(stop.returnedBeforeRelease);
     CHECK(stop.finished);
     CHECK(reaper.Abandonments() == 0);
-    CHECK(f.reactor.PendingSubmissions() == 0);
-    CHECK(f.reactor.Tick() == 0);
+    CHECK(f.Pending() == 0);
+    CHECK(f.Tick() == 0);
 }
 
 TEST_CASE("Stopping a cycle whose executor is its own reactor does not wait for the frame", "[expiry][reaper][offreactor]")
@@ -1094,12 +1121,12 @@ TEST_CASE("Stopping a cycle whose executor is its own reactor does not wait for 
     Fixture f;
     CapturingLogger logger;
     RecordingAbandonment abandonment;
-    ParkingReactor reactor { f.reactor };
+    ParkingReactor reactor { f };
     auto reaper = std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment);
     reaper->Start(reactor, reactor);
 
-    // One tick at a time until the hop out has been handed to the reactor. `Tick` swaps the
-    // ready batch before resuming, so that submission waits for a NEXT tick that never runs.
+    // One tick at a time until the hop out has been handed to the reactor. A `ParkingReactor`
+    // turn resumes one coroutine, so that submission waits for a NEXT tick that never runs.
     REQUIRE(TickUntil(
         f,
         "the hop out to be handed to the reactor",
@@ -1107,12 +1134,12 @@ TEST_CASE("Stopping a cycle whose executor is its own reactor does not wait for 
         // `Cycles()` is not atomic: readable here only because the sweep runs on this thread.
         [&] { return std::format("{}; cycles {}", Describe(reactor), reaper->Cycles()); }));
     REQUIRE(reactor.ParkedWorkSubmits() == 1);
-    REQUIRE(f.reactor.PendingSubmissions() == 1);
+    REQUIRE(f.Pending() == 1);
 
     reaper.reset();
 
     CHECK(abandonment.calls.load(std::memory_order_acquire) == 0);
-    CHECK(f.reactor.PendingSubmissions() == 0);
+    CHECK(f.Pending() == 0);
     CHECK_FALSE(std::ranges::any_of(logger.Snapshot(), [](auto const& record) {
         return record.level == LogLevel::Warn || record.level == LogLevel::Error;
     }));
@@ -1132,7 +1159,7 @@ TEST_CASE("A sweep frame that never comes back is abandoned by ending the proces
     Fixture f;
     CapturingLogger logger;
     RecordingAbandonment abandonment;
-    ThreadPoolExecutor pool { 1 };
+    core::async::ThreadPoolExecutor pool { 1 };
     HoldingExecutor executor { pool };
     auto reaper = std::make_unique<ExpiryReaper>(f.storage, logger, FastCycleShortDrain, nullptr, abandonment);
     executor.HoldNextSubmit();
@@ -1165,7 +1192,7 @@ TEST_CASE("A sweep that could not be handed to its executor is skipped without s
     // one failed allocation would mean nothing expires again.
     Fixture f;
     CapturingLogger logger;
-    ThreadPoolExecutor pool { 1 };
+    core::async::ThreadPoolExecutor pool { 1 };
     HoldingExecutor executor { pool };
     ReaperOnceBack reaper { f.storage, logger };
     executor.RefuseNextSubmit();
@@ -1193,8 +1220,8 @@ TEST_CASE("A hop back that could not be handed to the reactor still brings the s
     // again, and the cycle carries on from the reactor.
     Fixture f;
     CapturingLogger logger;
-    ThreadPoolExecutor pool { 1 };
-    ParkingReactor reactor { f.reactor };
+    core::async::ThreadPoolExecutor pool { 1 };
+    ParkingReactor reactor { f };
     ReaperOnceBack reaper { f.storage, logger };
     reactor.RefuseNextSubmit();
     reaper->Start(reactor, pool);

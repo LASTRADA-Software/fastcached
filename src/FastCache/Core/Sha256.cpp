@@ -2,9 +2,10 @@
 #include <FastCache/Core/CpuFeatures.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/EnumTable.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Core/Sha256.hpp>
+
+#include <core/Ranges.hpp>
 
 #if defined(_M_X64) || defined(__x86_64__)
     #include <immintrin.h>
@@ -343,7 +344,7 @@ bool Sha256EngineRunsOn(Sha256Engine engine, CpuFeatures const& features) noexce
 Sha256Engine SelectSha256Engine(CpuFeatures const& features) noexcept
 {
     // Any hardware engine beats Scalar, and a build carries at most one.
-    auto const* const hardware = FindIfOrNull(std::span { EngineRows }.subspan(1), [&features](EngineRow const& row) {
+    auto const* const hardware = core::findIfOrNull(std::span { EngineRows }.subspan(1), [&features](EngineRow const& row) {
         return Sha256EngineRunsOn(row.engine, features);
     });
     return hardware != nullptr ? hardware->engine : Sha256Engine::Scalar;

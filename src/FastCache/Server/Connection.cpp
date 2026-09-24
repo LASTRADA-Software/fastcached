@@ -14,13 +14,13 @@
 namespace FastCache
 {
 
-Connection::Connection(std::unique_ptr<ISocket> socket, ConnectionHoldings held) noexcept:
+Connection::Connection(std::unique_ptr<core::net::ISocket> socket, ConnectionHoldings held) noexcept:
     _socket { std::move(socket) },
     _held { held }
 {
 }
 
-Task<void> Connection::Run()
+core::async::Task<void> Connection::Run()
 {
     // Decorate this connection's logger with the client source (its IP) when
     // --log-source is on. SourceLogger forwards unchanged for an empty source,
@@ -48,7 +48,7 @@ Task<void> Connection::Run()
     // slow or stalled handshake never blocks the accept loop.
     if (auto const handshake = co_await _socket->handshakeIfNeeded(); !handshake.has_value())
     {
-        log.Logf(LogLevel::Debug, "Connection: handshake failed: {}", handshake.error().ToString());
+        log.Logf(LogLevel::Debug, "Connection: handshake failed: {}", handshake.error().toString());
         _socket->close();
         co_return;
     }
@@ -56,7 +56,7 @@ Task<void> Connection::Run()
     auto detect = co_await DetectProtocol(_socket.get());
     if (!detect.has_value())
     {
-        log.Logf(LogLevel::Debug, "Connection: autodetect failed: {}", detect.error().ToString());
+        log.Logf(LogLevel::Debug, "Connection: autodetect failed: {}", detect.error().toString());
         _socket->close();
         co_return;
     }

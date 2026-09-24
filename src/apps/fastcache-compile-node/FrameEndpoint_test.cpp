@@ -9,7 +9,6 @@
 
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Nonce.hpp>
@@ -18,10 +17,9 @@
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/NodeProof.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/BlockingConnector.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/SealedFrameSocket.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -49,8 +47,13 @@
 #include <vector>
 
 #include <CacheProtocol.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/net/BlockingConnector.hpp>
+#include <core/net/BlockingSocket.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/AbortiveClient.hpp>
 #include <tests/BoundedWait.hpp>
+#include <tests/HalfClose.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -84,10 +87,10 @@ struct Fleet
         service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     }
 
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
     Distributed::SchedulerProtocol protocol { service, metrics };
@@ -124,7 +127,7 @@ struct Fleet
 {
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
     return port;
 }
@@ -141,7 +144,9 @@ struct Fleet
 /// @param received Accumulator, appended to; must outlive the awaiting caller.
 /// @param count How many bytes must be present before this returns.
 /// @return False when the peer closed before that many arrived.
-[[nodiscard]] Task<bool> ReadAtLeast(ISocket* peer, std::vector<std::byte>* received, std::size_t count)
+[[nodiscard]] core::async::Task<bool> ReadAtLeast(core::net::ISocket* peer,
+                                                  std::vector<std::byte>* received,
+                                                  std::size_t count)
 {
     while (received->size() < count)
     {
@@ -164,7 +169,7 @@ struct Fleet
 /// there, which is also what lets a caller send a second request afterwards.
 /// @param peer Connected socket.
 /// @return Header plus payload, or empty when the peer closed without answering.
-[[nodiscard]] Task<std::vector<std::byte>> ReadOneReply(ISocket* peer)
+[[nodiscard]] core::async::Task<std::vector<std::byte>> ReadOneReply(core::net::ISocket* peer)
 {
     std::vector<std::byte> received;
 
@@ -193,7 +198,7 @@ struct Fleet
 /// @param peer Connected socket.
 /// @param limit Most bytes to accumulate before giving up.
 /// @return Everything received before EOF, or empty when the limit was reached first.
-[[nodiscard]] Task<std::vector<std::byte>> ReadUntilPeerCloses(ISocket* peer, std::size_t limit)
+[[nodiscard]] core::async::Task<std::vector<std::byte>> ReadUntilPeerCloses(core::net::ISocket* peer, std::size_t limit)
 {
     std::vector<std::byte> received;
     while (received.size() <= limit)
@@ -222,7 +227,7 @@ struct Fleet
 /// @param peer Connected socket.
 /// @param bytes What to send; may be a partial frame, which is the point.
 /// @return Whether the write was accepted.
-[[nodiscard]] Task<bool> SendRaw(ISocket* peer, std::vector<std::byte> bytes)
+[[nodiscard]] core::async::Task<bool> SendRaw(core::net::ISocket* peer, std::vector<std::byte> bytes)
 {
     auto const written = co_await peer->write(std::span<std::byte const> { bytes });
     co_return written.has_value() && *written == bytes.size();
@@ -246,19 +251,21 @@ struct Fleet
 ///         connection could not be made.
 [[nodiscard]] std::optional<std::vector<std::byte>> TryExchange(std::uint16_t port, std::span<std::byte const> frame)
 {
-    BlockingConnector connector;
-    auto socket = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    core::net::BlockingConnector connector;
+    auto socket =
+        core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
     if (!socket.has_value())
         return std::nullopt;
 
-    // One coroutine for the whole exchange: `SyncRun` drives a `Task`, so the awaits
+    // One coroutine for the whole exchange: `core::async::syncRun` drives a `core::async::Task`, so the awaits
     // have to live inside one rather than be called individually.
-    auto reply = SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
-        auto const written = co_await peer->write(std::span<std::byte const> { request });
-        if (!written.has_value())
-            co_return std::vector<std::byte> {};
-        co_return co_await ReadOneReply(peer);
-    }((*socket).get(), std::vector<std::byte> { frame.begin(), frame.end() }));
+    auto reply = core::async::syncRun(
+        [](core::net::ISocket* peer, std::vector<std::byte> request) -> core::async::Task<std::vector<std::byte>> {
+            auto const written = co_await peer->write(std::span<std::byte const> { request });
+            if (!written.has_value())
+                co_return std::vector<std::byte> {};
+            co_return co_await ReadOneReply(peer);
+        }((*socket).get(), std::vector<std::byte> { frame.begin(), frame.end() }));
 
     (*socket)->close();
     return reply;
@@ -370,7 +377,8 @@ class Conversation
   public:
     explicit Conversation(std::uint16_t port)
     {
-        auto socket = SyncRun(_connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+        auto socket =
+            core::async::syncRun(_connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
         REQUIRE(socket.has_value());
         _socket = std::move(*socket);
     }
@@ -380,12 +388,13 @@ class Conversation
     /// @return The reply, or empty when the peer closed without answering.
     [[nodiscard]] std::vector<std::byte> Send(std::span<std::byte const> frame)
     {
-        return SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
-            auto const written = co_await peer->write(std::span<std::byte const> { request });
-            if (!written.has_value())
-                co_return std::vector<std::byte> {};
-            co_return co_await ReadOneReply(peer);
-        }(_socket.get(), std::vector<std::byte> { frame.begin(), frame.end() }));
+        return core::async::syncRun(
+            [](core::net::ISocket* peer, std::vector<std::byte> request) -> core::async::Task<std::vector<std::byte>> {
+                auto const written = co_await peer->write(std::span<std::byte const> { request });
+                if (!written.has_value())
+                    co_return std::vector<std::byte> {};
+                co_return co_await ReadOneReply(peer);
+            }(_socket.get(), std::vector<std::byte> { frame.begin(), frame.end() }));
     }
 
     /// Send one frame and do NOT wait for its reply.
@@ -396,14 +405,14 @@ class Conversation
     /// @return True when the whole frame went out.
     [[nodiscard]] bool SendOnly(std::span<std::byte const> frame)
     {
-        return SyncRun(SendRaw(_socket.get(), std::vector<std::byte> { frame.begin(), frame.end() }));
+        return core::async::syncRun(SendRaw(_socket.get(), std::vector<std::byte> { frame.begin(), frame.end() }));
     }
 
     /// Read one reply that a previous `SendOnly` is owed.
     /// @return The reply, or empty when the peer closed without answering.
     [[nodiscard]] std::vector<std::byte> ReadReply()
     {
-        return SyncRun(ReadOneReply(_socket.get()));
+        return core::async::syncRun(ReadOneReply(_socket.get()));
     }
 
     /// Read the @p count bytes a sealed reply carries after its payload: its tag (#178).
@@ -411,19 +420,20 @@ class Conversation
     /// @return Them, or empty when the peer closed first.
     [[nodiscard]] std::vector<std::byte> ReadTrailer(std::size_t count)
     {
-        return SyncRun([](ISocket* peer, std::size_t want) -> Task<std::vector<std::byte>> {
-            std::vector<std::byte> received;
-            if (!co_await ReadAtLeast(peer, &received, want))
-                co_return std::vector<std::byte> {};
-            co_return received;
-        }(_socket.get(), count));
+        return core::async::syncRun(
+            [](core::net::ISocket* peer, std::size_t want) -> core::async::Task<std::vector<std::byte>> {
+                std::vector<std::byte> received;
+                if (!co_await ReadAtLeast(peer, &received, want))
+                    co_return std::vector<std::byte> {};
+                co_return received;
+            }(_socket.get(), count));
     }
 
     /// Read whatever else the server sends, until it closes.
     /// @return Every remaining byte, or empty when the limit was hit first.
     [[nodiscard]] std::vector<std::byte> ReadRest()
     {
-        return SyncRun(ReadUntilPeerCloses(_socket.get(), ReadRestLimit));
+        return core::async::syncRun(ReadUntilPeerCloses(_socket.get(), ReadRestLimit));
     }
 
     /// Hang up now, rather than at the end of the case.
@@ -443,7 +453,7 @@ class Conversation
     /// @return Every byte the server sent before it closed.
     [[nodiscard]] std::vector<std::byte> HalfCloseAndDrain()
     {
-        _socket->shutdownWrite();
+        REQUIRE(FastCache::Testing::ShutdownWrite(*_socket).has_value());
         return ReadRest();
     }
 
@@ -459,8 +469,8 @@ class Conversation
     Conversation& operator=(Conversation&&) = delete;
 
   private:
-    BlockingConnector _connector;
-    std::unique_ptr<ISocket> _socket;
+    core::net::BlockingConnector _connector;
+    std::unique_ptr<core::net::ISocket> _socket;
 };
 
 /// A configuration serving @p surface at @p spec.
@@ -551,7 +561,7 @@ TEST_CASE("Destroying the frame endpoint stops it, with nothing to remember", "[
 
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
 
     auto started = FrameEndpoint::Start(
@@ -664,10 +674,10 @@ TEST_CASE("A stranger is refused the fleet", "[node][scheduler]")
 
     auto const frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
 
-    CHECK(ErrorOf(SyncRun(fleet.responder.Answer(frame, PeerIdentity { .host = "10.9.9.9" })).bytes)
+    CHECK(ErrorOf(core::async::syncRun(fleet.responder.Answer(frame, PeerIdentity { .host = "10.9.9.9" })).bytes)
           == Wire::ErrorCode::NotAMember);
     // And a listed peer gets past the gate to the fleet's own answer.
-    CHECK(ErrorOf(SyncRun(fleet.responder.Answer(frame, PeerIdentity { .host = "10.0.0.1" })).bytes)
+    CHECK(ErrorOf(core::async::syncRun(fleet.responder.Answer(frame, PeerIdentity { .host = "10.0.0.1" })).bytes)
           == Wire::ErrorCode::NoWorker);
 }
 
@@ -719,7 +729,7 @@ namespace
 class HoldableResponder final: public IFrameResponder
 {
   public:
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> /*frame*/, PeerIdentity /*peer*/) override
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> /*frame*/, PeerIdentity /*peer*/) override
     {
         // Read BEFORE anything else in this body, and before the first `co_await`:
         // this is the handoff instant, and a suspension here would let the very
@@ -970,7 +980,7 @@ class HoldableResponder final: public IFrameResponder
         _ownBudget.store(own, std::memory_order_release);
     }
 
-    void UseReactor(FastCache::IReactor& reactor) noexcept
+    void UseReactor(core::net::EventLoop& reactor) noexcept
     {
         _reactor = &reactor;
     }
@@ -1141,7 +1151,7 @@ class HoldableResponder final: public IFrameResponder
     }
 
   private:
-    FastCache::IReactor* _reactor { nullptr };
+    core::net::EventLoop* _reactor { nullptr };
     std::atomic<bool> _held { false };
     /// Milliseconds, because the case sets it and the reactor thread reads it.
     std::atomic<std::chrono::milliseconds::rep> _holdBoundMs { FastCache::Testing::WaitHangGuard.count() };
@@ -1293,8 +1303,9 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
     REQUIRE(endpoint.has_value());
     fleet.Serve();
 
-    BlockingConnector connector;
-    auto socket = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    core::net::BlockingConnector connector;
+    auto socket =
+        core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
     REQUIRE(socket.has_value());
     auto* const peer = (*socket).get();
 
@@ -1303,11 +1314,11 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
     constexpr std::uint32_t Declared = 32ULL * 1024ULL;
     std::array<std::byte, Wire::RequestHeaderSize> frame {};
     WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::Op::Fetch), Declared);
-    REQUIRE(SyncRun(SendRaw(peer, std::vector<std::byte> { frame.begin(), frame.end() })));
+    REQUIRE(core::async::syncRun(SendRaw(peer, std::vector<std::byte> { frame.begin(), frame.end() })));
 
     // The refusal arrives first. Asserted so the observation below cannot pass because
     // the connection was closed for some entirely different reason.
-    auto const refusal = SyncRun(ReadOneReply(peer));
+    auto const refusal = core::async::syncRun(ReadOneReply(peer));
     REQUIRE_FALSE(refusal.empty());
     REQUIRE(ErrorOf(refusal) == Wire::ErrorCode::NotAMember);
 
@@ -1315,12 +1326,12 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
     // so "still pending" IS "still open". Bounded, and released by hand afterwards on
     // BOTH paths -- an unbounded wait here would turn a regression into a suite that
     // hangs rather than one that fails.
-    // `ReadAtLeast` rather than a raw `Read`: `SyncRun` drives a `Task`, and the file's
+    // `ReadAtLeast` rather than a raw `Read`: `core::async::syncRun` drives a `core::async::Task`, and the file's
     // existing helper is already the free-function-with-pointers shape the coroutine
     // lint rules require. It returns false exactly when the peer closed first.
     auto lingering = std::async(std::launch::async, [peer] {
         std::vector<std::byte> received;
-        return !SyncRun(ReadAtLeast(peer, &received, 1));
+        return !core::async::syncRun(ReadAtLeast(peer, &received, 1));
     });
 
     // Two sweeps: past any deadline the responder asked for, and comfortably inside
@@ -1330,7 +1341,7 @@ TEST_CASE("A peer refused before admission never gets the served window", "[node
 
     // Released by stopping the SERVER, never by closing this socket from here.
     //
-    // Closing it would unblock the reader -- and `BlockingSocket::Close` writes members
+    // Closing it would unblock the reader -- and `core::net::BlockingSocket::Close` writes members
     // that `Read` is concurrently reading on the other thread, which is a data race on
     // the socket object itself. Not theoretical: ThreadSanitizer reported exactly this,
     // three times, against the first version of this case.
@@ -1809,10 +1820,11 @@ TEST_CASE("The capacity cap counts connections, not requests", "[node][frame]")
     // Read without writing first, which keeps this case about the CAP: a client that
     // sends its request before reading exercises whether the refusal survives the
     // close as well, and that is a separate defect with a case of its own below.
-    BlockingConnector connector;
-    auto second = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    core::net::BlockingConnector connector;
+    auto second =
+        core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
     REQUIRE(second.has_value());
-    auto const refusal = SyncRun(ReadOneReply((*second).get()));
+    auto const refusal = core::async::syncRun(ReadOneReply((*second).get()));
     (*second)->close();
     CHECK(ErrorOf(refusal) == Wire::ErrorCode::EndpointBusy);
 }
@@ -1898,22 +1910,23 @@ TEST_CASE("An oversize refusal past the drain bound survives the close that foll
                          static_cast<std::uint8_t>(Wire::Op::Register),
                          static_cast<std::uint32_t>(declared));
 
-    BlockingConnector connector;
-    auto socket = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    core::net::BlockingConnector connector;
+    auto socket =
+        core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
     REQUIRE(socket.has_value());
     // Bounded: a read the defect leaves waiting ends here rather than hanging the case.
     (*socket)->setReceiveDeadline(5s);
-    REQUIRE(SyncRun(SendRaw((*socket).get(), request)));
+    REQUIRE(core::async::syncRun(SendRaw((*socket).get(), request)));
 
-    auto const refusal = SyncRun(ReadOneReply((*socket).get()));
+    auto const refusal = core::async::syncRun(ReadOneReply((*socket).get()));
     REQUIRE(ErrorOf(refusal) == Wire::ErrorCode::PayloadTooLarge);
 
     // And then the close was the half-close's FIN, not a reset.
-    auto const ending = SyncRun([](ISocket* peer) -> Task<IoResult> {
+    auto const ending = core::async::syncRun([](core::net::ISocket* peer) -> core::async::Task<core::net::IoResult> {
         std::array<std::byte, 64> after {};
         co_return co_await peer->read(std::span<std::byte> { after });
     }((*socket).get()));
-    INFO("after the refusal: " << (ending.has_value() ? std::format("{} bytes", *ending) : ending.error().ToString()));
+    INFO("after the refusal: " << (ending.has_value() ? std::format("{} bytes", *ending) : ending.error().toString()));
     REQUIRE(ending.has_value());
     REQUIRE(*ending == 0);
     (*socket)->close();
@@ -2185,17 +2198,18 @@ TEST_CASE("A peer swept before naming a verb and one swept owing an answer are c
     auto const requestsBefore = fleet.metrics.Read(IMetricsSink::Counter::FrameRequestDeadlineSweeps);
     auto const answersBefore = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
 
-    BlockingConnector connector;
+    core::net::BlockingConnector connector;
 
     // ARM ONE: connects and says nothing. It never names a verb, so it is swept on the
     // header window and belongs to the endpoint's own row.
-    auto silent = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto silent =
+        core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
     REQUIRE(silent.has_value());
 
     // ARM TWO: names a verb the responder then never answers. Swept owing an answer.
-    auto owed = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto owed = core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
     REQUIRE(owed.has_value());
-    REQUIRE(SyncRun(SendRaw((*owed).get(), Wire::EncodeFetch("k"))));
+    REQUIRE(core::async::syncRun(SendRaw((*owed).get(), Wire::EncodeFetch("k"))));
 
     // ONE wait for both, bounded and reporting what it waited for. The bound is
     // generous against `HeaderTimeout` plus a sweep interval, because what this case
@@ -2313,26 +2327,28 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
     auto const sweepsBefore = fleet.metrics.Read(IMetricsSink::Counter::FrameAnswerDeadlineSweeps);
     auto const toldBefore = fleet.metrics.Read(IMetricsSink::Counter::FrameDeadlineRefusalsSent);
 
-    BlockingConnector connector;
+    core::net::BlockingConnector connector;
 
     // ARM ONE: a whole FETCH, so the connection reaches `Answer` and parks there. The
     // responder is held, so the sweep finds this connection inside the surface with
     // its write side idle.
-    auto inSurface = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto inSurface =
+        core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
     REQUIRE(inSurface.has_value());
-    REQUIRE(SyncRun(SendRaw((*inSurface).get(), Wire::EncodeFetch("k"))));
+    REQUIRE(core::async::syncRun(SendRaw((*inSurface).get(), Wire::EncodeFetch("k"))));
 
     // ARM TWO: a header and NOT the body it declares. The connection decodes the
     // header, passes every gate, arms the same `AwaitingAnswer` window and then parks
     // in the payload read -- on the socket, where nothing but the close can reach it.
     auto const truncated = Wire::EncodeFetch("dribbled");
     REQUIRE(truncated.size() > Wire::RequestHeaderSize);
-    auto onSocket = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    auto onSocket =
+        core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
     REQUIRE(onSocket.has_value());
-    REQUIRE(
-        SyncRun(SendRaw((*onSocket).get(),
-                        std::vector<std::byte> {
-                            truncated.begin(), truncated.begin() + static_cast<std::ptrdiff_t>(Wire::RequestHeaderSize) })));
+    REQUIRE(core::async::syncRun(
+        SendRaw((*onSocket).get(),
+                std::vector<std::byte> { truncated.begin(),
+                                         truncated.begin() + static_cast<std::ptrdiff_t>(Wire::RequestHeaderSize) })));
 
     // Arm one must actually be INSIDE the responder before the sweep, or it is arm two
     // in disguise. Bounded, and it says which stage it was waiting for.
@@ -2364,7 +2380,7 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
     // ARM ONE's whole byte stream, to EOF. `ReadOneReply` would not do: it stops at
     // the first frame, so it cannot see a second one spliced in behind -- and "the
     // reply parsed" is precisely the assertion an interleaved write passes.
-    auto const received = SyncRun(ReadUntilPeerCloses((*inSurface).get(), 64ULL * 1024ULL));
+    auto const received = core::async::syncRun(ReadUntilPeerCloses((*inSurface).get(), 64ULL * 1024ULL));
     REQUIRE_FALSE(received.empty());
 
     auto const header = Wire::DecodeReplyHeader(received);
@@ -2391,7 +2407,7 @@ TEST_CASE("A peer swept inside the surface is told why, and one swept on the soc
     // close, and the close is the write side gone -- so "explainable" means "parked
     // inside the surface", not "has named a verb". Asserted so that a later change
     // cannot quietly start writing here from somewhere that does not own the socket.
-    auto const silence = SyncRun(ReadUntilPeerCloses((*onSocket).get(), 64ULL * 1024ULL));
+    auto const silence = core::async::syncRun(ReadUntilPeerCloses((*onSocket).get(), 64ULL * 1024ULL));
     CHECK(silence.empty());
 
     // One sweep was explained and one was not, so the two rows differ by exactly one.
@@ -3172,7 +3188,7 @@ struct TeardownWitness
     /// dropped is the whole point: a listener freed there is freed too early.
     std::atomic<bool> destroyed { false };
 
-    /// `IReactor::TeardownIsSerialisedWithDispatch()`, as of the destructor.
+    /// `core::net::EventLoop::TeardownIsSerialisedWithDispatch()`, as of the destructor.
     std::atomic<bool> ruleHeld { false };
 
     /// The two facts the rule is derived from, recorded separately so a failure says
@@ -3190,12 +3206,12 @@ struct TeardownWitness
 ///
 /// Local to this file rather than in `src/tests/`, because it stands for exactly one
 /// property and one case; a second user is what would make it a shared fake.
-class WitnessListener final: public IListener
+class WitnessListener final: public core::net::IListener
 {
   public:
     /// @param reactor The reactor this listener belongs to; asked, never driven.
     /// @param witness Where the destructor reports. Must outlive the reactor's loop.
-    WitnessListener(IReactor& reactor, std::shared_ptr<TeardownWitness> witness) noexcept:
+    WitnessListener(core::net::EventLoop& reactor, std::shared_ptr<TeardownWitness> witness) noexcept:
         _reactor { reactor },
         _witness { std::move(witness) }
     {
@@ -3223,21 +3239,22 @@ class WitnessListener final: public IListener
     ///
     /// This case is about teardown; an accept that parked would add a wait to it and
     /// change nothing, since `Shutdown()` waits for the sweeper either way.
-    AcceptAwaitable Accept() override
+    [[nodiscard]] core::async::Task<core::net::AcceptResult> accept() override
     {
-        return AcceptAwaitable { AcceptResult { std::unexpect,
-                                                NetError { .code = NetErrorCode::Eof, .systemCode = 0, .context = {} } } };
+        co_return core::net::AcceptResult {
+            std::unexpect, core::net::NetError { .code = core::net::NetErrorCode::Eof, .systemCode = 0, .context = {} }
+        };
     }
 
-    void Close() noexcept override {}
+    void close() noexcept override {}
 
-    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    [[nodiscard]] std::uint16_t boundPort() const noexcept override
     {
         return 0;
     }
 
   private:
-    IReactor& _reactor;
+    core::net::EventLoop& _reactor;
     std::shared_ptr<TeardownWitness> _witness;
 };
 
@@ -3531,7 +3548,7 @@ TEST_CASE("Every write on a framed endpoint names a sanctioned writer", "[node][
     auto const calls = CountOf(code, "WriteAll(EndpointWriter::");
     CHECK(calls >= EndpointWriterTable.size());
 
-    // ONE write primitive. `ISocket::write` is reached from exactly one place -- the
+    // ONE write primitive. `core::net::ISocket::write` is reached from exactly one place -- the
     // definition of `WriteAll` itself -- so a second spelling of "put bytes on this
     // socket" cannot be added without this failing.
     CHECK(CountOf(code, "->write(") == 1);
@@ -4065,8 +4082,9 @@ class FixedServerTrust final: public IServerTrust
 /// @return The layer.
 [[nodiscard]] std::unique_ptr<SealedFrameSocket> DialSealed(std::uint16_t port)
 {
-    BlockingConnector connector;
-    auto socket = SyncRun(connector.connect("127.0.0.1", port, DialOptions { .connectTimeout = 5s }));
+    core::net::BlockingConnector connector;
+    auto socket =
+        core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
     REQUIRE(socket.has_value());
     return std::make_unique<SealedFrameSocket>(*std::move(socket), SealedFrameEnd::Caller, Wire::MaxSealedReplyPayload);
 }
@@ -4303,7 +4321,7 @@ TEST_CASE("A worker proves itself through the client a node runs, and then speak
     REQUIRE(attempt.result == NodeProofResult::Proved);
     CHECK(sealed->Sealed());
 
-    auto const registered = SyncRun(Cc::ExchangeFramed(sealed.get(), &notice, RegisterFrame()));
+    auto const registered = core::async::syncRun(Cc::ExchangeFramed(sealed.get(), &notice, RegisterFrame()));
     CHECK(registered.IsHit());
     CHECK(rig.fleet.service.Workers().LiveWorkers().size() == 1);
 }

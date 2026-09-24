@@ -276,12 +276,12 @@ TEST_CASE("A node recovers its term and vote across a restart", "[consensus][raf
 
     ScriptedRandomSource random { { 0 } };
     {
-        auto node = std::move(RaftNode::Create(config, random, TimePoint {})).value();
+        auto node = std::move(RaftNode::Create(config, random, core::platform::SteadyTimePoint {})).value();
         auto const output = node.Receive(RequestVoteRequest { .term = Term { .value = 5 },
                                                               .candidateId = "n2",
                                                               .lastLogIndex = LogIndex::BeforeFirst(),
                                                               .lastLogTerm = Term::None() },
-                                         TimePoint {});
+                                         core::platform::SteadyTimePoint {});
         REQUIRE(output.persist.has_value());
         REQUIRE(store.SaveState(output.persist.value_or(PersistentState {})).has_value());
     }
@@ -289,7 +289,7 @@ TEST_CASE("A node recovers its term and vote across a restart", "[consensus][raf
     // The process restarts: a new node, the same store.
     auto const recovered = store.Load();
     REQUIRE(recovered.has_value());
-    auto restarted = std::move(RaftNode::Create(config, random, TimePoint {}, *recovered)).value();
+    auto restarted = std::move(RaftNode::Create(config, random, core::platform::SteadyTimePoint {}, *recovered)).value();
 
     CHECK(restarted.CurrentTerm() == Term { .value = 5 });
     CHECK(restarted.VotedFor() == std::optional<NodeId> { "n2" });
@@ -303,7 +303,7 @@ TEST_CASE("A node recovers its term and vote across a restart", "[consensus][raf
                                                                .candidateId = "n3",
                                                                .lastLogIndex = LogIndex::BeforeFirst(),
                                                                .lastLogTerm = Term::None() },
-                                          TimePoint {});
+                                          core::platform::SteadyTimePoint {});
 
     auto denied = false;
     for (auto const& outbound: output.messages)
@@ -331,7 +331,7 @@ TEST_CASE("A node recovers its log across a restart", "[consensus][raft][storage
                                                         .electionTimeoutMax = 300ms,
                                                         .heartbeatInterval = 50ms },
                                            random,
-                                           TimePoint {},
+                                           core::platform::SteadyTimePoint {},
                                            *recovered))
                     .value();
 
@@ -466,7 +466,7 @@ TEST_CASE("A leader's own writes round-trip through the store", "[consensus][raf
                                      .electionTimeoutMax = 300ms,
                                      .heartbeatInterval = 50ms };
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(config, random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(config, random, core::platform::SteadyTimePoint {})).value();
 
     auto const feed = [&store](RaftOutput const& output) {
         if (output.persistLog.has_value())
@@ -475,21 +475,21 @@ TEST_CASE("A leader's own writes round-trip through the store", "[consensus][raf
             REQUIRE(store.SaveState(output.persist.value_or(PersistentState {})).has_value());
     };
 
-    feed(node.Tick(TimePoint {} + 150ms));
+    feed(node.Tick(core::platform::SteadyTimePoint {} + 150ms));
     // The timeout starts a pre-vote round; the real election, and the durable
     // write it produces, follow the grant that carries it.
     feed(node.Receive(PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
-                      TimePoint {} + 150ms));
+                      core::platform::SteadyTimePoint {} + 150ms));
     feed(
         node.Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
-                     TimePoint {} + 150ms));
+                     core::platform::SteadyTimePoint {} + 150ms));
     REQUIRE(node.CurrentRole() == Role::Leader);
 
-    auto first = node.Propose(FastCache::BytesFromString("one"), TimePoint {} + 200ms);
+    auto first = node.Propose(FastCache::BytesFromString("one"), core::platform::SteadyTimePoint {} + 200ms);
     REQUIRE(first.has_value());
     feed(first->output);
 
-    auto second = node.Propose(FastCache::BytesFromString("two"), TimePoint {} + 201ms);
+    auto second = node.Propose(FastCache::BytesFromString("two"), core::platform::SteadyTimePoint {} + 201ms);
     REQUIRE(second.has_value());
     feed(second->output);
 

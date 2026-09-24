@@ -14,7 +14,7 @@ namespace FastCache
 /// It lives in `Platform/` and not in `Net/`, where it used to sit, because what
 /// it integrates with is a service supervisor rather than a network: it reads the
 /// process environment, checks a pid, and applies close-on-exec. It used to hand
-/// back `IListener`s, which did not make it a network primitive either -- and since
+/// back `core::net::IListener`s, which did not make it a network primitive either -- and since
 /// #290 stage 3 it hands back descriptors, so it now reaches into `Net/` not at all.
 /// The move was already right when the dependency existed: `Platform/` depending on
 /// `Net/` is the direction that was always intended, while the reverse put `Net/`'s
@@ -92,7 +92,7 @@ inline constexpr int ActivationFirstDescriptor = 3;
 /// used to build a `BlockingListener` per descriptor, which was right while the
 /// only thing an activated worker served was its dedicated compile port and that
 /// port ran on a thread of its own. The merged `0xFC` surface runs on the reactor,
-/// so the descriptor has to reach `PlatformListener::Adopt` instead -- and a
+/// so the descriptor has to reach `AdoptInheritedListener` instead -- and a
 /// listener built here would already OWN that descriptor, which makes handing it
 /// on a double close rather than a handover.
 ///
@@ -105,7 +105,7 @@ inline constexpr int ActivationFirstDescriptor = 3;
 /// listener to build here and no value to require.
 ///
 /// **Ownership stays with the caller until it hands a descriptor to a factory
-/// that takes it** -- `PlatformListener::Adopt`, which owns it thereafter
+/// that takes it** -- `AdoptInheritedListener`, which owns it thereafter
 /// including on its own failure paths, so a refused adoption is not a leak. A
 /// caller that adopts none of them must exit, which is what the only caller does:
 /// every path here that declines a handoff is a startup refusal.

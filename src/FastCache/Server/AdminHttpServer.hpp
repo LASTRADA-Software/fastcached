@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
-#include <FastCache/Net/IListener.hpp>
-#include <FastCache/Net/ISocket.hpp>
-#include <FastCache/Net/LingeringClose.hpp>
+#include <FastCache/Transport/LingeringClose.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -21,10 +17,18 @@
 #include <string_view>
 #include <vector>
 
+#include <core/async/Task.hpp>
+#include <core/net/IListener.hpp>
+#include <core/net/ISocket.hpp>
+#include <core/platform/Clock.hpp>
+
+namespace core::net
+{
+class ITlsContext;
+} // namespace core::net
+
 namespace FastCache
 {
-
-class TlsContext;
 
 /// One request header this server reads.
 ///
@@ -280,18 +284,18 @@ class AdminHttpServer
     /// @param tls Server TLS context, or nullptr to serve plaintext.
     /// @param surfaces The metrics surfaces this process serves, for `/metrics`. Defaults to
     ///                 `EverySurface`, so a process that has not been narrowed is unchanged.
-    AdminHttpServer(IListener& listener,
+    AdminHttpServer(core::net::IListener& listener,
                     IMetricsSink const& metrics,
                     SnapshotProvider snapshotProvider,
                     ILogger& logger,
-                    IClock& clock,
+                    core::platform::IClock& clock,
                     std::vector<AdminRoute> routes = {},
-                    TlsContext* tls = nullptr,
+                    core::net::ITlsContext* tls = nullptr,
                     std::span<MetricsSurface const> surfaces = EverySurface) noexcept;
 
     /// Accept loop; returns when the listener is closed via Shutdown().
     /// @return Task that resolves when the accept loop exits.
-    [[nodiscard]] Task<void> Run();
+    [[nodiscard]] core::async::Task<void> Run();
 
     /// Ask the accept loop to stop, without touching the listener.
     ///
@@ -324,14 +328,14 @@ class AdminHttpServer
     static constexpr std::size_t MaxConcurrentRequests = 32;
 
   private:
-    IListener& _listener;
+    core::net::IListener& _listener;
     IMetricsSink const& _metrics;
     SnapshotProvider _snapshotProvider;
     ILogger& _logger;
-    IClock& _clock;
+    core::platform::IClock& _clock;
     std::vector<AdminRoute> _routes;
     /// Server TLS context, or null for plaintext. Not owned.
-    TlsContext* _tls { nullptr };
+    core::net::ITlsContext* _tls { nullptr };
     /// Which metrics surfaces this process serves, for `/metrics`. A span over storage that
     /// outlives this server -- `EverySurface` and a binary's own set are both constexpr.
     std::span<MetricsSurface const> _surfaces { EverySurface };
@@ -362,11 +366,11 @@ class AdminHttpServer
 /// @param surfaces The metrics surfaces this process serves, for `/metrics`. Defaults to
 ///                 `EverySurface`, so the daemon is unchanged; a binary serving only some of
 ///                 them renders those rows absent rather than as a plausible zero (#1484).
-[[nodiscard]] Task<void> ServeAdminHttp(ISocket* socket,
-                                        IMetricsSink const* metrics,
-                                        AdminHttpServer::SnapshotProvider snapshotProvider,
-                                        IClock* clock,
-                                        std::span<AdminRoute const> routes = {},
-                                        std::span<MetricsSurface const> surfaces = EverySurface);
+[[nodiscard]] core::async::Task<void> ServeAdminHttp(core::net::ISocket* socket,
+                                                     IMetricsSink const* metrics,
+                                                     AdminHttpServer::SnapshotProvider snapshotProvider,
+                                                     core::platform::IClock* clock,
+                                                     std::span<AdminRoute const> routes = {},
+                                                     std::span<MetricsSurface const> surfaces = EverySurface);
 
 } // namespace FastCache

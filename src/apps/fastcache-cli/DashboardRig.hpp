@@ -4,9 +4,6 @@
 #include "DashboardLoop.hpp"
 #include "ScriptedDashboardEvents.hpp"
 
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Core/Clock.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <optional>
@@ -15,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/Unwrap.hpp>
 
 namespace FastCache::Cli::Testing
@@ -58,12 +57,12 @@ class CollectingSink final: public IFrameSink
 /// @param limits What bounds the run.
 /// @param out Where to put the result.
 /// @return The task to submit.
-[[nodiscard]] inline Task<void> DriveOnce(IDashboardEventSource* events,
-                                          SampleReader reader,
-                                          IDashboardView* view,
-                                          IFrameSink* sink,
-                                          DashboardLimits limits,
-                                          std::optional<DashboardExit>* out)
+[[nodiscard]] inline core::async::Task<void> DriveOnce(IDashboardEventSource* events,
+                                                       SampleReader reader,
+                                                       IDashboardView* view,
+                                                       IFrameSink* sink,
+                                                       DashboardLimits limits,
+                                                       std::optional<DashboardExit>* out)
 {
     *out = co_await RunDashboard(events, reader, view, sink, limits);
 }
@@ -81,15 +80,15 @@ class CollectingSink final: public IFrameSink
                                          CollectingSink& sink,
                                          SampleReader reader = &ReadStatsSample)
 {
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
     auto events = ScriptedDashboardEvents { reactor, std::move(script) };
 
     auto result = std::optional<DashboardExit> {};
     auto task = DriveOnce(&events, reader, &view, &sink, limits, &result);
 
     reactor.submit(task.handle());
-    reactor.Drain();
+    reactor.drain();
 
     REQUIRE(result.has_value());
     return FastCache::Testing::Unwrap(result);

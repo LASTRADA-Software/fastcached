@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Net/BlockingSocket.hpp> // Detail::EnsureNetworkInitialised
 #include <FastCache/Platform/LocalAddresses.hpp>
 
 #include <algorithm>
@@ -14,6 +13,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/WinsockInit.hpp>
 
 #if defined(_WIN32)
     #include <winsock2.h>
@@ -42,7 +43,7 @@ namespace
     /// Append one interface address, converted the way a PEER's address is converted.
     ///
     /// `inet_ntop` on the family's address bytes, with no `%scope` suffix, because
-    /// `FormatPeerAddress` produces the other side of every comparison this feeds and
+    /// `core::net::formatPeerAddress` produces the other side of every comparison this feeds and
     /// does exactly this. See the header for why a divergence here would be a set that
     /// looks populated and matches nothing.
     ///
@@ -110,7 +111,7 @@ std::vector<std::string> QueryLocalAddresses()
     //
     // A no-op away from Windows, which is why it is spelled once rather than behind
     // a second `#if` somebody has to keep in step.
-    Detail::EnsureNetworkInitialised();
+    core::platform::ensureWinsockInitialized();
 
     // A vector of pointer-sized words rather than of bytes, so the storage carries
     // the alignment `IP_ADAPTER_ADDRESSES` is read back at. A `std::byte` buffer is
@@ -157,7 +158,7 @@ std::vector<std::string> QueryLocalAddresses()
 std::vector<std::string> QueryLocalAddresses()
 {
     // A no-op here; see the Windows branch for why it is called at all.
-    Detail::EnsureNetworkInitialised();
+    core::platform::ensureWinsockInitialized();
 
     ifaddrs* head = nullptr;
     if (::getifaddrs(&head) != 0 || head == nullptr)
@@ -223,7 +224,7 @@ bool CachedLocalityOracle::IsThisMachine(std::string_view host) const
     // bound to `::` reports an IPv4 caller as `::ffff:10.0.0.1` while the probe
     // reports the interface as `10.0.0.1`, so a raw compare would refuse this
     // machine's own clients on exactly the dual-stack bind this rule was written
-    // for. It also refuses an unnameable peer -- `FormatPeerAddress` answers empty
+    // for. It also refuses an unnameable peer -- `core::net::formatPeerAddress` answers empty
     // for a family it does not know -- against an empty entry, which a raw compare
     // would have admitted.
     return std::ranges::any_of(_addresses, [host](std::string_view mine) { return SameHost(host, mine); });

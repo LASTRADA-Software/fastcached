@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -10,6 +9,7 @@
 #include <ranges>
 #include <string>
 
+#include <core/platform/Clock.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -23,7 +23,7 @@ namespace
 /// here, so a real clock would make every case both slow and flaky.
 struct Fixture
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     LeaseTable leases { clock, std::chrono::milliseconds { 1000 } };
 };
 

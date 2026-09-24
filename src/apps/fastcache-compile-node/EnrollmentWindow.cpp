@@ -243,7 +243,7 @@ Wire::EnrollmentPendingEntry* EnrollmentWindow::FindLocked(std::string_view node
     return found == _pending.end() ? nullptr : &*found;
 }
 
-std::uint64_t EnrollmentWindow::SecondsSince(TimePoint since) const noexcept
+std::uint64_t EnrollmentWindow::SecondsSince(core::platform::SteadyTimePoint since) const noexcept
 {
     auto const now = _clock.now();
     if (now <= since)

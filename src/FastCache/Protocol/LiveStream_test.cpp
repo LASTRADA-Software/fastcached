@@ -1,7 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/LiveStream.hpp>
@@ -19,6 +16,9 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/Task.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -151,7 +151,8 @@ class OpenGate final: public ILiveGate
 class SnapshotSink final: public IPushSink
 {
   public:
-    [[nodiscard]] Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds /*hold*/) override
+    [[nodiscard]] core::async::Task<PushOutcome> Push(std::vector<std::byte> frame,
+                                                      std::chrono::milliseconds /*hold*/) override
     {
         auto const push = Wire::DecodePush(Testing::PayloadOf(frame));
         if (push.has_value() && push->kind == Wire::PushKind::Snapshot)
@@ -175,7 +176,8 @@ class SnapshotSink final: public IPushSink
 };
 
 /// Serve one cache subscription, recording that it returned.
-DetachedTask ServeCache(LiveStream* live, SnapshotSink* sink, ILiveGate const* gate, IReactor* reactor, bool* returned)
+core::async::DetachedTask ServeCache(
+    LiveStream* live, SnapshotSink* sink, ILiveGate const* gate, core::net::EventLoop* reactor, bool* returned)
 {
     auto const frame = Wire::EncodeSubscribeRequest(
         Wire::SubscribeRequest { .subject = Wire::LiveSubject::Cache, .cadenceMillis = 500, .dashboardToken = {} });
@@ -198,13 +200,13 @@ struct TwoReactors
         first.stopping = true;
         second.stopping = true;
         clock.advance(2s);
-        firstReactor.Drain();
-        secondReactor.Drain();
+        firstReactor.drain();
+        secondReactor.drain();
     }
 
-    ManualClock clock;
-    TestReactor firstReactor { clock };
-    TestReactor secondReactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop firstReactor { clock };
+    core::net::testing::TestLoop secondReactor { clock };
     AtomicMetricsSink metrics;
     NumberedSources sources;
     OpenGate gate;
@@ -230,7 +232,7 @@ TEST_CASE("A subscriber whose first capture straddles a tick boundary sends that
         rig.clock.advance(500ms);
     };
     ServeCache(&rig.live, &rig.first, &rig.gate, &rig.firstReactor, &rig.firstReturned);
-    rig.firstReactor.Drain();
+    rig.firstReactor.drain();
 
     REQUIRE_FALSE(rig.first.snapshots.empty());
     CHECK(rig.first.snapshots.front().first == 0);
@@ -245,26 +247,26 @@ TEST_CASE("A capture another reactor is taking is not waited for: the subscriber
     TwoReactors rig;
     ServeCache(&rig.live, &rig.first, &rig.gate, &rig.firstReactor, &rig.firstReturned);
     ServeCache(&rig.live, &rig.second, &rig.gate, &rig.secondReactor, &rig.secondReturned);
-    rig.firstReactor.Drain();
-    rig.secondReactor.Drain();
+    rig.firstReactor.drain();
+    rig.secondReactor.drain();
     REQUIRE(rig.sources.captures == 1); // Tick 0, taken once and shared.
     REQUIRE(rig.second.snapshots.size() == 1);
 
     // The first reactor claims tick 1; while its capture is being taken, the second reactor's
     // subscriber comes due. It must neither wait for that capture nor take one of its own.
     rig.sources.duringNextCapture = [&rig] {
-        rig.secondReactor.Drain();
+        rig.secondReactor.drain();
         CHECK(rig.second.snapshots.size() == 1); // Deferred: nothing sent from the capture in progress.
     };
     rig.clock.advance(500ms);
-    rig.firstReactor.Drain();
+    rig.firstReactor.drain();
     CHECK(rig.sources.captures == 2);
     REQUIRE(rig.first.snapshots.size() == 2);
     CHECK(rig.first.snapshots.back().first == 1);
 
     // One stop-check later it reads what the first reactor published: tick 1's body, not tick 0's.
     rig.clock.advance(LiveStopCheck);
-    rig.secondReactor.Drain();
+    rig.secondReactor.drain();
     CHECK(rig.sources.captures == 2);
     REQUIRE(rig.second.snapshots.size() == 2);
     CHECK(rig.second.snapshots.back().first == 1);
@@ -283,33 +285,33 @@ TEST_CASE("A subscriber that finds the next capture claimed sends the newest one
     TwoReactors rig;
     ServeCache(&rig.live, &rig.first, &rig.gate, &rig.firstReactor, &rig.firstReturned);
     ServeCache(&rig.live, &rig.second, &rig.gate, &rig.secondReactor, &rig.secondReturned);
-    rig.firstReactor.Drain();
-    rig.secondReactor.Drain();
+    rig.firstReactor.drain();
+    rig.secondReactor.drain();
     REQUIRE(rig.second.snapshots.size() == 1);
 
     // Tick 1: the second reactor looks inside the first's capture and has read everything published.
     rig.sources.duringNextCapture = [&rig] {
-        rig.secondReactor.Drain();
+        rig.secondReactor.drain();
     };
     rig.clock.advance(500ms);
-    rig.firstReactor.Drain();
+    rig.firstReactor.drain();
     REQUIRE(rig.second.snapshots.size() == 1);
     REQUIRE(rig.first.snapshots.size() == 2);
 
     // Tick 2: claimed by the first reactor before the second looks again.
     auto sentInsideCapture = std::vector<std::uint64_t> {};
     rig.sources.duringNextCapture = [&rig, &sentInsideCapture] {
-        rig.secondReactor.Drain();
+        rig.secondReactor.drain();
         for (auto const& [tick, body]: rig.second.snapshots)
             sentInsideCapture.push_back(tick);
     };
     rig.clock.advance(500ms);
-    rig.firstReactor.Drain();
+    rig.firstReactor.drain();
     CHECK(sentInsideCapture == std::vector<std::uint64_t> { 0, 1 });
     CHECK(rig.sources.captures == 3);
 
     rig.clock.advance(LiveStopCheck);
-    rig.secondReactor.Drain();
+    rig.secondReactor.drain();
     REQUIRE(rig.second.snapshots.size() == 3);
     CHECK(rig.second.snapshots[1].second == rig.first.snapshots[1].second);
     CHECK(rig.second.snapshots.back().first == 2);

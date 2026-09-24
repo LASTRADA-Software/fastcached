@@ -30,11 +30,6 @@
 # The remaining CRC32C users are all daemon-side page and record checksums.
 
 set(_fc_cc_core
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Async/DeadlineTimer.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Async/EpollReactor.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Async/InterruptibleSleep.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Async/IocpReactor.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Async/KqueueReactor.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/Duration.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Cli/UsageDoc.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/CompileCache/PathCanon.cpp"
@@ -46,35 +41,22 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/SecureBytes.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Core/Sha256.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Metrics/IMetricsSink.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/SocketAddress.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingSocket.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/BlockingConnector.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/ConnectFlow.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/EpollConnector.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/EpollSocket.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/IocpConnector.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/IocpSocket.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/KqueueConnector.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/KqueueSocket.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/TcpClient.cpp"
-    "${CMAKE_SOURCE_DIR}/src/FastCache/Net/ThreadedAddressResolver.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/NarrowText.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Registry.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
 
-# The Net rows are the launcher's TCP client -- the blocking pair it dials with,
-# plus the reactor sockets and connectors that share its code -- and they are here
-# rather than in a copy of their own, because a copy is what went wrong: this tree had
-# three implementations of "dial, then send and receive whole messages", and the
-# one nobody compiled (compile-cache-testclient) was IPv4-literal-only, unbounded
-# and unprotected against SIGPIPE. See src/FastCache/Net/TcpClient.hpp.
+# The launcher's TCP client -- the blocking pair it dials with, and the event loop and
+# connector it dials through without blocking -- is core-cpp's `core::net` (#1596), linked
+# below, rather than a copy of its own, because a copy is what went wrong: this tree had three
+# implementations of "dial, then send and receive whole messages", and the one nobody compiled
+# (compile-cache-testclient) was IPv4-literal-only, unbounded and unprotected against SIGPIPE.
 #
-# They cost the launcher nothing it was avoiding. The rule this file exists to
-# protect is that fastcache-cc does not LINK FastCache -- so it stays free of
-# yaml-cpp, OpenSSL and the reactor, and can link the CRT statically -- and these
-# four reach only Net/NetError.hpp, Async/Task.hpp and Core/Profiling.hpp,
-# all header-only and all std-only. ws2_32 was already linked below.
+# It costs the launcher nothing it was avoiding. The rule this file exists to protect is that
+# fastcache-cc does not LINK FastCache -- so it stays free of yaml-cpp and OpenSSL -- and
+# `core::net` links only core-cpp's own base, platform and async libraries and the platform's
+# threads and sockets. core-cpp's TLS is a separate target, `core::net_tls`, which this does not
+# link.
 
 # Core/SecureBytes.cpp is here because the lease validator's collaborators hold key
 # material in it, and the validator is in WorkerProtocol.cpp -- this directory's file,
@@ -218,7 +200,7 @@ if(WIN32)
     target_link_libraries(fastcache-cc PRIVATE ws2_32)
 endif()
 
-# `Net/ThreadedAddressResolver.cpp` runs `getaddrinfo` on a pool of its own, because
+# `core::net::ThreadedAddressResolver` runs `getaddrinfo` on a pool of its own, because
 # it takes no timeout and a wedged resolver would otherwise stall every translation
 # unit in the build. That is the one thing this launcher genuinely needs a thread
 # for, and it needs the platform's thread support linked to get it.
@@ -231,19 +213,24 @@ endif()
 # that happens to work on the distributions CI uses and is not something to rely on.
 find_package(Threads REQUIRED)
 target_link_libraries(fastcache-cc PRIVATE Threads::Threads)
-# The reactor and its platform sockets are compiled in so the launcher can dial
-# without blocking -- see Net/IConnector.hpp. They cost no new library: the
-# reactor headers reach only Async/IReactor.hpp and Core/Clock.hpp, both
-# header-only and std-only, and the socket sources reach only NetError.hpp,
-# BlockingSocket.hpp and SocketAddress.hpp, which were already here. All six are
-# listed unconditionally and guard themselves with a file-scope #if, exactly as
-# src/FastCache/CMakeLists.txt lists them.
+# core-cpp's /MT twins where this launcher takes the static CRT -- Release under
+# FASTCACHED_STATIC_LAUNCHER, per the MSVC_RUNTIME_LIBRARY property below -- and the ordinary targets
+# everywhere else. A mix is refused at link time (`/failifmismatch: RuntimeLibrary`), and the
+# daemon, which links the DLL CRT, links the ordinary ones. `core::async` is header-only, so it has
+# no twin.
+if(MSVC AND FASTCACHED_STATIC_LAUNCHER)
+    target_link_libraries(fastcache-cc PRIVATE core::async "$<IF:$<CONFIG:Debug>,core::net,core::net_mt>")
+else()
+    target_link_libraries(fastcache-cc PRIVATE core::async core::net)
+endif()
+# The event loop and its platform sockets are core-cpp's `core::net` (#1596), linked above, so
+# the launcher can dial without blocking -- see `core::net::IConnector`.
 #
 # WIN32_LEAN_AND_MEAN / NOMINMAX / _WIN32_WINNT are NOT optional and NOT
 # inherited: they are PUBLIC on the FastCache target, and this binary
 # deliberately does not link FastCache. Without them the Windows build fails
-# outright, because Net/IocpSocket.hpp -> Async/IocpReactor.hpp -> <windows.h>
-# pulls in winsock.h BEFORE Net/IocpSocket.cpp includes <winsock2.h> -- the
+# outright on the first translation unit that reaches <windows.h> before
+# <winsock2.h>, which pulls in winsock.h first -- the
 # classic redefinition. Platform/Terminal.cpp already includes <windows.h> here
 # and survives only because nothing in that translation unit also wants winsock2.
 if(WIN32)
@@ -303,9 +290,6 @@ if(FASTCACHED_BUILD_TESTS)
         ObjectEquivalence_test.cpp
         CompileCorrelation_test.cpp
         ReactorExchange_test.cpp
-        # Test infrastructure, and on THIS target only: the shipped launcher must
-        # not carry a test double, and `_fc_cc_core` is what it is built from.
-        "${CMAKE_SOURCE_DIR}/src/FastCache/Async/TestReactor.cpp"
         Dispatch_test.cpp
         EndpointDial_test.cpp
         DependencyOutput_test.cpp
@@ -336,7 +320,7 @@ if(FASTCACHED_BUILD_TESTS)
         # ${_fc_cc_core} rows and links FastCache no more than the launcher does.
         target_compile_definitions(fastcache-cc-tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00)
     endif()
-    target_link_libraries(fastcache-cc-tests PRIVATE Catch2::Catch2 Threads::Threads fastcache-monocypher)
+    target_link_libraries(fastcache-cc-tests PRIVATE Catch2::Catch2 Threads::Threads fastcache-monocypher core::async core::net)
     if(FASTCACHED_ENABLE_COMPRESSION AND _fc_cc_zstd AND _fc_cc_lz4)
         target_link_libraries(fastcache-cc-tests PRIVATE ${_fc_cc_zstd} ${_fc_cc_lz4})
         target_compile_definitions(fastcache-cc-tests PRIVATE FC_COMPRESSION_ENABLED=1)

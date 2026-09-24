@@ -2,7 +2,6 @@
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/WriteErrorReportingStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Logger.hpp>
 
@@ -18,6 +17,8 @@
 #include <span>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace
 {
@@ -40,66 +41,69 @@ class StubStorage final: public FastCache::IStorage
     }
 
     std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view /*key*/,
-                                                                     FastCache::TimePoint /*now*/) override
+                                                                     core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::GetResult {};
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Set(std::string_view /*key*/,
                                                                     std::vector<std::byte> /*value*/,
                                                                     std::uint32_t /*flags*/,
-                                                                    FastCache::TimePoint /*expiry*/) override
+                                                                    core::platform::SteadyTimePoint /*expiry*/) override
     {
         return WriteResult();
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Add(std::string_view /*key*/,
                                                                     std::vector<std::byte> /*value*/,
                                                                     std::uint32_t /*flags*/,
-                                                                    FastCache::TimePoint /*expiry*/,
-                                                                    FastCache::TimePoint /*now*/) override
+                                                                    core::platform::SteadyTimePoint /*expiry*/,
+                                                                    core::platform::SteadyTimePoint /*now*/) override
     {
         return WriteResult();
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Replace(std::string_view /*key*/,
                                                                         std::vector<std::byte> /*value*/,
                                                                         std::uint32_t /*flags*/,
-                                                                        FastCache::TimePoint /*expiry*/,
-                                                                        FastCache::TimePoint /*now*/) override
+                                                                        core::platform::SteadyTimePoint /*expiry*/,
+                                                                        core::platform::SteadyTimePoint /*now*/) override
     {
         return WriteResult();
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view /*key*/,
                                                                        std::span<std::byte const> /*suffix*/,
                                                                        FastCache::CasToken /*expected*/,
-                                                                       FastCache::TimePoint /*now*/) override
+                                                                       core::platform::SteadyTimePoint /*now*/) override
     {
         return WriteResult();
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view /*key*/,
                                                                         std::span<std::byte const> /*prefix*/,
                                                                         FastCache::CasToken /*expected*/,
-                                                                        FastCache::TimePoint /*now*/) override
+                                                                        core::platform::SteadyTimePoint /*now*/) override
     {
         return WriteResult();
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> CompareAndSwap(std::string_view /*key*/,
-                                                                               FastCache::CasToken /*expected*/,
-                                                                               std::vector<std::byte> /*value*/,
-                                                                               std::uint32_t /*flags*/,
-                                                                               FastCache::TimePoint /*expiry*/,
-                                                                               FastCache::TimePoint /*now*/) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> CompareAndSwap(
+        std::string_view /*key*/,
+        FastCache::CasToken /*expected*/,
+        std::vector<std::byte> /*value*/,
+        std::uint32_t /*flags*/,
+        core::platform::SteadyTimePoint /*expiry*/,
+        core::platform::SteadyTimePoint /*now*/) override
     {
         return WriteResult();
     }
-    std::expected<IStorage::IncrResult, FastCache::StorageError> IncrementOrInitialize(std::string_view /*key*/,
-                                                                                       std::uint64_t /*magnitude*/,
-                                                                                       bool /*decrement*/,
-                                                                                       FastCache::TimePoint /*now*/) override
+    std::expected<IStorage::IncrResult, FastCache::StorageError> IncrementOrInitialize(
+        std::string_view /*key*/,
+        std::uint64_t /*magnitude*/,
+        bool /*decrement*/,
+        core::platform::SteadyTimePoint /*now*/) override
     {
         if (writeError.has_value())
             return std::unexpected(*writeError);
         return IStorage::IncrResult { .value = 0, .cas = FastCache::CasToken { 1 } };
     }
-    std::expected<void, FastCache::StorageError> Delete(std::string_view /*key*/, FastCache::TimePoint /*now*/) override
+    std::expected<void, FastCache::StorageError> Delete(std::string_view /*key*/,
+                                                        core::platform::SteadyTimePoint /*now*/) override
     {
         if (writeError.has_value())
             return std::unexpected(*writeError);
@@ -107,31 +111,32 @@ class StubStorage final: public FastCache::IStorage
     }
     std::expected<void, FastCache::StorageError> CompareAndDelete(std::string_view /*key*/,
                                                                   FastCache::CasToken /*expected*/,
-                                                                  FastCache::TimePoint /*now*/) override
+                                                                  core::platform::SteadyTimePoint /*now*/) override
     {
         if (writeError.has_value())
             return std::unexpected(*writeError);
         return {};
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view /*key*/,
-                                                                      FastCache::TimePoint /*newExpiry*/,
-                                                                      FastCache::TimePoint /*now*/) override
+                                                                      core::platform::SteadyTimePoint /*newExpiry*/,
+                                                                      core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::CasToken { 1 };
     }
     std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view /*key*/,
-                                                                      FastCache::TimePoint /*now*/) override
+                                                                      core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::GetResult {};
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view /*key*/,
-                                                                          std::optional<FastCache::TimePoint> /*newExpiry*/,
-                                                                          FastCache::TimePoint /*now*/) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(
+        std::string_view /*key*/,
+        std::optional<core::platform::SteadyTimePoint> /*newExpiry*/,
+        core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::CasToken { 1 };
     }
-    void FlushWithGeneration(FastCache::TimePoint /*effectiveAt*/) override {}
-    FastCache::PurgeOutcome PurgeExpired(FastCache::TimePoint /*now*/, FastCache::PurgeBudget /*budget*/) override
+    void FlushWithGeneration(core::platform::SteadyTimePoint /*effectiveAt*/) override {}
+    FastCache::PurgeOutcome PurgeExpired(core::platform::SteadyTimePoint /*now*/, FastCache::PurgeBudget /*budget*/) override
     {
         return {};
     }
@@ -176,14 +181,15 @@ TEST_CASE("WriteErrorReportingStorage can own the storage it reports for", "[cac
     FastCache::WriteErrorReportingStorage reporter { std::move(inner), logger };
     REQUIRE(inner == nullptr);
 
-    auto const result = reporter.Set("obj", std::vector<std::byte> { std::byte { 'x' } }, 0, FastCache::TimePoint::max());
+    auto const result =
+        reporter.Set("obj", std::vector<std::byte> { std::byte { 'x' } }, 0, core::platform::SteadyTimePoint::max());
     REQUIRE_FALSE(result.has_value());
     CHECK(reporter.Snapshot().writeErrors == 1);
     CHECK(HasLine(logger.Snapshot(), FastCache::LogLevel::Warn, { "storage write failed", "obj" }));
 
     // And a read still reaches the owned inner, so ownership did not change what
     // the decorator forwards -- only who keeps it alive.
-    CHECK(reporter.Get("obj", FastCache::TimePoint::max()).has_value());
+    CHECK(reporter.Get("obj", core::platform::SteadyTimePoint::max()).has_value());
 }
 
 TEST_CASE("WriteErrorReportingStorage logs and counts a persistence failure", "[cache][write-errors]")
@@ -196,7 +202,8 @@ TEST_CASE("WriteErrorReportingStorage logs and counts a persistence failure", "[
     inner.writeError = FastCache::StorageError { .code = FastCache::StorageErrorCode::IoError,
                                                  .systemCode = 28,
                                                  .context = "no space left on device" };
-    auto const result = reporter.Set("obj", std::vector<std::byte> { std::byte { 'x' } }, 0, FastCache::TimePoint::max());
+    auto const result =
+        reporter.Set("obj", std::vector<std::byte> { std::byte { 'x' } }, 0, core::platform::SteadyTimePoint::max());
 
     REQUIRE_FALSE(result.has_value());
     REQUIRE(reporter.Snapshot().writeErrors == 1);
@@ -217,15 +224,18 @@ TEST_CASE("WriteErrorReportingStorage ignores benign conditional-write outcomes"
     // ADD onto an existing key (KeyExists) and CAS on a stale token (CasMismatch)
     // are normal control flow, not persistence failures: neither counts nor logs.
     inner.writeError = FastCache::MakeStorageError(FastCache::StorageErrorCode::KeyExists);
-    REQUIRE_FALSE(reporter.Add("k", {}, 0, FastCache::TimePoint::max(), FastCache::TimePoint {}).has_value());
+    REQUIRE_FALSE(
+        reporter.Add("k", {}, 0, core::platform::SteadyTimePoint::max(), core::platform::SteadyTimePoint {}).has_value());
 
     inner.writeError = FastCache::MakeStorageError(FastCache::StorageErrorCode::CasMismatch);
-    REQUIRE_FALSE(reporter.CompareAndSwap("k", 7, {}, 0, FastCache::TimePoint::max(), FastCache::TimePoint {}).has_value());
+    REQUIRE_FALSE(
+        reporter.CompareAndSwap("k", 7, {}, 0, core::platform::SteadyTimePoint::max(), core::platform::SteadyTimePoint {})
+            .has_value());
 
     // ValueTooLarge is a client-side rejection, already visible via the reply;
     // it is deliberately not treated as a persistence failure either.
     inner.writeError = FastCache::MakeStorageError(FastCache::StorageErrorCode::ValueTooLarge);
-    REQUIRE_FALSE(reporter.Set("k", {}, 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE_FALSE(reporter.Set("k", {}, 0, core::platform::SteadyTimePoint::max()).has_value());
 
     REQUIRE(reporter.Snapshot().writeErrors == 0);
     REQUIRE(logger.Snapshot().empty());
@@ -238,7 +248,8 @@ TEST_CASE("WriteErrorReportingStorage is silent on a successful write and forwar
     FastCache::CapturingLogger logger;
     FastCache::WriteErrorReportingStorage reporter { inner, logger };
 
-    REQUIRE(reporter.Set("k", std::vector<std::byte> { std::byte { 'v' } }, 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(reporter.Set("k", std::vector<std::byte> { std::byte { 'v' } }, 0, core::platform::SteadyTimePoint::max())
+                .has_value());
 
     auto const snapshot = reporter.Snapshot();
     REQUIRE(snapshot.writeErrors == 0);
@@ -253,9 +264,9 @@ TEST_CASE("WriteErrorReportingStorage counts persistence failures across write v
     FastCache::WriteErrorReportingStorage reporter { inner, logger };
     inner.writeError = FastCache::MakeStorageError(FastCache::StorageErrorCode::OutOfMemory);
 
-    static_cast<void>(reporter.Set("k", {}, 0, FastCache::TimePoint::max()));
-    static_cast<void>(reporter.Append("k", {}, 0, FastCache::TimePoint {}));
-    static_cast<void>(reporter.IncrementOrInitialize("k", 1, /*decrement*/ false, FastCache::TimePoint {}));
+    static_cast<void>(reporter.Set("k", {}, 0, core::platform::SteadyTimePoint::max()));
+    static_cast<void>(reporter.Append("k", {}, 0, core::platform::SteadyTimePoint {}));
+    static_cast<void>(reporter.IncrementOrInitialize("k", 1, /*decrement*/ false, core::platform::SteadyTimePoint {}));
 
     // One count per failed write, regardless of verb.
     REQUIRE(reporter.Snapshot().writeErrors == 3);
@@ -277,16 +288,18 @@ TEST_CASE("WriteErrorReportingStorage reports a removal it could not persist, an
 
     // Nothing to remove is control flow: the ordinary answer to a repair's second run.
     inner.writeError = FastCache::MakeStorageError(FastCache::StorageErrorCode::KeyNotFound);
-    REQUIRE_FALSE(reporter.Delete("gone", FastCache::TimePoint {}).has_value());
-    REQUIRE_FALSE(reporter.CompareAndDelete("gone", FastCache::CasToken { 1 }, FastCache::TimePoint {}).has_value());
+    REQUIRE_FALSE(reporter.Delete("gone", core::platform::SteadyTimePoint {}).has_value());
+    REQUIRE_FALSE(
+        reporter.CompareAndDelete("gone", FastCache::CasToken { 1 }, core::platform::SteadyTimePoint {}).has_value());
     CHECK(reporter.Snapshot().writeErrors == 0);
     CHECK(logger.Snapshot().empty());
 
     inner.writeError = FastCache::StorageError { .code = FastCache::StorageErrorCode::IoError,
                                                  .systemCode = 5,
                                                  .context = "input/output error" };
-    REQUIRE_FALSE(reporter.Delete("obj", FastCache::TimePoint {}).has_value());
-    REQUIRE_FALSE(reporter.CompareAndDelete("obj", FastCache::CasToken { 1 }, FastCache::TimePoint {}).has_value());
+    REQUIRE_FALSE(reporter.Delete("obj", core::platform::SteadyTimePoint {}).has_value());
+    REQUIRE_FALSE(
+        reporter.CompareAndDelete("obj", FastCache::CasToken { 1 }, core::platform::SteadyTimePoint {}).has_value());
     CHECK(reporter.Snapshot().writeErrors == 2);
     auto const records = logger.Snapshot();
     CHECK(HasLine(records, FastCache::LogLevel::Warn, { "storage write failed: DELETE key=obj", "IoError", "system=5" }));

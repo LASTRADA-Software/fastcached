@@ -10,7 +10,6 @@
 #include "NodeMembership.hpp"
 #include "SchedulerTier.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -20,6 +19,7 @@
 #include <optional>
 #include <string>
 
+#include <core/platform/Clock.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -42,8 +42,8 @@ namespace
 /// rather than a scheduler.
 struct TierFixture
 {
-    ManualClock clock;
-    ManualWallClock wallClock;
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wallClock;
     AtomicMetricsSink metrics;
     NullLogger logger;
 

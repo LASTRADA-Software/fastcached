@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/TracingStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 #include <FastCache/Protocol/MemcachedMeta.hpp>
 #include <FastCache/Protocol/MemcachedText.hpp>
@@ -23,6 +20,11 @@
 #include <tuple>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/platform/Clock.hpp>
+#include <tests/HalfClose.hpp>
 #include <tests/ScriptedSocket.hpp>
 
 namespace
@@ -30,14 +32,14 @@ namespace
 
 struct MetaFixture
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
-    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     FastCache::MemcachedTextHandler handler;
 };
 
-FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view payload)
+core::async::Task<bool> WriteString(core::net::ISocket* socket, std::string_view payload)
 {
     auto const result = co_await socket->write(FastCache::AsBytes(payload));
     co_return result.has_value();
@@ -54,7 +56,7 @@ FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view p
 /// length, the callers below close the server side once `handler.Run` returns, so
 /// this always sees EOF (`*r == 0`) on the next Read. See the identical note on
 /// DrainResponse in RedisResp_test.cpp.
-FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
+core::async::Task<std::string> ReadAvailable(core::net::ISocket* socket)
 {
     std::string out;
     while (true)
@@ -73,14 +75,14 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
 
 std::string Exchange(MetaFixture& fix, std::string_view req)
 {
-    REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), req)));
-    fix.pair.client->shutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*priming*/ {}, /*session*/ {}));
+    REQUIRE(core::async::syncRun(WriteString(fix.pair.client.get(), req)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*fix.pair.client).has_value());
+    core::async::syncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*priming*/ {}, /*session*/ {}));
     // Close the server side so ReadAvailable always observes EOF rather than
     // parking on a reply whose length is an exact multiple of the chunk size.
     // The handler has returned, so it has nothing left to write.
     fix.pair.server->close();
-    return FastCache::SyncRun(ReadAvailable(fix.pair.client.get()));
+    return core::async::syncRun(ReadAvailable(fix.pair.client.get()));
 }
 
 /// Overwrite 16 KiB of the stack below the caller. The stores go through a
@@ -107,7 +109,7 @@ TEST_CASE("meta ms keeps its own source tag across the payload read", "[protocol
     // The read hook IS the other connection. A single-connection test cannot
     // reach this and passes under the bug, which is why the fixture above --
     // which drives whole conversations -- could never have caught it.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage inner;
     FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
     FastCache::TracingStorage tracer { inner, logger, clock };
@@ -121,7 +123,7 @@ TEST_CASE("meta ms keeps its own source tag across the payload read", "[protocol
 
     FastCache::Detail::storageSourceTag = "[203.0.113.7]";
     std::array<std::string_view, 2> const args { "k", "3" };
-    REQUIRE(FastCache::SyncRun(FastCache::MemcachedMeta::Dispatch(&socket, &engine, &reader, "ms", args)));
+    REQUIRE(core::async::syncRun(FastCache::MemcachedMeta::Dispatch(&socket, &engine, &reader, "ms", args)));
     FastCache::Detail::storageSourceTag = {};
 
     auto const records = logger.Snapshot();
@@ -144,7 +146,7 @@ TEST_CASE("meta ms keeps its flags across the payload read", "[protocol][meta][m
     // socket, and the read hook overwrites the stack below it, so flags left there
     // are gone. The reply AND the stored value are asserted: `EX` alone could come
     // from garbage that happened to carry a CAS precondition.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     auto const hi = FastCache::AsBytes(std::string_view { "hi" });
@@ -156,7 +158,7 @@ TEST_CASE("meta ms keeps its flags across the payload read", "[protocol][meta][m
     FastCache::ByteReader reader { socket, 1024, 1024, 256 };
 
     std::array<std::string_view, 4> const args { "k", "1", "M=A", "C999" };
-    REQUIRE(FastCache::SyncRun(FastCache::MemcachedMeta::Dispatch(&socket, &engine, &reader, "ms", args)));
+    REQUIRE(core::async::syncRun(FastCache::MemcachedMeta::Dispatch(&socket, &engine, &reader, "ms", args)));
 
     auto const& sent = socket.Sent();
     REQUIRE(std::string_view { reinterpret_cast<char const*>(sent.data()), sent.size() } == "EX\r\n");
@@ -526,20 +528,20 @@ TEST_CASE("meta mg l reports seconds since the previous read (regression)", "[pr
     // so the stored lastAccess advances on every read (the Approximate policy
     // defers that and would report l0 here); the since-previous-read semantics
     // are what this regression guards.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage { 0, 0, FastCache::LruMode::Strict };
     FastCache::CacheEngine engine { storage, clock };
     FastCache::MemcachedTextHandler handler;
 
     auto runOnce = [&](std::string_view req) {
-        auto pair = FastCache::InMemorySocketPair::Create();
-        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), req)));
-        pair.client->shutdownWrite();
-        FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*priming*/ {}, /*session*/ {}));
+        auto pair = core::net::testing::InMemorySocketPair::create();
+        REQUIRE(core::async::syncRun(WriteString(pair.client.get(), req)));
+        REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+        core::async::syncRun(handler.Run(pair.server.get(), &engine, /*priming*/ {}, /*session*/ {}));
         // See Exchange above: close the server side so the drain sees EOF instead
         // of parking on an exact-multiple-of-chunk-size reply.
         pair.server->close();
-        return FastCache::SyncRun(ReadAvailable(pair.client.get()));
+        return core::async::syncRun(ReadAvailable(pair.client.get()));
     };
 
     std::ignore = runOnce("set k 0 0 1\r\nA\r\nmg k\r\n"); // first read stamps lastAccess at T0

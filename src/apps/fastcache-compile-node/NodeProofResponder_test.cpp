@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -74,8 +75,8 @@ struct ProvingNode
 {
     AtomicMetricsSink metrics;
     CapturingLogger logger;
-    ManualClock clock;
-    ManualWallClock wallClock;
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wallClock;
     Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
     Distributed::SchedulerProtocol protocol { service, metrics };
@@ -156,30 +157,31 @@ TEST_CASE("A machine proving an admitted identity is admitted at an address on n
     ProvingNode node;
 
     auto const refused =
-        SyncRun(node.scheduler.Answer(LeaseFrame(), PeerIdentity { .host = std::string { StrangerAddress } })).bytes;
+        core::async::syncRun(node.scheduler.Answer(LeaseFrame(), PeerIdentity { .host = std::string { StrangerAddress } }))
+            .bytes;
     CHECK(ErrorOf(refused) == Wire::ErrorCode::NotAMember);
 
     // The same address, having proved: past the gate, and answered by the fleet itself. `NoWorker`
     // is the fleet answering -- there is no worker registered here -- which is the only reply that
     // says the caller got in.
-    auto const admitted = SyncRun(node.scheduler.Answer(LeaseFrame(),
-                                                        PeerIdentity { .host = std::string { StrangerAddress },
-                                                                       .proven = IdentityOf(AdmittedNode) }))
+    auto const admitted = core::async::syncRun(node.scheduler.Answer(LeaseFrame(),
+                                                                     PeerIdentity { .host = std::string { StrangerAddress },
+                                                                                    .proven = IdentityOf(AdmittedNode) }))
                               .bytes;
     CHECK(ErrorOf(admitted) == Wire::ErrorCode::NoWorker);
 
     // **#178 item 1**: the address changes between sessions and nothing is edited.
     auto const moved =
-        SyncRun(
+        core::async::syncRun(
             node.scheduler.Answer(LeaseFrame(), PeerIdentity { .host = "198.51.100.4", .proven = IdentityOf(AdmittedNode) }))
             .bytes;
     CHECK(ErrorOf(moved) == Wire::ErrorCode::NoWorker);
 
     // And an identity the cluster does NOT hold admits nothing: a caller that signs under its own
     // key is who it says, and still a stranger.
-    auto const unknown = SyncRun(node.scheduler.Answer(LeaseFrame(),
-                                                       PeerIdentity { .host = std::string { StrangerAddress },
-                                                                      .proven = IdentityOf(UnknownNode) }))
+    auto const unknown = core::async::syncRun(node.scheduler.Answer(LeaseFrame(),
+                                                                    PeerIdentity { .host = std::string { StrangerAddress },
+                                                                                   .proven = IdentityOf(UnknownNode) }))
                              .bytes;
     CHECK(ErrorOf(unknown) == Wire::ErrorCode::NotAMember);
 }
@@ -249,9 +251,9 @@ TEST_CASE("A revoked key is Forgotten although its host is on --fleet-member", "
     CHECK(node.metrics.Read(Stranger.counter) == 0);
 
     // And the scheduler, which reads the same fold: refused.
-    auto const lease = SyncRun(node.scheduler.Answer(LeaseFrame(),
-                                                     PeerIdentity { .host = std::string { ListedAddress },
-                                                                    .proven = IdentityOf(ForgottenNode) }))
+    auto const lease = core::async::syncRun(node.scheduler.Answer(LeaseFrame(),
+                                                                  PeerIdentity { .host = std::string { ListedAddress },
+                                                                                 .proven = IdentityOf(ForgottenNode) }))
                            .bytes;
     CHECK(ErrorOf(lease) == Wire::ErrorCode::NotAMember);
 
@@ -260,7 +262,8 @@ TEST_CASE("A revoked key is Forgotten although its host is on --fleet-member", "
     CHECK(Distributed::ExplainConnection(node.membership, ListedAddress, std::nullopt).verdict
           == Distributed::Membership::Member);
     auto const listedClient =
-        SyncRun(node.scheduler.Answer(LeaseFrame(), PeerIdentity { .host = std::string { ListedAddress } })).bytes;
+        core::async::syncRun(node.scheduler.Answer(LeaseFrame(), PeerIdentity { .host = std::string { ListedAddress } }))
+            .bytes;
     CHECK(ErrorOf(listedClient) == Wire::ErrorCode::NoWorker);
 }
 

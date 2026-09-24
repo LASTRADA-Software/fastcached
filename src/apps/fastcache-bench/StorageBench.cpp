@@ -19,7 +19,6 @@
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/ShardedStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/StringHash.hpp>
 
 #include <catch2/benchmark/catch_benchmark.hpp>
@@ -40,6 +39,8 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 using namespace FastCache;
 
@@ -91,8 +92,8 @@ inline void DenyHoisting() noexcept
 /// through the engine, since that is the only layer that reads a clock at all.
 enum class EngineClock : std::uint8_t
 {
-    Steady, ///< `SteadyClock` — a QueryPerformanceCounter per operation.
-    Cached, ///< `CachedClock` — a value the reactor refreshes once per iteration.
+    Steady, ///< `core::platform::SteadyClock` — a QueryPerformanceCounter per operation.
+    Cached, ///< `core::platform::CachedClock` — a value the reactor refreshes once per iteration.
 };
 
 /// One benchmarkable storage configuration.
@@ -181,8 +182,9 @@ class Fixture
             // once per iteration and every command in between reads the stored
             // value. Entries are populated with a 10-minute TTL, so a frozen
             // clock cannot expire them mid-run either way.
-            IClock& engineClock =
-                spec.engineClock == EngineClock::Cached ? static_cast<IClock&>(_cachedClock) : static_cast<IClock&>(_clock);
+            core::platform::IClock& engineClock = spec.engineClock == EngineClock::Cached
+                                                      ? static_cast<core::platform::IClock&>(_cachedClock)
+                                                      : static_cast<core::platform::IClock&>(_clock);
             _engine = std::make_unique<CacheEngine>(*_storage, engineClock);
         }
         Populate();
@@ -205,7 +207,7 @@ class Fixture
     /// @param key Key to look up.
     /// @param now Current clock value, for the layers that take one.
     /// @return True on a hit.
-    [[nodiscard]] bool Lookup(std::string_view key, TimePoint now) const
+    [[nodiscard]] bool Lookup(std::string_view key, core::platform::SteadyTimePoint now) const
     {
         auto const result = _engine ? _engine->Get(key) : _storage->Get(key, now);
         return result.has_value() && result->found;
@@ -248,8 +250,8 @@ class Fixture
         }
     }
 
-    SteadyClock _clock {};
-    CachedClock _cachedClock { _clock }; // declared after _clock: it holds a reference to it
+    core::platform::SteadyClock _clock {};
+    core::platform::CachedClock _cachedClock { _clock }; // declared after _clock: it holds a reference to it
     std::unique_ptr<IStorage> _storage {};
     std::unique_ptr<CacheEngine> _engine {};
 };
@@ -287,12 +289,12 @@ TEST_CASE("storage lookup, jitbit-equivalent workload", "[bench][lookup]")
     // Windows `steady_clock::now()` is a QueryPerformanceCounter, which is far
     // from free. Without this row the engine row's cost would be guesswork.
     {
-        SteadyClock clock;
-        IClock const& injected = clock; // reached through the seam, as production does
+        core::platform::SteadyClock clock;
+        core::platform::IClock const& injected = clock; // reached through the seam, as production does
 
         BENCHMARK("clock-now")
         {
-            TimePoint latest {};
+            core::platform::SteadyTimePoint latest {};
             for ([[maybe_unused]] auto const step: std::views::iota(std::size_t { 0 }, LookupsPerIteration))
             {
                 latest = injected.now();

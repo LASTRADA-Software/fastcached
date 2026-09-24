@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/DiscoveryService.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/InMemoryDatagram.hpp>
-#include <FastCache/Net/SharedPortDatagram.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -25,6 +22,9 @@
 #include <utility>
 #include <vector>
 
+#include <core/net/SharedPortDatagram.hpp>
+#include <core/net/testing/InMemoryDatagram.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/CoHostedDatagram.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/SecureRandomFakes.hpp>
@@ -44,7 +44,7 @@ using namespace std::chrono_literals;
 namespace
 {
 
-/// The bus address a `host:port` endpoint names -- see `DatagramAddress` for why
+/// The bus address a `host:port` endpoint names -- see `core::net::DatagramAddress` for why
 /// the two halves travel apart below this layer.
 ///
 /// Named for what it takes, because `InMemoryDatagram_test`'s `AtHost` takes a
@@ -53,7 +53,7 @@ namespace
 /// case comes to address nowhere at all.
 /// @param endpoint `host:port` text.
 /// @return The two halves apart.
-[[nodiscard]] DatagramAddress AtEndpoint(std::string_view endpoint)
+[[nodiscard]] core::net::DatagramAddress AtEndpoint(std::string_view endpoint)
 {
     // Asserted rather than defaulted. An endpoint this cannot split would
     // otherwise become `{"", 0}`, which is a perfectly valid bus address that
@@ -63,7 +63,7 @@ namespace
     // wrong thing".
     auto const parsed = ParseEndpoint(endpoint, "");
     REQUIRE(parsed.has_value());
-    return DatagramAddress { .host = Unwrap(parsed).first, .port = Unwrap(parsed).second };
+    return core::net::DatagramAddress { .host = Unwrap(parsed).first, .port = Unwrap(parsed).second };
 }
 
 /// One node on the segment: its socket, directory and service.
@@ -88,9 +88,9 @@ struct Node
     /// @param cluster Which fleet it belongs to.
     /// @param roster Whose key every id is, as this node's replicated state says.
     /// @param own The key this node signs its proofs with.
-    Node(std::unique_ptr<IDatagramSocket> ownSocket,
-         DatagramAddress beaconAddress,
-         IClock& clock,
+    Node(std::unique_ptr<core::net::IDatagramSocket> ownSocket,
+         core::net::DatagramAddress beaconAddress,
+         core::platform::IClock& clock,
          ISecureRandom& random,
          ILogger& logger,
          std::string id,
@@ -126,8 +126,8 @@ struct Node
     /// @param roster Whose key every id is, as this node's replicated state says.
     /// @param own The key this node signs its proofs with; by default the one `roster`'s
     ///        `SharedRoster::Of` records for @p id.
-    Node(DatagramBus& bus,
-         IClock& clock,
+    Node(core::net::testing::DatagramBus& bus,
+         core::platform::IClock& clock,
          ISecureRandom& random,
          ILogger& logger,
          std::string const& id,
@@ -140,8 +140,8 @@ struct Node
         // forwarded `endpoint` and the order of the two is unspecified, so there
         // is nothing here that could be moved from anyway; the copies happen
         // where they can be moved out of.
-        Node(bus.Open(AtEndpoint(endpoint)),
-             DatagramBus::broadcastAddress(),
+        Node(bus.open(AtEndpoint(endpoint)),
+             core::net::testing::DatagramBus::broadcastAddress(),
              clock,
              random,
              logger,
@@ -153,7 +153,7 @@ struct Node
     {
     }
 
-    std::unique_ptr<IDatagramSocket> socket;
+    std::unique_ptr<core::net::IDatagramSocket> socket;
     PeerDirectory directory;
     AtomicMetricsSink metrics;
     RosterPeerKeys keys;
@@ -226,12 +226,12 @@ TEST_CASE("Two nodes on one host share a beacon port and still prove their keys"
     // whichever co-hosted node the kernel picked, each one arriving somewhere
     // that had not asked for it, and the pair sat there seen-but-unproved
     // forever with nothing logged.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     NullLogger logger;
 
-    auto const beacon = DatagramBus::broadcastAddressOn(TestBeaconPort);
+    auto const beacon = core::net::testing::DatagramBus::broadcastAddressOn(TestBeaconPort);
     auto const roster = SharedRoster::Of({ "first", "second" });
 
     Node first { CoHostedDatagramSocket(bus, "10.0.0.1", 40001),
@@ -287,8 +287,8 @@ TEST_CASE("A peer that cannot name itself is never challenged", "[cluster][disco
     // `_pending` entry are both work an unauthenticated broadcast should not be
     // able to provoke -- and the datagram is REPORTED, which its two siblings
     // (another fleet's beacon, and this node's own) deliberately are not.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     CapturingLogger logger;
 
@@ -347,8 +347,8 @@ TEST_CASE("A proof is refused before this node logs what it claimed", "[cluster]
     // unauthenticated until its signature checks out -- so without this, anything on the
     // segment could write arbitrary bytes into a node's log by sending one beacon
     // and then one lie, holding no key at all.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     CapturingLogger logger;
 
@@ -382,8 +382,8 @@ TEST_CASE("A beacon this node cannot draw a challenge for is recorded, not chall
     // left pending that a proof could answer, and the Error names this host's generator --
     // once per interval, because a beacon is unauthenticated and anything on the segment can
     // provoke the line.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom denied { ScriptedSecureRandom::DeniedFailure() };
     ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     CapturingLogger logger;
@@ -418,8 +418,8 @@ TEST_CASE("Two nodes discover each other and prove the keys the roster holds for
     // The whole feature, end to end, in one process: beacon, challenge, proof,
     // authenticated. What makes this a unit test rather than a fixture is that the
     // segment, the clock and the nonces are all injected.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 1, 2 }) };
     NullLogger logger;
 
@@ -458,8 +458,8 @@ TEST_CASE("A proof under a key the roster does not hold is reported and never au
     // shared key a proof WAS membership. Now a proof names a key, and an outsider signs
     // perfectly well with one of its own -- so this is a machine that proves POSSESSION and
     // is still not authenticated, because the roster does not hold that key for its id.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 11 }) };
     CapturingLogger logger;
 
@@ -490,8 +490,8 @@ TEST_CASE("A KNOWN id proving another key is reported, not authenticated", "[clu
     // The impostor's shape, which the case above cannot show: the id is one the roster
     // knows, the endpoint is plausible, and the key is the impostor's own. An id is a label;
     // the key the roster holds for it is the credential.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 11 }) };
     NullLogger logger;
 
@@ -512,8 +512,8 @@ TEST_CASE("A proof under a REVOKED key is recognised as one", "[cluster][discove
 {
     // Revoked is not unknown: the remedies are opposite -- admit it if it belongs, against
     // never admit it again -- so the event, the counter and the log each say which.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 11 }) };
     CapturingLogger logger;
 
@@ -536,8 +536,8 @@ TEST_CASE("A proof whose signature does not verify is counted as forged and name
     // A signature that fails under the key the proof CARRIES is the one case where the key
     // is as much a claim as the id: anybody could have typed it. So it is counted, and
     // logged by the address it came from and nothing else.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 7 }) };
     CapturingLogger logger;
 
@@ -579,8 +579,8 @@ TEST_CASE("Proofs under keys the roster does not accept are all counted and repo
     // A fresh key costs nothing to make, so anything on the segment can send one proof per
     // beacon. The counter takes every one; the log takes the latest per interval and says how
     // many it stands for, or the line is a disk-exhaustion hole reached from outside the fleet.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 1, 2, 3 }) };
     CapturingLogger logger;
 
@@ -605,14 +605,14 @@ TEST_CASE("A proof nobody asked for is refused", "[cluster][discovery][service]"
     // A proof is only ever an answer to a challenge this node issued. An
     // unsolicited one carries a nonce nobody here chose, so accepting it would
     // make the nonce -- and therefore the replay protection -- pointless.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 5 }) };
     NullLogger logger;
 
     auto const roster = SharedRoster::Of({ "alice", "ghost" });
     Node alice { bus, clock, random, logger, "alice", "10.0.0.1:7000", "prod", roster };
-    auto intruder = bus.Open(AtEndpoint("10.0.0.9:7000"));
+    auto intruder = bus.open(AtEndpoint("10.0.0.9:7000"));
 
     DiscoveryWire::Challenge const invented { .clusterId = "prod", .nonce = {} };
     auto const ghost = TestKeyPair("ghost");
@@ -636,8 +636,8 @@ TEST_CASE("A challenge is spent once", "[cluster][discovery][service]")
     // A nonce that could answer twice is a nonce that can be replayed: an
     // observer who captured one valid proof could re-send it later and be
     // re-authenticated without ever holding the key.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 7 }) };
     NullLogger logger;
 
@@ -672,8 +672,8 @@ TEST_CASE("A challenge is spent once", "[cluster][discovery][service]")
 
 TEST_CASE("Two fleets on one segment ignore each other", "[cluster][discovery][service]")
 {
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 1 }) };
     NullLogger logger;
 
@@ -696,8 +696,8 @@ TEST_CASE("Discovery survives a lost beacon", "[cluster][discovery][service]")
     // These are broadcasts and loss is expected. What must not happen is a peer
     // being forgotten because one datagram went missing -- which is why the
     // directory's expiry is generous relative to the beacon interval.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 3 }) };
     NullLogger logger;
 
@@ -724,13 +724,13 @@ TEST_CASE("A challenge expires rather than accumulating", "[cluster][discovery][
     // A beacon is unauthenticated, so anything on the segment can provoke a
     // challenge. One entry per node and a lifetime is what keeps that from being
     // a memory-exhaustion hole reachable without holding any key.
-    DatagramBus bus;
-    ManualClock clock;
+    core::net::testing::DatagramBus bus;
+    core::platform::ManualClock clock;
     ScriptedSecureRandom random { NonceScript({ 1, 2, 3 }) };
     NullLogger logger;
 
     Node watcher { bus, clock, random, logger, "watcher", "10.0.0.1:7000", "prod", SharedRoster::Of({ "watcher" }) };
-    auto noisy = bus.Open(AtEndpoint("10.0.0.9:7000"));
+    auto noisy = bus.open(AtEndpoint("10.0.0.9:7000"));
 
     auto const beacon =
         DiscoveryWire::EncodeBeacon({ .clusterId = "prod", .nodeId = "noisy", .raftEndpoint = "10.0.0.9:7000" });

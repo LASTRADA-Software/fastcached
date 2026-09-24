@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/TracingStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Net/IAdmissionControl.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
+
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/IAdmissionControl.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
+#include <tests/HalfClose.hpp>
 #if defined(FC_TLS_ENABLED)
-    #include <FastCache/Net/TlsContext.hpp>
+    #include <core/net/Tls.hpp>
 #endif
 #include <FastCache/Server/Connection.hpp>
 #include <FastCache/Server/Server.hpp>
@@ -33,7 +36,7 @@
 namespace
 {
 
-FastCache::Task<std::string> ReadResponse(FastCache::ISocket* socket)
+core::async::Task<std::string> ReadResponse(core::net::ISocket* socket)
 {
     std::string out;
     while (true)
@@ -50,7 +53,7 @@ FastCache::Task<std::string> ReadResponse(FastCache::ISocket* socket)
     co_return out;
 }
 
-FastCache::Task<bool> Send(FastCache::ISocket* socket, std::string_view payload)
+core::async::Task<bool> Send(core::net::ISocket* socket, std::string_view payload)
 {
     auto const r = co_await socket->write(FastCache::AsBytes(payload));
     co_return r.has_value();
@@ -64,44 +67,44 @@ class ThrowOnGetStorage final: public FastCache::IStorage
 {
   public:
     std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view /*key*/,
-                                                                     FastCache::TimePoint /*now*/) override
+                                                                     core::platform::SteadyTimePoint /*now*/) override
     {
         throw std::bad_alloc {};
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Set(std::string_view key,
                                                                     std::vector<std::byte> value,
                                                                     std::uint32_t flags,
-                                                                    FastCache::TimePoint expiry) override
+                                                                    core::platform::SteadyTimePoint expiry) override
     {
         return _inner.Set(key, std::move(value), flags, expiry);
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Add(std::string_view key,
                                                                     std::vector<std::byte> value,
                                                                     std::uint32_t flags,
-                                                                    FastCache::TimePoint expiry,
-                                                                    FastCache::TimePoint now) override
+                                                                    core::platform::SteadyTimePoint expiry,
+                                                                    core::platform::SteadyTimePoint now) override
     {
         return _inner.Add(key, std::move(value), flags, expiry, now);
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Replace(std::string_view key,
                                                                         std::vector<std::byte> value,
                                                                         std::uint32_t flags,
-                                                                        FastCache::TimePoint expiry,
-                                                                        FastCache::TimePoint now) override
+                                                                        core::platform::SteadyTimePoint expiry,
+                                                                        core::platform::SteadyTimePoint now) override
     {
         return _inner.Replace(key, std::move(value), flags, expiry, now);
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view key,
                                                                        std::span<std::byte const> suffix,
                                                                        FastCache::CasToken expected,
-                                                                       FastCache::TimePoint now) override
+                                                                       core::platform::SteadyTimePoint now) override
     {
         return _inner.Append(key, suffix, expected, now);
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view key,
                                                                         std::span<std::byte const> prefix,
                                                                         FastCache::CasToken expected,
-                                                                        FastCache::TimePoint now) override
+                                                                        core::platform::SteadyTimePoint now) override
     {
         return _inner.Prepend(key, prefix, expected, now);
     }
@@ -109,44 +112,45 @@ class ThrowOnGetStorage final: public FastCache::IStorage
                                                                                FastCache::CasToken expected,
                                                                                std::vector<std::byte> value,
                                                                                std::uint32_t flags,
-                                                                               FastCache::TimePoint expiry,
-                                                                               FastCache::TimePoint now) override
+                                                                               core::platform::SteadyTimePoint expiry,
+                                                                               core::platform::SteadyTimePoint now) override
     {
         return _inner.CompareAndSwap(key, expected, std::move(value), flags, expiry, now);
     }
     std::expected<IncrResult, FastCache::StorageError> IncrementOrInitialize(std::string_view key,
                                                                              std::uint64_t magnitude,
                                                                              bool decrement,
-                                                                             FastCache::TimePoint now) override
+                                                                             core::platform::SteadyTimePoint now) override
     {
         return _inner.IncrementOrInitialize(key, magnitude, decrement, now);
     }
-    std::expected<void, FastCache::StorageError> Delete(std::string_view key, FastCache::TimePoint now) override
+    std::expected<void, FastCache::StorageError> Delete(std::string_view key, core::platform::SteadyTimePoint now) override
     {
         return _inner.Delete(key, now);
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view key,
-                                                                      FastCache::TimePoint newExpiry,
-                                                                      FastCache::TimePoint now) override
+                                                                      core::platform::SteadyTimePoint newExpiry,
+                                                                      core::platform::SteadyTimePoint now) override
     {
         return _inner.Touch(key, newExpiry, now);
     }
     std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view key,
-                                                                      FastCache::TimePoint now) override
+                                                                      core::platform::SteadyTimePoint now) override
     {
         return _inner.Peek(key, now);
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view key,
-                                                                          std::optional<FastCache::TimePoint> newExpiry,
-                                                                          FastCache::TimePoint now) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(
+        std::string_view key,
+        std::optional<core::platform::SteadyTimePoint> newExpiry,
+        core::platform::SteadyTimePoint now) override
     {
         return _inner.MarkStale(key, newExpiry, now);
     }
-    void FlushWithGeneration(FastCache::TimePoint effectiveAt) override
+    void FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt) override
     {
         _inner.FlushWithGeneration(effectiveAt);
     }
-    FastCache::PurgeOutcome PurgeExpired(FastCache::TimePoint now, FastCache::PurgeBudget budget) override
+    FastCache::PurgeOutcome PurgeExpired(core::platform::SteadyTimePoint now, FastCache::PurgeBudget budget) override
     {
         return _inner.PurgeExpired(now, budget);
     }
@@ -167,25 +171,25 @@ class ThrowOnGetStorage final: public FastCache::IStorage
 
 TEST_CASE("Server accepts and serves a memcached-text client end-to-end", "[server]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
-    FastCache::InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     FastCache::Server server { listener, engine, logger };
 
     // Stage a client BEFORE running the server so Accept resolves
     // synchronously on the first iteration.
     auto client = listener.connectClient();
-    REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
-    client->shutdownWrite();
+    REQUIRE(core::async::syncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
 
     // Close the listener — pre-queued connections drain before Accept
     // observes the closed state, so the staged client still gets served.
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    listener.close();
+    core::async::syncRun(server.Run());
 
-    auto const response = FastCache::SyncRun(ReadResponse(client.get()));
+    auto const response = core::async::syncRun(ReadResponse(client.get()));
     REQUIRE(response == "STORED\r\nVALUE foo 0 5\r\nhello\r\nEND\r\n");
     REQUIRE(server.AcceptedCount() == 1);
 }
@@ -195,19 +199,19 @@ TEST_CASE("Server with LogSource::Yes prefixes connection logs with the client I
     // A connection that EOFs before any byte makes autodetect fail, which the
     // Connection logs at Debug. With --log-source on, that line carries the
     // accepted socket's peer address as a bracketed prefix.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::CapturingLogger logger; // captures from Trace up
-    FastCache::InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     FastCache::Server server {
         listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
     };
 
     auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
-    client->shutdownWrite(); // EOF with no bytes -> autodetect fails -> Debug log
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value()); // EOF with no bytes -> autodetect fails -> Debug log
+    listener.close();
+    core::async::syncRun(server.Run());
 
     auto const records = logger.Snapshot();
     REQUIRE_FALSE(records.empty());
@@ -220,21 +224,21 @@ TEST_CASE("Server with LogSource::Yes prefixes the storage trace line with the c
     // The real use case: a well-behaved client. Each data operation produces
     // exactly ONE line — the TracingStorage `storage:` line — now carrying the
     // client IP. There is no separate connection-level command line to duplicate it.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage lru;
     FastCache::CapturingLogger logger; // captures from Trace up
     FastCache::TracingStorage storage { lru, logger, clock };
     FastCache::CacheEngine engine { storage, clock };
-    FastCache::InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     FastCache::Server server {
         listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
     };
 
     auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
-    REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
-    client->shutdownWrite();
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    REQUIRE(core::async::syncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
+    listener.close();
+    core::async::syncRun(server.Run());
 
     auto const messages = logger.Snapshot();
     REQUIRE(std::ranges::any_of(
@@ -250,19 +254,19 @@ TEST_CASE("Server without --log-source leaves the storage trace line unprefixed"
 {
     // Storage trace logging is independent of --log-source; the flag only adds
     // the IP prefix. At Trace without the flag the line is the original format.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage lru;
     FastCache::CapturingLogger logger;
     FastCache::TracingStorage storage { lru, logger, clock };
     FastCache::CacheEngine engine { storage, clock };
-    FastCache::InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     FastCache::Server server { listener, engine, logger }; // LogSource defaults to No
 
     auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
-    REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
-    client->shutdownWrite();
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    REQUIRE(core::async::syncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
+    listener.close();
+    core::async::syncRun(server.Run());
 
     auto const messages = logger.Snapshot();
     REQUIRE(std::ranges::any_of(messages, [](auto const& r) { return r.message.starts_with("storage: SET key=foo"); }));
@@ -276,21 +280,21 @@ TEST_CASE("Server: non-data commands are logged only under --log-everything", "[
     // surfaced at the connection level (with the IP under --log-source). The
     // data "set" always appears on its storage line either way.
     auto run = [](bool logEverything) {
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         FastCache::InMemoryLruStorage lru;
         FastCache::CapturingLogger logger;
         FastCache::TracingStorage storage { lru, logger, clock };
         FastCache::CacheEngine engine { storage, clock };
-        FastCache::InMemoryListener listener;
+        core::net::testing::InMemoryListener listener;
         FastCache::SessionContext session {};
         session.logEverything = logEverything;
         FastCache::Server server { listener, engine, logger, nullptr, nullptr, session, nullptr, FastCache::LogSource::Yes };
 
         auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
-        REQUIRE(FastCache::SyncRun(Send(client.get(), "version\r\nset foo 0 0 5\r\nhello\r\n")));
-        client->shutdownWrite();
-        listener.Close();
-        FastCache::SyncRun(server.Run());
+        REQUIRE(core::async::syncRun(Send(client.get(), "version\r\nset foo 0 0 5\r\nhello\r\n")));
+        REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
+        listener.close();
+        core::async::syncRun(server.Run());
         return logger.Snapshot();
     };
 
@@ -315,21 +319,21 @@ TEST_CASE("Server: command logging is silent at the default Info level", "[serve
     // Trace-level access logging (including the storage line) must not appear
     // at the default level, so normal production output is unchanged whether or
     // not --log-source is set.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage lru;
     FastCache::CapturingLogger logger { FastCache::LogLevel::Info }; // default threshold
     FastCache::TracingStorage storage { lru, logger, clock };
     FastCache::CacheEngine engine { storage, clock };
-    FastCache::InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     FastCache::Server server {
         listener, engine, logger, nullptr, nullptr, FastCache::SessionContext {}, nullptr, FastCache::LogSource::Yes
     };
 
     auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
-    REQUIRE(FastCache::SyncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
-    client->shutdownWrite();
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    REQUIRE(core::async::syncRun(Send(client.get(), "set foo 0 0 5\r\nhello\r\nget foo\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
+    listener.close();
+    core::async::syncRun(server.Run());
 
     auto const messages = logger.Snapshot();
     REQUIRE(std::ranges::none_of(messages, [](auto const& r) {
@@ -339,17 +343,17 @@ TEST_CASE("Server: command logging is silent at the default Info level", "[serve
 
 TEST_CASE("Server with LogSource::No leaves connection logs unprefixed", "[server][logsource]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::CapturingLogger logger;
-    FastCache::InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     FastCache::Server server { listener, engine, logger }; // LogSource defaults to No
 
     auto client = listener.connectClient(/*maxBytesInFlight*/ 0, /*peerAddress*/ "203.0.113.7");
-    client->shutdownWrite();
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
+    listener.close();
+    core::async::syncRun(server.Run());
 
     auto const records = logger.Snapshot();
     REQUIRE_FALSE(records.empty());
@@ -361,23 +365,23 @@ TEST_CASE("Server with LogSource::No leaves connection logs unprefixed", "[serve
 
 TEST_CASE("Server drops a connection whose handler throws instead of terminating", "[server][regression]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     ThrowOnGetStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
-    FastCache::InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     FastCache::Server server { listener, engine, logger };
 
     auto client = listener.connectClient();
-    REQUIRE(FastCache::SyncRun(Send(client.get(), "get foo\r\n")));
-    client->shutdownWrite();
-    listener.Close();
+    REQUIRE(core::async::syncRun(Send(client.get(), "get foo\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
+    listener.close();
 
     // The Get throws std::bad_alloc. Without the firewall in RunConnectionDetached
     // the throw would reach DetachedTask::unhandled_exception -> std::terminate and
     // abort this test process. With it, the one connection is dropped and Run()
     // returns normally — the server survives a handler exception.
-    FastCache::SyncRun(server.Run());
+    core::async::syncRun(server.Run());
     REQUIRE(server.AcceptedCount() == 1);
 }
 
@@ -390,23 +394,23 @@ TEST_CASE("Server: a refusal over a request the connection did not finish readin
     // half-closes, listens until this client closes, then closes. Driven through
     // `Server::Run`, so what is asserted is production's close rather than a fixture's copy
     // of it.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
-    FastCache::InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     FastCache::SessionContext session {};
     session.maxPayloadBytes = 1024;
     FastCache::Server server { listener, engine, logger, nullptr, nullptr, session };
 
     auto client = listener.connectClient();
     std::string const value(4096, 'x');
-    REQUIRE(FastCache::SyncRun(Send(client.get(), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4096\r\n" + value + "\r\n")));
-    client->shutdownWrite();
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    REQUIRE(core::async::syncRun(Send(client.get(), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4096\r\n" + value + "\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
+    listener.close();
+    core::async::syncRun(server.Run());
 
-    auto const response = FastCache::SyncRun(ReadResponse(client.get()));
+    auto const response = core::async::syncRun(ReadResponse(client.get()));
     INFO("response was: " << response.substr(0, 64));
     REQUIRE(response.starts_with("-ERR Protocol error:"));
 }
@@ -418,13 +422,13 @@ TEST_CASE("Server: a lingering connection holds its admission slot until it clos
     // way to hold sockets past it. The client here stays connected and silent after the
     // refusal, so only the linger's deadline ends the connection, and the slot is asserted
     // held on both sides of it.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
-    FastCache::TestReactor reactor { clock };
-    FastCache::InMemoryListener listener;
-    FastCache::CountingAdmissionControl admission { /*maxConcurrent*/ 4 };
+    core::net::testing::TestLoop reactor { clock };
+    core::net::testing::InMemoryListener listener;
+    core::net::CountingAdmissionControl admission { /*maxConcurrent*/ 4 };
     FastCache::SessionContext session {};
     session.maxPayloadBytes = 1024;
     session.reactor = &reactor;
@@ -432,35 +436,35 @@ TEST_CASE("Server: a lingering connection holds its admission slot until it clos
 
     auto client = listener.connectClient();
     std::string const value(4096, 'x');
-    REQUIRE(FastCache::SyncRun(Send(client.get(), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4096\r\n" + value + "\r\n")));
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    REQUIRE(core::async::syncRun(Send(client.get(), "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4096\r\n" + value + "\r\n")));
+    listener.close();
+    core::async::syncRun(server.Run());
 
     // Refused -- the refusal and the half-close have reached the client -- and still open.
-    CHECK(FastCache::SyncRun(ReadResponse(client.get())).starts_with("-ERR Protocol error:"));
+    CHECK(core::async::syncRun(ReadResponse(client.get())).starts_with("-ERR Protocol error:"));
     CHECK(admission.inFlight() == 1);
 
     clock.advance(FastCache::Connection::Linger.total - std::chrono::milliseconds { 1 });
-    std::ignore = reactor.Drain();
+    std::ignore = reactor.drain();
     CHECK(admission.inFlight() == 1);
 
     clock.advance(std::chrono::milliseconds { 1 });
-    std::ignore = reactor.Drain();
+    std::ignore = reactor.drain();
     CHECK(admission.inFlight() == 0);
 }
 
 TEST_CASE("Server::Shutdown closes the listener", "[server]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
-    FastCache::InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     FastCache::Server server { listener, engine, logger };
 
     auto serverTask = server.Run();
     server.Shutdown();
-    FastCache::SyncRun(std::move(serverTask));
+    core::async::syncRun(std::move(serverTask));
 
     REQUIRE(server.AcceptedCount() == 0);
 }
@@ -470,37 +474,38 @@ namespace
 
 /// Admission policy that always refuses (used to test the rejection path
 /// without needing to keep a long-running connection in flight).
-class AlwaysDenyAdmission final: public FastCache::IAdmissionControl
+class AlwaysDenyAdmission final: public core::net::IAdmissionControl
 {
   public:
-    [[nodiscard]] bool AllowAccept() noexcept override
+    [[nodiscard]] std::optional<core::net::AdmissionLease> tryAdmit() noexcept override
     {
-        return false;
+        return std::nullopt;
     }
-    void OnConnectionStarted() noexcept override {}
-    void OnConnectionEnded() noexcept override {}
+
+  private:
+    void release() noexcept override {}
 };
 
 } // namespace
 
 TEST_CASE("Server rejects connections when admission denies", "[server][admission]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
-    FastCache::InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     AlwaysDenyAdmission admission;
     FastCache::AtomicMetricsSink metrics;
     FastCache::Server server { listener, engine, logger, &admission, &metrics };
 
     auto c1 = listener.connectClient();
     auto c2 = listener.connectClient();
-    c1->shutdownWrite();
-    c2->shutdownWrite();
+    REQUIRE(FastCache::Testing::ShutdownWrite(*c1).has_value());
+    REQUIRE(FastCache::Testing::ShutdownWrite(*c2).has_value());
 
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    listener.close();
+    core::async::syncRun(server.Run());
 
     // Both incoming connections were refused; AcceptedCount only counts
     // admitted connections.
@@ -511,22 +516,22 @@ TEST_CASE("Server rejects connections when admission denies", "[server][admissio
 
 TEST_CASE("Server admits + tracks ConnectionsTotal", "[server][admission]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
-    FastCache::InMemoryListener listener;
-    FastCache::CountingAdmissionControl admission { /*maxConcurrent*/ 4 };
+    core::net::testing::InMemoryListener listener;
+    core::net::CountingAdmissionControl admission { /*maxConcurrent*/ 4 };
     FastCache::AtomicMetricsSink metrics;
     FastCache::Server server { listener, engine, logger, &admission, &metrics };
 
     auto c1 = listener.connectClient();
     auto c2 = listener.connectClient();
-    c1->shutdownWrite();
-    c2->shutdownWrite();
+    REQUIRE(FastCache::Testing::ShutdownWrite(*c1).has_value());
+    REQUIRE(FastCache::Testing::ShutdownWrite(*c2).has_value());
 
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    listener.close();
+    core::async::syncRun(server.Run());
 
     REQUIRE(server.AcceptedCount() == 2);
     REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsTotal) == 2);
@@ -554,26 +559,26 @@ TEST_CASE("Server: ConnectionsTotalTls / ConnectionsAdmissionRejectedTls bumped 
     // ShutdownWrite-closes.
     auto const certPath = std::string { FASTCACHED_TESTDATA_DIR } + "/tls/server.crt";
     auto const keyPath = std::string { FASTCACHED_TESTDATA_DIR } + "/tls/server.key";
-    auto tlsContextResult = FastCache::TlsContext::Create(certPath, keyPath);
+    auto tlsContextResult = core::net::makeTlsServerContextFromFiles(certPath, keyPath);
     REQUIRE(tlsContextResult.has_value());
     auto tlsContext = std::move(*tlsContextResult);
 
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
-    FastCache::InMemoryListener listener;
-    FastCache::CountingAdmissionControl admission { /*maxConcurrent*/ 4 };
+    core::net::testing::InMemoryListener listener;
+    core::net::CountingAdmissionControl admission { /*maxConcurrent*/ 4 };
     FastCache::AtomicMetricsSink metrics;
     FastCache::Server server { listener, engine, logger, &admission, &metrics, /*session*/ {}, tlsContext.get() };
 
     auto c1 = listener.connectClient();
     auto c2 = listener.connectClient();
-    c1->shutdownWrite();
-    c2->shutdownWrite();
+    REQUIRE(FastCache::Testing::ShutdownWrite(*c1).has_value());
+    REQUIRE(FastCache::Testing::ShutdownWrite(*c2).has_value());
 
-    listener.Close();
-    FastCache::SyncRun(server.Run());
+    listener.close();
+    core::async::syncRun(server.Run());
 
     REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsTotal) == 2);
     REQUIRE(metrics.Read(FastCache::IMetricsSink::Counter::ConnectionsTotalTls) == 2);

@@ -56,14 +56,14 @@ namespace
 
 } // namespace
 
-TracingStorage::TracingStorage(IStorage& inner, ILogger& logger, IClock& clock) noexcept:
+TracingStorage::TracingStorage(IStorage& inner, ILogger& logger, core::platform::IClock& clock) noexcept:
     _inner { inner },
     _logger { logger },
     _clock { clock }
 {
 }
 
-std::expected<GetResult, StorageError> TracingStorage::Get(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> TracingStorage::Get(std::string_view key, core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         "GET",
@@ -81,7 +81,7 @@ std::expected<GetResult, StorageError> TracingStorage::Get(std::string_view key,
 std::expected<CasToken, StorageError> TracingStorage::Set(std::string_view key,
                                                           std::vector<std::byte> value,
                                                           std::uint32_t flags,
-                                                          TimePoint expiry)
+                                                          core::platform::SteadyTimePoint expiry)
 {
     auto const bytes = value.size();
     return TraceCall(
@@ -95,8 +95,11 @@ std::expected<CasToken, StorageError> TracingStorage::Set(std::string_view key,
         });
 }
 
-std::expected<CasToken, StorageError> TracingStorage::Add(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> TracingStorage::Add(std::string_view key,
+                                                          std::vector<std::byte> value,
+                                                          std::uint32_t flags,
+                                                          core::platform::SteadyTimePoint expiry,
+                                                          core::platform::SteadyTimePoint now)
 {
     auto const bytes = value.size();
     return TraceCall(
@@ -110,8 +113,11 @@ std::expected<CasToken, StorageError> TracingStorage::Add(
         });
 }
 
-std::expected<CasToken, StorageError> TracingStorage::Replace(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> TracingStorage::Replace(std::string_view key,
+                                                              std::vector<std::byte> value,
+                                                              std::uint32_t flags,
+                                                              core::platform::SteadyTimePoint expiry,
+                                                              core::platform::SteadyTimePoint now)
 {
     auto const bytes = value.size();
     return TraceCall(
@@ -128,7 +134,7 @@ std::expected<CasToken, StorageError> TracingStorage::Replace(
 std::expected<CasToken, StorageError> TracingStorage::Append(std::string_view key,
                                                              std::span<std::byte const> suffix,
                                                              CasToken expected,
-                                                             TimePoint now)
+                                                             core::platform::SteadyTimePoint now)
 {
     auto const bytes = suffix.size();
     return TraceCall(
@@ -145,7 +151,7 @@ std::expected<CasToken, StorageError> TracingStorage::Append(std::string_view ke
 std::expected<CasToken, StorageError> TracingStorage::Prepend(std::string_view key,
                                                               std::span<std::byte const> prefix,
                                                               CasToken expected,
-                                                              TimePoint now)
+                                                              core::platform::SteadyTimePoint now)
 {
     auto const bytes = prefix.size();
     return TraceCall(
@@ -163,8 +169,8 @@ std::expected<CasToken, StorageError> TracingStorage::CompareAndSwap(std::string
                                                                      CasToken expected,
                                                                      std::vector<std::byte> value,
                                                                      std::uint32_t flags,
-                                                                     TimePoint expiry,
-                                                                     TimePoint now)
+                                                                     core::platform::SteadyTimePoint expiry,
+                                                                     core::platform::SteadyTimePoint now)
 {
     auto const bytes = value.size();
     return TraceCall(
@@ -181,7 +187,7 @@ std::expected<CasToken, StorageError> TracingStorage::CompareAndSwap(std::string
 std::expected<IStorage::IncrResult, StorageError> TracingStorage::IncrementOrInitialize(std::string_view key,
                                                                                         std::uint64_t magnitude,
                                                                                         bool decrement,
-                                                                                        TimePoint now)
+                                                                                        core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         decrement ? "DECR" : "INCR",
@@ -194,7 +200,7 @@ std::expected<IStorage::IncrResult, StorageError> TracingStorage::IncrementOrIni
         });
 }
 
-std::expected<void, StorageError> TracingStorage::Delete(std::string_view key, TimePoint now)
+std::expected<void, StorageError> TracingStorage::Delete(std::string_view key, core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         "DELETE",
@@ -207,7 +213,9 @@ std::expected<void, StorageError> TracingStorage::Delete(std::string_view key, T
         });
 }
 
-std::expected<CasToken, StorageError> TracingStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
+std::expected<CasToken, StorageError> TracingStorage::Touch(std::string_view key,
+                                                            core::platform::SteadyTimePoint newExpiry,
+                                                            core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         "TOUCH",
@@ -220,7 +228,7 @@ std::expected<CasToken, StorageError> TracingStorage::Touch(std::string_view key
         });
 }
 
-std::expected<GetResult, StorageError> TracingStorage::Peek(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> TracingStorage::Peek(std::string_view key, core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         "PEEK",
@@ -235,7 +243,7 @@ std::expected<GetResult, StorageError> TracingStorage::Peek(std::string_view key
         });
 }
 
-std::expected<bool, StorageError> TracingStorage::Prefetch(std::string_view key, TimePoint now)
+std::expected<bool, StorageError> TracingStorage::Prefetch(std::string_view key, core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         "PREFETCH",
@@ -247,26 +255,27 @@ std::expected<bool, StorageError> TracingStorage::Prefetch(std::string_view key,
             return *r ? "WARM" : "MISS";
         });
 }
-std::expected<std::optional<TimePoint>, StorageError> TracingStorage::PeekExpiry(std::string_view key, TimePoint now)
+std::expected<std::optional<core::platform::SteadyTimePoint>, StorageError> TracingStorage::PeekExpiry(
+    std::string_view key, core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         "PEEK_EXPIRY",
         key,
         [&] { return _inner.PeekExpiry(key, now); },
-        [](std::expected<std::optional<TimePoint>, StorageError> const& r) -> std::string {
+        [](std::expected<std::optional<core::platform::SteadyTimePoint>, StorageError> const& r) -> std::string {
             if (!r.has_value())
                 return std::string { ErrorOutcome(r.error()) };
             if (!r->has_value())
                 return "MISS";
-            if (**r == TimePoint::max())
+            if (**r == core::platform::SteadyTimePoint::max())
                 return "NO_TTL";
             return "HIT";
         });
 }
 
 std::expected<CasToken, StorageError> TracingStorage::MarkStale(std::string_view key,
-                                                                std::optional<TimePoint> newExpiry,
-                                                                TimePoint now)
+                                                                std::optional<core::platform::SteadyTimePoint> newExpiry,
+                                                                core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         "MARK_STALE",
@@ -279,7 +288,9 @@ std::expected<CasToken, StorageError> TracingStorage::MarkStale(std::string_view
         });
 }
 
-std::expected<GetResult, StorageError> TracingStorage::GetAndTouch(std::string_view key, TimePoint newExpiry, TimePoint now)
+std::expected<GetResult, StorageError> TracingStorage::GetAndTouch(std::string_view key,
+                                                                   core::platform::SteadyTimePoint newExpiry,
+                                                                   core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         "GAT",
@@ -294,7 +305,9 @@ std::expected<GetResult, StorageError> TracingStorage::GetAndTouch(std::string_v
         });
 }
 
-std::expected<void, StorageError> TracingStorage::CompareAndDelete(std::string_view key, CasToken expected, TimePoint now)
+std::expected<void, StorageError> TracingStorage::CompareAndDelete(std::string_view key,
+                                                                   CasToken expected,
+                                                                   core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         "CAD",
@@ -307,7 +320,7 @@ std::expected<void, StorageError> TracingStorage::CompareAndDelete(std::string_v
         });
 }
 
-std::expected<bool, StorageError> TracingStorage::ClearExpiry(std::string_view key, TimePoint now)
+std::expected<bool, StorageError> TracingStorage::ClearExpiry(std::string_view key, core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         "CLEAR_EXPIRY",
@@ -323,7 +336,7 @@ std::expected<bool, StorageError> TracingStorage::ClearExpiry(std::string_view k
 std::expected<CasToken, StorageError> TracingStorage::Update(
     std::string_view key,
     std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
-    TimePoint now)
+    core::platform::SteadyTimePoint now)
 {
     return TraceCall(
         "UPDATE",
@@ -336,7 +349,7 @@ std::expected<CasToken, StorageError> TracingStorage::Update(
         });
 }
 
-void TracingStorage::FlushWithGeneration(TimePoint effectiveAt)
+void TracingStorage::FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt)
 {
     bool const traceOn = _logger.MinLevel() <= LogLevel::Trace;
     auto const startedAt = _clock.now();
@@ -351,7 +364,7 @@ void TracingStorage::FlushWithGeneration(TimePoint effectiveAt)
     }
 }
 
-PurgeOutcome TracingStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
+PurgeOutcome TracingStorage::PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget)
 {
     return _inner.PurgeExpired(now, budget);
 }

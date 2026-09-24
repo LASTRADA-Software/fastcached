@@ -43,7 +43,7 @@ namespace FastCache::Testing
 /// covered `_CRT_WARN` and called `SetErrorMode`, while `IteratorDebugCanary.cpp`
 /// covered neither and guarded on `_MSC_VER` where the others guarded on `_WIN32`. That
 /// is the shape `.agent/rules/testing.md` already records for shared test helpers —
-/// three private copies of one scripted `ISocket` carried the same defect in two of
+/// three private copies of one scripted `core::net::ISocket` carried the same defect in two of
 /// them. A suppression that is *almost* everywhere is indistinguishable from one that
 /// is everywhere, right up to the run that hangs.
 ///

@@ -5,7 +5,6 @@
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/Roster.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
@@ -18,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -171,7 +172,7 @@ enum class EnrollControlOutcome : std::uint8_t
 /// Thread-safe: the responder reaches it from a reactor thread and the warning ticker
 /// from its own, so every method takes the lock. The decisions are pure with respect to
 /// I/O -- no socket, no file, no consensus -- which is what lets the whole of this be
-/// exercised against a `ManualClock`.
+/// exercised against a `core::platform::ManualClock`.
 class EnrollmentWindow
 {
   public:
@@ -179,7 +180,7 @@ class EnrollmentWindow
     /// @param conditions Where an open window is RAISED and a closed one cleared (#1364), or null on
     ///        a node that serves no window -- whose row its scope then answers, rather than this
     ///        object reporting a reassuring `clear` for a window nothing can open. Must outlive this.
-    explicit EnrollmentWindow(IClock const& clock, NodeConditions* conditions = nullptr):
+    explicit EnrollmentWindow(core::platform::IClock const& clock, NodeConditions* conditions = nullptr):
         _clock { clock },
         _conditions { conditions }
     {
@@ -275,7 +276,7 @@ class EnrollmentWindow
     /// The warning this window owes right now, if any, consuming it.
     ///
     /// **Pure and pulled rather than a thread of its own inside this class**, so the
-    /// whole repeating-warning property is exercisable against a `ManualClock`: a test
+    /// whole repeating-warning property is exercisable against a `core::platform::ManualClock`: a test
     /// advances the clock and asserts which calls answer. Whoever drives it decides how
     /// often to ask; asking more often than `EnrollmentWarningInterval` costs a lock and
     /// a comparison and answers nothing.
@@ -295,9 +296,9 @@ class EnrollmentWindow
     /// Seconds from @p since to now, floored at zero.
     /// @param since The earlier instant.
     /// @return The elapsed whole seconds.
-    [[nodiscard]] std::uint64_t SecondsSince(TimePoint since) const noexcept;
+    [[nodiscard]] std::uint64_t SecondsSince(core::platform::SteadyTimePoint since) const noexcept;
 
-    IClock const& _clock;
+    core::platform::IClock const& _clock;
 
     /// Where the window's state is reported as a condition; null on a node that serves none.
     /// Written under `_mutex`, so a racing open and close cannot report in the other order.
@@ -309,10 +310,10 @@ class EnrollmentWindow
     bool _open { false };
 
     /// When it was opened; meaningless while closed. Guarded by `_mutex`.
-    TimePoint _openedAt {};
+    core::platform::SteadyTimePoint _openedAt {};
 
     /// When the next warning falls due. Guarded by `_mutex`.
-    TimePoint _warnDueAt {};
+    core::platform::SteadyTimePoint _warnDueAt {};
 
     /// Who is waiting, oldest first. Guarded by `_mutex`.
     ///
@@ -327,10 +328,10 @@ class EnrollmentWindow
     /// When each entry first asked, parallel to `_pending`. Guarded by `_mutex`.
     ///
     /// Beside the list rather than inside `EnrollmentPendingEntry`, because that type is
-    /// the WIRE's and carries an age in seconds: a `TimePoint` on it would be an instant
+    /// the WIRE's and carries an age in seconds: a `core::platform::SteadyTimePoint` on it would be an instant
     /// on a report, which is the shape this project refuses -- a receiver differences it
     /// against its own clock, which is a different clock.
-    std::vector<TimePoint> _firstSeen;
+    std::vector<core::platform::SteadyTimePoint> _firstSeen;
 };
 
 } // namespace FastCache::Node

@@ -2,11 +2,11 @@
 #include "FrameEndpoint.hpp"
 #include "NodeIoLoop.hpp"
 
-#include <FastCache/Async/Task.hpp>
-
 #include <memory>
 #include <mutex>
 #include <utility>
+
+#include <core/async/Task.hpp>
 
 namespace FastCache::Node
 {
@@ -21,12 +21,12 @@ namespace
     /// a use-after-free waiting to happen -- the shape `RaftPeerServer::ServePeer`
     /// already uses for the same reason.
     ///
-    /// The `try` is a firewall. This is a `DetachedTask`, whose unhandled_exception
+    /// The `try` is a firewall. This is a `core::async::DetachedTask`, whose unhandled_exception
     /// terminates the process, and one surface throwing must not take the node with
     /// it -- the same reasoning `ReactorServerLoop` applies per connection.
     /// @param server The accept loop to run.
     /// @param owner Told when it ends, so the last loop can stop the reactor.
-    DetachedTask RunAdopted(FrameServer* server, NodeIoLoop* owner)
+    core::async::DetachedTask RunAdopted(FrameServer* server, NodeIoLoop* owner)
     {
         try
         {
@@ -70,7 +70,7 @@ void NodeIoLoop::Start()
     _thread = std::jthread { [this] { _reactor.run(); } };
 }
 
-void NodeIoLoop::Retire(std::unique_ptr<IListener> listener)
+void NodeIoLoop::Retire(std::unique_ptr<core::net::IListener> listener)
 {
     if (!listener)
         return;

@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
@@ -40,6 +38,9 @@
 #include <apps/fastcache-compile-node/NodePresenceTier.hpp>
 #include <apps/fastcache-compile-node/NodeRoster.hpp>
 #include <apps/fastcache-compile-node/SchedulerLink.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
@@ -189,7 +190,7 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// loopback is never forgotten -- deliberately, so a node always admits its own machine --
     /// so a forget published against the default caller applies to nobody and a case asserting
     /// a refusal goes green having exercised nothing. Any case about admission sets this first.
-    /// @param host The caller's host, as `ISocket::PeerAddress()` would report it.
+    /// @param host The caller's host, as `core::net::ISocket::PeerAddress()` would report it.
     void SetCallerHost(std::string host)
     {
         _callerHost = std::move(host);
@@ -314,7 +315,7 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     void Step(std::chrono::milliseconds by)
     {
         _clock.advance(by);
-        _wallClock.Advance(by);
+        _wallClock.advance(by);
     }
 
     /// Run @p hook the next time a compile is sent to a worker.
@@ -413,7 +414,7 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
             Cluster::RosterEndorsement { .clusterId = std::string { ClusterId },
                                          .version = state.rosterVersion,
                                          .rosterDigest = Cluster::DigestOfRoster(Cluster::ProjectRoster(state)),
-                                         .notAfter = _wallClock.Now() + Cluster::RosterEndorsementLifetime,
+                                         .notAfter = _wallClock.now() + Cluster::RosterEndorsementLifetime,
                                          .endorser = voter,
                                          .signature = {} },
             [&key](std::span<std::byte const> message) { return key.Sign(message); });
@@ -575,7 +576,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// @param options Ignored; nothing here blocks.
     /// @return A connection answering from that scheduler, or null when it is unreachable or
     ///         nobody was added there.
-    [[nodiscard]] std::unique_ptr<ISocket> Dial(std::string_view endpoint, DialOptions options) override
+    [[nodiscard]] std::unique_ptr<core::net::ISocket> Dial(std::string_view endpoint,
+                                                           core::net::DialOptions options) override
     {
         (void) options;
         if (std::ranges::contains(_unreachable, endpoint)
@@ -613,7 +615,7 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         // would let the two ends drift apart independently, which is the failure
         // #340 was.
         ScriptedSocket socket { std::move(reply) };
-        auto outcome = SyncRun(Cc::ExchangeFramed(&socket, &Unwatched(), std::move(frame), credential));
+        auto outcome = core::async::syncRun(Cc::ExchangeFramed(&socket, &Unwatched(), std::move(frame), credential));
 
         _calls[slot].kind = outcome.kind;
         _calls[slot].code = outcome.code;
@@ -767,7 +769,7 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
 
     /// A connection whose answer is computed from what was written to it, by the scheduler it
     /// was dialled at -- `ScriptedSocket`'s replay, with the reply decided when it is first read.
-    class AnsweringSocket final: public ISocket
+    class AnsweringSocket final: public core::net::ISocket
     {
       public:
         AnsweringSocket(FleetHarness& fleet, std::string endpoint):
@@ -776,14 +778,14 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         {
         }
 
-        [[nodiscard]] IoAwaitable write(std::span<std::byte const> bytes) override
+        [[nodiscard]] core::net::IoAwaitable write(std::span<std::byte const> bytes) override
         {
             _sent.insert(_sent.end(), bytes.begin(), bytes.end());
-            return IoAwaitable { IoResult { bytes.size() } };
+            return core::net::IoAwaitable { core::net::IoResult { bytes.size() } };
         }
 
-        [[nodiscard]] IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
-                                                std::shared_ptr<void const> /*keepAlive*/ = {}) override
+        [[nodiscard]] core::net::IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
+                                                           std::shared_ptr<void const> /*keepAlive*/ = {}) override
         {
             std::size_t total = 0;
             for (auto const& segment: segments)
@@ -791,10 +793,10 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                 _sent.insert(_sent.end(), segment.begin(), segment.end());
                 total += segment.size();
             }
-            return IoAwaitable { IoResult { total } };
+            return core::net::IoAwaitable { core::net::IoResult { total } };
         }
 
-        [[nodiscard]] IoAwaitable read(std::span<std::byte> buffer) override
+        [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override
         {
             if (!_answered)
             {
@@ -808,7 +810,7 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
             auto const take = std::min(_reply.size() - _cursor, buffer.size());
             std::copy_n(_reply.begin() + static_cast<std::ptrdiff_t>(_cursor), take, buffer.begin());
             _cursor += take;
-            return IoAwaitable { IoResult { take } };
+            return core::net::IoAwaitable { core::net::IoResult { take } };
         }
 
         void close() noexcept override
@@ -816,7 +818,7 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
             _closed = true;
         }
 
-        [[nodiscard]] bool IsClosed() const noexcept override
+        [[nodiscard]] bool isClosed() const noexcept override
         {
             return _closed;
         }
@@ -831,8 +833,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         bool _closed { false };
     };
 
-    ManualClock _clock;
-    ManualWallClock _wallClock;
+    core::platform::ManualClock _clock;
+    core::platform::ManualWallClock _wallClock;
     AtomicMetricsSink _metrics;
     NullLogger _logger;
     /// Schedulers a dial does not reach; see `SetUnreachable`.

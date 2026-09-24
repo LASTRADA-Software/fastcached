@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# No first-party C++ calls a range algorithm that `src/FastCache/Core/Ranges.hpp` wraps
-# directly: `std::ranges::iota` is spelled `FastCache::Ranges::Iota`, `std::ranges::fold_left`
-# is spelled `FastCache::Ranges::FoldLeft`, and so on for every facility that header wraps.
+# No first-party C++ calls a range algorithm that core-cpp's `<core/Ranges.hpp>` wraps
+# directly: `std::ranges::iota` is spelled `core::ranges::Iota`, `std::ranges::fold_left`
+# is spelled `core::ranges::FoldLeft`, and so on for every facility that header wraps. It was
+# `src/FastCache/Core/Ranges.hpp` until #1596 moved it into core-cpp; see `seamHeader` below.
 #
 # ## Why the seam exists
 #
@@ -91,10 +92,39 @@ if(NOT DEFINED FASTCACHED_SOURCE_DIR)
 endif()
 
 # The one path this check is anchored on. Its test is DERIVED from it.
-set(seamHeader "src/FastCache/Core/Ranges.hpp")
-string(REGEX REPLACE "\\.hpp$" "_test.cpp" seamTest "${seamHeader}")
+#
+# **Or the header is somebody else's, and then nothing in this tree is exempt.** Since #1596 the
+# seam is core-cpp's `<core/Ranges.hpp>` (`core::ranges::Iota`, `core::ranges::FoldLeft`), and
+# the ctest registration passes its absolute path as FASTCACHED_RANGES_SEAM_HEADER. The header and
+# its test are core-cpp's to keep, so the in-tree exemption has no subject and every first-party
+# file is scanned. Unset, the check reads an in-tree seam, which is what its self-test stages.
+if(DEFINED FASTCACHED_RANGES_SEAM_HEADER)
+    if(NOT EXISTS "${FASTCACHED_RANGES_SEAM_HEADER}")
+        message("")
+        message("  ${FASTCACHED_RANGES_SEAM_HEADER} does not exist.")
+        message("")
+        message("This check reads the wrapped facilities from core-cpp's seam header. With it gone")
+        message("it cannot say what to refuse -- a moved or renamed seam, not a clean tree.")
+        message(FATAL_ERROR "ranges-seam: the seam header ${FASTCACHED_RANGES_SEAM_HEADER} is missing and the scan cannot conclude")
+    endif()
+    set(seamHeader "${FASTCACHED_RANGES_SEAM_HEADER}")
+    set(seamHeaderPath "${FASTCACHED_RANGES_SEAM_HEADER}")
+    set(seamTest "")
+    set(seamSpelling "core::ranges")
+    set(seamInclude "core/Ranges.hpp")
+    set(anchors "")
+    set(exemptExpected 0)
+else()
+    set(seamHeader "src/FastCache/Core/Ranges.hpp")
+    set(seamHeaderPath "${FASTCACHED_SOURCE_DIR}/${seamHeader}")
+    string(REGEX REPLACE "\\.hpp$" "_test.cpp" seamTest "${seamHeader}")
+    set(seamSpelling "FastCache::Ranges")
+    set(seamInclude "FastCache/Core/Ranges.hpp")
+    set(anchors "${seamHeader};${seamTest}")
+    set(exemptExpected 2)
+endif()
 
-foreach(anchor IN ITEMS "${seamHeader}" "${seamTest}")
+foreach(anchor IN LISTS anchors)
     if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${anchor}")
         message("")
         message("  ${anchor} does not exist.")
@@ -110,7 +140,7 @@ endforeach()
 # ---------------------------------------------------------------------------
 # The rows, read from the header. Matched over the whole content, and the match stops before
 # the `;` that ends the declaration, so no element of the result list is split by one.
-file(READ "${FASTCACHED_SOURCE_DIR}/${seamHeader}" seamContent)
+file(READ "${seamHeaderPath}" seamContent)
 string(REPLACE "\r\n" "\n" seamContent "${seamContent}")
 set(selectionShape "#if defined\\((__cpp_lib_[a-z0-9_]+)\\)[^\n]*\ninline constexpr auto ([A-Z][A-Za-z0-9]*) = std::ranges::([a-z_][a-z0-9_]*)")
 string(REGEX MATCHALL "${selectionShape}" selections "${seamContent}")
@@ -181,7 +211,7 @@ set(violations "")
 set(exemptSeen 0)
 
 foreach(relative IN LISTS sourceFiles)
-    if(relative STREQUAL seamHeader OR relative STREQUAL seamTest)
+    if(exemptExpected GREATER 0 AND (relative STREQUAL seamHeader OR relative STREQUAL seamTest))
         math(EXPR exemptSeen "${exemptSeen} + 1")
         continue()
     endif()
@@ -210,9 +240,9 @@ endforeach()
 # The exemption must have matched both files it names. The anchors exist on disk (asserted
 # above); not seeing them HERE means the enumeration missed them -- an untracked seam, or a
 # walk excluding their directory -- and then nothing says it saw the rest of the tree either.
-if(NOT exemptSeen EQUAL 2)
+if(NOT exemptSeen EQUAL exemptExpected)
     message("")
-    message("  The enumeration (${scanSource}) listed ${exemptSeen} of the 2 exempt files:")
+    message("  The enumeration (${scanSource}) listed ${exemptSeen} of the ${exemptExpected} exempt files:")
     message("  ${seamHeader} and ${seamTest}.")
     message("")
     message("Both exist on disk, so a scan that did not list them is not scanning the tree it")
@@ -239,9 +269,8 @@ if(violations)
     message("")
     message("The fix at each site:")
     message("")
-    message("  1. #include <FastCache/Core/Ranges.hpp>")
-    message("  2. replace `std::ranges::<name>(...)` with `FastCache::Ranges::<Name>(...)`")
-    message("     (`Ranges::<Name>` inside namespace FastCache), same arguments.")
+    message("  1. #include <${seamInclude}>")
+    message("  2. replace `std::ranges::<name>(...)` with `${seamSpelling}::<Name>(...)`, same arguments.")
     message("")
     message("Wherever the library ships the facility the seam is an object of the standard")
     message("function object's own type, so nothing changes where it compiled before, and")

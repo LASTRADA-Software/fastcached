@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cli/Duration.hpp>
-#include <FastCache/Core/Ranges.hpp>
 
 #include <cassert>
 #include <charconv>
@@ -14,6 +13,8 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache
 {
@@ -117,7 +118,7 @@ std::expected<std::chrono::milliseconds, DurationFault> ParseDuration(std::strin
     if (suffix.empty())
         return std::unexpected(DurationFault::MissingUnit);
 
-    auto const* const unit = FindOrNull(DurationUnitTable, suffix, &DurationUnitSpec::suffix);
+    auto const* const unit = core::findOrNull(DurationUnitTable, suffix, &DurationUnitSpec::suffix);
     if (unit == nullptr)
         // A fraction's point is not a unit that happens to be unknown: `1.5s` is told to write whole numbers.
         return std::unexpected(suffix.front() == '.' || suffix.front() == ',' ? DurationFault::NotANumber

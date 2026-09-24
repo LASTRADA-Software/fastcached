@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
-#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/IProtocolHandler.hpp>
 
 #include <cstddef>
 #include <string_view>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
 
 namespace FastCache
 {
@@ -51,10 +52,10 @@ class RedisRespHandler final: public IProtocolHandler
     /// Returned by INFO; mirrors the memcached `version` semantics.
     [[nodiscard]] static std::string_view ServerVersion() noexcept;
 
-    [[nodiscard]] Task<void> Run(ISocket* socket,
-                                 CacheEngine* engine,
-                                 std::vector<std::byte> primingBytes,
-                                 SessionContext session) override;
+    [[nodiscard]] core::async::Task<void> Run(core::net::ISocket* socket,
+                                              CacheEngine* engine,
+                                              std::vector<std::byte> primingBytes,
+                                              SessionContext session) override;
 
     /// Test seam: override the per-connection MULTI queue caps so unit tests
     /// can exercise the breach path without actually allocating the

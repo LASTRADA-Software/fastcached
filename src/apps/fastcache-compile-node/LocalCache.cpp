@@ -17,12 +17,12 @@ namespace
     /// determines the object, so an entry is valid until it is evicted for space.
     /// Expiring one would only force a recompile of something still correct.
     ///
-    /// `TimePoint::max()` and NOT a default-constructed `TimePoint`. The storage
+    /// `core::platform::SteadyTimePoint::max()` and NOT a default-constructed `core::platform::SteadyTimePoint`. The storage
     /// tests `entry.expiry <= now`, so the zero value means "expired before any
     /// clock reading" rather than "no deadline" -- every write would land and be
     /// unreadable, which is a cache that silently stores nothing. `CacheEngine`
     /// spells never-expires the same way.
-    constexpr TimePoint NoExpiry = TimePoint::max();
+    constexpr core::platform::SteadyTimePoint NoExpiry = core::platform::SteadyTimePoint::max();
 
     /// Compile values carry no memcached flags word; the framing is the wire's.
     constexpr std::uint32_t NoFlags = 0;
@@ -51,7 +51,10 @@ namespace
     static_assert(RowsInEnumeratorOrder(UpstreamStoreCounters, &UpstreamStoreRow::outcome));
 } // namespace
 
-LocalCache::LocalCache(IStorage& local, ICacheUpstream& upstream, IClock& clock, IMetricsSink& metrics) noexcept:
+LocalCache::LocalCache(IStorage& local,
+                       ICacheUpstream& upstream,
+                       core::platform::IClock& clock,
+                       IMetricsSink& metrics) noexcept:
     _local { local },
     _upstream { upstream },
     _clock { clock },
@@ -59,7 +62,7 @@ LocalCache::LocalCache(IStorage& local, ICacheUpstream& upstream, IClock& clock,
 {
 }
 
-Task<std::optional<std::vector<std::byte>>> LocalCache::Fetch(std::string_view key)
+core::async::Task<std::optional<std::vector<std::byte>>> LocalCache::Fetch(std::string_view key)
 {
     if (auto const hit = _local.Get(key, _clock.now()); hit.has_value() && hit->found)
     {
@@ -97,7 +100,7 @@ Task<std::optional<std::vector<std::byte>>> LocalCache::Fetch(std::string_view k
     co_return fetched;
 }
 
-Task<bool> LocalCache::Store(std::string_view key, std::span<std::byte const> value)
+core::async::Task<bool> LocalCache::Store(std::string_view key, std::span<std::byte const> value)
 {
     // Local FIRST, and it is the write that must not be lost: it is what makes this
     // machine's next build fast, and it must not fail for a reason the network chose.

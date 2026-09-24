@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "HistoryChart.hpp"
 
-#include <FastCache/Core/Ranges.hpp>
-
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -11,6 +9,8 @@
 #include <span>
 #include <string>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Cli
 {
@@ -78,7 +78,7 @@ namespace
 
 std::size_t ChartWindowFor(std::size_t samples) noexcept
 {
-    auto const* const window = FindIfOrNull(ChartWindows, [samples](std::size_t span) { return span >= samples; });
+    auto const* const window = core::findIfOrNull(ChartWindows, [samples](std::size_t span) { return span >= samples; });
     return window != nullptr ? *window : ChartWindows.back();
 }
 

@@ -15,22 +15,12 @@
 #
 # The count of units reached by NO leg is printed on every run, and deliberately not
 # restated here: a figure in prose beside the table it describes is a second claim, and
-# this one went stale the first time a row was added. It is two kinds of unit, and the
-# reason column says which: the kqueue units, reached by nothing until a macOS leg exists
-# (https://github.com/LASTRADA-Software/fastcached/issues/858), and the instruction-set
-# probe, which holds no code for ANY analyser to read on any platform (#1447).
+# this one went stale the first time a row was added. It is one kind of unit: the
+# instruction-set probe, which holds no code for ANY analyser to read on any platform
+# (#1447). The kqueue units reached by nothing until a macOS leg exists
+# (https://github.com/LASTRADA-Software/fastcached/issues/858) were the other kind, and
+# left this tree with the event loop and the sockets for core-cpp (#1596).
 #
 # Format: <path><TAB><reached-by, comma-separated, or `none`><TAB><reason>
-src/FastCache/Async/IocpReactor.cpp	clang-tidy-windows	`#if defined(_WIN32)`
-src/FastCache/Async/IocpReactor_test.cpp	clang-tidy-windows	`#if defined(_WIN32)`
-src/FastCache/Net/IocpConnector.cpp	clang-tidy-windows	`#if defined(_WIN32)`
-src/FastCache/Net/IocpConnector_test.cpp	clang-tidy-windows	`#if defined(_WIN32)`
-src/FastCache/Net/IocpSocket.cpp	clang-tidy-windows	`#if defined(_WIN32)`
-src/FastCache/Net/IocpSocket_test.cpp	clang-tidy-windows	`#if defined(_WIN32)`
 src/tests/ErrorPopupsAtStartup.cpp	clang-tidy-windows	`#if defined(_MSC_VER)`: the startup object installs nothing off the MSVC CRT (#1389)
-src/FastCache/Async/KqueueReactor.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
-src/FastCache/Async/KqueueReactor_test.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
-src/FastCache/Net/KqueueConnector.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
-src/FastCache/Net/KqueueSocket.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
-src/FastCache/Net/KqueueSocket_test.cpp	none	`#if defined(__APPLE__)`; no macOS analyser leg exists
 src/tests/InstructionSetBaseline.cpp	none	preprocessor directives and `#error` only, on every platform: there is no code for an analyser to read, and what it decides is driven by `ctest -R instruction-set-probe-selftest` (#1447)

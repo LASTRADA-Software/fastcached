@@ -7,7 +7,6 @@
 #include "Responders.hpp"
 
 #include <FastCache/Auth/AuthPolicy.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseSigner.hpp>
@@ -26,6 +25,8 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -69,8 +70,8 @@ class SchedulerTier
     [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, std::string> Start(
         NodeConfig const& cfg,
         Distributed::IMembershipOracle const& membership,
-        IClock& clock,
-        WallClockRef wallClock,
+        core::platform::IClock& clock,
+        core::platform::WallClockRef wallClock,
         IMetricsSink& metrics,
         ILogger& logger,
         std::optional<Ed25519KeyPair> const& identityKey);
@@ -185,8 +186,8 @@ class SchedulerTier
 
   private:
     SchedulerTier(Distributed::IMembershipOracle const& membership,
-                  IClock& clock,
-                  WallClockRef wallClock,
+                  core::platform::IClock& clock,
+                  core::platform::WallClockRef wallClock,
                   IMetricsSink& metrics,
                   ILogger& logger,
                   std::string signerId,

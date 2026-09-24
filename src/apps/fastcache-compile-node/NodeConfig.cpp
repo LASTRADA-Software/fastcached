@@ -15,7 +15,6 @@
 #include <FastCache/Config/SecretProvenance.hpp>
 #include <FastCache/Core/Errors/ConfigError.hpp>
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Utf8.hpp>
 
 #include <algorithm>
@@ -32,6 +31,8 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Node
 {
@@ -665,8 +666,8 @@ namespace
     /// @return That rule's message, or nothing.
     [[nodiscard]] std::optional<std::string> FirstRefusal(std::span<ConfigRule const> rules, NodeConfig const& cfg)
     {
-        if (auto const* const rule =
-                FindIfOrNull(rules, [&cfg](ConfigRule const& row) { return InScope(row.scope, cfg) && row.refuses(cfg); }))
+        if (auto const* const rule = core::findIfOrNull(
+                rules, [&cfg](ConfigRule const& row) { return InScope(row.scope, cfg) && row.refuses(cfg); }))
             return std::string { rule->message };
         return std::nullopt;
     }
@@ -3508,7 +3509,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
     // rows judge combinations of settings a node USES, and a setting it cannot use is
     // the more specific diagnosis. Scoped rules below cannot collide with it: they are
     // asked only where their component runs, and it only where its component does not.
-    if (auto const* const unrun = FindIfOrNull(NodeOptions(), [&cfg](OptionSpec<NodeConfig> const& spec) {
+    if (auto const* const unrun = core::findIfOrNull(NodeOptions(), [&cfg](OptionSpec<NodeConfig> const& spec) {
             return spec.component != nullptr && !spec.component->runs(cfg) && NamesSetting(spec, cfg);
         }))
         return UnrunComponentRefusal(*unrun);

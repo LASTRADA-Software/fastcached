@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
-#include <FastCache/Net/TlsWrap.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <format>
@@ -21,6 +20,11 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+
+#include <core/async/IExecutor.hpp>
+#include <core/async/ParkedWork.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/ITlsContext.hpp>
 
 namespace FastCache
 {
@@ -41,13 +45,44 @@ AdminBindFailureReport DescribeToleratedAdminBindFailure(std::string_view addres
 
 namespace
 {
+    /// Where a TLS socket over this surface's sockets resumes a waiter it parked on itself.
+    ///
+    /// core-cpp's `ITlsContext::wrap` asks for the loop the socket belongs to, because a TLS
+    /// socket parks one operation on another -- a read waiting while a write drives the
+    /// handshake -- and hands the waiter back through it (#1596). This surface's sockets BLOCK
+    /// and belong to no loop: one thread serves one request at a time, reading and then writing,
+    /// so no second operation is ever in flight to park behind the first, and every operation
+    /// completes before it returns. Resuming inline is the only answer a loop-less thread has,
+    /// and it is only reachable through a concurrency this surface does not have.
+    class BlockingThreadExecutor final: public core::async::IExecutor
+    {
+      public:
+        using core::async::IExecutor::submit;
+
+        void submit(std::coroutine_handle<> handle) override
+        {
+            handle.resume();
+        }
+
+        void submit(core::async::ParkedWork work) override
+        {
+            work.resume.resume();
+        }
+    };
+
+    /// @return The one executor every admin TLS socket shares; stateless, so one is enough.
+    [[nodiscard]] core::async::IExecutor& AdminTlsExecutor() noexcept
+    {
+        static BlockingThreadExecutor executor;
+        return executor;
+    }
 
     /// Hard cap on the request head we will buffer before giving up. The admin
     /// surface only needs the request line and one header, so this is generous; it
     /// exists to stop a slow or hostile client from growing the buffer without bound.
     constexpr std::size_t MaxRequestBytes = 8192;
 
-    Task<bool> WriteAll(ISocket* socket, std::string_view data)
+    core::async::Task<bool> WriteAll(core::net::ISocket* socket, std::string_view data)
     {
         if (data.empty())
             co_return true;
@@ -366,7 +401,7 @@ namespace
     /// 60 KB head to `/healthz` are both answered `200 OK`, from a head this server
     /// only read the first 8,192 bytes of. That is the defect. A route reading no
     /// headers survives it by luck; `/fleet` reads a credential and does not.
-    Task<RequestHead> ReadRequestHead(ISocket* socket, IClock* clock)
+    core::async::Task<RequestHead> ReadRequestHead(core::net::ISocket* socket, core::platform::IClock* clock)
     {
         std::string buffer;
         bool sawHeadEnd = false;
@@ -397,10 +432,10 @@ namespace
                 //
                 // The request deadline is armed as `SO_RCVTIMEO` on the accepted
                 // socket (`BlockingListener::SetTimeouts` -- a concrete-type call,
-                // with no `IListener` seam, which is why a reactor-backed admin
+                // with no `core::net::IListener` seam, which is why a reactor-backed admin
                 // socket would never produce `Idle` at all), so it reaches this loop
                 // as a read *error* rather than as a signal of its own.
-                // `IsDeadlineExpiry` is what knows that the two platforms spell it
+                // `core::net::isDeadlineExpiry` is what knows that the two platforms spell it
                 // differently.
                 //
                 // Three outcomes, and the buffer decides only the last two: a peer
@@ -410,7 +445,7 @@ namespace
                 // begun. Falling through to the parse here is what served a
                 // truncated head, which is `TooLarge`'s defect reached without an
                 // oversize client.
-                if (!IsDeadlineExpiry(result.error().code))
+                if (!core::net::isDeadlineExpiry(result.error().code))
                     co_return RequestHead { .outcome = AdminHeadOutcome::PeerGone };
                 co_return RequestHead { .outcome = buffer.empty() ? AdminHeadOutcome::Idle : AdminHeadOutcome::Truncated };
             }
@@ -552,7 +587,7 @@ namespace
     /// By value, not by reference: this is a coroutine, so a reference parameter
     /// is one whose referent may be gone by the time the first `co_await`
     /// resumes -- the hazard `ServeAdminHttp`'s own signature already avoids.
-    Task<bool> WriteResponse(ISocket* socket, AdminResponse response)
+    core::async::Task<bool> WriteResponse(core::net::ISocket* socket, AdminResponse response)
     {
         auto const bodyless = CarriesNoContent(response.status);
         auto head = std::format("HTTP/1.1 {}\r\n", response.status);
@@ -581,12 +616,12 @@ namespace
 
 } // namespace
 
-Task<void> ServeAdminHttp(ISocket* socket,
-                          IMetricsSink const* metrics,
-                          AdminHttpServer::SnapshotProvider snapshotProvider,
-                          IClock* clock,
-                          std::span<AdminRoute const> routes,
-                          std::span<MetricsSurface const> surfaces)
+core::async::Task<void> ServeAdminHttp(core::net::ISocket* socket,
+                                       IMetricsSink const* metrics,
+                                       AdminHttpServer::SnapshotProvider snapshotProvider,
+                                       core::platform::IClock* clock,
+                                       std::span<AdminRoute const> routes,
+                                       std::span<MetricsSurface const> surfaces)
 {
     // TLS terminates here rather than in the accept loop, so a handshake failure
     // costs the same detached task a slow request does and never the loop. A
@@ -669,13 +704,13 @@ Task<void> ServeAdminHttp(ISocket* socket,
     co_return;
 }
 
-AdminHttpServer::AdminHttpServer(IListener& listener,
+AdminHttpServer::AdminHttpServer(core::net::IListener& listener,
                                  IMetricsSink const& metrics,
                                  SnapshotProvider snapshotProvider,
                                  ILogger& logger,
-                                 IClock& clock,
+                                 core::platform::IClock& clock,
                                  std::vector<AdminRoute> routes,
-                                 TlsContext* tls,
+                                 core::net::ITlsContext* tls,
                                  std::span<MetricsSurface const> surfaces) noexcept:
     _listener { listener },
     _metrics { metrics },
@@ -694,32 +729,32 @@ AdminHttpServer::AdminHttpServer(IListener& listener,
 /// loop can spawn it without capturing this — `inFlight` is passed by
 /// pointer with a lifetime that exceeds every spawned task (the
 /// AdminHttpServer's destructor blocks elsewhere).
-static DetachedTask ServeAdminConnection(std::unique_ptr<ISocket> socket,
-                                         IMetricsSink const* metrics,
-                                         AdminHttpServer::SnapshotProvider snapshotProvider,
-                                         IClock* clock,
-                                         std::span<AdminRoute const> routes,
-                                         std::span<MetricsSurface const> surfaces,
-                                         std::atomic<std::size_t>* inFlight)
+static core::async::DetachedTask ServeAdminConnection(std::unique_ptr<core::net::ISocket> socket,
+                                                      IMetricsSink const* metrics,
+                                                      AdminHttpServer::SnapshotProvider snapshotProvider,
+                                                      core::platform::IClock* clock,
+                                                      std::span<AdminRoute const> routes,
+                                                      std::span<MetricsSurface const> surfaces,
+                                                      std::atomic<std::size_t>* inFlight)
 {
     co_await ServeAdminHttp(socket.get(), metrics, std::move(snapshotProvider), clock, routes, surfaces);
     (void) co_await CloseLingering(socket.get(), nullptr, AdminHttpServer::Linger);
     inFlight->fetch_sub(1, std::memory_order_acq_rel);
 }
 
-Task<void> AdminHttpServer::Run()
+core::async::Task<void> AdminHttpServer::Run()
 {
     while (!_shuttingDown.load(std::memory_order_acquire))
     {
-        auto accepted = co_await _listener.Accept();
+        auto accepted = co_await _listener.accept();
         if (!accepted.has_value())
         {
             // A poll-timeout on the listening socket is how we wake to observe
             // Shutdown() on POSIX (where Close() does not unblock a parked
             // accept()); it is not a real failure, so loop and re-check the flag.
-            if (IsDeadlineExpiry(accepted.error().code))
+            if (core::net::isDeadlineExpiry(accepted.error().code))
                 continue;
-            _logger.Logf(LogLevel::Debug, "admin: accept loop ended ({})", accepted.error().ToString());
+            _logger.Logf(LogLevel::Debug, "admin: accept loop ended ({})", accepted.error().toString());
             co_return;
         }
         // Spawn the handler as a detached coroutine so a slow or hostile
@@ -747,8 +782,13 @@ Task<void> AdminHttpServer::Run()
             (void) co_await CloseLingering((*accepted).get(), nullptr, Linger);
             continue;
         }
-        ServeAdminConnection(
-            WrapTls(std::move(*accepted), _tls), &_metrics, _snapshotProvider, &_clock, _routes, _surfaces, &_inFlight);
+        ServeAdminConnection(core::net::wrapTls(std::move(*accepted), _tls, AdminTlsExecutor()),
+                             &_metrics,
+                             _snapshotProvider,
+                             &_clock,
+                             _routes,
+                             _surfaces,
+                             &_inFlight);
     }
     co_return;
 }
@@ -761,7 +801,7 @@ void AdminHttpServer::RequestStop() noexcept
 void AdminHttpServer::Shutdown() noexcept
 {
     RequestStop();
-    _listener.Close();
+    _listener.close();
     // Detached request coroutines may still be in flight. They borrow the
     // metrics sink, snapshot provider and routes held on this object, so we must
     // wait for them to drain before letting Shutdown return — otherwise an admin

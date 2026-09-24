@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -8,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/MembershipFakes.hpp>
 
@@ -140,7 +140,7 @@ TEST_CASE("An empty member entry does not admit a peer this machine cannot name"
 {
     // Two unanswerable questions are not a match. Under a raw string compare they
     // were: an endpoint that published as nothing stored an empty host, and the empty
-    // host is exactly what `FormatPeerAddress` answers for a peer whose `getpeername`
+    // host is exactly what `core::net::formatPeerAddress` answers for a peer whose `getpeername`
     // failed -- so the one caller that must never be admitted matched.
     ClusterMembership const cluster { MembershipParticipant::ClusterMembers, { "", "10.0.0.1:7000" } };
 
@@ -369,10 +369,10 @@ TEST_CASE("A scheduler refuses a non-member through the oracle", "[distributed][
     // what. Asserted together because each is correct in isolation and the wiring
     // between them is what a caller actually depends on.
     ClusterMembership const cluster { MembershipParticipant::ClusterMembers, { "10.0.0.1:7000" } };
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::AtomicMetricsSink metrics;
     FastCache::NullLogger schedulerLogger;
-    FastCache::ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = FastCache::Testing::TestLeaseSigner();
     SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
     service.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
@@ -443,7 +443,7 @@ TEST_CASE("Every spelling a kernel reports for a local peer is local", "[distrib
 TEST_CASE("A peer this machine cannot name is refused", "[distributed][membership]")
 {
     // The direction an unidentifiable caller has to fail in. An empty host is what
-    // `FormatPeerAddress` answers for a peer whose family it does not know or whose
+    // `core::net::formatPeerAddress` answers for a peer whose family it does not know or whose
     // `getpeername` failed, and handing this machine's CPU to something it cannot
     // name is the one outcome that must not be possible.
     ClusterMembership const membership { MembershipParticipant::ClusterMembers, { "10.0.0.1:7000" } };

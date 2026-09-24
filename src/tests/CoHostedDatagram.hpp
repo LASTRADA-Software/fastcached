@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Net/IDatagramSocket.hpp>
-#include <FastCache/Net/InMemoryDatagram.hpp>
-#include <FastCache/Net/SharedPortDatagram.hpp>
-
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+
+#include <core/net/IDatagramSocket.hpp>
+#include <core/net/SharedPortDatagram.hpp>
+#include <core/net/testing/InMemoryDatagram.hpp>
 
 namespace FastCache::Testing
 {
@@ -31,13 +31,16 @@ inline constexpr std::uint16_t TestBeaconPort = 6681;
 /// @param bus The segment.
 /// @param host The machine; co-hosted nodes pass the same one.
 /// @param ownPort The port only this node holds.
-/// @return The pair, as one socket.
-[[nodiscard]] inline std::unique_ptr<IDatagramSocket> CoHostedDatagramSocket(DatagramBus& bus,
-                                                                             std::string_view host,
-                                                                             std::uint16_t ownPort)
+/// @return The pair, as one socket; null when the segment would not open either half, which the
+///         case's own use of it then reports.
+[[nodiscard]] inline std::unique_ptr<core::net::IDatagramSocket> CoHostedDatagramSocket(core::net::testing::DatagramBus& bus,
+                                                                                        std::string_view host,
+                                                                                        std::uint16_t ownPort)
 {
-    return AnswerFromOwnAddress(bus.Open(DatagramAddress { .host = std::string { host }, .port = TestBeaconPort }),
-                                bus.Open(DatagramAddress { .host = std::string { host }, .port = ownPort }));
+    return core::net::answerFromOwnAddress(
+               bus.open(core::net::DatagramAddress { .host = std::string { host }, .port = TestBeaconPort }),
+               bus.open(core::net::DatagramAddress { .host = std::string { host }, .port = ownPort }))
+        .value_or(nullptr);
 }
 
 } // namespace FastCache::Testing

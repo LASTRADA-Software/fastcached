@@ -13,7 +13,6 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -31,6 +30,7 @@
 #include <vector>
 
 #include <WorkerProtocol.hpp>
+#include <core/net/ISocket.hpp>
 
 namespace FastCache::Node
 {
@@ -297,7 +297,9 @@ inline void AdoptRegistrars(std::vector<Cc::WorkerRegistrar> rebuilt,
 ///        name the endpoint actually reached, not the configured one, once a
 ///        redirect can have moved it.
 /// @return What landed, and where to go next if anywhere.
-[[nodiscard]] AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::string_view endpoint);
+[[nodiscard]] AnnounceOutcome AnnounceOnce(HeartbeatRound const& round,
+                                           core::net::ISocket& client,
+                                           std::string_view endpoint);
 
 /// Ceiling on OPENING the heartbeat's connection to a scheduler, name resolution
 /// included.
@@ -393,7 +395,7 @@ class IAnnouncement
     /// @param client The dialled connection.
     /// @param endpoint Where it was dialled, for the messages that name it.
     /// @return What was learned: how many entries landed, and any leader redirect.
-    [[nodiscard]] virtual AnnounceOutcome Attempt(ISocket& client, std::string_view endpoint) = 0;
+    [[nodiscard]] virtual AnnounceOutcome Attempt(core::net::ISocket& client, std::string_view endpoint) = 0;
 };
 
 /// How a round proves this machine on each connection it dials (#178).

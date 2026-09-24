@@ -8,11 +8,9 @@
 #include <FastCache/Cluster/MembershipPolicy.hpp>
 #include <FastCache/Cluster/PeerDirectory.hpp>
 #include <FastCache/Consensus/IRaftPeerKeys.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/IDatagramSocket.hpp>
 
 #include <chrono>
 #include <cstddef>
@@ -25,6 +23,9 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include <core/net/IDatagramSocket.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -91,7 +92,7 @@ class DiscoveryTier
     /// @param metrics Where proofs under keys the roster does not accept are counted.
     /// @param logger Where beacons, joins and rejections are reported.
     /// @return The tier, not yet running.
-    [[nodiscard]] static std::unique_ptr<DiscoveryTier> Over(std::unique_ptr<IDatagramSocket> socket,
+    [[nodiscard]] static std::unique_ptr<DiscoveryTier> Over(std::unique_ptr<core::net::IDatagramSocket> socket,
                                                              Cluster::DiscoveryConfig config,
                                                              Consensus::IRaftPeerKeys const& keys,
                                                              PeerObserver onPeers,
@@ -124,7 +125,7 @@ class DiscoveryTier
     /// socket reports and what a peer replies to.
     ///
     /// The join lives above the socket for the reason `Cc::DialEndpoint` exists
-    /// -- see `DatagramAddress`. Out of line so that reason does not make
+    /// -- see `core::net::DatagramAddress`. Out of line so that reason does not make
     /// `Core/HostPort.hpp` a dependency of everything including this header.
     /// @return `host:port`, bracketed when the host is an IPv6 literal.
     [[nodiscard]] std::string BoundEndpoint() const;
@@ -137,7 +138,7 @@ class DiscoveryTier
     }
 
   private:
-    DiscoveryTier(std::unique_ptr<IDatagramSocket> socket,
+    DiscoveryTier(std::unique_ptr<core::net::IDatagramSocket> socket,
                   Cluster::DiscoveryConfig config,
                   Consensus::IRaftPeerKeys const& keys,
                   PeerObserver onPeers,
@@ -156,12 +157,12 @@ class DiscoveryTier
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it -- the reference chain the other tiers own for the same reason.
-    std::unique_ptr<IDatagramSocket> _socket;
-    SteadyClock _clock;
+    std::unique_ptr<core::net::IDatagramSocket> _socket;
+    core::platform::SteadyClock _clock;
     std::unique_ptr<ISecureRandom> _random;
     Cluster::PeerDirectory _directory;
     std::chrono::seconds _beaconInterval;
-    TimePoint _nextBeacon;
+    core::platform::SteadyTimePoint _nextBeacon;
     Cluster::DiscoveryService _service;
 
     /// Started last and joined first, which the member order gives for free.

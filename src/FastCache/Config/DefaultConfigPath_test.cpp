@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/DefaultConfigPath.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/FileTrust.hpp>
 
@@ -20,6 +19,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <tests/ScratchPath.hpp>
 
 #if !defined(_WIN32)
@@ -147,7 +147,7 @@ class FakeProbe: public IConfigPathProbe
 }
 
 /// Find the first candidate matching `predicate`; the predicate counterpart to
-/// FastCache::FindOrNull, and a pointer for the same reason. See Ranges.hpp.
+/// core::findOrNull, and a pointer for the same reason. See Ranges.hpp.
 /// @param predicate Applied to each row in table order.
 /// @return The first match, or nullptr.
 [[nodiscard]] ConfigCandidate const* FindCandidateIf(auto predicate)
@@ -162,7 +162,7 @@ class FakeProbe: public IConfigPathProbe
 ///         guarantees exists.
 [[nodiscard]] ConfigCandidate const* SystemCandidate()
 {
-    return FastCache::FindOrNull(DefaultConfigCandidates(), ConfigScope::System, &ConfigCandidate::scope);
+    return core::findOrNull(DefaultConfigCandidates(), ConfigScope::System, &ConfigCandidate::scope);
 }
 
 /// A scratch directory for the seeding tests, removed again on destruction so a

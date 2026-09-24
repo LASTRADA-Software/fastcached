@@ -5,14 +5,12 @@
 #include "NodeSurfaces.hpp"
 #include "PeerIdentity.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/NodeProof.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/IListener.hpp>
 #include <FastCache/Protocol/CompileCacheAuth.hpp>
 #include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
@@ -29,6 +27,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/net/IListener.hpp>
 
 namespace FastCache::Node
 {
@@ -293,9 +294,9 @@ class IFrameStream
     ///        the returned task. A pointer because a coroutine parameter must not be a reference.
     /// @return The terminal reply, or empty to close without one -- the answer for a peer that
     ///         has left, and for a push that will never leave.
-    [[nodiscard]] virtual Task<std::vector<std::byte>> Serve(std::span<std::byte const> frame,
-                                                             PeerIdentity peer,
-                                                             IPushSink* sink) = 0;
+    [[nodiscard]] virtual core::async::Task<std::vector<std::byte>> Serve(std::span<std::byte const> frame,
+                                                                          PeerIdentity peer,
+                                                                          IPushSink* sink) = 0;
 };
 
 /// One connection's half-finished node handshake: what the caller opened with, what this server
@@ -417,7 +418,7 @@ class IFrameResponder
 
     /// Answer one complete request frame.
     ///
-    /// A `Task` because answering may now have to reach the network -- the cache
+    /// A `core::async::Task` because answering may now have to reach the network -- the cache
     /// surface consults an upstream, and that dial suspends rather than blocking
     /// the loop every other connection on this reactor is sharing. A responder
     /// that needs nothing is still free to `co_return` without suspending, which
@@ -427,7 +428,7 @@ class IFrameResponder
     ///        owning vector because a cache STORE carries an object file and
     ///        copying it here would double the peak footprint on the hot path of
     ///        a parallel build. It must outlive the returned task -- the same
-    ///        contract `SendAll` states, and true by construction at the one call
+    ///        contract `core::net::sendAll` states, and true by construction at the one call
     ///        site, where the backing vector is a local of the calling coroutine.
     /// @param peer Who is at the other end, for the surfaces whose policy needs it.
     ///        Owned rather than a view: it is short, and every policy-bearing
@@ -440,7 +441,7 @@ class IFrameResponder
     /// @return The encoded reply, or empty to close without answering -- which is
     ///         only ever right when the peer is not speaking this protocol at all --
     ///         and whatever must stay held until the endpoint has written it.
-    [[nodiscard]] virtual Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) = 0;
+    [[nodiscard]] virtual core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) = 0;
 
     /// May this peer send at all, before a byte of its payload is taken?
     ///
@@ -723,7 +724,7 @@ class IFrameResponder
     /// figure both doors charge is the one the worker advertises.
     ///
     /// **The handoff is tight by construction, and rests on two invariants stated
-    /// here because neither is visible at the release site.** `Task` is lazy
+    /// here because neither is visible at the release site.** `core::async::Task` is lazy
     /// (`Async/Task.hpp`: `initial_suspend` is `suspend_always`, with symmetric
     /// transfer at the final one), so `co_await Answer(...)` runs the body on the
     /// awaiting thread with no return to the loop; and the node's framed surfaces
@@ -759,7 +760,7 @@ class IFrameResponder
     ///
     /// ## The lifetime property, and why it is a property rather than a line of code
     ///
-    /// The watcher parks in `ISocket::WaitReadable`, and **a parked wait can only be
+    /// The watcher parks in `core::net::ISocket::WaitReadable`, and **a parked wait can only be
     /// cancelled by `Close()`** -- there is no other cancellation on the interface. So
     /// a watch that was armed and did not fire ends the connection after that reply,
     /// because the alternative is to issue the loop's next `Read` while the watcher is
@@ -821,7 +822,7 @@ class IFrameResponder
     /// than an impossibility, which is a materially weaker guard than this paragraph
     /// used to claim.
     ///
-    /// It said `ISocket` had no `ShutdownWrite` at all, so nothing here *could*
+    /// It said `core::net::ISocket` had no `ShutdownWrite` at all, so nothing here *could*
     /// half-close. #671 put `ShutdownWrite` on the interface itself
     /// (`ISocket.hpp`, virtual with a default no-op), precisely so the question would
     /// be askable in production rather than only over the in-memory transport. So every
@@ -985,7 +986,7 @@ class FrameServer
     ///
     /// ONE sweeper per server rather than one timer per connection, and that is the
     /// difference between a bounded cost and a parked frame per client.
-    /// `IReactor::Schedule` cannot be cancelled, so a per-connection timer would
+    /// `core::net::EventLoop::Schedule` cannot be cancelled, so a per-connection timer would
     /// stay on the wheel for the full interval after its connection had already
     /// finished -- the leak `Async/DeadlineTimer` documents at length.
     static constexpr std::chrono::milliseconds SweepInterval { HeaderTimeout / 4 };
@@ -1082,7 +1083,7 @@ class FrameServer
     ///        the owning surface's and reaches its counter through `IFrameResponder`.
     /// @param logger Shared logger.
     FrameServer(NodeIoLoop& io,
-                IListener& listener,
+                core::net::IListener& listener,
                 IFrameResponder& responder,
                 std::string_view what,
                 IMetricsSink& metrics,
@@ -1097,16 +1098,16 @@ class FrameServer
 
     /// Accept loop; returns when the listener is closed via `Shutdown()`.
     ///
-    /// Each accepted connection is served by a `DetachedTask` of its own rather
+    /// Each accepted connection is served by a `core::async::DetachedTask` of its own rather
     /// than inline, which is the entire point: the cache surface consults an
     /// upstream from inside its answer, and serving that inline is what made one
     /// slow dial stall every other client of this node.
-    [[nodiscard]] Task<void> Run();
+    [[nodiscard]] core::async::Task<void> Run();
 
     /// Stop accepting, close what is open, and wait for the connections to end.
     ///
     /// Safe from any thread. The closes are POSTED onto the reactor rather than
-    /// done here, and that is not caution: on epoll and kqueue `ISocket::Close`
+    /// done here, and that is not caution: on epoll and kqueue `core::net::ISocket::Close`
     /// completes a parked awaitable by resuming its coroutine INLINE, so closing
     /// from another thread would run this server's connection tasks there while the
     /// reactor thread is still driving them. IOCP routes cancellation back through
@@ -1148,7 +1149,7 @@ class FrameEndpoint
     /// The error is a diagnostic string rather than one of the project's four error
     /// enums, the same deliberate departure `AdminEndpoint::Start` documents: this
     /// fails in two ways belonging to two taxonomies -- a malformed listen spec is a
-    /// `ConfigError`, an address that will not bind is a `NetError` -- the caller's
+    /// `ConfigError`, an address that will not bind is a `core::net::NetError` -- the caller's
     /// response is identical either way, and what it needs is the text.
     /// **A surface, never an address.** This used to take the listen spec, the host a
     /// bare port falls back to and the surface's name as three loose arguments, and
@@ -1197,8 +1198,8 @@ class FrameEndpoint
     /// the descriptor itself, and the HOST can only come from `--advertise` -- which
     /// is why activation makes that flag mandatory and refuses at startup without it.
     ///
-    /// **The descriptor is handed on, never held.** `PlatformListener::Adopt` takes
-    /// ownership including on its own failure paths -- on IOCP it refuses, and an `int`
+    /// **The descriptor is handed on, never held.** `AdoptInheritedListener` takes
+    /// ownership including on its own failure paths -- on Windows it refuses, and an `int`
     /// names no socket there to own -- so this function neither closes it on a refusal
     /// nor lets anything else do so. A failed adoption is a startup
     /// refusal exactly as a failed bind is: an activated node that cannot serve the
@@ -1209,7 +1210,7 @@ class FrameEndpoint
     /// @param surface Which surface to serve. Its row supplies the name used in log
     ///        lines; its address is not consulted, because the unit chose it.
     /// @param descriptor An already-bound, already-listening descriptor. Ownership
-    ///        passes to the listener built here, whether or not that succeeds; IOCP
+    ///        passes to the listener built here, whether or not that succeeds; Windows
     ///        refuses without one to own.
     /// @param advertisedHost The host clients are told to dial, from `--advertise`.
     ///        The only honest answer to "what address is this", since the process
@@ -1259,7 +1260,7 @@ class FrameEndpoint
     /// @return The running endpoint. Never null.
     [[nodiscard]] static std::unique_ptr<FrameEndpoint> StartWithListener(NodeIoLoop& io,
                                                                           NodeSurface surface,
-                                                                          std::unique_ptr<IListener> listener,
+                                                                          std::unique_ptr<core::net::IListener> listener,
                                                                           std::string boundEndpoint,
                                                                           IFrameResponder& responder,
                                                                           IMetricsSink& metrics,
@@ -1297,7 +1298,7 @@ class FrameEndpoint
 
   private:
     FrameEndpoint(NodeIoLoop& io,
-                  std::unique_ptr<IListener> listener,
+                  std::unique_ptr<core::net::IListener> listener,
                   IFrameResponder& responder,
                   std::string_view what,
                   std::string boundEndpoint,
@@ -1312,11 +1313,11 @@ class FrameEndpoint
     /// while the reactor turns. See `NodeIoLoop::Retire`.
     NodeIoLoop& _io;
 
-    /// `IListener` and not the platform type, deliberately: naming the concrete one
+    /// `core::net::IListener` and not the platform type, deliberately: naming the concrete one
     /// would drag `<windows.h>` into every header that includes this, and nothing
     /// here needs more than Accept, Close and BoundPort -- the last of which is on
     /// the interface now precisely so this could stop being concrete.
-    std::unique_ptr<IListener> _listener;
+    std::unique_ptr<core::net::IListener> _listener;
     std::unique_ptr<FrameServer> _server;
     std::string _boundEndpoint;
 };

@@ -5,7 +5,6 @@
 // read must still hand back the original plaintext.
 
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -15,19 +14,21 @@
 #include <string>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
+
 using namespace FastCache;
 
 namespace
 {
 
-TimePoint Never()
+core::platform::SteadyTimePoint Never()
 {
-    return TimePoint::max();
+    return core::platform::SteadyTimePoint::max();
 }
 
-TimePoint Now()
+core::platform::SteadyTimePoint Now()
 {
-    return TimePoint {} + std::chrono::seconds { 1000 };
+    return core::platform::SteadyTimePoint {} + std::chrono::seconds { 1000 };
 }
 
 /// A payload that compresses well, mimicking the repetitive symbol and debug-info

@@ -3,7 +3,6 @@
 
 #include "NodeConfig.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -14,6 +13,7 @@
 #include <string_view>
 
 #include <WorkerProtocol.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -94,7 +94,7 @@ enum class SocketActivation : std::uint8_t
     Distributed::ILeaseRoster const* roster,
     Cc::IAdvertisedEndpointSource const& advertise,
     SocketActivation activation,
-    WallClockRef clock,
+    core::platform::WallClockRef clock,
     Distributed::WorkerLeaseState& lease,
     IMetricsSink& metrics,
     ILogger& logger);

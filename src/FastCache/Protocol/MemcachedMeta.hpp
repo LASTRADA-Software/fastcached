@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
-#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <span>
 #include <string_view>
+
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
 
 namespace FastCache
 {
@@ -41,11 +42,11 @@ class MemcachedMeta
     ///                value bytes after the command line).
     /// @param command Command name ("mg", "ms", ...).
     /// @param args    Tokens after the command name (key + flags).
-    [[nodiscard]] static Task<bool> Dispatch(ISocket* socket,
-                                             CacheEngine* engine,
-                                             ByteReader* reader,
-                                             std::string_view command,
-                                             std::span<std::string_view const> args);
+    [[nodiscard]] static core::async::Task<bool> Dispatch(core::net::ISocket* socket,
+                                                          CacheEngine* engine,
+                                                          ByteReader* reader,
+                                                          std::string_view command,
+                                                          std::span<std::string_view const> args);
 };
 
 } // namespace FastCache

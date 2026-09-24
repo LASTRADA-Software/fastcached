@@ -5,7 +5,6 @@
 #include <FastCache/Cache/IReclaimLog.hpp>
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 
 #include <cstddef>
@@ -15,6 +14,8 @@
 #include <span>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -68,58 +69,66 @@ class LayeredStorage final: public IStorage
     LayeredStorage& operator=(LayeredStorage&&) = delete;
     ~LayeredStorage() override = default;
 
-    [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key,
+                                                             core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Set(std::string_view key,
                                                             std::vector<std::byte> value,
                                                             std::uint32_t flags,
-                                                            TimePoint expiry) override;
+                                                            core::platform::SteadyTimePoint expiry) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Add(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Add(std::string_view key,
+                                                            std::vector<std::byte> value,
+                                                            std::uint32_t flags,
+                                                            core::platform::SteadyTimePoint expiry,
+                                                            core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Replace(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Replace(std::string_view key,
+                                                                std::vector<std::byte> value,
+                                                                std::uint32_t flags,
+                                                                core::platform::SteadyTimePoint expiry,
+                                                                core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Append(std::string_view key,
                                                                std::span<std::byte const> suffix,
                                                                CasToken expected,
-                                                               TimePoint now) override;
+                                                               core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Prepend(std::string_view key,
                                                                 std::span<std::byte const> prefix,
                                                                 CasToken expected,
-                                                                TimePoint now) override;
+                                                                core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> CompareAndSwap(std::string_view key,
                                                                        CasToken expected,
                                                                        std::vector<std::byte> value,
                                                                        std::uint32_t flags,
-                                                                       TimePoint expiry,
-                                                                       TimePoint now) override;
+                                                                       core::platform::SteadyTimePoint expiry,
+                                                                       core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(std::string_view key,
-                                                                                          std::uint64_t magnitude,
-                                                                                          bool decrement,
-                                                                                          TimePoint now) override;
+    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(
+        std::string_view key, std::uint64_t magnitude, bool decrement, core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key,
+                                                           core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Touch(std::string_view key,
-                                                              TimePoint newExpiry,
-                                                              TimePoint now) override;
+                                                              core::platform::SteadyTimePoint newExpiry,
+                                                              core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key,
+                                                              core::platform::SteadyTimePoint now) override;
 
     /// Warm `key` from L2 into the L1 mirror without any client-read side
     /// effect (no hit/miss stat change, no LRU-as-hit promotion). Reuses the
     /// same L2→L1 mirror path as a read-through Get but skips the stat
     /// bookkeeping. See IStorage::Prefetch.
-    [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key,
+                                                             core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> MarkStale(std::string_view key,
-                                                                  std::optional<TimePoint> newExpiry,
-                                                                  TimePoint now) override;
+                                                                  std::optional<core::platform::SteadyTimePoint> newExpiry,
+                                                                  core::platform::SteadyTimePoint now) override;
 
     // Explicit compound-op overrides (rather than the IStorage defaults) so
     // the two-tier get-and-touch / compare-and-delete behaviour is spelled
@@ -127,17 +136,18 @@ class LayeredStorage final: public IStorage
     // the enclosing ShardedStorage's per-shard lock; on the unwrapped reactor
     // there is no concurrent writer to exclude.
     [[nodiscard]] std::expected<GetResult, StorageError> GetAndTouch(std::string_view key,
-                                                                     TimePoint newExpiry,
-                                                                     TimePoint now) override;
+                                                                     core::platform::SteadyTimePoint newExpiry,
+                                                                     core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<void, StorageError> CompareAndDelete(std::string_view key,
                                                                      CasToken expected,
-                                                                     TimePoint now) override;
+                                                                     core::platform::SteadyTimePoint now) override;
 
     /// PERSIST primitive across both tiers. Forwards to L2 (the canonical
     /// store), then refreshes the L1 mirror so a subsequent Get sees the
     /// cleared TTL. See IStorage::ClearExpiry for the return contract.
-    [[nodiscard]] std::expected<bool, StorageError> ClearExpiry(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<bool, StorageError> ClearExpiry(std::string_view key,
+                                                                core::platform::SteadyTimePoint now) override;
 
     /// Read-modify-write across both tiers. Reads the canonical entry
     /// from L2 (the inherited default would consult L1's stale mirror),
@@ -150,10 +160,10 @@ class LayeredStorage final: public IStorage
     [[nodiscard]] std::expected<CasToken, StorageError> Update(
         std::string_view key,
         std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
-        TimePoint now) override;
+        core::platform::SteadyTimePoint now) override;
 
-    void FlushWithGeneration(TimePoint effectiveAt) override;
-    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
+    void FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt) override;
+    PurgeOutcome PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget) override;
 
     /// Route reclaim reporting to **L2 only, and only its expiries**.
     ///
@@ -209,7 +219,8 @@ class LayeredStorage final: public IStorage
   private:
     /// Reload `key` from L2 and mirror the result into L1 if found.
     /// @return The L2 GetResult on success (or error from L2).
-    [[nodiscard]] std::expected<GetResult, StorageError> LoadFromL2AndMirror(std::string_view key, TimePoint now);
+    [[nodiscard]] std::expected<GetResult, StorageError> LoadFromL2AndMirror(std::string_view key,
+                                                                             core::platform::SteadyTimePoint now);
 
     /// Mirror an entry into L1 with the lower tier's CAS preserved.
     void MirrorIntoL1(std::string_view key, CacheEntry entry);
@@ -224,7 +235,7 @@ class LayeredStorage final: public IStorage
     /// caller-visible error path.
     [[nodiscard]] std::expected<CasToken, StorageError> MirrorL2WriteResult(std::string_view key,
                                                                             CasToken l2Cas,
-                                                                            TimePoint now);
+                                                                            core::platform::SteadyTimePoint now);
 
     /// The log L2 is actually handed: forwards expiries and swallows evictions.
     ///
