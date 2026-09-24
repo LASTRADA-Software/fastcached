@@ -173,15 +173,17 @@ class RaftPeerServer
     ///
     /// **The closes are POSTED onto the reactor, never performed here**, and that
     /// is not caution
-    /// ([#885](https://github.com/LASTRADA-Software/fastcached/issues/885)). On
-    /// epoll and kqueue `core::net::ISocket::Close` completes a parked read by resuming its
-    /// coroutine **inline**, so closing from the stopping thread ran each
+    /// ([#885](https://github.com/LASTRADA-Software/fastcached/issues/885)). With
+    /// fastcached's own reactor, `Close` on epoll and kqueue completed a parked read by
+    /// resuming its coroutine **inline**, so closing from the stopping thread ran each
     /// per-connection task there -- while the reactor thread was still driving the
     /// others -- and destroyed the `std::unique_ptr<ISocket>` in that task's frame
     /// off the reactor, which is #668's rule
-    /// (`core::net::EventLoop::TeardownIsSerialisedWithDispatch()`) violated. IOCP routes
-    /// cancellation back through the port and does not resume inline, which is
-    /// exactly what would have made this a defect that passes CI on Windows.
+    /// (`core::net::EventLoop::TeardownIsSerialisedWithDispatch()`) violated. IOCP routed
+    /// cancellation back through the port and did not, which is what made it a defect
+    /// that passed CI on Windows. core-cpp's sockets resume a woken waiter in the loop's
+    /// next drain on every backend (0.2.1, guarantee G2), but `close()` itself still
+    /// touches the loop's registrations, so the closes are still posted.
     ///
     /// Measured on Linux before the fix: with the teardown assertion live at
     /// `~EpollSocket`, `cluster-e2e` was the only failure in the whole suite, and a

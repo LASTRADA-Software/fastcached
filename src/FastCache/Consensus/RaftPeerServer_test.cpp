@@ -1079,12 +1079,15 @@ TEST_CASE("Shutdown closes the peer listener on the reactor, not on the calling 
           "[consensus][raft][peerserver][teardown]")
 {
     // #885. `Shutdown()` used to close the listener and every accepted connection
-    // from whatever thread was tearing the node down. On epoll and kqueue
-    // `core::net::ISocket::Close` completes a parked read by resuming its coroutine INLINE, so
-    // that ran each per-connection task on the stopping thread -- while the reactor
-    // thread was still driving the others -- and destroyed the socket owned by that
-    // task's frame off the reactor, which is #668's rule. IOCP does not resume
-    // inline, so the platform that gates least is the one that could never show it.
+    // from whatever thread was tearing the node down. On fastcached's own reactor,
+    // `Close` on epoll and kqueue completed a parked read by resuming its coroutine
+    // INLINE, so that ran each per-connection task on the stopping thread -- while the
+    // reactor thread was still driving the others -- and destroyed the socket owned by
+    // that task's frame off the reactor, which is #668's rule. IOCP did not resume
+    // inline, so the platform that gated least was the one that could never show it.
+    // core-cpp resumes a woken task in the loop's next drain on every backend (0.2.1,
+    // guarantee G2), and a close still belongs on the loop's thread, which is what
+    // this case pins.
     //
     // Asserted as a THREAD IDENTITY, because that is what distinguishes: the
     // listener is closed either way, and a case checking only that it was closed

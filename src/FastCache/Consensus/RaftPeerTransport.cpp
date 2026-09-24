@@ -518,20 +518,18 @@ core::async::Task<void> PeerSenderAccess::RunSender(RaftPeerTransport* self, Raf
 
 core::async::DetachedTask PeerSenderAccess::CloseSockets(RaftPeerTransport* self, std::optional<NodeId> only)
 {
-    // The hop is the point. On epoll and kqueue `core::net::ISocket::Close` completes a
-    // parked awaitable by resuming its coroutine INLINE, so closing from the
-    // thread calling Stop() would run a peer's sender there while the reactor
-    // thread is live. IOCP routes cancellation back through the port and does
-    // not, which is precisely what would make this a bug that passes CI on
-    // Windows and corrupts state on Linux and macOS.
+    // The hop is the point. `core::net::ISocket::close` retires the socket's registration
+    // with the loop, which only the loop's thread may touch, and the sender it wakes then
+    // resumes in that loop's drain, on the reactor, never inside `close()` (core-cpp 0.2.1,
+    // guarantee G2). Closing from the thread calling Stop() would race the reactor on the
+    // first and, before 0.2.1, ran the sender on the wrong thread on epoll and kqueue.
     co_await core::async::ResumeOn { self->_reactor };
 
-    // Collected under the lock, closed outside it, and the split is the point.
-    // `Close` resumes a parked sender INLINE on epoll and kqueue -- on this thread,
-    // which is the whole reason for the hop above -- so a lock held across it is a
-    // lock held across arbitrary sender code, with `Send` and therefore the driver's
-    // mutex waiting behind it. `Peer::socket` is reactor-thread-only, so nothing but
-    // the map lookup needs the lock at all.
+    // Collected under the lock, closed outside it. The woken sender resumes in the loop's
+    // next drain rather than inside `close()` (G2), so the lock would no longer be held
+    // across sender code -- but a close is still no place to hold a lock that `Send`, and
+    // therefore the driver's mutex, can wait behind. `Peer::socket` is reactor-thread-only,
+    // so nothing but the map lookup needs the lock at all.
     auto closing = std::vector<core::net::ISocket*> {};
     {
         auto const guard = std::shared_lock { self->_peersMutex };

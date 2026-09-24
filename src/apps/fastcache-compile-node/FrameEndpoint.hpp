@@ -1107,12 +1107,11 @@ class FrameServer
     /// Stop accepting, close what is open, and wait for the connections to end.
     ///
     /// Safe from any thread. The closes are POSTED onto the reactor rather than
-    /// done here, and that is not caution: on epoll and kqueue `core::net::ISocket::Close`
-    /// completes a parked awaitable by resuming its coroutine INLINE, so closing
-    /// from another thread would run this server's connection tasks there while the
-    /// reactor thread is still driving them. IOCP routes cancellation back through
-    /// the port and does not, which is exactly what would make it a race that
-    /// passes CI on Windows.
+    /// done here, and that is not caution: `core::net::ISocket::close` retires the
+    /// socket's registration with the loop, which only the reactor's thread may touch.
+    /// The connection tasks a close wakes resume in the loop's next drain, on the
+    /// reactor, on every backend (core-cpp 0.2.1, guarantee G2); fastcached's own
+    /// reactor used to run them inline on epoll and kqueue, on the closing thread.
     void Shutdown() noexcept;
 
     /// Report a loop that threw, without throwing. Called by the owning loop's

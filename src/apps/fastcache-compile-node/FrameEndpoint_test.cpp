@@ -2641,8 +2641,8 @@ TEST_CASE("A client that RESETS mid-answer is noticed, and its object is not wri
 /// with the watcher retrieved or still parked is decided by the same alignment of two
 /// equal 1250 ms windows that decides which guard suppresses the count below. When it
 /// comes back parked, the only thing left to retrieve that watcher is the
-/// `socket->Close()` after the loop: inline on epoll and kqueue, MARSHALLED TO A LATER
-/// TURN on IOCP. A case that waited for the connection instead would there assert two
+/// `socket->Close()` after the loop, which resumes it in a LATER TURN of the loop (on every
+/// backend since core-cpp 0.2.1, G2). A case that waited for the connection instead would assert two
 /// flat rows against a watcher that has not spoken and PASS -- a green result for a
 /// broken guard, which is #691's own shape reappearing inside the control written to
 /// close it.

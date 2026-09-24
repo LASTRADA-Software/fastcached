@@ -772,7 +772,9 @@ namespace
     /// One wake, then done: a subscriber that sent bytes has asked for something else, and one
     /// whose wait answered EOF or an error has left.
     /// @param socket The connection; the handler retires this wait with `CancelRead` before it
-    ///        reads the socket again or returns, so the wait never outlives the socket.
+    ///        reads the socket again or returns. The retired wait resumes in the loop's next
+    ///        drain (core-cpp 0.2.1, G2), possibly after the socket is gone, which is why
+    ///        nothing below the `co_await` touches `socket`.
     /// @param watch Where the answer is left.
     core::async::DetachedTask WatchSubscriber(core::net::ISocket* socket, std::shared_ptr<SubscriberWatch> watch)
     {

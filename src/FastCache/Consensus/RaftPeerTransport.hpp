@@ -440,9 +440,9 @@ class RaftPeerTransport final: public IRaftTransport
     /// reason at all.
     ///
     /// Held only across the map operation, and never across a push, a dial, a write
-    /// or a socket close: `core::net::ISocket::Close` resumes a parked sender *inline* on epoll
-    /// and kqueue, so a lock held across it would be held across arbitrary sender
-    /// code — with `Send`, and therefore the driver's mutex, waiting behind it.
+    /// or a socket close. A close no longer runs the woken sender inside it -- core-cpp
+    /// resumes it in the loop's next drain (0.2.1, guarantee G2) -- but a lock held across
+    /// any of these is still a lock `Send`, and therefore the driver's mutex, waits behind.
     /// Taking a `Peer*` under the lock and using it outside is safe because a peer
     /// is never *erased*: the pointer a lookup hands back stays valid for this
     /// transport's life.

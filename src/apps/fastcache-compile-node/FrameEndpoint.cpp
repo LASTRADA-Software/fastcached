@@ -540,15 +540,17 @@ struct FrameServer::State
         }
 
         SweepTally tally;
-        // Acted on outside the lock: `Close` completes a parked read by resuming its
-        // coroutine inline, and that coroutine calls `Untrack`, which takes this
-        // same mutex.
+        // Acted on outside the lock: the close wakes a parked read whose coroutine calls
+        // `Untrack`, which takes this same mutex. It resumes in the loop's next drain, not
+        // inside `close()` (core-cpp 0.2.1, guarantee G2), so this no longer deadlocks
+        // either way, but a close is still no place to hold a lock the woken code takes.
         for (auto const& entry: overdue)
         {
             // Counted BEFORE the close, for the reason `core::net::SocketDeadlineTarget` records
-            // for the launcher's deadline: the close resumes a coroutine inline, so a
-            // tally written afterwards is written after that coroutine has already
-            // observed the socket shut.
+            // for the launcher's deadline: the tally must be in place before anything can
+            // observe the socket shut. The woken coroutine resumes in the loop's next drain
+            // since core-cpp 0.2.1 (G2), so afterwards would also be in time today, and
+            // before is right on any transport.
             tally.For(entry.phase) += 1;
             if (auto const& row = SweepPhaseTable[static_cast<std::size_t>(entry.phase)]; row.counter.has_value())
                 metrics.Increment(*row.counter);
@@ -587,10 +589,10 @@ struct FrameServer::State
     /// `TrackedConnection::swept` exists to prevent one level up.
     ///
     /// Collected under the lock and closed outside it, for the same reason
-    /// `CloseOverdue` above is written that way and not because the shape looked
-    /// tidy: `Close` completes a parked read by resuming its coroutine INLINE, and
-    /// that coroutine calls `Untrack`, which takes this same mutex. Closing inside
-    /// the loop deadlocks.
+    /// `CloseOverdue` above is written that way: the close wakes a parked read whose
+    /// coroutine calls `Untrack`, which takes this same mutex. With inline resumption,
+    /// which core-cpp's sockets no longer do (0.2.1, G2), closing inside the loop
+    /// deadlocked; a close is still no place to hold a lock the woken code takes.
     /// @param now The reactor's current time.
     /// @return How many deferrals ran out of grace.
     std::size_t CloseExpiredDeferrals(core::platform::SteadyTimePoint now)
@@ -1187,8 +1189,9 @@ namespace
     ///        lifetime guarantee.
     /// @param socket The connection, shared so a parked wait cancelled by `Close()`
     ///        cannot resume onto a destroyed socket -- the second use-after-free
-    ///        `RedisResp`'s readable watcher records, in a tree where `Close()`
-    ///        resumes inline on epoll and marshals on IOCP.
+    ///        `RedisResp`'s readable watcher records. Every backend resumes that wait
+    ///        in the loop's next drain (core-cpp 0.2.1, G2), after the connection's
+    ///        frame may have unwound, so the shared reference is needed everywhere.
     /// @param watch Where the answer is left; shared with the connection.
     core::async::DetachedTask WatchPeer(std::shared_ptr<FrameServer::State> state,
                                         std::shared_ptr<core::net::ISocket> socket,
@@ -2104,10 +2107,10 @@ namespace
         // connection is still the only writer and still decides everything; the second
         // reference exists because a peer watch can be parked in `WaitReadable` when
         // this frame unwinds, and the only cancellation on the interface is `Close()`,
-        // whose completion resumes that coroutine -- inline on epoll and kqueue,
-        // marshalled to a later turn on IOCP. Under a `unique_ptr` the IOCP path
-        // resumes the watcher onto a destroyed socket, which is verbatim the second
-        // use-after-free `RedisResp`'s readable watcher records and fixes the same way.
+        // whose completion resumes that coroutine in the loop's next drain -- on every
+        // backend since core-cpp 0.2.1 (G2). Under a `unique_ptr` the watcher would
+        // resume onto a destroyed socket, which is verbatim the second use-after-free
+        // `RedisResp`'s readable watcher records and fixes the same way.
         // Costs one control block per connection.
         //
         // And wrapped so a proof can seal it, on a surface that offers one (#178) -- see
@@ -2721,10 +2724,9 @@ void FrameServer::Shutdown() noexcept
         return;
     }
 
-    // Posted onto the reactor, never done here. See the declaration: on epoll and
-    // kqueue `Close` resumes a parked coroutine INLINE, so closing from the stopping
-    // thread would run this server's connection tasks on it while the reactor thread
-    // is still driving them.
+    // Posted onto the reactor, never done here. See the declaration: `close()` retires
+    // a socket's registration with the loop, which only the reactor's thread may do, and
+    // the connection tasks it wakes resume in that loop's drain (core-cpp 0.2.1, G2).
     [](std::shared_ptr<State> state) -> core::async::DetachedTask {
         co_await core::async::ResumeOn { state->io.Reactor() };
         state->CloseAll();

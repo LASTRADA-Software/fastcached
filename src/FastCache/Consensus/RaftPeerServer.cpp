@@ -500,8 +500,10 @@ void RaftPeerServer::CloseAll() noexcept
 {
     _listener.close();
 
-    // Copied out under the lock rather than closed under it, because a close
-    // resumes the task that removes itself from this very vector.
+    // Copied out under the lock rather than closed under it: the close wakes the task
+    // that removes itself from this very vector, and although that task now resumes in
+    // the loop's next drain rather than inside `close()` (core-cpp 0.2.1, guarantee G2),
+    // a close is no place to hold a lock the woken code takes.
     auto sockets = std::vector<core::net::ISocket*> {};
     {
         auto const guard = std::scoped_lock { _open.mutex };
@@ -516,11 +518,11 @@ void RaftPeerServer::Shutdown() noexcept
     if (_shuttingDown.exchange(true, std::memory_order_acq_rel))
         return;
 
-    // Posted onto the reactor, never done here. See the declaration: on epoll and
-    // kqueue `Close` completes a parked read by resuming its coroutine INLINE, so
-    // closing from the stopping thread runs this server's connection tasks there --
-    // and destroys the socket each of them owns off the reactor, which is the
-    // teardown rule (#668) violated at a second owner (#885).
+    // Posted onto the reactor, never done here. See the declaration: a socket is closed
+    // on the thread that drives it, because `close()` retires its registration with the
+    // loop, and the connection tasks it wakes then resume in that loop's drain, on the
+    // reactor -- which is where the socket each of them owns must be destroyed (the
+    // teardown rule, #668, which the stopping thread violated at a second owner, #885).
     //
     // Borrows `this` rather than sharing state, which is sound for the same reason
     // the connection tasks may: the drain below does not return until this has run.
