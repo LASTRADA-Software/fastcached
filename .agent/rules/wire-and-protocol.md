@@ -1787,7 +1787,9 @@ Every rule below has already been a bug.
     constraint stated by one consumer about itself is a constraint the next consumer
     never meets.
   - **The claim and the check are ONE expression.** `Detail::ClaimReadSlot`
-    (`Net/ReadSlot.hpp`) asserts the slot is free and then clears it, and the six
+    (`Net/ReadSlot.hpp`; core-cpp's `contract::claimReadSlot` since the move, and since
+    core-cpp 0.3.0 it ends the process in EVERY build) asserts the slot is free and then
+    clears it, and the six
     arm sites across `EpollSocket`, `KqueueSocket` and `IocpSocket` have no bare
     `awaitable = nullptr` left. There is no line to forget the guard on, at the
     seventh site as at the first -- the same shape as `SigningDomain` leaving no
@@ -1813,7 +1815,8 @@ Every rule below has already been a bug.
       when its own iteration ended, which is why the cancel belongs there.
     - **Refusing the new operation is still wrong**, and for the reason that did not
       change: it turns a silent leak into a broken connection on a live path.
-    - So `CancelRead` exists (below) and `ClaimReadSlot` still only asserts. The two
+    - So `CancelRead` exists (below) and `ClaimReadSlot` only names the misuse -- by ending the
+      process, in every build since core-cpp 0.3.0, where Release used to hang silently. The two
       are not alternatives: the tripwire names the misuse, the verb gives the caller
       the only spelling of *abandon* that is not `Close()`.
   - **It is watched refusing, and the hazard has no other coverage at all.** Measured
@@ -1821,7 +1824,8 @@ Every rule below has already been a bug.
     across `FastCacheTest` (2073 cases) and `fastcache-compile-node-tests`, and no
     script fixture drives a blocking RESP verb or a subscription over a real socket
     -- so nothing in the suite can see this, which is the ticket's own point.
-    `read-slot-guard-canary` double-arms a REAL socket through the real reactor, so
+    `read-slot-guard-canary` (now core-cpp's `socket-contract-canary`) double-arms a REAL
+    socket through the real reactor, so
     what it drives is the call site rather than the guard function, and
     `scripts/read-slot-guard-gate.cmake` requires the assertion's OWN words: a bare
     `WILL_FAIL` passes for a segfault, a missing library and a refused bind alike,
@@ -1835,15 +1839,17 @@ Every rule below has already been a bug.
   [#893](https://github.com/LASTRADA-Software/fastcached/issues/893)) folds the claim
   and the `assert` into one expression, for the reason the read side gives: a guard
   folded INTO the operation is self-enforcing, and one called alongside it needs a
-  scan. Debug-only, and refusing the operation is wrong here for the same reason.
+  scan. It ends the process in every build since core-cpp 0.3.0 (Debug-only before), and
+  refusing the operation is wrong here for the same reason.
   - **It reaches `FrameEndpoint`'s one-writer property because `WriteAll` sends a whole
     frame in ONE `ISocket::Write`.** So a write that PARKS is a half-sent frame, and a
     second writer arming over it is a client reading a length out of the middle of
     somebody else's frame -- the pulse-versus-reply interleaving
     [`distributed-compilation.md`](distributed-compilation.md) describes. A write that
     completes inline takes no claim and needs none.
-  - **Watched BOTH ways, which the read-side canary is not.**
-    `ctest -R write-slot-guard-canary` drives an ordinary sequential pair of writes and
+  - **Watched BOTH ways, which the read-side canary is not** -- in fastcached until the move;
+    core-cpp's `socket-contract-canary` watches both slots now.
+    `ctest -R write-slot-guard-canary` drove an ordinary sequential pair of writes and
     only then the double-arm, and `scripts/write-slot-guard-gate.cmake` requires the
     acceptance marker BEFORE the abort. A guard nobody has watched refuse is not a
     guard; a guard nobody has watched ACCEPT is not known to work either (#1031) -- one

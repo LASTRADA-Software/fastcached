@@ -812,16 +812,18 @@ Consequences that are each load-bearing:
         no `ClaimWriteSlot`, so the write slot is exactly as shared and entirely
         silent"*, and #893 added one -- so the text told the next reader not to look for
         a guard that was already in the tree, which is the expensive direction for a
-        stale rule to fail in (#1218). `Detail::ClaimWriteSlot` (`Net/WriteSlot.hpp`)
-        now does for the write slot what #663's `ClaimReadSlot` does for the read slot:
-        a double-arm dies in a Debug build naming the slot. It reaches THIS case because
+        stale rule to fail in (#1218). core-cpp's `contract::claimWriteSlot`
+        (`core/net/SocketContract.hpp`, once `Net/WriteSlot.hpp`) does for the write slot what
+        #663's `ClaimReadSlot` does for the read slot: a double-arm ends the process naming the
+        slot -- in every build since core-cpp 0.3.0, in Debug only before. It reaches THIS
+        case because
         `WriteAll` sends a whole frame in one `Write`, so a parked write is a half-sent
-        frame. Watched both ways by `ctest -R write-slot-guard-canary`, and the rule
+        frame. Watched by core-cpp's `socket-contract-canary`, and the rule
         lives in [`wire-and-protocol.md`](wire-and-protocol.md).
       - **`ReclaimFromPulse` is still load-bearing and the guard does not replace it.**
-        The claim is Debug-only and it names a misuse; it does not SETTLE the pulse, so
+        The claim names a misuse by ending the process; it does not SETTLE the pulse, so
         the ordering test remains the only thing that would notice the settle going
-        away in a release build.
+        away before a double-arm aborts a live node.
     - **A test that only watches the answer cannot see any of it.** Reading one framed
       reply stops at the first terminal status, so a pulse emitted AFTER the reply -- what
       a missing settle produces -- is invisible, and a case asserting "every frame but the

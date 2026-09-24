@@ -631,15 +631,14 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   pure virtual: **type system when the obligation is DO SOMETHING, scan when it is SAY WHY.**
 - **A `/simplify` finding is a change like any other and is not exempt from the review its subject
   just had.** And **a regression test can fail to reproduce its regression**.
-- A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming either while
-  the other is parked drops the parked coroutine with no signal. The rule lives on `ISocket`;
-  `Detail::ClaimReadSlot` folds the claim and the `assert` into one expression and
-  `read-slot-guard-canary` must die. Not a refusal — and **the hazard is the SITE, not ownership**,
-  which is a RETRACTION: at the ARM site a socket cannot tell a stale parked wait from a live one.
-- The WRITE slot is the same rule: one write op per direction, `Detail::ClaimWriteSlot`
-  (core-cpp's), reaching `FrameEndpoint`'s one-writer property because `WriteAll` sends a
-  whole frame in ONE `Write`. `write-slot-guard-canary` watches it BOTH ways — **a guard nobody has
-  watched ACCEPT is not known to work either** — and a new helper naming `Loop` stays unenforced.
+- A socket has ONE read operation (`Read` and `WaitReadable` share it) and ONE write operation.
+  The rule lives on core-cpp's `ISocket`; `contract::claimReadSlot` and `claimWriteSlot`
+  (`core/net/SocketContract.hpp`) fold the claim into the operation and, **since core-cpp 0.3.0,
+  END THE PROCESS in every build**, naming the direction and the handle — Release too, where it
+  was a silent hang. core-cpp's `socket-contract-canary` watches it. Not a refusal — and **the
+  hazard is the SITE, not ownership**, a RETRACTION: at the ARM site a socket cannot tell a stale
+  parked wait from a live one. `WriteAll` sends a whole frame in ONE `Write`, which is how the write
+  rule reaches `FrameEndpoint`'s one-writer property; a new helper naming `Loop` stays unenforced.
 - So a parked read is retrieved by `ISocket::CancelRead()` — the only spelling of *abandon* that is
   not `Close()`. ONE watch, re-TARGETED per pass, re-armed only once the previous has RESOLVED,
   retired by RAII AND explicitly before the reply write; what silences it is the RETIREMENT, never
