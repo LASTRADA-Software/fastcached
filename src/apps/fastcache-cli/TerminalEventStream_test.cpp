@@ -622,6 +622,32 @@ TEST_CASE("the production terminal wait delivers what the input handle had ready
     CHECK(input.readCount() == 1);
 }
 
+TEST_CASE("the production terminal wait ends the input when a read finds the terminal gone", "[cli][dashboard][terminal]")
+{
+    // core-cpp#49's shape: a terminal that hung up stays READABLE for ever, and every read answers
+    // its end (EIO, or an end of file) with nothing in it. The backend reports readiness, not a
+    // failure, so only the source can say the input is over -- `InputSource::inputClosed()`, which
+    // core-cpp 0.2.1 records. A wait that asks the backend alone answers "readable, nothing read"
+    // every time and the dashboard spins. WHAT DISTINGUISHES: the outcome says the input CLOSED, and
+    // a second wait says so again without reading, where the spin would read once per wait.
+    auto pipe = core::platform::createSystemPipe();
+    REQUIRE(pipe.has_value());
+    auto input = core::tui::runtime::testing::ScriptedInputSource { pipe->get() };
+    auto made = MakeTerminalInputWait(input, core::net::makeDefaultBackend());
+    REQUIRE(made.has_value());
+    auto& wait = *made;
+    input.closeInput();
+
+    auto const first = wait->Wait(WaitBoundMs);
+    CHECK(first.inputClosed);
+    CHECK(first.events.empty());
+    REQUIRE(input.readCount() == 1);
+
+    auto const second = wait->Wait(WaitBoundMs);
+    CHECK(second.inputClosed);
+    CHECK(input.readCount() == 1);
+}
+
 TEST_CASE("the production terminal wait delivers held-back input without waiting", "[cli][dashboard][terminal]")
 {
     // A key a terminal query read and did not consume, with nothing ready on the handle. WHAT

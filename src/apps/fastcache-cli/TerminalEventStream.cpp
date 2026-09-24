@@ -687,6 +687,11 @@ namespace
 
         [[nodiscard]] TerminalWaitOutcome WaitForReadiness(int timeoutMs)
         {
+            // An input the source has already found at its end is answered without waiting: the
+            // handle of a terminal that hung up stays readable, so waiting on it again would
+            // return at once, read nothing, and do the same forever (core-cpp#49).
+            if (_input.inputClosed())
+                return TerminalWaitOutcome { .inputClosed = true };
             for (auto& watch: _watches)
             {
                 watch.readable = false;
@@ -712,6 +717,15 @@ namespace
                     outcome.events.push_back(std::move(*resized));
             if (input.readable)
                 std::ranges::move(_input.readReady(), std::back_inserter(outcome.events));
+            // The end the READ found, which the backend cannot report: a terminal that hung up is
+            // readable, and only the read that answers EIO or an end of file tells the end from
+            // "nothing yet" -- core-cpp's `InputSource::inputClosed()`, recorded since 0.2.1. What
+            // that read delivered goes out with it.
+            if (_input.inputClosed())
+            {
+                outcome.inputClosed = true;
+                return outcome;
+            }
             // A bounded wait that ended with nothing ready is the parser's cue: a lone ESC with no
             // continuation after it is the Escape key.
             if (waited.dispatched == 0 && timeoutMs >= 0)
