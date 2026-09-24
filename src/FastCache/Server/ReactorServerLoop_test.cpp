@@ -232,7 +232,7 @@ TEST_CASE("Detail::StartExpiryCycle reclaims an untouched lapsed key through the
     chain.observer.expired.clear();
 
     FastCache::ReactorServerOptions options;
-    options.expiry = FastCache::ExpiryReaperOptions { .interval = 100ms, .stopWakeBound = 25ms };
+    options.expiry = FastCache::ExpiryReaperOptions { .interval = 100ms };
 
     auto const cycle =
         FastCache::Detail::StartExpiryCycle(chain.reactor, chain.reactor, chain.engine, chain.logger, options, nullptr);

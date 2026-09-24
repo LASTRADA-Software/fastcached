@@ -60,15 +60,6 @@ struct ExpiryReaperOptions
     /// Entries one sweep may reclaim. See `DefaultPurgeBudget`.
     std::size_t purgeBudget { DefaultPurgeBudget };
 
-    /// Longest the cycle may take to notice it has been cancelled.
-    ///
-    /// The sweep sleeps in steps no longer than this and re-reads the token at
-    /// each one, so a shutdown never waits out a whole backed-off `maxInterval`.
-    /// A non-positive value means one sleep straight through, which is a
-    /// legitimate thing to ask for and is spelled rather than defaulted -- the
-    /// same rule `InterruptibleSleepUntil` states.
-    core::platform::SteadyDuration stopWakeBound { std::chrono::milliseconds { 50 } };
-
     /// How long one sweep may hold the reactor before the scan budget is cut.
     ///
     /// **`scanBudget` counts ENTRIES, and entries are not work** (#946). Its own
@@ -145,7 +136,7 @@ static_assert(ExpiryReaperOptions::DefaultPurgeBudget <= ReclaimLog::DefaultCapa
 /// where the last one stopped, so the cost per cycle is fixed rather than
 /// proportional to how much is cached.
 ///
-/// It backs off when idle, and it wakes in `stopWakeBound` steps so a stop is
+/// It backs off when idle, and it parks once per interval: a stop cancels the park, so it is
 /// prompt and leaves nothing parked on the reactor's timer wheel.
 class ExpiryReaper
 {

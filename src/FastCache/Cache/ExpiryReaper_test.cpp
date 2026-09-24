@@ -464,10 +464,9 @@ class RecordingAbandonment final: public IDrainAbandonment
 /// release however long the look is, so a slow host cannot turn the fix red.
 constexpr auto StopLook = 200ms;
 
-/// A cycle that sweeps every millisecond and notices a stop within one, so a case reaches a hop in a
-/// few ticks -- with a stop drain short enough for a case to wait out.
+/// A cycle that sweeps every millisecond, so a case reaches a hop in a few ticks -- with a stop drain
+/// short enough for a case to wait out.
 constexpr ExpiryReaperOptions FastCycleShortDrain { .interval = 1ms,
-                                                    .stopWakeBound = 1ms,
                                                     .stopDrain = DrainBound { .ceiling = 20ms, .poll = 1ms } };
 
 /// The same cycle with a stop drain ceiling of ONE millisecond, for a reaper whose drain clock the
@@ -479,7 +478,6 @@ constexpr ExpiryReaperOptions FastCycleShortDrain { .interval = 1ms,
 /// away, the drain gives up, and the case's `Abandonments() == 0` fails on every host. Not zero:
 /// `DrainWithin` tests `Now() >= deadline`, so a zero ceiling is reached by a clock that never moves.
 constexpr ExpiryReaperOptions FastCycleHeldDrain { .interval = 1ms,
-                                                   .stopWakeBound = 1ms,
                                                    .stopDrain = DrainBound { .ceiling = 1ms, .poll = 1ms } };
 // The look must outlast the ceiling, or an unwired seam's real clock could end the look first.
 static_assert(StopLook > FastCycleHeldDrain.stopDrain.ceiling);
@@ -682,9 +680,7 @@ TEST_CASE("The expiry cycle reclaims a lapsed key nobody touched, and says so", 
     REQUIRE(f.storage.Set("gone", MakeBytes("v"), 0, f.clock.now() + 1s).has_value());
     f.observer.events.clear(); // Drop the SET's own event.
 
-    ExpiryReaper reaper {
-        f.storage, f.logger, ExpiryReaperOptions { .interval = 100ms, .stopWakeBound = 25ms }, &f.metrics
-    };
+    ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 100ms }, &f.metrics };
     auto task = reaper.Run(&f.reactor, &f.reactor, f.source.get_token());
     f.reactor.submit(task.handle());
     f.reactor.drain();
@@ -710,7 +706,7 @@ TEST_CASE("The expiry cycle stops promptly and leaves nothing parked", "[expiry]
     // either wait out the whole interval or return with a frame nobody will
     // ever resume and nobody will ever free.
     Fixture f;
-    ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s, .stopWakeBound = 50ms } };
+    ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s } };
     auto task = reaper.Run(&f.reactor, &f.reactor, f.source.get_token());
     f.reactor.submit(task.handle());
     f.reactor.drain();
@@ -726,6 +722,35 @@ TEST_CASE("The expiry cycle stops promptly and leaves nothing parked", "[expiry]
     CHECK(reaper.Cycles() == 0U);
 }
 
+TEST_CASE("An idle expiry cycle parks once for its interval rather than waking a step at a time", "[expiry][reaper]")
+{
+    // The cycle used to sleep in `stopWakeBound` steps and re-read its token at each one, because
+    // fastcached's reactor could not take a scheduled resumption back. core-cpp's can: a stop
+    // cancels the park itself (#1596). So between two sweeps nothing on this frame runs at all --
+    // counted here as what every turn resumed, with the clock stepped just short of the interval.
+    Fixture f;
+    ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s } };
+    auto task = reaper.Run(&f.reactor, &f.reactor, f.source.get_token());
+    f.reactor.submit(task.handle());
+    std::ignore = f.reactor.drain();
+    REQUIRE(f.reactor.pendingTimers() == 1);
+
+    auto resumed = std::size_t { 0 };
+    for ([[maybe_unused]] auto const step: std::views::iota(0, 599))
+    {
+        f.clock.advance(50ms);
+        resumed += f.reactor.drain();
+    }
+
+    CHECK(resumed == 0);
+    CHECK(reaper.Cycles() == 0U);
+    CHECK(f.reactor.pendingTimers() == 1);
+
+    f.source.request_stop();
+    std::ignore = f.reactor.drain();
+    CHECK(f.reactor.pendingTimers() == 0);
+}
+
 TEST_CASE("Stopping the expiry cycle reclaims a frame still parked on the reactor", "[expiry][reaper]")
 {
     // The case a graceful shutdown does not cover: the loop stops while the
@@ -734,7 +759,7 @@ TEST_CASE("Stopping the expiry cycle reclaims a frame still parked on the reacto
     // sanitizer build reports it as exactly that.
     Fixture f;
     {
-        ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s, .stopWakeBound = 50ms } };
+        ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 30s } };
         reaper.Start(f.reactor, f.reactor);
         f.reactor.drain();
         REQUIRE(f.reactor.pendingTimers() == 1); // Parked mid-interval.
@@ -792,9 +817,7 @@ TEST_CASE("The expiry cycle actually backs off on a running reactor", "[expiry][
     // The pure function above decides the interval; this is the check that the
     // loop uses what it decides.
     Fixture f;
-    ExpiryReaper reaper { f.storage,
-                          f.logger,
-                          ExpiryReaperOptions { .interval = 100ms, .maxInterval = 400ms, .stopWakeBound = 100ms } };
+    ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 100ms, .maxInterval = 400ms } };
     auto task = reaper.Run(&f.reactor, &f.reactor, f.source.get_token());
     f.reactor.submit(task.handle());
     f.reactor.drain();
@@ -974,7 +997,7 @@ TEST_CASE("Passing the reactor as the sweep executor keeps the sweep on the loop
 
     auto const reactorThread = std::this_thread::get_id();
     {
-        ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 1ms, .stopWakeBound = 1ms } };
+        ExpiryReaper reaper { f.storage, f.logger, ExpiryReaperOptions { .interval = 1ms } };
         reaper.Start(f.reactor, f.reactor);
         REQUIRE(TickUntil(
             f,

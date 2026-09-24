@@ -10,6 +10,7 @@
 #include <utility>
 
 #include <core/Profiling.hpp>
+#include <core/async/Cancellation.hpp>
 #include <core/async/ResumeOn.hpp>
 #include <core/net/SleepUntil.hpp>
 
@@ -57,6 +58,32 @@ namespace
                     count->fetch_sub(1, std::memory_order_acq_rel);
                 throw;
             }
+        }
+
+        void await_resume() const noexcept {}
+    };
+
+    /// Makes @p token this coroutine's OWN stop token, so every loop park it makes is woken by a stop.
+    ///
+    /// core-cpp's loop awaitables read the awaiting flow's token and cancel their own park when it
+    /// stops (`core::net::DelayAwaiter`). A cycle started as a root task has no awaiting flow to
+    /// inherit one from, so it adopts the token it was handed -- and a stop then ends the interval
+    /// wait at once, where the cycle used to sleep in `stopWakeBound` steps to notice it (#1596).
+    /// Never suspends.
+    struct AdoptStopToken
+    {
+        core::async::StopToken token; ///< The token the cycle stops on.
+
+        [[nodiscard]] bool await_ready() const noexcept
+        {
+            return false;
+        }
+
+        template <typename Promise>
+        [[nodiscard]] bool await_suspend(std::coroutine_handle<Promise> self) const noexcept
+        {
+            self.promise().setStopToken(token);
+            return false;
         }
 
         void await_resume() const noexcept {}
@@ -259,26 +286,30 @@ core::async::Task<void> ExpiryReaper::Run(core::net::EventLoop* reactor,
                  _options.scanBudget,
                  _options.purgeBudget);
 
+    co_await AdoptStopToken { .token = token };
+
     while (!token.stop_requested())
     {
-        // Bounded steps rather than one sleep straight to the deadline, so a
-        // stop is noticed within `stopWakeBound` rather than after a whole
-        // backed-off interval.
+        // ONE park straight to the deadline, and a stop cancels it: the token is this frame's own
+        // (`AdoptStopToken` above), so the park's stop callback retires it and the await throws
+        // `OperationCancelled`. The cycle used to sleep in `stopWakeBound` steps and re-read the
+        // token at each one, because fastcached's reactor could not take a scheduled resumption
+        // back; core-cpp's can, so an idle cycle now costs no wake-up at all (#1596).
         //
-        // Written out here rather than delegated to `InterruptibleSleepUntil`,
-        // and the reason is WHICH frame the reactor ends up holding: awaiting a
-        // nested `core::async::Task` parks the INNER coroutine's handle, so the handle a
-        // shutdown has to name would not be this task's. Awaiting `SleepUntil`
-        // directly makes them the same frame, which is what lets the owner take
-        // it back with `CancelPending` instead of leaking it. `core::net::DeadlineTimer`
-        // inlines its wait for exactly this reason.
-        auto const deadline = reactor->clock().now() + _interval;
-        while (!token.stop_requested())
+        // Awaited directly rather than through `interruptibleSleepUntil`, and the reason is WHICH
+        // frame the reactor ends up holding: awaiting a nested `core::async::Task` parks the INNER
+        // coroutine's handle, so the handle a shutdown has to name would not be this task's.
+        // Awaiting the loop's own delay makes them the same frame, which is what lets the owner
+        // take it back with `cancelPending` instead of leaking it. Named before it is awaited,
+        // to keep the call out of the `co_await` full-expression (MSVC C4737).
+        auto wait = core::net::sleepUntil(reactor, reactor->clock().now() + _interval);
+        try
         {
-            auto const now = reactor->clock().now();
-            if (now >= deadline)
-                break;
-            co_await core::net::sleepUntil(reactor, core::net::nextWakeStep(now, deadline, _options.stopWakeBound));
+            co_await wait;
+        }
+        catch (core::async::OperationCancelled const&)
+        {
+            break;
         }
         if (token.stop_requested())
             break;
