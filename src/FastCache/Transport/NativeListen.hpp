@@ -2,6 +2,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -11,6 +12,8 @@
 #include <core/net/IListener.hpp>
 #include <core/net/NetError.hpp>
 #include <core/net/SocketAddress.hpp>
+#include <core/net/Sockets.hpp>
+#include <core/net/UdpSocket.hpp>
 #include <core/platform/Types.hpp>
 
 namespace core::net
@@ -24,23 +27,35 @@ namespace FastCache
 /// @file NativeListen.hpp
 /// The one bind sequence this project keeps of its own, beside core-cpp's `core::net::listen`.
 ///
-/// core-cpp owns every socket this project reads and writes (#1596). What it does not have yet,
-/// and this file does, is two ways of standing up a listener that `core::net::listen` does not
-/// offer: a port several event loops share (SO_REUSEPORT, the daemon's multi-reactor path), and a
-/// listener a thread BLOCKS on (`BlockingListener`, the admin endpoints). Both are candidates for
-/// graduation into core-cpp; until then they are this file, and nothing else in this tree binds.
+/// core-cpp owns every socket this project reads and writes (#1596), and every listener a loop
+/// drives is `core::net::listen`, bound as `ClientListenOptions` says. What core-cpp does not
+/// offer, and this file does, is a listener a thread BLOCKS on: `BlockingListener` for the admin
+/// endpoints, and `AcceptRaw` for the Windows multi-reactor's accept thread. Both are candidates
+/// for graduation into core-cpp; until then they are this file, and nothing else in this tree
+/// binds.
 ///
-/// **Exclusive by default**, exactly as core-cpp's listeners: `SO_EXCLUSIVEADDRUSE` on Windows,
-/// where `SO_REUSEADDR` would let a second process take a port already being served, and
-/// `SO_REUSEADDR` on POSIX, where it only steps over a dead socket's TIME_WAIT. Sharing a port is
-/// `ReusePort::Yes`, and only that.
+/// **Exclusive**, exactly as core-cpp's listeners: `SO_EXCLUSIVEADDRUSE` on Windows, where
+/// `SO_REUSEADDR` would let a second process take a port already being served, and `SO_REUSEADDR`
+/// on POSIX, where it only steps over a dead socket's TIME_WAIT. A port several loops share is
+/// `core::net::PortSharing::Shared`, which only `core::net::listen` binds.
 
-/// Whether a listening socket shares its port with other listeners of this process.
-enum class ReusePort : bool
-{
-    No,  ///< The port is this socket's alone.
-    Yes, ///< SO_REUSEPORT: several listeners bind one port and the kernel spreads connections.
-};
+/// The kernel send and receive buffers every client connection asks for, so a reply of up to this
+/// size leaves in one write. A request: the kernel caps it at its own maximum.
+inline constexpr std::size_t ClientSocketBufferBytes = std::size_t { 1 } << 20;
+
+/// How the daemon binds a client listener on a loop, on every path: @p sharing decides whether
+/// other loops' listeners may bind the same port, and every connection it accepts asks for
+/// `ClientSocketBufferBytes` each way.
+/// @param host The address to bind.
+/// @param port The port; 0 lets the OS choose.
+/// @param backlog The listen backlog.
+/// @param sharing `Shared` for the POSIX multi-reactor's one listener per loop, `Exclusive`
+///        otherwise. Windows refuses `Shared` (`core::net::NetErrorCode::Unsupported`).
+/// @return The options to hand `core::net::listen`.
+[[nodiscard]] core::net::ListenOptions ClientListenOptions(std::string_view host,
+                                                           std::uint16_t port,
+                                                           int backlog,
+                                                           core::net::PortSharing sharing) noexcept;
 
 /// A socket this file bound and set listening.
 struct BoundSocket
@@ -49,15 +64,17 @@ struct BoundSocket
     int family { 0 };
 };
 
-/// Resolve @p host, then create, claim, bind and listen on the first candidate that allows it.
+/// Resolve @p host, then create, claim exclusively, bind and listen on the first candidate that
+/// allows it. The socket blocks: it is for a thread that accepts, not for a loop.
 /// @param resolver Resolves @p host (a literal or a name) to candidate addresses.
 /// @param host The address to bind; `0.0.0.0`, `::` and names all work.
 /// @param port The port; 0 lets the OS choose.
 /// @param backlog The listen backlog.
-/// @param reusePort Whether the port is shared with other listeners of this process.
 /// @return The listening socket, owned by the caller, or why no candidate could be bound.
-[[nodiscard]] std::expected<BoundSocket, std::string> BindAndListen(
-    core::net::IAddressResolver& resolver, std::string_view host, std::uint16_t port, int backlog, ReusePort reusePort);
+[[nodiscard]] std::expected<BoundSocket, std::string> BindAndListen(core::net::IAddressResolver& resolver,
+                                                                    std::string_view host,
+                                                                    std::uint16_t port,
+                                                                    int backlog);
 
 /// @return The port @p socket is bound to, or 0 when it cannot be asked.
 [[nodiscard]] std::uint16_t BoundPortOf(core::platform::NativeHandle socket) noexcept;
@@ -92,26 +109,6 @@ struct AcceptedSocket
 /// @param listening A bound, listening, blocking socket.
 /// @return The connection, or why none was taken.
 [[nodiscard]] std::expected<AcceptedSocket, core::net::NetError> AcceptRaw(core::platform::NativeHandle listening);
-
-/// A listener on a port other listeners of this process share, driven by @p loop.
-///
-/// The daemon's POSIX multi-reactor path binds one of these per reactor on the same port, and the
-/// kernel spreads connections across them. `core::net::listen` in core-cpp v0.1.0 has no way to
-/// ask for that, so the socket is bound here with `ReusePort::Yes` and handed to
-/// `core::net::adoptListener`. **This function is the seam that goes**: core-cpp v0.1.1 adds
-/// `ListenOptions::sharing`, and the body becomes one `core::net::listen` call when the pin moves.
-/// @param loop The loop the listener belongs to.
-/// @param host The address to bind.
-/// @param port The port.
-/// @param backlog The listen backlog.
-/// @param resolver Resolves @p host.
-/// @return The listener, or why it could not be made.
-[[nodiscard]] std::expected<std::unique_ptr<core::net::IListener>, std::string> ListenOnSharedPort(
-    core::net::EventLoop& loop,
-    std::string_view host,
-    std::uint16_t port,
-    int backlog,
-    core::net::IAddressResolver& resolver = core::net::defaultAddressResolver());
 
 /// A listener over a descriptor a supervisor handed this process (socket activation), driven by
 /// @p loop.

@@ -876,10 +876,11 @@ Every rule below has already been a bug.
     `TIME_WAIT`. A listening socket that never accepted does not enter `TIME_WAIT`
     itself, which is what the comment had actually been reasoning about.
   - **Sharing a port on purpose is still opt-in, and it is a different option.**
-    `ReusePort::Yes` (`SO_REUSEPORT`, POSIX only) is what lets N reactor threads
-    bind one port and have the kernel load-balance across them. Exclusivity is the
-    default, not the only setting, and both halves are asserted -- the second bind
-    refused, and two `ReusePort::Yes` listeners sharing.
+    `core::net::PortSharing::Shared` (`SO_REUSEPORT`, POSIX only; core-cpp refuses
+    it on Windows) is what lets N reactor threads bind one port and have the kernel
+    load-balance across them. Exclusivity is the default, not the only setting, and
+    both halves are asserted -- the exclusive bind refused, and two `Shared`
+    listeners sharing.
   - **A `setsockopt` carrying a security property is not best-effort.** It fails
     the candidate rather than being ignored the way `TCP_NODELAY` and
     `IPV6_V6ONLY` are: a daemon that silently came up shareable is worse than one
@@ -2201,7 +2202,7 @@ Every rule below has already been a bug.
     be added to all of them at once.
 
 - **No completion port is ever drained from several threads**, on Windows or anywhere
-  else. `IocpReactor.hpp` states the reason: a second thread dequeuing the same port
+  else. The reason (it was `IocpReactor.hpp`'s, before #1596): a second thread dequeuing the same port
   migrates a coroutine across threads mid-suspension, which every awaitable here is
   written against. `RunMultiReactorWindows` therefore runs **one thread per reactor**,
   exactly as the POSIX path does — `--threads N` is N independent single-threaded

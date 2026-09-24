@@ -2,6 +2,7 @@
 #include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -19,7 +20,9 @@
 #include <core/async/Task.hpp>
 #include <core/net/IListener.hpp>
 #include <core/net/NetError.hpp>
+#include <core/net/PlatformLoop.hpp>
 #include <core/net/SocketAddress.hpp>
+#include <core/net/Sockets.hpp>
 #include <core/platform/Types.hpp>
 #include <core/platform/WinsockInit.hpp>
 
@@ -104,13 +107,11 @@ class FakeAddressResolver final: public core::net::IAddressResolver
 
 /// Bind loopback through the production sequence.
 /// @param port The port; 0 lets the kernel choose.
-/// @param reusePort Whether the port is shared.
 /// @return The bound socket, or why not.
-[[nodiscard]] std::expected<FastCache::BoundSocket, std::string> BindLoopback(
-    std::uint16_t port, FastCache::ReusePort reusePort = FastCache::ReusePort::No)
+[[nodiscard]] std::expected<FastCache::BoundSocket, std::string> BindLoopback(std::uint16_t port)
 {
     FakeAddressResolver resolver { std::vector { MakeV4Endpoint("127.0.0.1", port) } };
-    return FastCache::BindAndListen(resolver, "127.0.0.1", port, /*backlog*/ 16, reusePort);
+    return FastCache::BindAndListen(resolver, "127.0.0.1", port, /*backlog*/ 16);
 }
 
 /// Await one accept.
@@ -126,7 +127,7 @@ class FakeAddressResolver final: public core::net::IAddressResolver
 TEST_CASE("BindAndListen binds the first resolved candidate", "[net][bind]")
 {
     FakeAddressResolver resolver { std::vector { MakeV4Endpoint("127.0.0.1", 0) } };
-    auto bound = FastCache::BindAndListen(resolver, "127.0.0.1", 0, /*backlog*/ 16, FastCache::ReusePort::No);
+    auto bound = FastCache::BindAndListen(resolver, "127.0.0.1", 0, /*backlog*/ 16);
     REQUIRE(bound.has_value());
     REQUIRE(bound->handle != core::platform::InvalidHandle);
     REQUIRE(bound->family == AF_INET);
@@ -141,7 +142,7 @@ TEST_CASE("BindAndListen falls over to the next candidate when the first cannot 
         MakeV4Endpoint("192.0.2.1", 0),
         MakeV4Endpoint("127.0.0.1", 0),
     } };
-    auto bound = FastCache::BindAndListen(resolver, "ignored", 0, /*backlog*/ 16, FastCache::ReusePort::No);
+    auto bound = FastCache::BindAndListen(resolver, "ignored", 0, /*backlog*/ 16);
     REQUIRE(bound.has_value());
     REQUIRE(bound->family == AF_INET);
     FastCache::CloseNativeSocket(bound->handle);
@@ -150,7 +151,7 @@ TEST_CASE("BindAndListen falls over to the next candidate when the first cannot 
 TEST_CASE("BindAndListen propagates a resolver error", "[net][bind]")
 {
     FakeAddressResolver resolver { std::string { "cannot resolve 'banana': no usable address" } };
-    auto const bound = FastCache::BindAndListen(resolver, "banana", 11211, /*backlog*/ 16, FastCache::ReusePort::No);
+    auto const bound = FastCache::BindAndListen(resolver, "banana", 11211, /*backlog*/ 16);
     REQUIRE_FALSE(bound.has_value());
     REQUIRE(bound.error().contains("banana"));
 }
@@ -158,7 +159,7 @@ TEST_CASE("BindAndListen propagates a resolver error", "[net][bind]")
 TEST_CASE("BindAndListen reports failure when no candidate is bindable", "[net][bind]")
 {
     FakeAddressResolver resolver { std::vector { MakeV4Endpoint("192.0.2.1", 0) } };
-    auto const bound = FastCache::BindAndListen(resolver, "192.0.2.1", 0, /*backlog*/ 16, FastCache::ReusePort::No);
+    auto const bound = FastCache::BindAndListen(resolver, "192.0.2.1", 0, /*backlog*/ 16);
     REQUIRE_FALSE(bound.has_value());
 }
 
@@ -185,31 +186,55 @@ TEST_CASE("BindAndListen keeps its address to itself while it is listening", "[n
     FastCache::CloseNativeSocket(held->handle);
 }
 
-#if defined(SO_REUSEPORT)
-TEST_CASE("ReusePort::Yes still lets several listeners share one port", "[net][bind][reuseport]")
+TEST_CASE("ClientListenOptions asks for 1 MiB buffers each way, whatever the sharing", "[net][listener][buffers]")
+{
+    // Both daemon paths bind through this one value, so a reply of up to 1 MiB leaves in one write
+    // on either. The single-reactor path used to call `core::net::listen` with no buffers at all,
+    // which kept the kernel's default on every connection it accepted.
+    auto const sharing = GENERATE(core::net::PortSharing::Exclusive, core::net::PortSharing::Shared);
+    auto const options = FastCache::ClientListenOptions("127.0.0.1", 11211, 64, sharing);
+    CHECK(options.host == "127.0.0.1");
+    CHECK(options.port == 11211);
+    CHECK(options.backlog == 64);
+    CHECK(options.sharing == sharing);
+    CHECK(options.buffers.send == FastCache::ClientSocketBufferBytes);
+    CHECK(options.buffers.receive == FastCache::ClientSocketBufferBytes);
+    CHECK(FastCache::ClientSocketBufferBytes == std::size_t { 1 } << 20);
+}
+
+TEST_CASE("PortSharing::Shared lets several loops' listeners bind one port", "[net][listener][reuseport]")
 {
     // Exclusivity is the default, not the only setting. The POSIX multi-reactor binds one
     // listener per loop on the same {address, port} and lets the kernel spread connections
-    // across them (`ListenOnSharedPort`), so a change that made every bind exclusive would
-    // present as a daemon that refuses to start with more than one reactor thread.
-    auto held = BindLoopback(0, FastCache::ReusePort::Yes);
+    // across them, so a change that made every bind exclusive would present as a daemon that
+    // refuses to start with more than one reactor thread. Windows has no such option, and
+    // core-cpp refuses it there rather than map it onto a hijackable SO_REUSEADDR.
+    core::net::PlatformLoop first;
+    core::net::PlatformLoop second;
+    auto held = core::net::listen(first, FastCache::ClientListenOptions("127.0.0.1", 0, 16, core::net::PortSharing::Shared));
+#if defined(_WIN32)
+    REQUIRE_FALSE(held.has_value());
+    CHECK(held.error().code == core::net::NetErrorCode::Unsupported);
+#else
     REQUIRE(held.has_value());
-
-    auto const port = FastCache::BoundPortOf(held->handle);
+    auto const port = (*held)->boundPort();
     REQUIRE(port != 0);
 
-    auto shared = BindLoopback(port, FastCache::ReusePort::Yes);
-    REQUIRE(shared.has_value());
+    auto shared =
+        core::net::listen(second, FastCache::ClientListenOptions("127.0.0.1", port, 16, core::net::PortSharing::Shared));
+    CHECK(shared.has_value());
 
-    FastCache::CloseNativeSocket(shared->handle);
-    FastCache::CloseNativeSocket(held->handle);
-}
+    // And exclusive is still exclusive: a third listener that does not ask to share is refused.
+    auto exclusive =
+        core::net::listen(second, FastCache::ClientListenOptions("127.0.0.1", port, 16, core::net::PortSharing::Exclusive));
+    CHECK_FALSE(exclusive.has_value());
 #endif
+}
 
 TEST_CASE("BindAndListen forces dual-stack (IPV6_V6ONLY=0) on an IPv6 wildcard bind", "[net][bind][dual-stack]")
 {
     FakeAddressResolver resolver { std::vector { MakeV6Endpoint("::", 0) } };
-    auto bound = FastCache::BindAndListen(resolver, "::", 0, /*backlog*/ 16, FastCache::ReusePort::No);
+    auto bound = FastCache::BindAndListen(resolver, "::", 0, /*backlog*/ 16);
     if (!bound.has_value())
         SKIP("IPv6 unavailable in this environment, so the dual-stack bind could not be made");
     REQUIRE(bound->family == AF_INET6);
@@ -336,8 +361,7 @@ TEST_CASE("closing a listening socket unblocks a parked AcceptRaw, and says whic
 #endif
 
     // The production spelling: `RunMultiReactorWindows` binds through exactly this call.
-    auto bound = FastCache::BindAndListen(
-        core::net::defaultAddressResolver(), "127.0.0.1", 0, /*backlog*/ 4, FastCache::ReusePort::No);
+    auto bound = FastCache::BindAndListen(core::net::defaultAddressResolver(), "127.0.0.1", 0, /*backlog*/ 4);
     if (!bound.has_value())
         SKIP("this platform would not bind a loopback listener: " + bound.error());
 

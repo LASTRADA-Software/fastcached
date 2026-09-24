@@ -20,9 +20,9 @@ src/FastCache/
                 WireFrame + WireFields (the shared framing), Profiling, and the crypto
                 seam — Ed25519, X25519, Hkdf, the ONLY way into vendored Monocypher
   Transport/    What this project keeps of its own beside core-cpp's sockets:
-                NativeListen (BindAndListen, ListenOnSharedPort for SO_REUSEPORT,
-                AdoptInheritedListener, and BlockingListener for the admin endpoints --
-                graduation candidates) and LingeringClose
+                NativeListen (ClientListenOptions, how every loop's listener binds;
+                BindAndListen, AcceptRaw and BlockingListener for threads that block;
+                AdoptInheritedListener -- graduation candidates) and LingeringClose
   Cli/          UsageDoc (usage text as data) and Options (the one parse loop),
                 dependency-free so fastcache-cc compiles them in rather than linking
   Cache/        IStorage atomic primitives, CacheEntry, CacheEngine, InMemoryLruStorage,
@@ -120,7 +120,7 @@ anybody asking for it, and reading it as "`--threads` above one" describes a
 single-threaded default this daemon does not have.
 
 **No completion port is ever drained from several threads**, on Windows or anywhere
-else. `IocpReactor.hpp` says that migrates a coroutine across threads and is unsafe,
+else. That migrates a coroutine across threads, which no awaitable here allows,
 and `RunMultiReactorWindows` runs one thread per reactor exactly as the POSIX path
 does. The one `ThreadPoolExecutor { 1 }` on each of the three serving paths runs the
 EXPIRY SWEEP; it drains no completion port and overlaps no `fsync` with anything. This
@@ -577,7 +577,7 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) rather than marking what it does not.
 - A listening socket claims its address exclusively — `SO_EXCLUSIVEADDRUSE` on Windows, where
   `SO_REUSEADDR` lets a second process take a port already being served. Sharing a port is
-  `ReusePort::Yes`, and only that.
+  `core::net::PortSharing::Shared`, and only that.
 - A struct a decoder returns **by value** must not borrow from the bytes it decoded:
   `Decode(Encode(x))` is a use-after-free the moment one member becomes a view. A `*View` type
   borrows and says so, anything else owns, and the choice is per type by a CONJUNCTION.

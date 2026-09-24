@@ -40,12 +40,13 @@ src/FastCache/
   Transport/    What this project keeps of its own beside core-cpp's `core::net` (#1596),
                 which is where the coroutines (`core::async`), the event loop, every
                 socket, TLS, the connectors and the resolvers live now. NativeListen:
-                BindAndListen (exclusive by default, SO_REUSEPORT only when asked),
-                ListenOnSharedPort (a port several loops share, handed to
-                `core::net::adoptListener`), AdoptInheritedListener (socket activation,
-                closing a descriptor it could not adopt) and BlockingListener (a
-                listener a thread BLOCKS on, for the admin endpoints) -- each a
-                candidate for graduation into core-cpp. LingeringClose (how a
+                ClientListenOptions (how every listener a loop drives is bound:
+                `core::net::listen` with 1 MiB buffers, `PortSharing::Shared` for the
+                POSIX multi-reactor), BindAndListen (exclusive, blocking), AcceptRaw
+                (the Windows accept thread's hand-off), AdoptInheritedListener (socket
+                activation, closing a descriptor it could not adopt) and
+                BlockingListener (a listener a thread BLOCKS on, for the admin
+                endpoints) -- the last four candidates for graduation into core-cpp. LingeringClose (how a
                 server closes after answering: half-close, listen until the
                 peer closes or a bound says stop, then close -- a bare close
                 over unread input is a reset that destroys the answer)

@@ -159,18 +159,16 @@ namespace
         apply(SO_SNDTIMEO, send);
     }
 
+#if !defined(_WIN32)
     /// Make @p socket non-blocking, which `core::net::adoptListener` asks of a listener it adopts.
+    /// POSIX only, because socket activation, its one caller, is.
     void SetNonBlocking(SocketValue socket) noexcept
     {
-#if defined(_WIN32)
-        u_long on = 1;
-        std::ignore = ::ioctlsocket(socket, FIONBIO, &on);
-#else
         auto const flags = ::fcntl(socket, F_GETFL, 0);
         if (flags >= 0)
             std::ignore = ::fcntl(socket, F_SETFL, flags | O_NONBLOCK);
-#endif
     }
+#endif
 } // namespace
 
 void CloseNativeSocket(core::platform::NativeHandle socket) noexcept
@@ -198,14 +196,30 @@ void ApplyHotSocketOptions(core::platform::NativeHandle handle) noexcept
 #endif
     // A small reply is not held back for the peer's ACK of an earlier one, and a large one leaves in
     // one write: the kernel clamps the buffer to its own maximum, so this is an upper hint.
-    constexpr auto SocketBufferBytes = 1 << 20;
+    constexpr auto SocketBufferBytes = static_cast<int>(ClientSocketBufferBytes);
     SetOption(socket, IPPROTO_TCP, TCP_NODELAY, 1);
     SetOption(socket, SOL_SOCKET, SO_SNDBUF, SocketBufferBytes);
     SetOption(socket, SOL_SOCKET, SO_RCVBUF, SocketBufferBytes);
 }
 
-std::expected<BoundSocket, std::string> BindAndListen(
-    core::net::IAddressResolver& resolver, std::string_view host, std::uint16_t port, int backlog, ReusePort reusePort)
+core::net::ListenOptions ClientListenOptions(std::string_view host,
+                                             std::uint16_t port,
+                                             int backlog,
+                                             core::net::PortSharing sharing) noexcept
+{
+    return core::net::ListenOptions {
+        .host = host,
+        .port = port,
+        .backlog = backlog,
+        .sharing = sharing,
+        .buffers = { .send = ClientSocketBufferBytes, .receive = ClientSocketBufferBytes },
+    };
+}
+
+std::expected<BoundSocket, std::string> BindAndListen(core::net::IAddressResolver& resolver,
+                                                      std::string_view host,
+                                                      std::uint16_t port,
+                                                      int backlog)
 {
     core::platform::ensureWinsockInitialized();
 
@@ -235,13 +249,6 @@ std::expected<BoundSocket, std::string> BindAndListen(
             CloseNativeSocket(owned);
             continue;
         }
-
-#if defined(SO_REUSEPORT)
-        if (reusePort == ReusePort::Yes)
-            SetOption(sock, SOL_SOCKET, SO_REUSEPORT, 1);
-#else
-        std::ignore = reusePort;
-#endif
 
         // Dual-stack, so a "::" wildcard accepts IPv4 clients too; best-effort.
         if (endpoint.family == AF_INET6)
@@ -274,26 +281,6 @@ std::uint16_t BoundPortOf(core::platform::NativeHandle socket) noexcept
     if (::getsockname(ToSocket(socket), reinterpret_cast<sockaddr*>(&address), &length) != 0)
         return 0;
     return core::net::detail::portOfSockaddr(&address, static_cast<std::uint32_t>(length));
-}
-
-std::expected<std::unique_ptr<core::net::IListener>, std::string> ListenOnSharedPort(core::net::EventLoop& loop,
-                                                                                     std::string_view host,
-                                                                                     std::uint16_t port,
-                                                                                     int backlog,
-                                                                                     core::net::IAddressResolver& resolver)
-{
-    auto bound = BindAndListen(resolver, host, port, backlog, ReusePort::Yes);
-    if (!bound.has_value())
-        return std::unexpected(std::move(bound).error());
-    SetNonBlocking(ToSocket(bound->handle));
-    auto adopted = core::net::adoptListener(loop, bound->handle);
-    if (!adopted.has_value())
-    {
-        // On failure the caller still owns the handle (core::net::adoptListener's contract).
-        CloseNativeSocket(bound->handle);
-        return std::unexpected(adopted.error().toString());
-    }
-    return std::move(adopted).value();
 }
 
 std::expected<std::unique_ptr<core::net::IListener>, std::string> AdoptInheritedListener(core::net::EventLoop& loop,
@@ -346,7 +333,7 @@ std::unique_ptr<BlockingListener> BlockingListener::Bind(std::string_view bindAd
                                                          core::net::IAddressResolver& resolver)
 {
     auto listener = std::unique_ptr<BlockingListener> { new BlockingListener {} };
-    auto bound = BindAndListen(resolver, bindAddress, port, backlog, ReusePort::No);
+    auto bound = BindAndListen(resolver, bindAddress, port, backlog);
     if (bound.has_value())
         listener->_handle = bound->handle;
     else

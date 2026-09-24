@@ -127,7 +127,7 @@ namespace
         {
             auto listener = core::net::listen(
                 reactor,
-                core::net::ListenOptions { .host = bind.address, .port = bind.port, .backlog = options.listenBacklog });
+                ClientListenOptions(bind.address, bind.port, options.listenBacklog, core::net::PortSharing::Exclusive));
             if (!listener.has_value())
             {
                 logger.Logf(LogLevel::Error,
@@ -328,8 +328,7 @@ namespace
         bindTls.reserve(options.binds.size());
         for (auto const& bind: options.binds)
         {
-            auto bound = BindAndListen(
-                core::net::defaultAddressResolver(), bind.address, bind.port, options.listenBacklog, ReusePort::No);
+            auto bound = BindAndListen(core::net::defaultAddressResolver(), bind.address, bind.port, options.listenBacklog);
             if (!bound.has_value())
             {
                 logger.Logf(LogLevel::Error, "fastcached: cannot bind {}:{} : {}", bind.address, bind.port, bound.error());
@@ -544,7 +543,9 @@ namespace
             reactors.push_back(std::make_unique<core::net::PlatformLoop>(clock));
             for (auto const& bind: options.binds)
             {
-                auto listener = ListenOnSharedPort(*reactors[i], bind.address, bind.port, options.listenBacklog);
+                auto listener = core::net::listen(
+                    *reactors[i],
+                    ClientListenOptions(bind.address, bind.port, options.listenBacklog, core::net::PortSharing::Shared));
                 if (!listener.has_value())
                 {
                     logger.Logf(LogLevel::Error,
@@ -552,7 +553,7 @@ namespace
                                 bind.address,
                                 bind.port,
                                 i,
-                                listener.error());
+                                listener.error().toString());
                     return EXIT_FAILURE;
                 }
                 listeners.push_back(std::move(*listener));
