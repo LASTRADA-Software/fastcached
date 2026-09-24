@@ -101,16 +101,6 @@ struct PeerTransportOptions
     /// costs is memory the compile cache wanted.
     std::size_t maxQueuedPerPeer { 256 };
 
-    /// Longest a sender may sit in a backoff it cannot be woken from.
-    ///
-    /// Teardown lag, in one number. `core::net::EventLoop::Schedule` cannot be cancelled, so
-    /// a backoff is slept in steps of this length with the stop re-read at each
-    /// one: a stop is observed within this bound rather than after
-    /// `reconnectBackoff`, which is what keeps shutdown independent of how
-    /// unreachable a peer happens to be. Costs one wake-up per bound per
-    /// unreachable peer, each of which loads one atomic and re-parks.
-    std::chrono::milliseconds stopWakeBound { 50 };
-
     /// How long an acceptor may take to challenge and then to answer this node's proof.
     ///
     /// `RaftWire::HandshakeBound`, the number the accepting end holds a dialler to. A
@@ -278,8 +268,8 @@ class RaftPeerTransport final: public IRaftTransport
     /// reactor's.
     ///
     /// Three things, in this order, because each closes a different suspension
-    /// point: cancel the stop token (which wakes every backoff within
-    /// `stopWakeBound`), close every outbox (which wakes a sender parked on
+    /// point: cancel the stop token (which cancels every backoff's one park),
+    /// close every outbox (which wakes a sender parked on
     /// `Pop` at once), and close every live socket **on the reactor's thread**
     /// (which is the only thing that completes a parked write, since no I/O
     /// timeout is armed). The last must be on that thread because on epoll and

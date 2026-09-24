@@ -728,19 +728,21 @@ TEST_CASE("Stopping is prompt even while a peer is unreachable", "[consensus][ra
     // merely happened to be fast would pass a wall-clock bound; what has to hold
     // is that teardown does not wait out `reconnectBackoff`, so shutdown stays
     // independent of how unreachable a peer happens to be.
+    //
+    // And with the clock NOT moved at all (#1596): the backoff is one park that the stop cancels,
+    // where it used to be slept in `stopWakeBound` steps so a stop was noticed within one.
     constexpr auto Backoff = 30s;
-    constexpr auto WakeBound = 50ms;
 
     Harness harness;
     harness.connector.Refuse(true);
-    harness.Start(PeerTransportOptions { .dialTimeout = 10s, .reconnectBackoff = Backoff, .stopWakeBound = WakeBound });
+    harness.Start(PeerTransportOptions { .dialTimeout = 10s, .reconnectBackoff = Backoff });
 
     auto const started = harness.clock.now();
-    harness.RequestStopAndDrain(WakeBound);
+    harness.RequestStopAndDrain(0ms);
 
     CHECK(harness.transport->SendersRunning() == 0);
-    // Woken within the bound, not after the backoff.
-    CHECK(harness.clock.now() - started == WakeBound);
+    // Woken by the stop itself, not by a step and not after the backoff.
+    CHECK(harness.clock.now() == started);
     CHECK(harness.reactor.pendingTimers() == 0);
     CHECK(harness.reactor.pendingSubmissions() == 0);
 }
@@ -753,7 +755,7 @@ TEST_CASE("A refused dial is not retried faster than the backoff", "[consensus][
     constexpr auto Backoff = 200ms;
     Harness harness;
     harness.connector.Refuse(true);
-    harness.Start(PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = Backoff, .stopWakeBound = 50ms });
+    harness.Start(PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = Backoff });
 
     REQUIRE(harness.connector.Attempts() == 1);
 
@@ -778,7 +780,7 @@ TEST_CASE("A connection that drops is also backed off", "[consensus][raft][trans
     // failure this repository already has a name for.
     constexpr auto Backoff = 200ms;
     Harness harness;
-    harness.Start(PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = Backoff, .stopWakeBound = 50ms });
+    harness.Start(PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = Backoff });
     REQUIRE(harness.connector.Attempts() == 1);
 
     // A write that fails ends the session, so the sender goes round the loop.
@@ -831,7 +833,7 @@ TEST_CASE("A dropped connection is redialled", "[consensus][raft][transport]")
 {
     constexpr auto Backoff = 10ms;
     Harness harness;
-    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff, .stopWakeBound = 5ms });
+    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff });
 
     harness.transport->Send("n2", Vote(1));
     harness.reactor.drain();
@@ -866,7 +868,7 @@ TEST_CASE("ConnectedPeers is exact across a reconnect, and zero after teardown",
     // reads as healthy.
     constexpr auto Backoff = 10ms;
     Harness harness;
-    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff, .stopWakeBound = 5ms });
+    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff });
 
     CHECK(harness.transport->ConnectedPeers() == 1);
 
@@ -1268,7 +1270,7 @@ TEST_CASE("A key revoked while its session is open ends the session before the n
     // the redial is judged against the roster as it is then.
     constexpr auto Backoff = 10ms;
     Harness harness;
-    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff, .stopWakeBound = 5ms });
+    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff });
 
     harness.transport->Send("n2", Vote(1));
     harness.reactor.drain();
@@ -1300,8 +1302,7 @@ TEST_CASE("An acceptor that never challenges is abandoned at the handshake bound
     constexpr auto Bound = 300ms;
     Harness harness;
     harness.record->script = AcceptorScript::NeverChallenges;
-    harness.Start(
-        PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = 10s, .stopWakeBound = 50ms, .handshakeBound = Bound });
+    harness.Start(PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = 10s, .handshakeBound = Bound });
 
     CHECK(harness.Refused(DiallerRefusal::Timeout) == 0);
     harness.clock.advance(Bound / 2);

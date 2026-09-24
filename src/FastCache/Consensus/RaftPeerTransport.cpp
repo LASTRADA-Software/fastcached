@@ -503,11 +503,11 @@ core::async::Task<void> PeerSenderAccess::RunSender(RaftPeerTransport* self, Raf
         // thread that burned one core; on the shared reactor it starves the
         // election timers, which is the "nine role changes in twelve seconds"
         // failure this repository already has a name for.
-        if (co_await core::net::interruptibleSleepUntil(&self->_reactor,
-                                                        token,
-                                                        self->_reactor.clock().now() + self->_options.reconnectBackoff,
-                                                        self->_options.stopWakeBound)
-            == core::net::WakeReason::Cancelled)
+        //
+        // One park, which the stop cancels (#1596): no `stopWakeBound` steps any more.
+        auto backoff = core::net::interruptibleSleepUntil(
+            &self->_reactor, token, self->_reactor.clock().now() + self->_options.reconnectBackoff);
+        if (co_await std::move(backoff) == core::net::WakeReason::Cancelled)
             break;
     }
 
