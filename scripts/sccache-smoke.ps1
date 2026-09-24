@@ -149,6 +149,10 @@ $obj = Join-Path $workdir 'hello.obj'
 # and read back together.
 $daemonOut = Join-Path $workdir 'fastcached.out.log'
 $daemonErr = Join-Path $workdir 'fastcached.err.log'
+# sccache's own server log, for the half of a failure the daemon cannot see: a
+# lookup that sccache abandoned, timed out or could not decode reaches the daemon
+# as an ordinary GET, or not at all. Debug, because a miss is not an error to it.
+$sccacheLog = Join-Path $workdir 'sccache.log'
 @'
 #include <string>
 int main() { return static_cast<int>(std::string{"hi"}.size()); }
@@ -171,9 +175,28 @@ function Get-DaemonLog {
     return $text
 }
 
+# How much of each log a failure prints. The daemon's trace for two compiles is a
+# few hundred lines; the cap only stops a runaway log from burying the reason.
+$FailureLogLines = 400
+
+# The last $FailureLogLines lines of @p text, under a heading that names them.
+function Write-LogTail($title, $text) {
+    if (-not $text) { Write-Host "  --- $($title): empty ---"; return }
+    $lines = @($text -split "`r?`n")
+    Write-Host "  --- $($title) (last $([Math]::Min($lines.Count, $FailureLogLines)) of $($lines.Count) lines) ---"
+    foreach ($line in ($lines | Select-Object -Last $FailureLogLines)) { Write-Host "  | $line" }
+}
+
+# Every failure prints what the daemon and sccache logged, before the cleanup
+# deletes both. A failure on a CI runner is otherwise a verdict with no evidence:
+# `no cache hit` on Windows-cl-release (#1598) said that the second compile
+# missed and nothing about why, and the run could not be repeated locally.
 function Stop-Smoke($reason, $detail) {
     Write-Host "sccache smoke ($protocol) FAILED: $reason"
     foreach ($line in $detail) { Write-Host "  $line" }
+    & sccache --stop-server *> $null
+    Write-LogTail 'fastcached log' (Get-DaemonLog)
+    Write-LogTail 'sccache log' $(if (Test-Path $sccacheLog) { Get-Content -Raw -ErrorAction SilentlyContinue $sccacheLog })
     Invoke-Cleanup
     exit 1
 }
@@ -218,7 +241,12 @@ try {
 }
 
 & sccache --stop-server *> $null
+# The level for the SERVER only: set around its start and cleared after, because the
+# same variable makes every client call below write debug lines into this output.
+$env:SCCACHE_ERROR_LOG = $sccacheLog
+$env:SCCACHE_LOG = 'debug'
 & sccache --start-server | Out-Null
+Remove-Item Env:SCCACHE_LOG -ErrorAction SilentlyContinue
 & sccache --zero-stats | Out-Null
 
 # First compile: cache miss; it is what populates fastcached.
@@ -258,7 +286,7 @@ while ((Get-Date) -lt $deadline) {
     if ((Get-DaemonLog) -match 'storage: SET key=[0-9a-f]/') { $stored = $true; break }
     if ($server.HasExited) {
         Stop-Smoke 'fastcached exited while waiting for it to store the first object' @(
-            "exit code: $($server.ExitCode)", '--- daemon log ---', (Get-DaemonLog))
+            "exit code: $($server.ExitCode)")
     }
     Start-Sleep -Milliseconds 200
 }

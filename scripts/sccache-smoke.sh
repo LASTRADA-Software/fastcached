@@ -185,6 +185,39 @@ workdir="$(mktemp -d)"
 src="${workdir}/hello.cpp"
 obj="${workdir}/hello.o"
 daemon_log="${workdir}/fastcached.log"
+# sccache's own server log, for the half of a failure the daemon cannot see: a
+# lookup that sccache abandoned, timed out or could not decode reaches the daemon
+# as an ordinary GET, or not at all. Debug, because a miss is not an error to it.
+sccache_log="${workdir}/sccache.log"
+
+# How much of each log a failure prints. The daemon's trace for two compiles is a
+# few hundred lines; the cap only stops a runaway log from burying the reason.
+failure_log_lines=400
+
+# Print the last `failure_log_lines` lines of a log under a heading that names it.
+# @param 1 the heading
+# @param 2 the log file
+print_log_tail() {
+    if [ ! -s "$2" ]; then
+        echo "  --- $1: empty ---" >&2
+        return
+    fi
+    local total shown
+    total="$(wc -l < "$2" | tr -d ' ')"
+    shown=$(( total < failure_log_lines ? total : failure_log_lines ))
+    echo "  --- $1 (last ${shown} of ${total} lines) ---" >&2
+    tail -n "$failure_log_lines" "$2" | sed 's/^/  | /' >&2
+}
+
+# Every failure prints what the daemon and sccache logged, before the cleanup
+# deletes both. A failure on a CI runner is otherwise a verdict with no evidence:
+# `no cache hit` on Windows-cl-release (#1598) said that the second compile
+# missed and nothing about why, and the run could not be repeated locally.
+print_failure_logs() {
+    sccache --stop-server >/dev/null 2>&1 || true
+    print_log_tail "fastcached log" "$daemon_log"
+    print_log_tail "sccache log" "$sccache_log"
+}
 cat > "$src" <<'EOF'
 #include <string>
 int main() { return static_cast<int>(std::string{"hi"}.size()); }
@@ -205,6 +238,7 @@ trap cleanup EXIT
 # in a subshell arrives here as SIGTERM, and `e2e_begin` turns it back into an
 # ordinary exit so the cleanup above still runs.
 e2e_begin "sccache smoke (${protocol})" "$workdir"
+e2e_on_fail print_failure_logs
 
 # Drawn from below the kernel's ephemeral range, where a connect probe can answer:
 # a port above the floor may be an outbound connection's local endpoint with nothing
@@ -282,7 +316,9 @@ stop_out="$(sccache --stop-server 2>&1)" || stop_status=$?
 # Stated apart because they are different claims with different evidence. Both
 # arms carry the stop's outcome, or whichever one fires on the day names sccache
 # and not the cause.
-if ! start_err="$(sccache --start-server 2>&1)"; then
+# The level for the SERVER only, set on this one call: the same variable makes every
+# client call below write debug lines into this output.
+if ! start_err="$(SCCACHE_ERROR_LOG="$sccache_log" SCCACHE_LOG=debug sccache --start-server 2>&1)"; then
     echo "sccache smoke (${protocol}) FAILED: \`sccache --start-server\` would not start a server" >&2
     echo "  it said: ${start_err:-(nothing)}" >&2
     echo "  \`sccache --stop-server\` exited ${stop_status} saying: ${stop_out:-(nothing)}" >&2
@@ -404,6 +440,7 @@ fail_smoke() {
     echo "sccache smoke (${protocol}) FAILED: $1" >&2
     shift
     for line in "$@"; do echo "  $line" >&2; done
+    print_failure_logs
     exit 1
 }
 
