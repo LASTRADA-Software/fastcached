@@ -33,9 +33,11 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -50,6 +52,9 @@
 #include <core/async/SyncRun.hpp>
 #include <core/net/BlockingConnector.hpp>
 #include <core/net/BlockingSocket.hpp>
+#include <core/net/IListener.hpp>
+#include <core/net/ISocket.hpp>
+#include <core/net/Sockets.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/AbortiveClient.hpp>
 #include <tests/BoundedWait.hpp>
@@ -3126,6 +3131,208 @@ TEST_CASE("A socket this node closed itself is not filed as a client that walked
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == 0);
 }
 
+namespace
+{
+
+/// When each thing happened on one connection, in one list both threads write to.
+///
+/// For the case below, whose one CI failure (#1598, core-cpp v0.2.1) printed nothing but its last
+/// check: the fixture logged into a `NullLogger`, and the client has no receive deadline, so all it
+/// could say was that the server closed the connection. Two stalls fit its 21 s -- request 2 picked
+/// up late, or reply 2's write never woken -- and this is what tells them apart the next time.
+class ConnectionTimeline
+{
+  public:
+    /// Record @p what, stamped with the time since the case began and the thread that saw it.
+    /// @param what The event.
+    void Note(std::string_view what)
+    {
+        auto const elapsed = std::chrono::duration<double, std::milli> { std::chrono::steady_clock::now() - _start };
+        auto const thread = std::hash<std::thread::id> {}(std::this_thread::get_id()) % 10'000;
+        auto const lock = std::scoped_lock { _mutex };
+        _lines.push_back(std::format("{:>10.1f} ms  t{:04}  {}", elapsed.count(), thread, what));
+    }
+
+    /// @return Every line, in the order they were noted.
+    [[nodiscard]] std::string Dump() const
+    {
+        auto const lock = std::scoped_lock { _mutex };
+        auto out = std::string { "connection timeline (ms since the case began, thread, event):\n" };
+        for (auto const& line: _lines)
+            out += line + '\n';
+        return out;
+    }
+
+  private:
+    std::chrono::steady_clock::time_point const _start = std::chrono::steady_clock::now();
+    mutable std::mutex _mutex;
+    std::vector<std::string> _lines;
+};
+
+/// The endpoint's own log lines, at every level, into the timeline.
+class TimelineLogger final: public ILogger
+{
+  public:
+    /// @param timeline Where the lines go.
+    explicit TimelineLogger(std::shared_ptr<ConnectionTimeline> timeline) noexcept:
+        _timeline { std::move(timeline) }
+    {
+    }
+
+    void Log(LogLevel level, std::string_view message) override
+    {
+        _timeline->Note(std::format("log level {}: {}", static_cast<int>(level), message));
+    }
+
+    [[nodiscard]] LogLevel MinLevel() const noexcept override
+    {
+        return LogLevel::Trace;
+    }
+
+    void SetMinLevel(LogLevel /*level*/) noexcept override {}
+
+  private:
+    std::shared_ptr<ConnectionTimeline> _timeline;
+};
+
+/// An accepted socket that notes every operation the endpoint makes on it: whether it completed
+/// inline or parked (for a write, parked is the kernel's EAGAIN), when it settled and with what, and
+/// every `close()` with the thread that called it -- the reactor's own when the sweeper closes.
+///
+/// Each operation is awaited inside a coroutine of its own, which adds a frame and a resumption to
+/// what it times; that is the price of seeing the settle at all.
+class TimelineSocket final: public core::net::ISocket
+{
+  public:
+    /// @param inner The accepted socket (owned).
+    /// @param timeline Where each operation is noted.
+    TimelineSocket(std::unique_ptr<core::net::ISocket> inner, std::shared_ptr<ConnectionTimeline> timeline) noexcept:
+        _inner { std::move(inner) },
+        _timeline { std::move(timeline) }
+    {
+    }
+
+    [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override
+    {
+        return core::net::IoAwaitable { Timed(_timeline, "read", buffer.size(), _inner->read(buffer)) };
+    }
+
+    [[nodiscard]] core::net::IoAwaitable write(std::span<std::byte const> buffer) override
+    {
+        return core::net::IoAwaitable { Timed(_timeline, "write", buffer.size(), _inner->write(buffer)) };
+    }
+
+    [[nodiscard]] core::net::IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
+                                                       std::shared_ptr<void const> keepAlive) override
+    {
+        auto total = std::size_t { 0 };
+        for (auto const segment: segments)
+            total += segment.size();
+        return core::net::IoAwaitable { Timed(
+            _timeline, "writeVectored", total, _inner->writeVectored(segments, std::move(keepAlive))) };
+    }
+
+    [[nodiscard]] core::net::IoAwaitable waitReadable() override
+    {
+        return core::net::IoAwaitable { Timed(_timeline, "waitReadable", 0, _inner->waitReadable()) };
+    }
+
+    void cancelRead() noexcept override
+    {
+        _timeline->Note("cancelRead");
+        _inner->cancelRead();
+    }
+
+    [[nodiscard]] core::net::ResultAwaitable<void> shutdownWrite() override
+    {
+        _timeline->Note("shutdownWrite");
+        return _inner->shutdownWrite();
+    }
+
+    void setReceiveDeadline(std::chrono::milliseconds deadline) noexcept override
+    {
+        _inner->setReceiveDeadline(deadline);
+    }
+
+    [[nodiscard]] std::string peerAddress() const override
+    {
+        return _inner->peerAddress();
+    }
+
+    void close() noexcept override
+    {
+        _timeline->Note(std::format("close (already closed: {})", _inner->isClosed()));
+        _inner->close();
+    }
+
+    [[nodiscard]] bool isClosed() const noexcept override
+    {
+        return _inner->isClosed();
+    }
+
+  private:
+    /// Await @p operation, noting whether it had to park and how it settled.
+    /// @param timeline Where to note it; by value, as a coroutine's parameters are.
+    /// @param what The verb; a string literal.
+    /// @param bytes How many bytes it was asked to move.
+    /// @param operation The inner socket's awaitable.
+    /// @return What @p operation produced.
+    static core::async::Task<core::net::IoAwaitable::Result> Timed(std::shared_ptr<ConnectionTimeline> timeline,
+                                                                   std::string_view what,
+                                                                   std::size_t bytes,
+                                                                   core::net::IoAwaitable operation)
+    {
+        auto const settledInline = operation.await_ready();
+        timeline->Note(std::format("{} {} B: {}", what, bytes, settledInline ? "inline" : "parked"));
+        auto result = co_await std::move(operation);
+        if (!settledInline)
+            timeline->Note(std::format(
+                "{} settled: {}", what, result.has_value() ? std::format("{} B", *result) : result.error().toString()));
+        co_return result;
+    }
+
+    std::unique_ptr<core::net::ISocket> _inner;
+    std::shared_ptr<ConnectionTimeline> _timeline;
+};
+
+/// A listener whose accepted sockets are `TimelineSocket`s.
+class TimelineListener final: public core::net::IListener
+{
+  public:
+    /// @param inner The bound listener (owned).
+    /// @param timeline Where its sockets note their operations.
+    TimelineListener(std::unique_ptr<core::net::IListener> inner, std::shared_ptr<ConnectionTimeline> timeline) noexcept:
+        _inner { std::move(inner) },
+        _timeline { std::move(timeline) }
+    {
+    }
+
+    [[nodiscard]] core::async::Task<core::net::AcceptResult> accept() override
+    {
+        auto accepted = co_await _inner->accept();
+        if (!accepted.has_value())
+            co_return accepted;
+        _timeline->Note("accepted");
+        co_return core::net::AcceptResult { std::make_unique<TimelineSocket>(std::move(*accepted), _timeline) };
+    }
+
+    void close() noexcept override
+    {
+        _inner->close();
+    }
+
+    [[nodiscard]] std::uint16_t boundPort() const noexcept override
+    {
+        return _inner->boundPort();
+    }
+
+  private:
+    std::unique_ptr<core::net::IListener> _inner;
+    std::shared_ptr<ConnectionTimeline> _timeline;
+};
+
+} // namespace
+
 TEST_CASE("A request pipelined while a watched reply is being written is still served", "[node][frame][peerwatch]")
 {
     // **The ordering half of the watch, and the one a small reply cannot reach.** The
@@ -3145,29 +3352,50 @@ TEST_CASE("A request pipelined while a watched reply is being written is still s
     responder.ReplyPayloadBytes(BigReplyBytes);
     responder.Hold(false);
 
-    auto const port = FreePort();
-    auto endpoint = FrameEndpoint::Start(
-        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), responder, fleet.metrics, fleet.logger);
-    REQUIRE(endpoint.has_value());
+    // Every operation on the connection and the endpoint's own log, on one clock, printed only when
+    // a check below fails. Bound the way `FrameEndpoint::Start` binds, with the listener wrapped.
+    auto const timeline = std::make_shared<ConnectionTimeline>();
+    TimelineLogger logger { timeline };
+    auto listened = core::net::listen(fleet.io.Reactor(), core::net::ListenOptions { .host = "127.0.0.1", .port = 0 });
+    REQUIRE(listened.has_value());
+    auto const port = (*listened)->boundPort();
+    auto endpoint = FrameEndpoint::StartWithListener(fleet.io,
+                                                     NodeSurface::Node,
+                                                     std::make_unique<TimelineListener>(std::move(*listened), timeline),
+                                                     std::format("127.0.0.1:{}", port),
+                                                     responder,
+                                                     fleet.metrics,
+                                                     logger);
+    REQUIRE(endpoint != nullptr);
     fleet.Serve();
 
     Conversation client { port };
     REQUIRE(client.SendOnly(Fetch("first-request-whose-reply-will-not-fit-in-one-write")));
+    timeline->Note("client: request 1 sent");
 
     // Waited for: the answer to be produced. The write is now under way and cannot
     // complete, because nothing on this side has read a byte of it yet.
     REQUIRE(WaitFor([&responder] { return responder.Answered() == 1; }));
+    timeline->Note("client: Answered() == 1 observed");
 
     // Sent INTO that stalled write.
     REQUIRE(client.SendOnly(Fetch("second-request-arriving-inside-the-first-reply")));
+    timeline->Note("client: request 2 sent");
 
     auto const first = client.ReadReply();
+    timeline->Note(std::format("client: reply 1 read, {} B", first.size()));
     REQUIRE(first.size() == Wire::ReplyHeaderSize + BigReplyBytes);
     CHECK(Unwrap(Wire::DecodeReplyHeader(first)).status == Wire::Status::Ok);
 
     // Waited for: the pipelined request to reach the responder. Dropped, it never does.
-    REQUIRE(WaitFor([&responder] { return responder.Entered() == 2; }));
-    CHECK_FALSE(client.ReadReply().empty());
+    auto const secondEntered = WaitFor([&responder] { return responder.Entered() == 2; });
+    timeline->Note(std::format("client: Entered() == 2 {}", secondEntered ? "observed" : "NOT observed within WatchWait"));
+    if (!secondEntered)
+        FAIL(timeline->Dump());
+    auto const second = client.ReadReply();
+    timeline->Note(std::format("client: reply 2 read, {} B", second.size()));
+    if (second.empty())
+        FAIL(timeline->Dump());
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::WorkerJobsAbandonedClientGone) == 0);
 }
 
