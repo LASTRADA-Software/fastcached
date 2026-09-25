@@ -527,6 +527,8 @@ namespace
     core::async::DetachedTask RunStopWatch(std::shared_ptr<LiveEventSource::State> shared)
     {
         auto& parts = shared->parts;
+        // On the reactor before the wait: a queue's pop resumes on the executor it parked on (core-cpp 0.4.0).
+        co_await core::async::ResumeOn { *parts.reactor };
         auto const wake = co_await parts.stop->Stopped(parts.stopWaiter, parts.reactor);
 
         // Released as soon as nothing waits on it, which is what puts the previous signal
