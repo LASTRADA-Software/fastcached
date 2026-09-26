@@ -324,7 +324,7 @@ inline constexpr HostSetVerdicts ForgottenVerdicts { .onMatch = Membership::Forg
 /// Discovery admits a peer at a `(node, endpoint)` pair, so the obvious member set is
 /// endpoints -- and matching a caller against it would never succeed even once. A peer
 /// *connecting* to the scheduler does so from an **ephemeral source port**, which is
-/// not its Raft endpoint and differs on every connection, so `ISocket::PeerAddress()`
+/// not its Raft endpoint and differs on every connection, so `core::net::ISocket::PeerAddress()`
 /// reports a bare host and there is nothing to compare a port against. An
 /// endpoint-keyed set would therefore refuse every legitimate member while looking
 /// entirely correct, and the fleet would silently never distribute anything.
@@ -414,7 +414,7 @@ class HostSetMembership: public IMembershipOracle
         return _hosts.size();
     }
 
-    /// @param peerAddress The connecting peer's **host**, as `ISocket::PeerAddress()`
+    /// @param peerAddress The connecting peer's **host**, as `core::net::ISocket::PeerAddress()`
     ///        reports it. Never an endpoint; see the class note.
     /// @return The verdict and, unless it is `Outsider`, this list as its author.
     [[nodiscard]] MembershipDecision Explain(std::string_view peerAddress) const override

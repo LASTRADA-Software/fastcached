@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/SetCodec.hpp>
 #include <FastCache/Cache/StreamCodec.hpp>
 #include <FastCache/Cache/WriteErrorReportingStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/MemcachedText.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
@@ -26,26 +23,31 @@
 #include <string_view>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/DeclaredCountBlob.hpp>
+#include <tests/HalfClose.hpp>
 
 using namespace FastCache;
 
 namespace
 {
 
-[[nodiscard]] Task<bool> WriteString(ISocket* socket, std::string_view payload)
+[[nodiscard]] core::async::Task<bool> WriteString(core::net::ISocket* socket, std::string_view payload)
 {
-    auto const result = co_await socket->Write(AsBytes(payload));
+    auto const result = co_await socket->write(AsBytes(payload));
     co_return result.has_value();
 }
 
-[[nodiscard]] Task<std::string> ReadAvailable(ISocket* socket)
+[[nodiscard]] core::async::Task<std::string> ReadAvailable(core::net::ISocket* socket)
 {
     std::string out;
     while (true)
     {
         std::vector<std::byte> chunk(256);
-        auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const result = co_await socket->read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!result.has_value() || *result == 0)
             break;
         for (auto const i: std::views::iota(std::size_t { 0 }, *result))
@@ -64,7 +66,7 @@ namespace
 /// it is invisible from either protocol's own test file.
 struct BothProtocols
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     InMemoryLruStorage storage;
     CacheEngine engine { storage, clock };
     MemcachedTextHandler text;
@@ -93,12 +95,12 @@ struct BothProtocols
     /// chunk size.
     [[nodiscard]] std::string Run(IProtocolHandler& handler, std::string_view request)
     {
-        auto pair = InMemorySocketPair::Create();
-        REQUIRE(SyncRun(WriteString(pair.client.get(), request)));
-        pair.client->ShutdownWrite();
-        SyncRun(handler.Run(pair.server.get(), &engine, /*primingBytes=*/ {}, SessionContext {}));
-        pair.server->Close();
-        return SyncRun(ReadAvailable(pair.client.get()));
+        auto pair = core::net::testing::InMemorySocketPair::create();
+        REQUIRE(core::async::syncRun(WriteString(pair.client.get(), request)));
+        REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+        core::async::syncRun(handler.Run(pair.server.get(), &engine, /*primingBytes=*/ {}, SessionContext {}));
+        pair.server->close();
+        return core::async::syncRun(ReadAvailable(pair.client.get()));
     }
 };
 
@@ -327,20 +329,20 @@ struct Observed
     WriteErrorReportingStorage storage { raw, logger };
     MemcachedTextHandler text;
     AtomicMetricsSink metrics;
-    ManualClock clock;
-    CacheEngine engine { storage, clock, DefaultSystemWallClock(), &metrics };
+    core::platform::ManualClock clock;
+    CacheEngine engine { storage, clock, core::platform::defaultSystemWallClock(), &metrics };
 
     /// Plant `blob` under `key` tagged with `flags`, as an ordinary memcached client.
     void Plant(std::string_view key, std::uint32_t flags, std::string_view blob)
     {
         auto const command = "set " + std::string { key } + " " + std::to_string(flags) + " 0 " + std::to_string(blob.size())
                              + "\r\n" + std::string { blob } + "\r\n";
-        auto pair = InMemorySocketPair::Create();
-        REQUIRE(SyncRun(WriteString(pair.client.get(), command)));
-        pair.client->ShutdownWrite();
-        SyncRun(text.Run(pair.server.get(), &engine, /*primingBytes=*/ {}, SessionContext {}));
-        pair.server->Close();
-        REQUIRE(SyncRun(ReadAvailable(pair.client.get())) == "STORED\r\n");
+        auto pair = core::net::testing::InMemorySocketPair::create();
+        REQUIRE(core::async::syncRun(WriteString(pair.client.get(), command)));
+        REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+        core::async::syncRun(text.Run(pair.server.get(), &engine, /*primingBytes=*/ {}, SessionContext {}));
+        pair.server->close();
+        REQUIRE(core::async::syncRun(ReadAvailable(pair.client.get())) == "STORED\r\n");
     }
 
     [[nodiscard]] std::uint64_t Malformed() const

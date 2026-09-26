@@ -37,34 +37,16 @@ src/FastCache/
                 that tags a session's frames under the key its handshake agreed, at an
                 implicit position: here rather than beside the Raft peer wire it was
                 written for, because the `0xFC` wire needs the same thing next
-  Async/        Task<T>, Cancellation, ResumeOn, SleepUntil,
-                InterruptibleSleepUntil (a bounded wait a stop can interrupt),
-                DeadlineTimer (the same shape with a callback, for a timeout that
-                must tear an operation down rather than merely stop waiting for
-                it -- and which retires its own frame through
-                IReactor::CancelPending rather than waiting out a poll),
-                AsyncQueue (MPSC, bounded, closable: what replaces a condition
-                variable once the consumer is a coroutine), IReactor
-                (Run/Stop/Submit/Schedule/CancelPending -- the last being how a
-                parked frame is ever reclaimed) + TestReactor and the platform
-                reactors (EpollReactor / IocpReactor / KqueueReactor)
-  Net/          ISocket, IListener, IConnector (the outbound counterpart to
-                IListener, coroutine-shaped: BlockingConnector for threads that
-                may block, PlatformConnector -> EpollConnector /
-                KqueueConnector / IocpConnector for a reactor thread, with
-                ConnectFlow the platform-free half all four share and
-                ReactorDial one body for the two readiness backends),
-                IAsyncAddressResolver + ThreadedAddressResolver (getaddrinfo has
-                no async form and no timeout, so it gets a fixed pool; a literal
-                address never reaches it), TcpClient (the ONE TCP client:
-                ConnectTcp plus the coroutine SendAll/RecvExactly loops, which
-                three separate copies of this code each used to carry),
-                IoAwaitable, IAdmissionControl, SocketAddress,
-                BlockingSocket (Winsock + POSIX),
-                EpollSocket / IocpSocket / KqueueSocket (reactor-driven),
-                InMemoryTransport (paired pipes + InMemoryListener, answering
-                every closed state the way a loopback socket does, pinned
-                against one by SocketClosedStates_test), LingeringClose (how a
+  Transport/    What this project keeps of its own beside core-cpp's `core::net` (#1596),
+                which is where the coroutines (`core::async`), the event loop, every
+                socket, TLS, the connectors and the resolvers live now. NativeListen:
+                ClientListenOptions (how every listener a loop drives is bound:
+                `core::net::listen` with 1 MiB buffers, `PortSharing::Shared` for the
+                POSIX multi-reactor), BindAndListen (exclusive, blocking), AcceptRaw
+                (the Windows accept thread's hand-off), AdoptInheritedListener (socket
+                activation, closing a descriptor it could not adopt) and
+                BlockingListener (a listener a thread BLOCKS on, for the admin
+                endpoints) -- the last four candidates for graduation into core-cpp. LingeringClose (how a
                 server closes after answering: half-close, listen until the
                 peer closes or a bound says stop, then close -- a bare close
                 over unread input is a reset that destroys the answer)

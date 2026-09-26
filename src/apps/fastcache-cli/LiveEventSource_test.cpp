@@ -42,11 +42,11 @@ namespace
 /// @param operations How many dials and reads to run.
 void Pump(Rig& rig, int operations)
 {
-    rig.reactor.Drain();
+    rig.reactor.drain();
     for ([[maybe_unused]] auto const turn: std::views::iota(0, operations))
     {
-        rig.pool.Drain();
-        rig.reactor.Drain();
+        rig.pool.drain();
+        rig.reactor.drain();
     }
 }
 
@@ -108,9 +108,9 @@ TEST_CASE("a live source subscribes with the operator's interval and delivers ea
     LiveEventSource source { std::move(parts) };
 
     // The dial is handed to the pool and has not run: nothing blocking ever runs on the reactor.
-    rig.reactor.Drain();
+    rig.reactor.drain();
     CHECK(stream.Opens() == 0);
-    CHECK(rig.pool.PendingSubmissions() == 1);
+    CHECK(rig.pool.pendingSubmissions() == 1);
 
     // The dial, then the grant; the read of the first reading is now out, asked at the epoch.
     Pump(rig, 2);
@@ -122,28 +122,28 @@ TEST_CASE("a live source subscribes with the operator's interval and delivers ea
     CHECK(stream.Requests().front().dashboardToken.empty());
     CHECK(stream.Expected() == std::vector<std::chrono::milliseconds> { 3000ms });
 
-    rig.clock.Advance(700ms);
-    rig.pool.Drain();
-    rig.reactor.Drain();
+    rig.clock.advance(700ms);
+    rig.pool.drain();
+    rig.reactor.drain();
     auto const one = NextDue(rig, source);
     REQUIRE(KindOf(one) == DashboardEventKind::Sample);
-    CHECK(Unwrap(one).at == TimePoint {} + 700ms);
+    CHECK(Unwrap(one).at == core::platform::SteadyTimePoint {} + 700ms);
     REQUIRE(Unwrap(one).reading.has_value());
     CHECK(Unwrap(Unwrap(one).reading) == first);
     CHECK(Unwrap(one).where == "127.0.0.1:6674");
     CHECK(Unwrap(one).cadence == std::optional<std::chrono::milliseconds> { 3000ms });
     CHECK_FALSE(Unwrap(one).document.has_value());
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
-    CHECK(rig.reactor.PendingTimers() == 0);
+    CHECK(rig.reactor.pendingTimers() == 0);
 
-    rig.pool.Drain();
-    rig.reactor.Drain();
+    rig.pool.drain();
+    rig.reactor.drain();
     auto const two = NextDue(rig, source);
     REQUIRE(KindOf(two) == DashboardEventKind::Sample);
     REQUIRE(Unwrap(two).reading.has_value());
     CHECK(Unwrap(Unwrap(two).reading) == second);
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
-    CHECK(rig.reactor.PendingTimers() == 0);
+    CHECK(rig.reactor.pendingTimers() == 0);
     CHECK(stream.Opens() == 1);
 
     CloseAndDrain(rig, source);
@@ -160,10 +160,10 @@ TEST_CASE("a live source stream keeps no timer: a push slower than the interval 
     Pump(rig, 2);
     REQUIRE(rig.subscription.Reads() == 1);
 
-    rig.clock.Advance(3 * Interval);
-    rig.reactor.Drain();
-    CHECK(rig.pool.PendingSubmissions() == 1);
-    CHECK(rig.reactor.PendingTimers() == 0);
+    rig.clock.advance(3 * Interval);
+    rig.reactor.drain();
+    CHECK(rig.pool.pendingSubmissions() == 1);
+    CHECK(rig.reactor.pendingTimers() == 0);
     CHECK(rig.subscription.Opens() == 1);
     CHECK(rig.subscription.Reads() == 1);
 
@@ -177,8 +177,8 @@ TEST_CASE("a keystroke that arrives while a dial or a read is outstanding is del
 
     // The reactor has run and the pool has not: the dial is handed off and has not happened, which
     // is the window this case is about.
-    rig.reactor.Drain();
-    CHECK(rig.pool.PendingSubmissions() == 1);
+    rig.reactor.drain();
+    CHECK(rig.pool.pendingSubmissions() == 1);
 
     rig.terminal->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "x" });
     auto const key = NextDue(rig, source);
@@ -196,8 +196,8 @@ TEST_CASE("a keystroke that arrives while a dial or a read is outstanding is del
     CHECK((during.has_value() && during->keys == "y"));
     CHECK(rig.subscription.Reads() == 1);
 
-    rig.pool.Drain();
-    rig.reactor.Drain();
+    rig.pool.drain();
+    rig.reactor.drain();
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Sample);
 
     CloseAndDrain(rig, source);
@@ -219,14 +219,14 @@ TEST_CASE(
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
-    rig.reactor.Submit(run.Native());
+    rig.reactor.submit(run.handle());
     Pump(rig, 3);
     REQUIRE(rig.sink.frames == 1);
-    CHECK(rig.pool.PendingSubmissions() == 1);
+    CHECK(rig.pool.pendingSubmissions() == 1);
     CHECK(stream.Leaves() == 0);
 
     rig.terminal->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" });
-    rig.reactor.Drain();
+    rig.reactor.drain();
 
     // The operator was not made to wait for the read: the loop has returned, it left the stream,
     // and the read is still out.
@@ -238,8 +238,8 @@ TEST_CASE(
     // subscription the caller must therefore not destroy yet.
     auto drained = false;
     auto wait = AwaitDrained(&source, &drained);
-    rig.reactor.Submit(wait.Native());
-    rig.reactor.Drain();
+    rig.reactor.submit(wait.handle());
+    rig.reactor.drain();
     CHECK_FALSE(drained);
 
     rig.Settle();
@@ -248,9 +248,9 @@ TEST_CASE(
     // Returned into a closed session, the second reading is dropped rather than drawn, and nothing re-dials.
     CHECK(rig.sink.frames == 1);
     CHECK(stream.Opens() == 1);
-    CHECK(rig.reactor.PendingTimers() == 0);
-    CHECK(rig.reactor.PendingSubmissions() == 0);
-    CHECK(rig.pool.PendingSubmissions() == 0);
+    CHECK(rig.reactor.pendingTimers() == 0);
+    CHECK(rig.reactor.pendingSubmissions() == 0);
+    CHECK(rig.pool.pendingSubmissions() == 0);
 
     // Whatever the checks above found, nothing may be left parked when the tasks go.
     source.Close();
@@ -265,7 +265,7 @@ TEST_CASE("closing a source that waits to subscribe again retires its timer with
     Rig rig;
     LiveEventSource source { rig.Parts() };
     rig.Settle();
-    CHECK(rig.reactor.PendingTimers() == 1);
+    CHECK(rig.reactor.pendingTimers() == 1);
 
     CloseAndDrain(rig, source);
     CHECK(rig.subscription.Opens() == 1);
@@ -281,12 +281,12 @@ TEST_CASE("a closed live source answers Detached, including to a read already wa
 
     auto waiting = std::optional<DashboardEvent> {};
     auto task = TakeOne(&source, &waiting);
-    rig.reactor.Submit(task.Native());
-    rig.reactor.Drain();
+    rig.reactor.submit(task.handle());
+    rig.reactor.drain();
     CHECK_FALSE(waiting.has_value());
 
     source.Close();
-    rig.reactor.Drain();
+    rig.reactor.drain();
     CHECK(KindOf(waiting) == DashboardEventKind::Detached);
     CHECK((waiting.has_value() && waiting->note == SessionClosedNote));
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Detached);
@@ -321,13 +321,13 @@ TEST_CASE("a stream that ends is one gap and the next subscription is one interv
         CHECK(NoteOf(ended) == std::format("{}: the server ended the stream", RigAddress()));
         CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
         CHECK(stream.Opens() == 1);
-        CHECK(rig.reactor.PendingTimers() == 1);
+        CHECK(rig.reactor.pendingTimers() == 1);
 
-        rig.clock.Advance(Interval - 1ms);
+        rig.clock.advance(Interval - 1ms);
         rig.Settle();
         CHECK(stream.Opens() == 1);
 
-        rig.clock.Advance(1ms);
+        rig.clock.advance(1ms);
         rig.Settle();
         REQUIRE(stream.Opens() == 2);
         CHECK(DialledTexts(stream).back() == RigAddress());
@@ -354,10 +354,10 @@ TEST_CASE("a stream that ends is one gap and the next subscription is one interv
         CHECK(NoteOf(silent) == std::format("{}: {}", RigAddress(), SilentStream));
         CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
 
-        rig.clock.Advance(Interval - 1ms);
+        rig.clock.advance(Interval - 1ms);
         rig.Settle();
         CHECK(stream.Opens() == 1);
-        rig.clock.Advance(1ms);
+        rig.clock.advance(1ms);
         rig.Settle();
         CHECK(stream.Opens() == 2);
         CHECK(DialledTexts(stream).back() == RigAddress());
@@ -377,21 +377,21 @@ TEST_CASE("a dial that fails is a gap and is retried once per interval and never
     auto parts = rig.Parts();
     parts.subscription = &stream;
     LiveEventSource source { std::move(parts) };
-    rig.reactor.Drain();
-    rig.clock.Advance(40ms);
+    rig.reactor.drain();
+    rig.clock.advance(40ms);
     rig.Settle();
 
     CHECK(stream.Opens() == 1);
     auto const failed = NextDue(rig, source);
     CHECK(FailedWith(failed, Outcome::Unreachable));
     CHECK(NoteOf(failed) == "connection refused");
-    CHECK((failed.has_value() && failed->at == TimePoint {} + 40ms));
+    CHECK((failed.has_value() && failed->at == core::platform::SteadyTimePoint {} + 40ms));
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
 
     rig.Settle();
     CHECK(stream.Opens() == 1);
 
-    rig.clock.Advance(Interval);
+    rig.clock.advance(Interval);
     rig.Settle();
     CHECK(stream.Opens() == 2);
     rig.Settle();
@@ -423,7 +423,7 @@ TEST_CASE("a NotLeader naming the leader is followed at once and the reading nam
     CHECK(Unwrap(sample).where == "10.0.0.9:7071");
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
 
-    rig.clock.Advance(Interval);
+    rig.clock.advance(Interval);
     rig.Settle();
     REQUIRE(stream.Opens() >= 3);
     CHECK(DialledTexts(stream)[2] == RigAddress());
@@ -459,9 +459,9 @@ TEST_CASE("leader redirects are bounded and the count restarts with every subscr
     CHECK(NoteOf(bounded).contains(std::format("followed {} leader redirects", MaxLeaderRedirects)));
     CHECK(NoteOf(bounded).contains("10.0.0.3:7071"));
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
-    CHECK(rig.reactor.PendingTimers() == 1);
+    CHECK(rig.reactor.pendingTimers() == 1);
 
-    rig.clock.Advance(Interval);
+    rig.clock.advance(Interval);
     rig.Settle();
     REQUIRE(stream.Opens() >= 5);
     CHECK(DialledTexts(stream)[3] == RigAddress());
@@ -499,7 +499,7 @@ TEST_CASE("a refusal before any reading ends the session Refused and names the c
         CHECK_FALSE(NoteOf(refused).contains("--dashboard-token-file"));
         CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
         CHECK(FinishedItself(NextDue(rig, source)));
-        CHECK(rig.reactor.PendingTimers() == 0);
+        CHECK(rig.reactor.pendingTimers() == 0);
         CHECK(stream.Opens() == 1);
 
         CloseAndDrain(rig, source);
@@ -579,10 +579,10 @@ TEST_CASE("a refusal after a reading is a gap and a retry and does not end the s
     CHECK(FailedWith(refused, Outcome::Refused));
     CHECK(NoteOf(refused).contains("--token-file"));
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
-    CHECK(rig.reactor.PendingTimers() == 1);
+    CHECK(rig.reactor.pendingTimers() == 1);
     CHECK(stream.Opens() == 1);
 
-    rig.clock.Advance(Interval);
+    rig.clock.advance(Interval);
     rig.Settle();
     CHECK(stream.Opens() == 2);
     auto const again = NextDue(rig, source);
@@ -610,10 +610,10 @@ TEST_CASE("a NotLeader naming nobody and a full node are gaps and retries even b
         CHECK(FailedWith(gap, Outcome::Unreachable));
         CHECK(NoteOf(gap).contains(detail));
         CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
-        CHECK(rig.reactor.PendingTimers() == 1);
+        CHECK(rig.reactor.pendingTimers() == 1);
         CHECK(stream.Opens() == 1);
 
-        rig.clock.Advance(Interval);
+        rig.clock.advance(Interval);
         rig.Settle();
         REQUIRE(stream.Opens() == 2);
         CHECK(DialledTexts(stream).back() == RigAddress());
@@ -656,7 +656,7 @@ TEST_CASE("a node this client cannot stream with ends the session Protocol even 
         CHECK(NoteOf(refused).contains(remedy));
         CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
         CHECK(FinishedItself(NextDue(rig, source)));
-        CHECK(rig.reactor.PendingTimers() == 0);
+        CHECK(rig.reactor.pendingTimers() == 0);
         CHECK(stream.Opens() == 1);
 
         CloseAndDrain(rig, source);
@@ -743,7 +743,7 @@ TEST_CASE("a frame this client cannot read ends the session Protocol", "[cli][li
     CHECK(NoteOf(unreadable).contains("layout"));
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
     CHECK(FinishedItself(NextDue(rig, source)));
-    CHECK(rig.reactor.PendingTimers() == 0);
+    CHECK(rig.reactor.pendingTimers() == 0);
     CHECK(stream.Opens() == 1);
 
     CloseAndDrain(rig, source);
@@ -832,8 +832,8 @@ TEST_CASE("events and gaps on a stream are not samples: only its readings are", 
 
     auto after = std::optional<DashboardEvent> {};
     auto task = TakeOne(&source, &after);
-    rig.reactor.Submit(task.Native());
-    rig.reactor.Drain();
+    rig.reactor.submit(task.handle());
+    rig.reactor.drain();
     CHECK_FALSE(after.has_value());
 
     CloseAndDrain(rig, source);
@@ -858,8 +858,8 @@ TEST_CASE("a resize is followed by a tick, so the frame is redrawn at the new si
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Key);
     auto after = std::optional<DashboardEvent> {};
     auto task = TakeOne(&source, &after);
-    rig.reactor.Submit(task.Native());
-    rig.reactor.Drain();
+    rig.reactor.submit(task.handle());
+    rig.reactor.drain();
     CHECK_FALSE(after.has_value());
 
     CloseAndDrain(rig, source);
@@ -872,7 +872,7 @@ TEST_CASE("a terminal that goes away ends the session", "[cli][live][source]")
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
-    rig.reactor.Submit(run.Native());
+    rig.reactor.submit(run.handle());
     rig.Settle();
     CHECK_FALSE(exit.has_value());
 
@@ -973,7 +973,7 @@ TEST_CASE("a run with no terminal takes its whole sample budget from one stream"
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits { .samples = 3 }, &exit);
-    rig.reactor.Submit(run.Native());
+    rig.reactor.submit(run.handle());
     rig.Settle();
 
     REQUIRE(exit.has_value());
@@ -991,13 +991,13 @@ TEST_CASE("a stop request after a sample ends a session with no terminal as answ
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
-    rig.reactor.Submit(run.Native());
+    rig.reactor.submit(run.handle());
     rig.Settle();
     CHECK(rig.subscription.Opens() == 1);
     CHECK_FALSE(exit.has_value());
 
     rig.stop->Fire();
-    rig.reactor.Drain();
+    rig.reactor.drain();
     // Released when its watch ended, which is what restores the disposition -- not when the
     // source goes.
     CHECK(rig.stopReleased);
@@ -1021,7 +1021,7 @@ TEST_CASE("a stop request arrives as StopRequested and never as a keystroke", "[
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
 
     rig.stop->Fire();
-    rig.reactor.Drain();
+    rig.reactor.drain();
     auto const stop = NextDue(rig, source);
     CHECK(KindOf(stop) == DashboardEventKind::StopRequested);
     CHECK((stop.has_value() && stop->keys.empty()));
@@ -1040,8 +1040,8 @@ TEST_CASE("a stop request before any sample does not end a session as answered",
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
-    rig.reactor.Submit(run.Native());
-    rig.reactor.Drain();
+    rig.reactor.submit(run.handle());
+    rig.reactor.drain();
 
     CHECK(StopOf(exit) == DashboardStop::Quit);
     CHECK((exit.has_value() && ExitCodeOf(exit->outcome) != 0));
@@ -1057,9 +1057,9 @@ TEST_CASE("a session with a stop signal keeps reading until a stop arrives and d
 
     auto exit = std::optional<DashboardExit> {};
     auto run = RunOver(&source, &rig.view, &rig.sink, DashboardLimits {}, &exit);
-    rig.reactor.Submit(run.Native());
+    rig.reactor.submit(run.handle());
     rig.Settle();
-    rig.clock.Advance(Interval);
+    rig.clock.advance(Interval);
     rig.Settle();
 
     // Nothing fired: the watch is waiting, not ending the session and not asking twice, while the
@@ -1099,17 +1099,18 @@ TEST_CASE("a terminal is released once nothing reads it and not when a stuck rea
     // operator's terminal in raw mode behind a process that is about to give up on that read.
     Rig rig;
     LiveEventSource source { rig.SpokenParts() };
-    rig.reactor.Drain();
-    CHECK(rig.pool.PendingSubmissions() == 1);
+    rig.reactor.drain();
+    CHECK(rig.pool.pendingSubmissions() == 1);
 
-    rig.clock.Advance(5ms);
+    rig.clock.advance(5ms);
     source.Close();
-    rig.reactor.Drain();
+    rig.reactor.drain();
     CHECK(rig.terminalRelease.released);
     CHECK(rig.terminalRelease.closedFirst);
     CHECK(rig.subscription.Leaves() == 1);
     // The dial is still out, and its start -- the epoch, before the clock moved -- is readable from anywhere.
-    CHECK(source.ReadOutstandingSince() == std::optional<TimePoint> { TimePoint {} });
+    CHECK(source.ReadOutstandingSince()
+          == std::optional<core::platform::SteadyTimePoint> { core::platform::SteadyTimePoint {} });
 
     rig.Settle();
     CHECK_FALSE(source.ReadOutstandingSince().has_value());
@@ -1125,7 +1126,7 @@ TEST_CASE("a terminal that goes away on its own is closed before it is released"
     // Detached with nobody having closed anything: the forwarder ends and releases the
     // terminal, which its contract says must be closed first -- and nobody else closed it.
     rig.terminal->GoAway();
-    rig.reactor.Drain();
+    rig.reactor.drain();
     CHECK(rig.terminalRelease.released);
     CHECK(rig.terminalRelease.closedFirst);
 

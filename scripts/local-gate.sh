@@ -2371,9 +2371,9 @@ target_set_report() {
 # listing zero files.
 #
 # The third-party roots of the tree in the working directory are excluded because this
-# build never reads those files: the vendored tree carries upstream's own CMakeLists,
-# which `vendor/CMakeLists.txt` states it deliberately does not use. One of them
-# registers `add_test(NAME test-tui ...)`, and counting a registration from a file no
+# build never reads those files: a vendored tree may carry upstream's own CMakeLists,
+# which this build does not use. The vendored endo TUI's did (#1596 removed it), and one
+# of them registered `add_test(NAME test-tui ...)`; counting a registration from a file no
 # build processes puts a permanently unclosable row in this derivation -- worse than a
 # red, because a line that can never be cleared is a line that stops being read. What is
 # declined is named on stderr; stdout is the list. A roots file that cannot be read

@@ -11,20 +11,16 @@
 // server and transport between them.
 #include "NodeKey.hpp"
 
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/RosterKeys.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/RaftPeerRefusals.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -37,6 +33,10 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/Task.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/ListenerConnector.hpp>
 #include <tests/ScratchPath.hpp>
 
@@ -150,7 +150,7 @@ struct Network
         server { listener, reactor,  sink,   logger,
                  metrics,  acceptor, random, Consensus::PeerServerOptions { .handshakeBound = 0ms } }
     {
-        [](Consensus::RaftPeerServer* accepting) -> DetachedTask {
+        [](Consensus::RaftPeerServer* accepting) -> core::async::DetachedTask {
             co_await accepting->Run();
         }(&server);
     }
@@ -162,8 +162,8 @@ struct Network
 
     ~Network()
     {
-        listener.Close();
-        reactor.Drain();
+        listener.close();
+        reactor.drain();
     }
 
     /// @param refusal An acceptor refusal.
@@ -173,9 +173,9 @@ struct Network
         return metrics.Read(Consensus::RowFor(refusal).counter);
     }
 
-    ManualClock clock;
-    TestReactor reactor { clock };
-    InMemoryListener listener;
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
+    core::net::testing::InMemoryListener listener;
     Testing::ListenerConnector connector { listener };
     RecordingSink sink;
     NullLogger logger;
@@ -202,7 +202,7 @@ struct Dialler
                     Consensus::PeerTransportOptions { .reconnectBackoff = ReconnectBackoff, .handshakeBound = 0ms } }
     {
         transport.Start();
-        net.reactor.Drain();
+        net.reactor.drain();
     }
 
     Dialler(Dialler const&) = delete;
@@ -215,9 +215,9 @@ struct Dialler
     ~Dialler()
     {
         transport.RequestStop();
-        net.reactor.Drain();
-        net.clock.Advance(50ms);
-        net.reactor.Drain();
+        net.reactor.drain();
+        net.clock.advance(50ms);
+        net.reactor.drain();
     }
 
     /// Send one vote to n1, as @p voter, and let it arrive.
@@ -230,7 +230,7 @@ struct Dialler
             Consensus::RaftMessage { Consensus::RequestVoteResponse { .term = Consensus::Term { .value = term },
                                                                       .decision = Consensus::VoteDecision::Granted,
                                                                       .voterId = voter } });
-        net.reactor.Drain();
+        net.reactor.drain();
     }
 
     /// @param refusal A dialler refusal.
@@ -311,8 +311,8 @@ TEST_CASE("After --cluster-forget=n3, n3's session closes and its redial is refu
     // and the one after it fails and ends the session.
     fromN3.Vote(3, "n3");
     fromN3.Vote(3, "n3");
-    network.clock.Advance(ReconnectBackoff);
-    network.reactor.Drain();
+    network.clock.advance(ReconnectBackoff);
+    network.reactor.drain();
     CHECK(network.sink.received.size() == 1);
     CHECK(fromN3.transport.ConnectedPeers() == 0);
     CHECK(network.Refused(Consensus::AcceptorRefusal::RevokedKey) == 1);

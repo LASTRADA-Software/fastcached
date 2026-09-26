@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "TerminalEventStream.hpp"
 
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Core/Ranges.hpp>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <exception>
@@ -21,9 +19,11 @@
 #include <variant>
 #include <vector>
 
-#include <tui/KeyCode.hpp>
-#include <tui/Modifier.hpp>
-#include <tui/TerminalOutput.hpp>
+#include <core/Ranges.hpp>
+#include <core/async/ResumeOn.hpp>
+#include <core/tui/KeyCode.hpp>
+#include <core/tui/Modifier.hpp>
+#include <core/tui/TerminalOutput.hpp>
 
 namespace FastCache::Cli
 {
@@ -33,7 +33,7 @@ namespace
     /// A named key and the bytes a terminal sends for it.
     struct NamedKeyRow
     {
-        tui::KeyCode key;
+        core::tui::KeyCode key;
         std::string_view bytes;
     };
 
@@ -43,32 +43,32 @@ namespace
     /// dashboard acts on, and `ESC` is the one of those here; the rest are spelled so that a
     /// consumer comparing bytes sees what an operator pressed rather than nothing.
     constexpr auto NamedKeys = std::to_array<NamedKeyRow>({
-        { .key = tui::KeyCode::Escape, .bytes = "\x1b" },
-        { .key = tui::KeyCode::Enter, .bytes = "\r" },
-        { .key = tui::KeyCode::Tab, .bytes = "\t" },
-        { .key = tui::KeyCode::Backspace, .bytes = "\x7f" },
-        { .key = tui::KeyCode::Up, .bytes = "\x1b[A" },
-        { .key = tui::KeyCode::Down, .bytes = "\x1b[B" },
-        { .key = tui::KeyCode::Right, .bytes = "\x1b[C" },
-        { .key = tui::KeyCode::Left, .bytes = "\x1b[D" },
-        { .key = tui::KeyCode::Home, .bytes = "\x1b[H" },
-        { .key = tui::KeyCode::End, .bytes = "\x1b[F" },
-        { .key = tui::KeyCode::Insert, .bytes = "\x1b[2~" },
-        { .key = tui::KeyCode::Delete, .bytes = "\x1b[3~" },
-        { .key = tui::KeyCode::PageUp, .bytes = "\x1b[5~" },
-        { .key = tui::KeyCode::PageDown, .bytes = "\x1b[6~" },
+        { .key = core::tui::KeyCode::Escape, .bytes = "\x1b" },
+        { .key = core::tui::KeyCode::Enter, .bytes = "\r" },
+        { .key = core::tui::KeyCode::Tab, .bytes = "\t" },
+        { .key = core::tui::KeyCode::Backspace, .bytes = "\x7f" },
+        { .key = core::tui::KeyCode::Up, .bytes = "\x1b[A" },
+        { .key = core::tui::KeyCode::Down, .bytes = "\x1b[B" },
+        { .key = core::tui::KeyCode::Right, .bytes = "\x1b[C" },
+        { .key = core::tui::KeyCode::Left, .bytes = "\x1b[D" },
+        { .key = core::tui::KeyCode::Home, .bytes = "\x1b[H" },
+        { .key = core::tui::KeyCode::End, .bytes = "\x1b[F" },
+        { .key = core::tui::KeyCode::Insert, .bytes = "\x1b[2~" },
+        { .key = core::tui::KeyCode::Delete, .bytes = "\x1b[3~" },
+        { .key = core::tui::KeyCode::PageUp, .bytes = "\x1b[5~" },
+        { .key = core::tui::KeyCode::PageDown, .bytes = "\x1b[6~" },
     });
 
     /// How long a wait lasts right after input arrived.
     ///
-    /// endo decides that a lone `ESC` is the Escape key, rather than the start of a sequence,
+    /// core-cpp decides that a lone `ESC` is the Escape key, rather than the start of a sequence,
     /// only when a wait TIMES OUT with nothing after it. A wait that blocks indefinitely never
     /// times out, so the first wait after any input is this short one and the next is unbounded
-    /// again. The figure is the one endo's parser documents for this decision.
+    /// again. The figure is the one core-cpp's parser documents for this decision.
     constexpr auto EscapeDecisionMs = 50;
 
     /// Whether @p modifiers includes @p wanted.
-    [[nodiscard]] constexpr bool Has(tui::Modifier modifiers, tui::Modifier wanted) noexcept
+    [[nodiscard]] constexpr bool Has(core::tui::Modifier modifiers, core::tui::Modifier wanted) noexcept
     {
         return (modifiers & wanted) == wanted;
     }
@@ -123,7 +123,7 @@ namespace
                                               .cellPixels = parts.cellPixels });
         }
 
-        [[nodiscard]] Task<DashboardEvent> Next() override
+        [[nodiscard]] core::async::Task<DashboardEvent> Next() override
         {
             while (true)
             {
@@ -147,16 +147,16 @@ namespace
 
                 // The wait blocks, so it runs on the pool, and the result is used only after the
                 // hop back: the stream's state belongs to the thread `Next()` is awaited on.
-                co_await ResumeOn { *_pool };
-                auto outcome = _source->wait(timeoutMs);
+                co_await core::async::ResumeOn { *_pool };
+                auto outcome = _source->Wait(timeoutMs);
                 // Still on the pool, before the next wait: the query reads its reply from the input
                 // this wait just finished reading, and hands back anything else it reads there.
                 auto const reread =
-                    _rereadCellPixels && std::ranges::any_of(outcome.events, [](tui::InputEvent const& input) {
-                        return std::holds_alternative<tui::ResizeEvent>(input);
+                    _rereadCellPixels && std::ranges::any_of(outcome.events, [](core::tui::InputEvent const& input) {
+                        return std::holds_alternative<core::tui::ResizeEvent>(input);
                     });
                 auto const measured = reread ? _rereadCellPixels() : std::nullopt;
-                co_await ResumeOn { *_resumeOn };
+                co_await core::async::ResumeOn { *_resumeOn };
 
                 // A short wait that came back empty has had its chance to settle a lone ESC.
                 _inputJustArrived = !(timeoutMs >= 0 && outcome.events.empty());
@@ -186,9 +186,9 @@ namespace
             _ready.push_back(std::move(event));
         }
 
-        tui::runtime::EventSource* _source;
-        IExecutor* _pool;
-        IExecutor* _resumeOn;
+        ITerminalInputWait* _source;
+        core::async::IExecutor* _pool;
+        core::async::IExecutor* _resumeOn;
         std::function<void()> _wake;
         std::function<std::optional<CellPixelSize>()> _rereadCellPixels;
         std::deque<DashboardEvent> _ready;
@@ -202,7 +202,7 @@ namespace
 {
     /// Begin and end synchronized output (DEC mode 2026).
     ///
-    /// The only presentation bytes spelled in this project. endo writes these solely from inside
+    /// The only presentation bytes spelled in this project. core-cpp writes these solely from inside
     /// `SyncGuard`, directly to a native handle, so unlike the rest of `TerminalScreenBytes` there is
     /// no buffered call to capture them from.
     constexpr auto SyncBegin = std::string_view { "\x1b[?2026h" };
@@ -212,9 +212,9 @@ namespace
     /// as its tail.
     constexpr auto Cancel = std::string_view { "\x18" };
 
-    /// An endo `TerminalOutput` whose destination is a string, so a sequence endo spells can be read
+    /// A core-cpp `TerminalOutput` whose destination is a string, so a sequence core-cpp spells can be read
     /// back as bytes rather than restated.
-    class CapturedOutput final: public tui::TerminalOutput
+    class CapturedOutput final: public core::tui::TerminalOutput
     {
       public:
         /// @return What was flushed so far.
@@ -353,7 +353,7 @@ namespace
             _device->Restore();
         }
 
-        [[nodiscard]] Task<DashboardEvent> Next() override
+        [[nodiscard]] core::async::Task<DashboardEvent> Next() override
         {
             return _stream->Next();
         }
@@ -420,17 +420,17 @@ namespace
 TerminalScreenBytes const& ScreenBytes()
 {
     static auto const bytes = [] {
-        auto const spell = [](void (*step)(tui::TerminalOutput&)) {
+        auto const spell = [](void (*step)(core::tui::TerminalOutput&)) {
             auto output = CapturedOutput {};
             step(output);
             return output.Take();
         };
         return TerminalScreenBytes {
-            .enter = spell([](tui::TerminalOutput& output) {
+            .enter = spell([](core::tui::TerminalOutput& output) {
                 output.enterAltScreen();
                 output.hideCursor();
             }),
-            .leave = spell([](tui::TerminalOutput& output) {
+            .leave = spell([](core::tui::TerminalOutput& output) {
                 output.showCursor();
                 output.leaveAltScreen();
             }),
@@ -448,12 +448,12 @@ bool PresentsSynchronized(TerminalCapabilities const& capabilities) noexcept
 
 namespace
 {
-    /// endo's style for a palette row.
+    /// core-cpp's style for a palette row.
     /// @param row The row.
     /// @return The style.
-    [[nodiscard]] tui::Style StyleOf(TonePaletteRow const& row)
+    [[nodiscard]] core::tui::Style StyleOf(TonePaletteRow const& row)
     {
-        auto style = tui::Style {};
+        auto style = core::tui::Style {};
         if (row.colour.has_value())
             style.fg = *row.colour;
         style.bold = row.bold;
@@ -469,7 +469,7 @@ namespace
         TerminalCapabilities const* record; ///< Whose palette answer applies; null writes every run plain.
     };
 
-    /// Write one row: its dressed runs through endo's styled text, the rest as it stands.
+    /// Write one row: its dressed runs through core-cpp's styled text, the rest as it stands.
     ///
     /// A run that does not lie inside the row, or that overlaps the one before it, is written plain, and so
     /// is every run where the record allows no colour: a span dresses bytes, and never adds, drops or
@@ -563,58 +563,222 @@ std::string FrameBytes(DashboardFrame const& frame, TerminalCapabilities const& 
                               PresentsSynchronized(capabilities));
 }
 
-SynchronizedOutputAnswer ToSynchronizedOutputAnswer(tui::DecModeStatus status) noexcept
+SynchronizedOutputAnswer ToSynchronizedOutputAnswer(core::tui::DecModeStatus status) noexcept
 {
-    // A switch with no default, so a status endo adds is a compiler warning here rather than a value
+    // A switch with no default, so a status core-cpp adds is a compiler warning here rather than a value
     // quietly read as one of these.
     switch (status)
     {
-        case tui::DecModeStatus::Set:
-        case tui::DecModeStatus::Reset:
+        case core::tui::DecModeStatus::Set:
+        case core::tui::DecModeStatus::Reset:
             return SynchronizedOutputAnswer::Supported;
-        case tui::DecModeStatus::NotRecognized:
-        case tui::DecModeStatus::PermanentlySet:
-        case tui::DecModeStatus::PermanentlyReset:
+        case core::tui::DecModeStatus::NotRecognized:
+        case core::tui::DecModeStatus::PermanentlySet:
+        case core::tui::DecModeStatus::PermanentlyReset:
             return SynchronizedOutputAnswer::NotSupported;
-        case tui::DecModeStatus::NoReply:
+        case core::tui::DecModeStatus::NoReply:
             return SynchronizedOutputAnswer::NoReply;
-        case tui::DecModeStatus::NotAsked:
+        case core::tui::DecModeStatus::NotAsked:
             return SynchronizedOutputAnswer::NotAsked;
     }
     return SynchronizedOutputAnswer::NotAsked;
 }
 
-std::string KeyBytes(tui::KeyEvent const& key)
+std::string KeyBytes(core::tui::KeyEvent const& key)
 {
     auto bytes = std::string {};
-    if (Has(key.modifiers, tui::Modifier::Ctrl) && key.codepoint >= U'@' && key.codepoint <= U'z')
+    if (Has(key.modifiers, core::tui::Modifier::Ctrl) && key.codepoint >= U'@' && key.codepoint <= U'z')
     {
         bytes.push_back(static_cast<char>(static_cast<std::uint32_t>(key.codepoint) & 0x1FU));
         return bytes;
     }
 
-    if (auto const* row = FindOrNull(NamedKeys, key.key, &NamedKeyRow::key))
+    if (auto const* row = core::findOrNull(NamedKeys, key.key, &NamedKeyRow::key))
         bytes = row->bytes;
     else if (key.codepoint != 0)
         bytes = EncodeUtf8(key.codepoint);
 
-    if (!bytes.empty() && Has(key.modifiers, tui::Modifier::Alt))
+    if (!bytes.empty() && Has(key.modifiers, core::tui::Modifier::Alt))
         bytes.insert(bytes.begin(), '\x1b');
     return bytes;
 }
 
-std::vector<DashboardEvent> ToDashboardEvents(tui::runtime::WaitOutcome const& outcome,
-                                              std::optional<CellPixelSize> cellPixels)
+namespace
+{
+    /// `ITerminalInputWait` over an `IoBackend`: what `MakeTerminalInputWait` returns.
+    ///
+    /// Every member but the backend's wake is touched only by the thread calling `Wait`, and the
+    /// readiness callbacks run inside that call, on that thread -- so the flags they set are plain.
+    class BackendTerminalInputWait final: public ITerminalInputWait
+    {
+      public:
+        /// Which of the input source's handles a watch is for.
+        enum class Channel : std::uint8_t
+        {
+            Input,
+            Resize,
+        };
+
+        BackendTerminalInputWait(core::tui::runtime::InputSource& input,
+                                 std::unique_ptr<core::net::IoBackend> backend) noexcept:
+            _input { input },
+            _backend { std::move(backend) }
+        {
+        }
+
+        BackendTerminalInputWait(BackendTerminalInputWait const&) = delete;
+        BackendTerminalInputWait(BackendTerminalInputWait&&) = delete;
+        BackendTerminalInputWait& operator=(BackendTerminalInputWait const&) = delete;
+        BackendTerminalInputWait& operator=(BackendTerminalInputWait&&) = delete;
+
+        ~BackendTerminalInputWait() override
+        {
+            for (auto& watch: _watches)
+                if (watch.attached)
+                    _backend->detach(watch.handler);
+        }
+
+        /// Attach @p handle to the backend as @p channel, watched for reading.
+        /// @return Nothing, or why the backend refused the handle.
+        [[nodiscard]] std::expected<void, std::string> Watch(Channel channel, core::platform::NativeHandle handle)
+        {
+            auto& watch = _watches.at(static_cast<std::size_t>(channel));
+            watch.handler.handle = handle;
+            watch.handler.owner = &watch;
+            if (auto attached = _backend->attach(watch.handler); !attached)
+                return std::unexpected(attached.error().toString());
+            watch.attached = true;
+            if (auto armed = _backend->setInterest(watch.handler, core::net::Interest::Read); !armed)
+                return std::unexpected(armed.error().toString());
+            return {};
+        }
+
+        [[nodiscard]] TerminalWaitOutcome Wait(int timeoutMs) override
+        {
+            // Input a query read and did not consume arrived BEFORE anything still on the handle,
+            // so it is delivered first and without waiting.
+            auto outcome = TerminalWaitOutcome { .events = _input.takePending() };
+            if (outcome.events.empty())
+                outcome = WaitForReadiness(timeoutMs);
+            std::ignore = _input.consumeReports(outcome.events);
+            return outcome;
+        }
+
+        void Wake() noexcept override
+        {
+            _backend->wake();
+        }
+
+      private:
+        /// One attached handle, and what the backend last reported for it.
+        struct Watched
+        {
+            core::net::ReadinessHandler handler;
+            bool attached { false };
+            bool readable { false };
+            bool failed { false };
+        };
+
+        /// The watch a readiness callback is about: each handler's owner is its own `Watched`.
+        [[nodiscard]] static Watched& Of(core::net::ReadinessHandler& handler) noexcept
+        {
+            return *static_cast<Watched*>(handler.owner);
+        }
+
+        [[nodiscard]] TerminalWaitOutcome WaitForReadiness(int timeoutMs)
+        {
+            // An input the source has already found at its end is answered without waiting: the
+            // handle of a terminal that hung up stays readable, so waiting on it again would
+            // return at once, read nothing, and do the same forever (core-cpp#49).
+            if (_input.inputClosed())
+                return TerminalWaitOutcome { .inputClosed = true };
+            for (auto& watch: _watches)
+            {
+                watch.readable = false;
+                watch.failed = false;
+            }
+            auto const timeout =
+                timeoutMs < 0 ? std::optional<core::platform::SteadyDuration> {}
+                              : std::optional<core::platform::SteadyDuration> { std::chrono::milliseconds { timeoutMs } };
+            auto const waited = _backend->wait(timeout);
+
+            auto const& input = _watches.at(static_cast<std::size_t>(Channel::Input));
+            auto const& resize = _watches.at(static_cast<std::size_t>(Channel::Resize));
+            auto outcome = TerminalWaitOutcome {};
+            // A hang-up the backend reported with nothing readable beside it: nothing will ever be
+            // read here again, and answering it as readable-and-empty would wake every wait at once.
+            if (input.failed && !input.readable)
+            {
+                outcome.inputClosed = true;
+                return outcome;
+            }
+            if (resize.readable)
+                if (auto resized = _input.readResize())
+                    outcome.events.push_back(std::move(*resized));
+            if (input.readable)
+                std::ranges::move(_input.readReady(), std::back_inserter(outcome.events));
+            // The end the READ found, which the backend cannot report: a terminal that hung up is
+            // readable, and only the read that answers EIO or an end of file tells the end from
+            // "nothing yet" -- core-cpp's `InputSource::inputClosed()`, recorded since 0.2.1. What
+            // that read delivered goes out with it.
+            if (_input.inputClosed())
+            {
+                outcome.inputClosed = true;
+                return outcome;
+            }
+            // A bounded wait that ended with nothing ready is the parser's cue: a lone ESC with no
+            // continuation after it is the Escape key.
+            if (waited.dispatched == 0 && timeoutMs >= 0)
+                outcome.events = _input.flushPartial();
+            return outcome;
+        }
+
+        static void OnReadable(core::net::ReadinessHandler& handler) noexcept
+        {
+            Of(handler).readable = true;
+        }
+
+        static void OnFailed(core::net::ReadinessHandler& handler) noexcept
+        {
+            Of(handler).failed = true;
+        }
+
+        core::tui::runtime::InputSource& _input;
+        std::unique_ptr<core::net::IoBackend> _backend;
+        /// Indexed by `Channel`.
+        std::array<Watched, 2> _watches {
+            Watched { .handler = { .onReadable = &OnReadable, .onError = &OnFailed } },
+            Watched { .handler = { .onReadable = &OnReadable, .onError = &OnFailed } },
+        };
+    };
+} // namespace
+
+std::expected<std::unique_ptr<ITerminalInputWait>, std::string> MakeTerminalInputWait(
+    core::tui::runtime::InputSource& input, std::unique_ptr<core::net::IoBackend> backend)
+{
+    using Channel = BackendTerminalInputWait::Channel;
+    auto wait = std::make_unique<BackendTerminalInputWait>(input, std::move(backend));
+    if (auto watched = wait->Watch(Channel::Input, input.inputHandle()); !watched)
+        return std::unexpected("the terminal's input: " + watched.error());
+    // A source with no resize channel -- a Windows console reports a resize as an input record --
+    // answers an invalid handle, and there is nothing to attach.
+    if (auto const resize = input.resizeHandle(); resize != core::platform::InvalidHandle)
+        if (auto watched = wait->Watch(Channel::Resize, resize); !watched)
+            return std::unexpected("the terminal's resize notification: " + watched.error());
+    return wait;
+}
+
+std::vector<DashboardEvent> ToDashboardEvents(TerminalWaitOutcome const& outcome, std::optional<CellPixelSize> cellPixels)
 {
     auto events = std::vector<DashboardEvent> {};
     for (auto const& input: outcome.events)
     {
-        if (auto const* key = std::get_if<tui::KeyEvent>(&input))
+        if (auto const* key = std::get_if<core::tui::KeyEvent>(&input))
         {
             if (auto bytes = KeyBytes(*key); !bytes.empty())
                 events.push_back(DashboardEvent { .kind = DashboardEventKind::Key, .keys = std::move(bytes) });
         }
-        else if (auto const* resize = std::get_if<tui::ResizeEvent>(&input))
+        else if (auto const* resize = std::get_if<core::tui::ResizeEvent>(&input))
         {
             events.push_back(DashboardEvent { .kind = DashboardEventKind::Resize,
                                               .columns = resize->columns,
@@ -622,12 +786,13 @@ std::vector<DashboardEvent> ToDashboardEvents(tui::runtime::WaitOutcome const& o
                                               .cellPixels = cellPixels });
         }
     }
-    if (outcome.interrupted)
+    if (outcome.inputClosed)
         events.push_back(DashboardEvent { .kind = DashboardEventKind::Detached, .note = "the terminal's input closed" });
     return events;
 }
 
-std::optional<CellPixelSize> ToCellPixelSize(std::expected<std::pair<int, int>, tui::QueryUnanswered> const& answer) noexcept
+std::optional<CellPixelSize> ToCellPixelSize(
+    std::expected<std::pair<int, int>, core::tui::QueryUnanswered> const& answer) noexcept
 {
     if (!answer.has_value())
         return std::nullopt;
@@ -637,17 +802,18 @@ std::optional<CellPixelSize> ToCellPixelSize(std::expected<std::pair<int, int>, 
     return CellPixelSize { .width = static_cast<std::size_t>(width), .height = static_cast<std::size_t>(height) };
 }
 
-SixelAnswer ToSixelAnswer(std::expected<tui::DeviceAttributesReport, tui::QueryUnanswered> const& attributes) noexcept
+SixelAnswer ToSixelAnswer(
+    std::expected<core::tui::DeviceAttributesReport, core::tui::QueryUnanswered> const& attributes) noexcept
 {
     if (attributes.has_value())
-        return tui::advertisesSixel(*attributes) ? SixelAnswer::Advertised : SixelAnswer::NotAdvertised;
-    // A switch with no default, so a third reason endo adds is a compiler warning here rather than
+        return core::tui::advertisesSixel(*attributes) ? SixelAnswer::Advertised : SixelAnswer::NotAdvertised;
+    // A switch with no default, so a third reason core-cpp adds is a compiler warning here rather than
     // a value quietly read as one of these two.
     switch (attributes.error())
     {
-        case tui::QueryUnanswered::NoReply:
+        case core::tui::QueryUnanswered::NoReply:
             return SixelAnswer::NoReply;
-        case tui::QueryUnanswered::NotAsked:
+        case core::tui::QueryUnanswered::NotAsked:
             return SixelAnswer::NotAsked;
     }
     return SixelAnswer::NotAsked;
@@ -658,9 +824,9 @@ std::unique_ptr<IDashboardEventSource> MakeTerminalEventStream(TerminalStreamPar
     return std::make_unique<TerminalEventStream>(std::move(parts));
 }
 
-Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::unique_ptr<ITerminalDevice> device,
-                                                                      IExecutor* pool,
-                                                                      IExecutor* resumeOn)
+core::async::Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::unique_ptr<ITerminalDevice> device,
+                                                                                   core::async::IExecutor* pool,
+                                                                                   core::async::IExecutor* resumeOn)
 {
     // Declared first, so it is the last local destroyed: every way out of this coroutine -- a refused
     // acquisition, an exception after raw mode was entered, the task being destroyed between the
@@ -671,7 +837,7 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
     // The acquisition and both queries BLOCK, so they run on the pool; the record is used only
     // after the hop back. The screen is entered last of the terminal-facing steps, once the queries
     // have their answers, and the encoding -- which asks the environment, not the terminal -- after it.
-    co_await ResumeOn { *pool };
+    co_await core::async::ResumeOn { *pool };
     try
     {
         if (auto acquired = device->Acquire(); !acquired)
@@ -694,7 +860,7 @@ Task<std::expected<StartedTerminal, std::string>> StartTerminalDevice(std::uniqu
     {
         capabilities = std::unexpected(std::string { "the terminal failed while being started: " } + failure.what());
     }
-    co_await ResumeOn { *resumeOn };
+    co_await core::async::ResumeOn { *resumeOn };
 
     if (!capabilities.has_value())
         co_return std::unexpected(std::move(capabilities).error());

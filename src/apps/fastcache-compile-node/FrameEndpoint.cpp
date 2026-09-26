@@ -4,17 +4,14 @@
 #include "FrameEndpoint.hpp"
 #include "NodeIoLoop.hpp"
 
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Core/Ranges.hpp>
-#include <FastCache/Net/LingeringClose.hpp>
-#include <FastCache/Net/PlatformListener.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 #include <FastCache/Protocol/SealedFrameSocket.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
+#include <FastCache/Transport/LingeringClose.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <algorithm>
 #include <array>
@@ -35,6 +32,10 @@
 #include <vector>
 
 #include <WorkerProtocol.hpp>
+#include <core/Ranges.hpp>
+#include <core/async/ResumeOn.hpp>
+#include <core/net/SleepUntil.hpp>
+#include <core/net/Sockets.hpp>
 
 namespace FastCache::Node
 {
@@ -61,10 +62,12 @@ namespace
     /// @param socket Where to write.
     /// @param bytes What to write.
     /// @return Whether all of it went out.
-    [[nodiscard]] Task<bool> WriteAll(EndpointWriter writer, ISocket* socket, std::span<std::byte const> bytes)
+    [[nodiscard]] core::async::Task<bool> WriteAll(EndpointWriter writer,
+                                                   core::net::ISocket* socket,
+                                                   std::span<std::byte const> bytes)
     {
         (void) writer;
-        auto const written = co_await socket->Write(bytes);
+        auto const written = co_await socket->write(bytes);
         co_return written.has_value() && *written == bytes.size();
     }
 
@@ -180,15 +183,15 @@ struct SweepTally
     /// @return How many connections were swept in total, closed and deferred alike.
     [[nodiscard]] std::size_t Total() const noexcept
     {
-        return Ranges::FoldLeft(swept, std::size_t { 0 }, std::plus {});
+        return core::ranges::FoldLeft(swept, std::size_t { 0 }, std::plus {});
     }
 };
 
 /// One connection this surface is serving, and when it must be done by.
 struct TrackedConnection
 {
-    ISocket* socket { nullptr };
-    TimePoint deadline {};
+    core::net::ISocket* socket { nullptr };
+    core::platform::SteadyTimePoint deadline {};
     SweepPhase phase { SweepPhase::AwaitingRequest };
 
     /// Whether a sweep has already closed and counted this one.
@@ -252,7 +255,7 @@ struct TrackedConnection
     /// `CloseExpiredDeferrals` disengages it too, and that is what stops a wedged
     /// responder from holding a descriptor for the life of the process where the old
     /// unconditional close released it. See `FrameServer::ExplanationGraceFor`.
-    std::optional<TimePoint> explainBy {};
+    std::optional<core::platform::SteadyTimePoint> explainBy {};
 
     /// The window this connection's current deadline was armed from.
     ///
@@ -266,7 +269,7 @@ struct TrackedConnection
 struct FrameServer::State
 {
     NodeIoLoop& io;
-    IListener& listener;
+    core::net::IListener& listener;
     IFrameResponder& responder;
     std::string what;
     IMetricsSink& metrics;
@@ -320,7 +323,7 @@ struct FrameServer::State
     std::atomic<std::size_t> loopsAlive { 0 };
 
     State(NodeIoLoop& loop,
-          IListener& l,
+          core::net::IListener& l,
           IFrameResponder& r,
           std::string_view name,
           IMetricsSink& sink,
@@ -348,7 +351,7 @@ struct FrameServer::State
     /// returning early is not an optimisation but the correct reading.
     /// @param socket The socket to look up.
     /// @return Its entry, or nullptr when it is no longer tracked.
-    [[nodiscard]] TrackedConnection* FindLocked(ISocket const* socket) noexcept
+    [[nodiscard]] TrackedConnection* FindLocked(core::net::ISocket const* socket) noexcept
     {
         auto const found = std::ranges::find(open, socket, &TrackedConnection::socket);
         return found == open.end() ? nullptr : &*found;
@@ -360,7 +363,10 @@ struct FrameServer::State
     /// @param phase Which window `deadline` belongs to.
     /// @param window The window @p deadline was computed from, kept because the
     ///        explanation grace is derived from it.
-    void Track(ISocket* socket, TimePoint deadline, SweepPhase phase, std::chrono::milliseconds window)
+    void Track(core::net::ISocket* socket,
+               core::platform::SteadyTimePoint deadline,
+               SweepPhase phase,
+               std::chrono::milliseconds window)
     {
         std::scoped_lock const guard { mutex };
         open.push_back(TrackedConnection { .socket = socket, .deadline = deadline, .phase = phase, .window = window });
@@ -383,7 +389,10 @@ struct FrameServer::State
     ///        would attribute the next sweep to the previous request's state.
     /// @param window The window @p deadline was computed from, moved with it for the
     ///        same reason and read by `CloseOverdue` to size the explanation grace.
-    void Rearm(ISocket* socket, TimePoint deadline, SweepPhase phase, std::chrono::milliseconds window)
+    void Rearm(core::net::ISocket* socket,
+               core::platform::SteadyTimePoint deadline,
+               SweepPhase phase,
+               std::chrono::milliseconds window)
     {
         std::scoped_lock const guard { mutex };
         if (auto* const entry = FindLocked(socket); entry != nullptr)
@@ -408,7 +417,7 @@ struct FrameServer::State
     /// No `bool` parameter, because there is nothing to pass: the leave half has to
     /// return the obligation it takes, so it cannot be this function with `false`.
     /// @param socket The tracked socket.
-    void EnterResponder(ISocket* socket)
+    void EnterResponder(core::net::ISocket* socket)
     {
         std::scoped_lock const guard { mutex };
         if (auto* const entry = FindLocked(socket); entry != nullptr)
@@ -444,7 +453,7 @@ struct FrameServer::State
     /// has to remember to disengage it.
     /// @param socket The tracked socket.
     /// @return True when this connection was swept and still owes its peer a reason.
-    [[nodiscard]] bool LeaveResponder(ISocket* socket)
+    [[nodiscard]] bool LeaveResponder(core::net::ISocket* socket)
     {
         std::scoped_lock const guard { mutex };
         auto* const entry = FindLocked(socket);
@@ -455,7 +464,7 @@ struct FrameServer::State
     }
 
     /// Deregister a socket. Must happen before its owner destroys it.
-    void Untrack(ISocket* socket)
+    void Untrack(core::net::ISocket* socket)
     {
         std::scoped_lock const guard { mutex };
         std::erase_if(open, [socket](auto const& entry) { return entry.socket == socket; });
@@ -501,7 +510,7 @@ struct FrameServer::State
     /// many of the swept were told why.
     /// @param now The reactor's current time.
     /// @return How many were swept in each phase, closed and deferred alike.
-    SweepTally CloseOverdue(TimePoint now)
+    SweepTally CloseOverdue(core::platform::SteadyTimePoint now)
     {
         std::vector<TrackedConnection> overdue;
         {
@@ -531,20 +540,22 @@ struct FrameServer::State
         }
 
         SweepTally tally;
-        // Acted on outside the lock: `Close` completes a parked read by resuming its
-        // coroutine inline, and that coroutine calls `Untrack`, which takes this
-        // same mutex.
+        // Acted on outside the lock: the close wakes a parked read whose coroutine calls
+        // `Untrack`, which takes this same mutex. It resumes in the loop's next drain, not
+        // inside `close()` (core-cpp 0.2.1, guarantee G2), so this no longer deadlocks
+        // either way, but a close is still no place to hold a lock the woken code takes.
         for (auto const& entry: overdue)
         {
-            // Counted BEFORE the close, for the reason `SocketDeadlineTarget` records
-            // for the launcher's deadline: the close resumes a coroutine inline, so a
-            // tally written afterwards is written after that coroutine has already
-            // observed the socket shut.
+            // Counted BEFORE the close, for the reason `core::net::SocketDeadlineTarget` records
+            // for the launcher's deadline: the tally must be in place before anything can
+            // observe the socket shut. The woken coroutine resumes in the loop's next drain
+            // since core-cpp 0.2.1 (G2), so afterwards would also be in time today, and
+            // before is right on any transport.
             tally.For(entry.phase) += 1;
             if (auto const& row = SweepPhaseTable[static_cast<std::size_t>(entry.phase)]; row.counter.has_value())
                 metrics.Increment(*row.counter);
             if (!entry.explainBy.has_value())
-                entry.socket->Close();
+                entry.socket->close();
         }
         return tally;
     }
@@ -557,7 +568,7 @@ struct FrameServer::State
     /// which is after this is read.
     /// @param socket The connection's socket.
     /// @return True when a sweep or a shutdown closed it here.
-    [[nodiscard]] bool ClosedLocally(ISocket const* socket) const
+    [[nodiscard]] bool ClosedLocally(core::net::ISocket const* socket) const
     {
         std::scoped_lock const guard { mutex };
         auto const found = std::ranges::find(open, socket, &TrackedConnection::socket);
@@ -578,15 +589,15 @@ struct FrameServer::State
     /// `TrackedConnection::swept` exists to prevent one level up.
     ///
     /// Collected under the lock and closed outside it, for the same reason
-    /// `CloseOverdue` above is written that way and not because the shape looked
-    /// tidy: `Close` completes a parked read by resuming its coroutine INLINE, and
-    /// that coroutine calls `Untrack`, which takes this same mutex. Closing inside
-    /// the loop deadlocks.
+    /// `CloseOverdue` above is written that way: the close wakes a parked read whose
+    /// coroutine calls `Untrack`, which takes this same mutex. With inline resumption,
+    /// which core-cpp's sockets no longer do (0.2.1, G2), closing inside the loop
+    /// deadlocked; a close is still no place to hold a lock the woken code takes.
     /// @param now The reactor's current time.
     /// @return How many deferrals ran out of grace.
-    std::size_t CloseExpiredDeferrals(TimePoint now)
+    std::size_t CloseExpiredDeferrals(core::platform::SteadyTimePoint now)
     {
-        std::vector<ISocket*> expired;
+        std::vector<core::net::ISocket*> expired;
         {
             std::scoped_lock const guard { mutex };
             for (auto& entry: open)
@@ -598,16 +609,16 @@ struct FrameServer::State
                 }
         }
         for (auto* socket: expired)
-            socket->Close();
+            socket->close();
         return expired.size();
     }
 
     /// Close the listener and every open connection. Reactor thread only.
     void CloseAll()
     {
-        listener.Close();
+        listener.close();
 
-        std::vector<ISocket*> sockets;
+        std::vector<core::net::ISocket*> sockets;
         {
             std::scoped_lock const guard { mutex };
             for (auto& entry: open)
@@ -617,7 +628,7 @@ struct FrameServer::State
             }
         }
         for (auto* socket: sockets)
-            socket->Close();
+            socket->close();
     }
 
     [[nodiscard]] std::size_t OpenCount() const
@@ -877,8 +888,8 @@ namespace
     /// A connection's socket, and the sealing layer under it when the surface offers a prover.
     struct ConnectionSocket
     {
-        std::shared_ptr<ISocket> socket; ///< What the loop, the watch and the pulse all use.
-        SealedFrameSocket* sealing;      ///< The same object, typed; null on a surface with no prover.
+        std::shared_ptr<core::net::ISocket> socket; ///< What the loop, the watch and the pulse all use.
+        SealedFrameSocket* sealing;                 ///< The same object, typed; null on a surface with no prover.
     };
 
     /// Wrap an accepted connection so a proof can seal it (#178).
@@ -893,10 +904,11 @@ namespace
     /// @param state The server state.
     /// @param owned The accepted connection.
     /// @return The socket to serve, and the sealing layer when there is one.
-    [[nodiscard]] ConnectionSocket WrapForSealing(FrameServer::State& state, std::unique_ptr<ISocket> owned)
+    [[nodiscard]] ConnectionSocket WrapForSealing(FrameServer::State& state, std::unique_ptr<core::net::ISocket> owned)
     {
         if (state.responder.NodeProver() == nullptr)
-            return ConnectionSocket { .socket = std::shared_ptr<ISocket> { std::move(owned) }, .sealing = nullptr };
+            return ConnectionSocket { .socket = std::shared_ptr<core::net::ISocket> { std::move(owned) },
+                                      .sealing = nullptr };
         auto sealed =
             std::make_shared<SealedFrameSocket>(std::move(owned), SealedFrameEnd::Server, state.responder.MaxRequestBytes());
         auto* const sealing = sealed.get();
@@ -1106,7 +1118,7 @@ namespace
     ///        suppressions above apply to it unchanged, so the abortive row is a
     ///        SUBSET of the departures row rather than a parallel tally that could
     ///        disagree with it.
-    void RecordDeparture(FrameServer::State& state, ISocket const* socket, PeerWatch& watch, PeerDeparture cause)
+    void RecordDeparture(FrameServer::State& state, core::net::ISocket const* socket, PeerWatch& watch, PeerDeparture cause)
     {
         watch.gone = true;
         watch.abortive = cause == PeerDeparture::Abortive;
@@ -1142,7 +1154,7 @@ namespace
     /// nothing, and every transport in this tree honours it. `EpollSocket` and
     /// `KqueueSocket` return the count their `MSG_PEEK` measured rather than a flat 1;
     /// `IocpSocket`'s completion still carries `bytes == 0` for every case, so its
-    /// `Dispatch` does the peek itself under `readPeekOnly`; `InMemorySocket` answers
+    /// `Dispatch` does the peek itself under `readPeekOnly`; `core::net::testing::InMemorySocket` answers
     /// `0` only when its inbound pipe is drained AND write-closed; `TlsSocket`
     /// delegates or reports buffered plaintext.
     ///
@@ -1177,12 +1189,13 @@ namespace
     ///        lifetime guarantee.
     /// @param socket The connection, shared so a parked wait cancelled by `Close()`
     ///        cannot resume onto a destroyed socket -- the second use-after-free
-    ///        `RedisResp`'s readable watcher records, in a tree where `Close()`
-    ///        resumes inline on epoll and marshals on IOCP.
+    ///        `RedisResp`'s readable watcher records. Every backend resumes that wait
+    ///        in the loop's next drain (core-cpp 0.2.1, G2), after the connection's
+    ///        frame may have unwound, so the shared reference is needed everywhere.
     /// @param watch Where the answer is left; shared with the connection.
-    DetachedTask WatchPeer(std::shared_ptr<FrameServer::State> state,
-                           std::shared_ptr<ISocket> socket,
-                           std::shared_ptr<PeerWatch> watch)
+    core::async::DetachedTask WatchPeer(std::shared_ptr<FrameServer::State> state,
+                                        std::shared_ptr<core::net::ISocket> socket,
+                                        std::shared_ptr<PeerWatch> watch)
     {
         // **ONE call decides the cause, and that is what makes the split clean.** This
         // reads the socket exactly once: `WaitReadable` reports the count (#677) and
@@ -1197,7 +1210,7 @@ namespace
         // total is unchanged, so the misfiling is silent. The clean two-way split is
         // therefore a CONSEQUENCE of #1090 rather than a property of this function,
         // which is the opposite of what #1092 warned about and the same fact.
-        auto const readable = co_await socket->WaitReadable();
+        auto const readable = co_await socket->waitReadable();
         if (!readable.has_value())
         {
             // An ERROR is an abortive close -- the peer reset, or the socket was closed
@@ -1236,7 +1249,7 @@ namespace
     /// `Cc::RunOneExchange`, which reads its reply and closes -- is gone within one
     /// step.
     ///
-    /// Polled rather than woken, for the reason `NextWakeStep` states: `IReactor::Schedule`
+    /// Polled rather than woken, for the reason `core::net::nextWakeStep` states: `core::net::EventLoop::Schedule`
     /// cannot be cancelled, so a wait that must also be woken by something else sleeps
     /// in steps and re-reads, leaving nothing parked behind it. The loop is inlined
     /// rather than delegated to `InterruptibleSleepUntil` for the reason that header
@@ -1273,15 +1286,15 @@ namespace
     /// are sure".
     /// @param reactor The loop this connection runs on; never null.
     /// @param watch The watch to wait on, shared so it cannot die under this frame.
-    Task<void> AwaitWatchQuiet(IReactor* reactor, std::shared_ptr<PeerWatch const> watch)
+    core::async::Task<void> AwaitWatchQuiet(core::net::EventLoop* reactor, std::shared_ptr<PeerWatch const> watch)
     {
         if (watch == nullptr)
             co_return; // Not watching: nothing is parked, so nothing has to be waited out.
 
-        auto const until = reactor->Clock().Now() + FrameServer::RefusalTimeout;
-        while (!watch->finished && reactor->Clock().Now() < until)
-            co_await SleepUntil { .reactor = reactor,
-                                  .deadline = NextWakeStep(reactor->Clock().Now(), until, FrameServer::GracefulCloseStep) };
+        auto const until = reactor->clock().now() + FrameServer::RefusalTimeout;
+        while (!watch->finished && reactor->clock().now() < until)
+            co_await core::net::sleepUntil(
+                reactor, core::net::nextWakeStep(reactor->clock().now(), until, FrameServer::GracefulCloseStep));
         co_return;
     }
 
@@ -1313,7 +1326,7 @@ namespace
     [[nodiscard]] std::shared_ptr<PeerWatch> ArmPeerWatch(std::shared_ptr<FrameServer::State> const& state,
                                                           std::uint8_t opRaw,
                                                           ByteReader const& reader,
-                                                          std::shared_ptr<ISocket> socket)
+                                                          std::shared_ptr<core::net::ISocket> socket)
     {
         auto const counter = state->responder.PeerWatchCounter(opRaw);
         if (!counter.has_value() || !reader.Buffered().empty())
@@ -1400,10 +1413,10 @@ namespace
     /// @param watch The watch, shared so it cannot die under the yield; may be null.
     /// @param hadReply Whether there was an answer to deliver at all.
     /// @return True when the peer went before the answer was ready.
-    Task<bool> AbandonIfPeerGone(FrameServer::State* state,
-                                 ISocket const* socket,
-                                 std::shared_ptr<PeerWatch> watch,
-                                 bool hadReply)
+    core::async::Task<bool> AbandonIfPeerGone(FrameServer::State* state,
+                                              core::net::ISocket const* socket,
+                                              std::shared_ptr<PeerWatch> watch,
+                                              bool hadReply)
     {
         // **Both arms end the connection without writing, which is why they are one
         // question.** An empty reply is `IFrameResponder::Answer`'s way of saying "close
@@ -1429,7 +1442,7 @@ namespace
         // this yields ONCE and re-reads, rather than waiting on something that may never
         // arrive.
         if (!watch->finished)
-            co_await ResumeOn { *reactor };
+            co_await core::async::ResumeOn { *reactor };
 
         // **Read, then marked, and the order is the whole of it.** A watcher that
         // concluded inside the yield above is acted on here AND counted by
@@ -1465,7 +1478,7 @@ namespace
     /// It took a `ByteReader*` until #1090, to hand back the bytes the probe `Read` had
     /// consumed. The watcher only peeks now, so there is nothing to hand back and the
     /// parameter went with the priming rather than being left unused.
-    Task<AfterWatch> SettleWatch(IReactor* reactor, std::shared_ptr<PeerWatch> watch)
+    core::async::Task<AfterWatch> SettleWatch(core::net::EventLoop* reactor, std::shared_ptr<PeerWatch> watch)
     {
         if (watch == nullptr)
             co_return AfterWatch::KeepServing; // Not watching: the loop is unchanged.
@@ -1474,7 +1487,7 @@ namespace
 
         // **A watch still parked ends the connection, and the caller's `break` IS the
         // cancellation**: it falls through to `socket->Close()`, the only thing on
-        // `ISocket` that can retrieve a coroutine parked in `WaitReadable`. Looping
+        // `core::net::ISocket` that can retrieve a coroutine parked in `WaitReadable`. Looping
         // round instead would arm a `Read` over that parked wait and silently leak its
         // frame; `IFrameResponder::PeerWatchCounter` carries the derivation.
         if (!watch->finished)
@@ -1534,7 +1547,7 @@ namespace
     /// thing that does both.
     ///
     /// **It sleeps in steps rather than for the whole interval**, for the reason
-    /// `AwaitWatchQuiet` gives: `IReactor::Schedule` cannot be cancelled, so a wait that
+    /// `AwaitWatchQuiet` gives: `core::net::EventLoop::Schedule` cannot be cancelled, so a wait that
     /// must also be endable by something else sleeps in steps and re-reads. Waiting out
     /// a whole five-second interval after `Answer` returned would hold every reply that
     /// long, which is the pulse making the thing it measures slower.
@@ -1549,18 +1562,17 @@ namespace
     ///        resume onto a destroyed socket -- the same lifetime rule `WatchPeer` has.
     /// @param pulse Where its state is left; shared with the connection.
     /// @param interval How long between frames.
-    DetachedTask PulseProgress(IReactor* reactor,
-                               std::shared_ptr<ISocket> socket,
-                               std::shared_ptr<ProgressPulse> pulse,
-                               std::chrono::milliseconds interval)
+    core::async::DetachedTask PulseProgress(core::net::EventLoop* reactor,
+                                            std::shared_ptr<core::net::ISocket> socket,
+                                            std::shared_ptr<ProgressPulse> pulse,
+                                            std::chrono::milliseconds interval)
     {
         while (!pulse->stopped)
         {
-            auto const until = reactor->Clock().Now() + interval;
-            while (!pulse->stopped && reactor->Clock().Now() < until)
-                co_await SleepUntil { .reactor = reactor,
-                                      .deadline =
-                                          NextWakeStep(reactor->Clock().Now(), until, FrameServer::GracefulCloseStep) };
+            auto const until = reactor->clock().now() + interval;
+            while (!pulse->stopped && reactor->clock().now() < until)
+                co_await core::net::sleepUntil(
+                    reactor, core::net::nextWakeStep(reactor->clock().now(), until, FrameServer::GracefulCloseStep));
 
             // Re-read AFTER the sleep and before the write, so a pulse that was told to
             // stop during its own interval never puts a frame in front of the reply it
@@ -1600,8 +1612,8 @@ namespace
     /// @return The pulse, or null when this request is not pulsed.
     [[nodiscard]] std::shared_ptr<ProgressPulse> ArmProgressPulse(IFrameResponder const& responder,
                                                                   std::uint8_t opRaw,
-                                                                  IReactor* reactor,
-                                                                  std::shared_ptr<ISocket> socket)
+                                                                  core::net::EventLoop* reactor,
+                                                                  std::shared_ptr<core::net::ISocket> socket)
     {
         auto const interval = responder.ProgressInterval(opRaw);
         if (!interval.has_value() || *interval <= std::chrono::milliseconds::zero())
@@ -1628,7 +1640,7 @@ namespace
     ///
     /// **A pulse still parked past the bound ends the connection**, and the caller's
     /// `break` IS the cancellation -- it falls through to `socket->Close()`, which is
-    /// the only thing on `ISocket` that can retrieve a coroutine suspended in `Write`.
+    /// the only thing on `core::net::ISocket` that can retrieve a coroutine suspended in `Write`.
     /// That is `SettleWatch`'s rule on the read side, applied to the write side for the
     /// same reason: continuing would arm a second write over a parked one.
     ///
@@ -1638,16 +1650,16 @@ namespace
     /// @param pulse The pulse, shared so it cannot die under the wait; may be null.
     /// @return True when the connection may go on to write; false when the pulse is
     ///         still holding the socket and this connection must end.
-    Task<bool> SettlePulse(IReactor* reactor, std::shared_ptr<ProgressPulse> pulse)
+    core::async::Task<bool> SettlePulse(core::net::EventLoop* reactor, std::shared_ptr<ProgressPulse> pulse)
     {
         if (pulse == nullptr)
             co_return true; // Not pulsing: nothing was ever armed, so nothing is held.
 
         pulse->stopped = true;
-        auto const until = reactor->Clock().Now() + FrameServer::RefusalTimeout;
-        while (!pulse->finished && reactor->Clock().Now() < until)
-            co_await SleepUntil { .reactor = reactor,
-                                  .deadline = NextWakeStep(reactor->Clock().Now(), until, FrameServer::GracefulCloseStep) };
+        auto const until = reactor->clock().now() + FrameServer::RefusalTimeout;
+        while (!pulse->finished && reactor->clock().now() < until)
+            co_await core::net::sleepUntil(
+                reactor, core::net::nextWakeStep(reactor->clock().now(), until, FrameServer::GracefulCloseStep));
         co_return pulse->finished;
     }
 
@@ -1670,7 +1682,9 @@ namespace
     /// @param socket The connection whose mark is cleared; not owned.
     /// @param pulse The pulse, shared so it cannot die under the wait; may be null.
     /// @return True when the connection may write its reply; false when it must end.
-    Task<bool> ReclaimFromPulse(FrameServer::State* state, ISocket* socket, std::shared_ptr<ProgressPulse> pulse)
+    core::async::Task<bool> ReclaimFromPulse(FrameServer::State* state,
+                                             core::net::ISocket* socket,
+                                             std::shared_ptr<ProgressPulse> pulse)
     {
         if (co_await SettlePulse(&state->io.Reactor(), pulse))
             co_return true;
@@ -1704,11 +1718,11 @@ namespace
     /// @param window The verb's answer window, as the responder named it.
     /// @param watch The peer watch, shared so it cannot die under the wait; may be null.
     /// @return True when this connection was swept and must end.
-    Task<bool> ExplainIfSwept(FrameServer::State* state,
-                              ISocket* socket,
-                              std::uint8_t opRaw,
-                              std::chrono::milliseconds window,
-                              std::shared_ptr<PeerWatch const> watch)
+    core::async::Task<bool> ExplainIfSwept(FrameServer::State* state,
+                                           core::net::ISocket* socket,
+                                           std::uint8_t opRaw,
+                                           std::chrono::milliseconds window,
+                                           std::shared_ptr<PeerWatch const> watch)
     {
         if (!state->LeaveResponder(socket))
             co_return false;
@@ -1890,8 +1904,8 @@ namespace
     /// @param cap The surface-wide request ceiling.
     /// @param how Which resynchronization the refusal called for.
     /// @return True when the connection may serve another request; false when it must end.
-    Task<bool> StepOverRefused(
-        ByteReader* reader, ISocket* socket, std::uint32_t declaredLength, std::size_t cap, Resynchronize how)
+    core::async::Task<bool> StepOverRefused(
+        ByteReader* reader, core::net::ISocket* socket, std::uint32_t declaredLength, std::size_t cap, Resynchronize how)
     {
         if (how == Resynchronize::Oversize)
         {
@@ -1920,7 +1934,7 @@ namespace
         /// @param watch The read watch armed for the stream; finished already when the peer had
         ///        pipelined bytes before it began.
         StreamSink(std::shared_ptr<FrameServer::State> state,
-                   std::shared_ptr<ISocket> socket,
+                   std::shared_ptr<core::net::ISocket> socket,
                    std::shared_ptr<PeerWatch const> watch) noexcept:
             _state { std::move(state) },
             _socket { std::move(socket) },
@@ -1936,13 +1950,14 @@ namespace
         /// sleeps would be a subscriber cut off for having been slow a moment ago, not for being
         /// stuck. Pushes are at most one granted cadence apart and a hold is never shorter than
         /// `CompileCacheWire::LiveIdleCadences` of them, so the second arm always covers the gap.
-        [[nodiscard]] Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds hold) override
+        [[nodiscard]] core::async::Task<PushOutcome> Push(std::vector<std::byte> frame,
+                                                          std::chrono::milliseconds hold) override
         {
             auto* const state = _state.get();
-            state->Rearm(_socket.get(), state->io.Reactor().Clock().Now() + hold, SweepPhase::Streaming, hold);
+            state->Rearm(_socket.get(), state->io.Reactor().clock().now() + hold, SweepPhase::Streaming, hold);
             if (co_await WriteAll(EndpointWriter::Stream, _socket.get(), frame))
             {
-                state->Rearm(_socket.get(), state->io.Reactor().Clock().Now() + hold, SweepPhase::Streaming, hold);
+                state->Rearm(_socket.get(), state->io.Reactor().clock().now() + hold, SweepPhase::Streaming, hold);
                 _tally.pushes += 1;
                 _tally.bytes += frame.size();
                 co_return PushOutcome::Delivered;
@@ -1977,7 +1992,7 @@ namespace
 
       private:
         std::shared_ptr<FrameServer::State> _state;
-        std::shared_ptr<ISocket> _socket;
+        std::shared_ptr<core::net::ISocket> _socket;
         std::shared_ptr<PeerWatch const> _watch;
         Node::StreamTally _tally {};
     };
@@ -2006,13 +2021,13 @@ namespace
     /// @param readerHoldsBytes Whether the connection's reader already holds a pipelined request.
     /// @return Whether this connection may serve another request: only when the peer is still
     ///         there with one of its own, which is `SettleWatch`'s answer after any reply.
-    Task<AfterWatch> ServeStream(std::shared_ptr<FrameServer::State> shared,
-                                 std::shared_ptr<ISocket> socket,
-                                 IFrameStream* stream,
-                                 std::vector<std::byte> frame,
-                                 std::uint8_t opRaw,
-                                 PeerIdentity peer,
-                                 bool readerHoldsBytes)
+    core::async::Task<AfterWatch> ServeStream(std::shared_ptr<FrameServer::State> shared,
+                                              std::shared_ptr<core::net::ISocket> socket,
+                                              IFrameStream* stream,
+                                              std::vector<std::byte> frame,
+                                              std::uint8_t opRaw,
+                                              PeerIdentity peer,
+                                              bool readerHoldsBytes)
     {
         auto* const state = shared.get();
         auto watch = std::make_shared<PeerWatch>(
@@ -2047,7 +2062,7 @@ namespace
         // One small frame, so the header window rather than a push's hold: a peer that stopped
         // reading has already had a whole hold.
         state->Rearm(socket.get(),
-                     state->io.Reactor().Clock().Now() + FrameServer::HeaderTimeout,
+                     state->io.Reactor().clock().now() + FrameServer::HeaderTimeout,
                      SweepPhase::Streaming,
                      FrameServer::HeaderTimeout);
         if (!co_await WriteAll(EndpointWriter::Stream, socket.get(), terminal))
@@ -2084,17 +2099,18 @@ namespace
     ///
     /// @param shared The server state, shared for the reason the socket below is.
     /// @param owned The accepted connection.
-    DetachedTask ServeConnection(std::shared_ptr<FrameServer::State> shared, std::unique_ptr<ISocket> owned)
+    core::async::DetachedTask ServeConnection(std::shared_ptr<FrameServer::State> shared,
+                                              std::unique_ptr<core::net::ISocket> owned)
     {
         auto* const state = shared.get();
         // **Shared rather than unique, for LIFETIME and for nothing else.** The
         // connection is still the only writer and still decides everything; the second
         // reference exists because a peer watch can be parked in `WaitReadable` when
         // this frame unwinds, and the only cancellation on the interface is `Close()`,
-        // whose completion resumes that coroutine -- inline on epoll and kqueue,
-        // marshalled to a later turn on IOCP. Under a `unique_ptr` the IOCP path
-        // resumes the watcher onto a destroyed socket, which is verbatim the second
-        // use-after-free `RedisResp`'s readable watcher records and fixes the same way.
+        // whose completion resumes that coroutine in the loop's next drain -- on every
+        // backend since core-cpp 0.2.1 (G2). Under a `unique_ptr` the watcher would
+        // resume onto a destroyed socket, which is verbatim the second use-after-free
+        // `RedisResp`'s readable watcher records and fixes the same way.
         // Costs one control block per connection.
         //
         // And wrapped so a proof can seal it, on a surface that offers one (#178) -- see
@@ -2114,7 +2130,7 @@ namespace
         // says how long ITS answer may take, because a cache exchange is a round trip
         // and a dispatched compile is however long a compiler runs (#223, #290).
         auto const deadlineFor = [state](std::chrono::milliseconds window) {
-            return state->io.Reactor().Clock().Now() + window;
+            return state->io.Reactor().clock().now() + window;
         };
         state->Track(
             socket.get(), deadlineFor(FrameServer::HeaderTimeout), SweepPhase::AwaitingRequest, FrameServer::HeaderTimeout);
@@ -2126,7 +2142,7 @@ namespace
             // The peer's HOST. A connection's source port is ephemeral and is not the
             // peer's endpoint, so for a surface whose policy needs an identity -- the
             // scheduler's -- this is all the kernel can supply.
-            auto const peer = socket->PeerAddress();
+            auto const peer = socket->peerAddress();
 
             // Who this connection IS, as an admission policy sees it: the address above, plus
             // whatever it goes on to PROVE. Per CONNECTION, exactly as `credentialAccepted`
@@ -2283,7 +2299,7 @@ namespace
                 // scheduler verbs sharing it (#448).
                 //
                 // Placed as the last statement before the await, and the gap is empty
-                // by construction rather than by timing: `Task` is lazy with symmetric
+                // by construction rather than by timing: `core::async::Task` is lazy with symmetric
                 // transfer, so the body below runs on THIS thread without returning to
                 // the loop, and the node's framed surfaces share one reactor thread --
                 // so no suspension point and no other thread can observe the lowered
@@ -2472,8 +2488,8 @@ namespace
         // Deregistered before the socket is destroyed, or the sweeper would hold a
         // pointer into a freed object.
         state->Untrack(socket.get());
-        NoteSealFault(*state, sealing, socket->PeerAddress());
-        socket->Close();
+        NoteSealFault(*state, sealing, socket->peerAddress());
+        socket->close();
         co_return;
     }
 
@@ -2491,7 +2507,8 @@ namespace
     /// refusal was never the thing they saw: they saw a connection reset, which names
     /// neither the surface nor the reason. A client that reads WITHOUT writing did
     /// receive it, which is how the two cases below tell the halves apart.
-    DetachedTask RefuseAtCapacity(std::shared_ptr<FrameServer::State> shared, std::unique_ptr<ISocket> owned)
+    core::async::DetachedTask RefuseAtCapacity(std::shared_ptr<FrameServer::State> shared,
+                                               std::unique_ptr<core::net::ISocket> owned)
     {
         auto* const state = shared.get();
         auto socket = std::move(owned);
@@ -2502,7 +2519,7 @@ namespace
         // at capacity park a socket per attempt for five seconds each -- taking no
         // slot, and so counted by nothing. This is the one place where being polite
         // has to stay cheap.
-        auto const deadline = state->io.Reactor().Clock().Now() + FrameServer::RefusalTimeout;
+        auto const deadline = state->io.Reactor().clock().now() + FrameServer::RefusalTimeout;
         // `AwaitingRequest`, and it is the honest phase rather than the convenient
         // one: this peer was refused at accept, so it has named no verb and never
         // will. A sweep here means the refusal write did not drain, which belongs
@@ -2535,7 +2552,7 @@ namespace
             state->logger.Logf(LogLevel::Error, "{}: dropping a refusal that threw", state->what);
         }
         state->Untrack(socket.get());
-        socket->Close();
+        socket->close();
         co_return;
     }
 
@@ -2544,12 +2561,12 @@ namespace
     /// One per server, on a bounded tick. It counts as an adopted loop for the
     /// reactor's stop rule, because it is a frame parked on the timer wheel and the
     /// reactor must not return while it is.
-    DetachedTask SweepOverdue(std::shared_ptr<FrameServer::State> shared)
+    core::async::DetachedTask SweepOverdue(std::shared_ptr<FrameServer::State> shared)
     {
         auto* const state = shared.get();
         while (!state->shuttingDown.load(std::memory_order_acquire))
         {
-            co_await SleepFor(state->io.Reactor(), FrameServer::SweepInterval);
+            co_await state->io.Reactor().delay(FrameServer::SweepInterval);
             if (state->shuttingDown.load(std::memory_order_acquire))
                 break;
             // Logged with the split, not the total. The two numbers answer different
@@ -2557,7 +2574,7 @@ namespace
             // and could not answer in time -- and a line carrying only their sum
             // cannot be read for either. The counters carry the same split for anyone
             // scraping rather than reading logs.
-            auto const now = state->io.Reactor().Clock().Now();
+            auto const now = state->io.Reactor().clock().now();
             if (auto const swept = state->CloseOverdue(now); swept.Total() != 0)
                 state->logger.Logf(LogLevel::Debug,
                                    "{}: swept {} connection(s): {} before a verb was named, {} with an answer owed, "
@@ -2599,7 +2616,7 @@ namespace
 } // namespace
 
 FrameServer::FrameServer(NodeIoLoop& io,
-                         IListener& listener,
+                         core::net::IListener& listener,
                          IFrameResponder& responder,
                          std::string_view what,
                          IMetricsSink& metrics,
@@ -2626,7 +2643,7 @@ std::size_t FrameServer::InFlightBytes() const noexcept
     return _state->inFlightBytes.load(std::memory_order_acquire);
 }
 
-Task<void> FrameServer::Run()
+core::async::Task<void> FrameServer::Run()
 {
     // The shared state is copied out FIRST, before anything can suspend, so nothing
     // after this line touches `this`. That is what lets the owning `FrameServer` be
@@ -2647,7 +2664,7 @@ Task<void> FrameServer::Run()
 
     while (!state->shuttingDown.load(std::memory_order_acquire))
     {
-        auto accepted = co_await state->listener.Accept();
+        auto accepted = co_await state->listener.accept();
         if (!accepted.has_value())
         {
             // `Close()` resolves a parked accept with Cancelled, which is how this
@@ -2658,11 +2675,11 @@ Task<void> FrameServer::Run()
             // This listener arms no poll timeout, so `Timeout` cannot arrive here at
             // all and the second operand would be dead. That is a REACHABILITY
             // reason: it is a fact about this listener, so an edit that gives it a
-            // poll timeout must switch this to `IsDeadlineExpiry` in the same change.
+            // poll timeout must switch this to `core::net::isDeadlineExpiry` in the same change.
             //
             // Not a semantic one. `WouldBlock` at an accept whose listener DOES arm a
             // timeout is exactly a deadline expiring -- that is what the admin surface
-            // and the Raft peer server call `IsDeadlineExpiry` for -- so "on an accept
+            // and the Raft peer server call `core::net::isDeadlineExpiry` for -- so "on an accept
             // WouldBlock is not an expiry" is false in general and must not be carried
             // back to those callers, which would stop accepting entirely.
             //
@@ -2670,9 +2687,9 @@ Task<void> FrameServer::Run()
             // where three reviewers in a row did not find it and filed the narrow test
             // as a defect (#824).
             auto const code = accepted.error().code;
-            if (code == NetErrorCode::WouldBlock)
+            if (code == core::net::NetErrorCode::WouldBlock)
                 continue;
-            state->logger.Logf(LogLevel::Debug, "{}: accept loop ended ({})", state->what, accepted.error().ToString());
+            state->logger.Logf(LogLevel::Debug, "{}: accept loop ended ({})", state->what, accepted.error().toString());
             break;
         }
 
@@ -2703,16 +2720,15 @@ void FrameServer::Shutdown() noexcept
     // a reactor that never turns.
     if (_state->loopsAlive.load(std::memory_order_acquire) == 0)
     {
-        _state->listener.Close();
+        _state->listener.close();
         return;
     }
 
-    // Posted onto the reactor, never done here. See the declaration: on epoll and
-    // kqueue `Close` resumes a parked coroutine INLINE, so closing from the stopping
-    // thread would run this server's connection tasks on it while the reactor thread
-    // is still driving them.
-    [](std::shared_ptr<State> state) -> DetachedTask {
-        co_await ResumeOn { state->io.Reactor() };
+    // Posted onto the reactor, never done here. See the declaration: `close()` retires
+    // a socket's registration with the loop, which only the reactor's thread may do, and
+    // the connection tasks it wakes resume in that loop's drain (core-cpp 0.2.1, G2).
+    [](std::shared_ptr<State> state) -> core::async::DetachedTask {
+        co_await core::async::ResumeOn { state->io.Reactor() };
         state->CloseAll();
         co_return;
     }(_state);
@@ -2739,7 +2755,7 @@ void FrameServer::Shutdown() noexcept
 }
 
 FrameEndpoint::FrameEndpoint(NodeIoLoop& io,
-                             std::unique_ptr<IListener> listener,
+                             std::unique_ptr<core::net::IListener> listener,
                              IFrameResponder& responder,
                              std::string_view what,
                              std::string boundEndpoint,
@@ -2790,7 +2806,7 @@ std::size_t FrameEndpoint::InFlightBytes() const noexcept
 
 std::unique_ptr<FrameEndpoint> FrameEndpoint::StartWithListener(NodeIoLoop& io,
                                                                 NodeSurface surface,
-                                                                std::unique_ptr<IListener> listener,
+                                                                std::unique_ptr<core::net::IListener> listener,
                                                                 std::string boundEndpoint,
                                                                 IFrameResponder& responder,
                                                                 IMetricsSink& metrics,
@@ -2833,12 +2849,12 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
     auto const& endpoint = *resolved;
     auto const& row = RowFor(surface);
 
-    auto listener = PlatformListener::Bind(io.Reactor(), endpoint.host, endpoint.port);
-    if (!listener || !listener->IsBound())
-        return std::unexpected { std::format("cannot bind {}:{} ({})",
-                                             endpoint.host,
-                                             endpoint.port,
-                                             listener ? listener->BindError() : std::string_view { "null listener" }) };
+    auto listened =
+        core::net::listen(io.Reactor(), core::net::ListenOptions { .host = endpoint.host, .port = endpoint.port });
+    if (!listened.has_value())
+        return std::unexpected { std::format(
+            "cannot bind {}:{} ({})", endpoint.host, endpoint.port, listened.error().toString()) };
+    auto listener = std::move(*listened);
 
     // No accept-poll timeout to apply any more, and its absence is the change rather
     // than an omission: it existed only because POSIX does not unblock a parked
@@ -2850,7 +2866,7 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::Start(
     // The port the listener ACTUALLY bound, not the one asked for. `0` means "pick a
     // free one", and an endpoint that echoed `:0` back could not tell an operator --
     // or a test -- where it ended up.
-    auto bound = std::format("{}:{}", endpoint.host, listener->BoundPort());
+    auto bound = std::format("{}:{}", endpoint.host, listener->boundPort());
     logger.Logf(LogLevel::Info, "{} listening on {}", row.name, bound);
 
     return StartWithListener(
@@ -2874,19 +2890,18 @@ std::expected<std::unique_ptr<FrameEndpoint>, std::string> FrameEndpoint::StartA
     // bind, no listen and no `SO_REUSEADDR` for that reason.
     //
     // Ownership of `descriptor` passes into this call and is not ours again on any
-    // path -- a POSIX listener closes it in its destructor, including when the adoption
-    // itself failed, and the IOCP one refuses a number that names no socket there -- so
-    // there is deliberately no `::close` anywhere below.
-    auto listener = PlatformListener::Adopt(io.Reactor(), descriptor);
-    if (!listener || !listener->IsBound())
-        return std::unexpected { std::format("cannot serve the socket-activated descriptor ({})",
-                                             listener ? listener->BindError() : std::string_view { "null listener" }) };
+    // path -- the listener closes it, and `AdoptInheritedListener` closes one it could
+    // not adopt -- so there is deliberately no `::close` anywhere below.
+    auto adopted = AdoptInheritedListener(io.Reactor(), descriptor);
+    if (!adopted.has_value())
+        return std::unexpected { std::format("cannot serve the socket-activated descriptor ({})", adopted.error()) };
+    auto listener = std::move(*adopted);
 
     // Asked of the SOCKET. The port is the unit's choice and this process is never
     // told it, so `BoundPort()` is the only thing that knows -- and it is what makes
     // an activated node's log line and its `BoundEndpoint()` say something true
     // rather than echo a `--listen-node` that configured nothing.
-    auto bound = FormatHostPort(advertisedHost, listener->BoundPort());
+    auto bound = FormatHostPort(advertisedHost, listener->boundPort());
     logger.Logf(LogLevel::Info, "{} serving a socket-activated listener, advertised as {}", row.name, bound);
 
     return StartWithListener(

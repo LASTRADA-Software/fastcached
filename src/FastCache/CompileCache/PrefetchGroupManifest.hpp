@@ -2,7 +2,6 @@
 #pragma once
 
 #include <FastCache/Cache/IStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 
 #include <cstddef>
@@ -11,6 +10,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -47,14 +48,17 @@ class PrefetchGroupManifest
     /// @return true if the key was added (or already present), false if the
     ///         prefetch group is at MaxKeysPerGroup and the key was dropped, or
     ///         StorageError on an I/O failure.
-    [[nodiscard]] std::expected<bool, StorageError> AddKey(std::string_view groupId, std::string_view key, TimePoint now);
+    [[nodiscard]] std::expected<bool, StorageError> AddKey(std::string_view groupId,
+                                                           std::string_view key,
+                                                           core::platform::SteadyTimePoint now);
 
     /// List the keys recorded for `groupId`, in insertion order.
     /// @param groupId Prefetch group identifier.
     /// @param now     Current clock value.
     /// @return The recorded keys (empty if the prefetch group is unknown), or
     ///         StorageError on an I/O failure.
-    [[nodiscard]] std::expected<std::vector<std::string>, StorageError> Keys(std::string_view groupId, TimePoint now);
+    [[nodiscard]] std::expected<std::vector<std::string>, StorageError> Keys(std::string_view groupId,
+                                                                             core::platform::SteadyTimePoint now);
 
     /// Reverse lookup: the prefetch group a key was recorded under, if any. Populated
     /// by AddKey so a FETCH can discover which prefetch group to prefetch. A key may
@@ -63,7 +67,8 @@ class PrefetchGroupManifest
     /// @param now Current clock value.
     /// @return The prefetch group id, or std::nullopt if the key is not in any prefetch group,
     ///         or StorageError on an I/O failure.
-    [[nodiscard]] std::expected<std::optional<std::string>, StorageError> GroupOf(std::string_view key, TimePoint now);
+    [[nodiscard]] std::expected<std::optional<std::string>, StorageError> GroupOf(std::string_view key,
+                                                                                  core::platform::SteadyTimePoint now);
 
   private:
     /// The storage key the manifest for `groupId` is stored under. Prefixed

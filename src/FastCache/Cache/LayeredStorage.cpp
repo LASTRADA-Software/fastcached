@@ -29,7 +29,8 @@ void LayeredStorage::DropFromL1(std::string_view key)
     _l1->EraseIfPresent(key);
 }
 
-std::expected<GetResult, StorageError> LayeredStorage::LoadFromL2AndMirror(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> LayeredStorage::LoadFromL2AndMirror(std::string_view key,
+                                                                           core::platform::SteadyTimePoint now)
 {
     auto l2Got = _l2->Get(key, now);
     if (!l2Got.has_value())
@@ -42,7 +43,7 @@ std::expected<GetResult, StorageError> LayeredStorage::LoadFromL2AndMirror(std::
 
 std::expected<CasToken, StorageError> LayeredStorage::MirrorL2WriteResult(std::string_view key,
                                                                           CasToken l2Cas,
-                                                                          TimePoint now)
+                                                                          core::platform::SteadyTimePoint now)
 {
     // After an L2 write succeeded with the given CAS, fetch the
     // freshly-stored entry from L2 so the L1 mirror gets every field
@@ -60,7 +61,7 @@ std::expected<CasToken, StorageError> LayeredStorage::MirrorL2WriteResult(std::s
     return l2Cas;
 }
 
-std::expected<GetResult, StorageError> LayeredStorage::Get(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> LayeredStorage::Get(std::string_view key, core::platform::SteadyTimePoint now)
 {
     ++_stats.cmdGet;
     auto l1Got = _l1->Get(key, now);
@@ -85,7 +86,7 @@ std::expected<GetResult, StorageError> LayeredStorage::Get(std::string_view key,
 std::expected<CasToken, StorageError> LayeredStorage::Set(std::string_view key,
                                                           std::vector<std::byte> value,
                                                           std::uint32_t flags,
-                                                          TimePoint expiry)
+                                                          core::platform::SteadyTimePoint expiry)
 {
     ++_stats.cmdSet;
     auto const cas = _l2->Set(key, std::move(value), flags, expiry);
@@ -96,71 +97,77 @@ std::expected<CasToken, StorageError> LayeredStorage::Set(std::string_view key,
     // returned by L2.Get(now=min()) — we want the value back, not its
     // alive-at-now decision. CowTreeStorage / InMemoryLruStorage both
     // treat expiry <= now as expired, so use a sentinel past instead.
-    return MirrorL2WriteResult(key, *cas, TimePoint::min());
+    return MirrorL2WriteResult(key, *cas, core::platform::SteadyTimePoint::min());
 }
 
-std::expected<CasToken, StorageError> LayeredStorage::Add(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> LayeredStorage::Add(std::string_view key,
+                                                          std::vector<std::byte> value,
+                                                          std::uint32_t flags,
+                                                          core::platform::SteadyTimePoint expiry,
+                                                          core::platform::SteadyTimePoint now)
 {
     ++_stats.cmdSet;
     auto const cas = _l2->Add(key, std::move(value), flags, expiry, now);
     if (!cas.has_value())
         return std::unexpected(cas.error());
-    return MirrorL2WriteResult(key, *cas, TimePoint::min());
+    return MirrorL2WriteResult(key, *cas, core::platform::SteadyTimePoint::min());
 }
 
-std::expected<CasToken, StorageError> LayeredStorage::Replace(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> LayeredStorage::Replace(std::string_view key,
+                                                              std::vector<std::byte> value,
+                                                              std::uint32_t flags,
+                                                              core::platform::SteadyTimePoint expiry,
+                                                              core::platform::SteadyTimePoint now)
 {
     ++_stats.cmdSet;
     auto const cas = _l2->Replace(key, std::move(value), flags, expiry, now);
     if (!cas.has_value())
         return std::unexpected(cas.error());
-    return MirrorL2WriteResult(key, *cas, TimePoint::min());
+    return MirrorL2WriteResult(key, *cas, core::platform::SteadyTimePoint::min());
 }
 
 std::expected<CasToken, StorageError> LayeredStorage::Append(std::string_view key,
                                                              std::span<std::byte const> suffix,
                                                              CasToken expected,
-                                                             TimePoint now)
+                                                             core::platform::SteadyTimePoint now)
 {
     ++_stats.cmdSet;
     auto const cas = _l2->Append(key, suffix, expected, now);
     if (!cas.has_value())
         return std::unexpected(cas.error());
-    return MirrorL2WriteResult(key, *cas, TimePoint::min());
+    return MirrorL2WriteResult(key, *cas, core::platform::SteadyTimePoint::min());
 }
 
 std::expected<CasToken, StorageError> LayeredStorage::Prepend(std::string_view key,
                                                               std::span<std::byte const> prefix,
                                                               CasToken expected,
-                                                              TimePoint now)
+                                                              core::platform::SteadyTimePoint now)
 {
     ++_stats.cmdSet;
     auto const cas = _l2->Prepend(key, prefix, expected, now);
     if (!cas.has_value())
         return std::unexpected(cas.error());
-    return MirrorL2WriteResult(key, *cas, TimePoint::min());
+    return MirrorL2WriteResult(key, *cas, core::platform::SteadyTimePoint::min());
 }
 
 std::expected<CasToken, StorageError> LayeredStorage::CompareAndSwap(std::string_view key,
                                                                      CasToken expected,
                                                                      std::vector<std::byte> value,
                                                                      std::uint32_t flags,
-                                                                     TimePoint expiry,
-                                                                     TimePoint now)
+                                                                     core::platform::SteadyTimePoint expiry,
+                                                                     core::platform::SteadyTimePoint now)
 {
     ++_stats.cmdSet;
     auto const cas = _l2->CompareAndSwap(key, expected, std::move(value), flags, expiry, now);
     if (!cas.has_value())
         return std::unexpected(cas.error());
-    return MirrorL2WriteResult(key, *cas, TimePoint::min());
+    return MirrorL2WriteResult(key, *cas, core::platform::SteadyTimePoint::min());
 }
 
 std::expected<IStorage::IncrResult, StorageError> LayeredStorage::IncrementOrInitialize(std::string_view key,
                                                                                         std::uint64_t magnitude,
                                                                                         bool decrement,
-                                                                                        TimePoint now)
+                                                                                        core::platform::SteadyTimePoint now)
 {
     ++_stats.cmdSet;
     auto const r = _l2->IncrementOrInitialize(key, magnitude, decrement, now);
@@ -168,13 +175,13 @@ std::expected<IStorage::IncrResult, StorageError> LayeredStorage::IncrementOrIni
         return std::unexpected(r.error());
     // Refresh L1 with the new entry — IncrementOrInitialize mutates
     // L2 and yields a new CAS; mirror that into L1 via a fetch.
-    auto const mirror = MirrorL2WriteResult(key, r->cas, TimePoint::min());
+    auto const mirror = MirrorL2WriteResult(key, r->cas, core::platform::SteadyTimePoint::min());
     if (!mirror.has_value())
         return std::unexpected(mirror.error());
     return *r;
 }
 
-std::expected<void, StorageError> LayeredStorage::Delete(std::string_view key, TimePoint now)
+std::expected<void, StorageError> LayeredStorage::Delete(std::string_view key, core::platform::SteadyTimePoint now)
 {
     auto const r = _l2->Delete(key, now);
     // Drop from L1 even if L2 reported KeyNotFound — the L1 mirror
@@ -184,7 +191,9 @@ std::expected<void, StorageError> LayeredStorage::Delete(std::string_view key, T
     return r;
 }
 
-std::expected<CasToken, StorageError> LayeredStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
+std::expected<CasToken, StorageError> LayeredStorage::Touch(std::string_view key,
+                                                            core::platform::SteadyTimePoint newExpiry,
+                                                            core::platform::SteadyTimePoint now)
 {
     auto const cas = _l2->Touch(key, newExpiry, now);
     if (!cas.has_value())
@@ -195,10 +204,10 @@ std::expected<CasToken, StorageError> LayeredStorage::Touch(std::string_view key
         return std::unexpected(cas.error());
     }
     // Re-fetch from L2 so the L1 mirror picks up the new expiry/CAS.
-    return MirrorL2WriteResult(key, *cas, TimePoint::min());
+    return MirrorL2WriteResult(key, *cas, core::platform::SteadyTimePoint::min());
 }
 
-std::expected<GetResult, StorageError> LayeredStorage::Peek(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> LayeredStorage::Peek(std::string_view key, core::platform::SteadyTimePoint now)
 {
     // Non-mutating across both tiers: L1 first, fall through to L2. No
     // mirror is populated (a Peek must leave observable state untouched).
@@ -210,7 +219,7 @@ std::expected<GetResult, StorageError> LayeredStorage::Peek(std::string_view key
     return _l2->Peek(key, now);
 }
 
-std::expected<bool, StorageError> LayeredStorage::Prefetch(std::string_view key, TimePoint now)
+std::expected<bool, StorageError> LayeredStorage::Prefetch(std::string_view key, core::platform::SteadyTimePoint now)
 {
     // Warm L1 from L2 via the shared mirror path. Deliberately does NOT touch
     // _stats: a prefetch is not a client read (see IStorage::Prefetch). If the
@@ -228,16 +237,18 @@ std::expected<bool, StorageError> LayeredStorage::Prefetch(std::string_view key,
 }
 
 std::expected<CasToken, StorageError> LayeredStorage::MarkStale(std::string_view key,
-                                                                std::optional<TimePoint> newExpiry,
-                                                                TimePoint now)
+                                                                std::optional<core::platform::SteadyTimePoint> newExpiry,
+                                                                core::platform::SteadyTimePoint now)
 {
     auto const cas = _l2->MarkStale(key, newExpiry, now);
     if (!cas.has_value())
         return std::unexpected(cas.error());
-    return MirrorL2WriteResult(key, *cas, TimePoint::min());
+    return MirrorL2WriteResult(key, *cas, core::platform::SteadyTimePoint::min());
 }
 
-std::expected<GetResult, StorageError> LayeredStorage::GetAndTouch(std::string_view key, TimePoint newExpiry, TimePoint now)
+std::expected<GetResult, StorageError> LayeredStorage::GetAndTouch(std::string_view key,
+                                                                   core::platform::SteadyTimePoint newExpiry,
+                                                                   core::platform::SteadyTimePoint now)
 {
     // Refresh the expiry (write-through to L2, mirror into L1) then read the
     // refreshed entry back through the tier. The atomicity boundary is the
@@ -249,7 +260,9 @@ std::expected<GetResult, StorageError> LayeredStorage::GetAndTouch(std::string_v
     return Get(key, now);
 }
 
-std::expected<void, StorageError> LayeredStorage::CompareAndDelete(std::string_view key, CasToken expected, TimePoint now)
+std::expected<void, StorageError> LayeredStorage::CompareAndDelete(std::string_view key,
+                                                                   CasToken expected,
+                                                                   core::platform::SteadyTimePoint now)
 {
     // Peek falls through to L2, so the CAS compare sees the canonical entry
     // even when it was evicted from the L1 mirror.
@@ -263,7 +276,7 @@ std::expected<void, StorageError> LayeredStorage::CompareAndDelete(std::string_v
     return Delete(key, now);
 }
 
-std::expected<bool, StorageError> LayeredStorage::ClearExpiry(std::string_view key, TimePoint now)
+std::expected<bool, StorageError> LayeredStorage::ClearExpiry(std::string_view key, core::platform::SteadyTimePoint now)
 {
     // L2 is canonical for the existence + TTL check; L1 is the mirror.
     // The atomicity boundary is the enclosing ShardedStorage's shard
@@ -274,9 +287,9 @@ std::expected<bool, StorageError> LayeredStorage::ClearExpiry(std::string_view k
         return std::unexpected(peeked.error());
     if (!peeked->found)
         return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
-    if (peeked->entry.expiry == TimePoint::max())
+    if (peeked->entry.expiry == core::platform::SteadyTimePoint::max())
         return false;
-    auto const touched = _l2->Touch(key, TimePoint::max(), now);
+    auto const touched = _l2->Touch(key, core::platform::SteadyTimePoint::max(), now);
     if (!touched.has_value())
         return std::unexpected(touched.error());
     // Refresh L1 with the new expiry/CAS so a subsequent Get sees the
@@ -289,7 +302,7 @@ std::expected<bool, StorageError> LayeredStorage::ClearExpiry(std::string_view k
 std::expected<CasToken, StorageError> LayeredStorage::Update(
     std::string_view key,
     std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
-    TimePoint now)
+    core::platform::SteadyTimePoint now)
 {
     // Read the canonical entry from L2 directly; consulting L1 via
     // Peek() would risk handing the callback a stale-mirror flags
@@ -307,11 +320,12 @@ std::expected<CasToken, StorageError> LayeredStorage::Update(
             // Preserve the prior expiry unless the callback overrides
             // (redis INCR/SADD semantics). Write through L2 and refresh
             // L1 verbatim via MirrorL2WriteResult.
-            auto const expiry = outcome->newExpiry.value_or(current->found ? current->entry.expiry : TimePoint::max());
+            auto const expiry =
+                outcome->newExpiry.value_or(current->found ? current->entry.expiry : core::platform::SteadyTimePoint::max());
             auto const cas = _l2->Set(key, std::move(outcome->value), outcome->flags, expiry);
             if (!cas.has_value())
                 return std::unexpected(cas.error());
-            return MirrorL2WriteResult(key, *cas, TimePoint::min());
+            return MirrorL2WriteResult(key, *cas, core::platform::SteadyTimePoint::min());
         }
         case UpdateAction::Delete:
             if (current->found)
@@ -324,13 +338,13 @@ std::expected<CasToken, StorageError> LayeredStorage::Update(
     return CasToken { 0 };
 }
 
-void LayeredStorage::FlushWithGeneration(TimePoint effectiveAt)
+void LayeredStorage::FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt)
 {
     _l2->FlushWithGeneration(effectiveAt);
     _l1->FlushWithGeneration(effectiveAt);
 }
 
-PurgeOutcome LayeredStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
+PurgeOutcome LayeredStorage::PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget)
 {
     // L2 is canonical for the counts — it holds every key, and it is where an
     // entry actually stops occupying anything. L1's purge is opportunistic: it

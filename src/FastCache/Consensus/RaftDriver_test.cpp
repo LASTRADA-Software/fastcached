@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/ClusterStateMachine.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
@@ -23,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+#include <core/net/testing/TestLoop.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -290,7 +290,7 @@ class FailingStorage final: public IRaftStorage
 /// @param driver The driver to advance.
 /// @param at When the timeout falls due.
 /// @return Whether the grant was accepted.
-[[nodiscard]] bool CarryPreVote(RaftDriver& driver, TimePoint at)
+[[nodiscard]] bool CarryPreVote(RaftDriver& driver, core::platform::SteadyTimePoint at)
 {
     return driver
         .Receive(PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" }, at)
@@ -310,17 +310,20 @@ TEST_CASE("Durable state is written before anything is sent", "[consensus][raft]
     ScriptedRandomSource random { { 0 } };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
-    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
+    REQUIRE(driver.Tick(core::platform::SteadyTimePoint {} + 150ms).has_value());
 
     // The pre-vote round sends while persisting nothing, and that is correct
     // rather than an exception to the rule: it changes no durable state, so
     // there is nothing that must reach the disk before it. The ordering this
     // case exists for is the ELECTION's, so the journal is read from there.
     journal.events.clear();
-    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(CarryPreVote(driver, core::platform::SteadyTimePoint {} + 150ms));
 
     REQUIRE_FALSE(journal.events.empty());
     auto const firstSend = std::ranges::find(journal.events, "send");
@@ -346,18 +349,21 @@ TEST_CASE("Term and vote are written before the log", "[consensus][raft][driver]
     ScriptedRandomSource random { { 0 } };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
     // Becoming leader writes both: the term/vote from standing for election, and
     // the no-op entry.
-    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
-    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(driver.Tick(core::platform::SteadyTimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, core::platform::SteadyTimePoint {} + 150ms));
     journal.events.clear();
     REQUIRE(
         driver
             .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
-                     TimePoint {} + 150ms)
+                     core::platform::SteadyTimePoint {} + 150ms)
             .has_value());
 
     auto const state = std::ranges::find(journal.events, "persist-state");
@@ -378,15 +384,18 @@ TEST_CASE("Committed entries are applied after the messages go out", "[consensus
     ScriptedRandomSource random { { 0 } };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
-    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
-    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(driver.Tick(core::platform::SteadyTimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, core::platform::SteadyTimePoint {} + 150ms));
     REQUIRE(
         driver
             .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
-                     TimePoint {} + 150ms)
+                     core::platform::SteadyTimePoint {} + 150ms)
             .has_value());
 
     journal.events.clear();
@@ -395,7 +404,7 @@ TEST_CASE("Committed entries are applied after the messages go out", "[consensus
                                                  .result = AppendResult::Accepted,
                                                  .matchIndex = LogIndex { .value = 1 },
                                                  .followerId = "n2" },
-                         TimePoint {} + 200ms)
+                         core::platform::SteadyTimePoint {} + 200ms)
                 .has_value());
 
     // A no-op commits here and is never delivered, so nothing is applied -- which
@@ -412,14 +421,17 @@ TEST_CASE("A proposal reaches storage, the wire and the application", "[consensu
     ScriptedRandomSource random { { 0 } };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
-    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
-    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(driver.Tick(core::platform::SteadyTimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, core::platform::SteadyTimePoint {} + 150ms));
     REQUIRE(driver.Node().CurrentRole() == Role::Leader);
 
-    auto const index = driver.Propose(FastCache::BytesFromString("only"), TimePoint {} + 200ms);
+    auto const index = driver.Propose(FastCache::BytesFromString("only"), core::platform::SteadyTimePoint {} + 200ms);
     REQUIRE(index.has_value());
 
     // A single-node cluster is its own quorum, so it commits at once.
@@ -441,12 +453,15 @@ TEST_CASE("A storage failure stops the driver and latches", "[consensus][raft][d
     ScriptedRandomSource random { { 0 } };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
     // The pre-vote round writes nothing, so it cannot fail; the election it
     // leads to is the first thing that touches the store.
-    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
+    REQUIRE(driver.Tick(core::platform::SteadyTimePoint {} + 150ms).has_value());
 
     // The pre-vote round has already gone out, and legitimately: it writes
     // nothing, so nothing had to be durable before it. What this case is about
@@ -455,7 +470,7 @@ TEST_CASE("A storage failure stops the driver and latches", "[consensus][raft][d
 
     auto const first =
         driver.Receive(PreVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
-                       TimePoint {} + 150ms);
+                       core::platform::SteadyTimePoint {} + 150ms);
     REQUIRE_FALSE(first.has_value());
     CHECK(first.error().code == ConsensusErrorCode::StorageFailure);
 
@@ -465,7 +480,7 @@ TEST_CASE("A storage failure stops the driver and latches", "[consensus][raft][d
     REQUIRE(driver.Failure().has_value());
 
     // And it stays failed rather than quietly resuming.
-    CHECK_FALSE(driver.Tick(TimePoint {} + 400ms).has_value());
+    CHECK_FALSE(driver.Tick(core::platform::SteadyTimePoint {} + 400ms).has_value());
     CHECK_FALSE(driver
                     .Receive(AppendEntriesRequest { .term = Term { .value = 9 },
                                                     .leaderId = "n2",
@@ -473,7 +488,7 @@ TEST_CASE("A storage failure stops the driver and latches", "[consensus][raft][d
                                                     .prevLogTerm = Term::None(),
                                                     .entries = {},
                                                     .leaderCommit = LogIndex::BeforeFirst() },
-                             TimePoint {} + 401ms)
+                             core::platform::SteadyTimePoint {} + 401ms)
                     .has_value());
 }
 
@@ -487,26 +502,26 @@ TEST_CASE("Run ticks the node on the reactor's timer", "[consensus][raft][driver
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.now())).value(), storage, transport, machine);
     auto& driver = *owned;
 
     // Started the way SleepUntil_test starts a root task: hand the handle to the
     // reactor rather than awaiting it, since there is no coroutine here to await
     // from.
     auto loop = driver.Run(&reactor);
-    reactor.Submit(loop.Native());
-    (void) reactor.Drain();
+    reactor.submit(loop.handle());
+    (void) reactor.drain();
 
     // Parked on the election deadline, having done nothing yet.
-    CHECK(reactor.PendingTimers() == 1);
+    CHECK(reactor.pendingTimers() == 1);
     CHECK(driver.Node().CurrentRole() == Role::Follower);
 
-    clock.Advance(150ms);
-    (void) reactor.Drain();
+    clock.advance(150ms);
+    (void) reactor.drain();
 
     // A pre-candidate, not a candidate: the loop drove the timeout, and nothing
     // has answered the pre-vote it asked.
@@ -514,8 +529,8 @@ TEST_CASE("Run ticks the node on the reactor's timer", "[consensus][raft][driver
     CHECK_FALSE(transport.Sent().empty());
 
     driver.Stop();
-    clock.Advance(400ms);
-    (void) reactor.Drain();
+    clock.advance(400ms);
+    (void) reactor.drain();
 }
 
 TEST_CASE("A node elected between ticks still heartbeats on time", "[consensus][raft][driver]")
@@ -538,20 +553,20 @@ TEST_CASE("A node elected between ticks still heartbeats on time", "[consensus][
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.now())).value(), storage, transport, machine);
     auto& driver = *owned;
 
     auto loop = driver.Run(&reactor);
-    reactor.Submit(loop.Native());
-    (void) reactor.Drain();
+    reactor.submit(loop.handle());
+    (void) reactor.drain();
 
-    clock.Advance(150ms);
-    (void) reactor.Drain();
-    REQUIRE(CarryPreVote(driver, clock.Now()));
+    clock.advance(150ms);
+    (void) reactor.drain();
+    REQUIRE(CarryPreVote(driver, clock.now()));
     REQUIRE(driver.Node().CurrentRole() == Role::Candidate);
 
     // The vote that carries the election, delivered while the loop is parked --
@@ -559,7 +574,7 @@ TEST_CASE("A node elected between ticks still heartbeats on time", "[consensus][
     REQUIRE(
         driver
             .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
-                     clock.Now())
+                     clock.now())
             .has_value());
     REQUIRE(driver.Node().CurrentRole() == Role::Leader);
 
@@ -567,13 +582,13 @@ TEST_CASE("A node elected between ticks still heartbeats on time", "[consensus][
     // new leader sends immediately. What is asserted is the SECOND one.
     auto const afterElection = transport.Sent().size();
 
-    clock.Advance(50ms);
-    (void) reactor.Drain();
+    clock.advance(50ms);
+    (void) reactor.drain();
     CHECK(transport.Sent().size() > afterElection);
 
     driver.Stop();
-    clock.Advance(400ms);
-    (void) reactor.Drain();
+    clock.advance(400ms);
+    (void) reactor.drain();
 }
 
 TEST_CASE("Stop ends the run loop", "[consensus][raft][driver]")
@@ -584,24 +599,24 @@ TEST_CASE("Stop ends the run loop", "[consensus][raft][driver]")
     RecordingMachine machine { journal };
     ScriptedRandomSource random { { 0 } };
 
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.Now())).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, clock.now())).value(), storage, transport, machine);
     auto& driver = *owned;
 
     auto loop = driver.Run(&reactor);
-    reactor.Submit(loop.Native());
-    (void) reactor.Drain();
+    reactor.submit(loop.handle());
+    (void) reactor.drain();
     driver.Stop();
 
-    clock.Advance(400ms);
-    (void) reactor.Drain();
+    clock.advance(400ms);
+    (void) reactor.drain();
 
     // Nothing is left parked, so the loop actually finished rather than
     // rescheduling itself forever.
-    CHECK(reactor.PendingTimers() == 0);
+    CHECK(reactor.pendingTimers() == 0);
 }
 
 TEST_CASE("An applied log is traded for a snapshot once enough has piled up", "[consensus][raft][driver]")
@@ -618,15 +633,16 @@ TEST_CASE("An applied log is traded for a snapshot once enough has piled up", "[
 
     constexpr auto Threshold = std::uint64_t { 4 };
 
-    auto const owned = MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(),
-                                  storage,
-                                  transport,
-                                  machine,
-                                  CompactionPolicy { .appliedEntriesBeforeCompaction = Threshold });
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine,
+                   CompactionPolicy { .appliedEntriesBeforeCompaction = Threshold });
     auto& driver = *owned;
 
-    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
-    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(driver.Tick(core::platform::SteadyTimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, core::platform::SteadyTimePoint {} + 150ms));
     REQUIRE(driver.Node().CurrentRole() == Role::Leader);
 
     // Driven to one short of the threshold rather than by a hand-counted number of
@@ -641,7 +657,9 @@ TEST_CASE("An applied log is traded for a snapshot once enough has piled up", "[
 
     while (unsnapshotted() + 1 < Threshold)
     {
-        REQUIRE(driver.Propose(FastCache::BytesFromString(std::format("e{}", step)), TimePoint {} + 200ms).has_value());
+        REQUIRE(
+            driver.Propose(FastCache::BytesFromString(std::format("e{}", step)), core::platform::SteadyTimePoint {} + 200ms)
+                .has_value());
         ++step;
     }
 
@@ -649,7 +667,7 @@ TEST_CASE("An applied log is traded for a snapshot once enough has piled up", "[
     CHECK(driver.Node().Log().SnapshotIndex() == LogIndex::BeforeFirst());
 
     // One more crosses it.
-    REQUIRE(driver.Propose(FastCache::BytesFromString("crossing"), TimePoint {} + 210ms).has_value());
+    REQUIRE(driver.Propose(FastCache::BytesFromString("crossing"), core::platform::SteadyTimePoint {} + 210ms).has_value());
 
     // The snapshot is asked of the application and made durable, and the log below
     // it is gone -- which is the point: what a restart replays is now bounded.
@@ -661,7 +679,7 @@ TEST_CASE("An applied log is traded for a snapshot once enough has piled up", "[
     // And the node carries on from there rather than refusing its own next append
     // as a gap -- the failure a trimmed log invites, and the reason the boundary is
     // recovered rather than assumed.
-    auto const after = driver.Propose(FastCache::BytesFromString("after"), TimePoint {} + 220ms);
+    auto const after = driver.Propose(FastCache::BytesFromString("after"), core::platform::SteadyTimePoint {} + 220ms);
     REQUIRE(after.has_value());
     CHECK(driver.Node().Log().LastIndex() == *after);
 }
@@ -678,14 +696,19 @@ TEST_CASE("A driver told nothing about compaction never discards anything", "[co
     ScriptedRandomSource random { { 0 } };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
-    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
-    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(driver.Tick(core::platform::SteadyTimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, core::platform::SteadyTimePoint {} + 150ms));
 
     for (auto const step: std::views::iota(0, 8))
-        REQUIRE(driver.Propose(FastCache::BytesFromString(std::format("e{}", step)), TimePoint {} + 200ms).has_value());
+        REQUIRE(
+            driver.Propose(FastCache::BytesFromString(std::format("e{}", step)), core::platform::SteadyTimePoint {} + 200ms)
+                .has_value());
 
     CHECK(std::ranges::find(journal.events, "snapshot") == journal.events.end());
     CHECK(driver.Node().Log().SnapshotIndex() == LogIndex::BeforeFirst());
@@ -707,23 +730,24 @@ TEST_CASE("A snapshot that cannot be written stops the driver", "[consensus][raf
     // Two, not one: the no-op a new leader appends is applied during the election
     // itself, so a threshold of one would fall due before there is a proposal to
     // attribute the refusal to.
-    auto const owned = MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(),
-                                  storage,
-                                  transport,
-                                  machine,
-                                  CompactionPolicy { .appliedEntriesBeforeCompaction = 2 });
+    auto const owned =
+        MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine,
+                   CompactionPolicy { .appliedEntriesBeforeCompaction = 2 });
     auto& driver = *owned;
 
-    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
-    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(driver.Tick(core::platform::SteadyTimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, core::platform::SteadyTimePoint {} + 150ms));
 
-    auto const proposed = driver.Propose(FastCache::BytesFromString("one"), TimePoint {} + 200ms);
+    auto const proposed = driver.Propose(FastCache::BytesFromString("one"), core::platform::SteadyTimePoint {} + 200ms);
     REQUIRE(!proposed.has_value());
     REQUIRE(driver.Failure().has_value());
 
     // Latched: the next call refuses with the same error rather than pretending
     // this node is still taking part.
-    CHECK(!driver.Tick(TimePoint {} + 400ms).has_value());
+    CHECK(!driver.Tick(core::platform::SteadyTimePoint {} + 400ms).has_value());
 }
 
 TEST_CASE("A role change is reported with the term it happened in", "[consensus][raft][driver]")
@@ -738,18 +762,21 @@ TEST_CASE("A role change is reported with the term it happened in", "[consensus]
     ScriptedRandomSource random { { 0 } };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
     auto reported = std::vector<RaftDriver::RoleChange> {};
     driver.ObserveRole([&reported](RaftDriver::RoleChange const& change) { reported.push_back(change); });
 
-    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
-    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(driver.Tick(core::platform::SteadyTimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, core::platform::SteadyTimePoint {} + 150ms));
     REQUIRE(
         driver
             .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
-                     TimePoint {} + 150ms)
+                     core::platform::SteadyTimePoint {} + 150ms)
             .has_value());
 
     REQUIRE_FALSE(reported.empty());
@@ -768,18 +795,21 @@ TEST_CASE("A deposition is reported with the peer that caused it", "[consensus][
     ScriptedRandomSource random { { 0 } };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
     auto reported = std::vector<RaftDriver::RoleChange> {};
     driver.ObserveRole([&reported](RaftDriver::RoleChange const& change) { reported.push_back(change); });
 
-    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
-    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(driver.Tick(core::platform::SteadyTimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, core::platform::SteadyTimePoint {} + 150ms));
     REQUIRE(
         driver
             .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
-                     TimePoint {} + 150ms)
+                     core::platform::SteadyTimePoint {} + 150ms)
             .has_value());
     reported.clear();
 
@@ -790,7 +820,7 @@ TEST_CASE("A deposition is reported with the peer that caused it", "[consensus][
                                                 .prevLogTerm = Term::None(),
                                                 .entries = {},
                                                 .leaderCommit = LogIndex::BeforeFirst() },
-                         TimePoint {} + 200ms)
+                         core::platform::SteadyTimePoint {} + 200ms)
                 .has_value());
 
     REQUIRE(reported.size() == 1);
@@ -817,7 +847,10 @@ TEST_CASE("A term that moves without the role moving is still reported", "[conse
     ScriptedRandomSource random { { 0 } };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
     auto reported = std::vector<RaftDriver::RoleChange> {};
@@ -832,7 +865,7 @@ TEST_CASE("A term that moves without the role moving is still reported", "[conse
                                                   .candidateId = "n2",
                                                   .lastLogIndex = LogIndex::BeforeFirst(),
                                                   .lastLogTerm = Term::None() },
-                             TimePoint {} + 10ms)
+                             core::platform::SteadyTimePoint {} + 10ms)
                     .has_value());
 
     // Collected with a loop rather than `std::ranges::to`, which this repository
@@ -874,7 +907,10 @@ TEST_CASE("CurrentProgress reports the role and the leader, under the same lock"
     ScriptedRandomSource random { { 0 } };
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
     // A quiet follower knows its members and no leader. Asserted BEFORE anything
@@ -889,8 +925,8 @@ TEST_CASE("CurrentProgress reports the role and the leader, under the same lock"
     // Campaigning: a role that moved without a leader appearing, which is the
     // reading that separates a node standing for election from one quietly
     // following. Both hold the same members and the same commit index.
-    REQUIRE(driver.Tick(TimePoint {} + 150ms).has_value());
-    REQUIRE(CarryPreVote(driver, TimePoint {} + 150ms));
+    REQUIRE(driver.Tick(core::platform::SteadyTimePoint {} + 150ms).has_value());
+    REQUIRE(CarryPreVote(driver, core::platform::SteadyTimePoint {} + 150ms));
 
     auto const campaigning = driver.CurrentProgress();
     CHECK(campaigning.role == Role::Candidate);
@@ -903,7 +939,7 @@ TEST_CASE("CurrentProgress reports the role and the leader, under the same lock"
     REQUIRE(
         driver
             .Receive(RequestVoteResponse { .term = Term { .value = 1 }, .decision = VoteDecision::Granted, .voterId = "n2" },
-                     TimePoint {} + 150ms)
+                     core::platform::SteadyTimePoint {} + 150ms)
             .has_value());
 
     auto const elected = driver.CurrentProgress();
@@ -920,7 +956,7 @@ TEST_CASE("CurrentProgress reports the role and the leader, under the same lock"
                                                 .prevLogTerm = Term::None(),
                                                 .entries = {},
                                                 .leaderCommit = LogIndex::BeforeFirst() },
-                         TimePoint {} + 200ms)
+                         core::platform::SteadyTimePoint {} + 200ms)
                 .has_value());
 
     auto const deposed = driver.CurrentProgress();
@@ -957,11 +993,12 @@ TEST_CASE("Constructing a driver over a recovered snapshot restores it before an
                                                         .state = state } };
 
         RecordingMachine machine { journal };
-        auto const owned =
-            MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {}, std::move(recovered))).value(),
-                       storage,
-                       transport,
-                       machine);
+        auto const owned = MakeDriver(
+            std::move(RaftNode::Create(SoloConfig(), random, core::platform::SteadyTimePoint {}, std::move(recovered)))
+                .value(),
+            storage,
+            transport,
+            machine);
         auto const& driver = *owned;
 
         REQUIRE(journal.events == std::vector<std::string> { "restore" });
@@ -975,7 +1012,10 @@ TEST_CASE("Constructing a driver over a recovered snapshot restores it before an
     {
         RecordingMachine machine { journal };
         auto const owned =
-            MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {})).value(), storage, transport, machine);
+            MakeDriver(std::move(RaftNode::Create(SoloConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                       storage,
+                       transport,
+                       machine);
         auto const& driver = *owned;
 
         CHECK(journal.events.empty());
@@ -1001,7 +1041,9 @@ class NoPeers final: public IRaftTransport
 /// @param command The change.
 /// @param at When.
 /// @return The index it landed at.
-[[nodiscard]] LogIndex ProposeCommand(RaftDriver& driver, Cluster::Command const& command, TimePoint at)
+[[nodiscard]] LogIndex ProposeCommand(RaftDriver& driver,
+                                      Cluster::Command const& command,
+                                      core::platform::SteadyTimePoint at)
 {
     auto const landed = driver.Propose(Cluster::Encode(command), at);
     REQUIRE(landed.has_value());
@@ -1016,8 +1058,11 @@ class NoPeers final: public IRaftTransport
 /// @param random Its randomness.
 /// @param start When it starts.
 /// @return The driver, a follower until `Elect`.
-[[nodiscard]] std::unique_ptr<RaftDriver> SoloOver(
-    FileRaftStorage& store, IRaftStateMachine& machine, NoPeers& transport, IRandomSource& random, TimePoint start)
+[[nodiscard]] std::unique_ptr<RaftDriver> SoloOver(FileRaftStorage& store,
+                                                   IRaftStateMachine& machine,
+                                                   NoPeers& transport,
+                                                   IRandomSource& random,
+                                                   core::platform::SteadyTimePoint start)
 {
     auto recovered = store.Load();
     REQUIRE(recovered.has_value());
@@ -1029,7 +1074,7 @@ class NoPeers final: public IRaftTransport
 /// Carry a solo driver to leadership.
 /// @param driver The driver.
 /// @param at When its election timeout falls due.
-void Elect(RaftDriver& driver, TimePoint at)
+void Elect(RaftDriver& driver, core::platform::SteadyTimePoint at)
 {
     REQUIRE(driver.Tick(at).has_value());
     REQUIRE(CarryPreVote(driver, at));
@@ -1059,10 +1104,10 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
         auto store = FileRaftStorage::Open(scratch.Path());
         REQUIRE(store.has_value());
         Cluster::ClusterStateMachine machine { logger, {} };
-        auto const driver = SoloOver(*store, machine, transport, random, TimePoint {});
-        Elect(*driver, TimePoint {} + 150ms);
+        auto const driver = SoloOver(*store, machine, transport, random, core::platform::SteadyTimePoint {});
+        Elect(*driver, core::platform::SteadyTimePoint {} + 150ms);
 
-        auto const at = TimePoint {} + 200ms;
+        auto const at = core::platform::SteadyTimePoint {} + 200ms;
         (void) ProposeCommand(*driver,
                               Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                                                  .key = "n2",
@@ -1129,7 +1174,7 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
     auto store = FileRaftStorage::Open(scratch.Path());
     REQUIRE(store.has_value());
     Cluster::ClusterStateMachine machine { logger, {} };
-    auto const driver = SoloOver(*store, machine, transport, random, TimePoint {} + 1s);
+    auto const driver = SoloOver(*store, machine, transport, random, core::platform::SteadyTimePoint {} + 1s);
     REQUIRE(driver->Node().SnapshotIndex() >= forgottenAt);
 
     // Before a single step: everything the snapshot covered is back.
@@ -1151,7 +1196,7 @@ TEST_CASE("A node restarted after compacting comes back holding every cluster fa
     // Leading again, it commits what it holds, and the entry above the snapshot lands ON
     // TOP of the restored state rather than in place of it: the whole state is what it
     // was before the restart.
-    Elect(*driver, TimePoint {} + 1s + 150ms);
+    Elect(*driver, core::platform::SteadyTimePoint {} + 1s + 150ms);
     CHECK(driver->Node().LastApplied() >= aboveAt);
     CHECK(machine.State() == before);
 }
@@ -1193,10 +1238,11 @@ TEST_CASE("A driver over recovered state its application cannot read is refused,
         };
     };
     auto const create = [&] {
-        return RaftDriver::Create(std::move(RaftNode::Create(SoloConfig(), random, TimePoint {}, recovered())).value(),
-                                  storage,
-                                  transport,
-                                  machine);
+        return RaftDriver::Create(
+            std::move(RaftNode::Create(SoloConfig(), random, core::platform::SteadyTimePoint {}, recovered())).value(),
+            storage,
+            transport,
+            machine);
     };
 
     SECTION("control: every command is asked about, and only then is the snapshot restored")
@@ -1253,7 +1299,10 @@ TEST_CASE("A follower's driver refuses a leader's snapshot its application canno
     machine.SetSnapshotsUnreadable(true);
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
     auto reported = std::vector<std::optional<RaftDriver::InstallRefusal>> {};
@@ -1267,7 +1316,7 @@ TEST_CASE("A follower's driver refuses a leader's snapshot its application canno
                                                 .configuration = TrioConfig().Bootstrap(),
                                                 .state = FastCache::BytesFromString("the state as of index 5") };
 
-    REQUIRE(driver.Receive(offer, TimePoint {} + 10ms).has_value());
+    REQUIRE(driver.Receive(offer, core::platform::SteadyTimePoint {} + 10ms).has_value());
 
     // Asked first, and nothing taken on: no snapshot persisted, none restored.
     REQUIRE(std::ranges::find(journal.events, std::string { "can-restore" }) != journal.events.end());
@@ -1288,8 +1337,8 @@ TEST_CASE("A follower's driver refuses a leader's snapshot its application canno
     CHECK(refusal.index == LogIndex { .value = 5 });
     CHECK(refusal.leader == "n2");
     CHECK(refusal.reason.code == ConsensusErrorCode::UnsupportedFormatVersion);
-    REQUIRE(driver.Receive(offer, TimePoint {} + 60ms).has_value());
-    REQUIRE(driver.Receive(offer, TimePoint {} + 110ms).has_value());
+    REQUIRE(driver.Receive(offer, core::platform::SteadyTimePoint {} + 60ms).has_value());
+    REQUIRE(driver.Receive(offer, core::platform::SteadyTimePoint {} + 110ms).has_value());
     CHECK(reported.size() == 1);
 
     // The entry after the snapshot is not applied on the stale base: the node does not hold
@@ -1303,7 +1352,7 @@ TEST_CASE("A follower's driver refuses a leader's snapshot its application canno
                                                                         .kind = EntryKind::Command,
                                                                         .payload = FastCache::BytesFromString("six") } },
                                                 .leaderCommit = LogIndex { .value = 6 } },
-                         TimePoint {} + 120ms)
+                         core::platform::SteadyTimePoint {} + 120ms)
                 .has_value());
     CHECK(machine.Applied().empty());
     CHECK(driver.Node().LastApplied() == LogIndex::BeforeFirst());
@@ -1311,7 +1360,7 @@ TEST_CASE("A follower's driver refuses a leader's snapshot its application canno
     SECTION("and once it can read the snapshot, it takes it on and the refusal ends")
     {
         machine.SetSnapshotsUnreadable(false);
-        REQUIRE(driver.Receive(offer, TimePoint {} + 160ms).has_value());
+        REQUIRE(driver.Receive(offer, core::platform::SteadyTimePoint {} + 160ms).has_value());
         CHECK(driver.Node().LastApplied() == LogIndex { .value = 5 });
         CHECK_FALSE(driver.CurrentProgress().installRefusal.has_value());
         REQUIRE(reported.size() == 2);
@@ -1334,7 +1383,10 @@ TEST_CASE("A machine that accepts a snapshot and then refuses to restore it stop
     machine.RefuseRestore();
 
     auto const owned =
-        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, TimePoint {})).value(), storage, transport, machine);
+        MakeDriver(std::move(RaftNode::Create(TrioConfig(), random, core::platform::SteadyTimePoint {})).value(),
+                   storage,
+                   transport,
+                   machine);
     auto& driver = *owned;
 
     auto const received = driver.Receive(InstallSnapshotRequest { .term = Term { .value = 1 },
@@ -1343,9 +1395,9 @@ TEST_CASE("A machine that accepts a snapshot and then refuses to restore it stop
                                                                   .lastIncludedTerm = Term { .value = 1 },
                                                                   .configuration = TrioConfig().Bootstrap(),
                                                                   .state = FastCache::BytesFromString("state") },
-                                         TimePoint {} + 10ms);
+                                         core::platform::SteadyTimePoint {} + 10ms);
     REQUIRE_FALSE(received.has_value());
     CHECK(received.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
     CHECK(driver.Failure().has_value());
-    CHECK_FALSE(driver.Tick(TimePoint {} + 500ms).has_value());
+    CHECK_FALSE(driver.Tick(core::platform::SteadyTimePoint {} + 500ms).has_value());
 }

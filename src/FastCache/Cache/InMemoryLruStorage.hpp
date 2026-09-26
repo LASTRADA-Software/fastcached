@@ -3,7 +3,6 @@
 
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/IStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/StringHash.hpp>
@@ -20,6 +19,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -81,7 +82,8 @@ class InMemoryLruStorage final: public IStorage
         _compression = options;
     }
 
-    [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key,
+                                                             core::platform::SteadyTimePoint now) override;
 
     /// In `Approximate` mode a shared-locked `Get` performs no structural
     /// mutation, so concurrent reads on one shard are race-free.
@@ -91,55 +93,61 @@ class InMemoryLruStorage final: public IStorage
         return _lruMode == LruMode::Approximate;
     }
 
-    void PromoteOnRead(std::string_view key, TimePoint now) override;
+    void PromoteOnRead(std::string_view key, core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Set(std::string_view key,
                                                             std::vector<std::byte> value,
                                                             std::uint32_t flags,
-                                                            TimePoint expiry) override;
+                                                            core::platform::SteadyTimePoint expiry) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Add(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Add(std::string_view key,
+                                                            std::vector<std::byte> value,
+                                                            std::uint32_t flags,
+                                                            core::platform::SteadyTimePoint expiry,
+                                                            core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Replace(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Replace(std::string_view key,
+                                                                std::vector<std::byte> value,
+                                                                std::uint32_t flags,
+                                                                core::platform::SteadyTimePoint expiry,
+                                                                core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Append(std::string_view key,
                                                                std::span<std::byte const> suffix,
                                                                CasToken expected,
-                                                               TimePoint now) override;
+                                                               core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Prepend(std::string_view key,
                                                                 std::span<std::byte const> prefix,
                                                                 CasToken expected,
-                                                                TimePoint now) override;
+                                                                core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> CompareAndSwap(std::string_view key,
                                                                        CasToken expected,
                                                                        std::vector<std::byte> value,
                                                                        std::uint32_t flags,
-                                                                       TimePoint expiry,
-                                                                       TimePoint now) override;
+                                                                       core::platform::SteadyTimePoint expiry,
+                                                                       core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(std::string_view key,
-                                                                                          std::uint64_t magnitude,
-                                                                                          bool decrement,
-                                                                                          TimePoint now) override;
+    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(
+        std::string_view key, std::uint64_t magnitude, bool decrement, core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key,
+                                                           core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Touch(std::string_view key,
-                                                              TimePoint newExpiry,
-                                                              TimePoint now) override;
+                                                              core::platform::SteadyTimePoint newExpiry,
+                                                              core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key,
+                                                              core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> MarkStale(std::string_view key,
-                                                                  std::optional<TimePoint> newExpiry,
-                                                                  TimePoint now) override;
+                                                                  std::optional<core::platform::SteadyTimePoint> newExpiry,
+                                                                  core::platform::SteadyTimePoint now) override;
 
-    void FlushWithGeneration(TimePoint effectiveAt) override;
-    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
+    void FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt) override;
+    PurgeOutcome PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget) override;
 
     /// Report this tier's reclaims — a lapsed TTL noticed during a lookup or a
     /// sweep, and the LRU tail dropped to stay under budget — to `log`.
@@ -217,7 +225,7 @@ class InMemoryLruStorage final: public IStorage
 
     /// Return iterator to the (non-expired, current-generation) entry, or
     /// end() on miss. Mutates the LRU on hits (moves to front).
-    Iterator FindAlive(std::string_view key, TimePoint now);
+    Iterator FindAlive(std::string_view key, core::platform::SteadyTimePoint now);
 
     /// Read-only lookup for the shared (Approximate) read path: locates a live
     /// entry **without** mutating `_lru`/`_index` (no splice, no lazy erase) and
@@ -227,14 +235,14 @@ class InMemoryLruStorage final: public IStorage
     /// @param key Lookup key.
     /// @param now Current clock value.
     /// @return Pointer to the live entry, or nullptr.
-    [[nodiscard]] CacheEntry const* FindAliveReadOnly(std::string_view key, TimePoint now) const;
+    [[nodiscard]] CacheEntry const* FindAliveReadOnly(std::string_view key, core::platform::SteadyTimePoint now) const;
 
     /// Read-only lookup that also reports the node's codec state, so a caller can
     /// decompress. Returns nullptr on miss.
     /// @param key The key to find.
     /// @param now Current time, for expiry.
     /// @return The node, or nullptr.
-    [[nodiscard]] Node const* FindNodeReadOnly(std::string_view key, TimePoint now) const;
+    [[nodiscard]] Node const* FindNodeReadOnly(std::string_view key, core::platform::SteadyTimePoint now) const;
 
     /// Compress `value` when the configured codec applies, else return it verbatim.
     /// @param value      Plaintext bytes.
@@ -260,13 +268,19 @@ class InMemoryLruStorage final: public IStorage
     /// Insert a new entry; evicts as needed to stay under the byte budget.
     /// The value bytes are copied into a fresh immutable buffer.
     /// @return CAS token of the inserted entry.
-    CasToken InsertNew(std::string key, std::span<std::byte const> value, std::uint32_t flags, TimePoint expiry);
+    CasToken InsertNew(std::string key,
+                       std::span<std::byte const> value,
+                       std::uint32_t flags,
+                       core::platform::SteadyTimePoint expiry);
 
     /// Mutate the existing entry in-place; updates byte accounting and
     /// promotes the entry to the front of the LRU. Bumps CAS. The value bytes
     /// are copied into a fresh immutable buffer (copy-on-write).
     /// @return New CAS token.
-    CasToken MutateExisting(Iterator it, std::span<std::byte const> value, std::uint32_t flags, TimePoint expiry);
+    CasToken MutateExisting(Iterator it,
+                            std::span<std::byte const> value,
+                            std::uint32_t flags,
+                            core::platform::SteadyTimePoint expiry);
 
     /// Evict from the LRU tail until bytesUsed <= maxBytes.
     void EvictToFit();
@@ -297,7 +311,7 @@ class InMemoryLruStorage final: public IStorage
     CompressionOptions _compression {};
     std::size_t _bytesUsed { 0 };
     std::uint64_t _liveGeneration { 1 };
-    TimePoint _flushEffectiveAt { TimePoint::min() };
+    core::platform::SteadyTimePoint _flushEffectiveAt { core::platform::SteadyTimePoint::min() };
     CasToken _nextCas { 1 };
 
     /// What the index above costs in RAM, accumulated as it changes. See

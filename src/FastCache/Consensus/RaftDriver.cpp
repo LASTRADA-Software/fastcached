@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Consensus/RaftDriver.hpp>
 
 #include <algorithm>
@@ -11,6 +10,8 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+
+#include <core/net/SleepUntil.hpp>
 
 namespace FastCache::Consensus
 {
@@ -277,7 +278,7 @@ std::expected<void, ConsensusError> RaftDriver::CompactIfDue()
     return {};
 }
 
-std::expected<void, ConsensusError> RaftDriver::Tick(TimePoint now)
+std::expected<void, ConsensusError> RaftDriver::Tick(core::platform::SteadyTimePoint now)
 {
     auto const guard = std::scoped_lock { _mutex };
     if (_failure.has_value())
@@ -286,7 +287,7 @@ std::expected<void, ConsensusError> RaftDriver::Tick(TimePoint now)
     return Deliver(_node.Tick(now));
 }
 
-std::expected<void, ConsensusError> RaftDriver::Receive(RaftMessage const& message, TimePoint now)
+std::expected<void, ConsensusError> RaftDriver::Receive(RaftMessage const& message, core::platform::SteadyTimePoint now)
 {
     auto const guard = std::scoped_lock { _mutex };
     if (_failure.has_value())
@@ -316,7 +317,8 @@ std::expected<void, ConsensusError> RaftDriver::Receive(RaftMessage const& messa
     return delivered;
 }
 
-std::expected<LogIndex, ConsensusError> RaftDriver::Propose(std::vector<std::byte> payload, TimePoint now)
+std::expected<LogIndex, ConsensusError> RaftDriver::Propose(std::vector<std::byte> payload,
+                                                            core::platform::SteadyTimePoint now)
 {
     auto const guard = std::scoped_lock { _mutex };
     if (_failure.has_value())
@@ -325,7 +327,8 @@ std::expected<LogIndex, ConsensusError> RaftDriver::Propose(std::vector<std::byt
     return Land(_node.Propose(std::move(payload), now));
 }
 
-std::expected<LogIndex, ConsensusError> RaftDriver::ProposeMembership(Configuration configuration, TimePoint now)
+std::expected<LogIndex, ConsensusError> RaftDriver::ProposeMembership(Configuration configuration,
+                                                                      core::platform::SteadyTimePoint now)
 {
     auto const guard = std::scoped_lock { _mutex };
     if (_failure.has_value())
@@ -365,7 +368,7 @@ std::expected<LogIndex, ConsensusError> RaftDriver::Land(std::expected<RaftNode:
     return index;
 }
 
-TimePoint RaftDriver::SleepDeadline(TimePoint now) const
+core::platform::SteadyTimePoint RaftDriver::SleepDeadline(core::platform::SteadyTimePoint now) const
 {
     // The node owns its own deadline, so the loop never has to know whether it is
     // waiting on an election or a heartbeat -- and a spurious early wake-up costs
@@ -392,18 +395,18 @@ TimePoint RaftDriver::SleepDeadline(TimePoint now) const
     return std::min(_node.NextDeadline(), now + _node.HeartbeatInterval());
 }
 
-Task<void> RaftDriver::Run(IReactor* reactor)
+core::async::Task<void> RaftDriver::Run(core::net::EventLoop* reactor)
 {
     while (reactor != nullptr && !_stopped.load(std::memory_order_relaxed) && !Failure().has_value())
     {
-        reactor->Clock().Refresh();
-        auto const now = reactor->Clock().Now();
+        reactor->clock().refresh();
+        auto const now = reactor->clock().now();
         (void) Tick(now);
 
         // The loop condition is the stop check: `Stop` during the sleep is seen
         // when it returns, and the bound above is what makes that at most one
         // heartbeat interval rather than most of an election timeout.
-        co_await SleepUntil { .reactor = reactor, .deadline = SleepDeadline(now) };
+        co_await core::net::sleepUntil(reactor, SleepDeadline(now));
     }
 }
 

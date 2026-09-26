@@ -2,9 +2,6 @@
 #include "CompileCorrelation.hpp"
 #include "Dispatch.hpp"
 
-#include <FastCache/Core/Clock.hpp>
-#include <FastCache/Net/KeepAlive.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
@@ -19,6 +16,9 @@
 #include <string_view>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/net/KeepAlive.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -43,7 +43,7 @@ namespace
 }
 
 /// One scripted peer: replays canned replies and records what it was sent.
-class ScriptedPeer final: public ISocket
+class ScriptedPeer final: public core::net::ISocket
 {
   public:
     explicit ScriptedPeer(std::vector<std::byte> replies, std::vector<std::byte>* sentSink):
@@ -52,35 +52,35 @@ class ScriptedPeer final: public ISocket
     {
     }
 
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> bytes) override
+    [[nodiscard]] core::net::IoAwaitable write(std::span<std::byte const> bytes) override
     {
         if (_sent != nullptr)
             _sent->insert(_sent->end(), bytes.begin(), bytes.end());
-        return IoAwaitable { IoResult { bytes.size() } };
+        return core::net::IoAwaitable { core::net::IoResult { bytes.size() } };
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override
     {
         // A read of zero is EOF, which is how a peer that ran out of script tells
         // RecvExactly the frame was short.
         auto const take = std::min(_replies.size() - _cursor, buffer.size());
         std::copy_n(_replies.begin() + static_cast<std::ptrdiff_t>(_cursor), take, buffer.begin());
         _cursor += take;
-        return IoAwaitable { IoResult { take } };
+        return core::net::IoAwaitable { core::net::IoResult { take } };
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> /*segments*/,
-                                            std::shared_ptr<void const> /*keepAlive*/ = {}) override
+    [[nodiscard]] core::net::IoAwaitable writeVectored(std::span<std::span<std::byte const> const> /*segments*/,
+                                                       std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
-        return IoAwaitable { IoResult { 0 } };
+        return core::net::IoAwaitable { core::net::IoResult { 0 } };
     }
 
-    void Close() noexcept override {}
-    [[nodiscard]] bool IsClosed() const noexcept override
+    void close() noexcept override {}
+    [[nodiscard]] bool isClosed() const noexcept override
     {
         return false;
     }
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return "scripted";
     }
@@ -94,8 +94,8 @@ class ScriptedPeer final: public ISocket
 /// An exchange that answers from a scripted peer per endpoint, and records which
 /// endpoints were reached, in what order, and under which budget.
 ///
-/// The peer is driven with `SyncRun` because a `ScriptedPeer`'s awaitables resolve
-/// inline and so never leave the task suspended -- the precondition `SyncRun`
+/// The peer is driven with `core::async::syncRun` because a `ScriptedPeer`'s awaitables resolve
+/// inline and so never leave the task suspended -- the precondition `core::async::syncRun`
 /// states. That keeps the framing under test: these cases assert what went ON the
 /// wire, which an exchange double returning a hand-built `CacheOutcome` could not.
 class ScriptedFleet final: public IEndpointExchange
@@ -153,7 +153,7 @@ class ScriptedFleet final: public IEndpointExchange
 
     /// Drive `CostsTime` against this clock, which the case also hands `Dispatch`.
     /// @param clock The case's clock; must outlive this fleet.
-    void UseClock(ManualClock& clock) noexcept
+    void UseClock(core::platform::ManualClock& clock) noexcept
     {
         _clock = &clock;
     }
@@ -183,9 +183,9 @@ class ScriptedFleet final: public IEndpointExchange
         // duration actually falls relative to the mint it contains.
         if (_clock != nullptr)
             if (auto const cost = _costs.find(key); cost != _costs.end())
-                _clock->Advance(cost->second);
+                _clock->advance(cost->second);
         ScriptedPeer peer { it->second, &_sent[key] };
-        return SyncRun(ExchangeFramed(&peer, &Unwatched(), std::move(frame), credential));
+        return core::async::syncRun(ExchangeFramed(&peer, &Unwatched(), std::move(frame), credential));
     }
 
     /// Endpoints dialled, in order. The ORDER is the assertion in several cases:
@@ -216,7 +216,7 @@ class ScriptedFleet final: public IEndpointExchange
     std::map<std::string, std::size_t> _limits;
     std::map<std::string, std::chrono::milliseconds> _durations;
     std::map<std::string, std::chrono::milliseconds> _costs;
-    ManualClock* _clock { nullptr };
+    core::platform::ManualClock* _clock { nullptr };
 };
 
 constexpr std::string_view Scheduler = "sched:6675";
@@ -485,7 +485,7 @@ TEST_CASE("The compile leg is dialled with keepalive and the control legs are no
     // The case above reads `DispatchBudgets const defaults;` -- the TYPE's defaults --
     // and that is exactly why this defect survived. Production never used them: the
     // launcher built the compile budget by copying the control budget and replacing
-    // its total, which overwrote `KeepAlive::Yes` with `No`, and the derivation lived
+    // its total, which overwrote `core::net::KeepAlive::Yes` with `No`, and the derivation lived
     // in `main.cpp`, which is in no test target. So the default member initializer was
     // the only statement of the intent and nothing read it, while the docs described
     // the unarmed behaviour and agreed with the code by accident.
@@ -505,8 +505,8 @@ TEST_CASE("The compile leg is dialled with keepalive and the control legs are no
     auto const budgets = DispatchBudgetsFor(DispatchBudgetKnobs {
         .connect = Connect, .controlTotal = ControlTotal, .compileTotal = CompileTotal, .compileIdle = CompileIdle });
 
-    CHECK(budgets.compile.keepAlive == KeepAlive::Yes);
-    CHECK(budgets.control.keepAlive == KeepAlive::No);
+    CHECK(budgets.compile.keepAlive == core::net::KeepAlive::Yes);
+    CHECK(budgets.control.keepAlive == core::net::KeepAlive::No);
     // The totals reach the legs they were named for. Asserted here as well, because a
     // derivation that arms keepalive correctly and swaps the deadlines is the same
     // function getting the same job wrong.
@@ -539,9 +539,9 @@ TEST_CASE("The compile leg is dialled with keepalive and the control legs are no
 
     // Lease, compile, release.
     REQUIRE(fleet.Budgets().size() == 3);
-    CHECK(fleet.Budgets()[0].keepAlive == KeepAlive::No);
-    CHECK(fleet.Budgets()[1].keepAlive == KeepAlive::Yes);
-    CHECK(fleet.Budgets()[2].keepAlive == KeepAlive::No);
+    CHECK(fleet.Budgets()[0].keepAlive == core::net::KeepAlive::No);
+    CHECK(fleet.Budgets()[1].keepAlive == core::net::KeepAlive::Yes);
+    CHECK(fleet.Budgets()[2].keepAlive == core::net::KeepAlive::No);
 
     // And so does the idle bound, for the reason keepalive is checked here as well as
     // on the struct: a derivation that fills the field correctly and hands the control
@@ -1410,7 +1410,7 @@ TEST_CASE("The client waits for as long as the GRANT says, not for as long as it
         // exchange happened to take, which rounds to zero on a quiet machine and to
         // one millisecond on a loaded one -- an exact assertion that is a flake and a
         // tolerant one that cannot see #1122's whole round trip.
-        ManualClock clock;
+        core::platform::ManualClock clock;
         ScriptedFleet fleet;
         fleet.UseClock(clock);
         fleet.Serve(std::string { Scheduler }, GrantReply({}, granted));
@@ -1451,7 +1451,7 @@ TEST_CASE("The client waits for as long as the GRANT says, not for as long as it
                       "a round trip of zero makes this case agree with the defect it exists to catch");
         static_assert(granted > roundTrip, "the exhausted-grant floor is the section below, not this one");
 
-        ManualClock clock;
+        core::platform::ManualClock clock;
         ScriptedFleet fleet;
         fleet.UseClock(clock);
         fleet.CostsTime(std::string { Scheduler }, roundTrip);
@@ -1480,7 +1480,7 @@ TEST_CASE("The client waits for as long as the GRANT says, not for as long as it
         constexpr auto roundTrip = std::chrono::milliseconds { 30'000 };
         static_assert(roundTrip > granted, "this section is only about the case where nothing is left");
 
-        ManualClock clock;
+        core::platform::ManualClock clock;
         ScriptedFleet fleet;
         fleet.UseClock(clock);
         fleet.CostsTime(std::string { Scheduler }, roundTrip);

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Core/Clock.hpp>
-
 #include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -90,7 +90,7 @@ class ILocalityOracle
     ILocalityOracle& operator=(ILocalityOracle&&) = delete;
     virtual ~ILocalityOracle() = default;
 
-    /// @param host The peer's **host**, as `ISocket::PeerAddress()` reports it --
+    /// @param host The peer's **host**, as `core::net::ISocket::PeerAddress()` reports it --
     ///        never an endpoint, and never with a port. A peer dials from an
     ///        ephemeral source port, which is the same reason
     ///        `Distributed::ClusterMembership` keys on hosts.
@@ -174,13 +174,13 @@ class CachedLocalityOracle final: public ILocalityOracle
     ///        past the loopback branch re-probes, which is for tests only -- in
     ///        production it is the amplifier the class note refuses.
     explicit CachedLocalityOracle(IHostAddressSource const& source,
-                                  IClock& clock,
+                                  core::platform::IClock& clock,
                                   std::chrono::milliseconds refreshInterval = DefaultRefreshInterval):
         _source { source },
         _clock { clock },
         _refreshInterval { refreshInterval },
         _addresses { source.Addresses() },
-        _sampledAt { clock.Now() }
+        _sampledAt { clock.now() }
     {
     }
 
@@ -189,7 +189,7 @@ class CachedLocalityOracle final: public ILocalityOracle
 
   private:
     IHostAddressSource const& _source;
-    IClock& _clock;
+    core::platform::IClock& _clock;
     std::chrono::milliseconds _refreshInterval;
 
     /// Guards the two members below. Mutable because `IsThisMachine` is logically
@@ -197,7 +197,7 @@ class CachedLocalityOracle final: public ILocalityOracle
     /// vector it is itself replacing.
     mutable std::mutex _mutex;
     mutable std::vector<std::string> _addresses;
-    mutable TimePoint _sampledAt;
+    mutable core::platform::SteadyTimePoint _sampledAt;
 };
 
 } // namespace FastCache

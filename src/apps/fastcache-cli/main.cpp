@@ -19,10 +19,7 @@
 #include "StatsGatherer.hpp"
 #include "TerminalCellWidth.hpp"
 
-#include <FastCache/Async/PlatformReactor.hpp>
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/StopSignal.hpp>
 #include <FastCache/Platform/Terminal.hpp>
@@ -38,6 +35,10 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include <core/async/ThreadPoolExecutor.hpp>
+#include <core/net/PlatformLoop.hpp>
+#include <core/platform/Clock.hpp>
 
 #if defined(_WIN32)
     #include <fcntl.h>
@@ -248,7 +249,8 @@ class StandardTerminalAcquisition final: public ITerminalAcquisition
     {
     }
 
-    [[nodiscard]] Task<std::expected<StartedTerminal, std::string>> Acquire(IExecutor* pool, IExecutor* resumeOn) override
+    [[nodiscard]] core::async::Task<std::expected<StartedTerminal, std::string>> Acquire(
+        core::async::IExecutor* pool, core::async::IExecutor* resumeOn) override
     {
         auto unstarted = MakeTerminalEvents(pool, resumeOn, _colour);
         if (!unstarted.has_value())
@@ -299,7 +301,7 @@ class ProcessAbandonedExit final: public IAbandonedExit
 class StopReactorOnExit
 {
   public:
-    explicit StopReactorOnExit(IReactor& reactor) noexcept:
+    explicit StopReactorOnExit(core::net::EventLoop& reactor) noexcept:
         _reactor { reactor }
     {
     }
@@ -311,11 +313,11 @@ class StopReactorOnExit
 
     ~StopReactorOnExit()
     {
-        _reactor.Stop();
+        _reactor.stop();
     }
 
   private:
-    IReactor& _reactor;
+    core::net::EventLoop& _reactor;
 };
 
 /// Run a verb that watches rather than answers once, and report how it ended.
@@ -346,14 +348,14 @@ class StopReactorOnExit
     auto const render =
         RenderOptions { .format = command.format, .color = UsageColor::Plain, .absentOverride = command.absentOverride };
 
-    SteadyClock clock;
-    PlatformReactor reactor { clock };
+    core::platform::SteadyClock clock;
+    core::net::PlatformLoop reactor { clock };
     // Declared BEFORE the pool that reads it, so it is destroyed after that pool has joined: a read
     // still inside it when the pool drains would otherwise run on a destroyed object.
     NodeSubscription subscription { command.timeouts, command.credential };
-    ThreadPoolExecutor streamPool { 1 };
-    ThreadPoolExecutor stopWaiter { 1 };
-    ThreadPoolExecutor terminalPool { 1 };
+    core::async::ThreadPoolExecutor streamPool { 1 };
+    core::async::ThreadPoolExecutor stopWaiter { 1 };
+    core::async::ThreadPoolExecutor terminalPool { 1 };
     StdoutFrames sink;
     StderrRemarks remarks { command.quiet };
     ProcessStopSignals stops;
@@ -364,7 +366,7 @@ class StopReactorOnExit
     StandardRungViews views { render, &TerminalCellWidth, sixel.has_value() ? sixel->get() : nullptr };
     ThreadDrainWait drainWait;
     std::optional<LiveEventSource> source;
-    std::jthread reactorThread { [&reactor] { reactor.Run(); } };
+    std::jthread reactorThread { [&reactor] { reactor.run(); } };
     auto const stopReactor = StopReactorOnExit { reactor };
 
     auto ending = verb.session(context,

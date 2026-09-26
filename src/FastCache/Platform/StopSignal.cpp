@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Platform/StopSignal.hpp>
 
 #include <algorithm>
@@ -9,6 +8,8 @@
 #include <format>
 #include <system_error>
 #include <utility>
+
+#include <core/async/ResumeOn.hpp>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -33,11 +34,12 @@ namespace
     class BlockingStopSignal: public IStopSignal
     {
       public:
-        [[nodiscard]] Task<StopWake> Stopped(IExecutor* waiter, IExecutor* resumeOn) final
+        [[nodiscard]] core::async::Task<StopWake> Stopped(core::async::IExecutor* waiter,
+                                                          core::async::IExecutor* resumeOn) final
         {
-            co_await ResumeOn { *waiter };
+            co_await core::async::ResumeOn { *waiter };
             auto const wake = WaitBlocking();
-            co_await ResumeOn { *resumeOn };
+            co_await core::async::ResumeOn { *resumeOn };
             co_return wake;
         }
 

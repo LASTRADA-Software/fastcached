@@ -2,11 +2,12 @@
 #pragma once
 
 #include <FastCache/Cache/SharedValue.hpp>
-#include <FastCache/Core/Clock.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -33,7 +34,7 @@ struct CacheEntry
     CasToken cas { 0 };
 
     /// Absolute expiry time; TimePoint::max() means "never".
-    TimePoint expiry { TimePoint::max() };
+    core::platform::SteadyTimePoint expiry { core::platform::SteadyTimePoint::max() };
 
     /// Generation counter (for flush_all). Entries with a generation lower
     /// than the storage's current "live" generation are treated as missing.
@@ -43,7 +44,7 @@ struct CacheEntry
     /// ("seconds since last access"). Updated by storage backends on every
     /// hit; defaults to TimePoint::min() for entries that have never been
     /// read since insertion.
-    TimePoint lastAccess { TimePoint::min() };
+    core::platform::SteadyTimePoint lastAccess { core::platform::SteadyTimePoint::min() };
 
     /// Stale marker. Set by the meta protocol's `md I` and `ms I` flags to
     /// indicate the entry is technically expired but still readable for

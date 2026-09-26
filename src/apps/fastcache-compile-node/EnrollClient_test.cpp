@@ -630,7 +630,7 @@ class InstantWait final: public IDrainWait
 {
   public:
     /// @return The accumulated instant.
-    [[nodiscard]] TimePoint Now() const noexcept override
+    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
     {
         return _now;
     }
@@ -642,7 +642,7 @@ class InstantWait final: public IDrainWait
     }
 
   private:
-    TimePoint _now {};
+    core::platform::SteadyTimePoint _now {};
 };
 
 /// A seed answering `NotLeader` and naming where to go instead.

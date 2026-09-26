@@ -11,7 +11,6 @@
 #include <FastCache/Cache/IStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -22,6 +21,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -83,7 +84,7 @@ class CacheTier
                                                                                       std::unique_ptr<IStorage> storage,
                                                                                       ICredentialSource const& credential,
                                                                                       ILocalityOracle const& locality,
-                                                                                      IClock& clock,
+                                                                                      core::platform::IClock& clock,
                                                                                       IMetricsSink& metrics,
                                                                                       ILogger& logger);
 
@@ -143,7 +144,7 @@ class CacheTier
     CacheTier(std::unique_ptr<IStorage> storage,
               std::unique_ptr<ICacheUpstream> upstream,
               ILocalityOracle const& locality,
-              IClock& clock,
+              core::platform::IClock& clock,
               IMetricsSink& metrics);
 
     // Declaration order IS construction order, and every one of these is referenced
@@ -262,7 +263,7 @@ constexpr std::string_view DiskStoreFileName = "objects.cow";
     NodeConfig const& cfg,
     ICredentialSource const& credential,
     ILocalityOracle const& locality,
-    IClock& clock,
+    core::platform::IClock& clock,
     IMetricsSink& metrics,
     ILogger& logger);
 

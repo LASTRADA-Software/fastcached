@@ -6,7 +6,6 @@
 #include <FastCache/Consensus/RaftLog.hpp>
 #include <FastCache/Consensus/RaftOutput.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
 
@@ -21,6 +20,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Consensus
 {
@@ -202,7 +203,7 @@ class RaftNode
     /// @return The node, or why the configuration was refused.
     [[nodiscard]] static std::expected<RaftNode, ConsensusError> Create(RaftConfig config,
                                                                         IRandomSource& random,
-                                                                        TimePoint now,
+                                                                        core::platform::SteadyTimePoint now,
                                                                         RecoveredState recovered = {});
 
     /// @return The role this node is currently playing.
@@ -264,7 +265,8 @@ class RaftNode
     /// @param payload Application bytes, never interpreted here.
     /// @param now The current instant.
     /// @return Where it landed and what to do, or why it was refused.
-    [[nodiscard]] std::expected<Proposal, ConsensusError> Propose(std::vector<std::byte> payload, TimePoint now);
+    [[nodiscard]] std::expected<Proposal, ConsensusError> Propose(std::vector<std::byte> payload,
+                                                                  core::platform::SteadyTimePoint now);
 
     /// Propose a new configuration, one member moved (§4.3).
     ///
@@ -290,7 +292,8 @@ class RaftNode
     /// @param configuration The proposed configuration.
     /// @param now The current instant.
     /// @return Where the entry landed and what to do, or why it was refused.
-    [[nodiscard]] std::expected<Proposal, ConsensusError> ProposeMembership(Configuration configuration, TimePoint now);
+    [[nodiscard]] std::expected<Proposal, ConsensusError> ProposeMembership(Configuration configuration,
+                                                                            core::platform::SteadyTimePoint now);
 
     /// Compact the log, keeping `state` as the snapshot that replaces it.
     ///
@@ -406,7 +409,7 @@ class RaftNode
     /// and -- for a role that would wait on an election -- on the standing, from
     /// `StandingTable`: a learner and a node with no cluster wait on nothing.
     /// @return The next instant at which something is due.
-    [[nodiscard]] TimePoint NextDeadline() const;
+    [[nodiscard]] core::platform::SteadyTimePoint NextDeadline() const;
 
     /// Advance time.
     ///
@@ -415,7 +418,7 @@ class RaftNode
     /// real reactor does — costs nothing.
     /// @param now The current instant.
     /// @return What the driver should do.
-    [[nodiscard]] RaftOutput Tick(TimePoint now);
+    [[nodiscard]] RaftOutput Tick(core::platform::SteadyTimePoint now);
 
     /// Handle one received message.
     /// @param message The message, from any member.
@@ -425,7 +428,7 @@ class RaftNode
     ///        (#1552). Ignored for every other message.
     /// @return What the driver should do.
     [[nodiscard]] RaftOutput Receive(RaftMessage const& message,
-                                     TimePoint now,
+                                     core::platform::SteadyTimePoint now,
                                      SnapshotReadability readability = SnapshotReadability::Readable);
 
   private:
@@ -435,7 +438,7 @@ class RaftNode
     /// @param random Source for election-timeout jitter.
     /// @param now The current instant.
     /// @param recovered What durable storage held.
-    RaftNode(RaftConfig config, IRandomSource& random, TimePoint now, RecoveredState recovered);
+    RaftNode(RaftConfig config, IRandomSource& random, core::platform::SteadyTimePoint now, RecoveredState recovered);
 
     /// Whether `id` is a configured member of this cluster, voter or learner.
     ///
@@ -493,8 +496,8 @@ class RaftNode
     [[nodiscard]] Configuration QuorumContactConfiguration() const;
 
     /// Begin an election for the next term (§5.2).
-    void StartPreVote(TimePoint now, RaftOutput& output);
-    void StartElection(TimePoint now, RaftOutput& output);
+    void StartPreVote(core::platform::SteadyTimePoint now, RaftOutput& output);
+    void StartElection(core::platform::SteadyTimePoint now, RaftOutput& output);
 
     /// Adopt a higher term and return to being a follower (§5.1).
     ///
@@ -512,7 +515,7 @@ class RaftNode
     /// @param from The peer whose message carried it.
     /// @param now Current time.
     /// @param output Where the report and any durable state are collected.
-    void StepDown(Term term, NodeId const& from, TimePoint now, RaftOutput& output);
+    void StepDown(Term term, NodeId const& from, core::platform::SteadyTimePoint now, RaftOutput& output);
 
     /// Give up leadership without changing the term, having lost quorum contact.
     ///
@@ -528,10 +531,10 @@ class RaftNode
     /// @param now When it happened, for the election timer.
     /// @param output Unused; taken so the shape matches the other transitions and a
     ///               later one that does need to persist cannot forget it.
-    void RelinquishLeadership(TimePoint now, RaftOutput& output);
+    void RelinquishLeadership(core::platform::SteadyTimePoint now, RaftOutput& output);
 
     /// Win the election and start heartbeating.
-    void BecomeLeader(TimePoint now, RaftOutput& output);
+    void BecomeLeader(core::platform::SteadyTimePoint now, RaftOutput& output);
 
     /// Record that a leader was heard from, by arming the election timer.
     ///
@@ -550,7 +553,7 @@ class RaftNode
     /// current leader, and *granting a vote* — and only one of them is contact
     /// from a leader. Which one a call site means is worth saying in its name.
     /// @param now Current time.
-    void NoteLeaderContact(TimePoint now);
+    void NoteLeaderContact(core::platform::SteadyTimePoint now);
 
     /// Record that a follower answered this leader.
     ///
@@ -561,7 +564,7 @@ class RaftNode
     /// it is in the middle of repairing.
     /// @param follower Which peer answered.
     /// @param now Current time.
-    void NoteFollowerContact(NodeId const& follower, TimePoint now);
+    void NoteFollowerContact(NodeId const& follower, core::platform::SteadyTimePoint now);
 
     /// Whether a majority of the cluster has answered this leader recently.
     ///
@@ -571,7 +574,7 @@ class RaftNode
     /// lease, which would need a clock-drift bound nothing else here assumes.
     /// @param now Current time.
     /// @return True while enough members are still answering.
-    [[nodiscard]] bool HasQuorumContact(TimePoint now) const;
+    [[nodiscard]] bool HasQuorumContact(core::platform::SteadyTimePoint now) const;
 
     /// Whether some leader is live, as far as this node can tell.
     ///
@@ -588,7 +591,7 @@ class RaftNode
     /// campaigning refused every peer timing out alongside it.
     /// @param now Current time.
     /// @return True while a leader is demonstrably live.
-    [[nodiscard]] bool HasLiveLeader(TimePoint now) const;
+    [[nodiscard]] bool HasLiveLeader(core::platform::SteadyTimePoint now) const;
 
     /// Arm the election timer with a freshly drawn randomized timeout.
     ///
@@ -596,7 +599,7 @@ class RaftNode
     /// per-node timeout makes the node with the shortest one win every election
     /// forever — and if that node is partitioned but alive, its repeated
     /// candidacies disrupt the cluster on a fixed schedule.
-    void ArmElectionTimer(TimePoint now);
+    void ArmElectionTimer(core::platform::SteadyTimePoint now);
 
     /// Queue a vote or pre-vote request to every VOTER other than this node.
     ///
@@ -652,7 +655,7 @@ class RaftNode
     /// @param message The message being received.
     /// @return True for a pre-vote request, and for a granted pre-vote response.
     [[nodiscard]] static bool IsPreVoteExempt(RaftMessage const& message) noexcept;
-    void OnPreVote(PreVoteRequest const& request, TimePoint now, RaftOutput& output);
+    void OnPreVote(PreVoteRequest const& request, core::platform::SteadyTimePoint now, RaftOutput& output);
 
     /// Which rule, if any, denies `request`.
     ///
@@ -662,24 +665,29 @@ class RaftNode
     /// @param request The pre-vote.
     /// @param now Current time.
     /// @return The refusal, or nullopt when the pre-vote would be granted.
-    [[nodiscard]] std::optional<VoteRefusal> PreVoteRefusal(PreVoteRequest const& request, TimePoint now) const;
+    [[nodiscard]] std::optional<VoteRefusal> PreVoteRefusal(PreVoteRequest const& request,
+                                                            core::platform::SteadyTimePoint now) const;
 
-    void OnPreVoteResponse(PreVoteResponse const& response, TimePoint now, RaftOutput& output);
-    void OnRequestVote(RequestVoteRequest const& request, TimePoint now, RaftOutput& output);
+    void OnPreVoteResponse(PreVoteResponse const& response, core::platform::SteadyTimePoint now, RaftOutput& output);
+    void OnRequestVote(RequestVoteRequest const& request, core::platform::SteadyTimePoint now, RaftOutput& output);
 
     /// Which rule, if any, denies `request`; `PreVoteRefusal`'s counterpart.
     /// @param request The vote request.
     /// @return The refusal, or nullopt when the vote would be granted.
     [[nodiscard]] std::optional<VoteRefusal> VoteRefusalFor(RequestVoteRequest const& request) const;
 
-    void OnRequestVoteResponse(RequestVoteResponse const& response, TimePoint now, RaftOutput& output);
-    void OnAppendEntries(AppendEntriesRequest const& request, TimePoint now, RaftOutput& output);
-    void OnAppendEntriesResponse(AppendEntriesResponse const& response, TimePoint now, RaftOutput& output);
+    void OnRequestVoteResponse(RequestVoteResponse const& response, core::platform::SteadyTimePoint now, RaftOutput& output);
+    void OnAppendEntries(AppendEntriesRequest const& request, core::platform::SteadyTimePoint now, RaftOutput& output);
+    void OnAppendEntriesResponse(AppendEntriesResponse const& response,
+                                 core::platform::SteadyTimePoint now,
+                                 RaftOutput& output);
     void OnInstallSnapshot(InstallSnapshotRequest const& request,
-                           TimePoint now,
+                           core::platform::SteadyTimePoint now,
                            SnapshotReadability readability,
                            RaftOutput& output);
-    void OnInstallSnapshotResponse(InstallSnapshotResponse const& response, TimePoint now, RaftOutput& output);
+    void OnInstallSnapshotResponse(InstallSnapshotResponse const& response,
+                                   core::platform::SteadyTimePoint now,
+                                   RaftOutput& output);
     [[nodiscard]] bool NeedsSnapshot(NodeId const& peer) const;
     [[nodiscard]] InstallSnapshotRequest MakeInstallSnapshotFor() const;
 
@@ -717,8 +725,8 @@ class RaftNode
     /// leader last speak" would be worse than not having one: the next person to
     /// need that question answered would reach for it without noticing it no
     /// longer decides anything.
-    TimePoint _electionDeadline {};
-    TimePoint _heartbeatDeadline {};
+    core::platform::SteadyTimePoint _electionDeadline {};
+    core::platform::SteadyTimePoint _heartbeatDeadline {};
 
     LogIndex _commitIndex {}; ///< Highest index known committed.
     LogIndex _lastApplied {}; ///< Highest index already emitted as applied.
@@ -749,7 +757,7 @@ class RaftNode
     /// looks like, so it must not be seeded with anything but real contact --
     /// which is why `BecomeLeader` clears it and fills it from the votes that
     /// were actually cast rather than from the peer list.
-    std::unordered_map<NodeId, TimePoint> _followerContact;
+    std::unordered_map<NodeId, core::platform::SteadyTimePoint> _followerContact;
 
     /// Voters that granted this node their vote in the current term, itself
     /// included while it is a voter. A set rather than a counter because a

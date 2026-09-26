@@ -12,10 +12,10 @@
 #include <string_view>
 #include <utility>
 
-#include <platform/Wakeup.hpp>
-#include <tui/Terminal.hpp>
-#include <tui/TerminalProtocols.hpp>
-#include <tui/runtime/TerminalEventSource.hpp>
+#include <core/net/IoBackend.hpp>
+#include <core/tui/Terminal.hpp>
+#include <core/tui/TerminalProtocols.hpp>
+#include <core/tui/runtime/TerminalInputSource.hpp>
 
 namespace FastCache::Cli
 {
@@ -24,46 +24,47 @@ namespace
 {
     /// The input's resets `RestoreNow` writes after the screen's, before putting the modes back.
     ///
-    /// The input protocols endo's `Terminal` pushes -- the union of what its POSIX and Windows arms
-    /// enable, since switching off a mode that was never on is harmless -- spelled through endo's own
+    /// The input protocols core-cpp's `Terminal` pushes -- the union of what its POSIX and Windows arms
+    /// enable, since switching off a mode that was never on is harmless -- spelled through core-cpp's own
     /// constants rather than restated. What the SCREEN switched on (synchronized output, the cursor,
     /// the alternate screen) is not here: the restore handle composes those, because it knows whether
     /// the screen is still entered, and passes them first.
     constexpr auto InputResetSequences = std::to_array<std::string_view>({
-        tui::protocols::DisableFocusTracking,
-        tui::protocols::DisableColorSchemeNotify,
-        tui::protocols::DisableBracketedPaste,
-        tui::protocols::DisableAnyMotionTracking,
-        tui::protocols::DisablePassiveMouseTracking,
-        tui::protocols::DisableWin32InputMode,
-        tui::protocols::DisableCsiU,
+        core::tui::protocols::DisableFocusTracking,
+        core::tui::protocols::DisableColorSchemeNotify,
+        core::tui::protocols::DisableBracketedPaste,
+        core::tui::protocols::DisableAnyMotionTracking,
+        core::tui::protocols::DisablePassiveMouseTracking,
+        core::tui::protocols::DisableWin32InputMode,
+        core::tui::protocols::DisableCsiU,
     });
 
     /// The DEC private mode synchronized output is asked about as.
     constexpr auto SynchronizedOutputMode = 2026;
 
-    /// endo's `Terminal`, the wakeup `Close()` signals, and the event source waiting on both.
+    /// core-cpp's `Terminal`, its handles and decoder as an input source, and the wait over them.
     ///
-    /// Member ORDER is the lifetime: the source borrows the terminal and the wakeup, so it is
-    /// declared after them and destroyed before them.
+    /// Member ORDER is the lifetime: the input source borrows the terminal and the wait borrows the
+    /// input source, so each is declared after what it borrows and destroyed before it. The wait is
+    /// made in `Acquire()`, because it attaches the terminal's handles once and an uninitialized
+    /// terminal has none -- on Windows the console handles are opened by `initialize()`.
     ///
-    /// Constructing it touches no terminal. `tui::Terminal`'s constructor allocates and nothing more;
+    /// Constructing it touches no terminal. `core::tui::Terminal`'s constructor allocates and nothing more;
     /// raw mode, protocols and queries all happen in `initialize()`, which only `Acquire()` calls.
-    class EndoTerminalDevice final: public ITerminalDevice
+    class TuiTerminalDevice final: public ITerminalDevice
     {
       public:
-        explicit EndoTerminalDevice(UsageColor colour):
-            _source { _terminal, &_wakeup },
+        explicit TuiTerminalDevice(UsageColor colour):
             _colour { colour }
         {
         }
 
-        EndoTerminalDevice(EndoTerminalDevice const&) = delete;
-        EndoTerminalDevice(EndoTerminalDevice&&) = delete;
-        EndoTerminalDevice& operator=(EndoTerminalDevice const&) = delete;
-        EndoTerminalDevice& operator=(EndoTerminalDevice&&) = delete;
+        TuiTerminalDevice(TuiTerminalDevice const&) = delete;
+        TuiTerminalDevice(TuiTerminalDevice&&) = delete;
+        TuiTerminalDevice& operator=(TuiTerminalDevice const&) = delete;
+        TuiTerminalDevice& operator=(TuiTerminalDevice&&) = delete;
 
-        ~EndoTerminalDevice() override
+        ~TuiTerminalDevice() override
         {
             Restore();
         }
@@ -78,6 +79,10 @@ namespace
                 _resets.append(sequence);
             if (auto opened = _terminal.initialize(); !opened)
                 return std::unexpected("the terminal could not be opened: " + opened.error());
+            auto wait = MakeTerminalInputWait(_input, core::net::makeDefaultBackend());
+            if (!wait)
+                return std::unexpected("the terminal's input could not be watched: " + wait.error());
+            _wait = std::move(wait).value();
             return {};
         }
 
@@ -94,7 +99,7 @@ namespace
         [[nodiscard]] std::optional<CellPixelSize> AskCellPixels() override
         {
             // Not a second `CSI 16 t`: `initialize()` already asked it, through the same raw-mode read
-            // and deadline as every endo query, and keeps the answer -- zero on each side when the
+            // and deadline as every core-cpp query, and keeps the answer -- zero on each side when the
             // terminal did not give one. Asking again would charge a silent terminal a second deadline
             // at every start for the same answer.
             return ToCellPixelSize(std::pair { _terminal.cellPixelWidth(), _terminal.cellPixelHeight() });
@@ -125,14 +130,15 @@ namespace
             return _terminal.rows();
         }
 
-        [[nodiscard]] tui::runtime::EventSource& Events() override
+        [[nodiscard]] ITerminalInputWait& Events() override
         {
-            return _source;
+            return *_wait;
         }
 
         void Wake() override
         {
-            _wakeup.signal();
+            if (_wait)
+                _wait->Wake();
         }
 
         void Write(std::string_view bytes) noexcept override
@@ -143,16 +149,20 @@ namespace
 
         void Restore() noexcept override
         {
-            // After a `RestoreNow`, endo's teardown below sends its input resets a second time. Every
+            // After a `RestoreNow`, core-cpp's teardown below sends its input resets a second time. Every
             // one of them lands where the terminal already is except the keyboard protocol's POP, which
             // would pop an entry the dashboard never pushed -- a shell's own. So the entry `RestoreNow`
             // popped is pushed back first, for this pop to take. Once: the exchange makes the device's
-            // own destructor, calling this again after endo has shut down, push nothing.
+            // own destructor, calling this again after core-cpp has shut down, push nothing.
             if (_restoredNow.exchange(false, std::memory_order_acq_rel))
             {
-                _terminal.output().writeRaw(tui::protocols::EnableCsiU);
+                _terminal.output().writeRaw(core::tui::protocols::EnableCsiU);
                 _terminal.output().flush();
             }
+            // The wait first: it has the terminal's handles attached to its backend, and `shutdown`
+            // closes the resize pipe among them. Nothing waits in it by now -- this runs once the
+            // events are closed and their last `Next()` has resumed.
+            _wait.reset();
             // `Terminal::shutdown` undoes a completed `initialize()` (protocols, raw mode, the SIGWINCH
             // handler) and does nothing when it never completed. The input's own `shutdown` then covers
             // an `initialize()` that got as far as raw mode and no further. Both are idempotent.
@@ -163,7 +173,7 @@ namespace
         void RestoreNow(std::string_view leading) noexcept override
         {
             // Not `shutdown()`: that closes the resize pipe the parked `poll` is waiting on and writes
-            // endo's state unlocked. The saved modes are this device's own, written once in `Acquire`
+            // core-cpp's state unlocked. The saved modes are this device's own, written once in `Acquire`
             // on the pool and read only after the start handed the device back.
             //
             // NO LOCK AGAINST A FRAME BEING WRITTEN, deliberately. If the reactor is halfway through
@@ -180,9 +190,9 @@ namespace
         }
 
       private:
-        tui::Terminal _terminal;
-        endo::platform::Wakeup _wakeup;
-        tui::runtime::TerminalEventSource _source;
+        core::tui::Terminal _terminal;
+        core::tui::runtime::TerminalInputSource _input { _terminal };
+        std::unique_ptr<ITerminalInputWait> _wait;
         std::optional<SavedTerminalModes> _saved;
         std::string _resets;
         std::atomic<bool> _restoredNow { false };
@@ -193,8 +203,8 @@ namespace
 struct UnstartedTerminal::Parts
 {
     std::unique_ptr<ITerminalDevice> device;
-    IExecutor* pool { nullptr };
-    IExecutor* resumeOn { nullptr };
+    core::async::IExecutor* pool { nullptr };
+    core::async::IExecutor* resumeOn { nullptr };
 };
 
 /// The one door to an `UnstartedTerminal`'s parts, so the type offers its holders nothing to call.
@@ -213,26 +223,27 @@ UnstartedTerminal::UnstartedTerminal(std::unique_ptr<Parts> parts) noexcept:
 
 UnstartedTerminal::~UnstartedTerminal() = default;
 
-std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(IExecutor* pool,
-                                                                                  IExecutor* resumeOn,
+std::expected<std::unique_ptr<UnstartedTerminal>, std::string> MakeTerminalEvents(core::async::IExecutor* pool,
+                                                                                  core::async::IExecutor* resumeOn,
                                                                                   UsageColor colour)
 {
     try
     {
         auto parts = std::make_unique<UnstartedTerminal::Parts>();
-        parts->device = std::make_unique<EndoTerminalDevice>(colour);
+        parts->device = std::make_unique<TuiTerminalDevice>(colour);
         parts->pool = pool;
         parts->resumeOn = resumeOn;
         return std::make_unique<UnstartedTerminal>(std::move(parts));
     }
     catch (std::exception const& failure)
     {
-        // endo's `Wakeup` throws when the OS will not hand out an eventfd, pipe or event.
+        // Allocation is all that can fail here: the terminal and its readiness backend are made
+        // when the terminal is started.
         return std::unexpected(std::string { "the terminal's wakeup could not be created: " } + failure.what());
     }
 }
 
-Task<std::expected<StartedTerminal, std::string>> StartTerminal(std::unique_ptr<UnstartedTerminal> terminal)
+core::async::Task<std::expected<StartedTerminal, std::string>> StartTerminal(std::unique_ptr<UnstartedTerminal> terminal)
 {
     auto& parts = UnstartedTerminalAccess::Of(*terminal);
     co_return co_await StartTerminalDevice(std::move(parts.device), parts.pool, parts.resumeOn);

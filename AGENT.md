@@ -19,17 +19,10 @@ src/FastCache/
                 StringHash, Owner, SecureBytes, SessionSeal, Utf8, Markup, Compression,
                 WireFrame + WireFields (the shared framing), Profiling, and the crypto
                 seam — Ed25519, X25519, Hkdf, the ONLY way into vendored Monocypher
-  Async/        Task<T>, Cancellation, ResumeOn, SleepUntil, InterruptibleSleepUntil,
-                DeadlineTimer, AsyncQueue, IExecutor with ThreadPoolExecutor for work
-                that BLOCKS, IReactor (an IExecutor plus Run/Stop/Schedule/CancelPending)
-                + TestReactor and the platform reactors (EpollReactor / IocpReactor /
-                KqueueReactor)
-  Net/          ISocket, IListener, IConnector (BlockingConnector; PlatformConnector ->
-                Epoll/Kqueue/IocpConnector, over ConnectFlow and ReactorDial),
-                IAsyncAddressResolver + ThreadedAddressResolver, TcpClient,
-                SocketAddress, BlockingSocket, the reactor sockets, TLS,
-                InMemoryTransport, HealthProbe, LingeringClose, IAdmissionControl,
-                IDatagramSocket + UdpSocket/InMemoryDatagram and SharedPortDatagram
+  Transport/    What this project keeps of its own beside core-cpp's sockets:
+                NativeListen (ClientListenOptions, how every loop's listener binds;
+                BindAndListen, AcceptRaw and BlockingListener for threads that block;
+                AdoptInheritedListener -- graduation candidates) and LingeringClose
   Cli/          UsageDoc (usage text as data) and Options (the one parse loop),
                 dependency-free so fastcache-cc compiles them in rather than linking
   Cache/        IStorage atomic primitives, CacheEntry, CacheEngine, InMemoryLruStorage,
@@ -127,7 +120,7 @@ anybody asking for it, and reading it as "`--threads` above one" describes a
 single-threaded default this daemon does not have.
 
 **No completion port is ever drained from several threads**, on Windows or anywhere
-else. `IocpReactor.hpp` says that migrates a coroutine across threads and is unsafe,
+else. That migrates a coroutine across threads, which no awaitable here allows,
 and `RunMultiReactorWindows` runs one thread per reactor exactly as the POSIX path
 does. The one `ThreadPoolExecutor { 1 }` on each of the three serving paths runs the
 EXPIRY SWEEP; it drains no completion port and overlaps no `fsync` with anything. This
@@ -532,7 +525,7 @@ shim is the same position from the other side.
 
 **[`.agent/rules/wire-and-protocol.md`](.agent/rules/wire-and-protocol.md)** —
 framing, the auth gate, sockets, dialling and coroutine lifetime. Before
-`Protocol/`, `Net/`, `Async/`.
+`Protocol/`, `Transport/`, or code over `core::async` and `core::net`.
 - A frame declares its own length, so a rejection is a **reply** and a resynchronization — never a
   close.
 - A reply carries a status byte and NO kind, so step-over-what-you-do-not-know is REQUEST-side
@@ -563,8 +556,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - **A new verb is not one dispatch, and none of the other places fails the BUILD**: a `switch` arm
   in the daemon (a missing one DROPS the frame), a `RelocatedVerbs` row, a documentation row for
   any counter it adds, and the live-stats layout pin.
-- `Net/` must not depend on `Core/`. `Async/` travels with it, plus three named dependency-free
-  leaf headers; `ctest -R net-boundary` enforces the table.
+- The coroutines, the event loop, the sockets and TLS are core-cpp's `core::async`, `core::net` and
+  `core::net_tls` (#1596), pinned in `CMakeLists.txt`. A defect in them is fixed in core-cpp and
+  re-pinned, never worked around here; `Transport/` holds only what core-cpp does not offer yet.
 - `CompileCacheWire.hpp` must stay header-only and dependency-free — the launcher does not link
   `FastCache` — so it carries cache tiers **positionally**, making `StorageTier`'s enumerator order
   a wire contract.
@@ -583,7 +577,7 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) rather than marking what it does not.
 - A listening socket claims its address exclusively — `SO_EXCLUSIVEADDRUSE` on Windows, where
   `SO_REUSEADDR` lets a second process take a port already being served. Sharing a port is
-  `ReusePort::Yes`, and only that.
+  `core::net::PortSharing::Shared`, and only that.
 - A struct a decoder returns **by value** must not borrow from the bytes it decoded:
   `Decode(Encode(x))` is a use-after-free the moment one member becomes a view. A `*View` type
   borrows and says so, anything else owns, and the choice is per type by a CONJUNCTION.
@@ -592,9 +586,9 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
 - A regression test for the above needs a payload of REAL SIZE **and** the right ARRANGEMENT: read
   inline nothing dangles at any size, so STORE, drop the source, churn the freed storage, then
   read. Pick a size that is REAL rather than large, and `static_assert` it.
-- There is exactly one TCP client, `Net/TcpClient`. Do not write a second.
-- A synchronous dial spends a thread the caller does not own — a reactor thread dials through
-  `PlatformConnector`, never `BlockingConnector`.
+- There is exactly one TCP client, `core::net::TcpClient`. Do not write a second.
+- A synchronous dial spends a thread the caller does not own — a loop thread dials through
+  `core::net::makeConnector`, never `BlockingConnector`.
 - EOF means "this peer has finished SENDING", not "this peer is gone": answer what is determined,
   abandon what is pending. `ISocket::ShutdownWrite` makes the question askable in PRODUCTION, the
   answer does not transfer between wires, and a watcher reads the COUNT. **DELETE an arm and see
@@ -637,15 +631,14 @@ framing, the auth gate, sockets, dialling and coroutine lifetime. Before
   pure virtual: **type system when the obligation is DO SOMETHING, scan when it is SAY WHY.**
 - **A `/simplify` finding is a change like any other and is not exempt from the review its subject
   just had.** And **a regression test can fail to reproduce its regression**.
-- A socket has ONE read operation and `Read` and `WaitReadable` share it, so arming either while
-  the other is parked drops the parked coroutine with no signal. The rule lives on `ISocket`;
-  `Detail::ClaimReadSlot` folds the claim and the `assert` into one expression and
-  `read-slot-guard-canary` must die. Not a refusal — and **the hazard is the SITE, not ownership**,
-  which is a RETRACTION: at the ARM site a socket cannot tell a stale parked wait from a live one.
-- The WRITE slot is the same rule: one write op per direction, `Detail::ClaimWriteSlot`
-  (`Net/WriteSlot.hpp`), reaching `FrameEndpoint`'s one-writer property because `WriteAll` sends a
-  whole frame in ONE `Write`. `write-slot-guard-canary` watches it BOTH ways — **a guard nobody has
-  watched ACCEPT is not known to work either** — and a new helper naming `Loop` stays unenforced.
+- A socket has ONE read operation (`Read` and `WaitReadable` share it) and ONE write operation.
+  The rule lives on core-cpp's `ISocket`; `contract::claimReadSlot` and `claimWriteSlot`
+  (`core/net/SocketContract.hpp`) fold the claim into the operation and, **since core-cpp 0.3.0,
+  END THE PROCESS in every build**, naming the direction and the handle — Release too, where it
+  was a silent hang. core-cpp's `socket-contract-canary` watches it. Not a refusal — and **the
+  hazard is the SITE, not ownership**, a RETRACTION: at the ARM site a socket cannot tell a stale
+  parked wait from a live one. `WriteAll` sends a whole frame in ONE `Write`, which is how the write
+  rule reaches `FrameEndpoint`'s one-writer property; a new helper naming `Loop` stays unenforced.
 - So a parked read is retrieved by `ISocket::CancelRead()` — the only spelling of *abandon* that is
   not `Close()`. ONE watch, re-TARGETED per pass, re-armed only once the previous has RESOLVED,
   retired by RAII AND explicitly before the reply write; what silences it is the RETIREMENT, never
@@ -1066,7 +1059,7 @@ what differs between compilers, standard libraries, hosts and tool versions.
 - **Which files are this project's own is ONE answer: `scripts/lib/third-party-roots.txt`.** A
   script listing the repository's files asks it (`first_party_paths`,
   `fastcached_decline_third_party`) and NAMES what it declined, or carries an exemption row with a
-  reason. `ctest -R third-party-roots`; a root is the upstream COPY (`vendor/endo`).
+  reason. `ctest -R third-party-roots`; a root is the upstream COPY (`vendor/monocypher`).
 - **And HOW a file set is found is one answer too: `fastcached_tracked_files`.** A `check-*.cmake`
   keeps its QUESTION and never its own work-tree probe, `ls-files` call, walk fallback or copy of
   the excluded names; `fastcached_first_party_cxx` is a CALLER, and the probe is
@@ -1291,7 +1284,7 @@ and what they may assume.
   protocol, however correct its assertions: every property defined by parking is vacuous over
   `InMemorySocket`. The survey of which have a real-socket case is in the rules file.
 - `InMemorySocket`'s CLOSED states are one table pinned against a real loopback pair
-  (`Net/SocketClosedStates_test.cpp`): where the platforms disagree it answers the way Windows does,
+  (core-cpp's `net/SocketClosedStates_test.cpp`): where the platforms disagree it answers the way Windows does,
   and on Windows every row is exact. A fake MORE permissive than a real socket is a red there (#1553).
 - So is a BUILDER, and it hides better: `src/tests/ForeignGenerationValue.hpp`. Hand-rolled copies
   fail SILENTLY, since every one asserts a REFUSAL that other damage also produces. Two facts live

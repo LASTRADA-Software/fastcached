@@ -3,8 +3,6 @@
 #include "NodeStatusResponder.hpp"
 #include "Responders.hpp"
 
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -29,6 +27,9 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -137,7 +138,7 @@ constexpr std::uint32_t DiscoveryPort = 9103;
 /// @return The reply bytes.
 [[nodiscard]] std::vector<std::byte> AnswerNow(IFrameResponder& responder, std::span<std::byte const> frame)
 {
-    return SyncRun(responder.Answer(frame, PeerIdentity { .host = std::string { CallerAddress } })).bytes;
+    return core::async::syncRun(responder.Answer(frame, PeerIdentity { .host = std::string { CallerAddress } })).bytes;
 }
 
 /// The bytes following a reply header.
@@ -267,7 +268,7 @@ struct Fixture
     ///        that publishes empty ones.
     /// @param direct Sources this case owns and the fixture only points at.
     Fixture(ConfigShape const& shape,
-            IClock const& clock,
+            core::platform::IClock const& clock,
             NodeComponents components = {},
             std::optional<ToolchainReading> initial = std::nullopt,
             DirectSources direct = {}):
@@ -275,7 +276,7 @@ struct Fixture
         runtime { initial.value_or(UnwiredSentinel) },
         status { cfg,
                  clock,
-                 clock.Now(),
+                 clock.now(),
                  "1.2.3",
                  "node-a",
                  components,
@@ -321,7 +322,7 @@ TEST_CASE("A node reports only the surfaces its configuration resolves", "[node]
     // discriminating assertion is therefore that the ROW is missing, never that some
     // port is zero -- an implementation pushing `{ Admin, 0 }` passes any test that only
     // reads ports.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     Fixture const adminOnly { { .admin = true }, clock };
     auto const fields = adminOnly.status.Describe();
 
@@ -361,7 +362,7 @@ TEST_CASE("The reported admin scheme follows the TLS MATERIAL, not a boolean", "
     // stand in for. The middle arm is the discriminating one: an implementation testing
     // `!tlsCertFile.empty()` alone passes the first and third and reports a TLS admin
     // surface this node cannot bind.
-    ManualClock clock;
+    core::platform::ManualClock clock;
 
     auto reported = [&clock](ConfigShape const& shape) {
         Fixture const fixture { shape, clock };
@@ -390,13 +391,13 @@ TEST_CASE("Uptime is re-read per call, not captured once", "[node][node-status]"
 {
     // A snapshot taken at construction reports a constant, which every single-call test
     // agrees with. Two calls across an advanced clock is what separates them.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     Fixture const fixture { {}, clock };
 
     CHECK(fixture.status.Describe().uptimeSeconds == 0);
-    clock.Advance(90s);
+    clock.advance(90s);
     CHECK(fixture.status.Describe().uptimeSeconds == 90);
-    clock.Advance(30s);
+    clock.advance(30s);
     CHECK(fixture.status.Describe().uptimeSeconds == 120);
 }
 
@@ -405,7 +406,7 @@ TEST_CASE("Component bits report what started, one bit each", "[node][node-statu
     // Asserted per bit rather than against a total, because a total is one number four
     // wrong assignments can produce: swap `Worker` and `Scheduler` and every node running
     // both still reports the same word.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     namespace Bits = Wire::NodeComponentBit;
 
     auto bitsFor = [&clock](NodeComponents const& components) {
@@ -428,7 +429,7 @@ TEST_CASE("A node reports which of the three toolchain states its worker is in",
     // catching survive a single-state check: an implementation that drops the state
     // reports absent, and one that hard-codes a state agrees with whichever case names
     // it. Neither passes all three.
-    ManualClock clock;
+    core::platform::ManualClock clock;
 
     auto reported = [&clock](ToolchainReading reading) {
         Fixture const fixture { {}, clock, { .worker = true }, reading };
@@ -467,7 +468,7 @@ TEST_CASE("The worker component BIT and the toolchain state answer different que
     // The discriminating shape is a CONJUNCTION, and each half alone is passed by the
     // defect: the bit must be identical across the two nodes (so it is shown to carry no
     // information) AND the state must differ (so something else does).
-    ManualClock clock;
+    core::platform::ManualClock clock;
     namespace Bits = Wire::NodeComponentBit;
 
     Fixture const walking { {},
@@ -503,7 +504,7 @@ TEST_CASE("A node that publishes no runtime facts reports them ABSENT, not as ze
     // The fixture parks `UnwiredSentinel` in the state object precisely so this case
     // cannot pass by coincidence: an implementation that reads the source without
     // checking the null reports `Serving`, 99 of 99, which no assertion below tolerates.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     Fixture const fixture { {}, clock, { .worker = true } };
     auto const fields = fixture.status.Describe();
 
@@ -520,7 +521,7 @@ TEST_CASE("The toolchain reading is re-read per call, not captured once", "[node
     // the survey runs on the heartbeat thread's first round, minutes later on a cold
     // machine. A snapshot taken at construction would report `Surveying` forever, and
     // every single-call test above would still agree with it.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     // NOT `const`: this case publishes into the fixture, which is what production's
     // heartbeat thread does and what the whole property is about.
     Fixture fixture { {},
@@ -558,7 +559,7 @@ TEST_CASE("A node reports the compile slots it offers and the ones in use", "[no
     // Read LIVE rather than published, so the discriminating assertion is that the
     // in-flight figure MOVES between two calls on one status object. A snapshot taken at
     // construction reports a constant that every single-call check agrees with.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     NullLogger logger;
     CompileCapacity capacity { 4, 1U << 20U, std::chrono::seconds { 1 }, logger };
     Fixture const fixture { {}, clock, { .worker = true }, std::nullopt, DirectSources { .capacity = &capacity } };
@@ -582,7 +583,7 @@ TEST_CASE("A node with no compile accounting reports no slots, rather than none 
     // An idle worker reports `0` in flight; a node running no worker tier must not, or
     // the two are one answer -- and `0 of 0` reads as a machine busy doing nothing
     // rather than one that was never going to compile anything.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     Fixture const fixture { {}, clock, { .cacheTier = true } };
     auto const fields = fixture.status.Describe();
 
@@ -595,7 +596,7 @@ TEST_CASE("Registration has three states, and the middle one is not silence", "[
     // Nothing publishes / nothing published YET / published and registered NOWHERE. The
     // third is the one an operator acts on -- a `--scheduler` nobody answers -- and it is
     // the one a two-state model reports as the first.
-    ManualClock clock;
+    core::platform::ManualClock clock;
 
     SECTION("nothing publishes runtime facts at all")
     {
@@ -631,13 +632,13 @@ TEST_CASE("A round that accepted nothing does not erase when this node last regi
     // the first time a scheduler is unreachable -- which is the exact moment an operator
     // asks, and the answer that sends them to the wrong half of the fleet. `registered`
     // correctly drops to zero; the INSTANT must survive.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     Fixture fixture { {}, clock, { .worker = true }, ToolchainReading {} };
 
-    fixture.runtime.PublishRegistration(3, 3, clock.Now());
+    fixture.runtime.PublishRegistration(3, 3, clock.now());
     CHECK(fixture.status.Describe().runtime.lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 0 });
 
-    clock.Advance(30s);
+    clock.advance(30s);
     fixture.runtime.PublishRegistration(0, 3, std::nullopt);
 
     auto const fields = fixture.status.Describe();
@@ -646,11 +647,11 @@ TEST_CASE("A round that accepted nothing does not erase when this node last regi
 
     // And it keeps ageing without being republished -- a duration computed per call
     // rather than a number stamped once.
-    clock.Advance(45s);
+    clock.advance(45s);
     CHECK(fixture.status.Describe().runtime.lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 75 });
 
     // A round that DOES accept resets it.
-    fixture.runtime.PublishRegistration(3, 3, clock.Now());
+    fixture.runtime.PublishRegistration(3, 3, clock.now());
     CHECK(fixture.status.Describe().runtime.lastRegistrationSecondsAgo == std::optional<std::uint64_t> { 0 });
 }
 
@@ -661,10 +662,10 @@ TEST_CASE("A node running no scheduler reports NO role, which is not `undecided`
     // it for a node that runs no scheduler at all claims participation in something that
     // is not happening. The absent case must be absent AND the undecided case must be
     // present, or the two have been collapsed.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger logger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
 
     Fixture const none { {}, clock, { .worker = true } };
     CHECK_FALSE(none.status.Describe().runtime.schedulerRole.has_value());
@@ -681,10 +682,10 @@ TEST_CASE("Each scheduler role crosses the wire as its own tag, with the leader 
     // Driven over all three: a mapping that collapses two roles is invisible in any case
     // that names only one, and the pair a fleet most needs separated -- leader and
     // follower -- renders identically in the component mask today.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger logger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     Fixture const fixture { {}, clock, { .scheduler = true }, std::nullopt, DirectSources { .scheduler = &scheduler } };
@@ -711,7 +712,7 @@ TEST_CASE("A consensus node reports the address peers DIAL, which is not the one
     // #1328. The ordinary joiner binds the wildcard and names where it is reached, so the
     // one reading that distinguishes the dial address from the bind is that one: a bound
     // `127.0.0.1` fixture would print the same string under both.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     Fixture const joiner { { .raft = true, .raftWildcard = true, .raftSelf = "10.0.0.4" }, clock };
     auto const fields = joiner.status.Describe();
 
@@ -748,7 +749,7 @@ TEST_CASE("ToolchainStateFor maps a served count onto the two states it decides"
 
 TEST_CASE("NodeStatus answers a member with what the node is", "[node][node-status]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     // A LIST, not `OpenMembership`, and that is the whole point of the fixture: a fake that
     // admits everyone cannot tell *the gate is wired* from *the gate admits everyone*, which
@@ -760,7 +761,7 @@ TEST_CASE("NodeStatus answers a member with what the node is", "[node][node-stat
     CapturedReadings const readings { metrics, {} };
     NodeStatusResponder responder { fixture.status, readings, membership, metrics };
 
-    clock.Advance(5s);
+    clock.advance(5s);
     auto const reply = AnswerNow(responder, HeaderFor(Wire::Op::NodeStatus));
     auto const header = Wire::DecodeReplyHeader(reply);
     REQUIRE(header.has_value());
@@ -787,7 +788,7 @@ TEST_CASE("NodeMetrics answers the reading /metrics renders, the cache tier's fi
     // verb answered before -- carries the counters too, so a case asserting only a counter passes
     // under the defect; the tier's items and delete hits are the half a node with no admin surface
     // could not see.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     ListedMembership const membership { { std::string { CallerAddress } },
                                         Distributed::MembershipParticipant::FleetMemberList };
@@ -852,7 +853,7 @@ TEST_CASE("the applied-tombstone count is absent with no cluster, zero with one,
     // #1471's second acceptance clause. THREE readings, because two would not distinguish the
     // field working from the field always saying nothing: an implementation that reports absent
     // unconditionally passes any case that only checks the unwired arm.
-    ManualClock clock;
+    core::platform::ManualClock clock;
 
     SECTION("a node with no cluster reports NOTHING, not zero")
     {
@@ -910,7 +911,7 @@ TEST_CASE("the applied-tombstone count is absent with no cluster, zero with one,
 
 TEST_CASE("The operator verbs are refused by name to a non-member, and counted once", "[node][node-status]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     ListedMembership const membership { { "10.0.0.9" }, Distributed::MembershipParticipant::FleetMemberList };
     Fixture const fixture { { .admin = true }, clock };
@@ -965,7 +966,7 @@ TEST_CASE("A verb this component does not own is UnimplementedVerb and is not co
     // Reachable only by calling `Answer` directly, since `MergedResponder` routes by
     // family. That is exactly why the arm exists: a predicate enforced only at the door
     // is one a later caller walks around.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     ListedMembership const membership { { std::string { CallerAddress } },
                                         Distributed::MembershipParticipant::FleetMemberList };
@@ -996,7 +997,7 @@ TEST_CASE("The operator surface requires no credential, so a plain worker can an
     // Asserted through `DecidePrePayload`, which is what actually decides it, rather than
     // by reading the getter back -- the getter agrees with itself under any
     // implementation.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     ListedMembership const membership { { std::string { CallerAddress } },
                                         Distributed::MembershipParticipant::FleetMemberList };
@@ -1032,7 +1033,7 @@ TEST_CASE("A frame-ceiling probe against the operator verbs is counted; an unkno
     // megabytes against one came from no client of this tree at any version. The
     // unknown-opcode arm is the discriminating half: it is unreachable through
     // `MergedResponder` and counting it would put a port scan and a probe in one series.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     ListedMembership const membership { { std::string { CallerAddress } },
                                         Distributed::MembershipParticipant::FleetMemberList };
@@ -1067,7 +1068,7 @@ TEST_CASE("MergedResponder routes the Node family to the node responder and nowh
     // The router's `Node` arm. `-Werror=switch` did NOT catch its absence on MSVC --
     // C4062 is off by default -- so the arm silently returned nullptr and every operator
     // verb answered *served nowhere* on the one platform this was developed on.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     ListedMembership const membership { { std::string { CallerAddress } },
                                         Distributed::MembershipParticipant::FleetMemberList };
@@ -1105,7 +1106,7 @@ TEST_CASE("explain-admission names every route that decided, and attributes a si
     // The acceptance is explicit that asserting *admitted* is not enough -- a reader that
     // answered `Member` for both routes is green while the attribution is wrong -- so every
     // section below asserts WHICH route, and the two-route section is the one that discriminates.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     Fixture const fixture { { .admin = true }, clock };
     CapturedReadings const readings { metrics, {} };
@@ -1278,7 +1279,7 @@ TEST_CASE("The consensus standing is absent with no consensus, and read per requ
     // this is the field that tells them apart. Read through the SLOT the way production
     // binds it -- the status is built before the tier exists -- so a case that handed the
     // fake straight to the status would pass under a slot that never forwarded anything.
-    ManualClock clock;
+    core::platform::ManualClock clock;
 
     SECTION("a node running no consensus reports NOTHING")
     {
@@ -1333,7 +1334,7 @@ TEST_CASE("A node reports its condition rows as they stand when asked, and none 
     // reader need not share this build's table. WIRED with nothing raised is the same list, all
     // `clear` or `not-evaluated`: the node saying "none" rather than going quiet. UNWIRED is no list
     // at all, which is what a build older than conditions answers and must not read as either.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     NodeConditions conditions;
     conditions.Clear(NodeCondition::EnrollmentWindowOpen);
     Fixture wired { ConfigShape {}, clock, {}, std::nullopt, DirectSources { .conditions = &conditions } };
@@ -1374,7 +1375,7 @@ TEST_CASE("A node reports the identity key it holds, and nothing on a node that 
 {
     // #178. Read from the configuration the start applied the key to -- through the SAME
     // reference production binds, so the case cannot pass on a copy the status never reads.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     Fixture fix { ConfigShape {}, clock };
 
     // Absent, not a key of zeroes: a node with no state directory holds no key.

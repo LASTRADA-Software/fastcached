@@ -6,7 +6,6 @@
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/RosterStore.hpp>
@@ -23,6 +22,8 @@
 #include <span>
 #include <string>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 /// @file NodeRoster.hpp
 /// The roster a node verifies lease grants against, and the half of NODE-ANNOUNCE that feeds
@@ -94,10 +95,8 @@ class NodeRoster final: public IPresenceRoster, public IServerTrust
     /// @param metrics Where a refused roster is counted. Borrowed.
     /// @param logger Where an adoption and a refusal are said. Borrowed.
     /// @return The roster, or why the node must not start.
-    [[nodiscard]] static std::expected<std::unique_ptr<NodeRoster>, std::string> Build(NodeConfig const& cfg,
-                                                                                       WallClockRef wallClock,
-                                                                                       IMetricsSink& metrics,
-                                                                                       ILogger& logger);
+    [[nodiscard]] static std::expected<std::unique_ptr<NodeRoster>, std::string> Build(
+        NodeConfig const& cfg, core::platform::WallClockRef wallClock, IMetricsSink& metrics, ILogger& logger);
 
     /// @return What a grant is verified against, or null when this node verifies none.
     [[nodiscard]] Distributed::ILeaseRoster const* Lease() const noexcept;
@@ -140,14 +139,14 @@ class NodeRoster final: public IPresenceRoster, public IServerTrust
     ~NodeRoster() override = default;
 
   private:
-    NodeRoster(WallClockRef wallClock,
+    NodeRoster(core::platform::WallClockRef wallClock,
                std::unique_ptr<Distributed::StateLeaseRoster> state,
                std::unique_ptr<Distributed::IRosterStore> store,
                std::unique_ptr<Distributed::RosterTrust> trust,
                IMetricsSink& metrics,
                ILogger& logger);
 
-    WallClockRef _wallClock;
+    core::platform::WallClockRef _wallClock;
 
     /// A consensus member's roster; null on any other node.
     std::unique_ptr<Distributed::StateLeaseRoster> _state;

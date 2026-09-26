@@ -38,30 +38,29 @@ namespace FastCache::Node
 /// ## What this table does, and what now enforces it
 ///
 /// The table itself is still a declaration: it names who may write and why. What
-/// changed is underneath it. `Detail::ClaimWriteSlot`
-/// (`FastCache/Net/WriteSlot.hpp`, #893) is the write-side mirror of
-/// `ClaimReadSlot`, folded INTO the operation so no arm site has a line to forget it
+/// changed is underneath it. `core::net::contract::claimWriteSlot`
+/// (`core/net/SocketContract.hpp`, core-cpp's since #893 moved there) is the write-side
+/// mirror of `claimReadSlot`, folded INTO the operation so no arm site has a line to forget it
 /// on -- which is the shape
 /// [#1218](https://github.com/LASTRADA-Software/fastcached/issues/1218) asked for and
 /// somebody else built while answering a TLS pump bug.
 ///
 /// **It reaches the case this table is about, and the reason is `WriteAll`.** That
-/// helper sends a whole frame in ONE `ISocket::Write`, so a write that PARKS is a
+/// helper sends a whole frame in ONE `core::net::ISocket::Write`, so a write that PARKS is a
 /// half-sent frame -- and a second writer arming over it is precisely the interleaving
 /// named above: a client reading a length out of the middle of somebody else's frame.
 /// Arming a write over a parked one is what the claim refuses. A write that completes
 /// inline takes no claim and needs none, because an unparked frame is atomic on this
 /// path.
 ///
-/// **Debug only, and that is a stated trade rather than an omission**, the same one
-/// the read side makes: in release the claim is one store, and refusing the operation
-/// instead would turn a silent leak into a broken connection on a live path.
+/// **It ends the process in every build since core-cpp 0.3.0**, naming the direction and
+/// the socket's handle. Until then it was Debug only, and a Release double-arm displaced
+/// the parked write, which was then never resumed -- a hang with no message. Refusing the
+/// new operation instead is still wrong: it would turn a misuse into a broken connection
+/// on a live path, far from the site that caused it.
 ///
-/// Watched BOTH WAYS by `ctest -R write-slot-guard-canary`, which drives an ordinary
-/// sequential pair of writes and then a double-arm, and requires the acceptance to be
-/// reported before the abort. A guard nobody has watched refuse is not a guard; a
-/// guard nobody has watched ACCEPT is not known to work either (#1031). That canary
-/// did not exist when `WriteSlot.hpp` first claimed it did.
+/// Watched by core-cpp's `socket-contract-canary`, on its Debug and Release legs. The
+/// fastcached canary that watched it both ways (#1031) went with `Net/` to core-cpp.
 ///
 /// ## What is still NOT enforced
 ///

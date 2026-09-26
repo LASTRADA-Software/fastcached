@@ -4,8 +4,6 @@
 #include "LiveSession.hpp"
 #include "TerminalCapabilities.hpp"
 
-#include <FastCache/Async/ResumeOn.hpp>
-
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -16,6 +14,8 @@
 #include <string>
 #include <string_view>
 #include <utility>
+
+#include <core/async/ResumeOn.hpp>
 
 namespace FastCache::Cli
 {
@@ -110,7 +110,7 @@ namespace
 
     /// Run a composed session on its reactor, and release @p done when it is over.
     ///
-    /// A `DetachedTask` because nothing on the reactor awaits it: the waiter is a thread. The
+    /// A `core::async::DetachedTask` because nothing on the reactor awaits it: the waiter is a thread. The
     /// catch is what keeps that thread from waiting forever -- a detached coroutine that let an
     /// exception out would terminate without releasing anything -- and the exception is carried
     /// to the waiter rather than swallowed.
@@ -119,12 +119,12 @@ namespace
     /// @param out Where the result goes.
     /// @param done Released once `out` is written.
     /// @return The detached task.
-    DetachedTask RunOnReactor(LiveSessionParts parts,
-                              std::optional<LiveEventSource>* source,
-                              SessionResult* out,
-                              std::binary_semaphore* done)
+    core::async::DetachedTask RunOnReactor(LiveSessionParts parts,
+                                           std::optional<LiveEventSource>* source,
+                                           SessionResult* out,
+                                           std::binary_semaphore* done)
     {
-        co_await ResumeOn { *parts.reactor };
+        co_await core::async::ResumeOn { *parts.reactor };
         try
         {
             out->run = co_await RunComposedSession(std::move(parts), source, &out->restore);
@@ -137,9 +137,9 @@ namespace
     }
 } // namespace
 
-Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts parts,
-                                                               std::optional<LiveEventSource>* source,
-                                                               std::shared_ptr<ITerminalRestore>* restore)
+core::async::Task<std::expected<LiveSessionRun, Answer>> RunComposedSession(LiveSessionParts parts,
+                                                                            std::optional<LiveEventSource>* source,
+                                                                            std::shared_ptr<ITerminalRestore>* restore)
 {
     auto run = LiveSessionRun {};
     auto const& subject = LiveSubjectTable[static_cast<std::size_t>(parts.plan.subject)];
@@ -244,7 +244,7 @@ FailureRemarks::FailureRemarks(IDashboardEventSource* events, SampleReader reade
 {
 }
 
-Task<DashboardEvent> FailureRemarks::Next()
+core::async::Task<DashboardEvent> FailureRemarks::Next()
 {
     auto event = co_await _events->Next();
     Observe(event);
@@ -286,7 +286,7 @@ void FailureRemarks::Observe(DashboardEvent const& event)
     _failing = std::move(reason);
 }
 
-std::string DescribeAbandonment(std::string_view endpoint, std::optional<Duration> readAge)
+std::string DescribeAbandonment(std::string_view endpoint, std::optional<core::platform::SteadyDuration> readAge)
 {
     if (!readAge.has_value())
         return std::format("gave up waiting for the live-stats session to finish: no read of the stream from {} was "
@@ -304,7 +304,8 @@ std::optional<std::string> DrainSession(LiveEventSource const& source, DrainBoun
         return std::nullopt;
     auto const since = source.ReadOutstandingSince();
     return DescribeAbandonment(source.StreamingEndpoint(),
-                               since.has_value() ? std::optional<Duration> { wait.Now() - *since } : std::nullopt);
+                               since.has_value() ? std::optional<core::platform::SteadyDuration> { wait.Now() - *since }
+                                                 : std::nullopt);
 }
 
 StandardRungViews::StandardRungViews(RenderOptions render, CellWidth cellWidth, ISixelEncoder* sixel):

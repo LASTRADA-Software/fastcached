@@ -9,16 +9,12 @@
 // refusal one end signs and the other reads as a key mismatch. So this file wires the real
 // transport to the real server over one in-memory link and asserts what each end COUNTED,
 // because a refusal pinned at one end only is half of a diagnosis.
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Consensus/RaftPeerRefusals.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -33,6 +29,10 @@
 #include <variant>
 #include <vector>
 
+#include <core/async/Task.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/ListenerConnector.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 
@@ -93,7 +93,7 @@ struct Link
         server { listener,      reactor,        sink,         logger,
                  serverMetrics, serverIdentity, serverRandom, PeerServerOptions { .handshakeBound = 0ms } }
     {
-        [](RaftPeerServer* accepting) -> DetachedTask {
+        [](RaftPeerServer* accepting) -> core::async::DetachedTask {
             co_await accepting->Run();
         }(&server);
 
@@ -107,7 +107,7 @@ struct Link
             diallerRandom,
             PeerTransportOptions { .reconnectBackoff = ReconnectBackoff, .handshakeBound = 0ms });
         transport->Start();
-        reactor.Drain();
+        reactor.drain();
     }
 
     Link(Link const&) = delete;
@@ -119,12 +119,12 @@ struct Link
     ~Link()
     {
         transport->RequestStop();
-        reactor.Drain();
-        clock.Advance(50ms);
-        reactor.Drain();
+        reactor.drain();
+        clock.advance(50ms);
+        reactor.drain();
         transport.reset();
-        listener.Close();
-        reactor.Drain();
+        listener.close();
+        reactor.drain();
     }
 
     /// Hand the transport one vote from the dialler, and let it reach the server.
@@ -135,7 +135,7 @@ struct Link
                         RaftMessage { RequestVoteResponse { .term = Term { .value = term },
                                                             .decision = VoteDecision::Granted,
                                                             .voterId = NodeId { dialler } } });
-        reactor.Drain();
+        reactor.drain();
     }
 
     /// @return How many peers the transport holds a proven session with.
@@ -174,9 +174,9 @@ struct Link
     RecordingSink sink;               ///< What the server delivered.
     AtomicMetricsSink serverMetrics;  ///< What the server counted.
     AtomicMetricsSink diallerMetrics; ///< What the transport counted.
-    ManualClock clock;
-    TestReactor reactor { clock };
-    InMemoryListener listener;
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
+    core::net::testing::InMemoryListener listener;
     Testing::ListenerConnector connector { listener };
     NullLogger logger;
     std::shared_ptr<Testing::SharedRoster> roster;
@@ -281,8 +281,8 @@ TEST_CASE("A key revoked mid-session closes that session, and the redial is refu
         // and lost -- it draws the reset -- and the one after it fails and ends the session.
         link.SendVote(3);
         link.SendVote(3);
-        link.clock.Advance(ReconnectBackoff);
-        link.reactor.Drain();
+        link.clock.advance(ReconnectBackoff);
+        link.reactor.drain();
 
         CHECK(link.sink.received.size() == 1);
         CHECK(link.Connected() == 0);
@@ -309,8 +309,8 @@ TEST_CASE("A key revoked mid-session closes that session, and the redial is refu
         CHECK(link.Refused(DiallerRefusal::KeyWithdrawn) == 1);
         CHECK(link.Connected() == 0);
 
-        link.clock.Advance(ReconnectBackoff);
-        link.reactor.Drain();
+        link.clock.advance(ReconnectBackoff);
+        link.reactor.drain();
 
         // The redial: n3 still proves n3 with the key it always had, and that key is revoked.
         CHECK(link.sink.received.size() == 1);

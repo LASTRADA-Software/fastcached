@@ -10,6 +10,8 @@
 #include <iostream>
 #include <utility>
 
+#include <core/async/SyncRun.hpp>
+
 namespace FastCache::Node
 {
 
@@ -312,7 +314,7 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
     return std::unexpected { std::string { "unknown cluster request" } };
 }
 
-std::expected<std::string, std::string> PutClusterRequest(ISocket& client,
+std::expected<std::string, std::string> PutClusterRequest(core::net::ISocket& client,
                                                           Cc::CredentialNotice& notice,
                                                           ClusterRequest const& request,
                                                           ICredentialSource const& credential,
@@ -329,7 +331,8 @@ std::expected<std::string, std::string> PutClusterRequest(ISocket& client,
     // exchanges in one breath -- and that is precisely why it is worth spelling: a
     // site that reads the secret where it SENDS it cannot acquire a gap later without
     // somebody deliberately putting one there.
-    auto const outcome = SyncRun(Cc::ExchangeFramed(&client, &notice, EncodeClusterRequest(request), credential.Current()));
+    auto const outcome =
+        core::async::syncRun(Cc::ExchangeFramed(&client, &notice, EncodeClusterRequest(request), credential.Current()));
 
     if (outcome.kind == Cc::CacheOutcomeKind::Transport)
         return std::unexpected { std::format("the scheduler at {} did not answer", scheduler) };
@@ -364,7 +367,7 @@ std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg,
     if (cfg.schedulers.empty())
         return std::unexpected { std::string { "--scheduler names where to ask; a cluster command needs one" } };
 
-    auto reached = DialFirstReachable(dialer, cfg.schedulers, DialOptions { .connectTimeout = DialTimeout });
+    auto reached = DialFirstReachable(dialer, cfg.schedulers, core::net::DialOptions { .connectTimeout = DialTimeout });
     if (!reached.has_value())
         return std::unexpected { std::format("cannot reach the scheduler at {}", JoinEndpoints(cfg.schedulers)) };
 

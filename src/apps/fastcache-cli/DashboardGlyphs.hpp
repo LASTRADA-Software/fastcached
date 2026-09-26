@@ -170,7 +170,7 @@ static_assert(RowsInEnumeratorOrder(RungGlyphTable, &RungGlyphs::rung),
 /// **A value the panels are handed, never a function they own.** A cell is not a byte and not a
 /// code point: a CJK hostname is two cells a character, a combining mark is none, and an emoji
 /// sequence is two however many code points it spells. The only function in this binary that knows
-/// that is the vendored terminal library's, and it is reached through the adapter layer rather than
+/// that is core-cpp's terminal library's, and it is reached through the adapter layer rather than
 /// named here, so this is the seam: one pointer, passed into every drawing function below and into
 /// `PanelContext`, and the SAME pointer everywhere a frame is laid out -- two width functions would
 /// be two opinions about where the right edge is.

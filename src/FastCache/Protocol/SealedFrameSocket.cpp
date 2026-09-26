@@ -71,7 +71,7 @@ std::string_view DescribeSealFault(SealFault fault) noexcept
     return SealFaults[static_cast<std::size_t>(fault)].why;
 }
 
-SealedFrameSocket::SealedFrameSocket(std::unique_ptr<ISocket> raw, SealedFrameEnd end, std::size_t maxPayload):
+SealedFrameSocket::SealedFrameSocket(std::unique_ptr<core::net::ISocket> raw, SealedFrameEnd end, std::size_t maxPayload):
     _raw { std::move(raw) },
     _end { end },
     _maxPayload { maxPayload }
@@ -99,11 +99,11 @@ std::optional<SealFault> SealedFrameSocket::Fault() const noexcept
     return _fault;
 }
 
-NetError SealedFrameSocket::FaultError() const
+core::net::NetError SealedFrameSocket::FaultError() const
 {
-    return NetError { .code = NetErrorCode::ConnReset,
-                      .systemCode = 0,
-                      .context = std::string { DescribeSealFault(_fault.value_or(SealFault::BadTag)) } };
+    return core::net::NetError { .code = core::net::NetErrorCode::ConnReset,
+                                 .systemCode = 0,
+                                 .context = std::string { DescribeSealFault(_fault.value_or(SealFault::BadTag)) } };
 }
 
 std::size_t SealedFrameSocket::ReleasedBytes() const noexcept
@@ -174,19 +174,19 @@ std::optional<SealFault> SealedFrameSocket::ReleaseWholeFrames()
     return fault;
 }
 
-Task<IoResult> SealedFrameSocket::PumpRead(std::span<std::byte> out)
+core::async::Task<core::net::IoResult> SealedFrameSocket::PumpRead(std::span<std::byte> out)
 {
     // A `while`: each pass reads whatever the raw socket has, and the loop ends on a verified
     // byte, an error, a fault or EOF -- none of which a `for` head can state.
     while (true)
     {
-        auto const got = co_await _raw->Read(std::span<std::byte> { _inScratch });
+        auto const got = co_await _raw->read(std::span<std::byte> { _inScratch });
         if (!got.has_value())
             co_return std::unexpected(got.error());
         if (*got == 0)
             // The peer has finished sending. A frame it left unfinished was never verified and is
             // never handed out; what the reader sees is the goodbye.
-            co_return IoResult { std::size_t { 0 } };
+            co_return core::net::IoResult { std::size_t { 0 } };
 
         _pending.insert(_pending.end(), _inScratch.begin(), _inScratch.begin() + static_cast<std::ptrdiff_t>(*got));
         _fault = ReleaseWholeFrames();
@@ -194,42 +194,27 @@ Task<IoResult> SealedFrameSocket::PumpRead(std::span<std::byte> out)
         // Verified frames ahead of a fault are handed out first: they are the peer's own, and the
         // read after them meets the fault.
         if (auto const n = TakeReleased(out); n > 0)
-            co_return IoResult { n };
+            co_return core::net::IoResult { n };
         if (_fault.has_value())
             co_return std::unexpected(FaultError());
     }
 }
 
-DetachedTask SealedFrameSocket::DriveRead(IoAwaitable* awaitable, std::span<std::byte> out)
+core::net::IoAwaitable SealedFrameSocket::read(std::span<std::byte> buffer)
 {
-    auto const result = co_await PumpRead(out);
-    awaitable->Complete(result);
-    co_return;
-}
-
-IoAwaitable SealedFrameSocket::Read(std::span<std::byte> buffer)
-{
-    Detail::RequireReadBuffer(buffer);
+    core::net::contract::requireReadBuffer(buffer);
     if (!_opener.has_value())
-        return _raw->Read(buffer);
+        return _raw->read(buffer);
 
     if (auto const n = TakeReleased(buffer); n > 0)
-        return IoAwaitable { IoResult { n } };
+        return core::net::IoAwaitable { core::net::IoResult { n } };
     if (_fault.has_value())
-        return IoAwaitable { IoResult { std::unexpected(FaultError()) } };
+        return core::net::IoAwaitable { core::net::IoResult { std::unexpected(FaultError()) } };
 
-    _readView = buffer;
-    IoAwaitable awaitable;
-    awaitable.SetSuspendCallback(
-        [](IoAwaitable* self, std::coroutine_handle<>) {
-            auto* const sealed = static_cast<SealedFrameSocket*>(self->CallbackState());
-            sealed->DriveRead(self, sealed->_readView);
-        },
-        this);
-    return awaitable;
+    return core::net::IoAwaitable { PumpRead(buffer) };
 }
 
-IoResult SealedFrameSocket::SealWhatIsWhole(std::span<std::span<std::byte const> const> segments)
+core::net::IoResult SealedFrameSocket::SealWhatIsWhole(std::span<std::span<std::byte const> const> segments)
 {
     auto written = std::size_t { 0 };
     for (auto const segment: segments)
@@ -241,9 +226,9 @@ IoResult SealedFrameSocket::SealWhatIsWhole(std::span<std::span<std::byte const>
     // Reached only once a proof has engaged the sealer, and answered closed without one, for
     // `ReleaseWholeFrames`' reason: bytes this layer cannot seal are bytes it may not send.
     if (!_sealer.has_value())
-        return std::unexpected(NetError { .code = NetErrorCode::ConnReset,
-                                          .systemCode = 0,
-                                          .context = "a sealing layer was asked to seal with no key agreed" });
+        return std::unexpected(core::net::NetError { .code = core::net::NetErrorCode::ConnReset,
+                                                     .systemCode = 0,
+                                                     .context = "a sealing layer was asked to seal with no key agreed" });
     auto& sealer = *_sealer;
     auto const isRequest = !ReadsRequests(_end);
     auto const headerBytes = HeaderBytes(isRequest);
@@ -259,9 +244,10 @@ IoResult SealedFrameSocket::SealWhatIsWhole(std::span<std::span<std::byte const>
         if (!declared.has_value())
             // This end's own writer framed something that is not a frame. Nothing after it can be
             // located, so nothing after it can be sealed; the connection is over.
-            return std::unexpected(NetError { .code = NetErrorCode::ConnReset,
-                                              .systemCode = 0,
-                                              .context = std::string { DescribeSealFault(SealFault::Unframed) } });
+            return std::unexpected(
+                core::net::NetError { .code = core::net::NetErrorCode::ConnReset,
+                                      .systemCode = 0,
+                                      .context = std::string { DescribeSealFault(SealFault::Unframed) } });
         auto const frameBytes = headerBytes + *declared;
         if (rest.size() < frameBytes)
             break;
@@ -271,119 +257,104 @@ IoResult SealedFrameSocket::SealWhatIsWhole(std::span<std::span<std::byte const>
         consumed += frameBytes;
     }
     _outPending.erase(_outPending.begin(), _outPending.begin() + static_cast<std::ptrdiff_t>(consumed));
-    return IoResult { written };
+    return core::net::IoResult { written };
 }
 
-Task<IoResult> SealedFrameSocket::PumpWrite(std::size_t reported)
+core::async::Task<core::net::IoResult> SealedFrameSocket::PumpWrite(std::size_t reported)
 {
     // A `while`: the raw socket may take a part of what is ready, and each pass sends the rest.
     while (!_outReady.empty())
     {
-        auto const sent = co_await _raw->Write(std::span<std::byte const> { _outReady });
+        auto const sent = co_await _raw->write(std::span<std::byte const> { _outReady });
         if (!sent.has_value())
             co_return std::unexpected(sent.error());
         if (*sent == 0)
-            co_return std::unexpected(
-                NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = "a sealed write sent nothing" });
+            co_return std::unexpected(core::net::NetError {
+                .code = core::net::NetErrorCode::ConnReset, .systemCode = 0, .context = "a sealed write sent nothing" });
         _outReady.erase(_outReady.begin(), _outReady.begin() + static_cast<std::ptrdiff_t>(*sent));
     }
-    co_return IoResult { reported };
+    co_return core::net::IoResult { reported };
 }
 
-DetachedTask SealedFrameSocket::DriveWrite(IoAwaitable* awaitable, std::size_t reported)
-{
-    auto const result = co_await PumpWrite(reported);
-    awaitable->Complete(result);
-    co_return;
-}
-
-IoAwaitable SealedFrameSocket::StartWrite(std::size_t reported)
+core::net::IoAwaitable SealedFrameSocket::StartWrite(std::size_t reported)
 {
     if (_outReady.empty())
         // Only part of a frame so far: nothing can be sealed until its payload is whole, and the
         // caller has handed over every byte it wrote.
-        return IoAwaitable { IoResult { reported } };
+        return core::net::IoAwaitable { core::net::IoResult { reported } };
 
-    _writeReported = reported;
-    IoAwaitable awaitable;
-    awaitable.SetSuspendCallback(
-        [](IoAwaitable* self, std::coroutine_handle<>) {
-            auto* const sealed = static_cast<SealedFrameSocket*>(self->CallbackState());
-            sealed->DriveWrite(self, sealed->_writeReported);
-        },
-        this);
-    return awaitable;
+    return core::net::IoAwaitable { PumpWrite(reported) };
 }
 
-IoAwaitable SealedFrameSocket::Write(std::span<std::byte const> buffer)
+core::net::IoAwaitable SealedFrameSocket::write(std::span<std::byte const> buffer)
 {
     if (!_sealer.has_value())
-        return _raw->Write(buffer);
+        return _raw->write(buffer);
     auto const segments = std::array { buffer };
     auto const taken = SealWhatIsWhole(segments);
     if (!taken.has_value())
-        return IoAwaitable { taken };
+        return core::net::IoAwaitable { taken };
     return StartWrite(*taken);
 }
 
-IoAwaitable SealedFrameSocket::WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                             std::shared_ptr<void const> keepAlive)
+core::net::IoAwaitable SealedFrameSocket::writeVectored(std::span<std::span<std::byte const> const> segments,
+                                                        std::shared_ptr<void const> keepAlive)
 {
     if (!_sealer.has_value())
-        return _raw->WriteVectored(segments, std::move(keepAlive));
+        return _raw->writeVectored(segments, std::move(keepAlive));
     // Copied synchronously into the frame being sealed, so neither the segments nor `keepAlive`
     // need outlive this call -- `TlsSocket`'s reason for the same.
     static_cast<void>(keepAlive);
     auto const taken = SealWhatIsWhole(segments);
     if (!taken.has_value())
-        return IoAwaitable { taken };
+        return core::net::IoAwaitable { taken };
     return StartWrite(*taken);
 }
 
-Task<std::expected<void, NetError>> SealedFrameSocket::HandshakeIfNeeded()
+core::net::ResultAwaitable<void> SealedFrameSocket::handshakeIfNeeded()
 {
-    co_return co_await _raw->HandshakeIfNeeded();
+    return _raw->handshakeIfNeeded();
 }
 
-IoAwaitable SealedFrameSocket::WaitReadable()
+core::net::IoAwaitable SealedFrameSocket::waitReadable()
 {
     if (!_opener.has_value())
-        return _raw->WaitReadable();
+        return _raw->waitReadable();
     if (auto const available = ReleasedBytes(); available > 0)
-        return IoAwaitable { IoResult { available } };
+        return core::net::IoAwaitable { core::net::IoResult { available } };
     if (_fault.has_value())
-        return IoAwaitable { IoResult { std::unexpected(FaultError()) } };
-    return _raw->WaitReadable();
+        return core::net::IoAwaitable { core::net::IoResult { std::unexpected(FaultError()) } };
+    return _raw->waitReadable();
 }
 
-void SealedFrameSocket::CancelRead() noexcept
+void SealedFrameSocket::cancelRead() noexcept
 {
-    _raw->CancelRead();
+    _raw->cancelRead();
 }
 
-std::string SealedFrameSocket::PeerAddress() const
+std::string SealedFrameSocket::peerAddress() const
 {
-    return _raw->PeerAddress();
+    return _raw->peerAddress();
 }
 
-void SealedFrameSocket::Close() noexcept
+void SealedFrameSocket::close() noexcept
 {
-    _raw->Close();
+    _raw->close();
 }
 
-void SealedFrameSocket::ShutdownWrite() noexcept
+core::net::ResultAwaitable<void> SealedFrameSocket::shutdownWrite()
 {
-    _raw->ShutdownWrite();
+    return _raw->shutdownWrite();
 }
 
-void SealedFrameSocket::SetReceiveDeadline(std::chrono::milliseconds deadline) noexcept
+void SealedFrameSocket::setReceiveDeadline(std::chrono::milliseconds deadline) noexcept
 {
-    _raw->SetReceiveDeadline(deadline);
+    _raw->setReceiveDeadline(deadline);
 }
 
-bool SealedFrameSocket::IsClosed() const noexcept
+bool SealedFrameSocket::isClosed() const noexcept
 {
-    return _raw->IsClosed();
+    return _raw->isClosed();
 }
 
 } // namespace FastCache

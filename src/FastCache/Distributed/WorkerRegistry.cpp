@@ -10,13 +10,13 @@
 namespace FastCache::Distributed
 {
 
-WorkerRegistry::WorkerRegistry(IClock& clock, std::chrono::milliseconds heartbeatTimeout) noexcept:
+WorkerRegistry::WorkerRegistry(core::platform::IClock& clock, std::chrono::milliseconds heartbeatTimeout) noexcept:
     _clock { clock },
     _heartbeatTimeout { heartbeatTimeout }
 {
 }
 
-bool WorkerRegistry::IsLive(Entry const& entry, TimePoint now) const noexcept
+bool WorkerRegistry::IsLive(Entry const& entry, core::platform::SteadyTimePoint now) const noexcept
 {
     // `now < lastSeen` is not a paranoia case: the clock is monotonic, but a
     // ManualClock in a test can be set backwards, and treating a negative age as
@@ -47,7 +47,7 @@ namespace
 std::string WorkerRegistry::Register(WorkerRegistration const& registration)
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     // Keyed on (fingerprint, endpoint), not on a new id each time: a worker that
     // restarts has lost its id but is the same host running the same toolchain.
@@ -148,7 +148,7 @@ std::optional<std::string> WorkerRegistry::Heartbeat(std::string_view workerId, 
     // is actually running; a heartbeat is a correction as much as a liveness signal.
     it->second.info.inFlight = load.inFlight;
     it->second.info.load = load;
-    it->second.lastSeen = _clock.Now();
+    it->second.lastSeen = _clock.now();
     return it->second.info.endpoint;
 }
 
@@ -215,7 +215,7 @@ namespace
 std::expected<WorkerInfo, PickError> WorkerRegistry::Pick(std::string_view fingerprint)
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     // The ENTRY rather than its `info`, because the winner is stamped below and the
     // record lives beside the entry rather than on the value handed to a lease --
@@ -317,7 +317,7 @@ void WorkerRegistry::JobFinished(std::string_view workerId)
 std::vector<std::string> WorkerRegistry::ExpireStale()
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     // Collected first, then erased -- the idiom `LeaseTable::ReleaseWorker` uses and
     // for the same reason: erasing while iterating invalidates the iterator, and the
@@ -351,7 +351,7 @@ bool WorkerRegistry::Remove(std::string_view workerId)
 std::vector<WorkerInfo> WorkerRegistry::LiveWorkers() const
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     std::vector<WorkerInfo> out;
     out.reserve(_workers.size());
@@ -368,23 +368,24 @@ std::vector<WorkerInfo> WorkerRegistry::LiveWorkers() const
 std::vector<WorkerReport> WorkerRegistry::LiveWorkerReports() const
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     std::vector<WorkerReport> out;
     out.reserve(_workers.size());
     for (auto const& [id, entry]: _workers)
         if (IsLive(entry, now))
-            out.push_back(WorkerReport { .info = entry.info,
-                                         .heartbeatAge = AgeOf(entry.lastSeen, now),
-                                         .registeredAge = AgeOf(entry.registeredAt, now),
-                                         // Absent stays absent rather than becoming a zero or an enormous age:
-                                         // an entry nothing has been sent to has no such instant, which is a
-                                         // different fact from one picked at the epoch (#1297). Measured
-                                         // against the SAME `now` as the two above, so one snapshot's three
-                                         // ages are comparable -- asking the clock per field would let a row
-                                         // report ages taken at three different instants.
-                                         .lastPickedAge = entry.lastPickedAt.transform(
-                                             [now](TimePoint const picked) { return AgeOf(picked, now); }) });
+            out.push_back(
+                WorkerReport { .info = entry.info,
+                               .heartbeatAge = AgeOf(entry.lastSeen, now),
+                               .registeredAge = AgeOf(entry.registeredAt, now),
+                               // Absent stays absent rather than becoming a zero or an enormous age:
+                               // an entry nothing has been sent to has no such instant, which is a
+                               // different fact from one picked at the epoch (#1297). Measured
+                               // against the SAME `now` as the two above, so one snapshot's three
+                               // ages are comparable -- asking the clock per field would let a row
+                               // report ages taken at three different instants.
+                               .lastPickedAge = entry.lastPickedAt.transform(
+                                   [now](core::platform::SteadyTimePoint const picked) { return AgeOf(picked, now); }) });
 
     // Sorted for the reason `LiveWorkers()` sorts: an unordered_map's iteration
     // order is neither stable nor meaningful, and this feeds a page an operator
@@ -414,10 +415,11 @@ namespace
     }
 } // namespace
 
-std::chrono::milliseconds WorkerRegistry::AgeOf(TimePoint lastSeen, TimePoint now) noexcept
+std::chrono::milliseconds WorkerRegistry::AgeOf(core::platform::SteadyTimePoint lastSeen,
+                                                core::platform::SteadyTimePoint now) noexcept
 {
     // Clamped at zero rather than allowed to go negative, for the reason `IsLive`
-    // is written the way it is: a `ManualClock` can legitimately be set backwards
+    // is written the way it is: a `core::platform::ManualClock` can legitimately be set backwards
     // in a test, and an unsigned duration would then report an age of several
     // hundred million years rather than "just now".
     if (now <= lastSeen)
@@ -437,13 +439,13 @@ void WorkerRegistry::NoteNodePresent(std::string endpoint,
     slot.load = load;
     slot.version = std::move(version);
     slot.conditions = std::move(conditions);
-    slot.lastSeen = _clock.Now();
+    slot.lastSeen = _clock.now();
 }
 
 std::vector<NodeReport> WorkerRegistry::NodeReports() const
 {
     std::scoped_lock const guard { _mutex };
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
 
     // Keyed on endpoint, because that is what the entries of one machine share --
     // this registry keys workers on (fingerprint, endpoint), so a node with two
@@ -451,7 +453,7 @@ std::vector<NodeReport> WorkerRegistry::NodeReports() const
     struct Candidate
     {
         NodeReport report;
-        TimePoint lastSeen {};
+        core::platform::SteadyTimePoint lastSeen {};
         bool contributorSaysCache { false };
     };
     std::map<std::string, Candidate> byEndpoint;

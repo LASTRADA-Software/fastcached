@@ -5,7 +5,6 @@
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -23,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/ForeignGenerationValue.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
@@ -54,7 +55,7 @@ struct Fixture
     // `LocalCache_test` for why a test fixture's padding is worth caring about.
     InMemoryLruStorage local { 64 * 1024 };
     NoUpstream upstream;
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     LocalCache cache { local, upstream, clock, metrics };
     CacheProxy proxy { cache, metrics };
@@ -69,11 +70,11 @@ TEST_CASE("A node stores and serves an object over the cache wire", "[node][cach
     // network -- including for objects this machine compiled minutes ago.
     Fixture fix;
 
-    auto const stored = SyncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
+    auto const stored = core::async::syncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
         .key = "k1", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = Bytes("object-one") })));
     REQUIRE(StatusOf(stored) == Wire::Status::Ok);
 
-    auto const fetched = SyncRun(fix.proxy.Answer(Wire::EncodeFetch("k1")));
+    auto const fetched = core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetch("k1")));
     REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
     auto const payload = PayloadOf(fetched);
     CHECK(std::vector<std::byte> { payload.begin(), payload.end() } == Bytes("object-one"));
@@ -103,14 +104,14 @@ TEST_CASE("A node canonicalizes a stored value's regions against the producer's 
         { .grammar = PathCanon::Grammar::ShowIncludes, .bytes = "Note: including file: /producer/src/dep.hpp\n" });
 
     auto const stored =
-        SyncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest { .key = "k-canon",
-                                                                        .prefetchGroup = {},
-                                                                        .srcRoot = "/producer/src",
-                                                                        .buildTree = "/producer/build",
-                                                                        .value = EncodeCompileValue(value) })));
+        core::async::syncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest { .key = "k-canon",
+                                                                                     .prefetchGroup = {},
+                                                                                     .srcRoot = "/producer/src",
+                                                                                     .buildTree = "/producer/build",
+                                                                                     .value = EncodeCompileValue(value) })));
     REQUIRE(StatusOf(stored) == Wire::Status::Ok);
 
-    auto const fetched = SyncRun(fix.proxy.Answer(Wire::EncodeFetch("k-canon")));
+    auto const fetched = core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetch("k-canon")));
     REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
     auto const decoded = DecodeCompileValue(PayloadOf(fetched));
     REQUIRE(decoded.has_value());
@@ -134,11 +135,11 @@ TEST_CASE("A value the node cannot decode is stored verbatim rather than refused
     // whole protocol.
     Fixture fix;
 
-    auto const stored = SyncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
+    auto const stored = core::async::syncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
         .key = "k-opaque", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = Bytes("not-a-value") })));
     REQUIRE(StatusOf(stored) == Wire::Status::Ok);
 
-    auto const fetched = SyncRun(fix.proxy.Answer(Wire::EncodeFetch("k-opaque")));
+    auto const fetched = core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetch("k-opaque")));
     REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
     auto const payload = PayloadOf(fetched);
     CHECK(std::vector<std::byte> { payload.begin(), payload.end() } == Bytes("not-a-value"));
@@ -162,7 +163,7 @@ TEST_CASE("A stored value from another generation is refused, not stored verbati
     // `src/tests/ForeignGenerationValue.hpp`, and in no other test binary (#649).
     auto const foreign = Testing::ForeignGenerationValue();
 
-    auto const stored = SyncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
+    auto const stored = core::async::syncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
         .key = "k-foreign", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = foreign })));
 
     // #544: its own code, not `MalformedValue`. This surface is where that mattered
@@ -181,7 +182,7 @@ TEST_CASE("A stored value from another generation is refused, not stored verbati
 
     // Refused means nothing was written. A `Miss` rather than the bytes coming back
     // is what says the verbatim arm was not taken.
-    CHECK(StatusOf(SyncRun(fix.proxy.Answer(Wire::EncodeFetch("k-foreign")))) == Wire::Status::Miss);
+    CHECK(StatusOf(core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetch("k-foreign")))) == Wire::Status::Miss);
 
     // Counted, per this tier's own classification rule: the baseline is zero, so a
     // rise is a real event and it is the only view of what refusing costs.
@@ -195,7 +196,7 @@ TEST_CASE("A miss is Miss, never Error", "[node][cacheproxy]")
     // zero-length payload rather than no payload, uniformly with every other reply.
     Fixture fix;
 
-    auto const reply = SyncRun(fix.proxy.Answer(Wire::EncodeFetch("never-stored")));
+    auto const reply = core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetch("never-stored")));
     REQUIRE(StatusOf(reply) == Wire::Status::Miss);
     CHECK(PayloadOf(reply).empty());
 }
@@ -208,7 +209,7 @@ TEST_CASE("A node's cache port refuses the other ports' verbs, as a reply", "[no
     Fixture fix;
 
     auto const lease = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
-    CHECK(ErrorOf(SyncRun(fix.proxy.Answer(lease))) == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(ErrorOf(core::async::syncRun(fix.proxy.Answer(lease))) == Wire::ErrorCode::DispatchNotPermitted);
 
     auto const compile = Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "t",
                                                                     .fingerprint = "gcc-14",
@@ -220,7 +221,7 @@ TEST_CASE("A node's cache port refuses the other ports' verbs, as a reply", "[no
                                                                     .compileDirReplacement = {},
                                                                     .sourceRoot = {},
                                                                     .sourceRootReplacement = {} });
-    CHECK(ErrorOf(SyncRun(fix.proxy.Answer(compile))) == Wire::ErrorCode::DispatchNotPermitted);
+    CHECK(ErrorOf(core::async::syncRun(fix.proxy.Answer(compile))) == Wire::ErrorCode::DispatchNotPermitted);
 }
 
 TEST_CASE("A node refuses AUTH with the one code the launcher steps over", "[node][cacheproxy]")
@@ -243,12 +244,12 @@ TEST_CASE("A node refuses AUTH with the one code the launcher steps over", "[nod
     Fixture fix;
 
     auto const auth = Wire::EncodeAuth(Wire::AuthRequest { .username = "bob", .secret = "s3cret" });
-    CHECK(ErrorOf(SyncRun(fix.proxy.Answer(auth))) == Wire::ErrorCode::UnknownOpcode);
+    CHECK(ErrorOf(core::async::syncRun(fix.proxy.Answer(auth))) == Wire::ErrorCode::UnknownOpcode);
 
     // And an empty username, which is how a bare `FASTCACHE_TOKEN` with no user
     // reaches the wire, takes the same answer.
     auto const tokenOnly = Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = "s3cret" });
-    CHECK(ErrorOf(SyncRun(fix.proxy.Answer(tokenOnly))) == Wire::ErrorCode::UnknownOpcode);
+    CHECK(ErrorOf(core::async::syncRun(fix.proxy.Answer(tokenOnly))) == Wire::ErrorCode::UnknownOpcode);
 }
 
 TEST_CASE("A frame that is not the cache proxy's protocol is the one condition that closes", "[node][cacheproxy]")
@@ -257,7 +258,7 @@ TEST_CASE("A frame that is not the cache proxy's protocol is the one condition t
 
     std::array<std::byte, Wire::RequestHeaderSize> frame {};
     WireFrame::PutHeader(frame, std::byte { 0x11 }, Wire::CurrentVersion, 0x01, 0);
-    CHECK(SyncRun(fix.proxy.Answer(frame)).empty());
+    CHECK(core::async::syncRun(fix.proxy.Answer(frame)).empty());
 }
 
 TEST_CASE("An unknown cache proxy opcode is stepped over, not fatal", "[node][cacheproxy]")
@@ -266,7 +267,7 @@ TEST_CASE("An unknown cache proxy opcode is stepped over, not fatal", "[node][ca
 
     std::array<std::byte, Wire::RequestHeaderSize> frame {};
     WireFrame::PutHeader(frame, Wire::Magic, Wire::CurrentVersion, 0xEE, 0);
-    CHECK(ErrorOf(SyncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::UnknownOpcode);
+    CHECK(ErrorOf(core::async::syncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::UnknownOpcode);
 }
 
 TEST_CASE("The node's cache answers this machine and refuses every other one", "[node][cache][cache-locality]")
@@ -285,7 +286,8 @@ TEST_CASE("The node's cache answers this machine and refuses every other one", "
 
     auto const fetch = Wire::EncodeFetch("some-key");
     auto const ask = [&](std::string peer) {
-        return Wire::DecodeReplyHeader(SyncRun(responder.Answer(fetch, PeerIdentity { .host = std::move(peer) })).bytes);
+        return Wire::DecodeReplyHeader(
+            core::async::syncRun(responder.Answer(fetch, PeerIdentity { .host = std::move(peer) })).bytes);
     };
 
     SECTION("over loopback, which is every ordinary fastcache-cc on this box")
@@ -333,7 +335,7 @@ TEST_CASE("The node's cache answers this machine and refuses every other one", "
 
     SECTION("and refuses a peer it cannot name at all")
     {
-        // What `FormatPeerAddress` answers for a family it does not know or a
+        // What `core::net::formatPeerAddress` answers for a family it does not know or a
         // `getpeername` that failed. Two unanswerable questions are not a match, and
         // an empty entry in the address set must not become a wildcard.
         auto const reply = ask("");
@@ -371,7 +373,8 @@ TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or n
     REQUIRE_FALSE(IsLoopbackHost("10.0.0.1"));
     REQUIRE_FALSE(locality.IsThisMachine("10.0.0.1"));
 
-    auto const refused = SyncRun(responder.Answer(Wire::EncodeFetch("some-key"), PeerIdentity { .host = "10.0.0.1" })).bytes;
+    auto const refused =
+        core::async::syncRun(responder.Answer(Wire::EncodeFetch("some-key"), PeerIdentity { .host = "10.0.0.1" })).bytes;
     auto const header = Wire::DecodeReplyHeader(refused);
     REQUIRE(header.has_value());
     CHECK(Unwrap(header).status == Wire::Status::Error);
@@ -547,7 +550,7 @@ TEST_CASE("(#491) the cache tier counts a version skew and an undecodable body",
                              0);
 
         auto const before = AllCounters(fix.metrics);
-        CHECK(ErrorOf(SyncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::UnsupportedVersion);
+        CHECK(ErrorOf(core::async::syncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::UnsupportedVersion);
         CHECK(Moved(before, AllCounters(fix.metrics))
               == Only(IMetricsSink::Counter::NodeCacheRequestsRefusedUnsupportedVersion));
     }
@@ -574,7 +577,7 @@ TEST_CASE("(#491) the cache tier counts a version skew and an undecodable body",
             frame[Wire::RequestHeaderSize + 1] = std::byte { 0xFF };
 
             auto const before = AllCounters(fix.metrics);
-            CHECK(ErrorOf(SyncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::MalformedFrame);
+            CHECK(ErrorOf(core::async::syncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::MalformedFrame);
             CHECK(Moved(before, AllCounters(fix.metrics))
                   == Only(IMetricsSink::Counter::NodeCacheRequestsRefusedMalformedPayload));
         }
@@ -590,8 +593,8 @@ TEST_CASE("(#491) the cache tier counts a version skew and an undecodable body",
         // rather than treating as fatal.
         Fixture fix;
         auto const before = AllCounters(fix.metrics);
-        auto const reply =
-            SyncRun(fix.proxy.Answer(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" })));
+        auto const reply = core::async::syncRun(
+            fix.proxy.Answer(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" })));
 
         CHECK(ErrorOf(reply) == Wire::UnimplementedVerb);
         CHECK(Moved(before, AllCounters(fix.metrics)).empty());
@@ -683,29 +686,38 @@ TEST_CASE("(#1276) a drop from another machine is refused before it removes anyt
     CachedLocalityOracle const locality { machine, fixture.clock };
     CacheResponder responder { fixture.proxy, locality, fixture.metrics };
 
-    auto const stored = SyncRun(responder.Answer(Wire::EncodeStore(Wire::StoreRequest { .key = "victim",
-                                                                                        .prefetchGroup = {},
-                                                                                        .srcRoot = "/src",
-                                                                                        .buildTree = "/build",
-                                                                                        .value = Bytes("object") }),
-                                                 PeerIdentity { .host = "127.0.0.1" }))
-                            .bytes;
+    auto const stored =
+        core::async::syncRun(responder.Answer(Wire::EncodeStore(Wire::StoreRequest { .key = "victim",
+                                                                                     .prefetchGroup = {},
+                                                                                     .srcRoot = "/src",
+                                                                                     .buildTree = "/build",
+                                                                                     .value = Bytes("object") }),
+                                              PeerIdentity { .host = "127.0.0.1" }))
+            .bytes;
     REQUIRE(StatusOf(stored) == Wire::Status::Ok);
 
     auto const refused =
-        SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), PeerIdentity { .host = "10.9.9.9" })).bytes;
+        core::async::syncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), PeerIdentity { .host = "10.9.9.9" })).bytes;
     CHECK(ErrorOf(refused) == Wire::ErrorCode::NotAMember);
     CHECK(fixture.metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
     CHECK(fixture.local.Snapshot().deleteHits == 0);
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), PeerIdentity { .host = "127.0.0.1" })).bytes)
-          == Wire::Status::Ok);
+    CHECK(
+        StatusOf(
+            core::async::syncRun(responder.Answer(Wire::EncodeFetch("victim"), PeerIdentity { .host = "127.0.0.1" })).bytes)
+        == Wire::Status::Ok);
 
     // And the same request from this machine is served, so the refusal above was about WHO
     // asked rather than about the request.
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), PeerIdentity { .host = "10.0.0.7" })).bytes)
-          == Wire::Status::Ok);
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeFetch("victim"), PeerIdentity { .host = "127.0.0.1" })).bytes)
-          == Wire::Status::Miss);
-    CHECK(StatusOf(SyncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), PeerIdentity { .host = "10.0.0.7" })).bytes)
-          == Wire::Status::Miss);
+    CHECK(
+        StatusOf(core::async::syncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), PeerIdentity { .host = "10.0.0.7" }))
+                     .bytes)
+        == Wire::Status::Ok);
+    CHECK(
+        StatusOf(
+            core::async::syncRun(responder.Answer(Wire::EncodeFetch("victim"), PeerIdentity { .host = "127.0.0.1" })).bytes)
+        == Wire::Status::Miss);
+    CHECK(
+        StatusOf(core::async::syncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), PeerIdentity { .host = "10.0.0.7" }))
+                     .bytes)
+        == Wire::Status::Miss);
 }

@@ -6,7 +6,6 @@
 #include "NodeCredential.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
-#include <FastCache/Net/ISocket.hpp>
 
 #include <cstddef>
 #include <expected>
@@ -14,6 +13,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/net/ISocket.hpp>
 
 namespace FastCache::Node
 {
@@ -59,7 +60,7 @@ namespace FastCache::Node
 /// @param credential What to present, asked at the moment of the exchange.
 /// @param scheduler Where @p client is connected, for the diagnostics.
 /// @return What to print, or what went wrong.
-[[nodiscard]] std::expected<std::string, std::string> PutClusterRequest(ISocket& client,
+[[nodiscard]] std::expected<std::string, std::string> PutClusterRequest(core::net::ISocket& client,
                                                                         Cc::CredentialNotice& notice,
                                                                         ClusterRequest const& request,
                                                                         ICredentialSource const& credential,

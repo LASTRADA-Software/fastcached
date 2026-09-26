@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Errors/ProtocolError.hpp>
-#include <FastCache/Net/ISocket.hpp>
 
 #include <cstddef>
 #include <expected>
@@ -11,6 +9,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
 
 namespace FastCache
 {
@@ -46,19 +47,19 @@ class ByteReader
     /// @param maxLineBytes Hard cap on a single line's length (CRLF stripped).
     /// @param maxPayloadBytes Hard cap on a single length-prefixed payload.
     /// @param readChunkBytes Size of each underlying socket read.
-    ByteReader(ISocket& socket,
+    ByteReader(core::net::ISocket& socket,
                std::size_t maxLineBytes,
                std::size_t maxPayloadBytes,
                std::size_t readChunkBytes = 4096) noexcept;
 
     /// Read the next CRLF-delimited line; returns the line without the CRLF.
     /// @return Task resolving to the line, or a ProtocolError.
-    [[nodiscard]] Task<LineResult> ReadLine();
+    [[nodiscard]] core::async::Task<LineResult> ReadLine();
 
     /// Read exactly `count` bytes from the stream.
     /// @param count Number of bytes to read.
     /// @return Task resolving to the byte vector or a ProtocolError.
-    [[nodiscard]] Task<BytesResult> ReadExactly(std::size_t count);
+    [[nodiscard]] core::async::Task<BytesResult> ReadExactly(std::size_t count);
 
     /// Drain (consume and discard) exactly `count` bytes from the stream
     /// without buffering them all at once. Used by protocols that need to
@@ -68,7 +69,7 @@ class ByteReader
     /// data on the daemon. Reads up to the internal chunk size at a time.
     /// @param count Number of bytes to skip.
     /// @return Task resolving to success or a ProtocolError.
-    [[nodiscard]] Task<std::expected<void, ProtocolError>> Skip(std::size_t count);
+    [[nodiscard]] core::async::Task<std::expected<void, ProtocolError>> Skip(std::size_t count);
 
     /// Prepend `bytes` to the internal buffer so subsequent reads see them
     /// first. Used by the protocol-autodetect layer to replay the bytes it
@@ -115,7 +116,7 @@ class ByteReader
 
     /// Pull one chunk from the socket into _buffer; sets _eof on EOF.
     /// @return Task resolving to bytes pulled, or ProtocolError on socket failure.
-    [[nodiscard]] Task<std::expected<std::size_t, ProtocolError>> PullChunk();
+    [[nodiscard]] core::async::Task<std::expected<std::size_t, ProtocolError>> PullChunk();
 
     /// @return Count of unconsumed bytes available in _buffer.
     [[nodiscard]] std::size_t Available() const noexcept
@@ -129,7 +130,7 @@ class ByteReader
     /// the common "consume a whole line, buffer now empty" case is O(1).
     void Compact();
 
-    ISocket& _socket;
+    core::net::ISocket& _socket;
     std::size_t _maxLineBytes;
     std::size_t _maxPayloadBytes;
     std::size_t _readChunkBytes;

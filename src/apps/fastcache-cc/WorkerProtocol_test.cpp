@@ -31,6 +31,7 @@
 #include <thread>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
@@ -192,7 +193,7 @@ inline constexpr std::string_view DefaultSource = "int main(){return 0;}";
 
 /// The wall clock every lease case reads, at `2024-01-01T00:00:00Z`.
 ///
-/// `ManualWallClock`, never the system one: an expiry compared against real time is
+/// `core::platform::ManualWallClock`, never the system one: an expiry compared against real time is
 /// a test whose meaning changes while it runs, and the skew slack is five minutes --
 /// long enough that a case using `now()` would pass for the wrong reason.
 ///
@@ -200,7 +201,8 @@ inline constexpr std::string_view DefaultSource = "int main(){return 0;}";
 /// static. Nothing here advances it, and a shared non-const clock invites the next
 /// case to -- at which point every other lease case's expiry arithmetic silently
 /// depends on the order they ran in.
-ManualWallClock const LeaseClock { std::chrono::system_clock::time_point { std::chrono::seconds { 1704067200 } } };
+core::platform::ManualWallClock const LeaseClock { std::chrono::system_clock::time_point {
+    std::chrono::seconds { 1704067200 } } };
 
 /// The term every grant here is minted under unless a case says otherwise.
 ///
@@ -240,7 +242,7 @@ constexpr std::uint64_t GrantTerm = 4;
                                               .endpoint = std::string { endpoint },
                                               .fingerprint = std::string { fingerprint },
                                               .key = "obj-abc",
-                                              .expiresAt = LeaseClock.Now() + validFor,
+                                              .expiresAt = LeaseClock.now() + validFor,
                                               .clusterId = std::string { cluster },
                                               .epoch = epoch,
                                               .signer = {} });
@@ -1724,7 +1726,7 @@ namespace
 // The comment that used to sit here said sharing would mean moving ninety lines to
 // reuse thirty, and preferred a second copy. That was answered by what happened
 // next: both copies carried the SAME `WriteVectored` defect -- a zero-byte success,
-// which `SendAll` reads as a short write -- and this one was found only because a
+// which `core::net::sendAll` reads as a short write -- and this one was found only because a
 // case here finally drove a vectored write through it, a day before the other was
 // noticed at all. The cost of a shared fake is lines; the cost of three is that a
 // bug fixed in one stays live in the others (#362).
@@ -1905,7 +1907,8 @@ TEST_CASE("A credentialled client reaches a worker that has no AUTH and still ge
     std::vector<std::string> said;
     Cc::CredentialNotice notice { [&said](std::string_view text) { said.emplace_back(text); } };
 
-    auto const outcome = SyncRun(CacheFetch(&client, &notice, "k", Credential { .username = {}, .secret = "s3cret" }));
+    auto const outcome =
+        core::async::syncRun(CacheFetch(&client, &notice, "k", Credential { .username = {}, .secret = "s3cret" }));
 
     // The command behind the credential is served. This is the half that was broken.
     REQUIRE(outcome.IsHit());
@@ -2060,7 +2063,7 @@ class IFrameResponder
 /// The reply is produced on the first READ, by which point the whole request has
 /// been written -- so nothing here has to know where a frame ends, and the framing
 /// stays entirely under test rather than being reimplemented by the fixture.
-class AnsweringPeer final: public ISocket
+class AnsweringPeer final: public core::net::ISocket
 {
   public:
     /// @param responder Turns the written request into a reply; must outlive this.
@@ -2069,14 +2072,14 @@ class AnsweringPeer final: public ISocket
     {
     }
 
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> bytes) override
+    [[nodiscard]] core::net::IoAwaitable write(std::span<std::byte const> bytes) override
     {
         _request.insert(_request.end(), bytes.begin(), bytes.end());
-        return IoAwaitable { IoResult { bytes.size() } };
+        return core::net::IoAwaitable { core::net::IoResult { bytes.size() } };
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                            std::shared_ptr<void const> /*keepAlive*/ = {}) override
+    [[nodiscard]] core::net::IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
+                                                       std::shared_ptr<void const> /*keepAlive*/ = {}) override
     {
         std::size_t written = 0;
         for (auto const& segment: segments)
@@ -2084,10 +2087,10 @@ class AnsweringPeer final: public ISocket
             _request.insert(_request.end(), segment.begin(), segment.end());
             written += segment.size();
         }
-        return IoAwaitable { IoResult { written } };
+        return core::net::IoAwaitable { core::net::IoResult { written } };
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override
     {
         if (!_answered)
         {
@@ -2095,19 +2098,19 @@ class AnsweringPeer final: public ISocket
             _answered = true;
         }
         // A read of zero is EOF, which is how a peer that has said everything it has
-        // to say tells `RecvExactly` the frame is over.
+        // to say tells `core::net::receiveExactly` the frame is over.
         auto const take = std::min(_reply.size() - _cursor, buffer.size());
         std::copy_n(_reply.begin() + static_cast<std::ptrdiff_t>(_cursor), take, buffer.begin());
         _cursor += take;
-        return IoAwaitable { IoResult { take } };
+        return core::net::IoAwaitable { core::net::IoResult { take } };
     }
 
-    void Close() noexcept override {}
-    [[nodiscard]] bool IsClosed() const noexcept override
+    void close() noexcept override {}
+    [[nodiscard]] bool isClosed() const noexcept override
     {
         return false;
     }
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return "answering";
     }
@@ -2147,7 +2150,7 @@ class LiveFleet final: public IEndpointExchange, public IFrameResponder
     {
         _current = std::string { hostPort };
         AnsweringPeer peer { *this };
-        return SyncRun(ExchangeFramed(&peer, &Unwatched(), std::move(frame), credential));
+        return core::async::syncRun(ExchangeFramed(&peer, &Unwatched(), std::move(frame), credential));
     }
 
     [[nodiscard]] std::vector<std::byte> Answer(std::span<std::byte const> request) override
@@ -2312,7 +2315,7 @@ TEST_CASE("A worker whose roster is absent or lapsed refuses every grant, and sa
 
     SECTION("a roster whose certification lapsed")
     {
-        auto const lapsed = LeaseClock.Now() - std::chrono::hours { 1 };
+        auto const lapsed = LeaseClock.now() - std::chrono::hours { 1 };
         roster.SetStanding(Distributed::RosterStanding::Expired, lapsed);
         auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
         REQUIRE(refusal.has_value());
@@ -2327,7 +2330,7 @@ TEST_CASE("A worker whose roster is absent or lapsed refuses every grant, and sa
 
     SECTION("the control: a current roster accepts the same grant")
     {
-        roster.SetStanding(Distributed::RosterStanding::Current, LeaseClock.Now() + std::chrono::minutes { 45 });
+        roster.SetStanding(Distributed::RosterStanding::Current, LeaseClock.now() + std::chrono::minutes { 45 });
         CHECK_FALSE(validator(GrantFor(ThisWorker), "gcc-13").refusal.has_value());
     }
 }

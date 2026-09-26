@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/AsyncQueue.hpp>
-#include <FastCache/Async/IReactor.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Platform/StopSignal.hpp>
+
+#include <core/async/AsyncQueue.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/EventLoop.hpp>
 
 namespace FastCache::Cli::Testing
 {
@@ -25,8 +26,8 @@ class ScriptedStopSignal final: public IStopSignal
     /// @param reactor Where a parked wait is resumed.
     /// @param released Set when this signal is destroyed, which is when production puts the
     ///        previous disposition back; null when the case does not ask.
-    explicit ScriptedStopSignal(IReactor& reactor, bool* released = nullptr):
-        _wakes { reactor, AsyncQueueOptions {} },
+    explicit ScriptedStopSignal(core::net::EventLoop& reactor, bool* released = nullptr):
+        _wakes { reactor, core::async::AsyncQueueOptions {} },
         _released { released }
     {
     }
@@ -45,27 +46,28 @@ class ScriptedStopSignal final: public IStopSignal
     /// The operator asks to stop.
     void Fire()
     {
-        (void) _wakes.Push(StopWake::Stopped);
+        (void) _wakes.push(StopWake::Stopped);
     }
 
     /// The wait itself fails.
     void Fail()
     {
-        (void) _wakes.Push(StopWake::Failed);
+        (void) _wakes.push(StopWake::Failed);
     }
 
-    [[nodiscard]] Task<StopWake> Stopped(IExecutor* waiter, IExecutor* resumeOn) override
+    [[nodiscard]] core::async::Task<StopWake> Stopped(core::async::IExecutor* waiter,
+                                                      core::async::IExecutor* resumeOn) override
     {
         static_cast<void>(waiter);
         static_cast<void>(resumeOn);
         ++_waits;
-        auto const wake = co_await _wakes.Pop();
+        auto const wake = co_await _wakes.pop();
         co_return wake.value_or(StopWake::Cancelled);
     }
 
     void Cancel() noexcept override
     {
-        _wakes.Close();
+        _wakes.close();
     }
 
     /// How many waits were started.
@@ -76,7 +78,7 @@ class ScriptedStopSignal final: public IStopSignal
     }
 
   private:
-    AsyncQueue<StopWake> _wakes;
+    core::async::AsyncQueue<StopWake> _wakes;
     bool* _released;
     int _waits { 0 };
 };

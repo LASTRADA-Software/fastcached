@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
@@ -13,6 +12,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Distributed
 {
@@ -51,11 +52,11 @@ struct Lease
 /// operator, printed on a page and served as JSON. The two facts an operator acts
 /// on are which key is held and by whom, and the token is neither.
 ///
-/// The age is a duration rather than the `TimePoint` it came from, and that is the
+/// The age is a duration rather than the `core::platform::SteadyTimePoint` it came from, and that is the
 /// injected clock defending itself -- the same rule `WorkerReport` states. Handed
 /// an instant, the obvious thing for a consumer to do is subtract
 /// `steady_clock::now()` from it, which is right in production and silently wrong
-/// under every `ManualClock` test, because the two clocks agree about nothing.
+/// under every `core::platform::ManualClock` test, because the two clocks agree about nothing.
 struct LeaseReport
 {
     std::string key;                  ///< The object key being compiled.
@@ -80,7 +81,7 @@ struct LeaseListing
 
 /// The set of leases the scheduler has issued and not yet seen resolved.
 ///
-/// **Pure with respect to I/O**, over an injected `IClock`, for the reason
+/// **Pure with respect to I/O**, over an injected `core::platform::IClock`, for the reason
 /// `WorkerRegistry` is: expiry is the whole behaviour here and testing it against
 /// wall-clock sleeps would be both slow and flaky.
 ///
@@ -115,7 +116,8 @@ class LeaseTable
     ///        reclaimed. Must comfortably exceed the slowest compile in the fleet:
     ///        reclaiming early does not abort the running job, it merely lets a
     ///        second client dispatch the same work.
-    explicit LeaseTable(IClock& clock, std::chrono::milliseconds leaseTimeout = DefaultLeaseTimeout) noexcept;
+    explicit LeaseTable(core::platform::IClock& clock,
+                        std::chrono::milliseconds leaseTimeout = DefaultLeaseTimeout) noexcept;
 
     /// Default lease lifetime.
     ///
@@ -338,11 +340,11 @@ class LeaseTable
     struct Entry
     {
         Lease lease;
-        TimePoint issuedAt {};
+        core::platform::SteadyTimePoint issuedAt {};
     };
 
     /// Whether `entry` is still within its lease lifetime.
-    [[nodiscard]] bool IsLive(Entry const& entry, TimePoint now) const noexcept;
+    [[nodiscard]] bool IsLive(Entry const& entry, core::platform::SteadyTimePoint now) const noexcept;
 
     /// Drop one entry from both maps.
     ///
@@ -353,7 +355,7 @@ class LeaseTable
     /// @param entry The token entry to remove; invalidated by the call.
     void Forget(std::unordered_map<std::string, Entry>::iterator entry);
 
-    IClock& _clock;
+    core::platform::IClock& _clock;
     std::chrono::milliseconds _leaseTimeout;
     mutable std::mutex _mutex;
     std::unordered_map<std::string, Entry> _byToken;          ///< Guarded by _mutex.

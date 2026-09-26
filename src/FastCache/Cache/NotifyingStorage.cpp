@@ -53,7 +53,7 @@ void NotifyingStorage::FlushReclaimed() const noexcept
         Emit(entry.kind, entry.key);
 }
 
-std::expected<GetResult, StorageError> NotifyingStorage::Get(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> NotifyingStorage::Get(std::string_view key, core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     // A Get can consume a lapsed TTL: on the strict-LRU path the lookup erases
@@ -66,7 +66,7 @@ std::expected<GetResult, StorageError> NotifyingStorage::Get(std::string_view ke
 std::expected<CasToken, StorageError> NotifyingStorage::Set(std::string_view key,
                                                             std::vector<std::byte> value,
                                                             std::uint32_t flags,
-                                                            TimePoint expiry)
+                                                            core::platform::SteadyTimePoint expiry)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.Set(key, std::move(value), flags, expiry);
@@ -75,8 +75,11 @@ std::expected<CasToken, StorageError> NotifyingStorage::Set(std::string_view key
     return result;
 }
 
-std::expected<CasToken, StorageError> NotifyingStorage::Add(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> NotifyingStorage::Add(std::string_view key,
+                                                            std::vector<std::byte> value,
+                                                            std::uint32_t flags,
+                                                            core::platform::SteadyTimePoint expiry,
+                                                            core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.Add(key, std::move(value), flags, expiry, now);
@@ -85,8 +88,11 @@ std::expected<CasToken, StorageError> NotifyingStorage::Add(
     return result;
 }
 
-std::expected<CasToken, StorageError> NotifyingStorage::Replace(
-    std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now)
+std::expected<CasToken, StorageError> NotifyingStorage::Replace(std::string_view key,
+                                                                std::vector<std::byte> value,
+                                                                std::uint32_t flags,
+                                                                core::platform::SteadyTimePoint expiry,
+                                                                core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.Replace(key, std::move(value), flags, expiry, now);
@@ -98,7 +104,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::Replace(
 std::expected<CasToken, StorageError> NotifyingStorage::Append(std::string_view key,
                                                                std::span<std::byte const> suffix,
                                                                CasToken expected,
-                                                               TimePoint now)
+                                                               core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.Append(key, suffix, expected, now);
@@ -110,7 +116,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::Append(std::string_view 
 std::expected<CasToken, StorageError> NotifyingStorage::Prepend(std::string_view key,
                                                                 std::span<std::byte const> prefix,
                                                                 CasToken expected,
-                                                                TimePoint now)
+                                                                core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.Prepend(key, prefix, expected, now);
@@ -123,8 +129,8 @@ std::expected<CasToken, StorageError> NotifyingStorage::CompareAndSwap(std::stri
                                                                        CasToken expected,
                                                                        std::vector<std::byte> value,
                                                                        std::uint32_t flags,
-                                                                       TimePoint expiry,
-                                                                       TimePoint now)
+                                                                       core::platform::SteadyTimePoint expiry,
+                                                                       core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.CompareAndSwap(key, expected, std::move(value), flags, expiry, now);
@@ -133,10 +139,8 @@ std::expected<CasToken, StorageError> NotifyingStorage::CompareAndSwap(std::stri
     return result;
 }
 
-std::expected<IStorage::IncrResult, StorageError> NotifyingStorage::IncrementOrInitialize(std::string_view key,
-                                                                                          std::uint64_t magnitude,
-                                                                                          bool decrement,
-                                                                                          TimePoint now)
+std::expected<IStorage::IncrResult, StorageError> NotifyingStorage::IncrementOrInitialize(
+    std::string_view key, std::uint64_t magnitude, bool decrement, core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.IncrementOrInitialize(key, magnitude, decrement, now);
@@ -145,7 +149,7 @@ std::expected<IStorage::IncrResult, StorageError> NotifyingStorage::IncrementOrI
     return result;
 }
 
-std::expected<void, StorageError> NotifyingStorage::Delete(std::string_view key, TimePoint now)
+std::expected<void, StorageError> NotifyingStorage::Delete(std::string_view key, core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.Delete(key, now);
@@ -154,7 +158,9 @@ std::expected<void, StorageError> NotifyingStorage::Delete(std::string_view key,
     return result;
 }
 
-std::expected<CasToken, StorageError> NotifyingStorage::Touch(std::string_view key, TimePoint newExpiry, TimePoint now)
+std::expected<CasToken, StorageError> NotifyingStorage::Touch(std::string_view key,
+                                                              core::platform::SteadyTimePoint newExpiry,
+                                                              core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.Touch(key, newExpiry, now);
@@ -163,26 +169,27 @@ std::expected<CasToken, StorageError> NotifyingStorage::Touch(std::string_view k
     return result;
 }
 
-std::expected<GetResult, StorageError> NotifyingStorage::Peek(std::string_view key, TimePoint now)
+std::expected<GetResult, StorageError> NotifyingStorage::Peek(std::string_view key, core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     return _inner.Peek(key, now);
 }
 
-std::expected<std::optional<TimePoint>, StorageError> NotifyingStorage::PeekExpiry(std::string_view key, TimePoint now)
+std::expected<std::optional<core::platform::SteadyTimePoint>, StorageError> NotifyingStorage::PeekExpiry(
+    std::string_view key, core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     return _inner.PeekExpiry(key, now);
 }
-std::expected<bool, StorageError> NotifyingStorage::Prefetch(std::string_view key, TimePoint now)
+std::expected<bool, StorageError> NotifyingStorage::Prefetch(std::string_view key, core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     return _inner.Prefetch(key, now);
 }
 
 std::expected<CasToken, StorageError> NotifyingStorage::MarkStale(std::string_view key,
-                                                                  std::optional<TimePoint> newExpiry,
-                                                                  TimePoint now)
+                                                                  std::optional<core::platform::SteadyTimePoint> newExpiry,
+                                                                  core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.MarkStale(key, newExpiry, now);
@@ -192,8 +199,8 @@ std::expected<CasToken, StorageError> NotifyingStorage::MarkStale(std::string_vi
 }
 
 std::expected<GetResult, StorageError> NotifyingStorage::GetAndTouch(std::string_view key,
-                                                                     TimePoint newExpiry,
-                                                                     TimePoint now)
+                                                                     core::platform::SteadyTimePoint newExpiry,
+                                                                     core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.GetAndTouch(key, newExpiry, now);
@@ -202,7 +209,9 @@ std::expected<GetResult, StorageError> NotifyingStorage::GetAndTouch(std::string
     return result;
 }
 
-std::expected<void, StorageError> NotifyingStorage::CompareAndDelete(std::string_view key, CasToken expected, TimePoint now)
+std::expected<void, StorageError> NotifyingStorage::CompareAndDelete(std::string_view key,
+                                                                     CasToken expected,
+                                                                     core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.CompareAndDelete(key, expected, now);
@@ -211,7 +220,7 @@ std::expected<void, StorageError> NotifyingStorage::CompareAndDelete(std::string
     return result;
 }
 
-std::expected<bool, StorageError> NotifyingStorage::ClearExpiry(std::string_view key, TimePoint now)
+std::expected<bool, StorageError> NotifyingStorage::ClearExpiry(std::string_view key, core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     auto result = _inner.ClearExpiry(key, now);
@@ -226,7 +235,7 @@ std::expected<bool, StorageError> NotifyingStorage::ClearExpiry(std::string_view
 std::expected<CasToken, StorageError> NotifyingStorage::Update(
     std::string_view key,
     std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
-    TimePoint now)
+    core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     // Track the inner outcome by sniffing the callback's UpdateAction.
@@ -267,7 +276,7 @@ std::expected<CasToken, StorageError> NotifyingStorage::Update(
     return result;
 }
 
-void NotifyingStorage::FlushWithGeneration(TimePoint effectiveAt)
+void NotifyingStorage::FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt)
 {
     ReclaimDrain const drain { *this };
     _inner.FlushWithGeneration(effectiveAt);
@@ -277,7 +286,7 @@ void NotifyingStorage::FlushWithGeneration(TimePoint effectiveAt)
     Notify(MutationKind::FlushDb, std::string_view {});
 }
 
-PurgeOutcome NotifyingStorage::PurgeExpired(TimePoint now, PurgeBudget budget)
+PurgeOutcome NotifyingStorage::PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget)
 {
     ReclaimDrain const drain { *this };
     // The counts this returns are still opaque — they say how many, not which —
@@ -317,7 +326,7 @@ bool NotifyingStorage::SupportsSharedRead() const noexcept
     return _inner.SupportsSharedRead();
 }
 
-void NotifyingStorage::PromoteOnRead(std::string_view key, TimePoint now)
+void NotifyingStorage::PromoteOnRead(std::string_view key, core::platform::SteadyTimePoint now)
 {
     ReclaimDrain const drain { *this };
     _inner.PromoteOnRead(key, now);

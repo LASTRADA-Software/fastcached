@@ -2,11 +2,6 @@
 #include "DashboardSampler.hpp"
 #include "LiveEventSource.hpp"
 
-#include <FastCache/Async/AsyncQueue.hpp>
-#include <FastCache/Async/DeadlineTimer.hpp>
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Core/Ranges.hpp>
-
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -19,6 +14,11 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+
+#include <core/Ranges.hpp>
+#include <core/async/AsyncQueue.hpp>
+#include <core/async/ResumeOn.hpp>
+#include <core/net/DeadlineTimer.hpp>
 
 namespace FastCache::Cli
 {
@@ -71,9 +71,9 @@ struct LiveEventSource::State
 {
     explicit State(LiveSourceParts from):
         parts { std::move(from) },
-        events { *parts.reactor, AsyncQueueOptions {} },
-        finished { *parts.reactor, AsyncQueueOptions {} },
-        due { *parts.reactor, AsyncQueueOptions {} },
+        events { *parts.reactor, core::async::AsyncQueueOptions {} },
+        finished { *parts.reactor, core::async::AsyncQueueOptions {} },
+        due { *parts.reactor, core::async::AsyncQueueOptions {} },
         presents { parts.frames != nullptr },
         frames { &parts.frames }
     {
@@ -90,22 +90,22 @@ struct LiveEventSource::State
     /// read before asking for the next, so none can outrun a consumer that draws a frame per
     /// tick. And what a bound would displace is a sample the budget counts or a quit key --
     /// either one lost silently is a session that miscounts or cannot be left.
-    AsyncQueue<DashboardEvent> events;
+    core::async::AsyncQueue<DashboardEvent> events;
 
     /// Closed when the last producer ends; nothing is ever pushed to it.
     ///
     /// A queue rather than a flag because `Drained()` has to PARK on it, and the queue is
     /// this tree's one way to park a coroutine until something else says so.
-    AsyncQueue<std::monostate> finished;
+    core::async::AsyncQueue<std::monostate> finished;
 
     /// Where the stream waits before subscribing again: the timer pushes when the wait is up,
     /// and `Close()` closes it.
     ///
-    /// **A `DeadlineTimer` feeding this queue rather than a `SleepUntil`**, because a sleep can
+    /// **A `core::net::DeadlineTimer` feeding this queue rather than a `SleepUntil`**, because a sleep can
     /// be taken back only by whoever holds the sleeping frame's handle. Closing the queue wakes
     /// the stream on the reactor's next turn, it leaves through its own tail like every other
     /// exit, and its timer's destructor takes the pending deadline off the heap.
-    AsyncQueue<std::monostate> due;
+    core::async::AsyncQueue<std::monostate> due;
 
     /// Whether the source was given a presenter at all, which `Frames()` answers by.
     bool presents;
@@ -125,7 +125,7 @@ struct LiveEventSource::State
     std::atomic<bool> drained { false };
 
     /// When the outstanding dial or read started, in the source clock's ticks, or `NoRead`.
-    std::atomic<TimePoint::rep> readSince { NoRead };
+    std::atomic<core::platform::SteadyTimePoint::rep> readSince { NoRead };
 
     /// Guards `streaming`, which a drain reads from another thread.
     mutable std::mutex streamingGuard;
@@ -134,20 +134,20 @@ struct LiveEventSource::State
     std::string streaming;
 
     /// `readSince` when nothing is out. No real reading of a steady clock is this.
-    static constexpr auto NoRead = std::numeric_limits<TimePoint::rep>::min();
+    static constexpr auto NoRead = std::numeric_limits<core::platform::SteadyTimePoint::rep>::min();
 
     /// Whether the session is closed.
     /// @return True once `Close()` has run.
     [[nodiscard]] bool Closed() const noexcept
     {
-        return events.IsClosed();
+        return events.isClosed();
     }
 
     /// Queue @p event for `Next()`.
     /// @param event What happened.
     void Deliver(DashboardEvent event)
     {
-        (void) events.Push(std::move(event));
+        (void) events.push(std::move(event));
     }
 
     /// Queue a sample outcome for `Next()`, and the frame it owes.
@@ -162,7 +162,7 @@ struct LiveEventSource::State
     /// @param at When the failure was observed.
     /// @param outcome What it means as an outcome.
     /// @param note Why, for a person.
-    void DeliverFailure(TimePoint at, Outcome outcome, std::string note)
+    void DeliverFailure(core::platform::SteadyTimePoint at, Outcome outcome, std::string note)
     {
         DeliverSample(DashboardEvent {
             .kind = DashboardEventKind::SampleFailed, .at = at, .outcome = outcome, .note = std::move(note) });
@@ -194,7 +194,7 @@ struct LiveEventSource::State
     /// Mark a dial or read as out, for `ReadOutstandingSince()`.
     void MarkOut() noexcept
     {
-        readSince.store(parts.clock->Now().time_since_epoch().count(), std::memory_order_release);
+        readSince.store(parts.clock->now().time_since_epoch().count(), std::memory_order_release);
     }
 
     /// Mark that nothing is out any more.
@@ -209,7 +209,7 @@ struct LiveEventSource::State
         if (--producers != 0)
             return;
         drained.store(true, std::memory_order_release);
-        finished.Close();
+        finished.close();
     }
 };
 
@@ -219,7 +219,7 @@ namespace
     /// @param due The source's `due` queue.
     void SubscriptionDue(void* due)
     {
-        (void) static_cast<AsyncQueue<std::monostate>*>(due)->Push(std::monostate {});
+        (void) static_cast<core::async::AsyncQueue<std::monostate>*>(due)->push(std::monostate {});
     }
 
     /// What a refusal of a subscription leaves the session to do.
@@ -306,7 +306,10 @@ namespace
     /// @param frame The refusal.
     /// @param where Who refused; replaced by the leader it named when this returns `Follow`.
     /// @return What the source does next.
-    [[nodiscard]] StreamEnd Refused(LiveEventSource::State* state, TimePoint at, LiveFrame const& frame, Endpoint* where)
+    [[nodiscard]] StreamEnd Refused(LiveEventSource::State* state,
+                                    core::platform::SteadyTimePoint at,
+                                    LiveFrame const& frame,
+                                    Endpoint* where)
     {
         auto const code = frame.code.value_or(Wire::ErrorCode::MalformedFrame);
         // `DecideLeaderHop`, the rule `fleet` follows too. A failed subscription is a gap, and the next
@@ -330,7 +333,7 @@ namespace
         }
 
         auto const* const row =
-            FindIfOrNull(StreamRefusalRows, [code](StreamRefusalRow const& each) { return each.code == code; });
+            core::findIfOrNull(StreamRefusalRows, [code](StreamRefusalRow const& each) { return each.code == code; });
         auto const outcome = row != nullptr ? row->outcome : Outcome::Refused;
         auto const course = row != nullptr ? row->course : RefusalCourse::Caller;
         auto const why = row != nullptr ? row->why : CallerRemedy(code, state->Request());
@@ -356,7 +359,7 @@ namespace
     /// @param where Where the stream answers.
     /// @param cadence What its grant said the server keeps.
     void DeliverReading(LiveEventSource::State* state,
-                        TimePoint at,
+                        core::platform::SteadyTimePoint at,
                         LiveFrame frame,
                         Endpoint const& where,
                         std::optional<std::chrono::milliseconds> cadence)
@@ -378,7 +381,7 @@ namespace
     /// @param state The source; the stream holds it alive.
     /// @param where Where to subscribe; replaced by the leader when this returns `Follow`.
     /// @return How the stream ended.
-    Task<StreamEnd> ReadStream(LiveEventSource::State* state, Endpoint* where)
+    core::async::Task<StreamEnd> ReadStream(LiveEventSource::State* state, Endpoint* where)
     {
         auto const& parts = state->parts;
 
@@ -390,7 +393,7 @@ namespace
             co_return StreamEnd::Closed;
         if (!opened.has_value())
         {
-            state->DeliverFailure(parts.clock->Now(), Outcome::Unreachable, opened.error().detail);
+            state->DeliverFailure(parts.clock->now(), Outcome::Unreachable, opened.error().detail);
             co_return StreamEnd::Retry;
         }
 
@@ -445,10 +448,10 @@ namespace
 
     /// Subscribe, read, and subscribe again after an interval; until closed or finished.
     /// @param shared The source's state; held so it outlives the source if need be.
-    DetachedTask RunStream(std::shared_ptr<LiveEventSource::State> shared)
+    core::async::DetachedTask RunStream(std::shared_ptr<LiveEventSource::State> shared)
     {
         auto const& parts = shared->parts;
-        co_await ResumeOn { *parts.reactor };
+        co_await core::async::ResumeOn { *parts.reactor };
 
         auto where = parts.endpoint;
         while (!shared->Closed())
@@ -470,14 +473,12 @@ namespace
             // afresh, or a session that once ran out of them could never follow one again.
             where = parts.endpoint;
             shared->redirects = 0;
-            // A zero poll interval: `Close()` wakes this through `due`, so the timer never needs to
-            // look at anything before its deadline.
-            auto const timer = DeadlineTimer { *parts.reactor,
-                                               parts.reactor->Clock().Now() + parts.interval,
-                                               &SubscriptionDue,
-                                               &shared->due,
-                                               Duration::zero() };
-            if (!(co_await shared->due.Pop()).has_value())
+            // `Close()` wakes this through `due`, so the timer never needs to look at anything
+            // before its deadline -- and core-cpp's parks once rather than polling.
+            auto const timer = core::net::DeadlineTimer {
+                *parts.reactor, parts.reactor->clock().now() + parts.interval, &SubscriptionDue, &shared->due
+            };
+            if (!(co_await shared->due.pop()).has_value())
                 break;
         }
         shared->ProducerEnded();
@@ -485,9 +486,9 @@ namespace
 
     /// Forward what the terminal says, until closed or until the terminal goes away.
     /// @param shared The source's state; held so it outlives the source if need be.
-    DetachedTask RunTerminal(std::shared_ptr<LiveEventSource::State> shared)
+    core::async::DetachedTask RunTerminal(std::shared_ptr<LiveEventSource::State> shared)
     {
-        co_await ResumeOn { *shared->parts.reactor };
+        co_await core::async::ResumeOn { *shared->parts.reactor };
 
         while (!shared->Closed())
         {
@@ -523,9 +524,11 @@ namespace
     /// **Awaited, never polled**: the blocking wait is on `stopWaiter`, and this resumes on
     /// the reactor only once the signal or `Close()` has said something.
     /// @param shared The source's state; held so it outlives the source if need be.
-    DetachedTask RunStopWatch(std::shared_ptr<LiveEventSource::State> shared)
+    core::async::DetachedTask RunStopWatch(std::shared_ptr<LiveEventSource::State> shared)
     {
         auto& parts = shared->parts;
+        // On the reactor before the wait: a queue's pop resumes on the executor it parked on (core-cpp 0.4.0).
+        co_await core::async::ResumeOn { *parts.reactor };
         auto const wake = co_await parts.stop->Stopped(parts.stopWaiter, parts.reactor);
 
         // Released as soon as nothing waits on it, which is what puts the previous signal
@@ -582,10 +585,10 @@ LiveEventSource::~LiveEventSource()
     Close();
 }
 
-Task<DashboardEvent> LiveEventSource::Next()
+core::async::Task<DashboardEvent> LiveEventSource::Next()
 {
     auto const state = _state;
-    auto event = co_await state->events.Pop();
+    auto event = co_await state->events.pop();
     if (!event.has_value())
         co_return DashboardEvent { .kind = DashboardEventKind::Detached, .note = std::string { SessionClosedNote } };
     co_return *std::move(event);
@@ -596,8 +599,8 @@ void LiveEventSource::Close() noexcept
     auto& state = *_state;
     if (state.Closed())
         return;
-    state.events.Close();
-    state.due.Close();
+    state.events.close();
+    state.due.close();
     // The one call allowed while a read is on the pool: a half-close, which the node answers by
     // closing, and that close is what returns the read.
     state.parts.subscription->Leave();
@@ -612,12 +615,12 @@ bool LiveEventSource::IsDrained() const noexcept
     return _state->drained.load(std::memory_order_acquire);
 }
 
-std::optional<TimePoint> LiveEventSource::ReadOutstandingSince() const noexcept
+std::optional<core::platform::SteadyTimePoint> LiveEventSource::ReadOutstandingSince() const noexcept
 {
     auto const since = _state->readSince.load(std::memory_order_acquire);
     if (since == State::NoRead)
         return std::nullopt;
-    return TimePoint { TimePoint::duration { since } };
+    return core::platform::SteadyTimePoint { core::platform::SteadyTimePoint::duration { since } };
 }
 
 std::string LiveEventSource::StreamingEndpoint() const
@@ -631,11 +634,11 @@ IFrameSink* LiveEventSource::Frames() noexcept
     return _state->presents ? &_state->frames : nullptr;
 }
 
-Task<void> LiveEventSource::Drained()
+core::async::Task<void> LiveEventSource::Drained()
 {
     auto const state = _state;
     // Nothing is ever pushed, so this resumes exactly when the last producer closes it.
-    (void) co_await state->finished.Pop();
+    (void) co_await state->finished.pop();
 }
 
 } // namespace FastCache::Cli

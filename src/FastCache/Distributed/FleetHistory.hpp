@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Distributed/FleetSample.hpp>
 
@@ -17,6 +16,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Distributed
 {
@@ -242,7 +243,7 @@ class FleetHistory
     static constexpr std::chrono::seconds SampleInterval = FleetSampleInterval;
 
     /// @param wall Where a bucket's timestamp comes from; injected so a test can place one.
-    explicit FleetHistory(WallClockRef wall);
+    explicit FleetHistory(core::platform::WallClockRef wall);
 
     /// Record one reading, folding it into whichever bucket its instant belongs to.
     ///
@@ -371,7 +372,7 @@ class FleetHistory
 
     [[nodiscard]] std::int64_t NowMillis() const noexcept;
 
-    WallClockRef _wall;
+    core::platform::WallClockRef _wall;
     mutable std::mutex _mutex;
 
     /// One ring per `FleetRingTable` row, in enumerator order.
@@ -427,7 +428,7 @@ class FleetNodeHistories final: public IFleetHistorySink
 {
   public:
     /// @param wall Where a bucket's timestamp comes from; injected so a test can place one.
-    explicit FleetNodeHistories(WallClockRef wall);
+    explicit FleetNodeHistories(core::platform::WallClockRef wall);
 
     /// Take what a node handed over.
     ///
@@ -485,7 +486,7 @@ class FleetNodeHistories final: public IFleetHistorySink
     [[nodiscard]] bool Save(std::filesystem::path const& path) const;
 
   private:
-    WallClockRef _wall;
+    core::platform::WallClockRef _wall;
     mutable std::mutex _mutex;
 
     /// One entry per machine: its series, and how far it has reported.

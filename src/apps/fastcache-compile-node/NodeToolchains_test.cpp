@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeToolchains.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Platform/EnvironmentTestUtils.hpp>
 
@@ -24,6 +23,7 @@
 
 #include <ToolchainHostTestUtils.hpp>
 #include <ToolchainProbe.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -300,9 +300,9 @@ void DescribeMsvcLayout(ScriptedToolchainHost& host)
 /// files against a ten-second window. What it does buy is that nobody has to remember
 /// to advance a clock to keep a case about toolchain resolution passing.
 /// @return A steady clock that outlives every case.
-[[nodiscard]] IClock const& TestClock()
+[[nodiscard]] core::platform::IClock const& TestClock()
 {
-    static SteadyClock const clock;
+    static core::platform::SteadyClock const clock;
     return clock;
 }
 

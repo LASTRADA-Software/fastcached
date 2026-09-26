@@ -4,8 +4,6 @@
 #include "FleetDocument.hpp"
 #include "ScriptedDashboardEvents.hpp"
 
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 
@@ -22,6 +20,8 @@
 #include <utility>
 #include <vector>
 
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -74,9 +74,9 @@ constexpr auto Elsewhere = std::string_view { "10.0.0.9:7071" };
 /// A steady time @p seconds after the clock's epoch.
 /// @param seconds How far in.
 /// @return The time point.
-[[nodiscard]] TimePoint At(int seconds)
+[[nodiscard]] core::platform::SteadyTimePoint At(int seconds)
 {
-    return TimePoint { std::chrono::seconds { seconds } };
+    return core::platform::SteadyTimePoint { std::chrono::seconds { seconds } };
 }
 
 /// A reading whose one counter reads @p value, captured the way a daemon captures one.
@@ -128,11 +128,17 @@ TEST_CASE("the dashboard's event source parks rather than resolving inline", "[c
     // pass.
     //
     // WHAT DISTINGUISHES: the loop must be INCOMPLETE after the task is submitted and
-    // only one turn of the reactor has run. A synchronous source finishes the whole
-    // script inside `Submit`, so `result` would already be engaged and `PendingTimers`
-    // would be zero. Asserting merely that the loop finishes passes either way.
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
+    // only one turn of the reactor has run, with the reactor holding its resumption. A
+    // synchronous source finishes the whole script inside `submit`, so `result` would
+    // already be engaged and the reactor would hold nothing. Asserting merely that the
+    // loop finishes passes either way.
+    //
+    // WHERE the reactor holds it is the loop's business, not this case's: the park is a
+    // deadline of "now", which the same turn's step 5 finds due and queues, to be resumed
+    // in the next turn's step 2 (core-cpp's guarantee G2). So after one turn it is a
+    // queued submission, not a live timer, and the check counts both.
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
     auto view = RecordingView {};
     auto sink = CollectingSink {};
     auto events = ScriptedDashboardEvents { reactor,
@@ -142,14 +148,14 @@ TEST_CASE("the dashboard's event source parks rather than resolving inline", "[c
     auto result = std::optional<DashboardExit> {};
     auto task = DriveOnce(&events, &ReadStatsSample, &view, &sink, DashboardLimits {}, &result);
 
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     CHECK(!result.has_value()); // nothing has run yet
 
-    (void) reactor.Tick();
+    (void) reactor.tick();
     CHECK(!result.has_value()); // the first Next() is PARKED, not answered
-    CHECK(reactor.PendingTimers() >= 1);
+    CHECK(reactor.pendingTimers() + reactor.pendingSubmissions() >= 1);
 
-    reactor.Drain();
+    reactor.drain();
     REQUIRE(result.has_value());
     CHECK(Unwrap(result).stop == DashboardStop::Quit);
 }

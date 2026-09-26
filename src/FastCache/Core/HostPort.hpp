@@ -156,7 +156,7 @@ namespace FastCache
 /// meets then decides what it is.
 ///
 /// An empty host matches **nothing**, the empty host included. That is the direction
-/// an unidentifiable peer has to fail in -- it is what `FormatPeerAddress` answers
+/// an unidentifiable peer has to fail in -- it is what `core::net::formatPeerAddress` answers
 /// for a peer whose family is unknown or whose `getpeername` failed, and two
 /// unanswerable questions are not a match.
 ///
@@ -180,7 +180,7 @@ namespace FastCache
 /// admitted to the fleet and refused its objects, or the reverse.
 ///
 /// Textual rather than a `SocketAddress` comparison, because what a caller has at
-/// these two sites is what `ISocket::PeerAddress()` reports — a host string. The
+/// these two sites is what `core::net::ISocket::PeerAddress()` reports — a host string. The
 /// spellings recognised are the ones a kernel actually produces for a loopback
 /// connection: `127.0.0.0/8` in any of its forms, IPv6 `::1`, and the
 /// IPv4-mapped `::ffff:127.x.x.x` a dual-stack listener reports for an IPv4 client.
@@ -188,7 +188,7 @@ namespace FastCache
 /// says it is, and a resolver is not something a security decision may depend on.
 ///
 /// An **empty** host is not local either, and that direction is deliberate. It is
-/// what `FormatPeerAddress` answers for a peer it could not identify — a family it
+/// what `core::net::formatPeerAddress` answers for a peer it could not identify — a family it
 /// does not know, or a `getpeername` that failed — and a caller this machine cannot
 /// name must not be handed its CPU. The one shape that is genuinely local and
 /// reports nothing is a Unix-domain socket, which is unreachable here: the node

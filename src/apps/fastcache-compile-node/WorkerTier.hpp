@@ -15,8 +15,6 @@
 #include "ScratchClaim.hpp"
 #include "WorkerLease.hpp"
 
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -46,6 +44,8 @@
 #include <ToolchainDiscovery.hpp>
 #include <ToolchainHost.hpp>
 #include <WorkerProtocol.hpp>
+#include <core/async/ThreadPoolExecutor.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -194,7 +194,7 @@ class WorkerTier
     /// hands over none, so it reads none.
     /// @param statusClock The clock `node-status` differences a registration against.
     /// @return The running heartbeat.
-    [[nodiscard]] WorkerHeartbeat Launch(IClock const& statusClock);
+    [[nodiscard]] WorkerHeartbeat Launch(core::platform::IClock const& statusClock);
 
     /// @return What answers the compile family on this node's `0xFC` listener.
     [[nodiscard]] CompileResponder& Responder() noexcept
@@ -274,7 +274,7 @@ class WorkerTier
                std::uint32_t slots);
 
     /// The heartbeat thread's body: the first survey, then a round per interval.
-    void Heartbeat(std::stop_token const& stop, IClock const& statusClock);
+    void Heartbeat(std::stop_token const& stop, core::platform::IClock const& statusClock);
 
     /// One registrar per served toolchain, carrying this machine's capacity record and
     /// the endpoint in force when it is called.
@@ -314,7 +314,7 @@ class WorkerTier
     /// it after -- `_prover`'s arrangement, for `_prover`'s reason.
     AnnouncedEndpoint& _announced;
     WorkerMachine _machine;
-    SteadyClock _toolchainClock;
+    core::platform::SteadyClock _toolchainClock;
     DiscoveredToolchains _discovered;
     std::map<std::string, ServedToolchain> _toolchains;
     std::unique_ptr<IScratchClaim> _scratchClaim;
@@ -323,7 +323,7 @@ class WorkerTier
     std::unique_ptr<Distributed::WorkerLeaseState> _leaseState;
     Cc::WorkerProtocol _protocol;
     std::uint32_t _slots;
-    ThreadPoolExecutor _pool;
+    core::async::ThreadPoolExecutor _pool;
     CompileCapacity _capacity;
     CompileResponder _responder;
     NodeRuntimeState _runtime;

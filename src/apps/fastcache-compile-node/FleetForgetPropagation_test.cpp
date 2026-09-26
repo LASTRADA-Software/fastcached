@@ -26,7 +26,6 @@
 #include "NodeStatusResponder.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -39,6 +38,7 @@
 #include <vector>
 
 #include <Dispatch.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/FleetHarness.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -79,7 +79,7 @@ constexpr std::string_view Key = "obj-1";
 struct Machine
 {
     /// @param clock Where uptime comes from; must outlive this.
-    explicit Machine(IClock const& clock):
+    explicit Machine(core::platform::IClock const& clock):
         // **`--fleet-member` NAMES the client, and without it this whole file tests nothing.**
         // A default `NodeConfig` lists no members, and an empty list refuses everybody but
         // loopback -- so the client would be refused as an OUTSIDER whether or not anything was
@@ -96,7 +96,7 @@ struct Machine
             return c;
         }() },
         status {
-            cfg, clock, clock.Now(), "1.2.3", "node-x", NodeComponents {}, NodeRuntimeSources { .membership = &membership }
+            cfg, clock, clock.now(), "1.2.3", "node-x", NodeComponents {}, NodeRuntimeSources { .membership = &membership }
         }
     {
     }
@@ -149,7 +149,7 @@ TEST_CASE("a forget committed on the leader is refused at a second machine AND r
     // would assert the wrong refusal. It also refuses `Register`, so a worker cannot even be
     // arranged there. So each machine is driven as the answering leader of its own fleet, and
     // what distinguishes the two is what each has APPLIED -- which is the subject anyway.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     Testing::FleetHarness fleet;
     fleet.AddScheduler(std::string { Applied });
     fleet.ElectLeader(Applied);
@@ -203,7 +203,7 @@ TEST_CASE("a machine that has NOT applied the forget reports differently, and st
     // The behind machine answers as its own fleet's leader, for the reason the case above
     // states: a follower refuses on leadership before membership is reached, which would make
     // "it still serves the client" untestable.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     Testing::FleetHarness fleet;
     fleet.AddScheduler(std::string { Behind });
     fleet.ElectLeader(Behind);

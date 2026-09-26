@@ -1,7 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/IReactor.hpp>
-#include <FastCache/Async/SleepUntil.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/SetCodec.hpp>
@@ -9,7 +6,6 @@
 #include <FastCache/Core/Bytes.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/NumericText.hpp>
-#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 #include <FastCache/Protocol/IPubSubRegistry.hpp>
@@ -42,6 +38,11 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <core/Profiling.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/EventLoop.hpp>
+#include <core/net/SleepUntil.hpp>
 
 namespace FastCache
 {
@@ -84,7 +85,7 @@ namespace
       public:
         /// @param reactor The reactor this connection is pinned to, or nullptr
         ///        for non-reactor transports (delivery then resumes inline).
-        explicit Subscriber(IReactor* reactor) noexcept:
+        explicit Subscriber(core::net::EventLoop* reactor) noexcept:
             _reactor { reactor }
         {
         }
@@ -128,33 +129,33 @@ namespace
         struct WakeLatch
         {
             std::mutex mu;
-            ParkedWork handle {};
+            core::async::ParkedWork handle {};
             bool resolved { false };
 
             /// Resume the parked loop if no arm has resolved yet. Thread-safe.
             /// @param reactor Reactor to marshal the resume onto, or nullptr to
             ///        resume inline (non-reactor transports / same thread).
-            void WakeOnce(IReactor* reactor)
+            void WakeOnce(core::net::EventLoop* reactor)
             {
-                // `Detail::Parked` rather than a bare handle, so every way of
+                // `core::async::detail::Parked` rather than a bare handle, so every way of
                 // leaving this function accounts for the chain: handed to the
                 // reactor, resumed inline, or -- if it is somehow neither -- freed
                 // by the guard rather than dropped. Nothing changes for a BORROWED
                 // handle, whose `abandon` is empty.
-                Detail::Parked toWake;
+                core::async::detail::Parked toWake;
                 {
                     std::scoped_lock const lock { mu };
                     if (resolved)
                         return;
                     resolved = true;
-                    toWake = Detail::Parked { std::exchange(handle, ParkedWork {}) };
+                    toWake = core::async::detail::Parked { std::exchange(handle, core::async::ParkedWork {}) };
                 }
-                if (toWake.Handle())
+                if (toWake.handle())
                 {
                     if (reactor != nullptr)
-                        reactor->Submit(toWake.Take());
+                        reactor->submit(toWake.take());
                     else
-                        toWake.Resume();
+                        toWake.resume();
                 }
             }
         };
@@ -172,7 +173,7 @@ namespace
             {
                 return self->HasPending() || self->_readablePending;
             }
-            /// Templated on the promise for `ResumeOn`'s reason: `WakeOnce` posts
+            /// Templated on the promise for `core::async::ResumeOn`'s reason: `WakeOnce` posts
             /// this chain to a reactor that may be destroyed before it dequeues it,
             /// and only the parking coroutine's own promise type knows whether
             /// anything else can free it
@@ -189,7 +190,7 @@ namespace
                 if (!self->_queue.empty() || self->_readablePending)
                     return false; // raced: work is already available.
                 auto const latch = std::make_shared<WakeLatch>();
-                latch->handle = Detail::ParkedWorkFor(handle);
+                latch->handle = core::async::detail::parkedWorkFor(handle);
                 self->_latch = latch;
                 return true;
             }
@@ -210,7 +211,7 @@ namespace
         /// becomes readable, and re-arms after the command loop has consumed the
         /// pending bytes. Idempotent: a second call is a no-op.
         /// @param socket The connection socket to watch.
-        void StartReadableWatcher(ISocket* socket)
+        void StartReadableWatcher(core::net::ISocket* socket)
         {
             {
                 std::scoped_lock const lock { _mu };
@@ -249,7 +250,7 @@ namespace
         void ShutdownWatcher() noexcept
         {
             std::shared_ptr<WakeLatch> latch;
-            ISocket* socket = nullptr;
+            core::net::ISocket* socket = nullptr;
             {
                 std::scoped_lock const lock { _mu };
                 _shuttingDown = true;
@@ -263,7 +264,7 @@ namespace
             // completion. The connection's own Close on its way out is
             // redundant once we've done this, but harmless.
             if (socket != nullptr)
-                socket->Close();
+                socket->close();
         }
 
         /// Called by the command loop once it has drained the readable bytes, so
@@ -309,7 +310,7 @@ namespace
         ///
         /// **That primitive now EXISTS**, and this sentence used to say it did not
         /// ("#710 is the ticket about that missing primitive") -- which, left standing,
-        /// is a comment telling the next reader not to try. `ISocket::CancelRead()`
+        /// is a comment telling the next reader not to try. `core::net::ISocket::CancelRead()`
         /// retires a parked read without closing the socket, and it is what
         /// [#755](https://github.com/LASTRADA-Software/fastcached/issues/755) wants:
         /// the watcher surviving the exit from subscribe mode can be retired directly
@@ -353,7 +354,7 @@ namespace
         /// is in subscribe mode and is abandoned when the connection frame ends).
         /// @param self Owning reference to the subscriber (keeps it alive
         ///             across every co_await, even after Run's frame returns).
-        static DetachedTask RunReadableWatcher(std::shared_ptr<Subscriber> self, ISocket* socket)
+        static core::async::DetachedTask RunReadableWatcher(std::shared_ptr<Subscriber> self, core::net::ISocket* socket)
         {
             while (true)
             {
@@ -362,7 +363,7 @@ namespace
                     if (self->_shuttingDown)
                         co_return;
                 }
-                auto const readable = co_await socket->WaitReadable();
+                auto const readable = co_await socket->waitReadable();
                 if (!readable.has_value())
                     co_return; // socket closed/errored — the loop will observe it.
 
@@ -419,13 +420,13 @@ namespace
                 std::scoped_lock const lock { latch->mu };
                 if (latch->resolved)
                     return false;
-                latch->handle = Detail::ParkedWorkFor(handle);
+                latch->handle = core::async::detail::parkedWorkFor(handle);
                 return true;
             }
             void await_resume() const noexcept {}
         };
 
-        IReactor* _reactor;
+        core::net::EventLoop* _reactor;
         mutable std::mutex _mu;
         std::deque<PushMessage> _queue;
         std::shared_ptr<WakeLatch> _latch {}; ///< Latch the command loop parks on.
@@ -436,7 +437,7 @@ namespace
         /// parked I/O. Lifetime: the connection owns the socket; the
         /// watcher is torn down via ShutdownWatcher BEFORE the
         /// connection destroys the socket.
-        ISocket* _socket { nullptr };
+        core::net::ISocket* _socket { nullptr };
         bool _readablePending { false }; ///< Watcher saw readable bytes.
         bool _watcherStarted { false };  ///< StartReadableWatcher ran.
         bool _shuttingDown { false };
@@ -576,7 +577,7 @@ namespace
       public:
         /// @param reactor Reactor to marshal the resume onto (the connection's),
         ///        or nullptr for non-reactor transports (resume inline).
-        explicit StreamWaiter(IReactor* reactor) noexcept:
+        explicit StreamWaiter(core::net::EventLoop* reactor) noexcept:
             _reactor { reactor }
         {
         }
@@ -624,7 +625,7 @@ namespace
                 std::scoped_lock const lock { self->_mu };
                 return self->_resolved;
             }
-            /// Templated on the promise for `ResumeOn`'s reason: `WakeOnce` posts
+            /// Templated on the promise for `core::async::ResumeOn`'s reason: `WakeOnce` posts
             /// this chain to a reactor that may be destroyed before it dequeues it,
             /// and only the parking coroutine's own promise type knows whether
             /// anything else can free it
@@ -638,7 +639,7 @@ namespace
                 std::scoped_lock const lock { self->_mu };
                 if (self->_resolved)
                     return false; // raced: resolved between await_ready and here.
-                self->_handle = Detail::ParkedWorkFor(handle);
+                self->_handle = core::async::detail::parkedWorkFor(handle);
                 return true;
             }
             void await_resume() const noexcept {}
@@ -657,7 +658,7 @@ namespace
         }
 
         /// The reactor this waiter resumes on (used to arm the timeout trampoline).
-        [[nodiscard]] IReactor* Reactor() const noexcept
+        [[nodiscard]] core::net::EventLoop* Reactor() const noexcept
         {
             return _reactor;
         }
@@ -669,9 +670,9 @@ namespace
         /// @param disconnected True when resolved by the client-disconnect arm.
         void WakeOnce(bool timedOut = false, bool disconnected = false) noexcept
         {
-            // `Detail::Parked` for the reason on `WakeLatch::WakeOnce`: handed on,
+            // `core::async::detail::Parked` for the reason on `WakeLatch::WakeOnce`: handed on,
             // resumed inline, or freed -- never dropped.
-            Detail::Parked toWake;
+            core::async::detail::Parked toWake;
             {
                 std::scoped_lock const lock { _mu };
                 if (_resolved)
@@ -679,20 +680,20 @@ namespace
                 _resolved = true;
                 _timedOut = timedOut;
                 _disconnected = disconnected;
-                toWake = Detail::Parked { std::exchange(_handle, ParkedWork {}) };
+                toWake = core::async::detail::Parked { std::exchange(_handle, core::async::ParkedWork {}) };
             }
-            if (toWake.Handle())
+            if (toWake.handle())
             {
                 if (_reactor != nullptr)
-                    _reactor->Submit(toWake.Take());
+                    _reactor->submit(toWake.take());
                 else
-                    toWake.Resume();
+                    toWake.resume();
             }
         }
 
-        IReactor* _reactor;
+        core::net::EventLoop* _reactor;
         mutable std::mutex _mu;
-        ParkedWork _handle {};
+        core::async::ParkedWork _handle {};
         bool _resolved { false };
         bool _timedOut { false };
         bool _disconnected { false };
@@ -704,7 +705,7 @@ namespace
     /// none** ([#710](https://github.com/LASTRADA-Software/fastcached/issues/710)). A
     /// pass that ended with the previous trampoline still parked in `WaitReadable`
     /// therefore armed a second one over it -- and a socket has ONE read operation
-    /// (`ISocket::Read`, #663), so the parked awaitable's pointer is dropped: that
+    /// (`core::net::ISocket::Read`, #663), so the parked awaitable's pointer is dropped: that
     /// coroutine is never resumed, never freed, and takes its `shared_ptr<StreamWaiter>`
     /// with it. On IOCP it is worse than a leak, because the reused `OVERLAPPED`
     /// completes the wrong operation and reports EOF on a healthy connection.
@@ -725,7 +726,7 @@ namespace
     ///
     /// **`Retire` is not `Disconnect`.** Retiring says *this blocking read is over*, so
     /// a trampoline resumed afterwards -- including by the `Cancelled` completion
-    /// `ISocket::CancelRead` delivers -- must resolve nobody. Without that, cancelling
+    /// `core::net::ISocket::CancelRead` delivers -- must resolve nobody. Without that, cancelling
     /// would present to the loop as the peer having gone, which is a healthy client
     /// dropped: the false disconnect `Net/ReadSlot.hpp` names as the reason a socket
     /// cannot do this for its caller.
@@ -814,7 +815,7 @@ namespace
         ///
         /// Every access is on the connection's own reactor thread: `StreamWaiter::WakeOnce`
         /// marshals the registry's cross-thread wake through `_reactor->Submit`, so it never
-        /// reaches this object, and `IReactor` is one worker thread per reactor. Measured at
+        /// reaches this object, and `core::net::EventLoop` is one worker thread per reactor. Measured at
         /// ~6 ns per pass against a pass that already takes `StreamWaiterRegistry`'s
         /// process-wide lock and walks its whole key map -- so it is unmeasurable in situ,
         /// on a path only a BLOCKing verb reaches.
@@ -849,7 +850,7 @@ namespace
     /// as sufficient is the trap here. It holds waiters by `weak_ptr` keyed on the
     /// raw pointer and upgrades under its lock precisely so `Wake()` cannot land on
     /// freed memory -- but `ArmTimeout` takes the waiter **by value as a
-    /// `shared_ptr`** and parks on the reactor's timer as a `DetachedTask`, so with a
+    /// `shared_ptr`** and parks on the reactor's timer as a `core::async::DetachedTask`, so with a
     /// deadline armed the `StreamWaiter` OUTLIVES the destroyed frame. The weak_ptr
     /// then still upgrades, `NotifyAppended` wakes a live waiter, and the waiter
     /// resumes a coroutine handle whose frame is gone.
@@ -863,14 +864,14 @@ namespace
     /// rather than to this guard, so neither would have been testing the fix:
     ///
     ///   * Destroying the frame by dropping `BlockingHarness` leaves `ArmTimeout`'s
-    ///     `DetachedTask` parked on `SleepUntil` with no reactor left to fire it --
+    ///     `core::async::DetachedTask` parked on `SleepUntil` with no reactor left to fire it --
     ///     ASan reports it as a 72-byte leak from `ArmTimeout`. That frame is
     ///     orphaned only because the reactor died first; in production the reactor
     ///     outlives the connection and the timer always fires.
-    ///   * Destroying it through `IReactor::CancelPending` instead is a
+    ///   * Destroying it through `core::net::EventLoop::CancelPending` instead is a
     ///     `heap-use-after-free`: the socket still holds a pointer to an
-    ///     `IoAwaitable` living IN that frame, so `~InMemorySocket` -> `Close()` ->
-    ///     `IoAwaitable::Complete` writes into freed storage.
+    ///     `core::net::IoAwaitable` living IN that frame, so `~InMemorySocket` -> `Close()` ->
+    ///     `core::net::IoAwaitable::Complete` writes into freed storage.
     ///
     /// A counting `IStreamWaiterRegistry` DID distinguish the two states -- one
     /// `Register` against zero `Unregister` without this destructor, one against one
@@ -932,7 +933,7 @@ namespace
     /// point. What it made synchronous everywhere is freeing the read SLOT. Resolving the
     /// WAITER inline is a narrower promise: it holds for a parked `WaitReadable`, which is
     /// what this watch parks, and NOT for a real `Read` on IOCP, which settles later
-    /// (`ISocket::CancelRead`). So *retirement is synchronous everywhere* -- the sentence
+    /// (`core::net::ISocket::CancelRead`). So *retirement is synchronous everywhere* -- the sentence
     /// that stood here -- is false as a general claim and true only of the one shape this
     /// class uses. The rule outlives its dead reason; the reason above holds on every
     /// platform and for every shape, which is why it is the one stated first.
@@ -940,7 +941,7 @@ namespace
     {
       public:
         /// @param socket The connection socket whose read slot the watch occupies.
-        explicit ScopedDisconnectWatch(ISocket* socket) noexcept:
+        explicit ScopedDisconnectWatch(core::net::ISocket* socket) noexcept:
             _socket { socket }
         {
         }
@@ -974,11 +975,11 @@ namespace
                 return;
             _watch->Retire();
             _watch.reset();
-            _socket->CancelRead();
+            _socket->cancelRead();
         }
 
       private:
-        ISocket* _socket;
+        core::net::ISocket* _socket;
         std::shared_ptr<DisconnectWatch> _watch {};
     };
 
@@ -989,10 +990,10 @@ namespace
     /// in-memory transport case) or no finite deadline.
     /// @param waiter   The waiter to time out (kept alive by this task).
     /// @param deadline Absolute timeout instant.
-    DetachedTask ArmTimeout(std::shared_ptr<StreamWaiter> waiter, TimePoint deadline)
+    core::async::DetachedTask ArmTimeout(std::shared_ptr<StreamWaiter> waiter, core::platform::SteadyTimePoint deadline)
     {
         auto* const reactor = waiter->Reactor();
-        co_await SleepUntil { .reactor = reactor, .deadline = deadline };
+        co_await core::net::sleepUntil(reactor, deadline);
         waiter->WakeTimeout();
     }
 
@@ -1007,7 +1008,7 @@ namespace
     /// an ABORTIVE close — an RST, surfacing as `ECONNRESET`/`WSAECONNRESET`. A
     /// count of **`0`** is EOF, which is how a GRACEFUL close arrives: a FIN makes
     /// the socket readable, and the count is what distinguishes it from pending data
-    /// (`ISocket::WaitReadable`, #677). Watching for the error alone therefore missed
+    /// (`core::net::ISocket::WaitReadable`, #677). Watching for the error alone therefore missed
     /// the ordinary way a client goes away, and leaked the socket on every graceful
     /// close ([#673](https://github.com/LASTRADA-Software/fastcached/issues/673)).
     /// That arm was measured never to fire, by deleting it; the figures and the
@@ -1064,12 +1065,12 @@ namespace
     /// @param watch  The blocking read's watch, which names the waiter to resolve and
     ///        says whether this trampoline is still wanted (kept alive here).
     /// @param socket The connection socket to watch for closure.
-    DetachedTask ArmDisconnect(std::shared_ptr<DisconnectWatch> watch, ISocket* socket)
+    core::async::DetachedTask ArmDisconnect(std::shared_ptr<DisconnectWatch> watch, core::net::ISocket* socket)
     {
-        auto const readable = co_await socket->WaitReadable();
+        auto const readable = co_await socket->waitReadable();
         if (!readable.has_value() || *readable == 0)
             // `Disconnect` is a no-op once the watch is retired, which is what keeps the
-            // `Cancelled` completion `ISocket::CancelRead` delivers from presenting as a
+            // `Cancelled` completion `core::net::ISocket::CancelRead` delivers from presenting as a
             // departure. The error case still has to reach here for a genuine abortive
             // close, so this cannot be narrowed to "not an error".
             watch->Disconnect();
@@ -1164,11 +1165,11 @@ namespace
         return ParseFiniteDouble(sv, out);
     }
 
-    Task<bool> WriteAll(ISocket* socket, std::string_view payload)
+    core::async::Task<bool> WriteAll(core::net::ISocket* socket, std::string_view payload)
     {
         if (payload.empty())
             co_return true;
-        auto const r = co_await socket->Write(AsBytes(payload));
+        auto const r = co_await socket->write(AsBytes(payload));
         // Verify the byte count, not merely that the call succeeded: ISocket::Write
         // is a write-all contract, so a short count is a backend bug that must
         // surface as a failed reply rather than a silently truncated one.
@@ -1181,24 +1182,24 @@ namespace
     /// @param segments  Ordered, non-owning views to gather.
     /// @param keepAlive Optional owner pinning the segments' backing storage.
     /// @return True if every byte was written.
-    Task<bool> WriteAllVectored(ISocket* socket,
-                                std::span<std::span<std::byte const> const> segments,
-                                std::shared_ptr<void const> keepAlive = {})
+    core::async::Task<bool> WriteAllVectored(core::net::ISocket* socket,
+                                             std::span<std::span<std::byte const> const> segments,
+                                             std::shared_ptr<void const> keepAlive = {})
     {
         std::size_t expected = 0;
         for (auto const seg: segments)
             expected += seg.size();
         if (expected == 0)
             co_return true;
-        auto const r = co_await socket->WriteVectored(segments, std::move(keepAlive));
+        auto const r = co_await socket->writeVectored(segments, std::move(keepAlive));
         co_return r.has_value() && *r == expected;
     }
 
-    Task<bool> ReplyOk(ISocket* socket)
+    core::async::Task<bool> ReplyOk(core::net::ISocket* socket)
     {
         co_return co_await WriteAll(socket, "+OK\r\n");
     }
-    Task<bool> ReplyPong(ISocket* socket)
+    core::async::Task<bool> ReplyPong(core::net::ISocket* socket)
     {
         co_return co_await WriteAll(socket, "+PONG\r\n");
     }
@@ -1208,12 +1209,12 @@ namespace
     /// (`*-1`) should special-case it; for fastcached's commands the bulk form
     /// is always the correct RESP2 spelling.
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> ReplyNull(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> ReplyNull(core::net::ISocket* socket, RespVersion resp)
     {
         co_return co_await WriteAll(socket, resp == RespVersion::Resp3 ? "_\r\n" : "$-1\r\n");
     }
 
-    Task<bool> ReplyInteger(ISocket* socket, std::int64_t value)
+    core::async::Task<bool> ReplyInteger(core::net::ISocket* socket, std::int64_t value)
     {
         co_return co_await WriteAll(socket, std::format(":{}\r\n", value));
     }
@@ -1221,7 +1222,7 @@ namespace
     /// Boolean reply. RESP3 has a native boolean (`#t`/`#f`); RESP2 has no
     /// boolean type, so the redis convention is an integer 1/0.
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> ReplyBoolean(ISocket* socket, bool value, RespVersion resp)
+    core::async::Task<bool> ReplyBoolean(core::net::ISocket* socket, bool value, RespVersion resp)
     {
         if (resp == RespVersion::Resp3)
             co_return co_await WriteAll(socket, value ? "#t\r\n" : "#f\r\n");
@@ -1231,7 +1232,7 @@ namespace
     /// Double reply. RESP3 has a native double (`,<d>\r\n`, with `inf`/`-inf`/
     /// `nan` spellings); RESP2 returns the formatted number as a bulk string.
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> ReplyDouble(ISocket* socket, double value, RespVersion resp)
+    core::async::Task<bool> ReplyDouble(core::net::ISocket* socket, double value, RespVersion resp)
     {
         // RESP3 normalises the non-finite values to inf/-inf/nan (no sign on nan).
         std::string text;
@@ -1253,7 +1254,7 @@ namespace
     /// decimal string). RESP3 has a native big number (`(<n>\r\n`); RESP2 falls
     /// back to a bulk string. The caller is responsible for the digits.
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> ReplyBigNumber(ISocket* socket, std::string_view digits, RespVersion resp)
+    core::async::Task<bool> ReplyBigNumber(core::net::ISocket* socket, std::string_view digits, RespVersion resp)
     {
         if (resp == RespVersion::Resp3)
             co_return co_await WriteAll(socket, std::format("({}\r\n", digits));
@@ -1265,14 +1266,17 @@ namespace
     /// falls back to a plain bulk string (the format hint is dropped).
     /// @param fmt  Three-character format code, e.g. "txt" or "mkd".
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> ReplyVerbatim(ISocket* socket, std::string_view fmt, std::string_view text, RespVersion resp)
+    core::async::Task<bool> ReplyVerbatim(core::net::ISocket* socket,
+                                          std::string_view fmt,
+                                          std::string_view text,
+                                          RespVersion resp)
     {
         if (resp == RespVersion::Resp3)
             co_return co_await WriteAll(socket, std::format("={}\r\n{}:{}\r\n", fmt.size() + 1 + text.size(), fmt, text));
         co_return co_await WriteAll(socket, std::format("${}\r\n{}\r\n", text.size(), text));
     }
 
-    Task<bool> ReplyError(ISocket* socket, std::string_view detail)
+    core::async::Task<bool> ReplyError(core::net::ISocket* socket, std::string_view detail)
     {
         co_return co_await WriteAll(socket, std::format("-ERR {}\r\n", detail));
     }
@@ -1309,7 +1313,10 @@ namespace
     /// `count` is the number of key/value PAIRS). The element bodies are written
     /// by the caller afterwards.
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> ReplyAggregateHeader(ISocket* socket, Aggregate kind, std::size_t count, RespVersion resp)
+    core::async::Task<bool> ReplyAggregateHeader(core::net::ISocket* socket,
+                                                 Aggregate kind,
+                                                 std::size_t count,
+                                                 RespVersion resp)
     {
         if (resp == RespVersion::Resp3)
         {
@@ -1347,14 +1354,16 @@ namespace
     /// (substituting an equivalent attribute-stripped reply), not just rely on
     /// this writer's silent no-op.
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> ReplyAttributeHeader(ISocket* socket, std::size_t count, RespVersion resp)
+    core::async::Task<bool> ReplyAttributeHeader(core::net::ISocket* socket, std::size_t count, RespVersion resp)
     {
         if (resp != RespVersion::Resp3)
             co_return true;
         co_return co_await WriteAll(socket, std::format("|{}\r\n", count));
     }
 
-    Task<bool> ReplyBulkString(ISocket* socket, std::span<std::byte const> bytes, std::shared_ptr<void const> keepAlive = {})
+    core::async::Task<bool> ReplyBulkString(core::net::ISocket* socket,
+                                            std::span<std::byte const> bytes,
+                                            std::shared_ptr<void const> keepAlive = {})
     {
         // Gather `$<len>\r\n` + bytes + `\r\n` into one scattered write: the
         // value segment points directly at the cached payload (no copy), and
@@ -1371,7 +1380,7 @@ namespace
         co_return co_await WriteAllVectored(socket, segments, std::move(keepAlive));
     }
 
-    Task<bool> ReplyBulkString(ISocket* socket, std::string_view text)
+    core::async::Task<bool> ReplyBulkString(core::net::ISocket* socket, std::string_view text)
     {
         co_return co_await ReplyBulkString(socket, AsBytes(text));
     }
@@ -1387,7 +1396,7 @@ namespace
     using ReadCommandResult = std::expected<ParsedCommand, ProtocolError>;
 
     /// Read a `$<len>\r\n<bytes>\r\n` bulk string argument from the reader->
-    Task<std::expected<std::string, ProtocolError>> ReadBulkArg(ByteReader* reader)
+    core::async::Task<std::expected<std::string, ProtocolError>> ReadBulkArg(ByteReader* reader)
     {
         auto const header = co_await reader->ReadLine();
         if (!header.has_value())
@@ -1411,7 +1420,7 @@ namespace
         co_return std::string { reinterpret_cast<char const*>(bytes->data()), bytes->size() };
     }
 
-    Task<ReadCommandResult> ReadOneCommand(ByteReader* reader)
+    core::async::Task<ReadCommandResult> ReadOneCommand(ByteReader* reader)
     {
         auto const first = co_await reader->ReadLine();
         if (!first.has_value())
@@ -1477,7 +1486,7 @@ namespace
         /// nullopt = no TTL. Sub-second precision preserved (the wire
         /// PX path goes through this end-to-end, not the lossy
         /// (raw+999)/1000 path the prior implementation forced).
-        std::optional<TimePoint> deadline {};
+        std::optional<core::platform::SteadyTimePoint> deadline {};
     };
 
     /// Redis caps TTL inputs at INT32_MAX for the seconds form and the
@@ -1496,7 +1505,8 @@ namespace
     /// @param clock Source of the current monotonic clock (to anchor PX/EX
     ///        into an absolute deadline at parse time — one clock read per
     ///        parse, deterministic under ManualClock).
-    [[nodiscard]] std::expected<SetOptions, std::string> ParseSetOptions(std::span<std::string const> tail, IClock& clock)
+    [[nodiscard]] std::expected<SetOptions, std::string> ParseSetOptions(std::span<std::string const> tail,
+                                                                         core::platform::IClock& clock)
     {
         SetOptions opts;
         // A `while` rather than a counting `for`, because `EX`/`PX` consume their value with a
@@ -1533,7 +1543,7 @@ namespace
                 if (raw == 0 || raw > cap)
                     return std::unexpected(std::string { "invalid expire time in 'set'" });
                 opts.deadline =
-                    millis ? clock.Now() + std::chrono::milliseconds { raw } : clock.Now() + std::chrono::seconds { raw };
+                    millis ? clock.now() + std::chrono::milliseconds { raw } : clock.now() + std::chrono::seconds { raw };
                 ++i; // the value, consumed
             }
             else
@@ -1545,7 +1555,7 @@ namespace
 
     /// Standard redis WRONGTYPE error reply, emitted when a string command lands
     /// on a key that holds a different type (e.g. a set) and vice versa.
-    Task<bool> ReplyWrongType(ISocket* socket)
+    core::async::Task<bool> ReplyWrongType(core::net::ISocket* socket)
     {
         co_return co_await WriteAll(socket, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
     }
@@ -1563,7 +1573,10 @@ namespace
         return !SetCodec::IsSet(flags) && !StreamCodec::IsStream(flags);
     }
 
-    Task<bool> HandleGet(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleGet(core::net::ISocket* socket,
+                                      CacheEngine* engine,
+                                      std::span<std::string const> args,
+                                      RespVersion resp)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'get'");
@@ -1577,8 +1590,11 @@ namespace
         co_return co_await ReplyBulkString(socket, result->entry.ValueBytes(), result->entry.value.AsKeepAlive());
     }
 
-    Task<bool> HandleSet(
-        ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleSet(core::net::ISocket* socket,
+                                      CacheEngine* engine,
+                                      ConnectionState* state,
+                                      std::span<std::string const> args,
+                                      RespVersion resp)
     {
         if (args.size() < 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'set'");
@@ -1592,7 +1608,7 @@ namespace
         auto bytes = BytesFromString(value);
         // Deadline is either the absolute TimePoint the EX/PX clause
         // anchored at parse time, or TimePoint::max() (no TTL).
-        auto const deadline = opts->deadline.value_or(TimePoint::max());
+        auto const deadline = opts->deadline.value_or(core::platform::SteadyTimePoint::max());
 
         std::expected<CasToken, StorageError> result { 0 };
         switch (opts->existence)
@@ -1621,8 +1637,11 @@ namespace
         co_return co_await ReplyError(socket, "storage failure");
     }
 
-    Task<bool> HandleSetEx(
-        ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args, bool millis)
+    core::async::Task<bool> HandleSetEx(core::net::ISocket* socket,
+                                        CacheEngine* engine,
+                                        ConnectionState* state,
+                                        std::span<std::string const> args,
+                                        bool millis)
     {
         if (args.size() != 3)
             co_return co_await ReplyError(
@@ -1640,8 +1659,8 @@ namespace
         // wire-supplied millisecond precision (the prior path forced
         // ceiling-division to whole seconds, turning `PSETEX k 50 v`
         // into a 1-second TTL).
-        auto const deadline = millis ? engine->Clock().Now() + std::chrono::milliseconds { raw }
-                                     : engine->Clock().Now() + std::chrono::seconds { raw };
+        auto const deadline = millis ? engine->Clock().now() + std::chrono::milliseconds { raw }
+                                     : engine->Clock().now() + std::chrono::seconds { raw };
         auto const result = engine->SetWithDeadline(args[0], std::move(bytes), 0, deadline);
         if (!result.has_value())
             co_return co_await ReplyError(socket, "storage failure");
@@ -1682,7 +1701,7 @@ namespace
     }
 
     /// Resolve a possibly-out-of-range relative delta into a steady-clock
-    /// deadline, clamping to `TimePoint::max()` rather than allowing chrono
+    /// deadline, clamping to `core::platform::SteadyTimePoint::max()` rather than allowing chrono
     /// duration overflow (a wire-supplied INT64_MAX in nanoseconds via
     /// `std::chrono::seconds{INT64_MAX}` would otherwise wrap into the
     /// distant past). Negative or zero deltas resolve to `now` (immediate
@@ -1691,7 +1710,9 @@ namespace
     /// @param delta Wire-unit count (seconds or milliseconds).
     /// @param unit  Which unit `delta` is denominated in.
     /// @return The clamped steady-clock deadline.
-    [[nodiscard]] TimePoint DeadlineFromDelta(TimePoint now, std::int64_t delta, TtlUnit unit) noexcept
+    [[nodiscard]] core::platform::SteadyTimePoint DeadlineFromDelta(core::platform::SteadyTimePoint now,
+                                                                    std::int64_t delta,
+                                                                    TtlUnit unit) noexcept
     {
         if (delta <= 0)
             return now;
@@ -1720,13 +1741,13 @@ namespace
     /// @param unit     Seconds vs milliseconds for the TTL word.
     /// @param absolute When true, the TTL word is an absolute UNIX timestamp;
     ///                 otherwise it's an offset from `now`.
-    Task<bool> HandleExpire(ISocket* socket,
-                            CacheEngine* engine,
-                            ConnectionState* state,
-                            std::span<std::string const> args,
-                            std::string_view verb,
-                            TtlUnit unit,
-                            bool absolute)
+    core::async::Task<bool> HandleExpire(core::net::ISocket* socket,
+                                         CacheEngine* engine,
+                                         ConnectionState* state,
+                                         std::span<std::string const> args,
+                                         std::string_view verb,
+                                         TtlUnit unit,
+                                         bool absolute)
     {
         if (args.size() != 2)
             co_return co_await ReplyError(socket, std::format("wrong number of arguments for '{}'", verb));
@@ -1740,9 +1761,9 @@ namespace
         // We achieve this by passing `now` to Touch, which sets the entry to
         // expire as soon as it is observed (the next operation purges it).
         auto& clock = engine->Clock();
-        auto const now = clock.Now();
+        auto const now = clock.now();
 
-        TimePoint deadline;
+        core::platform::SteadyTimePoint deadline;
         if (absolute)
         {
             // Anchor against the injected wall clock once per call;
@@ -1754,7 +1775,7 @@ namespace
             // IWallClock (not std::chrono::system_clock::now() directly)
             // lets tests drive the absolute branch deterministically via
             // ManualWallClock.
-            auto const sysNow = engine->WallClock().Now().time_since_epoch();
+            auto const sysNow = engine->WallClock().now().time_since_epoch();
             auto const sysWord = unit == TtlUnit::Seconds
                                      ? std::chrono::duration_cast<std::chrono::seconds>(sysNow).count()
                                      : std::chrono::duration_cast<std::chrono::milliseconds>(sysNow).count();
@@ -1786,7 +1807,10 @@ namespace
     /// Reads via `IStorage::PeekExpiry`, which does NOT bump LRU recency or
     /// `lastAccess` — a TTL probe must not be observable as a client access,
     /// or polling for expiry would keep the entry alive forever.
-    Task<bool> HandleTtl(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, TtlUnit unit)
+    core::async::Task<bool> HandleTtl(core::net::ISocket* socket,
+                                      CacheEngine* engine,
+                                      std::span<std::string const> args,
+                                      TtlUnit unit)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket,
@@ -1814,7 +1838,10 @@ namespace
     /// closes the prior TOCTOU window — a concurrent SETEX between the
     /// separate Ttl read and TouchAt write could let PERSIST clear the
     /// new TTL while reporting :1, or report :0 against a stale view.
-    Task<bool> HandlePersist(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandlePersist(core::net::ISocket* socket,
+                                          CacheEngine* engine,
+                                          ConnectionState* state,
+                                          std::span<std::string const> args)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'persist'");
@@ -1837,7 +1864,10 @@ namespace
         co_return co_await ReplyError(socket, "storage failure");
     }
 
-    Task<bool> HandleDel(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandleDel(core::net::ISocket* socket,
+                                      CacheEngine* engine,
+                                      ConnectionState* state,
+                                      std::span<std::string const> args)
     {
         if (args.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'del'");
@@ -1864,7 +1894,7 @@ namespace
         co_return co_await ReplyInteger(socket, deleted);
     }
 
-    Task<bool> HandleExists(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    core::async::Task<bool> HandleExists(core::net::ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
     {
         if (args.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'exists'");
@@ -1878,21 +1908,21 @@ namespace
         co_return co_await ReplyInteger(socket, found);
     }
 
-    Task<bool> HandlePing(ISocket* socket, std::span<std::string const> args)
+    core::async::Task<bool> HandlePing(core::net::ISocket* socket, std::span<std::string const> args)
     {
         if (args.empty())
             co_return co_await ReplyPong(socket);
         co_return co_await ReplyBulkString(socket, args[0]);
     }
 
-    Task<bool> HandleEcho(ISocket* socket, std::span<std::string const> args)
+    core::async::Task<bool> HandleEcho(core::net::ISocket* socket, std::span<std::string const> args)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'echo'");
         co_return co_await ReplyBulkString(socket, args[0]);
     }
 
-    Task<bool> HandleInfo(ISocket* socket, CacheEngine* engine, RespVersion resp)
+    core::async::Task<bool> HandleInfo(core::net::ISocket* socket, CacheEngine* engine, RespVersion resp)
     {
         auto const stats = engine->Snapshot();
         auto const body = std::format("# Server\r\nfastcached_version:{}\r\nredis_version:6.0.0-fastcached\r\n"
@@ -1923,7 +1953,7 @@ namespace
     /// `role`) from a data-driven field table. Rendered as a RESP3 map (`%`) or a
     /// flat RESP2 array (`*`) per the negotiated version. Mirrors redis/valkey.
     /// @param resp The (already-negotiated) protocol version to render under.
-    Task<bool> WriteHelloMap(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteHelloMap(core::net::ISocket* socket, RespVersion resp)
     {
         std::array<HelloField, 6> const fields { {
             { .key = "server", .stringValue = "fastcached", .intValue = 0, .isInteger = false },
@@ -1964,10 +1994,10 @@ namespace
     /// @param state   Per-connection state; `resp`/`authenticated` updated on
     ///        success (a pointer, not a reference, to satisfy the
     ///        coroutine-parameter lint; it points into Run's frame).
-    Task<bool> HandleHello(ISocket* socket,
-                           std::span<std::string const> args,
-                           SessionContext session,
-                           ConnectionState* state)
+    core::async::Task<bool> HandleHello(core::net::ISocket* socket,
+                                        std::span<std::string const> args,
+                                        SessionContext session,
+                                        ConnectionState* state)
     {
         auto negotiated = state->resp;
         std::size_t next = 0;
@@ -2055,7 +2085,7 @@ namespace
     /// `CommandTableInvoke` for queue-replay.
     struct CommandContext
     {
-        ISocket* socket;
+        core::net::ISocket* socket;
         CacheEngine* engine;
         std::span<std::string const> tail; ///< Arguments after the command name.
         ConnectionState* state;
@@ -2066,7 +2096,7 @@ namespace
     /// bypass Dispatch's prologue when replaying queued commands — at
     /// queue time the table index, arity, and auth state were already
     /// validated, so EXEC just re-invokes the handler directly.
-    [[nodiscard]] Task<bool> CommandTableInvoke(std::size_t index, CommandContext ctx);
+    [[nodiscard]] core::async::Task<bool> CommandTableInvoke(std::size_t index, CommandContext ctx);
 
     /// Find a command in the table by name (case-sensitive match against the
     /// canonical UPPER name in `CommandEntry`). Returns the index for
@@ -2083,7 +2113,7 @@ namespace
     /// @param index  Row in the dispatch table to emit.
     /// @param resp   Negotiated RESP version.
     /// @return False on a socket write failure.
-    Task<bool> WriteCommandDescriptor(ISocket* socket, std::size_t index, RespVersion resp)
+    core::async::Task<bool> WriteCommandDescriptor(core::net::ISocket* socket, std::size_t index, RespVersion resp)
     {
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, 6, resp))
             co_return false;
@@ -2113,7 +2143,7 @@ namespace
     ///
     /// Replying `*0` (the prior behaviour) made clients believe the
     /// daemon supported nothing and fall back to surprising defaults.
-    Task<bool> HandleCommand(ISocket* socket, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleCommand(core::net::ISocket* socket, std::span<std::string const> args, RespVersion resp)
     {
         auto const sub = args.empty() ? std::string {} : Upper(args[0]);
         auto const total = CommandTableSize();
@@ -2167,7 +2197,7 @@ namespace
         co_return true;
     }
 
-    Task<bool> HandleFlush(ISocket* socket, CacheEngine* engine, ConnectionState* state)
+    core::async::Task<bool> HandleFlush(core::net::ISocket* socket, CacheEngine* engine, ConnectionState* state)
     {
         engine->FlushAll(0);
         // FLUSHDB / FLUSHALL invalidate every WATCH'd key on every
@@ -2186,7 +2216,7 @@ namespace
         co_return co_await ReplyOk(socket);
     }
 
-    Task<bool> HandleSelect(ISocket* socket, std::span<std::string const> args)
+    core::async::Task<bool> HandleSelect(core::net::ISocket* socket, std::span<std::string const> args)
     {
         // fastcached exposes a single logical keyspace. The redis client
         // crate issues `SELECT <index>` whenever the connection URL names a
@@ -2196,7 +2226,7 @@ namespace
         co_return co_await ReplyOk(socket);
     }
 
-    Task<bool> HandleClient(ISocket* socket, std::span<std::string const> args)
+    core::async::Task<bool> HandleClient(core::net::ISocket* socket, std::span<std::string const> args)
     {
         // Client libraries send CLIENT SETNAME / SETINFO / ID / GETNAME during
         // connection setup. We hold no per-client state, so acknowledge each
@@ -2210,7 +2240,7 @@ namespace
         co_return co_await ReplyOk(socket);
     }
 
-    Task<bool> HandleConfig(ISocket* socket, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleConfig(core::net::ISocket* socket, std::span<std::string const> args, RespVersion resp)
     {
         // CONFIG GET <param>... — redis clients probe parameters such as
         // `maxmemory` / `save` on connect. We expose no runtime tunables, so
@@ -2242,8 +2272,8 @@ namespace
     /// @param channel The (un)subscribed channel or pattern.
     /// @param count   The connection's remaining subscription count.
     /// @param resp    The connection's negotiated protocol version.
-    Task<bool> WriteSubscribeConfirm(
-        ISocket* socket, std::string_view kind, std::string_view channel, std::int64_t count, RespVersion resp)
+    core::async::Task<bool> WriteSubscribeConfirm(
+        core::net::ISocket* socket, std::string_view kind, std::string_view channel, std::int64_t count, RespVersion resp)
     {
         co_return (co_await ReplyAggregateHeader(socket, Aggregate::Push, 3, resp))
             && (co_await ReplyBulkString(socket, kind)) && (co_await ReplyBulkString(socket, channel))
@@ -2255,7 +2285,7 @@ namespace
     /// @param message The delivery (by value — a coroutine parameter must not be
     ///        a reference).
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> WritePushMessage(ISocket* socket, PushMessage message, RespVersion resp)
+    core::async::Task<bool> WritePushMessage(core::net::ISocket* socket, PushMessage message, RespVersion resp)
     {
         if (message.kind == PushMessage::Kind::PMessage)
             co_return (co_await ReplyAggregateHeader(socket, Aggregate::Push, 4, resp))
@@ -2315,11 +2345,11 @@ namespace
     /// the connection's Subscriber lazily on first use.
     /// @param verb  The data descriptor selecting label + registry method.
     /// @param state Connection state (subscriber + subscriptionCount updated).
-    Task<bool> HandleSubscribeFamily(ISocket* socket,
-                                     SessionContext session,
-                                     std::span<std::string const> args,
-                                     SubscribeVerb verb,
-                                     ConnectionState* state)
+    core::async::Task<bool> HandleSubscribeFamily(core::net::ISocket* socket,
+                                                  SessionContext session,
+                                                  std::span<std::string const> args,
+                                                  SubscribeVerb verb,
+                                                  ConnectionState* state)
     {
         if (session.pubsub == nullptr || !state->subscriber)
             co_return co_await ReplyError(socket, "pub/sub is not available");
@@ -2365,7 +2395,9 @@ namespace
     }
 
     /// PUBLISH channel message — fan out to subscribers; reply the receiver count.
-    Task<bool> HandlePublish(ISocket* socket, SessionContext session, std::span<std::string const> args)
+    core::async::Task<bool> HandlePublish(core::net::ISocket* socket,
+                                          SessionContext session,
+                                          std::span<std::string const> args)
     {
         if (args.size() != 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'publish'");
@@ -2379,7 +2411,7 @@ namespace
     /// commands are queued (reply `+QUEUED`) until `EXEC` / `DISCARD`.
     /// Nested `MULTI` is rejected with the redis-standard error and does not
     /// affect the queue.
-    Task<bool> HandleMulti(ISocket* socket, ConnectionState* state)
+    core::async::Task<bool> HandleMulti(core::net::ISocket* socket, ConnectionState* state)
     {
         if (state->inMulti)
             co_return co_await ReplyError(socket, "MULTI calls can not be nested");
@@ -2402,7 +2434,7 @@ namespace
 
     /// `DISCARD` — abort the transaction: drop the queue and every WATCH.
     /// Outside `MULTI` redis replies `-ERR DISCARD without MULTI`.
-    Task<bool> HandleDiscard(ISocket* socket, ConnectionState* state)
+    core::async::Task<bool> HandleDiscard(core::net::ISocket* socket, ConnectionState* state)
     {
         if (!state->inMulti)
             co_return co_await ReplyError(socket, "DISCARD without MULTI");
@@ -2417,7 +2449,7 @@ namespace
 
     /// `UNWATCH` — drop every WATCH snapshot on this connection. Always +OK
     /// (no-op if there were no watches). Valid both inside and outside MULTI.
-    Task<bool> HandleUnwatch(ISocket* socket, ConnectionState* state)
+    core::async::Task<bool> HandleUnwatch(core::net::ISocket* socket, ConnectionState* state)
     {
         if (state->watch && state->watchRegistry != nullptr)
             state->watchRegistry->UnregisterAll(state->watch.get());
@@ -2428,7 +2460,10 @@ namespace
     /// mutation on any of them flips the connection's dirty flag and
     /// aborts the matching `EXEC` with a nil multi-bulk. Disallowed inside
     /// `MULTI` (matches redis).
-    Task<bool> HandleWatch(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandleWatch(core::net::ISocket* socket,
+                                        CacheEngine* engine,
+                                        ConnectionState* state,
+                                        std::span<std::string const> args)
     {
         if (args.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'watch'");
@@ -2492,7 +2527,10 @@ namespace
     /// touched since `WATCH`, drop the queue and reply `*-1` (nil multi-bulk,
     /// redis's "aborted" sentinel). Otherwise frame the responses of every
     /// queued command as a single `*N` multi-bulk in FIFO order.
-    Task<bool> HandleExec(ISocket* socket, CacheEngine* engine, SessionContext session, ConnectionState* state)
+    core::async::Task<bool> HandleExec(core::net::ISocket* socket,
+                                       CacheEngine* engine,
+                                       SessionContext session,
+                                       ConnectionState* state)
     {
         if (!state->inMulti)
             co_return co_await ReplyError(socket, "EXEC without MULTI");
@@ -2655,14 +2693,17 @@ namespace
     /// handling shared by every set command.
     /// @param err The storage error to translate (by value — a coroutine
     ///        parameter must not be a reference).
-    Task<bool> ReplySetError(ISocket* socket, StorageError err)
+    core::async::Task<bool> ReplySetError(core::net::ISocket* socket, StorageError err)
     {
         if (err.code == StorageErrorCode::WrongType)
             co_return co_await ReplyWrongType(socket);
         co_return co_await ReplyError(socket, "storage failure");
     }
 
-    Task<bool> HandleSAdd(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandleSAdd(core::net::ISocket* socket,
+                                       CacheEngine* engine,
+                                       ConnectionState* state,
+                                       std::span<std::string const> args)
     {
         if (args.size() < 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'sadd'");
@@ -2678,7 +2719,10 @@ namespace
         co_return co_await ReplyInteger(socket, *added);
     }
 
-    Task<bool> HandleSRem(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandleSRem(core::net::ISocket* socket,
+                                       CacheEngine* engine,
+                                       ConnectionState* state,
+                                       std::span<std::string const> args)
     {
         if (args.size() < 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'srem'");
@@ -2693,7 +2737,10 @@ namespace
         co_return co_await ReplyInteger(socket, *removed);
     }
 
-    Task<bool> HandleSMembers(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleSMembers(core::net::ISocket* socket,
+                                           CacheEngine* engine,
+                                           std::span<std::string const> args,
+                                           RespVersion resp)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'smembers'");
@@ -2709,7 +2756,10 @@ namespace
         co_return true;
     }
 
-    Task<bool> HandleSIsMember(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleSIsMember(core::net::ISocket* socket,
+                                            CacheEngine* engine,
+                                            std::span<std::string const> args,
+                                            RespVersion resp)
     {
         if (args.size() != 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'sismember'");
@@ -2720,7 +2770,10 @@ namespace
         co_return co_await ReplyBoolean(socket, *present, resp);
     }
 
-    Task<bool> HandleSMIsMember(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleSMIsMember(core::net::ISocket* socket,
+                                             CacheEngine* engine,
+                                             std::span<std::string const> args,
+                                             RespVersion resp)
     {
         if (args.size() < 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'smismember'");
@@ -2735,7 +2788,7 @@ namespace
         co_return true;
     }
 
-    Task<bool> HandleSCard(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    core::async::Task<bool> HandleSCard(core::net::ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'scard'");
@@ -2745,8 +2798,11 @@ namespace
         co_return co_await ReplyInteger(socket, *card);
     }
 
-    Task<bool> HandleSPop(
-        ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleSPop(core::net::ISocket* socket,
+                                       CacheEngine* engine,
+                                       ConnectionState* state,
+                                       std::span<std::string const> args,
+                                       RespVersion resp)
     {
         if (args.empty() || args.size() > 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'spop'");
@@ -2789,7 +2845,7 @@ namespace
     /// bare KeyNotFound it must translate.
     /// @param err The storage error to report (by value — a coroutine parameter
     ///        must not be a reference).
-    Task<bool> ReplyStreamError(ISocket* socket, StorageError err)
+    core::async::Task<bool> ReplyStreamError(core::net::ISocket* socket, StorageError err)
     {
         if (err.code == StorageErrorCode::WrongType)
             co_return co_await ReplyWrongType(socket);
@@ -2803,7 +2859,7 @@ namespace
     /// trimmed away, surfaced by XREADGROUP history reads) writes a null in the
     /// value slot, matching redis.
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> WriteStreamEntry(ISocket* socket, StreamCodec::StreamEntry entry, RespVersion resp)
+    core::async::Task<bool> WriteStreamEntry(core::net::ISocket* socket, StreamCodec::StreamEntry entry, RespVersion resp)
     {
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, 2, resp))
             co_return false;
@@ -2825,7 +2881,9 @@ namespace
 
     /// Write a list of stream entries as a top-level array of entries.
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> WriteStreamEntries(ISocket* socket, std::span<StreamCodec::StreamEntry const> entries, RespVersion resp)
+    core::async::Task<bool> WriteStreamEntries(core::net::ISocket* socket,
+                                               std::span<StreamCodec::StreamEntry const> entries,
+                                               RespVersion resp)
     {
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, entries.size(), resp))
             co_return false;
@@ -2965,11 +3023,11 @@ namespace
         return true;
     }
 
-    Task<bool> HandleXAdd(ISocket* socket,
-                          CacheEngine* engine,
-                          ConnectionState* state,
-                          SessionContext session,
-                          std::span<std::string const> args)
+    core::async::Task<bool> HandleXAdd(core::net::ISocket* socket,
+                                       CacheEngine* engine,
+                                       ConnectionState* state,
+                                       SessionContext session,
+                                       std::span<std::string const> args)
     {
         // XADD key [NOMKSTREAM] [MAXLEN|MINID [~|=] threshold] <id|*> field value [field value ...]
         if (args.size() < 4)
@@ -3034,7 +3092,7 @@ namespace
         co_return co_await ReplyBulkString(socket, added->Format());
     }
 
-    Task<bool> HandleXLen(ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
+    core::async::Task<bool> HandleXLen(core::net::ISocket* socket, CacheEngine* engine, std::span<std::string const> args)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'xlen'");
@@ -3044,8 +3102,8 @@ namespace
         co_return co_await ReplyInteger(socket, *len);
     }
 
-    Task<bool> HandleXRange(
-        ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp, bool reverse)
+    core::async::Task<bool> HandleXRange(
+        core::net::ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp, bool reverse)
     {
         // XRANGE key start end [COUNT n]   /   XREVRANGE key end start [COUNT n]
         if (args.size() != 3 && args.size() != 5)
@@ -3077,7 +3135,10 @@ namespace
         co_return co_await WriteStreamEntries(socket, *entries, resp);
     }
 
-    Task<bool> HandleXDel(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandleXDel(core::net::ISocket* socket,
+                                       CacheEngine* engine,
+                                       ConnectionState* state,
+                                       std::span<std::string const> args)
     {
         if (args.size() < 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'xdel'");
@@ -3101,7 +3162,10 @@ namespace
         co_return co_await ReplyInteger(socket, *removed);
     }
 
-    Task<bool> HandleXTrim(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandleXTrim(core::net::ISocket* socket,
+                                        CacheEngine* engine,
+                                        ConnectionState* state,
+                                        std::span<std::string const> args)
     {
         // XTRIM key MAXLEN|MINID [~|=] threshold
         if (args.size() < 3)
@@ -3122,7 +3186,10 @@ namespace
         co_return co_await ReplyInteger(socket, *evicted);
     }
 
-    Task<bool> HandleXSetId(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandleXSetId(core::net::ISocket* socket,
+                                         CacheEngine* engine,
+                                         ConnectionState* state,
+                                         std::span<std::string const> args)
     {
         // XSETID key id [ENTRIESADDED n] [MAXDELETEDID id]
         if (args.size() < 2)
@@ -3293,11 +3360,11 @@ namespace
     /// @param perKey       Per-key entry lists, parallel to `keys`.
     /// @param resp         The connection's negotiated protocol version.
     /// @param includeEmpty Emit a `[key, (empty array)]` pair for empty streams.
-    Task<bool> WriteXReadReply(ISocket* socket,
-                               std::span<std::string const> keys,
-                               std::span<std::vector<StreamCodec::StreamEntry> const> perKey,
-                               RespVersion resp,
-                               bool includeEmpty = false)
+    core::async::Task<bool> WriteXReadReply(core::net::ISocket* socket,
+                                            std::span<std::string const> keys,
+                                            std::span<std::vector<StreamCodec::StreamEntry> const> perKey,
+                                            RespVersion resp,
+                                            bool includeEmpty = false)
     {
         // Count the streams that will be emitted.
         std::size_t present = 0;
@@ -3364,18 +3431,20 @@ namespace
     /// @param now     The current monotonic clock value.
     /// @param blockMs The parsed BLOCK argument (nullopt = no BLOCK).
     /// @return The absolute deadline, or TimePoint::max() for forever.
-    [[nodiscard]] TimePoint BlockDeadline(TimePoint now, std::optional<std::uint64_t> blockMs) noexcept
+    [[nodiscard]] core::platform::SteadyTimePoint BlockDeadline(core::platform::SteadyTimePoint now,
+                                                                std::optional<std::uint64_t> blockMs) noexcept
     {
         if (!blockMs.has_value() || *blockMs == 0)
-            return TimePoint::max();
+            return core::platform::SteadyTimePoint::max();
         // Headroom from now to max(), in milliseconds (always >= 0 since now is a
         // real instant and max() is the end of the epoch); if the requested block
         // meets or exceeds it, treat the block as forever rather than wrapping the
         // time_point to a past instant or tripping signed-overflow UB.
-        auto const headroomMs = std::chrono::duration_cast<std::chrono::milliseconds>(TimePoint::max() - now).count();
+        auto const headroomMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(core::platform::SteadyTimePoint::max() - now).count();
         auto const headroom = headroomMs > 0 ? static_cast<std::uint64_t>(headroomMs) : std::uint64_t { 0 };
         if (*blockMs >= headroom)
-            return TimePoint::max();
+            return core::platform::SteadyTimePoint::max();
         return now + std::chrono::milliseconds { static_cast<std::chrono::milliseconds::rep>(*blockMs) };
     }
 
@@ -3404,16 +3473,16 @@ namespace
     /// @param emptyIsNil When the (non-blocking) poll yields no entries, reply
     ///                 nil if true (the `>` / plain-XREAD shape) or let `write`
     ///                 emit the empty-array shape if false (XREADGROUP history).
-    Task<bool> RunBlockingRead(ISocket* socket,
-                               SessionContext session,
-                               std::span<std::string const> keys,
-                               bool blocking,
-                               TimePoint deadline,
-                               RespVersion resp,
-                               std::function<std::expected<std::size_t, StorageError>()> poll,
-                               std::function<Task<bool>()> write,
-                               std::function<Task<bool>(StorageError const&)> onError,
-                               bool emptyIsNil)
+    core::async::Task<bool> RunBlockingRead(core::net::ISocket* socket,
+                                            SessionContext session,
+                                            std::span<std::string const> keys,
+                                            bool blocking,
+                                            core::platform::SteadyTimePoint deadline,
+                                            RespVersion resp,
+                                            std::function<std::expected<std::size_t, StorageError>()> poll,
+                                            std::function<core::async::Task<bool>()> write,
+                                            std::function<core::async::Task<bool>(StorageError const&)> onError,
+                                            bool emptyIsNil)
     {
         // Non-blocking fast path: poll exactly once, reply data-or-empty.
         if (!blocking)
@@ -3440,7 +3509,7 @@ namespace
             ScopedWaiterRegistration const registered { session.streamWaiters, waiter.get() };
             if (session.reactor != nullptr)
             {
-                if (deadline != TimePoint::max())
+                if (deadline != core::platform::SteadyTimePoint::max())
                     ArmTimeout(waiter, deadline);
                 // Re-targeted BEFORE the trampoline is armed, or a `WaitReadable` that
                 // resolves synchronously with EOF -- which is what the in-memory
@@ -3481,12 +3550,12 @@ namespace
         }
     }
 
-    Task<bool> HandleXRead(ISocket* socket,
-                           CacheEngine* engine,
-                           ConnectionState* state,
-                           SessionContext session,
-                           std::span<std::string const> args,
-                           RespVersion resp)
+    core::async::Task<bool> HandleXRead(core::net::ISocket* socket,
+                                        CacheEngine* engine,
+                                        ConnectionState* state,
+                                        SessionContext session,
+                                        std::span<std::string const> args,
+                                        RespVersion resp)
     {
         XReadRequest req;
         bool noAck = false;
@@ -3510,7 +3579,7 @@ namespace
         // registry wired in.
         bool const inExec = state != nullptr && state->inExecReplay;
         bool const blocking = req.blockMs.has_value() && session.streamWaiters != nullptr && !inExec;
-        auto const deadline = BlockDeadline(engine->Clock().Now(), req.blockMs);
+        auto const deadline = BlockDeadline(engine->Clock().now(), req.blockMs);
 
         std::vector<std::vector<StreamCodec::StreamEntry>> perKey;
         co_return co_await RunBlockingRead(
@@ -3521,8 +3590,8 @@ namespace
             deadline,
             resp,
             [&]() -> std::expected<std::size_t, StorageError> { return PollXRead(engine, req, cursors, perKey); },
-            [&]() -> Task<bool> { return WriteXReadReply(socket, req.keys, perKey, resp); },
-            [&](StorageError const& err) -> Task<bool> { return ReplyStreamError(socket, err); },
+            [&]() -> core::async::Task<bool> { return WriteXReadReply(socket, req.keys, perKey, resp); },
+            [&](StorageError const& err) -> core::async::Task<bool> { return ReplyStreamError(socket, err); },
             /*emptyIsNil=*/true);
     }
 
@@ -3537,10 +3606,10 @@ namespace
     /// @param key    The stream key named in the command.
     /// @param group  The group name named in the command.
     /// @param verb   The command name to cite (defaults to XREADGROUP's wording).
-    Task<bool> ReplyNoGroup(ISocket* socket,
-                            std::string_view key,
-                            std::string_view group,
-                            std::string_view verb = "XREADGROUP with GROUP option")
+    core::async::Task<bool> ReplyNoGroup(core::net::ISocket* socket,
+                                         std::string_view key,
+                                         std::string_view group,
+                                         std::string_view verb = "XREADGROUP with GROUP option")
     {
         co_return co_await WriteAll(socket,
                                     std::format("-NOGROUP No such key '{}' or consumer group '{}' in {}\r\n",
@@ -3577,7 +3646,10 @@ namespace
         return true;
     }
 
-    Task<bool> HandleXGroup(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandleXGroup(core::net::ISocket* socket,
+                                         CacheEngine* engine,
+                                         ConnectionState* state,
+                                         std::span<std::string const> args)
     {
         // XGROUP CREATE key group <id|$> [MKSTREAM]
         // XGROUP SETID key group <id|$>
@@ -3680,12 +3752,12 @@ namespace
         co_return co_await ReplyError(socket, "syntax error");
     }
 
-    Task<bool> HandleXReadGroup(ISocket* socket,
-                                CacheEngine* engine,
-                                ConnectionState* state,
-                                SessionContext session,
-                                std::span<std::string const> args,
-                                RespVersion resp)
+    core::async::Task<bool> HandleXReadGroup(core::net::ISocket* socket,
+                                             CacheEngine* engine,
+                                             ConnectionState* state,
+                                             SessionContext session,
+                                             std::span<std::string const> args,
+                                             RespVersion resp)
     {
         // XREADGROUP GROUP <group> <consumer> [COUNT n] [BLOCK ms] [NOACK] STREAMS key... id...
         if (args.size() < 3 || Upper(args[0]) != "GROUP")
@@ -3723,7 +3795,7 @@ namespace
         bool const inExec = state != nullptr && state->inExecReplay;
         bool const isHistory = !allNewEntries;
         bool const blocking = req.blockMs.has_value() && session.streamWaiters != nullptr && allNewEntries && !inExec;
-        auto const deadline = BlockDeadline(engine->Clock().Now(), req.blockMs);
+        auto const deadline = BlockDeadline(engine->Clock().now(), req.blockMs);
 
         // The poll records which key failed so the NOGROUP reply can name it.
         std::vector<std::vector<StreamCodec::StreamEntry>> perKey;
@@ -3757,8 +3829,8 @@ namespace
             deadline,
             resp,
             poll,
-            [&]() -> Task<bool> { return WriteXReadReply(socket, req.keys, perKey, resp, isHistory); },
-            [&](StorageError const& err) -> Task<bool> {
+            [&]() -> core::async::Task<bool> { return WriteXReadReply(socket, req.keys, perKey, resp, isHistory); },
+            [&](StorageError const& err) -> core::async::Task<bool> {
                 if (err.code == StorageErrorCode::WrongType)
                     return ReplyWrongType(socket);
                 return ReplyNoGroup(socket, req.keys[failedKey], group);
@@ -3766,7 +3838,10 @@ namespace
             /*emptyIsNil=*/!isHistory);
     }
 
-    Task<bool> HandleXAck(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandleXAck(core::net::ISocket* socket,
+                                       CacheEngine* engine,
+                                       ConnectionState* state,
+                                       std::span<std::string const> args)
     {
         // XACK key group id [id ...]
         if (args.size() < 3)
@@ -3796,7 +3871,7 @@ namespace
     /// Write one row of the XPENDING extended reply:
     /// `[ id, consumer, idle-ms, delivery-count ]`.
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> WritePendingRow(ISocket* socket, CacheEngine::PendingSummary row, RespVersion resp)
+    core::async::Task<bool> WritePendingRow(core::net::ISocket* socket, CacheEngine::PendingSummary row, RespVersion resp)
     {
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, 4, resp))
             co_return false;
@@ -3805,7 +3880,10 @@ namespace
             && (co_await ReplyInteger(socket, static_cast<std::int64_t>(row.deliveryCount)));
     }
 
-    Task<bool> HandleXPending(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleXPending(core::net::ISocket* socket,
+                                           CacheEngine* engine,
+                                           std::span<std::string const> args,
+                                           RespVersion resp)
     {
         // Summary:  XPENDING key group
         // Extended: XPENDING key group [IDLE ms] start end count [consumer]
@@ -3895,7 +3973,10 @@ namespace
     /// Shared reply for XCLAIM/XAUTOCLAIM's claimed-set: full entries, or just
     /// the IDs under JUSTID.
     /// @param resp The connection's negotiated protocol version.
-    Task<bool> WriteClaimEntries(ISocket* socket, CacheEngine::ClaimResult result, bool justId, RespVersion resp)
+    core::async::Task<bool> WriteClaimEntries(core::net::ISocket* socket,
+                                              CacheEngine::ClaimResult result,
+                                              bool justId,
+                                              RespVersion resp)
     {
         if (justId)
         {
@@ -3909,8 +3990,11 @@ namespace
         co_return co_await WriteStreamEntries(socket, result.entries, resp);
     }
 
-    Task<bool> HandleXClaim(
-        ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleXClaim(core::net::ISocket* socket,
+                                         CacheEngine* engine,
+                                         ConnectionState* state,
+                                         std::span<std::string const> args,
+                                         RespVersion resp)
     {
         // XCLAIM key group consumer min-idle-time id [id ...] [JUSTID] [FORCE] [IDLE ...] ...
         if (args.size() < 5)
@@ -3968,8 +4052,11 @@ namespace
         co_return co_await WriteClaimEntries(socket, *result, justId, resp);
     }
 
-    Task<bool> HandleXAutoClaim(
-        ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleXAutoClaim(core::net::ISocket* socket,
+                                             CacheEngine* engine,
+                                             ConnectionState* state,
+                                             std::span<std::string const> args,
+                                             RespVersion resp)
     {
         // XAUTOCLAIM key group consumer min-idle-time start [COUNT n] [JUSTID]
         if (args.size() < 5)
@@ -4033,18 +4120,21 @@ namespace
     }
 
     /// Write a map entry whose value is a bulk string: `field` then `value`.
-    Task<bool> WriteMapStr(ISocket* socket, std::string_view field, std::string_view value)
+    core::async::Task<bool> WriteMapStr(core::net::ISocket* socket, std::string_view field, std::string_view value)
     {
         co_return (co_await ReplyBulkString(socket, field)) && (co_await ReplyBulkString(socket, value));
     }
 
     /// Write a map entry whose value is an integer: `field` then `:value`.
-    Task<bool> WriteMapInt(ISocket* socket, std::string_view field, std::int64_t value)
+    core::async::Task<bool> WriteMapInt(core::net::ISocket* socket, std::string_view field, std::int64_t value)
     {
         co_return (co_await ReplyBulkString(socket, field)) && (co_await ReplyInteger(socket, value));
     }
 
-    Task<bool> HandleXInfoStream(ISocket* socket, CacheEngine* engine, std::string_view key, RespVersion resp)
+    core::async::Task<bool> HandleXInfoStream(core::net::ISocket* socket,
+                                              CacheEngine* engine,
+                                              std::string_view key,
+                                              RespVersion resp)
     {
         auto const info = engine->StreamInfoOf(key);
         if (!info.has_value())
@@ -4083,7 +4173,10 @@ namespace
         co_return co_await ReplyNull(socket, resp);
     }
 
-    Task<bool> HandleXInfoGroups(ISocket* socket, CacheEngine* engine, std::string_view key, RespVersion resp)
+    core::async::Task<bool> HandleXInfoGroups(core::net::ISocket* socket,
+                                              CacheEngine* engine,
+                                              std::string_view key,
+                                              RespVersion resp)
     {
         auto const groups = engine->StreamGroupInfo(key);
         if (!groups.has_value())
@@ -4116,8 +4209,8 @@ namespace
         co_return true;
     }
 
-    Task<bool> HandleXInfoConsumers(
-        ISocket* socket, CacheEngine* engine, std::string_view key, std::string_view group, RespVersion resp)
+    core::async::Task<bool> HandleXInfoConsumers(
+        core::net::ISocket* socket, CacheEngine* engine, std::string_view key, std::string_view group, RespVersion resp)
     {
         auto const consumers = engine->StreamConsumerInfo(key, group);
         if (!consumers.has_value())
@@ -4140,7 +4233,10 @@ namespace
         co_return true;
     }
 
-    Task<bool> HandleXInfo(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleXInfo(core::net::ISocket* socket,
+                                        CacheEngine* engine,
+                                        std::span<std::string const> args,
+                                        RespVersion resp)
     {
         // XINFO STREAM key  /  XINFO GROUPS key  /  XINFO CONSUMERS key group
         if (args.size() < 2)
@@ -4158,7 +4254,7 @@ namespace
     /// LOLWUT — redis's whimsical version/art command. We reply a short banner
     /// as a verbatim string (txt) under RESP3, a bulk string under RESP2. Cheap,
     /// and it exercises the verbatim writer on a second command besides INFO.
-    Task<bool> HandleLolwut(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> HandleLolwut(core::net::ISocket* socket, RespVersion resp)
     {
         auto const art = std::format("fastcached {}\n", RedisRespHandler::ServerVersion());
         co_return co_await ReplyVerbatim(socket, "txt", art, resp);
@@ -4168,10 +4264,10 @@ namespace
     /// the value bytes. Per redis/valkey the reply is the new value as a bulk
     /// string in BOTH RESP2 and RESP3 (it does not use the RESP3 double type);
     /// the dedicated double type is exercised by `DEBUG PROTOCOL double` instead.
-    Task<bool> HandleIncrByFloat(ISocket* socket,
-                                 CacheEngine* engine,
-                                 ConnectionState* state,
-                                 std::span<std::string const> args)
+    core::async::Task<bool> HandleIncrByFloat(core::net::ISocket* socket,
+                                              CacheEngine* engine,
+                                              ConnectionState* state,
+                                              std::span<std::string const> args)
     {
         if (args.size() != 2)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'incrbyfloat'");
@@ -4238,12 +4334,12 @@ namespace
     /// under concurrent writers.
     /// @param verb  Wire command name, drives the error string.
     /// @param delta Signed amount to add (negative for DEC*).
-    Task<bool> HandleIncrDecrBy(ISocket* socket,
-                                CacheEngine* engine,
-                                ConnectionState* state,
-                                std::string_view key,
-                                std::string_view verb,
-                                std::int64_t delta)
+    core::async::Task<bool> HandleIncrDecrBy(core::net::ISocket* socket,
+                                             CacheEngine* engine,
+                                             ConnectionState* state,
+                                             std::string_view key,
+                                             std::string_view verb,
+                                             std::int64_t delta)
     {
         std::int64_t newValue = 0;
         bool overflow = false;
@@ -4302,12 +4398,12 @@ namespace
 
     /// INCR / DECR — fixed-magnitude variants. Dispatched separately so the
     /// arg-count error string matches the wire verb exactly.
-    Task<bool> HandleIncrDecr(ISocket* socket,
-                              CacheEngine* engine,
-                              ConnectionState* state,
-                              std::span<std::string const> args,
-                              std::string_view verb,
-                              std::int64_t sign)
+    core::async::Task<bool> HandleIncrDecr(core::net::ISocket* socket,
+                                           CacheEngine* engine,
+                                           ConnectionState* state,
+                                           std::span<std::string const> args,
+                                           std::string_view verb,
+                                           std::int64_t sign)
     {
         if (args.size() != 1)
             co_return co_await ReplyError(socket, std::format("wrong number of arguments for '{}'", verb));
@@ -4316,12 +4412,12 @@ namespace
 
     /// INCRBY / DECRBY — variable-magnitude variants. The delta arg is
     /// signed; DECRBY negates it before delegating.
-    Task<bool> HandleIncrDecrByVerb(ISocket* socket,
-                                    CacheEngine* engine,
-                                    ConnectionState* state,
-                                    std::span<std::string const> args,
-                                    std::string_view verb,
-                                    bool negate)
+    core::async::Task<bool> HandleIncrDecrByVerb(core::net::ISocket* socket,
+                                                 CacheEngine* engine,
+                                                 ConnectionState* state,
+                                                 std::span<std::string const> args,
+                                                 std::string_view verb,
+                                                 bool negate)
     {
         if (args.size() != 2)
             co_return co_await ReplyError(socket, std::format("wrong number of arguments for '{}'", verb));
@@ -4343,7 +4439,10 @@ namespace
     /// Uses non-mutating Peek so a probe via MGET does not bump LRU
     /// recency on every key (which would defeat eviction under MGET-heavy
     /// read workloads); compare GET which does promote.
-    Task<bool> HandleMget(ISocket* socket, CacheEngine* engine, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleMget(core::net::ISocket* socket,
+                                       CacheEngine* engine,
+                                       std::span<std::string const> args,
+                                       RespVersion resp)
     {
         if (args.empty())
             co_return co_await ReplyError(socket, "wrong number of arguments for 'mget'");
@@ -4377,7 +4476,10 @@ namespace
     /// (matches redis cluster semantics where MSET on multiple slots is
     /// rejected, but on a single instance MSET is best-effort). Reply
     /// `+OK` once every key has been written.
-    Task<bool> HandleMset(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandleMset(core::net::ISocket* socket,
+                                       CacheEngine* engine,
+                                       ConnectionState* state,
+                                       std::span<std::string const> args)
     {
         if (args.empty() || (args.size() % 2) != 0)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'mset'");
@@ -4410,7 +4512,10 @@ namespace
     /// committed" on `:0`); a concurrent SET racing into the gap can
     /// still let one Add fail, but the rollback erases earlier writes
     /// from the batch so the keyspace is not left half-written.
-    Task<bool> HandleMsetNx(ISocket* socket, CacheEngine* engine, ConnectionState* state, std::span<std::string const> args)
+    core::async::Task<bool> HandleMsetNx(core::net::ISocket* socket,
+                                         CacheEngine* engine,
+                                         ConnectionState* state,
+                                         std::span<std::string const> args)
     {
         if (args.empty() || (args.size() % 2) != 0)
             co_return co_await ReplyError(socket, "wrong number of arguments for 'msetnx'");
@@ -4464,35 +4569,35 @@ namespace
     // type system. Adding a new type is one descriptor row, not another `if`
     // branch in HandleDebug.
 
-    Task<bool> WriteDebugString(ISocket* socket, RespVersion /*resp*/)
+    core::async::Task<bool> WriteDebugString(core::net::ISocket* socket, RespVersion /*resp*/)
     {
         co_return co_await ReplyBulkString(socket, std::string_view { "Simple status string" });
     }
-    Task<bool> WriteDebugInteger(ISocket* socket, RespVersion /*resp*/)
+    core::async::Task<bool> WriteDebugInteger(core::net::ISocket* socket, RespVersion /*resp*/)
     {
         co_return co_await ReplyInteger(socket, 12345);
     }
-    Task<bool> WriteDebugDouble(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteDebugDouble(core::net::ISocket* socket, RespVersion resp)
     {
         co_return co_await ReplyDouble(socket, 1.5, resp);
     }
-    Task<bool> WriteDebugBigNum(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteDebugBigNum(core::net::ISocket* socket, RespVersion resp)
     {
         co_return co_await ReplyBigNumber(socket, "1234567999999999999999999999999999999", resp);
     }
-    Task<bool> WriteDebugTrue(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteDebugTrue(core::net::ISocket* socket, RespVersion resp)
     {
         co_return co_await ReplyBoolean(socket, true, resp);
     }
-    Task<bool> WriteDebugFalse(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteDebugFalse(core::net::ISocket* socket, RespVersion resp)
     {
         co_return co_await ReplyBoolean(socket, false, resp);
     }
-    Task<bool> WriteDebugNull(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteDebugNull(core::net::ISocket* socket, RespVersion resp)
     {
         co_return co_await ReplyNull(socket, resp);
     }
-    Task<bool> WriteDebugArray(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteDebugArray(core::net::ISocket* socket, RespVersion resp)
     {
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Array, 3, resp))
             co_return false;
@@ -4502,11 +4607,11 @@ namespace
             co_return false;
         co_return co_await ReplyInteger(socket, 3);
     }
-    Task<bool> WriteDebugVerbatim(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteDebugVerbatim(core::net::ISocket* socket, RespVersion resp)
     {
         co_return co_await ReplyVerbatim(socket, "txt", "This is a verbatim\nstring", resp);
     }
-    Task<bool> WriteDebugMap(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteDebugMap(core::net::ISocket* socket, RespVersion resp)
     {
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Map, 1, resp))
             co_return false;
@@ -4514,7 +4619,7 @@ namespace
             co_return false;
         co_return co_await ReplyBoolean(socket, true, resp);
     }
-    Task<bool> WriteDebugSet(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteDebugSet(core::net::ISocket* socket, RespVersion resp)
     {
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Set, 2, resp))
             co_return false;
@@ -4528,7 +4633,7 @@ namespace
     /// markers chosen to make the frame visible on the wire, not the shape
     /// `WritePushMessage` produces for a real subscription (which starts
     /// with `message`/`pmessage`).
-    Task<bool> WriteDebugPush(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteDebugPush(core::net::ISocket* socket, RespVersion resp)
     {
         if (!co_await ReplyAggregateHeader(socket, Aggregate::Push, 3, resp))
             co_return false;
@@ -4544,7 +4649,7 @@ namespace
     /// desync the stream, so we substitute the bulk string "none" instead —
     /// the canonical view an attribute-aware client gets after stripping
     /// the advisory attribute.
-    Task<bool> WriteDebugAttrib(ISocket* socket, RespVersion resp)
+    core::async::Task<bool> WriteDebugAttrib(core::net::ISocket* socket, RespVersion resp)
     {
         if (resp != RespVersion::Resp3)
             co_return co_await ReplyBulkString(socket, std::string_view { "none" });
@@ -4560,8 +4665,8 @@ namespace
     /// One row of the DEBUG PROTOCOL dispatch table.
     struct DebugProtocolType
     {
-        std::string_view name;                      ///< Upper-cased wire name.
-        Task<bool> (*write)(ISocket*, RespVersion); ///< Writer for one value.
+        std::string_view name;                                              ///< Upper-cased wire name.
+        core::async::Task<bool> (*write)(core::net::ISocket*, RespVersion); ///< Writer for one value.
     };
 
     /// Data-driven DEBUG PROTOCOL type table. Adding a new conformance type
@@ -4585,7 +4690,7 @@ namespace
     /// DEBUG <subcommand> — only `DEBUG PROTOCOL <type>` is meaningful here.
     /// Looks up the upper-cased `<type>` in `DebugProtocolTypes` and invokes
     /// its writer; an unknown type replies the canonical redis error.
-    Task<bool> HandleDebug(ISocket* socket, std::span<std::string const> args, RespVersion resp)
+    core::async::Task<bool> HandleDebug(core::net::ISocket* socket, std::span<std::string const> args, RespVersion resp)
     {
         auto const sub = args.empty() ? std::string {} : Upper(args[0]);
         if (sub != "PROTOCOL" || args.size() < 2)
@@ -4598,7 +4703,8 @@ namespace
         // iterator variable satisfies both the Windows compilers and
         // clang-tidy's readability-qualified-auto. The function pointer has the
         // same type on every toolchain.
-        Task<bool> (*const write)(ISocket*, RespVersion) = [&]() -> Task<bool> (*)(ISocket*, RespVersion) {
+        core::async::Task<bool> (*const write)(core::net::ISocket*, RespVersion) =
+            [&]() -> core::async::Task<bool> (*)(core::net::ISocket*, RespVersion) {
             for (auto const& row: DebugProtocolTypes)
                 if (row.name == type)
                     return row.write;
@@ -4632,7 +4738,7 @@ namespace
     // (CommandContext was moved to the forward-declare block above so
     // HandleExec can use it.)
 
-    using CommandHandler = Task<bool> (*)(CommandContext);
+    using CommandHandler = core::async::Task<bool> (*)(CommandContext);
 
     /// One row of the command dispatch table: a command name, its handler,
     /// and the metadata `COMMAND` and `COMMAND DOCS` introspection clients
@@ -5186,7 +5292,7 @@ namespace
         return std::nullopt;
     }
 
-    Task<bool> CommandTableInvoke(std::size_t index, CommandContext ctx)
+    core::async::Task<bool> CommandTableInvoke(std::size_t index, CommandContext ctx)
     {
         return CommandTable[index].handler(ctx);
     }
@@ -5201,7 +5307,7 @@ namespace
     /// @param session Per-server collaborators (the registry to unsubscribe from).
     /// @param state   Per-connection state to clear.
     /// @return Always true; RESET never ends the session.
-    Task<bool> HandleReset(ISocket* socket, SessionContext session, ConnectionState* state)
+    core::async::Task<bool> HandleReset(core::net::ISocket* socket, SessionContext session, ConnectionState* state)
     {
         if (session.pubsub != nullptr && state->subscriber)
             session.pubsub->UnsubscribeAll(state->subscriber.get());
@@ -5219,7 +5325,10 @@ namespace
 
     /// Verify the AUTH credential against the policy and flip `state` on success.
     /// Factored out so Dispatch's pre-table prologue stays readable.
-    Task<bool> HandleAuth(ISocket* socket, std::span<std::string const> tail, SessionContext session, ConnectionState* state)
+    core::async::Task<bool> HandleAuth(core::net::ISocket* socket,
+                                       std::span<std::string const> tail,
+                                       SessionContext session,
+                                       ConnectionState* state)
     {
         auto const auth = session.CurrentAuth();
         if (auth == nullptr || !auth->Enabled())
@@ -5237,8 +5346,8 @@ namespace
         co_return co_await ReplyOk(socket);
     }
 
-    Task<bool> Dispatch(
-        ISocket* socket, CacheEngine* engine, ParsedCommand cmd, SessionContext session, ConnectionState* state)
+    core::async::Task<bool> Dispatch(
+        core::net::ISocket* socket, CacheEngine* engine, ParsedCommand cmd, SessionContext session, ConnectionState* state)
     {
         if (cmd.args.empty())
             co_return true;
@@ -5340,7 +5449,7 @@ namespace
         if (name == "QUIT")
         {
             (void) co_await ReplyOk(socket);
-            socket->Close();
+            socket->close();
             co_return false; // signal session end
         }
         if (name == "RESET")
@@ -5389,7 +5498,7 @@ namespace
     /// Flush any pub/sub messages queued for the subscriber to the socket as push
     /// frames. Runs on the connection's own reactor thread.
     /// @return False if a socket write failed (caller should end the session).
-    Task<bool> DrainPushes(ISocket* socket, Subscriber* subscriber, RespVersion resp)
+    core::async::Task<bool> DrainPushes(core::net::ISocket* socket, Subscriber* subscriber, RespVersion resp)
     {
         for (auto& message: subscriber->DrainQueue())
             if (!co_await WritePushMessage(socket, std::move(message), resp))
@@ -5410,10 +5519,10 @@ void RedisRespHandler::OverrideMultiQueueCapsForTests(std::size_t maxCommands, s
     _testMaxQueuedBytes = maxBytes;
 }
 
-Task<void> RedisRespHandler::Run(ISocket* socket,
-                                 CacheEngine* engine,
-                                 std::vector<std::byte> primingBytes,
-                                 SessionContext session)
+core::async::Task<void> RedisRespHandler::Run(core::net::ISocket* socket,
+                                              CacheEngine* engine,
+                                              std::vector<std::byte> primingBytes,
+                                              SessionContext session)
 {
     ByteReader reader { *socket, MaxLineBytes, session.maxPayloadBytes };
     reader.PrimeWith(std::span<std::byte const> { primingBytes.data(), primingBytes.size() });
@@ -5590,7 +5699,7 @@ Task<void> RedisRespHandler::Run(ISocket* socket,
             co_return; // RAII cleanup fires on the way out
 
         // One command handled and replied — mark the request frame.
-        FC_FRAME_MARK;
+        CORE_FRAME_MARK;
     }
 }
 

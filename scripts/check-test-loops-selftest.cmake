@@ -242,32 +242,10 @@ set(dashboardPanelFile
 }
 ")
 
-# #1452's rows over C linked lists: `getaddrinfo`'s result in three files, and the two lists
-# `LocalAddresses.cpp` walks -- `GetAdaptersAddresses`' adapters and their unicast addresses,
-# and `getifaddrs`' interfaces. Each file carries only its exempted sites, as many as the real one.
-set(healthProbeFile
-"bool Probe(addrinfo* results)
-{
-    for (addrinfo const* it = results; it != nullptr; it = it->ai_next)
-        if (Connect(it))
-            return true;
-    return false;
-}
-")
-set(socketAddressFile
-"void Resolve(addrinfo* head)
-{
-    for (addrinfo const* ai = head; ai != nullptr; ai = ai->ai_next)
-        Keep(ai);
-}
-")
-set(udpSocketFile
-"void Bind(addrinfo* resolved)
-{
-    for (auto const* candidate = resolved; candidate != nullptr; candidate = candidate->ai_next)
-        Try(candidate);
-}
-")
+# #1452's rows over C linked lists: the two lists `LocalAddresses.cpp` walks --
+# `GetAdaptersAddresses`' adapters and their unicast addresses, and `getifaddrs`' interfaces. The
+# file carries only its exempted sites, as many as the real one. (The `getaddrinfo` walks in three
+# `Net/` files were rows here too, until #1596 moved them into core-cpp.)
 set(localAddressesFile
 "void Windows(IP_ADAPTER_ADDRESSES const* head)
 {
@@ -349,15 +327,12 @@ function(fastcached_stage_and_run name target from to backlog outOutput outAppli
         "src/apps/fastcache-compile-node/NodeToolchains.cpp"
         "src/FastCache/Cli/UsageDoc.cpp"
         "src/apps/fastcache-cli/DashboardPanel.cpp"
-        "src/FastCache/Net/HealthProbe.cpp"
-        "src/FastCache/Net/SocketAddress.cpp"
-        "src/FastCache/Net/UdpSocket.cpp"
         "src/FastCache/Platform/LocalAddresses.cpp"
         "src/apps/fastcache-compile-node/ScratchClaim.cpp"
         "src/apps/fastcached/main.cpp")
     set(texts cleanFile helperHeader canaryFile liveFile probeFile runnerFile cliCommandFile
               socketExchangeFile nodeAnnounceFile parallelForFile nodeToolchainsFile
-              usageDocFile dashboardPanelFile healthProbeFile socketAddressFile udpSocketFile
+              usageDocFile dashboardPanelFile
               localAddressesFile scratchClaimFile daemonMainFile)
     list(LENGTH files stagedCount)
     math(EXPR lastStaged "${stagedCount} - 1")
@@ -469,12 +444,12 @@ endfunction()
 set(FastCachedTestLoopCases
     # The baseline, in both enumeration modes. Every refusal below is evidence only if
     # these pass -- and they pass only while every exemption row still matches its site.
-    "baseline via walk|none|-|-|no new C-style loop && directory walk (no git index) && 26 exempted site(s) in 20 row(s) && backlog: empty|CMake Error|-"
+    "baseline via walk|none|-|-|no new C-style loop && directory walk (no git index) && 23 exempted site(s) in 17 row(s) && backlog: empty|CMake Error|-"
     "baseline via git|none-git|-|-|no new C-style loop && git ls-files|CMake Error|-"
     # A tree inside another checkout is walked, not read from that checkout's index, which
     # knows none of it. Asking "inside a work tree" instead of "at its top" refused every
     # case when ctest staged them under the gate's build directory.
-    "baseline nested in another checkout|none-nested|-|-|no new C-style loop && directory walk (no git index) && 26 exempted site(s) in 20 row(s) && backlog: empty|CMake Error|-"
+    "baseline nested in another checkout|none-nested|-|-|no new C-style loop && directory walk (no git index) && 23 exempted site(s) in 17 row(s) && backlog: empty|CMake Error|-"
     "a counting loop nested in another checkout|newfile-nested|src/FastCache/Core/Fresh_test.cpp|int F()~n~{~n~    for (int i = 0~sc~ i < 3~sc~ ++i)~n~        Use(i)~sc~~n~}~n~|src/FastCache/Core/Fresh_test.cpp:3: a C-style for loop && directory walk (no git index)|-|-"
 
     # THE RED ARM.

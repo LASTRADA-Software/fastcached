@@ -7,7 +7,6 @@
 // `Markup.hpp` pulls in `Ranges.hpp` and `Utf8.hpp` and there is no `.cpp` between
 // the three, which is what makes the shared escaper reachable from here at all.
 #include <FastCache/Core/Markup.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/Environment.hpp>
 
 #include <algorithm>
@@ -25,6 +24,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -313,7 +314,7 @@ namespace
 
     /// Decode a log line's dispatch token.
     ///
-    /// `FindOrNull` rather than `std::ranges::find`: the table is a `std::array`,
+    /// `core::findOrNull` rather than `std::ranges::find`: the table is a `std::array`,
     /// whose iterator is a raw pointer on libc++ and a class type on the MSVC STL,
     /// and every spelling of the local either trips `readability-qualified-auto` on
     /// one or `modernize-use-auto` on the other. `Core/Ranges.hpp` exists to resolve
@@ -325,7 +326,7 @@ namespace
     ///         report on, and guessing at it would be a claim about a fleet.
     [[nodiscard]] DispatchOutcome ParseDispatchOutcome(std::string_view token)
     {
-        auto const* const row = FindOrNull(DispatchTable, token, &DispatchRow::token);
+        auto const* const row = core::findOrNull(DispatchTable, token, &DispatchRow::token);
         return row != nullptr ? row->outcome : DispatchOutcome::Unknown;
     }
 

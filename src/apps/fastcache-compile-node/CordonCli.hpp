@@ -5,7 +5,6 @@
 #include "NodeCredential.hpp"
 #include "NodeSurfaces.hpp"
 
-#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <expected>
@@ -13,6 +12,7 @@
 #include <string_view>
 
 #include <CacheProtocol.hpp>
+#include <core/net/ISocket.hpp>
 
 namespace FastCache::Node
 {
@@ -37,14 +37,14 @@ namespace FastCache::Node
 /// Put one cordon request to an already-connected node.
 ///
 /// Split from `RunCordonAdmin` for `PutClusterRequest`'s reason: the dial takes a
-/// `BlockingConnector` by type, so the exchange is what a scripted socket can drive.
+/// `core::net::BlockingConnector` by type, so the exchange is what a scripted socket can drive.
 /// @param client A connected node; not owned.
 /// @param notice Where "your credential went unchecked" is reported.
 /// @param action Cordon, or lift it.
 /// @param credential What to present, asked at the moment of the exchange.
 /// @param endpoint Where @p client is connected, for the diagnostics.
 /// @return What to print, or what went wrong.
-[[nodiscard]] std::expected<std::string, std::string> PutCordonRequest(ISocket& client,
+[[nodiscard]] std::expected<std::string, std::string> PutCordonRequest(core::net::ISocket& client,
                                                                        Cc::CredentialNotice& notice,
                                                                        CompileCacheWire::CordonAction action,
                                                                        ICredentialSource const& credential,

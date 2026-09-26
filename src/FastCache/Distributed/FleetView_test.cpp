@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/StorageTier.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/MachineName.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetText.hpp>
@@ -26,6 +24,8 @@
 #include <utility>
 #include <vector>
 
+#include <core/Ranges.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -490,7 +490,8 @@ TEST_CASE("Every name a fleet document gives a program is kebab-case, and a miss
         CHECK(std::ranges::find(sources, row.key) != sources.end());
     for (auto const source: std::array<std::string_view, 3> { "fleet-sections", "kpi-keys", "lease-outcomes" })
         CHECK(std::ranges::find(sources, source) != sources.end());
-    auto const* const tiers = FindIfOrNull(tables, [](MachineNameTable const& table) { return table.table == "tiers"; });
+    auto const* const tiers =
+        core::findIfOrNull(tables, [](MachineNameTable const& table) { return table.table == "tiers"; });
     REQUIRE(tiers != nullptr);
     CHECK(std::ranges::find(tiers->names, "disk-index-ram") != tiers->names.end());
 
@@ -547,7 +548,8 @@ TEST_CASE("The strip's words are public, row for row with its keys", "[distribut
     }
     CHECK(sparklines == 1);
 
-    auto const* const compiling = FindIfOrNull(kpis, [](FleetKpiText const& kpi) { return kpi.key == "compiling-now"; });
+    auto const* const compiling =
+        core::findIfOrNull(kpis, [](FleetKpiText const& kpi) { return kpi.key == "compiling-now"; });
     REQUIRE(compiling != nullptr);
     CHECK(compiling->label == "Compiling now");
     CHECK(compiling->ofNoun == "slots");
@@ -899,10 +901,10 @@ TEST_CASE("Each lease outcome carries its own number", "[distributed][fleetview]
 
 TEST_CASE("Collecting a fleet reads the registry per machine and the counters as they stand", "[distributed][fleetview]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = FastCache::Testing::TestLeaseSigner();
     SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
@@ -936,10 +938,10 @@ TEST_CASE("Collecting a fleet reads the registry per machine and the counters as
 
 TEST_CASE("Collecting a fleet without a cluster is a snapshot, not a crash", "[distributed][fleetview]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = FastCache::Testing::TestLeaseSigner();
     SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
 

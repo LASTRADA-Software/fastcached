@@ -84,24 +84,17 @@ if not best:
 # The positive control. If `nm` returns nothing for everything -- wrong binary, wrong
 # object format -- every TU reads as blind and this check would "find" the whole tree.
 # A run in which nothing is analysed is a broken instrument, not a discovery.
-# TWO positive controls, one per axis, because the signature has two preconditions
-# and they fail differently.
+# A positive control: `Server.cpp`, a big, unconditionally-compiled unit. Blind here means
+# the MEASUREMENT is broken (wrong `nm`, wrong object format), and without this the check
+# would report the whole tree.
 #
-#   `EpollSocket.cpp`   -- a big, unconditionally-compiled unit. Blind here means the
-#                          MEASUREMENT is broken (wrong `nm`, wrong object format), and
-#                          without this the check would report the whole tree.
-#   `TlsSocket_test.cpp` -- empty without `FASTCACHED_ENABLE_TLS` and analysed with it.
-#                          Blind here means this BUILD is not configured like the sweep,
-#                          so its blind set answers a different question than the table
-#                          records. Measured: the same tree gives 11 in the sweep's
-#                          configuration and 26 in a Release one without ASan, because
-#                          the two-symbol signature is the sanitizer's.
-for control, why in (("src/FastCache/Net/EpollSocket.cpp",
-                      "the measurement is broken, not the tree -- check `nm`"),
-                     ("src/FastCache/Net/TlsSocket_test.cpp",
-                      "this build is not configured like the clang-tidy sweep "
-                      "(needs FASTCACHED_ENABLE_TLS=ON), so its blind set is not the one "
-                      "scripts/tidy-blind-spots.txt describes")):
+# There was a second, on the other axis: `Net/TlsSocket_test.cpp`, empty without
+# `FASTCACHED_ENABLE_TLS`, so that a build not configured like the sweep could not answer
+# for it. The TLS socket and its tests are core-cpp's since #1596, and no unit left here is
+# empty without TLS, so that axis has no subject in this tree -- which is also why a
+# build's TLS setting no longer changes the blind set this table records.
+for control, why in (("src/FastCache/Server/Server.cpp",
+                      "the measurement is broken, not the tree -- check `nm`"),):
     if control in best and best[control] <= 2:
         print(f"!ERROR positive control {control} measured as blind "
               f"({best[control]} symbols); {why}", file=sys.stderr)

@@ -2,11 +2,13 @@
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/StopAwareWait.hpp>
+
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
 #if defined(FC_TLS_ENABLED)
-    #include <FastCache/Net/TlsContext.hpp>
+    #include <core/net/Tls.hpp>
 #endif
 #include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetText.hpp>
@@ -787,7 +789,7 @@ std::filesystem::path FleetHistoryPath(NodeConfig const& cfg)
 FleetSampler::FleetSampler(std::optional<Distributed::FleetSources> sources,
                            IMetricsSink const& metrics,
                            AdminHttpServer::SnapshotProvider node,
-                           WallClockRef wall,
+                           core::platform::WallClockRef wall,
                            HistoryPaths paths,
                            ILogger& logger):
     _sources { sources },
@@ -987,15 +989,15 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
     if (cfg.tlsSelfSigned || !cfg.tlsCertFile.empty())
     {
 #if defined(FC_TLS_ENABLED)
-        auto created = cfg.tlsSelfSigned ? TlsContext::CreateSelfSigned(SelfSignedSubjectNames(cfg, host))
-                                         // `.string()` because `TlsContext::Create` takes
-                                         // `string_view`, and a `std::filesystem::path` only
-                                         // converts to one implicitly where `string_type` IS
-                                         // `std::string` -- which is POSIX and not Windows.
-                                         : TlsContext::Create(cfg.tlsCertFile.string(), cfg.tlsKeyFile.string());
+        // The common name is this project's, stated rather than left to core-cpp's default of
+        // "localhost": a certificate a browser shows an operator names what it belongs to.
+        auto created = cfg.tlsSelfSigned
+                           ? core::net::makeSelfSignedServerContext(core::net::SelfSignedOptions {
+                                 .commonName = "fastcache-node", .subjectNames = SelfSignedSubjectNames(cfg, host) })
+                           : core::net::makeTlsServerContextFromFiles(cfg.tlsCertFile, cfg.tlsKeyFile);
         if (!created.has_value())
             return std::unexpected { std::format(
-                "{}: {}", cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert/--tls-key", created.error().ToString()) };
+                "{}: {}", cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert/--tls-key", created.error()) };
         surface.tls = std::move(*created);
 #else
         // Refused rather than warned about, and the daemon answers the same way: a
@@ -1050,12 +1052,12 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
         logger.Logf(LogLevel::Info,
                     "admin TLS uses a self-signed certificate generated at startup; SHA-256 fingerprint {} "
                     "(it changes on every restart)",
-                    surface.tls->CertificateFingerprint());
+                    surface.tls->certificateFingerprint());
         // And kept where somebody who was not watching the startup can read it (#1364): the line
         // above scrolls, and the fingerprint is the one thing an operator can compare.
         conditions.Raise(NodeCondition::GeneratedTlsCertificate,
                          std::format("the admin surface serves a certificate generated at startup; SHA-256 fingerprint {}",
-                                     surface.tls->CertificateFingerprint()));
+                                     surface.tls->certificateFingerprint()));
     }
     else
         conditions.Clear(NodeCondition::GeneratedTlsCertificate);
@@ -1081,7 +1083,7 @@ AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
                              std::string boundEndpoint,
                              ILogger& logger,
                              std::vector<AdminRoute> routes,
-                             TlsContext* tls,
+                             core::net::ITlsContext* tls,
                              ServedSurfaces surfaces):
     _listener { std::move(listener) },
     _surfaces { surfaces },
@@ -1100,7 +1102,7 @@ AdminEndpoint::AdminEndpoint(std::unique_ptr<BlockingListener> listener,
         tls,
         _surfaces.Span()) },
     _boundEndpoint { std::move(boundEndpoint) },
-    _thread { [server = _server.get()] { SyncRun(server->Run()); } }
+    _thread { [server = _server.get()] { core::async::syncRun(server->Run()); } }
 {
 }
 
@@ -1132,7 +1134,7 @@ std::expected<std::unique_ptr<AdminEndpoint>, std::string> AdminEndpoint::Start(
                                                                                 AdminHttpServer::SnapshotProvider snapshot,
                                                                                 ILogger& logger,
                                                                                 std::vector<AdminRoute> routes,
-                                                                                TlsContext* tls)
+                                                                                core::net::ITlsContext* tls)
 {
     // Resolved by the row, so the loopback default that decides whether a credential
     // is required is the same value this actually binds. A malformed address cannot

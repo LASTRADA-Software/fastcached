@@ -9,7 +9,6 @@
 #include "NodeMembership.hpp"
 #include "NodeRoster.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -24,6 +23,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -119,7 +120,7 @@ class NodeStatusResponder final: public IFrameResponder
     }
 
     /// @copydoc IFrameResponder::Answer
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///
@@ -362,7 +363,7 @@ struct RegistrationReading
     /// has never reached its scheduler -- the ordinary shape of a misconfigured
     /// `--scheduler` -- and one that registered an hour ago are the two states an
     /// operator is trying to separate, and a sentinel instant reports them alike.
-    std::optional<TimePoint> lastAccepted {};
+    std::optional<core::platform::SteadyTimePoint> lastAccepted {};
 };
 
 /// Where the worker publishes what it is doing, for a reader on another thread.
@@ -430,7 +431,9 @@ class NodeRuntimeState
     ///        that accepted nothing is not evidence that this node never registered,
     ///        and overwriting would turn every unreachable scheduler into a node that
     ///        had never reached one.
-    void PublishRegistration(std::uint32_t registered, std::uint32_t total, std::optional<TimePoint> acceptedAt)
+    void PublishRegistration(std::uint32_t registered,
+                             std::uint32_t total,
+                             std::optional<core::platform::SteadyTimePoint> acceptedAt)
     {
         std::scoped_lock const guard { _mutex };
         // Spelled out rather than nested ternaries, which the analyser refuses and is
@@ -577,8 +580,8 @@ class ConfiguredNodeStatus final: public INodeStatusSource
     ///        for a caller that publishes none, and it is what makes *nothing was wired*
     ///        distinguishable from *the worker serves nothing*.
     ConfiguredNodeStatus(NodeConfig const& cfg,
-                         IClock const& clock,
-                         TimePoint startedAt,
+                         core::platform::IClock const& clock,
+                         core::platform::SteadyTimePoint startedAt,
                          std::string version,
                          std::string nodeId,
                          NodeComponents components,
@@ -589,8 +592,8 @@ class ConfiguredNodeStatus final: public INodeStatusSource
 
   private:
     NodeConfig const& _cfg;
-    IClock const& _clock;
-    TimePoint _startedAt;
+    core::platform::IClock const& _clock;
+    core::platform::SteadyTimePoint _startedAt;
     std::string _version;
     std::string _nodeId;
     NodeComponents _components;

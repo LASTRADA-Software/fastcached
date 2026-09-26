@@ -2,10 +2,6 @@
 //
 // The test tree's one wait (`src/tests/BoundedWait.hpp`), tested here beside the drain it runs on,
 // the way `Net/SocketDecorator_test.cpp` tests its shared fake.
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Core/Clock.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -20,6 +16,9 @@
 #include <tuple>
 #include <utility>
 
+#include <core/async/Task.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/FrameSentinel.hpp>
 #include <tests/Unwrap.hpp>
@@ -171,8 +170,8 @@ TEST_CASE("A wait on a helper thread hands its account to the case instead of as
     CHECK(everything.AllReached());
 }
 
-// `AwaitUntil`, the same wait for a coroutine on a reactor (#1453). Driven on a `TestReactor` over a
-// `ManualClock`, so the bound and the reading are shown to follow the REACTOR's clock: every case below
+// `AwaitUntil`, the same wait for a coroutine on a reactor (#1453). Driven on a `core::net::testing::TestLoop` over a
+// `core::platform::ManualClock`, so the bound and the reading are shown to follow the REACTOR's clock: every case below
 // takes no real time worth measuring.
 
 namespace
@@ -184,11 +183,11 @@ namespace
 /// @param options  The bound and the rest.
 /// @param sentinel Counted when this frame dies.
 /// @param out      Where the outcome is written; must outlive the task.
-FastCache::DetachedTask AwaitFlag(FastCache::IReactor* reactor,
-                                  std::atomic<bool> const* flag,
-                                  ReactorWaitOptions options,
-                                  FrameSentinel sentinel,
-                                  std::optional<WaitOutcome>* out)
+core::async::DetachedTask AwaitFlag(core::net::EventLoop* reactor,
+                                    std::atomic<bool> const* flag,
+                                    ReactorWaitOptions options,
+                                    FrameSentinel sentinel,
+                                    std::optional<WaitOutcome>* out)
 {
     (void) sentinel;
     *out = co_await AwaitUntil(
@@ -208,16 +207,16 @@ TEST_CASE("A reactor wait that already holds returns at its first look and parks
     FrameCounters counters;
     std::atomic<bool> const flag { true };
     std::optional<WaitOutcome> outcome;
-    FastCache::ManualClock clock;
-    FastCache::TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
 
     AwaitFlag(&reactor, &flag, ReactorWaitOptions {}, FrameSentinel { &counters }, &outcome);
 
     REQUIRE(outcome.has_value());
     CHECK(Unwrap(outcome).reached);
     CHECK(Unwrap(outcome).account.empty());
-    CHECK(reactor.PendingSubmissions() == 0);
-    CHECK(reactor.PendingTimers() == 0);
+    CHECK(reactor.pendingSubmissions() == 0);
+    CHECK(reactor.pendingTimers() == 0);
     CHECK(counters.destroyed.load() == 1);
 }
 
@@ -228,23 +227,23 @@ TEST_CASE("A reactor wait takes a reactor turn between looks and ends when its c
     FrameCounters counters;
     std::atomic<bool> flag { false };
     std::optional<WaitOutcome> outcome;
-    FastCache::ManualClock clock;
-    FastCache::TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
 
     AwaitFlag(&reactor, &flag, ReactorWaitOptions {}, FrameSentinel { &counters }, &outcome);
     REQUIRE_FALSE(outcome.has_value());
     // Parked on the reactor rather than spinning the thread: one submission per look.
-    CHECK(reactor.PendingSubmissions() == 1);
-    std::ignore = reactor.Tick();
-    std::ignore = reactor.Tick();
+    CHECK(reactor.pendingSubmissions() == 1);
+    std::ignore = reactor.tick();
+    std::ignore = reactor.tick();
     REQUIRE_FALSE(outcome.has_value());
 
     flag.store(true, std::memory_order_release);
-    std::ignore = reactor.Tick();
+    std::ignore = reactor.tick();
 
     REQUIRE(outcome.has_value());
     CHECK(Unwrap(outcome).reached);
-    CHECK(reactor.PendingSubmissions() == 0);
+    CHECK(reactor.pendingSubmissions() == 0);
     CHECK(counters.destroyed.load() == 1);
 }
 
@@ -258,8 +257,8 @@ TEST_CASE("A reactor wait runs out on the reactor's clock and says what it found
     FrameCounters counters;
     std::atomic<bool> const flag { false };
     std::optional<WaitOutcome> outcome;
-    FastCache::ManualClock clock;
-    FastCache::TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
 
     AwaitFlag(&reactor,
               &flag,
@@ -267,46 +266,49 @@ TEST_CASE("A reactor wait runs out on the reactor's clock and says what it found
               FrameSentinel { &counters },
               &outcome);
     // Sleeping between looks parks on the reactor's timers, not its submissions.
-    CHECK(reactor.PendingTimers() == 1);
+    CHECK(reactor.pendingTimers() == 1);
     for ([[maybe_unused]] auto const step: std::views::iota(0, 100))
     {
         if (outcome.has_value())
             break;
-        clock.Advance(100ms);
-        std::ignore = reactor.Tick();
+        clock.advance(100ms);
+        std::ignore = reactor.tick();
     }
 
     REQUIRE(outcome.has_value());
     CHECK_FALSE(Unwrap(outcome).reached);
     CHECK(Unwrap(outcome).elapsed == 3s);
+    // Fifteen looks in thirty ticks, not thirty: core-cpp's loop fires a due deadline at the END of
+    // a turn and resumes it at the START of the next (its guarantee G2, one place resumes), so each
+    // 100 ms rest costs this drive two ticks where fastcached's `TestReactor` fired and resumed in one.
     CHECK_THAT(Unwrap(outcome).account,
                ContainsSubstring("AwaitUntil gave up waiting for the flag to be set after 3000 ms on the reactor's clock "
-                                 "and 30 turn(s).")
+                                 "and 15 turn(s).")
                    && ContainsSubstring("State at the end: unset; nobody sets it.") && ContainsSubstring("STALLED"));
-    CHECK(reactor.PendingTimers() == 0);
+    CHECK(reactor.pendingTimers() == 0);
     CHECK(counters.destroyed.load() == 1);
 }
 
 TEST_CASE("A reactor torn down while a coroutine waits in AwaitUntil frees that coroutine's chain once", "[core][wait]")
 {
-    // The helper is a `Task` awaited from the caller's frame, so what the reactor holds at teardown is the
+    // The helper is a `core::async::Task` awaited from the caller's frame, so what the reactor holds at teardown is the
     // helper's frame, not the caller's. It is freed from the chain's ROOT (`Detail::UnownedRootOf`, #1025),
     // which is what makes delegating the loop to a helper safe -- `SleepUntil.hpp` points here for that.
     // ASan/UBSan builds would also report a double free or a leak.
-    auto const rest = GENERATE(FastCache::Duration::zero(), FastCache::Duration { 1h });
+    auto const rest = GENERATE(core::platform::SteadyDuration::zero(), core::platform::SteadyDuration { 1h });
     INFO("rest between looks: " << std::chrono::duration_cast<std::chrono::milliseconds>(rest).count() << " ms");
     FrameCounters counters;
     std::atomic<bool> const flag { false };
     std::optional<WaitOutcome> outcome;
     {
-        FastCache::ManualClock clock;
-        FastCache::TestReactor reactor { clock };
+        core::platform::ManualClock clock;
+        core::net::testing::TestLoop reactor { clock };
         AwaitFlag(&reactor,
                   &flag,
                   ReactorWaitOptions { .context = {}, .bound = 2h, .rest = rest },
                   FrameSentinel { &counters },
                   &outcome);
-        REQUIRE(reactor.PendingSubmissions() + reactor.PendingTimers() == 1);
+        REQUIRE(reactor.pendingSubmissions() + reactor.pendingTimers() == 1);
         CHECK(counters.destroyed.load() == 0);
     }
     CHECK_FALSE(outcome.has_value());

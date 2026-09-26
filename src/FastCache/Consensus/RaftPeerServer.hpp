@@ -1,18 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/IReactor.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Consensus/IRaftMessageSink.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/RaftPeerRefusals.hpp>
 #include <FastCache/Consensus/RaftTypes.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/IListener.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -21,6 +17,11 @@
 #include <mutex>
 #include <string_view>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/net/EventLoop.hpp>
+#include <core/net/IListener.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Consensus
 {
@@ -49,7 +50,7 @@ struct PeerServerOptions
     /// How long a connection may take to prove an id before it is closed and counted.
     ///
     /// `RaftWire::HandshakeBound`, which the dialling end uses too. Non-positive arms
-    /// no deadline at all -- `ArmSocketDeadline`'s rule -- which exists for a test that
+    /// no deadline at all -- `core::net::armSocketDeadline`'s rule -- which exists for a test that
     /// drives the accept loop over a reactor nothing turns, where a deadline could never
     /// fire and would only be a coroutine frame left parked.
     std::chrono::milliseconds handshakeBound { RaftWire::HandshakeBound };
@@ -67,7 +68,7 @@ struct OpenConnections
     /// the node down.
     std::mutex mutex;
 
-    std::vector<ISocket*> sockets; ///< One per connection currently being served.
+    std::vector<core::net::ISocket*> sockets; ///< One per connection currently being served.
 };
 
 /// Accepts peer connections, has each one prove which member it is, and turns their
@@ -113,7 +114,7 @@ struct OpenConnections
 ///
 /// Not a preference. A blocking listener makes `co_await Accept()` and every
 /// `co_await` inside the per-connection task complete synchronously, so that
-/// task -- a `DetachedTask` precisely so several peers can be read at once --
+/// task -- a `core::async::DetachedTask` precisely so several peers can be read at once --
 /// runs to completion inline and the accept loop never reaches its next
 /// iteration. One peer is then served and no other is ever accepted: in a
 /// three-node cluster each node reads from exactly one of its two peers, votes
@@ -149,8 +150,8 @@ class RaftPeerServer
     /// @param random Where each connection's challenge nonce and ephemeral key come from. A
     ///        connection this node cannot draw them for is closed before it is challenged (#1527).
     /// @param options Frame, connection and handshake limits.
-    RaftPeerServer(IListener& listener,
-                   IReactor& reactor,
+    RaftPeerServer(core::net::IListener& listener,
+                   core::net::EventLoop& reactor,
                    IRaftMessageSink& sink,
                    ILogger& logger,
                    IMetricsSink& metrics,
@@ -160,27 +161,29 @@ class RaftPeerServer
 
     /// Accept loop; returns when the listener is closed via `Shutdown()`.
     /// @return Task that resolves when the loop exits.
-    [[nodiscard]] Task<void> Run();
+    [[nodiscard]] core::async::Task<void> Run();
 
     /// Stop accepting and close what is already accepted, so `Run()` returns.
     ///
     /// The connections matter as much as the listener. A peer's read is parked on
-    /// the reactor, and `IReactor::Run` returns with its parked work exactly where
+    /// the reactor, and `core::net::EventLoop::Run` returns with its parked work exactly where
     /// it was -- so a connection nobody closed is a coroutine frame nobody ever
     /// resumes and nobody ever frees. Closing the socket completes that read with
     /// `Cancelled`, which is how the frame reaches its own end.
     ///
     /// **The closes are POSTED onto the reactor, never performed here**, and that
     /// is not caution
-    /// ([#885](https://github.com/LASTRADA-Software/fastcached/issues/885)). On
-    /// epoll and kqueue `ISocket::Close` completes a parked read by resuming its
-    /// coroutine **inline**, so closing from the stopping thread ran each
+    /// ([#885](https://github.com/LASTRADA-Software/fastcached/issues/885)). With
+    /// fastcached's own reactor, `Close` on epoll and kqueue completed a parked read by
+    /// resuming its coroutine **inline**, so closing from the stopping thread ran each
     /// per-connection task there -- while the reactor thread was still driving the
     /// others -- and destroyed the `std::unique_ptr<ISocket>` in that task's frame
     /// off the reactor, which is #668's rule
-    /// (`IReactor::TeardownIsSerialisedWithDispatch()`) violated. IOCP routes
-    /// cancellation back through the port and does not resume inline, which is
-    /// exactly what would have made this a defect that passes CI on Windows.
+    /// (`core::net::EventLoop::TeardownIsSerialisedWithDispatch()`) violated. IOCP routed
+    /// cancellation back through the port and did not, which is what made it a defect
+    /// that passed CI on Windows. core-cpp's sockets resume a woken waiter in the loop's
+    /// next drain on every backend (0.2.1, guarantee G2), but `close()` itself still
+    /// touches the loop's registrations, so the closes are still posted.
     ///
     /// Measured on Linux before the fix: with the teardown assertion live at
     /// `~EpollSocket`, `cluster-e2e` was the only failure in the whole suite, and a
@@ -252,8 +255,8 @@ class RaftPeerServer
     /// @param error Why the draw failed.
     void NoteNoNonce(std::string_view peer, SecureRandomError const& error);
 
-    IListener& _listener;
-    IReactor& _reactor;
+    core::net::IListener& _listener;
+    core::net::EventLoop& _reactor;
     IRaftMessageSink& _sink;
     ILogger& _logger;
     IMetricsSink& _metrics;
@@ -284,11 +287,11 @@ class RaftPeerServer
     std::mutex _reportMutex;
 
     /// When the next pre-authentication refusal may be logged.
-    TimePoint _nextPreAuthReport {};
+    core::platform::SteadyTimePoint _nextPreAuthReport {};
 
     /// When the next connection closed for want of a nonce may be logged. Its own throttle,
     /// so a stranger provoking refusals cannot keep the line that names THIS host's fault quiet.
-    TimePoint _nextNoNonceReport {};
+    core::platform::SteadyTimePoint _nextNoNonceReport {};
 };
 
 } // namespace FastCache::Consensus

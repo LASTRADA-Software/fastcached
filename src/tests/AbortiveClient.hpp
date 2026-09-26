@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <span>
+
+#include <core/platform/Types.hpp>
+#include <core/platform/WinsockInit.hpp>
 
 #if defined(_WIN32)
     #include <winsock2.h>
@@ -22,7 +25,7 @@ namespace FastCache::Testing
 
 /// A loopback client that leaves by RESET rather than by FIN.
 ///
-/// **`ISocket` cannot express an abortive close, and should not.** The two
+/// **`core::net::ISocket` cannot express an abortive close, and should not.** The two
 /// departures are different bytes on the wire -- FIN says *I have finished
 /// sending*, RST says *this connection is gone* -- and a server tells them apart
 /// through different arms: `WaitReadable` answers `0` for the first and an ERROR
@@ -31,7 +34,7 @@ namespace FastCache::Testing
 ///
 /// A fake that can be told to return an error proves nothing about either, because
 /// the whole question is which of the two the KERNEL sends. So the close has to be
-/// real, which means a raw handle: there is no `ISocket` verb for it, and adding one
+/// real, which means a raw handle: there is no `core::net::ISocket` verb for it, and adding one
 /// would have exactly the consumers `ShutdownWrite` was added to avoid.
 /// `ShutdownWrite` earned its place by making a rule about half-closing statable in
 /// PRODUCTION; nothing in production wants to reset its own peer, since the shape of
@@ -51,22 +54,19 @@ namespace FastCache::Testing
 /// makes `WaitReadable_test.cpp`'s assertion -- that this really does report an
 /// ERROR rather than a `0` -- the guard for every other user.
 ///
-/// It builds on `Net::Detail` rather than its own platform aliases: `NativeSocket`,
-/// `InvalidSocket`, `CloseNativeSocket`, `EnsureNetworkInitialised` and
-/// `ArmNoSigPipe` are that header's answers to the same questions, and two of them
-/// are not optional.
+/// It builds on core-cpp's handle type (`core::platform::NativeHandle`) and on
+/// `FastCache::CloseNativeSocket`, and two of its steps are not optional.
 ///
-/// **`EnsureNetworkInitialised` because Winsock** returns `INVALID_SOCKET` with
-/// `WSANOTINITIALISED` for a `::socket` call that precedes it, so a client that
-/// omits it works only for as long as something else happens to have bound a
-/// listener first.
+/// **`core::platform::ensureWinsockInitialized` because Winsock** returns
+/// `INVALID_SOCKET` with `WSANOTINITIALISED` for a `::socket` call that precedes it,
+/// so a client that omits it works only for as long as something else happens to
+/// have bound a listener first.
 ///
-/// **`ArmNoSigPipe` because macOS**, where `SO_NOSIGPIPE` is defined and
-/// `NoSignalSendFlags()` is therefore `0` -- the two are alternatives, not
-/// belt-and-braces, and on that platform the suppression lives ENTIRELY in the
-/// socket option. Sending to a peer that has already gone would raise SIGPIPE and
-/// abort the whole Catch2 process: a crash rather than a failed assertion, on the
-/// one platform where this client's own subject makes a dead peer likely.
+/// **`SO_NOSIGPIPE` because macOS**, where `MSG_NOSIGNAL` does not exist and the
+/// suppression lives ENTIRELY in the socket option; Linux has the send flag instead.
+/// Sending to a peer that has already gone would raise SIGPIPE and abort the whole
+/// Catch2 process: a crash rather than a failed assertion, on the one platform where
+/// this client's own subject makes a dead peer likely.
 class AbortiveClient
 {
   public:
@@ -86,14 +86,14 @@ class AbortiveClient
     /// tidied. The guard is needed BECAUSE `Reset` invalidates the handle.
     ~AbortiveClient()
     {
-        if (_fd != Detail::InvalidSocket)
-            Detail::CloseNativeSocket(_fd);
+        if (_fd != core::platform::InvalidHandle)
+            CloseNativeSocket(_fd);
     }
 
     /// @return True when the connect succeeded.
     [[nodiscard]] bool Connected() const noexcept
     {
-        return _fd != Detail::InvalidSocket;
+        return _fd != core::platform::InvalidHandle;
     }
 
     /// Write a whole frame, looping over short sends.
@@ -110,10 +110,10 @@ class AbortiveClient
             // `SendLen` rather than a literal cast: Winsock's `send` takes an `int`
             // length and POSIX's takes a `size_t`, so one spelling is a sign
             // conversion on whichever platform it is not written for.
-            auto const chunk = ::send(static_cast<RawHandle>(_fd),
+            auto const chunk = ::send(Raw(_fd),
                                       reinterpret_cast<char const*>(frame.data()) + sent,
                                       static_cast<SendLen>(frame.size() - sent),
-                                      Detail::NoSignalSendFlags());
+                                      NoSignalSendFlags);
             if (chunk > 0)
             {
                 sent += static_cast<std::size_t>(chunk);
@@ -139,20 +139,18 @@ class AbortiveClient
     /// @return True when the socket was armed for an abortive close and shut.
     [[nodiscard]] bool Reset() noexcept
     {
-        if (_fd == Detail::InvalidSocket)
+        if (_fd == core::platform::InvalidHandle)
             return false;
         linger const abortive { .l_onoff = 1, .l_linger = 0 };
         // `reinterpret_cast`, not a hop through `void const*`: the two-step is what
         // `bugprone-casting-through-void` refuses, and setsockopt's `char const*` on
         // Winsock against `void const*` on POSIX is exactly the shape that invites it.
-        auto const armed = ::setsockopt(static_cast<RawHandle>(_fd),
-                                        SOL_SOCKET,
-                                        SO_LINGER,
-                                        reinterpret_cast<OptValue>(&abortive),
-                                        static_cast<int>(sizeof(abortive)))
-                           == 0;
-        Detail::CloseNativeSocket(_fd);
-        _fd = Detail::InvalidSocket;
+        auto const armed =
+            ::setsockopt(
+                Raw(_fd), SOL_SOCKET, SO_LINGER, reinterpret_cast<OptValue>(&abortive), static_cast<int>(sizeof(abortive)))
+            == 0;
+        CloseNativeSocket(_fd);
+        _fd = core::platform::InvalidHandle;
         return armed;
     }
 
@@ -161,10 +159,36 @@ class AbortiveClient
     using RawHandle = SOCKET;
     using OptValue = char const*;
     using SendLen = int;
+    static constexpr int NoSignalSendFlags = 0;
+
+    [[nodiscard]] static RawHandle Raw(core::platform::NativeHandle handle) noexcept
+    {
+        return reinterpret_cast<RawHandle>(handle);
+    }
+
+    [[nodiscard]] static core::platform::NativeHandle Native(RawHandle socket) noexcept
+    {
+        return reinterpret_cast<core::platform::NativeHandle>(socket);
+    }
 #else
     using RawHandle = int;
     using OptValue = void const*;
     using SendLen = std::size_t;
+    #if defined(MSG_NOSIGNAL)
+    static constexpr int NoSignalSendFlags = MSG_NOSIGNAL;
+    #else
+    static constexpr int NoSignalSendFlags = 0;
+    #endif
+
+    [[nodiscard]] static RawHandle Raw(core::platform::NativeHandle handle) noexcept
+    {
+        return handle;
+    }
+
+    [[nodiscard]] static core::platform::NativeHandle Native(RawHandle socket) noexcept
+    {
+        return socket;
+    }
 #endif
 
     /// Connect to loopback, or answer `InvalidSocket`.
@@ -172,25 +196,29 @@ class AbortiveClient
     /// Static, so the handle is a member INITIALIZER rather than an assignment in a
     /// constructor body.
     /// @param port The port to dial.
-    /// @return The connected handle, or `Detail::InvalidSocket` when a step failed.
-    [[nodiscard]] static Detail::NativeSocket Dial(std::uint16_t port) noexcept
+    /// @return The connected handle, or `core::platform::InvalidHandle` when a step failed.
+    [[nodiscard]] static core::platform::NativeHandle Dial(std::uint16_t port) noexcept
     {
-        Detail::EnsureNetworkInitialised();
-        auto const fd = static_cast<Detail::NativeSocket>(::socket(AF_INET, SOCK_STREAM, 0));
-        if (fd == Detail::InvalidSocket)
-            return Detail::InvalidSocket;
-        Detail::ArmNoSigPipe(fd);
+        core::platform::ensureWinsockInitialized();
+        auto const raw = ::socket(AF_INET, SOCK_STREAM, 0);
+        auto const fd = Native(raw);
+        if (fd == core::platform::InvalidHandle)
+            return core::platform::InvalidHandle;
+#if defined(SO_NOSIGPIPE)
+        int const on = 1;
+        static_cast<void>(::setsockopt(raw, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on)));
+#endif
         sockaddr_in addr {};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (::connect(static_cast<RawHandle>(fd), reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) == 0)
+        if (::connect(raw, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) == 0)
             return fd;
-        Detail::CloseNativeSocket(fd);
-        return Detail::InvalidSocket;
+        CloseNativeSocket(fd);
+        return core::platform::InvalidHandle;
     }
 
-    Detail::NativeSocket _fd { Detail::InvalidSocket };
+    core::platform::NativeHandle _fd { core::platform::InvalidHandle };
 };
 
 } // namespace FastCache::Testing

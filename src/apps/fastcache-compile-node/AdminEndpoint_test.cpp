@@ -2,7 +2,6 @@
 #include "AdminEndpoint.hpp"
 #include "NodeConditions.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetText.hpp>
@@ -11,7 +10,7 @@
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -35,6 +34,8 @@
 #include <utility>
 #include <vector>
 
+#include <core/net/BlockingSocket.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/FleetHistoryFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScratchPath.hpp>
@@ -118,7 +119,7 @@ AdminHttpServer::SnapshotProvider WorkerShapedSnapshot()
 // `_received`, which do. So a deleted `FleetHistory(IWallClock const&&)` overload
 // would leave this call site free to pass a temporary -- measured, gcc and clang
 // alike -- because inside a forwarding constructor the parameter is a named lvalue.
-// That is #1028 exactly, and it is why the guard is a `WallClockRef` PARAMETER
+// That is #1028 exactly, and it is why the guard is a `core::platform::WallClockRef` PARAMETER
 // carried by value rather than a deleted overload on whatever happens to store it.
 //
 // Both directions, or the refusal and "this type cannot be built at all" look the same.
@@ -126,7 +127,7 @@ static_assert(std::is_constructible_v<FleetSampler,
                                       std::nullopt_t,
                                       AtomicMetricsSink&,
                                       AdminHttpServer::SnapshotProvider,
-                                      SystemWallClock&,
+                                      core::platform::SystemWallClock&,
                                       HistoryPaths,
                                       NullLogger&>,
               "a named clock must still reach the sampler through the forwarder");
@@ -134,7 +135,7 @@ static_assert(!std::is_constructible_v<FleetSampler,
                                        std::nullopt_t,
                                        AtomicMetricsSink&,
                                        AdminHttpServer::SnapshotProvider,
-                                       SystemWallClock,
+                                       core::platform::SystemWallClock,
                                        HistoryPaths,
                                        NullLogger&>,
               "a temporary must be refused AT the forwarder: this is the case #1028 shipped");
@@ -208,7 +209,7 @@ TEST_CASE("A bare port binds loopback rather than the wildcard", "[node][admin]"
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
     REQUIRE(probe->IsBound());
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
 
     // The loopback default comes from the ROW now, not from an argument this call
@@ -260,7 +261,7 @@ TEST_CASE("Destroying the endpoint stops it, with nothing to remember", "[node][
 
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
 
     // Built HERE, on the case's thread: `AdminOn` asserts, and a Catch2 assertion on the
@@ -603,10 +604,10 @@ TEST_CASE("A credential file that cannot be used is refused rather than ignored"
 
 TEST_CASE("The fleet routes answer on their own paths and gate on the credential", "[node][admin][dashboard]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
@@ -677,10 +678,10 @@ TEST_CASE("A node that does not lead answers the dashboard with 503 and names th
     // `Gate()`'s `NotLeader` in HTTP's vocabulary. A 200 would present a follower's
     // partial registry as the whole fleet, and a redirect would name a port the
     // browser cannot use -- which is the defect this project already had once.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Follower, "10.0.0.9:6676", Distributed::StandaloneSchedulerTerm);
@@ -715,10 +716,10 @@ TEST_CASE("An endpoint with no credential serves the dashboard to anyone who rea
 {
     // What loopback gets, and the reason the startup rules refuse this shape on a
     // public bind: reaching loopback already means being on the machine.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
@@ -817,8 +818,8 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     NullLogger logger;
     ScriptedHostFacts const scrapeHost;
     Node::NodeConditions conditions;
-    ManualClock clock;
-    ManualWallClock wallClock;
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
@@ -828,7 +829,7 @@ TEST_CASE("An admin surface serves the fleet only when there is a fleet to read"
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
     REQUIRE(probe->IsBound());
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
 
     NodeConfig cfg;
@@ -875,7 +876,7 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
     REQUIRE(probe->IsBound());
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
 
     NodeConfig cfg;
@@ -891,7 +892,7 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     // The fingerprint is the only thing that authenticates a certificate nothing
     // signed, so it has to be reportable -- an operator compares it with what
     // their browser shows.
-    CHECK(surface->tls->CertificateFingerprint().size() == 64);
+    CHECK(surface->tls->certificateFingerprint().size() == 64);
 
     // And it is kept where somebody who missed the startup line can still read it (#1364): the
     // condition is raised carrying THIS certificate's fingerprint, not a generic sentence.
@@ -900,7 +901,7 @@ TEST_CASE("Asking for a generated certificate gives the surface one to serve", "
     auto const row =
         std::ranges::find(rows, std::string { "generated-tls-certificate" }, &CompileCacheWire::NodeConditionFields::id);
     REQUIRE(row != rows.end());
-    CHECK(row->detail.contains(surface->tls->CertificateFingerprint()));
+    CHECK(row->detail.contains(surface->tls->certificateFingerprint()));
 }
 #endif
 
@@ -916,7 +917,7 @@ TEST_CASE("A surface with no TLS asked for holds no context at all", "[node][adm
     auto probe = BlockingListener::Bind("127.0.0.1", 0);
     REQUIRE(probe);
     REQUIRE(probe->IsBound());
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
 
     NodeConfig cfg;
@@ -1033,11 +1034,11 @@ TEST_CASE("A node with nothing to report is not described as a busy one", "[node
 
 TEST_CASE("The sampler records only while this node leads", "[node][admin][fleethistory]")
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger logger;
-    SystemWallClock const wall;
-    ManualWallClock wallClock;
+    core::platform::SystemWallClock const wall;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
@@ -1068,11 +1069,11 @@ TEST_CASE("A sampler with a path writes its history and reads it back", "[node][
     auto const receivedFile = scratch.Path() / "received-history.bin";
     HistoryPaths const paths { .fleet = file, .node = nodeFile, .received = receivedFile };
 
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger logger;
-    SystemWallClock const wall;
-    ManualWallClock wallClock;
+    core::platform::SystemWallClock const wall;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
@@ -1104,11 +1105,11 @@ TEST_CASE("What the other machines handed over survives a leader restart", "[nod
     auto const receivedFile = scratch.Path() / "received-history.bin";
     HistoryPaths const paths { .fleet = file, .node = nodeFile, .received = receivedFile };
 
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger logger;
-    SystemWallClock const wall;
-    ManualWallClock wallClock;
+    core::platform::SystemWallClock const wall;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
@@ -1119,7 +1120,7 @@ TEST_CASE("What the other machines handed over survives a leader restart", "[nod
     // minute the moment it starts, and a window the leader sampled is deliberately
     // left alone by the backfill, so placing this one there made the assertion a
     // race against that thread rather than a test of the handover.
-    auto const minute = Testing::MinuteBucketStart(wall.Now()) - (3 * 60'000);
+    auto const minute = Testing::MinuteBucketStart(wall.now()) - (3 * 60'000);
     auto bucket = Testing::ClosedBucket(minute);
     bucket.values[static_cast<std::size_t>(Distributed::FleetMetric::JobsInFlight)] = 7;
 
@@ -1151,10 +1152,10 @@ TEST_CASE("A node with no scheduler still records itself", "[node][admin][fleeth
     // page would leave the fleet's year with a hole where its busiest members should
     // be -- and the hole would be invisible, because the leader's own series would
     // still be complete for every window it was elected for.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger logger;
-    SystemWallClock const wall;
+    core::platform::SystemWallClock const wall;
 
     FleetSampler sampler { std::nullopt, metrics, NodeFacts(3, 8), wall, HistoryPaths {}, logger };
 
@@ -1172,7 +1173,7 @@ TEST_CASE("A batch is offered again until a heartbeat takes it", "[node][admin][
 {
     // The cursor sits on the sampler rather than in the heartbeat loop, so this is
     // a case rather than something only running the program could show.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger logger;
     Testing::PlacedWallClock wall;
@@ -1237,10 +1238,10 @@ namespace
 /// The clock is a PLACED one for the same reason: with a system clock the readings land
 /// in whichever buckets real time puts them in, so they can share one and the fixture
 /// would look fixed while staying vacuous. `Testing::PlacedWallClock` rather than a
-/// `ManualWallClock` of this file's own, because it already carries the pinned
-/// 2026-01-01T00:00:00Z instant this needs -- a `ManualWallClock` defaults to 1970,
+/// `core::platform::ManualWallClock` of this file's own, because it already carries the pinned
+/// 2026-01-01T00:00:00Z instant this needs -- a `core::platform::ManualWallClock` defaults to 1970,
 /// where the handover case below, which places a bucket three minutes BEFORE
-/// `wall.Now()`, would compute a negative bucket start.
+/// `wall.now()`, would compute a negative bucket start.
 struct ChartFixture
 {
     /// How many readings the history is given.
@@ -1252,7 +1253,7 @@ struct ChartFixture
     /// without a stroke while the gauge chart already had one.
     static constexpr int Readings = 3;
 
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger logger;
 
@@ -1453,7 +1454,7 @@ TEST_CASE("The page draws what the other machines handed over", "[node][admin][c
     // Change how far apart `ChartFixture` places its readings and re-derive this
     // offset, or the case quietly starts asserting about a window the leader sampled
     // itself and stops testing the handover at all.
-    auto const missed = Testing::MinuteBucketStart(fixture.wall.Now()) - (3 * 60'000);
+    auto const missed = Testing::MinuteBucketStart(fixture.wall.now()) - (3 * 60'000);
     auto bucket = Testing::ClosedBucket(missed);
     bucket.values[static_cast<std::size_t>(Distributed::FleetMetric::JobsInFlight)] = 4242;
     REQUIRE(fixture.sampler->Received().AcceptHistory("10.0.0.7:6676", std::span { &bucket, 1 }) == 1);
@@ -1740,14 +1741,14 @@ TEST_CASE("A history a newer build wrote stops the sampler promising durability"
     auto const receivedFile = scratch.Path() / "received-history.bin";
     HistoryPaths const paths { .fleet = file, .node = nodeFile, .received = receivedFile };
 
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     CapturingLogger logger;
-    SystemWallClock const wall;
+    core::platform::SystemWallClock const wall;
     // Its own sink, unlike the cases above: `logger` is what this case reads back,
     // and the scheduler's lines are not the ones it is asserting about.
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
@@ -1796,11 +1797,11 @@ TEST_CASE("A follower still records itself", "[node][admin][fleethistory]")
     // an election, so a machine's year of history belonged to whichever peer happened
     // to be leading -- and one election left the page showing a different machine's
     // partial record with nothing saying so.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger logger;
-    SystemWallClock const wall;
-    ManualWallClock wallClock;
+    core::platform::SystemWallClock const wall;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, logger, signer, {} };
     Distributed::FleetSources const sources { .scheduler = &scheduler, .cluster = nullptr, .metrics = &metrics };
@@ -1840,10 +1841,10 @@ TEST_CASE("The fleet 401 is a page a phone can read, and says what the challenge
     // most-seen page of a rollout rendered at desktop zoom on a phone; and
     // `AdminCredential` also accepts `Bearer` and ignores Basic's username, neither
     // of which the header can say. A script user learned nothing from it.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
@@ -1887,10 +1888,10 @@ TEST_CASE("Both pages this binary serves open with the one document prologue", "
     // that cannot fail for the reason it exists. What is asserted instead is the
     // SHARED CONSTANT: inline a divergent literal at one of the two call sites and
     // exactly that site's CHECK reddens, naming which page lost it.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService scheduler { clock, wallClock, metrics, schedulerLogger, signer, {} };
     scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);

@@ -5,7 +5,6 @@
 #include "NodeKey.hpp"
 #include "NodeSurfaces.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
@@ -30,6 +29,8 @@
 #include <utility>
 
 #include <CacheProtocol.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
 
 namespace FastCache::Node
 {
@@ -415,7 +416,7 @@ std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
     auto notice =
         Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
 
-    auto const options = DialOptions { .connectTimeout = DialTimeout };
+    auto const options = core::net::DialOptions { .connectTimeout = DialTimeout };
     std::optional<std::string> leader;
     // `MaxRedirects + 1` because the bound was inclusive and `iota` is half-open: three
     // redirects means four asks, which is what this loop has always done.
@@ -433,10 +434,10 @@ std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
         auto const& endpoint = reached->endpoint;
 
         auto const outcome =
-            SyncRun(Cc::ExchangeFramed(reached->socket.get(),
-                                       &notice,
-                                       Wire::EncodeEnrollControl(WireVerbFor(request.action), request.subject),
-                                       credential.Current()));
+            core::async::syncRun(Cc::ExchangeFramed(reached->socket.get(),
+                                                    &notice,
+                                                    Wire::EncodeEnrollControl(WireVerbFor(request.action), request.subject),
+                                                    credential.Current()));
 
         if (outcome.kind == Cc::CacheOutcomeKind::Transport)
             return std::unexpected { std::format("the cluster at {} did not answer", endpoint) };
@@ -509,7 +510,7 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                                                         ISecureRandom& random,
                                                         IDrainWait& wait,
                                                         IEndpointDialer& dialer,
-                                                        IWallClock const& wallClock)
+                                                        core::platform::IWallClock const& wallClock)
 {
     // **This mode's own preconditions are refused HERE and not as `StartupPolicyRejection`
     // rows, and that is a decision rather than a missed table row.** That table judges a
@@ -642,13 +643,13 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
     while (true)
     {
         // Through the seam, so a test can script what comes BACK. The blocking dial
-        // and its `BlockingConnector` live in `BlockingEndpointDialer`, where
+        // and its `core::net::BlockingConnector` live in `BlockingEndpointDialer`, where
         // `DialEndpointBlocking` still sees the concrete type it requires.
-        auto client = dialer.Dial(seed, DialOptions { .connectTimeout = DialTimeout });
+        auto client = dialer.Dial(seed, core::net::DialOptions { .connectTimeout = DialTimeout });
         if (client == nullptr)
             return std::unexpected { std::format("cannot reach the seed at {}", seed) };
 
-        auto reading = ReadEnrollReply(SyncRun(Cc::ExchangeFramed(
+        auto reading = ReadEnrollReply(core::async::syncRun(Cc::ExchangeFramed(
             client.get(),
             &notice,
             Wire::EncodeEnroll(Wire::EnrollRequest {
@@ -664,7 +665,7 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                 if (!admitted.has_value() || self.role != Wire::EnrollRole::Worker)
                     return admitted;
                 Distributed::FileRosterStore store { NodeStateDirectory(cfg) / Distributed::RosterFileName };
-                return *admitted + KeepEnrolledRoster(reading.roster, reading.certificate, wallClock.Now(), store);
+                return *admitted + KeepEnrolledRoster(reading.roster, reading.certificate, wallClock.now(), store);
             }
             case EnrollProgress::Refused:
                 return std::unexpected { std::format("{} refused this machine ({})", seed, reading.detail) };

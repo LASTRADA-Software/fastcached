@@ -19,7 +19,7 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
                                                                         Distributed::ILeaseRoster const* roster,
                                                                         Cc::IAdvertisedEndpointSource const& advertise,
                                                                         SocketActivation activation,
-                                                                        WallClockRef clock,
+                                                                        core::platform::WallClockRef clock,
                                                                         Distributed::WorkerLeaseState& lease,
                                                                         IMetricsSink& metrics,
                                                                         ILogger& logger)

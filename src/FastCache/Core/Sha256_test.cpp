@@ -2,7 +2,6 @@
 #include <FastCache/Core/CpuFeatures.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/IRandomSource.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Sha256.hpp>
 #include <FastCache/Platform/Environment.hpp>
 
@@ -21,6 +20,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -248,7 +248,7 @@ TEST_CASE("SelectSha256Engine picks the hardware engine this build carries when 
     // carries a hardware engine, which is every build CI makes.
     constexpr CpuFeatures everything { .x86Sha = true, .x86Ssse3 = true, .x86Sse41 = true, .armSha2 = true };
     auto const engines = AllEngines();
-    auto const* const carried = FindIfOrNull(engines, [&everything](Sha256Engine engine) {
+    auto const* const carried = core::findIfOrNull(engines, [&everything](Sha256Engine engine) {
         return engine != Sha256Engine::Scalar && Sha256EngineRunsOn(engine, everything);
     });
     auto const expected = carried != nullptr ? *carried : Sha256Engine::Scalar;
@@ -289,7 +289,7 @@ TEST_CASE("Sha256::WithEngine refuses an engine this CPU cannot run", "[core][sh
     auto const features = DetectCpuFeatures();
     auto const engines = AllEngines();
     auto const* const absent =
-        FindIfOrNull(engines, [&features](Sha256Engine engine) { return !Sha256EngineRunsOn(engine, features); });
+        core::findIfOrNull(engines, [&features](Sha256Engine engine) { return !Sha256EngineRunsOn(engine, features); });
     REQUIRE(absent != nullptr);
 
     INFO("engine " << Sha256EngineName(*absent));
@@ -323,7 +323,7 @@ TEST_CASE("A run that states its SHA-256 engine runs that engine", "[core][sha25
     // here as a WRONG engine and send somebody to debug the detection.
     auto const engines = AllEngines();
     auto const* const named =
-        FindIfOrNull(engines, [&expected](Sha256Engine engine) { return Sha256EngineName(engine) == expected; });
+        core::findIfOrNull(engines, [&expected](Sha256Engine engine) { return Sha256EngineName(engine) == expected; });
     INFO("stated engine " << expected);
     REQUIRE(named != nullptr);
 

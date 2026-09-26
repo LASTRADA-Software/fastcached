@@ -678,66 +678,26 @@ Every rule below has already been a bug.
 
 ## The Net boundary
 
-<!-- agent-tripwire: `Net/` must not depend on `Core/`. `Async/` travels with it, plus three named dependency-free leaf headers -->
+<!-- agent-tripwire: The coroutines, the event loop, the sockets and TLS are core-cpp's `core::async`, `core::net` and `core::net_tls` -->
 
-- **`Net/` is meant to be lifted out of this tree, so what it may include is a
-  table and a test rather than an intention.** The constraint was already written
-  down -- "`Net` must not depend on `Core`, so `ConnectTcp` takes host and port
-  separately" -- and honoured for *new* code, while ten edges that predated it sat
-  there untouched (issue #100). That is the shape the constraint will always fail
-  in: an include graph drifts in silence. Nothing fails, nothing warns, no test
-  goes red, and the edge is discovered by whoever finally attempts the lift.
-  `ctest -R net-boundary` is the answer, and four things about it are
-  load-bearing:
-  - **`Async/` travels WITH `Net/`, and that decision had to come first.**
-    `ISocket::Read`/`Write` return `Task<T>`, `IoAwaitable` is the reactor's
-    completion hook, and `EpollSocket`/`IocpSocket`/`KqueueSocket` are the
-    reactors' own I/O side -- there is no `Net` without the awaitable vocabulary.
-    Moving that vocabulary into `Net/` instead is the alternative, and it is worse
-    twice over: it leaves `Async/` -- a general coroutine and event-loop library --
-    unusable without `Net/`, or it duplicates `Task`.
-  - **Three `Core/` leaf headers travel too, each a row with a reason, and the
-    check verifies they are still leaves.** `Core/Clock.hpp` (`IClock` and
-    `TimePoint`, which every deadline in `Net/` and every timer in `Async/` is
-    expressed in -- carrying a second clock interface would fragment the one seam
-    the whole codebase injects), `Core/Ranges.hpp` (`FindOrNull`, a toolchain
-    shim rather than a domain type) and `Core/Profiling.hpp` (the `FC_ZONE_*`
-    macros, which expand to `(void) 0` and carry no code at all). The row is only
-    safe while the header depends on nothing, so the check reads each one and
-    fails if it has grown a `FastCache/` include: a leaf that quietly gained one
-    would drag the whole of `Core/` back across the boundary while still passing.
-  - **An edge is closed by moving the file to the layer that owns it, not by
-    widening the table.** `Core/Errors/NetError.hpp` became `Net/NetError.hpp` --
-    it is `Net`'s own taxonomy and sat in `Core/Errors/` only because that is
-    where the taxonomies were shelved. `Net/Framing/LineReader` became
-    `Protocol/Framing/LineReader`: it fails with `ProtocolError`, its caps are a
-    session's caps, and its own doc lists the protocol handlers as its callers.
-    `Net/InheritedListener` became `Platform/InheritedListener`: it reads the
-    environment and checks a pid, and handing back an `IListener` does not make
-    socket activation a network primitive. In all three the dependency was
-    pointing the wrong way round, and moving the file makes `Protocol -> Net` and
-    `Platform -> Net` the directions that were always intended.
-  - **The check is a scan of the include graph, deliberately, and not a target
-    that compiles the set.** Compiling it means a second full build of `Net/` +
-    `Async/` in every configuration on every platform, and a staged include root
-    copied at configure time goes stale exactly when a header changes -- which is
-    the moment the answer matters. The scan reads the same graph the compiler
-    would, from the sources, in milliseconds; combined with this project's
-    separate rule that public headers are self-contained, a set closed under
-    inclusion is a set that compiles standalone. It was verified by running it
-    against the tree as it stood before this work, where it names all ten edges.
-  - **Test sources are out of scope and that is a decision, not an oversight.**
-    What gets lifted is the library. `Net/HealthProbe_test.cpp` drives the
-    daemon's own `AdminHttpServer`, which is the entire point of that case;
-    gating it would force either a second `AdminHttpServer` fake inside `Net/` or
-    the loss of the one test that proves the probe works against the real thing.
-    (This is also why the issue's own edge count was high: it counted `_test.cpp`
-    files, so `Core/Bytes.hpp` and `Core/Logger.hpp` appeared on the list while
-    never being reachable from production `Net/` code at all.)
+- **The lift this section prepared for has happened.** `Net/` and `Async/` were kept free of
+  `Core/` -- a table of allowed edges and `ctest -R net-boundary` -- so they could leave this tree,
+  and they did: they are core-cpp's `core::net` and `core::async` since
+  [#1596](https://github.com/LASTRADA-Software/fastcached/issues/1596), with TLS as `core::net_tls`
+  and the three leaf headers the table let travel (`Clock`, `Ranges`, `Profiling`) as core-cpp's
+  `core::platform` clock and `core::` base headers. The check went with them, because the
+  boundary is now a CMake target edge: fastcached's code cannot reach into core-cpp's internals
+  except through its installed headers, and core-cpp's own module table refuses an include across
+  its modules that it does not list.
+- **What is left here is what core-cpp does not offer yet, in `Transport/`, and a defect in the
+  moved code is fixed in core-cpp and re-pinned, never patched around here.** `NativeListen` (a
+  port several loops share, an inherited descriptor adopted, and the admin endpoints'
+  `BlockingListener`) and `LingeringClose` are each a graduation candidate; the pull request that
+  moved the rest names them.
 
 ## Sockets
 
-<!-- agent-tripwire: There is exactly one TCP client, `Net/TcpClient`. Do not write a second -->
+<!-- agent-tripwire: There is exactly one TCP client, `core::net::TcpClient`. Do not write a second -->
 
 - **Three implementations of one TCP client, and the rot was in the one nobody
   built.** `Net/BlockingConnector` dialled non-blocking through `getaddrinfo` and
@@ -916,10 +876,11 @@ Every rule below has already been a bug.
     `TIME_WAIT`. A listening socket that never accepted does not enter `TIME_WAIT`
     itself, which is what the comment had actually been reasoning about.
   - **Sharing a port on purpose is still opt-in, and it is a different option.**
-    `ReusePort::Yes` (`SO_REUSEPORT`, POSIX only) is what lets N reactor threads
-    bind one port and have the kernel load-balance across them. Exclusivity is the
-    default, not the only setting, and both halves are asserted -- the second bind
-    refused, and two `ReusePort::Yes` listeners sharing.
+    `core::net::PortSharing::Shared` (`SO_REUSEPORT`, POSIX only; core-cpp refuses
+    it on Windows) is what lets N reactor threads bind one port and have the kernel
+    load-balance across them. Exclusivity is the default, not the only setting, and
+    both halves are asserted -- the exclusive bind refused, and two `Shared`
+    listeners sharing.
   - **A `setsockopt` carrying a security property is not best-effort.** It fails
     the candidate rather than being ignored the way `TCP_NODELAY` and
     `IPV6_V6ONLY` are: a daemon that silently came up shareable is worse than one
@@ -1826,7 +1787,9 @@ Every rule below has already been a bug.
     constraint stated by one consumer about itself is a constraint the next consumer
     never meets.
   - **The claim and the check are ONE expression.** `Detail::ClaimReadSlot`
-    (`Net/ReadSlot.hpp`) asserts the slot is free and then clears it, and the six
+    (`Net/ReadSlot.hpp`; core-cpp's `contract::claimReadSlot` since the move, and since
+    core-cpp 0.3.0 it ends the process in EVERY build) asserts the slot is free and then
+    clears it, and the six
     arm sites across `EpollSocket`, `KqueueSocket` and `IocpSocket` have no bare
     `awaitable = nullptr` left. There is no line to forget the guard on, at the
     seventh site as at the first -- the same shape as `SigningDomain` leaving no
@@ -1852,7 +1815,8 @@ Every rule below has already been a bug.
       when its own iteration ended, which is why the cancel belongs there.
     - **Refusing the new operation is still wrong**, and for the reason that did not
       change: it turns a silent leak into a broken connection on a live path.
-    - So `CancelRead` exists (below) and `ClaimReadSlot` still only asserts. The two
+    - So `CancelRead` exists (below) and `ClaimReadSlot` only names the misuse -- by ending the
+      process, in every build since core-cpp 0.3.0, where Release used to hang silently. The two
       are not alternatives: the tripwire names the misuse, the verb gives the caller
       the only spelling of *abandon* that is not `Close()`.
   - **It is watched refusing, and the hazard has no other coverage at all.** Measured
@@ -1860,7 +1824,8 @@ Every rule below has already been a bug.
     across `FastCacheTest` (2073 cases) and `fastcache-compile-node-tests`, and no
     script fixture drives a blocking RESP verb or a subscription over a real socket
     -- so nothing in the suite can see this, which is the ticket's own point.
-    `read-slot-guard-canary` double-arms a REAL socket through the real reactor, so
+    `read-slot-guard-canary` (now core-cpp's `socket-contract-canary`) double-arms a REAL
+    socket through the real reactor, so
     what it drives is the call site rather than the guard function, and
     `scripts/read-slot-guard-gate.cmake` requires the assertion's OWN words: a bare
     `WILL_FAIL` passes for a segfault, a missing library and a refused bind alike,
@@ -1874,15 +1839,17 @@ Every rule below has already been a bug.
   [#893](https://github.com/LASTRADA-Software/fastcached/issues/893)) folds the claim
   and the `assert` into one expression, for the reason the read side gives: a guard
   folded INTO the operation is self-enforcing, and one called alongside it needs a
-  scan. Debug-only, and refusing the operation is wrong here for the same reason.
+  scan. It ends the process in every build since core-cpp 0.3.0 (Debug-only before), and
+  refusing the operation is wrong here for the same reason.
   - **It reaches `FrameEndpoint`'s one-writer property because `WriteAll` sends a whole
     frame in ONE `ISocket::Write`.** So a write that PARKS is a half-sent frame, and a
     second writer arming over it is a client reading a length out of the middle of
     somebody else's frame -- the pulse-versus-reply interleaving
     [`distributed-compilation.md`](distributed-compilation.md) describes. A write that
     completes inline takes no claim and needs none.
-  - **Watched BOTH ways, which the read-side canary is not.**
-    `ctest -R write-slot-guard-canary` drives an ordinary sequential pair of writes and
+  - **Watched BOTH ways, which the read-side canary is not** -- in fastcached until the move;
+    core-cpp's `socket-contract-canary` watches both slots now.
+    `ctest -R write-slot-guard-canary` drove an ordinary sequential pair of writes and
     only then the double-arm, and `scripts/write-slot-guard-gate.cmake` requires the
     acceptance marker BEFORE the abort. A guard nobody has watched refuse is not a
     guard; a guard nobody has watched ACCEPT is not known to work either (#1031) -- one
@@ -2241,7 +2208,7 @@ Every rule below has already been a bug.
     be added to all of them at once.
 
 - **No completion port is ever drained from several threads**, on Windows or anywhere
-  else. `IocpReactor.hpp` states the reason: a second thread dequeuing the same port
+  else. The reason (it was `IocpReactor.hpp`'s, before #1596): a second thread dequeuing the same port
   migrates a coroutine across threads mid-suspension, which every awaitable here is
   written against. `RunMultiReactorWindows` therefore runs **one thread per reactor**,
   exactly as the POSIX path does — `--threads N` is N independent single-threaded

@@ -4,15 +4,12 @@
 #include "NodeIdentity.hpp"
 #include "NodeSurfaces.hpp"
 
-#include <FastCache/Async/PlatformReactor.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Consensus/RaftNode.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/StopAwareWait.hpp>
-#include <FastCache/Net/PlatformConnector.hpp>
 
 #include <algorithm>
 #include <array>
@@ -22,6 +19,11 @@
 #include <mutex>
 #include <span>
 #include <utility>
+
+#include <core/net/IConnector.hpp>
+#include <core/net/PlatformLoop.hpp>
+#include <core/net/Sockets.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
 {
@@ -50,7 +52,7 @@ namespace
         void Deliver(Consensus::RaftMessage message) override
         {
             // `steady_clock` rather than the reactor's clock, and they are the same
-            // clock: `PlatformReactor` reports steady time, so a message stamped here
+            // clock: `core::net::PlatformLoop` reports steady time, so a message stamped here
             // and a timer fired there are on one timeline. Reading a wall clock
             // instead would let an NTP step look like an election timeout.
             auto const now = std::chrono::steady_clock::now();
@@ -243,7 +245,7 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                              std::string boundEndpoint,
                              RoleObserver onRole,
                              MembersObserver onMembers,
-                             WallClockRef wallClock,
+                             core::platform::WallClockRef wallClock,
                              std::string clusterId,
                              EndorsementObserver onEndorsement,
                              IMetricsSink& metrics,
@@ -258,7 +260,7 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     _metrics { metrics },
     _roster { std::move(identityKey), knownMembers },
     _identity { self.id, _roster },
-    _connector { std::make_unique<PlatformConnector>(_reactor, _resolver, _clock) },
+    _connector { core::net::makeConnector(_reactor, _resolver) },
     _application { logger, [this](Cluster::ClusterState const& state) { OnStateChanged(state); } },
     _onRole { std::move(onRole) },
     _boundEndpoint { std::move(boundEndpoint) },
@@ -296,7 +298,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     std::optional<Ed25519KeyPair> const& identityKey,
     RoleObserver onRole,
     MembersObserver onMembers,
-    WallClockRef wallClock,
+    core::platform::WallClockRef wallClock,
     EndorsementObserver onEndorsement,
     IMetricsSink& metrics,
     ILogger& logger,
@@ -422,21 +424,17 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // Bound against THIS node's reactor, which is what makes `co_await Accept()`
     // and every read inside `RaftPeerServer` actually suspend. A blocking listener
     // would serve the first peer that connects and never accept another.
-    _listener = PlatformListener::Bind(_reactor, bindAddress, bindPort);
+    auto listened = core::net::listen(_reactor, core::net::ListenOptions { .host = bindAddress, .port = bindPort });
 
-    // `IsBound()`, not a null check: `Bind` hands back a listener carrying the
-    // diagnostic rather than nothing at all, so testing for null tests nothing --
-    // the defect the worker's own listener records having shipped once.
-    if (_listener == nullptr || !_listener->IsBound())
+    // The failure is the `expected`'s, and carries its own diagnostic.
+    if (!listened.has_value())
     {
         // Through the row (#352), which carries why this is fatal. Not restated
         // here: a paraphrase beside a pointer is two copies that can disagree.
-        auto judged =
-            JudgeBindFailure(RowFor(NodeSurface::Raft),
-                             std::format("cannot bind {}: {}",
-                                         FormatHostPort(bindAddress, bindPort),
-                                         _listener ? _listener->BindError() : std::string_view { "null listener" }),
-                             _logger);
+        auto judged = JudgeBindFailure(
+            RowFor(NodeSurface::Raft),
+            std::format("cannot bind {}: {}", FormatHostPort(bindAddress, bindPort), listened.error().toString()),
+            _logger);
         if (!judged.has_value())
             return std::unexpected { std::move(judged).error() };
 
@@ -446,10 +444,10 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
         // against a listener that never bound, and the first `Propose` would dereference
         // a null `_driver`. Carrying a tolerated verdict here is not a branch, it is the
         // rest of this function.
-        _listener.reset();
         return std::unexpected { BindToleranceUnsupported(
             RowFor(NodeSurface::Raft), "the tier's driver, transport and peer server are built below this point") };
     }
+    _listener = std::move(*listened);
 
     // Two lists out of two, and the split is the whole of how a node joins. Who
     // this node DIALS is everything its operator named; who consensus COUNTS is
@@ -569,7 +567,7 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     _peerServer =
         std::make_unique<Consensus::RaftPeerServer>(*_listener, _reactor, *_sink, _logger, _metrics, _identity, _nonces);
 
-    // Both loops on ONE reactor, and neither through `SyncRun`: that function
+    // Both loops on ONE reactor, and neither through `core::async::syncRun`: that function
     // resumes a coroutine exactly once and throws when it is still suspended, so a
     // driver awaiting `SleepUntil` aborted the process the first time anybody
     // started three nodes.
@@ -577,12 +575,13 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     // The accept loop is submitted first, so a peer that dials the instant this
     // node's timers start finds somebody listening. The reverse order leaves a
     // window in which this node campaigns and refuses the votes it provoked.
-    auto serve = [](Consensus::RaftPeerServer* server, ConsensusTier* tier) -> DetachedTask {
+    auto serve = [](Consensus::RaftPeerServer* server, ConsensusTier* tier) -> core::async::DetachedTask {
         co_await server->Run();
         tier->NoteLoopFinished();
         co_return;
     };
-    auto tick = [](Consensus::RaftDriver* driver, IReactor* reactor, ConsensusTier* tier) -> DetachedTask {
+    auto tick =
+        [](Consensus::RaftDriver* driver, core::net::EventLoop* reactor, ConsensusTier* tier) -> core::async::DetachedTask {
         // The reactor arrives by pointer precisely because this is a coroutine: a
         // reference parameter is bound before the first suspension and then outlives
         // every frame that could have kept it alive.
@@ -601,7 +600,7 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     serve(_peerServer.get(), this);
     tick(_driver.get(), &_reactor, this);
 
-    _ioThread = std::jthread { [this] { _reactor.Run(); } };
+    _ioThread = std::jthread { [this] { _reactor.run(); } };
 
     // Third thread, and it is the one that can afford to be: it holds no socket and
     // does nothing at all in the ordinary case. What it may NOT do is run on either
@@ -746,13 +745,13 @@ void ConsensusTier::Desire(std::span<Cluster::DesiredMember const> records)
 
 void ConsensusTier::NoteLoopFinished() noexcept
 {
-    // The LAST one stops the reactor. `IReactor::Run` returns with its timer heap
+    // The LAST one stops the reactor. `core::net::EventLoop::Run` returns with its timer heap
     // and its parked work exactly where they were, so stopping it while either loop
     // is still suspended would leave a coroutine frame nobody ever resumes and
     // nobody ever frees -- a leak a sanitizer reports and a long-lived process pays
     // for.
     if (_loopsRunning.fetch_sub(1, std::memory_order_acq_rel) == 1)
-        _reactor.Stop();
+        _reactor.stop();
 }
 
 void ConsensusTier::Reconcile()
@@ -1169,7 +1168,7 @@ void ConsensusTier::Endorse(Cluster::ClusterState const& state)
         return;
 
     auto const digest = Cluster::DigestOfRoster(Cluster::ProjectRoster(state));
-    auto const now = _wallClock.Now();
+    auto const now = _wallClock.now();
 
     // Re-signed when the roster moved, and when a refresh is due. "Due" is measured from when
     // the last one was SIGNED, which its lapse states; a clock stepped backwards past that
@@ -1276,7 +1275,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
     std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
     NodeRoster& roster,
-    WallClockRef wallClock,
+    core::platform::WallClockRef wallClock,
     IMetricsSink& metrics,
     ILogger& logger,
     NodeConditions* conditions)

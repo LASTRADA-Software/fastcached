@@ -4,7 +4,6 @@
 #include <FastCache/Cache/LayeredStorage.hpp>
 #include <FastCache/Cache/ShardedStorage.hpp>
 #include <FastCache/Cache/StorageTestUtils.hpp>
-#include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -19,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/ScratchPath.hpp>
 
 using namespace std::chrono_literals;
@@ -43,12 +43,12 @@ std::unique_ptr<FastCache::LayeredStorage> MakeLayered(std::size_t l1Budget = 0)
 TEST_CASE("LayeredStorage Set + Get write-through roundtrip", "[layered]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const cas = storage->Set("k", MakeBytes("v"), 42, FastCache::TimePoint::max());
+    auto const cas = storage->Set("k", MakeBytes("v"), 42, core::platform::SteadyTimePoint::max());
     REQUIRE(cas.has_value());
 
-    auto got = storage->Get("k", clock.Now());
+    auto got = storage->Get("k", clock.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(Decode(got->entry.ValueBytes()) == "v");
@@ -59,15 +59,15 @@ TEST_CASE("LayeredStorage Set + Get write-through roundtrip", "[layered]")
 TEST_CASE("LayeredStorage Prefetch warms L1 from L2 without altering hit/miss stats", "[layered][prefetch]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE(storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
     // Evict the L1 mirror so the entry lives only in L2 (canonical).
     storage->L1().EraseIfPresent("k");
-    REQUIRE_FALSE(storage->L1().Get("k", clock.Now())->found);
+    REQUIRE_FALSE(storage->L1().Get("k", clock.now())->found);
 
     auto const before = storage->Snapshot();
-    auto const warmed = storage->Prefetch("k", clock.Now());
+    auto const warmed = storage->Prefetch("k", clock.now());
     REQUIRE(warmed.has_value());
     CHECK(*warmed == true);
     auto const after = storage->Snapshot();
@@ -78,7 +78,7 @@ TEST_CASE("LayeredStorage Prefetch warms L1 from L2 without altering hit/miss st
     CHECK(after.cmdGet == before.cmdGet);
 
     // The entry is now warm in L1 (a direct L1 Peek finds it, no L2 needed).
-    auto const l1 = storage->L1().Peek("k", clock.Now());
+    auto const l1 = storage->L1().Peek("k", clock.now());
     REQUIRE(l1.has_value());
     CHECK(l1->found);
 }
@@ -86,29 +86,29 @@ TEST_CASE("LayeredStorage Prefetch warms L1 from L2 without altering hit/miss st
 TEST_CASE("LayeredStorage Prefetch of an absent key reports miss and warms nothing", "[layered][prefetch]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const warmed = storage->Prefetch("absent", clock.Now());
+    auto const warmed = storage->Prefetch("absent", clock.now());
     REQUIRE(warmed.has_value());
     CHECK(*warmed == false);
-    CHECK_FALSE(storage->L1().Peek("absent", clock.Now())->found);
+    CHECK_FALSE(storage->L1().Peek("absent", clock.now())->found);
 }
 
 TEST_CASE("LayeredStorage write-through populates BOTH tiers", "[layered][write-through]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
-    auto const cas = storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
+    core::platform::ManualClock clock;
+    auto const cas = storage->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max());
     REQUIRE(cas.has_value());
 
     // Inspect L1 directly: entry must be present with L2's CAS.
-    auto l1Got = storage->L1().Get("k", clock.Now());
+    auto l1Got = storage->L1().Get("k", clock.now());
     REQUIRE(l1Got.has_value());
     REQUIRE(l1Got->found);
     REQUIRE(l1Got->entry.cas == *cas);
 
     // Inspect L2 directly: same CAS.
-    auto l2Got = storage->L2().Get("k", clock.Now());
+    auto l2Got = storage->L2().Get("k", clock.now());
     REQUIRE(l2Got.has_value());
     REQUIRE(l2Got->found);
     REQUIRE(l2Got->entry.cas == *cas);
@@ -117,20 +117,20 @@ TEST_CASE("LayeredStorage write-through populates BOTH tiers", "[layered][write-
 TEST_CASE("LayeredStorage read-through populates L1 on an L1 miss", "[layered][read-through]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     // Inject an entry directly into L2 without touching L1.
-    auto const directCas = storage->L2().Set("k", MakeBytes("disk-only"), 7, FastCache::TimePoint::max());
+    auto const directCas = storage->L2().Set("k", MakeBytes("disk-only"), 7, core::platform::SteadyTimePoint::max());
     REQUIRE(directCas.has_value());
 
     // First Get: L1 misses, L2 hits, mirror to L1.
-    auto first = storage->Get("k", clock.Now());
+    auto first = storage->Get("k", clock.now());
     REQUIRE(first.has_value());
     REQUIRE(first->found);
     REQUIRE(first->entry.cas == *directCas);
 
     // L1 should now have the entry with the same CAS as L2.
-    auto l1Direct = storage->L1().Get("k", clock.Now());
+    auto l1Direct = storage->L1().Get("k", clock.now());
     REQUIRE(l1Direct.has_value());
     REQUIRE(l1Direct->found);
     REQUIRE(l1Direct->entry.cas == *directCas);
@@ -143,45 +143,46 @@ TEST_CASE("LayeredStorage CompareAndSwap survives L1 eviction (CAS coherency)", 
     // observed earlier still succeeds; this proves the read-through
     // path mirrors L2's canonical CAS verbatim into L1.
     auto storage = MakeLayered(8);
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const cas = storage->Set("key", MakeBytes("12345678"), 0, FastCache::TimePoint::max());
+    auto const cas = storage->Set("key", MakeBytes("12345678"), 0, core::platform::SteadyTimePoint::max());
     REQUIRE(cas.has_value());
 
     // Insert other entries to evict "key" from L1.
     for (auto const i: std::views::iota(0, 10))
-        REQUIRE(
-            storage->Set(std::format("filler-{}", i), MakeBytes("XXXXXXXX"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage->Set(std::format("filler-{}", i), MakeBytes("XXXXXXXX"), 0, core::platform::SteadyTimePoint::max())
+                    .has_value());
 
     // L1 should no longer hold "key" (the small budget evicted it).
-    auto l1Probe = storage->L1().Get("key", clock.Now());
+    auto l1Probe = storage->L1().Get("key", clock.now());
     REQUIRE(l1Probe.has_value());
     REQUIRE_FALSE(l1Probe->found);
 
     // A Get through the layered storage repopulates L1 with L2's CAS;
     // a CAS with the original cas value still succeeds.
-    auto refetched = storage->Get("key", clock.Now());
+    auto refetched = storage->Get("key", clock.now());
     REQUIRE(refetched.has_value());
     REQUIRE(refetched->found);
     REQUIRE(refetched->entry.cas == *cas);
 
-    auto casResult = storage->CompareAndSwap("key", *cas, MakeBytes("post"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto casResult =
+        storage->CompareAndSwap("key", *cas, MakeBytes("post"), 0, core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE(casResult.has_value());
 }
 
 TEST_CASE("LayeredStorage Delete drops from both tiers", "[layered][delete]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
-    REQUIRE(storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    core::platform::ManualClock clock;
+    REQUIRE(storage->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
-    REQUIRE(storage->Delete("k", clock.Now()).has_value());
+    REQUIRE(storage->Delete("k", clock.now()).has_value());
 
-    auto l1 = storage->L1().Get("k", clock.Now());
+    auto l1 = storage->L1().Get("k", clock.now());
     REQUIRE(l1.has_value());
     REQUIRE_FALSE(l1->found);
 
-    auto l2 = storage->L2().Get("k", clock.Now());
+    auto l2 = storage->L2().Get("k", clock.now());
     REQUIRE(l2.has_value());
     REQUIRE_FALSE(l2->found);
 }
@@ -189,21 +190,21 @@ TEST_CASE("LayeredStorage Delete drops from both tiers", "[layered][delete]")
 TEST_CASE("LayeredStorage Append routes through L2 and mirrors to L1", "[layered][compound]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
-    REQUIRE(storage->Set("k", MakeBytes("hello"), 0, FastCache::TimePoint::max()).has_value());
+    core::platform::ManualClock clock;
+    REQUIRE(storage->Set("k", MakeBytes("hello"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     auto const suffix = MakeBytes(" world");
-    auto const cas = storage->Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, 0, clock.Now());
+    auto const cas = storage->Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, 0, clock.now());
     REQUIRE(cas.has_value());
 
     // Both tiers must reflect the appended value with the new CAS.
-    auto l1 = storage->L1().Get("k", clock.Now());
+    auto l1 = storage->L1().Get("k", clock.now());
     REQUIRE(l1.has_value());
     REQUIRE(l1->found);
     REQUIRE(Decode(l1->entry.ValueBytes()) == "hello world");
     REQUIRE(l1->entry.cas == *cas);
 
-    auto l2 = storage->L2().Get("k", clock.Now());
+    auto l2 = storage->L2().Get("k", clock.now());
     REQUIRE(l2.has_value());
     REQUIRE(l2->found);
     REQUIRE(Decode(l2->entry.ValueBytes()) == "hello world");
@@ -213,18 +214,18 @@ TEST_CASE("LayeredStorage Append routes through L2 and mirrors to L1", "[layered
 TEST_CASE("LayeredStorage IncrementOrInitialize routes through L2", "[layered][compound]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     // InMemoryLruStorage::IncrementOrInitialize requires the key to
     // exist (returns KeyNotFound otherwise) — seed an explicit "10"
     // so this test does not depend on the more permissive
     // CowTreeStorage initialise-on-missing behaviour.
-    REQUIRE(storage->Set("counter", MakeBytes("10"), 0, FastCache::TimePoint::max()).has_value());
-    auto next = storage->IncrementOrInitialize("counter", 5, /*decrement=*/false, clock.Now());
+    REQUIRE(storage->Set("counter", MakeBytes("10"), 0, core::platform::SteadyTimePoint::max()).has_value());
+    auto next = storage->IncrementOrInitialize("counter", 5, /*decrement=*/false, clock.now());
     REQUIRE(next.has_value());
     REQUIRE(next->value == 15U);
 
     // Verify L2 sees "15".
-    auto l2 = storage->L2().Get("counter", clock.Now());
+    auto l2 = storage->L2().Get("counter", clock.now());
     REQUIRE(l2.has_value());
     REQUIRE(l2->found);
     REQUIRE(Decode(l2->entry.ValueBytes()) == "15");
@@ -233,19 +234,19 @@ TEST_CASE("LayeredStorage IncrementOrInitialize routes through L2", "[layered][c
 TEST_CASE("LayeredStorage GetAndTouch refreshes TTL and reads through both tiers", "[layered][gat]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
-    REQUIRE(storage->Set("k", MakeBytes("v"), 0, clock.Now() + 1s).has_value());
+    core::platform::ManualClock clock;
+    REQUIRE(storage->Set("k", MakeBytes("v"), 0, clock.now() + 1s).has_value());
 
-    auto const newExpiry = clock.Now() + 60s;
-    auto const gat = storage->GetAndTouch("k", newExpiry, clock.Now());
+    auto const newExpiry = clock.now() + 60s;
+    auto const gat = storage->GetAndTouch("k", newExpiry, clock.now());
     REQUIRE(gat.has_value());
     REQUIRE(gat->found);
     REQUIRE(Decode(gat->entry.ValueBytes()) == "v");
     REQUIRE(gat->entry.expiry == newExpiry);
     // The canonical tier reflects the refreshed expiry.
-    REQUIRE(storage->L2().Get("k", clock.Now())->entry.expiry == newExpiry);
+    REQUIRE(storage->L2().Get("k", clock.now())->entry.expiry == newExpiry);
 
-    auto const miss = storage->GetAndTouch("absent", newExpiry, clock.Now());
+    auto const miss = storage->GetAndTouch("absent", newExpiry, clock.now());
     REQUIRE_FALSE(miss.has_value());
     REQUIRE(miss.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -253,39 +254,39 @@ TEST_CASE("LayeredStorage GetAndTouch refreshes TTL and reads through both tiers
 TEST_CASE("LayeredStorage CompareAndDelete checks CAS and drops both tiers", "[layered][cad]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
-    auto const setCas = storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
+    core::platform::ManualClock clock;
+    auto const setCas = storage->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max());
     REQUIRE(setCas.has_value());
 
     // Wrong CAS -> mismatch, entry survives.
-    auto const wrong = storage->CompareAndDelete("k", *setCas + 1, clock.Now());
+    auto const wrong = storage->CompareAndDelete("k", *setCas + 1, clock.now());
     REQUIRE_FALSE(wrong.has_value());
     REQUIRE(wrong.error().code == FastCache::StorageErrorCode::CasMismatch);
-    REQUIRE(storage->Get("k", clock.Now())->found);
+    REQUIRE(storage->Get("k", clock.now())->found);
 
     // Right CAS -> deleted from both tiers.
-    REQUIRE(storage->CompareAndDelete("k", *setCas, clock.Now()).has_value());
-    REQUIRE_FALSE(storage->Get("k", clock.Now())->found);
-    REQUIRE_FALSE(storage->L2().Get("k", clock.Now())->found);
+    REQUIRE(storage->CompareAndDelete("k", *setCas, clock.now()).has_value());
+    REQUIRE_FALSE(storage->Get("k", clock.now())->found);
+    REQUIRE_FALSE(storage->L2().Get("k", clock.now())->found);
 }
 
 TEST_CASE("LayeredStorage FlushWithGeneration hides entries in both tiers", "[layered][flush]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
-    REQUIRE(storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    core::platform::ManualClock clock;
+    REQUIRE(storage->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
-    storage->FlushWithGeneration(clock.Now());
+    storage->FlushWithGeneration(clock.now());
 
-    auto via = storage->Get("k", clock.Now());
+    auto via = storage->Get("k", clock.now());
     REQUIRE(via.has_value());
     REQUIRE_FALSE(via->found);
 
     // Both tiers individually treat the entry as flushed.
-    auto l1 = storage->L1().Get("k", clock.Now());
+    auto l1 = storage->L1().Get("k", clock.now());
     REQUIRE(l1.has_value());
     REQUIRE_FALSE(l1->found);
-    auto l2 = storage->L2().Get("k", clock.Now());
+    auto l2 = storage->L2().Get("k", clock.now());
     REQUIRE(l2.has_value());
     REQUIRE_FALSE(l2->found);
 }
@@ -293,22 +294,23 @@ TEST_CASE("LayeredStorage FlushWithGeneration hides entries in both tiers", "[la
 TEST_CASE("LayeredStorage PurgeExpired returns the L2 (canonical) count", "[layered][purge]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
-    auto const shortExpiry = clock.Now() + 1ms;
+    core::platform::ManualClock clock;
+    auto const shortExpiry = clock.now() + 1ms;
 
     for (auto const i: std::views::iota(0, 5))
         REQUIRE(storage->Set(std::format("expire-{}", i), MakeBytes("v"), 0, shortExpiry).has_value());
     for (auto const i: std::views::iota(0, 3))
-        REQUIRE(storage->Set(std::format("keep-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(
+            storage->Set(std::format("keep-{}", i), MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
-    clock.Advance(10ms);
-    auto const purged = storage->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged;
+    clock.advance(10ms);
+    auto const purged = storage->PurgeExpired(clock.now(), FastCache::PurgeBudget::Unbounded()).purged;
     REQUIRE(purged == 5U);
 
     // Surviving entries still reachable.
     for (auto const i: std::views::iota(0, 3))
     {
-        auto got = storage->Get(std::format("keep-{}", i), clock.Now());
+        auto got = storage->Get(std::format("keep-{}", i), clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
     }
@@ -317,20 +319,21 @@ TEST_CASE("LayeredStorage PurgeExpired returns the L2 (canonical) count", "[laye
 TEST_CASE("L1 eviction never loses data; L2 still serves every key", "[layered][eviction]")
 {
     auto storage = MakeLayered(64); // tiny L1 budget so only a few entries fit
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     constexpr int N = 50;
     for (auto const i: std::views::iota(0, N))
     {
         auto const key = std::format("k-{:02d}", i);
-        REQUIRE(storage->Set(key, MakeBytes(std::format("payload-{:02d}", i)), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage->Set(key, MakeBytes(std::format("payload-{:02d}", i)), 0, core::platform::SteadyTimePoint::max())
+                    .has_value());
     }
 
     // Every key must still be retrievable (L1 evicted older entries
     // but L2 holds them all).
     for (auto const i: std::views::iota(0, N))
     {
-        auto got = storage->Get(std::format("k-{:02d}", i), clock.Now());
+        auto got = storage->Get(std::format("k-{:02d}", i), clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.ValueBytes()) == std::format("payload-{:02d}", i));
@@ -340,13 +343,13 @@ TEST_CASE("L1 eviction never loses data; L2 still serves every key", "[layered][
 TEST_CASE("LayeredStorage Snapshot tracks LayeredStorage-level stats", "[layered][stats]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE(storage->Set("a", MakeBytes("1"), 0, FastCache::TimePoint::max()).has_value());
-    REQUIRE(storage->Set("b", MakeBytes("2"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage->Set("a", MakeBytes("1"), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE(storage->Set("b", MakeBytes("2"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
-    static_cast<void>(storage->Get("a", clock.Now()));
-    static_cast<void>(storage->Get("missing", clock.Now()));
+    static_cast<void>(storage->Get("a", clock.now()));
+    static_cast<void>(storage->Get("missing", clock.now()));
 
     auto const stats = storage->Snapshot();
     REQUIRE(stats.cmdSet == 2U);
@@ -398,22 +401,25 @@ TEST_CASE("Sharded composition: ShardedStorage of LayeredStorage(InMem, CowTree)
     // Phase 1: write through the layered+sharded stack.
     {
         auto storage = build();
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         for (auto const i: std::views::iota(0, 100))
         {
-            REQUIRE(
-                storage->Set(std::format("key-{}", i), MakeBytes(std::format("value-{}", i)), 0, FastCache::TimePoint::max())
-                    .has_value());
+            REQUIRE(storage
+                        ->Set(std::format("key-{}", i),
+                              MakeBytes(std::format("value-{}", i)),
+                              0,
+                              core::platform::SteadyTimePoint::max())
+                        .has_value());
         }
     }
 
     // Phase 2: rebuild against the same files; L1 starts empty.
     {
         auto storage = build();
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         for (auto const i: std::views::iota(0, 100))
         {
-            auto got = storage->Get(std::format("key-{}", i), clock.Now());
+            auto got = storage->Get(std::format("key-{}", i), clock.now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
             REQUIRE(Decode(got->entry.ValueBytes()) == std::format("value-{}", i));
@@ -435,7 +441,8 @@ TEST_CASE("LayeredStorage::Resize tunes only the L1 budget", "[layered][resize]"
     constexpr int N = 50;
     for (auto const i: std::views::iota(0, N))
     {
-        REQUIRE(storage->Set(std::format("k-{:02d}", i), MakeBytes("XXXXXXXX"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage->Set(std::format("k-{:02d}", i), MakeBytes("XXXXXXXX"), 0, core::platform::SteadyTimePoint::max())
+                    .has_value());
     }
     auto const before = storage->L1().Snapshot();
     REQUIRE(before.bytesUsed <= 1024U);
@@ -446,10 +453,10 @@ TEST_CASE("LayeredStorage::Resize tunes only the L1 budget", "[layered][resize]"
     REQUIRE(after.bytesLimit == 64U);
 
     // L2 still holds every entry — Resize only shrinks L1.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     for (auto const i: std::views::iota(0, N))
     {
-        auto got = storage->Get(std::format("k-{:02d}", i), clock.Now());
+        auto got = storage->Get(std::format("k-{:02d}", i), clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
     }
@@ -458,16 +465,17 @@ TEST_CASE("LayeredStorage::Resize tunes only the L1 budget", "[layered][resize]"
 TEST_CASE("LayeredStorage Add fails when present in L2 (canonical), even if L1 evicted", "[layered][add]")
 {
     auto storage = MakeLayered(8); // tiny L1
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE(storage->Set("k", MakeBytes("first"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage->Set("k", MakeBytes("first"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     // Push out L1 with other writes.
     for (auto const i: std::views::iota(0, 5))
-        REQUIRE(storage->Set(std::format("filler-{}", i), MakeBytes("XXXX"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage->Set(std::format("filler-{}", i), MakeBytes("XXXX"), 0, core::platform::SteadyTimePoint::max())
+                    .has_value());
 
     // L1 may have evicted "k", but L2 still has it — Add must fail.
-    auto r = storage->Add("k", MakeBytes("second"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto r = storage->Add("k", MakeBytes("second"), 0, core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyExists);
 }
@@ -475,8 +483,8 @@ TEST_CASE("LayeredStorage Add fails when present in L2 (canonical), even if L1 e
 TEST_CASE("LayeredStorage Replace fails when absent from both tiers", "[layered][replace]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
-    auto r = storage->Replace("missing", MakeBytes("nope"), 0, FastCache::TimePoint::max(), clock.Now());
+    core::platform::ManualClock clock;
+    auto r = storage->Replace("missing", MakeBytes("nope"), 0, core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -484,24 +492,24 @@ TEST_CASE("LayeredStorage Replace fails when absent from both tiers", "[layered]
 TEST_CASE("LayeredStorage Touch routes through L2 and mirrors into L1", "[layered][touch]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const setCas = storage->Set("k", MakeBytes("v"), 0, clock.Now() + 1s);
+    auto const setCas = storage->Set("k", MakeBytes("v"), 0, clock.now() + 1s);
     REQUIRE(setCas.has_value());
 
-    auto const newExpiry = clock.Now() + 60s;
-    auto const touched = storage->Touch("k", newExpiry, clock.Now());
+    auto const newExpiry = clock.now() + 60s;
+    auto const touched = storage->Touch("k", newExpiry, clock.now());
     REQUIRE(touched.has_value());
     REQUIRE(*touched != *setCas);
 
     // Both L1 and L2 must reflect the bumped CAS + new expiry.
-    auto const l1Got = storage->L1().Get("k", clock.Now());
+    auto const l1Got = storage->L1().Get("k", clock.now());
     REQUIRE(l1Got.has_value());
     REQUIRE(l1Got->found);
     REQUIRE(l1Got->entry.cas == *touched);
     REQUIRE(l1Got->entry.expiry == newExpiry);
 
-    auto const l2Got = storage->L2().Get("k", clock.Now());
+    auto const l2Got = storage->L2().Get("k", clock.now());
     REQUIRE(l2Got.has_value());
     REQUIRE(l2Got->found);
     REQUIRE(l2Got->entry.cas == *touched);
@@ -511,8 +519,8 @@ TEST_CASE("LayeredStorage Touch routes through L2 and mirrors into L1", "[layere
 TEST_CASE("LayeredStorage Touch miss does not corrupt L1", "[layered][touch]")
 {
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
-    auto const r = storage->Touch("nope", FastCache::TimePoint::max(), clock.Now());
+    core::platform::ManualClock clock;
+    auto const r = storage->Touch("nope", core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -524,12 +532,12 @@ TEST_CASE("LayeredStorage write-through preserves lastAccess in the L1 mirror", 
     // TimePoint::min(), defeating the meta `l` flag. The refresh now uses
     // a non-mutating Peek, so the touch's lastAccess survives.
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
-    clock.Advance(100s);
-    auto const t = clock.Now();
+    core::platform::ManualClock clock;
+    clock.advance(100s);
+    auto const t = clock.now();
 
-    REQUIRE(storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
-    REQUIRE(storage->Touch("k", FastCache::TimePoint::max(), t).has_value());
+    REQUIRE(storage->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE(storage->Touch("k", core::platform::SteadyTimePoint::max(), t).has_value());
 
     auto const l1 = storage->L1().Peek("k", t);
     REQUIRE(l1.has_value());
@@ -551,9 +559,9 @@ TEST_CASE("LayeredStorage over a CowTree L2 returns KeyNotFound on an incr miss"
     REQUIRE(l2.has_value());
     auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(0);
     FastCache::LayeredStorage storage { std::move(l1), std::move(*l2) };
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const r = storage.IncrementOrInitialize("counter", 5, /*decrement=*/false, clock.Now());
+    auto const r = storage.IncrementOrInitialize("counter", 5, /*decrement=*/false, clock.now());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -572,16 +580,16 @@ TEST_CASE("LayeredStorage over a CowTree L2 rejects an oversized Set without pol
     REQUIRE(l2.has_value());
     auto l1 = std::make_unique<FastCache::InMemoryLruStorage>(0, 16);
     FastCache::LayeredStorage storage { std::move(l1), std::move(*l2) };
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     auto const oversized = MakeBytes(std::string(17, 'x'));
-    auto const r = storage.Set("big", oversized, 0, FastCache::TimePoint::max());
+    auto const r = storage.Set("big", oversized, 0, core::platform::SteadyTimePoint::max());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::ValueTooLarge);
 
     // Neither tier was populated by the rejected write.
-    REQUIRE_FALSE(storage.L1().Get("big", clock.Now())->found);
-    REQUIRE_FALSE(storage.L2().Get("big", clock.Now())->found);
+    REQUIRE_FALSE(storage.L1().Get("big", clock.now())->found);
+    REQUIRE_FALSE(storage.L2().Get("big", clock.now())->found);
 }
 
 TEST_CASE("LayeredStorage::Update is atomic across L1+L2 and preserves expiry", "[layered][update][ttl]")
@@ -595,8 +603,8 @@ TEST_CASE("LayeredStorage::Update is atomic across L1+L2 and preserves expiry", 
     //      callback leaves outcome.newExpiry nullopt (redis INCR
     //      semantics).
     auto storage = MakeLayered();
-    FastCache::ManualClock clock;
-    auto const deadline = clock.Now() + 60s;
+    core::platform::ManualClock clock;
+    auto const deadline = clock.now() + 60s;
 
     // Seed with a value + TTL directly into L2 (no L1 mirror yet).
     REQUIRE(storage->L2().Set("k", MakeBytes("0"), 0, deadline).has_value());
@@ -615,11 +623,11 @@ TEST_CASE("LayeredStorage::Update is atomic across L1+L2 and preserves expiry", 
                 // .newExpiry left nullopt -> preserve prior TTL
             };
         },
-        clock.Now());
+        clock.now());
     REQUIRE(upd.has_value());
 
     // L2 sees the new value with the preserved expiry.
-    auto const l2 = storage->L2().Peek("k", clock.Now());
+    auto const l2 = storage->L2().Peek("k", clock.now());
     REQUIRE(l2.has_value());
     REQUIRE(l2->found);
     REQUIRE(Decode(l2->entry.ValueBytes()) == "1");
@@ -627,7 +635,7 @@ TEST_CASE("LayeredStorage::Update is atomic across L1+L2 and preserves expiry", 
 
     // L1 was refreshed verbatim with L2's CAS + expiry (mirror
     // coherent).
-    auto const l1 = storage->L1().Peek("k", clock.Now());
+    auto const l1 = storage->L1().Peek("k", clock.now());
     REQUIRE(l1.has_value());
     REQUIRE(l1->found);
     REQUIRE(l1->entry.cas == l2->entry.cas);

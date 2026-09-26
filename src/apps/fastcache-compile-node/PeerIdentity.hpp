@@ -36,7 +36,7 @@ struct PeerIdentity
     /// The kernel's peer HOST, as `getpeername` reported it. Never a name the peer chose, and
     /// never an endpoint: a peer dials from an ephemeral source port, so there is no port here.
     ///
-    /// It can legitimately be empty -- `FormatPeerAddress` answers that for a peer whose family
+    /// It can legitimately be empty -- `core::net::formatPeerAddress` answers that for a peer whose family
     /// is unknown or whose `getpeername` failed -- so a reader decides what an unnameable
     /// caller means rather than assuming a host.
     std::string host {};

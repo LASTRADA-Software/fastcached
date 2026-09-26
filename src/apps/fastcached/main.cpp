@@ -27,16 +27,12 @@
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Config/SecretExposureWatcher.hpp>
 #include <FastCache/Config/YamlReader.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/PathKind.hpp>
-#include <FastCache/Core/Profiling.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
-#include <FastCache/Net/HealthProbe.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
@@ -51,8 +47,15 @@
 #include <FastCache/Protocol/StreamWaiterRegistry.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
+
+#include <core/Profiling.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/net/BlockingSocket.hpp>
+#include <core/net/HealthProbe.hpp>
+#include <core/platform/Clock.hpp>
 #if defined(FC_TLS_ENABLED)
-    #include <FastCache/Net/TlsContext.hpp>
+    #include <core/net/Tls.hpp>
 #endif
 
 #include <algorithm>
@@ -727,14 +730,14 @@ int DaemonBody(FastCache::Config const& effective,
         logger.Logf(FastCache::LogLevel::Warn, "{}", warning);
     });
 
-    FastCache::SteadyClock steadyClock;
+    core::platform::SteadyClock steadyClock;
     // The engine reads the clock once per command, and on Windows that is a
     // QueryPerformanceCounter — ~16 ns, which measured as roughly a third of the
     // cost of serving a cached GET. Serving a value sampled once per reactor
     // iteration removes it from the per-command path entirely. The same object
     // goes to the server loop below (`serverOpts.clock`), because only whoever
     // owns the event loop can refresh it.
-    FastCache::CachedClock clock { steadyClock };
+    core::platform::CachedClock clock { steadyClock };
 
     auto const usingPersistent = !effective.storagePath.empty();
 
@@ -849,7 +852,7 @@ int DaemonBody(FastCache::Config const& effective,
     // seam where a storage error becomes a reply. Without it
     // `fastcache_cache_malformed_values_total` would stay at zero on the one process
     // that can observe the event (#296).
-    FastCache::CacheEngine engine { *storagePtr, clock, FastCache::DefaultSystemWallClock(), &metrics };
+    FastCache::CacheEngine engine { *storagePtr, clock, core::platform::defaultSystemWallClock(), &metrics };
 
     auto const durabilityName = [&] {
         switch (effective.storageDurability)
@@ -894,7 +897,7 @@ int DaemonBody(FastCache::Config const& effective,
     // TLS context: built once and shared read-only across connections. Fails
     // fast on a missing build feature or unreadable cert/key.
 #if defined(FC_TLS_ENABLED)
-    std::unique_ptr<FastCache::TlsContext> tlsContext;
+    std::shared_ptr<core::net::ITlsContext> tlsContext;
 #endif
     auto const anyTlsBind = std::ranges::any_of(effective.binds, [](auto const& b) { return b.tls; });
     if (effective.tlsEnabled || anyTlsBind)
@@ -905,10 +908,10 @@ int DaemonBody(FastCache::Config const& effective,
             logger.Log(FastCache::LogLevel::Fatal, "fastcached: --tls requires both --tls-cert and --tls-key");
             return EXIT_FAILURE;
         }
-        auto created = FastCache::TlsContext::Create(effective.tlsCertPath, effective.tlsKeyPath);
+        auto created = core::net::makeTlsServerContextFromFiles(effective.tlsCertPath, effective.tlsKeyPath);
         if (!created.has_value())
         {
-            logger.Logf(FastCache::LogLevel::Fatal, "fastcached: TLS init failed: {}", created.error().ToString());
+            logger.Logf(FastCache::LogLevel::Fatal, "fastcached: TLS init failed: {}", created.error());
             return EXIT_FAILURE;
         }
         tlsContext = std::move(*created);
@@ -1146,7 +1149,7 @@ int DaemonBody(FastCache::Config const& effective,
     // cache. Uptime reads `steadyClock`, not the cached one the engine uses: the cached clock only
     // advances when a reactor completes a loop iteration, so a daemon sitting idle would report a
     // frozen uptime until the next request arrived.
-    auto const startedAt = steadyClock.Now();
+    auto const startedAt = steadyClock.now();
     FastCache::AdminHttpServer::SnapshotProvider const snapshotProvider = [&engine, &steadyClock, startedAt] {
         return FastCache::MetricsSnapshot {
             .storage = engine.Snapshot(),
@@ -1160,7 +1163,7 @@ int DaemonBody(FastCache::Config const& effective,
             // the field is also what keeps a field added to the middle of the struct from silently
             // defaulting here.
             .host = std::nullopt,
-            .uptime = FastCache::Uptime { std::chrono::duration_cast<std::chrono::seconds>(steadyClock.Now() - startedAt) },
+            .uptime = FastCache::Uptime { std::chrono::duration_cast<std::chrono::seconds>(steadyClock.now() - startedAt) },
         };
     };
 
@@ -1211,8 +1214,8 @@ int DaemonBody(FastCache::Config const& effective,
             adminServer =
                 std::make_unique<FastCache::AdminHttpServer>(*adminListener, metrics, snapshotProvider, logger, steadyClock);
             adminThread = std::jthread { [&adminServer] {
-                FC_THREAD_NAME("fc-admin");
-                FastCache::SyncRun(adminServer->Run());
+                CORE_THREAD_NAME("fc-admin");
+                core::async::syncRun(adminServer->Run());
             } };
             logger.Logf(FastCache::LogLevel::Info,
                         "metrics endpoint on http://{}:{}/metrics (and /healthz)",
@@ -1242,7 +1245,7 @@ int DaemonBody(FastCache::Config const& effective,
 
 int main(int argc, char const* const* argv)
 {
-    FC_THREAD_NAME("fastcached-main");
+    CORE_THREAD_NAME("fastcached-main");
     std::span<char const* const> const args { argv + 1, argc > 0 ? static_cast<std::size_t>(argc - 1) : 0 };
 
     auto const parsed = FastCache::ParseCli(args);
@@ -1385,7 +1388,7 @@ int main(int argc, char const* const* argv)
     // 0/1. Loopback regardless of the configured metrics bind address, since the
     // probe runs inside the same host/container as the daemon.
     if (parsed->outcome == FastCache::CliOutcome::HealthCheck)
-        return FastCache::HttpHealthProbe("127.0.0.1", effective.metricsPort, "/healthz") ? EXIT_SUCCESS : EXIT_FAILURE;
+        return core::net::httpHealthProbe("127.0.0.1", effective.metricsPort, "/healthz") ? EXIT_SUCCESS : EXIT_FAILURE;
 
     // Service-control requests act on the service manager and exit; they never
     // run the daemon body.

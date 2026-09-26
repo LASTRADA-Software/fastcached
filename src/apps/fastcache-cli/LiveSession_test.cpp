@@ -7,12 +7,7 @@
 #include "ScriptedSixelEncoder.hpp"
 #include "TerminalCapabilities.hpp"
 
-#include <FastCache/Async/PlatformReactor.hpp>
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Platform/StopSignal.hpp>
 
@@ -39,6 +34,12 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <core/async/ResumeOn.hpp>
+#include <core/async/ThreadPoolExecutor.hpp>
+#include <core/net/PlatformLoop.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 
 #if !defined(_WIN32)
     #include <csignal>
@@ -112,7 +113,7 @@ class ScriptedAcquisition final: public ITerminalAcquisition
     /// @param answer What the terminal reports, or why it cannot be acquired.
     /// @param detachAtOnce Whether the acquired terminal goes away before its first read.
     /// @param noPresenter Whether the started terminal names nowhere to draw frames.
-    ScriptedAcquisition(IReactor& reactor,
+    ScriptedAcquisition(core::net::EventLoop& reactor,
                         std::expected<TerminalCapabilities, std::string> answer,
                         bool detachAtOnce,
                         bool noPresenter = false):
@@ -123,7 +124,8 @@ class ScriptedAcquisition final: public ITerminalAcquisition
     {
     }
 
-    [[nodiscard]] Task<std::expected<StartedTerminal, std::string>> Acquire(IExecutor* pool, IExecutor* resumeOn) override
+    [[nodiscard]] core::async::Task<std::expected<StartedTerminal, std::string>> Acquire(
+        core::async::IExecutor* pool, core::async::IExecutor* resumeOn) override
     {
         ++_calls;
         _askedPool = pool;
@@ -162,13 +164,13 @@ class ScriptedAcquisition final: public ITerminalAcquisition
     }
 
     /// @return The pool the last acquisition was told to block on.
-    [[nodiscard]] IExecutor* AskedPool() const noexcept
+    [[nodiscard]] core::async::IExecutor* AskedPool() const noexcept
     {
         return _askedPool;
     }
 
     /// @return Where the last acquisition was told to resume.
-    [[nodiscard]] IExecutor* AskedResumeOn() const noexcept
+    [[nodiscard]] core::async::IExecutor* AskedResumeOn() const noexcept
     {
         return _askedResumeOn;
     }
@@ -186,13 +188,13 @@ class ScriptedAcquisition final: public ITerminalAcquisition
     }
 
   private:
-    IReactor& _reactor;
+    core::net::EventLoop& _reactor;
     std::expected<TerminalCapabilities, std::string> _answer;
     bool _detachAtOnce;
     bool _noPresenter;
     int _calls { 0 };
-    IExecutor* _askedPool { nullptr };
-    IExecutor* _askedResumeOn { nullptr };
+    core::async::IExecutor* _askedPool { nullptr };
+    core::async::IExecutor* _askedResumeOn { nullptr };
     SpokenTerminal* _spoken { nullptr };
     TerminalRelease _release {};
     PresenterRecord _presented {};
@@ -205,7 +207,7 @@ class ScriptedInstaller final: public IStopSignalInstaller
   public:
     /// @param reactor Where an installed signal's wait parks.
     /// @param refusal Why installing fails, or empty when it succeeds.
-    ScriptedInstaller(IReactor& reactor, std::string refusal):
+    ScriptedInstaller(core::net::EventLoop& reactor, std::string refusal):
         _reactor { reactor },
         _refusal { std::move(refusal) }
     {
@@ -226,7 +228,7 @@ class ScriptedInstaller final: public IStopSignalInstaller
     }
 
   private:
-    IReactor& _reactor;
+    core::net::EventLoop& _reactor;
     std::string _refusal;
     int _calls { 0 };
 };
@@ -329,11 +331,11 @@ struct CompositionFaults
 /// @param out How it ended.
 /// @param threw Set when it ended by an exception.
 /// @return The task to submit.
-[[nodiscard]] Task<void> ComposeInto(LiveSessionParts parts,
-                                     std::optional<LiveEventSource>* source,
-                                     std::shared_ptr<ITerminalRestore>* restore,
-                                     std::optional<std::expected<LiveSessionRun, Answer>>* out,
-                                     bool* threw)
+[[nodiscard]] core::async::Task<void> ComposeInto(LiveSessionParts parts,
+                                                  std::optional<LiveEventSource>* source,
+                                                  std::shared_ptr<ITerminalRestore>* restore,
+                                                  std::optional<std::expected<LiveSessionRun, Answer>>* out,
+                                                  bool* threw)
 {
     try
     {
@@ -376,7 +378,7 @@ struct Composition
     ScriptedAcquisition terminals;
     ScriptedInstaller stops;
     RecordingRungViews views;
-    TestReactor terminalPool;
+    core::net::testing::TestLoop terminalPool;
     ILiveSubscription* subscription; ///< The rig's stream, unless the case named another.
     LiveSubject subject;
     SampleReader reader;
@@ -386,7 +388,7 @@ struct Composition
     std::shared_ptr<ITerminalRestore> restore;
     std::optional<std::expected<LiveSessionRun, Answer>> result;
     bool threw { false };
-    Task<void> task {};
+    core::async::Task<void> task {};
 
     /// Start the session on the rig's reactor.
     /// @param interactive Whether the standard streams are a terminal.
@@ -412,7 +414,7 @@ struct Composition
             .views = rungViews
         };
         task = ComposeInto(std::move(parts), &source, &restore, &result, &threw);
-        rig.reactor.Submit(task.Native());
+        rig.reactor.submit(task.handle());
     }
 
     /// Run the rig through @p rounds re-subscription intervals.
@@ -422,7 +424,7 @@ struct Composition
         rig.Settle();
         for ([[maybe_unused]] auto const round: std::views::iota(0, rounds))
         {
-            rig.clock.Advance(Interval);
+            rig.clock.advance(Interval);
             rig.Settle();
         }
     }
@@ -454,8 +456,8 @@ struct Composition
             source->Close();
         rig.Settle();
         CHECK((!source.has_value() || source->IsDrained()));
-        CHECK(rig.reactor.PendingTimers() == 0);
-        CHECK(rig.pool.PendingSubmissions() == 0);
+        CHECK(rig.reactor.pendingTimers() == 0);
+        CHECK(rig.pool.pendingSubmissions() == 0);
     }
 };
 
@@ -472,10 +474,10 @@ void StepReads(Rig& rig, ScriptedSubscription const& subscription, std::size_t r
     constexpr auto MostTurns = 1000;
     for ([[maybe_unused]] auto const turn: std::views::iota(0, MostTurns))
     {
-        rig.reactor.Drain();
+        rig.reactor.drain();
         if (subscription.Reads() >= reads)
             break;
-        rig.pool.Drain();
+        rig.pool.drain();
     }
     CHECK(subscription.Reads() == reads);
 }
@@ -512,7 +514,7 @@ class SteppedDrainWait final: public IDrainWait
     {
     }
 
-    [[nodiscard]] TimePoint Now() const noexcept override
+    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
     {
         return _now;
     }
@@ -533,7 +535,7 @@ class SteppedDrainWait final: public IDrainWait
   private:
     Rig* _settle;
     int _settleAfter;
-    TimePoint _now {};
+    core::platform::SteadyTimePoint _now {};
     int _sleeps { 0 };
 };
 
@@ -715,7 +717,7 @@ TEST_CASE("an interactive live-stats fleet session draws the fleet panel, and it
     CHECK(presented.placements.front().sixel.starts_with("sixel:"));
 
     composition.terminals.Spoken()->Say(DashboardEvent { .kind = DashboardEventKind::Key, .keys = "q" });
-    rig.reactor.Drain();
+    rig.reactor.drain();
     composition.Finish();
 }
 
@@ -782,8 +784,8 @@ namespace
 /// @return The remarks.
 [[nodiscard]] std::vector<std::string> RemarksOver(std::vector<DashboardEvent> script)
 {
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
     auto events = ScriptedDashboardEvents { reactor, std::move(script) };
     auto remarks = RecordingRemarks {};
     auto remarking = FailureRemarks { &events, &ReadStatsSample, &remarks };
@@ -791,8 +793,8 @@ namespace
     auto sink = CountSink {};
     auto exit = std::optional<DashboardExit> {};
     auto task = RunOver(&remarking, &view, &sink, DashboardLimits {}, &exit);
-    reactor.Submit(task.Native());
-    reactor.Drain();
+    reactor.submit(task.handle());
+    reactor.drain();
     REQUIRE(exit.has_value());
     return remarks.Lines();
 }
@@ -1219,8 +1221,8 @@ TEST_CASE("a dial that never returns is abandoned at the ceiling naming the endp
     Rig rig;
     LiveEventSource source { rig.Parts() };
     // The first dial is out, started at the clock's epoch -- where the drain's clock starts too.
-    rig.reactor.Drain();
-    CHECK(rig.pool.PendingSubmissions() == 1);
+    rig.reactor.drain();
+    CHECK(rig.pool.pendingSubmissions() == 1);
     source.Close();
 
     auto wait = SteppedDrainWait {};
@@ -1243,12 +1245,12 @@ TEST_CASE("an abandoned dial after a leader redirect names the leader and not th
     auto parts = rig.Parts();
     parts.subscription = &redirecting;
     LiveEventSource source { std::move(parts) };
-    rig.reactor.Drain(); // the first dial is handed off
-    rig.pool.Drain();    // and opens
-    rig.reactor.Drain(); // its first read is handed off
-    rig.pool.Drain();    // and answers NotLeader
-    rig.reactor.Drain(); // the redirect is followed: the second dial is out
-    REQUIRE(rig.pool.PendingSubmissions() == 1);
+    rig.reactor.drain(); // the first dial is handed off
+    rig.pool.drain();    // and opens
+    rig.reactor.drain(); // its first read is handed off
+    rig.pool.drain();    // and answers NotLeader
+    rig.reactor.drain(); // the redirect is followed: the second dial is out
+    REQUIRE(rig.pool.pendingSubmissions() == 1);
     source.Close();
 
     auto wait = SteppedDrainWait {};
@@ -1268,7 +1270,7 @@ TEST_CASE("a dial that returns inside the bound drains and abandons nothing", "[
     // stopped looking when it did.
     Rig rig;
     LiveEventSource source { rig.Parts() };
-    rig.reactor.Drain();
+    rig.reactor.drain();
     source.Close();
 
     auto wait = SteppedDrainWait { &rig, 3 };
@@ -1299,7 +1301,7 @@ class StopOnDemandInstaller final: public IStopSignalInstaller
 {
   public:
     /// @param reactor Where the signal's wait parks.
-    explicit StopOnDemandInstaller(IReactor& reactor):
+    explicit StopOnDemandInstaller(core::net::EventLoop& reactor):
         _reactor { reactor }
     {
     }
@@ -1343,7 +1345,7 @@ class StopOnDemandInstaller final: public IStopSignalInstaller
     }
 
   private:
-    IReactor& _reactor;
+    core::net::EventLoop& _reactor;
     std::atomic<ScriptedStopSignal*> _installed { nullptr };
     std::atomic<int> _calls { 0 };
     std::atomic<bool> _pressedUnarmed { false };
@@ -1440,9 +1442,9 @@ class StreamingSink final: public IFrameSink
 /// @param reactor Where to close it.
 /// @param source The source, when one was composed.
 /// @return The detached task.
-DetachedTask CloseOnReactor(IReactor* reactor, std::optional<LiveEventSource>* source)
+core::async::DetachedTask CloseOnReactor(core::net::EventLoop* reactor, std::optional<LiveEventSource>* source)
 {
-    co_await ResumeOn { *reactor };
+    co_await core::async::ResumeOn { *reactor };
     if (source->has_value())
         (*source)->Close();
 }
@@ -1479,7 +1481,7 @@ struct RunningSeat
         streamsInteractive { streamsInteractive },
         stoppedFromDial { stoppedFromDial }
     {
-        thread = std::jthread { [this] { reactor.Run(); } };
+        thread = std::jthread { [this] { reactor.run(); } };
     }
 
     RunningSeat(RunningSeat const&) = delete;
@@ -1496,7 +1498,7 @@ struct RunningSeat
             auto wait = ThreadDrainWait {};
             CHECK_FALSE(DrainSession(*source, DrainBound {}, wait).has_value());
         }
-        reactor.Stop();
+        reactor.stop();
         thread.join();
         source.reset();
     }
@@ -1574,11 +1576,11 @@ struct RunningSeat
     ILiveSubscription* subscriptionOverride { nullptr };
     IStopSignalInstaller* stopsOverride { nullptr };
     ITerminalAcquisition* terminalsOverride { nullptr };
-    SteadyClock clock;
-    PlatformReactor reactor { clock };
-    ThreadPoolExecutor streamPool { 1 };
-    ThreadPoolExecutor stopWaiter { 1 };
-    ThreadPoolExecutor terminalPool { 1 };
+    core::platform::SteadyClock clock;
+    core::net::PlatformLoop reactor { clock };
+    core::async::ThreadPoolExecutor streamPool { 1 };
+    core::async::ThreadPoolExecutor stopWaiter { 1 };
+    core::async::ThreadPoolExecutor terminalPool { 1 };
     StreamingSink sink;
     RecordingRemarks remarks;
     ScriptedInstaller stops { reactor, "" };

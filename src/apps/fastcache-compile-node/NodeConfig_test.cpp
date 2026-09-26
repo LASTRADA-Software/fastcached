@@ -19,7 +19,6 @@
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -42,6 +41,7 @@
 #include <utility>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <tests/PathFlagCoverage.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
@@ -5925,9 +5925,9 @@ TEST_CASE("NodeConfig: a node running no worker is refused every setting only a 
     {
         DYNAMIC_SECTION(flag)
         {
-            auto const* const sample = FindOrNull(WorkerSettingSamples, flag, &WorkerSettingSample::flag);
+            auto const* const sample = core::findOrNull(WorkerSettingSamples, flag, &WorkerSettingSample::flag);
             REQUIRE(sample != nullptr);
-            auto const* const row = FindOrNull(NodeOptions(), flag, &OptionSpec<NodeConfig>::primary);
+            auto const* const row = core::findOrNull(NodeOptions(), flag, &OptionSpec<NodeConfig>::primary);
             REQUIRE(row != nullptr);
             CHECK(row->component == &WorkerComponent);
 

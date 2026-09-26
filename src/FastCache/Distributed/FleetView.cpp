@@ -4,7 +4,6 @@
 #include <FastCache/Core/FigureText.hpp>
 #include <FastCache/Core/MachineName.hpp>
 #include <FastCache/Core/NumericText.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Distributed/FleetChart.hpp>
 #include <FastCache/Distributed/FleetText.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
@@ -14,6 +13,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+
+#include <core/Ranges.hpp>
 // For `std::llround`, which the KPI cells round with. MSVC pulls this in
 // transitively and libstdc++ does not, so its absence is a GCC/Clang-only build
 // failure that a green Windows build says nothing about -- measured, thirteen red
@@ -1680,7 +1681,7 @@ std::vector<std::string> FleetColumnNames(FleetSection section, FleetSnapshot co
 std::optional<CellFormat> CellFormatFromName(std::string_view name) noexcept
 {
     auto const* row =
-        FindIfOrNull(CellFormatTable, [name](CellFormatRow const& candidate) { return candidate.name == name; });
+        core::findIfOrNull(CellFormatTable, [name](CellFormatRow const& candidate) { return candidate.name == name; });
     return row == nullptr ? std::nullopt : std::optional<CellFormat> { row->format };
 }
 

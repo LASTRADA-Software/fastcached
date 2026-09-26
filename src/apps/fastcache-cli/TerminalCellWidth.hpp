@@ -12,12 +12,12 @@ namespace FastCache::Cli
 ///
 /// **Every panel frame a terminal shows is laid out through this function and no other.** It is
 /// bound where a session is composed, as `PanelContext::cellWidth`; the layout code measures nothing
-/// itself, and tests bind `Testing::FakeCellWidth` instead. Implemented over the vendored
-/// `tui::stringWidth` in `TerminalCellWidth.cpp`, the only file here that includes
+/// itself, and tests bind `Testing::FakeCellWidth` instead. Implemented over core-cpp's
+/// `core::tui::stringWidth` in `TerminalCellWidth.cpp`, the only file here that includes
 /// `<tui/Unicode.hpp>`: it walks grapheme clusters, so a CJK character is two cells, a combining
 /// sequence is its base character's width, and an emoji ZWJ sequence is two.
 ///
-/// **Measures only where the vendored terminal library is built** (`FASTCACHED_BUILD_TUI`). Without
+/// **Measures only where core-cpp's terminal library is built** (`FASTCACHED_BUILD_TUI`). Without
 /// it there is no terminal to lay a frame out for -- `MakeTerminalEvents` refuses first -- and the
 /// twin in `TerminalCellWidthUnavailable.cpp` ends the process naming the build rather than answering
 /// through a width function that knows no Unicode.

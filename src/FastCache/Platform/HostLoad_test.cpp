@@ -188,7 +188,7 @@ TEST_CASE("Memory and scratch pass through untouched, absence included", "[platf
 TEST_CASE("The real counter source answers this machine", "[platform][hostload][smoke]")
 {
     // A smoke test, and the reason it exists at all: an interface with only a fake
-    // behind it is an interface nobody has checked -- the lesson `OpenUdpSocket` is
+    // behind it is an interface nobody has checked -- the lesson `core::net::openUdpSocket` is
     // recorded for, where the real implementation returned null on Windows and no
     // fake would ever have shown it.
     //

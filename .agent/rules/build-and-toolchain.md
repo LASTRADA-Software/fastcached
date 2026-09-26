@@ -2494,7 +2494,7 @@ here, and four test binaries link `Catch2::Catch2WithMain`, so they set nothing.
   walk, or outside its roots, is exactly what it catches, and no `CMakeLists.txt` would
   read wrong. **The census is NOT taken through the walk**: its first version was, and
   dropping `vendor` from the walk's roots left the check green over an unsuppressed
-  `fastcache-tui-tests` -- a list derived by the thing it checks is exact about what that
+  `fastcache-tui-tests`, the vendored TUI's test binary while there was one -- a list derived by the thing it checks is exact about what that
   thing reached and silent about the rest. It is taken at the end of configure over the
   whole source tree; measured since, the same neuter is refused by name, and so is moving
   the walk ahead of `src/tests`.
@@ -3576,8 +3576,11 @@ makes it anyway and says so there.
     catch-all. The typed handler is emitted, but no try-map entry names it. With the fix the table
     declares two. **So an `await_ready` stays
     trivial -- a member read or a constant -- and a decision that needs a call moves into
-    `await_suspend`**, which may decline to park. `vendor/endo/tui/runtime/TuiRuntime.hpp`'s
-    `DelayAwaiter` now answers a constant `false`; that is a `VENDOR.md` row, and endo `c09959fc`.
+    `await_suspend`**, which may decline to park. The vendored
+    `vendor/endo/tui/runtime/TuiRuntime.hpp`'s `DelayAwaiter` answered a constant `false` (endo
+    `c09959fc`) until #1596 moved that code to core-cpp, whose v0.1.0 `EventLoop::DelayAwaiter`
+    reads the clock in `await_ready` again -- reported upstream, since every delay here goes
+    through it now.
   - **The evidence, by run**: 35340951724 is the failure; 35346860955 and 35348183117 the
     #1546 variants, on master and on #1432's branch; 35350059398 the #1545 flags read back as
     garbage beside an intact tag; 35352105607 the listing; 35354435799 both fixes built as CI
@@ -6348,11 +6351,11 @@ requires them to agree, because two readers of one format are two parsers.
 - **An exemption is a row with a REASON** (`third-party-roots-exemptions.txt`), and a row
   whose file no longer spells that walk is refused as stale. *Third-party code happens not
   to match* is not a reason: it is a bet on the world's layout.
-- **A root is the upstream COPY, never the directory holding copies.** `vendor/endo`, not
-  `vendor`: `vendor/CMakeLists.txt`, `VENDOR.md` and `MANIFEST` are written here, and a root
+- **A root is the upstream COPY, never the directory holding copies.** `vendor/monocypher`,
+  not `vendor`: `VENDOR.md` and `MANIFEST` are written here, and a root
   of `vendor` answers *third-party* for this project's own build glue, dropping it from every
   scan that reads the file. The next import is its own row -- and the second was: `vendor/monocypher`
-  (#178). The verbatim check and the figures check read the file too, so that row is also what
+  (#178), beside `vendor/endo` until #1596 moved that code to core-cpp. The verbatim check and the figures check read the file too, so that row is also what
   hashes the copy into `vendor/MANIFEST` and asks `vendor/VENDOR.md` to describe it; a re-sync
   names ONE root (`FASTCACHED_VENDOR_RESYNC_ROOT`), so it cannot bless another copy's changes.
 - **clang-format is the enumerator no script can make ask**, so each root is also a row of

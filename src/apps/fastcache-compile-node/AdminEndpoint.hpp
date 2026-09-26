@@ -6,19 +6,18 @@
 #include "NodeRoster.hpp"
 #include "NodeSurfaces.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/PrometheusFormatter.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Platform/HostInfo.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Server/AdminCredential.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <algorithm>
 #include <array>
@@ -36,16 +35,19 @@
 #include <thread>
 #include <vector>
 
+#include <core/net/BlockingSocket.hpp>
+#include <core/platform/Clock.hpp>
+
 // Under TLS the surface below OWNS a context, so the complete type is needed for
 // its deleter; without it the class is only ever a pointer that is always null,
 // and the forward declaration keeps this header free of OpenSSL either way.
 #if defined(FC_TLS_ENABLED)
-    #include <FastCache/Net/TlsContext.hpp>
+    #include <core/net/Tls.hpp>
 #else
-namespace FastCache
+namespace core::net
 {
-class TlsContext;
-}
+class ITlsContext;
+} // namespace core::net
 #endif
 
 namespace FastCache::Node
@@ -311,7 +313,7 @@ class FleetSampler final: public IFleetHistoryView
     FleetSampler(std::optional<Distributed::FleetSources> sources,
                  IMetricsSink const& metrics,
                  AdminHttpServer::SnapshotProvider node,
-                 WallClockRef wall,
+                 core::platform::WallClockRef wall,
                  HistoryPaths paths,
                  ILogger& logger);
 
@@ -540,7 +542,7 @@ class AdminEndpoint
     /// The error is a diagnostic string rather than one of the project's four error
     /// enums, and that is a deliberate departure. This fails in two ways that belong
     /// to two different taxonomies -- a malformed `--admin-listen` is a
-    /// `ConfigError`, an address that will not bind is a `NetError` -- and
+    /// `ConfigError`, an address that will not bind is a `core::net::NetError` -- and
     /// `ConfigErrorCode` has no enumerator that describes the second at all. The
     /// caller's response is identical either way (log it, refuse to start), so
     /// picking one enum would buy nothing and mislabel half the failures. What the
@@ -569,7 +571,7 @@ class AdminEndpoint
         AdminHttpServer::SnapshotProvider snapshot,
         ILogger& logger,
         std::vector<AdminRoute> routes = {},
-        TlsContext* tls = nullptr);
+        core::net::ITlsContext* tls = nullptr);
 
     /// Stop serving and join the thread.
     ~AdminEndpoint();
@@ -606,7 +608,7 @@ class AdminEndpoint
                   std::string boundEndpoint,
                   ILogger& logger,
                   std::vector<AdminRoute> routes,
-                  TlsContext* tls,
+                  core::net::ITlsContext* tls,
                   ServedSurfaces surfaces);
 
     std::unique_ptr<BlockingListener> _listener;
@@ -614,7 +616,7 @@ class AdminEndpoint
     /// **A stated deviation**: this class is app WIRING, and the testable seam for the
     /// head deadlines is one level down on `ServeAdminHttp(..., IClock&, ...)`, which is
     /// where a test that needs to move time reaches.
-    SteadyClock _clock;
+    core::platform::SteadyClock _clock;
     /// What this node serves, owned here because `_server` holds a SPAN of it and this used
     /// to be a `constexpr` global that outlived everything by construction. Declared before
     /// `_server` for that reason, exactly as `_listener` and `_clock` are.
@@ -636,7 +638,7 @@ struct AdminSurface
 {
 #if defined(FC_TLS_ENABLED)
     /// Server TLS context when a certificate was named, else null.
-    std::unique_ptr<TlsContext> tls;
+    std::shared_ptr<core::net::ITlsContext> tls;
 #endif
     /// The running endpoint. Null when the operator asked for no admin surface.
     std::unique_ptr<AdminEndpoint> endpoint;

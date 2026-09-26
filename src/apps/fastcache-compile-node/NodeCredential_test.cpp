@@ -4,14 +4,10 @@
 #include "NodeCredential.hpp"
 #include "RemoteUpstream.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Config/YamlReader.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/IAsyncAddressResolver.hpp>
-#include <FastCache/Net/IConnector.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -33,6 +29,11 @@
 
 #include <CacheProtocol.hpp>
 #include <WorkerProtocol.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/IAsyncAddressResolver.hpp>
+#include <core/net/IConnector.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
 
@@ -131,18 +132,20 @@ class RotatingCredential final: public ICredentialSource
 /// Deliberate rather than a shortcut: a real lookup makes these cases depend on the
 /// host's resolver, which `RemoteUpstream_test` has to `SKIP` around. A failed lookup
 /// leaves the endpoint verbatim, which is the path that reaches the connector.
-class UnresolvingResolver final: public IAsyncAddressResolver
+class UnresolvingResolver final: public core::net::IAsyncAddressResolver
 {
   public:
-    [[nodiscard]] Task<ResolveResult> Resolve(std::string host, std::uint16_t port, IReactor* /*reactor*/) override
+    [[nodiscard]] core::async::Task<core::net::ResolveResult> resolve(std::string host,
+                                                                      std::uint16_t port,
+                                                                      core::net::EventLoop* /*loop*/) override
     {
-        co_return std::unexpected(ResolveFailure(host, port, "scripted: this case dials the literal"));
+        co_return std::unexpected(core::net::resolveFailure(host, port, "scripted: this case dials the literal"));
     }
 };
 
-/// An `ISocket` that forwards to one somebody else owns.
+/// An `core::net::ISocket` that forwards to one somebody else owns.
 ///
-/// `IConnector::Connect` hands back a `unique_ptr`, and `RemoteUpstream` destroys it
+/// `core::net::IConnector::Connect` hands back a `unique_ptr`, and `RemoteUpstream` destroys it
 /// when the operation ends -- so a connector that merely remembered the raw pointer
 /// would be reading freed memory by the time a case asked what went out. That is not
 /// a hypothetical: written that way, this file's first case segfaulted and its
@@ -152,7 +155,7 @@ class UnresolvingResolver final: public IAsyncAddressResolver
 /// A forwarding shell rather than a fourth private copy of a recording socket: the
 /// script and the trace stay `Testing::ScriptedSocket`'s, which is the shared fake
 /// this repository keeps for the reason that private copies carry private bugs.
-class BorrowedSocket final: public ISocket
+class BorrowedSocket final: public core::net::ISocket
 {
   public:
     /// @param inner Where every call goes; must outlive this.
@@ -161,35 +164,35 @@ class BorrowedSocket final: public ISocket
     {
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override
     {
-        return _inner.Read(buffer);
+        return _inner.read(buffer);
     }
 
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
+    [[nodiscard]] core::net::IoAwaitable write(std::span<std::byte const> buffer) override
     {
-        return _inner.Write(buffer);
+        return _inner.write(buffer);
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                            std::shared_ptr<void const> keepAlive = {}) override
+    [[nodiscard]] core::net::IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
+                                                       std::shared_ptr<void const> keepAlive = {}) override
     {
-        return _inner.WriteVectored(segments, std::move(keepAlive));
+        return _inner.writeVectored(segments, std::move(keepAlive));
     }
 
-    void Close() noexcept override
+    void close() noexcept override
     {
-        _inner.Close();
+        _inner.close();
     }
 
-    [[nodiscard]] bool IsClosed() const noexcept override
+    [[nodiscard]] bool isClosed() const noexcept override
     {
-        return _inner.IsClosed();
+        return _inner.isClosed();
     }
 
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
-        return _inner.PeerAddress();
+        return _inner.peerAddress();
     }
 
   private:
@@ -202,7 +205,7 @@ class BorrowedSocket final: public ISocket
 /// question is what the SECOND connection sent. A connector returning one shared
 /// socket would let the first exchange's bytes answer for the second, so each dial
 /// gets its own; the connector keeps them so they can still be read afterwards.
-class ScriptingConnector final: public IConnector
+class ScriptingConnector final: public core::net::IConnector
 {
   public:
     /// @param script What each socket replays.
@@ -211,10 +214,12 @@ class ScriptingConnector final: public IConnector
     {
     }
 
-    [[nodiscard]] Task<SocketResult> Connect(std::string /*host*/, std::uint16_t /*port*/, DialOptions /*options*/) override
+    [[nodiscard]] core::async::Task<core::net::SocketResult> connect(std::string /*host*/,
+                                                                     std::uint16_t /*port*/,
+                                                                     core::net::DialOptions /*options*/) override
     {
         _dialled.push_back(std::make_unique<Testing::ScriptedSocket>(_script));
-        co_return SocketResult { std::make_unique<BorrowedSocket>(*_dialled.back()) };
+        co_return core::net::SocketResult { std::make_unique<BorrowedSocket>(*_dialled.back()) };
     }
 
     /// What each dial sent, oldest first.
@@ -288,17 +293,17 @@ TEST_CASE("Site 1: the shared cache is asked with the secret in force NOW", "[no
     RotatingCredential credential { FirstSecret };
     UnresolvingResolver resolver;
     ScriptingConnector connector { AcceptedThen(Wire::EncodeReply(Wire::Status::Miss, {})) };
-    ManualClock clock;
+    core::platform::ManualClock clock;
 
     RemoteUpstream upstream { "127.0.0.1:6674", credential, [](std::string_view) {}, connector, nullptr,
                               resolver,         clock,      ConnectTimeout,          IoTimeout, RefreshInterval };
 
-    (void) SyncRun(upstream.Fetch("k"));
+    (void) core::async::syncRun(upstream.Fetch("k"));
     REQUIRE(connector.Dials() == 1);
     CHECK(connector.SentOn(0) == AuthThen(FirstSecret, Wire::EncodeFetch("k")));
 
     credential.Rotate(SecondSecret);
-    (void) SyncRun(upstream.Fetch("k"));
+    (void) core::async::syncRun(upstream.Fetch("k"));
 
     REQUIRE(connector.Dials() == 2);
     // Both directions. "Carries the new secret" alone would pass for a client that
@@ -316,15 +321,15 @@ TEST_CASE("Site 1, the other verb: a STORE presents the rotated secret too", "[n
     RotatingCredential credential { FirstSecret };
     UnresolvingResolver resolver;
     ScriptingConnector connector { AcceptedThen(Wire::EncodeReply(Wire::Status::Ok, {})) };
-    ManualClock clock;
+    core::platform::ManualClock clock;
 
     RemoteUpstream upstream { "127.0.0.1:6674", credential, [](std::string_view) {}, connector, nullptr,
                               resolver,         clock,      ConnectTimeout,          IoTimeout, RefreshInterval };
 
     auto const value = std::vector<std::byte> { std::byte { 0x01 } };
-    (void) SyncRun(upstream.Store("k", value));
+    (void) core::async::syncRun(upstream.Store("k", value));
     credential.Rotate(SecondSecret);
-    (void) SyncRun(upstream.Store("k", value));
+    (void) core::async::syncRun(upstream.Store("k", value));
 
     REQUIRE(connector.Dials() == 2);
     auto const& second = connector.SentOn(1);

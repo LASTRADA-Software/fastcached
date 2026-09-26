@@ -2,7 +2,6 @@
 #include "EndpointDial.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Net/TcpClient.hpp>
 
 #include <chrono>
 #include <memory>
@@ -11,10 +10,15 @@
 #include <tuple>
 #include <utility>
 
+#include <core/async/SyncRun.hpp>
+#include <core/net/TcpClient.hpp>
+
 namespace FastCache::Cc
 {
 
-Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector, std::string_view hostPort, DialOptions options)
+core::async::Task<std::unique_ptr<core::net::ISocket>> DialEndpoint(core::net::IConnector* connector,
+                                                                    std::string_view hostPort,
+                                                                    core::net::DialOptions options)
 {
     // `ParseDialEndpoint` and not `SplitHostPort`/`ParseEndpoint`: the reasoning for
     // each of its three refusals -- a sentence that merely splits, an empty host, a
@@ -23,7 +27,7 @@ Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector, std::string_v
     // the identical text (#237).
     //
     // Refused HERE rather than left to the connector, which matters even though
-    // `Detail::RunConnectFlow` refuses an empty host too: the difference is between
+    // `core::net::detail::runConnectFlow` refuses an empty host too: the difference is between
     // "no connector was asked" and "a connector was asked and said no", which is the
     // distinction `EndpointDial_test`'s `RecordingConnector` exists to make and the
     // one a caller holding a connector outside the funnel depends on.
@@ -31,20 +35,22 @@ Task<std::unique_ptr<ISocket>> DialEndpoint(IConnector* connector, std::string_v
     if (!target.has_value())
         co_return nullptr;
 
-    auto socket = co_await connector->Connect(target->first, target->second, options);
+    auto socket = co_await connector->connect(target->first, target->second, options);
     if (!socket.has_value())
         co_return nullptr;
     co_return std::move(*socket);
 }
 
 /// @copydoc DialEndpointBlocking
-std::unique_ptr<ISocket> DialEndpointBlocking(BlockingConnector& connector, std::string_view hostPort, DialOptions options)
+std::unique_ptr<core::net::ISocket> DialEndpointBlocking(core::net::BlockingConnector& connector,
+                                                         std::string_view hostPort,
+                                                         core::net::DialOptions options)
 {
-    // Sound because the parameter is a `BlockingConnector` and not an
-    // `IConnector`: that connector resolves inline and waits with a syscall, so
-    // its task is never left suspended, which is exactly what `SyncRun` requires.
+    // Sound because the parameter is a `core::net::BlockingConnector` and not an
+    // `core::net::IConnector`: that connector resolves inline and waits with a syscall, so
+    // its task is never left suspended, which is exactly what `core::async::syncRun` requires.
     // Over a reactor connector this would throw.
-    return SyncRun(DialEndpoint(&connector, hostPort, options));
+    return core::async::syncRun(DialEndpoint(&connector, hostPort, options));
 }
 
 } // namespace FastCache::Cc

@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/IReactor.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -24,6 +22,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/net/EventLoop.hpp>
 
 namespace FastCache
 {
@@ -112,7 +113,8 @@ class IPushSink
     /// @param frame A whole frame; sent in one write, so a parked one is never spliced into.
     /// @param hold How long the write may stay parked before the connection is ended.
     /// @return How it left.
-    [[nodiscard]] virtual Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds hold) = 0;
+    [[nodiscard]] virtual core::async::Task<PushOutcome> Push(std::vector<std::byte> frame,
+                                                              std::chrono::milliseconds hold) = 0;
 
     /// @return What the peer has done since the stream began. Never consumes a byte.
     [[nodiscard]] virtual PeerActivity Activity() const noexcept = 0;
@@ -506,8 +508,11 @@ class LiveStream
     /// @param gate Who is admitted, at subscribe and on every tick.
     /// @param reactor Where this stream sleeps between ticks: its connection's reactor.
     /// @return The terminal reply, or empty to close without one.
-    [[nodiscard]] Task<std::vector<std::byte>> Serve(
-        std::span<std::byte const> frame, LiveWatcher watcher, IPushSink* sink, ILiveGate const* gate, IReactor* reactor);
+    [[nodiscard]] core::async::Task<std::vector<std::byte>> Serve(std::span<std::byte const> frame,
+                                                                  LiveWatcher watcher,
+                                                                  IPushSink* sink,
+                                                                  ILiveGate const* gate,
+                                                                  core::net::EventLoop* reactor);
 
     /// @return How many subscriptions are streaming right now.
     [[nodiscard]] std::size_t ActiveSubscriptions() const noexcept
@@ -581,12 +586,12 @@ class LiveStream
     /// @param sink The surface, asked whether it is stopping between looks.
     /// @param reactor Where the stream sleeps between looks.
     /// @return A `Ready` or `Stopped` observation, or `Busy` when the surface began stopping meanwhile.
-    [[nodiscard]] Task<Observation> AwaitView(CompileCacheWire::LiveSubject subject,
-                                              std::chrono::milliseconds floor,
-                                              std::uint64_t eventsFrom,
-                                              std::optional<std::uint64_t> seen,
-                                              IPushSink const* sink,
-                                              IReactor* reactor);
+    [[nodiscard]] core::async::Task<Observation> AwaitView(CompileCacheWire::LiveSubject subject,
+                                                           std::chrono::milliseconds floor,
+                                                           std::uint64_t eventsFrom,
+                                                           std::optional<std::uint64_t> seen,
+                                                           IPushSink const* sink,
+                                                           core::net::EventLoop* reactor);
 
     /// The terminal reply for what the sink saw, or nullopt when the peer is still watching.
     /// @param sink What the surface saw.

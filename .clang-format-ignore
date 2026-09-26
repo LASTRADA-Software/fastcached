@@ -1,7 +1,7 @@
 # Paths clang-format must not touch, in clang-format's own syntax (LLVM 18+).
 #
 # `vendor/` holds third-party sources copied VERBATIM from upstream, and verbatim
-# is the whole point: `git diff <import>..HEAD -- vendor/endo` is what gets sent
+# is the whole point: `git diff <import>..HEAD -- vendor/monocypher` is what gets sent
 # back upstream, so a reformat silently turns a contributable copy into a fork.
 #
 # This file rather than a path filter in the gate, because the hazard is anybody
@@ -15,5 +15,4 @@
 # `local-gate.sh` refuses a run where the formatter declined anything other than exactly
 # the offered files under the roots -- so a row here that stops matching, or one that
 # declines first-party code, is caught in the step that caused it.
-vendor/endo/**
 vendor/monocypher/**

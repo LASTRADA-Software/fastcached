@@ -68,9 +68,9 @@ std::expected<void, std::string> OpenEverything(NodeIoLoop& io, NodeConfig const
 {
     auto started = FrameEndpoint::Start(io, NodeSurface::Node, cfg, responder, metrics, logger);
     auto adopted = FrameEndpoint::StartAdopted(io, NodeSurface::Node, 3, host, responder, metrics, logger);
-    auto raft = PlatformListener::Bind(reactor, "127.0.0.1", 6675);
+    auto raft = core::net::listen(reactor, "127.0.0.1", 6675);
     auto admin = BlockingListener::Bind("127.0.0.1", 6676);
-    auto beacon = OpenSharedPortUdpSocket("0.0.0.0", 6677, 0);
+    auto beacon = core::net::openSharedPortUdpSocket("0.0.0.0", 6677, 0);
 
     if (!started.has_value())
     {
@@ -213,7 +213,7 @@ std::expected<void, std::string> OpenSome(NodeIoLoop& io, ILogger& logger)
 {
     auto started = FrameEndpoint::Start(io, NodeSurface::Node, cfg, responder, metrics, logger);
     auto adopted = FrameEndpoint::StartAdopted(io, NodeSurface::Node, 3, host, responder, metrics, logger);
-    auto raft = PlatformListener::Bind(reactor, "127.0.0.1", 6675);
+    auto raft = core::net::listen(reactor, "127.0.0.1", 6675);
     auto admin = BlockingListener::Bind("127.0.0.1", 6676);
     if (!started.has_value())
     {
@@ -230,9 +230,9 @@ file(MAKE_DIRECTORY "${tree}/${nodeDirectory}")
 file(WRITE "${tree}/${nodeDirectory}/OpenSome.cpp" "${renamedBody}")
 fastcached_run_check("${tree}" objected output)
 if(NOT objected)
-    list(APPEND failures "renamed: a tree where OpenSharedPortUdpSocket appears nowhere passed, so a renamed primitive would leave the check guarding a name nobody calls")
+    list(APPEND failures "renamed: a tree where core::net::openSharedPortUdpSocket appears nowhere passed, so a renamed primitive would leave the check guarding a name nobody calls")
 else()
-    string(FIND "${output}" "OpenSharedPortUdpSocket" position)
+    string(FIND "${output}" "core::net::openSharedPortUdpSocket" position)
     if(position EQUAL -1)
         list(APPEND failures "renamed: the check objected without naming which primitive matched nothing, so nobody can tell which row went stale")
     endif()

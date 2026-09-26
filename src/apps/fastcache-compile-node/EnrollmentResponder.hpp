@@ -98,7 +98,7 @@ class EnrollmentResponder final: public IFrameResponder
     ///
     /// Never suspends: every decision is taken from this node's own memory -- the window, and
     /// the replicated state it hands the roster from.
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override;
 
     /// @copydoc IFrameResponder::RefusePeer
     ///

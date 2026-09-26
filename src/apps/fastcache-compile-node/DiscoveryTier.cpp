@@ -3,17 +3,18 @@
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Net/SharedPortDatagram.hpp>
 
 #include <cstdio>
 #include <format>
 #include <optional>
 #include <utility>
 
+#include <core/net/SharedPortDatagram.hpp>
+
 namespace FastCache::Node
 {
 
-DiscoveryTier::DiscoveryTier(std::unique_ptr<IDatagramSocket> socket,
+DiscoveryTier::DiscoveryTier(std::unique_ptr<core::net::IDatagramSocket> socket,
                              Cluster::DiscoveryConfig config,
                              Consensus::IRaftPeerKeys const& keys,
                              PeerObserver onPeers,
@@ -29,12 +30,12 @@ DiscoveryTier::DiscoveryTier(std::unique_ptr<IDatagramSocket> socket,
     // Due immediately rather than one interval from now: a node that waited would be
     // invisible to a segment that is already up for as long as its own interval, and
     // the first beacon is the cheapest thing it will ever send.
-    _nextBeacon { _clock.Now() },
+    _nextBeacon { _clock.now() },
     _service { *_socket, _clock, *_random, _directory, std::move(config), keys, metrics, logger }
 {
 }
 
-std::unique_ptr<DiscoveryTier> DiscoveryTier::Over(std::unique_ptr<IDatagramSocket> socket,
+std::unique_ptr<DiscoveryTier> DiscoveryTier::Over(std::unique_ptr<core::net::IDatagramSocket> socket,
                                                    Cluster::DiscoveryConfig config,
                                                    Consensus::IRaftPeerKeys const& keys,
                                                    PeerObserver onPeers,
@@ -71,7 +72,7 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     // from. A node that answered on the shared port would be answering for its
     // machine, which is why two nodes on one host never finished proving the key.
     //
-    // Which socket takes which option is `OpenSharedPortUdpSocket`'s to know, not
+    // Which socket takes which option is `core::net::openSharedPortUdpSocket`'s to know, not
     // this function's: there are four of them, each easy to put on the wrong half,
     // and every wrong pairing still starts and still passes a test suite.
     // BOTH sockets come from this surface's row, not from a literal spelled here three
@@ -92,19 +93,20 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     auto const& bindHost = beaconSocket.host;
     auto const replyPort = endpoints.size() > 1 ? endpoints[1].port : std::uint16_t { 0 };
 
-    auto socket = OpenSharedPortUdpSocket(bindHost, beaconSocket.port, replyPort);
-    if (socket == nullptr)
+    auto opened = core::net::openSharedPortUdpSocket(bindHost, beaconSocket.port, replyPort);
+    if (!opened.has_value())
     {
         // Through the row (#352). Both ports are named because either can be the one
         // that failed and this cannot tell which -- a message blaming the beacon port
         // alone sends an operator to look at a port that bound perfectly.
-        auto judged =
-            JudgeBindFailure(RowFor(NodeSurface::Discovery),
-                             std::format("cannot bind the UDP sockets discovery needs: {} to listen on, and {} to answer on",
-                                         FormatHostPort(bindHost, beaconSocket.port),
-                                         cfg.discoveryReplyPort != 0 ? FormatHostPort(bindHost, cfg.discoveryReplyPort)
-                                                                     : std::string { "a port of this node's own" }),
-                             logger);
+        auto judged = JudgeBindFailure(
+            RowFor(NodeSurface::Discovery),
+            std::format("cannot bind the UDP sockets discovery needs: {} to listen on, and {} to answer on ({})",
+                        FormatHostPort(bindHost, beaconSocket.port),
+                        cfg.discoveryReplyPort != 0 ? FormatHostPort(bindHost, cfg.discoveryReplyPort)
+                                                    : std::string { "a port of this node's own" },
+                        opened.error().toString()),
+            logger);
         if (!judged.has_value())
             return std::unexpected { std::move(judged).error() };
 
@@ -117,17 +119,19 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
                                                           "a null tier already means \"--discovery was not asked for\"") };
     }
 
+    auto socket = std::move(*opened);
+
     // The port the operator configured, which is NOT the one the pair reports:
     // that is where this node is answered. Both go in the startup line.
     auto const listeningOn = FormatHostPort(bindHost, beaconSocket.port);
 
-    auto config =
-        Cluster::DiscoveryConfig { .clusterId = cfg.clusterId,
-                                   .nodeId = cfg.nodeId,
-                                   .raftEndpoint = std::string { raftEndpoint },
-                                   .beaconAddress = DatagramAddress { .host = announce->first, .port = beaconSocket.port },
-                                   .beaconInterval = Cluster::DiscoveryConfig {}.beaconInterval,
-                                   .challengeLifetime = Cluster::DiscoveryConfig {}.challengeLifetime };
+    auto config = Cluster::DiscoveryConfig { .clusterId = cfg.clusterId,
+                                             .nodeId = cfg.nodeId,
+                                             .raftEndpoint = std::string { raftEndpoint },
+                                             .beaconAddress = core::net::DatagramAddress { .host = announce->first,
+                                                                                           .port = beaconSocket.port },
+                                             .beaconInterval = Cluster::DiscoveryConfig {}.beaconInterval,
+                                             .challengeLifetime = Cluster::DiscoveryConfig {}.challengeLifetime };
 
     auto tier = Over(std::move(socket), std::move(config), keys, std::move(onPeers), metrics, logger);
 
@@ -151,7 +155,7 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
 
 std::string DiscoveryTier::BoundEndpoint() const
 {
-    auto const bound = _socket->BoundAddress();
+    auto const bound = _socket->boundAddress();
     // An empty host is what `BoundAddress` reports for a socket it could not name,
     // and joining that yields `:0` -- which reads as an endpoint rather than as
     // the absence of one, in the log line an operator checks to see where
@@ -166,13 +170,13 @@ DiscoveryTier::~DiscoveryTier()
     // The socket first, so a parked receive has a reason to return at its next poll,
     // and only then the stop -- which the loop observes on that same return. The
     // `jthread` joins in its own destructor after this, which the member order buys.
-    _socket->Close();
+    _socket->close();
     _thread.request_stop();
 }
 
 bool DiscoveryTier::Step(std::chrono::milliseconds timeout)
 {
-    if (_clock.Now() >= _nextBeacon)
+    if (_clock.now() >= _nextBeacon)
     {
         if (!_service.SendBeacon())
             // Logged and carried on. A datagram the local stack refused is a
@@ -180,7 +184,7 @@ bool DiscoveryTier::Step(std::chrono::milliseconds timeout)
             // and beacons repeat by design, so stopping here would turn a recoverable
             // moment into a node that never announces again.
             _logger.Log(LogLevel::Warn, "discovery: a beacon could not be sent");
-        _nextBeacon = _clock.Now() + _beaconInterval;
+        _nextBeacon = _clock.now() + _beaconInterval;
     }
 
     auto const event = _service.PumpOnce(timeout);

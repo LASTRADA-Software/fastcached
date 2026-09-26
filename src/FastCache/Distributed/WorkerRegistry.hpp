@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Protocol/NodeConditionWire.hpp>
 
@@ -15,6 +14,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Distributed
 {
@@ -117,10 +118,10 @@ struct WorkerInfo
 /// stops meaning anything the moment it is stored. An age is a property of an
 /// *observation*, so it lives on the report of one.
 ///
-/// The age is a duration rather than the `TimePoint` it came from, and that is the
-/// injected clock defending itself: handed a `TimePoint`, the obvious thing for a
+/// The age is a duration rather than the `core::platform::SteadyTimePoint` it came from, and that is the
+/// injected clock defending itself: handed a `core::platform::SteadyTimePoint`, the obvious thing for a
 /// consumer to do is subtract `steady_clock::now()` from it -- which is right in
-/// production and wrong under every `ManualClock` test, silently, because the two
+/// production and wrong under every `core::platform::ManualClock` test, silently, because the two
 /// clocks agree about nothing. Subtracting inside the registry means the answer
 /// comes from the clock the registry was given.
 struct WorkerReport
@@ -161,9 +162,9 @@ struct WorkerReport
     /// deliberately -- would mark the unused toolchain as picked the moment a job ran
     /// on the used one, which is precisely the state this must be able to see.
     ///
-    /// A duration rather than the `TimePoint` it came from, for the reason stated on
+    /// A duration rather than the `core::platform::SteadyTimePoint` it came from, for the reason stated on
     /// this struct: handed an instant, a consumer subtracts `steady_clock::now()`,
-    /// which is right in production and silently wrong under every `ManualClock`.
+    /// which is right in production and silently wrong under every `core::platform::ManualClock`.
     std::optional<std::chrono::milliseconds> lastPickedAge {};
 };
 
@@ -337,8 +338,8 @@ struct WorkerRegistration
 /// The set of live compile workers, grouped by toolchain.
 ///
 /// **Pure with respect to I/O**: it never opens a socket, spawns anything, or
-/// reads a clock of its own — time comes from the injected `IClock`, which is
-/// what makes expiry testable against `ManualClock` instead of against `sleep`.
+/// reads a clock of its own — time comes from the injected `core::platform::IClock`, which is
+/// what makes expiry testable against `core::platform::ManualClock` instead of against `sleep`.
 /// The whole scheduling policy therefore has unit tests and no fixtures.
 ///
 /// Thread-safe: several reactor threads answer registrations and leases
@@ -381,7 +382,8 @@ class WorkerRegistry
     /// @param heartbeatTimeout How long a worker may go unheard-from before it is
     ///        treated as gone. A worker that dies mid-job otherwise holds its slots
     ///        forever, and the fleet quietly shrinks to nothing with no diagnostic.
-    explicit WorkerRegistry(IClock& clock, std::chrono::milliseconds heartbeatTimeout = DefaultHeartbeatTimeout) noexcept;
+    explicit WorkerRegistry(core::platform::IClock& clock,
+                            std::chrono::milliseconds heartbeatTimeout = DefaultHeartbeatTimeout) noexcept;
 
     /// Default grace period before an unheard-from worker is dropped.
     ///
@@ -576,26 +578,26 @@ class WorkerRegistry
     struct Entry
     {
         WorkerInfo info;
-        TimePoint lastSeen {};
+        core::platform::SteadyTimePoint lastSeen {};
         /// When this entry entered the registry. See `WorkerReport::registeredAge`.
         ///
         /// Written once, at insertion. `Register` does not refresh it on an entry it
         /// finds, because that path is not a restart -- see the comment there.
-        TimePoint registeredAt {};
+        core::platform::SteadyTimePoint registeredAt {};
         /// When `Pick` last chose it; disengaged until it has been chosen once.
         ///
         /// Survives a re-registration: it is the LEADER's record of its own choices,
         /// and nothing a worker does changes what the scheduler did.
         ///
         /// An `optional` rather than a sentinel instant, because *never* is a state
-        /// and not an old reading: a default-constructed `TimePoint` under a
-        /// `ManualClock` that has not been advanced is indistinguishable from "picked
+        /// and not an old reading: a default-constructed `core::platform::SteadyTimePoint` under a
+        /// `core::platform::ManualClock` that has not been advanced is indistinguishable from "picked
         /// at the very start", and the two say opposite things.
-        std::optional<TimePoint> lastPickedAt {};
+        std::optional<core::platform::SteadyTimePoint> lastPickedAt {};
     };
 
     /// Whether `entry` has been heard from recently enough to dispatch to.
-    [[nodiscard]] bool IsLive(Entry const& entry, TimePoint now) const noexcept;
+    [[nodiscard]] bool IsLive(Entry const& entry, core::platform::SteadyTimePoint now) const noexcept;
 
     /// Which way `AdjustMachineInFlight` moves a machine's count.
     ///
@@ -627,9 +629,10 @@ class WorkerRegistry
     /// @param lastSeen When the entry last registered or heartbeat.
     /// @param now The instant the whole snapshot is measured against.
     /// @return The age; never negative, even under a clock set backwards.
-    [[nodiscard]] static std::chrono::milliseconds AgeOf(TimePoint lastSeen, TimePoint now) noexcept;
+    [[nodiscard]] static std::chrono::milliseconds AgeOf(core::platform::SteadyTimePoint lastSeen,
+                                                         core::platform::SteadyTimePoint now) noexcept;
 
-    IClock& _clock;
+    core::platform::IClock& _clock;
     std::chrono::milliseconds _heartbeatTimeout;
     mutable std::mutex _mutex;
     std::unordered_map<std::string, Entry> _workers; ///< Guarded by _mutex.
@@ -646,7 +649,7 @@ class WorkerRegistry
         NodeLoad load {};
         std::string version {};
         std::optional<std::vector<CompileCacheWire::NodeConditionFields>> conditions {};
-        TimePoint lastSeen {};
+        core::platform::SteadyTimePoint lastSeen {};
     };
     std::map<std::string, Presence> _present;
     std::uint64_t _nextId { 1 }; ///< Guarded by _mutex.

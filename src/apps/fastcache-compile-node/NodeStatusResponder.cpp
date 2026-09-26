@@ -249,7 +249,7 @@ std::optional<std::vector<std::byte>> NodeStatusResponder::RefusePeer(PeerIdenti
                               "this node reports its identity and counters to fleet members only");
 }
 
-Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
+core::async::Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
 {
     // The verb is read back out of the frame this call was handed rather than taken on
     // the endpoint's word: `Answer` is reachable directly, which is why the gate exists
@@ -324,8 +324,8 @@ Task<FrameReply> NodeStatusResponder::Answer(std::span<std::byte const> frame, P
 }
 
 ConfiguredNodeStatus::ConfiguredNodeStatus(NodeConfig const& cfg,
-                                           IClock const& clock,
-                                           TimePoint startedAt,
+                                           core::platform::IClock const& clock,
+                                           core::platform::SteadyTimePoint startedAt,
                                            std::string version,
                                            std::string nodeId,
                                            NodeComponents components,
@@ -378,7 +378,7 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
                   "NodeStatus carries an Ed25519 public key, so the two widths are one fact");
     fields.runtime.identityPublicKey = _cfg.identityPublicKey;
     fields.uptimeSeconds =
-        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(_clock.Now() - _startedAt).count());
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(_clock.now() - _startedAt).count());
 
     namespace Bits = CompileCacheWire::NodeComponentBit;
     fields.components = (_components.cacheTier ? Bits::CacheTier : 0U) | (_components.worker ? Bits::Worker : 0U)
@@ -423,7 +423,7 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
             // ago*, and zero would report the healthy answer for both.
             if (registration->lastAccepted.has_value())
                 fields.runtime.lastRegistrationSecondsAgo = static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::seconds>(_clock.Now() - *registration->lastAccepted).count());
+                    std::chrono::duration_cast<std::chrono::seconds>(_clock.now() - *registration->lastAccepted).count());
         }
     }
 

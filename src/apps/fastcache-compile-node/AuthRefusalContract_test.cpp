@@ -2,14 +2,11 @@
 #include "CacheProxy.hpp"
 #include "LocalCache.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/ISocket.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -23,6 +20,10 @@
 #include <vector>
 
 #include <CacheProtocol.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
@@ -80,8 +81,8 @@ namespace Wire = CompileCacheWire;
 /// @return The refusal frame this build's `SchedulerProtocol` sends.
 [[nodiscard]] std::vector<std::byte> SchedulerAnswersAuthDirectly()
 {
-    ManualClock clock;
-    ManualWallClock wallClock;
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wallClock;
     AtomicMetricsSink metrics;
     NullLogger logger;
     // No `SetRole`: the refusal is answered before `Route`, so before any `Gate()`.
@@ -120,7 +121,7 @@ TEST_CASE("A credentialled client reaches a scheduler that has no AUTH and still
     Cc::CredentialNotice notice { [&said](std::string_view text) { said.emplace_back(text); } };
 
     auto const outcome =
-        SyncRun(Cc::CacheFetch(&socket, &notice, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
+        core::async::syncRun(Cc::CacheFetch(&socket, &notice, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
 
     // The command behind the credential is served. This is the half that was broken.
     REQUIRE(outcome.IsHit());
@@ -177,12 +178,13 @@ TEST_CASE("A credentialled client reaches a cache tier that has no AUTH and stil
     // into the real `Cc::CacheProtocol`.
     InMemoryLruStorage local { 64 * 1024 };
     Node::NoUpstream upstream;
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     Node::LocalCache cache { local, upstream, clock, metrics };
     Node::CacheProxy proxy { cache, metrics };
 
-    auto const refusal = SyncRun(proxy.Answer(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" })));
+    auto const refusal =
+        core::async::syncRun(proxy.Answer(Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" })));
     REQUIRE_FALSE(refusal.empty());
 
     auto const stored = std::vector<std::byte> { std::byte { 0x9 } };
@@ -192,7 +194,7 @@ TEST_CASE("A credentialled client reaches a cache tier that has no AUTH and stil
     Cc::CredentialNotice notice { [&said](std::string_view text) { said.emplace_back(text); } };
 
     auto const outcome =
-        SyncRun(Cc::CacheFetch(&socket, &notice, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
+        core::async::syncRun(Cc::CacheFetch(&socket, &notice, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
 
     REQUIRE(outcome.IsHit());
     CHECK(outcome.value == stored);

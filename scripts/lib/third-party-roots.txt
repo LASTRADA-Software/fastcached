@@ -22,9 +22,9 @@
 # A root also has to be named in `.clang-format-ignore`, which clang-format reads for
 # itself; the check refuses a root that is missing there.
 #
-# A root is the COPY, not the directory holding copies. `vendor/endo`, never `vendor`:
-# `vendor/CMakeLists.txt`, `vendor/VENDOR.md` and `vendor/MANIFEST` are written here, so
-# "is `vendor/CMakeLists.txt` first-party?" is yes -- and a root of `vendor` answers no,
+# A root is the COPY, not the directory holding copies. `vendor/monocypher`, never `vendor`:
+# `vendor/VENDOR.md` and `vendor/MANIFEST` are written here, so "is `vendor/MANIFEST`
+# first-party?" is yes -- and a root of `vendor` answers no,
 # which drops this project's own build glue from every scan that reads this file. The
 # next import is its own row.
 #
@@ -32,5 +32,4 @@
 # into `vendor/MANIFEST`, and `scripts/check-vendor-figures.cmake` requires `vendor/VENDOR.md`
 # to describe each one. So a row here is the whole of adding a root to those checks too.
 
-vendor/endo
 vendor/monocypher

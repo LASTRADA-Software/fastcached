@@ -15,11 +15,8 @@
 
 #include "TestClientCli.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
-#include <FastCache/Net/ISocket.hpp>
-#include <FastCache/Net/TcpClient.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -41,6 +38,10 @@
 #include <FileBytes.hpp>
 #include <IProcessRunner.hpp>
 #include <ReplayGuard.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
+#include <core/net/TcpClient.hpp>
 
 namespace
 {
@@ -199,13 +200,13 @@ constexpr auto DaemonTimeout = std::chrono::seconds { 30 };
 ///
 /// @param a The parsed command line.
 /// @return The connected socket; never null.
-[[nodiscard]] std::unique_ptr<ISocket> Dial(TestClient::Args const& a)
+[[nodiscard]] std::unique_ptr<core::net::ISocket> Dial(TestClient::Args const& a)
 {
-    // `SyncRun` because this tool has no reactor and `ConnectTcp` uses a blocking
+    // `core::async::syncRun` because this tool has no reactor and `core::net::connectTcp` uses a blocking
     // connector, whose task resolves inline and is therefore never left suspended --
-    // the precondition `SyncRun` states, and the same reasoning the two helpers
+    // the precondition `core::async::syncRun` states, and the same reasoning the two helpers
     // below already carry.
-    auto socket = SyncRun(ConnectTcp(std::string { a.host }, a.port, DaemonTimeout, DaemonTimeout));
+    auto socket = core::async::syncRun(core::net::connectTcp(std::string { a.host }, a.port, DaemonTimeout, DaemonTimeout));
     if (!socket.has_value())
         Die("connect failed (" + socket.error().context + ") -- is fastcached running?");
     return std::move(*socket);
@@ -213,13 +214,13 @@ constexpr auto DaemonTimeout = std::chrono::seconds { 30 };
 
 /// Send every byte, or exit.
 ///
-/// `SyncRun` over a blocking socket resolves inline, so the task is never left
-/// suspended -- the one thing `SyncRun` refuses to read from.
+/// `core::async::syncRun` over a blocking socket resolves inline, so the task is never left
+/// suspended -- the one thing `core::async::syncRun` refuses to read from.
 /// @param socket Connected socket.
 /// @param bytes What to send.
-void SendOrDie(ISocket& socket, std::span<std::byte const> bytes)
+void SendOrDie(core::net::ISocket& socket, std::span<std::byte const> bytes)
 {
-    if (!SyncRun(SendAll(&socket, bytes)))
+    if (!core::async::syncRun(core::net::sendAll(&socket, bytes)))
         Die("send failed");
 }
 
@@ -227,9 +228,9 @@ void SendOrDie(ISocket& socket, std::span<std::byte const> bytes)
 /// @param socket Connected socket.
 /// @param count How many bytes are required.
 /// @return The bytes.
-[[nodiscard]] std::vector<std::byte> RecvOrDie(ISocket& socket, std::size_t count)
+[[nodiscard]] std::vector<std::byte> RecvOrDie(core::net::ISocket& socket, std::size_t count)
 {
-    auto got = SyncRun(RecvExactly(&socket, count));
+    auto got = core::async::syncRun(core::net::receiveExactly(&socket, count));
     if (!got.has_value())
         Die("recv failed (peer closed early)");
     return std::move(*got);
@@ -246,7 +247,7 @@ void SendOrDie(ISocket& socket, std::span<std::byte const> bytes)
 /// unparseable reply, which is the failure a pre-#245 client actually has.
 /// @param client Connected client.
 /// @return The decoded terminal status and its payload.
-[[nodiscard]] std::pair<Wire::Status, std::vector<std::byte>> RecvReply(ISocket& client)
+[[nodiscard]] std::pair<Wire::Status, std::vector<std::byte>> RecvReply(core::net::ISocket& client)
 {
     while (true)
     {

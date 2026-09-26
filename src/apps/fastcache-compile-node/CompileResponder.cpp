@@ -2,7 +2,6 @@
 #include "CompileResponder.hpp"
 #include "MembershipGate.hpp"
 
-#include <FastCache/Async/ResumeOn.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -14,6 +13,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <core/async/ResumeOn.hpp>
 
 namespace FastCache::Node
 {
@@ -222,7 +223,7 @@ std::vector<std::byte> CompileResponder::EndpointRefusalReply(EndpointRefusal re
     return AnswerEndpointRefusal(_metrics, ErrorCodeFor(refusal), row.answer, row.rationale, detail);
 }
 
-Task<FrameReply> CompileResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
+core::async::Task<FrameReply> CompileResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
 {
     // The gate is re-asked here rather than taken on the endpoint's word. `Answer` is
     // reachable directly -- which is why `CacheResponder` re-asks its own -- and a
@@ -295,7 +296,7 @@ Task<FrameReply> CompileResponder::Answer(std::span<std::byte const> frame, Peer
     // stall every other connection that reactor owns, and this worker would advertise
     // its slot cap while running one job at a time -- #213, which was measured on the
     // accept loop and is exactly as reachable here.
-    co_await ResumeOn { _jobs };
+    co_await core::async::ResumeOn { _jobs };
 
     std::optional<std::vector<std::byte>> reply;
     bool threw = false;
@@ -322,7 +323,7 @@ Task<FrameReply> CompileResponder::Answer(std::span<std::byte const> frame, Peer
     // the type system or in a functional test reports it: the object is correct and the
     // write usually succeeds. `CompileResponder_test.cpp` asserts the thread identity
     // instead, because that is the only thing that can see this.
-    co_await ResumeOn { _home };
+    co_await core::async::ResumeOn { _home };
 
     if (threw)
     {

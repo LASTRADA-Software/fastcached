@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/StorageTestUtils.hpp>
-#include <FastCache/Core/Clock.hpp>
-#include <FastCache/Core/Ranges.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -43,6 +41,8 @@
 #include <CowTree/InMemoryPageStore.hpp>
 #include <CowTree/Meta.hpp>
 #include <CowTree/PageId.hpp>
+#include <core/Ranges.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace std::chrono_literals;
@@ -153,12 +153,12 @@ TEST_CASE("CowTreeStorage reports what its key index costs in RAM", "[cowstorage
     // holds memory back for a cache it is not using.
     REQUIRE((*storage)->Snapshot().indexBytes == 0);
 
-    REQUIRE((*storage)->Set("a-key", MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)->Set("a-key", MakeBytes("value"), 0, core::platform::SteadyTimePoint::max()).has_value());
     auto const one = (*storage)->Snapshot().indexBytes;
     REQUIRE(one > 0);
 
     // It GROWS with the count, which is the property the figure exists to expose.
-    REQUIRE((*storage)->Set("another-key", MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)->Set("another-key", MakeBytes("value"), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE((*storage)->Snapshot().indexBytes > one);
 
     // A longer key costs more than a short one, which is why this is accumulated
@@ -169,19 +169,23 @@ TEST_CASE("CowTreeStorage reports what its key index costs in RAM", "[cowstorage
     wideOpts.path = wide.path;
     auto wideStorage = FastCache::CowTreeStorage::Open(wideOpts);
     REQUIRE(wideStorage.has_value());
-    REQUIRE((*wideStorage)->Set(std::string(200, 'k'), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*wideStorage)
+                ->Set(std::string(200, 'k'), MakeBytes("value"), 0, core::platform::SteadyTimePoint::max())
+                .has_value());
     REQUIRE((*wideStorage)->Snapshot().indexBytes > one);
 
     // And it comes back down, or a long-running node would report an index that only
     // ever grew -- which is worse than reporting nothing, because it would be
     // believed.
-    REQUIRE((*storage)->Delete("another-key", FastCache::TimePoint::min()).has_value());
+    REQUIRE((*storage)->Delete("another-key", core::platform::SteadyTimePoint::min()).has_value());
     REQUIRE((*storage)->Snapshot().indexBytes == one);
 
     // Overwriting is not a second entry. `TouchOrInsert` takes the existing-key path
     // there, and an accumulator that counted it twice would drift upward on exactly
     // the workload a compile cache runs.
-    REQUIRE((*storage)->Set("a-key", MakeBytes("a longer value than before"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)
+                ->Set("a-key", MakeBytes("a longer value than before"), 0, core::platform::SteadyTimePoint::max())
+                .has_value());
     REQUIRE((*storage)->Snapshot().indexBytes == one);
 }
 
@@ -194,11 +198,11 @@ TEST_CASE("CowTreeStorage Set + Get round-trips", "[cowstorage]")
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
 
-    FastCache::ManualClock clock;
-    auto const cas = (*storage)->Set("k", MakeBytes("hello"), 7, FastCache::TimePoint::max());
+    core::platform::ManualClock clock;
+    auto const cas = (*storage)->Set("k", MakeBytes("hello"), 7, core::platform::SteadyTimePoint::max());
     REQUIRE(cas.has_value());
 
-    auto got = (*storage)->Get("k", clock.Now());
+    auto got = (*storage)->Get("k", clock.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(Decode(got->entry.ValueBytes()) == "hello");
@@ -211,12 +215,12 @@ TEST_CASE("CowTreeStorage entries survive close + reopen", "[cowstorage][persist
     TempFile tmp;
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("k", MakeBytes("persisted"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("k", MakeBytes("persisted"), 0, core::platform::SteadyTimePoint::max()).has_value());
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock clock;
-        auto got = storage.Get("k", clock.Now());
+        core::platform::ManualClock clock;
+        auto got = storage.Get("k", clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.ValueBytes()) == "persisted");
@@ -231,15 +235,15 @@ TEST_CASE("Empty value roundtrips, including across reopen", "[cowstorage][round
 {
     TempFile tmp;
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("empty", {}, 0, FastCache::TimePoint::max()).has_value());
-        auto got = storage.Get("empty", FastCache::ManualClock {}.Now());
+        REQUIRE(storage.Set("empty", {}, 0, core::platform::SteadyTimePoint::max()).has_value());
+        auto got = storage.Get("empty", core::platform::ManualClock {}.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(ValueOf(got->entry).empty());
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto got = storage.Get("empty", FastCache::ManualClock {}.Now());
+        auto got = storage.Get("empty", core::platform::ManualClock {}.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(ValueOf(got->entry).empty());
@@ -257,17 +261,17 @@ TEST_CASE("Every single byte 0x00..0xFF roundtrips across reopen", "[cowstorage]
             // Evaluate Set() outside REQUIRE: the macro expands its argument
             // twice (eval + stringify), which trips bugprone-use-after-move on
             // the std::move(value).
-            auto const stored = storage.Set(key, std::move(value), 0, FastCache::TimePoint::max());
+            auto const stored = storage.Set(key, std::move(value), 0, core::platform::SteadyTimePoint::max());
             REQUIRE(stored.has_value());
         }
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         for (auto const b: std::views::iota(0, 256))
         {
             auto const key = std::format("k-{:02x}", b);
-            auto got = storage.Get(key, clock.Now());
+            auto got = storage.Get(key, clock.now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
             REQUIRE(got->entry.ValueSize() == 1U);
@@ -285,11 +289,11 @@ TEST_CASE("All-byte-values blob roundtrips across reopen", "[cowstorage][roundtr
         blob.push_back(static_cast<std::byte>(static_cast<std::uint8_t>(i)));
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("blob", blob, 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("blob", blob, 0, core::platform::SteadyTimePoint::max()).has_value());
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto got = storage.Get("blob", FastCache::ManualClock {}.Now());
+        auto got = storage.Get("blob", core::platform::ManualClock {}.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(ValueOf(got->entry) == blob);
@@ -303,18 +307,18 @@ TEST_CASE("1 KiB / 64 KiB random binary roundtrips across reopen", "[cowstorage]
     auto const medium = RandomBytes(64 * 1024, 0xBBBB2222ULL);
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("small", small, 0, FastCache::TimePoint::max()).has_value());
-        REQUIRE(storage.Set("medium", medium, 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("small", small, 0, core::platform::SteadyTimePoint::max()).has_value());
+        REQUIRE(storage.Set("medium", medium, 0, core::platform::SteadyTimePoint::max()).has_value());
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock clock;
-        auto a = storage.Get("small", clock.Now());
+        core::platform::ManualClock clock;
+        auto a = storage.Get("small", clock.now());
         REQUIRE(a.has_value());
         REQUIRE(a->found);
         REQUIRE(ValueOf(a->entry) == small);
 
-        auto b = storage.Get("medium", clock.Now());
+        auto b = storage.Get("medium", clock.now());
         REQUIRE(b.has_value());
         REQUIRE(b->found);
         REQUIRE(ValueOf(b->entry) == medium);
@@ -334,12 +338,12 @@ TEST_CASE("Value exactly at maxValueBytes roundtrips; one over returns ValueTooL
     auto const fits = RandomBytes(4096, 0xCCCC3333ULL);
     auto const oversized = RandomBytes(4097, 0xDDDD4444ULL);
 
-    REQUIRE((*storage)->Set("fits", fits, 0, FastCache::TimePoint::max()).has_value());
-    auto const oversizedResult = (*storage)->Set("oversized", oversized, 0, FastCache::TimePoint::max());
+    REQUIRE((*storage)->Set("fits", fits, 0, core::platform::SteadyTimePoint::max()).has_value());
+    auto const oversizedResult = (*storage)->Set("oversized", oversized, 0, core::platform::SteadyTimePoint::max());
     REQUIRE_FALSE(oversizedResult.has_value());
     REQUIRE(oversizedResult.error().code == FastCache::StorageErrorCode::ValueTooLarge);
 
-    auto got = (*storage)->Get("fits", FastCache::ManualClock {}.Now());
+    auto got = (*storage)->Get("fits", core::platform::ManualClock {}.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(ValueOf(got->entry) == fits);
@@ -353,24 +357,24 @@ TEST_CASE("Keys with embedded NULs and non-ASCII bytes roundtrip", "[cowstorage]
     std::string const keyC { '\x00', '\x01', '\xFF' };
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set(keyA, MakeBytes("A"), 0, FastCache::TimePoint::max()).has_value());
-        REQUIRE(storage.Set(keyB, MakeBytes("B"), 0, FastCache::TimePoint::max()).has_value());
-        REQUIRE(storage.Set(keyC, MakeBytes("C"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set(keyA, MakeBytes("A"), 0, core::platform::SteadyTimePoint::max()).has_value());
+        REQUIRE(storage.Set(keyB, MakeBytes("B"), 0, core::platform::SteadyTimePoint::max()).has_value());
+        REQUIRE(storage.Set(keyC, MakeBytes("C"), 0, core::platform::SteadyTimePoint::max()).has_value());
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock clock;
-        auto a = storage.Get(keyA, clock.Now());
+        core::platform::ManualClock clock;
+        auto a = storage.Get(keyA, clock.now());
         REQUIRE(a.has_value());
         REQUIRE(a->found);
         REQUIRE(Decode(a->entry.ValueBytes()) == "A");
 
-        auto b = storage.Get(keyB, clock.Now());
+        auto b = storage.Get(keyB, clock.now());
         REQUIRE(b.has_value());
         REQUIRE(b->found);
         REQUIRE(Decode(b->entry.ValueBytes()) == "B");
 
-        auto c = storage.Get(keyC, clock.Now());
+        auto c = storage.Get(keyC, clock.now());
         REQUIRE(c.has_value());
         REQUIRE(c->found);
         REQUIRE(Decode(c->entry.ValueBytes()) == "C");
@@ -390,15 +394,15 @@ TEST_CASE("Flags roundtrip across reopen", "[cowstorage][roundtrip][metadata]")
         for (auto const i: std::views::iota(std::size_t { 0 }, std::size(kFlags)))
         {
             auto const key = std::format("flag-{}", i);
-            REQUIRE(storage.Set(key, MakeBytes("v"), kFlags[i], FastCache::TimePoint::max()).has_value());
+            REQUIRE(storage.Set(key, MakeBytes("v"), kFlags[i], core::platform::SteadyTimePoint::max()).has_value());
         }
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         for (auto const i: std::views::iota(std::size_t { 0 }, std::size(kFlags)))
         {
-            auto got = storage.Get(std::format("flag-{}", i), clock.Now());
+            auto got = storage.Get(std::format("flag-{}", i), clock.now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
             REQUIRE(got->entry.flags == kFlags[i]);
@@ -409,21 +413,21 @@ TEST_CASE("Flags roundtrip across reopen", "[cowstorage][roundtrip][metadata]")
 TEST_CASE("Expiry roundtrip across reopen", "[cowstorage][roundtrip][metadata]")
 {
     TempFile tmp;
-    FastCache::ManualClock clock;
-    auto const farFuture = clock.Now() + 24h;
+    core::platform::ManualClock clock;
+    auto const farFuture = clock.now() + 24h;
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("forever", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("forever", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
         REQUIRE(storage.Set("future", MakeBytes("v"), 0, farFuture).has_value());
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto forever = storage.Get("forever", clock.Now());
+        auto forever = storage.Get("forever", clock.now());
         REQUIRE(forever.has_value());
         REQUIRE(forever->found);
-        REQUIRE(forever->entry.expiry == FastCache::TimePoint::max());
+        REQUIRE(forever->entry.expiry == core::platform::SteadyTimePoint::max());
 
-        auto future = storage.Get("future", clock.Now());
+        auto future = storage.Get("future", clock.now());
         REQUIRE(future.has_value());
         REQUIRE(future->found);
         REQUIRE(future->entry.expiry == farFuture);
@@ -440,7 +444,7 @@ TEST_CASE("CAS tokens are strictly monotonic within a session", "[cowstorage][ca
     FastCache::CasToken last { 0 };
     for (auto const i: std::views::iota(0, 10))
     {
-        auto const cas = (*storage)->Set(std::format("k-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max());
+        auto const cas = (*storage)->Set(std::format("k-{}", i), MakeBytes("v"), 0, core::platform::SteadyTimePoint::max());
         REQUIRE(cas.has_value());
         REQUIRE(*cas > last);
         last = *cas;
@@ -460,15 +464,15 @@ TEST_CASE("Many small entries fit and read back across reopen", "[cowstorage][sh
         {
             auto const key = std::format("key-{:05d}", i);
             auto const value = std::format("value-{:05d}", i);
-            REQUIRE(storage.Set(key, MakeBytes(value), 0, FastCache::TimePoint::max()).has_value());
+            REQUIRE(storage.Set(key, MakeBytes(value), 0, core::platform::SteadyTimePoint::max()).has_value());
         }
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         // Shuffle the iteration order so the test exercises non-trivial tree paths.
         std::vector<int> order(N);
-        FastCache::Ranges::Iota(order, 0);
+        core::ranges::Iota(order, 0);
         // Deterministic seed via seed_seq for reproducibility;
         // bugprone-random-generator-seed only flags direct literal seeding.
         std::seed_seq seed { 0x12345678U, 0x9ABCDEF0U, 0x0FEDCBA9U, 0x87654321U };
@@ -477,7 +481,7 @@ TEST_CASE("Many small entries fit and read back across reopen", "[cowstorage][sh
 
         for (int const i: order)
         {
-            auto got = storage.Get(std::format("key-{:05d}", i), clock.Now());
+            auto got = storage.Get(std::format("key-{:05d}", i), clock.now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
             REQUIRE(Decode(got->entry.ValueBytes()) == std::format("value-{:05d}", i));
@@ -494,13 +498,13 @@ TEST_CASE("Sort-key prefixes do not leak across entries", "[cowstorage][shape]")
     };
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
         for (auto const& [k, v]: items)
-            REQUIRE(storage.Set(k, MakeBytes(v), 0, FastCache::TimePoint::max()).has_value());
+            REQUIRE(storage.Set(k, MakeBytes(v), 0, core::platform::SteadyTimePoint::max()).has_value());
     });
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         for (auto const& [k, v]: items)
         {
-            auto got = storage.Get(k, clock.Now());
+            auto got = storage.Get(k, clock.now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
             REQUIRE(Decode(got->entry.ValueBytes()) == v);
@@ -512,12 +516,12 @@ TEST_CASE("Update replaces in place; only the latest value persists", "[cowstora
 {
     TempFile tmp;
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("k", MakeBytes("v1"), 0, FastCache::TimePoint::max()).has_value());
-        REQUIRE(storage.Set("k", MakeBytes("v2"), 0, FastCache::TimePoint::max()).has_value());
-        REQUIRE(storage.Set("k", MakeBytes("v3"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("k", MakeBytes("v1"), 0, core::platform::SteadyTimePoint::max()).has_value());
+        REQUIRE(storage.Set("k", MakeBytes("v2"), 0, core::platform::SteadyTimePoint::max()).has_value());
+        REQUIRE(storage.Set("k", MakeBytes("v3"), 0, core::platform::SteadyTimePoint::max()).has_value());
     });
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto got = storage.Get("k", FastCache::ManualClock {}.Now());
+        auto got = storage.Get("k", core::platform::ManualClock {}.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.ValueBytes()) == "v3");
@@ -527,14 +531,14 @@ TEST_CASE("Update replaces in place; only the latest value persists", "[cowstora
 TEST_CASE("Delete + reinsert with different value persists the new value", "[cowstorage][shape]")
 {
     TempFile tmp;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("k", MakeBytes("old"), 0, FastCache::TimePoint::max()).has_value());
-        REQUIRE(storage.Delete("k", clock.Now()).has_value());
-        REQUIRE(storage.Set("k", MakeBytes("new"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("k", MakeBytes("old"), 0, core::platform::SteadyTimePoint::max()).has_value());
+        REQUIRE(storage.Delete("k", clock.now()).has_value());
+        REQUIRE(storage.Set("k", MakeBytes("new"), 0, core::platform::SteadyTimePoint::max()).has_value());
     });
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto got = storage.Get("k", clock.Now());
+        auto got = storage.Get("k", clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.ValueBytes()) == "new");
@@ -551,10 +555,10 @@ TEST_CASE("CowTreeStorage Add fails on existing key", "[cowstorage]")
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE((*storage)->Set("k", MakeBytes("first"), 0, FastCache::TimePoint::max()).has_value());
-    auto r = (*storage)->Add("k", MakeBytes("second"), 0, FastCache::TimePoint::max(), clock.Now());
+    REQUIRE((*storage)->Set("k", MakeBytes("first"), 0, core::platform::SteadyTimePoint::max()).has_value());
+    auto r = (*storage)->Add("k", MakeBytes("second"), 0, core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyExists);
 }
@@ -565,8 +569,8 @@ TEST_CASE("CowTreeStorage Replace fails when missing", "[cowstorage]")
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
-    auto r = (*storage)->Replace("k", MakeBytes("nope"), 0, FastCache::TimePoint::max(), clock.Now());
+    core::platform::ManualClock clock;
+    auto r = (*storage)->Replace("k", MakeBytes("nope"), 0, core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -574,13 +578,13 @@ TEST_CASE("CowTreeStorage Replace fails when missing", "[cowstorage]")
 TEST_CASE("Replace overwrites and persists across reopen", "[cowstorage][roundtrip]")
 {
     TempFile tmp;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("k", MakeBytes("v1"), 0, FastCache::TimePoint::max()).has_value());
-        REQUIRE(storage.Replace("k", MakeBytes("v2"), 0, FastCache::TimePoint::max(), clock.Now()).has_value());
+        REQUIRE(storage.Set("k", MakeBytes("v1"), 0, core::platform::SteadyTimePoint::max()).has_value());
+        REQUIRE(storage.Replace("k", MakeBytes("v2"), 0, core::platform::SteadyTimePoint::max(), clock.now()).has_value());
     });
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto got = storage.Get("k", clock.Now());
+        auto got = storage.Get("k", clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.ValueBytes()) == "v2");
@@ -590,24 +594,24 @@ TEST_CASE("Replace overwrites and persists across reopen", "[cowstorage][roundtr
 TEST_CASE("Append + Prepend round-trip and persist", "[cowstorage][roundtrip]")
 {
     TempFile tmp;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     auto const suffix = MakeBytes(" end");
     auto const prefix = MakeBytes("start ");
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("k", MakeBytes("middle"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("k", MakeBytes("middle"), 0, core::platform::SteadyTimePoint::max()).has_value());
         REQUIRE(
-            storage.Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, 0, clock.Now()).has_value());
+            storage.Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, 0, clock.now()).has_value());
         REQUIRE(
-            storage.Prepend("k", std::span<std::byte const> { prefix.data(), prefix.size() }, 0, clock.Now()).has_value());
-        auto got = storage.Get("k", clock.Now());
+            storage.Prepend("k", std::span<std::byte const> { prefix.data(), prefix.size() }, 0, clock.now()).has_value());
+        auto got = storage.Get("k", clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.ValueBytes()) == "start middle end");
     });
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto got = storage.Get("k", clock.Now());
+        auto got = storage.Get("k", clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.ValueBytes()) == "start middle end");
@@ -624,16 +628,16 @@ TEST_CASE("Append exceeding maxValueBytes returns ValueTooLarge and leaves value
 
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE((*storage)->Set("k", MakeBytes("0123456789ABCDE"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)->Set("k", MakeBytes("0123456789ABCDE"), 0, core::platform::SteadyTimePoint::max()).has_value());
     auto const overflow = MakeBytes("XX");
     auto const result =
-        (*storage)->Append("k", std::span<std::byte const> { overflow.data(), overflow.size() }, 0, clock.Now());
+        (*storage)->Append("k", std::span<std::byte const> { overflow.data(), overflow.size() }, 0, clock.now());
     REQUIRE_FALSE(result.has_value());
     REQUIRE(result.error().code == FastCache::StorageErrorCode::ValueTooLarge);
 
-    auto got = (*storage)->Get("k", clock.Now());
+    auto got = (*storage)->Get("k", clock.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(Decode(got->entry.ValueBytes()) == "0123456789ABCDE");
@@ -642,22 +646,22 @@ TEST_CASE("Append exceeding maxValueBytes returns ValueTooLarge and leaves value
 TEST_CASE("CompareAndSwap success path persists across reopen", "[cowstorage][cas][roundtrip]")
 {
     TempFile tmp;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::CasToken originalCas { 0 };
     FastCache::CasToken newCas { 0 };
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto const setCas = storage.Set("k", MakeBytes("one"), 0, FastCache::TimePoint::max());
+        auto const setCas = storage.Set("k", MakeBytes("one"), 0, core::platform::SteadyTimePoint::max());
         REQUIRE(setCas.has_value());
         originalCas = *setCas;
-        auto const casResult =
-            storage.CompareAndSwap("k", originalCas, MakeBytes("two"), 0, FastCache::TimePoint::max(), clock.Now());
+        auto const casResult = storage.CompareAndSwap(
+            "k", originalCas, MakeBytes("two"), 0, core::platform::SteadyTimePoint::max(), clock.now());
         REQUIRE(casResult.has_value());
         newCas = *casResult;
         REQUIRE(newCas != originalCas);
     });
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto got = storage.Get("k", clock.Now());
+        auto got = storage.Get("k", clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.ValueBytes()) == "two");
@@ -670,15 +674,16 @@ TEST_CASE("CompareAndSwap mismatch leaves entry untouched", "[cowstorage][cas]")
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const setCas = (*storage)->Set("k", MakeBytes("one"), 7, FastCache::TimePoint::max());
+    auto const setCas = (*storage)->Set("k", MakeBytes("one"), 7, core::platform::SteadyTimePoint::max());
     REQUIRE(setCas.has_value());
-    auto const wrong = (*storage)->CompareAndSwap("k", 999, MakeBytes("two"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto const wrong =
+        (*storage)->CompareAndSwap("k", 999, MakeBytes("two"), 0, core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE_FALSE(wrong.has_value());
     REQUIRE(wrong.error().code == FastCache::StorageErrorCode::CasMismatch);
 
-    auto got = (*storage)->Get("k", clock.Now());
+    auto got = (*storage)->Get("k", clock.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(Decode(got->entry.ValueBytes()) == "one");
@@ -689,24 +694,24 @@ TEST_CASE("CompareAndSwap mismatch leaves entry untouched", "[cowstorage][cas]")
 TEST_CASE("IncrementOrInitialize returns KeyNotFound on a miss; increments an existing key", "[cowstorage][incr][roundtrip]")
 {
     TempFile tmp;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
         // Contract: a missing key is a miss, NOT an auto-create. The
         // protocol layer owns the "initialize" semantics (binary
         // initial/expiration, meta J/N) and re-issues a Set on KeyNotFound.
-        auto miss = storage.IncrementOrInitialize("counter", 10, /*decrement=*/false, clock.Now());
+        auto miss = storage.IncrementOrInitialize("counter", 10, /*decrement=*/false, clock.now());
         REQUIRE_FALSE(miss.has_value());
         REQUIRE(miss.error().code == FastCache::StorageErrorCode::KeyNotFound);
 
         // Seed the key, then increment the existing value.
-        REQUIRE(storage.Set("counter", MakeBytes("10"), 0, FastCache::TimePoint::max()).has_value());
-        auto b = storage.IncrementOrInitialize("counter", 5, /*decrement=*/false, clock.Now());
+        REQUIRE(storage.Set("counter", MakeBytes("10"), 0, core::platform::SteadyTimePoint::max()).has_value());
+        auto b = storage.IncrementOrInitialize("counter", 5, /*decrement=*/false, clock.now());
         REQUIRE(b.has_value());
         REQUIRE(b->value == 15U);
     });
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto got = storage.Get("counter", clock.Now());
+        auto got = storage.Get("counter", clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.ValueBytes()) == "15");
@@ -719,10 +724,10 @@ TEST_CASE("IncrementOrInitialize floors at 0 on saturating decrement", "[cowstor
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE((*storage)->Set("k", MakeBytes("5"), 0, FastCache::TimePoint::max()).has_value());
-    auto r = (*storage)->IncrementOrInitialize("k", 10, /*decrement=*/true, clock.Now());
+    REQUIRE((*storage)->Set("k", MakeBytes("5"), 0, core::platform::SteadyTimePoint::max()).has_value());
+    auto r = (*storage)->IncrementOrInitialize("k", 10, /*decrement=*/true, clock.now());
     REQUIRE(r.has_value());
     REQUIRE(r->value == 0U);
 }
@@ -738,15 +743,15 @@ TEST_CASE("IncrementOrInitialize handles full-uint64 magnitudes without signed-o
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     constexpr std::uint64_t Huge = 1ULL << 63;
 
-    REQUIRE((*storage)->Set("k", MakeBytes("0"), 0, FastCache::TimePoint::max()).has_value());
-    auto const up = (*storage)->IncrementOrInitialize("k", Huge, /*decrement=*/false, clock.Now());
+    REQUIRE((*storage)->Set("k", MakeBytes("0"), 0, core::platform::SteadyTimePoint::max()).has_value());
+    auto const up = (*storage)->IncrementOrInitialize("k", Huge, /*decrement=*/false, clock.now());
     REQUIRE(up.has_value());
     REQUIRE(up->value == Huge); // 0 + 2^63, not aliased to a decrement
 
-    auto const down = (*storage)->IncrementOrInitialize("k", Huge, /*decrement=*/true, clock.Now());
+    auto const down = (*storage)->IncrementOrInitialize("k", Huge, /*decrement=*/true, clock.now());
     REQUIRE(down.has_value());
     REQUIRE(down->value == 0U); // 2^63 - 2^63
 }
@@ -760,14 +765,14 @@ TEST_CASE("CowTreeStorage Touch preserves the fetched bit (a touch is not a read
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, clock.Now() + 1s).has_value());
-    REQUIRE((*storage)->Get("k", clock.Now())->found);                          // fetched = true
-    REQUIRE((*storage)->Touch("k", clock.Now() + 1s, clock.Now()).has_value()); // must keep fetched
+    REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, clock.now() + 1s).has_value());
+    REQUIRE((*storage)->Get("k", clock.now())->found);                          // fetched = true
+    REQUIRE((*storage)->Touch("k", clock.now() + 1s, clock.now()).has_value()); // must keep fetched
 
-    clock.Advance(2s);
-    REQUIRE((*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
+    clock.advance(2s);
+    REQUIRE((*storage)->PurgeExpired(clock.now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
     REQUIRE((*storage)->Snapshot().expiredUnfetched == 0U);
 }
 
@@ -779,14 +784,14 @@ TEST_CASE("CowTreeStorage MarkStale preserves the fetched bit", "[cowstorage][st
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, clock.Now() + 1s).has_value());
-    REQUIRE((*storage)->Get("k", clock.Now())->found);                          // fetched = true
-    REQUIRE((*storage)->MarkStale("k", std::nullopt, clock.Now()).has_value()); // must keep fetched
+    REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, clock.now() + 1s).has_value());
+    REQUIRE((*storage)->Get("k", clock.now())->found);                          // fetched = true
+    REQUIRE((*storage)->MarkStale("k", std::nullopt, clock.now()).has_value()); // must keep fetched
 
-    clock.Advance(2s);
-    REQUIRE((*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
+    clock.advance(2s);
+    REQUIRE((*storage)->PurgeExpired(clock.now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
     REQUIRE((*storage)->Snapshot().expiredUnfetched == 0U);
 }
 
@@ -796,17 +801,17 @@ TEST_CASE("CowTreeStorage GetAndTouch refreshes the expiry and returns the entry
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, clock.Now() + 1s).has_value());
-    auto const newExpiry = clock.Now() + 60s;
-    auto const gat = (*storage)->GetAndTouch("k", newExpiry, clock.Now());
+    REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, clock.now() + 1s).has_value());
+    auto const newExpiry = clock.now() + 60s;
+    auto const gat = (*storage)->GetAndTouch("k", newExpiry, clock.now());
     REQUIRE(gat.has_value());
     REQUIRE(gat->found);
     REQUIRE(Decode(gat->entry.ValueBytes()) == "v");
     REQUIRE(gat->entry.expiry == newExpiry);
 
-    auto const miss = (*storage)->GetAndTouch("absent", newExpiry, clock.Now());
+    auto const miss = (*storage)->GetAndTouch("absent", newExpiry, clock.now());
     REQUIRE_FALSE(miss.has_value());
     REQUIRE(miss.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -817,23 +822,23 @@ TEST_CASE("CowTreeStorage CompareAndDelete honours the CAS precondition", "[cows
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const setCas = (*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
+    auto const setCas = (*storage)->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max());
     REQUIRE(setCas.has_value());
 
     // Wrong CAS -> mismatch, entry survives.
-    auto const wrong = (*storage)->CompareAndDelete("k", *setCas + 1, clock.Now());
+    auto const wrong = (*storage)->CompareAndDelete("k", *setCas + 1, clock.now());
     REQUIRE_FALSE(wrong.has_value());
     REQUIRE(wrong.error().code == FastCache::StorageErrorCode::CasMismatch);
-    REQUIRE((*storage)->Get("k", clock.Now())->found);
+    REQUIRE((*storage)->Get("k", clock.now())->found);
 
     // Right CAS -> deleted.
-    REQUIRE((*storage)->CompareAndDelete("k", *setCas, clock.Now()).has_value());
-    REQUIRE_FALSE((*storage)->Get("k", clock.Now())->found);
+    REQUIRE((*storage)->CompareAndDelete("k", *setCas, clock.now()).has_value());
+    REQUIRE_FALSE((*storage)->Get("k", clock.now())->found);
 
     // Absent key -> KeyNotFound.
-    auto const absent = (*storage)->CompareAndDelete("absent", 1, clock.Now());
+    auto const absent = (*storage)->CompareAndDelete("absent", 1, clock.now());
     REQUIRE_FALSE(absent.has_value());
     REQUIRE(absent.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -848,16 +853,18 @@ TEST_CASE("CowTreeStorage CAS mismatch path", "[cowstorage]")
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto cas = (*storage)->Set("k", MakeBytes("one"), 0, FastCache::TimePoint::max());
+    auto cas = (*storage)->Set("k", MakeBytes("one"), 0, core::platform::SteadyTimePoint::max());
     REQUIRE(cas.has_value());
 
-    auto wrong = (*storage)->CompareAndSwap("k", 999, MakeBytes("two"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto wrong =
+        (*storage)->CompareAndSwap("k", 999, MakeBytes("two"), 0, core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE_FALSE(wrong.has_value());
     REQUIRE(wrong.error().code == FastCache::StorageErrorCode::CasMismatch);
 
-    auto right = (*storage)->CompareAndSwap("k", *cas, MakeBytes("two"), 0, FastCache::TimePoint::max(), clock.Now());
+    auto right =
+        (*storage)->CompareAndSwap("k", *cas, MakeBytes("two"), 0, core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE(right.has_value());
 }
 
@@ -867,15 +874,15 @@ TEST_CASE("CowTreeStorage Delete + TTL expiry path", "[cowstorage]")
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const expiry = clock.Now() + 100ms;
+    auto const expiry = clock.now() + 100ms;
     REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, expiry).has_value());
-    auto const before = (*storage)->Get("k", clock.Now());
+    auto const before = (*storage)->Get("k", clock.now());
     REQUIRE(before->found);
 
-    clock.Advance(200ms);
-    auto const after = (*storage)->Get("k", clock.Now());
+    clock.advance(200ms);
+    auto const after = (*storage)->Get("k", clock.now());
     REQUIRE(after.has_value());
     REQUIRE_FALSE(after->found);
 }
@@ -886,14 +893,14 @@ TEST_CASE("Delete on expired entry erases the on-disk record across reopen", "[c
     // return KeyNotFound without erasing the disk record, so a
     // subsequent reopen would have the entry still occupying space.
     TempFile tmp;
-    FastCache::ManualClock clock;
-    auto const shortExpiry = clock.Now() + 1ms;
+    core::platform::ManualClock clock;
+    auto const shortExpiry = clock.now() + 1ms;
 
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
         REQUIRE(storage.Set("k", MakeBytes("v"), 0, shortExpiry).has_value());
-        FastCache::ManualClock laterClock;
-        laterClock.Advance(10ms);
-        auto deleted = storage.Delete("k", laterClock.Now());
+        core::platform::ManualClock laterClock;
+        laterClock.advance(10ms);
+        auto deleted = storage.Delete("k", laterClock.now());
         REQUIRE_FALSE(deleted.has_value());
         REQUIRE(deleted.error().code == FastCache::StorageErrorCode::KeyNotFound);
     });
@@ -901,8 +908,8 @@ TEST_CASE("Delete on expired entry erases the on-disk record across reopen", "[c
     // After reopen the entry must not resurface even if the clock is
     // rewound to before the original expiry.
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock freshClock;
-        auto got = storage.Get("k", freshClock.Now());
+        core::platform::ManualClock freshClock;
+        auto got = storage.Get("k", freshClock.now());
         REQUIRE(got.has_value());
         REQUIRE_FALSE(got->found);
     });
@@ -921,25 +928,25 @@ TEST_CASE("Get on an expired entry does NOT mutate the tree (no BeginWrite from 
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
-    auto const shortExpiry = clock.Now() + 1ms;
+    core::platform::ManualClock clock;
+    auto const shortExpiry = clock.now() + 1ms;
     REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, shortExpiry).has_value());
-    clock.Advance(10ms);
+    clock.advance(10ms);
 
     // Issue several Gets back-to-back; none should return found, none
     // should mutate the tree visibly to subsequent Gets.
     for ([[maybe_unused]] auto const i: std::views::iota(0, 5))
     {
-        auto got = (*storage)->Get("k", clock.Now());
+        auto got = (*storage)->Get("k", clock.now());
         REQUIRE(got.has_value());
         REQUIRE_FALSE(got->found);
     }
 
     // PurgeExpired should now report 1 victim and remove it.
-    auto const purged = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged;
+    auto const purged = (*storage)->PurgeExpired(clock.now(), FastCache::PurgeBudget::Unbounded()).purged;
     REQUIRE(purged == 1U);
 
-    auto after = (*storage)->Get("k", clock.Now());
+    auto after = (*storage)->Get("k", clock.now());
     REQUIRE(after.has_value());
     REQUIRE_FALSE(after->found);
 }
@@ -950,21 +957,23 @@ TEST_CASE("PurgeExpired clears all expired entries and reports the count", "[cow
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
-    auto const shortExpiry = clock.Now() + 1ms;
+    core::platform::ManualClock clock;
+    auto const shortExpiry = clock.now() + 1ms;
 
     for (auto const i: std::views::iota(0, 6))
         REQUIRE((*storage)->Set(std::format("expire-{}", i), MakeBytes("v"), 0, shortExpiry).has_value());
     for (auto const i: std::views::iota(0, 4))
-        REQUIRE((*storage)->Set(std::format("keep-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)
+                    ->Set(std::format("keep-{}", i), MakeBytes("v"), 0, core::platform::SteadyTimePoint::max())
+                    .has_value());
 
-    clock.Advance(10ms);
-    auto const purged = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged;
+    clock.advance(10ms);
+    auto const purged = (*storage)->PurgeExpired(clock.now(), FastCache::PurgeBudget::Unbounded()).purged;
     REQUIRE(purged == 6U);
 
     for (auto const i: std::views::iota(0, 4))
     {
-        auto got = (*storage)->Get(std::format("keep-{}", i), clock.Now());
+        auto got = (*storage)->Get(std::format("keep-{}", i), clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
     }
@@ -978,15 +987,15 @@ TEST_CASE("CowTreeStorage counts every expiry, whichever path removed it", "[cow
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
-    REQUIRE((*storage)->Set("deleted", MakeBytes("v"), 0, clock.Now() + 1ms).has_value());
-    REQUIRE((*storage)->Set("swept", MakeBytes("v"), 0, clock.Now() + 1ms).has_value());
-    REQUIRE((*storage)->Set("kept", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+    core::platform::ManualClock clock;
+    REQUIRE((*storage)->Set("deleted", MakeBytes("v"), 0, clock.now() + 1ms).has_value());
+    REQUIRE((*storage)->Set("swept", MakeBytes("v"), 0, clock.now() + 1ms).has_value());
+    REQUIRE((*storage)->Set("kept", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
-    clock.Advance(10ms);
-    REQUIRE_FALSE((*storage)->Delete("deleted", clock.Now()).has_value());
+    clock.advance(10ms);
+    REQUIRE_FALSE((*storage)->Delete("deleted", clock.now()).has_value());
     CHECK((*storage)->Snapshot().expirations == 1U);
-    REQUIRE((*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
+    REQUIRE((*storage)->PurgeExpired(clock.now(), FastCache::PurgeBudget::Unbounded()).purged == 1U);
     CHECK((*storage)->Snapshot().expirations == 2U);
 }
 
@@ -1000,31 +1009,33 @@ TEST_CASE("PurgeExpired on the disk tier is bounded and resumes", "[cowstorage][
     FastCache::CowTreeStorage::Options opts { .path = tmp.path };
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     // Written first, so the newest-first mirror leaves them BEHIND the live
     // ones -- out of reach of a sweep that restarted at the front each cycle.
     for (auto const i: std::views::iota(0, 3))
-        REQUIRE((*storage)->Set(std::format("expire-{}", i), MakeBytes("v"), 0, clock.Now() + 1ms).has_value());
+        REQUIRE((*storage)->Set(std::format("expire-{}", i), MakeBytes("v"), 0, clock.now() + 1ms).has_value());
     for (auto const i: std::views::iota(0, 4))
-        REQUIRE((*storage)->Set(std::format("keep-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
-    clock.Advance(10ms);
+        REQUIRE((*storage)
+                    ->Set(std::format("keep-{}", i), MakeBytes("v"), 0, core::platform::SteadyTimePoint::max())
+                    .has_value());
+    clock.advance(10ms);
 
-    auto const first = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 4 });
+    auto const first = (*storage)->PurgeExpired(clock.now(), FastCache::PurgeBudget { .maxScanned = 4 });
     CHECK(first.scanned == 4U);
     CHECK(first.purged == 0U);
     CHECK_FALSE(first.completedPass);
 
-    auto const second = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 3 });
+    auto const second = (*storage)->PurgeExpired(clock.now(), FastCache::PurgeBudget { .maxScanned = 3 });
     CHECK(second.purged == 3U);
 
     for (auto const i: std::views::iota(0, 4))
     {
-        auto const got = (*storage)->Get(std::format("keep-{}", i), clock.Now());
+        auto const got = (*storage)->Get(std::format("keep-{}", i), clock.now());
         REQUIRE(got.has_value());
         CHECK(got->found);
     }
-    CHECK((*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded()).completedPass);
+    CHECK((*storage)->PurgeExpired(clock.now(), FastCache::PurgeBudget::Unbounded()).completedPass);
 }
 
 // ============================================================================
@@ -1040,21 +1051,23 @@ TEST_CASE("EvictToFit drops LRU tail when over maxBytes", "[cowstorage][eviction
 
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     // Insert until total bytes exceeds the cap; the cap+eviction model
     // is best-effort soft.
     for (auto const i: std::views::iota(0, 50))
     {
         auto const value = std::format("v-{:08d}", i); // 10 bytes each
-        REQUIRE((*storage)->Set(std::format("k-{:03d}", i), MakeBytes(value), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)
+                    ->Set(std::format("k-{:03d}", i), MakeBytes(value), 0, core::platform::SteadyTimePoint::max())
+                    .has_value());
     }
     auto const stats = (*storage)->Snapshot();
     REQUIRE(stats.bytesUsed <= opts.maxBytes);
     REQUIRE(stats.evictions > 0U);
 
     // The most recently inserted keys should still be readable.
-    auto last = (*storage)->Get("k-049", clock.Now());
+    auto last = (*storage)->Get("k-049", clock.now());
     REQUIRE(last.has_value());
     REQUIRE(last->found);
 }
@@ -1074,7 +1087,7 @@ TEST_CASE("Resize shrinks budget and triggers immediate eviction", "[cowstorage]
                     ->Set(std::format("k-{:03d}", i),
                           RandomBytes(64, static_cast<std::uint64_t>(i)),
                           0,
-                          FastCache::TimePoint::max())
+                          core::platform::SteadyTimePoint::max())
                     .has_value());
     auto const before = (*storage)->Snapshot();
     REQUIRE(before.itemCount == 100U);
@@ -1101,17 +1114,17 @@ TEST_CASE("Three Open/Close cycles preserve every entry", "[cowstorage][persist]
                             .Set(std::format("k-{:04d}", i),
                                  MakeBytes(std::format("v-{:04d}", i)),
                                  0,
-                                 FastCache::TimePoint::max())
+                                 core::platform::SteadyTimePoint::max())
                             .has_value());
         });
     };
 
     auto verify = [&] {
         WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-            FastCache::ManualClock clock;
+            core::platform::ManualClock clock;
             for (auto const i: std::views::iota(0, N))
             {
-                auto got = storage.Get(std::format("k-{:04d}", i), clock.Now());
+                auto got = storage.Get(std::format("k-{:04d}", i), clock.now());
                 REQUIRE(got.has_value());
                 REQUIRE(got->found);
                 REQUIRE(Decode(got->entry.ValueBytes()) == std::format("v-{:04d}", i));
@@ -1128,39 +1141,47 @@ TEST_CASE("Three Open/Close cycles preserve every entry", "[cowstorage][persist]
 TEST_CASE("Mixed Set/Update/Delete script replays identically across a mid-script reopen", "[cowstorage][persist]")
 {
     TempFile tmp;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     // Phase 1: Set 20 keys, update 10 of them, delete 5.
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
         for (auto const i: std::views::iota(0, 20))
-            REQUIRE(storage.Set(std::format("k-{}", i), MakeBytes(std::format("v0-{}", i)), 0, FastCache::TimePoint::max())
+            REQUIRE(storage
+                        .Set(std::format("k-{}", i),
+                             MakeBytes(std::format("v0-{}", i)),
+                             0,
+                             core::platform::SteadyTimePoint::max())
                         .has_value());
         for (auto const i: std::views::iota(0, 10))
-            REQUIRE(storage.Set(std::format("k-{}", i), MakeBytes(std::format("v1-{}", i)), 0, FastCache::TimePoint::max())
+            REQUIRE(storage
+                        .Set(std::format("k-{}", i),
+                             MakeBytes(std::format("v1-{}", i)),
+                             0,
+                             core::platform::SteadyTimePoint::max())
                         .has_value());
         for (auto const i: std::views::iota(15, 20))
-            REQUIRE(storage.Delete(std::format("k-{}", i), clock.Now()).has_value());
+            REQUIRE(storage.Delete(std::format("k-{}", i), clock.now()).has_value());
     });
 
     // Phase 2: After reopen, verify the expected state.
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
         for (auto const i: std::views::iota(0, 10))
         {
-            auto got = storage.Get(std::format("k-{}", i), clock.Now());
+            auto got = storage.Get(std::format("k-{}", i), clock.now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
             REQUIRE(Decode(got->entry.ValueBytes()) == std::format("v1-{}", i));
         }
         for (auto const i: std::views::iota(10, 15))
         {
-            auto got = storage.Get(std::format("k-{}", i), clock.Now());
+            auto got = storage.Get(std::format("k-{}", i), clock.now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
             REQUIRE(Decode(got->entry.ValueBytes()) == std::format("v0-{}", i));
         }
         for (auto const i: std::views::iota(15, 20))
         {
-            auto got = storage.Get(std::format("k-{}", i), clock.Now());
+            auto got = storage.Get(std::format("k-{}", i), clock.now());
             REQUIRE(got.has_value());
             REQUIRE_FALSE(got->found);
         }
@@ -1184,7 +1205,7 @@ TEST_CASE("Open with a non-existent path under an existing directory creates the
         opts.path = path;
         auto storage = FastCache::CowTreeStorage::Open(opts);
         REQUIRE(storage.has_value());
-        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
     REQUIRE(std::filesystem::exists(path));
     std::filesystem::remove(path, ec);
@@ -1324,7 +1345,7 @@ TEST_CASE("Damage to both meta pages refuses the store at Open, and refuses it a
     {
         auto storage = OpenDamaged(tmp.path);
         REQUIRE(storage.has_value());
-        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
 
     // Only the two meta slots. Everything beneath them is left exactly as the
@@ -1402,7 +1423,8 @@ TEST_CASE("Damage below the meta pages still opens, and costs keys rather than t
         auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
         REQUIRE(storage.has_value());
         for (auto const i: std::views::iota(0, DamageRecords))
-            REQUIRE((*storage)->Set(DamageKey(i), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+            REQUIRE(
+                (*storage)->Set(DamageKey(i), MakeBytes("value"), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
 
     auto const pageCount = store.PageCount();
@@ -1454,7 +1476,7 @@ TEST_CASE("Damage below the meta pages still opens, and costs keys rather than t
         }
         else
         {
-            FastCache::ManualClock clock;
+            core::platform::ManualClock clock;
             auto corrupt = 0;
             auto readable = 0;
             for (auto const i: std::views::iota(0, DamageRecords))
@@ -1466,7 +1488,7 @@ TEST_CASE("Damage below the meta pages still opens, and costs keys rather than t
                 // it says to copy the file before deleting it.
                 if (corrupt > 0 && readable > 0)
                     break;
-                auto const got = (*storage)->Get(DamageKey(i), clock.Now());
+                auto const got = (*storage)->Get(DamageKey(i), clock.now());
                 if (!got.has_value())
                 {
                     if (got.error().code == FastCache::StorageErrorCode::Corrupt)
@@ -1631,7 +1653,9 @@ constexpr int MetaDamageKeysPerGeneration = 5;
         auto storage = OpenDamaged(path);
         REQUIRE(storage.has_value());
         for (auto const i: std::views::iota(0, MetaDamageKeysPerGeneration))
-            REQUIRE((*storage)->Set(GenerationKey(gen, i), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+            REQUIRE((*storage)
+                        ->Set(GenerationKey(gen, i), MakeBytes("value"), 0, core::platform::SteadyTimePoint::max())
+                        .has_value());
     }
 
     // The fixture's own precondition, asserted rather than assumed: two slots,
@@ -1777,13 +1801,13 @@ TEST_CASE("One damaged meta slot leaves the store open, silent, and on the survi
         REQUIRE(opened.has_value());
         REQUIRE(said.empty());
 
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         for (auto const gen: std::views::iota(1, MetaDamageGenerations + 1))
         {
             for (auto const i: std::views::iota(0, MetaDamageKeysPerGeneration))
             {
                 CAPTURE(gen, i);
-                auto const got = (*opened)->Get(GenerationKey(gen, i), clock.Now());
+                auto const got = (*opened)->Get(GenerationKey(gen, i), clock.now());
                 // A key from a commit the surviving slot never saw is a MISS,
                 // not a failure: the store is internally consistent, it is just
                 // consistent with an earlier moment. Reporting `Corrupt` for it
@@ -1865,7 +1889,9 @@ TEST_CASE("Recovering onto the surviving meta slot does not spend it", "[cowstor
                 // wrote, reopened with the durability an operator picks for safety.
                 auto storage = OpenDamaged(tmp.path, durabilityRow.durability);
                 REQUIRE(storage.has_value());
-                REQUIRE((*storage)->Set("after-recovery", MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+                REQUIRE((*storage)
+                            ->Set("after-recovery", MakeBytes("value"), 0, core::platform::SteadyTimePoint::max())
+                            .has_value());
             }
 
             auto const after = ReadWholeFile(tmp.path);
@@ -2215,7 +2241,7 @@ TEST_CASE("A v3 store converts in place, and every entry survives it", "[cowstor
         {
             auto const& sample = samples[index];
             auto bytes = RandomBytes(sample.size, 0xA5A5ULL + index);
-            REQUIRE((*storage)->Set(sample.key, bytes, sample.flags, FastCache::TimePoint::max()).has_value());
+            REQUIRE((*storage)->Set(sample.key, bytes, sample.flags, core::platform::SteadyTimePoint::max()).has_value());
             written.emplace(sample.key, std::move(bytes));
         }
     }
@@ -2247,10 +2273,10 @@ TEST_CASE("A v3 store converts in place, and every entry survives it", "[cowstor
     auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
     REQUIRE(storage.has_value());
 
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     for (auto const& sample: samples)
     {
-        auto const got = (*storage)->Get(sample.key, clock.Now());
+        auto const got = (*storage)->Get(sample.key, clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(FastCache::Testing::ValueOf(got->entry) == written.at(sample.key));
@@ -2278,7 +2304,9 @@ TEST_CASE("An interrupted conversion is refused by name rather than mis-parsed",
         auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
         REQUIRE(storage.has_value());
         for (auto const i: std::views::iota(0, 6))
-            REQUIRE((*storage)->Set(std::format("key-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+            REQUIRE((*storage)
+                        ->Set(std::format("key-{}", i), MakeBytes("v"), 0, core::platform::SteadyTimePoint::max())
+                        .has_value());
     }
     DowngradeStoreToV3(store, 2);
 
@@ -2310,7 +2338,9 @@ TEST_CASE("A conversion another build started is never picked up", "[cowstorage]
         auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
         REQUIRE(storage.has_value());
         for (auto const i: std::views::iota(0, 6))
-            REQUIRE((*storage)->Set(std::format("key-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+            REQUIRE((*storage)
+                        ->Set(std::format("key-{}", i), MakeBytes("v"), 0, core::platform::SteadyTimePoint::max())
+                        .has_value());
     }
     DowngradeStoreToV3(store, 2, Future);
 
@@ -2350,7 +2380,9 @@ TEST_CASE("Resuming converts only what is left, and never the same record twice"
         {
             auto const key = std::format("key-{}", i);
             auto bytes = RandomBytes(64 + static_cast<std::size_t>(i), 0xBEEFULL + static_cast<std::uint64_t>(i));
-            REQUIRE((*storage)->Set(key, bytes, static_cast<std::uint32_t>(i) + 1, FastCache::TimePoint::max()).has_value());
+            REQUIRE((*storage)
+                        ->Set(key, bytes, static_cast<std::uint32_t>(i) + 1, core::platform::SteadyTimePoint::max())
+                        .has_value());
             written.emplace(key, std::move(bytes));
         }
     }
@@ -2365,11 +2397,11 @@ TEST_CASE("Resuming converts only what is left, and never the same record twice"
     FastCache::CowTreeStorage::Options opts;
     auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     for (auto const i: std::views::iota(0, Total))
     {
         auto const key = std::format("key-{}", i);
-        auto const got = (*storage)->Get(key, clock.Now());
+        auto const got = (*storage)->Get(key, clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(FastCache::Testing::ValueOf(got->entry) == written.at(key));
@@ -2399,7 +2431,9 @@ TEST_CASE("A conversion killed part-way finishes correctly on a re-run", "[cowst
             {
                 auto const key = std::format("key-{:05d}", i);
                 auto bytes = MakeBytes(std::format("value-{}", i));
-                REQUIRE((*storage)->Set(key, bytes, static_cast<std::uint32_t>(i), FastCache::TimePoint::max()).has_value());
+                REQUIRE((*storage)
+                            ->Set(key, bytes, static_cast<std::uint32_t>(i), core::platform::SteadyTimePoint::max())
+                            .has_value());
                 written.emplace(key, std::move(bytes));
             }
         }
@@ -2420,11 +2454,11 @@ TEST_CASE("A conversion killed part-way finishes correctly on a re-run", "[cowst
         FastCache::CowTreeStorage::Options opts;
         auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
         REQUIRE(storage.has_value());
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         for (auto const i: std::views::iota(0, Total))
         {
             auto const key = std::format("key-{:05d}", i);
-            auto const got = (*storage)->Get(key, clock.Now());
+            auto const got = (*storage)->Get(key, clock.now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
             REQUIRE(FastCache::Testing::ValueOf(got->entry) == written.at(key));
@@ -2463,7 +2497,7 @@ TEST_CASE("Converting a store costs a slice of headroom, not a multiple of the s
             {
                 auto const key = std::format("key-{:05d}", i);
                 auto bytes = MakeBytes(std::format("value-{}", i));
-                REQUIRE((*storage)->Set(key, bytes, 0, FastCache::TimePoint::max()).has_value());
+                REQUIRE((*storage)->Set(key, bytes, 0, core::platform::SteadyTimePoint::max()).has_value());
                 written.emplace(key, std::move(bytes));
             }
         }
@@ -2485,10 +2519,10 @@ TEST_CASE("Converting a store costs a slice of headroom, not a multiple of the s
         // property under test.
         auto storage = FastCache::CowTreeStorage::Open(opts);
         REQUIRE(storage.has_value());
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         for (auto const& [key, value]: written)
         {
-            auto const got = (*storage)->Get(key, clock.Now());
+            auto const got = (*storage)->Get(key, clock.now());
             REQUIRE(got.has_value());
             REQUIRE(got->found);
             REQUIRE(FastCache::Testing::ValueOf(got->entry) == value);
@@ -2519,7 +2553,7 @@ TEST_CASE("A record whose expiry does not fit the clock is decoded, not undefine
         opts.compression = FastCache::CompressionCodec::Identity;
         auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
         REQUIRE(storage.has_value());
-        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
 
     // Rewrite the record's expiry field to a microsecond count that is huge but
@@ -2555,10 +2589,10 @@ TEST_CASE("A record whose expiry does not fit the clock is decoded, not undefine
     // Clamped to "never", which is the nearest representable instant, and the
     // entry is still readable rather than the process being in undefined
     // behaviour.
-    auto const got = (*storage)->Peek("k", FastCache::ManualClock {}.Now());
+    auto const got = (*storage)->Peek("k", core::platform::ManualClock {}.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
-    REQUIRE(got->entry.expiry == FastCache::TimePoint::max());
+    REQUIRE(got->entry.expiry == core::platform::SteadyTimePoint::max());
 }
 
 TEST_CASE("A store older than any reader is refused, not rewritten in place", "[cowstorage][format][migrate]")
@@ -2623,7 +2657,7 @@ TEST_CASE("Converting a store already at the current version changes nothing", "
         FastCache::CowTreeStorage::Options opts;
         auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
         REQUIRE(storage.has_value());
-        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
 
     auto const report = FastCache::CowTreeStorage::MigrateStore(store);
@@ -2668,7 +2702,7 @@ TEST_CASE("A converted store keeps working as a cache", "[cowstorage][format][mi
         opts.compression = FastCache::CompressionCodec::Identity;
         auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
         REQUIRE(storage.has_value());
-        REQUIRE((*storage)->Set("old", MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)->Set("old", MakeBytes("value"), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
     DowngradeStoreToV3(store);
     REQUIRE(FastCache::CowTreeStorage::MigrateStore(store).has_value());
@@ -2677,16 +2711,16 @@ TEST_CASE("A converted store keeps working as a cache", "[cowstorage][format][mi
     auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
     REQUIRE(storage.has_value());
 
-    FastCache::ManualClock clock;
-    REQUIRE((*storage)->Set("new", MakeBytes("written-after"), 0, FastCache::TimePoint::max()).has_value());
-    REQUIRE((*storage)->Delete("old", clock.Now()).has_value());
+    core::platform::ManualClock clock;
+    REQUIRE((*storage)->Set("new", MakeBytes("written-after"), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE((*storage)->Delete("old", clock.now()).has_value());
 
-    auto const fresh = (*storage)->Get("new", clock.Now());
+    auto const fresh = (*storage)->Get("new", clock.now());
     REQUIRE(fresh.has_value());
     REQUIRE(fresh->found);
     REQUIRE(Decode(fresh->entry.ValueBytes()) == "written-after");
 
-    auto const gone = (*storage)->Get("old", clock.Now());
+    auto const gone = (*storage)->Get("old", clock.now());
     REQUIRE(gone.has_value());
     REQUIRE_FALSE(gone->found);
 }
@@ -2699,7 +2733,7 @@ TEST_CASE("Converting a second time reports nothing left to do", "[cowstorage][f
         opts.compression = FastCache::CompressionCodec::Identity;
         auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
         REQUIRE(storage.has_value());
-        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
     DowngradeStoreToV3(store);
 
@@ -2725,7 +2759,7 @@ TEST_CASE("Set above maxValueBytes returns ValueTooLarge", "[cowstorage][boundar
     REQUIRE(storage.has_value());
 
     auto const too_big = RandomBytes(33, 0x1ULL);
-    auto const r = (*storage)->Set("k", too_big, 0, FastCache::TimePoint::max());
+    auto const r = (*storage)->Set("k", too_big, 0, core::platform::SteadyTimePoint::max());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::ValueTooLarge);
 }
@@ -2733,21 +2767,21 @@ TEST_CASE("Set above maxValueBytes returns ValueTooLarge", "[cowstorage][boundar
 TEST_CASE("Touch refreshes expiry and bumps CAS, persists across reopen", "[cowstorage][touch]")
 {
     TempFile tmp;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::CowTreeStorage::Options opts;
     opts.path = tmp.path;
 
     auto firstCas = FastCache::CasToken { 0 };
-    auto extendedExpiry = clock.Now() + 60s;
+    auto extendedExpiry = clock.now() + 60s;
     {
         auto storage = FastCache::CowTreeStorage::Open(opts);
         REQUIRE(storage.has_value());
 
-        auto const setCas = (*storage)->Set("k", MakeBytes("payload"), 0xBEEF, clock.Now() + 1s);
+        auto const setCas = (*storage)->Set("k", MakeBytes("payload"), 0xBEEF, clock.now() + 1s);
         REQUIRE(setCas.has_value());
         firstCas = *setCas;
 
-        auto const touched = (*storage)->Touch("k", extendedExpiry, clock.Now());
+        auto const touched = (*storage)->Touch("k", extendedExpiry, clock.now());
         REQUIRE(touched.has_value());
         REQUIRE(*touched != firstCas);
 
@@ -2758,7 +2792,7 @@ TEST_CASE("Touch refreshes expiry and bumps CAS, persists across reopen", "[cows
     // Reopen: the touch should have persisted (extended expiry + new CAS).
     auto reopened = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(reopened.has_value());
-    auto const got = (*reopened)->Get("k", clock.Now() + 30s);
+    auto const got = (*reopened)->Get("k", clock.now() + 30s);
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(Decode(got->entry.ValueBytes()) == "payload");
@@ -2769,14 +2803,14 @@ TEST_CASE("Touch refreshes expiry and bumps CAS, persists across reopen", "[cows
 TEST_CASE("Touch on absent key returns KeyNotFound + bumps touchMisses", "[cowstorage][touch]")
 {
     TempFile tmp;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::CowTreeStorage::Options opts;
     opts.path = tmp.path;
 
     auto storage = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(storage.has_value());
 
-    auto const r = (*storage)->Touch("nope", FastCache::TimePoint::max(), clock.Now());
+    auto const r = (*storage)->Touch("nope", core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
     REQUIRE((*storage)->Snapshot().touchMisses == 1U);
@@ -2785,21 +2819,21 @@ TEST_CASE("Touch on absent key returns KeyNotFound + bumps touchMisses", "[cowst
 TEST_CASE("CowTree v2 trailer round-trips lastAccess and stale across reopen", "[cowstorage][v2]")
 {
     TempFile tmp;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::CowTreeStorage::Options opts;
     opts.path = tmp.path;
-    clock.Advance(7s);
-    auto const t = clock.Now();
+    clock.advance(7s);
+    auto const t = clock.now();
 
     {
         auto storage = FastCache::CowTreeStorage::Open(opts);
         REQUIRE(storage.has_value());
-        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
         // Touch persists lastAccess; MarkStale persists the stale flag.
         // (A read no longer writes — see the "no write on read" test — so
         // we exercise the trailer via the write paths that legitimately
         // own those fields.)
-        REQUIRE((*storage)->Touch("k", FastCache::TimePoint::max(), t).has_value());
+        REQUIRE((*storage)->Touch("k", core::platform::SteadyTimePoint::max(), t).has_value());
         REQUIRE((*storage)->MarkStale("k", std::nullopt, t).has_value());
     }
 
@@ -2821,20 +2855,20 @@ TEST_CASE("CowTreeStorage Get does not persist lastAccess (no write on a read pa
     // the persisted value (set by Set, which never reads) stays the unset
     // sentinel across a reopen.
     TempFile tmp;
-    FastCache::ManualClock clock;
-    clock.Advance(100s);
+    core::platform::ManualClock clock;
+    clock.advance(100s);
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
-        auto const got = storage.Get("k", clock.Now());
+        REQUIRE(storage.Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
+        auto const got = storage.Get("k", clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
-        REQUIRE(got->entry.lastAccess == clock.Now()); // fresh in the returned copy
+        REQUIRE(got->entry.lastAccess == clock.now()); // fresh in the returned copy
     });
     WithOpenStorage(tmp.path, [&](FastCache::CowTreeStorage& storage) {
-        auto const peeked = storage.Peek("k", clock.Now());
+        auto const peeked = storage.Peek("k", clock.now());
         REQUIRE(peeked.has_value());
         REQUIRE(peeked->found);
-        REQUIRE(peeked->entry.lastAccess == FastCache::TimePoint::min()); // never written by the read
+        REQUIRE(peeked->entry.lastAccess == core::platform::SteadyTimePoint::min()); // never written by the read
     });
 }
 
@@ -2870,17 +2904,17 @@ TEST_CASE("Overflow chains round-trip across many sizes and survive reopen", "[c
         for (auto const size: sizes)
         {
             auto const value = RandomBytes(size, 0xA000ULL + size);
-            REQUIRE((*storage)->Set(std::format("k{}", size), value, 0, FastCache::TimePoint::max()).has_value());
+            REQUIRE((*storage)->Set(std::format("k{}", size), value, 0, core::platform::SteadyTimePoint::max()).has_value());
         }
     }
 
     auto reopened = FastCache::CowTreeStorage::Open(OverflowOptions(tmp.path));
     REQUIRE(reopened.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     for (auto const size: sizes)
     {
         auto const value = RandomBytes(size, 0xA000ULL + size);
-        auto const got = (*reopened)->Get(std::format("k{}", size), clock.Now());
+        auto const got = (*reopened)->Get(std::format("k{}", size), clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(ValueOf(got->entry) == value); // exact bytewise round-trip via the chain
@@ -2895,18 +2929,19 @@ TEST_CASE("Overwriting a large value reclaims the old overflow chain", "[cowstor
     auto storage = FastCache::CowTreeStorage::Open(OverflowOptions(tmp.path, CowTree::FilePageStore::Durability::Fsync));
     REQUIRE(storage.has_value());
 
-    REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 1), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 1), 0, core::platform::SteadyTimePoint::max()).has_value());
     auto const afterFirst = std::filesystem::file_size(tmp.path);
 
     for (auto const i: std::views::iota(0U, 12U))
-        REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 100U + i), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(
+            (*storage)->Set("k", RandomBytes(256 * 1024, 100U + i), 0, core::platform::SteadyTimePoint::max()).has_value());
     auto const afterMany = std::filesystem::file_size(tmp.path);
 
     // Each overwrite frees the previous chain, so the file reuses pages instead
     // of growing ~12x. (A leak would push this well past 3x.)
     REQUIRE(afterMany < afterFirst * 3);
 
-    auto const got = (*storage)->Get("k", FastCache::ManualClock {}.Now());
+    auto const got = (*storage)->Get("k", core::platform::ManualClock {}.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(ValueOf(got->entry) == RandomBytes(256 * 1024, 111)); // last write wins
@@ -2919,19 +2954,20 @@ TEST_CASE("Deleting a large value frees its overflow chain for reuse", "[cowstor
     // (Batched would defer the freed-chain reuse to the group-commit boundary).
     auto storage = FastCache::CowTreeStorage::Open(OverflowOptions(tmp.path, CowTree::FilePageStore::Durability::Fsync));
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 5), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 5), 0, core::platform::SteadyTimePoint::max()).has_value());
     auto const afterFirst = std::filesystem::file_size(tmp.path);
     for (auto const i: std::views::iota(0U, 8U))
     {
-        REQUIRE((*storage)->Delete("k", clock.Now()).has_value());
-        REQUIRE((*storage)->Set("k", RandomBytes(256 * 1024, 200U + i), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)->Delete("k", clock.now()).has_value());
+        REQUIRE(
+            (*storage)->Set("k", RandomBytes(256 * 1024, 200U + i), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
     REQUIRE(std::filesystem::file_size(tmp.path) < afterFirst * 3);
 
-    REQUIRE((*storage)->Delete("k", clock.Now()).has_value());
-    auto const got = (*storage)->Get("k", clock.Now());
+    REQUIRE((*storage)->Delete("k", clock.now()).has_value());
+    auto const got = (*storage)->Get("k", clock.now());
     REQUIRE(got.has_value());
     REQUIRE_FALSE(got->found);
 }
@@ -2945,7 +2981,7 @@ TEST_CASE("Crash during overflow-chain write leaves the previous value intact", 
     {
         auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
         REQUIRE(storage.has_value());
-        REQUIRE((*storage)->Set("k", MakeBytes("initial"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("initial"), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
 
     {
@@ -2955,7 +2991,7 @@ TEST_CASE("Crash during overflow-chain write leaves the previous value intact", 
         plan.failNthWrite = 1; // fail the first overflow-chunk write
         store.SetFaultPlan(plan);
         store.ResetCounters();
-        auto const r = (*storage)->Set("k", RandomBytes(50000, 9), 0, FastCache::TimePoint::max());
+        auto const r = (*storage)->Set("k", RandomBytes(50000, 9), 0, core::platform::SteadyTimePoint::max());
         REQUIRE_FALSE(r.has_value());
     }
 
@@ -2963,7 +2999,7 @@ TEST_CASE("Crash during overflow-chain write leaves the previous value intact", 
     store.ResetCounters();
     auto reopened = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
     REQUIRE(reopened.has_value());
-    auto const got = (*reopened)->Get("k", FastCache::ManualClock {}.Now());
+    auto const got = (*reopened)->Get("k", core::platform::ManualClock {}.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(Decode(got->entry.ValueBytes()) == "initial"); // rolled back, never a hybrid
@@ -2978,7 +3014,7 @@ TEST_CASE("Crash during overflow SyncData leaves the previous value intact", "[c
     {
         auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
         REQUIRE(storage.has_value());
-        REQUIRE((*storage)->Set("k", MakeBytes("initial"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*storage)->Set("k", MakeBytes("initial"), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
 
     {
@@ -2988,7 +3024,7 @@ TEST_CASE("Crash during overflow SyncData leaves the previous value intact", "[c
         plan.failNthSyncData = 1; // fail the durability barrier before the meta flip
         store.SetFaultPlan(plan);
         store.ResetCounters();
-        auto const r = (*storage)->Set("k", RandomBytes(50000, 11), 0, FastCache::TimePoint::max());
+        auto const r = (*storage)->Set("k", RandomBytes(50000, 11), 0, core::platform::SteadyTimePoint::max());
         REQUIRE_FALSE(r.has_value());
     }
 
@@ -2996,7 +3032,7 @@ TEST_CASE("Crash during overflow SyncData leaves the previous value intact", "[c
     store.ResetCounters();
     auto reopened = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
     REQUIRE(reopened.has_value());
-    auto const got = (*reopened)->Get("k", FastCache::ManualClock {}.Now());
+    auto const got = (*reopened)->Get("k", core::platform::ManualClock {}.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(Decode(got->entry.ValueBytes()) == "initial");
@@ -3031,12 +3067,12 @@ TEST_CASE("Reclaiming a corrupted overflow chain never frees another key's pages
     auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
     REQUIRE(storage.has_value());
 
-    REQUIRE((*storage)->Set("victim", victimBytes, 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)->Set("victim", victimBytes, 0, core::platform::SteadyTimePoint::max()).has_value());
     auto const victimPages = liveOverflowPages(2048);
     REQUIRE_FALSE(victimPages.empty());
     auto const victimPage = victimPages.front();
 
-    REQUIRE((*storage)->Set("target", targetBytes, 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)->Set("target", targetBytes, 0, core::platform::SteadyTimePoint::max()).has_value());
     std::vector<std::uint64_t> targetPages;
     for (auto const id: liveOverflowPages(2048))
         if (std::ranges::find(victimPages, id) == victimPages.end())
@@ -3056,15 +3092,16 @@ TEST_CASE("Reclaiming a corrupted overflow chain never frees another key's pages
 
     // Overwrite target with a tiny inline value: this reclaims the (now corrupt)
     // overflow chain. The CRC guard must stop the walk at the first bad page.
-    REQUIRE((*storage)->Set("target", MakeBytes("small"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*storage)->Set("target", MakeBytes("small"), 0, core::platform::SteadyTimePoint::max()).has_value());
     // Churn allocations so a wrongly-freed victim page would be reused + clobbered.
     for (auto const i: std::views::iota(0U, 8U))
-        REQUIRE((*storage)
-                    ->Set(std::format("filler-{}", i), RandomBytes(50000, 900U + i), 0, FastCache::TimePoint::max())
-                    .has_value());
+        REQUIRE(
+            (*storage)
+                ->Set(std::format("filler-{}", i), RandomBytes(50000, 900U + i), 0, core::platform::SteadyTimePoint::max())
+                .has_value());
 
     // The victim's bytes survive intact: its pages were never freed.
-    auto const got = (*storage)->Get("victim", FastCache::ManualClock {}.Now());
+    auto const got = (*storage)->Get("victim", core::platform::ManualClock {}.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(ValueOf(got->entry) == victimBytes);
@@ -3079,14 +3116,14 @@ TEST_CASE("Touch on a large value reuses the overflow chain without an O(value) 
 
     auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     auto const big = RandomBytes(50000, 0xABCDULL); // ~13 overflow pages at 4 KiB
-    REQUIRE((*storage)->Set("k", big, 0, clock.Now() + 1s).has_value());
+    REQUIRE((*storage)->Set("k", big, 0, clock.now() + 1s).has_value());
 
     auto const writesBefore = store.WriteCount();
-    auto const newExpiry = clock.Now() + 3600s;
-    auto const touched = (*storage)->Touch("k", newExpiry, clock.Now());
+    auto const newExpiry = clock.now() + 3600s;
+    auto const touched = (*storage)->Touch("k", newExpiry, clock.now());
     REQUIRE(touched.has_value());
     auto const writesByTouch = store.WriteCount() - writesBefore;
 
@@ -3095,7 +3132,7 @@ TEST_CASE("Touch on a large value reuses the overflow chain without an O(value) 
     REQUIRE(writesByTouch < 8);
 
     // The value is intact and the expiry was refreshed without touching the chain.
-    auto const got = (*storage)->Get("k", clock.Now() + 1800s);
+    auto const got = (*storage)->Get("k", clock.now() + 1800s);
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(ValueOf(got->entry) == big);
@@ -3144,21 +3181,21 @@ TEST_CASE("Compression: values round-trip under every codec, inline and overflow
     auto const large = CompressibleBytes(64 * 1024);
 
     WithOpenStorageCompressed(tmp.path, codec, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("small", small, 1, FastCache::TimePoint::max()).has_value());
-        REQUIRE(storage.Set("large", large, 2, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("small", small, 1, core::platform::SteadyTimePoint::max()).has_value());
+        REQUIRE(storage.Set("large", large, 2, core::platform::SteadyTimePoint::max()).has_value());
     });
 
     // Reopen (fresh LRU mirror, values materialised from disk) and verify the
     // plaintext survives a decompress round-trip.
     WithOpenStorageCompressed(tmp.path, codec, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock clock;
-        auto gotSmall = storage.Get("small", clock.Now());
+        core::platform::ManualClock clock;
+        auto gotSmall = storage.Get("small", clock.now());
         REQUIRE(gotSmall.has_value());
         REQUIRE(gotSmall->found);
         REQUIRE(ValueOf(gotSmall->entry) == small);
         REQUIRE(gotSmall->entry.flags == 1U);
 
-        auto gotLarge = storage.Get("large", clock.Now());
+        auto gotLarge = storage.Get("large", clock.now());
         REQUIRE(gotLarge.has_value());
         REQUIRE(gotLarge->found);
         REQUIRE(ValueOf(gotLarge->entry) == large);
@@ -3175,12 +3212,12 @@ TEST_CASE("Compression: a compressible value shrinks the on-disk file", "[cowsto
 
     TempFile rawFile;
     WithOpenStorageCompressed(rawFile.path, FastCache::CompressionCodec::Identity, [&](FastCache::CowTreeStorage& s) {
-        REQUIRE(s.Set("k", value, 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(s.Set("k", value, 0, core::platform::SteadyTimePoint::max()).has_value());
     });
 
     TempFile zstdFile;
     WithOpenStorageCompressed(zstdFile.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& s) {
-        REQUIRE(s.Set("k", value, 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(s.Set("k", value, 0, core::platform::SteadyTimePoint::max()).has_value());
     });
 
     CHECK(StoreFileSize(zstdFile.path) < StoreFileSize(rawFile.path));
@@ -3197,13 +3234,13 @@ TEST_CASE("Compression: an incompressible value falls back to Identity (shrink-c
 
     TempFile rawFile;
     WithOpenStorageCompressed(rawFile.path, FastCache::CompressionCodec::Identity, [&](FastCache::CowTreeStorage& s) {
-        REQUIRE(s.Set("k", value, 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(s.Set("k", value, 0, core::platform::SteadyTimePoint::max()).has_value());
     });
     TempFile zstdFile;
     WithOpenStorageCompressed(zstdFile.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& s) {
-        REQUIRE(s.Set("k", value, 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(s.Set("k", value, 0, core::platform::SteadyTimePoint::max()).has_value());
         // Value still reads back correctly despite the Identity fallback.
-        auto got = s.Get("k", FastCache::ManualClock {}.Now());
+        auto got = s.Get("k", core::platform::ManualClock {}.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(ValueOf(got->entry) == value);
@@ -3221,23 +3258,23 @@ TEST_CASE("Compression: Append/Prepend on a compressed entry yield correct plain
 
     TempFile tmp;
     WithOpenStorageCompressed(tmp.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         auto const base = CompressibleBytes(2000);
-        REQUIRE(storage.Set("k", base, 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("k", base, 0, core::platform::SteadyTimePoint::max()).has_value());
 
         auto const suffix = MakeBytes("-SUFFIX");
         REQUIRE(
-            storage.Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, 0, clock.Now()).has_value());
+            storage.Append("k", std::span<std::byte const> { suffix.data(), suffix.size() }, 0, clock.now()).has_value());
         auto const prefix = MakeBytes("PREFIX-");
         REQUIRE(
-            storage.Prepend("k", std::span<std::byte const> { prefix.data(), prefix.size() }, 0, clock.Now()).has_value());
+            storage.Prepend("k", std::span<std::byte const> { prefix.data(), prefix.size() }, 0, clock.now()).has_value());
 
         std::vector<std::byte> expected;
         expected.insert(expected.end(), prefix.begin(), prefix.end());
         expected.insert(expected.end(), base.begin(), base.end());
         expected.insert(expected.end(), suffix.begin(), suffix.end());
 
-        auto got = storage.Get("k", clock.Now());
+        auto got = storage.Get("k", clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(ValueOf(got->entry) == expected);
@@ -3253,13 +3290,13 @@ TEST_CASE("Compression: Touch preserves the compressed value unchanged", "[cowst
     auto const value = CompressibleBytes(64 * 1024);
     WithOpenStorageCompressed(tmp.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& storage) {
         using namespace std::chrono_literals;
-        FastCache::ManualClock clock;
-        REQUIRE(storage.Set("k", value, 5, clock.Now() + 1s).has_value());
+        core::platform::ManualClock clock;
+        REQUIRE(storage.Set("k", value, 5, clock.now() + 1s).has_value());
 
-        auto const newExpiry = clock.Now() + 3600s;
-        REQUIRE(storage.Touch("k", newExpiry, clock.Now()).has_value());
+        auto const newExpiry = clock.now() + 3600s;
+        REQUIRE(storage.Touch("k", newExpiry, clock.now()).has_value());
 
-        auto got = storage.Get("k", clock.Now() + 60s);
+        auto got = storage.Get("k", clock.now() + 60s);
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(ValueOf(got->entry) == value); // value survived the metadata rewrite
@@ -3280,29 +3317,29 @@ TEST_CASE("Compression: a store mixes codecs and reads each by its own tag", "[c
 
     // First session writes an lz4-tagged entry.
     WithOpenStorageCompressed(tmp.path, FastCache::CompressionCodec::Lz4, [&](FastCache::CowTreeStorage& storage) {
-        REQUIRE(storage.Set("lz4key", lz4Value, 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("lz4key", lz4Value, 0, core::platform::SteadyTimePoint::max()).has_value());
     });
 
     // Second session is configured for zstd. The old lz4 entry must still read
     // (decoded by its own per-entry tag), and a new entry is written as zstd.
     WithOpenStorageCompressed(tmp.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock clock;
-        auto oldGot = storage.Get("lz4key", clock.Now());
+        core::platform::ManualClock clock;
+        auto oldGot = storage.Get("lz4key", clock.now());
         REQUIRE(oldGot.has_value());
         REQUIRE(oldGot->found);
         REQUIRE(ValueOf(oldGot->entry) == lz4Value);
 
-        REQUIRE(storage.Set("zstdkey", zstdValue, 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage.Set("zstdkey", zstdValue, 0, core::platform::SteadyTimePoint::max()).has_value());
     });
 
     // Reopen once more: both entries survive and decode correctly.
     WithOpenStorageCompressed(tmp.path, FastCache::CompressionCodec::Zstd, [&](FastCache::CowTreeStorage& storage) {
-        FastCache::ManualClock clock;
-        auto a = storage.Get("lz4key", clock.Now());
+        core::platform::ManualClock clock;
+        auto a = storage.Get("lz4key", clock.now());
         REQUIRE(a.has_value());
         REQUIRE(a->found);
         REQUIRE(ValueOf(a->entry) == lz4Value);
-        auto b = storage.Get("zstdkey", clock.Now());
+        auto b = storage.Get("zstdkey", clock.now());
         REQUIRE(b.has_value());
         REQUIRE(b->found);
         REQUIRE(ValueOf(b->entry) == zstdValue);
@@ -3364,15 +3401,15 @@ TEST_CASE("Closing a CowTreeStorage releases the path for the next one", "[cowst
     {
         auto first = FastCache::CowTreeStorage::Open(opts);
         REQUIRE(first.has_value());
-        REQUIRE((*first)->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE((*first)->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
 
     // Every restart goes through here, so the claim must not outlive the object
     // that took it -- and the data written under it must still be there.
     auto second = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(second.has_value());
-    FastCache::ManualClock clock;
-    auto const got = (*second)->Get("k", clock.Now());
+    core::platform::ManualClock clock;
+    auto const got = (*second)->Get("k", clock.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
 }
@@ -3395,7 +3432,7 @@ TEST_CASE("The expiry sweep reads a TTL without inflating the value", "[cowstora
     opts.maxValueBytes = 4 * 1024 * 1024;
     auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
     REQUIRE(storage.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     // SEMI-compressible, and that is the whole difficulty. `StoreEntry` lets the
     // STORED (post-compression) size decide inline-vs-overflow, so a trivially
@@ -3411,18 +3448,18 @@ TEST_CASE("The expiry sweep reads a TTL without inflating the value", "[cowstora
         lcg = (lcg * 6364136223846793005ULL) + 1442695040888963407ULL;
         c = static_cast<char>('a' + ((lcg >> 33) % 16));
     }
-    REQUIRE((*storage)->Set("k", MakeBytes(big), 0, clock.Now() + 3600s).has_value());
+    REQUIRE((*storage)->Set("k", MakeBytes(big), 0, clock.now() + 3600s).has_value());
 
     // A Get is the control: it must materialise the value, so it must walk the
     // chain. Without it the sweep's own figure calibrates against nothing.
     auto const beforeGet = store.ReadCount();
-    REQUIRE((*storage)->Get("k", clock.Now())->found);
+    REQUIRE((*storage)->Get("k", clock.now())->found);
     auto const getReads = store.ReadCount() - beforeGet;
     REQUIRE(getReads > 8U); // the chain really is many pages
 
     // The sweep scans the same key and reclaims nothing -- the TTL is an hour out.
     auto const beforeSweep = store.ReadCount();
-    auto const outcome = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded());
+    auto const outcome = (*storage)->PurgeExpired(clock.now(), FastCache::PurgeBudget::Unbounded());
     auto const sweepReads = store.ReadCount() - beforeSweep;
     REQUIRE(outcome.scanned == 1U);
     REQUIRE(outcome.purged == 0U);
@@ -3435,10 +3472,10 @@ TEST_CASE("The expiry sweep reads a TTL without inflating the value", "[cowstora
     // ... and the sweep still WORKS: an out-of-line compressed value expires
     // exactly when it did. Without this, "reads less" and "reads nothing
     // useful" are the same passing test.
-    clock.Advance(3601s);
-    auto const lapsed = (*storage)->PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded());
+    clock.advance(3601s);
+    auto const lapsed = (*storage)->PurgeExpired(clock.now(), FastCache::PurgeBudget::Unbounded());
     REQUIRE(lapsed.purged == 1U);
-    REQUIRE_FALSE((*storage)->Get("k", clock.Now())->found);
+    REQUIRE_FALSE((*storage)->Get("k", clock.now())->found);
 }
 
 TEST_CASE("A reopened store's index reports what has been TOUCHED, not what is on disk", "[cowstorage][index][capacity]")
@@ -3473,8 +3510,9 @@ TEST_CASE("A reopened store's index reports what has been TOUCHED, not what is o
         auto first = FastCache::CowTreeStorage::Open(opts);
         REQUIRE(first.has_value());
         for (auto const i: std::views::iota(0, Objects))
-            REQUIRE(
-                (*first)->Set(std::format("key-{:04}", i), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+            REQUIRE((*first)
+                        ->Set(std::format("key-{:04}", i), MakeBytes("value"), 0, core::platform::SteadyTimePoint::max())
+                        .has_value());
         // Not vacuous: the index really is populated before the close, so a zero after
         // it is the reopen and not a store that never held anything.
         REQUIRE((*first)->Snapshot().indexBytes > 0);
@@ -3493,8 +3531,8 @@ TEST_CASE("A reopened store's index reports what has been TOUCHED, not what is o
     // than about an empty store.
     CHECK((*second)->Snapshot().itemCount == Objects);
 
-    FastCache::ManualClock clock;
-    auto const got = (*second)->Get("key-0000", clock.Now());
+    core::platform::ManualClock clock;
+    auto const got = (*second)->Get("key-0000", clock.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
 
@@ -3523,7 +3561,11 @@ TEST_CASE("A store reuses the pages a previous session freed", "[cowstorage][fre
 
     auto const write300 = [&](FastCache::CowTreeStorage& store) {
         for (auto const i: std::views::iota(0, 300))
-            REQUIRE(store.Set(std::format("k-{:04}", i), MakeBytes(std::string(1024, 'x')), 0, FastCache::TimePoint::max())
+            REQUIRE(store
+                        .Set(std::format("k-{:04}", i),
+                             MakeBytes(std::string(1024, 'x')),
+                             0,
+                             core::platform::SteadyTimePoint::max())
                         .has_value());
     };
 
@@ -3579,10 +3621,12 @@ TEST_CASE("A reopened store's bytesUsed describes the STORE, and reads do not in
         auto first = FastCache::CowTreeStorage::Open(opts);
         REQUIRE(first.has_value());
         for (auto const i: std::views::iota(0, Objects))
-            REQUIRE(
-                (*first)
-                    ->Set(std::format("k-{:02}", i), MakeBytes(std::string(ValueLen, 'x')), 0, FastCache::TimePoint::max())
-                    .has_value());
+            REQUIRE((*first)
+                        ->Set(std::format("k-{:02}", i),
+                              MakeBytes(std::string(ValueLen, 'x')),
+                              0,
+                              core::platform::SteadyTimePoint::max())
+                        .has_value());
         REQUIRE((*first)->Snapshot().bytesUsed == Objects * ValueLen);
     }
 
@@ -3594,10 +3638,10 @@ TEST_CASE("A reopened store's bytesUsed describes the STORE, and reads do not in
     // gauge operators watch read under the limit exactly while the store was over it.
     CHECK((*second)->Snapshot().bytesUsed == Objects * ValueLen);
 
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     for (auto const i: std::views::iota(0, Objects))
     {
-        auto const got = (*second)->Get(std::format("k-{:02}", i), clock.Now());
+        auto const got = (*second)->Get(std::format("k-{:02}", i), clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
     }
@@ -3630,10 +3674,12 @@ TEST_CASE("A reopened store over its bound evicts entries it has never touched",
         auto first = FastCache::CowTreeStorage::Open(opts);
         REQUIRE(first.has_value());
         for (auto const i: std::views::iota(0, Objects))
-            REQUIRE(
-                (*first)
-                    ->Set(std::format("k-{:02}", i), MakeBytes(std::string(ValueLen, 'x')), 0, FastCache::TimePoint::max())
-                    .has_value());
+            REQUIRE((*first)
+                        ->Set(std::format("k-{:02}", i),
+                              MakeBytes(std::string(ValueLen, 'x')),
+                              0,
+                              core::platform::SteadyTimePoint::max())
+                        .has_value());
         REQUIRE((*first)->Snapshot().bytesUsed == Objects * ValueLen);
     }
 
@@ -3644,8 +3690,8 @@ TEST_CASE("A reopened store over its bound evicts entries it has never touched",
     // Touched, so it is the one entry in the mirror. Everything else is cold, and cold
     // means "not used since this process started" -- strictly less recently used than
     // this one, whatever order they were written in.
-    FastCache::ManualClock clock;
-    auto const warmed = (*second)->Get("k-00", clock.Now());
+    core::platform::ManualClock clock;
+    auto const warmed = (*second)->Get("k-00", clock.now());
     REQUIRE(warmed.has_value());
     REQUIRE(warmed->found);
 
@@ -3665,14 +3711,14 @@ TEST_CASE("A reopened store over its bound evicts entries it has never touched",
     //
     // It also keeps this case honest about the fix: without this assertion it would
     // pass against an implementation that erased whatever the walk reached first.
-    auto const survivor = (*second)->Get("k-00", clock.Now());
+    auto const survivor = (*second)->Get("k-00", clock.now());
     REQUIRE(survivor.has_value());
     CHECK(survivor->found);
 
     std::size_t present = 0;
     for (auto const i: std::views::iota(0, Objects))
     {
-        auto const got = (*second)->Get(std::format("k-{:02}", i), clock.Now());
+        auto const got = (*second)->Get(std::format("k-{:02}", i), clock.now());
         REQUIRE(got.has_value());
         if (got->found)
             ++present;
@@ -3692,20 +3738,20 @@ TEST_CASE("The store's byte total follows deletes and replaces, not just writes"
 
     auto store = FastCache::CowTreeStorage::Open(opts);
     REQUIRE(store.has_value());
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE((*store)->Set("a", MakeBytes(std::string(1000, 'x')), 0, FastCache::TimePoint::max()).has_value());
-    REQUIRE((*store)->Set("b", MakeBytes(std::string(1000, 'x')), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*store)->Set("a", MakeBytes(std::string(1000, 'x')), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE((*store)->Set("b", MakeBytes(std::string(1000, 'x')), 0, core::platform::SteadyTimePoint::max()).has_value());
     CHECK((*store)->Snapshot().bytesUsed == 2000);
 
     // A replace is a delta, not an addition.
-    REQUIRE((*store)->Set("a", MakeBytes(std::string(400, 'x')), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE((*store)->Set("a", MakeBytes(std::string(400, 'x')), 0, core::platform::SteadyTimePoint::max()).has_value());
     CHECK((*store)->Snapshot().bytesUsed == 1400);
 
-    REQUIRE((*store)->Delete("b", clock.Now()).has_value());
+    REQUIRE((*store)->Delete("b", clock.now()).has_value());
     CHECK((*store)->Snapshot().bytesUsed == 400);
 
-    REQUIRE((*store)->Delete("a", clock.Now()).has_value());
+    REQUIRE((*store)->Delete("a", clock.now()).has_value());
     CHECK((*store)->Snapshot().bytesUsed == 0);
 }
 
@@ -3729,8 +3775,9 @@ TEST_CASE("A reopened store projects what its index WILL cost, not what it costs
         auto first = FastCache::CowTreeStorage::Open(opts);
         REQUIRE(first.has_value());
         for (auto const i: std::views::iota(0, Objects))
-            REQUIRE(
-                (*first)->Set(std::format("key-{:04}", i), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+            REQUIRE((*first)
+                        ->Set(std::format("key-{:04}", i), MakeBytes("value"), 0, core::platform::SteadyTimePoint::max())
+                        .has_value());
         auto const warm = (*first)->Snapshot();
         // Warm, the projection is at least the actual cost and slightly above it: the
         // tree also holds the store's RESERVED records -- the format marker and the
@@ -3777,14 +3824,15 @@ TEST_CASE("A reopened store reports the items it HOLDS rather than the ones this
     opts.path = tmp.path;
 
     constexpr int Objects = 37;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     {
         auto first = FastCache::CowTreeStorage::Open(opts);
         REQUIRE(first.has_value());
         for (auto const i: std::views::iota(0, Objects))
-            REQUIRE(
-                (*first)->Set(std::format("key-{:04}", i), MakeBytes("value"), 0, FastCache::TimePoint::max()).has_value());
+            REQUIRE((*first)
+                        ->Set(std::format("key-{:04}", i), MakeBytes("value"), 0, core::platform::SteadyTimePoint::max())
+                        .has_value());
 
         // Warm, this figure was ALREADY right, and it has to stay right: the mirror and
         // the store agree here, so a fix that moved the warm reading moved the wrong
@@ -3819,7 +3867,7 @@ TEST_CASE("A reopened store reports the items it HOLDS rather than the ones this
 
     // One read, and the mirror now costs something while the count does not move: the
     // figure is the store's, not a mirror that happens to have been filled.
-    REQUIRE((*second)->Get("key-0000", clock.Now()).has_value());
+    REQUIRE((*second)->Get("key-0000", clock.now()).has_value());
     auto const touched = (*second)->Snapshot();
     CHECK(touched.itemCount == Objects);
     CHECK(touched.indexBytes > 0);

@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/IReactor.hpp>
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Async/SleepUntil.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 
 #include <catch2/catch_message.hpp>
@@ -26,6 +21,12 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include <core/async/ResumeOn.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/EventLoop.hpp>
+#include <core/net/SleepUntil.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Testing
 {
@@ -120,7 +121,7 @@ class PollingDrainWait final: public IDrainWait
     {
     }
 
-    [[nodiscard]] TimePoint Now() const noexcept override
+    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
     {
         return DefaultDrainWait().Now();
     }
@@ -333,7 +334,7 @@ template <typename Reactor, std::predicate Predicate, typename State>
                      std::move(reached),
                      std::move(state),
                      WaitOptions {
-                         .step = [&reactor] { std::ignore = reactor.Drain(); },
+                         .step = [&reactor] { std::ignore = reactor.drain(); },
                          .context = {},
                          .bound = bound,
                          .rest = WaitRest,
@@ -344,9 +345,10 @@ template <typename Reactor, std::predicate Predicate, typename State>
 struct ReactorWaitOptions
 {
     std::function<std::string()> context; ///< Printed once in an account and never tracked for change.
-    Duration bound = std::chrono::duration_cast<Duration>(WaitHangGuard); ///< Reactor-clock time the wait may take.
+    core::platform::SteadyDuration bound =
+        std::chrono::duration_cast<core::platform::SteadyDuration>(WaitHangGuard); ///< Reactor-clock time the wait may take.
     /// Zero yields one reactor turn between looks; anything else sleeps that long on the reactor's clock.
-    Duration rest = Duration::zero();
+    core::platform::SteadyDuration rest = core::platform::SteadyDuration::zero();
 };
 
 /// Await, on @p reactor, until @p reached holds, for at most `options.bound` of the REACTOR's clock, and
@@ -354,9 +356,9 @@ struct ReactorWaitOptions
 ///
 /// **For a coroutine, which must not block the thread it runs on**: `WaitUntil` sleeps its thread, and a
 /// coroutine on a reactor that did so would stall the very loop that has to make @p reached true. So
-/// this parks between looks -- `ResumeOn` or `SleepFor`, both through the reactor, so a teardown frees
-/// the chain from its root (`Detail::UnownedRootOf`, #1025) -- and reads its bound off `reactor->Clock()`,
-/// the clock its sleeps already use: a `ManualClock` case bounds it on manual time.
+/// this parks between looks -- `core::async::ResumeOn` or `core::net::EventLoop::delay`, both through the reactor, so a
+/// teardown frees the chain from its root (`Detail::UnownedRootOf`, #1025) -- and reads its bound off `reactor->Clock()`,
+/// the clock its sleeps already use: a `core::platform::ManualClock` case bounds it on manual time.
 ///
 /// The account and its reading are `WaitUntilOutcome`'s, in `ReactorWaitVoice`, with durations from the
 /// reactor's clock. Touches no Catch2 state: keep the outcome with `OffThreadWaits::Keep` and assert
@@ -372,18 +374,18 @@ struct ReactorWaitOptions
 /// @param options The untracked context, the bound and the rest.
 /// @return Whether @p reached held within the bound, and the account when it did not.
 template <std::predicate Predicate, typename State>
-[[nodiscard]] Task<WaitOutcome> AwaitUntil(
-    IReactor* reactor, std::string what, Predicate reached, State state, ReactorWaitOptions options = {})
+[[nodiscard]] core::async::Task<WaitOutcome> AwaitUntil(
+    core::net::EventLoop* reactor, std::string what, Predicate reached, State state, ReactorWaitOptions options = {})
 {
-    auto const& clock = reactor->Clock();
-    auto const started = clock.Now();
+    auto const& clock = reactor->clock();
+    auto const started = clock.now();
     std::string seen = state();
     auto lastChange = started;
     auto changes = 0;
     std::size_t turns = 0;
     while (!reached())
     {
-        auto const now = clock.Now();
+        auto const now = clock.now();
         if (now - started >= options.bound)
         {
             auto const readings = WaitReadings {
@@ -404,14 +406,14 @@ template <std::predicate Predicate, typename State>
             ++changes;
         }
         ++turns;
-        if (options.rest == Duration::zero())
-            co_await ResumeOn { *reactor };
+        if (options.rest == core::platform::SteadyDuration::zero())
+            co_await core::async::ResumeOn { *reactor };
         else
-            co_await SleepFor(*reactor, options.rest);
+            co_await reactor->delay(options.rest);
     }
     co_return WaitOutcome {
         .reached = true,
-        .elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - started),
+        .elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(clock.now() - started),
         .account = {},
     };
 }

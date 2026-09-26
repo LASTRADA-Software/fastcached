@@ -112,17 +112,20 @@ no work-stealing and no per-request locking on the cache hot path.
 differs by platform:
 
 - **POSIX (Linux/macOS):** one listener per reactor, all bound with
-  `SO_REUSEPORT` (`ReusePort::Yes`). The kernel load-balances incoming
-  connections across the listeners, so each reactor accepts and serves its
-  own share directly — no cross-thread handoff.
+  `SO_REUSEPORT` (`core::net::PortSharing::Shared`). On Linux the kernel
+  load-balances incoming connections across the listeners, so each reactor
+  accepts and serves its own share directly — no cross-thread handoff. macOS
+  binds them but hands every connection to the newest listener, so there one
+  reactor serves them all.
 - **Windows:** IOCP has no `SO_REUSEPORT`, so a blocking acceptor thread per
   bind round-robins accepted sockets across the IOCP reactors. Each handed-off
   socket runs `co_await ResumeOn{reactor}` first, which re-schedules the
-  coroutine onto the target reactor's thread before any I/O — restoring the
-  "one connection, one reactor thread" invariant. **No completion port is ever
-  drained from several threads**: `IocpReactor.hpp` calls that unsafe, because
-  it migrates a coroutine across threads, and `RunMultiReactorWindows` runs one
-  thread per reactor exactly as the POSIX path does. This page claimed the
+  coroutine onto the target reactor's thread, and only there hands the raw
+  handle to `core::net::adoptSocket` — restoring the "one connection, one
+  reactor thread" invariant. **No completion port is ever drained from several
+  threads**: that would migrate a coroutine across threads, and
+  `RunMultiReactorWindows` runs one thread per reactor exactly as the POSIX
+  path does. This page claimed the
   opposite — several threads draining one IOCP so a page-store `fsync` overlaps
   serving other connections — until
   [#896](https://github.com/LASTRADA-Software/fastcached/issues/896); that

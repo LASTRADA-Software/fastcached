@@ -3,7 +3,6 @@
 #include "EndpointDialerTestUtils.hpp"
 
 #include <FastCache/Cli/Options.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -19,6 +18,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
@@ -68,10 +68,10 @@ struct Fixture
         service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
     }
 
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
     Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
     Distributed::SchedulerProtocol protocol { service, metrics };

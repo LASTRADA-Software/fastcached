@@ -626,7 +626,7 @@ std::optional<FleetRange> FleetRangeFromKey(std::string_view key) noexcept
     return std::nullopt;
 }
 
-FleetHistory::FleetHistory(WallClockRef wall):
+FleetHistory::FleetHistory(core::platform::WallClockRef wall):
     _wall { wall }
 {
     // Sized from the table rather than from three named constants, so a ring added
@@ -637,7 +637,7 @@ FleetHistory::FleetHistory(WallClockRef wall):
 
 std::int64_t FleetHistory::NowMillis() const noexcept
 {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(_wall.Now().time_since_epoch()).count();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(_wall.now().time_since_epoch()).count();
 }
 
 void FleetHistory::Record(EnumTable<FleetMetric, std::uint64_t> const& values)
@@ -905,7 +905,7 @@ bool FleetHistory::Load(std::filesystem::path const& path)
     return true;
 }
 
-FleetNodeHistories::FleetNodeHistories(WallClockRef wall):
+FleetNodeHistories::FleetNodeHistories(core::platform::WallClockRef wall):
     _wall { wall }
 {
 }

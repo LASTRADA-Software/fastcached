@@ -3,7 +3,6 @@
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/ShardedStorage.hpp>
 #include <FastCache/Cache/StorageTestUtils.hpp>
-#include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -27,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 
 using FastCache::Testing::Decode;
@@ -76,7 +76,7 @@ class ParkableStorage: public FastCache::IStorage
     }
 
     std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view /*key*/,
-                                                                     FastCache::TimePoint /*now*/) override
+                                                                     core::platform::SteadyTimePoint /*now*/) override
     {
         ++readInFlight;
         std::unique_lock lock { mu };
@@ -88,7 +88,7 @@ class ParkableStorage: public FastCache::IStorage
     std::expected<FastCache::CasToken, FastCache::StorageError> Set(std::string_view /*key*/,
                                                                     std::vector<std::byte> /*value*/,
                                                                     std::uint32_t /*flags*/,
-                                                                    FastCache::TimePoint /*expiry*/) override
+                                                                    core::platform::SteadyTimePoint /*expiry*/) override
     {
         ++writeInFlight;
         std::unique_lock lock { mu };
@@ -101,69 +101,75 @@ class ParkableStorage: public FastCache::IStorage
     std::expected<FastCache::CasToken, FastCache::StorageError> Add(std::string_view /*key*/,
                                                                     std::vector<std::byte> /*value*/,
                                                                     std::uint32_t /*flags*/,
-                                                                    FastCache::TimePoint /*expiry*/,
-                                                                    FastCache::TimePoint /*now*/) override
+                                                                    core::platform::SteadyTimePoint /*expiry*/,
+                                                                    core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::CasToken { 0 };
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Replace(std::string_view /*key*/,
                                                                         std::vector<std::byte> /*value*/,
                                                                         std::uint32_t /*flags*/,
-                                                                        FastCache::TimePoint /*expiry*/,
-                                                                        FastCache::TimePoint /*now*/) override
+                                                                        core::platform::SteadyTimePoint /*expiry*/,
+                                                                        core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::CasToken { 0 };
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view /*key*/,
                                                                        std::span<std::byte const> /*suffix*/,
                                                                        FastCache::CasToken /*expected*/,
-                                                                       FastCache::TimePoint /*now*/) override
+                                                                       core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::CasToken { 0 };
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view /*key*/,
                                                                         std::span<std::byte const> /*prefix*/,
                                                                         FastCache::CasToken /*expected*/,
-                                                                        FastCache::TimePoint /*now*/) override
+                                                                        core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::CasToken { 0 };
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> CompareAndSwap(std::string_view /*key*/,
-                                                                               FastCache::CasToken /*expected*/,
-                                                                               std::vector<std::byte> /*value*/,
-                                                                               std::uint32_t /*flags*/,
-                                                                               FastCache::TimePoint /*expiry*/,
-                                                                               FastCache::TimePoint /*now*/) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> CompareAndSwap(
+        std::string_view /*key*/,
+        FastCache::CasToken /*expected*/,
+        std::vector<std::byte> /*value*/,
+        std::uint32_t /*flags*/,
+        core::platform::SteadyTimePoint /*expiry*/,
+        core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::CasToken { 0 };
     }
     std::expected<FastCache::IStorage::IncrResult, FastCache::StorageError> IncrementOrInitialize(
-        std::string_view /*key*/, std::uint64_t /*magnitude*/, bool /*decrement*/, FastCache::TimePoint /*now*/) override
+        std::string_view /*key*/,
+        std::uint64_t /*magnitude*/,
+        bool /*decrement*/,
+        core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::IStorage::IncrResult { .value = 0, .cas = FastCache::CasToken { 0 } };
     }
-    std::expected<void, FastCache::StorageError> Delete(std::string_view /*key*/, FastCache::TimePoint /*now*/) override
+    std::expected<void, FastCache::StorageError> Delete(std::string_view /*key*/,
+                                                        core::platform::SteadyTimePoint /*now*/) override
     {
         return {};
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view /*key*/,
-                                                                      FastCache::TimePoint /*newExpiry*/,
-                                                                      FastCache::TimePoint /*now*/) override
+                                                                      core::platform::SteadyTimePoint /*newExpiry*/,
+                                                                      core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::CasToken { 0 };
     }
     std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view /*key*/,
-                                                                      FastCache::TimePoint /*now*/) override
+                                                                      core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::GetResult { .found = false, .entry = {} };
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view /*key*/,
-                                                                          std::optional<FastCache::TimePoint> /*newExpiry*/,
-                                                                          FastCache::TimePoint /*now*/) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(
+        std::string_view /*key*/,
+        std::optional<core::platform::SteadyTimePoint> /*newExpiry*/,
+        core::platform::SteadyTimePoint /*now*/) override
     {
         return FastCache::CasToken { 0 };
     }
-    void FlushWithGeneration(FastCache::TimePoint /*effectiveAt*/) override {}
+    void FlushWithGeneration(core::platform::SteadyTimePoint /*effectiveAt*/) override {}
     void Resize(std::size_t /*newMaxBytes*/) override {}
     /// How many times this shard has been asked to sweep.
     ///
@@ -171,7 +177,7 @@ class ParkableStorage: public FastCache::IStorage
     /// shard came first would ask shard 0 every cycle and never reach the rest.
     std::atomic<int> sweeps { 0 };
 
-    FastCache::PurgeOutcome PurgeExpired(FastCache::TimePoint /*now*/, FastCache::PurgeBudget budget) override
+    FastCache::PurgeOutcome PurgeExpired(core::platform::SteadyTimePoint /*now*/, FastCache::PurgeBudget budget) override
     {
         ++sweeps;
         // Reports the whole scan ceiling as spent, so a caller handing the
@@ -257,19 +263,19 @@ TEST_CASE("ShardedStorage: a bounded sweep rotates across shards", "[sharded][pu
         shards.emplace_back(std::move(shard));
     }
     FastCache::ShardedStorage storage { std::move(shards) };
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     // A ceiling of one entry reaches exactly one shard per call.
     for ([[maybe_unused]] auto const i: std::views::iota(std::size_t { 0 }, ShardCount))
     {
-        auto const outcome = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget { .maxScanned = 1 });
+        auto const outcome = storage.PurgeExpired(clock.now(), FastCache::PurgeBudget { .maxScanned = 1 });
         CHECK_FALSE(outcome.completedPass); // Shards were left unvisited.
     }
     for (auto const* shard: raw)
         CHECK(shard->sweeps.load() == 1);
 
     // With no ceiling every shard is swept in the one call.
-    std::ignore = storage.PurgeExpired(clock.Now(), FastCache::PurgeBudget::Unbounded());
+    std::ignore = storage.PurgeExpired(clock.now(), FastCache::PurgeBudget::Unbounded());
     for (auto const* shard: raw)
         CHECK(shard->sweeps.load() == 2);
 }
@@ -282,11 +288,11 @@ TEST_CASE("ShardedStorage rejects empty shard list", "[sharded]")
 TEST_CASE("ShardedStorage round-trips Set + Get through the right shard", "[sharded]")
 {
     auto storage = MakeSharded(4);
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    REQUIRE(storage->Set("foo", MakeBytes("bar"), 0, FastCache::TimePoint::max()).has_value());
+    REQUIRE(storage->Set("foo", MakeBytes("bar"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
-    auto const got = storage->Get("foo", clock.Now());
+    auto const got = storage->Get("foo", clock.now());
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(Decode(got->entry.ValueBytes()) == "bar");
@@ -296,16 +302,16 @@ TEST_CASE("ShardedStorage Touch routes to the owning shard", "[sharded][touch]")
 {
     using namespace std::chrono_literals;
     auto storage = MakeSharded(4);
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const setCas = storage->Set("hello", MakeBytes("v"), 0, clock.Now() + 1s);
+    auto const setCas = storage->Set("hello", MakeBytes("v"), 0, clock.now() + 1s);
     REQUIRE(setCas.has_value());
 
-    auto const touched = storage->Touch("hello", clock.Now() + 60s, clock.Now());
+    auto const touched = storage->Touch("hello", clock.now() + 60s, clock.now());
     REQUIRE(touched.has_value());
     REQUIRE(*touched != *setCas);
 
-    auto const got = storage->Get("hello", clock.Now() + 30s);
+    auto const got = storage->Get("hello", clock.now() + 30s);
     REQUIRE(got.has_value());
     REQUIRE(got->found);
     REQUIRE(got->entry.cas == *touched);
@@ -314,8 +320,8 @@ TEST_CASE("ShardedStorage Touch routes to the owning shard", "[sharded][touch]")
 TEST_CASE("ShardedStorage Touch on absent key returns KeyNotFound", "[sharded][touch]")
 {
     auto storage = MakeSharded(4);
-    FastCache::ManualClock clock;
-    auto const r = storage->Touch("nope", FastCache::TimePoint::max(), clock.Now());
+    core::platform::ManualClock clock;
+    auto const r = storage->Touch("nope", core::platform::SteadyTimePoint::max(), clock.now());
     REQUIRE_FALSE(r.has_value());
     REQUIRE(r.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -379,11 +385,11 @@ TEST_CASE("ShardedStorage spreads keys evenly over every shard, including non-po
 TEST_CASE("ShardedStorage Snapshot aggregates per-shard stats", "[sharded]")
 {
     auto storage = MakeSharded(4);
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     // Insert across shards.
     for (auto const i: std::views::iota(0, 16))
-        REQUIRE(storage->Set(std::format("k-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage->Set(std::format("k-{}", i), MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     auto const stats = storage->Snapshot();
     REQUIRE(stats.itemCount == 16U);
@@ -420,16 +426,16 @@ TEST_CASE("ShardedStorage Resize splits the total budget evenly across shards", 
 TEST_CASE("ShardedStorage FlushWithGeneration invalidates entries in every shard", "[sharded]")
 {
     auto storage = MakeSharded(4);
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     for (auto const i: std::views::iota(0, 16))
-        REQUIRE(storage->Set(std::format("k-{}", i), MakeBytes("v"), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage->Set(std::format("k-{}", i), MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()).has_value());
 
-    storage->FlushWithGeneration(clock.Now());
+    storage->FlushWithGeneration(clock.now());
 
     for (auto const i: std::views::iota(0, 16))
     {
-        auto const got = storage->Get(std::format("k-{}", i), clock.Now());
+        auto const got = storage->Get(std::format("k-{}", i), clock.now());
         REQUIRE(got.has_value());
         REQUIRE_FALSE(got->found);
     }
@@ -449,14 +455,14 @@ TEST_CASE("Concurrent same-shard Gets serialise for a non-shared-read backend", 
     std::vector<std::unique_ptr<FastCache::IStorage>> shards;
     shards.push_back(std::move(parkable));
     FastCache::ShardedStorage storage { std::move(shards) };
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     std::jthread reader1;
     std::jthread reader2;
     ReleaseParksOnUnwind const release { { park } }; // after the threads, so it opens the park before they join
 
     // First reader: parks inside Get while holding the unique lock.
-    reader1 = std::jthread { [&] { (void) storage.Get("any-key", clock.Now()); } };
+    reader1 = std::jthread { [&] { (void) storage.Get("any-key", clock.now()); } };
     REQUIRE(WaitUntil(
         "the first reader to park inside Get",
         [&] { return park->readInFlight.load() == 1; },
@@ -465,7 +471,7 @@ TEST_CASE("Concurrent same-shard Gets serialise for a non-shared-read backend", 
     // Second reader on the same shard: must block on the unique lock
     // and therefore not reach the stub while reader1 is still parked
     // inside Get. We confirm with a brief grace window.
-    reader2 = std::jthread { [&] { (void) storage.Get("another-key", clock.Now()); } };
+    reader2 = std::jthread { [&] { (void) storage.Get("another-key", clock.now()); } };
     using namespace std::chrono_literals;
     std::this_thread::sleep_for(50ms);
     REQUIRE(park->readInFlight.load() == 1);
@@ -490,13 +496,13 @@ TEST_CASE("Concurrent same-shard Gets run in parallel for a shared-read backend"
     std::vector<std::unique_ptr<FastCache::IStorage>> shards;
     shards.push_back(std::move(parkable));
     FastCache::ShardedStorage storage { std::move(shards) };
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     std::jthread reader1;
     std::jthread reader2;
     ReleaseParksOnUnwind const release { { park } }; // after the threads, so it opens the park before they join
-    reader1 = std::jthread { [&] { (void) storage.Get("key-a", clock.Now()); } };
-    reader2 = std::jthread { [&] { (void) storage.Get("key-b", clock.Now()); } };
+    reader1 = std::jthread { [&] { (void) storage.Get("key-a", clock.now()); } };
+    reader2 = std::jthread { [&] { (void) storage.Get("key-b", clock.now()); } };
 
     // Both readers must reach the stub concurrently while parked — proving the
     // shared lock admits them simultaneously.
@@ -521,7 +527,7 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
     // clang-tsan preset, this surfaces any data race; correctness-wise every
     // observed value must be one a writer actually stored (never torn).
     auto storage = MakeSharded(4);
-    FastCache::SteadyClock clock;
+    core::platform::SteadyClock clock;
 
     // A handful of keys, each with a fixed set of legal values, so a reader can
     // verify any value it sees is a complete, valid one written by some thread.
@@ -534,7 +540,7 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
     };
     constexpr int ValuesPerKey = 4;
     for (auto const k: std::views::iota(0, KeyCount))
-        REQUIRE(storage->Set(keyOf(k), MakeBytes(valueOf(k, 0)), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage->Set(keyOf(k), MakeBytes(valueOf(k, 0)), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     constexpr int ThreadCount = 8;
     std::atomic<bool> torn { false };
@@ -553,11 +559,11 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
                 if ((rng() & 1U) != 0U)
                 {
                     int const v = static_cast<int>(rng() % ValuesPerKey);
-                    (void) storage->Set(keyOf(k), MakeBytes(valueOf(k, v)), 0, FastCache::TimePoint::max());
+                    (void) storage->Set(keyOf(k), MakeBytes(valueOf(k, v)), 0, core::platform::SteadyTimePoint::max());
                 }
                 else
                 {
-                    auto const got = storage->Get(keyOf(k), clock.Now());
+                    auto const got = storage->Get(keyOf(k), clock.now());
                     if (got.has_value() && got->found)
                     {
                         auto const text = Decode(got->entry.ValueBytes());
@@ -578,7 +584,7 @@ TEST_CASE("ShardedStorage concurrent Get/Set over real storage is race-free", "[
     // Every key still resolves to a legal value after the storm.
     for (auto const k: std::views::iota(0, KeyCount))
     {
-        auto const got = storage->Get(keyOf(k), clock.Now());
+        auto const got = storage->Get(keyOf(k), clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
     }
@@ -597,7 +603,7 @@ TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism
     shards.push_back(std::move(parkable0));
     shards.push_back(std::move(parkable1));
     FastCache::ShardedStorage storage { std::move(shards) };
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     // Find two keys, one per shard.
     std::string keyShard0;
@@ -618,8 +624,8 @@ TEST_CASE("Cross-shard Gets run in parallel (sharding preserves read parallelism
     std::jthread reader0;
     std::jthread reader1;
     ReleaseParksOnUnwind const release { { park0, park1 } }; // after the threads, so it opens the parks before they join
-    reader0 = std::jthread { [&] { (void) storage.Get(keyShard0, clock.Now()); } };
-    reader1 = std::jthread { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
+    reader0 = std::jthread { [&] { (void) storage.Get(keyShard0, clock.now()); } };
+    reader1 = std::jthread { [&] { (void) storage.Get(keyShard1, clock.now()); } };
     REQUIRE(WaitUntil(
         "a reader inside Get on each shard",
         [&] { return park0->readInFlight.load() == 1 && park1->readInFlight.load() == 1; },
@@ -644,7 +650,7 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     shards.push_back(std::move(parkable0));
     shards.push_back(std::move(parkable1));
     FastCache::ShardedStorage storage { std::move(shards) };
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
     // Find a key that lives in shard 0 vs shard 1.
     std::string keyShard0;
@@ -667,7 +673,8 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     ReleaseParksOnUnwind const release { { park0, park1 } }; // after the threads, so it opens the parks before they join
 
     // Writer parks inside Set on shard 0, holding the exclusive lock.
-    writer = std::jthread { [&] { (void) storage.Set(keyShard0, MakeBytes("v"), 0, FastCache::TimePoint::max()); } };
+    writer =
+        std::jthread { [&] { (void) storage.Set(keyShard0, MakeBytes("v"), 0, core::platform::SteadyTimePoint::max()); } };
     REQUIRE(WaitUntil(
         "the writer to park inside Set on shard 0",
         [&] { return park0->writeInFlight.load() == 1; },
@@ -676,7 +683,7 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     // A reader on the same shard MUST block — until the writer releases,
     // readInFlight on shard 0 stays at 0.
     sameShardReader = std::jthread { [&] {
-        (void) storage.Get(keyShard0, clock.Now());
+        (void) storage.Get(keyShard0, clock.now());
         sameShardReadEntered = true;
     } };
 
@@ -688,7 +695,7 @@ TEST_CASE("A writer excludes readers on the same shard but not across shards", "
     // A reader on a DIFFERENT shard must proceed immediately — it should
     // reach the inner stub (where parkGet=true holds it) without being
     // blocked by the unrelated writer on shard 0.
-    otherShardReader = std::jthread { [&] { (void) storage.Get(keyShard1, clock.Now()); } };
+    otherShardReader = std::jthread { [&] { (void) storage.Get(keyShard1, clock.now()); } };
     REQUIRE(WaitUntil(
         "the other shard's reader to reach Get past the writer",
         [&] { return park1->readInFlight.load() == 1; },
@@ -721,7 +728,7 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
     std::mutex oracleMu;
 
     auto worker = [&](unsigned seed) {
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         std::mt19937 rng { seed };
         std::uniform_int_distribution<int> opDist { 0, 9 };
         std::uniform_int_distribution<int> keyDist { 0, 31 };
@@ -738,7 +745,7 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
                     std::scoped_lock const lock { oracleMu };
                     oracle[key] = val;
                 }
-                (void) storage->Set(key, MakeBytes(val), 0, FastCache::TimePoint::max());
+                (void) storage->Set(key, MakeBytes(val), 0, core::platform::SteadyTimePoint::max());
             }
             else // ~30% deletes
             {
@@ -746,7 +753,7 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
                     std::scoped_lock const lock { oracleMu };
                     oracle.erase(key);
                 }
-                (void) storage->Delete(key, clock.Now());
+                (void) storage->Delete(key, clock.now());
             }
         }
     };
@@ -773,17 +780,17 @@ TEST_CASE("Concurrent random workload matches std::map oracle", "[sharded][concu
     //
     // Final pass: every key sees a deterministic last-write so we can
     // assert exact equality.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     for (auto const i: std::views::iota(0, 32))
     {
         auto const key = std::format("k-{:02d}", i);
         auto const val = std::format("final-{}", i);
-        REQUIRE(storage->Set(key, MakeBytes(val), 0, FastCache::TimePoint::max()).has_value());
+        REQUIRE(storage->Set(key, MakeBytes(val), 0, core::platform::SteadyTimePoint::max()).has_value());
     }
     for (auto const i: std::views::iota(0, 32))
     {
         auto const key = std::format("k-{:02d}", i);
-        auto const got = storage->Get(key, clock.Now());
+        auto const got = storage->Get(key, clock.now());
         REQUIRE(got.has_value());
         REQUIRE(got->found);
         REQUIRE(Decode(got->entry.ValueBytes()) == std::format("final-{}", i));
@@ -794,20 +801,20 @@ TEST_CASE("ShardedStorage GetAndTouch refreshes expiry and returns the post-touc
 {
     using namespace std::chrono_literals;
     auto storage = MakeSharded(4);
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const setCas = storage->Set("k", MakeBytes("v"), 0, clock.Now() + 1s);
+    auto const setCas = storage->Set("k", MakeBytes("v"), 0, clock.now() + 1s);
     REQUIRE(setCas.has_value());
 
-    auto const gat = storage->GetAndTouch("k", clock.Now() + 60s, clock.Now());
+    auto const gat = storage->GetAndTouch("k", clock.now() + 60s, clock.now());
     REQUIRE(gat.has_value());
     REQUIRE(gat->found);
     REQUIRE(Decode(gat->entry.ValueBytes()) == "v");
     REQUIRE(gat->entry.cas != *setCas);              // touch bumped CAS
-    REQUIRE(gat->entry.expiry == clock.Now() + 60s); // and refreshed expiry
+    REQUIRE(gat->entry.expiry == clock.now() + 60s); // and refreshed expiry
 
     // Miss propagates KeyNotFound.
-    auto const miss = storage->GetAndTouch("absent", clock.Now() + 60s, clock.Now());
+    auto const miss = storage->GetAndTouch("absent", clock.now() + 60s, clock.now());
     REQUIRE_FALSE(miss.has_value());
     REQUIRE(miss.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -815,23 +822,23 @@ TEST_CASE("ShardedStorage GetAndTouch refreshes expiry and returns the post-touc
 TEST_CASE("ShardedStorage CompareAndDelete removes only on a CAS match", "[sharded][cas]")
 {
     auto storage = MakeSharded(4);
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const setCas = storage->Set("k", MakeBytes("v"), 0, FastCache::TimePoint::max());
+    auto const setCas = storage->Set("k", MakeBytes("v"), 0, core::platform::SteadyTimePoint::max());
     REQUIRE(setCas.has_value());
 
     // Wrong CAS: rejected, entry survives.
-    auto const mismatch = storage->CompareAndDelete("k", *setCas + 1, clock.Now());
+    auto const mismatch = storage->CompareAndDelete("k", *setCas + 1, clock.now());
     REQUIRE_FALSE(mismatch.has_value());
     REQUIRE(mismatch.error().code == FastCache::StorageErrorCode::CasMismatch);
-    REQUIRE(storage->Get("k", clock.Now())->found);
+    REQUIRE(storage->Get("k", clock.now())->found);
 
     // Right CAS: deleted.
-    REQUIRE(storage->CompareAndDelete("k", *setCas, clock.Now()).has_value());
-    REQUIRE_FALSE(storage->Get("k", clock.Now())->found);
+    REQUIRE(storage->CompareAndDelete("k", *setCas, clock.now()).has_value());
+    REQUIRE_FALSE(storage->Get("k", clock.now())->found);
 
     // Absent key: KeyNotFound.
-    auto const absent = storage->CompareAndDelete("nope", 1, clock.Now());
+    auto const absent = storage->CompareAndDelete("nope", 1, clock.now());
     REQUIRE_FALSE(absent.has_value());
     REQUIRE(absent.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -847,8 +854,8 @@ TEST_CASE("ShardedStorage::Update preserves prior expiry on Store", "[sharded][u
     using namespace FastCache::Testing;
     using namespace std::chrono_literals;
     auto storage = MakeSharded(4);
-    FastCache::ManualClock clock;
-    auto const deadline = clock.Now() + 60s;
+    core::platform::ManualClock clock;
+    auto const deadline = clock.now() + 60s;
 
     REQUIRE(storage->Set("k", MakeBytes("0"), 0, deadline).has_value());
 
@@ -864,10 +871,10 @@ TEST_CASE("ShardedStorage::Update preserves prior expiry on Store", "[sharded][u
                 // newExpiry left nullopt → preserve prior expiry
             };
         },
-        clock.Now());
+        clock.now());
     REQUIRE(upd.has_value());
 
-    auto const after = storage->Peek("k", clock.Now());
+    auto const after = storage->Peek("k", clock.now());
     REQUIRE(after.has_value());
     REQUIRE(after->found);
     REQUIRE(after->entry.expiry == deadline);

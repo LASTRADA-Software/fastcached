@@ -22,7 +22,7 @@ namespace FastCache::Cli
 /// §9.11, §9.12). A fixture substitutes the record, which is how the ASCII rung is driven without
 /// a terminal that lacks Unicode.
 ///
-/// It names nothing from `vendor/`: endo's DA1 and DECRQM answers are translated into
+/// It names nothing from core-cpp: its DA1 and DECRQM answers are translated into
 /// `SixelAnswer` and `SynchronizedOutputAnswer` where they are read, in `TerminalEventStream.cpp`.
 
 /// What the terminal said about Sixel graphics, or why it said nothing.

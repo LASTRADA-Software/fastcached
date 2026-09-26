@@ -2,7 +2,6 @@
 #pragma once
 
 #include <FastCache/Cluster/RosterCertificate.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetSample.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
@@ -24,6 +23,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Distributed
 {
@@ -268,7 +269,7 @@ struct CallerContext
     ///
     /// This used to say "who the peer says it is, for logs; never trusted for a
     /// decision", and every clause of that was wrong. The transport fills it from
-    /// `ISocket::PeerAddress()` and hands the *same* string to the membership
+    /// `core::net::ISocket::PeerAddress()` and hands the *same* string to the membership
     /// oracle, so it is already the basis of the one decision on this surface that
     /// matters -- and it is the only fact here a caller cannot forge.
     ///
@@ -280,7 +281,7 @@ struct CallerContext
     /// A bare host, never an endpoint: a peer dials from an **ephemeral source
     /// port**, so there is no port here to compare anything against.
     ///
-    /// It can legitimately be empty -- `FormatPeerAddress` answers that for a peer
+    /// It can legitimately be empty -- `core::net::formatPeerAddress` answers that for a peer
     /// whose family is unknown or whose `getpeername` failed -- so anything reading
     /// it must decide what an unnameable caller means rather than assume a host.
     ///
@@ -331,7 +332,7 @@ struct CallerContext
 /// The service is deliberately I/O-free, exactly as `WorkerRegistry` and
 /// `LeaseTable` beneath it are: it decides, and something else writes. That is what
 /// lets every rule below -- leadership, membership, capacity, duplicate
-/// suppression, expiry -- be a `ManualClock` unit test rather than a socket and a
+/// suppression, expiry -- be a `core::platform::ManualClock` unit test rather than a socket and a
 /// sleep.
 struct SchedulerReply
 {
@@ -421,8 +422,8 @@ class SchedulerService
     ///        grant's signature, so a worker refuses a grant from a fleet that is not its
     ///        own (#322). **Empty is legal** and means a node with no `--cluster-id`: a
     ///        verifier that names none expects none.
-    SchedulerService(IClock& clock,
-                     WallClockRef wallClock,
+    SchedulerService(core::platform::IClock& clock,
+                     core::platform::WallClockRef wallClock,
                      IMetricsSink& metrics,
                      ILogger& logger,
                      ILeaseSigner const& signer,
@@ -984,7 +985,7 @@ class SchedulerService
                                              std::string_view endpoint,
                                              std::string_view fingerprint);
 
-    WallClockRef _wallClock;
+    core::platform::WallClockRef _wallClock;
     IMetricsSink& _metrics;
     /// Where the endpoint-mismatch observation goes (#242).
     ///

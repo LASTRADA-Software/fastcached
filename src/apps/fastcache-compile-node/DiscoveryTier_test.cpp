@@ -3,7 +3,6 @@
 
 #include <FastCache/Cluster/MembershipPolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/InMemoryDatagram.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -17,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include <core/net/testing/InMemoryDatagram.hpp>
 #include <tests/CoHostedDatagram.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 
@@ -35,7 +35,7 @@ namespace
 /// @param nodeId Its identity.
 /// @param beaconAddress Where this node announces itself.
 /// @return The configuration.
-[[nodiscard]] Cluster::DiscoveryConfig ConfigFor(std::string const& nodeId, DatagramAddress beaconAddress)
+[[nodiscard]] Cluster::DiscoveryConfig ConfigFor(std::string const& nodeId, core::net::DatagramAddress beaconAddress)
 {
     return Cluster::DiscoveryConfig { .clusterId = "fleet",
                                       .nodeId = nodeId,
@@ -61,9 +61,9 @@ struct Peer
     /// @param bus The segment.
     /// @param nodeId This node's identity; its key is `TestKeyPair(nodeId)`.
     /// @param roster Whose key every id is, as this node's replicated state says.
-    Peer(DatagramBus& bus, std::string const& nodeId, std::shared_ptr<SharedRoster const> roster):
-        Peer(bus.Open(DatagramAddress { .host = nodeId, .port = TestBeaconPort }),
-             DatagramBus::BroadcastAddress(),
+    Peer(core::net::testing::DatagramBus& bus, std::string const& nodeId, std::shared_ptr<SharedRoster const> roster):
+        Peer(bus.open(core::net::DatagramAddress { .host = nodeId, .port = TestBeaconPort }),
+             core::net::testing::DatagramBus::broadcastAddress(),
              nodeId,
              std::move(roster))
     {
@@ -74,8 +74,8 @@ struct Peer
     /// @param beaconAddress Where it announces itself.
     /// @param nodeId This node's identity; its key is `TestKeyPair(nodeId)`.
     /// @param roster Whose key every id is, as this node's replicated state says.
-    Peer(std::unique_ptr<IDatagramSocket> socket,
-         DatagramAddress beaconAddress,
+    Peer(std::unique_ptr<core::net::IDatagramSocket> socket,
+         core::net::DatagramAddress beaconAddress,
          std::string const& nodeId,
          std::shared_ptr<SharedRoster const> roster):
         keys { TestKeyPair(nodeId), std::move(roster) },
@@ -118,7 +118,7 @@ TEST_CASE("Two nodes the roster knows find and prove each other", "[node][discov
 {
     // The whole handshake, driven by hand: no threads, no sleeps, and a failure
     // names the step it happened at rather than timing out.
-    DatagramBus bus;
+    core::net::testing::DatagramBus bus;
     auto const roster = SharedRoster::Of({ "n1", "n2" });
     Peer first { bus, "n1", roster };
     Peer second { bus, "n2", roster };
@@ -168,7 +168,7 @@ TEST_CASE("A node that cannot name itself is never desired", "[node][discovery]"
     // ever GENERATED. One a leader would refuse every pass, forever, is the shape
     // that stalls a cluster: `Reconcile` abandons the pass at the first refusal and
     // never reaches `ReconcileQuorum`.
-    DatagramBus bus;
+    core::net::testing::DatagramBus bus;
     // A truncated three-byte sequence -- the shape is right and the bytes stop
     // early -- which reaches the endpoint too, since a node's endpoint is derived
     // from its id here exactly as an operator's `--raft-peer` derives from what
@@ -207,7 +207,7 @@ TEST_CASE("A beacon from an UNKNOWN key is reported and never desired", "[node][
     // reconciler would admit. Now a machine proves possession of a key of its own, and
     // proving it perfectly is not enough: the roster does not hold that key for `n2`, so
     // `n2` is seen, counted, reported, and never handed to `Desire`.
-    DatagramBus bus;
+    core::net::testing::DatagramBus bus;
     auto const roster = SharedRoster::Of({ "n1" });
     Peer honest { bus, "n1", roster };
     Peer stranger { bus, "n2", roster };
@@ -225,7 +225,7 @@ TEST_CASE("The same stranger IS desired once the roster holds its key", "[node][
     // the roster now holds `n2`'s key. Without it the refusal above passes under a tier
     // that desires nobody at all -- which would also end auto-admission, and would also
     // break every discovered address change.
-    DatagramBus bus;
+    core::net::testing::DatagramBus bus;
     auto const roster = SharedRoster::Of({ "n1" });
     roster->Admit("n2", TestKeyPair("n2").PublicKey());
     Peer honest { bus, "n1", roster };
@@ -245,7 +245,7 @@ TEST_CASE("A peer whose proven key the roster has since revoked is not desired a
     // directory remembers a proof from whenever it was taken. So what is published is
     // re-asked of the roster at the moment it is published: `n2` proved its key, the key
     // was then revoked, and `n3` proving ITS key must not carry `n2` along with it.
-    DatagramBus bus;
+    core::net::testing::DatagramBus bus;
     auto roster = SharedRoster::Of({ "n1", "n2", "n3" });
     Peer first { bus, "n1", roster };
     Peer second { bus, "n2", roster };
@@ -276,8 +276,8 @@ TEST_CASE("Two nodes on one host find and prove each other", "[node][discovery]"
     //
     // Driven step by step rather than by a settle loop, because each step here is
     // one leg of the handshake and a failure should name the leg.
-    DatagramBus bus;
-    auto const beacon = DatagramBus::BroadcastAddressOn(TestBeaconPort);
+    core::net::testing::DatagramBus bus;
+    auto const beacon = core::net::testing::DatagramBus::broadcastAddressOn(TestBeaconPort);
 
     auto const roster = SharedRoster::Of({ "n1", "n2" });
     Peer first { CoHostedDatagramSocket(bus, "host", 40001), beacon, "n1", roster };
@@ -319,7 +319,7 @@ TEST_CASE("A peer discovery proves is recorded as a learner", "[node][discovery]
     // the roster knows it, as a `--raft-peer n2=...@<key>` typed on `n1` makes it known
     // before the state records any `n2`. A key nobody holds is reported and never desired
     // (the UNKNOWN-key case above), so this path records a learner and admits nobody new.
-    DatagramBus bus;
+    core::net::testing::DatagramBus bus;
     auto const roster = SharedRoster::Of({ "n1", "n2" });
     Peer first { bus, "n1", roster };
     Peer second { bus, "n2", roster };
@@ -350,16 +350,16 @@ TEST_CASE("Two fleets on one segment ignore each other at the node's discovery t
     // A cluster id is routing rather than authentication, and this is what it buys:
     // the challenge is never even issued, so a roster that knew both would not help.
     // Checked before a challenge goes out AND before one is answered.
-    DatagramBus bus;
+    core::net::testing::DatagramBus bus;
     auto const roster = SharedRoster::Of({ "n1", "n2" });
     Peer ours { bus, "n1", roster };
 
     NullLogger otherLogger;
     AtomicMetricsSink otherMetrics;
     RosterPeerKeys otherKeys { TestKeyPair("n2"), roster };
-    auto otherConfig = ConfigFor("n2", DatagramBus::BroadcastAddress());
+    auto otherConfig = ConfigFor("n2", core::net::testing::DatagramBus::broadcastAddress());
     otherConfig.clusterId = "somebody-elses";
-    auto const theirs = DiscoveryTier::Over(bus.Open(DatagramAddress { .host = "n2", .port = TestBeaconPort }),
+    auto const theirs = DiscoveryTier::Over(bus.open(core::net::DatagramAddress { .host = "n2", .port = TestBeaconPort }),
                                             std::move(otherConfig),
                                             otherKeys,
                                             {},

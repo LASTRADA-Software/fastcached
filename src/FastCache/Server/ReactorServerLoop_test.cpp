@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cache/NotifyingStorage.hpp>
 #include <FastCache/Cache/ReclaimLog.hpp>
 #include <FastCache/Cache/StorageTestUtils.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 
@@ -30,6 +27,9 @@
 #include <thread>
 #include <vector>
 
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -50,7 +50,7 @@ TEST_CASE("RunReactorServer rejects a TLS-flagged bind when no TLS context is co
     // TLS-flagged bind and a null tlsContext, calling RunReactorServer
     // directly, and asserting EXIT_FAILURE without the listener ever
     // being bound (no port collision regardless of test order).
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::NullLogger logger;
@@ -160,7 +160,7 @@ TEST_CASE("Detail::VerifyTlsContextForTlsBinds accepts mixed plaintext+TLS binds
     options.binds.push_back(FastCache::BindConfig { .address = "127.0.0.1", .port = 6380, .tls = true });
     // Non-null sentinel; the verifier only checks the pointer for nullness.
     // reinterpret_cast is intentional — the verifier never dereferences.
-    options.tlsContext = reinterpret_cast<FastCache::TlsContext*>(0x1);
+    options.tlsContext = reinterpret_cast<core::net::ITlsContext*>(0x1);
 
     auto const exitCode = FastCache::Detail::VerifyTlsContextForTlsBinds(options, logger);
     REQUIRE(exitCode == EXIT_SUCCESS);
@@ -204,9 +204,9 @@ struct DaemonChain
     FastCache::NullLogger logger;
     ExpireRecorder observer;
     FastCache::NotifyingStorage storage { lru, &observer };
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::ReclaimLog log { &observer };
-    FastCache::TestReactor reactor { clock };
+    core::net::testing::TestLoop reactor { clock };
     FastCache::CacheEngine engine { storage, clock };
 
     DaemonChain()
@@ -228,22 +228,22 @@ TEST_CASE("Detail::StartExpiryCycle reclaims an untouched lapsed key through the
     // place and invisible to every storage-level test.
     using namespace std::chrono_literals;
     DaemonChain chain;
-    REQUIRE(chain.engine.Storage().Set("gone", FastCache::Testing::MakeBytes("v"), 0, chain.clock.Now() + 1s).has_value());
+    REQUIRE(chain.engine.Storage().Set("gone", FastCache::Testing::MakeBytes("v"), 0, chain.clock.now() + 1s).has_value());
     chain.observer.expired.clear();
 
     FastCache::ReactorServerOptions options;
-    options.expiry = FastCache::ExpiryReaperOptions { .interval = 100ms, .stopWakeBound = 25ms };
+    options.expiry = FastCache::ExpiryReaperOptions { .interval = 100ms };
 
     auto const cycle =
         FastCache::Detail::StartExpiryCycle(chain.reactor, chain.reactor, chain.engine, chain.logger, options, nullptr);
     REQUIRE(cycle != nullptr);
-    chain.reactor.Drain();
+    chain.reactor.drain();
     CHECK(chain.engine.Storage().Snapshot().itemCount == 1U); // Nothing has lapsed yet.
 
     // Nothing touches the key. Before the cycle existed this is where it stayed
     // resident and unreported for the life of the process.
-    chain.clock.Advance(2s);
-    chain.reactor.Drain();
+    chain.clock.advance(2s);
+    chain.reactor.drain();
 
     CHECK(chain.engine.Storage().Snapshot().itemCount == 0U);
     CHECK(chain.observer.expired == std::vector<std::string> { "gone" });
@@ -256,20 +256,20 @@ TEST_CASE("Detail::StartExpiryCycle honours a zero interval by starting nothing"
     // deadline nothing will move is a frame the reactor has to outlive.
     using namespace std::chrono_literals;
     DaemonChain chain;
-    REQUIRE(chain.engine.Storage().Set("gone", FastCache::Testing::MakeBytes("v"), 0, chain.clock.Now() + 1s).has_value());
+    REQUIRE(chain.engine.Storage().Set("gone", FastCache::Testing::MakeBytes("v"), 0, chain.clock.now() + 1s).has_value());
 
     FastCache::ReactorServerOptions options;
-    options.expiry = FastCache::ExpiryReaperOptions { .interval = FastCache::Duration::zero() };
+    options.expiry = FastCache::ExpiryReaperOptions { .interval = core::platform::SteadyDuration::zero() };
 
     auto const cycle =
         FastCache::Detail::StartExpiryCycle(chain.reactor, chain.reactor, chain.engine, chain.logger, options, nullptr);
     REQUIRE(cycle != nullptr);
-    chain.reactor.Drain();
-    chain.clock.Advance(1h);
-    chain.reactor.Drain();
+    chain.reactor.drain();
+    chain.clock.advance(1h);
+    chain.reactor.drain();
 
     CHECK(cycle->Cycles() == 0U);
-    CHECK(chain.reactor.PendingTimers() == 0);
+    CHECK(chain.reactor.pendingTimers() == 0);
     CHECK(chain.engine.Storage().Snapshot().itemCount == 1U); // Expiry stays access-driven.
 }
 
@@ -279,7 +279,7 @@ TEST_CASE("ReactorServerOptions defaults the expiry cycle on", "[server][reactor
     // by a caller that does not mention expiry -- which is every test fixture
     // and every future embedder -- must not silently reproduce #162.
     FastCache::ReactorServerOptions const options;
-    CHECK(options.expiry.interval > FastCache::Duration::zero());
+    CHECK(options.expiry.interval > core::platform::SteadyDuration::zero());
     CHECK(options.expiry.scanBudget != 0U);
     CHECK(options.expiry.purgeBudget != 0U);
 }
@@ -449,7 +449,7 @@ void CheckReadinessComplete(std::vector<FastCache::CapturingLogger::Record> cons
     // one would leave the flag set and this run would stop before arming.
     FastCache::DaemonControls::Instance().Reset();
 
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
@@ -588,7 +588,7 @@ TEST_CASE("RunReactorServer reports a bind it cannot make at Error and refuses t
     // Provoked with RFC 5737 `192.0.2.1`, an address no host holds: it is refused on
     // every platform and needs no second listener kept alive, which is the technique
     // `AdminHttpServer_test` already uses for the same reason.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::CapturingLogger logger;
@@ -613,7 +613,7 @@ TEST_CASE("Detail::ArmAcceptLoops does not count an accept loop that never armed
     // readiness path the end-to-end cases above cannot reach: they bind real
     // listeners, so every accept loop arms and the refusal never fires.
     //
-    // A closed `InMemoryListener` answers `Accept()` with a ready error instead of
+    // A closed `core::net::testing::InMemoryListener` answers `Accept()` with a ready error instead of
     // parking, so `Server::Run()` returns before suspending and `IsAccepting()` is
     // false by the time the call returns. That is exactly "started but not armed",
     // and counting it would put an acceptor that does not exist into the readiness
@@ -622,20 +622,20 @@ TEST_CASE("Detail::ArmAcceptLoops does not count an accept loop that never armed
     // The POSITIVE direction is asserted by the two end-to-end cases above, which
     // count one arm per bind against real listeners and pin the ordering. It is
     // deliberately not asserted here as well: a `Server` over a LIVE
-    // `InMemoryListener` ends parked on `Accept()`, and unparking it walks into a
+    // `core::net::testing::InMemoryListener` ends parked on `Accept()`, and unparking it walks into a
     // dangling-handle defect in that fake which is unrelated to this change and
     // lives outside this lane -- see the note on the pull request. Saying which
     // direction is covered where is the point; a case that quietly covered one and
     // read as covering both would be the worse outcome.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::CapturingLogger logger { FastCache::LogLevel::Trace };
 
-    FastCache::InMemoryListener first;
-    FastCache::InMemoryListener second;
-    first.Close();
-    second.Close();
+    core::net::testing::InMemoryListener first;
+    core::net::testing::InMemoryListener second;
+    first.close();
+    second.close();
 
     std::vector<std::unique_ptr<FastCache::Server>> servers;
     servers.push_back(std::make_unique<FastCache::Server>(first, engine, logger));

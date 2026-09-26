@@ -13,7 +13,7 @@ namespace FastCache::Node
 {
 
 std::expected<std::unique_ptr<NodeRoster>, std::string> NodeRoster::Build(NodeConfig const& cfg,
-                                                                          WallClockRef wallClock,
+                                                                          core::platform::WallClockRef wallClock,
                                                                           IMetricsSink& metrics,
                                                                           ILogger& logger)
 {
@@ -61,7 +61,7 @@ std::expected<std::unique_ptr<NodeRoster>, std::string> NodeRoster::Build(NodeCo
         wallClock, nullptr, std::move(store), std::move(trust), metrics, logger } };
 }
 
-NodeRoster::NodeRoster(WallClockRef wallClock,
+NodeRoster::NodeRoster(core::platform::WallClockRef wallClock,
                        std::unique_ptr<Distributed::StateLeaseRoster> state,
                        std::unique_ptr<Distributed::IRosterStore> store,
                        std::unique_ptr<Distributed::RosterTrust> trust,
@@ -86,7 +86,7 @@ Distributed::ILeaseRoster const* NodeRoster::Lease() const noexcept
 ServerStanding NodeRoster::StandingOf(std::string_view serverId, Ed25519PublicKey const& serverKey) const
 {
     auto const* const roster = Lease();
-    if (roster == nullptr || roster->Read(_wallClock.Now()).standing == Distributed::RosterStanding::Absent)
+    if (roster == nullptr || roster->Read(_wallClock.now()).standing == Distributed::RosterStanding::Absent)
         return ServerStanding::Unchecked;
 
     // A revocation first, whatever id it was revoked under: the key is the fact, and a removed
@@ -147,12 +147,12 @@ void NodeRoster::Offered(std::span<std::byte const> certified)
         }
         return;
     }
-    std::ignore = _trust->Offer(*decoded, _wallClock.Now());
+    std::ignore = _trust->Offer(*decoded, _wallClock.now());
 }
 
 bool NodeRoster::Wanting() const
 {
-    return _trust != nullptr && _trust->Read(_wallClock.Now()).standing != Distributed::RosterStanding::Current;
+    return _trust != nullptr && _trust->Read(_wallClock.now()).standing != Distributed::RosterStanding::Current;
 }
 
 std::optional<Distributed::RosterSummary> NodeRoster::Summary() const
@@ -168,10 +168,10 @@ std::optional<std::uint64_t> NodeRoster::ExpiresInSeconds() const
 {
     if (_trust == nullptr)
         return std::nullopt;
-    auto const reading = _trust->Read(_wallClock.Now());
+    auto const reading = _trust->Read(_wallClock.now());
     if (!reading.certifiedUntil.has_value())
         return std::nullopt;
-    auto const now = _wallClock.Now();
+    auto const now = _wallClock.now();
     if (*reading.certifiedUntil <= now)
         return std::uint64_t { 0 };
     return static_cast<std::uint64_t>(

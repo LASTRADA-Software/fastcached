@@ -14,15 +14,15 @@ namespace FastCache::Cc
 /// injected seam for an ambient dependency, defined where its consumer lives,
 /// with a fake in tests.
 ///
-/// ## Why not `IExecutor`
+/// ## Why not `core::async::IExecutor`
 ///
 /// `FastCache/Async/IExecutor.hpp` is the **coroutine-resumption** seam -- AGENT.md
-/// calls it "the one thing `ResumeOn` needs" -- and its only method takes a
-/// `std::coroutine_handle<>`. Its one implementation, `ThreadPoolExecutor`, offers
-/// nothing else, `ResumeOn` is usable only from inside a coroutine, and `Task<T>` is
+/// calls it "the one thing `core::async::ResumeOn` needs" -- and its only method takes a
+/// `std::coroutine_handle<>`. Its one implementation, `core::async::ThreadPoolExecutor`, offers
+/// nothing else, `core::async::ResumeOn` is usable only from inside a coroutine, and `core::async::Task<T>` is
 /// awaitable-only: nothing in this repository can drive a task to completion from
 /// synchronous code. The toolchain walk is synchronous startup code, so reaching
-/// `IExecutor` would mean either adding a sync-wait primitive to `Async/` -- which
+/// `core::async::IExecutor` would mean either adding a sync-wait primitive to `Async/` -- which
 /// is a deadlock generator the first time somebody calls it from a pool or reactor
 /// thread, and the tree already has the rule that names the shape -- or
 /// hand-writing coroutine frames and a latch here, which is more bespoke

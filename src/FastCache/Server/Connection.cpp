@@ -14,13 +14,13 @@
 namespace FastCache
 {
 
-Connection::Connection(std::unique_ptr<ISocket> socket, ConnectionHoldings held) noexcept:
+Connection::Connection(std::unique_ptr<core::net::ISocket> socket, ConnectionHoldings held) noexcept:
     _socket { std::move(socket) },
     _held { held }
 {
 }
 
-Task<void> Connection::Run()
+core::async::Task<void> Connection::Run()
 {
     // Decorate this connection's logger with the client source (its IP) when
     // --log-source is on. SourceLogger forwards unchanged for an empty source,
@@ -30,7 +30,7 @@ Task<void> Connection::Run()
     auto sourceTag = std::string {};
     if (_held.logSource == LogSource::Yes)
     {
-        if (auto const peer = _socket->PeerAddress(); !peer.empty())
+        if (auto const peer = _socket->peerAddress(); !peer.empty())
             sourceTag = std::format("[{}]", peer);
     }
     SourceLogger log { _held.logger, sourceTag };
@@ -46,18 +46,18 @@ Task<void> Connection::Run()
     // Drive any transport handshake (TLS) before reading application bytes.
     // No-op for plaintext sockets; runs on this per-connection coroutine so a
     // slow or stalled handshake never blocks the accept loop.
-    if (auto const handshake = co_await _socket->HandshakeIfNeeded(); !handshake.has_value())
+    if (auto const handshake = co_await _socket->handshakeIfNeeded(); !handshake.has_value())
     {
-        log.Logf(LogLevel::Debug, "Connection: handshake failed: {}", handshake.error().ToString());
-        _socket->Close();
+        log.Logf(LogLevel::Debug, "Connection: handshake failed: {}", handshake.error().toString());
+        _socket->close();
         co_return;
     }
 
     auto detect = co_await DetectProtocol(_socket.get());
     if (!detect.has_value())
     {
-        log.Logf(LogLevel::Debug, "Connection: autodetect failed: {}", detect.error().ToString());
-        _socket->Close();
+        log.Logf(LogLevel::Debug, "Connection: autodetect failed: {}", detect.error().toString());
+        _socket->close();
         co_return;
     }
 

@@ -2,7 +2,6 @@
 #include "FleetTextResponder.hpp"
 #include "Responders.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -24,6 +23,8 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
 #include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
@@ -123,7 +124,7 @@ struct Rig
                                              std::vector<std::byte> const& frame,
                                              std::string_view peer)
     {
-        return SyncRun(on.Answer(frame, PeerIdentity { .host = std::string { peer } })).bytes;
+        return core::async::syncRun(on.Answer(frame, PeerIdentity { .host = std::string { peer } })).bytes;
     }
 
     /// Ask the rig's responder from this machine, which a node with no token file admits.
@@ -343,8 +344,9 @@ TEST_CASE("MergedResponder routes the Fleet family to the fleet-text component a
     MergedResponder merged { SurfaceComponents { .fleet = &rig.responder } };
 
     CHECK(merged.OwnerOf(static_cast<std::uint8_t>(Wire::Op::FleetText)) == &rig.responder);
-    CHECK(Testing::StatusOf(SyncRun(merged.Answer(FleetTextFrame(), PeerIdentity { .host = "127.0.0.1" })).bytes)
-          == Wire::Status::Ok);
+    CHECK(
+        Testing::StatusOf(core::async::syncRun(merged.Answer(FleetTextFrame(), PeerIdentity { .host = "127.0.0.1" })).bytes)
+        == Wire::Status::Ok);
 
     // Routes rather than catching all: no other verb reaches it.
     for (auto const& row: Wire::OpTable)
@@ -357,7 +359,8 @@ TEST_CASE("MergedResponder routes the Fleet family to the fleet-text component a
     SECTION("and a node with no fleet-text component answers served-nowhere rather than crashing")
     {
         MergedResponder without { SurfaceComponents {} };
-        CHECK(Testing::ErrorOf(SyncRun(without.Answer(FleetTextFrame(), PeerIdentity { .host = "127.0.0.1" })).bytes)
+        CHECK(Testing::ErrorOf(
+                  core::async::syncRun(without.Answer(FleetTextFrame(), PeerIdentity { .host = "127.0.0.1" })).bytes)
               == Wire::UnimplementedVerb);
     }
 

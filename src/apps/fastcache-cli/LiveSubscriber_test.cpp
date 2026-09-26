@@ -3,13 +3,11 @@
 #include "NodeClient.hpp"
 #include "SocketExchange.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReadingCodec.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
-#include <FastCache/Net/TcpClient.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -25,6 +23,10 @@
 #include <thread>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/BlockingSocket.hpp>
+#include <core/net/TcpClient.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -222,18 +224,18 @@ namespace
 /// Await one accept; a blocking listener resolves it synchronously.
 /// @param listener The bound listener.
 /// @return The accepted socket, or the accept error.
-[[nodiscard]] Task<AcceptResult> AcceptOne(BlockingListener* listener)
+[[nodiscard]] core::async::Task<core::net::AcceptResult> AcceptOne(BlockingListener* listener)
 {
-    co_return co_await listener->Accept();
+    co_return co_await listener->accept();
 }
 
-/// One read, as a task `SyncRun` can drive.
+/// One read, as a task `core::async::syncRun` can drive.
 /// @param socket The socket.
 /// @param buffer Where the bytes go; not empty.
 /// @return Bytes read, `0` for EOF, or the failure.
-[[nodiscard]] Task<IoResult> ReadSome(ISocket* socket, std::span<std::byte> buffer)
+[[nodiscard]] core::async::Task<core::net::IoResult> ReadSome(core::net::ISocket* socket, std::span<std::byte> buffer)
 {
-    co_return co_await socket->Read(buffer);
+    co_return co_await socket->read(buffer);
 }
 
 /// What the stand-in node observed.
@@ -253,17 +255,17 @@ struct ServerRecord
 /// @param record Where what happened is written.
 void ServeOneStream(BlockingListener* listener, ServerRecord* record)
 {
-    auto accepted = SyncRun(AcceptOne(listener));
+    auto accepted = core::async::syncRun(AcceptOne(listener));
     if (!accepted.has_value())
         return;
     auto const socket = *std::move(accepted);
-    socket->SetReceiveDeadline(5s);
+    socket->setReceiveDeadline(5s);
 
-    auto const header = SyncRun(RecvExactly(socket.get(), Wire::RequestHeaderSize));
+    auto const header = core::async::syncRun(core::net::receiveExactly(socket.get(), Wire::RequestHeaderSize));
     auto const decoded = header.has_value() ? Wire::DecodeRequestHeader(*header) : std::nullopt;
     if (!decoded.has_value())
         return;
-    auto const payload = SyncRun(RecvExactly(socket.get(), decoded->payloadLength));
+    auto const payload = core::async::syncRun(core::net::receiveExactly(socket.get(), decoded->payloadLength));
     auto const request = payload.has_value() ? Wire::DecodeSubscribeRequest(*payload) : std::nullopt;
     if (!request.has_value())
         return;
@@ -277,13 +279,14 @@ void ServeOneStream(BlockingListener* listener, ServerRecord* record)
                                                                                   .statsLayout = StatsReadingLayout,
                                                                                   .endpoint = "127.0.0.1" }));
     auto const snapshot = Wire::EncodeReply(Wire::Status::Push, Wire::EncodeLiveSnapshot(1, reading));
-    record->wrote = SyncRun(SendAll(socket.get(), granted)) && SyncRun(SendAll(socket.get(), snapshot));
+    record->wrote = core::async::syncRun(core::net::sendAll(socket.get(), granted))
+                    && core::async::syncRun(core::net::sendAll(socket.get(), snapshot));
 
     auto buffer = std::array<std::byte, 64> {};
-    auto const got = SyncRun(ReadSome(socket.get(), buffer));
+    auto const got = core::async::syncRun(ReadSome(socket.get(), buffer));
     record->sawEof = got.has_value() && *got == 0;
     record->sawError = !got.has_value();
-    socket->Close();
+    socket->close();
 }
 
 } // namespace
@@ -303,7 +306,7 @@ TEST_CASE("A subscription reads its stream, and leaving it while a read blocks i
         auto const server = std::jthread { [&listener, &record] { ServeOneStream(listener.get(), &record); } };
 
         auto const opened = subscription.Open(
-            Endpoint { .host = "127.0.0.1", .port = listener->BoundPort() },
+            Endpoint { .host = "127.0.0.1", .port = listener->boundPort() },
             Wire::SubscribeRequest { .subject = Wire::LiveSubject::Node, .cadenceMillis = 500, .dashboardToken = {} });
         REQUIRE(opened.has_value());
 
@@ -334,7 +337,7 @@ TEST_CASE("A subscription reads its stream, and leaving it while a read blocks i
 
     // A session that left does not dial again.
     auto const again = subscription.Open(
-        Endpoint { .host = "127.0.0.1", .port = listener->BoundPort() },
+        Endpoint { .host = "127.0.0.1", .port = listener->boundPort() },
         Wire::SubscribeRequest { .subject = Wire::LiveSubject::Node, .cadenceMillis = 500, .dashboardToken = {} });
     CHECK_FALSE(again.has_value());
 }
@@ -363,7 +366,7 @@ TEST_CASE("A leave that arrives while the subscription dials is still the node's
     {
         auto const server = std::jthread { [&listener, &record] { ServeOneStream(listener.get(), &record); } };
         auto const opened = subscription.Open(
-            Endpoint { .host = "127.0.0.1", .port = listener->BoundPort() },
+            Endpoint { .host = "127.0.0.1", .port = listener->boundPort() },
             Wire::SubscribeRequest { .subject = Wire::LiveSubject::Cache, .cadenceMillis = 500, .dashboardToken = {} });
         REQUIRE(opened.has_value());
     }

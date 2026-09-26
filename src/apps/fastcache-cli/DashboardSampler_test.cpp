@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DashboardSampler.hpp"
 
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
-#include <FastCache/Core/Clock.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
@@ -20,6 +15,10 @@
 #include <tuple>
 #include <vector>
 
+#include <core/async/ResumeOn.hpp>
+#include <core/async/ThreadPoolExecutor.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -79,8 +78,11 @@ class RecordingSubscription final: public ILiveSubscription
 /// @param resumeOn Where to come back.
 /// @param out Where to put the result.
 /// @return The task to submit.
-[[nodiscard]] Task<void> TakeOnce(
-    ILiveSubscription* subscription, IClock* clock, IExecutor* pool, IExecutor* resumeOn, std::optional<FrameOutcome>* out)
+[[nodiscard]] core::async::Task<void> TakeOnce(ILiveSubscription* subscription,
+                                               core::platform::IClock* clock,
+                                               core::async::IExecutor* pool,
+                                               core::async::IExecutor* resumeOn,
+                                               std::optional<FrameOutcome>* out)
 {
     *out = co_await TakeFrame(subscription, clock, pool, resumeOn);
 }
@@ -92,7 +94,7 @@ class RecordingSubscription final: public ILiveSubscription
 class TimedSubscription final: public ILiveSubscription
 {
   public:
-    TimedSubscription(ManualClock& clock, Duration during):
+    TimedSubscription(core::platform::ManualClock& clock, core::platform::SteadyDuration during):
         _clock { clock },
         _during { during }
     {
@@ -106,7 +108,7 @@ class TimedSubscription final: public ILiveSubscription
 
     [[nodiscard]] std::expected<NodeReply, ExchangeError> Read() override
     {
-        _clock.Advance(_during);
+        _clock.advance(_during);
         return NodeReply { .status = CompileCacheWire::Status::Ok };
     }
 
@@ -115,40 +117,40 @@ class TimedSubscription final: public ILiveSubscription
     void Leave() noexcept override {}
 
   private:
-    ManualClock& _clock;
-    Duration _during;
+    core::platform::ManualClock& _clock;
+    core::platform::SteadyDuration _during;
 };
 
 /// An executor that makes the queue take time before it hands work on.
 ///
 /// Stands in for the reactor's own latency: the delay between a continuation being posted
 /// and the reactor running it, which is real and which must not become part of a reading.
-class SlowQueue final: public IExecutor
+class SlowQueue final: public core::async::IExecutor
 {
   public:
-    SlowQueue(ManualClock& clock, Duration delay, IExecutor& inner):
+    SlowQueue(core::platform::ManualClock& clock, core::platform::SteadyDuration delay, core::async::IExecutor& inner):
         _clock { clock },
         _delay { delay },
         _inner { inner }
     {
     }
 
-    void Submit(std::coroutine_handle<> handle) override
+    void submit(std::coroutine_handle<> handle) override
     {
-        _clock.Advance(_delay);
-        _inner.Submit(handle);
+        _clock.advance(_delay);
+        _inner.submit(handle);
     }
 
-    void Submit(ParkedWork work) override
+    void submit(core::async::ParkedWork work) override
     {
-        _clock.Advance(_delay);
-        _inner.Submit(work);
+        _clock.advance(_delay);
+        _inner.submit(work);
     }
 
   private:
-    ManualClock& _clock;
-    Duration _delay;
-    IExecutor& _inner;
+    core::platform::ManualClock& _clock;
+    core::platform::SteadyDuration _delay;
+    core::async::IExecutor& _inner;
 };
 
 /// Record which thread an executor runs work on.
@@ -156,9 +158,11 @@ class SlowQueue final: public IExecutor
 /// @param where Where to record the thread id.
 /// @param ran Set once the hop has happened.
 /// @return The task to submit.
-[[nodiscard]] Task<void> MarkThread(IExecutor* pool, std::atomic<std::thread::id>* where, std::atomic<bool>* ran)
+[[nodiscard]] core::async::Task<void> MarkThread(core::async::IExecutor* pool,
+                                                 std::atomic<std::thread::id>* where,
+                                                 std::atomic<bool>* ran)
 {
-    co_await ResumeOn { *pool };
+    co_await core::async::ResumeOn { *pool };
     where->store(std::this_thread::get_id(), std::memory_order_release);
     ran->store(true, std::memory_order_release);
 }
@@ -175,17 +179,17 @@ TEST_CASE("a stream frame is read off the reactor and delivered back onto it", "
     // implementation that dropped both hops and called `Read()` inline would produce
     // exactly the same frame, and every assertion about the frame would still pass.
     // So this case asserts three things about WHERE, and the frame only incidentally.
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto subscription = RecordingSubscription {};
 
     auto const driverThread = std::this_thread::get_id();
     auto result = std::optional<FrameOutcome> {};
     auto task = TakeOnce(&subscription, &clock, &pool, &reactor, &result);
 
-    reactor.Submit(task.Native());
-    reactor.Drain();
+    reactor.submit(task.handle());
+    reactor.drain();
 
     // The read is now parked on the pool, blocking. The reactor has run out of work,
     // which is itself the point: the loop is FREE while a frame is outstanding. A CHECK,
@@ -251,10 +255,10 @@ TEST_CASE("the sampler's thread identities are not equal by construction", "[cli
     // not exist yet where the task has to be declared.
     auto poolThread = std::atomic<std::thread::id> {};
     auto ran = std::atomic<bool> { false };
-    auto marker = std::optional<Task<void>> {};
-    auto pool = ThreadPoolExecutor { 1 };
+    auto marker = std::optional<core::async::Task<void>> {};
+    auto pool = core::async::ThreadPoolExecutor { 1 };
 
-    pool.Submit(marker.emplace(MarkThread(&pool, &poolThread, &ran)).Native());
+    pool.submit(marker.emplace(MarkThread(&pool, &poolThread, &ran)).handle());
 
     REQUIRE(WaitUntil(
         "the marker to run on the pool thread",
@@ -275,31 +279,31 @@ TEST_CASE("a frame is stamped after its read returns and before the hop back", "
     // Stamped before the read reads the start; stamped after the hop reads 12 s. Only the
     // right line reads exactly 5 s, and an assertion of "later than the start" would pass
     // for the second mistake.
-    constexpr auto InsideRead = Duration { std::chrono::seconds { 5 } };
-    constexpr auto InQueue = Duration { std::chrono::seconds { 7 } };
+    constexpr auto InsideRead = core::platform::SteadyDuration { std::chrono::seconds { 5 } };
+    constexpr auto InQueue = core::platform::SteadyDuration { std::chrono::seconds { 7 } };
 
-    auto clock = ManualClock {};
-    auto const start = clock.Now();
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto const start = clock.now();
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
     auto subscription = TimedSubscription { clock, InsideRead };
     auto queue = SlowQueue { clock, InQueue, reactor };
 
     auto result = std::optional<FrameOutcome> {};
     auto task = TakeOnce(&subscription, &clock, &pool, &queue, &result);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     REQUIRE(DrainUntil(
         reactor,
         "the stamped frame to come back through the slow queue",
         [&result] { return result.has_value(); },
         [&clock, start] {
             return std::format("{} ms of manual time passed",
-                               std::chrono::duration_cast<std::chrono::milliseconds>(clock.Now() - start).count());
+                               std::chrono::duration_cast<std::chrono::milliseconds>(clock.now() - start).count());
         }));
 
     REQUIRE(result.has_value());
     CHECK(Unwrap(result).takenAt == start + InsideRead);
     // And the queue delay really happened, or the case above would pass on a line that
     // cannot tell "after the hop" from "before it".
-    CHECK(clock.Now() == start + InsideRead + InQueue);
+    CHECK(clock.now() == start + InsideRead + InQueue);
 }

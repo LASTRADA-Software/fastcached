@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/SleepUntil.hpp>
 #include <FastCache/Metrics/StatsReadingCodec.hpp>
 #include <FastCache/Protocol/LiveStream.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
@@ -10,6 +9,8 @@
 #include <limits>
 #include <ranges>
 #include <utility>
+
+#include <core/net/SleepUntil.hpp>
 
 namespace FastCache
 {
@@ -98,15 +99,16 @@ namespace
                                                     .counter = IMetricsSink::Counter::LiveSubscriptionsRefusedMalformed };
 
     /// The tick @p now falls in, on a grid of @p floor.
-    [[nodiscard]] std::uint64_t TickOf(TimePoint now, std::chrono::milliseconds floor) noexcept
+    [[nodiscard]] std::uint64_t TickOf(core::platform::SteadyTimePoint now, std::chrono::milliseconds floor) noexcept
     {
         return static_cast<std::uint64_t>(now.time_since_epoch() / floor);
     }
 
     /// When the tick after @p tick begins.
-    [[nodiscard]] TimePoint NextTickAt(std::uint64_t tick, std::chrono::milliseconds floor) noexcept
+    [[nodiscard]] core::platform::SteadyTimePoint NextTickAt(std::uint64_t tick, std::chrono::milliseconds floor) noexcept
     {
-        return TimePoint { std::chrono::duration_cast<Duration>(floor * static_cast<std::int64_t>(tick + 1)) };
+        return core::platform::SteadyTimePoint { std::chrono::duration_cast<core::platform::SteadyDuration>(
+            floor * static_cast<std::int64_t>(tick + 1)) };
     }
 
     /// Holds one place under `MaxLiveSubscriptions` for as long as a stream runs.
@@ -389,19 +391,19 @@ LiveStream::Observation LiveStream::Observe(Wire::LiveSubject subject,
     return observation;
 }
 
-Task<LiveStream::Observation> LiveStream::AwaitView(Wire::LiveSubject subject,
-                                                    std::chrono::milliseconds floor,
-                                                    std::uint64_t eventsFrom,
-                                                    std::optional<std::uint64_t> seen,
-                                                    IPushSink const* sink,
-                                                    IReactor* reactor)
+core::async::Task<LiveStream::Observation> LiveStream::AwaitView(Wire::LiveSubject subject,
+                                                                 std::chrono::milliseconds floor,
+                                                                 std::uint64_t eventsFrom,
+                                                                 std::optional<std::uint64_t> seen,
+                                                                 IPushSink const* sink,
+                                                                 core::net::EventLoop* reactor)
 {
     while (true)
     {
-        auto observation = Observe(subject, TickOf(reactor->Clock().Now(), floor), eventsFrom, seen);
+        auto observation = Observe(subject, TickOf(reactor->clock().now(), floor), eventsFrom, seen);
         if (observation.seen != Seen::Busy || sink->Stopping())
             co_return observation;
-        co_await SleepUntil { .reactor = reactor, .deadline = reactor->Clock().Now() + LiveStopCheck };
+        co_await core::net::sleepUntil(reactor, reactor->clock().now() + LiveStopCheck);
     }
 }
 
@@ -430,8 +432,11 @@ std::optional<std::vector<std::byte>> LiveStream::EndedBySink(IPushSink const& s
     return std::nullopt;
 }
 
-Task<std::vector<std::byte>> LiveStream::Serve(
-    std::span<std::byte const> frame, LiveWatcher watcher, IPushSink* sink, ILiveGate const* gate, IReactor* reactor)
+core::async::Task<std::vector<std::byte>> LiveStream::Serve(std::span<std::byte const> frame,
+                                                            LiveWatcher watcher,
+                                                            IPushSink* sink,
+                                                            ILiveGate const* gate,
+                                                            core::net::EventLoop* reactor)
 {
     // The gate's authority, whatever a surface asked at its door: `Serve` is reachable directly.
     if (auto refusal = gate->RefuseWatcher(watcher); refusal.has_value())
@@ -548,8 +553,8 @@ Task<std::vector<std::byte>> LiveStream::Serve(
 
         // In steps, so a stop is seen within one `LiveStopCheck` rather than one tick.
         auto const wake = NextTickAt(tick, floor);
-        while (!sink->Stopping() && reactor->Clock().Now() < wake)
-            co_await SleepUntil { .reactor = reactor, .deadline = std::min(wake, reactor->Clock().Now() + LiveStopCheck) };
+        while (!sink->Stopping() && reactor->clock().now() < wake)
+            co_await core::net::sleepUntil(reactor, std::min(wake, reactor->clock().now() + LiveStopCheck));
     }
 }
 

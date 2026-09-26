@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/YamlReader.hpp>
-#include <FastCache/Core/Ranges.hpp>
 
 #include <yaml-cpp/yaml.h>
 
@@ -10,6 +9,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache
 {
@@ -108,7 +109,7 @@ std::expected<std::vector<YamlSetting>, ConfigError> ReadYamlSettings(std::files
         // what a repetition means by accident: a scalar row keeps the LAST value and a
         // list row APPENDS both -- two silent answers, neither of them anything the
         // operator can see, and the first of them discards a value somebody wrote.
-        if (auto const* const earlier = FindOrNull(settings, key, &YamlSetting::key); earlier != nullptr)
+        if (auto const* const earlier = core::findOrNull(settings, key, &YamlSetting::key); earlier != nullptr)
             return std::unexpected(MakeError(ConfigErrorCode::ParseError,
                                              path,
                                              key,

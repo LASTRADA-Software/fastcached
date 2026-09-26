@@ -4,7 +4,6 @@
 #include "CacheProtocol.hpp"
 #include "CodecEnvelope.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <array>
@@ -17,12 +16,14 @@
 #include <string_view>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
+
 namespace FastCache::Cc
 {
 
 /// Runs one framed request/reply against an endpoint named at runtime.
 ///
-/// The library's `ISocket` is one *connected* peer, which was enough
+/// The library's `core::net::ISocket` is one *connected* peer, which was enough
 /// while there was only ever one address to reach. Distribution talks to two —
 /// the scheduler, and then whichever worker the scheduler names — so reaching an
 /// endpoint becomes the thing that has to be injected. Tests answer with scripted
@@ -32,7 +33,7 @@ namespace FastCache::Cc
 /// deadline expressible.** A dialer can only hand back a socket, so the only
 /// ceiling it can arm is `SO_RCVTIMEO`, which bounds a single `recv`; a worker
 /// dribbling one byte before each expiry holds the build forever without ever
-/// exceeding it. Bounding the *exchange* is `DeadlineTimer`'s job and needs the
+/// exceeding it. Bounding the *exchange* is `core::net::DeadlineTimer`'s job and needs the
 /// reactor the exchange runs on, which is `ReactorExchange` — so the caller asks
 /// for an exchange and hands over the budget it must finish inside.
 class IEndpointExchange
@@ -149,7 +150,9 @@ struct DispatchBudgets
     /// keepalive is what answers that in seconds without shortening the deadline back
     /// into #223. The control exchanges above leave it off: a lease or a release that
     /// stalls is already bounded by a round trip.
-    ExchangeBudget compile { .total = DefaultDispatchTotal, .idle = DefaultDispatchIdle, .keepAlive = KeepAlive::Yes };
+    ExchangeBudget compile { .total = DefaultDispatchTotal,
+                             .idle = DefaultDispatchIdle,
+                             .keepAlive = core::net::KeepAlive::Yes };
 
     /// Ceiling on the object a worker may declare its reply expands to.
     ///
@@ -199,7 +202,7 @@ struct DispatchBudgetKnobs
 /// fields and not one.** It was derived in `main.cpp` by copying the control budget
 /// and replacing its total, on the stated reasoning that only the total differs —
 /// which was true when it was written and stopped being true when the compile leg
-/// gained `keepAlive` (#247). The copy silently overwrote `KeepAlive::Yes` with the
+/// gained `keepAlive` (#247). The copy silently overwrote `core::net::KeepAlive::Yes` with the
 /// control leg's `No`, so no shipped launcher has ever armed keepalive on the one
 /// exchange it exists for, and a worker whose host vanished still cost the full
 /// `FASTCACHE_DISPATCH_TIMEOUT`. Nothing could see it: the default member
@@ -217,11 +220,12 @@ struct DispatchBudgetKnobs
 [[nodiscard]] constexpr DispatchBudgets DispatchBudgetsFor(DispatchBudgetKnobs const& knobs) noexcept
 {
     return DispatchBudgets {
-        .control = ExchangeBudget { .connect = knobs.connect, .total = knobs.controlTotal, .keepAlive = KeepAlive::No },
+        .control =
+            ExchangeBudget { .connect = knobs.connect, .total = knobs.controlTotal, .keepAlive = core::net::KeepAlive::No },
         .compile = ExchangeBudget { .connect = knobs.connect,
                                     .total = knobs.compileTotal,
                                     .idle = knobs.compileIdle,
-                                    .keepAlive = KeepAlive::Yes },
+                                    .keepAlive = core::net::KeepAlive::Yes },
     };
 }
 
@@ -258,7 +262,7 @@ struct DispatchBudgetKnobs
 /// **`spent` is measured by the CLIENT, on its own monotonic clock, and no instant
 /// crosses the wire.** The ticket proposed carrying the mint instant instead, and
 /// that is the shape this repository already refuses -- *a heartbeat age is a
-/// duration on a report, never a `TimePoint`* -- because two machines' `steady_clock`
+/// duration on a report, never a `core::platform::SteadyTimePoint`* -- because two machines' `steady_clock`
 /// epochs are unrelated and a `system_clock` comparison is the clock-skew defect
 /// #522's second finding was. The client does not need the mint instant: the mint
 /// happened somewhere between its own `LEASE` send and the grant's arrival, so the
@@ -666,7 +670,7 @@ struct DispatchRequest
 /// @param credential Presented to both peers; default-constructed sends none.
 /// @param acceptedCodecs What this client can decode, most-preferred first.
 /// @param clock Where "now" comes from, so a case can make the `LEASE` round trip take
-///        a visible amount of time. Null means this process's own `SteadyClock`, which
+///        a visible amount of time. Null means this process's own `core::platform::SteadyClock`, which
 ///        is the same *inject it, null is the real one* spelling `ReactorServerOptions`
 ///        uses -- the alternative, a defaulted reference to a function-local static, is
 ///        ambient state wearing a parameter's clothes. Only ever read for
@@ -678,7 +682,7 @@ struct DispatchRequest
                                       DispatchBudgets const& budgets = {},
                                       Credential const& credential = {},
                                       CompileCacheWire::CodecList const& acceptedCodecs = {},
-                                      IClock* clock = nullptr);
+                                      core::platform::IClock* clock = nullptr);
 
 /// Split a COMPILE request's argument field back into arguments.
 ///

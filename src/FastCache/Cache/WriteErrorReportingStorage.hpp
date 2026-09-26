@@ -3,7 +3,6 @@
 
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/IStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/Logger.hpp>
 
@@ -18,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -74,73 +75,82 @@ class WriteErrorReportingStorage final: public IStorage
     /// @param logger Sink for the `Warn` write-failure lines.
     WriteErrorReportingStorage(std::unique_ptr<IStorage> inner, ILogger& logger) noexcept;
 
-    [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key,
+                                                             core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Set(std::string_view key,
                                                             std::vector<std::byte> value,
                                                             std::uint32_t flags,
-                                                            TimePoint expiry) override;
+                                                            core::platform::SteadyTimePoint expiry) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Add(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Add(std::string_view key,
+                                                            std::vector<std::byte> value,
+                                                            std::uint32_t flags,
+                                                            core::platform::SteadyTimePoint expiry,
+                                                            core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Replace(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Replace(std::string_view key,
+                                                                std::vector<std::byte> value,
+                                                                std::uint32_t flags,
+                                                                core::platform::SteadyTimePoint expiry,
+                                                                core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Append(std::string_view key,
                                                                std::span<std::byte const> suffix,
                                                                CasToken expected,
-                                                               TimePoint now) override;
+                                                               core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Prepend(std::string_view key,
                                                                 std::span<std::byte const> prefix,
                                                                 CasToken expected,
-                                                                TimePoint now) override;
+                                                                core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> CompareAndSwap(std::string_view key,
                                                                        CasToken expected,
                                                                        std::vector<std::byte> value,
                                                                        std::uint32_t flags,
-                                                                       TimePoint expiry,
-                                                                       TimePoint now) override;
+                                                                       core::platform::SteadyTimePoint expiry,
+                                                                       core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(std::string_view key,
-                                                                                          std::uint64_t magnitude,
-                                                                                          bool decrement,
-                                                                                          TimePoint now) override;
+    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(
+        std::string_view key, std::uint64_t magnitude, bool decrement, core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key,
+                                                           core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Touch(std::string_view key,
-                                                              TimePoint newExpiry,
-                                                              TimePoint now) override;
+                                                              core::platform::SteadyTimePoint newExpiry,
+                                                              core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key,
+                                                              core::platform::SteadyTimePoint now) override;
 
     /// Forward Prefetch to the inner storage (a prefetch performs no value
     /// write, so there is no write-error to meter). See IStorage::Prefetch.
-    [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<bool, StorageError> Prefetch(std::string_view key,
+                                                             core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<std::optional<TimePoint>, StorageError> PeekExpiry(std::string_view key,
-                                                                                   TimePoint now) override;
+    [[nodiscard]] std::expected<std::optional<core::platform::SteadyTimePoint>, StorageError> PeekExpiry(
+        std::string_view key, core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> MarkStale(std::string_view key,
-                                                                  std::optional<TimePoint> newExpiry,
-                                                                  TimePoint now) override;
+                                                                  std::optional<core::platform::SteadyTimePoint> newExpiry,
+                                                                  core::platform::SteadyTimePoint now) override;
 
     // Compound primitives are forwarded explicitly (not left to the IStorage
     // base defaults) so the inner backend's atomic implementation is used — the
     // base default would re-decompose them into separate primitives and lose the
     // inner lock-owning decorator's atomicity, exactly as TracingStorage does.
     [[nodiscard]] std::expected<GetResult, StorageError> GetAndTouch(std::string_view key,
-                                                                     TimePoint newExpiry,
-                                                                     TimePoint now) override;
+                                                                     core::platform::SteadyTimePoint newExpiry,
+                                                                     core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<void, StorageError> CompareAndDelete(std::string_view key,
                                                                      CasToken expected,
-                                                                     TimePoint now) override;
+                                                                     core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<bool, StorageError> ClearExpiry(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<bool, StorageError> ClearExpiry(std::string_view key,
+                                                                core::platform::SteadyTimePoint now) override;
 
     /// Read-modify-write forwarded to the inner atomic implementation; its
     /// result is inspected because a `Store` outcome is a value write that can
@@ -148,10 +158,10 @@ class WriteErrorReportingStorage final: public IStorage
     [[nodiscard]] std::expected<CasToken, StorageError> Update(
         std::string_view key,
         std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
-        TimePoint now) override;
+        core::platform::SteadyTimePoint now) override;
 
-    void FlushWithGeneration(TimePoint effectiveAt) override;
-    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
+    void FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt) override;
+    PurgeOutcome PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget) override;
     void Resize(std::size_t newMaxBytes) override;
 
     /// Forward to the inner storage: this decorator counts write errors, it

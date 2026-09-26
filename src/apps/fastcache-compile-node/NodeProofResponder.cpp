@@ -153,7 +153,7 @@ namespace
 
 } // namespace
 
-Task<FrameReply> NodeProofResponder::Answer(std::span<std::byte const> frame, PeerIdentity /*peer*/)
+core::async::Task<FrameReply> NodeProofResponder::Answer(std::span<std::byte const> frame, PeerIdentity /*peer*/)
 {
     // The peer is not consulted, and the parameter is unnamed to say so: `RefusePeer` admits
     // everybody here by decision, so a gate reading it would refuse the population this surface

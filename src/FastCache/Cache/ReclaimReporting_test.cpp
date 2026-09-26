@@ -10,7 +10,6 @@
 #include <FastCache/Cache/LayeredStorage.hpp>
 #include <FastCache/Cache/ReclaimLog.hpp>
 #include <FastCache/Cache/ShardedStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -24,6 +23,7 @@
 #include <tuple>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/ScratchPath.hpp>
 
 namespace
@@ -66,8 +66,8 @@ class AlwaysListening final: public IStorageMutationObserver
 /// A verb that loads a record before it writes, and the name a failure reports.
 struct ReclaimingVerb
 {
-    std::string_view name;                                               ///< For the failure message.
-    void (*invoke)(IStorage& tier, std::string_view key, TimePoint now); ///< Runs it, outcome ignored.
+    std::string_view name;                                                                     ///< For the failure message.
+    void (*invoke)(IStorage& tier, std::string_view key, core::platform::SteadyTimePoint now); ///< Runs it, outcome ignored.
 };
 
 /// Every such verb. Each must reclaim a record it finds lapsed and say so, on
@@ -75,39 +75,45 @@ struct ReclaimingVerb
 /// verb added without a reclaim fails here rather than in the field.
 auto const ReclaimingVerbs = std::to_array<ReclaimingVerb>({
     { .name = "delete",
-      .invoke = [](IStorage& tier, std::string_view key, TimePoint now) { std::ignore = tier.Delete(key, now); } },
+      .invoke = [](IStorage& tier,
+                   std::string_view key,
+                   core::platform::SteadyTimePoint now) { std::ignore = tier.Delete(key, now); } },
     { .name = "add",
-      .invoke = [](IStorage& tier,
-                   std::string_view key,
-                   TimePoint now) { std::ignore = tier.Add(key, Value(8), 0, TimePoint::max(), now); } },
+      .invoke =
+          [](IStorage& tier, std::string_view key, core::platform::SteadyTimePoint now) {
+              std::ignore = tier.Add(key, Value(8), 0, core::platform::SteadyTimePoint::max(), now);
+          } },
     { .name = "replace",
-      .invoke = [](IStorage& tier,
-                   std::string_view key,
-                   TimePoint now) { std::ignore = tier.Replace(key, Value(8), 0, TimePoint::max(), now); } },
+      .invoke =
+          [](IStorage& tier, std::string_view key, core::platform::SteadyTimePoint now) {
+              std::ignore = tier.Replace(key, Value(8), 0, core::platform::SteadyTimePoint::max(), now);
+          } },
     { .name = "append",
       .invoke =
-          [](IStorage& tier, std::string_view key, TimePoint now) {
+          [](IStorage& tier, std::string_view key, core::platform::SteadyTimePoint now) {
               auto const suffix = Value(4);
               std::ignore = tier.Append(key, suffix, 0, now);
           } },
     { .name = "prepend",
       .invoke =
-          [](IStorage& tier, std::string_view key, TimePoint now) {
+          [](IStorage& tier, std::string_view key, core::platform::SteadyTimePoint now) {
               auto const prefix = Value(4);
               std::ignore = tier.Prepend(key, prefix, 0, now);
           } },
     { .name = "cas",
-      .invoke = [](IStorage& tier,
-                   std::string_view key,
-                   TimePoint now) { std::ignore = tier.CompareAndSwap(key, 1, Value(8), 0, TimePoint::max(), now); } },
+      .invoke =
+          [](IStorage& tier, std::string_view key, core::platform::SteadyTimePoint now) {
+              std::ignore = tier.CompareAndSwap(key, 1, Value(8), 0, core::platform::SteadyTimePoint::max(), now);
+          } },
     { .name = "incr",
       .invoke = [](IStorage& tier,
                    std::string_view key,
-                   TimePoint now) { std::ignore = tier.IncrementOrInitialize(key, 1, false, now); } },
+                   core::platform::SteadyTimePoint now) { std::ignore = tier.IncrementOrInitialize(key, 1, false, now); } },
     { .name = "touch",
-      .invoke = [](IStorage& tier,
-                   std::string_view key,
-                   TimePoint now) { std::ignore = tier.Touch(key, TimePoint::max(), now); } },
+      .invoke =
+          [](IStorage& tier, std::string_view key, core::platform::SteadyTimePoint now) {
+              std::ignore = tier.Touch(key, core::platform::SteadyTimePoint::max(), now);
+          } },
 });
 
 } // namespace
@@ -120,8 +126,8 @@ TEST_CASE("A tier reports nothing until a log is routed to it", "[cache][reclaim
 
     // Budget is 100 bytes; the second Set must evict the first. Nobody has
     // called SetReclaimLog, so nothing is reported.
-    REQUIRE(lru.Set("a", Value(80), 0, TimePoint::max()).has_value());
-    REQUIRE(lru.Set("b", Value(80), 0, TimePoint::max()).has_value());
+    REQUIRE(lru.Set("a", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE(lru.Set("b", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE_FALSE(log.HasPending());
 }
 
@@ -132,10 +138,10 @@ TEST_CASE("The in-memory tier reports the LRU tail it evicted", "[cache][reclaim
     InMemoryLruStorage lru { 100 };
     lru.SetReclaimLog(&log);
 
-    REQUIRE(lru.Set("a", Value(80), 0, TimePoint::max()).has_value());
+    REQUIRE(lru.Set("a", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE(DrainNames(log).empty());
 
-    REQUIRE(lru.Set("b", Value(80), 0, TimePoint::max()).has_value());
+    REQUIRE(lru.Set("b", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE(DrainNames(log) == std::vector<std::string> { "evict:a" });
 }
 
@@ -148,7 +154,7 @@ TEST_CASE("The in-memory tier reports a TTL it finds lapsed", "[cache][reclaim-r
     InMemoryLruStorage lru { 0, 0, LruMode::Strict };
     lru.SetReclaimLog(&log);
 
-    auto const start = TimePoint {};
+    auto const start = core::platform::SteadyTimePoint {};
     auto const expiry = start + std::chrono::seconds { 10 };
     REQUIRE(lru.Set("doomed", Value(8), 0, expiry).has_value());
     REQUIRE(DrainNames(log).empty());
@@ -170,9 +176,9 @@ TEST_CASE("A generation flush is not reported as an expiry", "[cache][reclaim-re
     InMemoryLruStorage lru;
     lru.SetReclaimLog(&log);
 
-    REQUIRE(lru.Set("kept", Value(8), 0, TimePoint::max()).has_value());
-    lru.FlushWithGeneration(TimePoint {});
-    REQUIRE(lru.PurgeExpired(TimePoint {}, PurgeBudget::Unbounded()).purged == 1);
+    REQUIRE(lru.Set("kept", Value(8), 0, core::platform::SteadyTimePoint::max()).has_value());
+    lru.FlushWithGeneration(core::platform::SteadyTimePoint {});
+    REQUIRE(lru.PurgeExpired(core::platform::SteadyTimePoint {}, PurgeBudget::Unbounded()).purged == 1);
     REQUIRE(DrainNames(log).empty());
 }
 
@@ -183,10 +189,10 @@ TEST_CASE("A sweep reports the entries whose TTL had passed", "[cache][reclaim-r
     InMemoryLruStorage lru;
     lru.SetReclaimLog(&log);
 
-    auto const start = TimePoint {};
+    auto const start = core::platform::SteadyTimePoint {};
     auto const expiry = start + std::chrono::seconds { 5 };
     REQUIRE(lru.Set("gone", Value(8), 0, expiry).has_value());
-    REQUIRE(lru.Set("stays", Value(8), 0, TimePoint::max()).has_value());
+    REQUIRE(lru.Set("stays", Value(8), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     REQUIRE(lru.PurgeExpired(expiry + std::chrono::seconds { 1 }, PurgeBudget::Unbounded()).purged == 1);
     REQUIRE(DrainNames(log) == std::vector<std::string> { "expire:gone" });
@@ -200,8 +206,8 @@ TEST_CASE("Routing a log to nullptr stops the reporting", "[cache][reclaim-repor
     lru.SetReclaimLog(&log);
     lru.SetReclaimLog(nullptr);
 
-    REQUIRE(lru.Set("a", Value(80), 0, TimePoint::max()).has_value());
-    REQUIRE(lru.Set("b", Value(80), 0, TimePoint::max()).has_value());
+    REQUIRE(lru.Set("a", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE(lru.Set("b", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE_FALSE(log.HasPending());
 }
 
@@ -219,7 +225,7 @@ TEST_CASE("ShardedStorage routes the log to every shard", "[cache][reclaim-repor
     // Enough distinct keys that both shards are driven past their budget; the
     // point is that neither shard is silent, whichever key lands where.
     for (auto const& key: { "a", "b", "c", "d", "e", "f", "g", "h" })
-        REQUIRE(sharded.Set(key, Value(80), 0, TimePoint::max()).has_value());
+        REQUIRE(sharded.Set(key, Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     auto const names = DrainNames(log);
     REQUIRE_FALSE(names.empty());
@@ -240,7 +246,7 @@ TEST_CASE("Every write verb reclaims the lapsed record it finds, on both backend
     // dead bytes on disk until a sweep or a DELETE reached them, and an
     // `expired` event a subscriber got in memory and not on disk.
     FastCache::Testing::ScratchDirectory const dir { "reclaim-write-paths" };
-    auto const expiry = TimePoint {} + std::chrono::seconds { 5 };
+    auto const expiry = core::platform::SteadyTimePoint {} + std::chrono::seconds { 5 };
     auto const later = expiry + std::chrono::seconds { 1 };
 
     for (auto const& verb: ReclaimingVerbs)
@@ -286,9 +292,9 @@ TEST_CASE("Evicting entries a flush already made invisible reports nothing", "[c
     InMemoryLruStorage lru { 100 };
     lru.SetReclaimLog(&log);
 
-    REQUIRE(lru.Set("a", Value(80), 0, TimePoint::max()).has_value());
-    lru.FlushWithGeneration(TimePoint {});
-    REQUIRE(lru.Set("b", Value(80), 0, TimePoint::max()).has_value());
+    REQUIRE(lru.Set("a", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
+    lru.FlushWithGeneration(core::platform::SteadyTimePoint {});
+    REQUIRE(lru.Set("b", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     // The flushed entry really was evicted — otherwise the silence is vacuous.
     REQUIRE(lru.Snapshot().evictions > 0);
@@ -309,9 +315,9 @@ TEST_CASE("The disk tier does not report evicting what a flush already voided", 
     ReclaimLog log { &obs };
     (*tier)->SetReclaimLog(&log);
 
-    REQUIRE((*tier)->Set("a", Value(80), 0, TimePoint::max()).has_value());
-    (*tier)->FlushWithGeneration(TimePoint {});
-    REQUIRE((*tier)->Set("b", Value(80), 0, TimePoint::max()).has_value());
+    REQUIRE((*tier)->Set("a", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
+    (*tier)->FlushWithGeneration(core::platform::SteadyTimePoint {});
+    REQUIRE((*tier)->Set("b", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     REQUIRE((*tier)->Snapshot().evictions > 0);
     REQUIRE(DrainNames(log).empty());
@@ -337,14 +343,14 @@ TEST_CASE("A LayeredStorage does not report an L2 eviction either", "[cache][rec
     LayeredStorage layered { std::make_unique<InMemoryLruStorage>(0), std::move(*l2) };
     layered.SetReclaimLog(&log);
 
-    REQUIRE(layered.Set("a", Value(80), 0, TimePoint::max()).has_value());
-    REQUIRE(layered.Set("b", Value(80), 0, TimePoint::max()).has_value());
+    REQUIRE(layered.Set("a", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE(layered.Set("b", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     REQUIRE(layered.L2().Snapshot().evictions > 0);
     REQUIRE(DrainNames(log).empty());
 
     // And the evicted key is still served, which is what made the event wrong.
-    auto const got = layered.Get("a", TimePoint {});
+    auto const got = layered.Get("a", core::platform::SteadyTimePoint {});
     REQUIRE(got.has_value());
     REQUIRE(got->found);
 }
@@ -365,7 +371,7 @@ TEST_CASE("A LayeredStorage still reports an L2 expiry", "[cache][reclaim-report
     LayeredStorage layered { std::make_unique<InMemoryLruStorage>(0), std::move(*l2) };
     layered.SetReclaimLog(&log);
 
-    auto const expiry = TimePoint {} + std::chrono::seconds { 5 };
+    auto const expiry = core::platform::SteadyTimePoint {} + std::chrono::seconds { 5 };
     REQUIRE(layered.Set("gone", Value(8), 0, expiry).has_value());
     REQUIRE(layered.PurgeExpired(expiry + std::chrono::seconds { 1 }, PurgeBudget::Unbounded()).purged == 1);
 
@@ -386,10 +392,10 @@ TEST_CASE("The disk tier reports what it evicted to stay under its budget", "[ca
     ReclaimLog log { &obs };
     (*tier)->SetReclaimLog(&log);
 
-    REQUIRE((*tier)->Set("a", Value(80), 0, TimePoint::max()).has_value());
+    REQUIRE((*tier)->Set("a", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE(DrainNames(log).empty());
 
-    REQUIRE((*tier)->Set("b", Value(80), 0, TimePoint::max()).has_value());
+    REQUIRE((*tier)->Set("b", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE(DrainNames(log) == std::vector<std::string> { "evict:a" });
 }
 
@@ -406,9 +412,9 @@ TEST_CASE("The disk tier's sweep reports only the entries whose TTL had passed",
     ReclaimLog log { &obs };
     (*tier)->SetReclaimLog(&log);
 
-    auto const expiry = TimePoint {} + std::chrono::seconds { 5 };
+    auto const expiry = core::platform::SteadyTimePoint {} + std::chrono::seconds { 5 };
     REQUIRE((*tier)->Set("gone", Value(8), 0, expiry).has_value());
-    REQUIRE((*tier)->Set("stays", Value(8), 0, TimePoint::max()).has_value());
+    REQUIRE((*tier)->Set("stays", Value(8), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     REQUIRE((*tier)->PurgeExpired(expiry + std::chrono::seconds { 1 }, PurgeBudget::Unbounded()).purged == 1);
     REQUIRE(DrainNames(log) == std::vector<std::string> { "expire:gone" });
@@ -435,8 +441,8 @@ TEST_CASE("A LayeredStorage L1 demotion is not reported as an eviction", "[cache
     LayeredStorage layered { std::make_unique<InMemoryLruStorage>(100), std::move(*l2) };
     layered.SetReclaimLog(&log);
 
-    REQUIRE(layered.Set("a", Value(80), 0, TimePoint::max()).has_value());
-    REQUIRE(layered.Set("b", Value(80), 0, TimePoint::max()).has_value());
+    REQUIRE(layered.Set("a", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
+    REQUIRE(layered.Set("b", Value(80), 0, core::platform::SteadyTimePoint::max()).has_value());
 
     // Asserted before the silence is: an empty log proves nothing unless the
     // demotion this test is about actually happened.
@@ -445,7 +451,7 @@ TEST_CASE("A LayeredStorage L1 demotion is not reported as an eviction", "[cache
 
     // And the demoted key is genuinely still served, which is what made the
     // event wrong rather than merely noisy.
-    auto const got = layered.Get("a", TimePoint {});
+    auto const got = layered.Get("a", core::platform::SteadyTimePoint {});
     REQUIRE(got.has_value());
     REQUIRE(got->found);
 }
@@ -462,16 +468,16 @@ TEST_CASE("A plain Set over a lapsed key reclaims nothing, so reports nothing", 
     InMemoryLruStorage lru;
     lru.SetReclaimLog(&log);
 
-    auto const expiry = TimePoint {} + std::chrono::seconds { 5 };
+    auto const expiry = core::platform::SteadyTimePoint {} + std::chrono::seconds { 5 };
     REQUIRE(lru.Set("k", Value(8), 0, expiry).has_value());
     REQUIRE(DrainNames(log).empty());
 
-    REQUIRE(lru.Set("k", Value(8), 0, TimePoint::max()).has_value());
+    REQUIRE(lru.Set("k", Value(8), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE(DrainNames(log).empty());
 
     // Whereas a verb that must find the key first does reclaim and report.
     REQUIRE(lru.Set("j", Value(8), 0, expiry).has_value());
     auto const later = expiry + std::chrono::seconds { 1 };
-    REQUIRE_FALSE(lru.Touch("j", TimePoint::max(), later).has_value());
+    REQUIRE_FALSE(lru.Touch("j", core::platform::SteadyTimePoint::max(), later).has_value());
     REQUIRE(DrainNames(log) == std::vector<std::string> { "expire:j" });
 }

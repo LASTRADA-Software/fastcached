@@ -6,7 +6,6 @@
 #include "WorkerTier.hpp"
 #include "WorkerTierTestFixture.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
@@ -27,6 +26,7 @@
 #include <IProcessRunner.hpp>
 #include <ToolchainDiscovery.hpp>
 #include <ToolchainHost.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/ScratchPath.hpp>
 
 using namespace FastCache;

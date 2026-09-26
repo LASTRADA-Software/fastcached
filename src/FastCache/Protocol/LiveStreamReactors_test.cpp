@@ -2,7 +2,7 @@
 //
 // One `LiveStream` served on two REAL reactors, the shape `fastcached --threads 2` runs (#1399).
 //
-// Every other live-stats case drives one `TestReactor`, where one thread does everything and no
+// Every other live-stats case drives one `core::net::testing::TestLoop`, where one thread does everything and no
 // subscriber can wait on another. The daemon shares ONE stream across all of its reactors -- the
 // per-tick capture cache behind one mutex, the cap behind one atomic -- so what those cases cannot
 // see is what one reactor's subscriber costs another's: a lock held across work on one thread is a
@@ -10,11 +10,6 @@
 // real clock and measure it: every reactor carries a heartbeat whose lateness is how long its
 // thread could not run.
 
-#include <FastCache/Async/PlatformReactor.hpp>
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Async/SleepUntil.hpp>
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReadingCodec.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -43,6 +38,11 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/ResumeOn.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/PlatformLoop.hpp>
+#include <core/net/SleepUntil.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -161,17 +161,18 @@ class RecordingSink final: public IPushSink
     /// @param reactor The reactor this subscriber's connection runs on.
     /// @param park How long each snapshot push stays parked; zero delivers at once.
     /// @param stopping Set when the case ends every stream.
-    RecordingSink(IReactor& reactor, std::chrono::milliseconds park, std::atomic<bool> const& stopping) noexcept:
+    RecordingSink(core::net::EventLoop& reactor, std::chrono::milliseconds park, std::atomic<bool> const& stopping) noexcept:
         _reactor { reactor },
         _park { park },
         _stopping { stopping }
     {
     }
 
-    [[nodiscard]] Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds /*hold*/) override
+    [[nodiscard]] core::async::Task<PushOutcome> Push(std::vector<std::byte> frame,
+                                                      std::chrono::milliseconds /*hold*/) override
     {
         // The surface is the one writer, so every push reaches it on its connection's reactor.
-        if (!_reactor.IsOnWorkerThread())
+        if (!_reactor.isOnWorkerThread())
             _offReactor.fetch_add(1, std::memory_order_acq_rel);
         auto const snapshot = IsSnapshot(frame);
         {
@@ -179,7 +180,7 @@ class RecordingSink final: public IPushSink
             _frames.push_back(std::move(frame));
         }
         if (snapshot && _park > 0ms)
-            co_await SleepUntil { .reactor = &_reactor, .deadline = _reactor.Clock().Now() + _park };
+            co_await core::net::sleepUntil(&_reactor, _reactor.clock().now() + _park);
         co_return PushOutcome::Delivered;
     }
 
@@ -217,7 +218,7 @@ class RecordingSink final: public IPushSink
         return push.has_value() && push->kind == Wire::PushKind::Snapshot;
     }
 
-    IReactor& _reactor;
+    core::net::EventLoop& _reactor;
     std::chrono::milliseconds _park;
     std::atomic<bool> const& _stopping;
     mutable std::mutex _mutex;
@@ -244,15 +245,15 @@ constexpr auto HeartbeatStep = 20ms;
 /// @param reactor Where to beat.
 /// @param heartbeat What to record into.
 /// @param stopping When to end.
-DetachedTask Beat(IReactor* reactor, Heartbeat* heartbeat, std::atomic<bool> const* stopping)
+core::async::DetachedTask Beat(core::net::EventLoop* reactor, Heartbeat* heartbeat, std::atomic<bool> const* stopping)
 {
-    co_await ResumeOn { *reactor };
+    co_await core::async::ResumeOn { *reactor };
     heartbeat->thread.store(std::this_thread::get_id(), std::memory_order_release);
     while (!stopping->load(std::memory_order_acquire))
     {
-        auto const deadline = reactor->Clock().Now() + HeartbeatStep;
-        co_await SleepUntil { .reactor = reactor, .deadline = deadline };
-        auto const late = std::chrono::duration_cast<std::chrono::microseconds>(reactor->Clock().Now() - deadline).count();
+        auto const deadline = reactor->clock().now() + HeartbeatStep;
+        co_await core::net::sleepUntil(reactor, deadline);
+        auto const late = std::chrono::duration_cast<std::chrono::microseconds>(reactor->clock().now() - deadline).count();
         auto worst = heartbeat->worstMicros.load(std::memory_order_acquire);
         while (late > worst && !heartbeat->worstMicros.compare_exchange_weak(worst, late))
         {
@@ -273,9 +274,10 @@ struct Ended
 /// @param sink Its surface.
 /// @param gate Who is admitted.
 /// @param ended Set when the stream returns.
-DetachedTask Subscribe(LiveStream* live, IReactor* reactor, RecordingSink* sink, OpenGate const* gate, Ended* ended)
+core::async::DetachedTask Subscribe(
+    LiveStream* live, core::net::EventLoop* reactor, RecordingSink* sink, OpenGate const* gate, Ended* ended)
 {
-    co_await ResumeOn { *reactor };
+    co_await core::async::ResumeOn { *reactor };
     auto const frame = Wire::EncodeSubscribeRequest(
         Wire::SubscribeRequest { .subject = Wire::LiveSubject::Cache, .cadenceMillis = 0, .dashboardToken = {} });
     (void) co_await live->Serve(frame, LiveWatcher { .host = "127.0.0.1" }, sink, gate, reactor);
@@ -285,9 +287,9 @@ DetachedTask Subscribe(LiveStream* live, IReactor* reactor, RecordingSink* sink,
 /// A reactor on its own thread, stopped and joined before it is destroyed on every way out of a case.
 struct ReactorThread
 {
-    SteadyClock clock;
-    PlatformReactor reactor { clock };
-    std::thread worker { [this] { reactor.Run(); } };
+    core::platform::SteadyClock clock;
+    core::net::PlatformLoop reactor { clock };
+    std::thread worker { [this] { reactor.run(); } };
 
     ReactorThread() = default;
     ReactorThread(ReactorThread const&) = delete;
@@ -299,7 +301,7 @@ struct ReactorThread
     {
         // Joined before `reactor` goes, which member order alone would not give: this body runs
         // first. Anything still parked on it is freed with it, and owns what that touches.
-        reactor.Stop();
+        reactor.stop();
         worker.join();
     }
 };

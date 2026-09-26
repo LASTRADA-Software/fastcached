@@ -117,7 +117,7 @@ struct LeaseClaims
 
     /// When the grant stops being good, as an absolute WALL-CLOCK instant.
     ///
-    /// Wall-clock and not `TimePoint`, which is this tree's steady clock: a steady
+    /// Wall-clock and not `core::platform::SteadyTimePoint`, which is this tree's steady clock: a steady
     /// instant means nothing on another machine, and a lease is checked on a
     /// machine other than the one that minted it by definition.
     std::chrono::system_clock::time_point expiresAt {};

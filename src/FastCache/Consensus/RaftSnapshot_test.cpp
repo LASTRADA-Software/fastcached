@@ -35,9 +35,9 @@ constexpr auto ElectionMin = 150ms;
 /// A time point `millis` after the epoch.
 /// @param millis Offset in milliseconds.
 /// @return The instant.
-[[nodiscard]] TimePoint At(std::int64_t millis)
+[[nodiscard]] core::platform::SteadyTimePoint At(std::int64_t millis)
 {
-    return TimePoint {} + std::chrono::milliseconds { millis };
+    return core::platform::SteadyTimePoint {} + std::chrono::milliseconds { millis };
 }
 
 /// A three-node configuration for `self`.
@@ -71,7 +71,7 @@ template <typename T>
 struct LeaderWithLog
 {
     ScriptedRandomSource random { { 0 } };
-    RaftNode node = std::move(RaftNode::Create(ThreeNodes(), random, TimePoint {})).value();
+    RaftNode node = std::move(RaftNode::Create(ThreeNodes(), random, core::platform::SteadyTimePoint {})).value();
 
     explicit LeaderWithLog(std::size_t count)
     {
@@ -241,7 +241,7 @@ TEST_CASE("A leader sends a snapshot to a follower it can no longer replay to", 
 TEST_CASE("A follower adopts a snapshot it cannot replay to", "[consensus][raft][snapshot]")
 {
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, core::platform::SteadyTimePoint {})).value();
 
     auto const output =
         node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
@@ -286,7 +286,7 @@ TEST_CASE("A snapshot from the leader of this term ends the election", "[consens
     // resolved and then immediately re-run, which is the defect the AppendEntries
     // path carries a comment about.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, core::platform::SteadyTimePoint {})).value();
 
     // A split vote n2 lost: it stood in term 1, and n1 took the term with n3.
     (void) node.Tick(At(ElectionMin.count()));
@@ -316,7 +316,7 @@ TEST_CASE("A snapshot from outside the configuration is refused", "[consensus][r
     // configuration on this node, with a term above its own as the only thing to
     // supply -- while the identical attempt over `AppendEntries` was refused.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, core::platform::SteadyTimePoint {})).value();
 
     auto const output = node.Receive(InstallSnapshotRequest { .term = Term { .value = 9 },
                                                               .leaderId = "stranger",
@@ -347,7 +347,7 @@ TEST_CASE("A node with no cluster adopts the snapshot that catches it up", "[con
     ScriptedRandomSource random { { 0 } };
     auto joining = ThreeNodes("n4");
     joining.voters.clear();
-    auto node = std::move(RaftNode::Create(std::move(joining), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(std::move(joining), random, core::platform::SteadyTimePoint {})).value();
     REQUIRE_FALSE(node.HasCluster());
 
     auto const output =
@@ -372,7 +372,7 @@ TEST_CASE("A stale snapshot does not roll a follower backwards", "[consensus][ra
     // it covers: those entries have been acknowledged, and a leader may have
     // committed on that acknowledgement.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, core::platform::SteadyTimePoint {})).value();
 
     (void) node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
                                                  .leaderId = "n1",
@@ -406,7 +406,7 @@ TEST_CASE("A stale snapshot does not roll a follower backwards", "[consensus][ra
 TEST_CASE("A snapshot from an older term is refused", "[consensus][raft][snapshot]")
 {
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, core::platform::SteadyTimePoint {})).value();
 
     // Reach term 5 first.
     (void) node.Receive(AppendEntriesRequest { .term = Term { .value = 5 },
@@ -497,7 +497,7 @@ TEST_CASE("An installed snapshot is persisted before it is acknowledged", "[cons
     // towards commitment -- a Leader Completeness hazard, and the same rule the
     // vote and the log already obey.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, core::platform::SteadyTimePoint {})).value();
 
     auto const output =
         node.Receive(InstallSnapshotRequest { .term = Term { .value = 4 },
@@ -547,7 +547,7 @@ TEST_CASE("A node recovered from a snapshot resumes above the boundary", "[conse
                                                     .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
                                                     .state = BytesFromString("recovered") } };
 
-    auto node = std::move(RaftNode::Create(ThreeNodes(), random, TimePoint {}, recovered)).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes(), random, core::platform::SteadyTimePoint {}, recovered)).value();
 
     CHECK(node.SnapshotIndex() == LogIndex { .value = 9 });
     CHECK(node.Log().FirstIndex() == LogIndex { .value = 10 });
@@ -584,7 +584,7 @@ TEST_CASE("A membership change survives compaction and a restart", "[consensus][
                                                     .state = BytesFromString("s") } };
 
     // Bootstrapped with three members, recovered under four.
-    auto node = std::move(RaftNode::Create(ThreeNodes(), random, TimePoint {}, recovered)).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes(), random, core::platform::SteadyTimePoint {}, recovered)).value();
     // Not cosmetic: this set is what a quorum is counted over, so forgetting the
     // fourth member would let three nodes commit on a majority of the wrong set.
     CHECK(node.ActiveConfiguration().voters == grown);
@@ -610,7 +610,7 @@ TEST_CASE("A recovered log that still covers its snapshot is reconciled", "[cons
                                                     .configuration = { .voters = { "n1", "n2", "n3" }, .learners = {} },
                                                     .state = BytesFromString("s") } };
 
-    auto node = std::move(RaftNode::Create(ThreeNodes(), random, TimePoint {}, recovered)).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes(), random, core::platform::SteadyTimePoint {}, recovered)).value();
 
     // The covered prefix is dropped and the rest kept, so nothing above the
     // boundary is lost and nothing below it is answered about.
@@ -629,7 +629,7 @@ TEST_CASE("A learner caught up by a snapshot learns that it is one", "[consensus
     ScriptedRandomSource random { { 0 } };
     auto joining = ThreeNodes("n4");
     joining.voters.clear();
-    auto node = std::move(RaftNode::Create(std::move(joining), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(std::move(joining), random, core::platform::SteadyTimePoint {})).value();
     REQUIRE(node.CurrentStanding() == Standing::NoCluster);
 
     auto const configuration = Configuration { .voters = { "n1", "n2", "n3" }, .learners = { "n4" } };
@@ -643,7 +643,7 @@ TEST_CASE("A learner caught up by a snapshot learns that it is one", "[consensus
 
     CHECK(node.ActiveConfiguration() == configuration);
     CHECK(node.CurrentStanding() == Standing::Learner);
-    CHECK(node.NextDeadline() == TimePoint::max());
+    CHECK(node.NextDeadline() == core::platform::SteadyTimePoint::max());
 
     // And what it makes durable is the same pair, so a restart comes back a learner.
     REQUIRE(output.saveSnapshot.has_value());
@@ -663,7 +663,7 @@ TEST_CASE("A follower whose application cannot read a leader's snapshot refuses 
     // The leader is still HEARD: a refused offer arms the election timer like any other
     // word from a leader, so the node does not campaign against the leader offering it.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, core::platform::SteadyTimePoint {})).value();
 
     auto const offer = InstallSnapshotRequest { .term = Term { .value = 1 },
                                                 .leaderId = "n1",

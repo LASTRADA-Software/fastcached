@@ -74,7 +74,6 @@
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/EnumTable.hpp>
-#include <FastCache/Net/TcpClient.hpp>
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/NarrowText.hpp>
 #include <FastCache/Platform/Terminal.hpp>
@@ -103,6 +102,8 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#include <core/net/TcpClient.hpp>
 
 #if defined(_WIN32)
     #include <winsock2.h>

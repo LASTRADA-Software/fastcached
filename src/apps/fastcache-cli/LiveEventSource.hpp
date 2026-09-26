@@ -7,9 +7,6 @@
 #include "FleetReach.hpp"
 #include "LiveSubscriber.hpp"
 
-#include <FastCache/Async/IExecutor.hpp>
-#include <FastCache/Async/IReactor.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Platform/StopSignal.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -18,6 +15,10 @@
 #include <optional>
 #include <string>
 #include <string_view>
+
+#include <core/async/IExecutor.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/EventLoop.hpp>
 
 namespace FastCache::Cli
 {
@@ -28,7 +29,7 @@ namespace FastCache::Cli
 ///
 /// **Every producer is a coroutine parked on the reactor, and nothing on the reactor
 /// sleeps.** The stream runs `TakeFrame`'s two hops off the reactor and back for every frame,
-/// waits on a `DeadlineTimer` before subscribing again, the terminal's own source parks on
+/// waits on a `core::net::DeadlineTimer` before subscribing again, the terminal's own source parks on
 /// whatever it reads, and a stop request blocks on a waiter thread of its own before it hops
 /// back. So a keystroke that lands while a read is still on the pool is delivered while that
 /// read is still on the pool: nothing here waits for one producer before hearing another, which
@@ -61,7 +62,7 @@ struct LiveSourceParts
 {
     /// Where every event is delivered, and whose clock paces the re-subscriptions. Close, Next and
     /// Drained are called on its thread; so is every resumption this source performs.
-    IReactor* reactor { nullptr };
+    core::net::EventLoop* reactor { nullptr };
 
     /// The stream every reading arrives on. Opened, read and re-opened only on `pool`; left from
     /// `Close()`.
@@ -77,14 +78,14 @@ struct LiveSourceParts
     std::string dashboardToken {};
 
     /// Where the blocking dial and every blocking read run.
-    IExecutor* pool { nullptr };
+    core::async::IExecutor* pool { nullptr };
 
     /// What a reading is stamped with, and when an outstanding read started.
     ///
     /// Its own part rather than `reactor->Clock()`, because a reading is stamped ON THE POOL the
     /// moment `Read()` returns: a clock refreshed once per reactor turn would hand that thread a
-    /// stale reading, and every rate would be divided by a wrong duration. `SteadyClock` in production.
-    IClock* clock { nullptr };
+    /// stale reading, and every rate would be divided by a wrong duration. `core::platform::SteadyClock` in production.
+    core::platform::IClock* clock { nullptr };
 
     /// The cadence asked of the server, and the wait before subscribing again after a stream ends.
     ///
@@ -120,7 +121,7 @@ struct LiveSourceParts
 
     /// Where `stop`'s blocking wait runs, when there is a `stop`: see `IStopSignal::Stopped`
     /// for why it is never `pool`.
-    IExecutor* stopWaiter { nullptr };
+    core::async::IExecutor* stopWaiter { nullptr };
 };
 
 /// Reads a subscription and forwards a terminal and a stop request, as one stream.
@@ -150,7 +151,7 @@ class LiveEventSource final: public IDashboardEventSource
     LiveEventSource& operator=(LiveEventSource const&) = delete;
     LiveEventSource& operator=(LiveEventSource&&) = delete;
 
-    [[nodiscard]] Task<DashboardEvent> Next() override;
+    [[nodiscard]] core::async::Task<DashboardEvent> Next() override;
 
     /// Stop every producer.
     ///
@@ -168,7 +169,7 @@ class LiveEventSource final: public IDashboardEventSource
     /// seeing `IsDrained()`, is what makes destroying the subscription and the pool afterwards
     /// safe. One caller.
     /// @return A task completing when every producer has finished.
-    [[nodiscard]] Task<void> Drained();
+    [[nodiscard]] core::async::Task<void> Drained();
 
     /// Whether every producer has finished.
     ///
@@ -182,9 +183,9 @@ class LiveEventSource final: public IDashboardEventSource
     /// **Safe from any thread**: this is what a drain waiting from outside the reactor reads
     /// to say how long a read it is about to abandon had been out. Measured on the source's
     /// `clock`, so a caller subtracting it from another clock's `Now()` needs that clock to
-    /// count from the same epoch -- `SteadyClock` against `steady_clock` does.
+    /// count from the same epoch -- `core::platform::SteadyClock` against `steady_clock` does.
     /// @return The start of the outstanding read, or nullopt.
-    [[nodiscard]] std::optional<TimePoint> ReadOutstandingSince() const noexcept;
+    [[nodiscard]] std::optional<core::platform::SteadyTimePoint> ReadOutstandingSince() const noexcept;
 
     /// Where the stream dials now: `--addr`, or the leader a refusal named.
     ///
@@ -206,7 +207,7 @@ class LiveEventSource final: public IDashboardEventSource
     /// The producers' shared state; outlives the source while a producer still runs.
     ///
     /// Public only so the .cpp's producer coroutines can name it, the same reason and the
-    /// same spelling as `DeadlineTimer::State`. Treat as private.
+    /// same spelling as `core::net::DeadlineTimer::State`. Treat as private.
     struct State;
 
   private:

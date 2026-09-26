@@ -7,18 +7,14 @@
 #include "NodeSurfaces.hpp"
 #include "Responders.hpp"
 
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
-#include <FastCache/Net/BlockingConnector.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -44,6 +40,12 @@
 #include <CompileJob.hpp>
 #include <StubObjectTestSupport.hpp>
 #include <WorkerProtocol.hpp>
+#include <core/async/ResumeOn.hpp>
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/async/ThreadPoolExecutor.hpp>
+#include <core/net/BlockingConnector.hpp>
+#include <core/net/BlockingSocket.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -197,12 +199,12 @@ struct Fixture
 /// The id of the one thread @p pool runs work on.
 ///
 /// Discovered by hopping through the seam rather than asked of the pool, because that
-/// is what a coroutine reaching it will actually observe -- and because `IExecutor`
+/// is what a coroutine reaching it will actually observe -- and because `core::async::IExecutor`
 /// deliberately says nothing about threads, which is why a compile could ever have
 /// ended up on the wrong one.
 /// @param pool A single-threaded executor.
 /// @return The thread it resumes handles on.
-[[nodiscard]] std::thread::id ThreadOf(IExecutor& pool)
+[[nodiscard]] std::thread::id ThreadOf(core::async::IExecutor& pool)
 {
     std::promise<std::thread::id> where;
     auto future = where.get_future();
@@ -212,8 +214,8 @@ struct Fixture
     // moment the value is set is exactly the shape where that bites. A pointer says the
     // lifetime is the caller's, and `cppcoreguidelines-avoid-reference-coroutine-parameters`
     // refuses the other spelling rather than leaving it to a comment.
-    [](IExecutor* target, std::promise<std::thread::id> out) -> DetachedTask {
-        co_await ResumeOn { *target };
+    [](core::async::IExecutor* target, std::promise<std::thread::id> out) -> core::async::DetachedTask {
+        co_await core::async::ResumeOn { *target };
         out.set_value(std::this_thread::get_id());
         co_return;
     }(&pool, std::move(where));
@@ -249,7 +251,7 @@ enum class ReplyHold : std::uint8_t
 /// @param peer The caller's host.
 /// @return What was answered, and on which threads.
 [[nodiscard]] Answered AnswerFrom(CompileResponder& responder,
-                                  IExecutor& reactor,
+                                  core::async::IExecutor& reactor,
                                   std::vector<std::byte> frame,
                                   std::string peer = "127.0.0.1",
                                   ReplyHold holding = ReplyHold::Release)
@@ -260,12 +262,12 @@ enum class ReplyHold : std::uint8_t
     // reference parameter's referent alive, and both of these outlive the call by being
     // the caller's locals rather than by anything this frame does.
     [](CompileResponder* target,
-       IExecutor* loop,
+       core::async::IExecutor* loop,
        std::vector<std::byte> request,
        std::string caller,
        ReplyHold keep,
-       std::promise<Answered> out) -> DetachedTask {
-        co_await ResumeOn { *loop };
+       std::promise<Answered> out) -> core::async::DetachedTask {
+        co_await core::async::ResumeOn { *loop };
         auto const startedOn = std::this_thread::get_id();
 
         // `request` is a local of THIS frame, which stays alive across the suspension
@@ -308,8 +310,8 @@ TEST_CASE("A compile leaves the reactor and the reply comes back to it", "[node]
     // Both produce a correct object. A test that checked only the reply would pass
     // under either, which is why these are assertions about thread identity.
     Fixture fix;
-    ThreadPoolExecutor reactor { 1 };
-    ThreadPoolExecutor jobs { 1 };
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity {
         /*slots=*/2, /*byteBudget=*/64ULL * 1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger
     };
@@ -352,8 +354,8 @@ TEST_CASE("A refusal is answered on the reactor without reaching the pool", "[no
     // by never having left it -- so this case pins the thread as well, or a future
     // rearrangement could move a refusal onto the pool and nothing would notice.
     Fixture fix;
-    ThreadPoolExecutor reactor { 1 };
-    ThreadPoolExecutor jobs { 1 };
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/0, /*byteBudget=*/1024ULL, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder responder {
         fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
@@ -377,8 +379,8 @@ TEST_CASE("The merged surface applies the worker's own membership rule", "[node]
     // caller the original refuses. Without this the merged port would run a stranger's
     // compiler for them -- and it binds the wildcard on any node that schedules.
     Fixture fix;
-    ThreadPoolExecutor reactor { 1 };
-    ThreadPoolExecutor jobs { 1 };
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
     Distributed::ClusterMembership const listed { Distributed::MembershipParticipant::FleetMemberList, { "10.0.0.1:6676" } };
     CompileResponder responder { fix.protocol, capacity, listed, fix.locality, jobs, reactor, fix.metrics, fix.logger };
@@ -407,8 +409,8 @@ TEST_CASE("A stopping worker admits no more compiles", "[node][compile-responder
     // admitted after `~CompileCapacity` began waiting would be a job the drain had already
     // stopped counting on -- started against members it is about to free.
     Fixture fix;
-    ThreadPoolExecutor reactor { 1 };
-    ThreadPoolExecutor jobs { 1 };
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/4, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder responder {
         fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
@@ -446,8 +448,8 @@ TEST_CASE("A compile declaring more than the budget is refused, not charged", "[
     constexpr std::size_t Held = 1ULL * 1024ULL * 1024ULL;
 
     Fixture fix;
-    ThreadPoolExecutor reactor { 1 };
-    ThreadPoolExecutor jobs { 1 };
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, Budget, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder responder {
         fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
@@ -491,8 +493,8 @@ TEST_CASE("The compile surface requires no connection credential", "[node][compi
     // signed for this worker's endpoint, checked inside `WorkerProtocol`. Answering
     // `true` here would refuse every client the dedicated port serves today.
     Fixture fix;
-    ThreadPoolExecutor reactor { 1 };
-    ThreadPoolExecutor jobs { 1 };
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder const responder { fix.protocol, capacity, fix.membership, fix.locality,
                                        jobs,         reactor,  fix.metrics,    fix.logger };
@@ -522,8 +524,8 @@ TEST_CASE("The merged router sends a compile to the compile responder", "[node][
     // `UnimplementedVerb` for the whole `Compile` family because there was no component
     // to route to; now there is, and the cache and scheduler answers are unchanged.
     Fixture fix;
-    ThreadPoolExecutor reactor { 1 };
-    ThreadPoolExecutor jobs { 1 };
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder compile {
         fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
@@ -545,7 +547,7 @@ TEST_CASE("The merged router sends a compile to the compile responder", "[node][
 // ---------------------------------------------------------------------------
 // Against the REAL endpoint.
 //
-// Everything above substitutes two `ThreadPoolExecutor`s for a reactor, which is what
+// Everything above substitutes two `core::async::ThreadPoolExecutor`s for a reactor, which is what
 // makes the thread assertions expressible -- and that substitution cannot see two
 // defects that live in `FrameEndpoint` itself: its request deadline, which closes a
 // socket out from under an answer, and its stop rule, which can stop the reactor while
@@ -625,7 +627,7 @@ class ShortWindowResponder final: public IFrameResponder
     {
     }
 
-    [[nodiscard]] Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
+    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> frame, PeerIdentity peer) override
     {
         co_return co_await _inner.Answer(frame, std::move(peer));
     }
@@ -722,16 +724,17 @@ class ShortWindowResponder final: public IFrameResponder
 /// These cases drive the MERGED surface. The worker is present because it owns the
 /// capacity and the stop, not because its own accept loop is under test, and `Run()`
 /// is never called on it.
-class IdleListener final: public IListener
+class IdleListener final: public core::net::IListener
 {
   public:
-    AcceptAwaitable Accept() override
+    [[nodiscard]] core::async::Task<core::net::AcceptResult> accept() override
     {
-        return AcceptAwaitable { AcceptResult { std::unexpect,
-                                                NetError { .code = NetErrorCode::Eof, .systemCode = 0, .context = {} } } };
+        co_return core::net::AcceptResult {
+            std::unexpect, core::net::NetError { .code = core::net::NetErrorCode::Eof, .systemCode = 0, .context = {} }
+        };
     }
-    void Close() noexcept override {}
-    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    void close() noexcept override {}
+    [[nodiscard]] std::uint16_t boundPort() const noexcept override
     {
         return 0;
     }
@@ -750,7 +753,7 @@ class IdleListener final: public IListener
     // Asked of the SOCKET: `Bind` returns a listener in an errored state rather than
     // nothing, so a null check passes on a bind that failed and the port comes back 0.
     REQUIRE(probe->IsBound());
-    auto const port = probe->BoundPort();
+    auto const port = probe->boundPort();
     probe.reset();
     return port;
 }
@@ -775,55 +778,56 @@ class IdleListener final: public IListener
                                                                 std::vector<std::byte> frame,
                                                                 std::size_t* progressSeen = nullptr)
 {
-    BlockingConnector connector;
-    auto socket =
-        SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    core::net::BlockingConnector connector;
+    auto socket = core::async::syncRun(
+        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
     if (!socket.has_value())
         return std::nullopt;
 
     std::size_t pulses = 0;
-    auto reply =
-        SyncRun([](ISocket* peer, std::vector<std::byte> request, std::size_t* seen) -> Task<std::vector<std::byte>> {
-            auto const written = co_await peer->Write(std::span<std::byte const> { request });
-            if (!written.has_value())
-                co_return std::vector<std::byte> {};
+    auto reply = core::async::syncRun([](core::net::ISocket* peer,
+                                         std::vector<std::byte> request,
+                                         std::size_t* seen) -> core::async::Task<std::vector<std::byte>> {
+        auto const written = co_await peer->write(std::span<std::byte const> { request });
+        if (!written.has_value())
+            co_return std::vector<std::byte> {};
 
-            // **A COMPILE reply is a STREAM, not a frame** (#245): zero or more
-            // `Status::Progress` pulses precede exactly one terminal status. This helper
-            // steps over them the way `Cc::RecvReply` does, so a case reading it goes on
-            // asserting about the ANSWER -- which is the property every one of them is
-            // about -- while the count is available to the one case that is about the
-            // pulses themselves.
-            std::vector<std::byte> received;
-            while (true)
+        // **A COMPILE reply is a STREAM, not a frame** (#245): zero or more
+        // `Status::Progress` pulses precede exactly one terminal status. This helper
+        // steps over them the way `Cc::RecvReply` does, so a case reading it goes on
+        // asserting about the ANSWER -- which is the property every one of them is
+        // about -- while the count is available to the one case that is about the
+        // pulses themselves.
+        std::vector<std::byte> received;
+        while (true)
+        {
+            auto want = Wire::ReplyHeaderSize;
+            while (received.size() < want)
             {
-                auto want = Wire::ReplyHeaderSize;
-                while (received.size() < want)
-                {
-                    std::array<std::byte, 4096> chunk {};
-                    auto const read = co_await peer->Read(std::span<std::byte> { chunk });
-                    if (!read.has_value() || *read == 0)
-                        co_return std::vector<std::byte> {};
-                    received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+                std::array<std::byte, 4096> chunk {};
+                auto const read = co_await peer->read(std::span<std::byte> { chunk });
+                if (!read.has_value() || *read == 0)
+                    co_return std::vector<std::byte> {};
+                received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
 
-                    if (received.size() >= Wire::ReplyHeaderSize && want == Wire::ReplyHeaderSize)
-                        if (auto const header = Wire::DecodeReplyHeader(received); header.has_value())
-                            want = Wire::ReplyHeaderSize + header->payloadLength;
-                }
-
-                auto const header = Wire::DecodeReplyHeader(received);
-                if (!header.has_value() || Wire::IsTerminalStatus(Unwrap(header).status))
-                    co_return received;
-
-                if (seen != nullptr)
-                    ++*seen;
-                // Drained by the DECLARED length, exactly as a real reader does, so anything
-                // a later version puts in this payload cannot desynchronise the stream.
-                received.erase(received.begin(), received.begin() + static_cast<std::ptrdiff_t>(want));
+                if (received.size() >= Wire::ReplyHeaderSize && want == Wire::ReplyHeaderSize)
+                    if (auto const header = Wire::DecodeReplyHeader(received); header.has_value())
+                        want = Wire::ReplyHeaderSize + header->payloadLength;
             }
-        }((*socket).get(), std::move(frame), &pulses));
 
-    (*socket)->Close();
+            auto const header = Wire::DecodeReplyHeader(received);
+            if (!header.has_value() || Wire::IsTerminalStatus(Unwrap(header).status))
+                co_return received;
+
+            if (seen != nullptr)
+                ++*seen;
+            // Drained by the DECLARED length, exactly as a real reader does, so anything
+            // a later version puts in this payload cannot desynchronise the stream.
+            received.erase(received.begin(), received.begin() + static_cast<std::ptrdiff_t>(want));
+        }
+    }((*socket).get(), std::move(frame), &pulses));
+
+    (*socket)->close();
     if (progressSeen != nullptr)
         *progressSeen = pulses;
     return reply;
@@ -875,29 +879,30 @@ class IdleListener final: public IListener
 /// @return Every byte the node wrote, in order, or nullopt when the dial itself failed.
 [[nodiscard]] std::optional<std::vector<std::byte>> TryExchangeUntilEof(std::uint16_t port, std::vector<std::byte> frame)
 {
-    BlockingConnector connector;
-    auto socket =
-        SyncRun(connector.Connect("127.0.0.1", port, DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    core::net::BlockingConnector connector;
+    auto socket = core::async::syncRun(
+        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
     if (!socket.has_value())
         return std::nullopt;
 
-    auto stream = SyncRun([](ISocket* peer, std::vector<std::byte> request) -> Task<std::vector<std::byte>> {
-        auto const written = co_await peer->Write(std::span<std::byte const> { request });
-        if (!written.has_value())
-            co_return std::vector<std::byte> {};
+    auto stream = core::async::syncRun(
+        [](core::net::ISocket* peer, std::vector<std::byte> request) -> core::async::Task<std::vector<std::byte>> {
+            auto const written = co_await peer->write(std::span<std::byte const> { request });
+            if (!written.has_value())
+                co_return std::vector<std::byte> {};
 
-        std::vector<std::byte> received;
-        while (true)
-        {
-            std::array<std::byte, 4096> chunk {};
-            auto const read = co_await peer->Read(std::span<std::byte> { chunk });
-            if (!read.has_value() || *read == 0)
-                co_return received;
-            received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
-        }
-    }((*socket).get(), std::move(frame)));
+            std::vector<std::byte> received;
+            while (true)
+            {
+                std::array<std::byte, 4096> chunk {};
+                auto const read = co_await peer->read(std::span<std::byte> { chunk });
+                if (!read.has_value() || *read == 0)
+                    co_return received;
+                received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+            }
+        }((*socket).get(), std::move(frame)));
 
-    (*socket)->Close();
+    (*socket)->close();
     return stream;
 }
 
@@ -1041,7 +1046,7 @@ struct MergedWorker
     HoldingRunner runner;
     Cc::CompileJobRunner jobs;
     Cc::WorkerProtocol protocol;
-    ThreadPoolExecutor pool { 2 };
+    core::async::ThreadPoolExecutor pool { 2 };
     // The accounting on its own. It was reached through a `WorkerServer`, which was
     // this object plus the accept loop #290 stage 3 retired -- and the loop was never
     // what these cases were about: they exercise the merged surface's responder, which
@@ -1783,8 +1788,8 @@ TEST_CASE("A compile's slot is held until its reply has been written, so drained
     // written. So between the two -- the stretch in which an 84 MB object is still going
     // out -- the worker is not drained, and a cordoned one must not say it is.
     Fixture fix;
-    ThreadPoolExecutor reactor { 1 };
-    ThreadPoolExecutor jobs { 1 };
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity {
         /*slots=*/2, /*byteBudget=*/64ULL * 1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger
     };
@@ -1816,8 +1821,8 @@ TEST_CASE("A cordon is answered for this machine only, whatever the peer's membe
     // fixture admits every peer to compile, which is what makes a gate asking membership
     // for the cordon pass the peer that must be refused.
     Fixture fix;
-    ThreadPoolExecutor reactor { 1 };
-    ThreadPoolExecutor jobs { 1 };
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder responder {
         fix.protocol, capacity, fix.membership, fix.locality, jobs, reactor, fix.metrics, fix.logger
@@ -1863,8 +1868,8 @@ TEST_CASE("A cordon is a round trip, not a compile, to every question the endpoi
     // nobody charges. The compile's answers are asserted beside it, so a responder that
     // answered every verb one way fails one half whichever way it chose.
     Fixture fix;
-    ThreadPoolExecutor reactor { 1 };
-    ThreadPoolExecutor jobs { 1 };
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder const responder { fix.protocol, capacity, fix.membership, fix.locality,
                                        jobs,         reactor,  fix.metrics,    fix.logger };

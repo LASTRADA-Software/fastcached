@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/DeadlineTimer.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
@@ -26,6 +25,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <core/net/DeadlineTimer.hpp>
 
 namespace FastCache
 {
@@ -220,9 +221,9 @@ namespace
 
     /// Write all bytes of `payload` to the socket.
     /// @return true on success, false on socket error.
-    [[nodiscard]] Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> payload)
+    [[nodiscard]] core::async::Task<bool> WriteAll(core::net::ISocket* socket, std::span<std::byte const> payload)
     {
-        auto const r = co_await socket->Write(payload);
+        auto const r = co_await socket->write(payload);
         // Verify the byte count, not merely that the call succeeded: ISocket::Write
         // is a write-all contract, so a short count is a backend bug that must
         // surface as a failed reply rather than a silently truncated one. A
@@ -236,7 +237,9 @@ namespace
     /// @param status The outcome.
     /// @param payload Reply body, taken by value so it survives the suspend point.
     /// @return true when the whole reply reached the socket.
-    [[nodiscard]] Task<bool> Reply(ISocket* socket, Wire::Status status, std::vector<std::byte> payload)
+    [[nodiscard]] core::async::Task<bool> Reply(core::net::ISocket* socket,
+                                                Wire::Status status,
+                                                std::vector<std::byte> payload)
     {
         auto const frame = Wire::EncodeReply(status, payload);
         co_return co_await WriteAll(socket, frame);
@@ -266,10 +269,10 @@ namespace
     /// @param refusal Which refusal, as one row.
     /// @param message Detail; the code's default message is used when empty.
     /// @return true when the whole reply reached the socket.
-    [[nodiscard]] Task<bool> ReplyRefused(ISocket* socket,
-                                          IMetricsSink* metrics,
-                                          Cc::SurfaceRefusal refusal,
-                                          std::string message)
+    [[nodiscard]] core::async::Task<bool> ReplyRefused(core::net::ISocket* socket,
+                                                       IMetricsSink* metrics,
+                                                       Cc::SurfaceRefusal refusal,
+                                                       std::string message)
     {
         auto const frame = Cc::Refuse(metrics, refusal, message);
         co_return co_await WriteAll(socket, frame);
@@ -322,7 +325,9 @@ namespace
     /// @param refusal Which refusal, and why nothing rises for it.
     /// @param message Detail; the code's default message is used when empty.
     /// @return true when the whole reply reached the socket.
-    [[nodiscard]] Task<bool> ReplyUncounted(ISocket* socket, Cc::UncountedRefusal refusal, std::string message)
+    [[nodiscard]] core::async::Task<bool> ReplyUncounted(core::net::ISocket* socket,
+                                                         Cc::UncountedRefusal refusal,
+                                                         std::string message)
     {
         auto const frame = Cc::RefuseWithoutCounter(refusal, message);
         co_return co_await WriteAll(socket, frame);
@@ -348,11 +353,11 @@ namespace
     ///                 reference parameter across a suspend point, and the field
     ///                 views below point into it.
     /// @return Whether the command loop should continue or abort.
-    [[nodiscard]] Task<Next> HandleStore(ISocket* socket,
-                                         IMetricsSink* metrics,
-                                         CacheEngine* engine,
-                                         PrefetchGroupManifest* manifest,
-                                         std::vector<std::byte> payload)
+    [[nodiscard]] core::async::Task<Next> HandleStore(core::net::ISocket* socket,
+                                                      IMetricsSink* metrics,
+                                                      CacheEngine* engine,
+                                                      PrefetchGroupManifest* manifest,
+                                                      std::vector<std::byte> payload)
     {
         auto const fields = Wire::DecodeStorePayload(payload);
         if (!fields.has_value())
@@ -450,7 +455,7 @@ namespace
         // Record prefetch group membership (best-effort: a manifest failure must not fail
         // the STORE — the value is already safely stored).
         if (!groupStr.empty())
-            (void) manifest->AddKey(groupStr, keyStr, engine->Clock().Now());
+            (void) manifest->AddKey(groupStr, keyStr, engine->Clock().now());
 
         co_return co_await Reply(socket, Wire::Status::Ok, {}) ? Next::Continue : Next::Abort;
     }
@@ -476,11 +481,11 @@ namespace
     ///                      VERIFIED. Never cleared: a later failed attempt must not
     ///                      revoke something the peer already proved.
     /// @return Whether the command loop should continue or abort.
-    [[nodiscard]] Task<Next> HandleAuth(ISocket* socket,
-                                        IMetricsSink* metrics,
-                                        std::shared_ptr<AuthPolicy const> policy,
-                                        std::vector<std::byte> payload,
-                                        bool* credentialAccepted)
+    [[nodiscard]] core::async::Task<Next> HandleAuth(core::net::ISocket* socket,
+                                                     IMetricsSink* metrics,
+                                                     std::shared_ptr<AuthPolicy const> policy,
+                                                     std::vector<std::byte> payload,
+                                                     bool* credentialAccepted)
     {
         // The decision is shared with the compile node's frame server, which
         // terminates this verb too (#289); what stays here is how to ANSWER it.
@@ -582,7 +587,7 @@ namespace
                        std::string const& keyStr,
                        std::set<std::string, std::less<>>& primedGroups)
     {
-        auto const now = engine->Clock().Now();
+        auto const now = engine->Clock().now();
         auto const prefetchGroup = manifest->GroupOf(keyStr, now);
         if (!prefetchGroup.has_value() || !prefetchGroup->has_value() || primedGroups.contains(**prefetchGroup))
             return;
@@ -610,12 +615,12 @@ namespace
     ///                      (pointer: a coroutine must not hold reference params).
     /// @param payload       The request payload, by value (see HandleStore).
     /// @return Whether the command loop should continue or abort.
-    [[nodiscard]] Task<Next> HandleFetch(ISocket* socket,
-                                         IMetricsSink* metrics,
-                                         CacheEngine* engine,
-                                         PrefetchGroupManifest* manifest,
-                                         std::set<std::string, std::less<>>* primedGroups,
-                                         std::vector<std::byte> payload)
+    [[nodiscard]] core::async::Task<Next> HandleFetch(core::net::ISocket* socket,
+                                                      IMetricsSink* metrics,
+                                                      CacheEngine* engine,
+                                                      PrefetchGroupManifest* manifest,
+                                                      std::set<std::string, std::less<>>* primedGroups,
+                                                      std::vector<std::byte> payload)
     {
         auto const key = Wire::DecodeFetchPayload(payload);
         if (!key.has_value())
@@ -671,10 +676,10 @@ namespace
     /// @param engine   Cache engine.
     /// @param payload  The request payload, by value (see HandleStore).
     /// @return Whether the command loop should continue or abort.
-    [[nodiscard]] Task<Next> HandleCacheDrop(ISocket* socket,
-                                             IMetricsSink* metrics,
-                                             CacheEngine* engine,
-                                             std::vector<std::byte> payload)
+    [[nodiscard]] core::async::Task<Next> HandleCacheDrop(core::net::ISocket* socket,
+                                                          IMetricsSink* metrics,
+                                                          CacheEngine* engine,
+                                                          std::vector<std::byte> payload)
     {
         auto const key = Wire::DecodeCacheDropPayload(payload);
         if (!key.has_value())
@@ -717,7 +722,7 @@ namespace
     /// @param op The verb, already resolved against the table.
     /// @param payload The request payload, by value (see HandleStore).
     /// @return Whether the command loop should continue or abort.
-    [[nodiscard]] Task<Next> HandleDistributed(ISocket* socket, Wire::Op op)
+    [[nodiscard]] core::async::Task<Next> HandleDistributed(core::net::ISocket* socket, Wire::Op op)
     {
         // Answered, never served. `fastcached` is a cache and nothing else: the fleet's
         // scheduler moved to `fastcache-compile-node --serve-scheduler`, because
@@ -767,11 +772,13 @@ namespace
     /// One wake, then done: a subscriber that sent bytes has asked for something else, and one
     /// whose wait answered EOF or an error has left.
     /// @param socket The connection; the handler retires this wait with `CancelRead` before it
-    ///        reads the socket again or returns, so the wait never outlives the socket.
+    ///        reads the socket again or returns. The retired wait resumes in the loop's next
+    ///        drain (core-cpp 0.2.1, G2), possibly after the socket is gone, which is why
+    ///        nothing below the `co_await` touches `socket`.
     /// @param watch Where the answer is left.
-    DetachedTask WatchSubscriber(ISocket* socket, std::shared_ptr<SubscriberWatch> watch)
+    core::async::DetachedTask WatchSubscriber(core::net::ISocket* socket, std::shared_ptr<SubscriberWatch> watch)
     {
-        auto const readable = co_await socket->WaitReadable();
+        auto const readable = co_await socket->waitReadable();
         if (!watch->retired)
         {
             watch->gone = !readable.has_value() || *readable == 0;
@@ -783,8 +790,8 @@ namespace
     /// What a push's hold closed, if it expired.
     struct PushHold
     {
-        ISocket* socket { nullptr }; ///< The connection to close.
-        bool expired { false };      ///< Whether the hold ran out and closed it.
+        core::net::ISocket* socket { nullptr }; ///< The connection to close.
+        bool expired { false };                 ///< Whether the hold ran out and closed it.
     };
 
     /// End a connection whose push stayed parked past its hold.
@@ -796,7 +803,7 @@ namespace
     {
         auto* const hold = static_cast<PushHold*>(state);
         hold->expired = true;
-        hold->socket->Close();
+        hold->socket->close();
     }
 
     /// The daemon's half of a stream: every push written here, bounded by a timer of its own.
@@ -809,7 +816,9 @@ namespace
         /// @param socket The connection.
         /// @param reactor The connection's reactor, which runs the hold.
         /// @param watch The read watch armed for the stream.
-        DaemonPushSink(ISocket* socket, IReactor* reactor, std::shared_ptr<SubscriberWatch const> watch) noexcept:
+        DaemonPushSink(core::net::ISocket* socket,
+                       core::net::EventLoop* reactor,
+                       std::shared_ptr<SubscriberWatch const> watch) noexcept:
             _socket { socket },
             _reactor { reactor },
             _watch { std::move(watch) }
@@ -817,10 +826,11 @@ namespace
         }
 
         /// @copydoc IPushSink::Push
-        [[nodiscard]] Task<PushOutcome> Push(std::vector<std::byte> frame, std::chrono::milliseconds hold) override
+        [[nodiscard]] core::async::Task<PushOutcome> Push(std::vector<std::byte> frame,
+                                                          std::chrono::milliseconds hold) override
         {
             PushHold state { .socket = _socket, .expired = false };
-            DeadlineTimer const timer { *_reactor, _reactor->Clock().Now() + hold, &ExpirePushHold, &state };
+            core::net::DeadlineTimer const timer { *_reactor, _reactor->clock().now() + hold, &ExpirePushHold, &state };
             if (co_await WriteAll(_socket, frame))
                 co_return PushOutcome::Delivered;
             co_return state.expired ? PushOutcome::Stalled : PushOutcome::Lost;
@@ -847,8 +857,8 @@ namespace
         }
 
       private:
-        ISocket* _socket;
-        IReactor* _reactor;
+        core::net::ISocket* _socket;
+        core::net::EventLoop* _reactor;
         std::shared_ptr<SubscriberWatch const> _watch;
     };
 
@@ -922,7 +932,7 @@ namespace
     /// The connection state a subscription borrows from the command loop.
     struct SubscribeContext
     {
-        ISocket* socket { nullptr };                ///< The connection.
+        core::net::ISocket* socket { nullptr };     ///< The connection.
         ByteReader const* reader { nullptr };       ///< Its reader, for what it has already buffered.
         SessionContext const* session { nullptr };  ///< Its session.
         bool const* credentialAccepted { nullptr }; ///< Whether it proved a credential.
@@ -944,7 +954,7 @@ namespace
     /// @param context The connection state borrowed from the loop.
     /// @param frame The whole request, header included.
     /// @return Whether the command loop continues.
-    [[nodiscard]] Task<Next> HandleSubscribe(SubscribeContext context, std::vector<std::byte> frame)
+    [[nodiscard]] core::async::Task<Next> HandleSubscribe(SubscribeContext context, std::vector<std::byte> frame)
     {
         auto* const socket = context.socket;
         auto const* const session = context.session;
@@ -967,12 +977,12 @@ namespace
         // `proven` is left disengaged and that is the truth rather than a default: this daemon
         // runs no node handshake, so no connection it serves can ever have proved an identity.
         auto const terminal = co_await session->liveStats->Serve(
-            frame, LiveWatcher { .host = socket->PeerAddress() }, &sink, &gate, session->reactor);
+            frame, LiveWatcher { .host = socket->peerAddress() }, &sink, &gate, session->reactor);
 
         if (!watch->finished)
         {
             watch->retired = true;
-            socket->CancelRead();
+            socket->cancelRead();
         }
         if (terminal.empty())
             co_return Next::Abort;
@@ -981,10 +991,10 @@ namespace
 
 } // namespace
 
-Task<void> CompileCacheHandler::Run(ISocket* socket,
-                                    CacheEngine* engine,
-                                    std::vector<std::byte> primingBytes,
-                                    SessionContext session)
+core::async::Task<void> CompileCacheHandler::Run(core::net::ISocket* socket,
+                                                 CacheEngine* engine,
+                                                 std::vector<std::byte> primingBytes,
+                                                 SessionContext session)
 {
     ByteReader reader { *socket, MaxLineBytes, session.maxPayloadBytes };
     reader.PrimeWith(primingBytes);

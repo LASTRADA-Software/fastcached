@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/PlatformReactor.hpp>
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
-#include <FastCache/Core/Clock.hpp>
-#include <FastCache/Core/Profiling.hpp>
-#include <FastCache/Net/BlockingSocket.hpp>
-#include <FastCache/Net/PlatformListener.hpp>
-#include <FastCache/Net/SocketAddress.hpp>
 #include <FastCache/Platform/CpuAffinity.hpp>
 #include <FastCache/Platform/DaemonControls.hpp>
 #include <FastCache/Server/Connection.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 #include <FastCache/Server/Server.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -21,22 +14,28 @@
 #include <cstdlib>
 #include <format>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <vector>
 
+#include <core/Profiling.hpp>
+#include <core/async/Task.hpp>
+#include <core/async/ThreadPoolExecutor.hpp>
+#include <core/net/BlockingSocket.hpp>
+#include <core/net/PlatformLoop.hpp>
+#include <core/net/SocketAddress.hpp>
+#include <core/net/Sockets.hpp>
+#include <core/platform/Clock.hpp>
+
 #if defined(_WIN32)
-    #include <FastCache/Async/ResumeOn.hpp>
-    #include <FastCache/Net/IocpSocket.hpp>
-#elif defined(__linux__)
-    #include <FastCache/Net/EpollSocket.hpp>
-#elif defined(__APPLE__)
-    #include <FastCache/Net/KqueueSocket.hpp>
+    #include <core/async/ResumeOn.hpp>
 #endif
 
-#include <FastCache/Net/TlsWrap.hpp>
+#include <core/net/ITlsContext.hpp>
 
 namespace FastCache
 {
@@ -72,21 +71,21 @@ namespace
     int RunSingleReactor(ReactorServerOptions const& options,
                          CacheEngine& engine,
                          ILogger& logger,
-                         IAdmissionControl* admission,
+                         core::net::IAdmissionControl* admission,
                          IMetricsSink* metrics)
     {
         if (int const r = Detail::VerifyTlsContextForTlsBinds(options, logger); r != EXIT_SUCCESS)
             return r;
-        FC_THREAD_NAME("fc-reactor");
-        SteadyClock ownClock;
-        IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
+        CORE_THREAD_NAME("fc-reactor");
+        core::platform::SteadyClock ownClock;
+        core::platform::IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
 
         // **Declared FIRST, so destroyed LAST, and since
         // [#1025](https://github.com/LASTRADA-Software/fastcached/issues/1025) that
         // ordering carries a requirement it did not before.** It must outlive the
         // listeners and servers, which hold references to it -- but its destructor now
         // FREES the coroutine chains still parked on it, so their frames' destructors
-        // run after `servers`, `expiryPool`, the reaper and the per-bind `TlsContext`
+        // run after `servers`, `expiryPool`, the reaper and the per-bind `core::net::ITlsContext`
         // are already gone. Before that change those frames were never destroyed at
         // all, so nothing depended on what they touch.
         //
@@ -95,7 +94,7 @@ namespace
         // `~EpollSocket` / `~IocpSocket` call back into THIS reactor, which is alive
         // because it is the object being destroyed and a destructor body runs before
         // its members. Everything else `Connection` holds is a reference or a raw
-        // pointer with a trivial destructor, and `IAdmissionControl::OnConnectionEnded`
+        // pointer with a trivial destructor, and `core::net::IAdmissionControl::OnConnectionEnded`
         // sits on the `co_return` path, which a destroyed frame does not run.
         //
         // So: anything handed to a connection whose destructor does more than nothing
@@ -112,7 +111,7 @@ namespace
         // declared here reaches a connection except by being handed to it. The guard
         // sits on the handing over, which is the narrow door, instead of on the wide
         // set of things that merely happen to be declared nearby.
-        PlatformReactor reactor { clock };
+        core::net::PlatformLoop reactor { clock };
 
         // Declared before the servers it counts and before anything that arms one,
         // so it outlives every caller and is destroyed last -- which is also what
@@ -120,23 +119,25 @@ namespace
         // path below.
         ReadinessAnnouncer announcer { logger, std::format("{} bind(s)", options.binds.size()) };
 
-        std::vector<std::unique_ptr<PlatformListener>> listeners;
+        std::vector<std::unique_ptr<core::net::IListener>> listeners;
         std::vector<std::unique_ptr<Server>> servers;
         listeners.reserve(options.binds.size());
         servers.reserve(options.binds.size());
         for (auto const& bind: options.binds)
         {
-            auto listener = PlatformListener::Bind(reactor, bind.address, bind.port, options.listenBacklog);
-            if (!listener || !listener->IsBound())
+            auto listener = core::net::listen(
+                reactor,
+                ClientListenOptions(bind.address, bind.port, options.listenBacklog, core::net::PortSharing::Exclusive));
+            if (!listener.has_value())
             {
                 logger.Logf(LogLevel::Error,
                             "fastcached: cannot bind {}:{} : {}",
                             bind.address,
                             bind.port,
-                            listener ? listener->BindError() : std::string_view { "null listener" });
+                            listener.error().toString());
                 return EXIT_FAILURE;
             }
-            listeners.push_back(std::move(listener));
+            listeners.push_back(std::move(*listener));
             // Per-bind tls flag: a plaintext bind passes nullptr so accepted
             // sockets bypass the TLS wrapper; a TLS bind reuses the single
             // shared TlsContext (no per-bind cert/SNI in this iteration).
@@ -180,7 +181,7 @@ namespace
         //
         // One thread: the sweep is a single cycle, and a second would only let two
         // sweeps overlap on one store.
-        ThreadPoolExecutor expiryPool { 1 };
+        core::async::ThreadPoolExecutor expiryPool { 1 };
         auto const expiry = Detail::StartExpiryCycle(reactor, expiryPool, engine, logger, options, metrics);
 
         std::atomic<bool> watchdogQuit { false };
@@ -193,9 +194,9 @@ namespace
         //
         // `Stop()` is the one call that is safe from another thread: it sets a flag and
         // writes the wake fd, touching nothing the loop walks.
-        auto watchdog = MakeWatchdog(watchdogQuit, [&] { reactor.Stop(); });
+        auto watchdog = MakeWatchdog(watchdogQuit, [&] { reactor.stop(); });
 
-        reactor.Run();
+        reactor.run();
         watchdogQuit.store(true, std::memory_order_release);
 
         // **The other half, and REORDERING ALONE would not have been it.** Moving
@@ -207,10 +208,19 @@ namespace
         // holds on its `!Running()` term, which is what `Detach` now asserts.
         //
         // It is also tidier than leaving the accept loops parked for the reactor's
-        // destructor to abandon (#1025): closing the listener resumes each one inline,
-        // on this thread, and it ends through its own `co_return`.
+        // destructor to abandon (#1025): closing the listener completes each parked
+        // accept, and the turn below resumes it on this thread, where it ends through its
+        // own `co_return`.
+        //
+        // **The turn is not optional** (#1596). core-cpp's loop resumes a completed
+        // operation on its NEXT turn rather than inside `close()`, and `run()` has already
+        // returned -- so without it every accept loop stays queued until `~EventLoop`
+        // frees it, which is after `servers` are gone, and `~AcceptingScope` then writes
+        // to a destroyed `Server`. ThreadSanitizer reported exactly that as a
+        // heap-use-after-free.
         for (auto& s: servers)
             s->Shutdown();
+        std::ignore = reactor.runUntilIdle();
 
         std::uint64_t total = 0;
         for (auto const& s: servers)
@@ -223,40 +233,44 @@ namespace
 
     /// Drive one accepted connection to completion on a specific reactor's
     /// thread. The connection is handed off from the acceptor thread: it first
-    /// reschedules onto `reactor` (so the socket is created and all its I/O
+    /// reschedules onto `reactor` (so the socket is adopted and all its I/O
     /// completions land on that one thread — no coroutine migration), then
-    /// wraps the raw handle and runs the protocol session.
-    DetachedTask RunHandedOffConnection(IocpReactor& reactor,
-                                        Detail::NativeSocket raw,
-                                        CacheEngine& engine,
-                                        ILogger& logger,
-                                        IAdmissionControl* admission,
-                                        SessionContext session,
-                                        [[maybe_unused]] TlsContext* tls,
-                                        std::string peerAddress,
-                                        LogSource logSource)
+    /// adopts the raw handle and runs the protocol session.
+    ///
+    /// `core::net::adoptSocket` is the adoption, and it is called on `reactor`'s own
+    /// thread, after the hop, because that is its contract. It owns the handle from
+    /// the call on, including when it refuses, and it leaves socket options alone --
+    /// which is why `AcceptRaw` has already applied them.
+    /// @param lease The connection's admission slot, held for as long as this frame lives.
+    core::async::DetachedTask RunHandedOffConnection(core::net::PlatformLoop& reactor,
+                                                     AcceptedSocket raw,
+                                                     CacheEngine& engine,
+                                                     ILogger& logger,
+                                                     std::optional<core::net::AdmissionLease> lease,
+                                                     SessionContext session,
+                                                     core::net::ITlsContext* tls,
+                                                     LogSource logSource)
     {
-        co_await ResumeOn { reactor };
+        co_await core::async::ResumeOn { reactor };
         // This connection now runs on `reactor`; pin pub/sub delivery to it so a
-        // message published elsewhere wakes this subscriber via reactor.Submit.
+        // message published elsewhere wakes this subscriber via reactor.submit.
         session.reactor = &reactor;
         // Firewall: this is a DetachedTask (unhandled_exception -> std::terminate),
         // so a handler exception must drop only this connection, not the daemon.
         try
         {
-            auto socket = std::make_unique<IocpSocket>(reactor, static_cast<std::uintptr_t>(raw), std::move(peerAddress));
-            if (!socket->IsAttached())
+            auto socket = core::net::adoptSocket(reactor, raw.handle, std::move(raw.peer));
+            if (!socket.has_value())
             {
-                // CreateIoCompletionPort failed for this socket: no completion
-                // will ever be dequeued, so awaiting would hang the connection
-                // and leak its admission slot. Drop it now; the unique_ptr's
-                // destructor closes the socket.
-                logger.Logf(LogLevel::Error, "handed-off connection: IOCP association failed; dropping");
+                // Refused -- the completion port would not take it, say -- and the handle is
+                // already closed by the refusal. Awaiting would hang the connection; drop it.
+                logger.Logf(
+                    LogLevel::Error, "handed-off connection: adoption failed ({}); dropping", socket.error().toString());
             }
             else
             {
                 Connection connection {
-                    WrapTls(std::move(socket), tls),
+                    core::net::wrapTls(std::move(*socket), tls, reactor),
                     ConnectionHoldings { .engine = engine, .logger = logger, .session = session, .logSource = logSource }
                 };
                 co_await connection.Run();
@@ -266,8 +280,7 @@ namespace
         {
             LogConnectionFirewallException(logger);
         }
-        if (admission)
-            admission->OnConnectionEnded();
+        static_cast<void>(lease);
         co_return;
     }
 
@@ -279,14 +292,14 @@ namespace
     int RunMultiReactorWindows(ReactorServerOptions const& options,
                                CacheEngine& engine,
                                ILogger& logger,
-                               IAdmissionControl* admission,
+                               core::net::IAdmissionControl* admission,
                                IMetricsSink* metrics,
                                unsigned reactorCount)
     {
         if (int const r = Detail::VerifyTlsContextForTlsBinds(options, logger); r != EXIT_SUCCESS)
             return r;
-        SteadyClock ownClock;
-        IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
+        core::platform::SteadyClock ownClock;
+        core::platform::IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
         // Readiness on this platform takes TWO kinds of participant, and both are
         // load-bearing. An acceptor thread parked in `AcceptRaw` takes the socket; an
         // IOCP reactor's `Run()` is what ever serves it, because every accepted handle
@@ -300,31 +313,30 @@ namespace
         // `ExpectAcceptor`.
         ReadinessAnnouncer announcer { logger, std::format("{} bind(s) x {} reactors", options.binds.size(), reactorCount) };
 
-        std::vector<std::unique_ptr<IocpReactor>> reactors;
+        std::vector<std::unique_ptr<core::net::PlatformLoop>> reactors;
         reactors.reserve(reactorCount);
         for ([[maybe_unused]] auto const i: std::views::iota(0U, reactorCount))
         {
-            reactors.push_back(std::make_unique<IocpReactor>(clock));
+            reactors.push_back(std::make_unique<core::net::PlatformLoop>(clock));
             announcer.ExpectAcceptor();
         }
 
         // One listening socket per BindConfig; each acceptor thread owns one.
-        std::vector<Detail::NativeSocket> listenSocks;
+        std::vector<core::platform::NativeHandle> listenSocks;
         std::vector<bool> bindTls; // parallel to listenSocks
         listenSocks.reserve(options.binds.size());
         bindTls.reserve(options.binds.size());
         for (auto const& bind: options.binds)
         {
-            auto bound = Detail::BindAndListen(
-                DefaultAddressResolver(), bind.address, bind.port, options.listenBacklog, /*extraTypeFlags*/ 0);
+            auto bound = BindAndListen(core::net::defaultAddressResolver(), bind.address, bind.port, options.listenBacklog);
             if (!bound.has_value())
             {
                 logger.Logf(LogLevel::Error, "fastcached: cannot bind {}:{} : {}", bind.address, bind.port, bound.error());
                 for (auto const sock: listenSocks)
-                    Detail::CloseNativeSocket(sock);
+                    CloseNativeSocket(sock);
                 return EXIT_FAILURE;
             }
-            listenSocks.push_back(bound->socket);
+            listenSocks.push_back(bound->handle);
             bindTls.push_back(bind.tls);
         }
         std::atomic<std::uint64_t> accepted { 0 };
@@ -349,17 +361,19 @@ namespace
                 // zone records, so a `std::format(...).c_str()` would dangle
                 // immediately after the full-expression's semicolon.
                 [[maybe_unused]] auto const threadName = std::format("fc-acceptor-{}", bindIdx);
-                FC_THREAD_NAME(threadName.c_str());
+                CORE_THREAD_NAME(threadName.c_str());
                 auto const listenSock = listenSocks[bindIdx];
                 auto* const perBindTls = bindTls[bindIdx] ? options.tlsContext : nullptr;
                 // Armed the moment this thread is about to block in `AcceptRaw`.
                 announcer.AcceptorArmed(std::format("acceptor thread {}", bindIdx));
                 while (!stopping.load(std::memory_order_acquire) && !stopToken.stop_requested())
                 {
-                    auto raw = Detail::AcceptRaw(listenSock);
+                    auto raw = AcceptRaw(listenSock);
                     if (!raw.has_value())
                         break;
-                    if (admission && !admission->AllowAccept())
+                    // Admitted and counted in one step, as `Server::Run` does it.
+                    auto lease = admission != nullptr ? admission->tryAdmit() : std::nullopt;
+                    if (admission != nullptr && !lease.has_value())
                     {
                         if (metrics)
                         {
@@ -367,11 +381,9 @@ namespace
                             if (perBindTls != nullptr)
                                 metrics->Increment(IMetricsSink::Counter::ConnectionsAdmissionRejectedTls);
                         }
-                        Detail::CloseNativeSocket(*raw);
+                        CloseNativeSocket(raw->handle);
                         continue;
                     }
-                    if (admission)
-                        admission->OnConnectionStarted();
                     accepted.fetch_add(1, std::memory_order_relaxed);
                     if (metrics)
                     {
@@ -381,22 +393,17 @@ namespace
                     }
                     auto const idx = nextReactor.fetch_add(1, std::memory_order_relaxed) % reactorCount;
                     auto& reactor = *reactors[idx];
-                    // AcceptRaw hands off a connected handle without a captured
-                    // peer; query it now (on the acceptor thread) so --log-source
-                    // can prefix this connection's log lines with the client IP.
-                    auto peer = options.logSource ? Detail::PeerAddressOf(*raw) : std::string {};
                     // Per-bind copy for the same reason the other two platform paths
                     // make one: this connection carries its endpoint's role mask, not
                     // the daemon's.
                     auto session = options.session;
                     RunHandedOffConnection(reactor,
-                                           *raw,
+                                           std::move(*raw),
                                            engine,
                                            logger,
-                                           admission,
+                                           std::move(lease),
                                            session,
                                            perBindTls,
-                                           std::move(peer),
                                            options.logSource ? LogSource::Yes : LogSource::No);
                 }
             });
@@ -425,7 +432,7 @@ namespace
         // suspicion from the same comment.
         //
         // Measured on Windows, 3 runs: `closesocket` under a parked `::accept` returns
-        // `WSAEINTR` → `NetErrorCode::Cancelled`, the acceptor's `!raw.has_value()`
+        // `WSAEINTR` → `core::net::NetErrorCode::Cancelled`, the acceptor's `!raw.has_value()`
         // breaks its loop, and `~jthread` joins. It is NOT the hazard #1207 fixed on
         // `BlockingListener`: that remedy is *stop, JOIN, then close*, and it rests on
         // POSIX NOT waking a parked `accept` (measured by `scripts/probes/accept-close-wakeup.cpp`:
@@ -433,7 +440,7 @@ namespace
         // elapsed -- never the sum of the sleeps a wait asked for), so closing early buys
         // nothing there. Here the close is the wakeup, so
         // joining first would hang forever. The POSIX sibling below can join-then-close
-        // only because its acceptors are reactor-driven `PlatformListener`s. Pinned by
+        // only because its acceptors are loop-driven `core::net` listeners. Pinned by
         // `ctest -R AcceptRaw`, which had no equivalent when #1238 was filed.
         //
         // What is NOT closed by this: an acceptor that has just passed its `stopping`
@@ -448,9 +455,9 @@ namespace
                 return; // another caller already ran the teardown.
             stopping.store(true, std::memory_order_release);
             for (auto const sock: listenSocks)
-                Detail::CloseNativeSocket(sock);
+                CloseNativeSocket(sock);
             for (auto& reactor: reactors)
-                reactor->Stop();
+                reactor->stop();
         };
         auto watchdog = MakeWatchdog(watchdogQuit, stopAll);
 
@@ -464,7 +471,7 @@ namespace
         //
         // One thread: the sweep is a single cycle, and a second would only let two
         // sweeps overlap on one store.
-        ThreadPoolExecutor expiryPool { 1 };
+        core::async::ThreadPoolExecutor expiryPool { 1 };
         auto const expiry = Detail::StartExpiryCycle(*reactors[0], expiryPool, engine, logger, options, metrics);
 
         std::vector<std::jthread> threads;
@@ -472,13 +479,13 @@ namespace
         for (auto const i: std::views::iota(1U, reactorCount))
             threads.emplace_back([&reactors, &announcer, i] {
                 [[maybe_unused]] auto const threadName = std::format("fc-reactor-{}", i);
-                FC_THREAD_NAME(threadName.c_str());
+                CORE_THREAD_NAME(threadName.c_str());
                 announcer.AcceptorArmed(std::format("reactor {}", i));
-                reactors[i]->Run();
+                reactors[i]->run();
             });
-        FC_THREAD_NAME("fc-reactor-0");
+        CORE_THREAD_NAME("fc-reactor-0");
         announcer.AcceptorArmed("reactor 0");
-        reactors[0]->Run();
+        reactors[0]->run();
         threads.clear();
 
         // Unconditional cleanup: if reactors[0]->Run() returned through any
@@ -507,20 +514,20 @@ namespace
     int RunMultiReactorPosix(ReactorServerOptions const& options,
                              CacheEngine& engine,
                              ILogger& logger,
-                             IAdmissionControl* admission,
+                             core::net::IAdmissionControl* admission,
                              IMetricsSink* metrics,
                              unsigned reactorCount)
     {
         if (int const r = Detail::VerifyTlsContextForTlsBinds(options, logger); r != EXIT_SUCCESS)
             return r;
-        SteadyClock ownClock;
-        IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
-        std::vector<std::unique_ptr<PlatformReactor>> reactors;
+        core::platform::SteadyClock ownClock;
+        core::platform::IClock& clock = options.clock != nullptr ? *options.clock : ownClock;
+        std::vector<std::unique_ptr<core::net::PlatformLoop>> reactors;
         // Listeners and servers are laid out as `[reactor * binds + bind]`
         // — a flat array indexed by `reactor * binds.size() + bindIdx`. This
         // keeps the lifetime simple and lets the watchdog tear them down with
         // a single pass.
-        std::vector<std::unique_ptr<PlatformListener>> listeners;
+        std::vector<std::unique_ptr<core::net::IListener>> listeners;
         std::vector<std::unique_ptr<Server>> servers;
         reactors.reserve(reactorCount);
         auto const bindCount = options.binds.size();
@@ -533,22 +540,23 @@ namespace
 
         for (auto const i: std::views::iota(0U, reactorCount))
         {
-            reactors.push_back(std::make_unique<PlatformReactor>(clock));
+            reactors.push_back(std::make_unique<core::net::PlatformLoop>(clock));
             for (auto const& bind: options.binds)
             {
-                auto listener = PlatformListener::Bind(
-                    *reactors[i], bind.address, bind.port, options.listenBacklog, DefaultAddressResolver(), ReusePort::Yes);
-                if (!listener || !listener->IsBound())
+                auto listener = core::net::listen(
+                    *reactors[i],
+                    ClientListenOptions(bind.address, bind.port, options.listenBacklog, core::net::PortSharing::Shared));
+                if (!listener.has_value())
                 {
                     logger.Logf(LogLevel::Error,
                                 "fastcached: cannot bind {}:{} on reactor {}: {}",
                                 bind.address,
                                 bind.port,
                                 i,
-                                listener ? listener->BindError() : std::string_view { "null listener" });
+                                listener.error().toString());
                     return EXIT_FAILURE;
                 }
-                listeners.push_back(std::move(listener));
+                listeners.push_back(std::move(*listener));
                 auto* const perBindTls = bind.tls ? options.tlsContext : nullptr;
                 // The endpoint's own policy travels with every connection it accepts.
                 // Without this a handler cannot tell which listener a frame arrived on,
@@ -580,7 +588,7 @@ namespace
         // down after every loop has returned, below.
         auto watchdog = MakeWatchdog(watchdogQuit, [&] {
             for (auto& reactor: reactors)
-                reactor->Stop();
+                reactor->stop();
         });
 
         auto const onlineCpus = OnlineCpuCount();
@@ -602,7 +610,7 @@ namespace
                 group,
                 announcer,
                 logger);
-            reactors[index]->Run();
+            reactors[index]->run();
         };
 
         // **Declared BEFORE the reaper, and that ordering is the mechanism.** Locals
@@ -615,7 +623,7 @@ namespace
         //
         // One thread: the sweep is a single cycle, and a second would only let two
         // sweeps overlap on one store.
-        ThreadPoolExecutor expiryPool { 1 };
+        core::async::ThreadPoolExecutor expiryPool { 1 };
         auto const expiry = Detail::StartExpiryCycle(*reactors[0], expiryPool, engine, logger, options, metrics);
 
         std::vector<std::jthread> threads;
@@ -625,10 +633,10 @@ namespace
                 // Hoist into a stack local; Tracy's SetThreadName does not
                 // copy and would dangle on a `std::format(...).c_str()`.
                 [[maybe_unused]] auto const threadName = std::format("fc-reactor-{}", i);
-                FC_THREAD_NAME(threadName.c_str());
+                CORE_THREAD_NAME(threadName.c_str());
                 runReactor(i);
             });
-        FC_THREAD_NAME("fc-reactor-0");
+        CORE_THREAD_NAME("fc-reactor-0");
         runReactor(0);
         threads.clear();
 
@@ -638,8 +646,13 @@ namespace
         // joins -- so no reactor is `Running()` and closing a listener here cannot walk
         // a batch anybody is dispatching. See the single-reactor path for why the order
         // rather than the thread was never the fix (#1208).
+        //
+        // And each loop takes the turn that resumes its accept loops, for the single-reactor
+        // path's reason: nothing else will before `~EventLoop`, which runs after `servers`.
         for (auto& server: servers)
             server->Shutdown();
+        for (auto& reactor: reactors)
+            std::ignore = reactor->runUntilIdle();
 
         std::uint64_t total = 0;
         for (auto& server: servers)
@@ -655,7 +668,7 @@ namespace
 int RunReactorServer(ReactorServerOptions const& options,
                      CacheEngine& engine,
                      ILogger& logger,
-                     IAdmissionControl* admission,
+                     core::net::IAdmissionControl* admission,
                      IMetricsSink* metrics)
 {
     if (options.binds.empty())
@@ -676,8 +689,8 @@ int RunReactorServer(ReactorServerOptions const& options,
 namespace Detail
 {
 
-    std::unique_ptr<ExpiryReaper> StartExpiryCycle(IReactor& reactor,
-                                                   IExecutor& sweepOn,
+    std::unique_ptr<ExpiryReaper> StartExpiryCycle(core::net::EventLoop& reactor,
+                                                   core::async::IExecutor& sweepOn,
                                                    CacheEngine& engine,
                                                    ILogger& logger,
                                                    ReactorServerOptions const& options,
@@ -698,7 +711,7 @@ namespace Detail
         // listener's `Accept()`. That is what turns "started" into "armed", and it
         // is the whole reason the readiness line can be emitted below rather than
         // above.
-        auto runAccept = [](Server* s) -> DetachedTask {
+        auto runAccept = [](Server* s) -> core::async::DetachedTask {
             co_await s->Run();
             co_return;
         };

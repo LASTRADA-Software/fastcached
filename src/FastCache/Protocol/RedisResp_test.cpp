@@ -1,14 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
-#include <FastCache/Net/LingeringClose.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
 #include <FastCache/Protocol/PubSubRegistry.hpp>
 #include <FastCache/Protocol/RedisResp.hpp>
@@ -16,6 +11,7 @@
 #include <FastCache/Protocol/SessionContext.hpp>
 #include <FastCache/Protocol/StreamWaiterRegistry.hpp>
 #include <FastCache/Server/Connection.hpp>
+#include <FastCache/Transport/LingeringClose.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -30,8 +26,14 @@
 #include <thread>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/net/testing/ParkingReadableSocket.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/FrameSentinel.hpp>
-#include <tests/SocketDecorator.hpp>
+#include <tests/HalfClose.hpp>
 
 namespace
 {
@@ -44,15 +46,15 @@ struct RespFixture
     // `CacheEngine` gained a member (#296). `clock` still precedes `engine`, which
     // holds a reference to it.
     FastCache::InMemoryLruStorage storage;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::CacheEngine engine { storage, clock };
-    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     FastCache::RedisRespHandler handler;
 };
 
-FastCache::Task<bool> WriteString(FastCache::ISocket* s, std::string_view payload)
+core::async::Task<bool> WriteString(core::net::ISocket* s, std::string_view payload)
 {
-    auto const r = co_await s->Write(FastCache::AsBytes(payload));
+    auto const r = co_await s->write(FastCache::AsBytes(payload));
     co_return r.has_value();
 }
 
@@ -64,13 +66,13 @@ FastCache::Task<bool> WriteString(FastCache::ISocket* s, std::string_view payloa
 /// deterministic regardless, `Exchange` below closes the server side after
 /// `handler.Run` returns, so DrainResponse always sees EOF (`*r == 0`) on the
 /// next Read.
-FastCache::Task<std::string> DrainResponse(FastCache::ISocket* s)
+core::async::Task<std::string> DrainResponse(core::net::ISocket* s)
 {
     std::string out;
     while (true)
     {
         std::vector<std::byte> chunk(512);
-        auto const r = co_await s->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const r = co_await s->read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!r.has_value() || *r == 0)
             break;
         for (auto const i: std::views::iota(std::size_t { 0 }, *r))
@@ -83,9 +85,9 @@ FastCache::Task<std::string> DrainResponse(FastCache::ISocket* s)
 
 std::string Exchange(RespFixture& fix, std::string_view request, FastCache::SessionContext session = {})
 {
-    REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
-    fix.pair.client->ShutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, session));
+    REQUIRE(core::async::syncRun(WriteString(fix.pair.client.get(), request)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*fix.pair.client).has_value());
+    core::async::syncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, session));
     // Close the server side so DrainResponse always observes EOF — defends
     // against the latent "reply exactly 512 bytes long" park case in the
     // historical partial-read heuristic above. The non-pubsub handler path
@@ -97,8 +99,8 @@ std::string Exchange(RespFixture& fix, std::string_view request, FastCache::Sess
     // returns with the rest unread, and a bare close over unread bytes is a reset
     // that destroys the reply before the client reads it (#1554). This client has
     // half-closed, so the linger meets EOF at once.
-    FastCache::SyncRun(FastCache::CloseLingering(fix.pair.server.get(), nullptr, FastCache::Connection::Linger));
-    return FastCache::SyncRun(DrainResponse(fix.pair.client.get()));
+    core::async::syncRun(FastCache::CloseLingering(fix.pair.server.get(), nullptr, FastCache::Connection::Linger));
+    return core::async::syncRun(DrainResponse(fix.pair.client.get()));
 }
 
 } // namespace
@@ -573,7 +575,7 @@ TEST_CASE("RESP: EXPIREAT in the past deletes the key on the next access", "[pro
     // between SET and the post-deadline read — the wire-level Exchange
     // helper runs the whole batch in one go, leaving no point at which
     // to advance time.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
 
@@ -581,7 +583,7 @@ TEST_CASE("RESP: EXPIREAT in the past deletes the key on the next access", "[pro
     REQUIRE(set.has_value());
 
     // 1-second relative TTL via TouchAt — same path EXPIRE/EXPIREAT take.
-    auto const touch = engine.TouchAt("k", clock.Now() + std::chrono::seconds { 1 });
+    auto const touch = engine.TouchAt("k", clock.now() + std::chrono::seconds { 1 });
     REQUIRE(touch.has_value());
 
     // Before the deadline: still visible with a positive TTL.
@@ -592,7 +594,7 @@ TEST_CASE("RESP: EXPIREAT in the past deletes the key on the next access", "[pro
         REQUIRE(before->value().hasExpiry);
 
     // Step past the deadline: TTL reports -2 (missing) and GET misses.
-    clock.Advance(std::chrono::seconds { 2 });
+    clock.advance(std::chrono::seconds { 2 });
     auto const after = engine.Ttl("k");
     REQUIRE(after.has_value());
     REQUIRE(!after->has_value()); // expired -> reported as missing
@@ -609,7 +611,7 @@ TEST_CASE("RESP: TTL probe does NOT bump LRU recency", "[protocol][resp][ttl]")
     // are deferred and sampled). The budget fits exactly two 50-byte
     // values; the third insertion must evict the LRU tail, and that tail
     // had better be `a` (no TTL bump) and not `b`.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage { 100, 0, FastCache::LruMode::Strict };
     FastCache::CacheEngine engine { storage, clock };
 
@@ -771,13 +773,13 @@ TEST_CASE("RESP: COMMAND DOCS replies an empty map", "[protocol][resp][command]"
 
 TEST_CASE("RESP: INCR preserves TTL across counter mutation", "[protocol][resp][ttl][incr]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
 
     // SET k 0; EXPIRE k 60 (via TouchAt, the same path Phase 2 wires up).
     REQUIRE(engine.Set("k", std::vector<std::byte> { std::byte { '0' } }, 0, 0).has_value());
-    auto const deadline = clock.Now() + std::chrono::seconds { 60 };
+    auto const deadline = clock.now() + std::chrono::seconds { 60 };
     REQUIRE(engine.TouchAt("k", deadline).has_value());
 
     // Mutate through Update — same path INCR/DECR/INCRBY/DECRBY take.
@@ -804,12 +806,12 @@ TEST_CASE("RESP: INCRBY preserves TTL", "[protocol][resp][ttl][incr]")
     // level INCRBY routes through CacheEngine::Update which is what
     // HandleIncrDecrBy invokes. Drive Update directly so we cover the
     // full Phase 1 surface (not just IncrementOrInitialize).
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
 
     REQUIRE(engine.Set("k", std::vector<std::byte> { std::byte { '1' }, std::byte { '0' } }, 0, 0).has_value());
-    REQUIRE(engine.TouchAt("k", clock.Now() + std::chrono::seconds { 60 }).has_value());
+    REQUIRE(engine.TouchAt("k", clock.now() + std::chrono::seconds { 60 }).has_value());
 
     // Mutate via Update returning Store with the implicit (preserve) expiry.
     auto const upd = engine.Update("k", [](FastCache::GetResult const&) {
@@ -833,13 +835,13 @@ TEST_CASE("RESP: INCRBY preserves TTL", "[protocol][resp][ttl][incr]")
 
 TEST_CASE("RESP: SADD preserves TTL", "[protocol][resp][ttl][sets]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
 
     std::array<std::string const, 2> const initial { "alpha", "beta" };
     REQUIRE(engine.SetAdd("s", std::span<std::string const> { initial }).has_value());
-    REQUIRE(engine.TouchAt("s", clock.Now() + std::chrono::seconds { 60 }).has_value());
+    REQUIRE(engine.TouchAt("s", clock.now() + std::chrono::seconds { 60 }).has_value());
 
     // Add a member — pre-fix this would wipe the TTL.
     std::array<std::string const, 1> const more { "gamma" };
@@ -856,13 +858,13 @@ TEST_CASE("RESP: SADD preserves TTL", "[protocol][resp][ttl][sets]")
 
 TEST_CASE("RESP: SREM preserves TTL on remaining members", "[protocol][resp][ttl][sets]")
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
 
     std::array<std::string const, 3> const initial { "a", "b", "c" };
     REQUIRE(engine.SetAdd("s", std::span<std::string const> { initial }).has_value());
-    REQUIRE(engine.TouchAt("s", clock.Now() + std::chrono::seconds { 60 }).has_value());
+    REQUIRE(engine.TouchAt("s", clock.now() + std::chrono::seconds { 60 }).has_value());
 
     std::array<std::string const, 1> const remove { "a" };
     auto const removed = engine.SetRemove("s", std::span<std::string const> { remove });
@@ -1000,11 +1002,11 @@ TEST_CASE("RESP: SET PX 50 keeps sub-second TTL (no second-rounding)", "[protoco
 {
     // Pre-fix: `(50 + 999) / 1000 = 1` → 1-second TTL.
     // Post-fix: `now + 50ms` → ~50ms remaining.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
 
-    auto const deadline = clock.Now() + std::chrono::milliseconds { 50 };
+    auto const deadline = clock.now() + std::chrono::milliseconds { 50 };
     REQUIRE(engine.SetWithDeadline("k", std::vector<std::byte> { std::byte { 'v' } }, 0, deadline).has_value());
 
     auto const ttl = engine.Ttl("k");
@@ -1065,11 +1067,11 @@ TEST_CASE("RESP: PSETEX preserves milliseconds end-to-end", "[protocol][resp][se
     // path). Drive directly so the test can read PTTL out of the
     // engine — Exchange runs the whole batch under one ManualClock
     // tick, so the remaining ms is exactly the request.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
 
-    auto const deadline = clock.Now() + std::chrono::milliseconds { 50 };
+    auto const deadline = clock.now() + std::chrono::milliseconds { 50 };
     REQUIRE(engine.SetWithDeadline("k", std::vector<std::byte> { std::byte { 'v' } }, 0, deadline).has_value());
 
     auto const ttl = engine.Ttl("k");
@@ -1116,7 +1118,7 @@ TEST_CASE("RESP: MGET does NOT bump LRU recency", "[protocol][resp][mget]")
     // five times via MGET. Pre-fix MGET called Get (promotes), so
     // `b` would be evicted. Post-fix MGET calls Peek (no promotion),
     // so `a` is evicted.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage { 100, 0, FastCache::LruMode::Strict };
     FastCache::CacheEngine engine { storage, clock };
 
@@ -1180,28 +1182,28 @@ TEST_CASE("IStorage::ClearExpiry default decomposes Peek + Touch", "[cache][pers
     // (InMemoryLruStorage inherits it; ShardedStorage/LayeredStorage
     // override it for atomic lock-spanning).
     FastCache::InMemoryLruStorage storage;
-    FastCache::ManualClock clock;
-    auto const deadline = clock.Now() + std::chrono::seconds { 60 };
+    core::platform::ManualClock clock;
+    auto const deadline = clock.now() + std::chrono::seconds { 60 };
 
     REQUIRE(storage.Set("k", std::vector<std::byte> { std::byte { 'v' } }, 0, deadline).has_value());
 
-    auto const r = storage.ClearExpiry("k", clock.Now());
+    auto const r = storage.ClearExpiry("k", clock.now());
     REQUIRE(r.has_value());
     REQUIRE(*r); // TTL was cleared
 
     // Verify the entry persists with no TTL.
-    auto const peek = storage.Peek("k", clock.Now());
+    auto const peek = storage.Peek("k", clock.now());
     REQUIRE(peek.has_value());
     REQUIRE(peek->found);
-    REQUIRE(peek->entry.expiry == FastCache::TimePoint::max());
+    REQUIRE(peek->entry.expiry == core::platform::SteadyTimePoint::max());
 
     // Calling again returns false (the key exists but has no TTL).
-    auto const r2 = storage.ClearExpiry("k", clock.Now());
+    auto const r2 = storage.ClearExpiry("k", clock.now());
     REQUIRE(r2.has_value());
     REQUIRE_FALSE(*r2);
 
     // Absent key: KeyNotFound.
-    auto const r3 = storage.ClearExpiry("nope", clock.Now());
+    auto const r3 = storage.ClearExpiry("nope", clock.now());
     REQUIRE_FALSE(r3.has_value());
     REQUIRE(r3.error().code == FastCache::StorageErrorCode::KeyNotFound);
 }
@@ -1244,7 +1246,7 @@ TEST_CASE("RESP: MSETNX rolls back on race-induced partial write", "[protocol][r
     // should erase the already-committed `a`, and `c` was never tried.
     // We drive this directly through the engine to control the race
     // ordering deterministically.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
 
@@ -1346,15 +1348,15 @@ TEST_CASE("ManualWallClock is deterministic", "[core][clock]")
 {
     using namespace std::chrono_literals;
     auto const start = std::chrono::system_clock::time_point { 1'000'000s };
-    FastCache::ManualWallClock wallClock { start };
-    REQUIRE(wallClock.Now() == start);
+    core::platform::ManualWallClock wallClock { start };
+    REQUIRE(wallClock.now() == start);
 
-    wallClock.Advance(60s);
-    REQUIRE(wallClock.Now() == start + 60s);
+    wallClock.advance(60s);
+    REQUIRE(wallClock.now() == start + 60s);
 
     auto const target = std::chrono::system_clock::time_point { 2'000'000s };
-    wallClock.SetNow(target);
-    REQUIRE(wallClock.Now() == target);
+    wallClock.setNow(target);
+    REQUIRE(wallClock.now() == target);
 }
 
 TEST_CASE("RESP: EXPIREAT past deletes the key via the wire path", "[protocol][resp][ttl][expire]")
@@ -1368,12 +1370,12 @@ TEST_CASE("RESP: EXPIREAT past deletes the key via the wire path", "[protocol][r
     // ahead of the EXPIREAT timestamp and observe the key being
     // deleted on next access in one Exchange.
     using namespace std::chrono_literals;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     auto const start = std::chrono::system_clock::time_point { 2'000'000s };
-    FastCache::ManualWallClock wallClock { start };
+    core::platform::ManualWallClock wallClock { start };
     FastCache::CacheEngine engine { storage, clock, wallClock };
-    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     FastCache::RedisRespHandler handler;
 
     // The EXPIREAT timestamp is 1 second BEFORE the wall clock's now,
@@ -1385,10 +1387,10 @@ TEST_CASE("RESP: EXPIREAT past deletes the key via the wire path", "[protocol][r
                                  "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
                                  std::to_string(ts).size(),
                                  ts);
-    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), req)));
-    pair.client->ShutdownWrite();
-    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, /*session*/ {}));
-    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(core::async::syncRun(WriteString(pair.client.get(), req)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+    core::async::syncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, /*session*/ {}));
+    auto const out = core::async::syncRun(DrainResponse(pair.client.get()));
     REQUIRE(out == "+OK\r\n:1\r\n$-1\r\n");
 }
 
@@ -1401,19 +1403,19 @@ TEST_CASE("CacheEngine::ExpiryFromExptime uses the injected IWallClock", "[cache
     // the absolute threshold but BEFORE the wall-clock now — expect
     // immediate expiry (deadline == now).
     using namespace std::chrono_literals;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     // Wall clock at year 2100 (way past INT32_MAX, the boundary of
     // memcached's relative-vs-absolute threshold)
     auto const farFuture = std::chrono::system_clock::time_point { std::chrono::seconds { 4'102'444'800LL } };
-    FastCache::ManualWallClock wallClock { farFuture };
+    core::platform::ManualWallClock wallClock { farFuture };
     FastCache::CacheEngine engine { storage, clock, wallClock };
 
     // exptime = 3'000'000 seconds (35 days) — above 2592000 so treated
     // as an absolute UNIX timestamp. But absolute "3 million" is in the
     // 1970s, way before the wall clock's 2100. Result: immediate expiry.
     auto const deadline = engine.ExpiryFromExptime(3'000'000U);
-    REQUIRE(deadline == clock.Now());
+    REQUIRE(deadline == clock.now());
 }
 
 // ----- Redis transactions: WATCH / MULTI / EXEC / DISCARD / UNWATCH -----------
@@ -1423,11 +1425,11 @@ namespace
 
 struct TxFixture
 {
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::WatchRegistry watches;
-    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     FastCache::RedisRespHandler handler;
 
     [[nodiscard]] FastCache::SessionContext Session() noexcept
@@ -1440,10 +1442,10 @@ struct TxFixture
 
 std::string ExchangeTx(TxFixture& fix, std::string_view request)
 {
-    REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
-    fix.pair.client->ShutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, fix.Session()));
-    return FastCache::SyncRun(DrainResponse(fix.pair.client.get()));
+    REQUIRE(core::async::syncRun(WriteString(fix.pair.client.get(), request)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*fix.pair.client).has_value());
+    core::async::syncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, fix.Session()));
+    return core::async::syncRun(DrainResponse(fix.pair.client.get()));
 }
 
 } // namespace
@@ -1770,14 +1772,14 @@ struct KeyspaceFixture
 {
     // Cache-line-aligned member first; see `RespFixture` for why the analyzer cares.
     FastCache::InMemoryLruStorage storage;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::PubSubRegistry pubsub;
     // Subscribed to capture published events. Constructed AFTER pubsub so the
     // registry pointer is valid for the whole fixture lifetime.
     std::shared_ptr<RecordingSubscriber> sub = std::make_shared<RecordingSubscriber>();
     std::unique_ptr<FastCache::KeyspaceNotifier> notifier;
-    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     FastCache::RedisRespHandler handler;
 
     void EnableEvents(std::uint32_t mask)
@@ -1806,10 +1808,10 @@ struct KeyspaceFixture
 
 std::string ExchangeKs(KeyspaceFixture& fix, std::string_view request)
 {
-    REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
-    fix.pair.client->ShutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, fix.Session()));
-    return FastCache::SyncRun(DrainResponse(fix.pair.client.get()));
+    REQUIRE(core::async::syncRun(WriteString(fix.pair.client.get(), request)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*fix.pair.client).has_value());
+    core::async::syncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primer*/ {}, fix.Session()));
+    return core::async::syncRun(DrainResponse(fix.pair.client.get()));
 }
 
 } // namespace
@@ -2233,44 +2235,45 @@ class FailingPeekStorage final: public FastCache::IStorage
         _failOnlyForKey = key;
     }
 
-    std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view key, FastCache::TimePoint now) override
+    std::expected<FastCache::GetResult, FastCache::StorageError> Get(std::string_view key,
+                                                                     core::platform::SteadyTimePoint now) override
     {
         return _inner.Get(key, now);
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Set(std::string_view key,
                                                                     std::vector<std::byte> value,
                                                                     std::uint32_t flags,
-                                                                    FastCache::TimePoint expiry) override
+                                                                    core::platform::SteadyTimePoint expiry) override
     {
         return _inner.Set(key, std::move(value), flags, expiry);
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Add(std::string_view key,
                                                                     std::vector<std::byte> value,
                                                                     std::uint32_t flags,
-                                                                    FastCache::TimePoint expiry,
-                                                                    FastCache::TimePoint now) override
+                                                                    core::platform::SteadyTimePoint expiry,
+                                                                    core::platform::SteadyTimePoint now) override
     {
         return _inner.Add(key, std::move(value), flags, expiry, now);
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Replace(std::string_view key,
                                                                         std::vector<std::byte> value,
                                                                         std::uint32_t flags,
-                                                                        FastCache::TimePoint expiry,
-                                                                        FastCache::TimePoint now) override
+                                                                        core::platform::SteadyTimePoint expiry,
+                                                                        core::platform::SteadyTimePoint now) override
     {
         return _inner.Replace(key, std::move(value), flags, expiry, now);
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Append(std::string_view key,
                                                                        std::span<std::byte const> suffix,
                                                                        FastCache::CasToken expected,
-                                                                       FastCache::TimePoint now) override
+                                                                       core::platform::SteadyTimePoint now) override
     {
         return _inner.Append(key, suffix, expected, now);
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Prepend(std::string_view key,
                                                                         std::span<std::byte const> prefix,
                                                                         FastCache::CasToken expected,
-                                                                        FastCache::TimePoint now) override
+                                                                        core::platform::SteadyTimePoint now) override
     {
         return _inner.Prepend(key, prefix, expected, now);
     }
@@ -2278,30 +2281,30 @@ class FailingPeekStorage final: public FastCache::IStorage
                                                                                FastCache::CasToken expected,
                                                                                std::vector<std::byte> value,
                                                                                std::uint32_t flags,
-                                                                               FastCache::TimePoint expiry,
-                                                                               FastCache::TimePoint now) override
+                                                                               core::platform::SteadyTimePoint expiry,
+                                                                               core::platform::SteadyTimePoint now) override
     {
         return _inner.CompareAndSwap(key, expected, std::move(value), flags, expiry, now);
     }
     std::expected<IncrResult, FastCache::StorageError> IncrementOrInitialize(std::string_view key,
                                                                              std::uint64_t magnitude,
                                                                              bool decrement,
-                                                                             FastCache::TimePoint now) override
+                                                                             core::platform::SteadyTimePoint now) override
     {
         return _inner.IncrementOrInitialize(key, magnitude, decrement, now);
     }
-    std::expected<void, FastCache::StorageError> Delete(std::string_view key, FastCache::TimePoint now) override
+    std::expected<void, FastCache::StorageError> Delete(std::string_view key, core::platform::SteadyTimePoint now) override
     {
         return _inner.Delete(key, now);
     }
     std::expected<FastCache::CasToken, FastCache::StorageError> Touch(std::string_view key,
-                                                                      FastCache::TimePoint newExpiry,
-                                                                      FastCache::TimePoint now) override
+                                                                      core::platform::SteadyTimePoint newExpiry,
+                                                                      core::platform::SteadyTimePoint now) override
     {
         return _inner.Touch(key, newExpiry, now);
     }
     std::expected<FastCache::GetResult, FastCache::StorageError> Peek(std::string_view key,
-                                                                      FastCache::TimePoint now) override
+                                                                      core::platform::SteadyTimePoint now) override
     {
         // When `_failOnlyForKey` is set, behave like a normal storage for
         // every key EXCEPT that one — lets the partial-WATCH-rollback test
@@ -2310,17 +2313,18 @@ class FailingPeekStorage final: public FastCache::IStorage
             return _inner.Peek(key, now);
         return std::unexpected(FastCache::MakeStorageError(FastCache::StorageErrorCode::IoError));
     }
-    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(std::string_view key,
-                                                                          std::optional<FastCache::TimePoint> newExpiry,
-                                                                          FastCache::TimePoint now) override
+    std::expected<FastCache::CasToken, FastCache::StorageError> MarkStale(
+        std::string_view key,
+        std::optional<core::platform::SteadyTimePoint> newExpiry,
+        core::platform::SteadyTimePoint now) override
     {
         return _inner.MarkStale(key, newExpiry, now);
     }
-    void FlushWithGeneration(FastCache::TimePoint effectiveAt) override
+    void FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt) override
     {
         _inner.FlushWithGeneration(effectiveAt);
     }
-    FastCache::PurgeOutcome PurgeExpired(FastCache::TimePoint now, FastCache::PurgeBudget budget) override
+    FastCache::PurgeOutcome PurgeExpired(core::platform::SteadyTimePoint now, FastCache::PurgeBudget budget) override
     {
         return _inner.PurgeExpired(now, budget);
     }
@@ -2345,20 +2349,20 @@ TEST_CASE("RESP: WATCH on a faulting Peek replies an error (not silent CAS=0)", 
     // The faulty-Peek shim forces engine->PeekCas to return a StorageError.
     // WATCH must surface this as -ERR rather than silently snapshotting CAS=0:
     // the latter would let a later EXEC commit against an unread storage view.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FailingPeekStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::WatchRegistry watches;
-    auto pair = FastCache::InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     FastCache::RedisRespHandler handler;
 
     FastCache::SessionContext session;
     session.watches = &watches;
 
-    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n")));
-    pair.client->ShutdownWrite();
-    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
-    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(core::async::syncRun(WriteString(pair.client.get(), "*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+    core::async::syncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    auto const out = core::async::syncRun(DrainResponse(pair.client.get()));
     REQUIRE(out == "-ERR storage failure during WATCH\r\n");
 }
 
@@ -2409,11 +2413,11 @@ TEST_CASE("RESP: WATCH partial-failure replies +OK then -ERR without aborting th
     // returns. That's fine — the production guarantee for partial rollback
     // is "subsequent WATCH/MULTI/EXEC on the SAME connection sees the
     // prior watch as live", which the registry-level tests already cover.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FailingPeekStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::WatchRegistry watches;
-    auto pair = FastCache::InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     FastCache::RedisRespHandler handler;
 
     FastCache::SessionContext session;
@@ -2422,13 +2426,13 @@ TEST_CASE("RESP: WATCH partial-failure replies +OK then -ERR without aborting th
     // Storage fails ONLY for `b`; `a`'s WATCH succeeds normally.
     storage.FailOnlyForKey("b");
 
-    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(),
-                                           "*2\r\n$5\r\nWATCH\r\n$1\r\na\r\n" // succeeds — `a` is registered + snapshotted
-                                           "*2\r\n$5\r\nWATCH\r\n$1\r\nb\r\n" // fails — only `b` should roll back
-                                           )));
-    pair.client->ShutdownWrite();
-    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
-    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(core::async::syncRun(WriteString(pair.client.get(),
+                                             "*2\r\n$5\r\nWATCH\r\n$1\r\na\r\n" // succeeds — `a` is registered + snapshotted
+                                             "*2\r\n$5\r\nWATCH\r\n$1\r\nb\r\n" // fails — only `b` should roll back
+                                             )));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+    core::async::syncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    auto const out = core::async::syncRun(DrainResponse(pair.client.get()));
     REQUIRE(out == "+OK\r\n-ERR storage failure during WATCH\r\n");
 }
 
@@ -2450,11 +2454,11 @@ TEST_CASE("RESP: SUBSCRIBE then immediate disconnect tears down the watcher clea
     // The observable contract: handler.Run returns cleanly without UAF
     // / leak. SyncRun completing at all is the proof — any UAF inside
     // the orphaned watcher would crash the test process under ASAN/TSAN.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::PubSubRegistry pubsub;
-    auto pair = FastCache::InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     FastCache::RedisRespHandler handler;
 
     FastCache::SessionContext session;
@@ -2465,16 +2469,16 @@ TEST_CASE("RESP: SUBSCRIBE then immediate disconnect tears down the watcher clea
     // ShutdownWrite triggers a clean EOF on the server-side read,
     // exiting Run; Cleanup's destructor calls ShutdownWatcher which now
     // forces socket->Close so the parked watcher unblocks too.
-    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n")));
-    pair.client->ShutdownWrite();
+    REQUIRE(core::async::syncRun(WriteString(pair.client.get(), "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
 
     // The handler.Run completing at all is the regression assertion: a
     // pre-fix orphaned watcher would either deadlock the SyncRun or
     // produce a delayed UAF.
-    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    core::async::syncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
 
     // First subscribe-confirm frame must have been sent before teardown.
-    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    auto const out = core::async::syncRun(DrainResponse(pair.client.get()));
     REQUIRE(out.contains("subscribe"));
 }
 
@@ -2505,11 +2509,11 @@ TEST_CASE("RESP: WATCH partial-failure does NOT wipe re-registered earlier watch
     // The connection-internal proof is observed at the registry side:
     // a Touched('a') AFTER the partial-failure WATCH still finds the
     // index entry and dirties the handle.
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FailingPeekStorage storage;
     FastCache::CacheEngine engine { storage, clock };
     FastCache::WatchRegistry watches;
-    auto pair = FastCache::InMemorySocketPair::Create();
+    auto pair = core::net::testing::InMemorySocketPair::create();
     FastCache::RedisRespHandler handler;
 
     FastCache::SessionContext session;
@@ -2517,13 +2521,13 @@ TEST_CASE("RESP: WATCH partial-failure does NOT wipe re-registered earlier watch
 
     storage.FailOnlyForKey("b");
 
-    REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(),
-                                           "*2\r\n$5\r\nWATCH\r\n$1\r\na\r\n"            // (1) +OK, `a` registered
-                                           "*3\r\n$5\r\nWATCH\r\n$1\r\na\r\n$1\r\nb\r\n" // (2) -ERR, only `b` rolled back
-                                           )));
-    pair.client->ShutdownWrite();
-    FastCache::SyncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
-    auto const out = FastCache::SyncRun(DrainResponse(pair.client.get()));
+    REQUIRE(core::async::syncRun(WriteString(pair.client.get(),
+                                             "*2\r\n$5\r\nWATCH\r\n$1\r\na\r\n"            // (1) +OK, `a` registered
+                                             "*3\r\n$5\r\nWATCH\r\n$1\r\na\r\n$1\r\nb\r\n" // (2) -ERR, only `b` rolled back
+                                             )));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+    core::async::syncRun(handler.Run(pair.server.get(), &engine, /*primer*/ {}, session));
+    auto const out = core::async::syncRun(DrainResponse(pair.client.get()));
     REQUIRE(out == "+OK\r\n-ERR storage failure during WATCH\r\n");
 
     // The crucial post-fix invariant: `a` is STILL in the registry index
@@ -3236,10 +3240,10 @@ struct BlockingHarness
     // clang-analyzer-optin.performance.Padding quiet -- it started reporting this
     // struct when TestReactor grew the mutex its interface always promised.
     FastCache::InMemoryLruStorage storage;
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::CacheEngine engine { storage, clock };
-    FastCache::TestReactor reactor { clock };
-    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    core::net::testing::TestLoop reactor { clock };
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     FastCache::StreamWaiterRegistry waiters;
     FastCache::RedisRespHandler handler;
     std::string reply;
@@ -3273,8 +3277,8 @@ struct BlockingHarness
     /// a case asserts has been produced -- see the note on the cases themselves.
     void EndConnection()
     {
-        pair.client->ShutdownWrite();
-        reactor.Run();
+        REQUIRE(FastCache::Testing::ShutdownWrite(*pair.client).has_value());
+        reactor.drain();
     }
 
     /// Launcher coroutine: runs the handler on @p socket and captures the reply.
@@ -3282,26 +3286,26 @@ struct BlockingHarness
     /// Split out of `RunHandler` so a case can interpose a decorator between the
     /// handler and the pair's server end -- which is the only way to stage a
     /// readability watch that genuinely PARKS, since the in-memory transport always
-    /// answers `WaitReadable` inline (see `Testing::ParkingReadableSocket`).
+    /// answers `WaitReadable` inline (see `core::net::testing::ParkingReadableSocket`).
     /// @param socket  What the handler serves on; must outlive this task.
     /// @param session Session context, by value: a coroutine must not hold a
     ///        reference parameter across a suspension.
-    FastCache::Task<void> RunHandlerOn(FastCache::ISocket* socket, FastCache::SessionContext session)
+    core::async::Task<void> RunHandlerOn(core::net::ISocket* socket, FastCache::SessionContext session)
     {
         co_await handler.Run(socket, &engine, /*primer*/ {}, session);
         handlerReturned = true;
-        socket->Close();
+        socket->close();
         reply = co_await DrainResponse(pair.client.get());
     }
 
     /// A launched handler whose destructor RETIRES the parked reads before the
     /// coroutine frames holding their awaitables are freed.
     ///
-    /// The cases used to hold the launcher as a bare `Task<void>` local declared AFTER
+    /// The cases used to hold the launcher as a bare `core::async::Task<void>` local declared AFTER
     /// the harness, so at scope exit the task died FIRST: its frames went, leaving
-    /// `InMemorySocket::_pendingRead` pointing into freed storage, and the socket's own
+    /// `core::net::testing::InMemorySocket::_pendingRead` pointing into freed storage, and the socket's own
     /// destruction then COMPLETED that pointer. ASan reported `heap-use-after-free` in
-    /// `IoAwaitable::Complete` — in `Net/`, in production code, naming neither the case
+    /// `core::net::IoAwaitable::Complete` — in `Net/`, in production code, naming neither the case
     /// nor the assertion that actually failed
     /// ([#888](https://github.com/LASTRADA-Software/fastcached/issues/888)).
     ///
@@ -3330,7 +3334,7 @@ struct BlockingHarness
         /// @param served  What the handler was launched on — the pair's server end, or a
         ///                decorator over it, which forwards `Close`.
         /// @param task    The launched coroutine.
-        Launcher(BlockingHarness& harness, FastCache::ISocket& served, FastCache::Task<void> task) noexcept:
+        Launcher(BlockingHarness& harness, core::net::ISocket& served, core::async::Task<void> task) noexcept:
             _harness { &harness },
             _served { &served },
             _task { std::move(task) }
@@ -3344,21 +3348,21 @@ struct BlockingHarness
 
         ~Launcher()
         {
-            _served->Close();
-            _harness->pair.server->Close();
-            _harness->pair.client->Close();
+            _served->close();
+            _harness->pair.server->close();
+            _harness->pair.client->close();
         }
 
-        /// @return The coroutine handle, for `TestReactor::Submit`.
+        /// @return The coroutine handle, for `core::net::testing::TestLoop::Submit`.
         [[nodiscard]] auto Native() const noexcept
         {
-            return _task.Native();
+            return _task.handle();
         }
 
       private:
         BlockingHarness* _harness;
-        FastCache::ISocket* _served;
-        FastCache::Task<void> _task;
+        core::net::ISocket* _served;
+        core::async::Task<void> _task;
     };
 
     /// Launch the handler on the pair's server end.
@@ -3374,7 +3378,7 @@ struct BlockingHarness
     ///                declaring it before the launcher in the case gives you.
     /// @param session Session context.
     /// @return The launcher.
-    [[nodiscard]] Launcher LaunchOn(FastCache::ISocket& served, FastCache::SessionContext session)
+    [[nodiscard]] Launcher LaunchOn(core::net::ISocket& served, FastCache::SessionContext session)
     {
         return Launcher { *this, served, RunHandlerOn(&served, session) };
     }
@@ -3393,16 +3397,16 @@ TEST_CASE("RESP: XREAD BLOCK parks then wakes on a later XADD", "[protocol][resp
     auto session = h.Session();
 
     // Seed an entry and arm a blocking read for entries strictly after it.
-    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
-                                           "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
-                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
-                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
+    REQUIRE(core::async::syncRun(WriteString(h.pair.client.get(),
+                                             "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                             "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                             "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
 
     // Launch the handler on the reactor; it processes the XADD, then parks on
     // the blocking XREAD (no entry after 1-0 yet).
     auto launcher = h.Launch(session);
-    h.reactor.Submit(launcher.Native());
-    h.reactor.Run();
+    h.reactor.submit(launcher.Native());
+    h.reactor.drain();
     // Parked and NOT abandoned: the peer is still able to send, so the disconnect
     // arm must have declined to fire.
     REQUIRE_FALSE(h.handlerReturned);
@@ -3417,7 +3421,7 @@ TEST_CASE("RESP: XREAD BLOCK parks then wakes on a later XADD", "[protocol][resp
                                           false);
     REQUIRE(added.has_value());
     h.waiters.NotifyAppended("s");
-    h.reactor.Run();
+    h.reactor.drain();
 
     // The reply is written but the handler is now parked on the NEXT command.
     h.EndConnection();
@@ -3431,20 +3435,20 @@ TEST_CASE("RESP: XREAD BLOCK times out to nil when the deadline elapses", "[prot
     BlockingHarness h;
     auto session = h.Session();
 
-    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
-                                           "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
-                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$2\r\n50\r\n"
-                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
+    REQUIRE(core::async::syncRun(WriteString(h.pair.client.get(),
+                                             "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                             "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$2\r\n50\r\n"
+                                             "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
 
     auto launcher = h.Launch(session);
-    h.reactor.Submit(launcher.Native());
-    h.reactor.Run();
+    h.reactor.submit(launcher.Native());
+    h.reactor.drain();
     REQUIRE_FALSE(h.handlerReturned); // parked, waiting on the 50ms deadline.
 
     // Advance past the deadline; the scheduled timeout fires, waking the reader
     // which finds no data and replies nil.
-    h.clock.SetNow(h.clock.Now() + std::chrono::milliseconds { 51 });
-    h.reactor.Run();
+    h.clock.setNow(h.clock.now() + std::chrono::milliseconds { 51 });
+    h.reactor.drain();
 
     h.EndConnection();
     REQUIRE(h.handlerReturned);
@@ -3463,20 +3467,20 @@ TEST_CASE("RESP: XREAD BLOCK 0 is abandoned when the peer closes gracefully", "[
     // the leak the disconnect arm exists to prevent.
     //
     // It rests on `handlerReturned` for the reason recorded on that member, and
-    // `TestReactor::Run` drains and returns rather than blocking, so under the
+    // `core::net::testing::TestLoop::Run` drains and returns rather than blocking, so under the
     // pre-fix code this FAILS at the assertion instead of hanging.
     BlockingHarness h;
     auto session = h.Session();
 
-    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
-                                           "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
-                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
-                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
-    h.pair.client->ShutdownWrite(); // the peer has finished sending, and is gone.
+    REQUIRE(core::async::syncRun(WriteString(h.pair.client.get(),
+                                             "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                             "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                             "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*h.pair.client).has_value()); // the peer has finished sending, and is gone.
 
     auto launcher = h.Launch(session);
-    h.reactor.Submit(launcher.Native());
-    h.reactor.Run();
+    h.reactor.submit(launcher.Native());
+    h.reactor.drain();
 
     // The handler unwound instead of parking: no XADD ever arrives, and nothing
     // else in this test would ever wake it.
@@ -3495,27 +3499,27 @@ TEST_CASE("RESP: a blocking read retires its readability watch instead of leavin
     // next `Read` claimed that slot and ORPHANED the watch's coroutine: never resumed,
     // never freed, one frame plus its `shared_ptr<StreamWaiter>` per blocking read.
     //
-    // Unreachable on the plain pair: `InMemorySocket::WaitReadable` answers inline, so
+    // Unreachable on the plain pair: `core::net::testing::InMemorySocket::WaitReadable` answers inline, so
     // nothing is ever parked and twelve blocking cases were green throughout.
     // `ParkingReadableSocket` is what a reactor socket does instead.
     BlockingHarness h;
-    FastCache::Testing::ParkingReadableSocket watched { *h.pair.server };
+    core::net::testing::ParkingReadableSocket watched { *h.pair.server };
     auto session = h.Session();
 
-    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
-                                           "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
-                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
-                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
+    REQUIRE(core::async::syncRun(WriteString(h.pair.client.get(),
+                                             "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-0\r\n$1\r\nf\r\n$1\r\nv\r\n"
+                                             "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                             "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n")));
 
     auto launcher = h.LaunchOn(watched, session);
-    h.reactor.Submit(launcher.Native());
-    h.reactor.Run();
+    h.reactor.submit(launcher.Native());
+    h.reactor.drain();
     REQUIRE_FALSE(h.handlerReturned);
     // The premise, asserted rather than assumed: a watch is armed and genuinely parked.
     // Without this the two assertions below would hold vacuously on any transport that
     // never parks, which is exactly how this defect stayed invisible.
-    REQUIRE(watched.WatchesArmed() == 1);
-    REQUIRE(watched.IsWatchParked());
+    REQUIRE(watched.watchesArmed() == 1);
+    REQUIRE(watched.isWatchParked());
 
     // A second connection appends what the read is waiting for; it replies and returns
     // to the command loop, which reads again.
@@ -3527,13 +3531,13 @@ TEST_CASE("RESP: a blocking read retires its readability watch instead of leavin
                                           false);
     REQUIRE(added.has_value());
     h.waiters.NotifyAppended("s");
-    h.reactor.Run();
+    h.reactor.drain();
 
     // What DISTINGUISHES: the watch was retired by the caller that armed it, before the
     // command loop's next read could claim the slot. Pre-fix, `WatchesOrphaned()` is 1
     // and `WatchesRetiredByCancel()` is 0.
-    REQUIRE(watched.WatchesOrphaned() == 0);
-    REQUIRE(watched.WatchesRetiredByCancel() == 1);
+    REQUIRE(watched.watchesOrphaned() == 0);
+    REQUIRE(watched.watchesRetiredByCancel() == 1);
     // A guard rather than the claim, and the difference is worth being honest about:
     // nothing has called `Close()` on the decorator yet at this point -- `RunHandlerOn`
     // only closes after the handler returns -- so BOTH the fixed and the broken build
@@ -3542,8 +3546,8 @@ TEST_CASE("RESP: a blocking read retires its readability watch instead of leavin
     // being read as interchangeable if the case is later moved past `EndConnection()`,
     // which is exactly when a fix that only ever retired via `Close()` would start
     // passing.
-    REQUIRE(watched.WatchesRetiredByClose() == 0);
-    REQUIRE_FALSE(watched.IsWatchParked());
+    REQUIRE(watched.watchesRetiredByClose() == 0);
+    REQUIRE_FALSE(watched.isWatchParked());
 
     h.EndConnection();
     REQUIRE(h.handlerReturned);
@@ -3558,19 +3562,19 @@ TEST_CASE("RESP: a blocking read that loops does not arm a second readability wa
     // of orphaned watches grows with the number of spurious wakes, unbounded on a
     // `BLOCK 0` reader.
     BlockingHarness h;
-    FastCache::Testing::ParkingReadableSocket watched { *h.pair.server };
+    core::net::testing::ParkingReadableSocket watched { *h.pair.server };
     auto session = h.Session();
 
     // Waits for something after 5-0, which nothing below will satisfy until the end.
-    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
-                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
-                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
+    REQUIRE(core::async::syncRun(WriteString(h.pair.client.get(),
+                                             "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                             "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
 
     auto launcher = h.LaunchOn(watched, session);
-    h.reactor.Submit(launcher.Native());
-    h.reactor.Run();
+    h.reactor.submit(launcher.Native());
+    h.reactor.drain();
     REQUIRE_FALSE(h.handlerReturned);
-    REQUIRE(watched.WatchesArmed() == 1);
+    REQUIRE(watched.watchesArmed() == 1);
 
     // Two real appends the cursor does not want: each wakes the read, which re-polls,
     // finds nothing after 5-0 and loops. The watch is still parked, so it must be
@@ -3585,14 +3589,14 @@ TEST_CASE("RESP: a blocking read that loops does not arm a second readability wa
                                                  false);
         REQUIRE(unwanted.has_value());
         h.waiters.NotifyAppended("s");
-        h.reactor.Run();
+        h.reactor.drain();
         REQUIRE_FALSE(h.handlerReturned);
         // What DISTINGUISHES: pre-fix this is 2 then 3, and one watch is orphaned per
         // pass. The parked assertion is what stops the count staying at 1 for the wrong
         // reason -- a build that stopped watching at all would also read 1.
-        REQUIRE(watched.WatchesArmed() == 1);
-        REQUIRE(watched.WatchesOrphaned() == 0);
-        REQUIRE(watched.IsWatchParked());
+        REQUIRE(watched.watchesArmed() == 1);
+        REQUIRE(watched.watchesOrphaned() == 0);
+        REQUIRE(watched.isWatchParked());
     }
 
     // The entry it IS waiting for ends the read, and the watch is retired with it.
@@ -3604,9 +3608,9 @@ TEST_CASE("RESP: a blocking read that loops does not arm a second readability wa
                                            false);
     REQUIRE(wanted.has_value());
     h.waiters.NotifyAppended("s");
-    h.reactor.Run();
-    REQUIRE(watched.WatchesOrphaned() == 0);
-    REQUIRE(watched.WatchesRetiredByCancel() == 1);
+    h.reactor.drain();
+    REQUIRE(watched.watchesOrphaned() == 0);
+    REQUIRE(watched.watchesRetiredByCancel() == 1);
 
     h.EndConnection();
     REQUIRE(h.handlerReturned);
@@ -3623,26 +3627,26 @@ TEST_CASE("RESP: a readability watch that resolved IS re-armed on the next pass"
     // Re-arming after THAT is both legitimate and safe, because the slot is free. The
     // rule is "only once the previous one has resolved", never "only once".
     BlockingHarness h;
-    FastCache::Testing::ParkingReadableSocket watched { *h.pair.server };
+    core::net::testing::ParkingReadableSocket watched { *h.pair.server };
     auto session = h.Session();
 
-    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
-                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
-                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
+    REQUIRE(core::async::syncRun(WriteString(h.pair.client.get(),
+                                             "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                             "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
 
     auto launcher = h.LaunchOn(watched, session);
-    h.reactor.Submit(launcher.Native());
-    h.reactor.Run();
-    REQUIRE(watched.WatchesArmed() == 1);
-    REQUIRE(watched.IsWatchParked());
+    h.reactor.submit(launcher.Native());
+    h.reactor.drain();
+    REQUIRE(watched.watchesArmed() == 1);
+    REQUIRE(watched.isWatchParked());
 
     // Bytes pending: the watch resolves and gives the slot back, and the reader is NOT
     // abandoned -- a count above zero is a pipelined command, not a peer that left.
-    watched.ResolveReadable(1);
-    h.reactor.Run();
+    watched.resolveReadable(1);
+    h.reactor.drain();
     REQUIRE_FALSE(h.handlerReturned);
-    REQUIRE(watched.WatchesResolved() == 1);
-    REQUIRE_FALSE(watched.IsWatchParked());
+    REQUIRE(watched.watchesResolved() == 1);
+    REQUIRE_FALSE(watched.isWatchParked());
 
     // Now make the read loop. The slot is free, so this pass must arm a fresh watch.
     auto const unwanted = h.engine.StreamAdd("s",
@@ -3653,17 +3657,17 @@ TEST_CASE("RESP: a readability watch that resolved IS re-armed on the next pass"
                                              false);
     REQUIRE(unwanted.has_value());
     h.waiters.NotifyAppended("s");
-    h.reactor.Run();
-    REQUIRE(watched.WatchesArmed() == 2);
-    REQUIRE(watched.WatchesOrphaned() == 0);
-    REQUIRE(watched.IsWatchParked());
+    h.reactor.drain();
+    REQUIRE(watched.watchesArmed() == 2);
+    REQUIRE(watched.watchesOrphaned() == 0);
+    REQUIRE(watched.isWatchParked());
 
     // And the SECOND watch is live rather than merely counted: EOF through it ends the
     // read. `EndConnection()` cannot do this job here -- half-closing the pair reaches
     // the inner socket, and the handler is parked on the decorator's watch, which only
     // this resolves. A case that ended there would hang rather than assert.
-    watched.ResolveReadable(0);
-    h.reactor.Run();
+    watched.resolveReadable(0);
+    h.reactor.drain();
     REQUIRE(h.handlerReturned);
 }
 
@@ -3678,23 +3682,23 @@ TEST_CASE("RESP: a parked readability watch still reports a peer that went away"
     // a departure -- so retirement has to be what silences it, not the error code. Here
     // nothing is retired and the departure must arrive.
     BlockingHarness h;
-    FastCache::Testing::ParkingReadableSocket watched { *h.pair.server };
+    core::net::testing::ParkingReadableSocket watched { *h.pair.server };
     auto session = h.Session();
 
-    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
-                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
-                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
+    REQUIRE(core::async::syncRun(WriteString(h.pair.client.get(),
+                                             "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                             "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
 
     auto launcher = h.LaunchOn(watched, session);
-    h.reactor.Submit(launcher.Native());
-    h.reactor.Run();
+    h.reactor.submit(launcher.Native());
+    h.reactor.drain();
     REQUIRE_FALSE(h.handlerReturned);
-    REQUIRE(watched.IsWatchParked());
+    REQUIRE(watched.isWatchParked());
 
     // `0` is EOF: the peer has finished sending. Nothing else in this case would ever
     // wake the reader, so `handlerReturned` can only be the disconnect arm firing.
-    watched.ResolveReadable(0);
-    h.reactor.Run();
+    watched.resolveReadable(0);
+    h.reactor.drain();
     REQUIRE(h.handlerReturned);
 }
 
@@ -3719,19 +3723,19 @@ TEST_CASE("RESP: a pipelined command does not abandon a parked XREAD BLOCK 0", "
     BlockingHarness h;
     auto session = h.Session();
 
-    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(),
-                                           "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
-                                           "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
+    REQUIRE(core::async::syncRun(WriteString(h.pair.client.get(),
+                                             "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n"
+                                             "$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n5-0\r\n")));
 
     auto launcher = h.Launch(session);
-    h.reactor.Submit(launcher.Native());
-    h.reactor.Run();
+    h.reactor.submit(launcher.Native());
+    h.reactor.drain();
     REQUIRE_FALSE(h.handlerReturned);
 
     // Pipeline a second command behind the parked one, then append an entry the
     // blocked read does not want: it wakes, re-polls, finds nothing after 5-0, and
     // re-arms the disconnect watch -- now with the PING's bytes waiting.
-    REQUIRE(FastCache::SyncRun(WriteString(h.pair.client.get(), "*1\r\n$4\r\nPING\r\n")));
+    REQUIRE(core::async::syncRun(WriteString(h.pair.client.get(), "*1\r\n$4\r\nPING\r\n")));
     auto const unwanted = h.engine.StreamAdd("s",
                                              FastCache::StreamCodec::StreamId { .ms = 1, .seq = 0 },
                                              false,
@@ -3740,7 +3744,7 @@ TEST_CASE("RESP: a pipelined command does not abandon a parked XREAD BLOCK 0", "
                                              false);
     REQUIRE(unwanted.has_value());
     h.waiters.NotifyAppended("s");
-    h.reactor.Run();
+    h.reactor.drain();
     REQUIRE_FALSE(h.handlerReturned); // data pending is not a departure.
 
     // Still blocked, so the entry it IS waiting for wakes it, and the pipelined
@@ -3753,7 +3757,7 @@ TEST_CASE("RESP: a pipelined command does not abandon a parked XREAD BLOCK 0", "
                                            false);
     REQUIRE(wanted.has_value());
     h.waiters.NotifyAppended("s");
-    h.reactor.Run();
+    h.reactor.drain();
 
     h.EndConnection();
     REQUIRE(h.handlerReturned);
@@ -3768,16 +3772,16 @@ TEST_CASE("RESP: XREAD BLOCK inside MULTI/EXEC does not park; EXEC returns immed
     // MULTI; XREAD BLOCK 0 STREAMS s $ ; EXEC — on an empty stream the blocking
     // read would otherwise park forever mid-EXEC. Inside a transaction it must
     // serve non-blockingly and EXEC must complete in a single reactor run.
-    REQUIRE(FastCache::SyncRun(
+    REQUIRE(core::async::syncRun(
         WriteString(h.pair.client.get(),
                     "*1\r\n$5\r\nMULTI\r\n"
                     "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n$\r\n"
                     "*1\r\n$4\r\nEXEC\r\n")));
-    h.pair.client->ShutdownWrite();
+    REQUIRE(FastCache::Testing::ShutdownWrite(*h.pair.client).has_value());
 
     auto launcher = h.Launch(session);
-    h.reactor.Submit(launcher.Native());
-    h.reactor.Run();
+    h.reactor.submit(launcher.Native());
+    h.reactor.drain();
 
     // The connection completed (handler returned, reply drained) without any
     // further XADD/wake: EXEC produced its aggregate with a nil element for the
@@ -3793,7 +3797,7 @@ TEST_CASE("RESP: XREAD BLOCK inside MULTI/EXEC does not park; EXEC returns immed
 // `Subscriber::WakeLatch::WakeOnce` and the blocking read's latch both hand the
 // parked handle over with `reactor->Submit(toWake)` -- BORROWED, erased at the
 // await site, carrying no ownership -- so a reactor destroyed before that post is
-// dequeued frees nothing. Correct for a session some `Task` owns, a leak for a
+// dequeued frees nothing. Correct for a session some `core::async::Task` owns, a leak for a
 // detached one.
 //
 // Two cases rather than one, because they are two lines with two wake paths: a
@@ -3803,7 +3807,7 @@ TEST_CASE("RESP: XREAD BLOCK inside MULTI/EXEC does not park; EXEC returns immed
 //
 // **The reactor is declared LAST in every case below, so it is destroyed FIRST.**
 // That is the opposite of `BlockingHarness`'s order and it is deliberate: those
-// cases destroy the launcher `Task` before the harness, while here the REACTOR is
+// cases destroy the launcher `core::async::Task` before the harness, while here the REACTOR is
 // what frees the chain, and a chain freed after the socket and the registries it
 // points into would be reading freed memory the moment #1041 is fixed.
 namespace
@@ -3813,12 +3817,12 @@ using FastCache::Testing::FrameCounters;
 using FastCache::Testing::FrameSentinel;
 
 /// A session owned by NOBODY, parked on something only another connection wakes.
-FastCache::DetachedTask ServeDetached(FastCache::RedisRespHandler* handler,
-                                      FastCache::ISocket* socket,
-                                      FastCache::CacheEngine* engine,
-                                      FastCache::SessionContext session,
-                                      FrameSentinel sentinel,
-                                      FrameCounters* counters)
+core::async::DetachedTask ServeDetached(FastCache::RedisRespHandler* handler,
+                                        core::net::ISocket* socket,
+                                        FastCache::CacheEngine* engine,
+                                        FastCache::SessionContext session,
+                                        FrameSentinel sentinel,
+                                        FrameCounters* counters)
 {
     (void) sentinel;
     counters->parked.fetch_add(1, std::memory_order_acq_rel);
@@ -3827,13 +3831,13 @@ FastCache::DetachedTask ServeDetached(FastCache::RedisRespHandler* handler,
     co_return;
 }
 
-/// The same shape, owned by the `Task` the caller holds. The control.
-FastCache::Task<void> ServeOwned(FastCache::RedisRespHandler* handler,
-                                 FastCache::ISocket* socket,
-                                 FastCache::CacheEngine* engine,
-                                 FastCache::SessionContext session,
-                                 FrameSentinel sentinel,
-                                 FrameCounters* counters)
+/// The same shape, owned by the `core::async::Task` the caller holds. The control.
+core::async::Task<void> ServeOwned(FastCache::RedisRespHandler* handler,
+                                   core::net::ISocket* socket,
+                                   FastCache::CacheEngine* engine,
+                                   FastCache::SessionContext session,
+                                   FrameSentinel sentinel,
+                                   FrameCounters* counters)
 {
     (void) sentinel;
     counters->parked.fetch_add(1, std::memory_order_acq_rel);
@@ -3855,31 +3859,31 @@ TEST_CASE("A detached subscriber woken by a publish and never dequeued is freed 
     FrameCounters counters;
     {
         FastCache::InMemoryLruStorage storage;
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         FastCache::CacheEngine engine { storage, clock };
         FastCache::PubSubRegistry pubsub;
-        auto pair = FastCache::InMemorySocketPair::Create();
+        auto pair = core::net::testing::InMemorySocketPair::create();
         FastCache::RedisRespHandler handler;
-        // `InMemorySocket::WaitReadable` answers INLINE, so on the plain pair the
+        // `core::net::testing::InMemorySocket::WaitReadable` answers INLINE, so on the plain pair the
         // subscriber's readable arm never parks and the push arm never has a handle
         // to hand back -- the same blind spot that kept #710 invisible across twelve
         // blocking cases.
-        FastCache::Testing::ParkingReadableSocket watched { *pair.server };
-        FastCache::TestReactor reactor { clock };
+        core::net::testing::ParkingReadableSocket watched { *pair.server };
+        core::net::testing::TestLoop reactor { clock };
 
         FastCache::SessionContext session;
         session.pubsub = &pubsub;
         session.reactor = &reactor;
 
-        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n")));
+        REQUIRE(core::async::syncRun(WriteString(pair.client.get(), "*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\nch\r\n")));
 
         ServeDetached(&handler, &watched, &engine, session, FrameSentinel { &counters }, &counters);
         REQUIRE(counters.parked == 1);
-        REQUIRE(watched.IsWatchParked());
+        REQUIRE(watched.isWatchParked());
 
         // The wake path under test: Publish -> Deliver -> WakeOnce -> Submit.
         REQUIRE(pubsub.Publish("ch", "hello") == 1);
-        REQUIRE(reactor.PendingSubmissions() == 1);
+        REQUIRE(reactor.pendingSubmissions() == 1);
         REQUIRE(counters.completed == 0);
         // The reactor is destroyed WITHOUT draining, so the post is never dequeued.
     }
@@ -3892,18 +3896,18 @@ TEST_CASE("A detached blocking read woken by an append and never dequeued is fre
     FrameCounters counters;
     {
         FastCache::InMemoryLruStorage storage;
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         FastCache::CacheEngine engine { storage, clock };
-        auto pair = FastCache::InMemorySocketPair::Create();
+        auto pair = core::net::testing::InMemorySocketPair::create();
         FastCache::StreamWaiterRegistry waiters;
         FastCache::RedisRespHandler handler;
-        FastCache::TestReactor reactor { clock };
+        core::net::testing::TestLoop reactor { clock };
 
         FastCache::SessionContext session;
         session.streamWaiters = &waiters;
         session.reactor = &reactor;
 
-        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), std::string { SeedThenBlock })));
+        REQUIRE(core::async::syncRun(WriteString(pair.client.get(), std::string { SeedThenBlock })));
 
         ServeDetached(&handler, pair.server.get(), &engine, session, FrameSentinel { &counters }, &counters);
         REQUIRE(counters.parked == 1);
@@ -3919,7 +3923,7 @@ TEST_CASE("A detached blocking read woken by an append and never dequeued is fre
         // The second wake path: NotifyAppended -> WakeOnce -> Submit. A different
         // line from the pub/sub one, which is why this is its own case.
         waiters.NotifyAppended("s");
-        REQUIRE(reactor.PendingSubmissions() == 1);
+        REQUIRE(reactor.pendingSubmissions() == 1);
         REQUIRE(counters.completed == 0);
     }
     CHECK(counters.destroyed == 1);
@@ -3933,22 +3937,22 @@ TEST_CASE("A RESP session some Task owns is left alone by the reactor", "[protoc
     FrameCounters counters;
     {
         FastCache::InMemoryLruStorage storage;
-        FastCache::ManualClock clock;
+        core::platform::ManualClock clock;
         FastCache::CacheEngine engine { storage, clock };
-        auto pair = FastCache::InMemorySocketPair::Create();
+        auto pair = core::net::testing::InMemorySocketPair::create();
         FastCache::StreamWaiterRegistry waiters;
         FastCache::RedisRespHandler handler;
-        FastCache::TestReactor reactor { clock };
+        core::net::testing::TestLoop reactor { clock };
 
         FastCache::SessionContext session;
         session.streamWaiters = &waiters;
         session.reactor = &reactor;
 
-        REQUIRE(FastCache::SyncRun(WriteString(pair.client.get(), std::string { SeedThenBlock })));
+        REQUIRE(core::async::syncRun(WriteString(pair.client.get(), std::string { SeedThenBlock })));
 
         auto served = ServeOwned(&handler, pair.server.get(), &engine, session, FrameSentinel { &counters }, &counters);
-        reactor.Submit(served.Native());
-        reactor.Run();
+        reactor.submit(served.handle());
+        reactor.drain();
         REQUIRE(counters.parked == 1);
 
         auto const added = engine.StreamAdd("s",
@@ -3959,7 +3963,7 @@ TEST_CASE("A RESP session some Task owns is left alone by the reactor", "[protoc
                                             false);
         REQUIRE(added.has_value());
         waiters.NotifyAppended("s");
-        REQUIRE(reactor.PendingSubmissions() == 1);
+        REQUIRE(reactor.pendingSubmissions() == 1);
         // Reactor destroyed with the post undrained, exactly as above -- but this
         // frame has an owner, so it must survive until `served` goes out of scope.
         CHECK(counters.destroyed == 0);

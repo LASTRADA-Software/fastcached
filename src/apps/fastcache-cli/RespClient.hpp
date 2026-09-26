@@ -22,7 +22,7 @@ namespace FastCache::Cli
 /// tests compare whole literal reply strings by hand, so there was nothing to lift.
 ///
 /// The parser is a pure function over bytes with an explicit *incomplete* answer,
-/// rather than a coroutine over an `ISocket`. That is what lets every reply
+/// rather than a coroutine over an `core::net::ISocket`. That is what lets every reply
 /// shape -- including the malformed and truncated ones, which are the interesting
 /// half and the ones a real server will not produce on demand -- be tested against
 /// a byte string with no socket and no daemon.

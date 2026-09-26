@@ -182,7 +182,7 @@ struct FleetBucket
 {
     /// Wall-clock start of the bucket, in milliseconds since the epoch.
     ///
-    /// Wall clock and not `TimePoint`: this outlives the process, and a steady
+    /// Wall clock and not `core::platform::SteadyTimePoint`: this outlives the process, and a steady
     /// clock's origin is meaningless across a restart.
     std::int64_t startMillis { 0 };
 

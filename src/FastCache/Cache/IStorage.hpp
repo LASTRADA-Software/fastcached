@@ -3,7 +3,6 @@
 
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/StorageTier.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 
@@ -19,6 +18,8 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
+
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -358,24 +359,31 @@ class IStorage
     /// @param key Lookup key.
     /// @param now Current clock value (drives TTL expiry).
     /// @return GetResult, or StorageError on I/O failure.
-    [[nodiscard]] virtual std::expected<GetResult, StorageError> Get(std::string_view key, TimePoint now) = 0;
+    [[nodiscard]] virtual std::expected<GetResult, StorageError> Get(std::string_view key,
+                                                                     core::platform::SteadyTimePoint now) = 0;
 
     /// Unconditionally store `value` under `key`. Overwrites any existing
     /// entry. Issues a new CAS token and returns it.
     [[nodiscard]] virtual std::expected<CasToken, StorageError> Set(std::string_view key,
                                                                     std::vector<std::byte> value,
                                                                     std::uint32_t flags,
-                                                                    TimePoint expiry) = 0;
+                                                                    core::platform::SteadyTimePoint expiry) = 0;
 
     /// Store only if no value currently exists under `key`. Returns the new
     /// CAS token, or StorageError(KeyExists) if the key was present.
-    [[nodiscard]] virtual std::expected<CasToken, StorageError> Add(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) = 0;
+    [[nodiscard]] virtual std::expected<CasToken, StorageError> Add(std::string_view key,
+                                                                    std::vector<std::byte> value,
+                                                                    std::uint32_t flags,
+                                                                    core::platform::SteadyTimePoint expiry,
+                                                                    core::platform::SteadyTimePoint now) = 0;
 
     /// Store only if a value currently exists under `key`. Returns the new
     /// CAS token, or StorageError(KeyNotFound).
-    [[nodiscard]] virtual std::expected<CasToken, StorageError> Replace(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) = 0;
+    [[nodiscard]] virtual std::expected<CasToken, StorageError> Replace(std::string_view key,
+                                                                        std::vector<std::byte> value,
+                                                                        std::uint32_t flags,
+                                                                        core::platform::SteadyTimePoint expiry,
+                                                                        core::platform::SteadyTimePoint now) = 0;
 
     /// Append `suffix` to the existing value at `key`. Flags and expiry are
     /// preserved. CAS bumps.
@@ -389,14 +397,14 @@ class IStorage
     [[nodiscard]] virtual std::expected<CasToken, StorageError> Append(std::string_view key,
                                                                        std::span<std::byte const> suffix,
                                                                        CasToken expected,
-                                                                       TimePoint now) = 0;
+                                                                       core::platform::SteadyTimePoint now) = 0;
 
     /// Prepend `prefix` to the existing value at `key`. `expected` is the
     /// optional CAS precondition (0 = unconditional), as for `Append`.
     [[nodiscard]] virtual std::expected<CasToken, StorageError> Prepend(std::string_view key,
                                                                         std::span<std::byte const> prefix,
                                                                         CasToken expected,
-                                                                        TimePoint now) = 0;
+                                                                        core::platform::SteadyTimePoint now) = 0;
 
     /// Compare expected CAS against the current entry's CAS and replace the
     /// value if they match. Yields StorageError(CasMismatch) on mismatch.
@@ -404,8 +412,8 @@ class IStorage
                                                                                CasToken expected,
                                                                                std::vector<std::byte> value,
                                                                                std::uint32_t flags,
-                                                                               TimePoint expiry,
-                                                                               TimePoint now) = 0;
+                                                                               core::platform::SteadyTimePoint expiry,
+                                                                               core::platform::SteadyTimePoint now) = 0;
 
     /// Treat the existing value as an ASCII unsigned integer and add or
     /// subtract `magnitude`. memcached semantics: increment wraps modulo
@@ -422,13 +430,12 @@ class IStorage
     /// @param decrement When true, subtract (saturating at 0); else add (mod 2^64).
     /// @param now       Current clock value (drives the existence check).
     /// @return New value and CAS token, or StorageError(KeyNotFound).
-    [[nodiscard]] virtual std::expected<IncrResult, StorageError> IncrementOrInitialize(std::string_view key,
-                                                                                        std::uint64_t magnitude,
-                                                                                        bool decrement,
-                                                                                        TimePoint now) = 0;
+    [[nodiscard]] virtual std::expected<IncrResult, StorageError> IncrementOrInitialize(
+        std::string_view key, std::uint64_t magnitude, bool decrement, core::platform::SteadyTimePoint now) = 0;
 
     /// Delete the entry. Returns StorageError(KeyNotFound) if no entry exists.
-    [[nodiscard]] virtual std::expected<void, StorageError> Delete(std::string_view key, TimePoint now) = 0;
+    [[nodiscard]] virtual std::expected<void, StorageError> Delete(std::string_view key,
+                                                                   core::platform::SteadyTimePoint now) = 0;
 
     /// Refresh the entry's expiry without rewriting its value. Bumps CAS.
     /// Returns StorageError(KeyNotFound) if no live entry exists.
@@ -437,8 +444,8 @@ class IStorage
     /// @param now       Current clock value (drives existence check).
     /// @return New CAS token, or StorageError(KeyNotFound).
     [[nodiscard]] virtual std::expected<CasToken, StorageError> Touch(std::string_view key,
-                                                                      TimePoint newExpiry,
-                                                                      TimePoint now) = 0;
+                                                                      core::platform::SteadyTimePoint newExpiry,
+                                                                      core::platform::SteadyTimePoint now) = 0;
 
     /// Non-mutating lookup. Like `Get`, but does **not** update the
     /// entry's `lastAccess`, promote it in the LRU, or bump hit/miss
@@ -448,7 +455,8 @@ class IStorage
     /// @param key Lookup key.
     /// @param now Current clock value (drives the TTL existence check).
     /// @return GetResult, or StorageError on I/O failure.
-    [[nodiscard]] virtual std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) = 0;
+    [[nodiscard]] virtual std::expected<GetResult, StorageError> Peek(std::string_view key,
+                                                                      core::platform::SteadyTimePoint now) = 0;
 
     /// Read just the absolute expiry of the entry under `key` without
     /// touching its value, LRU recency, hit/miss stats, or `lastAccess`.
@@ -462,15 +470,15 @@ class IStorage
     /// @param now Current clock value (drives the TTL existence check).
     /// @return The entry's absolute expiry, or std::nullopt if the key
     ///         is absent or already expired.
-    [[nodiscard]] virtual std::expected<std::optional<TimePoint>, StorageError> PeekExpiry(std::string_view key,
-                                                                                           TimePoint now)
+    [[nodiscard]] virtual std::expected<std::optional<core::platform::SteadyTimePoint>, StorageError> PeekExpiry(
+        std::string_view key, core::platform::SteadyTimePoint now)
     {
         auto const peek = Peek(key, now);
         if (!peek.has_value())
             return std::unexpected(peek.error());
         if (!peek->found)
-            return std::optional<TimePoint> {};
-        return std::optional<TimePoint> { peek->entry.expiry };
+            return std::optional<core::platform::SteadyTimePoint> {};
+        return std::optional<core::platform::SteadyTimePoint> { peek->entry.expiry };
     }
 
     /// Mark the live entry under `key` stale without removing it (the meta
@@ -481,9 +489,10 @@ class IStorage
     /// @param newExpiry New absolute expiry, or `std::nullopt` to leave it.
     /// @param now       Current clock value (drives the existence check).
     /// @return New CAS token, or StorageError(KeyNotFound) if absent.
-    [[nodiscard]] virtual std::expected<CasToken, StorageError> MarkStale(std::string_view key,
-                                                                          std::optional<TimePoint> newExpiry,
-                                                                          TimePoint now) = 0;
+    [[nodiscard]] virtual std::expected<CasToken, StorageError> MarkStale(
+        std::string_view key,
+        std::optional<core::platform::SteadyTimePoint> newExpiry,
+        core::platform::SteadyTimePoint now) = 0;
 
     /// What an `Update` callback decides to do with the entry under the key.
     enum class UpdateAction : std::uint8_t
@@ -505,8 +514,8 @@ class IStorage
         /// the storage layer therefore forwards the existing
         /// `current->entry.expiry` rather than wiping it. Callbacks that
         /// DO want to change the TTL (a SETEX-like compound op) set
-        /// this explicitly; `TimePoint::max()` clears any TTL.
-        std::optional<TimePoint> newExpiry {};
+        /// this explicitly; `core::platform::SteadyTimePoint::max()` clears any TTL.
+        std::optional<core::platform::SteadyTimePoint> newExpiry {};
     };
 
     /// Guarded read-modify-write: atomically read the entry under `key`, hand it
@@ -528,7 +537,7 @@ class IStorage
     [[nodiscard]] virtual std::expected<CasToken, StorageError> Update(
         std::string_view key,
         std::function<std::expected<UpdateOutcome, StorageError>(GetResult const&)> const& fn,
-        TimePoint now)
+        core::platform::SteadyTimePoint now)
     {
         auto const current = Peek(key, now);
         if (!current.has_value())
@@ -544,7 +553,8 @@ class IStorage
                 // outcome->newExpiry; if it leaves that nullopt we
                 // forward the current entry's expiry (or
                 // TimePoint::max() for a fresh insert).
-                auto const expiry = outcome->newExpiry.value_or(current->found ? current->entry.expiry : TimePoint::max());
+                auto const expiry = outcome->newExpiry.value_or(current->found ? current->entry.expiry
+                                                                               : core::platform::SteadyTimePoint::max());
                 return Set(key, std::move(outcome->value), outcome->flags, expiry);
             }
             case UpdateAction::Delete:
@@ -570,8 +580,8 @@ class IStorage
     /// @param now       Current clock value.
     /// @return The refreshed GetResult, or StorageError(KeyNotFound) on miss.
     [[nodiscard]] virtual std::expected<GetResult, StorageError> GetAndTouch(std::string_view key,
-                                                                             TimePoint newExpiry,
-                                                                             TimePoint now)
+                                                                             core::platform::SteadyTimePoint newExpiry,
+                                                                             core::platform::SteadyTimePoint now)
     {
         auto const touched = Touch(key, newExpiry, now);
         if (!touched.has_value())
@@ -580,7 +590,7 @@ class IStorage
     }
 
     /// Atomically clear the entry's TTL (redis `PERSIST`). Reads the entry
-    /// and, if it has a TTL, applies a `TimePoint::max()` expiry in the
+    /// and, if it has a TTL, applies a `core::platform::SteadyTimePoint::max()` expiry in the
     /// same critical section the inner backend uses for `Touch`. The
     /// atomicity boundary is the lock-owning decorator's (ShardedStorage's
     /// per-shard lock); the default-impl decomposition is safe only when
@@ -594,16 +604,17 @@ class IStorage
     ///           that want to observe absence can).
     /// @param key Lookup key.
     /// @param now Current clock value (drives the existence check).
-    [[nodiscard]] virtual std::expected<bool, StorageError> ClearExpiry(std::string_view key, TimePoint now)
+    [[nodiscard]] virtual std::expected<bool, StorageError> ClearExpiry(std::string_view key,
+                                                                        core::platform::SteadyTimePoint now)
     {
         auto const peek = Peek(key, now);
         if (!peek.has_value())
             return std::unexpected(peek.error());
         if (!peek->found)
             return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
-        if (peek->entry.expiry == TimePoint::max())
+        if (peek->entry.expiry == core::platform::SteadyTimePoint::max())
             return false;
-        auto const touched = Touch(key, TimePoint::max(), now);
+        auto const touched = Touch(key, core::platform::SteadyTimePoint::max(), now);
         if (!touched.has_value())
             return std::unexpected(touched.error());
         return true;
@@ -623,7 +634,7 @@ class IStorage
     ///         StorageError(CasMismatch) if the CAS differs.
     [[nodiscard]] virtual std::expected<void, StorageError> CompareAndDelete(std::string_view key,
                                                                              CasToken expected,
-                                                                             TimePoint now)
+                                                                             core::platform::SteadyTimePoint now)
     {
         auto const got = Peek(key, now);
         if (!got.has_value())
@@ -639,7 +650,7 @@ class IStorage
     /// become invisible. Optional `effectiveAt` lets memcached's
     /// `flush_all <delay>` schedule a delayed flush — entries inserted
     /// before effectiveAt are dropped lazily once `now >= effectiveAt`.
-    virtual void FlushWithGeneration(TimePoint effectiveAt) = 0;
+    virtual void FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt) = 0;
 
     /// Purge entries whose expiry has passed, doing at most `budget` worth of work.
     ///
@@ -656,7 +667,7 @@ class IStorage
     /// @param budget Ceilings for this call; `PurgeBudget::Unbounded()` for none.
     /// @return What this call examined and reclaimed, and whether it got all
     ///         the way round.
-    virtual PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) = 0;
+    virtual PurgeOutcome PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget) = 0;
 
     /// Reconfigure the byte budget at runtime (e.g. on SIGHUP reload).
     /// Budget-owning backends evict to fit; forwarding decorators pass it
@@ -731,7 +742,8 @@ class IStorage
     /// @param now Current clock value (drives the TTL existence check).
     /// @return true if a live entry now resides warm (or already existed),
     ///         false on miss, or StorageError on I/O failure.
-    [[nodiscard]] virtual std::expected<bool, StorageError> Prefetch(std::string_view key, TimePoint now)
+    [[nodiscard]] virtual std::expected<bool, StorageError> Prefetch(std::string_view key,
+                                                                     core::platform::SteadyTimePoint now)
     {
         auto const peek = Peek(key, now);
         if (!peek.has_value())
@@ -748,7 +760,7 @@ class IStorage
     /// promote on `Get` itself need no deferred promotion).
     /// @param key Key to promote.
     /// @param now Current clock value (for the access-time advance).
-    virtual void PromoteOnRead(std::string_view key, TimePoint now)
+    virtual void PromoteOnRead(std::string_view key, core::platform::SteadyTimePoint now)
     {
         static_cast<void>(key);
         static_cast<void>(now);

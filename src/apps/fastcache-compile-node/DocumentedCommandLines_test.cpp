@@ -2,7 +2,6 @@
 #include "NodeConfig.hpp"
 
 #include <FastCache/Cli/Options.hpp>
-#include <FastCache/Core/Ranges.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -19,6 +18,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -228,7 +229,7 @@ constexpr std::array SkippedExamples {
 
 /// Whether @p command names a verb that ends the process before the startup gate.
 ///
-/// `FindIfOrNull` rather than `ranges::find_if`, and that is portability rather than
+/// `core::findIfOrNull` rather than `ranges::find_if`, and that is portability rather than
 /// taste: an iterator into a `std::array` is a raw POINTER on libstdc++ and libc++
 /// and a CLASS on the MSVC STL, so `readability-qualified-auto` asks for a spelling
 /// (`auto const *const`) that only compiles on two of the three. The helper resolves
@@ -238,7 +239,7 @@ constexpr std::array SkippedExamples {
 /// @return The row, or nullptr when this command line is a start.
 [[nodiscard]] NonStartVerb const* NonStartVerbIn(std::string_view command)
 {
-    return FindIfOrNull(NonStartVerbs, [command](NonStartVerb const& verb) { return command.contains(verb.flag); });
+    return core::findIfOrNull(NonStartVerbs, [command](NonStartVerb const& verb) { return command.contains(verb.flag); });
 }
 
 /// The exclusion row covering @p page, if any.
@@ -246,7 +247,7 @@ constexpr std::array SkippedExamples {
 /// @return The row, or nullptr when the page is checked.
 [[nodiscard]] ExcludedPage const* ExclusionFor(std::string_view page)
 {
-    return FindIfOrNull(ExcludedPages, [page](ExcludedPage const& row) { return page.contains(row.needle); });
+    return core::findIfOrNull(ExcludedPages, [page](ExcludedPage const& row) { return page.contains(row.needle); });
 }
 
 /// The skip row covering @p command, if any.
@@ -254,7 +255,8 @@ constexpr std::array SkippedExamples {
 /// @return The row, or nullptr when the command line is checked.
 [[nodiscard]] SkippedExample const* SkipFor(std::string_view command)
 {
-    return FindIfOrNull(SkippedExamples, [command](SkippedExample const& row) { return command.contains(row.needle); });
+    return core::findIfOrNull(SkippedExamples,
+                              [command](SkippedExample const& row) { return command.contains(row.needle); });
 }
 
 /// One command line found in the documentation.

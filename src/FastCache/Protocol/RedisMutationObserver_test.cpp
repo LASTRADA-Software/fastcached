@@ -222,11 +222,11 @@ TEST_CASE("The whole chain delivers expired and evicted to a subscriber", "[prot
 
     // Eviction: a 200-byte budget and three 150-byte values.
     for (auto const& key: { "a", "b", "c" })
-        REQUIRE(notifying.Set(key, std::vector<std::byte>(150), 0, TimePoint::max()).has_value());
+        REQUIRE(notifying.Set(key, std::vector<std::byte>(150), 0, core::platform::SteadyTimePoint::max()).has_value());
     REQUIRE_FALSE(evictedSub->messages.empty());
 
     // Expiry: reclaimed by the lookup, published by the observer.
-    auto const expiry = TimePoint {} + std::chrono::seconds { 5 };
+    auto const expiry = core::platform::SteadyTimePoint {} + std::chrono::seconds { 5 };
     REQUIRE(notifying.Set("doomed", std::vector<std::byte>(8), 0, expiry).has_value());
     auto const got = notifying.Get("doomed", expiry + std::chrono::seconds { 1 });
     REQUIRE(got.has_value());

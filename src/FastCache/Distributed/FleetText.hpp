@@ -2,7 +2,6 @@
 #pragma once
 
 #include <FastCache/Core/Markup.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Utf8.hpp>
 
 #include <algorithm>
@@ -13,6 +12,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Distributed
 {

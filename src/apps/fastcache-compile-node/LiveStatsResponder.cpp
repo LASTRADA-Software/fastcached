@@ -180,7 +180,7 @@ namespace
 LiveStatsResponder::LiveStatsResponder(ILiveStatsSources const& sources,
                                        Distributed::IMembershipOracle const& membership,
                                        AdminCredential dashboard,
-                                       IReactor& reactor,
+                                       core::net::EventLoop& reactor,
                                        IMetricsSink& metrics) noexcept:
     _sources { sources },
     _membership { membership },
@@ -191,7 +191,7 @@ LiveStatsResponder::LiveStatsResponder(ILiveStatsSources const& sources,
 {
 }
 
-Task<FrameReply> LiveStatsResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
+core::async::Task<FrameReply> LiveStatsResponder::Answer(std::span<std::byte const> frame, PeerIdentity peer)
 {
     auto const header = Wire::DecodeRequestHeader(frame);
     auto const opRaw = header.has_value() ? header->opRaw : std::uint8_t { 0xFF };
@@ -285,7 +285,9 @@ std::optional<std::vector<std::byte>> LiveStatsResponder::Recheck(Wire::LiveSubj
     return std::nullopt;
 }
 
-Task<std::vector<std::byte>> LiveStatsResponder::Serve(std::span<std::byte const> frame, PeerIdentity peer, IPushSink* sink)
+core::async::Task<std::vector<std::byte>> LiveStatsResponder::Serve(std::span<std::byte const> frame,
+                                                                    PeerIdentity peer,
+                                                                    IPushSink* sink)
 {
     // Narrowed, not dropped (#1512). `LiveWatcher` is what a gate may act on -- the host and
     // the identity its connection proved (#178) -- and it OWNS both because `Recheck` reads

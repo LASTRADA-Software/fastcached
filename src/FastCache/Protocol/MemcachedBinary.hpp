@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
-#include <FastCache/Net/ISocket.hpp>
 #include <FastCache/Protocol/IProtocolHandler.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/net/ISocket.hpp>
 
 namespace FastCache
 {
@@ -32,10 +33,10 @@ namespace FastCache
 class MemcachedBinaryHandler final: public IProtocolHandler
 {
   public:
-    [[nodiscard]] Task<void> Run(ISocket* socket,
-                                 CacheEngine* engine,
-                                 std::vector<std::byte> primingBytes,
-                                 SessionContext session) override;
+    [[nodiscard]] core::async::Task<void> Run(core::net::ISocket* socket,
+                                              CacheEngine* engine,
+                                              std::vector<std::byte> primingBytes,
+                                              SessionContext session) override;
 };
 
 } // namespace FastCache

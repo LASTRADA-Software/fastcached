@@ -8,10 +8,14 @@
 
 #include <string_view>
 
+namespace core::net
+{
+class EventLoop;
+} // namespace core::net
+
 namespace FastCache
 {
 
-class IReactor;              // Async/IReactor.hpp — the reactor this connection is pinned to.
 class IPubSubRegistry;       // Protocol/IPubSubRegistry.hpp — process-wide pub/sub registry.
 class IStreamWaiterRegistry; // Protocol/IStreamWaiterRegistry.hpp — blocking stream-read coordinator.
 class IMetricsSink;          // Metrics/IMetricsSink.hpp — counter sink for protocol outcomes.
@@ -55,7 +59,7 @@ struct SessionContext
     /// its own command loop when a message is delivered from another reactor
     /// thread. Null when there is no reactor (blocking/in-memory transports);
     /// pub/sub delivery then resumes inline on the same thread.
-    IReactor* reactor { nullptr };
+    core::net::EventLoop* reactor { nullptr };
 
     /// Process-wide WATCH registry for the Redis `WATCH`/`MULTI`/`EXEC`
     /// transaction family. Null when transactions are not wired in (unit

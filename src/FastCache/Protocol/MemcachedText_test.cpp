@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Bytes.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 #include <FastCache/Protocol/MemcachedText.hpp>
 #include <FastCache/Protocol/SessionContext.hpp>
 
@@ -22,6 +19,12 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/platform/Clock.hpp>
+#include <tests/HalfClose.hpp>
+
 namespace
 {
 
@@ -36,26 +39,26 @@ struct TextFixture
     {
     }
 
-    FastCache::ManualClock clock;
+    core::platform::ManualClock clock;
     FastCache::InMemoryLruStorage storage;
     FastCache::CacheEngine engine { storage, clock };
-    FastCache::InMemorySocketPair pair = FastCache::InMemorySocketPair::Create();
+    core::net::testing::InMemorySocketPair pair = core::net::testing::InMemorySocketPair::create();
     FastCache::MemcachedTextHandler handler;
 };
 
-FastCache::Task<bool> WriteString(FastCache::ISocket* socket, std::string_view payload)
+core::async::Task<bool> WriteString(core::net::ISocket* socket, std::string_view payload)
 {
-    auto const result = co_await socket->Write(FastCache::AsBytes(payload));
+    auto const result = co_await socket->write(FastCache::AsBytes(payload));
     co_return result.has_value();
 }
 
-FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
+core::async::Task<std::string> ReadAvailable(core::net::ISocket* socket)
 {
     std::string out;
     while (true)
     {
         std::vector<std::byte> chunk(256);
-        auto const result = co_await socket->Read(std::span<std::byte> { chunk.data(), chunk.size() });
+        auto const result = co_await socket->read(std::span<std::byte> { chunk.data(), chunk.size() });
         if (!result.has_value())
             break;
         if (*result == 0)
@@ -74,12 +77,12 @@ FastCache::Task<std::string> ReadAvailable(FastCache::ISocket* socket)
 /// our request so the handler observes EOF and the task completes.
 std::string Exchange(TextFixture& fix, std::string_view request, FastCache::SessionContext session = {})
 {
-    REQUIRE(FastCache::SyncRun(WriteString(fix.pair.client.get(), request)));
+    REQUIRE(core::async::syncRun(WriteString(fix.pair.client.get(), request)));
     // Half-close: server will see EOF after consuming `request`, but the
     // client's read side stays open so we can read the response back.
-    fix.pair.client->ShutdownWrite();
+    REQUIRE(FastCache::Testing::ShutdownWrite(*fix.pair.client).has_value());
 
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primingBytes*/ {}, session));
+    core::async::syncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, /*primingBytes*/ {}, session));
     // Close the server side so ReadAvailable always observes EOF. The handler
     // does NOT close its own write side when its loop ends, so without this the
     // drain relies on the partial-read heuristic above and parks forever on a
@@ -88,8 +91,8 @@ std::string Exchange(TextFixture& fix, std::string_view request, FastCache::Sess
     // RedisResp_test.cpp. The handler has returned, so it has nothing left to
     // write; the bytes already in the pipe survive CloseWrite and are drained
     // before EOF is reported.
-    fix.pair.server->Close();
-    return FastCache::SyncRun(ReadAvailable(fix.pair.client.get()));
+    fix.pair.server->close();
+    return core::async::syncRun(ReadAvailable(fix.pair.client.get()));
 }
 
 } // namespace
@@ -156,8 +159,8 @@ void DriveWithPriming(TextFixture& fix, std::string_view request, FastCache::Ses
 {
     auto const bytes = FastCache::AsBytes(request);
     std::vector<std::byte> priming { bytes.begin(), bytes.end() };
-    fix.pair.client->ShutdownWrite();
-    FastCache::SyncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, std::move(priming), session));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*fix.pair.client).has_value());
+    core::async::syncRun(fix.handler.Run(fix.pair.server.get(), &fix.engine, std::move(priming), session));
 }
 
 } // namespace

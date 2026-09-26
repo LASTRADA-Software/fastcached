@@ -6,12 +6,12 @@
 #include <chrono>
 #include <cstddef>
 
+using core::platform::SteadyTimePoint;
 using FastCache::DefaultDrainWait;
 using FastCache::DrainBound;
 using FastCache::DrainResult;
 using FastCache::DrainWithin;
 using FastCache::IDrainWait;
-using FastCache::TimePoint;
 
 using namespace std::chrono_literals;
 
@@ -36,7 +36,7 @@ class OverrunningDrainWait final: public IDrainWait
     {
     }
 
-    [[nodiscard]] TimePoint Now() const noexcept override
+    [[nodiscard]] core::platform::SteadyTimePoint Now() const noexcept override
     {
         return _now;
     }
@@ -56,13 +56,13 @@ class OverrunningDrainWait final: public IDrainWait
     /// @return How much time this wait has handed out since construction.
     [[nodiscard]] std::chrono::milliseconds Elapsed() const noexcept
     {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(_now - TimePoint {});
+        return std::chrono::duration_cast<std::chrono::milliseconds>(_now - core::platform::SteadyTimePoint {});
     }
 
   private:
     int _overrun;
     std::size_t _sleeps { 0 };
-    TimePoint _now {};
+    core::platform::SteadyTimePoint _now {};
 };
 
 /// A predicate that reports busy for the first `n` calls and idle afterwards.

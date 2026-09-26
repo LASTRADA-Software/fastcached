@@ -2,16 +2,16 @@
 #include "EndpointDial.hpp"
 #include "ReactorExchange.hpp"
 
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Net/PlatformConnector.hpp>
-#include <FastCache/Net/SocketDeadline.hpp>
-#include <FastCache/Net/ThreadedAddressResolver.hpp>
-
 #include <cassert>
 #include <chrono>
 #include <memory>
 #include <optional>
 #include <utility>
+
+#include <core/async/Task.hpp>
+#include <core/net/IConnector.hpp>
+#include <core/net/SocketDeadline.hpp>
+#include <core/net/ThreadedAddressResolver.hpp>
 
 namespace FastCache::Cc
 {
@@ -27,7 +27,7 @@ namespace
     /// this answers *has anything happened lately*, and only the second can be short on
     /// a dispatched compile (#245).
     ///
-    /// **Re-armed by destroying and rebuilding the timer**, because `DeadlineTimer`
+    /// **Re-armed by destroying and rebuilding the timer**, because `core::net::DeadlineTimer`
     /// captures its deadline in its own coroutine frame and is deliberately immovable:
     /// destroying one disarms it and takes its wait straight back off the reactor
     /// (`CancelPending`), and constructing the next arms the following window. Those are
@@ -37,11 +37,11 @@ namespace
     /// `DefaultProgressInterval` per dispatched compile -- against the minutes it is
     /// measuring.
     ///
-    /// **It cannot go through `ArmSocketDeadline`, and that is a language fact rather
+    /// **It cannot go through `core::net::armSocketDeadline`, and that is a language fact rather
     /// than a choice**: that helper hands back a `std::optional<DeadlineTimer>`, which an
     /// immovable element makes initialize-only -- there is no assignment, and no
     /// `emplace` that can take one. So what is shared with it is the
-    /// `SocketDeadlineTarget` type and its ordering contract (record the firing BEFORE
+    /// `core::net::SocketDeadlineTarget` type and its ordering contract (record the firing BEFORE
     /// the close, so a caller resumed by that close never sees a shut socket with no
     /// reason attached), and the *non-positive means unbounded* rule is asked of
     /// `ExchangeBudget::BoundsIdle()` -- the one place this project states it, and the
@@ -49,7 +49,7 @@ namespace
     ///
     /// Everything here runs on the reactor thread: `MovedForward` is called from the
     /// exchange coroutine, which this reactor resumes. So the timer is built and torn
-    /// down on the thread that owns it, as `DeadlineTimer` requires.
+    /// down on the thread that owns it, as `core::net::DeadlineTimer` requires.
     class IdleWindow final: public IExchangeLiveness
     {
       public:
@@ -57,7 +57,7 @@ namespace
         /// @param budget The exchange's budget; only its idle bound is read.
         /// @param target What to close on expiry and where the firing is recorded; must
         ///        outlive this.
-        IdleWindow(IReactor& reactor, ExchangeBudget budget, SocketDeadlineTarget* target) noexcept:
+        IdleWindow(core::net::EventLoop& reactor, ExchangeBudget budget, core::net::SocketDeadlineTarget* target) noexcept:
             _reactor { &reactor },
             _budget { budget },
             _target { target }
@@ -79,27 +79,27 @@ namespace
             // armed at once" from being a reading of the standard somebody has to do at
             // this call site.
             _timer.reset();
-            _timer.emplace(*_reactor, _reactor->Clock().Now() + _budget.idle, &OnSilence, _target);
+            _timer.emplace(*_reactor, _reactor->clock().now() + _budget.idle, &OnSilence, _target);
         }
 
       private:
         /// Close the socket and say that the silence bound is what did it.
         ///
-        /// Recorded BEFORE the close, which is `SocketDeadlineTarget`'s own rule: the
+        /// Recorded BEFORE the close, which is `core::net::SocketDeadlineTarget`'s own rule: the
         /// close resumes whoever is parked on that socket, so a flag set afterwards
         /// would be read by a caller that has already decided what happened.
-        /// @param state The `SocketDeadlineTarget`, as a `void*`.
+        /// @param state The `core::net::SocketDeadlineTarget`, as a `void*`.
         static void OnSilence(void* state) noexcept
         {
-            auto& fired = *static_cast<SocketDeadlineTarget*>(state);
+            auto& fired = *static_cast<core::net::SocketDeadlineTarget*>(state);
             fired.expired = true;
-            fired.socket->Close();
+            fired.socket->close();
         }
 
-        IReactor* _reactor;
+        core::net::EventLoop* _reactor;
         ExchangeBudget _budget;
-        SocketDeadlineTarget* _target;
-        std::optional<DeadlineTimer> _timer;
+        core::net::SocketDeadlineTarget* _target;
+        std::optional<core::net::DeadlineTimer> _timer;
     };
 
     /// The whole exchange, as one coroutine.
@@ -114,20 +114,20 @@ namespace
     /// @param credential Presented with the request.
     /// @param budget The two deadlines.
     /// @param out Where to leave the outcome.
-    DetachedTask RunExchange(IReactor* reactor,
-                             IConnector* connector,
-                             CredentialNotice* notice,
-                             std::string hostPort,
-                             std::vector<std::byte> frame,
-                             Credential credential,
-                             ExchangeBudget budget,
-                             CacheOutcome* out)
+    core::async::DetachedTask RunExchange(core::net::EventLoop* reactor,
+                                          core::net::IConnector* connector,
+                                          CredentialNotice* notice,
+                                          std::string hostPort,
+                                          std::vector<std::byte> frame,
+                                          Credential credential,
+                                          ExchangeBudget budget,
+                                          CacheOutcome* out)
     {
         // The budget carries both: how long the dial may take, and whether this is the
         // exchange that must notice a peer whose host went away. See
         // `ExchangeBudget::keepAlive` for why one number cannot answer both questions.
         auto client = co_await DialEndpoint(
-            connector, hostPort, DialOptions { .connectTimeout = budget.connect, .keepAlive = budget.keepAlive });
+            connector, hostPort, core::net::DialOptions { .connectTimeout = budget.connect, .keepAlive = budget.keepAlive });
         if (client == nullptr)
         {
             // Unreachable is a transport failure, which every caller answers by
@@ -139,7 +139,7 @@ namespace
             // different headers.
             *out = CacheOutcome {};
             out->transportFailure = TransportFailure::Unreached;
-            reactor->Stop();
+            reactor->stop();
             co_return;
         }
 
@@ -151,11 +151,11 @@ namespace
             //
             // An unbounded budget arms NOTHING, which is what `FASTCACHE_TIMEOUT=0s`
             // has always been documented to mean. That rule now lives in
-            // `ArmSocketDeadline`, which the node's upstream shares (#248) -- it was
+            // `core::net::armSocketDeadline`, which the node's upstream shares (#248) -- it was
             // implemented here and again in `RemoteUpstream`, and only one of the two
             // had a regression test.
-            SocketDeadlineTarget target { .socket = client.get() };
-            auto const bound = ArmSocketDeadline(reactor, budget.total, &target);
+            core::net::SocketDeadlineTarget target { .socket = client.get() };
+            auto const bound = core::net::armSocketDeadline(reactor, budget.total, &target);
 
             // The idle bound is a SECOND deadline on the same socket, and the two are
             // not redundant: `total` asks how long this exchange may legitimately take
@@ -165,7 +165,7 @@ namespace
             //
             // Armed here rather than after the request goes out, so a peer that accepts
             // the connection and then says nothing at all is inside it from the start.
-            SocketDeadlineTarget silence { .socket = client.get() };
+            core::net::SocketDeadlineTarget silence { .socket = client.get() };
             IdleWindow idle { *reactor, budget, &silence };
             idle.MovedForward();
 
@@ -191,14 +191,16 @@ namespace
             }
         }
 
-        client->Close();
-        reactor->Stop();
+        client->close();
+        reactor->stop();
         co_return;
     }
 
 } // namespace
 
-ReactorExchange::ReactorExchange(IReactor& reactor, IConnector& connector, CredentialNotice& notice) noexcept:
+ReactorExchange::ReactorExchange(core::net::EventLoop& reactor,
+                                 core::net::IConnector& connector,
+                                 CredentialNotice& notice) noexcept:
     _reactor { reactor },
     _connector { connector },
     _notice { notice }
@@ -234,7 +236,7 @@ CacheOutcome ReactorExchange::Run(std::string_view hostPort,
                 std::move(credential),
                 budget,
                 &outcome);
-    _reactor.Run();
+    _reactor.run();
     return outcome;
 }
 
@@ -244,22 +246,22 @@ CacheOutcome RunOneExchange(std::string_view hostPort,
                             Credential credential,
                             ExchangeBudget budget)
 {
-    SteadyClock clock;
-    PlatformReactor reactor { clock };
+    core::platform::SteadyClock clock;
+    core::net::PlatformLoop reactor { clock };
 
     // Two threads at most, started only if a hostname is actually looked up. The
     // launcher's endpoint is nearly always a literal, which never reaches the pool --
     // so the common case pays nothing for the one that matters.
-    ThreadedAddressResolver resolver;
-    PlatformConnector connector { reactor, resolver, clock };
+    core::net::ThreadedAddressResolver resolver;
+    auto const connector = core::net::makeConnector(reactor, resolver);
 
-    ReactorExchange exchange { reactor, connector, notice };
+    ReactorExchange exchange { reactor, *connector, notice };
     auto outcome = exchange.Run(hostPort, std::move(frame), std::move(credential), budget);
 
     // Stopped before the reactor goes out of scope: a worker handing a result back
     // Submits to a reactor whose `Run` has already returned would queue a handle
     // nobody resumes, which is a leaked coroutine frame.
-    resolver.Stop();
+    resolver.stop();
     return outcome;
 }
 
@@ -270,7 +272,7 @@ namespace
     /// A reactor per exchange, not a blocking socket, and that is what the budget
     /// rests on: `SO_RCVTIMEO` bounds one `recv`, so a worker dribbling a byte
     /// before each expiry could hold a build forever. `RunOneExchange` arms a
-    /// `DeadlineTimer` that CLOSES the socket, which bounds the whole conversation.
+    /// `core::net::DeadlineTimer` that CLOSES the socket, which bounds the whole conversation.
     ///
     /// Stateless, so a dispatch builds and tears down a reactor and a resolver three
     /// times rather than reusing one connector, as the blocking dialler this replaced

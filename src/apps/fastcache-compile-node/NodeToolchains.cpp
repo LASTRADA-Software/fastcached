@@ -115,7 +115,7 @@ namespace
                                                                 std::vector<ToolchainEntry> const& entries,
                                                                 Cc::IProcessRunner& runner,
                                                                 Cc::IToolchainHost& host,
-                                                                IClock const& clock,
+                                                                core::platform::IClock const& clock,
                                                                 ILogger& logger,
                                                                 SurveyVoice voice)
     {
@@ -152,7 +152,7 @@ namespace
             // A constructor rather than designated initialisers: an override makes
             // this polymorphic, and a polymorphic class is not an aggregate.
             AnnouncingParallelFor(Cc::IParallelFor& parallelFor,
-                                  IClock const& source,
+                                  core::platform::IClock const& source,
                                   ILogger& sink,
                                   std::stop_token const& stopping,
                                   SurveyVoice narration) noexcept:
@@ -165,7 +165,7 @@ namespace
             }
 
             Cc::IParallelFor& inner;
-            IClock const& clock;
+            core::platform::IClock const& clock;
             ILogger& logger;
             /// Observed per hashed file; see `Run`. A reference because the token
             /// outlives this wrapper -- it belongs to the thread being stopped.
@@ -449,7 +449,7 @@ std::optional<DiscoveredToolchains> DiscoverToolchainEntries(NodeConfig const& c
 SurveyResult FingerprintToolchains(DiscoveredToolchains const& discovered,
                                    Cc::IProcessRunner& runner,
                                    Cc::IToolchainHost& host,
-                                   IClock const& clock,
+                                   core::platform::IClock const& clock,
                                    ILogger& logger,
                                    std::stop_token const& stop,
                                    SurveyVoice voice)
@@ -657,7 +657,7 @@ std::optional<std::map<std::string, ServedToolchain>> ResolveToolchains(NodeConf
                                                                         Cc::IToolchainDiscovery* discovery,
                                                                         Cc::IProcessRunner& runner,
                                                                         Cc::IToolchainHost& host,
-                                                                        IClock const& clock,
+                                                                        core::platform::IClock const& clock,
                                                                         ILogger& logger,
                                                                         SurveyVoice voice)
 {
@@ -712,7 +712,7 @@ ToolchainRefresh RefreshToolchains(std::map<std::string, ServedToolchain> const&
                                    Cc::IToolchainDiscovery* discovery,
                                    Cc::IProcessRunner& runner,
                                    Cc::IToolchainHost& host,
-                                   IClock const& clock,
+                                   core::platform::IClock const& clock,
                                    ILogger& logger,
                                    RecheckDepth depth,
                                    SurveyVoice voice)

@@ -15,7 +15,7 @@ namespace FastCache
 {
 
 /// Randomness provider abstraction, and the third member of the ambient-resource
-/// family beside `IClock` and `ISocket`.
+/// family beside `core::platform::IClock` and `core::net::ISocket`.
 ///
 /// Randomness is exactly as untestable as wall-clock time when it is reached for
 /// directly, and for the same reason: a decision that depends on it cannot be
@@ -45,7 +45,7 @@ class IRandomSource
     /// Draw a uniformly distributed value from an inclusive range.
     ///
     /// Must be safe to call from any thread and from several at once, matching
-    /// `IClock::Now()`: a source is shared by whatever collaborators were handed
+    /// `core::platform::IClock::Now()`: a source is shared by whatever collaborators were handed
     /// the same reference, and requiring each of them to know which thread the
     /// others run on would defeat the point of injecting it.
     /// @param lowInclusive Smallest value that may be returned.
@@ -230,7 +230,7 @@ class SystemRandomSource final: public IRandomSource
 
 /// Test `IRandomSource` returning a scripted sequence, cycling once exhausted.
 ///
-/// The `ManualClock` of randomness, and named for `ScriptedSignalSource`, which
+/// The `core::platform::ManualClock` of randomness, and named for `ScriptedSignalSource`, which
 /// is the same idea applied to signals: a test states the draws it wants and the
 /// behaviour under test becomes reproducible.
 ///

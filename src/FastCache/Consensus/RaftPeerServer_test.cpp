@@ -6,8 +6,6 @@
 // over rather than end the connection, because a node running a newer build would
 // otherwise partition itself from every older peer in a fleet nobody upgrades
 // atomically.
-#include <FastCache/Async/PlatformReactor.hpp>
-#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Consensus/RaftPeerServer.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
@@ -18,7 +16,6 @@
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -39,6 +36,11 @@
 #include <variant>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
+#include <core/net/PlatformLoop.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <tests/HalfClose.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -134,9 +136,9 @@ struct MirroredServer
 /// @param socket Destination; never null.
 /// @param bytes What to send.
 /// @return Whether all of it was accepted.
-[[nodiscard]] Task<bool> WriteAll(ISocket* socket, std::span<std::byte const> bytes)
+[[nodiscard]] core::async::Task<bool> WriteAll(core::net::ISocket* socket, std::span<std::byte const> bytes)
 {
-    auto const written = co_await socket->Write(bytes);
+    auto const written = co_await socket->write(bytes);
     co_return written.has_value() && *written == bytes.size();
 }
 
@@ -144,9 +146,9 @@ struct MirroredServer
 /// @param socket Source; never null.
 /// @param buffer Where to put it.
 /// @return How many bytes arrived; zero at the end or on an error.
-[[nodiscard]] Task<std::size_t> ReadSome(ISocket* socket, std::span<std::byte> buffer)
+[[nodiscard]] core::async::Task<std::size_t> ReadSome(core::net::ISocket* socket, std::span<std::byte> buffer)
 {
-    auto const read = co_await socket->Read(buffer);
+    auto const read = co_await socket->read(buffer);
     co_return read.has_value() ? *read : std::size_t { 0 };
 }
 
@@ -320,7 +322,7 @@ struct Served
 ///
 /// The handshake bound is off: the reactor here is never turned, so a deadline could
 /// never fire and would only be a timer left parked on it. The bound has a case of its
-/// own over a `TestReactor`.
+/// own over a `core::net::testing::TestLoop`.
 /// @param wire The bytes a peer sends.
 /// @param sink Where decoded messages land.
 /// @param random Where the server draws its challenge from.
@@ -336,27 +338,27 @@ struct Served
                                  std::shared_ptr<Testing::SharedRoster const> const& roster = Roster())
 {
     Served served;
-    InMemoryListener listener;
-    SteadyClock clock;
-    PlatformReactor reactor { clock };
+    core::net::testing::InMemoryListener listener;
+    core::platform::SteadyClock clock;
+    core::net::PlatformLoop reactor { clock };
     Testing::TestPeerIdentity const identity { NodeId { ServerId }, Testing::TestKeyPair(std::string { ServerId }), roster };
     served.server =
         std::make_unique<RaftPeerServer>(listener, reactor, sink, logger, *served.metrics, identity, random, options);
 
-    auto client = listener.ConnectClient();
+    auto client = listener.connectClient();
     if (!wire.empty())
-        REQUIRE(SyncRun(WriteAll(client.get(), wire)));
-    client->ShutdownWrite();
+        REQUIRE(core::async::syncRun(WriteAll(client.get(), wire)));
+    REQUIRE(FastCache::Testing::ShutdownWrite(*client).has_value());
 
     // The listener drains queued connections before reporting itself closed, so
     // closing here still delivers the one connection and then ends the loop.
-    listener.Close();
-    SyncRun(served.server->Run());
+    listener.close();
+    core::async::syncRun(served.server->Run());
 
     auto buffer = std::array<std::byte, 4096> {};
     while (true)
     {
-        auto const got = SyncRun(ReadSome(client.get(), buffer));
+        auto const got = core::async::syncRun(ReadSome(client.get(), buffer));
         if (got == 0)
             break;
         Append(served.replied, std::span<std::byte const> { buffer }.first(got));
@@ -917,14 +919,14 @@ TEST_CASE("A connection that does not prove an id within the bound is closed and
           "[consensus][raft][peerserver][handshake]")
 {
     // Before the handshake existed, a connection that sent nothing held a slot for as long
-    // as its socket lived. Driven over a `TestReactor`, so the bound fires when the clock
+    // as its socket lived. Driven over a `core::net::testing::TestLoop`, so the bound fires when the clock
     // says and not when a host is slow enough.
     constexpr auto Bound = 500ms;
 
-    InMemoryListener listener;
+    core::net::testing::InMemoryListener listener;
     NullLogger logger;
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     RecordingSink sink;
     AtomicMetricsSink metrics;
     Testing::TestPeerIdentity const identity { NodeId { ServerId },
@@ -934,24 +936,24 @@ TEST_CASE("A connection that does not prove an id within the bound is closed and
     RaftPeerServer server { listener, reactor,  sink,   logger,
                             metrics,  identity, random, PeerServerOptions { .handshakeBound = Bound } };
 
-    auto accepting = [](RaftPeerServer* s) -> DetachedTask {
+    auto accepting = [](RaftPeerServer* s) -> core::async::DetachedTask {
         co_await s->Run();
     };
     accepting(&server);
 
-    auto const client = listener.ConnectClient();
-    reactor.Drain();
+    auto const client = listener.connectClient();
+    reactor.drain();
 
     auto const timedOut = [&metrics] {
         return metrics.Read(RowFor(AcceptorRefusal::HandshakeTimeout).counter);
     };
 
-    clock.Advance(Bound / 2);
-    reactor.Drain();
+    clock.advance(Bound / 2);
+    reactor.drain();
     CHECK(timedOut() == 0);
 
-    clock.Advance(Bound);
-    reactor.Drain();
+    clock.advance(Bound);
+    reactor.drain();
     CHECK(timedOut() == 1);
 
     // The control the bound needs beside it: nothing else was counted, so the close was
@@ -959,9 +961,9 @@ TEST_CASE("A connection that does not prove an id within the bound is closed and
     CHECK(metrics.Read(RowFor(AcceptorRefusal::NoHandshake).counter) == 0);
     CHECK(sink.received.empty());
 
-    listener.Close();
-    reactor.Drain();
-    CHECK(reactor.PendingTimers() == 0);
+    listener.close();
+    reactor.drain();
+    CHECK(reactor.pendingTimers() == 0);
 }
 
 namespace
@@ -992,7 +994,7 @@ class RunningReactor
 {
   public:
     RunningReactor():
-        _thread { [this] { _reactor.Run(); } }
+        _thread { [this] { _reactor.run(); } }
     {
     }
 
@@ -1001,7 +1003,7 @@ class RunningReactor
         // Asked to stop BEFORE the member sweep, because `_thread` is declared last
         // and so is joined first -- a join without this would wait on a loop with no
         // reason to return.
-        _reactor.Stop();
+        _reactor.stop();
     }
 
     RunningReactor(RunningReactor const&) = delete;
@@ -1010,7 +1012,7 @@ class RunningReactor
     RunningReactor& operator=(RunningReactor&&) = delete;
 
     /// @return The reactor, for handing to whatever is under test.
-    [[nodiscard]] IReactor& Get() noexcept
+    [[nodiscard]] core::net::EventLoop& Get() noexcept
     {
         return _reactor;
     }
@@ -1022,8 +1024,8 @@ class RunningReactor
     }
 
   private:
-    SteadyClock _clock;
-    PlatformReactor _reactor { _clock };
+    core::platform::SteadyClock _clock;
+    core::net::PlatformLoop _reactor { _clock };
     std::jthread _thread;
 };
 
@@ -1032,28 +1034,29 @@ class RunningReactor
 /// The whole of #885 is *which thread* closes, so the fake records a thread id
 /// rather than a boolean: "it was closed" is true under the defect and under the
 /// fix alike, and a case asserting that could never fail for the reason it exists.
-class ClosingThreadListener final: public IListener
+class ClosingThreadListener final: public core::net::IListener
 {
   public:
     /// Never yields a connection; this case drives `Shutdown()`, not `Run()`.
-    AcceptAwaitable Accept() override
+    [[nodiscard]] core::async::Task<core::net::AcceptResult> accept() override
     {
-        return AcceptAwaitable { AcceptResult {
-            std::unexpect, NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = {} } } };
+        co_return core::net::AcceptResult {
+            std::unexpect, core::net::NetError { .code = core::net::NetErrorCode::Cancelled, .systemCode = 0, .context = {} }
+        };
     }
 
-    void Close() noexcept override
+    void close() noexcept override
     {
         _closedOn.store(std::this_thread::get_id(), std::memory_order_release);
         _closes.fetch_add(1, std::memory_order_acq_rel);
     }
 
-    [[nodiscard]] std::uint16_t BoundPort() const noexcept override
+    [[nodiscard]] std::uint16_t boundPort() const noexcept override
     {
         return 0;
     }
 
-    /// @return How many times `Close()` has been called.
+    /// @return How many times `close()` has been called.
     [[nodiscard]] std::size_t Closes() const noexcept
     {
         return _closes.load(std::memory_order_acquire);
@@ -1076,12 +1079,15 @@ TEST_CASE("Shutdown closes the peer listener on the reactor, not on the calling 
           "[consensus][raft][peerserver][teardown]")
 {
     // #885. `Shutdown()` used to close the listener and every accepted connection
-    // from whatever thread was tearing the node down. On epoll and kqueue
-    // `ISocket::Close` completes a parked read by resuming its coroutine INLINE, so
-    // that ran each per-connection task on the stopping thread -- while the reactor
-    // thread was still driving the others -- and destroyed the socket owned by that
-    // task's frame off the reactor, which is #668's rule. IOCP does not resume
-    // inline, so the platform that gates least is the one that could never show it.
+    // from whatever thread was tearing the node down. On fastcached's own reactor,
+    // `Close` on epoll and kqueue completed a parked read by resuming its coroutine
+    // INLINE, so that ran each per-connection task on the stopping thread -- while the
+    // reactor thread was still driving the others -- and destroyed the socket owned by
+    // that task's frame off the reactor, which is #668's rule. IOCP did not resume
+    // inline, so the platform that gated least was the one that could never show it.
+    // core-cpp resumes a woken task in the loop's next drain on every backend (0.2.1,
+    // guarantee G2), and a close still belongs on the loop's thread, which is what
+    // this case pins.
     //
     // Asserted as a THREAD IDENTITY, because that is what distinguishes: the
     // listener is closed either way, and a case checking only that it was closed
@@ -1103,8 +1109,8 @@ TEST_CASE("Shutdown closes the peer listener on the reactor, not on the calling 
     // The arrangement, asserted rather than assumed: if the reactor were not running,
     // the closes would be posted where nothing runs them and the identity below would
     // be comparing two things that mean nothing.
-    REQUIRE(WaitFor([&loop] { return loop.Get().Running(); }));
-    REQUIRE_FALSE(loop.Get().IsOnWorkerThread());
+    REQUIRE(WaitFor([&loop] { return loop.Get().running(); }));
+    REQUIRE_FALSE(loop.Get().isOnWorkerThread());
 
     RaftPeerServer server { listener, loop.Get(), sink, logger, metrics, identity, random };
 

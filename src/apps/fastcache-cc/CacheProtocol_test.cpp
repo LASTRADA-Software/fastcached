@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/async/SyncRun.hpp>
 #include <tests/ScriptedSocket.hpp>
 
 using namespace FastCache;
@@ -96,7 +97,7 @@ TEST_CASE("A progress frame is stepped over, and the answer behind it is the out
                                               Wire::EncodeReply(Wire::Status::Ok, object) }) };
     CountingLiveness liveness;
 
-    auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
+    auto const outcome = core::async::syncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
 
     CHECK(outcome.kind == CacheOutcomeKind::Hit);
     CHECK(outcome.value == object);
@@ -120,20 +121,23 @@ TEST_CASE("A decided outcome carries no transport failure")
 
     {
         Testing::ScriptedSocket client { Stream({ Wire::EncodeReply(Wire::Status::Ok, object) }) };
-        auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, nullptr));
+        auto const outcome =
+            core::async::syncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, nullptr));
         CHECK(outcome.kind == CacheOutcomeKind::Hit);
         CHECK(outcome.transportFailure == TransportFailure::None);
     }
     {
         Testing::ScriptedSocket client { Stream({ Wire::EncodeReply(Wire::Status::Miss, {}) }) };
-        auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, nullptr));
+        auto const outcome =
+            core::async::syncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, nullptr));
         CHECK(outcome.kind != CacheOutcomeKind::Transport);
         CHECK(outcome.transportFailure == TransportFailure::None);
     }
     {
         Testing::ScriptedSocket client { Stream(
             { Wire::EncodeErrorReply(Wire::ErrorCode::UnsupportedVersion, "too old") }) };
-        auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, nullptr));
+        auto const outcome =
+            core::async::syncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, nullptr));
         CHECK(outcome.kind == CacheOutcomeKind::Rejected);
         CHECK(outcome.transportFailure == TransportFailure::None);
     }
@@ -156,7 +160,7 @@ TEST_CASE("A refusal behind a progress frame is still the refusal")
         { Wire::EncodeProgressReply(), Wire::EncodeErrorReply(Wire::ErrorCode::WorkerSpawnFailed, "no compiler") }) };
     CountingLiveness liveness;
 
-    auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
+    auto const outcome = core::async::syncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
 
     CHECK(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(outcome.code == Wire::ErrorCode::WorkerSpawnFailed);
@@ -172,7 +176,7 @@ TEST_CASE("A peer that pulses and then breaks is a transport failure, not a hit"
     Testing::ScriptedSocket client { Stream({ Wire::EncodeProgressReply(), Wire::EncodeProgressReply() }) };
     CountingLiveness liveness;
 
-    auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
+    auto const outcome = core::async::syncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), {}, &liveness));
 
     CHECK(outcome.kind == CacheOutcomeKind::Transport);
     CHECK(outcome.value.empty());
@@ -186,7 +190,8 @@ TEST_CASE("An exchange with nobody listening for liveness behaves exactly as it 
     // whole frame, and the outcome is what it always was.
     Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Miss, {}) };
 
-    auto const outcome = SyncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), Credential {}, nullptr));
+    auto const outcome =
+        core::async::syncRun(ExchangeFramed(&client, &Unwatched(), Wire::EncodeFetch("k"), Credential {}, nullptr));
 
     CHECK(outcome.kind == CacheOutcomeKind::Miss);
 }
@@ -207,7 +212,7 @@ TEST_CASE("A pulse ahead of a credentialled command does not strand the AUTH rep
                                               Wire::EncodeReply(Wire::Status::Ok, object) }) };
     CountingLiveness liveness;
 
-    auto const outcome = SyncRun(ExchangeFramed(
+    auto const outcome = core::async::syncRun(ExchangeFramed(
         &client, &Unwatched(), Wire::EncodeFetch("k"), Credential { .username = "", .secret = "s3cret" }, &liveness));
 
     CHECK(outcome.kind == CacheOutcomeKind::Hit);
@@ -222,7 +227,7 @@ TEST_CASE("CacheFetch sends exactly what the wire module specifies")
     // what makes client and server agree by construction: both sides frame
     // through the same function, so they cannot drift apart independently.
     Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Miss, {}) };
-    (void) SyncRun(CacheFetch(&client, &Unwatched(), "the-key"));
+    (void) core::async::syncRun(CacheFetch(&client, &Unwatched(), "the-key"));
 
     CHECK(client.Sent() == Wire::EncodeFetch("the-key"));
 }
@@ -232,7 +237,7 @@ TEST_CASE("CacheFetch returns the payload on a hit")
     auto const stored = std::vector<std::byte> { std::byte { 0xDE }, std::byte { 0xAD } };
     Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Ok, stored) };
 
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k"));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k"));
     CHECK(outcome.kind == CacheOutcomeKind::Hit);
     CHECK(outcome.IsHit());
     CHECK(outcome.value == stored);
@@ -246,13 +251,13 @@ TEST_CASE("CacheFetch reports a version rejection distinctly from a miss")
     // slower with no explanation.
     auto const missOutcome = [] {
         Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Miss, {}) };
-        return SyncRun(CacheFetch(&client, &Unwatched(), "k"));
+        return core::async::syncRun(CacheFetch(&client, &Unwatched(), "k"));
     }();
 
     auto const rejectedOutcome = [] {
         Testing::ScriptedSocket client { Wire::EncodeErrorReply(Wire::ErrorCode::UnsupportedVersion,
                                                                 "unsupported wire version 2; this server speaks 1..1") };
-        return SyncRun(CacheFetch(&client, &Unwatched(), "k"));
+        return core::async::syncRun(CacheFetch(&client, &Unwatched(), "k"));
     }();
 
     CHECK(missOutcome.kind == CacheOutcomeKind::Miss);
@@ -281,13 +286,14 @@ TEST_CASE("CacheStore drains a refusal by its declared length")
 
     Testing::ScriptedSocket client { reply };
     auto const value = std::vector<std::byte> { std::byte { 0x01 } };
-    auto const outcome = SyncRun(CacheStore(&client,
-                                            &Unwatched(),
-                                            Wire::StoreRequest { .key = "k",
-                                                                 .prefetchGroup = "c",
-                                                                 .srcRoot = "/s",
-                                                                 .buildTree = "/b",
-                                                                 .value = std::span<std::byte const> { value } }));
+    auto const outcome =
+        core::async::syncRun(CacheStore(&client,
+                                        &Unwatched(),
+                                        Wire::StoreRequest { .key = "k",
+                                                             .prefetchGroup = "c",
+                                                             .srcRoot = "/s",
+                                                             .buildTree = "/b",
+                                                             .value = std::span<std::byte const> { value } }));
 
     CHECK(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(outcome.code == Wire::ErrorCode::StorageWriteFailed);
@@ -302,7 +308,7 @@ TEST_CASE("CacheStore sends exactly what the wire module specifies")
     };
 
     Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Ok, {}) };
-    auto const outcome = SyncRun(CacheStore(&client, &Unwatched(), request));
+    auto const outcome = core::async::syncRun(CacheStore(&client, &Unwatched(), request));
 
     CHECK(outcome.kind == CacheOutcomeKind::Hit);
     CHECK(client.Sent() == Wire::EncodeStore(request));
@@ -315,13 +321,13 @@ TEST_CASE("A transport failure is not mistaken for a miss or a refusal")
     SECTION("send fails")
     {
         Testing::FailingSocket client;
-        CHECK(SyncRun(CacheFetch(&client, &Unwatched(), "k")).kind == CacheOutcomeKind::Transport);
+        CHECK(core::async::syncRun(CacheFetch(&client, &Unwatched(), "k")).kind == CacheOutcomeKind::Transport);
     }
 
     SECTION("the peer closes before a full reply header")
     {
         Testing::ScriptedSocket client { std::vector<std::byte> { std::byte { 0x01 } } };
-        CHECK(SyncRun(CacheFetch(&client, &Unwatched(), "k")).kind == CacheOutcomeKind::Transport);
+        CHECK(core::async::syncRun(CacheFetch(&client, &Unwatched(), "k")).kind == CacheOutcomeKind::Transport);
     }
 
     SECTION("the peer declares more payload than it sends")
@@ -329,7 +335,7 @@ TEST_CASE("A transport failure is not mistaken for a miss or a refusal")
         auto truncated = Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte>(8, std::byte { 0x11 }));
         truncated.resize(truncated.size() - 2);
         Testing::ScriptedSocket client { truncated };
-        CHECK(SyncRun(CacheFetch(&client, &Unwatched(), "k")).kind == CacheOutcomeKind::Transport);
+        CHECK(core::async::syncRun(CacheFetch(&client, &Unwatched(), "k")).kind == CacheOutcomeKind::Transport);
     }
 }
 
@@ -418,7 +424,7 @@ TEST_CASE("An unconfigured credential changes nothing on the wire")
     // send byte-for-byte what it always sent. Anything else would make upgrading
     // the launcher a wire change for every daemon in a fleet.
     Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Miss, {}) };
-    (void) SyncRun(CacheFetch(&client, &Unwatched(), "the-key", Credential {}));
+    (void) core::async::syncRun(CacheFetch(&client, &Unwatched(), "the-key", Credential {}));
 
     CHECK(client.Sent() == Wire::EncodeFetch("the-key"));
 }
@@ -429,7 +435,7 @@ TEST_CASE("A username without a secret is not a credential")
     // Sending an AUTH carrying an empty secret would be refused by every server
     // that requires one, turning a harmless typo into a build with no cache.
     Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Miss, {}) };
-    (void) SyncRun(CacheFetch(&client, &Unwatched(), "k", Credential { .username = "bob", .secret = "" }));
+    (void) core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Credential { .username = "bob", .secret = "" }));
 
     CHECK(client.Sent() == Wire::EncodeFetch("k"));
 }
@@ -446,7 +452,7 @@ TEST_CASE("A credential is pipelined ahead of the command, with no round trip be
     Testing::ScriptedSocket client { Replies(
         { Wire::EncodeReply(Wire::Status::Ok, {}), Wire::EncodeReply(Wire::Status::Miss, {}) }) };
 
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Token("s3cret")));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Token("s3cret")));
     CHECK(outcome.kind == CacheOutcomeKind::Miss);
 
     auto expected = Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = "s3cret" });
@@ -469,7 +475,7 @@ TEST_CASE("A hit behind a credential is served, and both replies are consumed")
     auto const script = Replies({ Wire::EncodeReply(Wire::Status::Ok, {}), Wire::EncodeReply(Wire::Status::Ok, stored) });
     Testing::ScriptedSocket client { script };
 
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Token("s3cret")));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Token("s3cret")));
     REQUIRE(outcome.IsHit());
     CHECK(outcome.value == stored);
     CHECK(client.Cursor() == script.size());
@@ -485,7 +491,7 @@ TEST_CASE("A rejected credential surfaces as the credential's refusal, not the c
                                   Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, {}) });
     Testing::ScriptedSocket client { script };
 
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Token("wrong")));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Token("wrong")));
     REQUIRE(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(outcome.code == Wire::ErrorCode::Unauthenticated);
     CHECK(outcome.message == "authentication failed");
@@ -507,7 +513,7 @@ TEST_CASE("CacheStore presents the credential the same way CacheFetch does")
                                               .srcRoot = "/src",
                                               .buildTree = "/build",
                                               .value = std::span<std::byte const> { body } };
-    auto const outcome = SyncRun(CacheStore(&client, &Unwatched(), request, Token("s3cret", "bob")));
+    auto const outcome = core::async::syncRun(CacheStore(&client, &Unwatched(), request, Token("s3cret", "bob")));
     CHECK(outcome.IsHit());
 
     auto expected = Wire::EncodeAuth(Wire::AuthRequest { .username = "bob", .secret = "s3cret" });
@@ -529,7 +535,7 @@ TEST_CASE("A daemon that dies after the AUTH reply is a transport failure, not a
     // replies and got one, so there is no command outcome to report.
     Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Ok, {}) };
 
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Token("s3cret")));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Token("s3cret")));
     CHECK(outcome.kind == CacheOutcomeKind::Transport);
     CHECK_FALSE(outcome.IsHit());
 }
@@ -550,7 +556,7 @@ TEST_CASE("A daemon predating the AUTH verb still serves the command behind it")
     Testing::ScriptedSocket client { Replies({ Wire::EncodeErrorReply(Wire::ErrorCode::UnknownOpcode, "unknown opcode 0x03"),
                                                Wire::EncodeReply(Wire::Status::Ok, stored) }) };
 
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Token("s3cret")));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Token("s3cret")));
     REQUIRE(outcome.IsHit());
     CHECK(outcome.value == stored);
 
@@ -569,7 +575,7 @@ TEST_CASE("An ordinary refusal is not mistaken for an absent AUTH verb")
         { Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, "authentication failed"),
           Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, {}) }) };
 
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Token("wrong")));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Token("wrong")));
     CHECK(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(outcome.code == Wire::ErrorCode::Unauthenticated);
     CHECK_FALSE(outcome.credentialIgnored);
@@ -581,7 +587,7 @@ TEST_CASE("An uncredentialed exchange never reports an ignored credential")
     // it", not "no AUTH frame was involved". A launcher with no token configured
     // asked for nothing and must say nothing.
     Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Miss, {}) };
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
     CHECK_FALSE(outcome.credentialIgnored);
 }
 
@@ -599,7 +605,7 @@ TEST_CASE("An empty NotLeader message reaches the wire as prose, not as nothing"
     // needless ceremony. It is the reason the parse exists, so it is asserted here
     // and not merely asserted about.
     Testing::ScriptedSocket client { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, {}) };
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
 
     REQUIRE(outcome.kind == CacheOutcomeKind::Rejected);
     REQUIRE(outcome.code == Wire::ErrorCode::NotLeader);
@@ -614,7 +620,7 @@ TEST_CASE("RedirectTarget returns the endpoint a NotLeader names")
     // reason as above -- a hand-built `CacheOutcome` would prove only that the
     // struct can hold an endpoint.
     Testing::ScriptedSocket client { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.1:7000") };
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
 
     REQUIRE(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(RedirectTarget(outcome) == std::optional<std::string> { "10.0.0.1:7000" });
@@ -640,7 +646,7 @@ TEST_CASE("RedirectTarget parses an endpoint rather than merely splitting one")
 
     CAPTURE(prose);
     Testing::ScriptedSocket client { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, prose) };
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
 
     REQUIRE(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(RedirectTarget(outcome) == std::nullopt);
@@ -652,7 +658,7 @@ TEST_CASE("Only NotLeader is an instruction, whatever else a refusal carries")
     // `NoWorker` with a message that parses must not become a redirect, or a client
     // would follow a diagnostic somewhere no scheduler is listening.
     Testing::ScriptedSocket client { Wire::EncodeErrorReply(Wire::ErrorCode::NoWorker, "10.0.0.1:7000") };
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
 
     REQUIRE(outcome.kind == CacheOutcomeKind::Rejected);
     CHECK(RedirectTarget(outcome) == std::nullopt);
@@ -665,7 +671,7 @@ TEST_CASE("A served object is not a redirect")
     // never be mistaken for somewhere else to ask.
     Testing::ScriptedSocket client { Wire::EncodeReply(Wire::Status::Ok,
                                                        Wire::AsBytes(std::string_view { "10.0.0.1:7000" })) };
-    auto const outcome = SyncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Credential {}));
 
     REQUIRE(outcome.kind == CacheOutcomeKind::Hit);
     CHECK(RedirectTarget(outcome) == std::nullopt);

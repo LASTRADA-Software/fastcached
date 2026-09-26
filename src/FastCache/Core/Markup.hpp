@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Utf8.hpp>
 
 #include <algorithm>
@@ -11,6 +10,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache
 {
@@ -59,7 +60,7 @@ struct TextEscape
 
 /// What one format writes for `byte`, or nothing when it may carry it as it is.
 ///
-/// `FindOrNull` rather than `std::ranges::find_if`, for the reason `Core/Ranges.hpp`
+/// `core::findOrNull` rather than `std::ranges::find_if`, for the reason `Core/Ranges.hpp`
 /// exists: over a `std::array` libstdc++ and libc++ yield a raw pointer, so
 /// clang-tidy's `readability-qualified-auto` asks for `auto const* const`, which
 /// MSVC's class-type iterator cannot deduce. `TraitsOf` in `Platform/ServiceControl.cpp`
@@ -78,7 +79,7 @@ struct TextEscape
 /// @return Its spelling, or an empty view when the byte needs none.
 [[nodiscard]] constexpr std::string_view EscapeFor(std::span<TextEscape const> escapes, char byte) noexcept
 {
-    auto const* const row = FindOrNull(escapes, byte, &TextEscape::byte);
+    auto const* const row = core::findOrNull(escapes, byte, &TextEscape::byte);
     return row != nullptr ? row->spelling : std::string_view {};
 }
 

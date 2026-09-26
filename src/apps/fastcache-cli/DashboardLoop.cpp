@@ -99,7 +99,7 @@ namespace
     /// @param model What to update.
     /// @param reading What the session's reader made of the sample.
     /// @param at When the sample was taken.
-    void AcceptReading(DashboardModel& model, SampleReading reading, TimePoint at)
+    void AcceptReading(DashboardModel& model, SampleReading reading, core::platform::SteadyTimePoint at)
     {
         auto stamp = ReadingStamp { .at = at,
                                     .source = std::move(reading.source),
@@ -109,8 +109,8 @@ namespace
         // The interval is decided ONCE, and the run length and the history are both written from
         // that one decision, so the history and `BrokenRun()` cannot come to disagree about it.
         auto const elapsed = model.runLength > 0 && model.latestStamp.has_value() && ContinuesRun(*model.latestStamp, stamp)
-                                 ? std::optional<Duration> { stamp.at - model.latestStamp->at }
-                                 : std::optional<Duration> {};
+                                 ? std::optional<core::platform::SteadyDuration> { stamp.at - model.latestStamp->at }
+                                 : std::optional<core::platform::SteadyDuration> {};
         model.runLength = elapsed.has_value() ? model.runLength + 1 : 1;
         RecordHistory(
             model,
@@ -236,7 +236,7 @@ bool IsQuitKey(std::string_view keys) noexcept
     return std::ranges::find(QuitKeys, keys) != QuitKeys.end();
 }
 
-Task<DashboardExit> RunDashboard(
+core::async::Task<DashboardExit> RunDashboard(
     IDashboardEventSource* events, SampleReader reader, IDashboardView* view, IFrameSink* sink, DashboardLimits limits)
 {
     auto exit = DashboardExit { .stop = DashboardStop::SourceDetached, .outcome = Outcome::Unreachable, .model = {} };

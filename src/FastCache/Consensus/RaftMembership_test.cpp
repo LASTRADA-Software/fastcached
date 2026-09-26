@@ -33,9 +33,9 @@ constexpr auto ElectionMin = 150ms;
 /// A time point `millis` after the epoch.
 /// @param millis Offset in milliseconds.
 /// @return The instant.
-[[nodiscard]] TimePoint At(std::int64_t millis)
+[[nodiscard]] core::platform::SteadyTimePoint At(std::int64_t millis)
 {
-    return TimePoint {} + std::chrono::milliseconds { millis };
+    return core::platform::SteadyTimePoint {} + std::chrono::milliseconds { millis };
 }
 
 /// A configuration of voters and no learners -- every configuration this file used
@@ -88,7 +88,7 @@ constexpr auto ElectionMin = 150ms;
 struct LeaderFixture
 {
     ScriptedRandomSource random { { 0 } };
-    RaftNode node = std::move(RaftNode::Create(ThreeNodes(), random, TimePoint {})).value();
+    RaftNode node = std::move(RaftNode::Create(ThreeNodes(), random, core::platform::SteadyTimePoint {})).value();
 
     LeaderFixture()
     {
@@ -396,7 +396,7 @@ TEST_CASE("A second change is refused until the first commits", "[consensus][raf
 TEST_CASE("A non-leader cannot change the configuration", "[consensus][raft][membership]")
 {
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes(), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes(), random, core::platform::SteadyTimePoint {})).value();
 
     auto const refused = node.ProposeMembership(Voters({ "n1", "n2" }), At(10));
     REQUIRE_FALSE(refused.has_value());
@@ -416,7 +416,7 @@ TEST_CASE("A follower adopts a configuration it receives", "[consensus][raft][me
     // Every node has to reach the same configuration through the log, or a
     // cluster becomes two clusters that each think they are one.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, core::platform::SteadyTimePoint {})).value();
     REQUIRE(node.ActiveConfiguration().voters.size() == 3);
 
     (void) node.Receive(
@@ -441,7 +441,7 @@ TEST_CASE("A truncated configuration is rolled back", "[consensus][raft][members
     // configuration the cluster discarded would count quorums against a set
     // nobody else has.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(ThreeNodes("n2"), random, core::platform::SteadyTimePoint {})).value();
 
     (void) node.Receive(
         AppendEntriesRequest { .term = Term { .value = 1 },
@@ -482,7 +482,8 @@ TEST_CASE("A restarted node comes back under the configuration in its log", "[co
                                      .kind = EntryKind::Configuration,
                                      .payload = Membership::Encode(Voters({ "n1", "n2" })) } };
 
-    auto node = std::move(RaftNode::Create(ThreeNodes(), random, TimePoint {}, std::move(recovered))).value();
+    auto node =
+        std::move(RaftNode::Create(ThreeNodes(), random, core::platform::SteadyTimePoint {}, std::move(recovered))).value();
     CHECK(node.ActiveConfiguration() == Voters({ "n1", "n2" }));
 }
 
@@ -553,7 +554,7 @@ TEST_CASE("A leader is not deposed by the member it has just admitted", "[consen
     // fails on a wholesale regression of the mechanism. An uncommented subset would
     // read as a separate property to the next person counting cases.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(OneNode(), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(OneNode(), random, core::platform::SteadyTimePoint {})).value();
 
     (void) node.Tick(At(ElectionMin.count()));
     REQUIRE(node.CurrentRole() == Role::Leader);
@@ -591,7 +592,7 @@ TEST_CASE("A leader whose joiner never answers keeps leading, because deposing i
     // leader that cannot commit* into *no leader that also cannot commit* -- the
     // same deadlock #1095 reports, reached by a different route.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(OneNode(), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(OneNode(), random, core::platform::SteadyTimePoint {})).value();
 
     (void) node.Tick(At(ElectionMin.count()));
     REQUIRE(node.CurrentRole() == Role::Leader);
@@ -633,7 +634,7 @@ TEST_CASE("Once the change commits, the NEW configuration governs and a silent m
     // like anybody else's. A fix that kept consulting the committed configuration
     // forever would pass every other case in this file and fail this one.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(OneNode(), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(OneNode(), random, core::platform::SteadyTimePoint {})).value();
 
     (void) node.Tick(At(ElectionMin.count()));
     REQUIRE(node.CurrentRole() == Role::Leader);
@@ -865,7 +866,7 @@ TEST_CASE("A leader whose only other member is a learner leads through that lear
     // one learner, the learner never answers, and ten election timeouts later the
     // voter still leads -- because a learner's silence is not a lost quorum.
     ScriptedRandomSource random { { 0 } };
-    auto node = std::move(RaftNode::Create(OneNode(), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(OneNode(), random, core::platform::SteadyTimePoint {})).value();
 
     (void) node.Tick(At(ElectionMin.count()));
     REQUIRE(node.CurrentRole() == Role::Leader);
@@ -904,7 +905,7 @@ TEST_CASE("A leader demoted to a learner steps down once the demotion commits, a
     CHECK(fix.node.CurrentRole() == Role::Follower);
 
     // And it waits on nothing from now on, however long nobody speaks to it.
-    CHECK(fix.node.NextDeadline() == TimePoint::max());
+    CHECK(fix.node.NextDeadline() == core::platform::SteadyTimePoint::max());
     auto const quiet = fix.node.Tick(At(100 * ElectionMin.count()));
     CHECK(quiet.messages.empty());
     CHECK(fix.node.CurrentRole() == Role::Follower);
@@ -921,7 +922,7 @@ TEST_CASE("A node removed from a one-voter configuration does not elect itself",
     ScriptedRandomSource random { { 0 } };
     auto config = ThreeNodes("n2");
     config.voters = { "n1", "n2" };
-    auto node = std::move(RaftNode::Create(std::move(config), random, TimePoint {})).value();
+    auto node = std::move(RaftNode::Create(std::move(config), random, core::platform::SteadyTimePoint {})).value();
 
     // The leader, n1, replicates the entry removing n2.
     (void) node.Receive(AppendEntriesRequest { .term = Term { .value = 1 },

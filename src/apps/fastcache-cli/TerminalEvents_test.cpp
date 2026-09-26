@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "TerminalEvents.hpp"
 
-#include <FastCache/Async/TestReactor.hpp>
-#include <FastCache/Async/ThreadPoolExecutor.hpp>
-#include <FastCache/Core/Clock.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -16,6 +12,9 @@
 #include <thread>
 #include <utility>
 
+#include <core/async/ThreadPoolExecutor.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/ScopedPipeStdin.hpp>
 
@@ -35,22 +34,22 @@ namespace
 /// @param done The condition waited for.
 /// @param what What it means if it never becomes true.
 template <std::predicate Condition>
-void DrainUntil(TestReactor& reactor, Condition done, char const* what)
+void DrainUntil(core::net::testing::TestLoop& reactor, Condition done, char const* what)
 {
     // Out of the REQUIRE: its macro spells the expression twice, so a move inside it reads as a use after move.
     auto const reached = FastCache::Testing::DrainUntil(
         reactor,
         what,
         std::move(done),
-        [&reactor] { return std::format("{} submission(s) pending on the reactor", reactor.PendingSubmissions()); },
+        [&reactor] { return std::format("{} submission(s) pending on the reactor", reactor.pendingSubmissions()); },
         std::chrono::seconds { 30 });
     REQUIRE(reached);
 }
 
 /// Start @p terminal, writing the result where the caller can read it.
-[[nodiscard]] Task<void> StartInto(std::unique_ptr<UnstartedTerminal> terminal,
-                                   std::expected<StartedTerminal, std::string>* out,
-                                   bool* delivered)
+[[nodiscard]] core::async::Task<void> StartInto(std::unique_ptr<UnstartedTerminal> terminal,
+                                                std::expected<StartedTerminal, std::string>* out,
+                                                bool* delivered)
 {
     *out = co_await StartTerminal(std::move(terminal));
     *delivered = true;
@@ -64,9 +63,9 @@ TEST_CASE("a terminal is made without one, and starting it with none refuses by 
     // make it and never start it. Only the start asks whether there is a terminal.
     ScopedPipeStdin const guard;
     REQUIRE(guard.installed);
-    auto clock = ManualClock {};
-    auto reactor = TestReactor { clock };
-    auto pool = ThreadPoolExecutor { 1 };
+    auto clock = core::platform::ManualClock {};
+    auto reactor = core::net::testing::TestLoop { clock };
+    auto pool = core::async::ThreadPoolExecutor { 1 };
 
     auto made = MakeTerminalEvents(&pool, &reactor, UsageColor::Plain);
     REQUIRE(made.has_value());
@@ -74,7 +73,7 @@ TEST_CASE("a terminal is made without one, and starting it with none refuses by 
     auto started = std::expected<StartedTerminal, std::string> { std::unexpected(std::string { "never delivered" }) };
     auto delivered = false;
     auto task = StartInto(std::move(*made), &started, &delivered);
-    reactor.Submit(task.Native());
+    reactor.submit(task.handle());
     DrainUntil(reactor, [&delivered] { return delivered; }, "StartTerminal never resumed");
 
     REQUIRE_FALSE(started.has_value());

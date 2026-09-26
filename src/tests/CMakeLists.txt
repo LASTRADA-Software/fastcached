@@ -658,283 +658,6 @@ set_tests_properties("script-interpreter-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
-# The read-slot canary: the third program in this file that MUST die.
-#
-# `Detail::ClaimReadSlot` (`src/FastCache/Net/ReadSlot.hpp`) is the tripwire for
-# #663 -- a socket has ONE read operation, `Read` and `WaitReadable` share it, and
-# arming either while the other is parked drops the parked coroutine, which is then
-# never resumed and never freed. No assertion, no error, no log, and a leak
-# proportional to traffic on whatever path did it.
-#
-# Nothing in this tree observes that: measured while landing the guard, a probe at
-# the six arm sites reported ZERO double-arms across `FastCacheTest` (2073 cases) and
-# `fastcache-compile-node-tests`, and no script fixture drives a blocking RESP verb
-# or a subscription over a real socket at all. So the hazard has no coverage
-# whatsoever -- which is the ticket's own point, and the reason the guard cannot be
-# left unwatched.
-#
-# It double-arms a REAL socket through the real reactor, so what it drives is the
-# CALL SITE and not the guard function. Asserting `ClaimReadSlot` in isolation would
-# prove the `assert` fires and say nothing about whether `EpollSocket::Read` reaches
-# it -- which is the half that rots when a seventh arm site is added.
-#
-# `scripts/read-slot-guard-gate.cmake` and not a bare `WILL_FAIL`, for the reason
-# the iterator-debug block above gives: an inversion cannot say WHY a green result
-# is meaningless, and a non-zero exit is not proof on its own. The gate requires the
-# assertion's own words, and keeps "never got that far", "survived" and "died of
-# something else" apart from "the guard refused".
-#
-# Guarded to Debug because `assert` compiles out everywhere else. Every preset this
-# project ships is single-config Ninja with an explicit `CMAKE_BUILD_TYPE`, so this
-# is a real condition rather than one that is silently always false.
-# ---------------------------------------------------------------------------
-# The write-slot canary: the read-slot canary's missing half.
-#
-# `Detail::ClaimWriteSlot` (`src/FastCache/Net/WriteSlot.hpp`) landed with #893 and
-# its own header said it was "Watched refusing by `ctest -R write-slot-guard-canary`".
-# No such registration existed: `git grep write-slot-guard-canary` returned exactly
-# one hit tree-wide, the sentence making the claim. A guard nobody has watched refuse
-# is not a guard, and a header asserting otherwise is worse than silence because it
-# retires the suspicion (#1218).
-#
-# **This one also watches the guard ACCEPT, which the read-side canary does not.** A
-# `ClaimWriteSlot` that objected to every write would pass a refusal-only gate and
-# break every honest caller, surfacing days later somewhere else as a different
-# defect (#1031). The canary drives an ordinary sequential pair first and the gate
-# requires that marker BEFORE the abort, so the two observations are one run rather
-# than two claims.
-#
-# `scripts/write-slot-guard-gate.cmake` and not a bare `WILL_FAIL`, for the reason
-# the read-slot block above gives: an inversion cannot say WHY a green result is
-# meaningless, and it would accept a segfault, a missing library and a refused bind
-# alike.
-#
-# Guarded to Debug because `assert` compiles out everywhere else.
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_executable(write-slot-guard-canary WriteSlotGuardCanary.cpp)
-    target_link_libraries(write-slot-guard-canary PRIVATE FastCache)
-    add_test(
-        NAME "write-slot-guard-canary"
-        COMMAND ${CMAKE_COMMAND}
-            "-DFASTCACHED_CANARY=$<TARGET_FILE:write-slot-guard-canary>"
-            -P "${CMAKE_SOURCE_DIR}/scripts/write-slot-guard-gate.cmake"
-    )
-    set_tests_properties("write-slot-guard-canary" PROPERTIES
-        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-        LABELS "hygiene"
-        TIMEOUT 120
-    )
-endif()
-
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_executable(read-slot-guard-canary ReadSlotGuardCanary.cpp)
-    target_link_libraries(read-slot-guard-canary PRIVATE FastCache)
-    add_test(
-        NAME "read-slot-guard-canary"
-        COMMAND ${CMAKE_COMMAND}
-            "-DFASTCACHED_CANARY=$<TARGET_FILE:read-slot-guard-canary>"
-            -P "${CMAKE_SOURCE_DIR}/scripts/read-slot-guard-gate.cmake"
-    )
-    set_tests_properties("read-slot-guard-canary" PROPERTIES
-        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-        LABELS "hygiene"
-        TIMEOUT 120
-    )
-endif()
-
-# ---------------------------------------------------------------------------
-# The empty-read-buffer canary: another program that MUST die.
-#
-# `Detail::RequireReadBuffer` (`src/FastCache/Net/ISocket.hpp`) is the tripwire for
-# #838 -- `ISocket::Read` documents that its destination span must be non-empty and
-# nothing enforced it, so a caller reaching `Read` with an empty span was answered
-# `0`, which on this interface means the peer has finished sending. A graceful close
-# that never happened, handed to the caller by the one call whose result the type has
-# no way to express.
-#
-# It hands the empty span to a REAL transport, so what it drives is the CALL SITE and
-# not the guard function -- asserting `RequireReadBuffer` in isolation would prove the
-# `assert` fires and say nothing about whether an `ISocket::Read` reaches it. Which
-# transport, and why it is `InMemorySocket` rather than a reactor socket, is argued in
-# the canary's own header: a canary aborts at the first violation, so it watches ONE
-# site whatever it picks, and the one worth watching is the one with no environmental
-# failure modes and the same verdict on every platform.
-#
-# `scripts/empty-read-buffer-gate.cmake` and not a bare `WILL_FAIL`, for the reason
-# the two blocks above give. Guarded to Debug because `assert` compiles out elsewhere.
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_executable(empty-read-buffer-canary EmptyReadBufferCanary.cpp)
-    target_link_libraries(empty-read-buffer-canary PRIVATE FastCache)
-    add_test(
-        NAME "empty-read-buffer-canary"
-        COMMAND ${CMAKE_COMMAND}
-            "-DFASTCACHED_CANARY=$<TARGET_FILE:empty-read-buffer-canary>"
-            -P "${CMAKE_SOURCE_DIR}/scripts/empty-read-buffer-gate.cmake"
-    )
-    set_tests_properties("empty-read-buffer-canary" PROPERTIES
-        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-        LABELS "hygiene"
-        TIMEOUT 120
-    )
-endif()
-
-# ---------------------------------------------------------------------------
-# The canary above watches ONE call site; this is what holds the other five.
-#
-# A canary aborts at the first violation, so it can only ever drive one `Read`
-# whatever it picks -- and that is #492's shape: exact about the site it knows,
-# silent about the ones it does not, and silence reads identically to complete
-# coverage. Measured rather than argued: with `Detail::RequireReadBuffer` deleted
-# from `EpollSocket::Read` -- the transport every Linux deployment reads through --
-# `empty-read-buffer-canary` PASSES and the whole suite reports 3316 of 3316.
-#
-# `Detail::ClaimReadSlot` next door needs no equivalent because it IS the claim: an
-# arm site cannot omit it without omitting the operation. `RequireReadBuffer` is
-# purely additive, which is exactly the difference.
-#
-# The check DERIVES its set from the sources rather than tabulating six paths, so a
-# seventh transport is caught by construction; it requires the call to stand before
-# the body's first `return`, because all six open with `if (_closed) return ...` and
-# a guard that drifts below that is skipped while a presence-only scan reads green;
-# and it fails closed on an empty scan twice over. Not guarded to Debug: it reads
-# TEXT, so it covers the Windows and macOS transports from a Linux run.
-add_test(
-    NAME "read-buffer-guard"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-read-buffer-guard.cmake"
-)
-set_tests_properties("read-buffer-guard" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 120
-)
-
-add_test(
-    NAME "read-buffer-guard-selftest"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/read-buffer-guard-selftest"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-read-buffer-guard-selftest.cmake"
-)
-set_tests_properties("read-buffer-guard-selftest" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 120
-)
-
-# ---------------------------------------------------------------------------
-# Every transport the library hands out ANSWERS `CancelRead`, rather than inheriting
-# `ISocket`'s default no-op.
-#
-# The sibling of the check above and deliberately a different shape: `read-buffer-guard`
-# reads bodies in `.cpp`, this reads DECLARATIONS in `.hpp`, because what a transport
-# owes here is an answer rather than a call. A socket that inherits the no-op cannot
-# retire a parked read at all -- the awaiting coroutine is never resumed and its frame
-# is never freed, with no signal anywhere (#663, #710). On #710's branch two of six
-# transports inherited it and BOTH park.
-#
-# A scan rather than a pure virtual, which was proposed, priced (13 files, 15 classes,
-# 8 new bodies) and refused: it compels seven test doubles to write `{}` with no reason
-# beside it, which is *forgot* in the vocabulary of *decided* (#892). Reach for the type
-# system when the obligation is DO SOMETHING and for a scan when it is SAY WHY.
-#
-# Not guarded to any platform: it reads TEXT, so a Linux run covers the Windows and
-# macOS transports.
-add_test(
-    NAME "cancel-read-declared"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-cancel-read-declared.cmake"
-)
-set_tests_properties("cancel-read-declared" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 120
-)
-
-add_test(
-    NAME "cancel-read-declared-selftest"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/cancel-read-declared-selftest"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-cancel-read-declared-selftest.cmake"
-)
-set_tests_properties("cancel-read-declared-selftest" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 120
-)
-
-# ---------------------------------------------------------------------------
-# A reactor's teardown rule is watched refusing, on every platform rather than one.
-#
-# `IReactor::TeardownIsSerialisedWithDispatch()` is the tripwire for #668: an object
-# a reactor owns is destroyed on that reactor's worker thread or with the reactor
-# stopped, or clearing a pending awaitable races the completion dispatch.
-#
-# **The registration is the point of the ticket, not an accessory to it.** That rule
-# was asserted only in `IocpSocket.cpp` -- wholly inside `#if defined(_WIN32)` -- and
-# only `IocpReactor` could answer the two questions it rests on. So the sole observer
-# in the whole CI matrix was `Windows-cl-debug`: the only leg that both builds Debug
-# and runs `ctest`, not a required context, and reporting the violation
-# intermittently (two greens and one red on identical source). Making the question
-# askable of every reactor is what lets this canary run everywhere, which is why the
-# ticket's second half -- "the only leg that can see it does not gate" -- is answered
-# here rather than by promoting that leg.
-#
-# `scripts/reactor-teardown-gate.cmake` and not a bare `WILL_FAIL`, for the reason
-# the two blocks above give: an inversion cannot say WHY a green result is
-# meaningless, and a non-zero exit is not proof on its own. The gate requires the
-# assertion's own words, and keeps "never got that far", "survived" and "died of
-# something else" apart from "the guard refused".
-#
-# Guarded to Debug because `assert` compiles out everywhere else. Every preset this
-# project ships is single-config Ninja with an explicit `CMAKE_BUILD_TYPE`, so this
-# is a real condition rather than one that is silently always false.
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_executable(reactor-teardown-canary ReactorTeardownCanary.cpp)
-    target_link_libraries(reactor-teardown-canary PRIVATE FastCache)
-    add_test(
-        NAME "reactor-teardown-canary"
-        COMMAND ${CMAKE_COMMAND}
-            "-DFASTCACHED_CANARY=$<TARGET_FILE:reactor-teardown-canary>"
-            -P "${CMAKE_SOURCE_DIR}/scripts/reactor-teardown-gate.cmake"
-    )
-    set_tests_properties("reactor-teardown-canary" PROPERTIES
-        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-        LABELS "hygiene"
-        TIMEOUT 120
-    )
-endif()
-
-# The teardown gate is watched refusing, because a gate is an instrument too.
-#
-# `reactor-teardown-canary` above only runs where `assert` is live, so on a Release
-# leg the gate itself is the only part of #668's mechanism present -- and a gate that
-# has never been seen to refuse is the thing this whole ticket is about, one level up.
-# Five staged canary outcomes, and each case asserts WHICH refusal it got rather than
-# only that it refused: the gate's first check is "did the canary establish the
-# arrangement", so a stub that failed to start would be refused by it and a
-# refusal-only assertion would pass with every later check deleted (#723).
-#
-# `${FASTCACHED_BASH} <path>` rather than a bare path, so a mode-644 checkout fails
-# the SCRIPT and not five want-fail assertions that cannot tell exit 126 from the
-# rule firing -- and through the PINNED interpreter rather than a bare `bash`, which
-# ctest resolves from PATH at run time and which `script-interpreter` refuses (#379).
-add_test(
-    NAME "reactor-teardown-gate-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/reactor-teardown-gate-selftest.sh"
-            "${CMAKE_SOURCE_DIR}/scripts/reactor-teardown-gate.cmake"
-)
-set_tests_properties("reactor-teardown-gate-selftest" PROPERTIES
-    ENVIRONMENT "CMAKE_COMMAND=${CMAKE_COMMAND}"
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 120
-)
-
-# ---------------------------------------------------------------------------
 # A hygiene check traverses each directory once, not once per file pattern.
 #
 # `file(GLOB_RECURSE var a b c)` traverses the tree once PER PATTERN, and the call site
@@ -1812,35 +1535,6 @@ set_tests_properties("repository-hygiene-selftest" PROPERTIES
     TIMEOUT 120
 )
 
-# ---------------------------------------------------------------------------
-# The Net boundary. Fails when anything under Net/ or Async/ includes a FastCache
-# header from outside the standalone unit those two form, or when one of the
-# three dependency-free leaf headers they are allowed to reach stops being
-# dependency-free. scripts/check-net-boundary.cmake carries the table and the
-# reason each row is in it, and prints the whole table on failure.
-#
-# Net/ is meant to be lifted out of this tree and upstreamed, and that is a
-# property of the include graph -- which drifts in silence. Nothing fails, nothing
-# warns, and the edge is found by whoever attempts the lift: issue #100 counted
-# ten that had accumulated exactly that way, none of which any test could see.
-#
-# Not labelled "smoke", for the reason repository-hygiene is not: it starts no
-# daemon, opens no socket and needs no compiler, so it belongs in the default
-# `ctest` set and must survive `ctest -LE smoke`. It finishes in milliseconds.
-# Unlike repository-hygiene it has no skip path at all -- it reads the source
-# tree, which is present in an exported tarball exactly as it is in a checkout.
-add_test(
-    NAME "net-boundary"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-net-boundary.cmake"
-)
-set_tests_properties("net-boundary" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
-)
-
 # A stall is retried; a verdict is not.
 #
 # `cmake/MacOSNotarizePkg.cmake` bounds `notarytool submit --wait` and retries it
@@ -2010,46 +1704,6 @@ else()
         TIMEOUT 120
     )
 endif()
-
-# And the half that did not exist. `net-boundary` had NO selftest: nothing had
-# ever watched it refuse, which by this tree's standard means it was not a guard
-# -- and it had been carrying a wrong rule for as long as the rule existed (#517,
-# where `\.` is not a valid CMake escape, so the `..` test evaluated as
-# `(^|/)..(/|$)` and matched any two-character segment).
-#
-# Three defects, all found by writing this fixture, all invisible to a passing
-# run:
-#
-#   * one stray `]` in a comment on an include line made the check pass over a
-#     real cross-boundary include -- `file(STRINGS)` returns a list an unbalanced
-#     bracket merges (#518, which classified this as PARTIAL from a clean-tree
-#     injection; with a violation planted it is silent, not partial);
-#   * the empty-directory guard -- the one its own comment calls "the one failure
-#     mode a boundary test must not be allowed to have" -- could never fire,
-#     because `if(unitSources STREQUAL "")` reads an UNSET variable as the
-#     literal string `unitSources`; and
-#   * nothing pinned either direction of the `..` rule.
-#
-# Seven cases, and the three that carry the weight are `bracket` (a planted
-# violation behind a bracket), `bracketAlone` (so `bracket` cannot pass for the
-# wrong reason) and `vacuous`. Each has been WATCHED to fail: removing the
-# bracket neutralisation reddens `bracket` alone, unquoting the guard reddens
-# `vacuous` alone, and restoring the old `..` regex reddens `twochar` alone.
-#
-# Synthesised trees under a scratch directory, never the real source root, so
-# nothing can be left behind in the worktree.
-add_test(
-    NAME "net-boundary-selftest"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/net-boundary-selftest"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-net-boundary-selftest.cmake"
-)
-set_tests_properties("net-boundary-selftest" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
-)
 
 # ---------------------------------------------------------------------------
 # The startup diagnostics `docs/operations/corrupt-store.md` quotes VERBATIM are
@@ -2775,30 +2429,12 @@ set_tests_properties("target-file-guards" PROPERTIES
 # nothing, and a build option the reader never turned into a target is refused as lost
 # rows rather than silently dropped.
 #
-# Eight more since #1369, for the SECOND source of optional targets -- a directory the
-# root adds only under a `FASTCACHED_BUILD_*` option outside `src/`, which is `vendor/`.
-# Before #1369 an unguarded `$<TARGET_FILE:fastcache-tui-linkprobe>` planted in this file
-# PASSED, because the check never read the file declaring that target. They assert:
-# - a planted violation in EACH source is refused and names the source that made the
-#   target optional (the app-table case above checks that too);
-# - the gated file's reference to its own target passes;
-# - the app table's own equality still refuses a dropped row with a gated target present;
-# - each of the second reader's own assertions refuses: a root option whose `if()` was
-#   not read, a declaration whose target name was not read, and no gated directory;
-# - a stray `]` in the gated file changes nothing.
-#
-# Seven more from the review of that first version, each of which it failed:
-# - a target the ROOT declares under an option is not exempt in the root, which runs with
-#   the option OFF too;
-# - a gated directory spelled quoted or under `${CMAKE_CURRENT_SOURCE_DIR}` keeps its
-#   targets, and one no path can be resolved from is refused by its spelling;
-# - `if(X)  # why`, a condition spelled across lines, and upper-case `IF`/`ADD_EXECUTABLE`
-#   are all followed;
-# - an `endif()` with no open `if()` is reported where it happened.
-#
-# The run states how many trees it built: 20. Shown to bite: against master's check 14
-# of the 20 fail, against the first #1369 version 7 do, and neutering each assertion or
-# fix fails exactly its own case.
+# Two more pin the frame walker the reference scan uses: a condition spelled across lines
+# is followed, and an `endif()` with no open `if()` is reported where it happened. They are
+# what is left of the fifteen #1369 added for a SECOND source of optional targets -- a
+# directory the root added only under a `FASTCACHED_BUILD_*` option outside `src/`, which
+# was `vendor/` -- and #1596 removed with that directory and its reader. The run states
+# how many trees it built: 7.
 #
 # The bracket sits on a ROW and not in a comment, which is the difference between a
 # regression test and the appearance of one: a REGEX-filtered `file(STRINGS)` discards
@@ -5839,40 +5475,6 @@ set_tests_properties("configure-subprocess-bounds-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
-# The write-slot discipline: the read-slot rule's missing half (#893).
-#
-# A socket has ONE operation per direction. `Net/ReadSlot.hpp` states that for
-# reads, where arming over a parked operation drops the coroutine with no
-# assertion, no error and no log (#663) -- and the write side was the same machine
-# with none of the machinery. `TlsSocket::CancelRead` retires a pump parked on the
-# READ slot; one suspended in `FlushOutgoing`'s `_raw->Write` is not retired at all.
-#
-# A scan rather than a canary, and that is not a shortcut: a canary aborts at the
-# FIRST violation, so it watches one site whatever it picks and is silent about the
-# rest -- which is how the read-buffer guard could be deleted from `EpollSocket`
-# with the whole suite still green.
-add_test(
-    NAME "write-slot-guard"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-write-slot-guard.sh"
-)
-set_tests_properties("write-slot-guard" PROPERTIES
-    LABELS "hygiene"
-    TIMEOUT 60
-)
-
-# Six cases, both directions -- including a seventh transport joining no list, a
-# transport contradicting its own exemption, and an empty tree refusing rather
-# than reporting clean.
-add_test(
-    NAME "write-slot-guard-selftest"
-    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-write-slot-guard.sh" --self-test
-)
-set_tests_properties("write-slot-guard-selftest" PROPERTIES
-    LABELS "hygiene"
-    TIMEOUT 60
-)
-
-# ---------------------------------------------------------------------------
 # Every `gh` listing goes through the shared reporter, or says why it does not.
 #
 # A listing that came back AT its `--limit` is a real answer about a set that is
@@ -6096,6 +5698,7 @@ add_test(
     NAME "ranges-seam"
     COMMAND ${CMAKE_COMMAND}
         "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_RANGES_SEAM_HEADER=${core-cpp_SOURCE_DIR}/src/core/Ranges.hpp"
         "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
         -P "${CMAKE_SOURCE_DIR}/scripts/check-ranges-seam.cmake"
 )
@@ -7440,9 +7043,9 @@ set_tests_properties("cli-ambient-reads-selftest" PROPERTIES
 # ----------------------------------------------------------------------------
 # vendor/ is still byte-for-byte what was imported (#134).
 #
-# The copy under vendor/ is third-party source taken verbatim from upstream, and
+# A copy under vendor/ is third-party source taken verbatim from upstream, and
 # it is only worth having while it stays diffable against upstream -- `git diff
-# <import>..HEAD -- vendor/endo` is the patch that gets contributed back. An edit
+# <import>..HEAD -- vendor/monocypher` is the patch that gets contributed back. An edit
 # applied in place breaks nothing here, which is exactly why nothing else would
 # catch it: the build stays green and the loss surfaces months later, when
 # somebody tries to upstream a fix and finds the diff full of local noise.
@@ -7461,103 +7064,6 @@ set_tests_properties("vendor-verbatim" PROPERTIES
     FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
     LABELS "hygiene"
     TIMEOUT 300
-)
-
-# ----------------------------------------------------------------------------
-# The vendored TUI's source set is a LINK closure, not just an include closure (#134).
-#
-# `fastcache-tui-linkprobe` is an executable over the vendored objects whose `main`
-# does nothing: the LINK is the test, and it already fails the build when a symbol
-# does not resolve. This registration exists so the guard is visible to `ctest -N`
-# and so a `Not Run` stays distinguishable from a pass -- which is why it RUNS the
-# binary rather than merely naming it.
-#
-# What it defends, measured: the first source set was derived by reading `#include`
-# lines and left FIFTEEN unresolved `tui::` symbols. Everything compiled. A static
-# archive never resolves symbols, so `ninja` was green, the vendor partition
-# assertion was green and `vendor-verbatim` was green -- the wall of link errors
-# waits for the first consumer, which is the worst place to meet it because it looks
-# like the consumer is broken. Proved by deletion: dropping one source while
-# reclassifying it so the partition still passes leaves this the ONLY guard that
-# reddens, naming `tui::HyperlinkEmitter::HyperlinkEmitter(...)` at `Buffer.cpp:289`.
-#
-# Guarded on `TARGET` as well as on the option. `$<TARGET_FILE:>` naming a target
-# that was not built is a hard error at GENERATE time, which fails the whole
-# configure with a message blaming CMake rather than the option the operator set --
-# the two conditions are independent and both are owed.
-#
-# It needs no daemon, socket or compiler, so it is `hygiene`, in the default set.
-if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-linkprobe)
-    add_test(
-        NAME "vendor-tui-link-closure"
-        COMMAND $<TARGET_FILE:fastcache-tui-linkprobe>
-    )
-    set_tests_properties("vendor-tui-link-closure" PROPERTIES
-        LABELS "hygiene"
-        TIMEOUT 60
-    )
-endif()
-
-# ----------------------------------------------------------------------------
-# ...and the probe must be SEEN to refuse, on every run (#1376).
-#
-# `vendor-tui-link-closure` is the accepting direction. Its refusing direction was shown once, by
-# deletion, and the paragraph above recorded it -- which is a sentence, and a sentence cannot fail.
-# A linker told to allow undefined symbols, or objects that stopped reaching the link, would leave
-# that test green over a tree missing an implementation. So this builds
-# `fastcache-tui-linkprobe-canary` -- the same probe with `platform/SignalHandler.cpp` left out, the
-# one miss that shipped -- and requires the link to FAIL naming the definition it lacks. A canary
-# that links, and one that fails for another reason, are both refusals of the GUARD, by name.
-#
-# It runs `cmake --build` on this tree, for one link: the objects are the probe's own, already built.
-# Guarded on the canary TARGET as well as the option, for the reason the block above states.
-if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-linkprobe-canary)
-    add_test(
-        NAME "vendor-tui-link-closure-refuses"
-        COMMAND ${CMAKE_COMMAND}
-            "-DFASTCACHED_BUILD_DIR=${CMAKE_BINARY_DIR}"
-            "-DFASTCACHED_BUILD_CONFIG=$<CONFIG>"
-            "-DFASTCACHED_CANARY_TARGET=fastcache-tui-linkprobe-canary"
-            "-DFASTCACHED_CANARY_SYMBOL=SignalHandler::hasPendingSigint"
-            -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-link-canary.cmake"
-    )
-    set_tests_properties("vendor-tui-link-closure-refuses" PROPERTIES
-        FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-        LABELS "hygiene"
-        TIMEOUT 300
-    )
-endif()
-
-# The canary check's three verdicts, driven by stand-in commands: a canary that linked, one that
-# failed without naming the symbol, and one that failed naming it -- the only accepting case.
-# Unconditional: it needs no build tree and no vendored target.
-add_test(
-    NAME "vendor-tui-link-canary-selftest"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-tui-link-canary-selftest"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-link-canary-selftest.cmake"
-)
-set_tests_properties("vendor-tui-link-canary-selftest" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
-)
-
-# The probe's ROOT is derived: the configure refuses a vendored `.cpp` that no link checks
-# (`cmake/VendorLinkRoots.cmake`, called from `vendor/CMakeLists.txt`). That call can only show the
-# verdict the real tree earns, which on a good tree is acceptance -- so every home a link checks, and
-# every home it does not, is driven here over synthetic records. Unconditional: pure `cmake -P`.
-add_test(
-    NAME "vendor-link-roots-selftest"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-link-roots-selftest.cmake"
-)
-set_tests_properties("vendor-link-roots-selftest" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
 )
 
 # ----------------------------------------------------------------------------
@@ -7594,50 +7100,6 @@ set_tests_properties("vendor-figures-selftest" PROPERTIES
     LABELS "hygiene"
     TIMEOUT 60
 )
-
-# The vendored TUI runtime's own tests (#1374). Declared in `vendor/CMakeLists.txt`,
-# registered HERE because `add_subdirectory(vendor)` runs before `enable_testing()`
-# -- an `add_test` in that file builds a binary that never runs and reports nothing,
-# which looks exactly like a registered test that passes.
-#
-# What it pins is the fact the mockable-dashboard plan rests on: `TuiRuntime` reads
-# time only through its injected `IClock`. It was claimed by a header comment and
-# measured by nothing. Two of the cases are the discrimination -- "An injected
-# ManualClock makes a delay's computed timeout exact" freezes the clock and requires
-# the delay NOT to fire, and "A delay fires deterministically once the ManualClock
-# crosses its deadline" advances a ManualClock 40ms per scripted wait and requires a
-# 100ms delay to resume on the THIRD wait, `REQUIRE(source.waitCount() == 3)`. A
-# hidden `steady_clock::now()` in any awaiter makes the first flake as real time
-# crosses the deadline and the second resume at the wrong wait. Neither is a test
-# that passes either way.
-#
-# A third pins the readiness half: "Runtime delivers a scripted input event to a
-# waiting flow" wakes on a pushed key with no clock advancing and no timer anywhere,
-# which is what fails against any `SleepUntil(now + interval)` implementation.
-#
-# The same binary carries endo's `TerminalQuery_test.cpp` (#1375, a declared local change):
-# queries keep the input they read, time out on an injected clock, and say NotAsked or NoReply
-# rather than returning a value that stands for both.
-#
-# ONE ctest entry running the whole binary rather than `catch_discover_tests`,
-# deliberately: per-case registration would put upstream's case names into this
-# repository's ctest namespace and under its Catch2 name hygiene, which vendored
-# tests have no reason to satisfy, and it would expose them to the SKIP_RETURN_CODE
-# collision (#1152). Catch2's exit status is its failed-assertion count, so a plain
-# non-zero is the failure signal this needs and nothing here maps 4 to "skipped".
-#
-# Guarded on `TARGET` as well as the option: `$<TARGET_FILE:>` on a target that was
-# not built is a hard error at generate time, and the two conditions are independent.
-if(FASTCACHED_BUILD_TUI AND TARGET fastcache-tui-tests)
-    add_test(
-        NAME "vendor-tui-runtime-clock"
-        COMMAND $<TARGET_FILE:fastcache-tui-tests>
-    )
-    set_tests_properties("vendor-tui-runtime-clock" PROPERTIES
-        LABELS "hygiene"
-        TIMEOUT 120
-    )
-endif()
 
 # ---------------------------------------------------------------------------
 # cli-node-flags: `fastcache-cli --help` sends operators to flags that exist.
@@ -7871,50 +7333,6 @@ else()
         "only an MSVC Debug CRT has an assert report mode to route, and this build is not one")
 endif()
 
-# The vendored vocabulary stays in vendor/ (#1377). Building endo's `runtime/` (#1374) put
-# `coro::Task`, `coro::Cancellation` and `endo::platform::IClock` into the link beside our
-# own, and the vendored include root is exposed PUBLIC with `coro/` and `platform/` beside
-# `tui/`, so no arrangement of the target can keep first-party code out of them. Fails when
-# anything under src/, tests included, reaches `<coro/...>` or `<platform/Clock.hpp>`, by
-# spelling or through a vendored header, outside the adapter layer's exemption rows.
-# scripts/check-vendor-vocabulary.cmake carries the tables and says in its refusal what the
-# rule does not cover.
-#
-# Default set, for net-boundary's reason: no daemon, no socket, no compiler, and no skip path,
-# since the source tree and vendor/ are both present in an exported tarball. Its zero has a
-# positive control: a vendored header known to reach `coro/` is walked by the same reader and
-# must be seen to reach it, or the run refuses rather than reporting a clean src/.
-add_test(
-    NAME "vendor-vocabulary"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-vocabulary.cmake"
-)
-set_tests_properties("vendor-vocabulary" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
-)
-
-# The shipped tree reaches none of the vocabulary, so the real run only ever shows the
-# accepting direction. Everything about refusing is shown here, over synthesised trees
-# under a scratch directory: every forbidden spelling, the closure at one and two hops, a
-# first-party file shadowing a vendored one, both ways an exemption row goes stale, a dead
-# control, and a scan of nothing. Each case has been WATCHED to fail: every mutant of the check
-# tried reddens exactly the cases it should and no others, and the unmutated check reddens none.
-add_test(
-    NAME "vendor-vocabulary-selftest"
-    COMMAND ${CMAKE_COMMAND}
-        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
-        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/vendor-vocabulary-selftest"
-        -P "${CMAKE_SOURCE_DIR}/scripts/check-vendor-vocabulary-selftest.cmake"
-)
-set_tests_properties("vendor-vocabulary-selftest" PROPERTIES
-    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
-    LABELS "hygiene"
-    TIMEOUT 60
-)
-
 # `vendor-verbatim` told a declared local change from an accidental edit only in its refusal
 # TEXT: regenerating the manifest silenced it for any edit, declared or not (found landing
 # #1375, the first local change this tree carries). The manifest now records each file's
@@ -7963,22 +7381,26 @@ set_tests_properties("cli-exit-code-docs-selftest" PROPERTIES
     TIMEOUT 60
 )
 
-# The vendored TUI is sanitized in the OBJECTS, not only on a compile line (#134). Until the
-# target-by-target block after `include(Sanitizers)` in the top-level CMakeLists.txt, every
-# `vendor/` target was declared before the directory-scoped sanitizer options and built with none,
-# while the configure printed "Enabling". This reads the objects `fastcache-tui-objects` produced
-# for the undefined init reference each enabled sanitizer leaves, beside a CONTROL object compiled
-# in the same configuration with `-fno-sanitize=all`, which must come back without it -- so the
-# reader is watched saying "absent" as well as "present". ASan and TSan only: UBSan leaves no
-# per-object init to read, and MSVC has no `nm`.
+# Code this project does not build under its own directory-scoped flags is sanitized in the
+# OBJECTS, not only on a compile line (#134). Until the target-by-target block after
+# `include(Sanitizers)` in the top-level CMakeLists.txt, the vendored TUI was declared before the
+# directory-scoped sanitizer options and built with none, while the configure printed "Enabling".
+# This reads the objects of each such target for the undefined init reference each enabled
+# sanitizer leaves, beside a CONTROL object compiled in the same configuration with
+# `-fno-sanitize=all`, which must come back without it -- so the reader is watched saying "absent"
+# as well as "present". ASan and TSan only: UBSan leaves no per-object init to read, and MSVC has no
+# `nm`.
 #
-# Monocypher (#178) is read here too, from the targets cmake/Monocypher.cmake names, and it is
-# unconditional where the TUI is not -- so the check now runs in a sanitizer build with
-# `FASTCACHED_BUILD_TUI=OFF` as well, reading the one vendored copy that build compiles.
+# Two sources of such targets. Monocypher (#178), from the targets cmake/Monocypher.cmake names,
+# unconditionally. And core-cpp (#1596), whose libraries that block instruments from its
+# `CORE_CPP_TARGETS` property: read here through the ones this build is sure to compile. core-cpp's
+# targets are EXCLUDE_FROM_ALL, so a library nothing links has no objects to read, and `core::tui`
+# -- behind the terminal wait on the pool -- is the one `fastcache-cli` links.
 if((ENABLE_SANITIZER_ADDRESS OR ENABLE_SANITIZER_THREAD) AND NOT MSVC AND CMAKE_NM)
     set(_fcVendoredObjectTargets ${FASTCACHED_MONOCYPHER_TARGETS})
-    if(TARGET fastcache-tui-objects)
-        list(APPEND _fcVendoredObjectTargets fastcache-tui-objects)
+    if(TARGET core::tui)
+        get_target_property(_fcCoreCppTui core::tui ALIASED_TARGET)
+        list(APPEND _fcVendoredObjectTargets ${_fcCoreCppTui})
     endif()
     set(_fcVendoredObjects "")
     foreach(_fcVendoredObjectTarget IN LISTS _fcVendoredObjectTargets)

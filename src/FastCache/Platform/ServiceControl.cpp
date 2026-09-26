@@ -3,7 +3,6 @@
 #include <FastCache/Config/DefaultConfigPath.hpp>
 #include <FastCache/Core/Markup.hpp>
 #include <FastCache/Core/PathKind.hpp>
-#include <FastCache/Core/Ranges.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
@@ -23,6 +22,8 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include <core/Ranges.hpp>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -827,14 +828,14 @@ namespace
     /// FastCache/Core/Ranges.hpp.
     [[nodiscard]] constexpr ScopeTraits const& TraitsOf(ServiceScope scope) noexcept
     {
-        auto const* const traits = FindOrNull(ScopeTable, scope, &ScopeTraits::scope);
+        auto const* const traits = core::findOrNull(ScopeTable, scope, &ScopeTraits::scope);
         return traits != nullptr ? *traits : ScopeTable.front();
     }
 } // namespace
 
 std::expected<ServiceScope, ConfigError> ParseServiceScope(std::string_view text)
 {
-    if (auto const* const traits = FindOrNull(ScopeTable, text, &ScopeTraits::name))
+    if (auto const* const traits = core::findOrNull(ScopeTable, text, &ScopeTraits::name))
         return traits->scope;
 
     return std::unexpected(
@@ -1529,7 +1530,7 @@ ServiceControlResult InstallService(ServiceSpec const& spec, ServiceScope /*scop
     //
     // The numbers are the other two's, not new ones: systemd's units carry
     // `Restart=on-failure` with `RestartSec=1`, and the launchd job this file
-    // generates carries `KeepAlive` with `ThrottleInterval=30`. So the first two
+    // generates carries `core::net::KeepAlive` with `ThrottleInterval=30`. So the first two
     // attempts are immediate-ish and the third backs off to thirty seconds -- and
     // the third repeats, because Windows applies the LAST action to every failure
     // past the end of the array. An hour of health resets the count, which is the

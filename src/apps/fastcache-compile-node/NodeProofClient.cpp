@@ -2,7 +2,6 @@
 #include "../fastcache-cc/CacheProtocol.hpp"
 #include "NodeProofClient.hpp"
 
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Distributed/NodeProof.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -10,6 +9,9 @@
 #include <algorithm>
 #include <format>
 #include <utility>
+
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
 
 namespace FastCache::Node
 {
@@ -70,7 +72,8 @@ NodeProofAttempt NodeProofClient::Prove(SealedFrameSocket& peer,
     std::ranges::copy(*nonce, request.nonce.begin());
     std::ranges::copy(ephemeral->publicKey, request.ephemeral.begin());
 
-    auto const challenged = SyncRun(Cc::ExchangeFramed(&peer, &notice, Wire::EncodeNodeChallenge(request), credential));
+    auto const challenged =
+        core::async::syncRun(Cc::ExchangeFramed(&peer, &notice, Wire::EncodeNodeChallenge(request), credential));
     if (!challenged.IsHit())
         return Unproved(challenged);
 
@@ -104,7 +107,7 @@ NodeProofAttempt NodeProofClient::Prove(SealedFrameSocket& peer,
     // before the proof leaves; the sending one only once the answer has verified, since the proof
     // itself travels in the clear.
     peer.SealReceiving(std::move(keys->serverToCaller));
-    auto const proved = SyncRun(Cc::ExchangeFramed(
+    auto const proved = core::async::syncRun(Cc::ExchangeFramed(
         &peer, &notice, Wire::EncodeProveNode(Distributed::MintNodeProof(_key, _nodeId, request, *reply)), credential));
     if (!proved.IsHit())
         return Unproved(proved);

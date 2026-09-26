@@ -2,7 +2,6 @@
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
@@ -23,6 +22,7 @@
 #include <string_view>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/FleetHistoryFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -99,13 +99,13 @@ struct Leading
         service.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
     }
 
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
 
     /// Capturing rather than null, so the one line this service writes is readable
     /// from any case that cares and costs the rest nothing.
     CapturingLogger logger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     KeyPairLeaseSigner const signer = Testing::TestLeaseSigner();
     SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
 };
@@ -134,10 +134,10 @@ struct Signing
     /// What a worker verifies this scheduler's grants against: it, as a voter.
     Testing::FixedLeaseRoster roster { { "scheduler" } };
 
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     CapturingLogger logger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     KeyPairLeaseSigner const signer = Testing::TestLeaseSigner("scheduler");
     SchedulerService service { clock, wallClock, metrics, logger, signer, TestCluster };
 };
@@ -186,7 +186,7 @@ TEST_CASE("A granted lease reaches the fleet page as a row, with its holder's ad
     Leading fleet;
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
     REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "stuck-key")).status == Wire::Status::Ok);
-    fleet.clock.Advance(2s);
+    fleet.clock.advance(2s);
 
     auto const snapshot =
         CollectFleet(FleetSources { .scheduler = &fleet.service, .cluster = nullptr, .metrics = &fleet.metrics });
@@ -207,10 +207,10 @@ TEST_CASE("Only the leader hands out capacity", "[distributed][scheduler]")
     // worker here would put it in a fleet nothing schedules onto -- and it would
     // heartbeat into that void forever. The refusal carries the leader's address so
     // the caller can redirect instead.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
 
@@ -301,10 +301,10 @@ TEST_CASE("Membership is checked after leadership", "[distributed][scheduler]")
     // know the cluster's membership any better than it knows the fleet, so
     // answering `NotAMember` there would send an operator looking at a policy that
     // was never consulted. Cheapest and most certain fact first.
-    ManualClock clock;
+    core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
     NullLogger schedulerLogger;
-    ManualWallClock wallClock;
+    core::platform::ManualWallClock wallClock;
     auto const signer = Testing::TestLeaseSigner();
     SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
     service.SetRole(SchedulerRole::Follower, "10.0.0.1:7000", StandaloneSchedulerTerm);
@@ -485,7 +485,7 @@ TEST_CASE("A worker that stops heartbeating leaves the fleet", "[distributed][sc
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
     REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "key-1")).status == Wire::Status::Ok);
 
-    fleet.clock.Advance(WorkerRegistry::DefaultHeartbeatTimeout + 1s);
+    fleet.clock.advance(WorkerRegistry::DefaultHeartbeatTimeout + 1s);
 
     CHECK(fleet.service.Workers().LiveWorkers().empty());
     CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).error == Wire::ErrorCode::NoWorker);
@@ -615,7 +615,7 @@ TEST_CASE("Withdrawing an id the scheduler does not know succeeds", "[distribute
 TEST_CASE("A withdrawal closes the dispatch window the heartbeat timeout leaves open", "[distributed][scheduler]")
 {
     // The before/after #573 asks for, as a number rather than an argument, and on a
-    // `ManualClock` rather than wall time -- which is the only kind of clock a verdict
+    // `core::platform::ManualClock` rather than wall time -- which is the only kind of clock a verdict
     // can rest on here.
     SECTION("without one, dispatch continues until the timeout")
     {
@@ -625,10 +625,10 @@ TEST_CASE("A withdrawal closes the dispatch window the heartbeat timeout leaves 
         // The window. `ReapExpiredWorkers()` runs before `Pick`, so an entry one tick
         // inside its timeout survives the reap and is still handed out -- a lease
         // granted to a worker that has stopped serving this fingerprint.
-        fleet.clock.Advance(WorkerRegistry::DefaultHeartbeatTimeout - 1s);
+        fleet.clock.advance(WorkerRegistry::DefaultHeartbeatTimeout - 1s);
         CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-1")).status == Wire::Status::Ok);
 
-        fleet.clock.Advance(2s);
+        fleet.clock.advance(2s);
         CHECK(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).error == Wire::ErrorCode::NoWorker);
     }
 
@@ -745,7 +745,7 @@ TEST_CASE("An expired lease stops suppressing its key", "[distributed][scheduler
     constexpr auto Steps = (LeaseTable::DefaultLeaseTimeout / Step) + 1;
     for ([[maybe_unused]] auto const tick: std::views::iota(0, static_cast<int>(Steps)))
     {
-        fleet.clock.Advance(Step);
+        fleet.clock.advance(Step);
         auto const workers = fleet.service.Workers().LiveWorkers();
         REQUIRE(workers.size() == 1);
         REQUIRE(fleet.service.Heartbeat(Insider, workers.front().id, NodeLoad {}).status == Wire::Status::Ok);
@@ -893,7 +893,7 @@ TEST_CASE("A machine that goes away takes its leases with it", "[distributed][sc
 
     // Past the heartbeat timeout but well inside the lease's own: expiry must not be
     // what frees this key, or the case is proving nothing.
-    fleet.clock.Advance(WorkerRegistry::DefaultHeartbeatTimeout + 1ms);
+    fleet.clock.advance(WorkerRegistry::DefaultHeartbeatTimeout + 1ms);
     static_assert(WorkerRegistry::DefaultHeartbeatTimeout < LeaseTable::DefaultLeaseTimeout);
 
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "10.0.0.3:7100")).status == Wire::Status::Ok);
@@ -975,7 +975,7 @@ TEST_CASE("A job that outlived its lease is told so", "[distributed][scheduler]"
     auto const slow = fleet.service.Lease(Insider, Ask("gcc-14", "slow-key"));
     REQUIRE(slow.status == Wire::Status::Ok);
 
-    fleet.clock.Advance(LeaseTable::DefaultLeaseTimeout + 1ms);
+    fleet.clock.advance(LeaseTable::DefaultLeaseTimeout + 1ms);
 
     CHECK(fleet.service.Release(Insider, TokenOf(slow), "slow-key").error == Wire::ErrorCode::UnknownLease);
     CHECK(fleet.metrics.Read(IMetricsSink::Counter::DispatchLeasesReleased) == 0);
@@ -1009,7 +1009,7 @@ TEST_CASE("Only a job that outlived its lease moves the late-release counter", "
     REQUIRE(outlived.service.Register(Insider, OneSlot("gcc-14", "10.0.0.2:7100")).status == Wire::Status::Ok);
     auto const slow = outlived.service.Lease(Insider, Ask("gcc-14", "slow-key"));
     REQUIRE(slow.status == Wire::Status::Ok);
-    outlived.clock.Advance(LeaseTable::DefaultLeaseTimeout + 1ms);
+    outlived.clock.advance(LeaseTable::DefaultLeaseTimeout + 1ms);
     auto const late = outlived.service.Release(Insider, TokenOf(slow), "slow-key");
 
     // (2) A second release of one token. The first erased the entry, so this one
@@ -1086,7 +1086,7 @@ TEST_CASE("A lease reclaimed with its worker is not counted as a job that outliv
 
     // Past the heartbeat timeout and well inside the lease's own, so the lease is
     // still live at the moment its worker is dropped.
-    fleet.clock.Advance(WorkerRegistry::DefaultHeartbeatTimeout + 1ms);
+    fleet.clock.advance(WorkerRegistry::DefaultHeartbeatTimeout + 1ms);
     static_assert(WorkerRegistry::DefaultHeartbeatTimeout < LeaseTable::DefaultLeaseTimeout);
 
     // A replacement machine, and then a request for UNRELATED work: the reap runs
@@ -1425,7 +1425,7 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
     // worker's validator was `[](...){ return true; }`. Anyone who could reach a
     // compile port and present any string got a compile.
     Signing fleet;
-    fleet.wallClock.SetNow(Noon);
+    fleet.wallClock.setNow(Noon);
 
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "peer-1:7100")).status == Wire::Status::Ok);
     auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "obj-1"));
@@ -1487,7 +1487,7 @@ TEST_CASE("A grant is signed for exactly one worker, and only that worker's is v
 TEST_CASE("A release names a lease this scheduler actually signed", "[distributed][scheduler][lease]")
 {
     Signing fleet;
-    fleet.wallClock.SetNow(Noon);
+    fleet.wallClock.setNow(Noon);
 
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "peer-1:7100")).status == Wire::Status::Ok);
     auto const granted = fleet.service.Lease(Insider, Ask("gcc-14", "obj-1"));
@@ -1596,7 +1596,7 @@ TEST_CASE("Every grant is signed by the scheduler that issued it, and says nothi
     // which this service has a warning to write about it. The token is not the lease table's
     // bare handle, and the one line the old unsigned path wrote is never written.
     Signing fleet;
-    fleet.wallClock.SetNow(Noon);
+    fleet.wallClock.setNow(Noon);
     REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "peer-1:7100")).status == Wire::Status::Ok);
     fleet.logger.Clear();
 
@@ -2344,7 +2344,7 @@ TEST_CASE("A scheduler takes only a current voter's endorsement of the roster it
     // verifies under it; a verified endorsement of another roster is ordinary during a change
     // and kept out, never counted; a node with no cluster certifies nothing.
     Signing fleet;
-    fleet.wallClock.SetNow(Noon);
+    fleet.wallClock.setNow(Noon);
     auto const state = VotersState({ "n1", "n2", "n3" }, 4);
 
     CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n1", state, Noon + 1h))
@@ -2376,7 +2376,7 @@ TEST_CASE("A scheduler hands out a roster only once a strict majority of its vot
     // have endorsed the roster this state holds, unexpired -- a worker refuses anything less,
     // so anything less is bytes on every announcement for nobody.
     Signing fleet;
-    fleet.wallClock.SetNow(Noon);
+    fleet.wallClock.setNow(Noon);
     StubCluster cluster;
     cluster.state = VotersState({ "n1", "n2", "n3" }, 4);
     fleet.service.AdministerWith(cluster);

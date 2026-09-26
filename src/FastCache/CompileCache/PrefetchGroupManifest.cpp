@@ -123,7 +123,7 @@ std::string PrefetchGroupManifest::ReverseKey(std::string_view key)
 
 std::expected<bool, StorageError> PrefetchGroupManifest::AddKey(std::string_view groupId,
                                                                 std::string_view key,
-                                                                TimePoint now)
+                                                                core::platform::SteadyTimePoint now)
 {
     std::string const manifestKey = ManifestKey(groupId);
     bool added = false;
@@ -180,12 +180,13 @@ std::expected<bool, StorageError> PrefetchGroupManifest::AddKey(std::string_view
         std::vector<std::byte> groupBytes;
         auto const* p = reinterpret_cast<std::byte const*>(groupId.data());
         groupBytes.assign(p, p + groupId.size());
-        (void) _storage.Set(ReverseKey(key), std::move(groupBytes), /*flags=*/0, TimePoint::max());
+        (void) _storage.Set(ReverseKey(key), std::move(groupBytes), /*flags=*/0, core::platform::SteadyTimePoint::max());
     }
     return added;
 }
 
-std::expected<std::optional<std::string>, StorageError> PrefetchGroupManifest::GroupOf(std::string_view key, TimePoint now)
+std::expected<std::optional<std::string>, StorageError> PrefetchGroupManifest::GroupOf(std::string_view key,
+                                                                                       core::platform::SteadyTimePoint now)
 {
     auto const got = _storage.Peek(ReverseKey(key), now);
     if (!got.has_value())
@@ -196,7 +197,8 @@ std::expected<std::optional<std::string>, StorageError> PrefetchGroupManifest::G
     return std::optional<std::string> { std::string { reinterpret_cast<char const*>(bytes.data()), bytes.size() } };
 }
 
-std::expected<std::vector<std::string>, StorageError> PrefetchGroupManifest::Keys(std::string_view groupId, TimePoint now)
+std::expected<std::vector<std::string>, StorageError> PrefetchGroupManifest::Keys(std::string_view groupId,
+                                                                                  core::platform::SteadyTimePoint now)
 {
     auto const got = _storage.Peek(ManifestKey(groupId), now);
     if (!got.has_value())

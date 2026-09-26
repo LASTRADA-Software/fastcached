@@ -228,7 +228,7 @@ namespace
                   "a refusal row for a verb this tier serves is dead: the lookup never reaches it");
 } // namespace
 
-Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame)
+core::async::Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame)
 {
     auto const header = Wire::DecodeRequestHeader(frame);
     if (!header.has_value())

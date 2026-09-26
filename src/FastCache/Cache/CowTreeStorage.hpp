@@ -3,7 +3,6 @@
 
 #include <FastCache/Cache/CacheEntry.hpp>
 #include <FastCache/Cache/IStorage.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Compression.hpp>
 #include <FastCache/Core/Errors/StorageError.hpp>
 #include <FastCache/Core/StringHash.hpp>
@@ -25,6 +24,7 @@
 #include <CowTree/CowTree.hpp>
 #include <CowTree/FilePageStore.hpp>
 #include <CowTree/IPageStore.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache
 {
@@ -246,52 +246,59 @@ class CowTreeStorage final: public IStorage
     CowTreeStorage& operator=(CowTreeStorage&&) = delete;
     ~CowTreeStorage() override;
 
-    [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<GetResult, StorageError> Get(std::string_view key,
+                                                             core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Set(std::string_view key,
                                                             std::vector<std::byte> value,
                                                             std::uint32_t flags,
-                                                            TimePoint expiry) override;
+                                                            core::platform::SteadyTimePoint expiry) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Add(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Add(std::string_view key,
+                                                            std::vector<std::byte> value,
+                                                            std::uint32_t flags,
+                                                            core::platform::SteadyTimePoint expiry,
+                                                            core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<CasToken, StorageError> Replace(
-        std::string_view key, std::vector<std::byte> value, std::uint32_t flags, TimePoint expiry, TimePoint now) override;
+    [[nodiscard]] std::expected<CasToken, StorageError> Replace(std::string_view key,
+                                                                std::vector<std::byte> value,
+                                                                std::uint32_t flags,
+                                                                core::platform::SteadyTimePoint expiry,
+                                                                core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Append(std::string_view key,
                                                                std::span<std::byte const> suffix,
                                                                CasToken expected,
-                                                               TimePoint now) override;
+                                                               core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Prepend(std::string_view key,
                                                                 std::span<std::byte const> prefix,
                                                                 CasToken expected,
-                                                                TimePoint now) override;
+                                                                core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> CompareAndSwap(std::string_view key,
                                                                        CasToken expected,
                                                                        std::vector<std::byte> value,
                                                                        std::uint32_t flags,
-                                                                       TimePoint expiry,
-                                                                       TimePoint now) override;
+                                                                       core::platform::SteadyTimePoint expiry,
+                                                                       core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(std::string_view key,
-                                                                                          std::uint64_t magnitude,
-                                                                                          bool decrement,
-                                                                                          TimePoint now) override;
+    [[nodiscard]] std::expected<IStorage::IncrResult, StorageError> IncrementOrInitialize(
+        std::string_view key, std::uint64_t magnitude, bool decrement, core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<void, StorageError> Delete(std::string_view key,
+                                                           core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> Touch(std::string_view key,
-                                                              TimePoint newExpiry,
-                                                              TimePoint now) override;
+                                                              core::platform::SteadyTimePoint newExpiry,
+                                                              core::platform::SteadyTimePoint now) override;
 
-    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key, TimePoint now) override;
+    [[nodiscard]] std::expected<GetResult, StorageError> Peek(std::string_view key,
+                                                              core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<CasToken, StorageError> MarkStale(std::string_view key,
-                                                                  std::optional<TimePoint> newExpiry,
-                                                                  TimePoint now) override;
+                                                                  std::optional<core::platform::SteadyTimePoint> newExpiry,
+                                                                  core::platform::SteadyTimePoint now) override;
 
     // Explicit compound-op overrides (rather than the IStorage defaults) so
     // the get-and-touch / compare-and-delete behaviour of the persistent
@@ -300,15 +307,15 @@ class CowTreeStorage final: public IStorage
     // per-shard lock (this tier is never the lock owner); on the unwrapped
     // single-threaded reactor there is no concurrent writer to exclude.
     [[nodiscard]] std::expected<GetResult, StorageError> GetAndTouch(std::string_view key,
-                                                                     TimePoint newExpiry,
-                                                                     TimePoint now) override;
+                                                                     core::platform::SteadyTimePoint newExpiry,
+                                                                     core::platform::SteadyTimePoint now) override;
 
     [[nodiscard]] std::expected<void, StorageError> CompareAndDelete(std::string_view key,
                                                                      CasToken expected,
-                                                                     TimePoint now) override;
+                                                                     core::platform::SteadyTimePoint now) override;
 
-    void FlushWithGeneration(TimePoint effectiveAt) override;
-    PurgeOutcome PurgeExpired(TimePoint now, PurgeBudget budget) override;
+    void FlushWithGeneration(core::platform::SteadyTimePoint effectiveAt) override;
+    PurgeOutcome PurgeExpired(core::platform::SteadyTimePoint now, PurgeBudget budget) override;
 
     /// Report this tier's reclaims — TTLs found lapsed during a sweep, and the
     /// LRU tail dropped to stay under the on-disk budget — to `log`.
@@ -417,7 +424,7 @@ class CowTreeStorage final: public IStorage
     /// @param key   The record's key. Must not alias the LRU node's own string.
     /// @param entry The record as loaded, already known to be dead.
     /// @param now   Current clock value; decides lapsed from merely flushed.
-    void ReclaimDeadRecord(std::string_view key, CacheEntry const& entry, TimePoint now);
+    void ReclaimDeadRecord(std::string_view key, CacheEntry const& entry, core::platform::SteadyTimePoint now);
 
     /// Decide a write path's existence check, reclaiming whatever it finds dead.
     ///
@@ -438,7 +445,9 @@ class CowTreeStorage final: public IStorage
     ///         none -- absent, TTL lapsed, or voided by a flush. In the latter
     ///         two a dead record has already been erased, and reported when its
     ///         TTL was what killed it.
-    [[nodiscard]] CacheEntry* AcceptLiveRecord(std::string_view key, std::optional<LoadedEntry>& loaded, TimePoint now);
+    [[nodiscard]] CacheEntry* AcceptLiveRecord(std::string_view key,
+                                               std::optional<LoadedEntry>& loaded,
+                                               core::platform::SteadyTimePoint now);
 
     /// Apply a metadata-only mutation (TTL / stale / lastAccess) to the stored
     /// record for `key`, rewriting ONLY the leaf record and REUSING any existing
@@ -449,7 +458,7 @@ class CowTreeStorage final: public IStorage
     /// @param mutate Callback adjusting the parsed entry's metadata in place.
     /// @return The new CAS token, or KeyNotFound if absent/expired/flushed.
     [[nodiscard]] std::expected<CasToken, StorageError> UpdateRecordMetadata(std::string_view key,
-                                                                             TimePoint now,
+                                                                             core::platform::SteadyTimePoint now,
                                                                              std::function<void(CacheEntry&)> const& mutate);
 
     /// A leaf record parsed into its header plus either inline value bounds or
@@ -773,7 +782,7 @@ class CowTreeStorage final: public IStorage
     /// session -- see `EvictColdSlice` for why the cold set cannot grow.
     bool _coldExhausted { false };
     std::uint64_t _liveGeneration { 1 };
-    TimePoint _flushEffectiveAt { TimePoint::min() };
+    core::platform::SteadyTimePoint _flushEffectiveAt { core::platform::SteadyTimePoint::min() };
     CasToken _nextCas { 1 };
     mutable StorageStats _stats;
 };

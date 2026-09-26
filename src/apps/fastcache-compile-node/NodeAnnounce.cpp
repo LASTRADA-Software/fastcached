@@ -74,7 +74,7 @@ Wire::LoadFields SampleMachineLoad(IHostLoadSampler& loadSampler,
                                                            .cordoned = cordoned });
 }
 
-AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, ISocket& client, std::string_view endpoint)
+AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& client, std::string_view endpoint)
 {
     // Counted rather than short-circuited: one toolchain the scheduler refuses must
     // not stop the others from being announced, or a single bad entry silently
@@ -258,7 +258,7 @@ std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEnd
         {
         }
 
-        [[nodiscard]] AnnounceOutcome Attempt(ISocket& client, std::string_view endpoint) override
+        [[nodiscard]] AnnounceOutcome Attempt(core::net::ISocket& client, std::string_view endpoint) override
         {
             return AnnounceOnce(_round, client, endpoint);
         }
@@ -304,7 +304,7 @@ std::size_t DialAndAnnounce(
 {
     for (link.BeginRound();;)
     {
-        auto client = dialer.Dial(link.Target(), DialOptions { .connectTimeout = HeartbeatConnectTimeout });
+        auto client = dialer.Dial(link.Target(), core::net::DialOptions { .connectTimeout = HeartbeatConnectTimeout });
         if (client == nullptr)
         {
             // Named BEFORE `Lost()` moves the target, and the fallback named after it:

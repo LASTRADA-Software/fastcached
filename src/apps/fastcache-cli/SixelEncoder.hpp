@@ -12,20 +12,20 @@ namespace FastCache::Cli
 {
 
 /// @file SixelEncoder.hpp
-/// Turning pixels into Sixel data: the Sixel rung's one door to the vendored TUI.
+/// Turning pixels into Sixel data: the Sixel rung's one door to core-cpp's terminal UI.
 ///
-/// **One function behind an interface, and the vendored encoder behind exactly one file.** The
-/// dashboard draws a chart as RGBA pixels and hands them here; `EndoSixelEncoder.cpp` is the only
-/// file of this binary that includes `<tui/Sixel.hpp>`, so the vendored vocabulary meets the
-/// first-party one in one place (`vendor/VENDOR.md`: widen the adapter, never add a crossing). A
+/// **One function behind an interface, and core-cpp's encoder behind exactly one file.** The
+/// dashboard draws a chart as RGBA pixels and hands them here; `TuiSixelEncoder.cpp` is the only
+/// file of this binary that includes `<core/tui/Sixel.hpp>`, so core-cpp's vocabulary meets the
+/// first-party one in one place (widen the adapter, never add a crossing). A
 /// test substitutes `Testing::ScriptedSixelEncoder` and needs no TUI at all.
 ///
-/// **The same image encodes to the same bytes on every standard library.** The vendored median-cut
+/// **The same image encodes to the same bytes on every standard library.** Core-cpp's median-cut
 /// quantizer orders a bucket's pixels by the whole colour, its widest channel first, so no split
 /// follows the order a sort happened to leave equal keys in. It once sorted on the widest channel
 /// alone, unstably, and libstdc++, libc++ and MSVC's library each encoded one image to different
 /// bytes. So one event list renders one Sixel frame everywhere, and `SixelEncoder_test.cpp` pins an
-/// encoding's digest at this seam -- the image and the digest the vendored `tui/Sixel_test.cpp`
+/// encoding's digest at this seam -- the image and the digest core-cpp's `core/tui/Sixel_test.cpp`
 /// pins below it.
 
 /// RGBA pixels, row-major, four bytes per pixel, borrowed for the call.
@@ -60,7 +60,7 @@ class ISixelEncoder
 
 /// The production encoder, or why this build has none.
 ///
-/// A build without the vendored TUI (`FASTCACHED_BUILD_TUI=OFF`) refuses by saying so, rather than
+/// A build without core-cpp's terminal UI (`FASTCACHED_BUILD_TUI=OFF`) refuses by saying so, rather than
 /// failing to link, so the composition that asks for one can report why the Sixel rung is out of
 /// reach.
 /// @return The encoder, or the reason there is none.

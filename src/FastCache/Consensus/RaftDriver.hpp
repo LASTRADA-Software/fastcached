@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Async/IReactor.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Consensus/IRaftStateMachine.hpp>
 #include <FastCache/Consensus/IRaftStorage.hpp>
 #include <FastCache/Consensus/IRaftTransport.hpp>
 #include <FastCache/Consensus/RaftNode.hpp>
-#include <FastCache/Core/Clock.hpp>
 
 #include <atomic>
 #include <cstddef>
@@ -19,6 +16,10 @@
 #include <optional>
 #include <unordered_map>
 #include <vector>
+
+#include <core/async/Task.hpp>
+#include <core/net/EventLoop.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Consensus
 {
@@ -231,19 +232,21 @@ class RaftDriver
     /// Advance time, doing whatever falls due.
     /// @param now The current instant.
     /// @return Nothing, or the storage failure that stopped this node.
-    [[nodiscard]] std::expected<void, ConsensusError> Tick(TimePoint now);
+    [[nodiscard]] std::expected<void, ConsensusError> Tick(core::platform::SteadyTimePoint now);
 
     /// Feed in a message received from a peer.
     /// @param message What arrived.
     /// @param now The current instant.
     /// @return Nothing, or the storage failure that stopped this node.
-    [[nodiscard]] std::expected<void, ConsensusError> Receive(RaftMessage const& message, TimePoint now);
+    [[nodiscard]] std::expected<void, ConsensusError> Receive(RaftMessage const& message,
+                                                              core::platform::SteadyTimePoint now);
 
     /// Offer an entry to the cluster.
     /// @param payload Application bytes.
     /// @param now The current instant.
     /// @return Where it landed, or why it was refused.
-    [[nodiscard]] std::expected<LogIndex, ConsensusError> Propose(std::vector<std::byte> payload, TimePoint now);
+    [[nodiscard]] std::expected<LogIndex, ConsensusError> Propose(std::vector<std::byte> payload,
+                                                                  core::platform::SteadyTimePoint now);
 
     /// Offer the cluster a new configuration, one member moved.
     ///
@@ -255,7 +258,8 @@ class RaftDriver
     /// @param configuration The proposed configuration, voters and learners.
     /// @param now The current instant.
     /// @return Where the entry landed, or why it was refused.
-    [[nodiscard]] std::expected<LogIndex, ConsensusError> ProposeMembership(Configuration configuration, TimePoint now);
+    [[nodiscard]] std::expected<LogIndex, ConsensusError> ProposeMembership(Configuration configuration,
+                                                                            core::platform::SteadyTimePoint now);
 
     /// What consensus counts, how far it has agreed, and what this node is playing.
     ///
@@ -347,7 +351,7 @@ class RaftDriver
     ///
     /// Only the timer half: messages arrive through `Receive`, called by whatever
     /// owns the transport. Splitting it that way is what lets this loop be tested
-    /// against `TestReactor` and a `ManualClock` with no sockets in sight, and it
+    /// against `core::net::testing::TestLoop` and a `core::platform::ManualClock` with no sockets in sight, and it
     /// is also the shape a real transport wants — it already has a read loop and
     /// needs somewhere to hand what it read.
     /// A pointer rather than a reference because this is a coroutine: a reference
@@ -357,7 +361,7 @@ class RaftDriver
     /// @param reactor Supplies both the timer wheel and the clock; must outlive
     ///        the returned task and must not be null.
     /// @return A task that completes when `Stop` is called or storage fails.
-    [[nodiscard]] Task<void> Run(IReactor* reactor);
+    [[nodiscard]] core::async::Task<void> Run(core::net::EventLoop* reactor);
 
     /// Ask `Run` to finish. Safe to call before it starts, and from any thread.
     ///
@@ -411,7 +415,7 @@ class RaftDriver
     /// that re-elects every second.
     /// @param now The instant the sleep starts from.
     /// @return The instant to wake at.
-    [[nodiscard]] TimePoint SleepDeadline(TimePoint now) const;
+    [[nodiscard]] core::platform::SteadyTimePoint SleepDeadline(core::platform::SteadyTimePoint now) const;
 
     /// Report the role if it has moved since the last report.
     /// @param cause What a step-down reported, if this step had one.

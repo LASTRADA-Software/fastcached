@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -10,6 +9,7 @@
 #include <ranges>
 #include <string>
 
+#include <core/platform/Clock.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -23,7 +23,7 @@ namespace
 /// here, so a real clock would make every case both slow and flaky.
 struct Fixture
 {
-    ManualClock clock;
+    core::platform::ManualClock clock;
     LeaseTable leases { clock, std::chrono::milliseconds { 1000 } };
 };
 
@@ -131,7 +131,7 @@ TEST_CASE("The three ways a release resolves nothing are told apart", "[distribu
     CHECK_FALSE(fix.leases.Acquire("objkey-1", "w2").has_value());
 
     // Issued, this caller's own key, and past its lifetime: the job outlived it.
-    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    fix.clock.advance(std::chrono::milliseconds { 1001 });
     auto const expired = fix.leases.Release(Unwrap(other).token, "objkey-2");
 
     REQUIRE_FALSE(unknown.has_value());
@@ -160,7 +160,7 @@ TEST_CASE("An abandoned lease expires and the key becomes leasable again", "[dis
     auto const lease = fix.leases.Acquire("objkey-1", "w1");
     REQUIRE(lease.has_value());
 
-    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    fix.clock.advance(std::chrono::milliseconds { 1001 });
     CHECK_FALSE(fix.leases.Find(Unwrap(lease).token).has_value());
     CHECK(fix.leases.LiveLeases(0).total == 0);
 
@@ -179,7 +179,7 @@ TEST_CASE("Releasing an expired lease does not evict the client that replaced it
     auto const first = fix.leases.Acquire("objkey-1", "w1");
     REQUIRE(first.has_value());
 
-    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    fix.clock.advance(std::chrono::milliseconds { 1001 });
     auto const second = fix.leases.Acquire("objkey-1", "w2");
     REQUIRE(second.has_value());
 
@@ -220,7 +220,7 @@ TEST_CASE("An expired lease reports as gone rather than as freed", "[distributed
     auto const lease = fix.leases.Acquire("objkey-1", "w1");
     REQUIRE(lease.has_value());
 
-    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    fix.clock.advance(std::chrono::milliseconds { 1001 });
     CHECK_FALSE(fix.leases.Release(Unwrap(lease).token, "objkey-1").has_value());
 
     // And the entry went with it rather than being left for a later `Acquire` to
@@ -261,7 +261,7 @@ TEST_CASE("Re-leasing an expired key does not leak the old token", "[distributed
     auto const first = fix.leases.Acquire("objkey-1", "w1");
     REQUIRE(first.has_value());
 
-    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    fix.clock.advance(std::chrono::milliseconds { 1001 });
     REQUIRE(fix.leases.Acquire("objkey-1", "w2").has_value());
 
     // The old token is gone entirely, not merely expired.
@@ -277,9 +277,9 @@ TEST_CASE("The live leases can be walked, oldest first", "[distributed][lease]")
     // still heartbeating.
     Fixture fix;
     REQUIRE(fix.leases.Acquire("oldest", "w1").has_value());
-    fix.clock.Advance(std::chrono::milliseconds { 300 });
+    fix.clock.advance(std::chrono::milliseconds { 300 });
     REQUIRE(fix.leases.Acquire("middle", "w2").has_value());
-    fix.clock.Advance(std::chrono::milliseconds { 100 });
+    fix.clock.advance(std::chrono::milliseconds { 100 });
     REQUIRE(fix.leases.Acquire("newest", "w1").has_value());
 
     auto const held = fix.leases.LiveLeases(10).oldest;
@@ -311,7 +311,7 @@ TEST_CASE("The lease listing is bounded, and keeps the oldest", "[distributed][l
     for (auto const index: std::views::iota(0, 5))
     {
         REQUIRE(fix.leases.Acquire(std::format("key-{}", index), "w1").has_value());
-        fix.clock.Advance(std::chrono::milliseconds { 10 });
+        fix.clock.advance(std::chrono::milliseconds { 10 });
     }
 
     auto const listing = fix.leases.LiveLeases(2);
@@ -333,7 +333,7 @@ TEST_CASE("An expired lease is not listed, even while it is still in the table",
     // listing it would put a lease on the page that stopped suppressing anything.
     Fixture fix;
     REQUIRE(fix.leases.Acquire("abandoned", "w1").has_value());
-    fix.clock.Advance(std::chrono::milliseconds { 1001 });
+    fix.clock.advance(std::chrono::milliseconds { 1001 });
     REQUIRE(fix.leases.Acquire("live-one", "w1").has_value());
 
     auto const held = fix.leases.LiveLeases(10).oldest;
@@ -355,11 +355,11 @@ TEST_CASE("A resolved lease leaves the listing at once", "[distributed][lease]")
 TEST_CASE("A clock that moves backwards does not expire live leases", "[distributed][lease]")
 {
     Fixture fix;
-    fix.clock.Advance(std::chrono::milliseconds { 5000 });
+    fix.clock.advance(std::chrono::milliseconds { 5000 });
     auto const lease = fix.leases.Acquire("objkey-1", "w1");
     REQUIRE(lease.has_value());
 
-    fix.clock.Advance(std::chrono::milliseconds { -2000 });
+    fix.clock.advance(std::chrono::milliseconds { -2000 });
     CHECK(fix.leases.Find(Unwrap(lease).token).has_value());
 }
 
@@ -383,7 +383,7 @@ TEST_CASE("A lease keeps the bound it was granted under when a later one is shor
     REQUIRE(brief.has_value());
 
     // Past the NEW bound and well inside the OLD one.
-    fix.clock.Advance(1'000ms);
+    fix.clock.advance(1'000ms);
 
     // The one that matters: the in-flight generous lease is still live, judged against
     // what it was granted under. Read through `Find`, which is the call a worker's
@@ -413,7 +413,7 @@ TEST_CASE("A lease granted under a longer bound is not expired early by a shorte
     auto const brief = fix.leases.Acquire("objkey-brief", "w1", 100ms);
     REQUIRE(brief.has_value());
 
-    fix.clock.Advance(500ms); // past the grant, inside the table's own default
+    fix.clock.advance(500ms); // past the grant, inside the table's own default
 
     CHECK_FALSE(fix.leases.Find(Unwrap(brief).token).has_value());
 
@@ -437,8 +437,8 @@ TEST_CASE("A caller that names no lifetime gets the table's own, which is the on
     REQUIRE(lease.has_value());
     CHECK(Unwrap(lease).lifetime == fix.leases.Timeout());
 
-    fix.clock.Advance(900ms);
+    fix.clock.advance(900ms);
     CHECK(fix.leases.Find(Unwrap(lease).token).has_value());
-    fix.clock.Advance(200ms);
+    fix.clock.advance(200ms);
     CHECK_FALSE(fix.leases.Find(Unwrap(lease).token).has_value());
 }

@@ -16,6 +16,8 @@
 #include <string>
 #include <utility>
 
+#include <core/async/SyncRun.hpp>
+
 namespace FastCache::Cc
 {
 
@@ -145,12 +147,12 @@ namespace
 
 LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
                                     IAdvertisedEndpointSource const& advertisedEndpoint,
-                                    WallClockRef clock,
+                                    core::platform::WallClockRef clock,
                                     Distributed::WorkerLeaseState& lease,
                                     IMetricsSink& metrics,
                                     std::chrono::seconds slack)
 {
-    // `clock` by VALUE: a `WallClockRef` IS the borrow, so copying it into the closure
+    // `clock` by VALUE: a `core::platform::WallClockRef` IS the borrow, so copying it into the closure
     // carries the guard rather than re-binding a reference. This capture was `&clock`,
     // and it is the retention a member scan cannot see -- the validator outlives this
     // call and nothing anywhere declares a wall-clock member for it (#1032).
@@ -173,7 +175,7 @@ LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
         // one reading and was then filed against a later one would be remembered under a
         // deadline the check never saw. It is also one syscall rather than two on the
         // path of every dispatched compile.
-        auto const now = clock.Now();
+        auto const now = clock.now();
 
         // Read ONCE per request, for `now`'s reason: the heartbeat thread republishes
         // this when the node's advertised address moves, so two reads inside one
@@ -629,14 +631,14 @@ WorkerRegistrar::WorkerRegistrar(CredentialNotice& notice,
 {
 }
 
-std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(ISocket& scheduler, Credential const& credential)
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocket& scheduler, Credential const& credential)
 {
     auto const frame = Wire::EncodeRegister(Wire::RegisterRequest { .fingerprint = _fingerprint,
                                                                     .endpoint = _endpoint,
                                                                     .slots = _slots,
                                                                     .acceptedCodecs = _acceptedCodecs,
                                                                     .capacity = _capacity });
-    auto const outcome = SyncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
+    auto const outcome = core::async::syncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
     if (!outcome.IsHit())
         // The scheduler's own words, code and message both, which is the whole
         // reason this is not a bool: "not a member of this cluster" and "fingerprint
@@ -679,7 +681,7 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(ISocket& schedule
     return {};
 }
 
-std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(ISocket& scheduler,
+std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(core::net::ISocket& scheduler,
                                                                             CredentialNotice& notice,
                                                                             std::string_view endpoint,
                                                                             Wire::CapacityFields const& capacity,
@@ -689,7 +691,7 @@ std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(ISoc
 {
     auto const frame = Wire::EncodeNodeAnnounce(
         Wire::NodeAnnounceRequest { .endpoint = endpoint, .capacity = capacity, .load = load, .endorsement = endorsement });
-    auto outcome = SyncRun(ExchangeFramed(&scheduler, &notice, frame, credential));
+    auto outcome = core::async::syncRun(ExchangeFramed(&scheduler, &notice, frame, credential));
     if (outcome.IsHit())
         return std::move(outcome.value);
 
@@ -700,7 +702,7 @@ std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(ISoc
     return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 }
 
-std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& scheduler,
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(core::net::ISocket& scheduler,
                                                                 std::uint32_t inFlight,
                                                                 Wire::LoadFields const& load,
                                                                 Credential const& credential)
@@ -713,7 +715,7 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& schedul
         return std::unexpected { AnnounceRefusal { .reason = "not registered", .leader = std::nullopt } };
 
     auto const frame = Wire::EncodeHeartbeat(_workerId, inFlight, load);
-    auto const outcome = SyncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
+    auto const outcome = core::async::syncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
     if (outcome.IsHit())
         return {};
 
@@ -732,7 +734,7 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(ISocket& schedul
     return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 }
 
-std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(ISocket& scheduler, Credential const& credential)
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(core::net::ISocket& scheduler, Credential const& credential)
 {
     if (_workerId.empty())
         // Never registered, so there is nothing on the other end to retire. Named
@@ -741,7 +743,7 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(ISocket& schedule
         return std::unexpected { AnnounceRefusal { .reason = "not registered", .leader = std::nullopt } };
 
     auto const frame = Wire::EncodeWithdraw(_workerId);
-    auto const outcome = SyncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
+    auto const outcome = core::async::syncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
     if (outcome.IsHit())
         return {};
 

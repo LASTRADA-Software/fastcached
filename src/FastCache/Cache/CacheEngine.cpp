@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/SetCodec.hpp>
-#include <FastCache/Core/Profiling.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -17,10 +16,15 @@
 #include <utility>
 #include <vector>
 
+#include <core/Profiling.hpp>
+
 namespace FastCache
 {
 
-CacheEngine::CacheEngine(IStorage& storage, IClock& clock, WallClockRef wallClock, IMetricsSink* metrics) noexcept:
+CacheEngine::CacheEngine(IStorage& storage,
+                         core::platform::IClock& clock,
+                         core::platform::WallClockRef wallClock,
+                         IMetricsSink* metrics) noexcept:
     _storage { storage },
     _clock { clock },
     _wallClock { wallClock },
@@ -28,12 +32,12 @@ CacheEngine::CacheEngine(IStorage& storage, IClock& clock, WallClockRef wallCloc
 {
 }
 
-TimePoint CacheEngine::ExpiryFromExptime(std::uint32_t exptime) const noexcept
+core::platform::SteadyTimePoint CacheEngine::ExpiryFromExptime(std::uint32_t exptime) const noexcept
 {
     if (exptime == 0)
-        return TimePoint::max();
+        return core::platform::SteadyTimePoint::max();
 
-    auto const now = _clock.Now();
+    auto const now = _clock.now();
     if (std::chrono::seconds { exptime } <= MemcachedRelativeExptimeCeiling)
         return now + std::chrono::seconds { exptime };
 
@@ -42,7 +46,7 @@ TimePoint CacheEngine::ExpiryFromExptime(std::uint32_t exptime) const noexcept
     // ManualWallClock (the legacy code reached for
     // std::chrono::system_clock::now() inline, which was both a DI
     // violation and made the EXPIREAT wire path untestable).
-    auto const sysNow = _wallClock.Now();
+    auto const sysNow = _wallClock.now();
     auto const sysSeconds = std::chrono::duration_cast<std::chrono::seconds>(sysNow.time_since_epoch()).count();
     auto const delta = static_cast<std::int64_t>(exptime) - sysSeconds;
     if (delta <= 0)
@@ -52,26 +56,26 @@ TimePoint CacheEngine::ExpiryFromExptime(std::uint32_t exptime) const noexcept
 
 std::expected<GetResult, StorageError> CacheEngine::Get(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Get");
-    return _storage.Get(key, _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::Get");
+    return _storage.Get(key, _clock.now());
 }
 
 std::expected<GetResult, StorageError> CacheEngine::Peek(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Peek");
-    return _storage.Peek(key, _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::Peek");
+    return _storage.Peek(key, _clock.now());
 }
 
 std::expected<bool, StorageError> CacheEngine::Prefetch(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Prefetch");
-    return _storage.Prefetch(key, _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::Prefetch");
+    return _storage.Prefetch(key, _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::PeekCas(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::PeekCas");
-    auto const result = _storage.Peek(key, _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::PeekCas");
+    auto const result = _storage.Peek(key, _clock.now());
     if (!result.has_value())
         return std::unexpected(result.error());
     return result->found ? result->entry.cas : CasToken { 0 };
@@ -82,16 +86,16 @@ std::expected<CasToken, StorageError> CacheEngine::Set(std::string_view key,
                                                        std::uint32_t flags,
                                                        std::uint32_t exptime)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Set");
+    CORE_ZONE_SCOPED_N("CacheEngine::Set");
     return _storage.Set(key, std::move(value), flags, ExpiryFromExptime(exptime));
 }
 
 std::expected<CasToken, StorageError> CacheEngine::SetWithDeadline(std::string_view key,
                                                                    std::vector<std::byte> value,
                                                                    std::uint32_t flags,
-                                                                   TimePoint deadline)
+                                                                   core::platform::SteadyTimePoint deadline)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::SetWithDeadline");
+    CORE_ZONE_SCOPED_N("CacheEngine::SetWithDeadline");
     return _storage.Set(key, std::move(value), flags, deadline);
 }
 
@@ -100,17 +104,17 @@ std::expected<CasToken, StorageError> CacheEngine::Add(std::string_view key,
                                                        std::uint32_t flags,
                                                        std::uint32_t exptime)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Add");
-    return _storage.Add(key, std::move(value), flags, ExpiryFromExptime(exptime), _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::Add");
+    return _storage.Add(key, std::move(value), flags, ExpiryFromExptime(exptime), _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::AddWithDeadline(std::string_view key,
                                                                    std::vector<std::byte> value,
                                                                    std::uint32_t flags,
-                                                                   TimePoint deadline)
+                                                                   core::platform::SteadyTimePoint deadline)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::AddWithDeadline");
-    return _storage.Add(key, std::move(value), flags, deadline, _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::AddWithDeadline");
+    return _storage.Add(key, std::move(value), flags, deadline, _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::Replace(std::string_view key,
@@ -118,17 +122,17 @@ std::expected<CasToken, StorageError> CacheEngine::Replace(std::string_view key,
                                                            std::uint32_t flags,
                                                            std::uint32_t exptime)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Replace");
-    return _storage.Replace(key, std::move(value), flags, ExpiryFromExptime(exptime), _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::Replace");
+    return _storage.Replace(key, std::move(value), flags, ExpiryFromExptime(exptime), _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::ReplaceWithDeadline(std::string_view key,
                                                                        std::vector<std::byte> value,
                                                                        std::uint32_t flags,
-                                                                       TimePoint deadline)
+                                                                       core::platform::SteadyTimePoint deadline)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::ReplaceWithDeadline");
-    return _storage.Replace(key, std::move(value), flags, deadline, _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::ReplaceWithDeadline");
+    return _storage.Replace(key, std::move(value), flags, deadline, _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::ConcatGuarded(std::string_view key,
@@ -171,14 +175,14 @@ std::expected<CasToken, StorageError> CacheEngine::ConcatGuarded(std::string_vie
                                              .flags = current.found ? current.entry.flags : 0U,
                                              .action = IStorage::UpdateAction::Store };
         },
-        _clock.Now());
+        _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::Append(std::string_view key,
                                                           std::span<std::byte const> suffix,
                                                           CasToken expected)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Append");
+    CORE_ZONE_SCOPED_N("CacheEngine::Append");
     return ConcatGuarded(key, suffix, expected, /*atFront=*/false);
 }
 
@@ -186,105 +190,106 @@ std::expected<CasToken, StorageError> CacheEngine::Prepend(std::string_view key,
                                                            std::span<std::byte const> prefix,
                                                            CasToken expected)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Prepend");
+    CORE_ZONE_SCOPED_N("CacheEngine::Prepend");
     return ConcatGuarded(key, prefix, expected, /*atFront=*/true);
 }
 
 std::expected<CasToken, StorageError> CacheEngine::CompareAndSwap(
     std::string_view key, CasToken expected, std::vector<std::byte> value, std::uint32_t flags, std::uint32_t exptime)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::CompareAndSwap");
-    return _storage.CompareAndSwap(key, expected, std::move(value), flags, ExpiryFromExptime(exptime), _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::CompareAndSwap");
+    return _storage.CompareAndSwap(key, expected, std::move(value), flags, ExpiryFromExptime(exptime), _clock.now());
 }
 
 std::expected<IStorage::IncrResult, StorageError> CacheEngine::Increment(std::string_view key, std::uint64_t delta)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Increment");
+    CORE_ZONE_SCOPED_N("CacheEngine::Increment");
     // The full uint64 delta is forwarded verbatim — memcached increments wrap
     // modulo 2^64, and a signed cast would alias deltas >= 2^63 to decrements.
-    return _storage.IncrementOrInitialize(key, delta, /*decrement=*/false, _clock.Now());
+    return _storage.IncrementOrInitialize(key, delta, /*decrement=*/false, _clock.now());
 }
 
 std::expected<IStorage::IncrResult, StorageError> CacheEngine::Decrement(std::string_view key, std::uint64_t delta)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Decrement");
+    CORE_ZONE_SCOPED_N("CacheEngine::Decrement");
     // Pass the magnitude + direction rather than a negated signed delta:
     // negating INT64_MIN (delta == 2^63) would be signed-overflow UB.
-    return _storage.IncrementOrInitialize(key, delta, /*decrement=*/true, _clock.Now());
+    return _storage.IncrementOrInitialize(key, delta, /*decrement=*/true, _clock.now());
 }
 
 std::expected<void, StorageError> CacheEngine::Delete(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Delete");
-    return _storage.Delete(key, _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::Delete");
+    return _storage.Delete(key, _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::Touch(std::string_view key, std::uint32_t exptime)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Touch");
-    return _storage.Touch(key, ExpiryFromExptime(exptime), _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::Touch");
+    return _storage.Touch(key, ExpiryFromExptime(exptime), _clock.now());
 }
 
-std::expected<CasToken, StorageError> CacheEngine::TouchAt(std::string_view key, TimePoint newExpiry)
+std::expected<CasToken, StorageError> CacheEngine::TouchAt(std::string_view key, core::platform::SteadyTimePoint newExpiry)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::TouchAt");
-    return _storage.Touch(key, newExpiry, _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::TouchAt");
+    return _storage.Touch(key, newExpiry, _clock.now());
 }
 
 std::expected<std::optional<CacheEngine::TtlResult>, StorageError> CacheEngine::Ttl(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Ttl");
-    auto const now = _clock.Now();
+    CORE_ZONE_SCOPED_N("CacheEngine::Ttl");
+    auto const now = _clock.now();
     auto const expiry = _storage.PeekExpiry(key, now);
     if (!expiry.has_value())
         return std::unexpected(expiry.error());
     if (!expiry->has_value())
         return std::optional<TtlResult> {};
     auto const deadline = **expiry;
-    if (deadline == TimePoint::max())
-        return std::optional<TtlResult> { TtlResult { .hasExpiry = false, .remaining = Duration { 0 } } };
-    auto const remaining = deadline > now ? (deadline - now) : Duration { 0 };
+    if (deadline == core::platform::SteadyTimePoint::max())
+        return std::optional<TtlResult> { TtlResult { .hasExpiry = false,
+                                                      .remaining = core::platform::SteadyDuration { 0 } } };
+    auto const remaining = deadline > now ? (deadline - now) : core::platform::SteadyDuration { 0 };
     return std::optional<TtlResult> { TtlResult { .hasExpiry = true, .remaining = remaining } };
 }
 
 std::expected<bool, StorageError> CacheEngine::ClearExpiry(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::ClearExpiry");
-    return _storage.ClearExpiry(key, _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::ClearExpiry");
+    return _storage.ClearExpiry(key, _clock.now());
 }
 
 std::expected<GetResult, StorageError> CacheEngine::GetAndTouch(std::string_view key, std::uint32_t exptime)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::GetAndTouch");
-    return _storage.GetAndTouch(key, ExpiryFromExptime(exptime), _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::GetAndTouch");
+    return _storage.GetAndTouch(key, ExpiryFromExptime(exptime), _clock.now());
 }
 
 std::expected<void, StorageError> CacheEngine::CompareAndDelete(std::string_view key, CasToken expected)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::CompareAndDelete");
-    return _storage.CompareAndDelete(key, expected, _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::CompareAndDelete");
+    return _storage.CompareAndDelete(key, expected, _clock.now());
 }
 
 std::expected<CasToken, StorageError> CacheEngine::MarkStale(std::string_view key, std::optional<std::uint32_t> newExptime)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::MarkStale");
-    std::optional<TimePoint> newExpiry;
+    CORE_ZONE_SCOPED_N("CacheEngine::MarkStale");
+    std::optional<core::platform::SteadyTimePoint> newExpiry;
     if (newExptime.has_value())
         newExpiry = ExpiryFromExptime(*newExptime);
-    return _storage.MarkStale(key, newExpiry, _clock.Now());
+    return _storage.MarkStale(key, newExpiry, _clock.now());
 }
 
 void CacheEngine::FlushAll(std::uint32_t delaySeconds)
 {
-    auto const effectiveAt = delaySeconds == 0 ? _clock.Now() : _clock.Now() + std::chrono::seconds { delaySeconds };
+    auto const effectiveAt = delaySeconds == 0 ? _clock.now() : _clock.now() + std::chrono::seconds { delaySeconds };
     _storage.FlushWithGeneration(effectiveAt);
 }
 
 std::expected<CasToken, StorageError> CacheEngine::Update(
     std::string_view key, std::function<std::expected<IStorage::UpdateOutcome, StorageError>(GetResult const&)> const& fn)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::Update");
-    return _storage.Update(key, fn, _clock.Now());
+    CORE_ZONE_SCOPED_N("CacheEngine::Update");
+    return _storage.Update(key, fn, _clock.now());
 }
 
 namespace
@@ -353,7 +358,7 @@ namespace
 
 std::expected<std::int64_t, StorageError> CacheEngine::SetAdd(std::string_view key, std::span<std::string const> members)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::SetAdd");
+    CORE_ZONE_SCOPED_N("CacheEngine::SetAdd");
     std::int64_t added = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         std::vector<std::string> existing;
@@ -391,7 +396,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::SetAdd(std::string_view k
 
 std::expected<std::int64_t, StorageError> CacheEngine::SetRemove(std::string_view key, std::span<std::string const> members)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::SetRemove");
+    CORE_ZONE_SCOPED_N("CacheEngine::SetRemove");
     std::int64_t removed = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         std::vector<std::string> existing;
@@ -421,13 +426,13 @@ std::expected<std::int64_t, StorageError> CacheEngine::SetRemove(std::string_vie
 
 std::expected<std::vector<std::string>, StorageError> CacheEngine::SetMembers(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::SetMembers");
+    CORE_ZONE_SCOPED_N("CacheEngine::SetMembers");
     return WithSet(*this, key, [](std::vector<std::string> const& members) { return members; });
 }
 
 std::expected<bool, StorageError> CacheEngine::SetIsMember(std::string_view key, std::string_view member)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::SetIsMember");
+    CORE_ZONE_SCOPED_N("CacheEngine::SetIsMember");
     return WithSet(*this, key, [member](std::vector<std::string> const& members) {
         return std::ranges::binary_search(members, member);
     });
@@ -436,7 +441,7 @@ std::expected<bool, StorageError> CacheEngine::SetIsMember(std::string_view key,
 std::expected<std::vector<bool>, StorageError> CacheEngine::SetMIsMember(std::string_view key,
                                                                          std::span<std::string const> members)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::SetMIsMember");
+    CORE_ZONE_SCOPED_N("CacheEngine::SetMIsMember");
     return WithSet(*this, key, [members](std::vector<std::string> const& existing) {
         std::vector<bool> out;
         out.reserve(members.size());
@@ -448,14 +453,14 @@ std::expected<std::vector<bool>, StorageError> CacheEngine::SetMIsMember(std::st
 
 std::expected<std::int64_t, StorageError> CacheEngine::SetCard(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::SetCard");
+    CORE_ZONE_SCOPED_N("CacheEngine::SetCard");
     return WithSet(
         *this, key, [](std::vector<std::string> const& members) { return static_cast<std::int64_t>(members.size()); });
 }
 
 std::expected<std::vector<std::string>, StorageError> CacheEngine::SetPop(std::string_view key, std::size_t count)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::SetPop");
+    CORE_ZONE_SCOPED_N("CacheEngine::SetPop");
     std::vector<std::string> popped;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         std::vector<std::string> existing;
@@ -629,7 +634,7 @@ namespace
 std::uint64_t CacheEngine::WallNowMs() const noexcept
 {
     return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(_wallClock.Now().time_since_epoch()).count());
+        std::chrono::duration_cast<std::chrono::milliseconds>(_wallClock.now().time_since_epoch()).count());
 }
 
 std::expected<StreamId, StorageError> CacheEngine::StreamAdd(std::string_view key,
@@ -639,7 +644,7 @@ std::expected<StreamId, StorageError> CacheEngine::StreamAdd(std::string_view ke
                                                              std::optional<StreamTrim> trim,
                                                              bool noMkStream)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamAdd");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamAdd");
     auto const nowMs = WallNowMs();
     StreamId assigned {};
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
@@ -711,7 +716,7 @@ std::expected<StreamId, StorageError> CacheEngine::StreamAdd(std::string_view ke
 
 std::expected<std::int64_t, StorageError> CacheEngine::StreamLen(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamLen");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamLen");
     return WithStream(*this, key, [](Stream const* stream) -> std::expected<std::int64_t, StorageError> {
         return stream == nullptr ? std::int64_t { 0 } : static_cast<std::int64_t>(stream->entries.size());
     });
@@ -720,7 +725,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::StreamLen(std::string_vie
 std::expected<std::vector<StreamEntry>, StorageError> CacheEngine::StreamRange(
     std::string_view key, StreamId start, StreamId end, std::size_t count, bool reverse)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamRange");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamRange");
     return WithStream(*this, key, [&](Stream const* stream) -> std::expected<std::vector<StreamEntry>, StorageError> {
         std::vector<StreamEntry> out;
         if (stream == nullptr || start > end)
@@ -740,7 +745,7 @@ std::expected<std::vector<StreamEntry>, StorageError> CacheEngine::StreamRead(st
                                                                               StreamId after,
                                                                               std::size_t count)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamRead");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamRead");
     // Nothing can be strictly after the maximal ID. Next() saturates at Max(),
     // so without this guard a cursor already at Max() would form the inclusive
     // range [Max, Max] and re-return the maximal entry on every poll (an
@@ -752,7 +757,7 @@ std::expected<std::vector<StreamEntry>, StorageError> CacheEngine::StreamRead(st
 
 std::expected<std::int64_t, StorageError> CacheEngine::StreamDelete(std::string_view key, std::span<StreamId const> ids)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamDelete");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamDelete");
     std::int64_t removed = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
@@ -782,7 +787,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::StreamDelete(std::string_
 
 std::expected<std::int64_t, StorageError> CacheEngine::StreamTrimTo(std::string_view key, StreamTrim trim)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamTrimTo");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamTrimTo");
     std::int64_t evicted = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
@@ -804,7 +809,7 @@ std::expected<void, StorageError> CacheEngine::StreamSetId(std::string_view key,
                                                            std::optional<std::uint64_t> entriesAdded,
                                                            std::optional<StreamId> maxDeletedId)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamSetId");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamSetId");
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
         auto const loaded = LoadStream(*this, current, stream);
@@ -828,7 +833,7 @@ std::expected<void, StorageError> CacheEngine::StreamSetId(std::string_view key,
 
 std::expected<StreamId, StorageError> CacheEngine::StreamLastId(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamLastId");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamLastId");
     return WithStream(*this, key, [](Stream const* stream) -> std::expected<StreamId, StorageError> {
         return stream == nullptr ? StreamId::Min() : stream->lastId;
     });
@@ -859,7 +864,7 @@ namespace
 std::expected<void, StorageError> CacheEngine::StreamGroupCreate(
     std::string_view key, std::string_view group, GroupStart start, StreamId at, bool mkStream)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamGroupCreate");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamGroupCreate");
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
         auto const loaded = LoadStream(*this, current, stream);
@@ -886,7 +891,7 @@ std::expected<void, StorageError> CacheEngine::StreamGroupSetId(std::string_view
                                                                 GroupStart start,
                                                                 StreamId at)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamGroupSetId");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamGroupSetId");
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
         auto const loaded = LoadStream(*this, current, stream);
@@ -905,7 +910,7 @@ std::expected<void, StorageError> CacheEngine::StreamGroupSetId(std::string_view
 
 std::expected<bool, StorageError> CacheEngine::StreamGroupDestroy(std::string_view key, std::string_view group)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamGroupDestroy");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamGroupDestroy");
     bool removed = false;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
@@ -932,7 +937,7 @@ std::expected<bool, StorageError> CacheEngine::StreamConsumerCreate(std::string_
                                                                     std::string_view group,
                                                                     std::string_view consumer)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamConsumerCreate");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamConsumerCreate");
     bool created = false;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
@@ -956,7 +961,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::StreamConsumerDelete(std:
                                                                             std::string_view group,
                                                                             std::string_view consumer)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamConsumerDelete");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamConsumerDelete");
     std::int64_t dropped = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
@@ -985,7 +990,7 @@ std::expected<std::vector<StreamEntry>, StorageError> CacheEngine::StreamReadGro
                                                                                    std::size_t count,
                                                                                    bool noAck)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamReadGroup");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamReadGroup");
     auto const nowMs = WallNowMs();
     std::vector<StreamEntry> out;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
@@ -1060,7 +1065,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::StreamAck(std::string_vie
                                                                  std::string_view group,
                                                                  std::span<StreamId const> ids)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamAck");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamAck");
     std::int64_t acked = 0;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
         Stream stream;
@@ -1085,7 +1090,7 @@ std::expected<std::int64_t, StorageError> CacheEngine::StreamAck(std::string_vie
 std::expected<CacheEngine::PendingOverview, StorageError> CacheEngine::StreamPendingSummary(std::string_view key,
                                                                                             std::string_view group)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamPendingSummary");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamPendingSummary");
     return WithStream(*this, key, [&](Stream const* stream) -> std::expected<PendingOverview, StorageError> {
         if (stream == nullptr)
             return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
@@ -1121,7 +1126,7 @@ std::expected<std::vector<CacheEngine::PendingSummary>, StorageError> CacheEngin
     std::optional<std::string_view> consumer,
     std::uint64_t minIdleMs)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamPendingRange");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamPendingRange");
     auto const nowMs = WallNowMs();
     return WithStream(*this, key, [&](Stream const* stream) -> std::expected<std::vector<PendingSummary>, StorageError> {
         if (stream == nullptr)
@@ -1208,7 +1213,7 @@ std::expected<CacheEngine::ClaimResult, StorageError> CacheEngine::StreamClaim(s
                                                                                bool justId,
                                                                                bool force)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamClaim");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamClaim");
     auto const nowMs = WallNowMs();
     ClaimResult claimed;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
@@ -1281,7 +1286,7 @@ std::expected<CacheEngine::ClaimResult, StorageError> CacheEngine::StreamAutoCla
                                                                                    std::size_t count,
                                                                                    bool justId)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamAutoClaim");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamAutoClaim");
     auto const nowMs = WallNowMs();
     ClaimResult claimed;
     auto const result = Update(key, [&](GetResult const& current) -> std::expected<IStorage::UpdateOutcome, StorageError> {
@@ -1330,7 +1335,7 @@ std::expected<CacheEngine::ClaimResult, StorageError> CacheEngine::StreamAutoCla
 
 std::expected<CacheEngine::StreamInfo, StorageError> CacheEngine::StreamInfoOf(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamInfoOf");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamInfoOf");
     return WithStream(*this, key, [](Stream const* stream) -> std::expected<StreamInfo, StorageError> {
         if (stream == nullptr)
             return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
@@ -1351,7 +1356,7 @@ std::expected<CacheEngine::StreamInfo, StorageError> CacheEngine::StreamInfoOf(s
 
 std::expected<std::vector<CacheEngine::GroupInfo>, StorageError> CacheEngine::StreamGroupInfo(std::string_view key)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamGroupInfo");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamGroupInfo");
     return WithStream(*this, key, [](Stream const* stream) -> std::expected<std::vector<GroupInfo>, StorageError> {
         if (stream == nullptr)
             return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));
@@ -1374,7 +1379,7 @@ std::expected<std::vector<CacheEngine::GroupInfo>, StorageError> CacheEngine::St
 std::expected<std::vector<CacheEngine::ConsumerInfo>, StorageError> CacheEngine::StreamConsumerInfo(std::string_view key,
                                                                                                     std::string_view group)
 {
-    FC_ZONE_SCOPED_N("CacheEngine::StreamConsumerInfo");
+    CORE_ZONE_SCOPED_N("CacheEngine::StreamConsumerInfo");
     return WithStream(*this, key, [&](Stream const* stream) -> std::expected<std::vector<ConsumerInfo>, StorageError> {
         if (stream == nullptr)
             return std::unexpected(MakeStorageError(StorageErrorCode::KeyNotFound));

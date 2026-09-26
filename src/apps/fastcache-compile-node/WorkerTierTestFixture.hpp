@@ -12,7 +12,6 @@
 #include "ScratchClaim.hpp"
 #include "WorkerTier.hpp"
 
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/NodePolicy.hpp>
@@ -31,6 +30,7 @@
 #include <IProcessRunner.hpp>
 #include <ToolchainDiscovery.hpp>
 #include <ToolchainHost.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/ScratchPath.hpp>
 
 namespace FastCache::Node::WorkerTierTesting
@@ -74,7 +74,7 @@ struct WorkerTierFixture
     AtomicMetricsSink metrics;
     Distributed::OpenMembership membership;
     FastCache::Testing::ScriptedHostAddresses addresses;
-    ManualClock clock;
+    core::platform::ManualClock clock;
     CachedLocalityOracle locality { addresses, clock };
     NodeIoLoop io;
     std::unique_ptr<IHostFactsSource> host = MakeSystemHostFacts();

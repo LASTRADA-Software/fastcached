@@ -24,7 +24,7 @@
 #
 # Not "the source tree minus dependencies": CI points `CPM_SOURCE_CACHE` inside the workspace, so every
 # dependency's units sit under the source tree, and an exclusion rule bets on a layout this repository
-# does not control. Units outside `src/` -- dependencies, `vendor/endo`, sources generated into the
+# does not control. Units outside `src/` -- dependencies, `vendor/monocypher`, sources generated into the
 # build tree -- are declined, counted and the first one named. A flag on a first-party TARGET reaches
 # that target's `src/` units too, so declining its generated units loses nothing this rule is about.
 #

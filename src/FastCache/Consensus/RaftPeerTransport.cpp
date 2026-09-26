@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-#include <FastCache/Async/InterruptibleSleep.hpp>
-#include <FastCache/Async/ResumeOn.hpp>
-#include <FastCache/Async/Task.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/BoundedDrain.hpp>
-#include <FastCache/Net/SocketDeadline.hpp>
 #include <FastCache/Protocol/Framing/LineReader.hpp>
 
 #include <algorithm>
@@ -24,6 +20,11 @@
 #include <utility>
 #include <vector>
 
+#include <core/async/ResumeOn.hpp>
+#include <core/async/Task.hpp>
+#include <core/net/InterruptibleSleep.hpp>
+#include <core/net/SocketDeadline.hpp>
+
 namespace FastCache::Consensus
 {
 
@@ -32,8 +33,8 @@ namespace
 
     /// Write every byte of `bytes` to `socket`.
     ///
-    /// A coroutine because `ISocket::Write` is awaitable, awaited by the peer's
-    /// sender on the reactor. It used to be driven with `SyncRun`, which was sound
+    /// A coroutine because `core::net::ISocket::Write` is awaitable, awaited by the peer's
+    /// sender on the reactor. It used to be driven with `core::async::syncRun`, which was sound
     /// only because the socket was a blocking one; now it really suspends, which
     /// is what makes a write completable by closing the socket rather than only by
     /// the peer reading it.
@@ -44,7 +45,7 @@ namespace
     /// kept it alive. `RaftDriver::Run` takes its reactor the same way, for the
     /// same reason.
     ///
-    /// `ISocket::Write` is write-all by contract -- "Resolves with the byte count
+    /// `core::net::ISocket::Write` is write-all by contract -- "Resolves with the byte count
     /// actually written (== buffer.size() on success)" -- so the count is checked
     /// rather than looped over. A resume loop here would be dead code that reads as
     /// a statement about the interface, and a reader who believed it would write
@@ -53,9 +54,9 @@ namespace
     /// @param socket The connected peer socket; never null.
     /// @param bytes The framed message.
     /// @return Whether every byte reached the socket.
-    [[nodiscard]] Task<bool> WriteFrame(ISocket* socket, std::span<std::byte const> bytes)
+    [[nodiscard]] core::async::Task<bool> WriteFrame(core::net::ISocket* socket, std::span<std::byte const> bytes)
     {
-        auto const written = co_await socket->Write(bytes);
+        auto const written = co_await socket->write(bytes);
         co_return written.has_value() && *written == bytes.size();
     }
 
@@ -85,7 +86,7 @@ namespace
     /// @param reader The connection's reader; never null.
     /// @return What the read produced.
     template <RaftWire::MessageType Type>
-    [[nodiscard]] Task<HandshakeFrameRead> ReadHandshakeFrame(ByteReader* reader)
+    [[nodiscard]] core::async::Task<HandshakeFrameRead> ReadHandshakeFrame(ByteReader* reader)
     {
         using Outcome = HandshakeFrameRead::Outcome;
         auto const& expected = RaftWire::Detail::RowOf<Type>;
@@ -203,7 +204,7 @@ struct PeerSenderAccess
     };
 
     /// One connection's life: dial, prove this node's id, serve, end.
-    static Task<Outcome> ServeOnce(RaftPeerTransport* self, RaftPeerTransport::Peer* peer);
+    static core::async::Task<Outcome> ServeOnce(RaftPeerTransport* self, RaftPeerTransport::Peer* peer);
 
     /// Prove this node's id to the acceptor at `peer->socket`, and check its verdict, within
     /// the handshake bound.
@@ -213,12 +214,12 @@ struct PeerSenderAccess
     /// @return The key the acceptor proved itself with and the session's key, when it
     ///         accepted this node as the member it dialled; nothing otherwise, the refusal
     ///         already counted.
-    static Task<std::optional<ProvenAcceptor>> Handshake(RaftPeerTransport* self,
-                                                         RaftPeerTransport::Peer* peer,
-                                                         PeerEndpoint where);
+    static core::async::Task<std::optional<ProvenAcceptor>> Handshake(RaftPeerTransport* self,
+                                                                      RaftPeerTransport::Peer* peer,
+                                                                      PeerEndpoint where);
 
     /// One peer's whole life. Ends only on a stop.
-    static Task<void> RunSender(RaftPeerTransport* self, RaftPeerTransport::Peer* peer);
+    static core::async::Task<void> RunSender(RaftPeerTransport* self, RaftPeerTransport::Peer* peer);
 
     /// Close live peer sockets, on the reactor's thread.
     ///
@@ -228,10 +229,11 @@ struct PeerSenderAccess
     /// it runs on and that argument is the same either way.
     /// @param self The transport.
     /// @param only Which peer, or nullopt for every one.
-    static DetachedTask CloseSockets(RaftPeerTransport* self, std::optional<NodeId> only);
+    static core::async::DetachedTask CloseSockets(RaftPeerTransport* self, std::optional<NodeId> only);
 };
 
-Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* self, RaftPeerTransport::Peer* peer)
+core::async::Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* self,
+                                                                         RaftPeerTransport::Peer* peer)
 {
     // No I/O bound on the socket, which is unchanged and deliberate: it decides
     // when a peer is declared dead, and that is its own decision rather than a
@@ -244,8 +246,8 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     // next one reads the new address here.
     auto const where = self->AddressOf(*peer);
 
-    auto dialed = co_await self->_connector.Connect(
-        where.host, where.port, DialOptions { .connectTimeout = self->_options.dialTimeout });
+    auto dialed = co_await self->_connector.connect(
+        where.host, where.port, core::net::DialOptions { .connectTimeout = self->_options.dialTimeout });
     if (!dialed.has_value())
     {
         // Debug, not Warn. A peer being down is the ordinary condition Raft is
@@ -262,9 +264,9 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     // abandoned -- destroying a suspended task frees a frame the reactor still
     // points into -- so it is always awaited to completion and the socket it
     // produced is closed here.
-    if (self->_stop.Token().IsCancelled())
+    if (self->_stop.get_token().stop_requested())
     {
-        dialed.value()->Close();
+        dialed.value()->close();
         co_return Outcome::Stop;
     }
 
@@ -277,7 +279,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     // would be served at its old address until that connection happened to break.
     if (auto const current = self->AddressOf(*peer); current.host != where.host || current.port != where.port)
     {
-        peer->socket->Close();
+        peer->socket->close();
         peer->socket.reset();
         co_return Outcome::Retry;
     }
@@ -288,7 +290,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
     auto proven = co_await Handshake(self, peer, where);
     if (!proven.has_value())
     {
-        peer->socket->Close();
+        peer->socket->close();
         peer->socket.reset();
         co_return Outcome::Retry;
     }
@@ -298,7 +300,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
 
     while (true)
     {
-        auto frame = co_await peer->outbox.Pop();
+        auto frame = co_await peer->outbox.pop();
         if (!frame.has_value())
             co_return Outcome::Stop; // the outbox was closed
 
@@ -309,7 +311,7 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
         {
             self->NoteDialRefusal(*peer, where, DiallerRefusal::KeyWithdrawn, "");
             self->_dropped.fetch_add(1, std::memory_order_relaxed);
-            peer->socket->Close();
+            peer->socket->close();
             peer->socket.reset();
             co_return Outcome::Retry;
         }
@@ -317,28 +319,28 @@ Task<PeerSenderAccess::Outcome> PeerSenderAccess::ServeOnce(RaftPeerTransport* s
         // Sealed HERE rather than when queued, because a frame's tag is bound to the
         // connection it goes out on and to its position there -- and a queued frame
         // outlives the connection that was current when it was framed. Appended to the
-        // frame so it goes out in the one write `ISocket::Write`'s contract makes whole.
+        // frame so it goes out in the one write `core::net::ISocket::Write`'s contract makes whole.
         auto const bytes = std::span<std::byte const> { *frame };
         auto const headerSize = std::min(bytes.size(), RaftWire::HeaderSize);
         auto const tag = sealer.Seal(bytes.first(headerSize), bytes.subspan(headerSize));
         frame->insert(frame->end(), tag.begin(), tag.end());
 
         // Written from a local of this frame, never from a queue element:
-        // `ISocket::Write` requires the buffer to stay at a stable address until
+        // `core::net::ISocket::Write` requires the buffer to stay at a stable address until
         // the awaitable resumes, and a deque's element addresses do not.
         if (!co_await WriteFrame(peer->socket.get(), *frame))
         {
             self->_dropped.fetch_add(1, std::memory_order_relaxed);
-            peer->socket->Close();
+            peer->socket->close();
             peer->socket.reset();
             co_return Outcome::Retry;
         }
     }
 }
 
-Task<std::optional<ProvenAcceptor>> PeerSenderAccess::Handshake(RaftPeerTransport* self,
-                                                                RaftPeerTransport::Peer* peer,
-                                                                PeerEndpoint where)
+core::async::Task<std::optional<ProvenAcceptor>> PeerSenderAccess::Handshake(RaftPeerTransport* self,
+                                                                             RaftPeerTransport::Peer* peer,
+                                                                             PeerEndpoint where)
 {
     using ReadOutcome = HandshakeFrameRead::Outcome;
     auto* const socket = peer->socket.get();
@@ -347,8 +349,8 @@ Task<std::optional<ProvenAcceptor>> PeerSenderAccess::Handshake(RaftPeerTranspor
     // that never challenges -- a build from before the handshake, which only ever reads --
     // and one that never answers the proof are both a connection this sender would
     // otherwise sit on forever, with nothing queued for it reaching anybody.
-    SocketDeadlineTarget expiry { .socket = socket };
-    auto deadline = ArmSocketDeadline(&self->_reactor, self->_options.handshakeBound, &expiry);
+    core::net::SocketDeadlineTarget expiry { .socket = socket };
+    auto deadline = core::net::armSocketDeadline(&self->_reactor, self->_options.handshakeBound, &expiry);
 
     // The handshake frames and nothing larger: this reader is abandoned at the verdict,
     // since nothing an acceptor sends after it is read.
@@ -468,12 +470,12 @@ Task<std::optional<ProvenAcceptor>> PeerSenderAccess::Handshake(RaftPeerTranspor
     co_return std::nullopt;
 }
 
-Task<void> PeerSenderAccess::RunSender(RaftPeerTransport* self, RaftPeerTransport::Peer* peer)
+core::async::Task<void> PeerSenderAccess::RunSender(RaftPeerTransport* self, RaftPeerTransport::Peer* peer)
 {
     self->_reactorThread.store(std::this_thread::get_id(), std::memory_order_relaxed);
 
-    auto const token = self->_stop.Token();
-    while (!token.IsCancelled())
+    auto const token = self->_stop.get_token();
+    while (!token.stop_requested())
     {
         auto outcome = Outcome::Retry;
         try
@@ -482,16 +484,16 @@ Task<void> PeerSenderAccess::RunSender(RaftPeerTransport* self, RaftPeerTranspor
         }
         catch (...)
         {
-            // The hazard inverts rather than disappearing. With a `DetachedTask`
+            // The hazard inverts rather than disappearing. With a `core::async::DetachedTask`
             // an escaped exception is std::terminate -- a node killed over one
-            // peer. With an unawaited `Task<void>` it is stored in the promise
+            // peer. With an unawaited `core::async::Task<void>` it is stored in the promise
             // and never read, so the sender would simply end, forever, with
             // nothing logged anywhere: "three nodes sat at undecided with no
             // error" spelled for one peer. So it is caught and reported.
             self->NoteSenderThrew(peer->endpoint.id);
         }
 
-        if (outcome == Outcome::Stop || token.IsCancelled())
+        if (outcome == Outcome::Stop || token.stop_requested())
             break;
 
         // Backed off after EVERY session, not only a failed dial. The thread
@@ -501,11 +503,11 @@ Task<void> PeerSenderAccess::RunSender(RaftPeerTransport* self, RaftPeerTranspor
         // thread that burned one core; on the shared reactor it starves the
         // election timers, which is the "nine role changes in twelve seconds"
         // failure this repository already has a name for.
-        if (co_await InterruptibleSleepUntil(&self->_reactor,
-                                             token,
-                                             self->_reactor.Clock().Now() + self->_options.reconnectBackoff,
-                                             self->_options.stopWakeBound)
-            == WakeReason::Cancelled)
+        //
+        // One park, which the stop cancels (#1596): no `stopWakeBound` steps any more.
+        auto backoff = core::net::interruptibleSleepUntil(
+            &self->_reactor, token, self->_reactor.clock().now() + self->_options.reconnectBackoff);
+        if (co_await std::move(backoff) == core::net::WakeReason::Cancelled)
             break;
     }
 
@@ -514,23 +516,21 @@ Task<void> PeerSenderAccess::RunSender(RaftPeerTransport* self, RaftPeerTranspor
     co_return;
 }
 
-DetachedTask PeerSenderAccess::CloseSockets(RaftPeerTransport* self, std::optional<NodeId> only)
+core::async::DetachedTask PeerSenderAccess::CloseSockets(RaftPeerTransport* self, std::optional<NodeId> only)
 {
-    // The hop is the point. On epoll and kqueue `ISocket::Close` completes a
-    // parked awaitable by resuming its coroutine INLINE, so closing from the
-    // thread calling Stop() would run a peer's sender there while the reactor
-    // thread is live. IOCP routes cancellation back through the port and does
-    // not, which is precisely what would make this a bug that passes CI on
-    // Windows and corrupts state on Linux and macOS.
-    co_await ResumeOn { self->_reactor };
+    // The hop is the point. `core::net::ISocket::close` retires the socket's registration
+    // with the loop, which only the loop's thread may touch, and the sender it wakes then
+    // resumes in that loop's drain, on the reactor, never inside `close()` (core-cpp 0.2.1,
+    // guarantee G2). Closing from the thread calling Stop() would race the reactor on the
+    // first and, before 0.2.1, ran the sender on the wrong thread on epoll and kqueue.
+    co_await core::async::ResumeOn { self->_reactor };
 
-    // Collected under the lock, closed outside it, and the split is the point.
-    // `Close` resumes a parked sender INLINE on epoll and kqueue -- on this thread,
-    // which is the whole reason for the hop above -- so a lock held across it is a
-    // lock held across arbitrary sender code, with `Send` and therefore the driver's
-    // mutex waiting behind it. `Peer::socket` is reactor-thread-only, so nothing but
-    // the map lookup needs the lock at all.
-    auto closing = std::vector<ISocket*> {};
+    // Collected under the lock, closed outside it. The woken sender resumes in the loop's
+    // next drain rather than inside `close()` (G2), so the lock would no longer be held
+    // across sender code -- but a close is still no place to hold a lock that `Send`, and
+    // therefore the driver's mutex, can wait behind. `Peer::socket` is reactor-thread-only,
+    // so nothing but the map lookup needs the lock at all.
+    auto closing = std::vector<core::net::ISocket*> {};
     {
         auto const guard = std::shared_lock { self->_peersMutex };
         if (only.has_value())
@@ -548,13 +548,13 @@ DetachedTask PeerSenderAccess::CloseSockets(RaftPeerTransport* self, std::option
 
     for (auto* const socket: closing)
         if (socket != nullptr)
-            socket->Close();
+            socket->close();
     co_return;
 }
 
 RaftPeerTransport::RaftPeerTransport(std::vector<PeerEndpoint> peers,
-                                     IReactor& reactor,
-                                     IConnector& connector,
+                                     core::net::EventLoop& reactor,
+                                     core::net::IConnector& connector,
                                      ILogger& logger,
                                      IMetricsSink& metrics,
                                      IRaftPeerIdentity const& identity,
@@ -600,8 +600,9 @@ PeerChange RaftPeerTransport::Learn(PeerEndpoint where)
                 _peers.emplace(id,
                                std::make_unique<Peer>(std::move(where),
                                                       _reactor,
-                                                      AsyncQueueOptions { .capacity = _options.maxQueuedPerPeer,
-                                                                          .overflow = AsyncQueueOverflow::DropOldest }));
+                                                      core::async::AsyncQueueOptions {
+                                                          .capacity = _options.maxQueuedPerPeer,
+                                                          .overflow = core::async::AsyncQueueOverflow::DropOldest }));
             if (_lifecycle == Lifecycle::Running)
                 StartSender(*inserted.first->second);
 
@@ -630,7 +631,7 @@ PeerChange RaftPeerTransport::Learn(PeerEndpoint where)
         //
         // Submitted INSIDE the lock, which is what makes the guard mean anything:
         // `RequestStop` takes this same lock exclusively, so it cannot slip between
-        // the test and the submission. Safe because `ResumeOn` never resumes inline
+        // the test and the submission. Safe because `core::async::ResumeOn` never resumes inline
         // -- it suspends and posts -- so nothing here runs on the reactor's thread,
         // and the frame's first lock acquisition happens after this scope ends.
         if (_lifecycle == Lifecycle::Running && _sendersRunning.load(std::memory_order_acquire) != 0)
@@ -666,7 +667,7 @@ void RaftPeerTransport::StartSender(Peer& peer)
     // is lazy and what depends on it. Submitting under `_peersMutex` is safe for
     // exactly that reason -- the body's first instruction runs on the reactor
     // thread, so nothing here runs it inline.
-    _reactor.Submit(peer.sender.Native());
+    _reactor.submit(peer.sender.handle());
 }
 
 RaftPeerTransport::~RaftPeerTransport()
@@ -691,7 +692,7 @@ void RaftPeerTransport::Start()
 
 void RaftPeerTransport::RequestStop() noexcept
 {
-    _stop.Cancel();
+    _stop.request_stop();
 
     // `Stopping` and the outbox closures under one lock, so a `Learn` racing this
     // either finishes first -- and has its outbox closed by the loop below -- or
@@ -701,7 +702,7 @@ void RaftPeerTransport::RequestStop() noexcept
         auto const guard = std::unique_lock { _peersMutex };
         _lifecycle = Lifecycle::Stopping;
         for (auto& [id, peer]: _peers)
-            peer->outbox.Close();
+            peer->outbox.close();
     }
 
     if (_sendersRunning.load(std::memory_order_acquire) != 0)
@@ -746,7 +747,7 @@ void RaftPeerTransport::Stop() noexcept
                                 DrainBound {}.ceiling.count()));
         auto const guard = std::unique_lock { _peersMutex };
         for (auto& [id, peer]: _peers)
-            std::ignore = peer->sender.Release();
+            std::ignore = peer->sender.release();
     }
 }
 
@@ -771,7 +772,7 @@ void RaftPeerTransport::NoteSenderThrew(NodeId const& peer) noexcept
 
 void RaftPeerTransport::NoteOwnFault(Peer& peer, PeerEndpoint const& where, std::string_view reason)
 {
-    auto const now = _reactor.Clock().Now();
+    auto const now = _reactor.clock().now();
     if (now < peer.nextRefusalReport)
         return;
     peer.nextRefusalReport = now + RefusalReportInterval;
@@ -787,7 +788,7 @@ void RaftPeerTransport::NoteDialRefusal(Peer& peer,
     auto const& row = RowFor(refusal);
     _metrics.Increment(row.counter);
 
-    auto const now = _reactor.Clock().Now();
+    auto const now = _reactor.clock().now();
     if (now < peer.nextRefusalReport)
         return;
     peer.nextRefusalReport = now + RefusalReportInterval;
@@ -805,7 +806,7 @@ void RaftPeerTransport::NoteDialRefusal(Peer& peer,
 
 void RaftPeerTransport::Send(NodeId const& to, RaftMessage message)
 {
-    if (_stop.Token().IsCancelled())
+    if (_stop.get_token().stop_requested())
         return;
 
     if (to == _self)
@@ -846,10 +847,10 @@ void RaftPeerTransport::Send(NodeId const& to, RaftMessage message)
         return;
     }
 
-    // Never resumes the sender inline -- see `AsyncQueue`. This matters here
+    // Never resumes the sender inline -- see `core::async::AsyncQueue`. This matters here
     // specifically because `Send` is reached from `RaftDriver::Deliver`, which
     // holds the driver's mutex.
-    auto const pushed = target->outbox.Push(std::move(frame));
+    auto const pushed = target->outbox.push(std::move(frame));
     _dropped.fetch_add(pushed.displaced, std::memory_order_relaxed);
 }
 

@@ -31,10 +31,10 @@
 #
 # A source scan cannot answer it. `#else`-less platform guards also appear at the END
 # of files that are otherwise ordinary, and a TU can go blind on a FEATURE flag rather
-# than a platform one -- `TlsSocket_test.cpp` is empty without `FASTCACHED_ENABLE_TLS`
-# and analysed with it. Modelling the preprocessor to decide this is the failure mode
-# `check-net-boundary`'s header warns about: a model that is subtly wrong fails in the
-# confident direction. So this asks the OBJECTS what the compiler actually emitted.
+# than a platform one -- `Net/TlsSocket_test.cpp` was empty without
+# `FASTCACHED_ENABLE_TLS` and analysed with it, until #1596 moved it into core-cpp.
+# Modelling the preprocessor to decide this fails the way any subtly wrong model does:
+# in the confident direction. So this asks the OBJECTS what the compiler actually emitted.
 #
 # A TU that contributed nothing defines exactly the two symbols the sanitizer adds to
 # every object; anything real defines hundreds. The threshold is therefore not a

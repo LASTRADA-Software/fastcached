@@ -9,18 +9,14 @@
 // choosing, answers with a verdict, and then checks every frame's tag under the session it
 // agreed before recording it -- so "a frame reached the peer" still means what it meant, on a
 // connection whose two ends proved their ids.
-#include <FastCache/Async/SleepUntil.hpp>
-#include <FastCache/Async/TestReactor.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Nonce.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
-#include <FastCache/Net/InMemoryTransport.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -42,6 +38,10 @@
 #include <utility>
 #include <vector>
 
+#include <core/net/SleepUntil.hpp>
+#include <core/net/testing/InMemorySocket.hpp>
+#include <core/net/testing/TestLoop.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/SecureRandomFakes.hpp>
 
@@ -82,7 +82,7 @@ enum class AcceptorScript : std::uint8_t
 
 /// A socket that is the acceptor's end of a connection: it answers the handshake,
 /// then records what was written and can be told to fail.
-class RecordingSocket final: public ISocket
+class RecordingSocket final: public core::net::ISocket
 {
   public:
     /// Shared state, so a test can read it after the transport has closed and
@@ -187,70 +187,74 @@ class RecordingSocket final: public ISocket
         }
     }
 
-    [[nodiscard]] IoAwaitable Read(std::span<std::byte> buffer) override
+    [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override
     {
         if (_closed)
-            return IoAwaitable { std::unexpected {
-                NetError { .code = NetErrorCode::BadFileHandle, .systemCode = 0, .context = "socket closed" } } };
+            return core::net::IoAwaitable { std::unexpected { core::net::NetError {
+                .code = core::net::NetErrorCode::BadHandle, .systemCode = 0, .context = "socket closed" } } };
 
         if (!_inbound.empty())
         {
             auto const count = std::min(buffer.size(), _inbound.size());
             std::copy_n(_inbound.begin(), count, buffer.begin());
             _inbound.erase(_inbound.begin(), _inbound.begin() + static_cast<std::ptrdiff_t>(count));
-            return IoAwaitable { IoResult { count } };
+            return core::net::IoAwaitable { core::net::IoResult { count } };
         }
 
         // An acceptor that says nothing: parked until `Close()`, which is what the
         // handshake bound does to it.
         if (_script == AcceptorScript::NeverChallenges)
         {
-            IoAwaitable parked;
-            parked.SetSuspendCallback(
-                [](IoAwaitable* self, std::coroutine_handle<>) {
-                    auto* const socket = static_cast<RecordingSocket*>(self->CallbackState());
-                    socket->_parkedRead = self;
+            return core::net::IoAwaitable {
+                [](void* owner, core::net::IoAwaitable& self) { static_cast<RecordingSocket*>(owner)->_parkedRead = &self; },
+                [](void* owner, void* awaitable) noexcept {
+                    auto* const socket = static_cast<RecordingSocket*>(owner);
+                    if (socket->_parkedRead == awaitable)
+                        socket->_parkedRead = nullptr;
                 },
-                this);
-            return parked;
+                this,
+            };
         }
 
         // Nothing more is coming: the acceptor refused the proof, or has nothing to say
         // after the verdict.
-        return IoAwaitable { IoResult { std::size_t { 0 } } };
+        return core::net::IoAwaitable { core::net::IoResult { std::size_t { 0 } } };
     }
 
-    [[nodiscard]] IoAwaitable Write(std::span<std::byte const> buffer) override
+    [[nodiscard]] core::net::IoAwaitable write(std::span<std::byte const> buffer) override
     {
         // A closed socket refuses, as every real one does. Recording the write
         // instead would let the transport go on feeding a connection it has
         // dropped -- and "the peer moved, so its connection was closed" is a case
         // whose whole observable consequence is the write that then fails.
         if (_closed)
-            return IoAwaitable { std::unexpected {
-                NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = "socket closed" } } };
+            return core::net::IoAwaitable { std::unexpected { core::net::NetError {
+                .code = core::net::NetErrorCode::ConnReset, .systemCode = 0, .context = "socket closed" } } };
 
         if (!_opener.has_value())
             return AnswerProof(buffer);
 
         std::scoped_lock const guard { _record->mutex };
         if (_record->failWrites)
-            return IoAwaitable { std::unexpected {
-                NetError { .code = NetErrorCode::ConnReset, .systemCode = 0, .context = "scripted write failure" } } };
+            return core::net::IoAwaitable { std::unexpected { core::net::NetError {
+                .code = core::net::NetErrorCode::ConnReset, .systemCode = 0, .context = "scripted write failure" } } };
 
         if (_record->parkWrites)
         {
             // Deferred, and stashed so `Close()` can complete it -- mirroring
             // `EpollSocket`, where closing is exactly what resolves a parked
             // operation.
-            IoAwaitable parked;
-            parked.SetSuspendCallback(
-                [](IoAwaitable* self, std::coroutine_handle<>) {
-                    auto* const socket = static_cast<RecordingSocket*>(self->CallbackState());
-                    socket->_parkedWrite = self;
+            return core::net::IoAwaitable {
+                [](void* owner, core::net::IoAwaitable& self) {
+                    static_cast<RecordingSocket*>(owner)->_parkedWrite = &self;
                 },
-                this);
-            return parked;
+                [](void* owner, void* awaitable) noexcept {
+                    auto* const socket = static_cast<RecordingSocket*>(owner);
+                    if (socket->_parkedWrite == awaitable)
+                        socket->_parkedWrite = nullptr;
+                },
+                this,
+            };
         }
 
         // The tag is checked here, as the acceptor would, and the frame is recorded
@@ -269,20 +273,20 @@ class RecordingSocket final: public ISocket
                 ++_record->unverifiedWrites;
         }
         _record->wake.notify_all();
-        return IoAwaitable { IoResult { buffer.size() } };
+        return core::net::IoAwaitable { core::net::IoResult { buffer.size() } };
     }
 
-    [[nodiscard]] IoAwaitable WriteVectored(std::span<std::span<std::byte const> const> segments,
-                                            std::shared_ptr<void const> keepAlive = {}) override
+    [[nodiscard]] core::net::IoAwaitable writeVectored(std::span<std::span<std::byte const> const> segments,
+                                                       std::shared_ptr<void const> keepAlive = {}) override
     {
         std::ignore = keepAlive;
         std::size_t total = 0;
         for (auto const& segment: segments)
             total += segment.size();
-        return IoAwaitable { IoResult { total } };
+        return core::net::IoAwaitable { core::net::IoResult { total } };
     }
 
-    void Close() noexcept override
+    void close() noexcept override
     {
         _closed = true;
         // Completing the parked operation is what `Close` MEANS on a reactor
@@ -299,16 +303,16 @@ class RecordingSocket final: public ISocket
         auto* const parkedRead = std::exchange(_parkedRead, nullptr);
         for (auto* const parked: { parkedWrite, parkedRead })
             if (parked != nullptr)
-                parked->Complete(std::unexpected {
-                    NetError { .code = NetErrorCode::Cancelled, .systemCode = 0, .context = "socket closed" } });
+                parked->complete(std::unexpected { core::net::NetError {
+                    .code = core::net::NetErrorCode::Cancelled, .systemCode = 0, .context = "socket closed" } });
     }
 
-    [[nodiscard]] bool IsClosed() const noexcept override
+    [[nodiscard]] bool isClosed() const noexcept override
     {
         return _closed;
     }
 
-    [[nodiscard]] std::string PeerAddress() const override
+    [[nodiscard]] std::string peerAddress() const override
     {
         return "scripted";
     }
@@ -322,7 +326,7 @@ class RecordingSocket final: public ISocket
     /// the proof names it.
     /// @param buffer The proof frame.
     /// @return The write's result.
-    [[nodiscard]] IoAwaitable AnswerProof(std::span<std::byte const> buffer)
+    [[nodiscard]] core::net::IoAwaitable AnswerProof(std::span<std::byte const> buffer)
     {
         auto const header = RaftWire::DecodeHeader(buffer);
         auto const proof =
@@ -330,7 +334,7 @@ class RecordingSocket final: public ISocket
                 ? RaftWire::DecodeProof(*header, buffer.subspan(RaftWire::HeaderSize))
                 : std::expected<RaftWire::ProofFrame, ConsensusError> { std::unexpect, MalformedWireFrame("no header") };
         if (!proof.has_value())
-            return IoAwaitable { IoResult { buffer.size() } };
+            return core::net::IoAwaitable { core::net::IoResult { buffer.size() } };
 
         NodeId self;
         {
@@ -349,7 +353,7 @@ class RecordingSocket final: public ISocket
         }
         if (judgement.outcome == ProofOutcome::Accepted && judgement.session.has_value())
             _opener.emplace(*std::move(judgement.session));
-        return IoAwaitable { IoResult { buffer.size() } };
+        return core::net::IoAwaitable { core::net::IoResult { buffer.size() } };
     }
 
     std::shared_ptr<Record> _record;
@@ -359,19 +363,19 @@ class RecordingSocket final: public ISocket
     std::uint64_t _seed { 0 };
     std::deque<std::byte> _inbound;
     std::optional<FrameOpener> _opener;
-    IoAwaitable* _parkedWrite { nullptr };
-    IoAwaitable* _parkedRead { nullptr };
+    core::net::IoAwaitable* _parkedWrite { nullptr };
+    core::net::IoAwaitable* _parkedRead { nullptr };
     bool _closed { false };
 };
 
 /// A connector under the test's control: it can refuse, or hand out sockets
 /// that record what the transport wrote.
-class ScriptedConnector final: public IConnector
+class ScriptedConnector final: public core::net::IConnector
 {
   public:
     /// @param record Shared write log handed to every socket produced.
     /// @param reactor Where a delayed dial parks; must outlive the connector.
-    ScriptedConnector(std::shared_ptr<RecordingSocket::Record> record, IReactor& reactor) noexcept:
+    ScriptedConnector(std::shared_ptr<RecordingSocket::Record> record, core::net::EventLoop& reactor) noexcept:
         _record { std::move(record) },
         _reactor { reactor }
     {
@@ -387,7 +391,7 @@ class ScriptedConnector final: public IConnector
     /// Park every subsequent dial for this long before it resolves.
     ///
     /// The one thing a connector that answers inline cannot produce: the window in
-    /// which a dial is in flight. `PlatformConnector` really does suspend there, and
+    /// which a dial is in flight. `core::net::makeConnector`'s connector really does suspend there, and
     /// a peer that moves during that window is a case with no other way in.
     /// @param delay How long to park; zero answers inline as before.
     void DelayDial(std::chrono::milliseconds delay) noexcept
@@ -417,9 +421,11 @@ class ScriptedConnector final: public IConnector
     ///
     /// Answers inline unless `DelayDial` says otherwise, which is what keeps the
     /// cases that are not about dialling free of clock arithmetic. It *can* park,
-    /// because `PlatformConnector` does: a dial in flight is a real state, and the
+    /// because `core::net::makeConnector`'s connector does: a dial in flight is a real state, and the
     /// transport has to behave when a peer moves during one.
-    [[nodiscard]] Task<SocketResult> Connect(std::string host, std::uint16_t port, DialOptions options) override
+    [[nodiscard]] core::async::Task<core::net::SocketResult> connect(std::string host,
+                                                                     std::uint16_t port,
+                                                                     core::net::DialOptions options) override
     {
         std::ignore = options;
         _attempts.fetch_add(1, std::memory_order_relaxed);
@@ -429,17 +435,17 @@ class ScriptedConnector final: public IConnector
         }
 
         if (auto const delay = _delay.load(std::memory_order_relaxed); delay > 0)
-            co_await SleepUntil(&_reactor, _reactor.Clock().Now() + std::chrono::milliseconds { delay });
+            co_await core::net::sleepUntil(&_reactor, _reactor.clock().now() + std::chrono::milliseconds { delay });
 
         if (_refuse.load(std::memory_order_relaxed))
-            co_return std::unexpected { NetError {
-                .code = NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" } };
+            co_return std::unexpected { core::net::NetError {
+                .code = core::net::NetErrorCode::ConnRefused, .systemCode = 0, .context = "scripted refusal" } };
         co_return std::make_unique<RecordingSocket>(_record);
     }
 
   private:
     std::shared_ptr<RecordingSocket::Record> _record;
-    IReactor& _reactor;
+    core::net::EventLoop& _reactor;
     std::atomic<bool> _refuse { false };
     std::atomic<std::int64_t> _delay { 0 };
     std::atomic<std::size_t> _attempts { 0 };
@@ -465,7 +471,7 @@ class ScriptedConnector final: public IConnector
 
 /// Clock, reactor and transport, wired the way production wires them.
 ///
-/// Every wall-clock wait has left this file. The senders run on a `TestReactor`
+/// Every wall-clock wait has left this file. The senders run on a `core::net::testing::TestLoop`
 /// driven by the test's own thread, so "let the sender make progress" is
 /// `Drain()` and "let the backoff elapse" is `Advance()`. What that buys is not
 /// only speed: the old file had a case whose comment described a race it had to
@@ -473,8 +479,8 @@ class ScriptedConnector final: public IConnector
 struct Harness
 {
     std::shared_ptr<RecordingSocket::Record> record { std::make_shared<RecordingSocket::Record>() };
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector { record, reactor };
     CapturingLogger logger;
     AtomicMetricsSink metrics;
@@ -521,7 +527,7 @@ struct Harness
     {
         Build(options);
         transport->Start();
-        reactor.Drain();
+        reactor.drain();
     }
 
     /// Ask the senders to finish and let them, without the blocking `Stop()`.
@@ -533,9 +539,9 @@ struct Harness
     void RequestStopAndDrain(std::chrono::milliseconds wakeBound = std::chrono::milliseconds { 50 })
     {
         transport->RequestStop();
-        reactor.Drain();
-        clock.Advance(wakeBound);
-        reactor.Drain();
+        reactor.drain();
+        clock.advance(wakeBound);
+        reactor.drain();
     }
 
     /// @return How many frames the peer socket has been handed, with a tag that verified.
@@ -574,7 +580,7 @@ TEST_CASE("A sent message reaches the peer as a decodable frame", "[consensus][r
     // resuming it, which is what keeps it out of the driver's mutex.
     CHECK(harness.Writes() == 0);
 
-    harness.reactor.Drain();
+    harness.reactor.drain();
     REQUIRE(harness.Writes() == 1);
 
     // Asserted by decoding rather than by byte count: what matters is that the
@@ -605,7 +611,7 @@ TEST_CASE("A dialler that cannot draw a nonce sends no proof and blames itself r
     harness.Start();
 
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     CHECK(denied.FillCount() >= 1);
     CHECK(harness.Writes() == 0);
@@ -635,7 +641,7 @@ TEST_CASE("Send hands the message over without advancing the sender", "[consensu
         harness.transport->Send("n2", Vote(static_cast<std::uint64_t>(term)));
 
     CHECK(harness.Writes() == 0);
-    harness.reactor.Drain();
+    harness.reactor.drain();
     CHECK(harness.Writes() == 4);
 
     harness.RequestStopAndDrain();
@@ -647,8 +653,8 @@ TEST_CASE("A message for this node itself is not sent anywhere", "[consensus][ra
     // write, so the transport tolerates its own id rather than making each caller
     // filter -- but it must not give itself a socket and a sender.
     auto record = std::make_shared<RecordingSocket::Record>();
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector { record, reactor };
     NullLogger logger;
     AtomicMetricsSink metrics;
@@ -659,11 +665,11 @@ TEST_CASE("A message for this node itself is not sent anywhere", "[consensus][ra
                                       PeerEndpoint { .id = "n2", .host = "unused", .port = 2 } };
     RaftPeerTransport transport { std::move(peers), reactor, connector, logger, metrics, *identity, random };
     transport.Start();
-    reactor.Drain();
+    reactor.drain();
 
     transport.Send("n1", Vote(1));
     transport.Send("n2", Vote(2));
-    reactor.Drain();
+    reactor.drain();
 
     {
         std::scoped_lock const guard { record->mutex };
@@ -675,9 +681,9 @@ TEST_CASE("A message for this node itself is not sent anywhere", "[consensus][ra
     // waiting `Stop()`, which asserts when called from the thread the senders run
     // on -- and in a test that thread is this one.
     transport.RequestStop();
-    reactor.Drain();
-    clock.Advance(50ms);
-    reactor.Drain();
+    reactor.drain();
+    clock.advance(50ms);
+    reactor.drain();
     REQUIRE(transport.SendersRunning() == 0);
 }
 
@@ -722,21 +728,23 @@ TEST_CASE("Stopping is prompt even while a peer is unreachable", "[consensus][ra
     // merely happened to be fast would pass a wall-clock bound; what has to hold
     // is that teardown does not wait out `reconnectBackoff`, so shutdown stays
     // independent of how unreachable a peer happens to be.
+    //
+    // And with the clock NOT moved at all (#1596): the backoff is one park that the stop cancels,
+    // where it used to be slept in `stopWakeBound` steps so a stop was noticed within one.
     constexpr auto Backoff = 30s;
-    constexpr auto WakeBound = 50ms;
 
     Harness harness;
     harness.connector.Refuse(true);
-    harness.Start(PeerTransportOptions { .dialTimeout = 10s, .reconnectBackoff = Backoff, .stopWakeBound = WakeBound });
+    harness.Start(PeerTransportOptions { .dialTimeout = 10s, .reconnectBackoff = Backoff });
 
-    auto const started = harness.clock.Now();
-    harness.RequestStopAndDrain(WakeBound);
+    auto const started = harness.clock.now();
+    harness.RequestStopAndDrain(0ms);
 
     CHECK(harness.transport->SendersRunning() == 0);
-    // Woken within the bound, not after the backoff.
-    CHECK(harness.clock.Now() - started == WakeBound);
-    CHECK(harness.reactor.PendingTimers() == 0);
-    CHECK(harness.reactor.PendingSubmissions() == 0);
+    // Woken by the stop itself, not by a step and not after the backoff.
+    CHECK(harness.clock.now() == started);
+    CHECK(harness.reactor.pendingTimers() == 0);
+    CHECK(harness.reactor.pendingSubmissions() == 0);
 }
 
 TEST_CASE("A refused dial is not retried faster than the backoff", "[consensus][raft][transport]")
@@ -747,16 +755,16 @@ TEST_CASE("A refused dial is not retried faster than the backoff", "[consensus][
     constexpr auto Backoff = 200ms;
     Harness harness;
     harness.connector.Refuse(true);
-    harness.Start(PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = Backoff, .stopWakeBound = 50ms });
+    harness.Start(PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = Backoff });
 
     REQUIRE(harness.connector.Attempts() == 1);
 
-    harness.clock.Advance(Backoff / 2);
-    harness.reactor.Drain();
+    harness.clock.advance(Backoff / 2);
+    harness.reactor.drain();
     CHECK(harness.connector.Attempts() == 1);
 
-    harness.clock.Advance(Backoff);
-    harness.reactor.Drain();
+    harness.clock.advance(Backoff);
+    harness.reactor.drain();
     CHECK(harness.connector.Attempts() == 2);
 
     harness.RequestStopAndDrain();
@@ -772,19 +780,19 @@ TEST_CASE("A connection that drops is also backed off", "[consensus][raft][trans
     // failure this repository already has a name for.
     constexpr auto Backoff = 200ms;
     Harness harness;
-    harness.Start(PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = Backoff, .stopWakeBound = 50ms });
+    harness.Start(PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = Backoff });
     REQUIRE(harness.connector.Attempts() == 1);
 
     // A write that fails ends the session, so the sender goes round the loop.
     harness.record->failWrites = true;
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     // Still one: the redial waits for the backoff rather than happening at once.
     CHECK(harness.connector.Attempts() == 1);
 
-    harness.clock.Advance(Backoff);
-    harness.reactor.Drain();
+    harness.clock.advance(Backoff);
+    harness.reactor.drain();
     CHECK(harness.connector.Attempts() == 2);
 
     harness.RequestStopAndDrain();
@@ -808,7 +816,7 @@ TEST_CASE("Stopping completes a write the peer never read", "[consensus][raft][t
     harness.record->parkWrites = true;
 
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     // The sender is inside the write, and nothing the peer does will end it.
     REQUIRE(harness.transport->SendersRunning() == 1);
@@ -817,27 +825,27 @@ TEST_CASE("Stopping completes a write the peer never read", "[consensus][raft][t
     harness.RequestStopAndDrain();
 
     CHECK(harness.transport->SendersRunning() == 0);
-    CHECK(harness.reactor.PendingSubmissions() == 0);
-    CHECK(harness.reactor.PendingTimers() == 0);
+    CHECK(harness.reactor.pendingSubmissions() == 0);
+    CHECK(harness.reactor.pendingTimers() == 0);
 }
 
 TEST_CASE("A dropped connection is redialled", "[consensus][raft][transport]")
 {
     constexpr auto Backoff = 10ms;
     Harness harness;
-    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff, .stopWakeBound = 5ms });
+    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff });
 
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
     REQUIRE(harness.Writes() == 1);
     auto const firstAttempts = harness.connector.Attempts();
 
     // Fail one write, which ends the session; then let the backoff elapse.
     harness.record->failWrites = true;
     harness.transport->Send("n2", Vote(2));
-    harness.reactor.Drain();
-    harness.clock.Advance(Backoff);
-    harness.reactor.Drain();
+    harness.reactor.drain();
+    harness.clock.advance(Backoff);
+    harness.reactor.drain();
 
     CHECK(harness.connector.Attempts() > firstAttempts);
 
@@ -846,7 +854,7 @@ TEST_CASE("A dropped connection is redialled", "[consensus][raft][transport]")
     // exists because nothing here runs on a thread of its own.
     harness.record->failWrites = false;
     harness.transport->Send("n2", Vote(3));
-    harness.reactor.Drain();
+    harness.reactor.drain();
     CHECK(harness.Writes() == 2);
 
     harness.RequestStopAndDrain(5ms);
@@ -860,18 +868,18 @@ TEST_CASE("ConnectedPeers is exact across a reconnect, and zero after teardown",
     // reads as healthy.
     constexpr auto Backoff = 10ms;
     Harness harness;
-    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff, .stopWakeBound = 5ms });
+    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff });
 
     CHECK(harness.transport->ConnectedPeers() == 1);
 
     harness.record->failWrites = true;
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
     CHECK(harness.transport->ConnectedPeers() == 0);
 
     harness.record->failWrites = false;
-    harness.clock.Advance(Backoff);
-    harness.reactor.Drain();
+    harness.clock.advance(Backoff);
+    harness.reactor.drain();
     CHECK(harness.transport->ConnectedPeers() == 1);
 
     harness.RequestStopAndDrain(5ms);
@@ -881,8 +889,8 @@ TEST_CASE("ConnectedPeers is exact across a reconnect, and zero after teardown",
 TEST_CASE("Stop is idempotent and safe before Start", "[consensus][raft][transport]")
 {
     auto record = std::make_shared<RecordingSocket::Record>();
-    ManualClock clock;
-    TestReactor reactor { clock };
+    core::platform::ManualClock clock;
+    core::net::testing::TestLoop reactor { clock };
     ScriptedConnector connector { record, reactor };
     NullLogger logger;
     AtomicMetricsSink metrics;
@@ -911,10 +919,10 @@ TEST_CASE("A peer learned after the start is dialled and served", "[consensus][r
 
     CHECK(harness.transport->Learn(PeerEndpoint { .id = "n3", .host = "elsewhere", .port = 7 }) == PeerChange::Added);
     CHECK(harness.transport->PeerCount() == 2);
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     harness.transport->Send("n3", Vote(2));
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     CHECK(harness.transport->DroppedMessages() == 1);
     CHECK(harness.Writes() == 1);
@@ -935,7 +943,7 @@ TEST_CASE("A peer learned before the start is dialled when it starts", "[consens
     CHECK(harness.transport->SendersRunning() == 0);
 
     harness.transport->Start();
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     CHECK(harness.transport->SendersRunning() == 2);
     CHECK(harness.transport->ConnectedPeers() == 2);
@@ -954,7 +962,7 @@ TEST_CASE("Learning a peer that has not moved changes nothing", "[consensus][raf
 
     auto const dials = harness.connector.Attempts();
     CHECK(harness.transport->Learn(PeerEndpoint { .id = "n2", .host = "unused", .port = 1 }) == PeerChange::Unchanged);
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     CHECK(harness.transport->PeerCount() == 1);
     CHECK(harness.connector.Attempts() == dials);
@@ -973,7 +981,7 @@ TEST_CASE("A peer that moved is redialled at its new address", "[consensus][raft
     REQUIRE(harness.connector.LastTarget() == "unused:1");
 
     CHECK(harness.transport->Learn(PeerEndpoint { .id = "n2", .host = "moved", .port = 2 }) == PeerChange::Readdressed);
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     // The socket is closed and the session is not yet over, which is the honest
     // shape rather than a shortcoming to hide: the sender is parked on its outbox,
@@ -986,13 +994,13 @@ TEST_CASE("A peer that moved is redialled at its new address", "[consensus][raft
     // does for any dropped connection.
     auto const dropped = harness.transport->DroppedMessages();
     harness.transport->Send("n2", Vote(3));
-    harness.reactor.Drain();
+    harness.reactor.drain();
     CHECK(harness.transport->DroppedMessages() == dropped + 1);
     CHECK(harness.Writes() == 0);
     CHECK(harness.transport->ConnectedPeers() == 0);
 
-    harness.clock.Advance(1s);
-    harness.reactor.Drain();
+    harness.clock.advance(1s);
+    harness.reactor.drain();
 
     // And the redial names the new address, which is the whole property.
     CHECK(harness.transport->PeerCount() == 1);
@@ -1000,7 +1008,7 @@ TEST_CASE("A peer that moved is redialled at its new address", "[consensus][raft
     CHECK(harness.transport->ConnectedPeers() == 1);
 
     harness.transport->Send("n2", Vote(4));
-    harness.reactor.Drain();
+    harness.reactor.drain();
     CHECK(harness.Writes() == 1);
 
     harness.RequestStopAndDrain();
@@ -1023,11 +1031,11 @@ TEST_CASE("A peer that moves during a dial is not served at its old address", "[
     harness.connector.DelayDial(DialTime);
     harness.FailWrites(true);
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
     REQUIRE(harness.transport->ConnectedPeers() == 0);
 
-    harness.clock.Advance(1s);
-    harness.reactor.Drain();
+    harness.clock.advance(1s);
+    harness.reactor.drain();
 
     // In flight now: the dial has been made and has not resolved.
     auto const dialing = harness.connector.Attempts();
@@ -1040,13 +1048,13 @@ TEST_CASE("A peer that moves during a dial is not served at its old address", "[
     // because the session it would open never re-reads the address.
     harness.FailWrites(false);
     harness.connector.DelayDial(0ms);
-    harness.clock.Advance(DialTime);
-    harness.reactor.Drain();
+    harness.clock.advance(DialTime);
+    harness.reactor.drain();
     CHECK(harness.transport->ConnectedPeers() == 0);
     CHECK(harness.connector.Attempts() == dialing);
 
-    harness.clock.Advance(1s);
-    harness.reactor.Drain();
+    harness.clock.advance(1s);
+    harness.reactor.drain();
     CHECK(harness.connector.LastTarget() == "moved:5");
     CHECK(harness.transport->ConnectedPeers() == 1);
 
@@ -1063,11 +1071,11 @@ TEST_CASE("Learning before the start does not queue work on an unrun reactor", "
     harness.Build();
 
     CHECK(harness.transport->Learn(PeerEndpoint { .id = "n2", .host = "moved", .port = 6 }) == PeerChange::Readdressed);
-    CHECK(harness.reactor.PendingSubmissions() == 0);
+    CHECK(harness.reactor.pendingSubmissions() == 0);
 
     // And the new address is the one it dials when it does start.
     harness.transport->Start();
-    harness.reactor.Drain();
+    harness.reactor.drain();
     CHECK(harness.connector.LastTarget() == "moved:6");
 
     harness.RequestStopAndDrain();
@@ -1110,7 +1118,7 @@ TEST_CASE("An acceptor that proves its id is sent the messages, and nothing is c
 
     CHECK(harness.transport->ConnectedPeers() == 1);
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
     CHECK(harness.Writes() == 1);
 
     for (auto const& row: DiallerRefusals)
@@ -1132,7 +1140,7 @@ TEST_CASE("An acceptor that holds no key for this node closes, and is never sent
     harness.Start();
 
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     CHECK(harness.Writes() == 0);
     CHECK(harness.transport->ConnectedPeers() == 0);
@@ -1152,7 +1160,7 @@ TEST_CASE("A verdict signed with another machine's key is refused as the accepto
     harness.Start();
 
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     CHECK(harness.Writes() == 0);
     CHECK(harness.transport->ConnectedPeers() == 0);
@@ -1171,7 +1179,7 @@ TEST_CASE("A signed wrong-target verdict is counted as such, and nothing is sent
     harness.Start();
 
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     CHECK(harness.Writes() == 0);
     CHECK(harness.transport->ConnectedPeers() == 0);
@@ -1206,7 +1214,7 @@ TEST_CASE("An acceptor this node holds no key for is sent nothing, counted by na
     harness.Start();
 
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     CHECK(harness.Writes() == 0);
     CHECK(harness.transport->ConnectedPeers() == 0);
@@ -1226,7 +1234,7 @@ TEST_CASE("An acceptor whose key the cluster revoked is sent nothing, counted by
     harness.Start();
 
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     CHECK(harness.Writes() == 0);
     CHECK(harness.transport->ConnectedPeers() == 0);
@@ -1262,23 +1270,23 @@ TEST_CASE("A key revoked while its session is open ends the session before the n
     // the redial is judged against the roster as it is then.
     constexpr auto Backoff = 10ms;
     Harness harness;
-    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff, .stopWakeBound = 5ms });
+    harness.Start(PeerTransportOptions { .dialTimeout = 50ms, .reconnectBackoff = Backoff });
 
     harness.transport->Send("n2", Vote(1));
-    harness.reactor.Drain();
+    harness.reactor.drain();
     REQUIRE(harness.Writes() == 1);
     REQUIRE(harness.transport->ConnectedPeers() == 1);
 
     harness.roster->Revoke("n2");
     harness.transport->Send("n2", Vote(2));
-    harness.reactor.Drain();
+    harness.reactor.drain();
 
     CHECK(harness.Writes() == 1);
     CHECK(harness.Refused(DiallerRefusal::KeyWithdrawn) == 1);
     CHECK(harness.transport->ConnectedPeers() == 0);
 
-    harness.clock.Advance(Backoff);
-    harness.reactor.Drain();
+    harness.clock.advance(Backoff);
+    harness.reactor.drain();
     CHECK(harness.Refused(DiallerRefusal::AcceptorKeyRevoked) == 1);
     CHECK(harness.transport->ConnectedPeers() == 0);
     CHECK(harness.Writes() == 1);
@@ -1294,16 +1302,15 @@ TEST_CASE("An acceptor that never challenges is abandoned at the handshake bound
     constexpr auto Bound = 300ms;
     Harness harness;
     harness.record->script = AcceptorScript::NeverChallenges;
-    harness.Start(
-        PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = 10s, .stopWakeBound = 50ms, .handshakeBound = Bound });
+    harness.Start(PeerTransportOptions { .dialTimeout = 1s, .reconnectBackoff = 10s, .handshakeBound = Bound });
 
     CHECK(harness.Refused(DiallerRefusal::Timeout) == 0);
-    harness.clock.Advance(Bound / 2);
-    harness.reactor.Drain();
+    harness.clock.advance(Bound / 2);
+    harness.reactor.drain();
     CHECK(harness.Refused(DiallerRefusal::Timeout) == 0);
 
-    harness.clock.Advance(Bound);
-    harness.reactor.Drain();
+    harness.clock.advance(Bound);
+    harness.reactor.drain();
     CHECK(harness.Refused(DiallerRefusal::Timeout) == 1);
     CHECK(harness.transport->ConnectedPeers() == 0);
 

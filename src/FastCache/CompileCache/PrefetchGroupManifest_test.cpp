@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/CompileCache/PrefetchGroupManifest.hpp>
-#include <FastCache/Core/Clock.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -12,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include <core/platform/Clock.hpp>
 #include <tests/DeclaredCountBlob.hpp>
 
 using namespace FastCache;
@@ -26,8 +26,8 @@ TEST_CASE("The manifest value carries the layout DecodeKeyList reads, byte for b
     // with bytes spelled field by field through a builder sharing no code with it.
     InMemoryLruStorage storage { 0 };
     PrefetchGroupManifest manifest { storage };
-    ManualClock clock;
-    auto const now = clock.Now();
+    core::platform::ManualClock clock;
+    auto const now = clock.now();
 
     REQUIRE(manifest.AddKey("envA", "one", now).has_value());
     REQUIRE(manifest.AddKey("envA", "two", now).has_value());
@@ -48,8 +48,8 @@ TEST_CASE("PrefetchGroupManifest accumulates keys per prefetch group id")
 {
     InMemoryLruStorage storage { 0 };
     PrefetchGroupManifest manifest { storage };
-    ManualClock clock;
-    auto const now = clock.Now();
+    core::platform::ManualClock clock;
+    auto const now = clock.now();
 
     REQUIRE(manifest.AddKey("envA", "objkey1", now).has_value());
     REQUIRE(manifest.AddKey("envA", "objkey2", now).has_value());
@@ -71,8 +71,8 @@ TEST_CASE("PrefetchGroupManifest AddKey is idempotent")
 {
     InMemoryLruStorage storage { 0 };
     PrefetchGroupManifest manifest { storage };
-    ManualClock clock;
-    auto const now = clock.Now();
+    core::platform::ManualClock clock;
+    auto const now = clock.now();
 
     REQUIRE(manifest.AddKey("env", "k", now).has_value());
     REQUIRE(manifest.AddKey("env", "k", now).has_value());
@@ -85,8 +85,8 @@ TEST_CASE("PrefetchGroupManifest GroupOf reverse-maps a key to its prefetch grou
 {
     InMemoryLruStorage storage { 0 };
     PrefetchGroupManifest manifest { storage };
-    ManualClock clock;
-    auto const now = clock.Now();
+    core::platform::ManualClock clock;
+    auto const now = clock.now();
 
     REQUIRE(manifest.AddKey("envA", "k1", now).has_value());
     REQUIRE(manifest.AddKey("envB", "k2", now).has_value());
@@ -111,9 +111,9 @@ TEST_CASE("PrefetchGroupManifest reports empty for an unknown prefetch group")
 {
     InMemoryLruStorage storage { 0 };
     PrefetchGroupManifest manifest { storage };
-    ManualClock clock;
+    core::platform::ManualClock clock;
 
-    auto const keys = manifest.Keys("never-seen", clock.Now());
+    auto const keys = manifest.Keys("never-seen", clock.now());
     REQUIRE(keys.has_value());
     CHECK(keys->empty());
 }
@@ -122,8 +122,8 @@ TEST_CASE("PrefetchGroupManifest preserves insertion order across many keys")
 {
     InMemoryLruStorage storage { 0 };
     PrefetchGroupManifest manifest { storage };
-    ManualClock clock;
-    auto const now = clock.Now();
+    core::platform::ManualClock clock;
+    auto const now = clock.now();
 
     for (auto const i: std::views::iota(0, 50))
         REQUIRE(manifest.AddKey("env", "k" + std::to_string(i), now).has_value());
@@ -144,8 +144,8 @@ TEST_CASE("PrefetchGroupManifest refuses a key count the manifest bytes cannot s
     // that is over 130 GB asked for by four bytes.
     InMemoryLruStorage storage { 0 };
     PrefetchGroupManifest manifest { storage };
-    ManualClock clock;
-    auto const now = clock.Now();
+    core::platform::ManualClock clock;
+    auto const now = clock.now();
 
     // The manifest's own storage key, as `ManifestKey` builds it: a 0x01 control byte
     // that keeps it out of the user keyspace, then `cohort:`, then the group id.
@@ -153,7 +153,7 @@ TEST_CASE("PrefetchGroupManifest refuses a key count the manifest bytes cannot s
 
     // `[u32 count = 0xFFFFFFFF]` and not one byte more.
     std::vector<std::byte> const hostile(4, std::byte { 0xFF });
-    REQUIRE(storage.Set(manifestKey, hostile, /*flags=*/0, /*expiry=*/TimePoint::max()).has_value());
+    REQUIRE(storage.Set(manifestKey, hostile, /*flags=*/0, /*expiry=*/core::platform::SteadyTimePoint::max()).has_value());
 
     // Refused by NAME rather than read as an empty group. `Corrupt` is the enumerator
     // for "this store holds bytes this build did not write", and it has to be distinct
@@ -173,12 +173,12 @@ TEST_CASE("An undecodable prefetch manifest is never silently overwritten")
     // understand. One value cannot be a refusal on FETCH and a fresh start on STORE.
     InMemoryLruStorage storage { 0 };
     PrefetchGroupManifest manifest { storage };
-    ManualClock clock;
-    auto const now = clock.Now();
+    core::platform::ManualClock clock;
+    auto const now = clock.now();
 
     std::string const manifestKey = std::string { '\x01' } + "cohort:" + "envHostile";
     std::vector<std::byte> const hostile(4, std::byte { 0xFF });
-    REQUIRE(storage.Set(manifestKey, hostile, /*flags=*/0, /*expiry=*/TimePoint::max()).has_value());
+    REQUIRE(storage.Set(manifestKey, hostile, /*flags=*/0, /*expiry=*/core::platform::SteadyTimePoint::max()).has_value());
 
     auto const added = manifest.AddKey("envHostile", "objkey1", now);
     REQUIRE_FALSE(added.has_value());
@@ -201,12 +201,12 @@ TEST_CASE("A prefetch manifest too short to hold a count is refused, not overwri
     // hole the count check closes.
     InMemoryLruStorage storage { 0 };
     PrefetchGroupManifest manifest { storage };
-    ManualClock clock;
-    auto const now = clock.Now();
+    core::platform::ManualClock clock;
+    auto const now = clock.now();
 
     std::string const manifestKey = std::string { '\x01' } + "cohort:" + "envStub";
     std::vector<std::byte> const stub(3, std::byte { 0xFF });
-    REQUIRE(storage.Set(manifestKey, stub, /*flags=*/0, /*expiry=*/TimePoint::max()).has_value());
+    REQUIRE(storage.Set(manifestKey, stub, /*flags=*/0, /*expiry=*/core::platform::SteadyTimePoint::max()).has_value());
 
     auto const keys = manifest.Keys("envStub", now);
     REQUIRE_FALSE(keys.has_value());

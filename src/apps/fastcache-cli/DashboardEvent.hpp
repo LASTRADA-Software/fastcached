@@ -4,8 +4,6 @@
 #include "CliAnswer.hpp"
 #include "DashboardFrame.hpp"
 
-#include <FastCache/Async/Task.hpp>
-#include <FastCache/Core/Clock.hpp>
 #include <FastCache/Metrics/StatsReading.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -15,6 +13,9 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+
+#include <core/async/Task.hpp>
+#include <core/platform/Clock.hpp>
 
 namespace FastCache::Cli
 {
@@ -75,11 +76,11 @@ struct DashboardEvent
     /// one that happened -- `DrainWithin`'s defect -- so a sampler that fell behind would report
     /// every rate too high by exactly how far behind it was, and nothing would say so.
     ///
-    /// A steady `TimePoint`, and the `static_assert` below the struct keeps it one. A wall clock
+    /// A steady `core::platform::SteadyTimePoint`, and the `static_assert` below the struct keeps it one. A wall clock
     /// is not a duration -- this tree has measured WSL2 stepping `CLOCK_REALTIME` backwards -- so
     /// #134 §9.4's *wall time steps back and no rate moves* holds because no wall time can be
     /// stored here at all.
-    TimePoint at {};
+    core::platform::SteadyTimePoint at {};
 
     /// `Sample`, `cache` and `node` sessions: the reading the stream pushed, decoded into the one
     /// model `/metrics` renders from (#1399).
@@ -132,9 +133,9 @@ struct DashboardEvent
     /// delivers a real Ctrl-C here, and `IsQuitKey` still reads it.
     std::string keys {};
 
-    /// `Resize`: the new geometry, as endo reports it.
+    /// `Resize`: the new geometry, as core-cpp reports it.
     ///
-    /// Two ints rather than a geometry struct, because `tui::Terminal` answers
+    /// Two ints rather than a geometry struct, because `core::tui::Terminal` answers
     /// `columns()` and `rows()` and has no such struct. Wrapping them here would be
     /// a third spelling of something that already has two, which is the duplicate
     /// type this deliberately avoided the first time.
@@ -190,7 +191,7 @@ class IDashboardEventSource
     /// and drained, so the loop has one termination condition rather than a sentinel
     /// beside a flag.
     /// @return The event.
-    [[nodiscard]] virtual Task<DashboardEvent> Next() = 0;
+    [[nodiscard]] virtual core::async::Task<DashboardEvent> Next() = 0;
 
     /// Stop producing.
     ///
