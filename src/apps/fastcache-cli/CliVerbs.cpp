@@ -8,6 +8,7 @@
 
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Distributed/MembershipWire.hpp>
@@ -190,6 +191,20 @@ namespace
             answer.advisories.emplace_back(BinaryCellAdvisory);
         else
             answer.advisories.emplace_back(std::format("{}; {}", BinaryCellAdvisory, note));
+    }
+
+    /// The `fleet-id` cell: the paste string VERBATIM when `--fleet-id` takes it, and otherwise the string
+    /// followed by the parser's own refusal -- a fleet with more voters than a pin may name
+    /// (`Cluster::MaxPinnedVoterKeys`), or a node of another build -- so nothing a machine would refuse
+    /// reads as something to paste. The parser is the one `--fleet-id` reads, never a count kept here.
+    /// @param text What the node reported.
+    /// @return The cell.
+    [[nodiscard]] Cell FleetIdCell(std::string const& text)
+    {
+        auto const parsed = Cluster::ParsePinnedFleet(text);
+        if (parsed.has_value())
+            return TextCell(text);
+        return TextCell(std::format("{} (--fleet-id refuses this as it stands: {})", text, parsed.error()));
     }
 
     /// A value cell plus the remark that goes with it when the bytes are not text.
@@ -1054,24 +1069,6 @@ namespace
             record.push_back({ .name = std::string { name }, .value = NumberCell(static_cast<std::uint64_t>(*value)) });
     }
 
-    /// An instant a node sent as milliseconds since the Unix epoch, as a UTC timestamp.
-    ///
-    /// A value this host's clock cannot represent is rendered as the number it was, never
-    /// converted: the conversion to the clock's own period overflows, and a node is a peer.
-    /// @param millis What the node sent.
-    /// @return `YYYY-MM-DDTHH:MM:SSZ`, or the raw count.
-    [[nodiscard]] std::string RenderEpochMillis(std::uint64_t millis)
-    {
-        constexpr auto MaxMillis =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::duration::max()).count();
-        if (millis > static_cast<std::uint64_t>(MaxMillis))
-            return std::format("{} ms since the epoch", millis);
-        auto const instant =
-            std::chrono::system_clock::time_point { std::chrono::duration_cast<std::chrono::system_clock::duration>(
-                std::chrono::milliseconds { static_cast<std::int64_t>(millis) }) };
-        return std::format("{:%FT%TZ}", std::chrono::floor<std::chrono::seconds>(instant));
-    }
-
     /// Turn a decoded node status into the reported record.
     ///
     /// Pure, and separate from the handler, so the reported SHAPE is testable without a
@@ -1223,6 +1220,16 @@ namespace
         if (fields.runtime.stateDirectoryReason.has_value())
             record.push_back({ .name = "state-directory-reason", .value = TextCell(*fields.runtime.stateDirectoryReason) });
 
+        // **The pin to paste, and the pin this node trusts by** (`--fleet-id`). `fleet-id` is
+        // `<cluster-id>@<key>[,<key>...]` for this node's fleet and its voters, exactly what another
+        // machine's --fleet-id (and the installer's FASTCACHE_FLEET_ID) takes. `fleet-pin` reads `none`
+        // on a node that trusts on first use -- the answer, not an absence -- and both are absent from
+        // a node too old to say, for the enrollment state's reason.
+        if (fields.runtime.fleetId.has_value())
+            record.push_back({ .name = "fleet-id", .value = FleetIdCell(*fields.runtime.fleetId) });
+        if (fields.runtime.fleetPin.has_value())
+            record.push_back({ .name = "fleet-pin", .value = TextCell(fields.runtime.fleetPin->fleet.value_or("none")) });
+
         // **Which set consensus counts this node in** (#1449): `voter`, `learner`, or --
         // on a node waiting to be admitted -- `no-cluster`. A learner and a following
         // voter report the same `scheduler-role`, and only one of them stands when the
@@ -1234,23 +1241,14 @@ namespace
                   .value = TextCell(std::string { NameOfConsensusStanding(*fields.runtime.consensusStanding) }) });
 
         // **The roster this node verifies lease grants against** (#178): which one, how many
-        // vote, how many machines are admitted by key, how many keys the cluster revoked, and
-        // until when a majority of its voters vouch for it. ABSENT on a node that holds none --
-        // it checks no grant, and four zeroes would read as a roster of nobody. The lapse is
-        // absent on a consensus member, whose roster is the state it applied and never lapses;
-        // rendered as a UTC instant, whole seconds, because it is compared against a clock.
+        // vote, and how many keys the cluster revoked. ABSENT on a node that holds none -- it
+        // checks no grant, and three zeroes would read as a roster of nobody.
         if (fields.runtime.roster.has_value())
         {
             auto const& roster = *fields.runtime.roster;
             record.push_back({ .name = "roster-version", .value = NumberCell(roster.version) });
             record.push_back({ .name = "roster-voters", .value = NumberCell(static_cast<std::uint64_t>(roster.voters)) });
-            record.push_back(
-                { .name = "roster-principals", .value = NumberCell(static_cast<std::uint64_t>(roster.principals)) });
             record.push_back({ .name = "roster-revoked", .value = NumberCell(static_cast<std::uint64_t>(roster.revoked)) });
-            record.push_back({ .name = "roster-certified-until",
-                               .value = roster.certifiedUntilMillis.has_value()
-                                            ? TextCell(RenderEpochMillis(*roster.certifiedUntilMillis))
-                                            : AbsentCell() });
         }
 
         // **What this node reads through to, or serves, as the fleet's shared cache**: where the
@@ -1768,14 +1766,14 @@ namespace
         std::vector<std::vector<Cell>> rows;
         rows.reserve(state.members.size());
         for (auto const& member: state.members)
-            // **Absent, not empty.** An empty `schedulerEndpoint` is the ORDINARY state
-            // of every member that has never led -- a leader announces its own record on
-            // election -- so it is a member that has not said, never a member reachable
-            // at the empty string. A blank cell would read as a rendering fault, and a
+            // **Absent, not empty.** An empty `schedulerEndpoint` is the state of a
+            // member that has announced none -- every member's record carries the
+            // endpoint its join stated -- so it is a member that has not said, never a
+            // member reachable at the empty string. A blank cell would read as a rendering fault, and a
             // zero would be a claim.
             //
             // And `scheduler-state` says which absence (#1340): never announced, or
-            // cleared by a re-admit. A column of its own rather than a word in the
+            // cleared by a record re-proposed with none. A column of its own rather than a word in the
             // endpoint cell, so `scheduler` stays an address or ABSENT in every format.
             //
             // `seat` is the set the operator admitted the member into (#1449) -- the
@@ -2518,7 +2516,7 @@ namespace
           .maxOperands = 0,
           .operands = "",
           .summary = "who the cluster has agreed is a member, and where each\n"
-                     "answers; a member that has never led shows no scheduler",
+                     "answers; a member that has announced none shows no scheduler",
           .protocolCommand = "cluster-status",
           .modifiers = Modifier::None,
           .handler = &ClusterMembers,

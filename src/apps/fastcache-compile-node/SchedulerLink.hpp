@@ -33,6 +33,29 @@ namespace FastCache::Node
 /// surfaces, not because one is derived from the other.
 constexpr int MaxAnnounceRedirects = 2;
 
+/// Where a node registers NOW: the scheduler endpoints a round walks, re-read at the start of every
+/// round (`SchedulerLink::BeginRound`).
+///
+/// A seam rather than a list, because the answer moves while the node runs: a node that serves no
+/// scheduler registers at its fleet's voters, and a voter that moves its `0xFC` endpoint announces
+/// the new one, proven, and the leader records it -- so the APPLIED state names the new endpoint while
+/// the formation record still remembers the old one until a reform. `Node::AppliedSchedulers` is the
+/// production answer.
+class ISchedulerEndpointSource
+{
+  public:
+    ISchedulerEndpointSource() = default;
+    ISchedulerEndpointSource(ISchedulerEndpointSource const&) = delete;
+    ISchedulerEndpointSource(ISchedulerEndpointSource&&) = delete;
+    ISchedulerEndpointSource& operator=(ISchedulerEndpointSource const&) = delete;
+    ISchedulerEndpointSource& operator=(ISchedulerEndpointSource&&) = delete;
+    virtual ~ISchedulerEndpointSource() = default;
+
+    /// @return The endpoints to register with, in the order a round tries them; empty when none is
+    ///         known. Called from a round's own thread while another thread may move the answer.
+    [[nodiscard]] virtual std::vector<std::string> Current() const = 0;
+};
+
 /// Where this node believes the scheduler's leader is, across heartbeat rounds.
 ///
 /// **Pure**: no socket, no clock, no logger. The heartbeat thread dials whatever
@@ -106,14 +129,36 @@ class SchedulerLink
     /// @return The link, or nothing when @p configured is empty.
     [[nodiscard]] static std::optional<SchedulerLink> For(std::vector<std::string> configured);
 
-    /// @return The endpoints this link was built over, in order: fixed for its lifetime, so
-    ///         safe to read from any thread while a round moves `Target()`.
+    /// A link over what @p source answers now, re-read at the start of every round, or nothing when
+    /// it answers none. A name of its own rather than an overload of `For`, which a braced empty list
+    /// would make ambiguous.
+    ///
+    /// **Re-read in `BeginRound`, the one call every round makes**, never by each loop beside it: a
+    /// voter that moved its `0xFC` endpoint is reached at the next round of BOTH loops that dial
+    /// through a link, and neither can forget to ask.
+    /// @param source Where this node registers now; must outlive the link.
+    /// @return The link, or nothing when @p source answers an empty list.
+    [[nodiscard]] static std::optional<SchedulerLink> Over(ISchedulerEndpointSource const& source);
+
+    /// @return The endpoints the current round walks, in order. Moved only by `BeginRound`, so read
+    ///         it on the round's own thread, or before the first round.
     [[nodiscard]] std::vector<std::string> const& Configured() const noexcept
     {
         return _configured;
     }
 
-    /// Start a heartbeat round, resetting the per-round redirect budget.
+    /// Walk @p configured from the next round on.
+    ///
+    /// The walk keeps its place by ENDPOINT rather than by position: the endpoint that last accepted
+    /// a round stays where the next round starts when it is still listed, and the list's first entry
+    /// is where a round starts when it is not. A remembered leader is kept -- it is not a configured
+    /// endpoint, and a moved list says nothing about who leads. An empty list changes nothing: a
+    /// source that knows no endpoint for a moment is no reason to forget every one this link knew.
+    /// @param configured The endpoints, in order.
+    void Retarget(std::vector<std::string> configured);
+
+    /// Start a heartbeat round, resetting the per-round redirect budget, and re-read where this node
+    /// registers when the link was built over a source (`Retarget`).
     ///
     /// The budget is per round rather than per process: a fleet that re-elects
     /// once an hour should spend one redirect an hour, not exhaust a lifetime
@@ -155,6 +200,8 @@ class SchedulerLink
     [[nodiscard]] std::string const& ConfiguredAt(std::size_t offset) const noexcept;
 
     std::vector<std::string> _configured;
+    /// Where `BeginRound` re-reads the list; null for a link built over a fixed one.
+    ISchedulerEndpointSource const* _source { nullptr };
     /// The leader a round has been accepted at, when that is not a configured
     /// endpoint; empty until one has been.
     std::optional<std::string> _learned;

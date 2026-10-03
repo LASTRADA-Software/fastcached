@@ -17,6 +17,7 @@
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/SeedSources.hpp>
 #include <FastCache/Cluster/SplitEvidence.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/StopAwareWait.hpp>
@@ -28,6 +29,7 @@
 #include <chrono>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -144,6 +146,12 @@ class LateClusterAdmin final: public Distributed::IClusterAdmin
     /// @copydoc Distributed::IClusterAdmin::ProposeToCluster
     [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& command) override;
 
+    /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
+    ///
+    /// Dropped while no tier is attached: nobody leads that this node knows, and the member announces
+    /// again at its next interval.
+    void NoteAnnouncedEndpoint(Consensus::NodeId const& member, std::string endpoint) override;
+
   private:
     std::atomic<Distributed::IClusterAdmin*> _admin { nullptr };
 };
@@ -193,11 +201,13 @@ class FormationRuntime
     static constexpr std::chrono::milliseconds IoTimeout = EnrollDialTimeout;
 
     /// @param cfg The configuration the record shaped; must outlive this.
-    /// @param identityKey This node's identity key: what every `Enroll` states and every summary is
-    ///        signed under. `MakeFormationRuntime` refuses a configuration that holds none.
+    /// @param identityKey This node's identity key pair: what every `Enroll` states and is signed
+    ///        with. `MakeFormationRuntime` refuses a node that holds none. Must outlive this.
     /// @param record The record this body runs by.
     /// @param durables What outlives the body.
     /// @param reloader The live configuration, or null when this node has no file; must outlive this.
+    /// @param advertised Where this node's `0xFC` port answers now: what every summary and every
+    ///        `Enroll` states. Must outlive this.
     /// @param memos The join memos this fleet's members announced -- the scheduler's, when this node
     ///        serves one -- or null for none. Must outlive this.
     /// @param metrics Where the controller counts; must outlive this.
@@ -205,10 +215,11 @@ class FormationRuntime
     /// @param conditions Where `formation-move-refused` is answered; null when nobody reads it. Must
     ///        outlive this.
     FormationRuntime(NodeConfig const& cfg,
-                     Ed25519PublicKey const& identityKey,
+                     Ed25519KeyPair const& identityKey,
                      Cluster::FormationRecord record,
                      FormationDurables durables,
                      NodeReloader const* reloader,
+                     Cc::IAdvertisedEndpointSource const& advertised,
                      Cluster::IAnnouncedJoinMemos const* memos,
                      IMetricsSink& metrics,
                      ILogger& logger,
@@ -290,12 +301,14 @@ inline constexpr std::string_view FormationNeedsIdentityKey =
 /// computed (`AnsweredFleetSummary`) and moves nowhere.
 ///
 /// **A configuration that runs consensus and holds no identity key is REFUSED, never run under a zero
-/// key.** The key is what every `Enroll` states and every summary is signed under, and a defaulted one
-/// passes every check this side makes: the window records zero, an approval made from the row admits
-/// zero, and the joiner validates the roster against the zero it sent. Only the Raft session would
-/// refuse, long after.
+/// key.** The key is what every `Enroll` states and is signed with, and a defaulted one would pass
+/// every check this side makes: the window records zero, an approval made from the row admits zero,
+/// and the joiner validates the roster against the zero it sent. Only the Raft session would refuse,
+/// long after.
 /// @param cfg The configuration the record shaped; must outlive the runtime.
+/// @param identityKey This node's identity key pair, as its start resolved it; must outlive the runtime.
 /// @param body What the body runs its formation by.
+/// @param advertised Where this node's `0xFC` port answers now; must outlive the runtime.
 /// @param scheduler This node's scheduler, whose service holds the join memos members announced;
 ///        null when it serves none. Must outlive the runtime.
 /// @param metrics Where the controller counts.
@@ -303,12 +316,15 @@ inline constexpr std::string_view FormationNeedsIdentityKey =
 /// @param conditions Where `formation-move-refused` is answered; null when nobody reads it.
 /// @return The runtime, not yet beating; null when the configuration runs no consensus; or
 ///         `FormationNeedsIdentityKey` when it runs consensus and holds no identity key.
-[[nodiscard]] std::expected<std::unique_ptr<FormationRuntime>, std::string> MakeFormationRuntime(NodeConfig const& cfg,
-                                                                                                 FormationBody const& body,
-                                                                                                 SchedulerTier* scheduler,
-                                                                                                 IMetricsSink& metrics,
-                                                                                                 ILogger& logger,
-                                                                                                 NodeConditions* conditions);
+[[nodiscard]] std::expected<std::unique_ptr<FormationRuntime>, std::string> MakeFormationRuntime(
+    NodeConfig const& cfg,
+    std::optional<Ed25519KeyPair> const& identityKey,
+    FormationBody const& body,
+    Cc::IAdvertisedEndpointSource const& advertised,
+    SchedulerTier* scheduler,
+    IMetricsSink& metrics,
+    ILogger& logger,
+    NodeConditions* conditions);
 
 /// What this node answers about itself: the controller's summary, or @p fallback when no formation runs.
 /// @param runtime The body's formation; may be null.

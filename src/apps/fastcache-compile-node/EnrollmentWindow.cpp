@@ -68,10 +68,35 @@ EnrollDecision EnrollmentWindow::Offer(JoinerClaim const& claim, std::string_vie
         // A machine that has genuinely moved is therefore refused and enrolled again --
         // one operator action, and the same answer `--cluster-admit` already gives for
         // recording a move.
-        if (existing->decision == Wire::EnrollmentDecision::Pending)
+        //
+        // The refresh is the KEY HOLDER's own: the responder verified the request's signature under
+        // this key before offering it here (`Cluster::VerifyEnrollRequest`), so a host that merely
+        // knows the public id and key cannot move the endpoint a person is about to approve.
+        //
+        // **And it is FRESH**: only a request signed over the challenge this row holds NOW refreshes
+        // it, and it replaces that challenge. A genuine request recorded on the way and replayed
+        // later answers a challenge the row has moved past, so it keeps the row as it is -- without
+        // this, it rolled the row back to an endpoint the joiner had left. Such a poll still keeps
+        // the row alive and is answered with the current challenge, so the joiner catches up.
+        auto const index = static_cast<std::size_t>(existing - _pending.data());
+        auto const fresh = claim.answered.has_value() && *claim.answered == _challenges[index];
+        if (existing->decision == Wire::EnrollmentDecision::Pending && fresh)
         {
             existing->nodeEndpoint = std::string { claim.nodeEndpoint };
             existing->peerId = std::string { peerId };
+            _challenges[index] = claim.issue;
+        }
+        else if (existing->decision == Wire::EnrollmentDecision::Pending)
+        {
+            // Unrefreshed: a stale answer stating another endpoint is shown to the person, as a
+            // decided row's disagreement is below -- it is also how somebody replaying looks. It
+            // moves nothing that decides anything, but it has kept the row alive above
+            // (`_lastSeen`), so a replayer can hold a joiner that stopped asking on the list past
+            // its lifetime -- a list slot and the operator's attention, the cost a poll under
+            // another key already has, and accepted for the same reason: the lifetime is about a
+            // machine that stopped ASKING.
+            if (existing->nodeEndpoint != claim.nodeEndpoint)
+                ++existing->claimsChanged;
         }
         else if (existing->nodeEndpoint != claim.nodeEndpoint || existing->peerId != peerId)
         {
@@ -87,8 +112,10 @@ EnrollDecision EnrollmentWindow::Offer(JoinerClaim const& claim, std::string_vie
         {
             case Wire::EnrollmentDecision::Pending:
                 // The comparison, when the joiner asks: nothing wakes when the deadline passes.
-                // Only the machine that asked FIRST under this id is reached here -- a later key
-                // was answered above -- so a `claimsChanged` poll is never auto-approved.
+                // Only a poll under the key and role the row RECORDED is reached here -- another
+                // key was answered above -- and what an auto-approval admits is the ROW: its key and
+                // its endpoint, whatever this poll stated. So a stale poll that just counted in
+                // `claimsChanged` may be the one that fires it, and records nothing it said.
                 return AutoApprovingLocked() ? EnrollDecision::AutoApprove : EnrollDecision::Pending;
             case Wire::EnrollmentDecision::Approved:
                 // Every poll, and nothing is spent: what an approval leads to is the roster,
@@ -139,6 +166,7 @@ EnrollDecision EnrollmentWindow::Offer(JoinerClaim const& claim, std::string_vie
     _firstSeen.push_back(_clock.now());
     _lastSeen.push_back(_clock.now());
     _autoApprovedArmedAt.emplace_back(std::nullopt);
+    _challenges.push_back(claim.issue);
     ReportWaitingLocked();
     return AutoApprovingLocked() ? EnrollDecision::AutoApprove : EnrollDecision::Pending;
 }
@@ -303,6 +331,16 @@ void EnrollmentWindow::KeepLocked(std::vector<std::size_t> const& kept) const
     _firstSeen = pick(_firstSeen);
     _lastSeen = pick(_lastSeen);
     _autoApprovedArmedAt = pick(_autoApprovedArmedAt);
+    _challenges = pick(_challenges);
+}
+
+std::optional<Wire::EnrollChallenge> EnrollmentWindow::ChallengeFor(std::string_view nodeId) const
+{
+    std::scoped_lock const guard { _mutex };
+    auto const found = std::ranges::find(_pending, nodeId, &Wire::EnrollmentPendingEntry::nodeId);
+    if (found == _pending.end())
+        return std::nullopt;
+    return _challenges[static_cast<std::size_t>(found - _pending.begin())];
 }
 
 std::vector<std::string> EnrollmentWindow::ClearPending()
@@ -464,6 +502,7 @@ void EnrollmentWindow::OnRoleChanged(Distributed::SchedulerRole role, std::strin
     _firstSeen.clear();
     _lastSeen.clear();
     _autoApprovedArmedAt.clear();
+    _challenges.clear();
     ReportWaitingLocked();
     ReportWindowClosedLocked();
 }

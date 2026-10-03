@@ -88,18 +88,25 @@ TEST_CASE("A roster survives its own encoding", "[cluster][roster]")
     CHECK(*decoded == roster);
 }
 
-TEST_CASE("A roster's digest moves with who may vouch for whom, and with nothing an election moves", "[cluster][roster]")
+TEST_CASE("A roster's digest moves with every fact it carries, the recorded 0xFC endpoint included, and with no bookkeeping",
+          "[cluster][roster]")
 {
-    // What distinguishes: a scheduler endpoint changes every time a member leads, so a digest
-    // that moved with it would need a fresh endorsement per election; a key, a seat or a
-    // revocation is exactly what an endorsement vouches for.
+    // The recorded `0xFC` endpoint is what a joiner remembers its fleet's voters at, so the roster
+    // carries it and its digest moves with it -- affordable since the certified roster, which voters
+    // endorsed per digest, retired. The endpoint's HISTORY is bookkeeping the joiner has no use for,
+    // and moves nothing.
     auto const state = SampleState();
     auto const digest = DigestOfRoster(ProjectRoster(state));
 
-    auto elected = state;
-    elected.members[0].schedulerEndpoint = "n1.example:6677";
-    elected.members[0].schedulerEndpointHistory = SchedulerEndpointHistory::Announced;
-    CHECK(DigestOfRoster(ProjectRoster(elected)) == digest);
+    auto moved = state;
+    moved.members[0].schedulerEndpoint = "n1.example:6677";
+    CHECK(DigestOfRoster(ProjectRoster(moved)) != digest);
+    CHECK(ProjectRoster(moved).members[0].schedulerEndpoint == "n1.example:6677");
+
+    auto history = state;
+    history.members[0].schedulerEndpointHistory = SchedulerEndpointHistory::Announced;
+    REQUIRE(history.members[0].schedulerEndpointHistory != state.members[0].schedulerEndpointHistory);
+    CHECK(DigestOfRoster(ProjectRoster(history)) == digest);
 
     auto rekeyed = state;
     rekeyed.members[1].publicKey = TestKeyPair("elsewhere").PublicKey();
@@ -126,9 +133,31 @@ TEST_CASE("A roster another build laid out is refused by name, and a damaged one
     auto const& fields = Testing::Unwrap(split);
     REQUIRE(fields[0].size() == 1);
 
-    // The byte, pinned as well as the name: the version is the first field's only byte.
-    CHECK(fields[0][0] == std::byte { 0x01 });
-    static_assert(RosterFormatVersion == 1);
+    // The byte, pinned as well as the name: the version is the first field's only byte. 2 since a
+    // member carries its recorded `0xFC` endpoint: a roster is PERSISTED (a learner's formation record
+    // keeps its approval's), so a layout change without a bump would read an old record as damage.
+    CHECK(fields[0][0] == std::byte { 0x02 });
+    static_assert(RosterFormatVersion == 2);
+
+    SECTION("the previous layout, a record written before members carried an endpoint")
+    {
+        // Built by hand as version 1 wrote it -- four fields a member -- and refused by NAME, so a
+        // learner whose record holds one is told which build wrote it, never that its file is damaged.
+        auto const member = WireFields::Encode({ WireFields::AsBytes(std::string_view { "n1" }),
+                                                 WireFields::AsBytes(std::string_view { "n1:6680" }),
+                                                 std::span<std::byte const> { std::array { std::byte { 0x00 } } },
+                                                 std::span<std::byte const> {} });
+        auto const members = WireFields::Encode({ std::span<std::byte const> { member } });
+        auto const empty = WireFields::Encode(WireFields::FieldList {});
+        auto const old = WireFields::Encode({ std::span<std::byte const> { std::array { std::byte { 0x01 } } },
+                                              std::span<std::byte const> { members },
+                                              std::span<std::byte const> { empty },
+                                              std::span<std::byte const> { empty } });
+        auto const decoded = DecodeRoster(old);
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == ConsensusErrorCode::UnsupportedVersion);
+        CHECK(decoded.error().context.contains("roster encoding version 1 (this build reads 2)"));
+    }
 
     SECTION("another layout version")
     {
@@ -190,7 +219,7 @@ TEST_CASE("A roster member with an empty or all-zero key is refused by name", "[
 {
     // A member holds a key by type, so no `Roster` can carry one without -- and the bytes still
     // can, since the field is a length-prefixed run like every other. Built from the bytes: one
-    // member, no principals, no revocations.
+    // member, with no recorded `0xFC` endpoint, no principals, no revocations.
     auto const version = std::array { static_cast<std::byte>(RosterFormatVersion) };
     auto const seat = std::array { static_cast<std::byte>(MemberSeat::Voter) };
     auto const key = TestKeyPair("n1").PublicKey();
@@ -198,7 +227,8 @@ TEST_CASE("A roster member with an empty or all-zero key is refused by name", "[
         auto const member = WireFields::Encode({ WireFields::AsBytes(std::string_view { "n1" }),
                                                  WireFields::AsBytes(std::string_view { "n1.example:6680" }),
                                                  std::span<std::byte const> { seat },
-                                                 keyField });
+                                                 keyField,
+                                                 std::span<std::byte const> {} });
         auto const members = WireFields::Encode({ std::span<std::byte const> { member } });
         return WireFields::Encode({ std::span<std::byte const> { version },
                                     std::span<std::byte const> { members },
@@ -212,8 +242,8 @@ TEST_CASE("A roster member with an empty or all-zero key is refused by name", "[
     REQUIRE(keyed.has_value());
     CHECK(Testing::Unwrap(keyed).members.at(0).publicKey == key);
 
-    // Named apart from every other malformed entry, as `DecodeState` names its own: a kept roster
-    // that holds one says so in its own words.
+    // Named apart from every other malformed entry, as `DecodeState` names its own: a roster that
+    // holds one says so in its own words.
     auto const zero = Ed25519PublicKey {};
     for (auto const keyField: { std::span<std::byte const> {}, std::span<std::byte const> { zero } })
     {

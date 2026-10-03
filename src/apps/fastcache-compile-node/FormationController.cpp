@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -41,15 +42,13 @@ namespace
     /// endpoint only the dialler reaches is to withhold the whole announcement
     /// (`Cluster::AnnouncesOnlyThisMachine`) -- right for the endpoints a peer NEEDS, wrong for this
     /// one, which only makes the node a target a peer holding its key may ask again. A node that
-    /// states none is simply not one.
+    /// states none is simply not one. The rule is `IsPeerDialableEndpoint`, the one every route
+    /// into a member record asks.
     /// @param advertised The endpoint `AdvertisedEndpoint` names.
     /// @return The endpoint to state, or empty.
     [[nodiscard]] std::string StatedNodeEndpoint(std::string_view advertised)
     {
-        auto const host = HostOfEndpoint(advertised);
-        if (advertised.empty() || NamesOnlyThisMachine(host) || IsWildcardHost(host))
-            return {};
-        return std::string { advertised };
+        return PeerDialableOrNone(advertised);
     }
 } // namespace
 
@@ -62,6 +61,8 @@ struct FormationController::TriggerContext
     Cluster::ProvenFleet const* fleet { nullptr };   ///< `YieldDecided`: the fleet it yields to.
     std::span<std::byte const> roster {};            ///< `Approved`: the roster the fleet handed over.
     Cluster::DissolveOrder const* order { nullptr }; ///< `DissolvedInto`: the survivor the fleet leaves for.
+    /// `Approved`: the key the admission was verified under, which the record keeps for the pin to judge.
+    std::optional<Ed25519PublicKey> admittedBy {};
 };
 
 FormationController::FormationController(FormationParts parts, SelfFacts self, Cluster::FormationRecord record):
@@ -107,7 +108,7 @@ Wire::FleetSummary FormationController::CurrentLocked() const
         .raftEndpoint = row.raftListener == Cluster::RaftListenerState::Open ? _self.raftEndpoint : std::string {},
         .members = std::move(members),
         .memberTotal = total,
-        .nodeEndpoint = StatedNodeEndpoint(_self.nodeEndpoint),
+        .nodeEndpoint = StatedNodeEndpoint(_self.advertised.Current()),
         .leaderKey = LeaderKeyLocked(),
         .pointsAt = {},
     };
@@ -220,7 +221,8 @@ std::optional<FormationController::FollowedPointer> FormationController::Pointer
     auto const& summary = fleet.Summary();
     auto const& pointer = summary.pointsAt;
     // A pointer back at this node is this node's own fleet, which it has nothing to ask about.
-    if (Cluster::ClassifyEncounter(own, fleet.Proven(), Cluster::SplitEvidence::None) != Cluster::Encounter::Follow
+    if (Cluster::ClassifyEncounter(own, fleet.Proven(), Cluster::SplitEvidence::None, _self.pin)
+            != Cluster::Encounter::Follow
         || !ParseDialEndpoint(pointer.leaderNodeEndpoint).has_value() || pointer.leaderId == _self.nodeId)
         return std::nullopt;
     return FollowedPointer { .pendingId = summary.clusterId, .pointer = pointer };
@@ -299,7 +301,17 @@ void FormationController::TickSolitary()
         }
         _seen.clear();
 
-        target = Cluster::PreferredTarget(own, eligible);
+        // What the pin withholds is told and counted per proof, before the decision: a node that sits
+        // alone beside a fleet it would have joined must say why, and the attack the pin stops -- a
+        // fleet proving itself older to be joined -- reads as exactly this.
+        for (auto const& fleet: eligible)
+            if (Cluster::ClassifyEncounter(own, fleet.Proven(), Cluster::SplitEvidence::None, _self.pin)
+                == Cluster::Encounter::PinnedElsewhere)
+            {
+                _parts.metrics.Increment(IMetricsSink::Counter::FormationYieldsRefusedPin);
+                NamePinWithheld(fleet.Summary().clusterId);
+            }
+        target = Cluster::PreferredTarget(own, eligible, _self.pin);
         // A decision spends neither turn: the pointer is not followed, and the probe stays due.
         auto const now = _parts.clock.now();
         auto const probeIsDue = !target.has_value() && !seeds.empty() && now >= _nextProbeAt;
@@ -313,6 +325,35 @@ void FormationController::TickSolitary()
         {
             pointer = std::move(candidate);
             _nextFollowAt = now + SeedProbeInterval;
+        }
+    }
+
+    // **A join this node could not finish is not decided.** A learner states where its `0xFC` port
+    // answers and the fleet records it, so a node advertising none a peer can dial would yield, send
+    // nothing (`PollProven`), give the join up after `PendingGiveUpAfter` and yield again -- its record
+    // rewritten twice a cycle, and `Pending` announced to the segment meanwhile. Said once per
+    // advertise; the next beat that reads a dialable one decides as usual.
+    if (target.has_value())
+    {
+        auto const joiner = Joiner(std::nullopt);
+        auto const statable = !EnrollRoleRowFor(joiner.role).statesEndpoint || !joiner.nodeEndpoint.empty();
+        auto const advertised = _self.advertised.Current();
+        std::scoped_lock const lock { _lock };
+        if (statable)
+            _unstatableSaidFor.reset();
+        else
+        {
+            if (_unstatableSaidFor != advertised)
+            {
+                _unstatableSaidFor = advertised;
+                _parts.logger.Logf(LogLevel::Warn,
+                                   "formation: not asking {} to admit this node: it advertises no 0xFC endpoint another "
+                                   "machine can dial ({}), and a fleet records where each member answers -- set "
+                                   "--advertise to one that is not loopback, localhost or a wildcard",
+                                   target->Summary().clusterId,
+                                   advertised.empty() ? std::string { "none" } : advertised);
+            }
+            return;
         }
     }
 
@@ -403,7 +444,7 @@ std::optional<Cluster::Command> FormationController::ProposalLocked(Wire::FleetS
     // a non-split row yield. Its proof is the JOINT neuter `fleet-yields-unguarded` (both guards gone:
     // the fleet cases go red); with this line alone removed, everything stays green by construction.
     if (Cluster::HealingOf(reading.evidence) != Cluster::SplitHealing::Automatically
-        || Cluster::ClassifyEncounter(own, seen, reading.evidence) != Cluster::Encounter::Yield)
+        || Cluster::ClassifyEncounter(own, seen, reading.evidence, _self.pin) != Cluster::Encounter::Yield)
         return std::nullopt;
     auto const& summary = seen.Summary();
     // Every member dials it next, so a survivor naming no leader it could reach is not followed --
@@ -484,6 +525,7 @@ void FormationController::TickPending()
     auto pollKey = std::optional<Ed25519PublicKey> {};
     auto expectedKey = std::optional<Ed25519PublicKey> {};
     auto anchor = std::optional<ChainLink> {};
+    auto challenge = std::optional<Wire::EnrollChallenge> {};
     {
         std::scoped_lock const lock { _lock };
         if (_record.mode != NodeMode::Pending || !_record.joining.has_value())
@@ -493,6 +535,8 @@ void FormationController::TickPending()
         pollKey = _pollKey;
         expectedKey = _expectedKey;
         anchor = _anchor;
+        if (_challenge.has_value() && _challenge->first == endpoint)
+            challenge = _challenge->second;
     }
     auto const& clusterId = target.summary.clusterId;
 
@@ -510,7 +554,7 @@ void FormationController::TickPending()
         reading = *std::move(failed);
     }
     else
-        reading = PollProven(endpoint, target, *pollKey);
+        reading = PollProven(endpoint, target, *pollKey, challenge);
 
     // What the answer asks for is decided under the lock; the move it asks for is made outside it.
     auto trigger = std::optional<FormationTrigger> {};
@@ -541,6 +585,24 @@ void FormationController::TickPending()
             why = std::format(
                 "{} gave no answer it signed for {} minute(s): {}", clusterId, PendingGiveUpAfter.count(), reading.detail);
         };
+        // **Every answer a pinned node acts on is one a pinned voter SIGNED** -- an admission, a refusal
+        // and a not-yet alike: each moves the node, sends it away, or keeps it waiting. Asked at the act,
+        // though the key polled is pinned already (the root passed `ClassifyEncounter`, every other link
+        // `ProvePollEndpoint`): a record somebody else wrote reaches here too, and the answer is the
+        // move. Refused as no answer at all, counted towards giving the join up.
+        auto const signedAnswer = reading.progress == EnrollProgress::Admitted || reading.progress == EnrollProgress::Refused
+                                  || reading.progress == EnrollProgress::Waiting;
+        if (signedAnswer && pollKey.has_value() && !Cluster::AdmitsFleet(_self.pin, clusterId, *pollKey))
+        {
+            _parts.metrics.Increment(IMetricsSink::Counter::FormationAdmissionsRefusedPin);
+            reading = EnrollReading { .progress = EnrollProgress::Fatal,
+                                      .detail = std::format("{}'s answer is signed by key {}, which --fleet-id ({}) does "
+                                                            "not pin; it is not taken",
+                                                            clusterId,
+                                                            FormatEd25519PublicKey(*pollKey),
+                                                            Cluster::PinText(_self.pin)),
+                                      .roster = {} };
+        }
         switch (reading.progress)
         {
             case EnrollProgress::Admitted:
@@ -583,6 +645,13 @@ void FormationController::TickPending()
                 // answering, so the join is alive.
                 _redirects = 0;
                 _failingSince.reset();
+                // Its challenge is answered by the next poll of the same endpoint, which is what lets
+                // that poll refresh the row -- the endpoint this node states there above all. Only a
+                // VERIFIED answer reaches this arm, so the challenge is the fleet's own.
+                if (reading.challenge.has_value())
+                    _challenge.emplace(endpoint, *reading.challenge);
+                else
+                    _challenge.reset();
                 sayOnce(LogLevel::Info, std::format("{} ({}); asking again", reading.detail, clusterId));
                 break;
             case EnrollProgress::Closed:
@@ -619,8 +688,11 @@ void FormationController::TickPending()
     if (!trigger.has_value())
         return;
 
-    auto const outcome =
-        Fire(*trigger, TriggerContext { .decidedFor = decidedFor, .fleet = nullptr, .roster = reading.roster }, why);
+    auto const outcome = Fire(
+        *trigger,
+        TriggerContext {
+            .decidedFor = decidedFor, .fleet = nullptr, .roster = reading.roster, .order = nullptr, .admittedBy = pollKey },
+        why);
     if (outcome.fired && *trigger == FormationTrigger::Abandoned)
         _parts.metrics.Increment(IMetricsSink::Counter::FormationJoinsAbandoned);
     Reform(outcome);
@@ -659,13 +731,22 @@ void FormationController::OnClusterState(Cluster::ClusterState const& state,
             triggers.emplace_back(FormationTrigger::SelfForgotten, "the cluster forgot this node");
         // Then a dissolve: the whole fleet is leaving, so nothing else it says about a seat matters.
         // Never into the cluster this node is in, which no leader proposes and no member follows.
-        else if (state.dissolveOrder.has_value() && state.dissolveOrder->clusterId != clusterId)
+        // **A pinned node follows no dissolve, and the ID decides it**: the start check holds it in the
+        // cluster it is pinned to, and a dissolve leaves for ANOTHER one, which the pin never names. The
+        // order's keys are fields of the replicated state -- claimed, never proven to this node -- so no
+        // signer is offered: the one predicate, asked with none, refuses whatever is pinned and admits
+        // whatever is not. The rest of the fleet leaves, and this node stays where its operator put it,
+        // saying so.
+        else if (state.dissolveOrder.has_value() && state.dissolveOrder->clusterId != clusterId
+                 && Cluster::AdmitsFleet(_self.pin, state.dissolveOrder->clusterId, std::span<Ed25519PublicKey const> {}))
         {
             order = state.dissolveOrder;
             triggers.emplace_back(FormationTrigger::DissolvedInto, "its fleet dissolved into the survivor of a split");
         }
         else
         {
+            if (state.dissolveOrder.has_value() && state.dissolveOrder->clusterId != clusterId)
+                RefuseUnpinnedOrderLocked(state.dissolveOrder->clusterId);
             for (auto const& member: state.members)
             {
                 if (member.id != _self.nodeId)
@@ -917,7 +998,18 @@ std::expected<Cluster::FormationRecord, std::string> FormationController::Move(C
     switch (row.effect)
     {
         case FormationEffect::Dissolve:
-            return DissolveInto(from, context.roster, Joiner(), _publisher, _parts.endpoints, _parts.logger);
+            // An admission is acted on only once verified under a key this node proved, which the poll
+            // holds whenever it reads one -- so no key here is a caller's mistake, refused rather than
+            // recorded as a membership nothing vouches for.
+            if (!context.admittedBy.has_value())
+                return std::unexpected { std::string { "the admission names no key this node proved" } };
+            return DissolveInto(from,
+                                context.roster,
+                                *context.admittedBy,
+                                Joiner(std::nullopt),
+                                _publisher,
+                                _parts.endpoints,
+                                _parts.logger);
         case FormationEffect::ArchiveAndMint:
             return ArchiveAndMint(from, _publisher, _parts.random, _parts.wall.get());
         case FormationEffect::LeaveForSurvivor:
@@ -985,14 +1077,19 @@ std::expected<void, std::string> FormationController::ApplyToRecord(FormationEff
 /// A learner, stating its `0xFC` endpoint exactly when the leader's
 /// `EnrollRoleTable` row for a learner says the role states one. The SAME column the responder judges
 /// a request by: a joiner stating one the row says it does not was refused `MalformedFrame` at every
-/// poll, and the zero-config join never reached the operator's list.
-JoinerIdentity FormationController::Joiner() const
+/// poll, and the zero-config join never reached the operator's list. Read NOW, at every poll, and
+/// stated as every summary states it: never an endpoint that would send a client to itself.
+/// @param challenge The asked node's latest challenge for this joiner, or none.
+JoinerIdentity FormationController::Joiner(std::optional<Wire::EnrollChallenge> challenge) const
 {
     constexpr auto role = Wire::EnrollRole::Learner;
     return JoinerIdentity { .nodeId = _self.nodeId,
-                            .nodeEndpoint = EnrollRoleRowFor(role).statesEndpoint ? _self.nodeEndpoint : std::string {},
+                            .nodeEndpoint = EnrollRoleRowFor(role).statesEndpoint
+                                                ? StatedNodeEndpoint(_self.advertised.Current())
+                                                : std::string {},
                             .role = role,
-                            .publicKey = _self.publicKey };
+                            .publicKey = _self.publicKey,
+                            .challenge = challenge };
 }
 
 /// Point the next poll at the recorded fleet's leader, with a fresh redirect chain and give-up. The
@@ -1009,6 +1106,7 @@ void FormationController::ResetPoll()
     ResetChain();
     _failingSince.reset();
     _lastSaid.clear();
+    _challenge.reset();
 }
 
 /// Back to the endpoint the join was decided on, with the keys `ResetPoll` describes, and nothing
@@ -1068,9 +1166,7 @@ std::optional<EnrollReading> FormationController::ProvePollEndpoint(std::string 
                                                                     std::optional<ChainLink> const& anchor)
 {
     auto const fatal = [](std::string detail) {
-        return EnrollReading {
-            .progress = EnrollProgress::Fatal, .detail = std::move(detail), .roster = {}, .certificate = {}
-        };
+        return EnrollReading { .progress = EnrollProgress::Fatal, .detail = std::move(detail), .roster = {} };
     };
 
     if (!expected.has_value())
@@ -1108,6 +1204,22 @@ std::optional<EnrollReading> FormationController::ProvePollEndpoint(std::string 
                                  FormatEd25519PublicKey(proven->Key()),
                                  clusterId,
                                  FormatEd25519PublicKey(*expected)));
+    // **A leader the pin does not name is never asked** -- reached through a redirect or named by the
+    // summary decided on alike: its every answer would be signed by a key no pinned voter is. The
+    // refusal names the key, because a voter promoted since the pin was written is the honest cause
+    // and adding it is the remedy.
+    if (!Cluster::AdmitsFleet(_self.pin, clusterId, proven->Key()))
+    {
+        _parts.metrics.Increment(IMetricsSink::Counter::FormationAdmissionsRefusedPin);
+        auto const pin = Cluster::PinText(_self.pin);
+        return fatal(std::format("{} leads {} under key {}, which --fleet-id does not pin; if it is a voter of the "
+                                 "fleet you meant, add it: --fleet-id={},{}",
+                                 endpoint,
+                                 clusterId,
+                                 FormatEd25519PublicKey(proven->Key()),
+                                 pin,
+                                 FormatEd25519PublicKey(proven->Key())));
+    }
 
     std::scoped_lock const lock { _lock };
     // The key is held for the endpoint it was proved at, and only while it is still the one asked.
@@ -1137,13 +1249,27 @@ std::optional<EnrollReading> FormationController::ProvePollEndpoint(std::string 
 /// @return The reading the beat decides on.
 EnrollReading FormationController::PollProven(std::string const& endpoint,
                                               Cluster::JoinTarget const& target,
-                                              Ed25519PublicKey const& pollKey)
+                                              Ed25519PublicKey const& pollKey,
+                                              std::optional<Wire::EnrollChallenge> challenge)
 {
     auto const fatal = [](std::string detail) {
-        return EnrollReading {
-            .progress = EnrollProgress::Fatal, .detail = std::move(detail), .roster = {}, .certificate = {}
-        };
+        return EnrollReading { .progress = EnrollProgress::Fatal, .detail = std::move(detail), .roster = {} };
     };
+
+    // **A request this node already knows the leader refuses is not sent.** The role states where this
+    // node's `0xFC` port answers and the record keeps it, so an endpoint only this machine reaches -- a
+    // loopback or wildcard advertise, or no node surface at all -- is stated as none, and a learner
+    // stating none is refused `MalformedFrame` at every poll, counted as the LEADER's malformed request.
+    // The reason is local, so it is said here, once (the beat says a reading once until it changes), and
+    // the join is given up as any other unanswered one: until the advertised endpoint is one a peer can
+    // dial -- an accepted reload of `--advertise` is read at the next beat -- there is nothing to ask.
+    auto const joiner = Joiner(challenge);
+    if (EnrollRoleRowFor(joiner.role).statesEndpoint && joiner.nodeEndpoint.empty())
+        return fatal(std::format("this node advertises no 0xFC endpoint another machine can dial ({}), and a fleet "
+                                 "records where each member answers -- so it does not ask {} to admit it until "
+                                 "--advertise names one that is not loopback, localhost or a wildcard",
+                                 _self.advertised.Current().empty() ? std::string { "none" } : _self.advertised.Current(),
+                                 endpoint));
 
     // A nonce nobody can predict, or no request: one a relay could guess is one whose answer it could
     // have recorded from another ask.
@@ -1151,7 +1277,6 @@ EnrollReading FormationController::PollProven(std::string const& endpoint,
     if (auto const drawn = _parts.random.Fill(nonce); !drawn.has_value())
         return fatal(std::format("no nonce could be drawn to ask {}: {}", endpoint, drawn.error().ToString()));
 
-    auto const joiner = Joiner();
     auto reading = _parts.enroll.Poll(endpoint, joiner, nonce);
     // A wire refusal -- a redirect, a closed window, a failure -- is signed by nobody and is judged
     // where it is read: a redirect's endpoint is proved before it is asked.
@@ -1164,14 +1289,16 @@ EnrollReading FormationController::PollProven(std::string const& endpoint,
     // request's nonce, this node, the fleet's id and the OUTCOME, by the key proved here. Anything
     // else is refused by name and counted, and reads as NO answer -- never as the refusal it claims
     // to be -- which counts towards giving the join up and is asked again on the next beat.
-    auto const verdict = Cluster::VerifyAdmission(Cluster::AdmissionClaim { .nonce = nonce,
-                                                                            .joinerId = joiner.nodeId,
-                                                                            .joinerKey = joiner.publicKey,
-                                                                            .clusterId = target.summary.clusterId,
-                                                                            .outcome = *outcome,
-                                                                            .roster = reading.roster },
-                                                  reading.signature,
-                                                  pollKey);
+    auto const verdict =
+        Cluster::VerifyAdmission(Cluster::AdmissionClaim { .nonce = nonce,
+                                                           .joinerId = joiner.nodeId,
+                                                           .joinerKey = joiner.publicKey,
+                                                           .clusterId = target.summary.clusterId,
+                                                           .outcome = *outcome,
+                                                           .roster = reading.roster,
+                                                           .challenge = Wire::ChallengeBytes(reading.challenge) },
+                                 reading.signature,
+                                 pollKey);
     if (verdict != Cluster::AdmissionSignature::Verified)
     {
         _parts.metrics.Increment(IMetricsSink::Counter::FormationAdmissionsUnverified);
@@ -1238,6 +1365,37 @@ void FormationController::NameUnaskable(std::string const& clusterId)
                        "have nowhere to keep that fleet's store if the fleet ever forgot it",
                        BoundedPeerText(clusterId, CompileCacheWire::MaxIdBytes),
                        CompileCacheWire::MaxIdBytes);
+}
+
+/// Say, once per fleet id, that the pin keeps this node from asking a fleet it would otherwise have
+/// asked: latched and bounded as `NameUnaskable` is. The caller holds the lock.
+void FormationController::NamePinWithheld(std::string const& clusterId)
+{
+    if (_namedPinWithheld.contains(clusterId) || _namedPinWithheld.size() >= MaxNamedUnaskableFleets)
+        return;
+    _namedPinWithheld.insert(clusterId);
+    _parts.logger.Logf(LogLevel::Warn,
+                       "formation: not asking the fleet {} to admit this node, which trust on first use would have: "
+                       "--fleet-id pins it to {}",
+                       BoundedPeerText(clusterId, CompileCacheWire::MaxIdBytes),
+                       Cluster::PinText(_self.pin));
+}
+
+/// Refuse this node's fleet's order to dissolve into @p clusterId, which the pin does not admit:
+/// counted and said once per survivor, every applied state after the first naming the same one. The
+/// caller holds the lock.
+void FormationController::RefuseUnpinnedOrderLocked(std::string const& clusterId)
+{
+    if (_refusedOrderFor == clusterId)
+        return;
+    _refusedOrderFor = clusterId;
+    _parts.metrics.Increment(IMetricsSink::Counter::FormationAdmissionsRefusedPin);
+    _parts.logger.Logf(LogLevel::Warn,
+                       "formation: not following this fleet's dissolve into {}: --fleet-id pins this node to {}; "
+                       "staying {} while the rest of the fleet leaves",
+                       BoundedPeerText(clusterId, CompileCacheWire::MaxIdBytes),
+                       Cluster::PinText(_self.pin),
+                       NodeModeRowFor(_record.mode).name);
 }
 
 /// Ask for the reform a move called for, with the lock released.

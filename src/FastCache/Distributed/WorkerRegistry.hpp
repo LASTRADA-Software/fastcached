@@ -324,11 +324,6 @@ struct NodePresence
     /// `SchedulerService::AnnounceNode` unless it is text.
     std::optional<std::vector<CompileCacheWire::NodeConditionFields>> conditions {};
 
-    /// The machine's signed endorsement of the roster it applied, when it is a voter holding
-    /// one; empty otherwise (#178). Borrowed and opaque until the scheduler decodes it and
-    /// verifies the signature -- which it does before reading a single claim in it.
-    std::span<std::byte const> endorsement {};
-
     /// The fleets the machine once asked to admit it -- the evidence a split of this fleet is told on,
     /// which the scheduler files under the id the caller PROVED. Borrowed from the decoded frame.
     std::span<CompileCacheWire::JoinMemoFields const> joinMemos {};

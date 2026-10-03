@@ -178,22 +178,22 @@ enum class LeaseRefusalReason : std::uint8_t
 {
     /// Not a lease token at all -- not base64, not this format, not this version.
     Malformed,
-    /// This worker holds no roster it can verify a grant against: it has not yet been
-    /// handed one it could certify, and holds none from an earlier run (#178).
+    /// This worker holds no roster it can verify a grant against: the state it applied records
+    /// no voter's key yet (#178).
     ///
     /// A fact about THIS WORKER, like `Unregistered`, so answering it before the signature
-    /// is no oracle. Its own reason rather than a share of `RosterExpired`, because the
-    /// operator actions are opposite: this one never reached a leader whose roster its
-    /// anchors certify, while an expired one did and has since been cut off.
+    /// is no oracle. Its own reason rather than a share of `Unauthorized`, because it says
+    /// nothing about the grant: no grant from anybody could verify here yet.
     NoRoster,
-    /// This worker's roster has not been re-certified by a majority of its voters for longer
-    /// than its lifetime and the skew slack (#178).
+    /// This worker has heard from no leader its applied configuration counts for longer than
+    /// `LeaderSilenceBound` (`Distributed::StateLeaseRoster`), so the state it would verify a grant
+    /// against may be one its fleet has moved past -- a voter forgotten meanwhile still in it.
     ///
-    /// The bound on how long a worker cut off from the cluster -- or kept talking to an
-    /// ex-leader that withholds every newer roster -- goes on trusting the voters it last
-    /// heard of. Past it, a grant signed by a machine the cluster has since revoked would
-    /// verify, so none is honoured.
-    RosterExpired,
+    /// `NoRoster`'s class: a fact about THIS WORKER, answered before the signature and so no
+    /// oracle, and nothing about the grant. Its own reason because the operator action differs: a
+    /// worker that never applied a voter is starting, and one that has stopped hearing a leader is
+    /// cut off from its fleet.
+    Isolated,
     /// A grant no key this worker's roster holds for the named signer verifies: an unknown
     /// signer, a signer that is not a voter, or a forgery.
     Unauthorized,
@@ -266,11 +266,10 @@ struct LeaseRefusalDescriptor
 /// one: a client already answers it correctly, and a second spelling of one fact
 /// is how two peers come to disagree about what happened.
 ///
-/// `NoRoster` and `RosterExpired` share a code of their own, `RosterExpired` (#178):
-/// neither is a statement about the grant, both say this WORKER cannot verify anybody's
-/// grant right now, and a client that read either as "your lease is bad" would stop asking
-/// the right scheduler for a fresh one. `SignerRevoked` shares `LeaseUnauthorized` and keeps
-/// a counter of its own, for `ClusterMismatch`'s reason below.
+/// `NoRoster` and `Isolated` share a code of their own, `GrantUnverifiable` (#178): neither is a
+/// statement about the grant, both say this WORKER cannot verify anybody's grant right now, and a
+/// client that read it as "your lease is bad" would stop asking the right scheduler for a fresh one. `SignerRevoked` shares
+/// `LeaseUnauthorized` and keeps a counter of its own, for `ClusterMismatch`'s reason below.
 ///
 /// `ClusterMismatch` and `Replayed` share `LeaseUnauthorized` too, and each keeps a
 /// counter of its own. The wire code is the same because the client's answer is the
@@ -293,11 +292,11 @@ inline constexpr EnumTable<LeaseRefusalReason, LeaseRefusalDescriptor> LeaseRefu
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized },
     { .reason = LeaseRefusalReason::NoRoster,
-      .code = CompileCacheWire::ErrorCode::RosterExpired,
+      .code = CompileCacheWire::ErrorCode::GrantUnverifiable,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster },
-    { .reason = LeaseRefusalReason::RosterExpired,
-      .code = CompileCacheWire::ErrorCode::RosterExpired,
-      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseRosterExpired },
+    { .reason = LeaseRefusalReason::Isolated,
+      .code = CompileCacheWire::ErrorCode::GrantUnverifiable,
+      .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseIsolated },
     { .reason = LeaseRefusalReason::Unauthorized,
       .code = CompileCacheWire::ErrorCode::LeaseUnauthorized,
       .workerCounter = IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized },
@@ -425,40 +424,58 @@ class ILeaseSignerKeys
     [[nodiscard]] virtual LeaseSignerKeys KeysOf(std::string_view signer) const = 0;
 };
 
-/// Whether a worker's roster may be trusted at an instant (#178).
+/// Whether a worker's roster can verify a grant at an instant (#178).
 ///
-/// **PRIVATE: persisted and transmitted nowhere.** Three answers rather than a `bool`,
-/// because the two ways of being unusable are opposite operator actions: a worker with no
-/// roster never reached a leader its anchors certify, while an expired one did and has since
-/// been cut off.
+/// **PRIVATE: persisted and transmitted nowhere.** An enum rather than a `bool`, so the reading
+/// says WHICH absence it is rather than leaving a `false` to be read as "not trusted".
 enum class RosterStanding : std::uint8_t
 {
-    Current, ///< Trusted: certified, and not past its certification and the slack.
-    Expired, ///< Held, and past its certification and the slack.
-    Absent,  ///< Nothing a grant could be verified against.
+    Current,  ///< Some voter's key is known: a grant is checked against it.
+    Absent,   ///< Nothing a grant could be verified against.
+    Isolated, ///< Voters are known, but no leader they count has spoken for `LeaderSilenceBound`.
+    Last,     ///< Not a standing, and has no row: the length of a table keyed by one.
 };
+
+/// What a validator does with a roster's standing: verify against it, or refuse before the
+/// signature with a reason about THIS worker.
+struct RosterStandingRow
+{
+    RosterStanding standing;                   ///< The standing this row describes.
+    std::optional<LeaseRefusalReason> refusal; ///< What every grant is refused with; nullopt verifies.
+    std::string_view detail;                   ///< What the refusal says; empty where nothing is refused.
+};
+
+/// One row per `RosterStanding`, in enumerator order: the ONE place a standing becomes a refusal.
+inline constexpr EnumTable<RosterStanding, RosterStandingRow> RosterStandingTable { {
+    { .standing = RosterStanding::Current, .refusal = std::nullopt, .detail = {} },
+    { .standing = RosterStanding::Absent,
+      .refusal = LeaseRefusalReason::NoRoster,
+      .detail = "the state this worker applied records no voter's key yet, so it can verify no grant" },
+    { .standing = RosterStanding::Isolated,
+      .refusal = LeaseRefusalReason::Isolated,
+      .detail = "this worker has heard from no leader its fleet counts for longer than it may trust the state it "
+                "applied, so it verifies no grant until one speaks again" },
+} };
+
+static_assert(RowsInEnumeratorOrder(RosterStandingTable, &RosterStandingRow::standing),
+              "RosterStandingTable must hold one row per RosterStanding, in enumerator order");
 
 /// What a worker's roster says about itself at an instant.
 struct RosterReading
 {
-    RosterStanding standing { RosterStanding::Absent }; ///< Whether it may be trusted.
-
-    /// When its certification lapses -- or lapsed. Absent for no roster at all, and for a
-    /// roster that needs no certificate: a consensus member's own applied state.
-    std::optional<std::chrono::system_clock::time_point> certifiedUntil;
+    RosterStanding standing { RosterStanding::Absent }; ///< Whether a grant can be verified.
 };
 
-/// A worker's roster: who may sign its grants, and whether it may be trusted now (#178).
+/// A worker's roster: who may sign its grants, and whether it can verify one now (#178).
 ///
-/// Implemented twice, because a node answers the question two ways: a consensus member from
-/// the state it applied, which needs no certificate, and a worker with no consensus from the
-/// certified roster it adopted (`Distributed::RosterTrust`). Both are read per request, so an
-/// applied revocation or an adopted roster reaches the next grant rather than the next restart.
+/// The state the node's own consensus applied (`Distributed::StateLeaseRoster`): every serving
+/// node runs consensus, so there is no other kind. Read per request, so an applied revocation
+/// reaches the next grant rather than the next restart.
 class ILeaseRoster: public ILeaseSignerKeys
 {
   public:
     /// @param now This machine's wall clock.
-    /// @return Whether the roster may be trusted at @p now, and until when.
+    /// @return Whether the roster can verify a grant at @p now.
     [[nodiscard]] virtual RosterReading Read(std::chrono::system_clock::time_point now) const = 0;
 
     /// Who the roster admits as a MACHINE, which is a wider question than who may sign a grant:

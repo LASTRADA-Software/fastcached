@@ -4,6 +4,7 @@
 #include "NodeConditions.hpp"
 
 #include <FastCache/Cluster/Encounter.hpp>
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Cluster/ProvenFleet.hpp>
 #include <FastCache/Cluster/SplitEvidence.hpp>
 
@@ -37,6 +38,11 @@ namespace FastCache::Node
 /// exactly while there is split evidence for a pair the encounter table would otherwise call
 /// `ForeignFleet`, raises foreign for every other `ForeignFleet`, and moves a fleet between the two the
 /// moment either changes.
+///
+/// **A fleet the pin keeps this node out of is raised as foreign too** (`Cluster::Encounter::PinnedElsewhere`):
+/// a node that sits alone beside a fleet it would have joined must say why, naming the fleet and the
+/// pin, whatever state either side is in -- and that is decided BEFORE a split is, since a fleet the
+/// pin refuses is not one this node heals into either.
 ///
 /// Every proven fleet of ANOTHER cluster is forwarded to `next`, whatever this decided: formation reads
 /// the same stream, and a watch that swallowed what it did not raise for would starve it. A reply of
@@ -73,12 +79,15 @@ class ForeignFleetWatch final: public Cluster::IFleetObserver
     /// @param next Where every proven fleet goes on to. Must outlive this.
     /// @param listenFor How long discovery is watched before an empty table may read `clear`: the
     ///        beacon interval discovery runs at.
+    /// @param pin The cluster `--fleet-id` pins this node to, or none: the formation controller's own,
+    ///        so the watch and the decision it explains cannot disagree.
     ForeignFleetWatch(Cluster::IFleetSummarySource const& self,
                       Cluster::ISplitEvidenceSource const& evidence,
                       core::platform::IClock const& clock,
                       NodeConditions& conditions,
                       Cluster::IFleetObserver& next,
-                      std::chrono::seconds listenFor);
+                      std::chrono::seconds listenFor,
+                      Cluster::FleetPin pin);
 
     /// Classify @p fleet against this node, raise or re-say the rows, and forward it to `next`.
     /// @param fleet A proven fleet of another cluster.
@@ -101,7 +110,7 @@ class ForeignFleetWatch final: public Cluster::IFleetObserver
     /// What meeting a proven fleet means for the rows. **Private**: never transmitted or persisted.
     enum class Verdict : std::uint8_t
     {
-        Foreign, ///< Neither yields: no evidence proves a split.
+        Foreign, ///< Neither yields: no evidence proves a split, or the pin keeps this node out.
         Healing, ///< The evidence proves a split: the tiebreak decides who yields, or an operator does.
         Neither, ///< Nothing for either row: a first join, the same fleet, or a solitary side.
     };
@@ -161,6 +170,7 @@ class ForeignFleetWatch final: public Cluster::IFleetObserver
     std::map<std::string, Seen> _healing;
 
     std::chrono::seconds _listenFor;                           ///< See the constructor.
+    Cluster::FleetPin _pin;                                    ///< See the constructor.
     core::platform::SteadyTimePoint _startedAt;                ///< When this watch began listening.
     std::optional<core::platform::SteadyTimePoint> _lastHeard; ///< When a reply was last proven.
     Hearing _published { Hearing::Listening };                 ///< What the rows last said was heard.

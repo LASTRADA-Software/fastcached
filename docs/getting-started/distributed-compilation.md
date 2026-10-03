@@ -205,8 +205,8 @@ fastcache-compile-node \
 
 **A scheduler is a cluster, even of one**
 ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). It signs every
-lease with its own identity key, and it hands its workers a *roster* — the cluster's
-voters and their keys — that a majority of those voters certify, so it holds
+lease with its own identity key, and its workers check that signature against the
+cluster's voters and their keys as their own consensus applied them, so it holds
 replicated state and runs consensus to keep it. No flag asks for either: its first
 start mints a cluster of one into its state directory, which it leads, and whose mode
 serves the scheduler. Consensus is on by default (`--listen-raft` defaults to `6680`),
@@ -618,8 +618,8 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_lease_replayed_total` | An **authentic**, unexpired lease that this worker had **already run**. A lease authorizes exactly one compile — one grant per lease, presented once, with no retry — so nothing honest produces this and it should read zero forever. Any rise is somebody presenting a captured grant a second time. Do not sum it with `..._wrong_cluster_total` either: they share a wire code and nothing else, and they send you to opposite places. |
 | `fastcache_worker_jobs_refused_lease_endpoint_mismatch_total` | An **authentic** lease named a different worker. Almost never a replay and almost always a worker registered under an address clients do not dial — a NAT, or a hostname where clients resolve an address. |
 | `fastcache_worker_jobs_refused_lease_expired_total` | An **authentic** lease had expired. A rise on one machine and nowhere else is that machine's clock, not the fleet's leases — which is why the check carries skew slack and why this is worth seeing per node. |
-| `fastcache_worker_jobs_refused_lease_no_roster_total` | The worker holds **no roster** to check any lease against yet. A few at startup are ordinary; a rise that does not stop means no leader it reaches is endorsed by the voters it trusts. |
-| `fastcache_worker_jobs_refused_lease_roster_expired_total` | The worker's roster was not re-certified within its lifetime, so it can no longer tell a live voter from a revoked one. It is cut off from the leader, or reaches only an ex-leader withholding newer rosters — `fastcache_node_roster_expires_in_seconds` reached 0 first. |
+| `fastcache_worker_jobs_refused_lease_isolated_total` | This worker has heard from **no leader** its fleet counts for longer than it may trust the state it applied (65 minutes), so a voter the fleet forgot meanwhile could still be in it, and every lease is refused until one speaks again. Should read zero; a rise means the worker is cut off from its fleet's consensus while something still hands it leases. |
+| `fastcache_worker_jobs_refused_lease_no_roster_total` | The state this worker applied records **no voter's key** yet, so no lease from anybody can verify. A few while a node starts or joins are ordinary; a rise that does not stop means this node never applied its fleet's state. |
 | `fastcache_worker_scratch_roots_reclaimed_total` | This worker took over a scratch root left behind by a node that exited without cleaning up. The work itself is correct — a root is only reclaimed once its previous owner's exclusive claim is free, which the OS releases however that process died. A rise means nodes are **dying rather than stopping**, which is worth knowing and is visible nowhere else. |
 | `fastcache_worker_bytes_received_total` / `..._returned_total` | Link volume, counted at the socket. |
 
@@ -639,6 +639,16 @@ fixes, and one number covering both tells you neither.
 > than left exported at zero because a series that reads zero for ever because its event
 > is impossible looks exactly like one reading zero because the event has not happened,
 > and only one of those means your fleet is healthy.
+>
+> **Retired with the certified roster.** `fastcache_worker_jobs_refused_lease_roster_expired_total`,
+> `fastcache_node_roster_expires_in_seconds`, `fastcache_worker_rosters_refused_uncertified_total`,
+> `fastcache_worker_rosters_refused_expired_total` and
+> `fastcache_scheduler_roster_endorsements_refused_total` no longer exist. Every node verifies a
+> grant against the state its own consensus applied, which nothing certifies and nothing lapses,
+> so none of those events can happen. Point those alerts at
+> `fastcache_worker_jobs_refused_lease_no_roster_total` (a node whose applied state names no voter
+> yet) and `fastcache_worker_jobs_refused_lease_signer_revoked_total` (a machine the cluster
+> removed, still minting).
 
 The `..._lease_*` counters move only on a worker that checks leases: a consensus
 member -- a learner included -- against the state it applies, or a worker holding a roster

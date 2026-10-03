@@ -1,113 +1,66 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "NodeIdentity.hpp"
 #include "NodeRoster.hpp"
-#include "NodeStateFiles.hpp"
 
 // Its own header FIRST and in a group of its own, for `WorkerLease.cpp`'s reason.
 #include "NodeMembership.hpp"
 
 #include <algorithm>
 #include <format>
-#include <tuple>
 #include <utility>
 
 namespace FastCache::Node
 {
 
 std::expected<std::unique_ptr<NodeRoster>, NodeRefusal> NodeRoster::Build(NodeConfig const& cfg,
-                                                                          core::platform::WallClockRef wallClock,
-                                                                          IMetricsSink& metrics,
-                                                                          ILogger& logger)
+                                                                          core::platform::IClock const& clock,
+                                                                          NodeConditions* conditions)
 {
-    // A consensus member's roster is the state it applies, whatever else it names.
+    // A consensus member's roster is the state it applies, and every serving node is one.
     if (RunsConsensus(cfg))
-        return std::unique_ptr<NodeRoster> { new NodeRoster {
-            wallClock, std::make_unique<Distributed::StateLeaseRoster>(), nullptr, nullptr, metrics, logger } };
+        return std::unique_ptr<NodeRoster> { new NodeRoster { std::make_unique<Distributed::StateLeaseRoster>(clock),
+                                                              conditions } };
 
-    // What an earlier run adopted, when this node keeps a state directory: the only trust root a
-    // node that runs no consensus can have, since nothing typed on its command line anchors one.
-    // The directory is the one the node keeps, typed or the default its start resolved.
-    auto kept = std::optional<Cluster::PersistedRoster> {};
-    auto store = std::unique_ptr<Distributed::IRosterStore> {};
-    if (auto const chosen = ChosenStateDirectory(cfg); chosen.has_value())
-    {
-        auto const path = chosen->path / Distributed::RosterFileName;
-        auto loaded = Distributed::LoadPersistedRoster(path);
-        if (!loaded.has_value())
-        {
-            // By the ARM: a read that failed may succeed at the next start, and a roster that was
-            // read and cannot be used is a verdict the next start reaches again. Only the read arm
-            // is told how to hand the file to the service's account: the other was read.
-            if (loaded.error().step == Distributed::RosterLoadStep::Read)
-                return std::unexpected { Refusal(
-                    NodeRefusalCause::KeptRosterIo,
-                    std::format("{}{}", loaded.error().reason, StateFileUnreadableHint(path))) };
-            return std::unexpected { Refusal(NodeRefusalCause::KeptRoster, std::move(loaded).error().reason) };
-        }
-        kept = *std::move(loaded);
-        store = std::make_unique<Distributed::FileRosterStore>(path);
-    }
-
-    if (!kept.has_value())
-    {
-        // Nothing to verify a grant against. Legal only where no other machine can present one
-        // -- the table refused the rest before any state directory was asked, and this is the
-        // same rule answered for a node whose directory turned out to hold nothing. `Absent`
-        // is what this branch has just found out, at the one place that read the directory.
-        if (RunsWorker(cfg) && CompileVerbsReachOtherMachines(cfg, RosterPresence::Absent))
-            return std::unexpected { Refusal(NodeRefusalCause::KeptRoster, std::string { RosterlessWorkerRefusal }) };
-        return std::unique_ptr<NodeRoster> { new NodeRoster { wallClock, nullptr, nullptr, nullptr, metrics, logger } };
-    }
-
-    // No cluster is ASSERTED: `--cluster-id` is gone, and the formation record is the one author
-    // of this node's cluster.
-    auto trust = std::make_unique<Distributed::RosterTrust>(
-        std::nullopt, std::vector<Ed25519PublicKey> {}, std::move(kept), store.get(), metrics, logger);
-    return std::unique_ptr<NodeRoster> { new NodeRoster {
-        wallClock, nullptr, std::move(store), std::move(trust), metrics, logger } };
+    // Nothing to verify a grant against. Legal only where no other machine can present one -- and
+    // the startup table refuses a worker that runs no consensus before any tier is built, so this
+    // is the belt behind it.
+    if (RunsWorker(cfg) && CompileVerbsReachOtherMachines(cfg, RosterPresence::Absent))
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, std::string { RosterlessWorkerRefusal }) };
+    return std::unique_ptr<NodeRoster> { new NodeRoster { nullptr, conditions } };
 }
 
-NodeRoster::NodeRoster(core::platform::WallClockRef wallClock,
-                       std::unique_ptr<Distributed::StateLeaseRoster> state,
-                       std::unique_ptr<Distributed::IRosterStore> store,
-                       std::unique_ptr<Distributed::RosterTrust> trust,
-                       IMetricsSink& metrics,
-                       ILogger& logger):
-    _wallClock { wallClock },
+NodeRoster::NodeRoster(std::unique_ptr<Distributed::StateLeaseRoster> state, NodeConditions* conditions):
     _state { std::move(state) },
-    _store { std::move(store) },
-    _trust { std::move(trust) },
-    _metrics { metrics },
-    _logger { logger }
+    _conditions { conditions }
 {
+    // Answered from the START, which counts as contact: a row nobody evaluated until the first
+    // consensus pass would read `undecided` on every fresh node. A node verifying no grant leaves
+    // the row to its scope -- it runs no consensus, so `Settle` answers it.
+    if (_state != nullptr && _conditions != nullptr)
+        _conditions->Clear(NodeCondition::ConsensusLeaderSilent);
 }
 
 Distributed::ILeaseRoster const* NodeRoster::Lease() const noexcept
 {
-    if (_state != nullptr)
-        return _state.get();
-    return _trust.get();
+    return _state.get();
 }
 
 ServerStanding NodeRoster::StandingOf(std::string_view serverId, Ed25519PublicKey const& serverKey) const
 {
-    auto const* const roster = Lease();
-    if (roster == nullptr || roster->Read(_wallClock.now()).standing == Distributed::RosterStanding::Absent)
+    if (_state == nullptr)
         return ServerStanding::Unchecked;
 
     // A revocation first, whatever id it was revoked under: the key is the fact, and a removed
     // machine claiming a voter's id is still the removed machine.
-    auto const keys = roster->KeysOf(serverId);
+    auto const keys = _state->KeysOf(serverId);
     if (std::ranges::contains(keys.revoked, serverKey))
         return ServerStanding::Revoked;
     if (keys.live == serverKey)
         return ServerStanding::Voter;
-    // A consensus member whose applied state names no voter yet has nothing to place a server
-    // against, so it answers `Unchecked` rather than calling every server a stranger; the
-    // revocation above is still asked. That is the one state left here: a voter record always
-    // carries its key, since `ClusterMember::publicKey` is required by type, so a keyless voter --
-    // the other state this branch once answered -- cannot be built.
-    if (_state != nullptr && !_state->HoldsVoterKeys())
+    // A member whose applied state names no voter yet has nothing to place a server against, so it
+    // answers `Unchecked` rather than calling every server a stranger; the revocation above is still
+    // asked. That is the one state left here: a voter record always carries its key, since
+    // `ClusterMember::publicKey` is required by type, so a keyless voter cannot be built.
+    if (!_state->HoldsVoterKeys())
         return ServerStanding::Unchecked;
     return ServerStanding::NotVoter;
 }
@@ -123,80 +76,36 @@ void NodeRoster::Applied(Cluster::ClusterState const& state)
         _state->Adopt(state);
 }
 
-void NodeRoster::Endorsed(Cluster::RosterEndorsement const& endorsement)
+void NodeRoster::ConsensusPass(Distributed::LeaderReading const& reading)
 {
-    auto encoded = Cluster::EncodeEndorsement(endorsement);
-    std::scoped_lock const lock { _endorsementMutex };
-    _endorsement = std::move(encoded);
-}
-
-std::vector<std::byte> NodeRoster::Endorsement() const
-{
-    std::scoped_lock const lock { _endorsementMutex };
-    return _endorsement;
-}
-
-void NodeRoster::Offered(std::span<std::byte const> certified)
-{
-    // A consensus member has its state, and a node with no trust root could judge nothing: a
-    // roster handed to either is ignored rather than adopted on the scheduler's word.
-    if (_trust == nullptr || certified.empty())
+    if (_state == nullptr)
         return;
-
-    auto decoded = Cluster::DecodeCertifiedRoster(certified);
-    if (!decoded.has_value())
-    {
-        // Not certified, since nothing in it could be checked: counted as one, and said once.
-        _metrics.Increment(IMetricsSink::Counter::WorkerRostersRefusedUncertified);
-        std::scoped_lock const lock { _endorsementMutex };
-        if (!_warnedMalformed)
-        {
-            _warnedMalformed = true;
-            _logger.Logf(LogLevel::Warn,
-                         "roster: a scheduler answered with a roster this build cannot read ({}); keeping the one this "
-                         "node holds (every such answer is counted; this line is not repeated)",
-                         decoded.error().context);
-        }
+    _state->NoteLeaderReading(reading);
+    if (_conditions == nullptr)
         return;
-    }
-    std::ignore = _trust->Offer(*decoded, _wallClock.now());
-}
-
-bool NodeRoster::Wanting() const
-{
-    return _trust != nullptr && _trust->Read(_wallClock.now()).standing != Distributed::RosterStanding::Current;
+    // Live, and from the same reading every grant is checked by, so the row and the refusals it
+    // explains cannot disagree.
+    if (_state->Isolated())
+        _conditions->Raise(NodeCondition::ConsensusLeaderSilent,
+                           std::format("no leader this node's fleet counts has spoken to it for over {} minutes; every "
+                                       "lease grant is refused until one does",
+                                       Distributed::LeaderSilenceBound.count()));
+    else
+        _conditions->Clear(NodeCondition::ConsensusLeaderSilent);
 }
 
 std::optional<Distributed::RosterSummary> NodeRoster::Summary() const
 {
-    if (_state != nullptr)
-        return _state->Summary();
-    if (_trust != nullptr)
-        return _trust->Summary();
-    return std::nullopt;
+    if (_state == nullptr)
+        return std::nullopt;
+    return _state->Summary();
 }
 
 std::optional<Cluster::Roster> NodeRoster::HeldRoster() const
 {
-    if (_state != nullptr)
-        return _state->Held();
-    if (_trust != nullptr)
-        return _trust->Held();
-    return std::nullopt;
-}
-
-std::optional<std::uint64_t> NodeRoster::ExpiresInSeconds() const
-{
-    if (_trust == nullptr)
+    if (_state == nullptr)
         return std::nullopt;
-    auto const reading = _trust->Read(_wallClock.now());
-    if (!reading.certifiedUntil.has_value())
-        return std::nullopt;
-    auto const now = _wallClock.now();
-    if (*reading.certifiedUntil <= now)
-        return std::uint64_t { 0 };
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(*reading.certifiedUntil - now).count());
+    return _state->Held();
 }
 
 } // namespace FastCache::Node

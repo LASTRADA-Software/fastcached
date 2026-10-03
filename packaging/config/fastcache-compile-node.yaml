@@ -233,6 +233,16 @@
 #  - <host>
 #  - <host>:<port>
 
+# the ONE fleet this node may belong to, and the voters whose key it takes
+# that fleet's word from: paste the fleet-id `fastcache-cli node` prints on a
+# machine of that fleet (<cluster-id>@<key>[,<key>...]). Without it discovery
+# is trust-on-first-use: anybody on the segment can prove an older fleet and
+# be joined. Pinned, the node joins no other fleet, and on its way in takes
+# no summary, answer or leader its fleet's pinned voters did not sign; once
+# joined, the fleet's agreed state decides. An id with no key is refused:
+# every beacon carries the id.
+#fleet_id:
+
 # serve /metrics and /healthz here; off unless given. A bare port binds
 # loopback: a scrape endpoint on a public interface is an operator's
 # decision, not a default. /healthz is also the liveness probe this worker

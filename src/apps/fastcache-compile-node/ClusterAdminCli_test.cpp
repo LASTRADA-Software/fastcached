@@ -62,6 +62,9 @@ struct FakeCluster final: public Distributed::IClusterAdmin
         return state;
     }
 
+    /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
+    void NoteAnnouncedEndpoint(Consensus::NodeId const& /*member*/, std::string /*endpoint*/) override {}
+
     [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& command) override
     {
         proposed.push_back(command);
@@ -120,7 +123,7 @@ struct Fixture
 /// @param kind What it does.
 /// @param key The member id or setting name.
 /// @param value The consensus endpoint or setting value.
-/// @param scheduler Where clients reach this member while it leads.
+/// @param scheduler Where this member's `0xFC` port answers.
 /// @return The command.
 [[nodiscard]] Cluster::Command Cmd(Cluster::CommandKind kind,
                                    std::string key,
@@ -275,7 +278,7 @@ TEST_CASE("A status request round-trips through the real protocol", "[node][clus
 
     // The report answers the operator's real question, which is usually "what CAN I
     // set" -- so every key this build knows appears whether or not somebody has set
-    // it, and a member that has never led shows a dash rather than a blank.
+    // it, and a member that has announced none shows a dash rather than a blank.
     CHECK(rendered->contains("n1"));
     CHECK(rendered->contains("10.0.0.1:6675"));
     CHECK(rendered->contains("scheduler=-"));
@@ -458,6 +461,9 @@ TEST_CASE("A change the cluster would refuse is refused with its reason", "[node
         {
             return {};
         }
+
+        /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
+        void NoteAnnouncedEndpoint(Consensus::NodeId const& /*member*/, std::string /*endpoint*/) override {}
 
         [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& command) override
         {

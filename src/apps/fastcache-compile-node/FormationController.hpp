@@ -8,6 +8,7 @@
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/FleetEndpoints.hpp>
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/FormationTransitions.hpp>
 #include <FastCache/Cluster/NodeMode.hpp>
@@ -35,6 +36,7 @@
 #include <utility>
 #include <vector>
 
+#include <WorkerProtocol.hpp>
 #include <core/platform/Clock.hpp>
 
 namespace FastCache::Node
@@ -132,17 +134,26 @@ struct SelfFacts
 {
     std::string nodeId;            ///< Its minted id.
     Ed25519PublicKey publicKey {}; ///< Its identity key.
-    std::string nodeEndpoint;      ///< Its `0xFC` endpoint, as `AdvertisedEndpoint(cfg)` states it.
-    std::string raftEndpoint;      ///< Where its Raft port answers; announced EMPTY while its listener is closed.
+
+    /// Where its `0xFC` port answers, read at every summary and every `Enroll` -- never captured, so
+    /// an accepted reload of `--advertise` is what the next poll states and the leader records. The
+    /// one object the worker registers under (`AnnouncedEndpoint`). Must outlive the controller.
+    Cc::IAdvertisedEndpointSource const& advertised;
+
+    std::string raftEndpoint; ///< Where its Raft port answers; announced EMPTY while its listener is closed.
 
     /// Whether it may ask a fleet to take it. A node confined to this machine asks no seed and polls
     /// no fleet -- a member admitted at a loopback address is one nobody else can reach -- and so
     /// decides nothing on a beat, a pending one included: it stays its own cluster, serving its own
     /// scheduler, until a restart with a name other machines resolve resumes the join.
     FleetReachability reach { FleetReachability::Open };
+
+    /// The one cluster `--fleet-id` lets it belong to, or none: asked of every yield it decides, every
+    /// admission it takes and every dissolve it follows (`Cluster::AdmitsFleet`). Fixed for the life of
+    /// the process -- the flag is `Reloadable::No` -- so a value, never a seam.
+    Cluster::FleetPin pin;
 };
 
-/// What a formation controller acts through. Every member outlives the controller.
 /// Whether the startup rules refuse the shape a record would give this node: what EVERY formation
 /// transition asks of the record it is about to write, before writing it.
 ///
@@ -163,6 +174,7 @@ class IShapeJudge
     [[nodiscard]] virtual std::optional<std::string> RefusalOf(Cluster::FormationRecord const& next) const = 0;
 };
 
+/// What a formation controller acts through. Every member outlives the controller.
 struct FormationParts
 {
     Cluster::IFormationStore& store;        ///< Where every change is written, before it is acted on.
@@ -188,7 +200,7 @@ struct FormationParts
     core::platform::IClock const& clock; ///< What the give-up and the probe interval are measured on.
     core::platform::WallClockRef wall;   ///< What the record's instants and the rejection window read.
     ISecureRandom& random;               ///< Where a newly minted cluster id, and each poll's nonce, come from.
-    IMetricsSink& metrics;               ///< `FormationYields`, `FormationJoinsAbandoned`, the admission refusals.
+    IMetricsSink& metrics;               ///< `FormationYields`, `FormationJoinsAbandoned`, the admission and pin refusals.
     ILogger& logger;                     ///< Every move, and every move that could not be written.
 
     /// Asked of every record a move is about to write: a move whose shape the startup rules refuse is
@@ -322,7 +334,7 @@ class FormationController final:
     [[nodiscard]] std::expected<void, std::string> ApplyToRecord(Cluster::FormationEffect effect,
                                                                  TriggerContext const& context,
                                                                  Cluster::FormationRecord& next) const;
-    [[nodiscard]] JoinerIdentity Joiner() const;
+    [[nodiscard]] JoinerIdentity Joiner(std::optional<CompileCacheWire::EnrollChallenge> challenge) const;
     void ResetPoll();
     void ResetChain();
     /// An endpoint and the key the chain from the key that proved the fleet proved there.
@@ -337,9 +349,12 @@ class FormationController final:
                                                                  std::optional<ChainLink> const& anchor);
     [[nodiscard]] EnrollReading PollProven(std::string const& endpoint,
                                            Cluster::JoinTarget const& target,
-                                           Ed25519PublicKey const& pollKey);
+                                           Ed25519PublicKey const& pollKey,
+                                           std::optional<CompileCacheWire::EnrollChallenge> challenge);
     void Queue(Cluster::ProvenFleet const& fleet);
     void NameUnaskable(std::string const& clusterId);
+    void NamePinWithheld(std::string const& clusterId);
+    void RefuseUnpinnedOrderLocked(std::string const& clusterId);
     [[nodiscard]] std::uint64_t WallSeconds() const;
     /// Count a reading nobody signed towards giving the join up. The caller holds the lock.
     /// @return True once `PendingGiveUpAfter` has passed with no answer a proven key signed.
@@ -412,6 +427,14 @@ class FormationController final:
     std::optional<core::platform::SteadyTimePoint> _failingSince; ///< When the fleet last stopped answering.
     std::string _lastSaid;                                        ///< The last reading told to the log.
     std::set<std::string> _namedUnaskable;                        ///< Fleet ids already named as never asked.
+    std::set<std::string> _namedPinWithheld;                      ///< Fleet ids already named as withheld by the pin.
+    std::string _refusedOrderFor; ///< The survivor whose dissolve order the pin last refused, said once.
+    /// The advertise this node last said it cannot join under, so it is said once per advertise.
+    std::optional<std::string> _unstatableSaidFor;
+    /// The challenge the last VERIFIED `Pending` answer issued, beside the endpoint that issued it:
+    /// sent back only to that endpoint, so the row there refreshes (`EnrollRequest::challenge`).
+    /// A challenge is one node's row's, so a poll anywhere else states none.
+    std::optional<std::pair<std::string, CompileCacheWire::EnrollChallenge>> _challenge;
     std::string _proposedFor;                                   ///< The survivor this leader last proposed dissolving into.
     std::optional<core::platform::SteadyTimePoint> _proposedAt; ///< When; the same proposal waits `SeedProbeInterval`.
     /// When this node may next follow a pending node's pointer: one follow per `SeedProbeInterval`,

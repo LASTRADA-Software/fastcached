@@ -172,7 +172,8 @@ void FormFleet(RaftClusterHarness& cluster, NodeId const& voter, NodeId const& l
 {
     auto const evidence = Cluster::SplitEvidenceFor(StateOf(cluster, leader), leader, record, announced, seen);
     if (Cluster::HealingOf(evidence) != Cluster::SplitHealing::Automatically
-        || Cluster::ClassifyEncounter(Own(cluster, leader, created), seen, evidence) != Cluster::Encounter::Yield)
+        || Cluster::ClassifyEncounter(Own(cluster, leader, created), seen, evidence, Cluster::FleetPin {})
+               != Cluster::Encounter::Yield)
         return std::nullopt;
     auto const& summary = seen.Summary();
     // The survivor's leader's key, reached from the key that proved it, as the controller reaches it.
@@ -365,7 +366,7 @@ TEST_CASE("An older fleet listing this fleet's leader, proven by a key this flee
 
     auto const claim = Speaking(cluster, "n5", "n5", 1, { "n5", "n1", "n2" });
     CHECK(Cluster::SplitEvidenceFor(StateOf(cluster, "n1"), "n1", {}, {}, claim) == Cluster::SplitEvidence::None);
-    CHECK(Cluster::ClassifyEncounter(Own(cluster, "n1", 200), claim, Cluster::SplitEvidence::None)
+    CHECK(Cluster::ClassifyEncounter(Own(cluster, "n1", 200), claim, Cluster::SplitEvidence::None, Cluster::FleetPin {})
           == Cluster::Encounter::ForeignFleet);
     CHECK_FALSE(Decide(cluster, "n1", 200, {}, {}, claim).has_value());
 

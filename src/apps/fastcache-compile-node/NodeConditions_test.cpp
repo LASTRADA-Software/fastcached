@@ -5,6 +5,7 @@
 #include "EnrollmentWindow.hpp"
 #include "FormationLoop.hpp"
 #include "FormationRuntime.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 #include "NodeDefaults.hpp"
 #include "NodeMembership.hpp"
@@ -67,6 +68,15 @@ using FastCache::Testing::Unwrap;
 namespace
 {
 namespace Wire = CompileCacheWire;
+
+/// Where a tier under test says its `0xFC` port answers: what its founding record states. One object
+/// for the whole binary, so it outlives every tier a case starts.
+/// @return The source.
+[[nodiscard]] FastCache::Cc::IAdvertisedEndpointSource const& TestAdvertised()
+{
+    static FastCache::Node::AnnouncedEndpoint const advertised { "127.0.0.1:6674" };
+    return advertised;
+}
 
 /// `NodeMembership` reports an unreadable `fleet-open` row here; no case asserts on it.
 NullLogger membershipLog;
@@ -330,12 +340,14 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     // `own-record-awaited`.
     NodeConfig proving;
     proving.raftListen = "127.0.0.1:6680";
-    core::platform::ManualWallClock rosterClock;
-    auto const roster = NodeRoster::Build(proving, rosterClock, metrics, logger);
-    REQUIRE(roster.has_value());
+    // Its roster answers no condition here: the consensus scope's own roster, below, is the one
+    // built as `main` builds it.
+    core::platform::ManualClock proverRosterClock;
+    auto const proverRoster = NodeRoster::Build(proving, proverRosterClock, nullptr);
+    REQUIRE(proverRoster.has_value());
     auto const proverKey = FastCache::Testing::TestKeyPair("n1");
     FastCache::Testing::ScriptedSecureRandom proofRandom;
-    NodeProofClient const prover { "n1", proverKey, *Unwrap(roster), &membership, &conditions, proofRandom };
+    NodeProofClient const prover { "n1", proverKey, *Unwrap(proverRoster), &membership, &conditions, proofRandom };
 
     // The scheduler scope: a scheduler, signing with its identity key (#178), started the way `main`
     // starts it -- with the registry -- because it answers its fleet-wide rows as it starts.
@@ -378,14 +390,18 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     clusteredNode.raftSelf = "127.0.0.1";
     clusteredNode.clusterDir = consensusState / "state";
     clusteredNode.identityPublicKey = FastCache::Testing::TestKeyPair("n1").PublicKey(); // what a formation states
+    // Its lease roster, built as `main` builds it: it answers `consensus-leader-silent`, from the
+    // start and at every consensus pass.
+    core::platform::SteadyClock const rosterClock;
+    auto const roster = NodeRoster::Build(clusteredNode, rosterClock, &conditions);
+    REQUIRE(roster.has_value());
     auto const consensus = ConsensusTier::Start(
         clusteredNode,
-        {},
+        TestAdvertised(),
         FastCache::Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
-        [](Cluster::ClusterState const&) {},
-        core::platform::defaultSystemWallClock(),
-        {},
+        [&roster](Cluster::ClusterState const& state) { (*roster)->Applied(state); },
+        [&roster](Distributed::LeaderReading const& reading) { (*roster)->ConsensusPass(reading); },
         metrics,
         logger,
         &conditions,
@@ -443,7 +459,9 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
                                                                                 .srv = formationSrv,
                                                                                 .wait = formationWait } },
                         .reloader = nullptr };
-    auto const formation = MakeFormationRuntime(clusteredNode, formationBody, nullptr, metrics, logger, &conditions);
+    auto const formationKey = std::optional { FastCache::Testing::TestKeyPair("n1") }; // what its Enroll is signed with
+    auto const formation = MakeFormationRuntime(
+        clusteredNode, formationKey, formationBody, TestAdvertised(), nullptr, metrics, logger, &conditions);
     REQUIRE(formation.has_value());
     REQUIRE(*formation != nullptr);
 

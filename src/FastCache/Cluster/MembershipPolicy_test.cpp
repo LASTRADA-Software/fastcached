@@ -30,7 +30,7 @@ namespace
 /// A record the cluster has agreed on.
 /// @param id The identity.
 /// @param raft Where its consensus port answers.
-/// @param scheduler Where clients reach it while it leads.
+/// @param scheduler Where its `0xFC` port answers.
 /// @param seat Which set the operator admitted it into.
 /// @return The member.
 [[nodiscard]] ClusterMember Member(std::string id,

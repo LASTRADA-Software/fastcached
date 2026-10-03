@@ -26,14 +26,13 @@ namespace FastCache
 ///
 /// ONE enum for every construction rather than one per construction, because the question a label
 /// answers is asked ACROSS them: one key signs a node's discovery proofs, its fleet summaries, its
-/// roster endorsements, its leases, both halves of its Raft handshake, both halves of its node
-/// proof, its machine tickets and the admissions it answers, so a label is the only thing keeping a
+/// leases, both halves of its Raft handshake, both halves of its node proof, its machine tickets, the
+/// admissions it answers and the enrollment it asks for, so a label is the only thing keeping a
 /// signature made for one from verifying as another.
 enum class IdentityKeyPurpose : std::uint8_t
 {
     DiscoveryProof,      ///< A discovery proof: the answer to a challenge this node was sent.
     FleetSummary,        ///< A FLEET-SUMMARY answer, over a nonce a STRANGER chose.
-    RosterEndorsement,   ///< A voter's statement that a roster is the cluster's.
     Lease,               ///< A scheduler's grant.
     RaftDiallerProof,    ///< A Raft peer dialler's proof.
     RaftAcceptorVerdict, ///< A Raft peer acceptor's verdict on that proof.
@@ -41,6 +40,7 @@ enum class IdentityKeyPurpose : std::uint8_t
     NodeProof,           ///< A node-proof caller's proof.
     MachineTicket,       ///< A machine ticket: this machine speaks, to ONE audience, for a minute.
     EnrollAdmission,     ///< An ENROLL answer to a joiner, of any outcome, over a nonce the JOINER chose.
+    EnrollRequest,       ///< A joiner's ENROLL request, over every field it states, under the key it asks with.
     Last,                ///< Not a construction, and has no row: the length of a table keyed by one.
 };
 
@@ -58,7 +58,7 @@ struct IdentityKeyLabel
 /// version it is:
 /// - `discovery-proof-v3`: the fields it covers became a whole fleet summary where an id and an
 ///   endpoint were, and a label names ONE construction.
-/// - `fleet-summary-v1`, `roster-endorsement-v1`: new with their constructions.
+/// - `fleet-summary-v1`: new with its construction.
 /// - `lease-v3`: versioned with the token, so a signature over a version-2 claim list never
 ///   verifies as a version-3 one under the same key.
 /// - `raft-proof-v3`, `raft-verdict-v3`: the transcript gained the session direction, and a
@@ -67,11 +67,10 @@ struct IdentityKeyLabel
 /// - `node-challenge-v2`, `node-proof-v2`: `node-proof-v1` was the pre-shared key's MAC label.
 /// - `ticket-v1`: new with its construction (spec §5), and the label tickets were first signed
 ///   under, so routing them through this table moved no byte on the wire.
-/// - `enroll-admission-v1`: new with its construction.
+/// - `enroll-admission-v1`, `enroll-request-v1`: new with their constructions.
 inline constexpr EnumTable<IdentityKeyPurpose, IdentityKeyLabel> IdentityKeyLabels { {
     { .purpose = IdentityKeyPurpose::DiscoveryProof, .label = "fastcache-discovery-proof-v3" },
     { .purpose = IdentityKeyPurpose::FleetSummary, .label = "fastcache-fleet-summary-v1" },
-    { .purpose = IdentityKeyPurpose::RosterEndorsement, .label = "fastcache-roster-endorsement-v1" },
     { .purpose = IdentityKeyPurpose::Lease, .label = "fastcache-lease-v3" },
     { .purpose = IdentityKeyPurpose::RaftDiallerProof, .label = "fastcache-raft-proof-v3" },
     { .purpose = IdentityKeyPurpose::RaftAcceptorVerdict, .label = "fastcache-raft-verdict-v3" },
@@ -79,6 +78,7 @@ inline constexpr EnumTable<IdentityKeyPurpose, IdentityKeyLabel> IdentityKeyLabe
     { .purpose = IdentityKeyPurpose::NodeProof, .label = "fastcache-node-proof-v2" },
     { .purpose = IdentityKeyPurpose::MachineTicket, .label = "fastcache-ticket-v1" },
     { .purpose = IdentityKeyPurpose::EnrollAdmission, .label = "fastcache-enroll-admission-v1" },
+    { .purpose = IdentityKeyPurpose::EnrollRequest, .label = "fastcache-enroll-request-v1" },
 } };
 
 static_assert(RowsInEnumeratorOrder(IdentityKeyLabels, &IdentityKeyLabel::purpose),
@@ -90,10 +90,12 @@ static_assert(RowsInEnumeratorOrder(IdentityKeyLabels, &IdentityKeyLabel::purpos
 ///
 /// The `-v1` discovery, lease, Raft and node-proof labels were the pre-shared key's MAC labels
 /// (#1308, #178); `discovery-proof-v2` signed an id and an endpoint rather than a summary; the Raft
-/// `-v2` pair signed a transcript with no session direction.
-inline constexpr std::array<std::string_view, 8> RetiredIdentityKeyLabels {
-    "fastcache-discovery-v1",    "fastcache-discovery-proof-v2", "fastcache-lease-v1",        "fastcache-raft-proof-v1",
-    "fastcache-raft-verdict-v1", "fastcache-raft-proof-v2",      "fastcache-raft-verdict-v2", "fastcache-node-proof-v1",
+/// `-v2` pair signed a transcript with no session direction; `roster-endorsement-v1` signed a
+/// voter's endorsement of a certified roster, which no node uses any more.
+inline constexpr std::array<std::string_view, 9> RetiredIdentityKeyLabels {
+    "fastcache-discovery-v1",    "fastcache-discovery-proof-v2", "fastcache-lease-v1",
+    "fastcache-raft-proof-v1",   "fastcache-raft-verdict-v1",    "fastcache-raft-proof-v2",
+    "fastcache-raft-verdict-v2", "fastcache-node-proof-v1",      "fastcache-roster-endorsement-v1",
 };
 
 /// Whether every label is present, no two are the same, and none is retired.
@@ -146,7 +148,7 @@ template <typename Row, std::size_t N>
 /// **The label is first BY CONSTRUCTION**: the only way to make one is `Of`, which takes the
 /// purpose rather than the label and writes the label itself, so a builder cannot drop it, move
 /// it or spell it. What an identity key signs is this type and nothing else -- `SignLabelled`,
-/// `ILeaseSigner::Sign`, `IRaftPeerKeys::SignAsSelf` and `SignEndorsement`'s signer take it --
+/// `ILeaseSigner::Sign` and `IRaftPeerKeys::SignAsSelf` take it --
 /// which is what makes "every construction carries its label first" a property of the types
 /// rather than of each builder remembering to.
 class LabelledMessage

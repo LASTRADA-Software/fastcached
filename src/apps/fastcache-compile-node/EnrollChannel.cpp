@@ -16,8 +16,9 @@ namespace FastCache::Node
 
 namespace Wire = CompileCacheWire;
 
-DialledEnrollChannel::DialledEnrollChannel(IEndpointDialer& dialer):
-    _dialer { dialer }
+DialledEnrollChannel::DialledEnrollChannel(IEndpointDialer& dialer, Ed25519KeyPair const& identity):
+    _dialer { dialer },
+    _identity { identity }
 {
 }
 
@@ -29,21 +30,13 @@ EnrollReading DialledEnrollChannel::Poll(std::string_view endpoint,
     if (client == nullptr)
         return EnrollReading { .progress = EnrollProgress::Fatal,
                                .detail = std::format("cannot reach {}", endpoint),
-                               .roster = {},
-                               .certificate = {} };
+                               .roster = {} };
 
     // Silent and never consulted: a notice reports a credential the peer ignored, and this exchange
     // presents none -- by name, never by a defaulted argument.
     auto notice = Cc::CredentialNotice::Silent();
-    return ReadEnrollReply(
-        core::async::syncRun(Cc::ExchangeFramed(client.get(),
-                                                &notice,
-                                                Wire::EncodeEnroll(Wire::EnrollRequest { .nodeId = self.nodeId,
-                                                                                         .nodeEndpoint = self.nodeEndpoint,
-                                                                                         .role = self.role,
-                                                                                         .publicKey = self.publicKey,
-                                                                                         .nonce = nonce }),
-                                                NoCredential())));
+    return ReadEnrollReply(core::async::syncRun(
+        Cc::ExchangeFramed(client.get(), &notice, EncodeSignedEnroll(self, _identity, nonce), NoCredential())));
 }
 
 } // namespace FastCache::Node

@@ -44,6 +44,7 @@
 #include <core/net/testing/SocketDecorator.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
+#include <tests/ConsensusStandingFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/ReactorHomeFakes.hpp>
 #include <tests/SharedTierFakes.hpp>
@@ -76,6 +77,14 @@ namespace FastCache::Testing
 class SharedCacheFleet
 {
   public:
+    /// The host every recorded `0xFC` endpoint names, which `RecordingConnector` dials at loopback.
+    ///
+    /// Not loopback itself: a member record holds only an endpoint another machine can dial
+    /// (`IsPeerDialableEndpoint`, which `Cluster::ValidateAgainst` asks), so a record naming
+    /// `127.0.0.1` is one production refuses. A `.test` name (RFC 6761) resolves nowhere, so only
+    /// this fixture's connector can reach it, and the PORT tells the machines apart.
+    static constexpr std::string_view FleetHost = "fleet.test";
+
     /// Records the verb of the first frame in every write a dialled socket makes: an AUTH pipelined
     /// ahead of a FETCH is the first frame of that write, so "no AUTH" and "nothing after the
     /// challenge" are both assertions about this list.
@@ -145,6 +154,9 @@ class SharedCacheFleet
         {
             if (auto hook = std::exchange(_beforeDial, {}))
                 hook();
+            // A recorded endpoint names `FleetHost`, which every machine of this fleet answers on.
+            if (host == FleetHost)
+                host = "127.0.0.1";
             auto socket = co_await _inner.connect(std::move(host), port, options);
             if (!socket.has_value())
                 co_return socket;
@@ -370,7 +382,8 @@ class SharedCacheFleet
         SystemSecureRandom random;
         MemoryOpener opener;
         Node::SharedCacheHost host { id, opener, nullptr, logger, Node::ReconcileOn::Caller };
-        Node::NodeProofResponder prover { id, identity, roster, random, metrics, logger };
+        Testing::ScriptedAppliedState consensus { Node::AppliedStateReading::CaughtUp };
+        Node::NodeProofResponder prover { id, identity, roster, consensus, random, metrics, logger };
         Node::SharedCacheResponder responder { host, roster, metrics };
         Node::MergedResponder merged { Node::SurfaceComponents { .nodeProof = &prover, .sharedCache = &responder } };
         StallingResponder front { merged };
@@ -509,7 +522,7 @@ class SharedCacheFleet
         Commit(Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
                                   .key = id,
                                   .value = member->raftEndpoint,
-                                  .schedulerEndpoint = std::format("127.0.0.1:{}", Machine(signsAs).port),
+                                  .schedulerEndpoint = std::format("{}:{}", FleetHost, Machine(signsAs).port),
                                   .publicKey = TestKeyPair(id).PublicKey(),
                                   .role = std::nullopt });
     }

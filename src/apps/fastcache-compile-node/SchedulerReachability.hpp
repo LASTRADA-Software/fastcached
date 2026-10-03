@@ -59,6 +59,7 @@ enum class SchedulerOutcome : std::uint8_t
     NoHandshake,         ///< It serves no identity handshake, so it is no scheduler of this fleet.
     Untrusted,           ///< This machine will not prove itself to it.
     IdentityRefused,     ///< It did not accept this machine's identity.
+    IdentityDeferred,    ///< It could not judge this machine's identity yet.
     RegistrationRefused, ///< It did not register one of this worker's toolchains.
     PresenceRefused,     ///< It did not record this machine.
     Last                 ///< Not an outcome.
@@ -104,6 +105,11 @@ inline constexpr auto SchedulerOutcomeTable = EnumTable<SchedulerOutcome, Schedu
                           .proof = NodeProofResult::Refused,
                           .failure = "{0} did not accept this machine's identity: {2}",
                           .recovery = "{0} accepted this machine's identity again after {3}s" },
+    SchedulerOutcomeRow { .outcome = SchedulerOutcome::IdentityDeferred,
+                          .stage = AnnounceStage::Proof,
+                          .proof = NodeProofResult::Deferred,
+                          .failure = "{0} cannot judge this machine's identity yet, asking again shortly: {2}",
+                          .recovery = "{0} accepted this machine's identity after {3}s" },
     SchedulerOutcomeRow { .outcome = SchedulerOutcome::RegistrationRefused,
                           .stage = AnnounceStage::Announcement,
                           .proof = std::nullopt,

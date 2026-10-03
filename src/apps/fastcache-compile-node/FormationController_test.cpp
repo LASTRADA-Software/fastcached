@@ -3,6 +3,7 @@
 #include "EnrollmentWindow.hpp"
 #include "FormationController.hpp"
 #include "FormationRuntime.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodeFormation.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
@@ -25,6 +26,7 @@
 #include <cstdint>
 #include <format>
 #include <future>
+#include <initializer_list>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -95,9 +97,7 @@ constexpr std::chrono::seconds MachineStartsAt { 1'700'000'000 };
 /// @return The reading.
 [[nodiscard]] EnrollReading Reading(EnrollProgress progress, std::string detail, std::vector<std::byte> roster = {})
 {
-    return EnrollReading {
-        .progress = progress, .detail = std::move(detail), .roster = std::move(roster), .certificate = {}
-    };
+    return EnrollReading { .progress = progress, .detail = std::move(detail), .roster = std::move(roster) };
 }
 
 /// An admission of whoever asked, signed over the nonce of the poll it answers by @p signer's key
@@ -137,7 +137,8 @@ constexpr std::chrono::seconds MachineStartsAt { 1'700'000'000 };
         return Cluster::RosterMember { .id = id,
                                        .raftEndpoint = memberSeat == MemberSeat::Voter ? id.substr(2) + ":6680" : "",
                                        .seat = memberSeat,
-                                       .publicKey = Testing::TestKeyPair(id).PublicKey() };
+                                       .publicKey = Testing::TestKeyPair(id).PublicKey(),
+                                       .schedulerEndpoint = {} };
     };
     auto roster = Cluster::Roster { .members = { member("n-evil", MemberSeat::Voter),
                                                  member("n-laptop", MemberSeat::Learner),
@@ -177,6 +178,33 @@ constexpr std::chrono::seconds MachineStartsAt { 1'700'000'000 };
 [[nodiscard]] Testing::ScriptedAnswer Waiting()
 {
     return Testing::ScriptedAnswer { UnsignedWaiting(),
+                                     Testing::AdmissionSigning { .signer = "n-office", .clusterId = "c-office" } };
+}
+
+/// A challenge whose every byte is @p fill.
+/// @param fill The byte.
+/// @return The challenge.
+[[nodiscard]] CompileCacheWire::EnrollChallenge Challenge(std::uint8_t fill)
+{
+    auto challenge = CompileCacheWire::EnrollChallenge {};
+    challenge.fill(std::byte { fill });
+    return challenge;
+}
+
+/// @param challenge What the answer hands the joiner to sign over next.
+/// @return A fleet that has not decided yet, handing @p challenge out, nobody's signature on it.
+[[nodiscard]] EnrollReading UnsignedWaitingWith(CompileCacheWire::EnrollChallenge challenge)
+{
+    auto reading = UnsignedWaiting();
+    reading.challenge = challenge;
+    return reading;
+}
+
+/// @param challenge What the answer hands the joiner to sign over next.
+/// @return A fleet that has not decided yet, handing @p challenge out, as the office's leader answers it.
+[[nodiscard]] Testing::ScriptedAnswer WaitingWith(CompileCacheWire::EnrollChallenge challenge)
+{
+    return Testing::ScriptedAnswer { UnsignedWaitingWith(challenge),
                                      Testing::AdmissionSigning { .signer = "n-office", .clusterId = "c-office" } };
 }
 
@@ -261,17 +289,21 @@ struct Machine
     /// @param typedSeeds The `--fleet-seed` values it was given, if any.
     /// @param nodeEndpoint The `0xFC` endpoint it advertises; by default one named after its id.
     /// @param reach Whether other machines can be its fleet at all.
+    /// @param pin The cluster `--fleet-id` pins it to; none by default.
     Machine(std::string const& nodeId,
             FormationRecord record,
             std::vector<std::string> typedSeeds = {},
             std::optional<std::string> const& nodeEndpoint = std::nullopt,
-            FleetReachability reach = FleetReachability::Open):
+            FleetReachability reach = FleetReachability::Open,
+            Cluster::FleetPin pin = {}):
         typed { std::move(typedSeeds) },
+        advertised { nodeEndpoint.value_or(nodeId.substr(2) + ":6674") },
         self { .nodeId = nodeId,
                .publicKey = Testing::TestKeyPair(nodeId).PublicKey(),
-               .nodeEndpoint = nodeEndpoint.value_or(nodeId.substr(2) + ":6674"),
+               .advertised = advertised,
                .raftEndpoint = nodeId.substr(2) + ":6680",
-               .reach = reach },
+               .reach = reach,
+               .pin = std::move(pin) },
         controller { FormationParts { .store = store,
                                       .enroll = enroll,
                                       .probe = probe,
@@ -317,6 +349,7 @@ struct Machine
     Testing::ScriptedShapeJudge judge;
     NodeConditions conditions;
     std::vector<std::string> typed;
+    AnnouncedEndpoint advertised; ///< Where its `0xFC` port answers; `Publish` moves it, as a reload does.
     SelfFacts self;
     FormationController controller;
 };
@@ -516,10 +549,46 @@ TEST_CASE("A solitary node that proves an older solitary cluster records the joi
     CHECK(laptop.enroll.Asked()[0].self.role == CompileCacheWire::EnrollRole::Learner);
     CHECK(laptop.enroll.Asked()[0].self.nodeId == "n-laptop");
     CHECK(laptop.enroll.Asked()[0].self.publicKey == laptop.self.publicKey);
-    // Its endpoint exactly when the role states one, by the column the responder judges it by.
-    CHECK(laptop.enroll.Asked()[0].self.nodeEndpoint
-          == (EnrollRoleRowFor(CompileCacheWire::EnrollRole::Learner).statesEndpoint ? laptop.self.nodeEndpoint
-                                                                                     : std::string {}));
+    // Its endpoint exactly when the role states one, by the column the responder judges it by -- and a
+    // learner's does: the approval records it as the member's `0xFC` endpoint.
+    REQUIRE(EnrollRoleRowFor(CompileCacheWire::EnrollRole::Learner).statesEndpoint);
+    CHECK(laptop.enroll.Asked()[0].self.nodeEndpoint == "laptop:6674");
+
+    // Read at every poll, never captured: an accepted reload of `--advertise` is what the next one states.
+    laptop.advertised.Publish("10.9.0.4:6674");
+    laptop.controller.Tick();
+    REQUIRE(laptop.enroll.Asked().size() >= 2);
+    CHECK(laptop.enroll.Asked().back().self.nodeEndpoint == "10.9.0.4:6674");
+}
+
+TEST_CASE("A solitary node that advertises no endpoint a peer can dial decides no join, and says why once",
+          "[node][formation][controller][endpoint]")
+{
+    // A join it could not finish is not decided: the learner it would become must state where it
+    // answers. Yielding anyway sent nothing, gave up after ten minutes and yielded again, rewriting the
+    // record twice a cycle while the segment heard `Pending`.
+    Machine laptop { "n-laptop", Minted("c-laptop", 500), {}, "127.0.0.1:6674" };
+    for (auto const beat: { 1, 2 })
+    {
+        INFO("beat " << beat);
+        laptop.controller.OnFleetProven(Proven("c-office", FleetState::Solitary, OfficeCreatedAt, "office:6674"));
+        laptop.controller.Tick();
+    }
+    CHECK(laptop.store.Saves().empty());
+    CHECK(laptop.controller.Mode() == NodeMode::Solitary);
+    CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationYields) == 0);
+    auto const said = std::ranges::count_if(laptop.logger.Snapshot(), [](CapturingLogger::Record const& record) {
+        return record.message.contains("not asking c-office to admit this node")
+               && record.message.contains("(127.0.0.1:6674)");
+    });
+    CHECK(said == 1);
+
+    // The control: the same node, once it advertises a name a peer can dial, decides the join.
+    laptop.advertised.Publish("laptop.corp.example:6674");
+    laptop.controller.OnFleetProven(Proven("c-office", FleetState::Solitary, OfficeCreatedAt, "office:6674"));
+    laptop.controller.Tick();
+    REQUIRE(laptop.store.Saves().size() == 1);
+    CHECK(laptop.store.Saves()[0].mode == NodeMode::Pending);
 }
 
 TEST_CASE("A younger solitary node is asked and does not ask", "[node][formation][controller]")
@@ -821,6 +890,35 @@ TEST_CASE("An admission is asked for over a fresh nonce, from the leader the nod
     CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationAdmissionsUnverified) == 0);
 }
 
+TEST_CASE("A poll answers the challenge the leader's last verified answer handed out",
+          "[node][formation][controller][enroll]")
+{
+    // The leader refreshes a pending row -- the endpoint this node states above all -- only from a
+    // request signed over the challenge the row holds now, which each `Pending` answer hands out. So
+    // the next poll answers it, and only a challenge the fleet's own key signed is ever answered: one
+    // a relay slipped into an unsigned answer is not adopted.
+    Machine laptop { "n-laptop", Pending("c-laptop", 500, "c-office", "office:6674") };
+    laptop.enroll.Script({ WaitingWith(Challenge(0xD1)),
+                           WaitingWith(Challenge(0xD2)),
+                           Testing::ScriptedAnswer { UnsignedWaitingWith(Challenge(0xD9)) },
+                           Waiting(),
+                           Waiting() });
+    for (auto const beat: std::views::iota(0, 5))
+    {
+        static_cast<void>(beat);
+        laptop.controller.Tick();
+    }
+
+    auto const& asked = laptop.enroll.Asked();
+    REQUIRE(asked.size() == 5);
+    CHECK_FALSE(asked[0].self.challenge.has_value()); // a first ask answers nothing
+    CHECK(asked[1].self.challenge == Challenge(0xD1));
+    CHECK(asked[2].self.challenge == Challenge(0xD2));
+    CHECK(asked[3].self.challenge == Challenge(0xD2)); // the unsigned answer's challenge was not adopted
+    CHECK_FALSE(asked[4].self.challenge.has_value());  // a verified answer handing none clears it
+    CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationAdmissionsUnverified) == 1);
+}
+
 TEST_CASE("An admission recorded from another ask is refused, though the fleet's own key signed it",
           "[node][formation][controller][enroll]")
 {
@@ -942,6 +1040,30 @@ TEST_CASE("A poll whose nonce cannot be drawn is not sent", "[node][formation][c
     CHECK(laptop.controller.Mode() == NodeMode::Pending);
     CHECK(Logged(laptop.logger, "no nonce could be drawn to ask office:6674"));
     CHECK(Logged(laptop.logger, "scripted-getrandom"));
+}
+
+TEST_CASE("A pending node that advertises no endpoint a peer can dial does not ask, and says why once",
+          "[node][formation][controller][enroll][endpoint]")
+{
+    // The leader refuses a learner stating no endpoint, and the reason is this node's own: so nothing is
+    // sent, the reason is said once rather than every beat, and an advertise a peer CAN dial is asked
+    // with at the next beat -- it is read at every poll.
+    Machine laptop { "n-laptop", Pending("c-laptop", 500, "c-office", "office:6674"), {}, "127.0.0.1:6674" };
+    laptop.enroll.ScriptForever(Admitted(OfficeRosterWith("n-laptop")));
+    laptop.controller.Tick();
+    laptop.controller.Tick();
+
+    CHECK(laptop.enroll.Asked().empty());
+    CHECK(laptop.controller.Mode() == NodeMode::Pending);
+    auto const said = std::ranges::count_if(laptop.logger.Snapshot(), [](CapturingLogger::Record const& record) {
+        return record.message.contains("advertises no 0xFC endpoint another machine can dial (127.0.0.1:6674)");
+    });
+    CHECK(said == 1);
+
+    // The control: the same node, once it advertises a name a peer can dial, asks.
+    laptop.advertised.Publish("laptop.corp.example:6674");
+    laptop.controller.Tick();
+    CHECK_FALSE(laptop.enroll.Asked().empty());
 }
 
 TEST_CASE("A rejection returns the node to solitary and it does not ask that fleet again for an hour",
@@ -2005,4 +2127,249 @@ TEST_CASE("A fleet's leader proposes no dissolve into a survivor whose leader no
     office.controller.Tick();
     REQUIRE(office.admin.Proposed().size() == 1);
     CHECK(office.admin.Proposed()[0].leaderKey == std::optional { Testing::TestKeyPair("n-home").PublicKey() });
+}
+
+namespace
+{
+/// A pin to @p clusterId, naming @p voters' keys.
+/// @param clusterId The pinned cluster id.
+/// @param voters Whose `TestKeyPair` the pin names; by default the office's one voter.
+/// @return The pin.
+[[nodiscard]] Cluster::FleetPin PinTo(std::string_view clusterId,
+                                      std::initializer_list<std::string_view> voters = { "n-office" })
+{
+    auto fleet = Cluster::PinnedFleet { .clusterId = std::string { clusterId }, .voterKeys = {} };
+    for (auto const voter: voters)
+        fleet.voterKeys.push_back(Testing::TestKeyPair(std::string { voter }).PublicKey());
+    return Cluster::FleetPin { .fleet = std::move(fleet) };
+}
+
+/// The office's summary as a machine that copied its cluster id says it, under its own key.
+/// @param endpoint Where it says the office's leader answers.
+/// @return The impostor's summary, unsigned.
+[[nodiscard]] FleetSummary Impostor(std::string_view endpoint)
+{
+    auto summary = OfficeSummary("c-office", endpoint);
+    summary.nodeId = "n-rogue";
+    summary.leaderId = "n-rogue";
+    summary.createdAtUnixSeconds = 0;
+    return summary;
+}
+} // namespace
+
+TEST_CASE("A pinned solitary node does not ask an older fleet of another cluster, and counts every proof of it",
+          "[node][formation][controller][pin][security]")
+{
+    // The attack the pin exists for: a fleet anybody can prove, older than everything.
+    auto const rogue = Proven("c-rogue", FleetState::Established, 0, "rogue:6674");
+
+    SECTION("unpinned, the control: trust on first use asks it")
+    {
+        Machine laptop { "n-laptop", Minted("c-laptop", 500) };
+        laptop.controller.OnFleetProven(rogue);
+        laptop.controller.Tick();
+        CHECK(laptop.controller.Mode() == NodeMode::Pending);
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationYields) == 1);
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationYieldsRefusedPin) == 0);
+    }
+    SECTION("pinned to the office: it stays alone, counts the proof and names the fleet once")
+    {
+        Machine laptop { "n-laptop", Minted("c-laptop", 500), {}, std::nullopt, FleetReachability::Open, PinTo("c-office") };
+        laptop.controller.OnFleetProven(rogue);
+        laptop.controller.Tick();
+        CHECK(laptop.controller.Mode() == NodeMode::Solitary);
+        CHECK(laptop.store.Saves().empty());
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationYields) == 0);
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationYieldsRefusedPin) == 1);
+        CHECK(Logged(laptop.logger, "not asking the fleet c-rogue to admit this node"));
+        CHECK(Logged(laptop.logger, "--fleet-id pins it to c-office@"));
+
+        // Every proof counts -- a fleet that keeps beaconing keeps counting -- and the line is said once.
+        laptop.controller.OnFleetProven(rogue);
+        laptop.controller.Tick();
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationYieldsRefusedPin) == 2);
+        CHECK(std::ranges::count_if(laptop.logger.Snapshot(),
+                                    [](CapturingLogger::Record const& record) {
+                                        return record.message.contains("not asking the fleet c-rogue");
+                                    })
+              == 1);
+    }
+}
+
+TEST_CASE("A machine that copies the pinned cluster id and signs with its own key is refused by beacon and by seed",
+          "[node][formation][controller][pin][security]")
+{
+    SECTION("by beacon")
+    {
+        auto const impostor = Cluster::ProvenFleet::FromBeaconProof(Testing::ProvenBy(Impostor("rogue:6674"), "n-rogue"));
+        Machine unpinned { "n-laptop", Minted("c-laptop", 500) };
+        unpinned.controller.OnFleetProven(impostor);
+        unpinned.controller.Tick();
+        CHECK(unpinned.controller.Mode() == NodeMode::Pending); // the control: trust on first use is taken
+
+        Machine pinned { "n-laptop", Minted("c-laptop", 500), {}, std::nullopt, FleetReachability::Open, PinTo("c-office") };
+        pinned.controller.OnFleetProven(impostor);
+        pinned.controller.Tick();
+        CHECK(pinned.controller.Mode() == NodeMode::Solitary);
+        CHECK(pinned.metrics.Read(IMetricsSink::Counter::FormationYieldsRefusedPin) == 1);
+    }
+    SECTION("by a typed seed, which outranks every beacon")
+    {
+        auto const answer = Testing::ProvenSeed(Impostor("rogue:6674"), Cluster::SeedSource::FleetSeedFlag);
+        Machine pinned { "n-laptop",   Minted("c-laptop", 500), { "office:6674" },
+                         std::nullopt, FleetReachability::Open, PinTo("c-office") };
+        pinned.probe.Answer("office:6674", answer);
+        pinned.controller.Tick(); // asks the seed
+        pinned.controller.Tick(); // decides
+        CHECK(pinned.controller.Mode() == NodeMode::Solitary);
+        CHECK(pinned.metrics.Read(IMetricsSink::Counter::FormationYieldsRefusedPin) == 1);
+
+        // The genuine office at the same seed, signed by its pinned voter, is joined.
+        Machine genuine { "n-laptop",   Minted("c-laptop", 500), { "office:6674" },
+                          std::nullopt, FleetReachability::Open, PinTo("c-office") };
+        genuine.probe.Answer(
+            "office:6674",
+            Testing::ProvenSeed(OfficeSummary("c-office", "office:6674"), Cluster::SeedSource::FleetSeedFlag));
+        genuine.controller.Tick();
+        genuine.controller.Tick();
+        CHECK(genuine.controller.Mode() == NodeMode::Pending);
+        CHECK(genuine.metrics.Read(IMetricsSink::Counter::FormationYieldsRefusedPin) == 0);
+    }
+}
+
+TEST_CASE("A pinned solitary node asks the fleet it is pinned to, though an older one is proven beside it",
+          "[node][formation][controller][pin]")
+{
+    Machine laptop { "n-laptop",   Minted("c-laptop", 500), {},
+                     std::nullopt, FleetReachability::Open, PinTo("c-office", { "c-office" }) };
+    laptop.controller.OnFleetProven(Proven("c-rogue", FleetState::Established, 0, "rogue:6674"));
+    laptop.controller.OnFleetProven(Proven("c-office", FleetState::Established, OfficeCreatedAt, "office:6674"));
+    laptop.controller.Tick();
+    REQUIRE(laptop.store.Saves().size() == 1);
+    REQUIRE(laptop.store.Saves()[0].joining.has_value());
+    CHECK(Unwrap(laptop.store.Saves()[0].joining).summary.clusterId == "c-office");
+    CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationYields) == 1);
+    CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationYieldsRefusedPin) == 1); // the rogue, still counted
+}
+
+TEST_CASE("A pinned pending node takes an answer only from a pinned voter's key, and refuses any other by name",
+          "[node][formation][controller][pin][security]")
+{
+    SECTION("the genuine pinned voter admits it")
+    {
+        Machine laptop {
+            "n-laptop",       Pending("c-laptop", 500, "c-office", "office:6674"), {}, std::nullopt, FleetReachability::Open,
+            PinTo("c-office")
+        };
+        laptop.enroll.Script({ Admitted(OfficeRosterWith("n-laptop")) });
+        laptop.controller.Tick();
+        CHECK(laptop.controller.Mode() == NodeMode::Learner);
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationAdmissionsRefusedPin) == 0);
+        // The record keeps the key the admission was verified under, which every later start judges.
+        auto const record = laptop.controller.Record();
+        REQUIRE(record.fleet.has_value());
+        CHECK(Unwrap(record.fleet).admittedBy == Testing::TestKeyPair("n-office").PublicKey());
+    }
+    SECTION("an approval signed by a key the pin does not name is no answer, counted")
+    {
+        // A record that asked the impostor -- written before the pin, or by somebody else -- polls a key
+        // the pin does not name, and the impostor's admission, though it verifies under that key, is not
+        // taken.
+        auto record = Pending("c-laptop", 500, "c-office", "rogue:6674");
+        record.joining = Cluster::JoinTarget { .summary = Impostor("rogue:6674"),
+                                               .provenKey = Testing::TestKeyPair("n-rogue").PublicKey(),
+                                               .askedAtUnixSeconds = 42 };
+        Machine laptop { "n-laptop", record, {}, std::nullopt, FleetReachability::Open, PinTo("c-office") };
+        laptop.enroll.Script({ AdmittedBy("n-rogue", "c-office", Testing::RosterWith("n-rogue", "n-laptop")) });
+        laptop.controller.Tick();
+        CHECK(laptop.controller.Mode() == NodeMode::Pending);
+        CHECK(laptop.store.Saves().empty());
+        CHECK(laptop.reform.Requests() == 0);
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationAdmissionsRefusedPin) == 1);
+        CHECK(Logged(laptop.logger,
+                     std::format("c-office's answer is signed by key {}, which --fleet-id",
+                                 FormatEd25519PublicKey(Testing::TestKeyPair("n-rogue").PublicKey()))));
+    }
+}
+
+TEST_CASE("A leader a redirect names is asked only when the pin names its key, and refused with the key to add",
+          "[node][formation][controller][pin]")
+{
+    // n-office answers NotLeader naming desk:6674, and desk proves n-desk's key -- a voter promoted
+    // since the pin was written. Pinned to n-office alone, desk is never asked and the refusal names
+    // the key to add; pinned to both, desk is asked and its admission taken.
+    auto desk = OfficeSummary("c-office", "desk:6674");
+    desk.leaderId = "n-desk";
+    desk.nodeId = "n-desk";
+    auto const deskKey = FormatEd25519PublicKey(Testing::TestKeyPair("n-desk").PublicKey());
+
+    SECTION("pinned to the office's first voter only")
+    {
+        Machine laptop {
+            "n-laptop",       Pending("c-laptop", 500, "c-office", "office:6674"), {}, std::nullopt, FleetReachability::Open,
+            PinTo("c-office")
+        };
+        laptop.probe.AnswerSummary("office:6674", OfficeNamingLeader("n-desk"));
+        laptop.probe.AnswerSummary("desk:6674", Testing::ProvenBy(desk, "n-desk"));
+        laptop.enroll.Script({ Redirect("desk:6674"), AdmittedBy("n-desk", "c-office", OfficeRosterWith("n-laptop")) });
+        for ([[maybe_unused]] auto const beat: std::views::iota(0, 3))
+            laptop.controller.Tick();
+        // Desk is never asked; the next poll goes back to the office, whose key the join was decided on.
+        CHECK_FALSE(std::ranges::contains(laptop.enroll.AskedEndpoints(), std::string { "desk:6674" }));
+        CHECK(laptop.controller.Mode() == NodeMode::Pending);
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationAdmissionsRefusedPin) == 1);
+        CHECK(Logged(laptop.logger,
+                     std::format("desk:6674 leads c-office under key {}, which --fleet-id does not pin", deskKey)));
+        CHECK(Logged(laptop.logger, std::format("add it: --fleet-id={},{}", Cluster::PinText(PinTo("c-office")), deskKey)));
+    }
+    SECTION("pinned to both voters, the control: the second voter is asked and admits it")
+    {
+        Machine laptop { "n-laptop",
+                         Pending("c-laptop", 500, "c-office", "office:6674"),
+                         {},
+                         std::nullopt,
+                         FleetReachability::Open,
+                         PinTo("c-office", { "n-office", "n-desk" }) };
+        laptop.probe.AnswerSummary("office:6674", OfficeNamingLeader("n-desk"));
+        laptop.probe.AnswerSummary("desk:6674", Testing::ProvenBy(desk, "n-desk"));
+        laptop.enroll.Script({ Redirect("desk:6674"), AdmittedBy("n-desk", "c-office", OfficeRosterWith("n-laptop")) });
+        for ([[maybe_unused]] auto const beat: std::views::iota(0, 3))
+            laptop.controller.Tick();
+        CHECK(laptop.enroll.AskedEndpoints() == std::vector<std::string> { "office:6674", "desk:6674" });
+        CHECK(laptop.controller.Mode() == NodeMode::Learner);
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationAdmissionsRefusedPin) == 0);
+        // The key that SIGNED the admission is desk's, not the office's the join was decided on: the
+        // record keeps the one it verified the answer under.
+        auto const record = laptop.controller.Record();
+        REQUIRE(record.fleet.has_value());
+        CHECK(Unwrap(record.fleet).admittedBy == Testing::TestKeyPair("n-desk").PublicKey());
+    }
+}
+
+TEST_CASE("A pinned member does not follow its fleet's dissolve into another cluster, and says so once",
+          "[node][formation][controller][pin][split]")
+{
+    SECTION("pinned to its fleet: it stays while the rest leave")
+    {
+        Machine laptop { "n-laptop",   LearnerIn("c-laptop", "c-office"), {},
+                         std::nullopt, FleetReachability::Open,           PinTo("c-office") };
+        laptop.controller.OnClusterState(OfficeDissolvingIntoHome(), "c-office", "n-office", "office:6674");
+        CHECK(laptop.controller.Mode() == NodeMode::Learner);
+        CHECK(laptop.store.Saves().empty());
+        CHECK(laptop.reform.Requests() == 0);
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationAdmissionsRefusedPin) == 1);
+        CHECK(Logged(laptop.logger,
+                     "not following this fleet's dissolve into c-home: --fleet-id pins this node to c-office@"));
+
+        // Every state after the first names the same survivor: one refusal, not one per state.
+        laptop.controller.OnClusterState(OfficeDissolvingIntoHome(), "c-office", "n-office", "office:6674");
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationAdmissionsRefusedPin) == 1);
+    }
+    SECTION("unpinned, the control: it leaves for the survivor")
+    {
+        Machine laptop { "n-laptop", LearnerIn("c-laptop", "c-office") };
+        laptop.controller.OnClusterState(OfficeDissolvingIntoHome(), "c-office", "n-office", "office:6674");
+        CHECK(laptop.controller.Mode() == NodeMode::Pending);
+        CHECK(laptop.metrics.Read(IMetricsSink::Counter::FormationAdmissionsRefusedPin) == 0);
+    }
 }

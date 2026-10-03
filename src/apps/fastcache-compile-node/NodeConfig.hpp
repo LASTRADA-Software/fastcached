@@ -570,6 +570,20 @@ struct NodeConfig
     /// present is one the operator typed and a registration replays each of them.
     std::vector<std::string> fleetSeeds;
 
+    /// The one cluster this node may belong to and the voters it takes that cluster's word from
+    /// (`--fleet-id=<cluster-id>@<key>[,<key>...]`), or absent to trust on first use.
+    ///
+    /// **Zero-config discovery is trust-on-first-use**, and this is the operator's remedy for it
+    /// (`Cluster::FleetPin`): a pinned node yields to no fleet but this one as a pinned voter signs
+    /// it, accepts no answer or leader another key signed on its way in, follows no dissolve, and
+    /// refuses to start on a formation record committing it elsewhere. A KEY pin, because a cluster
+    /// id is a name every beacon carries. It anchors the JOIN: once joined, the fleet's applied state
+    /// is the authority.
+    ///
+    /// No provenance bit: the `optional` IS its provenance (`PresentIn`), and absent is the
+    /// instruction a registration must carry by saying nothing.
+    std::optional<Cluster::PinnedFleet> fleetPin;
+
     /// The name the platform's supervisor keys this worker's registration on.
     ///
     /// Distinct from the daemon's `FastCached` by default, because the two are
@@ -1306,19 +1320,6 @@ inline constexpr std::string_view RaftListenDefaultHost = "0.0.0.0";
 /// whatever the bind (#287), and every other verb refuses a caller that is not a member.
 inline constexpr std::string_view NodeSurfaceDefaultHost = "0.0.0.0";
 
-/// Whether @p host names every interface rather than a machine.
-///
-/// The two spellings of "every interface", plus the empty host -- which reaches `getaddrinfo`
-/// as nullptr under AI_PASSIVE and is therefore the wildcard as well, the case
-/// `--listen-node=:6674` is refused for. Brackets are the caller's to strip (`HostOfEndpoint`
-/// does), so `[::]` arrives here as `::`.
-/// @param host A host, unbracketed.
-/// @return True for a wildcard.
-[[nodiscard]] constexpr bool IsWildcardHost(std::string_view host) noexcept
-{
-    return host.empty() || host == "0.0.0.0" || host == "::";
-}
-
 /// The endpoint this node tells other machines to dial.
 ///
 /// **One derivation, because three consumers must agree or the fleet breaks in a way
@@ -1572,10 +1573,10 @@ inline constexpr std::string_view TlsUnavailableRefusal =
 
 /// Why a worker that could verify no lease is refused, when other machines can reach it (#178).
 ///
-/// Answered by the startup check of the state directory (`NodeRoster::Build`), the one moment the
-/// answer can be known: only the directory says whether a node that runs no consensus holds a
-/// roster. There is no configuration's half any more: every node has a state directory to keep
-/// one in.
+/// Answered by `NodeRoster::Build`: the only roster there is, is the state a node's own consensus
+/// applies, so a node that runs none holds none, and a worker on it that other machines can reach
+/// could verify no grant. The startup table refuses a worker that runs no consensus first
+/// (`WorkerConsensusClosed`), so the build's refusal is the belt behind it.
 inline constexpr std::string_view RosterlessWorkerRefusal =
     "a node that admits peers on other machines checks the lease a client presents to its worker, against the state "
     "its fleet's consensus applies -- and this node runs no consensus and holds no roster, so it could verify "
@@ -1664,33 +1665,19 @@ inline constexpr std::string_view NodeRunsNothingRefusal =
 
 /// What a caller of a fleet predicate knows about the roster this node verifies keys against.
 ///
-/// PRIVATE: never transmitted and never persisted. Three answers because the configuration
-/// cannot see a roster a state directory kept: only `NodeRoster::Build` and what runs after it
-/// know `Held` or `Absent`, and a question asked before that is `Unknown`. A fourth for a node
-/// running consensus, whose roster is the state it applies and whose members its formation
-/// record already names: `Formed` asks the record, where `Unknown` would count the fleet the
-/// node MAY found later -- the fail-closed reading a guard wants and a statement about the
-/// present must not make.
+/// PRIVATE: never transmitted and never persisted. A node's roster is the state its OWN consensus
+/// applies (#178, T25), so only a node running consensus ever holds one -- no state directory keeps
+/// one for a node that does not. Three answers, because callers ask with three different amounts of
+/// knowledge: `Absent` says no key route is to be counted; `Formed` asks the formation record, which
+/// names the members consensus starts with; `Unknown` counts the key route every consensus node
+/// has -- the fleet a solitary node MAY found later, the fail-closed reading a guard wants and a
+/// statement about the present must not make.
 enum class RosterPresence : std::uint8_t
 {
-    Held,    ///< A roster is held, so a proof or a ticket can admit another machine.
-    Absent,  ///< No roster is held, so no key can admit anybody.
-    Unknown, ///< Asked before any roster was read; the configuration decides (`AdmitsByKey`).
+    Absent,  ///< No key route is counted: no roster, or a caller that asks about the others alone.
+    Unknown, ///< A guard's reading: a node running consensus holds a roster that may admit by key.
     Formed,  ///< Consensus's own roster: it admits exactly the members the formation record's mode names.
 };
-
-/// Whether a key -- a proof or a ticket -- could ever admit a machine that is not this one.
-///
-/// A key admits only against a roster, and two things in a configuration may give this node
-/// one: consensus, whose roster is the state it applies; and the state directory, which may
-/// hold a roster an earlier run adopted --
-/// the one `ChosenStateDirectory` names, typed or the default the start resolved, since that is
-/// where `NodeRoster::Build` reads a kept roster back. It answers "may", never "does": a
-/// directory that turns out empty is `NodeRoster::Build`'s finding, and until that runs the
-/// fail-closed reading is that a key route is live.
-/// @param cfg The parsed configuration.
-/// @return Whether any clause of the configuration may give this node a roster.
-[[nodiscard]] bool AdmitsByKey(NodeConfig const& cfg);
 
 /// Whether this node runs a compile worker: surveys its toolchains, claims a scratch
 /// root, serves the compile verbs and registers with a scheduler.

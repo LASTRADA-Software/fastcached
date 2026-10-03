@@ -604,18 +604,21 @@ inline constexpr std::array DeclineCauseTable {
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeKeyUnknown, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeKeyRevoked, .cause = DeclineCause::NotPermitted },
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NodeIdentityRequired, .cause = DeclineCause::NotPermitted },
+    // A NODE's proof a node could not judge yet: retriable for the node that proves, and
+    // unreachable from a compile, since the launcher proves nothing -- so the rows above' answer.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::RosterNotYetApplied, .cause = DeclineCause::NotPermitted },
     // Enrollment's, for `EnrollmentFull`'s reason above.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentHostFull, .cause = DeclineCause::NotPermitted },
     // A worker that can verify nobody's grant (#178): ONE machine declining the job it was
     // handed, and the machine is where the cause is -- cut off from the leader whose roster
     // it would need, or only reaching an ex-leader that withholds it. Not `NotPermitted`,
     // which points at this client's configuration, which is fine.
-    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::RosterExpired, .cause = DeclineCause::WorkerRefused },
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::GrantUnverifiable, .cause = DeclineCause::WorkerRefused },
     // A machine ticket refused: this machine is not admitted, its key was revoked, or the ticket
     // named another node or has lapsed. Usually fixed where this client stands rather than by
     // adding machines, so `NotPermitted`. The exception is one worker whose roster is stale and
-    // does not yet hold this machine -- `RosterExpired`'s case, which another worker would not
-    // share.
+    // does not yet hold this machine -- a worker behind its fleet's state, which another worker
+    // would not share.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::TicketRefused, .cause = DeclineCause::NotPermitted },
     // An operator's control verb from a caller only `--fleet-open` admitted. The launcher sends no
     // control verb, so a compile cannot reach it; were one to, no retry clears it, which is

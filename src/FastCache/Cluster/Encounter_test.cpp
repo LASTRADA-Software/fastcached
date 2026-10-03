@@ -8,9 +8,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <tests/FormationFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
@@ -43,8 +45,8 @@ namespace
 /// Whether the encounter decision can be asked of a seen side of type @p Seen.
 template <typename Seen>
 concept DecidesAgainst = requires(FleetSummary const& own, Seen const& seen) {
-    ClassifyEncounter(own, seen, SplitEvidence::None);
-    YieldTo(own, seen, SplitEvidence::None);
+    ClassifyEncounter(own, seen, SplitEvidence::None, FleetPin {});
+    YieldTo(own, seen, SplitEvidence::None, FleetPin {});
 };
 
 // A raw summary -- what a beacon carries -- cannot even be passed as the seen side; only a
@@ -75,6 +77,7 @@ struct Row
         case Encounter::SameFleet:
         case Encounter::ForeignFleet:
         case Encounter::Follow:
+        case Encounter::PinnedElsewhere:
         case Encounter::Last:
             break;
     }
@@ -156,14 +159,14 @@ TEST_CASE("ClassifyEncounter decides every pair of fleet states and every tie", 
     for (auto const& row: rows)
     {
         INFO(row.name);
-        CHECK(ClassifyEncounter(row.own, Proven(row.seen), SplitEvidence::None) == row.expected);
-        CHECK(YieldTo(row.own, Proven(row.seen), SplitEvidence::None) == (row.expected == Encounter::Yield));
+        CHECK(ClassifyEncounter(row.own, Proven(row.seen), SplitEvidence::None, FleetPin {}) == row.expected);
+        CHECK(YieldTo(row.own, Proven(row.seen), SplitEvidence::None, FleetPin {}) == (row.expected == Encounter::Yield));
     }
 }
 
 TEST_CASE("Exactly one of two solitary fleets yields to the other whichever meets first", "[cluster][formation][encounter]")
 {
-    // The split-brain property itself: for every pair, YieldTo(a, b) XOR YieldTo(b, a).
+    // The split-brain property itself: for every pair, YieldTo(a, b, FleetPin {}) XOR YieldTo(b, a, FleetPin {}).
     auto const fleets = std::array { Fleet("aa", FleetState::Solitary, 7),
                                      Fleet("bb", FleetState::Solitary, 7),
                                      Fleet("cc", FleetState::Solitary, 3),
@@ -174,7 +177,8 @@ TEST_CASE("Exactly one of two solitary fleets yields to the other whichever meet
             if (a.clusterId == b.clusterId)
                 continue;
             INFO(a.clusterId << " against " << b.clusterId);
-            CHECK(YieldTo(a, Proven(b), SplitEvidence::None) != YieldTo(b, Proven(a), SplitEvidence::None));
+            CHECK(YieldTo(a, Proven(b), SplitEvidence::None, FleetPin {})
+                  != YieldTo(b, Proven(a), SplitEvidence::None, FleetPin {}));
         }
 }
 
@@ -201,13 +205,13 @@ TEST_CASE("Two sides of every encounter conclude mirror images of each other", "
             INFO(a.clusterId << " against " << b.clusterId);
             auto const bothEstablished = a.state == FleetState::Established && b.state == FleetState::Established;
             // Exactly one yields, or neither when both are established -- never both.
-            CHECK(static_cast<int>(YieldTo(a, Proven(b), SplitEvidence::None))
-                      + static_cast<int>(YieldTo(b, Proven(a), SplitEvidence::None))
+            CHECK(static_cast<int>(YieldTo(a, Proven(b), SplitEvidence::None, FleetPin {}))
+                      + static_cast<int>(YieldTo(b, Proven(a), SplitEvidence::None, FleetPin {}))
                   == (bothEstablished ? 0 : 1));
-            CHECK(ClassifyEncounter(b, Proven(a), SplitEvidence::None)
-                  == MirrorOf(ClassifyEncounter(a, Proven(b), SplitEvidence::None)));
+            CHECK(ClassifyEncounter(b, Proven(a), SplitEvidence::None, FleetPin {})
+                  == MirrorOf(ClassifyEncounter(a, Proven(b), SplitEvidence::None, FleetPin {})));
             if (bothEstablished)
-                CHECK(ClassifyEncounter(a, Proven(b), SplitEvidence::None) == Encounter::ForeignFleet);
+                CHECK(ClassifyEncounter(a, Proven(b), SplitEvidence::None, FleetPin {}) == Encounter::ForeignFleet);
         }
     CHECK(pairs == fleets.size() * (fleets.size() - 1));
 }
@@ -226,8 +230,8 @@ TEST_CASE("A node never yields to its own cluster id whatever the other fields s
                 "someone-else";
             seen.nodeId = "someone-else";
             INFO(static_cast<int>(ownState) << " against " << static_cast<int>(seenState));
-            CHECK(ClassifyEncounter(own, Proven(seen), SplitEvidence::None) == Encounter::SameFleet);
-            CHECK_FALSE(YieldTo(own, Proven(seen), SplitEvidence::None));
+            CHECK(ClassifyEncounter(own, Proven(seen), SplitEvidence::None, FleetPin {}) == Encounter::SameFleet);
+            CHECK_FALSE(YieldTo(own, Proven(seen), SplitEvidence::None, FleetPin {}));
         }
 }
 
@@ -239,13 +243,14 @@ TEST_CASE("A clock that read before the epoch yields to every sane one", "[clust
     {
         auto const sane = Fleet("zz", FleetState::Solitary, created);
         INFO(created);
-        CHECK(ClassifyEncounter(broken, Proven(sane), SplitEvidence::None) == Encounter::Yield);
-        CHECK(ClassifyEncounter(sane, Proven(broken), SplitEvidence::None) == Encounter::Stay);
+        CHECK(ClassifyEncounter(broken, Proven(sane), SplitEvidence::None, FleetPin {}) == Encounter::Yield);
+        CHECK(ClassifyEncounter(sane, Proven(broken), SplitEvidence::None, FleetPin {}) == Encounter::Stay);
     }
     // Established still beats solitary, whichever clock is broken.
     CHECK(ClassifyEncounter(Fleet("aa", FleetState::Established, UnbelievableClockCreatedAt),
                             Proven(Fleet("zz", FleetState::Solitary, 0)),
-                            SplitEvidence::None)
+                            SplitEvidence::None,
+                            FleetPin {})
           == Encounter::Stay);
 }
 
@@ -268,25 +273,28 @@ TEST_CASE("Two established fleets proven to be one fleet decide by the tiebreak,
                 continue;
             ++pairs;
             INFO(a.clusterId << " against " << b.clusterId);
-            CHECK(YieldTo(a, Proven(b), verified) != YieldTo(b, Proven(a), verified));
-            CHECK(ClassifyEncounter(b, Proven(a), verified) == MirrorOf(ClassifyEncounter(a, Proven(b), verified)));
+            CHECK(YieldTo(a, Proven(b), verified, FleetPin {}) != YieldTo(b, Proven(a), verified, FleetPin {}));
+            CHECK(ClassifyEncounter(b, Proven(a), verified, FleetPin {})
+                  == MirrorOf(ClassifyEncounter(a, Proven(b), verified, FleetPin {})));
 
             // Evidence on ONE side only: that side decides by the tiebreak and the other stays
             // foreign, so the two can never both yield -- the one that must yield waits for its own
             // evidence rather than the other moving for it.
-            auto const oneSided = static_cast<int>(YieldTo(a, Proven(b), verified))
-                                  + static_cast<int>(YieldTo(b, Proven(a), SplitEvidence::None));
+            auto const oneSided = static_cast<int>(YieldTo(a, Proven(b), verified, FleetPin {}))
+                                  + static_cast<int>(YieldTo(b, Proven(a), SplitEvidence::None, FleetPin {}));
             CHECK(oneSided <= 1);
-            CHECK(ClassifyEncounter(b, Proven(a), SplitEvidence::None) == Encounter::ForeignFleet);
+            CHECK(ClassifyEncounter(b, Proven(a), SplitEvidence::None, FleetPin {}) == Encounter::ForeignFleet);
         }
     CHECK(pairs == fleets.size() * (fleets.size() - 1));
 
     // The winner is the tiebreak's: the older fleet stays, the younger yields.
     CHECK(
-        ClassifyEncounter(Fleet("zz", FleetState::Established, 9), Proven(Fleet("yy", FleetState::Established, 1)), verified)
+        ClassifyEncounter(
+            Fleet("zz", FleetState::Established, 9), Proven(Fleet("yy", FleetState::Established, 1)), verified, FleetPin {})
         == Encounter::Yield);
     CHECK(
-        ClassifyEncounter(Fleet("yy", FleetState::Established, 1), Proven(Fleet("zz", FleetState::Established, 9)), verified)
+        ClassifyEncounter(
+            Fleet("yy", FleetState::Established, 1), Proven(Fleet("zz", FleetState::Established, 9)), verified, FleetPin {})
         == Encounter::Stay);
 }
 
@@ -305,8 +313,8 @@ TEST_CASE("Split evidence changes nothing but what would otherwise be foreign", 
             {
                 INFO(a.clusterId << " against " << b.clusterId << " with "
                                  << SplitEvidenceNames[static_cast<std::size_t>(kind)].name);
-                auto const without = ClassifyEncounter(a, Proven(b), SplitEvidence::None);
-                auto const with = ClassifyEncounter(a, Proven(b), kind);
+                auto const without = ClassifyEncounter(a, Proven(b), SplitEvidence::None, FleetPin {});
+                auto const with = ClassifyEncounter(a, Proven(b), kind, FleetPin {});
                 ++decided;
                 if (without == Encounter::ForeignFleet && HealingOf(kind) == SplitHealing::Automatically)
                     CHECK((with == Encounter::Yield || with == Encounter::Stay));
@@ -331,9 +339,120 @@ TEST_CASE("Only a voter's key heals a split by itself; a memo's and a learner's 
     // An older established fleet: what the younger one decides on each kind.
     auto const own = Fleet("zz", FleetState::Established, 9);
     auto const older = Proven(Fleet("aa", FleetState::Established, 1));
-    CHECK(ClassifyEncounter(own, older, SplitEvidence::TheirSpeakerIsOurVoter) == Encounter::Yield);
-    CHECK(ClassifyEncounter(own, older, SplitEvidence::TheirSpeakerIsOurLearner) == Encounter::ForeignFleet);
-    CHECK(ClassifyEncounter(own, older, SplitEvidence::WeAskedAndTheyListUs) == Encounter::ForeignFleet);
+    CHECK(ClassifyEncounter(own, older, SplitEvidence::TheirSpeakerIsOurVoter, FleetPin {}) == Encounter::Yield);
+    CHECK(ClassifyEncounter(own, older, SplitEvidence::TheirSpeakerIsOurLearner, FleetPin {}) == Encounter::ForeignFleet);
+    CHECK(ClassifyEncounter(own, older, SplitEvidence::WeAskedAndTheyListUs, FleetPin {}) == Encounter::ForeignFleet);
     CHECK(IsSplit(SplitEvidence::WeAskedAndTheyListUs)); // told, all the same
     CHECK_FALSE(IsSplit(SplitEvidence::None));
+}
+
+namespace
+{
+/// A pin to @p id, naming @p voters' keys -- by default the key `Proven` signs @p id's summary with.
+/// @param id The pinned cluster id.
+/// @param voters Whose `TestKeyPair` the pin names; empty for @p id's own.
+/// @return The pin.
+[[nodiscard]] FleetPin PinTo(std::string_view id, std::initializer_list<std::string_view> voters = {})
+{
+    auto named = std::vector<std::string_view> { voters };
+    if (named.empty())
+        named.push_back(id);
+    auto fleet = PinnedFleet { .clusterId = std::string { id }, .voterKeys = {} };
+    for (auto const voter: named)
+        fleet.voterKeys.push_back(Testing::TestKeyPair(std::string { voter }).PublicKey());
+    return FleetPin { .fleet = std::move(fleet) };
+}
+} // namespace
+
+TEST_CASE("A pinned node does not yield to an older established fleet of another cluster",
+          "[cluster][formation][encounter][pin][security]")
+{
+    // The attack the pin exists for: anybody can prove "established, created at 0" under a fresh key.
+    auto const own = Fleet("own", FleetState::Solitary, 900);
+    auto const rogue = Proven(Fleet("rogue", FleetState::Established, 0));
+
+    // The control first: trust on first use yields to it, which is why it is an attack.
+    CHECK(ClassifyEncounter(own, rogue, SplitEvidence::None, FleetPin {}) == Encounter::Yield);
+    CHECK(ClassifyEncounter(own, rogue, SplitEvidence::None, PinTo("office")) == Encounter::PinnedElsewhere);
+    CHECK_FALSE(YieldTo(own, rogue, SplitEvidence::None, PinTo("office")));
+}
+
+TEST_CASE("A fleet claiming the pinned cluster id under a key the pin does not name is never yielded to",
+          "[cluster][formation][encounter][pin][security]")
+{
+    // The id is a name every beacon carries, so the impostor copies it exactly and signs with its own key.
+    auto const own = Fleet("own", FleetState::Solitary, 900);
+    auto const impostor = Testing::ProvenBy(Fleet("office", FleetState::Established, 0), "n-rogue");
+    CHECK(ClassifyEncounter(own, impostor, SplitEvidence::None, FleetPin {}) == Encounter::Yield); // the control
+    CHECK(ClassifyEncounter(own, impostor, SplitEvidence::None, PinTo("office")) == Encounter::PinnedElsewhere);
+
+    // Nor does it win the tiebreak the pinned fleet would: an older node decides as if unpinned, and stays.
+    auto const older = Fleet("older", FleetState::Solitary, 1);
+    auto const solitaryImpostor = Testing::ProvenBy(Fleet("office", FleetState::Solitary, 900), "n-rogue");
+    CHECK(ClassifyEncounter(older, solitaryImpostor, SplitEvidence::None, PinTo("office")) == Encounter::Stay);
+}
+
+TEST_CASE("A pinned node yields to the fleet it is pinned to, under any of the pinned voters' keys",
+          "[cluster][formation][encounter][pin]")
+{
+    auto const own = Fleet("own", FleetState::Solitary, 900);
+    auto const office = Fleet("office", FleetState::Established, 950);
+    CHECK(ClassifyEncounter(own, Proven(office), SplitEvidence::None, PinTo("office")) == Encounter::Yield);
+
+    // A second voter of the office speaks for it: accepted when the pin names that voter too, and
+    // refused when it does not -- the key, not the id, is what decides.
+    auto const bySecond = Testing::ProvenBy(office, "n-desk");
+    CHECK(ClassifyEncounter(own, bySecond, SplitEvidence::None, PinTo("office", { "office", "n-desk" }))
+          == Encounter::Yield);
+    CHECK(ClassifyEncounter(own, bySecond, SplitEvidence::None, PinTo("office")) == Encounter::PinnedElsewhere);
+
+    // And it wins the tiebreak against an OLDER solitary node pinned to it, which would otherwise wait
+    // forever to be joined by a fleet it can never join back.
+    auto const older = Fleet("older", FleetState::Solitary, 1);
+    auto const solitaryOffice = Proven(Fleet("office", FleetState::Solitary, 900));
+    CHECK(ClassifyEncounter(older, solitaryOffice, SplitEvidence::None, FleetPin {}) == Encounter::Stay);
+    CHECK(ClassifyEncounter(older, solitaryOffice, SplitEvidence::None, PinTo("office")) == Encounter::Yield);
+}
+
+TEST_CASE("The pin compares the whole cluster id, never a prefix and never folded",
+          "[cluster][formation][encounter][pin][security]")
+{
+    // Every pin names the RIGHT key, so the id alone is what each row varies.
+    auto const own = Fleet("own", FleetState::Solitary, 900);
+    auto const office = Proven(Fleet("0123abcd", FleetState::Established, 1));
+    CHECK(ClassifyEncounter(own, office, SplitEvidence::None, PinTo("0123abcd")) == Encounter::Yield);
+    for (auto const* const almost: { "0123abc", "0123abcd0", "0123ABCD", "" })
+    {
+        INFO("pinned to '" << almost << "'");
+        CHECK(ClassifyEncounter(own, office, SplitEvidence::None, PinTo(almost, { "0123abcd" }))
+              == Encounter::PinnedElsewhere);
+    }
+}
+
+TEST_CASE("The pin only withholds a yield and never adds one outside a tiebreak", "[cluster][formation][encounter][pin]")
+{
+    // An established node does not yield to a solitary one because the pin names it, and a pending
+    // node pinned to is followed, not joined: the pin restricts what moves a node.
+    auto const established = Fleet("own", FleetState::Established, 1);
+    CHECK(ClassifyEncounter(
+              established, Proven(Fleet("office", FleetState::Solitary, 900)), SplitEvidence::None, PinTo("office"))
+          == Encounter::Stay);
+    auto const solitary = Fleet("own", FleetState::Solitary, 900);
+    CHECK(ClassifyEncounter(solitary, Proven(Fleet("office", FleetState::Pending, 1)), SplitEvidence::None, PinTo("office"))
+          == Encounter::Follow);
+
+    // A node pinned to its OWN cluster -- the fleet's founder -- yields to nobody.
+    auto const founder = Fleet("office", FleetState::Solitary, 900);
+    CHECK(ClassifyEncounter(founder, Proven(Fleet("older", FleetState::Solitary, 1)), SplitEvidence::None, PinTo("office"))
+          == Encounter::PinnedElsewhere);
+    CHECK(
+        ClassifyEncounter(founder, Proven(Fleet("younger", FleetState::Solitary, 950)), SplitEvidence::None, PinTo("office"))
+        == Encounter::Stay);
+
+    // And a split a voter's key proves does not move a fleet pinned to itself into the survivor.
+    auto const fleet = Fleet("office", FleetState::Established, 9);
+    auto const survivor = Proven(Fleet("aa", FleetState::Established, 1));
+    CHECK(ClassifyEncounter(fleet, survivor, SplitEvidence::TheirSpeakerIsOurVoter, FleetPin {}) == Encounter::Yield);
+    CHECK(ClassifyEncounter(fleet, survivor, SplitEvidence::TheirSpeakerIsOurVoter, PinTo("office"))
+          == Encounter::PinnedElsewhere);
 }

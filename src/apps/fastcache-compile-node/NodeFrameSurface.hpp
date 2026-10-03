@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "EnrollmentAbsence.hpp"
 #include "FrameEndpoint.hpp"
 #include "NodeRefusal.hpp"
 #include "Responders.hpp"
@@ -28,6 +29,11 @@ class SessionResponder;
 class SharedCacheService;
 class WorkerTier;
 struct NodeConfig;
+
+/// The enrollment family's owner on a node that serves it, or why it does not: ONE value, so a
+/// composition cannot name a responder and a reason at once, nor leave out the reason a joiner
+/// pointed here is refused with.
+using EnrollmentOwner = std::expected<EnrollmentResponder*, EnrollmentAbsence>;
 
 /// This node's one `0xFC` listener, and the router in front of it.
 ///
@@ -166,7 +172,8 @@ class NodeFrameSurface
 /// @param scheduler The scheduler tier, or nullptr when this node does not schedule.
 /// @param worker The worker tier, or nullptr when this node runs no worker.
 /// @param node The operator verbs' responder; every node has one.
-/// @param enrollment The enrollment responder, or nullptr when this node serves no window.
+/// @param enrollment The enrollment responder, or why this node serves no window
+///                   (`EnrollmentAbsenceOf`), which the family is then refused with.
 /// @param live The live-stats responder; every node has one.
 /// @param fleet The fleet-text responder; every node has one.
 /// @param nodeProof The identity prover, or nullptr when this node runs no consensus.
@@ -178,7 +185,7 @@ class NodeFrameSurface
                                                          SchedulerTier* scheduler,
                                                          WorkerTier* worker,
                                                          NodeStatusResponder& node,
-                                                         EnrollmentResponder* enrollment,
+                                                         EnrollmentOwner enrollment,
                                                          LiveStatsResponder& live,
                                                          FleetTextResponder& fleet,
                                                          NodeProofResponder* nodeProof,

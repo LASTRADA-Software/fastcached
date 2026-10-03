@@ -94,6 +94,18 @@
                       Name="FleetSeed" Type="raw" Bitness="always64" />
     </Property>
 
+    <!-- OPTIONAL: the ONE fleet the node may belong to, and the voters whose
+         key it takes that fleet's word from, as `fastcache-cli node` prints it
+         (<cluster-id>@<key>[,<key>...]), passed VERBATIM as the node's fleet-id
+         flag. Left out, discovery is trust-on-first-use. Security material: a
+         value the node's parser refuses fails the registration by name rather
+         than registering a node pinned to nothing. -->
+    <Property Id="FASTCACHE_FLEET_ID" Secure="yes">
+      <RegistrySearch Id="FastCacheRememberedFleetId" Root="HKLM"
+                      Key="SOFTWARE\fastcached\Installer"
+                      Name="FleetId" Type="raw" Bitness="always64" />
+    </Property>
+
     <!-- The remember-property pattern for the optional properties above.
          AppSearch overwrites a property with what its RegistrySearch finds, so a
          value the transaction STATES is saved first and put back after: the
@@ -127,6 +139,14 @@
                  Value="[FastCacheFleetSeedTyped]"
                  After="AppSearch" Sequence="both"
                  Condition="FastCacheFleetSeedTyped" />
+    <SetProperty Action="SaveTypedFastCacheFleetId" Id="FastCacheFleetIdTyped"
+                 Value="[FASTCACHE_FLEET_ID]"
+                 Before="AppSearch" Sequence="both"
+                 Condition="FASTCACHE_FLEET_ID" />
+    <SetProperty Action="RestoreTypedFastCacheFleetId" Id="FASTCACHE_FLEET_ID"
+                 Value="[FastCacheFleetIdTyped]"
+                 After="AppSearch" Sequence="both"
+                 Condition="FastCacheFleetIdTyped" />
 
     <!-- Who owns the key the remembered values live in: a component of the root
          feature, so an uninstall removes the key and forgets them. It does NOT
@@ -316,6 +336,15 @@
                  After="SetFastCacheNodeDiscoveryReplyArgument" Sequence="execute"
                  Condition="FASTCACHE_FLEET_SEED" />
 
+    <!-- The fleet pin, the same way: the flag when the property is given,
+         nothing at all when it is not, and the value VERBATIM. Worker state, so
+         the registration replays it at every start; not reloadable, so a new
+         pin takes the restart a re-registration's service start is. -->
+    <SetProperty Action="SetFastCacheFleetIdArgument" Id="FastCacheFleetIdArgument"
+                 Value="--fleet-id=[FASTCACHE_FLEET_ID]"
+                 After="SetFastCacheFleetSeedArgument" Sequence="execute"
+                 Condition="FASTCACHE_FLEET_ID" />
+
     <!-- Seed each machine-wide config from its template, only when absent, so
          an upgrade never discards operator edits. The binary seeds its OWN
          file: the destination comes from its application name. Return="ignore":
@@ -370,7 +399,7 @@
          the life of the service. -->
     <CustomAction Id="FastCacheNodeInstallService"
                   Directory="INSTALL_ROOT"
-                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --install-service --service-start=auto [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedArgument]"
+                  ExeCommand="&quot;[INSTALL_ROOT]bin\fastcache-compile-node.exe&quot; --install-service --service-start=auto [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedArgument] [FastCacheFleetIdArgument]"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
     <CustomAction Id="FastCacheNodeStartService"
@@ -401,11 +430,19 @@
                   ExeCommand="&quot;[System64Folder]sc.exe&quot; delete FastCached"
                   Execute="deferred" Impersonate="no" Return="ignore" />
 
-    <!-- Remember what this transaction registered, for the next one's AppSearch:
+    <!-- Remember what this transaction registers, for the next one's AppSearch:
          the value it ENDED with (stated, or read back), written whole, an empty one
          included. Return="check", unlike the registrations: a value that could
          not be written is a scope the next repair silently widens to any address,
-         and failing the transaction says so where nothing else would. -->
+         and failing the transaction says so where nothing else would.
+
+         Scheduled BEFORE the registrations, never after: the values are fixed
+         when the deferred script is generated, so nothing is lost by writing them
+         first, and a write that fails then rolls the transaction back before
+         anything is registered. After them, a failed write rolled the FILES back
+         while the services it had just registered, and started, stayed behind --
+         pointing at removed binaries on a fresh install, replaying a command line
+         against the restored old ones on an upgrade. -->
     <CustomAction Id="FastCacheRememberFirewallAllow"
                   Directory="INSTALL_ROOT"
                   ExeCommand="&quot;[System64Folder]reg.exe&quot; add HKLM\SOFTWARE\fastcached\Installer /v FirewallAllow /t REG_SZ /d &quot;[FASTCACHE_FIREWALL_ALLOW]&quot; /f /reg:64"
@@ -417,6 +454,10 @@
     <CustomAction Id="FastCacheRememberFleetSeed"
                   Directory="INSTALL_ROOT"
                   ExeCommand="&quot;[System64Folder]reg.exe&quot; add HKLM\SOFTWARE\fastcached\Installer /v FleetSeed /t REG_SZ /d &quot;[FASTCACHE_FLEET_SEED]&quot; /f /reg:64"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="FastCacheRememberFleetId"
+                  Directory="INSTALL_ROOT"
+                  ExeCommand="&quot;[System64Folder]reg.exe&quot; add HKLM\SOFTWARE\fastcached\Installer /v FleetId /t REG_SZ /d &quot;[FASTCACHE_FLEET_ID]&quot; /f /reg:64"
                   Execute="deferred" Impersonate="no" Return="check" />
 
     <!-- Removal. It runs while the binary still exists (before RemoveFiles),
@@ -446,7 +487,19 @@
       <Custom Action="FastCacheNodeSeedConfig" After="FastCachedSeedConfig"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
-      <Custom Action="FastCachedInstallService" After="FastCacheNodeSeedConfig"
+      <!-- Every transaction that registers a service remembers what it
+           registers with, FIRST (see the FastCacheRemember actions): the same
+           conditions as the registrations, OR'ed. -->
+      <Custom Action="FastCacheRememberFirewallAllow" After="FastCacheNodeSeedConfig"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCacheRememberNodeAdvertise" After="FastCacheRememberFirewallAllow"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCacheRememberFleetSeed" After="FastCacheRememberNodeAdvertise"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+      <Custom Action="FastCacheRememberFleetId" After="FastCacheRememberFleetSeed"
+              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
+
+      <Custom Action="FastCachedInstallService" After="FastCacheRememberFleetId"
               Condition="FASTCACHED_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCachedStopForNode" After="FastCachedInstallService"
               Condition="FASTCACHED_SELECTED = &quot;1&quot; AND FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
@@ -455,17 +508,19 @@
 
       <!-- The node is (re)registered on every transaction that leaves it
            installed, as fastcached is: it needs no property, and the
-           advertised endpoint and the fleet seed are optional and arrive
-           through FastCacheNodeAdvertiseArgument and
-           FastCacheFleetSeedArgument. Re-registering is also what clears
-           the scheduler flag an earlier package registered, which the node now
-           refuses on a node that serves: a registration kept as it was found
-           would fail at every start. The optional properties are REMEMBERED
-           (the RegistrySearch rows above), so a repair or upgrade that leaves
-           out FASTCACHE_NODE_ADVERTISE, FASTCACHE_FIREWALL_ALLOW or
-           FASTCACHE_FLEET_SEED registers what the install did; only an
-           installer that predates remembering has nothing to read back, and
-           an upgrade from one still registers the node, with what it states.
+           advertised endpoint, the fleet seed and the fleet pin are optional
+           and arrive through FastCacheNodeAdvertiseArgument,
+           FastCacheFleetSeedArgument and FastCacheFleetIdArgument.
+           Re-registering is also what clears the scheduler flag an earlier
+           package registered, which the node now refuses on a node that
+           serves: a registration kept as it was found would fail at every
+           start. The optional properties are REMEMBERED (the RegistrySearch
+           rows above), so a repair or upgrade that leaves out
+           FASTCACHE_NODE_ADVERTISE, FASTCACHE_FIREWALL_ALLOW,
+           FASTCACHE_FLEET_SEED or FASTCACHE_FLEET_ID registers what the
+           install did; only an installer that predates remembering has nothing
+           to read back, and an upgrade from one still registers the node, with
+           what it states.
 
            The start is conditioned on the feature alone too: the
            ServiceControl row below stopped the service before replacing its
@@ -475,15 +530,6 @@
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
       <Custom Action="FastCacheNodeStartService" After="FastCacheNodeInstallService"
               Condition="FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-
-      <!-- Every transaction that registered a service remembers what it
-           registered with: the same conditions as the registrations, OR'ed. -->
-      <Custom Action="FastCacheRememberFirewallAllow" After="FastCacheNodeStartService"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCacheRememberNodeAdvertise" After="FastCacheRememberFirewallAllow"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
-      <Custom Action="FastCacheRememberFleetSeed" After="FastCacheRememberNodeAdvertise"
-              Condition="FASTCACHED_SELECTED = &quot;1&quot; OR FASTCACHE_NODE_SELECTED = &quot;1&quot;" />
 
       <!-- A feature being removed, and not the old product's half of an
            upgrade: an upgrade keeps the registration and re-applies it. -->

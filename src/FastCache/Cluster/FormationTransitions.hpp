@@ -222,9 +222,12 @@ static_assert(EveryOriginRankIsDistinct(), "every FleetOrigin needs a rank of it
 /// node yields at all is `ClassifyEncounter`'s answer, never re-derived here.
 /// @param own What this node says about itself.
 /// @param seen The proven fleets it knows of.
+/// @param pin The cluster `--fleet-id` pins this node to, or none: asked of every candidate through
+///        `ClassifyEncounter`, so a fleet the pin refuses is never the one chosen.
 /// @return The fleet to ask, or nothing when it yields to none of them.
 [[nodiscard]] inline std::optional<ProvenFleet> PreferredTarget(CompileCacheWire::FleetSummary const& own,
-                                                                std::span<ProvenFleet const> seen)
+                                                                std::span<ProvenFleet const> seen,
+                                                                FleetPin const& pin)
 {
     auto const key = [](ProvenFleet const& fleet) {
         auto const& summary = fleet.Summary();
@@ -238,7 +241,7 @@ static_assert(EveryOriginRankIsDistinct(), "every FleetOrigin needs a rank of it
     {
         // A FIRST join: only a solitary node asks, and the rows a solitary node meets decide alike
         // with split evidence and without (`EvidenceDecidesOnlyForeignPairs`).
-        if (ClassifyEncounter(own, fleet.Proven(), SplitEvidence::None) != Encounter::Yield)
+        if (ClassifyEncounter(own, fleet.Proven(), SplitEvidence::None, pin) != Encounter::Yield)
             continue;
         if (best == nullptr || key(fleet) < key(*best))
             best = &fleet;

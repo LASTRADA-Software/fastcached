@@ -120,6 +120,32 @@ std::error_code SyncDirectoryToDisk(std::filesystem::path const& directory)
 #endif
 }
 
+std::span<std::error_code const> UnsupportedDirectorySyncAnswers()
+{
+#if defined(_WIN32)
+    static auto const answers = std::to_array<std::error_code>({
+        std::error_code { ERROR_INVALID_FUNCTION, std::system_category() },
+        std::error_code { ERROR_NOT_SUPPORTED, std::system_category() },
+        std::error_code { ERROR_INVALID_PARAMETER, std::system_category() },
+    });
+#else
+    // `ENOTSUP` and `EOPNOTSUPP` are one value on Linux and two on some other systems; a duplicate
+    // row costs nothing.
+    static auto const answers = std::to_array<std::error_code>({
+        std::error_code { EINVAL, std::generic_category() },
+        std::error_code { ENOTSUP, std::generic_category() },
+        std::error_code { EOPNOTSUPP, std::generic_category() },
+        std::error_code { EBADF, std::generic_category() },
+    });
+#endif
+    return answers;
+}
+
+bool MeansDirectorySyncUnsupported(std::error_code failure) noexcept
+{
+    return std::ranges::contains(UnsupportedDirectorySyncAnswers(), failure);
+}
+
 gsl::owner<std::FILE*> OpenBinary(std::filesystem::path const& path, char const* mode)
 {
 #if defined(_WIN32)
@@ -289,9 +315,18 @@ std::expected<Platform::ReplacedBy, ConsensusError> ReplaceFileWith(std::filesys
 
     // The rename changed the directory, and only a flush of the directory makes that survive a
     // power loss. Reported rather than swallowed: the new file is in place, but a caller told it is
-    // durable could act on a write a power cut takes back -- a vote, for one.
+    // durable could act on a write a power cut takes back -- a vote, for one. Except where the
+    // FILESYSTEM cannot sync a directory at all: that is degraded and carried back, never refused, or
+    // such a volume refuses every state write forever.
     auto const directory = path.has_parent_path() ? path.parent_path() : std::filesystem::path { "." };
-    if (auto const synced = files.SyncDirectory(directory); synced)
+    auto const synced = files.SyncDirectory(directory);
+    if (synced && MeansDirectorySyncUnsupported(synced))
+    {
+        auto degraded = *replaced;
+        degraded.directoryUnsynced = synced;
+        return degraded;
+    }
+    if (synced)
         return std::unexpected { FastCache::StorageFailure(
             std::format("replaced {}, but cannot sync its directory {}: {}; the replace is not known to survive a "
                         "power loss",
@@ -311,10 +346,10 @@ std::expected<void, ConsensusError> ReplaceFileAtomically(std::filesystem::path 
 }
 
 std::expected<Platform::ReplacedBy, ConsensusError> ProbeReplaceRoute(std::filesystem::path const& directory,
+                                                                      IDurableFiles& files,
                                                                       Platform::IReplacingRename const& rename)
 {
     auto const probe = directory / ReplaceProbeFileName;
-    auto files = SystemDurableFiles {};
     // Twice: the first may CREATE the file, and only a rename over one that exists is the replace
     // every state file there goes through.
     auto const first = ReplaceFileWith(probe, std::span<std::byte const> {}, StateFile::Formation, files, rename);

@@ -170,6 +170,44 @@ belongs. The three refusals are counted apart
 (`fastcache_discovery_proofs_refused_{unknown_key,revoked_key,forged}_total`), because
 their remedies are different.
 
+### Threat model: LAN discovery is trust-on-first-use
+
+Everything above is about a member of one cluster proving itself to that cluster. Joining a
+fleet is a different question, and on a LAN it is answered by **trust on first use**: a
+solitary node yields to the fleet it proves older or established, and a proof binds a KEY,
+never the truth of the summary it signs. A key costs nothing to mint, so anybody on the
+segment can prove "established, created at 0" and be asked to admit every solitary node that
+hears it -- and a node it approves takes on its roster, dispatching its launchers' source to
+that fleet's workers and compiling that fleet's jobs.
+
+**A key pin stops a LAN impostor; an unpinned node trusts on first use.** The pin names the
+cluster and its voters' identity keys (`--fleet-id=<cluster-id>@<key>[,<key>...]`), because a
+cluster id is a name every beacon carries: what a pinned node accepts on its way into its fleet
+is what one of those keys signed.
+
+| Attacker can… | Unpinned | Pinned (`--fleet-id`) |
+|---|---|---|
+| Mint a fleet and prove it older | Every solitary node that hears it asks to join | Not asked: counted, and raised as `foreign-fleet-visible` |
+| Claim the pinned fleet's id under its own key, by beacon or as a seed | Joined, exactly as above | Not asked: counted, and raised naming the impostor's key |
+| Answer the node's `Enroll`, or redirect it to a leader of its choosing | Its approval is taken | Refused unless a pinned voter signed it; a leader whose key is not pinned is never asked, and the refusal names the key to add |
+| Hold a pinned voter's identity key | -- | That voter's exposure everywhere: revoke the key and re-pin |
+| Capture the fleet's quorum after the node joined | Everything any member's quorum gets | The same: the pin is not asked after the join |
+
+**The pin anchors the JOIN; from then on the fleet's applied state is the authority.** A pinned
+node asks its pin of every way INTO a fleet -- the summary it yields to, every answer to its ask,
+the leader a redirect names, a dissolve, and its record at every start, judged by the key that
+signed its admission -- and of nothing once it has joined: it follows its fleet's leaders, takes
+the roster the fleet commits, and is granted work by the voters that roster names, pinned or not,
+as any member is. That is deliberate, since pinning every leader forever would make every
+promotion an outage for every pinned machine, and it bounds what the pin protects: an attacker
+who captures the fleet's quorum after a node joined -- its voters' keys, or an approval an
+operator should not have given -- gets everything a member's quorum gets, the pinned nodes
+included.
+
+The pin is the operator's remedy for exactly this, one setting per machine, while zero-config
+formation stays the default: see
+[pinning a node to one fleet](../tools/fastcache-compile-node.md#pinning-a-node-to-one-fleet).
+
 ## Implementation notes
 
 | Piece | Where | Nature |

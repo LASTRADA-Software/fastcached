@@ -383,19 +383,20 @@ TEST_CASE("A node with no roster builds a validator that learns and spends nothi
     // second compile of any TU whose token bytes repeated.
     NodeConfig cfg;
     WorkerState state;
+    CapturingLogger logger;
 
-    auto validator = MakeWorkerLeaseValidator(cfg,
-                                              nullptr,
-                                              state.advertised,
-                                              SocketActivation::No,
-                                              LeaseClock,
-                                              state.lease,
-                                              state.metrics,
-                                              state.logger,
-                                              state.inForce);
+    auto validator = MakeWorkerLeaseValidator(
+        cfg, nullptr, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, logger, state.inForce);
     REQUIRE(validator.has_value());
     // What the reload guard reads: the factory recorded the check it built (review I-2b).
     CHECK(state.inForce.Current() == BuiltLeaseCheck::Unchecked);
+    // Said once, and in words that are TRUE on this tree: no consensus is no roster, and no flag
+    // names one -- `--voter-key`, which once did, anchors nothing (#178).
+    auto const lines = logger.Snapshot();
+    REQUIRE(lines.size() == 1);
+    CHECK(lines.front().level == LogLevel::Warn);
+    CHECK(lines.front().message.contains("runs no consensus and so keeps no roster"));
+    CHECK_FALSE(lines.front().message.contains("--voter-key"));
     // Registered, as every case here but the unregistered one assumes (#401).
     state.lease.fleet.Pin(std::string { ThisCluster });
 
@@ -424,11 +425,16 @@ TEST_CASE("A socket-activated worker that admits remote peers and holds no roste
                                                   state.logger,
                                                   state.inForce);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("--listen-raft"));
+    // A remedy an operator can follow: the only roster is consensus's. Naming `--voter-key`, which
+    // anchors nothing since the certified roster retired, would get the same refusal again.
+    CHECK(refused.error().contains("run consensus (--listen-raft)"));
+    CHECK_FALSE(refused.error().contains("--voter-key"));
     // Refused before anything was built, so nothing is recorded for the reload guard to read.
     CHECK(state.inForce.Current() == BuiltLeaseCheck::None);
 
-    // The control: the same node HOLDING a roster builds its checking validator.
+    // The control: the same node HOLDING a roster builds its checking validator, and says what it
+    // checks against -- the state its consensus applies, the one roster there is.
+    CapturingLogger logger;
     CHECK(MakeWorkerLeaseValidator(cfg,
                                    &TestRoster(),
                                    state.advertised,
@@ -436,9 +442,13 @@ TEST_CASE("A socket-activated worker that admits remote peers and holds no roste
                                    LeaseClock,
                                    state.lease,
                                    state.metrics,
-                                   state.logger,
+                                   logger,
                                    state.inForce)
               .has_value());
+    auto const lines = logger.Snapshot();
+    REQUIRE(lines.size() == 1);
+    CHECK(lines.front().message.contains("against the state this node's consensus applies"));
+    CHECK_FALSE(lines.front().message.contains("certify"));
     CHECK(state.inForce.Current() == BuiltLeaseCheck::Signed);
 }
 
@@ -505,9 +515,8 @@ TEST_CASE("A learner verifies the grant its fleet's leader signed against the st
     REQUIRE(RunsConsensus(cfg));
     REQUIRE_FALSE(ServesScheduler(cfg));
 
-    AtomicMetricsSink rosterMetrics;
-    NullLogger rosterLogger;
-    auto built = NodeRoster::Build(cfg, LeaseClock, rosterMetrics, rosterLogger);
+    core::platform::ManualClock rosterClock;
+    auto built = NodeRoster::Build(cfg, rosterClock, nullptr);
     REQUIRE(built.has_value());
     auto& roster = *Testing::Unwrap(built);
     REQUIRE(roster.Lease() != nullptr);
@@ -598,9 +607,8 @@ TEST_CASE("A node whose name reaches only itself grants its own worker a lease t
     CHECK(CompileCacheWire::AsStringView(Testing::Unwrap(grant).endpoint) == advertised);
 
     // Its worker: the roster is the state its own consensus applies, this node its one voter.
-    AtomicMetricsSink rosterMetrics;
-    NullLogger rosterLogger;
-    auto built = NodeRoster::Build(cfg, wall, rosterMetrics, rosterLogger);
+    core::platform::ManualClock rosterClock;
+    auto built = NodeRoster::Build(cfg, rosterClock, nullptr);
     REQUIRE(built.has_value());
     auto& roster = *Testing::Unwrap(built);
     REQUIRE(roster.Lease() != nullptr);
@@ -627,7 +635,7 @@ TEST_CASE("A node whose name reaches only itself grants its own worker a lease t
             return record.message.contains(phrase);
         });
     };
-    CHECK(said("verifying lease signatures against the roster this node applies"));
+    CHECK(said("verifying lease signatures against the state this node's consensus applies"));
     CHECK_FALSE(said("compiling WITHOUT verifying"));
 
     auto const decision = (*validator)(CompileCacheWire::AsStringView(Testing::Unwrap(grant).leaseToken), "gcc-13");

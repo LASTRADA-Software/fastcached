@@ -266,6 +266,47 @@ Every rule below has already been a bug.
       (`FleetStateTable`), and leaves `leaderId`, `leaderNodeEndpoint` and `leaderKey` EMPTY,
       which every reader already treats as no leader to ask. A rule every reader had to
       remember -- consult the state first -- would be the census this makes unnecessary.
+  - **A fleet's proof binds a KEY, never the truth of its summary, so joining a fleet on a LAN is
+    trust-on-first-use unless the node is PINNED -- and the pin is a KEY pin** (`--fleet-id=
+    <cluster-id>@<voter-key>[,...]`, `Cluster::FleetPin`). A key costs nothing, so anybody on the
+    segment can prove "established, created at 0": unpinned, every solitary node that hears it
+    yields, enrolls, and on its approval adopts its roster -- launchers dispatching source to its
+    workers, the node compiling its jobs. **A cluster id is a name every beacon carries, so a pin by
+    name alone stops nobody who can hear the fleet it names** -- that pin shipped first and was
+    replaced in the same task; an id with no key is REFUSED where typed, never read as a pin by name,
+    because that would be a confident wrong signal of safety. The threat model is stated in
+    `docs/getting-started/cluster-discovery.md`: a key pin stops a LAN impostor; an unpinned node
+    trusts on first use.
+    - **ONE predicate, `AdmitsFleet(pin, clusterId, signers)`**: the id compared WHOLE and one of the
+      signers a pinned voter key. Asked of the summary yielded to (INSIDE `ClassifyEncounter`, a
+      REQUIRED parameter, so beacon, seed, SRV and remembered routes are one decision --
+      `Encounter::PinnedElsewhere`), of every `Enroll` answer and of the leader a redirect names
+      (`ProvePollEndpoint`, whose refusal names the key to ADD -- a promoted voter is the honest
+      cause), of the dissolve order (with NO signer: its keys are claimed fields of the replicated
+      order, and the id decides, since a pinned node is in its pinned cluster and a survivor is
+      another), and of the record (`ApplyFormation`, judged by ONE key this node PROVED: the asked
+      fleet's proven key, the key that SIGNED the admission -- `FleetMembership::admittedBy`, never
+      the voters the stored roster CLAIMS, which a forged approval lists as easily -- or its own).
+    - **The pin anchors the JOIN; from then on the fleet's applied state is the authority.**
+      After the join nothing asks the pin: Raft takes `AppendEntries` from whoever the
+      configuration counts, the lease roster verifies grants against the APPLIED voters, and a
+      voter promoted later is followed. Deliberate -- pinning every leader forever makes every
+      promotion an outage for every pinned node -- and the limit of the protection: a capture of
+      the fleet's quorum after the join gets everything, as with any member. So a promoted voter's
+      key belongs in the pins of machines NOT YET joined (their join may be redirected to it) and
+      in its OWN pin (or it serves no enrollment), and nowhere else is it needed.
+    - **It restricts and never widens, with ONE turn the other way**: the pinned fleet, as a pinned
+      voter signs it, wins a tiebreak the node is in. Without it, a pinned node whose own cluster is
+      the OLDER stays, and an unpinned founder then yields to IT. For that second half a node that
+      could not answer as a pinned voter serves no enrollment (`ServesEnrollment` asks the pin of its
+      own cluster under its OWN key), and a joiner pointed at it is told WHICH reason
+      (`EnrollmentAbsenceTable`), never *runs no consensus* from a node that runs it. Pin the
+      founder to its own `fleet-id`, too.
+    - **NODE-STATUS prints the pin to paste** (`fleet-id`, through the ONE formatter
+      `ParsePinnedFleet` reads back), so nobody composes keys by hand. The unpinned control beside
+      each pinned case -- `Encounter_test`, `FormationController_test`, `FormationFleet_test` -- is
+      what shows the attack is real rather than assumed, and the impostor cases (the id copied, signed
+      by another key) are what a name pin fails.
   - **A memo of a fleet that ADMITTED this node is never displaced by asks that went
     nowhere.** A fleet costs nothing to mint, so eight asks would push out the one memo an
     operator's split is told on; `RememberAsked` drops the oldest memo NOT admitted first
@@ -382,7 +423,7 @@ Every rule below has already been a bug.
     -- a coincidence that lasts until somebody adds a field or a signer. **The safety was a
     property of the PAIR, not of either construction.** It matters MORE with identity keys,
     not less: one node key now signs its discovery proof, its Raft proof and verdict, its
-    roster endorsement, its challenge replies and -- on a scheduler -- every lease, so a label
+    challenge replies and -- on a scheduler -- every lease, so a label
     is the only thing keeping one of those from verifying as another. So the labels are ONE
     table again, `Core/IdentityKeyLabel.hpp`'s `IdentityKeyLabels`, keyed by
     `IdentityKeyPurpose`: present, distinct and never retired is a `static_assert` over it
@@ -390,7 +431,7 @@ Every rule below has already been a bug.
     keyed on the same enum so a construction added without one fails the BUILD.
   - **A label is first BY TYPE, not by each builder remembering to put it there.** Every
     identity-key signing seam takes a `LabelledMessage` -- `SignLabelled`,
-    `ILeaseSigner::Sign`, `IRaftPeerKeys::SignAsSelf`, `SignEndorsement`'s signer -- and
+    `ILeaseSigner::Sign`, `IRaftPeerKeys::SignAsSelf` -- and
     the only way to make one is `LabelledMessage::Of(purpose, fields)`, which writes the
     label itself. A protocol that signs twice keeps an enum of its own mapped onto a
     purpose (`RaftPeerSignatureLabels`, `NodeProofSignatureLabels`, each
@@ -1242,7 +1283,16 @@ and it is recorded here because the question will be asked again.
     to it opened with `FILE_FLAG_BACKUP_SEMANTICS` and `FILE_WRITE_DATA`, measured to succeed on
     NTFS and ReFS where read access alone is refused. A failed directory sync is a failed
     replace, reported and never taken as durable; the identity key, created once rather than
-    replaced, flushes its directory the same way.
+    replaced, flushes its directory the same way. **Except a FILESYSTEM that cannot sync a
+    directory at all** (`MeansDirectorySyncUnsupported`, a table of named answers per platform):
+    a sync it does not offer never succeeds, so refusing it refused EVERY state write on such a
+    volume. That is DEGRADED -- the replace lands, the answer rides `ReplacedBy::directoryUnsynced`,
+    and the start probe says it once and counts it (`StateDirectorySyncsUnsupported`) -- while any
+    OTHER refusal of the sync still fails the replace, since it may be a sync that would have
+    succeeded.
+    **Such a volume runs with a STATED durability gap**: a power loss there can resurrect an old
+    vote or record -- PostgreSQL's `fsync_fname` precedent -- and the start probe's one warning and
+    `fastcache_state_directory_syncs_unsupported_total` are what an operator sees of it.
   - **The write order is snapshot-then-trim, and the crash window it leaves is
     the reason that order is right.** A crash between them leaves a durable
     snapshot beside a log that still holds the entries it covers, which
@@ -1738,6 +1788,34 @@ and it is recorded here because the question will be asked again.
     it: it fails closed, counting a member too many rather than too few. Taking a
     typed member out of the quorum stays the operator's decision, made by editing that
     `--raft-peer` line.
+  - **Every member record says where its `0xFC` port answers.** `ClusterMember::schedulerEndpoint`
+    is every member's `0xFC` endpoint, learners included, and it is what anything resolving a
+    machine reads (a shared-cache resolver among them). It is set at join from the
+    `Enroll` request, which carries the joiner's CURRENT advertised endpoint (read through
+    `Cc::IAdvertisedEndpointSource` at every poll, so a reload between polls is what the leader
+    records) and is SIGNED by the key it asks with, over every field it states -- verified before
+    the window records or refreshes anything (`Cluster::VerifyEnrollRequest`, before any other claim
+    is reported on, revocation included). The id and the key are PUBLIC, so an unsigned request let
+    any host poll under a joiner's pair with its own endpoint, and the last poll before approval was
+    what the record kept. It is moved afterwards only by a PROVEN NODE-ANNOUNCE: the leader compares the endpoint
+    a member announced, under the id it proved on that connection, with the recorded one, and
+    re-proposes that member's record (its own seat, `publicKey = nullopt` so its key is kept)
+    through the ordinary desired-member reconcile (`Cluster::AnnouncedEndpointDesires`). Never from
+    an unproven claim, never for an id the state does not record (an announcement admits nobody),
+    and never more than one change in flight per member. A leader asserts its own on every pass,
+    read from the same source; an operator's admit or promotion states none and KEEPS the recorded
+    one, since `AddMember` applies wholesale and the same machine at the same port has not moved --
+    but only under the SAME key (or none): a re-admit naming another key records a REPLACED
+    machine, and keeping its predecessor's endpoint would send a resolver to the old host expecting
+    the new key, so it clears until the new machine announces.
+    - **What the record may hold is ONE rule, asked wherever an endpoint is produced and once more
+      where the record is decided**: one ANOTHER machine can dial (`IsPeerDialableEndpoint`: a
+      dial endpoint whose host is neither `NamesOnlyThisMachine` nor a wildcard), or none.
+      `Cluster::Validate` refuses anything else on `AddMember`/`AddLearner`, whichever route
+      proposed it, and each producer -- the joiner's `Enroll`, the responder judging it, a proven
+      announcement, a leader's own word -- states none in its place. Three routes with three
+      filters had recorded a loopback member the join route refused, and a resolver sent there
+      reaches ITSELF with no error at either end.
   - **`--cluster-admit` is the counterpart `--cluster-forget` never had.** Nothing
     could put a member *into* the replicated state without `--discovery`, so a typed
     fleet could shrink and never grow. It carries `<id>=<host>:<port>` — the same

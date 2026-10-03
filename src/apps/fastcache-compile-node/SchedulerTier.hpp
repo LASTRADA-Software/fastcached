@@ -140,28 +140,12 @@ class SchedulerTier
     /// @param leaderEndpoint Where the leader answers, empty when nobody leads.
     void SetRole(Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch);
 
-    /// Take this node's own endorsement of the roster it applied (#178).
-    ///
-    /// The door a node's OWN endorsement reaches its own scheduler through, so a lone
-    /// scheduler certifies its roster without dialling itself; every other voter's arrives on
-    /// NODE-ANNOUNCE, through the same `AcceptEndorsement`.
-    ///
-    /// Kept as well as offered, because it can arrive BEFORE `Administer`: the consensus tier's
-    /// reconciler starts inside its own start, and the tier is handed to this one only after.
-    /// An endorsement offered to a scheduler with no cluster is refused `NoState`, and dropping
-    /// it would leave a lone scheduler with no certified roster until the next refresh -- a
-    /// quarter of an hour of every grant refused. `Administer` offers it again.
-    /// @param endorsement The endorsement.
-    void Endorse(Cluster::RosterEndorsement const& endorsement);
-
     /// Give this surface a cluster to administer.
     ///
     /// The second seam consensus drives, and it is a setter for the same reason
     /// `SetRole` is: consensus is constructed after this surface, because it needs
     /// the port this one bound. Left uncalled, the cluster verbs answer
     /// `NoCluster`, which is what a node running no cluster should say.
-    /// And the node's own endorsement, when one arrived before the cluster did, is offered again
-    /// now: see `Endorse`.
     /// @param admin The cluster; must outlive this tier.
     void Administer(Distributed::IClusterAdmin& admin);
 
@@ -254,13 +238,6 @@ class SchedulerTier
     Distributed::SchedulerProtocol _protocol;
 
     SchedulerResponder _responder;
-
-    /// This node's latest own endorsement, and the lock that serialises it against
-    /// `Administer`: the reconciler thread offers endorsements while `main` hands the service
-    /// its cluster, and the service's cluster pointer is not otherwise guarded until the
-    /// surfaces start serving.
-    std::mutex _ownEndorsementMutex;
-    std::optional<Cluster::RosterEndorsement> _ownEndorsement; ///< Guarded by `_ownEndorsementMutex`.
 
     /// Where the fleet-wide rows are answered. Borrowed; outlives this tier.
     NodeConditions& _conditions;

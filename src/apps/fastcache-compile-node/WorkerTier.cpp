@@ -227,10 +227,11 @@ std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> WorkerTier::Start(Worker
         return std::unique_ptr<WorkerTier> {};
 
     // The link the heartbeat announces through, built HERE so a worker cannot exist
-    // without one: the tier's constructor takes it by value. Aimed where the formation
-    // record says this node registers (`SchedulersOf`), never at `--scheduler`, which
-    // aims one-shot verbs and is refused on a node that serves.
-    auto link = SchedulerLink::For(SchedulersOf(parts.cfg, parts.activatedNodeEndpoint));
+    // without one: the tier's constructor takes it by value. Aimed where this node registers
+    // NOW (`AppliedSchedulers`: its own scheduler, or the voters its applied state records,
+    // else the formation record's answer), re-read at every round, never at `--scheduler`,
+    // which aims one-shot verbs and is refused on a node that serves.
+    auto link = SchedulerLink::Over(parts.schedulers);
     if (!link.has_value())
         return std::unexpected { Refusal(
             NodeRefusalCause::EarlierRule,
@@ -586,7 +587,7 @@ void WorkerTier::Heartbeat(std::stop_token const& stop,
                            _capacity,
                            _hostInbox,
                            announcedCordon,
-                           NextAnnounceWait(_prover, false),
+                           NextAnnounceWait(_prover),
                            [this, &round, &statusClock] { WithdrawForSuspend(round, statusClock); })
             == HeartbeatWake::Stopped)
             break;

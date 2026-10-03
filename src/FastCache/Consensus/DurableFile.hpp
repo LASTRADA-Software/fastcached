@@ -73,6 +73,32 @@ using ReadStream = std::unique_ptr<std::FILE, int (*)(std::FILE*)>;
 /// @return Nothing, or why the directory could not be opened or flushed.
 [[nodiscard]] std::error_code SyncDirectoryToDisk(std::filesystem::path const& directory);
 
+/// The answers a directory sync gives on a FILESYSTEM that cannot sync a directory at all, as this
+/// platform spells them -- never about the directory or the files in it.
+///
+/// POSIX: `EINVAL`, `ENOTSUP` / `EOPNOTSUPP` and `EBADF` from `fsync` on a directory descriptor, which
+/// some network and FUSE filesystems answer (PostgreSQL's `fsync_fname` ignores exactly `EBADF` and
+/// `EINVAL` for directories, and SQLite ignores the directory sync's result). Windows:
+/// `ERROR_INVALID_FUNCTION`, `ERROR_NOT_SUPPORTED` and `ERROR_INVALID_PARAMETER` from `FlushFileBuffers`
+/// on a directory handle (the lead's R-A table),
+/// which a volume whose filesystem does not implement the call answers -- INFERRED for FAT, exFAT and
+/// SMB; only NTFS and ReFS are measured above, and both sync.
+/// @return The codes, one table rather than a ladder at the call.
+[[nodiscard]] std::span<std::error_code const> UnsupportedDirectorySyncAnswers();
+
+/// Whether @p failure is a filesystem saying it cannot sync a directory (`UnsupportedDirectorySyncAnswers`)
+/// rather than one sync failing.
+///
+/// **DEGRADED, never refused** (step 20 recheck, R-A): a state directory on such a volume refused
+/// EVERY state write -- the formation record, the roster, the Raft term and vote -- because a sync the
+/// filesystem does not offer can never succeed. The replace is reported landed and the answer travels
+/// back in `Platform::ReplacedBy::directoryUnsynced`, so the node's start probe says it once
+/// (`Node::ReportReplaceRoute`) and counts it. Every OTHER refusal of the sync still fails the replace:
+/// it may be a sync that would have succeeded.
+/// @param failure What `IDurableFiles::SyncDirectory` answered.
+/// @return True when the filesystem cannot sync a directory at all.
+[[nodiscard]] bool MeansDirectorySyncUnsupported(std::error_code failure) noexcept;
+
 /// Flush a stream all the way to the platter.
 ///
 /// `fflush` alone only pushes the C library's buffer into the kernel, which a
@@ -206,10 +232,13 @@ static_assert(ReplaceProbeTemporaryName.size() == ReplaceProbeFileName.size() + 
 /// does) and replaces, then removes, a stale probe -- so the state directory's judge names both
 /// rather than refusing the next start over a file nothing trusts.
 /// @param directory The state directory.
+/// @param files How the probe's temporary is created, written, synced and closed, and its directory
+///        synced: this machine's (`SystemDurableFiles`) in production.
 /// @param rename The POSIX-semantics rename tried first.
-/// @return How a replace there moves its file, or why the probe could not be written.
+/// @return How a replace there moves its file -- and whether its directory could be synced -- or why
+///         the probe could not be written.
 [[nodiscard]] std::expected<Platform::ReplacedBy, ConsensusError> ProbeReplaceRoute(
-    std::filesystem::path const& directory, Platform::IReplacingRename const& rename);
+    std::filesystem::path const& directory, IDurableFiles& files, Platform::IReplacingRename const& rename);
 
 /// Replace `path` with `body`, indivisibly.
 ///
@@ -217,8 +246,9 @@ static_assert(ReplaceProbeTemporaryName.size() == ReplaceProbeFileName.size() + 
 /// it, and the directory flushed: rename is the only single filesystem operation that replaces a
 /// file's contents in one step, so a crash leaves either the whole previous file or the whole new
 /// one, and the directory sync is what keeps a power loss from bringing back the previous one after
-/// the replace was reported (`SyncDirectoryToDisk`). A failed directory sync is a failed replace. On Windows the
-/// rename has POSIX semantics (`Platform::RenameIntoPlace`), so a reader that holds the file open
+/// the replace was reported (`SyncDirectoryToDisk`). A failed directory sync is a failed replace -- except on a
+/// filesystem that cannot sync a directory at all, where it is degraded and said (`MeansDirectorySyncUnsupported`). On
+/// Windows the rename has POSIX semantics (`Platform::RenameIntoPlace`), so a reader that holds the file open
 /// (`OpenForReading`) does not refuse it; a filesystem that has no such rename is renamed over the
 /// classic way, which `ProbeReplaceRoute` makes visible.
 ///

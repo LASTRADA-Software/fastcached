@@ -40,10 +40,11 @@ namespace
     [[nodiscard]] NodeProofAttempt Unproved(Cc::CacheOutcome const& outcome,
                                             std::optional<ServerStanding> standing = std::nullopt)
     {
-        auto const offered = !(outcome.kind == Cc::CacheOutcomeKind::Rejected && SaysNoProofHere(outcome.code));
-        return NodeProofAttempt { .result = offered ? NodeProofResult::Refused : NodeProofResult::NotOffered,
-                                  .reason = Cc::DescribeOutcome(outcome),
-                                  .standing = standing };
+        auto const rejected = outcome.kind == Cc::CacheOutcomeKind::Rejected;
+        auto const result = rejected && SaysNoProofHere(outcome.code)                          ? NodeProofResult::NotOffered
+                            : rejected && outcome.code == Wire::ErrorCode::RosterNotYetApplied ? NodeProofResult::Deferred
+                                                                                               : NodeProofResult::Refused;
+        return NodeProofAttempt { .result = result, .reason = Cc::DescribeOutcome(outcome), .standing = standing };
     }
 
     /// Who is proving, borrowed from the client for one handshake.
@@ -276,7 +277,7 @@ core::async::Task<NodeProofAttempt> NodeProofClient::ProveAsync(SealedFrameSocke
     // out: the proof IS this machine's credential (`Cc::ExchangeWithSchedulerAsync`).
     auto step = co_await Challenge(Prover { .nodeId = _nodeId, .key = &_key, .random = &_random }, peer, trust);
     if (!step.has_value())
-        co_return std::move(step).error();
+        co_return Noted(std::move(step).error());
 
     // The server answers the proof SEALED, whatever it decides, so the receiving seal is engaged
     // before the proof leaves; the sending one only once the answer has verified, since the proof
@@ -284,10 +285,19 @@ core::async::Task<NodeProofAttempt> NodeProofClient::ProveAsync(SealedFrameSocke
     peer->SealReceiving(std::move(step->keys.serverToCaller));
     auto const proved = co_await Cc::ExchangeWithSchedulerAsync(peer, std::move(step->frame));
     if (!proved.IsHit())
-        co_return Unproved(proved, step->standing);
+        co_return Noted(Unproved(proved, step->standing));
 
     peer->SealSending(std::move(step->keys.callerToServer));
-    co_return NodeProofAttempt { .result = NodeProofResult::Proved, .reason = {}, .standing = step->standing };
+    co_return Noted(NodeProofAttempt { .result = NodeProofResult::Proved, .reason = {}, .standing = step->standing });
+}
+
+NodeProofAttempt NodeProofClient::Noted(NodeProofAttempt attempt) const noexcept
+{
+    if (attempt.result == NodeProofResult::Deferred)
+        _deferrals.fetch_add(1, std::memory_order_relaxed);
+    else
+        _deferrals.store(0, std::memory_order_relaxed);
+    return attempt;
 }
 
 NodeProofAttempt NodeProofClient::Prove(SealedFrameSocket& peer) const

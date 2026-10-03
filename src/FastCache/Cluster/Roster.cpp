@@ -24,8 +24,9 @@ namespace
     /// Fields in an encoded roster: the layout version, then the three groups.
     constexpr std::size_t RosterFields = 4;
 
-    /// Fields one member occupies: id, consensus endpoint, seat, key.
-    constexpr std::size_t MemberFields = 4;
+    /// Fields one member occupies: id, consensus endpoint, seat, key, `0xFC` endpoint (empty when
+    /// none).
+    constexpr std::size_t MemberFields = 5;
 
     /// Fields one principal occupies: id, key, role.
     constexpr std::size_t PrincipalFields = 3;
@@ -97,8 +98,11 @@ Roster ProjectRoster(ClusterState const& state)
     Roster roster;
     roster.members.reserve(state.members.size());
     for (auto const& member: state.members)
-        roster.members.push_back(RosterMember {
-            .id = member.id, .raftEndpoint = member.raftEndpoint, .seat = member.seat, .publicKey = member.publicKey });
+        roster.members.push_back(RosterMember { .id = member.id,
+                                                .raftEndpoint = member.raftEndpoint,
+                                                .seat = member.seat,
+                                                .publicKey = member.publicKey,
+                                                .schedulerEndpoint = member.schedulerEndpoint });
     roster.principals = state.principals;
     roster.revoked = state.revokedKeys;
     return roster;
@@ -111,7 +115,8 @@ std::vector<std::byte> EncodeRoster(Roster const& roster)
         return WireFields::Encode({ WireFields::AsBytes(member.id),
                                     WireFields::AsBytes(member.raftEndpoint),
                                     std::span<std::byte const> { seat },
-                                    std::span<std::byte const> { member.publicKey } });
+                                    std::span<std::byte const> { member.publicKey },
+                                    WireFields::AsBytes(member.schedulerEndpoint) });
     });
     auto const principals = EncodeGroup(roster.principals, [](ClusterPrincipal const& principal) {
         auto const role = std::array { static_cast<std::byte>(principal.role) };
@@ -162,7 +167,8 @@ std::expected<Roster, ConsensusError> DecodeRoster(std::span<std::byte const> by
             return RosterMember { .id = std::string { WireFields::AsStringView(entry[0]) },
                                   .raftEndpoint = std::string { WireFields::AsStringView(entry[1]) },
                                   .seat = *seat,
-                                  .publicKey = *key };
+                                  .publicKey = *key,
+                                  .schedulerEndpoint = std::string { WireFields::AsStringView(entry[4]) } };
         });
     auto principals = DecodeGroup<ClusterPrincipal>(
         (*fields)[2], PrincipalFields, [&keylessPrincipal](auto const& entry) -> std::optional<ClusterPrincipal> {

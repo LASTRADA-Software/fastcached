@@ -59,7 +59,8 @@ class DialledEnrollChannel final: public IEnrollChannel
 {
   public:
     /// @param dialer How an endpoint is reached; must outlive this.
-    explicit DialledEnrollChannel(IEndpointDialer& dialer);
+    /// @param identity This node's identity key pair, which signs every request; must outlive this.
+    DialledEnrollChannel(IEndpointDialer& dialer, Ed25519KeyPair const& identity);
 
     /// @copydoc IEnrollChannel::Poll
     [[nodiscard]] EnrollReading Poll(std::string_view endpoint,
@@ -68,6 +69,7 @@ class DialledEnrollChannel final: public IEnrollChannel
 
   private:
     IEndpointDialer& _dialer;
+    Ed25519KeyPair const& _identity;
 };
 
 } // namespace FastCache::Node

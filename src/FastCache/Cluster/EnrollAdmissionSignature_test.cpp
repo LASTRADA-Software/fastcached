@@ -45,7 +45,8 @@ struct Admission
                             .joinerKey = TestKeyPair("n-laptop").PublicKey(),
                             .clusterId = "c-office",
                             .outcome = CompileCacheWire::EnrollOutcome::Approved,
-                            .roster = admission.roster };
+                            .roster = admission.roster,
+                            .challenge = {} };
 }
 
 /// @return The office's admission of n-laptop over a nonce of 0x11s.
@@ -125,6 +126,12 @@ TEST_CASE("An admission's signature covers the nonce, the joiner, its key, the c
     auto otherRoster = ClaimOf(admission);
     otherRoster.roster = evilRoster;
     CHECK(VerifyAdmission(otherRoster, signature, office.PublicKey()) == AdmissionSignature::Forged);
+
+    // And the challenge it hands out: one somebody on the way swapped in is not the fleet's.
+    auto const swappedIn = NonceOf(std::byte { 0x77 });
+    auto otherChallenge = ClaimOf(admission);
+    otherChallenge.challenge = swappedIn;
+    CHECK(VerifyAdmission(otherChallenge, signature, office.PublicKey()) == AdmissionSignature::Forged);
 }
 
 TEST_CASE("A refusal and a not-yet are signed and verified as an admission is", "[cluster][formation][enroll]")

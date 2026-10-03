@@ -379,17 +379,15 @@ TEST_CASE("A leading scheduler raises mixed-node-versions for two builds of one 
     REQUIRE(fix.conditions.StateOf(NodeCondition::MixedNodeVersions) == Wire::ConditionState::Clear);
 
     auto const odd = std::string { VersionString } + "-other-build";
-    REQUIRE((*tier)
-                ->ServiceForSurfaces()
-                .AnnounceNode(Insider,
-                              Distributed::NodePresence { .endpoint = "10.0.0.8:6674",
-                                                          .version = odd,
-                                                          .capacity = {},
-                                                          .load = {},
-                                                          .conditions = std::nullopt,
-                                                          .endorsement = {} })
-                .status
-            == Wire::Status::Ok);
+    REQUIRE(
+        (*tier)
+            ->ServiceForSurfaces()
+            .AnnounceNode(
+                Insider,
+                Distributed::NodePresence {
+                    .endpoint = "10.0.0.8:6674", .version = odd, .capacity = {}, .load = {}, .conditions = std::nullopt })
+            .status
+        == Wire::Status::Ok);
     (*tier)->EvaluateConditions();
 
     auto const raised = SentRow(fix.conditions, NodeCondition::MixedNodeVersions);
@@ -421,26 +419,21 @@ TEST_CASE("mixed-node-versions counts a machine that named no version apart, and
     (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
 
     auto const odd = std::string { VersionString } + "-other-build";
+    REQUIRE(
+        (*tier)
+            ->ServiceForSurfaces()
+            .AnnounceNode(
+                Insider,
+                Distributed::NodePresence {
+                    .endpoint = "10.0.0.8:6674", .version = odd, .capacity = {}, .load = {}, .conditions = std::nullopt })
+            .status
+        == Wire::Status::Ok);
     REQUIRE((*tier)
                 ->ServiceForSurfaces()
-                .AnnounceNode(Insider,
-                              Distributed::NodePresence { .endpoint = "10.0.0.8:6674",
-                                                          .version = odd,
-                                                          .capacity = {},
-                                                          .load = {},
-                                                          .conditions = std::nullopt,
-                                                          .endorsement = {} })
-                .status
-            == Wire::Status::Ok);
-    REQUIRE((*tier)
-                ->ServiceForSurfaces()
-                .AnnounceNode(Insider,
-                              Distributed::NodePresence { .endpoint = "10.0.0.9:6674",
-                                                          .version = {},
-                                                          .capacity = {},
-                                                          .load = {},
-                                                          .conditions = std::nullopt,
-                                                          .endorsement = {} })
+                .AnnounceNode(
+                    Insider,
+                    Distributed::NodePresence {
+                        .endpoint = "10.0.0.9:6674", .version = {}, .capacity = {}, .load = {}, .conditions = std::nullopt })
                 .status
             == Wire::Status::Ok);
     (*tier)->EvaluateConditions();

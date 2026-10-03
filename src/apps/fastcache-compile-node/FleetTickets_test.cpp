@@ -13,7 +13,6 @@
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
 
-#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
@@ -258,9 +257,9 @@ TEST_CASE("A learner's verdict on a ticket follows the state it applied, never a
     learner.Apply();
     CHECK(learner.CheckTicket(office.fleet.TicketFor(desktop, Pc, 2)).has_value());
 
-    // Asleep past what a certified roster's endorsement and its slack would have allowed: the
-    // state it applied is still the state it applied.
-    office.fleet.Step(Cluster::RosterEndorsementLifetime + std::chrono::hours { 1 });
+    // Asleep for days: the state it applied is still the state it applied, since nothing a learner
+    // holds lapses with time.
+    office.fleet.Step(std::chrono::days { 3 });
     CHECK(learner.CheckTicket(office.fleet.TicketFor(Laptop, Pc, 4)).has_value());
 }
 

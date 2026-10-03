@@ -45,6 +45,21 @@ namespace
     constexpr Cc::SurfaceRefusal RefusedUnknownKey { .code = Wire::ErrorCode::NodeKeyUnknown,
                                                      .counter = IMetricsSink::Counter::NodeProofsRefusedUnknownKey };
 
+    /// A signature that verified under a key this node's roster lacks, while the state that roster is
+    /// published from has not caught up with the log this node recovered at start.
+    ///
+    /// Not `RefusedUnknownKey`: the key may be one the cluster holds and this node has not applied
+    /// yet -- a lone voter before its election commits, a follower before its leader first speaks --
+    /// and "admit it" would then be a confident wrong signal at every start. Transient, so the prover
+    /// asks again on a short backoff.
+    ///
+    /// One field per line, which the trailing comma keeps: the counter-attribution scan reads a row's
+    /// `.counter = Counter::X` on ONE line, and a wrapped one reads as a counter nobody writes.
+    constexpr Cc::SurfaceRefusal RefusedNotYetApplied {
+        .code = Wire::ErrorCode::RosterNotYetApplied,
+        .counter = IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied,
+    };
+
     /// A signature that verified under a key this cluster REVOKED: the forgotten machine itself.
     ///
     /// Refused, and the connection is MARKED rather than closed: every later verb on it is refused
@@ -307,7 +322,18 @@ NodeProofVerdict NodeProofResponder::Verify(NodeHandshake const& handshake, std:
                                  "as the forgotten machine's"),
                       std::move(identity));
     if (!Distributed::RestsOnProvenIdentity(standing))
+    {
+        // Asked only once the roster has no opinion, so a key it holds is accepted whatever the
+        // reading: "not yet" replaces only the refusal that may be wrong until the state catches up.
+        if (_consensus.CurrentAppliedState() != AppliedStateReading::CaughtUp)
+            return sealed(Cc::Refuse(_metrics,
+                                     RefusedNotYetApplied,
+                                     std::format("this node has not applied its cluster's state since it started, so it "
+                                                 "cannot judge {}'s key yet; it is asked again in a moment",
+                                                 identity.id)),
+                          std::nullopt);
         return sealed(Cc::Refuse(_metrics, RefusedUnknownKey, UnknownKeyReason(identity)), std::nullopt);
+    }
 
     _metrics.Increment(IMetricsSink::Counter::NodeProofsAccepted);
     return sealed(Wire::EncodeReply(Wire::Status::Ok, {}), std::move(identity));

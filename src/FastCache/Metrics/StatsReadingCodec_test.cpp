@@ -355,6 +355,29 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
+    // Moved when a node could be pinned to one fleet (`--fleet-id`): two counters joined the
+    // catalogue -- a proven fleet the pin kept a solitary node from asking
+    // (`formation_yields_refused_pin`), and a move into another cluster a pinned node refused
+    // (`formation_admissions_refused_pin`) -- which changes which cells every live-stats reading
+    // carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when a worker began bounding its trust in the state it applied by its own consensus:
+    // one counter joined the catalogue for a grant refused because no leader that state counts has
+    // spoken for `LeaderSilenceBound` (`worker_jobs_refused_lease_isolated`), which changes which
+    // cells every live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved when a joiner began signing its `Enroll`: one counter joined the catalogue for a request
+    // whose signature does not verify under the key it asks with (`enrollment_requests_refused_forged`),
+    // which changes which cells every live-stats reading carries. Clients and nodes upgrade together,
+    // as below.
+    //
+    // Moved when the certified roster retired: four counters left the catalogue with it
+    // (`worker_jobs_refused_lease_roster_expired`, `worker_rosters_refused_uncertified`,
+    // `worker_rosters_refused_expired`, `scheduler_roster_endorsements_refused`), and the snapshot's
+    // `rosterExpiresInSeconds` field went with the lapse it counted down to -- its presence bit
+    // retired, never reused. Every node verifies grants against the state it applied, which has
+    // no lapse. Clients and nodes upgrade together, as below.
+    //
     // Moved by the state-file replace probe: one counter joined the catalogue for a serving body that
     // found its state files replaced by the classic rename (`state_file_replaces_fell_back`), which
     // changes which cells every live-stats reading carries. Clients and nodes upgrade together, as
@@ -561,7 +584,26 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // Moved when step 20 put lane 2a batch 2's counters after integration's own rows (ruling 8),
     // `formation_admissions_unverified` after `dispatch_node_announcements_field_too_long` and
     // `state_file_replaces_fell_back` last. Read off the built test, never computed by hand.
-    CHECK(StatsReadingLayout == 0x13f2562893c19abeULL);
+    //
+    // Moved when batch 3 picked the certified roster's retirement onto that order: its four
+    // counters and the `rosterExpiresInSeconds` field left, as the first paragraph says. Read off
+    // the built test, never computed by hand.
+    //
+    // Moved when batch 3 picked `enrollment_requests_refused_forged` after
+    // `enrollment_requests_refused_revoked_key`, where the lane put it. Read off the built test,
+    // never computed by hand.
+    //
+    // Moved when batch 3 picked `worker_jobs_refused_lease_isolated` where the lane put it. Read off
+    // the built test, never computed by hand.
+    //
+    // Moved when batch 3 merged the rest of lane 2a in one: its counters joined where the lane put
+    // them. Read off the built test, never computed by hand.
+    //
+    // Moved when integration appended `state_directory_syncs_unsupported` after
+    // `state_file_replaces_fell_back` (R-A), and again when it appended
+    // `node_proofs_refused_roster_not_yet_applied` after that (M3). Read off the built test, never
+    // computed by hand.
+    CHECK(StatsReadingLayout == 0x8c2f5a0c4a56c00fULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

@@ -5,12 +5,14 @@
 // authenticated. `MembershipPolicy_test` pins each rule as a pure function; what only a
 // cluster can show is what the CONSEQUENCES of a rule do to consensus -- who steps down,
 // who is elected, what commits.
+#include <FastCache/Cluster/AnnouncedEndpoints.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/MembershipPolicy.hpp>
 #include <FastCache/Cluster/RosterKeys.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Consensus/RaftClusterHarness.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -98,6 +100,17 @@ constexpr std::array<char const*, 5> EveryMachine { "n1", "n2", "n3", "n4", "n5"
     return std::ranges::find(state.members, id, &ClusterMember::id) != state.members.end();
 }
 
+/// The record `state` keeps for `id`; the calling case stops when there is none.
+/// @param state A node's applied state.
+/// @param id The member.
+/// @return Its record.
+[[nodiscard]] ClusterMember RecordOf(ClusterState const& state, Consensus::NodeId const& id)
+{
+    auto const found = std::ranges::find(state.members, id, &ClusterMember::id);
+    REQUIRE(found != state.members.end());
+    return *found;
+}
+
 /// A fleet: a Raft cluster whose log carries `Cluster::Command`s, reconciled by whoever
 /// leads exactly as `ConsensusTier::Reconcile` does it.
 ///
@@ -172,10 +185,13 @@ class Fleet
         auto const state = StateAt(*leader);
         auto const progress = _cluster.At(*leader).driver->CurrentProgress();
         auto const& configuration = progress.configuration;
-        // Keyed as the tier keys them: a discovered peer's desire states no key, and the leader
-        // fills in the one its roster holds live for it (`WithLiveKeys`).
+        // What members announced, merged into the desires as the tier merges them, then keyed as the
+        // tier keys them: a discovered peer's desire states no key, and the leader fills in the one its
+        // roster holds live for it (`WithLiveKeys`). Nothing is held in flight here: a re-proposal of a
+        // record still uncommitted is the same record again.
+        auto const desired = WithAnnouncedEndpoints(DesiredBy(*leader), AnnouncedEndpointDesires(state, _announced, {}));
         auto const plan =
-            MembershipProposals(state, configuration, WithLiveKeys(state, DesiredBy(*leader), *_rosters.at(*leader)));
+            MembershipProposals(state, configuration, WithLiveKeys(state, desired, *_rosters.at(*leader)));
         for (auto const& command: plan.proposals)
             std::ignore = _cluster.ProposeOnLeader(Encode(command));
 
@@ -231,6 +247,34 @@ class Fleet
                                               .publicKey = KeyOf(id),
                                               .role = std::nullopt }))
             .has_value();
+    }
+
+    /// An approved enrollment: the learner's record, proposed on the leader as the responder's
+    /// `ClusterAdmit` proposes it -- no consensus endpoint, the `0xFC` endpoint its `Enroll` stated,
+    /// and the key it asked under. A record only: no Raft member answers for it.
+    /// @param id The learner.
+    /// @param schedulerEndpoint Where its `0xFC` port answers.
+    /// @param key Its identity key.
+    /// @return Whether a leader took it.
+    bool AdmitLearner(Consensus::NodeId const& id, std::string schedulerEndpoint, Ed25519PublicKey const& key)
+    {
+        return _cluster
+            .ProposeOnLeader(Encode(Command { .kind = CommandKind::AddLearner,
+                                              .key = id,
+                                              .value = {},
+                                              .schedulerEndpoint = std::move(schedulerEndpoint),
+                                              .publicKey = key,
+                                              .role = std::nullopt }))
+            .has_value();
+    }
+
+    /// A proven NODE-ANNOUNCE from @p id reaching the leader's scheduler, which notes an endpoint
+    /// that differs from the record: kept, latest wins, for every pass to merge -- as the tier keeps it.
+    /// @param id The member that proved itself.
+    /// @param endpoint Where it says its `0xFC` port answers.
+    void Announce(Consensus::NodeId const& id, std::string endpoint)
+    {
+        _announced.insert_or_assign(id, std::move(endpoint));
     }
 
     /// Every member's roster adopts its own node's applied state and configuration -- what
@@ -295,6 +339,7 @@ class Fleet
 
     Consensus::RaftClusterHarness _cluster;
     std::vector<Consensus::NodeId> _catchingUp;
+    AnnouncedEndpointMap _announced; ///< What members announced, as the leader's tier keeps it.
 };
 
 /// Step until one leader exists, or give up.
@@ -671,5 +716,34 @@ TEST_CASE("A cluster keeps committing when its quorum grows from one to two", "[
     fleet.Cluster().Run(StepsPerPass * 4);
     CHECK(fleet.StateAt("n1").SettingOf("lease-lifetime") == std::optional<std::string> { "30min" });
     CHECK(fleet.StateAt("n2").SettingOf("lease-lifetime") == std::optional<std::string> { "30min" });
+    RequireNoViolations(fleet.Cluster());
+}
+
+TEST_CASE("A learner's announced endpoint replaces its record through consensus and keeps its seat and key",
+          "[consensus][cluster][membership][endpoint]")
+{
+    // The record every resolver dials moves on the member's own word, and through the log: every
+    // node applies the new endpoint, and the re-proposal is the WHOLE record, so a seat or a key it
+    // dropped would be dropped everywhere. n4 is the laptop: a machine that joined with no bootstrap
+    // set, approved as a learner -- n4 itself included among the nodes that apply it.
+    Fleet fleet { { "n1", "n2", "n3" } };
+    REQUIRE(SettleOnLeader(fleet.Cluster()));
+    fleet.Join("n4");
+    auto const laptopKey = Testing::TestKeyPair("n4").PublicKey();
+    REQUIRE(fleet.AdmitLearner("n4", "laptop:6674", laptopKey));
+    fleet.Cluster().Run(StepsPerPass * 4);
+    auto const leader = Unwrap(fleet.Cluster().Leader());
+    REQUIRE(RecordOf(fleet.StateAt(leader), "n4").schedulerEndpoint == "laptop:6674");
+
+    fleet.Announce("n4", "10.9.0.4:6674");
+    fleet.Reconcile(10);
+    for (auto const* const id: { "n1", "n2", "n3", "n4" })
+    {
+        INFO(id);
+        auto const record = RecordOf(fleet.StateAt(id), "n4");
+        CHECK(record.schedulerEndpoint == "10.9.0.4:6674");
+        CHECK(record.seat == MemberSeat::Learner);
+        CHECK(record.publicKey == std::optional { laptopKey });
+    }
     RequireNoViolations(fleet.Cluster());
 }

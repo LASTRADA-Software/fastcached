@@ -309,19 +309,9 @@ void SchedulerTier::WatchConditions(std::chrono::milliseconds interval)
     } };
 }
 
-void SchedulerTier::Endorse(Cluster::RosterEndorsement const& endorsement)
-{
-    std::scoped_lock const lock { _ownEndorsementMutex };
-    _ownEndorsement = endorsement;
-    std::ignore = _service.AcceptEndorsement(endorsement);
-}
-
 void SchedulerTier::Administer(Distributed::IClusterAdmin& admin)
 {
-    std::scoped_lock const lock { _ownEndorsementMutex };
     _service.AdministerWith(admin);
-    if (_ownEndorsement.has_value())
-        std::ignore = _service.AcceptEndorsement(*_ownEndorsement);
 }
 
 } // namespace FastCache::Node

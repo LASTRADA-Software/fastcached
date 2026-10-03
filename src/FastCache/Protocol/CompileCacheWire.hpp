@@ -727,11 +727,10 @@ enum class Op : std::uint8_t
     /// only on the verb that carried the batch*) then has two answers depending on a
     /// configuration flag.
     ///
-    /// **And it is how the certified roster travels (#178).** A voter's announcement carries
-    /// its signed endorsement of the roster it applied; the leader's `Ok` carries the roster a
-    /// majority of the current voters endorse, or nothing until they have. Riding the verb
-    /// every node already sends costs no log entry and no second loop -- and a worker that
-    /// follows `NotLeader` to the real leader adopts that leader's roster in the same round.
+    /// **It once carried a certified roster (#178)**: a voter's endorsement in the request, the
+    /// roster a majority endorsed in the `Ok`. Both are gone from the grammar -- every node applies
+    /// the state its own consensus replicates and verifies grants against that -- so the request is
+    /// the endpoint, the capacity, the load and the join memos, and the `Ok` carries nothing.
     NodeAnnounce = 0x1A,
 
     /// Ask a node which routes admit or refuse a MACHINE, or the caller's own connection (#1471).
@@ -1217,7 +1216,8 @@ enum class ErrorCode : std::uint8_t
     /// looking like a protocol bug.
     NodeProofUnchallenged = 0x26,
 
-    /// A node proof's signature did not verify under the identity key it presented.
+    /// A node proof's signature did not verify under the identity key it presented -- or an
+    /// `Enroll`'s, under the key it asks to be admitted with (`Cluster::VerifyEnrollRequest`).
     ///
     /// A signature over a different challenge, a different id or a different handshake, or bytes
     /// that are no signature at all -- one answer, deliberately: the verification cannot tell them
@@ -1231,18 +1231,9 @@ enum class ErrorCode : std::uint8_t
     /// (`OpDescriptor::identity`).
     NodeProofRejected = 0x27,
 
-    /// This worker cannot verify ANY grant right now: it holds no roster its trust anchors
-    /// certify, or the one it holds has not been re-certified by a majority of its voters for
-    /// longer than its lifetime and the skew slack (#178).
-    ///
-    /// A statement about the WORKER, never about the grant, which is why it is not
-    /// `LeaseUnauthorized` or `LeaseExpired`: a client told its lease was bad would ask the same
-    /// scheduler for another and be refused again, while this says the machine it was sent to
-    /// is cut off from the cluster that vouches for its schedulers. A fleet whose every worker
-    /// answers this is a fleet whose leader has stopped certifying rosters -- or whose workers
-    /// only reach an ex-leader that withholds them -- and the worker's
-    /// `fastcache_roster_expires_in_seconds` gauge is where it showed first.
-    RosterExpired = 0x28,
+    // 0x28 is RETIRED and never reused -- it was `RosterExpired`, named for the certified
+    // roster's lapse (#178); `GrantUnverifiable` (0x31) carries what it still meant. See
+    // `RetiredErrorCodes`.
 
     /// A node proof verified under a key this cluster does not hold for the id it named (#178).
     ///
@@ -1325,6 +1316,31 @@ enum class ErrorCode : std::uint8_t
     /// (`DeclineCause::Unrecognised`), which is true, rather than as anything it would act on
     /// wrongly.
     WorkerRejectedArgument = 0x30,
+
+    /// This worker cannot verify ANY grant right now (#178): the state it applied records no
+    /// voter's key yet, or no leader its applied configuration counts has spoken to it for longer
+    /// than `Distributed::LeaderSilenceBound`.
+    ///
+    /// A statement about the WORKER, never about the grant, which is why it is not
+    /// `LeaseUnauthorized` or `LeaseExpired`: a client told its lease was bad would ask the same
+    /// scheduler for another and be refused again, while this says the machine it was sent to
+    /// cannot vouch for anybody's grant until it hears from its fleet. What `RosterExpired`
+    /// (0x28, retired) meant once the certified roster it was named for was gone.
+    ///
+    /// 0x31 rather than the next number on this branch: 0x2D-0x30 are allocated to other work
+    /// (`TicketRefused`, `IdentifiedCallerRequired`, `NotSharedCache`, `WorkerRejectedArgument`).
+    GrantUnverifiable = 0x31,
+
+    /// A node proof this node cannot judge YET: its consensus has not applied the log it recovered at
+    /// start, so the key roster it judges by may lack a key its cluster holds (batch 3's M3).
+    ///
+    /// Answered in place of `NodeKeyUnknown` and only while that lasts -- a lone voter before its
+    /// election commits, a follower before its leader's first `AppendEntries` -- because
+    /// `NodeKeyUnknown` there is a confident wrong signal: it tells an operator to ADMIT a machine
+    /// the cluster already holds, and the prover waits a whole announce interval to try again.
+    /// A statement about the ANSWERING node, never about the caller, so it is retriable: the prover
+    /// asks again on a short bounded backoff (`Node::DeferredProofWait`).
+    RosterNotYetApplied = 0x32,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -1940,9 +1956,9 @@ inline constexpr std::size_t MaxExplainAdmissionPayload = 512;
 
 /// Payload ceiling for a reply read on a SEALED connection by the side that proved.
 ///
-/// The verbs a joining machine sends are answered from tables -- a worker id, a certified roster --
-/// so this bounds how much a sealing reader buffers before it can check a tag, rather than any
-/// reply a joining machine is owed. A certified roster for a fleet of hundreds is tens of kilobytes.
+/// The verbs a joining machine sends are answered from tables -- a worker id, a roster -- so this
+/// bounds how much a sealing reader buffers before it can check a tag, rather than any reply a
+/// joining machine is owed. A roster for a fleet of hundreds is tens of kilobytes.
 inline constexpr std::size_t MaxSealedReplyPayload = 4U * 1024U * 1024U;
 
 /// The largest refusal a client reads: an `Error` reply's code and its sentence.
@@ -2235,14 +2251,16 @@ inline constexpr std::array OpTable {
                    .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::NodeAnnounce,
                    .name = "node-announce",
-                   .fieldCount = 5, // endpoint, capacity, load, endorsement, join memos
+                   .fieldCount = 4, // endpoint, capacity, load, join memos
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    // Not pre-auth: this column is the daemon's credential gate, which a node
                    // never reaches. On a node no verb waits for a credential -- admission is
                    // `RefusePeer`'s, and this verb requires a proven identity there.
                    .preAuth = RequiresAuth,
                    .maxPayload = BoundedTo(MaxControlPayload),
-                   .maxReply = ReplyBoundedTo(MaxReportReply),
+                   // Its `Ok` is EMPTY since the certified roster left it (#178), so a refusal's sentence
+                   // is the most it ever answers.
+                   .maxReply = ReplyBoundedTo(MaxRefusalReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::ProvenNodeOnly },
     OpDescriptor { .code = Op::Heartbeat,
@@ -2432,7 +2450,7 @@ inline constexpr std::array OpTable {
     // comment a reviewer reads to understand this table's security posture.
     OpDescriptor { .code = Op::Enroll,
                    .name = "enroll",
-                   .fieldCount = 5, // nodeId, nodeEndpoint, role, publicKey, nonce
+                   .fieldCount = 7, // nodeId, nodeEndpoint, role, publicKey, nonce, challenge, signature
                    .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
                    // The second such row this table has ever held, and the first that is
                    // not AUTH. `PreAuthVerbsAreBounded` is what keeps the ceiling below
@@ -2928,12 +2946,6 @@ inline constexpr std::array ErrorTable {
                       .defaultMessage = "the node proof's signature does not verify under the key it presented",
                       .retry = RetryWillNotHelp,
                       .retryWhy = "the signature does not verify, and the same signature never will" },
-    ErrorDescriptor { .code = ErrorCode::RosterExpired,
-                      .name = "roster-expired",
-                      .defaultMessage = "this worker holds no roster its voters currently certify, so it can verify no "
-                                        "grant",
-                      .retry = RetryMayHelp,
-                      .retryWhy = "the worker's roster is re-certified once its voters are reachable again" },
     ErrorDescriptor { .code = ErrorCode::NodeKeyUnknown,
                       .name = "node-key-unknown",
                       .defaultMessage = "this cluster holds no such identity key for that node; it has not been admitted",
@@ -2984,6 +2996,20 @@ inline constexpr std::array ErrorTable {
                       .retry = RetryWillNotHelp,
                       .retryWhy = "the worker's allowlist does not change while it is asked; an operator adds the "
                                   "argument with --allow-compile-arg, or the compile runs locally" },
+    ErrorDescriptor { .code = ErrorCode::GrantUnverifiable,
+                      .name = "grant-unverifiable",
+                      .defaultMessage = "this worker can verify no grant right now: its applied state names no voter, or "
+                                        "it has not heard from a leader it counts",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "a statement about the worker, which verifies again once its applied state names a "
+                                  "voter and a leader it counts speaks to it" },
+    ErrorDescriptor { .code = ErrorCode::RosterNotYetApplied,
+                      .name = "roster-not-yet-applied",
+                      .defaultMessage = "this node has not applied its cluster's state since it started, so it cannot "
+                                        "judge that identity key yet",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "a statement about the answering node, which judges the key once its consensus has "
+                                  "applied the log it recovered -- an election or a leader's first word away" },
 };
 
 /// Whether every row says why asking again may or may not help.
@@ -3005,7 +3031,7 @@ inline constexpr std::array RetriableErrorCodes {
     ErrorCode::Withdrawn,          ErrorCode::ClusterChangeInFlight,
     ErrorCode::EndpointBusy,       ErrorCode::WorkerToolchainSurveyInFlight,
     ErrorCode::EnrollmentFull,     ErrorCode::EnrollmentHostFull,
-    ErrorCode::RosterExpired,
+    ErrorCode::GrantUnverifiable,  ErrorCode::RosterNotYetApplied,
 };
 
 /// Whether the table's retriable rows are exactly `RetriableErrorCodes`.
@@ -3038,7 +3064,11 @@ static_assert(RetriableCodesArePinned(), "ErrorTable's retriable rows and Retria
 ///
 /// 0x22 was EnrollmentClosed. Since zero-config formation a joiner's request is always recorded
 /// and the approval is the gate; #178 already made the window guard no secret.
-inline constexpr std::array<std::uint8_t, 3> RetiredErrorCodes { 0x06, 0x22, 0x24 };
+///
+/// 0x28 was RosterExpired, named for the certified roster's lapse (#178). The roster no longer
+/// lapses -- every node's is the state its own consensus applied -- so what the code still meant
+/// travels as `GrantUnverifiable`, under a name that says it.
+inline constexpr std::array<std::uint8_t, 4> RetiredErrorCodes { 0x06, 0x22, 0x24, 0x28 };
 
 /// Whether the error table has kept clear of every retired byte.
 ///
@@ -3058,7 +3088,7 @@ inline constexpr std::array<std::uint8_t, 3> RetiredErrorCodes { 0x06, 0x22, 0x2
 static_assert(NoRetiredErrorCodeIsReused(),
               "a retired wire code must never be reassigned -- a peer built against an older header still reports it "
               "under its old name (0x06 was canonicalization-failed, see issues #59 and #69; 0x22 was "
-              "enrollment-closed; 0x24 was enrollment-already-collected, see #178)");
+              "enrollment-closed; 0x24 was enrollment-already-collected, see #178; 0x28 was roster-expired)");
 
 /// Opcodes that once meant something and must never mean anything again: 0x16 was
 /// CLUSTER-ADMIT-CLIENT and 0x17 CLUSTER-FORGET-CLIENT (#1309), retired when a machine
@@ -5239,21 +5269,11 @@ inline constexpr std::size_t MaxJoinMemoListBytes =
     MaxAnnouncedJoinMemos
     * Detail::FramedField(Detail::FramedField(MaxIdBytes) + Detail::FramedField(IdentityPublicKeyBytes));
 
-/// The longest roster endorsement a node attaches: `Cluster::EncodeEndorsement`'s six fields --
-/// cluster id, roster version, the roster's SHA-256 (32 bytes), not-after, endorser id, signature.
-/// OPAQUE to this header, which names no `Cluster/` type; `RosterCertificate_test` encodes the
-/// longest one and asserts it fits.
-inline constexpr std::size_t MaxRosterEndorsementBytes =
-    Detail::FramedField(MaxIdBytes) + Detail::FramedField(sizeof(std::uint64_t)) + Detail::FramedField(32)
-    + Detail::FramedField(sizeof(std::uint64_t)) + Detail::FramedField(MaxIdBytes) + Detail::FramedField(NodeSignatureBytes);
-
 /// Everything a NODE-ANNOUNCE carries besides its history batch and its condition list, at its
-/// longest: the endpoint, the capacity record, the load record's fixed fields, the endorsement, the
-/// join memos.
+/// longest: the endpoint, the capacity record, the load record's fixed fields, the join memos.
 inline constexpr std::size_t MaxNodeAnnounceOtherBytes =
     Detail::FramedField(MaxEndpointBytes) + Detail::FramedField(MaxCapacityRecordBytes)
-    + Detail::FramedField(MaxLoadRecordFixedBytes) + Detail::FramedField(MaxRosterEndorsementBytes)
-    + Detail::FramedField(MaxJoinMemoListBytes);
+    + Detail::FramedField(MaxLoadRecordFixedBytes) + Detail::FramedField(MaxJoinMemoListBytes);
 
 /// ONE budget for the verb, summed, rather than two fractions each checked alone (which said
 /// nothing about whether the rest still fit). Every term is a constant, never a figure restated here:
@@ -5467,19 +5487,9 @@ struct NodeAnnounceRequest
     /// nothing at all when it had no worker.
     LoadFields load {};
 
-    /// This node's signed endorsement of the roster it has applied, when it is a voter
-    /// holding one; empty otherwise (#178).
-    ///
-    /// OPAQUE here, encoded by `Cluster/RosterCertificate` -- this header stays
-    /// dependency-free, and the leader verifies the signature before it reads a single claim
-    /// in it. A top-level field of its own rather than a member of `load`: it is not a
-    /// reading of the machine, and the leader must be able to refuse it without refusing the
-    /// load and the history that ride beside it.
-    std::span<std::byte const> endorsement {};
-
     /// The fleets this node once asked to admit it (`EncodeJoinMemos`): how the leader holds every
     /// member's evidence that a fleet it sees is this one split, whichever machine did the asking.
-    /// A top-level field for the endorsement's reason: it is not a reading of the machine.
+    /// A top-level field rather than part of `load`: it is not a reading of the machine.
     std::span<JoinMemoFields const> joinMemos {};
 };
 
@@ -5498,7 +5508,6 @@ struct NodeAnnounceRequest
                                  { AsBytes(request.endpoint),
                                    std::span<std::byte const> { capacity },
                                    std::span<std::byte const> { load },
-                                   request.endorsement,
                                    std::span<std::byte const> { memos } });
 }
 
@@ -5514,8 +5523,7 @@ struct NodeAnnounceView
     std::span<std::byte const> endpoint;
     CapacityFields capacity {};
     LoadFields load {};
-    std::span<std::byte const> endorsement; ///< Borrowed, and empty when none travelled.
-    std::vector<JoinMemoFields> joinMemos;  ///< Owned: the leader keeps them past the frame.
+    std::vector<JoinMemoFields> joinMemos; ///< Owned: the leader keeps them past the frame.
 };
 
 /// Split a NODE-ANNOUNCE payload.
@@ -5532,14 +5540,12 @@ struct NodeAnnounceView
     auto load = DecodeLoad((*fields)[2]);
     if (!load.has_value())
         return std::nullopt;
-    auto memos = DecodeJoinMemos((*fields)[4]);
+    auto memos = DecodeJoinMemos((*fields)[3]);
     if (!memos.has_value())
         return std::nullopt;
-    return NodeAnnounceView { .endpoint = (*fields)[0],
-                              .capacity = *std::move(capacity),
-                              .load = *std::move(load),
-                              .endorsement = (*fields)[3],
-                              .joinMemos = *std::move(memos) };
+    return NodeAnnounceView {
+        .endpoint = (*fields)[0], .capacity = *std::move(capacity), .load = *std::move(load), .joinMemos = *std::move(memos)
+    };
 }
 
 /// Frame a HEARTBEAT request.
@@ -6579,19 +6585,15 @@ struct AdmissionExplanationFields
 /// What `--node-status` says about the roster a node verifies lease grants against (#178).
 ///
 /// Carried as its own nested record inside `NodeRuntimeFields`, because it is one fact with
-/// five parts and an operator reads it as one: which roster, how many vote, how many machines
-/// are admitted by key, how many keys are revoked, and until when it is certified.
+/// three parts and an operator reads it as one: which roster, how many vote, and how many keys
+/// are revoked. The principal count and the certification lapse it once carried are gone with
+/// principal admission and the certified roster: every node's roster is the state its own
+/// consensus applied, which admits nobody by key alone and never lapses.
 struct NodeRosterFields
 {
-    std::uint64_t version { 0 };    ///< `ClusterState::rosterVersion` of the roster held.
-    std::uint32_t voters { 0 };     ///< Members that vote.
-    std::uint32_t principals { 0 }; ///< Machines admitted by key rather than as members.
-    std::uint32_t revoked { 0 };    ///< Keys the cluster will never admit again.
-
-    /// When its certification lapses, in milliseconds since the Unix epoch -- ABSENT on a
-    /// consensus member, whose roster is the state it applied and needs no certificate. A
-    /// worker past this instant (and the clock-skew slack) refuses every grant `roster-expired`.
-    std::optional<std::uint64_t> certifiedUntilMillis {};
+    std::uint64_t version { 0 }; ///< `ClusterState::rosterVersion` of the roster held.
+    std::uint32_t voters { 0 };  ///< Members that vote.
+    std::uint32_t revoked { 0 }; ///< Keys the cluster will never admit again.
 
     [[nodiscard]] friend bool operator==(NodeRosterFields const&, NodeRosterFields const&) = default;
 };
@@ -6639,6 +6641,30 @@ struct SharedCacheStatusFields
     std::string detail;                                            ///< One sentence; empty when there is nothing to add.
 
     [[nodiscard]] friend bool operator==(SharedCacheStatusFields const&, SharedCacheStatusFields const&) = default;
+};
+
+/// Whether a node is pinned to one fleet (`--fleet-id`), as the first byte of its nested record.
+///
+/// **Transmitted**: the byte rides `NodeRuntimeFields::fleetPin`, so each value is stated and none is
+/// ever renumbered.
+enum class WireFleetPinTag : std::uint8_t
+{
+    Unpinned = 0, ///< Trust on first use: nothing follows.
+    Pinned = 1,   ///< Pinned: the pin follows as `--fleet-id` spells it, never empty.
+};
+
+/// What `--fleet-id` pins a node to, as `NodeStatus` reports it.
+///
+/// A record of its own rather than an optional text, because there are THREE answers and an optional
+/// has two: pinned, pinned to nothing -- the trust-on-first-use default an operator asks about
+/// precisely to find out whether it is still in force -- and a node too old to say, which reads as the
+/// whole record absent. The pin travels as TEXT, `<cluster-id>@<key>[,<key>...]`, exactly as
+/// `--fleet-id` takes it: this header links nothing that could parse a key, and the reader shows it.
+struct NodeFleetPinFields
+{
+    std::optional<std::string> fleet; ///< The pin as `--fleet-id` spells it, or disengaged on an unpinned node.
+
+    [[nodiscard]] friend bool operator==(NodeFleetPinFields const&, NodeFleetPinFields const&) = default;
 };
 
 /// What a node's live components report about themselves, as opposed to what its
@@ -6834,6 +6860,16 @@ struct NodeRuntimeFields
     /// What this node reads through to, or serves, as the fleet's shared cache; disengaged
     /// on a sender too old to say. See `SharedCacheStatusFields`.
     std::optional<SharedCacheStatusFields> sharedCache {};
+
+    /// What another machine's `--fleet-id` is to be set to, to pin it to this node's fleet: this
+    /// node's cluster and the identity keys of the voters its applied state records,
+    /// `<cluster-id>@<key>[,<key>...]`, ready to paste. Disengaged on a node with no cluster or no
+    /// roster to name voters from, or a sender too old to say. Never legally empty when engaged.
+    std::optional<std::string> fleetId {};
+
+    /// What `--fleet-id` pins this node to, or disengaged from a sender too old to say. Every node
+    /// that says anything says this: unpinned is an answer, not an absence.
+    std::optional<NodeFleetPinFields> fleetPin {};
 };
 
 /// What an operator reads `NodeRuntimeFields::consensusEndpoint` under, as prose: the
@@ -6919,7 +6955,16 @@ namespace Detail
 } // namespace Detail
 
 /// Fields a `NodeRosterFields` record carries. A reader accepts more, and ignores the surplus.
-inline constexpr std::size_t NodeRosterFieldCount = 5;
+///
+/// Four, of which the third is RESERVED: it carried the principal count (#178) and travels EMPTY,
+/// never read and never reassigned. Kept as a position rather than closed up, because this record
+/// is read POSITIONALLY with the surplus ignored -- closing the gap would have a reader take a
+/// principal count for the revoked one. The certification lapse that rode fifth is dropped
+/// outright: a trailing field a reader ignores as surplus.
+inline constexpr std::size_t NodeRosterFieldCount = 4;
+
+/// Where the retired principal count sat in a `NodeRosterFields` record: RESERVED, sent empty.
+inline constexpr std::size_t NodeRosterReservedField = 2;
 
 /// Encode a roster summary as one nested record.
 /// @param roster The summary.
@@ -6928,14 +6973,52 @@ inline constexpr std::size_t NodeRosterFieldCount = 5;
 {
     auto const version = WireFields::ToBigEndian<std::uint64_t>(roster.version);
     auto const voters = WireFields::ToBigEndian<std::uint32_t>(roster.voters);
-    auto const principals = WireFields::ToBigEndian<std::uint32_t>(roster.principals);
     auto const revoked = WireFields::ToBigEndian<std::uint32_t>(roster.revoked);
-    auto const certifiedUntil = Detail::OptionalBigEndian(roster.certifiedUntilMillis);
     return WireFields::Encode({ std::span<std::byte const> { version },
                                 std::span<std::byte const> { voters },
-                                std::span<std::byte const> { principals },
-                                std::span<std::byte const> { revoked },
-                                certifiedUntil });
+                                std::span<std::byte const> {}, // NodeRosterReservedField
+                                std::span<std::byte const> { revoked } });
+}
+
+/// Encode a fleet pin as one nested record: its tag, then the pin's text or nothing.
+/// @param pin The pin.
+/// @return Its bytes; never empty, so an engaged pin -- pinned to nothing included -- never reads back
+///         as absent.
+[[nodiscard]] inline std::vector<std::byte> EncodeNodeFleetPin(NodeFleetPinFields const& pin)
+{
+    auto const tag =
+        std::array { static_cast<std::byte>(pin.fleet.has_value() ? WireFleetPinTag::Pinned : WireFleetPinTag::Unpinned) };
+    return WireFields::Encode(
+        { std::span<std::byte const> { tag }, pin.fleet.has_value() ? AsBytes(*pin.fleet) : std::span<std::byte const> {} });
+}
+
+/// Read a fleet pin.
+/// @param field The nested record's bytes; empty is ABSENT.
+/// @param out Set only when the field carried a pin.
+/// @return False when the field was present and not a pin this build reads: an unknown tag, an id
+///         beside `Unpinned`, or none beside `Pinned`.
+[[nodiscard]] inline bool ReadNodeFleetPin(std::span<std::byte const> field, std::optional<NodeFleetPinFields>& out)
+{
+    if (field.empty())
+        return true;
+    auto const parts = WireFields::SplitAll(field);
+    if (!parts.has_value() || parts->size() < 2 || (*parts)[0].size() != 1)
+        return false;
+    auto const id = (*parts)[1];
+    switch (static_cast<WireFleetPinTag>((*parts)[0][0]))
+    {
+        case WireFleetPinTag::Unpinned:
+            if (!id.empty())
+                return false;
+            out = NodeFleetPinFields {};
+            return true;
+        case WireFleetPinTag::Pinned:
+            if (id.empty())
+                return false;
+            out = NodeFleetPinFields { .fleet = std::string { AsStringView(id) } };
+            return true;
+    }
+    return false;
 }
 
 /// Read a roster summary.
@@ -6951,17 +7034,10 @@ inline constexpr std::size_t NodeRosterFieldCount = 5;
         return false;
     auto const version = WireFields::FromBigEndian<std::uint64_t>((*parts)[0]);
     auto const voters = WireFields::FromBigEndian<std::uint32_t>((*parts)[1]);
-    auto const principals = WireFields::FromBigEndian<std::uint32_t>((*parts)[2]);
     auto const revoked = WireFields::FromBigEndian<std::uint32_t>((*parts)[3]);
-    auto roster = NodeRosterFields {};
-    if (!version.has_value() || !voters.has_value() || !principals.has_value() || !revoked.has_value()
-        || !Detail::ReadOptionalBigEndian((*parts)[4], roster.certifiedUntilMillis))
+    if (!version.has_value() || !voters.has_value() || !revoked.has_value())
         return false;
-    roster.version = *version;
-    roster.voters = *voters;
-    roster.principals = *principals;
-    roster.revoked = *revoked;
-    out = roster;
+    out = NodeRosterFields { .version = *version, .voters = *voters, .revoked = *revoked };
     return true;
 }
 
@@ -7101,6 +7177,9 @@ inline constexpr std::size_t SharedCacheStatusFieldCount = 5;
     // Absent as zero length; an engaged record is never empty -- see `EncodeSharedCacheStatus`.
     auto const sharedCache =
         runtime.sharedCache.has_value() ? EncodeSharedCacheStatus(*runtime.sharedCache) : std::vector<std::byte> {};
+    // Absent as zero length; an engaged fleet id is never empty, and an engaged pin never encodes empty.
+    auto const fleetId = runtime.fleetId.has_value() ? AsBytes(*runtime.fleetId) : std::span<std::byte const> {};
+    auto const fleetPin = runtime.fleetPin.has_value() ? EncodeNodeFleetPin(*runtime.fleetPin) : std::vector<std::byte> {};
 
     // Positional, so the ORDER here is the wire contract for this record. Append only:
     // an insertion shifts every later field and every peer decodes one fact as the next.
@@ -7125,7 +7204,9 @@ inline constexpr std::size_t SharedCacheStatusFieldCount = 5;
                                 autoApproveLeft,
                                 stateDirectory,
                                 stateDirectoryReason,
-                                sharedCache });
+                                sharedCache,
+                                fleetId,
+                                fleetPin });
 }
 
 /// Read a runtime record back.
@@ -7322,6 +7403,13 @@ inline constexpr std::size_t SharedCacheStatusFieldCount = 5;
     // build before it; a source or state byte this build does not name leaves it absent rather
     // than refusing the whole reply.
     if (!ReadSharedCacheStatus(at(21), out.sharedCache))
+        return std::nullopt;
+
+    // Fields 22 and 23, the fleet pin's: empty is ABSENT, as for the consensus endpoint, and a pin
+    // record this build cannot read refuses the record for the rule every field above follows.
+    if (auto const fleetId = at(22); !fleetId.empty())
+        out.fleetId = std::string { AsStringView(fleetId) };
+    if (!ReadNodeFleetPin(at(23), out.fleetPin))
         return std::nullopt;
 
     return out;
@@ -7844,11 +7932,32 @@ inline constexpr std::array EnrollControlVerbTable {
 static_assert(NoRetiredEnrollControlVerbIsReused(),
               "0x01 was open and 0x02 was close; a retired verb byte is never reassigned");
 
+/// A challenge a leader issues for one pending enrollment row: `NodeChallengeBytes` it drew, which
+/// the joiner's NEXT request must sign over for that request to refresh the row.
+using EnrollChallenge = std::array<std::byte, NodeChallengeBytes>;
+
+/// The bytes a challenge travels and is signed as: all of them, or EMPTY when there is none -- the
+/// one spelling every encoder and every signed claim uses, so the two cannot disagree about absence.
+/// @param challenge The challenge, or none.
+/// @return A view of it, valid while @p challenge lives.
+[[nodiscard]] inline std::span<std::byte const> ChallengeBytes(std::optional<EnrollChallenge> const& challenge)
+{
+    return challenge.has_value() ? std::span<std::byte const> { *challenge } : std::span<std::byte const> {};
+}
+
+/// Deleted: a view of a temporary challenge dangles before it is read.
+std::span<std::byte const> ChallengeBytes(std::optional<EnrollChallenge> const&& challenge) = delete;
+
 /// A machine asking to be let in, under the identity it minted.
 ///
-/// **The key is PUBLIC and the request carries nothing secret** (#178): what the joiner proves
-/// later, on every wire, is that it holds the private half -- and what an operator checks now
+/// **The key is PUBLIC and the request carries nothing secret** (#178): what an operator checks
 /// is that the key the leader lists is the one the joiner printed.
+///
+/// **And the request is SIGNED by that key** (`Cluster::SignEnrollRequest`), over every other field:
+/// the id and the key are public -- a beacon carries one, the roster both -- so an unsigned request
+/// let any host poll under a joiner's id and key with an endpoint of its own, and the last poll
+/// before approval was what the record kept. Signed, only the key's holder can create or refresh a
+/// row under it; the leader verifies before it records anything (`EnrollmentResponder`).
 struct EnrollRequest
 {
     std::string_view nodeId; ///< The identity it minted into its own `--cluster-dir`.
@@ -7863,6 +7972,17 @@ struct EnrollRequest
     /// `NodeChallengeBytes` the joiner drew for THIS request, which an `Approved` answer is signed
     /// over: what makes a recorded admission worthless to anybody who replays it at a later ask.
     std::span<std::byte const> nonce;
+
+    /// The latest challenge the leader issued this joiner (`EnrollReplyView::challenge`), or EMPTY on
+    /// a first request. **What makes a refresh FRESH**: the joiner's own nonce gives the JOINER
+    /// freshness, and nothing gave the LEADER any, so a verbatim replay of an earlier genuine request
+    /// rolled a pending row back to an endpoint the joiner had left. A row refreshes only from a
+    /// request signed over the challenge it holds now, which it then replaces.
+    std::span<std::byte const> challenge;
+
+    /// `NodeSignatureBytes`: the joiner's signature, under `publicKey`, over every field above
+    /// (`Cluster::EnrollRequestMessage`).
+    std::span<std::byte const> signature;
 };
 
 /// The same, decoded from a received payload. The id and the endpoint are views; the role and
@@ -7874,15 +7994,18 @@ struct EnrollView
     EnrollRole role { EnrollRole::Learner };                    ///< What it asks to be admitted as.
     std::array<std::byte, IdentityPublicKeyBytes> publicKey {}; ///< Its identity key.
     std::array<std::byte, NodeChallengeBytes> nonce {};         ///< What an admission is signed over.
+    std::optional<EnrollChallenge> challenge {};                ///< The leader's it answers; none on a first ask.
+    std::array<std::byte, NodeSignatureBytes> signature {};     ///< The joiner's, over every field above.
 };
 
 /// Frame an ENROLL request.
 ///
-/// Five fields. The id, the `0xFC` endpoint the joiner currently advertises -- shown to the
+/// Seven fields. The id, the `0xFC` endpoint the joiner currently advertises -- shown to the
 /// operator beside the host the request came from -- the role because a learner and a worker
 /// are admitted by different commands, the key because it is what the cluster records
-/// instead of handing a secret back, and a nonce the answering node signs an admission over.
-/// The joiner states all five because it is the only party that knows any of them.
+/// instead of handing a secret back, a nonce the answering node signs an admission over, the
+/// leader's latest challenge (empty on a first ask), and the joiner's own signature over the six
+/// before it, which is what makes the endpoint its own and current word.
 /// @param request Who is asking, as what, under which key, and where it will answer.
 /// @param version Version to advertise.
 /// @return The framed request.
@@ -7895,16 +8018,19 @@ struct EnrollView
                                    AsBytes(request.nodeEndpoint),
                                    std::span<std::byte const> { role },
                                    request.publicKey,
-                                   request.nonce });
+                                   request.nonce,
+                                   request.challenge,
+                                   request.signature });
 }
 
 /// Split an ENROLL payload.
 ///
 /// Refuses a role this build does not implement, a key that is not exactly one key wide -- a
 /// prefix of a key is a different key, and an operator would be shown a string no machine holds --
-/// and a nonce that is not exactly `NodeChallengeBytes`, which both ends would sign and verify over
-/// different bytes. Whether the endpoint suits the role is the RESPONDER's to refuse, with a
-/// sentence of its own.
+/// a nonce that is not exactly `NodeChallengeBytes`, which both ends would sign and verify over
+/// different bytes, a challenge that is neither empty nor exactly that wide, and a signature that is
+/// not exactly `NodeSignatureBytes`, which verifies nothing. Whether the endpoint suits the role, and whether the signature
+/// VERIFIES, are the RESPONDER's to refuse, each with a sentence of its own.
 /// @param payload The bytes following the request header.
 /// @return The fields, or nullopt when malformed.
 [[nodiscard]] inline std::optional<EnrollView> DecodeEnrollPayload(std::span<std::byte const> payload)
@@ -7915,16 +8041,24 @@ struct EnrollView
     auto const role = (*fields)[2];
     auto const key = (*fields)[3];
     auto const nonce = (*fields)[4];
+    auto const challenge = (*fields)[5];
+    auto const signature = (*fields)[6];
     if (role.size() != 1 || !IsKnownEnrollRole(static_cast<std::uint8_t>(role[0])) || key.size() != IdentityPublicKeyBytes
-        || nonce.size() != NodeChallengeBytes)
+        || nonce.size() != NodeChallengeBytes || (!challenge.empty() && challenge.size() != NodeChallengeBytes)
+        || signature.size() != NodeSignatureBytes)
         return std::nullopt;
     auto view = EnrollView { .nodeId = (*fields)[0],
                              .nodeEndpoint = (*fields)[1],
                              .role = static_cast<EnrollRole>(role[0]),
                              .publicKey = {},
-                             .nonce = {} };
+                             .nonce = {},
+                             .challenge = std::nullopt,
+                             .signature = {} };
     std::ranges::copy(key, view.publicKey.begin());
     std::ranges::copy(nonce, view.nonce.begin());
+    if (!challenge.empty())
+        std::ranges::copy(challenge, view.challenge.emplace().begin());
+    std::ranges::copy(signature, view.signature.begin());
     return view;
 }
 
@@ -7956,11 +8090,10 @@ struct EnrollReplyView
 
     std::span<std::byte const> roster {}; ///< The roster, and EMPTY for every outcome but `Approved`.
 
-    /// The leader's CERTIFIED roster -- `Cluster::EncodeCertifiedRoster`'s bytes -- which an
-    /// approved worker keeps as its trust root, so it needs no `--voter-key` (#178). Empty for
-    /// every outcome but `Approved`, and empty on an approval while a majority of the voters has
-    /// not yet endorsed the roster: the worker then adopts one on its first announcement instead.
-    std::span<std::byte const> certificate {};
+    /// The challenge this joiner's NEXT request must sign over to refresh its row
+    /// (`EnrollRequest::challenge`); DISENGAGED for every outcome but `Pending`, which alone leaves
+    /// a row to refresh. Inside what the signature covers, so nobody between the ends can swap it.
+    std::optional<EnrollChallenge> challenge {};
 
     /// The answering node's signature over the answer, and DISENGAGED when the reply carries none.
     /// Every outcome is signed, and a joiner holding a key for the fleet it asked treats an answer
@@ -7977,16 +8110,22 @@ struct EnrollReplyView
 ///
 /// **The signature is two fields, both empty or both exactly one wide**, for the roster's reason: a
 /// reply carrying none says so by length, and a joiner treats such an answer as no answer.
+///
+/// Five fields: the outcome, the roster, the challenge, the key and the signature. The certified
+/// roster that once rode third is gone from the grammar (#178) -- an approved machine applies its
+/// fleet's state and verifies grants against that -- and the six-field reply that carried it is
+/// refused on its count.
 /// @param outcome What was decided.
 /// @param roster `Cluster::EncodeRoster(Cluster::ProjectRoster(state))`'s bytes for `Approved`, empty otherwise.
-/// @param certificate The leader's certified roster for `Approved`, when it has one; empty otherwise.
+/// @param challenge What the joiner's next request must sign over: exactly `NodeChallengeBytes` for
+///        `Pending`, empty for every other outcome.
 /// @param signature The answering node's signature over this answer, whatever its outcome. **No
 ///        default**: every outcome is signed, so a call that leaves it out fails to build rather than
 ///        sending an answer every joiner treats as none; a case that means unsigned says `std::nullopt`.
 /// @return The reply payload, to be carried by `EncodeReply(Status::Ok, ...)`.
 [[nodiscard]] inline std::vector<std::byte> EncodeEnrollReply(EnrollOutcome outcome,
                                                               std::span<std::byte const> roster,
-                                                              std::span<std::byte const> certificate,
+                                                              std::span<std::byte const> challenge,
                                                               std::optional<EnrollReplySignature> const& signature)
 {
     std::array<std::byte, 1> const tag { static_cast<std::byte>(outcome) };
@@ -7994,7 +8133,7 @@ struct EnrollReplyView
         signature.has_value() ? std::span<std::byte const> { signature->publicKey } : std::span<std::byte const> {};
     auto const signatureBytes =
         signature.has_value() ? std::span<std::byte const> { signature->signature } : std::span<std::byte const> {};
-    return WireFields::Encode({ std::span<std::byte const> { tag }, roster, certificate, key, signatureBytes });
+    return WireFields::Encode({ std::span<std::byte const> { tag }, roster, challenge, key, signatureBytes });
 }
 
 /// Read an ENROLL reply payload back.
@@ -8013,6 +8152,9 @@ struct EnrollReplyView
 {
     auto const fields = WireFields::SplitExactly(payload, 5);
     if (!fields.has_value())
+        return std::nullopt;
+    auto const challengeBytes = (*fields)[2];
+    if (!challengeBytes.empty() && challengeBytes.size() != NodeChallengeBytes)
         return std::nullopt;
     auto const key = (*fields)[3];
     auto const signatureBytes = (*fields)[4];
@@ -8038,10 +8180,12 @@ struct EnrollReplyView
         std::ranges::copy(key, signature->publicKey.begin());
         std::ranges::copy(signatureBytes, signature->signature.begin());
     }
-    return EnrollReplyView { .outcome = static_cast<EnrollOutcome>(tag[0]),
-                             .roster = (*fields)[1],
-                             .certificate = (*fields)[2],
-                             .signature = signature };
+    auto challenge = std::optional<EnrollChallenge> {};
+    if (!challengeBytes.empty())
+        std::ranges::copy(challengeBytes, challenge.emplace().begin());
+    return EnrollReplyView {
+        .outcome = static_cast<EnrollOutcome>(tag[0]), .roster = (*fields)[1], .challenge = challenge, .signature = signature
+    };
 }
 
 /// Frame an ENROLL-CONTROL request.

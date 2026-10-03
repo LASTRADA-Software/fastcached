@@ -29,11 +29,11 @@ namespace FastCache::Cluster
 /// travels.
 ///
 /// It exists because an empty `schedulerEndpoint` is two states (#1340). A member
-/// that has never led has not said, which is ordinary. A member whose endpoint a
-/// re-admit cleared HAD said, and `AddMember` wiped it wholesale -- right for a move,
-/// and reachable without one, because enrollment recovery re-approves through the same
-/// verb. The causes differ and so do the remedies, and the endpoint alone cannot tell
-/// them apart.
+/// that has announced none has not said -- a bootstrap peer typed on a command line,
+/// before its first announcement. A member whose endpoint was cleared HAD said, and a
+/// record re-proposed with none wiped it, since `AddMember` and `AddLearner` apply
+/// wholesale. The causes differ and so do the remedies, and the endpoint alone cannot
+/// tell them apart.
 ///
 /// **A history rather than a three-state status**, because *announced* is already what
 /// a non-empty endpoint says: storing it a second time would be a second source of
@@ -103,7 +103,8 @@ struct ClusterMember
     /// endpoint may be empty; `Validate` is where the one is required and the other is not.
     std::string raftEndpoint;
 
-    /// host:port clients reach the fleet on while this member LEADS; may be empty.
+    /// host:port this member's `0xFC` port answers on, for EVERY member, learners included; empty
+    /// until it is announced.
     ///
     /// **A second endpoint rather than one**, and the reason is a defect this pairing
     /// closes rather than a generality. `NotLeader` carries a redirect, and the one
@@ -113,14 +114,27 @@ struct ClusterMember
     /// ports, two facts, and collapsing them made every redirect in a real cluster
     /// point somewhere nothing could be done with.
     ///
-    /// Empty is legitimate and means "this member has not said". Only a *leader's*
-    /// matters, and a leader announces its own record on election -- so the value is
-    /// absent exactly for the members whose value nobody needs, and a bootstrap peer
-    /// that has never led carries none rather than carrying a guess.
+    /// **What anything resolving a machine reads** -- the redirect reads the leader's, and a
+    /// resolver reads any member's. It is the member's own word: set at join from the endpoint its
+    /// `Enroll` stated -- SIGNED by the key it asked with, and verified before the leader records or
+    /// refreshes anything (`Cluster::VerifyEnrollRequest`) -- asserted by a leader for itself on
+    /// every reconcile pass, and moved for any other member only by a PROVEN NODE-ANNOUNCE, which has
+    /// the leader re-propose that member's record with its seat and key kept
+    /// (`Cluster::AnnouncedEndpointDesires`). Never from an unproven claim, never for an id the state
+    /// does not record, one change in flight per member.
     ///
-    /// Empty has a second cause, which `schedulerEndpointHistory` tells apart: a
-    /// re-admit clears it. A reader reporting WHY it is empty asks
-    /// `SchedulerEndpointStateOf`, never this field and a second guess.
+    /// Empty is legitimate and means "this member has not said" -- a bootstrap peer that has
+    /// announced nothing yet carries none rather than a guess. **Otherwise one ANOTHER machine can
+    /// dial** (`IsPeerDialableEndpoint`): `Validate` refuses a loopback, `localhost` or wildcard one
+    /// on every route above, and each producer states none in its place, because a resolver sent
+    /// there reaches itself.
+    ///
+    /// Empty has a second cause, which `schedulerEndpointHistory` tells apart: a record
+    /// re-proposed with none clears it -- a leader whose own advertised endpoint became empty, or an
+    /// operator's re-admit under ANOTHER key, which records a replaced machine whose predecessor's
+    /// endpoint is the wrong one to dial. A re-admit under the same key, or none, states none and
+    /// KEEPS what is recorded. A reader reporting WHY it is empty asks `SchedulerEndpointStateOf`,
+    /// never this field and a second guess.
     std::string schedulerEndpoint;
 
     /// Whether `schedulerEndpoint` has ever held a value since this id was admitted.
@@ -230,9 +244,10 @@ struct RevokedKey
 /// `--cluster-status` and `fastcache-cli cluster-members` cannot answer it three ways.
 enum class SchedulerEndpointState : std::uint8_t
 {
-    Announced,      ///< Recorded: where clients reach the fleet while this member leads.
-    NeverAnnounced, ///< Never recorded. A member that has not led; the ordinary case.
-    Cleared,        ///< Recorded once and wiped by a re-admit; it returns when the member next leads.
+    Announced,      ///< Recorded: where this member's `0xFC` port answers.
+    NeverAnnounced, ///< Never recorded. A member that has announced none yet.
+    Cleared,        ///< Wiped by a record re-proposed with none -- a leader advertising none, or a machine
+                    ///< replaced under another key; back when the member next announces.
     Last,           ///< Not a state, and has no row: the length of a table keyed by one.
 };
 
@@ -661,10 +676,10 @@ struct ClusterState
     /// @return Its Raft endpoint, or nullopt when it is not a member.
     [[nodiscard]] std::optional<std::string> RaftEndpointOf(std::string_view id) const;
 
-    /// Where clients reach the fleet while `id` leads, if it has said.
+    /// Where `id`'s `0xFC` port answers, if it has said.
     ///
     /// Absent for a member that is not known, for one that has never announced
-    /// itself **and** for one a re-admit cleared, which are deliberately the same
+    /// itself **and** for one whose endpoint was cleared, which are deliberately the same
     /// answer here: all three mean there is nowhere to send a client, and a caller
     /// routing one would have nothing different to do about any of them. Telling the
     /// last two apart is a question for a person reading a report, and
@@ -926,13 +941,13 @@ struct Command
     /// empty otherwise.
     std::string value;
 
-    /// `AddMember`/`AddLearner` only: where clients reach the fleet while this member leads.
+    /// `AddMember`/`AddLearner` only: where this member's `0xFC` port answers.
     ///
     /// Applied **wholesale**, so an empty one clears whatever was recorded rather
-    /// than leaving it. That is the right way round: a member is re-admitted when its
-    /// record has changed, and a node that moved has moved both ports -- keeping the
-    /// old scheduler endpoint would redirect clients to an address that member no
-    /// longer answers, which is worse than redirecting them nowhere. The member keeps
+    /// than leaving it. That is the right way round: whoever proposes the command states
+    /// the whole record -- `SchedulerService::ClusterAdmit` carries the recorded endpoint
+    /// when its caller states none, and a member that moved has its record re-proposed with
+    /// the new one -- so an empty one here is an assertion and never an omission. The member keeps
     /// the fact that it had one (`SchedulerEndpointHistory`), which `Apply` derives
     /// rather than this command carrying it. Refused for the other two verbs, because a
     /// field a verb ignores is a field somebody misunderstood.

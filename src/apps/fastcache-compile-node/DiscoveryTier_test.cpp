@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
 #include "DiscoveryTier.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 
 #include <FastCache/Cli/Options.hpp>
@@ -56,6 +57,15 @@ using FastCache::Testing::Unwrap;
 
 namespace
 {
+/// Where a tier under test says its `0xFC` port answers: what its founding record states. One object
+/// for the whole binary, so it outlives every tier a case starts.
+/// @return The source.
+[[nodiscard]] FastCache::Cc::IAdvertisedEndpointSource const& TestAdvertised()
+{
+    static FastCache::Node::AnnouncedEndpoint const advertised { "127.0.0.1:6674" };
+    return advertised;
+}
+
 /// Where one node beacons, and how often.
 /// @param beaconAddress Where this node announces itself.
 /// @return The configuration.
@@ -145,7 +155,8 @@ struct Peer
             .fleets = fleets,
             .onPeers = [this](std::span<Cluster::DesiredMember const> peers) { seen.assign(peers.begin(), peers.end()); },
             .metrics = metrics,
-            .logger = logger }) }
+            .logger = logger,
+            .pin = {} }) }
     {
     }
 };
@@ -504,12 +515,11 @@ TEST_CASE("Discovery on a consensus port bound to loopback stands down when defa
 
     auto started = ConsensusTier::Start(
         cfg,
-        {},
+        TestAdvertised(),
         TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
-        core::platform::defaultSystemWallClock(),
-        {},
+        ConsensusTier::LeaderContactObserver {},
         metrics,
         logger,
         nullptr,
@@ -720,7 +730,8 @@ struct BeatingTier
                                    .fleets = fleets,
                                    .onPeers = [](std::span<Cluster::DesiredMember const>) {},
                                    .metrics = metrics,
-                                   .logger = logger });
+                                   .logger = logger,
+                                   .pin = {} });
     }
 
     /// Run @p count beats, one beacon interval apart, the first at the current instant.

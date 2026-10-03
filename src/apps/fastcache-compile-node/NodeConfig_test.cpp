@@ -38,6 +38,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <initializer_list>
 #include <optional>
 #include <ranges>
 #include <sstream>
@@ -514,6 +515,8 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.discoveryAddress = "255.255.255.255:6681";
     cfg.discoveryReplyPort = 6682;
     cfg.fleetSeeds = { "office-a:6674", "office-b:7000" };
+    cfg.fleetPin = Cluster::PinnedFleet { .clusterId = "0123456789abcdef0123456789abcdef",
+                                          .voterKeys = { Testing::TestKeyPair("scheduler-01.internal").PublicKey() } };
     cfg.logLevel = LogLevel::Debug;
     // Worker state, so it has to survive a registration: a service installed with
     // timestamps on must come back with them on, or the operator who turned them on
@@ -726,29 +729,22 @@ TEST_CASE("A node with no roster admits by key nobody, so only --fleet-open or i
     NodeConfig cfg;
     cfg.nodeListen = "0.0.0.0:6674";
     CHECK_FALSE(AdmitsRemotePeers(cfg, RosterPresence::Absent));
-    CHECK(AdmitsRemotePeers(cfg, RosterPresence::Held));
-    // Unknown asks the configuration, and nothing in this one can hold a roster...
+    // Unknown counts a key route only where consensus runs, and nothing in this one runs it...
     CHECK_FALSE(AdmitsRemotePeers(cfg, RosterPresence::Unknown));
-    // ...until something can: a state directory may keep one.
+    // ...and a state directory is NO key route any more: a node's roster is the state its own
+    // consensus applies (#178, T25), and no directory keeps one for a node that runs none.
     cfg.clusterDir = "cluster";
-    CHECK(AdmitsRemotePeers(cfg, RosterPresence::Unknown));
+    CHECK_FALSE(AdmitsRemotePeers(cfg, RosterPresence::Unknown));
     CHECK_FALSE(AdmitsRemotePeers(cfg, RosterPresence::Absent));
     cfg.fleetOpen = true;
     CHECK(AdmitsRemotePeers(cfg, RosterPresence::Absent));
 
-    // Each clause that may give this node a roster is a key route on its own: a state directory
-    // may keep one an earlier run adopted.
-    NodeConfig anchored;
-    anchored.clusterDir = "cluster";
-    CHECK(AdmitsByKey(anchored));
-    CHECK(AdmitsRemotePeers(anchored, RosterPresence::Unknown));
-    // Consensus is one, on a solitary node too: it admits nobody else yet, but an approval makes
+    // Consensus IS one, on a solitary node too: it admits nobody else yet, but an approval makes
     // it a fleet's founder without a restart, and its roster then admits machines by key.
     auto const clustered = Testing::FirstStart(NodeConfig {});
     REQUIRE(RunsConsensus(clustered));
-    CHECK(AdmitsByKey(clustered));
     CHECK(AdmitsRemotePeers(clustered, RosterPresence::Unknown));
-    CHECK_FALSE(AdmitsByKey(NodeConfig {}));
+    CHECK_FALSE(AdmitsRemotePeers(clustered, RosterPresence::Absent));
 
     // And the fleet the formation record puts this node in widens whatever is known about a
     // roster: a pending node is about to be handed a member set, and a joined one's members are
@@ -771,14 +767,13 @@ TEST_CASE("A network-facing worker with a roster reaches other machines through 
     // The first fail-open guard: the ticket route must reach the question that decides
     // whether a worker may build `UncheckedLeaseValidator`, or removing `--fleet-member`
     // made every roster-holding worker look single-machine.
-    NodeConfig cfg;
+    auto cfg = Testing::FirstStart(NodeConfig {}); // runs consensus, so it holds a roster
+    REQUIRE(RunsConsensus(cfg));
     cfg.nodeListen = "0.0.0.0:6674";
-    cfg.clusterDir = "cluster"; // a state directory may keep a roster
-    CHECK(CompileVerbsReachOtherMachines(cfg, RosterPresence::Held));
     CHECK(CompileVerbsReachOtherMachines(cfg, RosterPresence::Unknown));
     CHECK_FALSE(CompileVerbsReachOtherMachines(cfg, RosterPresence::Absent));
     cfg.nodeListen = "127.0.0.1:6674"; // the port faces nothing
-    CHECK_FALSE(CompileVerbsReachOtherMachines(cfg, RosterPresence::Held));
+    CHECK_FALSE(CompileVerbsReachOtherMachines(cfg, RosterPresence::Unknown));
 }
 
 TEST_CASE("A compile port bound by NAME faces the network, whatever the name begins with", "[node][config][admission]")
@@ -787,20 +782,20 @@ TEST_CASE("A compile port bound by NAME faces the network, whatever the name beg
     // it IS -- a name -- and a name may resolve anywhere. `127.cache.example.com` read as
     // loopback while `IsLoopbackHost` matched a prefix, which switched the lease check OFF for a
     // port that could be facing the network: the fail-open direction. Every name now faces it.
-    NodeConfig cfg;
-    cfg.clusterDir = "cluster"; // a state directory may keep a roster
+    auto cfg = Testing::FirstStart(NodeConfig {}); // runs consensus, so it holds a roster
+    REQUIRE(RunsConsensus(cfg));
     for (auto const* named: { "127.cache.example.com:6674", "localhost:6674", "worker-01.internal:6674" })
     {
         INFO(named);
         cfg.nodeListen = named;
-        CHECK(CompileVerbsReachOtherMachines(cfg, RosterPresence::Held));
+        CHECK(CompileVerbsReachOtherMachines(cfg, RosterPresence::Unknown));
     }
     // The control: a loopback LITERAL anywhere in 127.0.0.0/8 faces nothing.
     for (auto const* literal: { "127.0.0.1:6674", "127.5.5.5:6674", "[::1]:6674" })
     {
         INFO(literal);
         cfg.nodeListen = literal;
-        CHECK_FALSE(CompileVerbsReachOtherMachines(cfg, RosterPresence::Held));
+        CHECK_FALSE(CompileVerbsReachOtherMachines(cfg, RosterPresence::Unknown));
     }
 }
 
@@ -2076,8 +2071,9 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
     {
         // This section asserted a refusal naming `--fleet-member` and `--fleet-open`: an
         // empty member set on a node that was not clustered. Since #178 a scheduler IS
-        // clustered -- it signs every grant with its identity key and hands its workers a
-        // roster its voters certify, so it holds replicated state even alone -- and since
+        // clustered -- it signs every grant with its identity key, and its workers check that
+        // signature against the state their own consensus applied, so it holds replicated
+        // state even alone -- and since
         // the mode decides the duty, a node whose consensus is closed serves none: there is
         // no such scheduler left to refuse. Its roster admits machines by key, which is a
         // route to admission no startup rule can read.
@@ -5554,14 +5550,15 @@ TEST_CASE("ObservabilityAnnouncement tells a fleet node it opens no admin surfac
 
     SECTION("a node admitting another machine is told, and told what to type")
     {
-        // A state directory, which may keep a roster that admits machines by key, on a
-        // port another machine can reach -- asked of a node running no consensus, whose
-        // roster is whatever that directory keeps. Such a node runs no worker: one would have
-        // nowhere to register, and is refused by name (`WorkerConsensusClosed`), so this is
-        // the cache-only node that shape still starts as.
+        // `--fleet-open`, which admits every caller, on a port another machine can reach --
+        // asked of a node running no consensus, so the open policy is the ONE route: a state
+        // directory admits nobody by key since T25 (a node's roster is the state its own
+        // consensus applies). Such a node runs no worker: one would have nowhere to register,
+        // and is refused by name (`WorkerConsensusClosed`), so this is the cache-only node that
+        // shape still starts as.
         auto cfg = base();
         cfg.raftListen.clear();
-        cfg.clusterDir = "cluster";
+        cfg.fleetOpen = true;
         cfg.slots = 0;
         INFO("refusal: " << StartupPolicyRejection(cfg).value_or("<none>"));
         REQUIRE_FALSE(StartupPolicyRejection(cfg).has_value());
@@ -6700,4 +6697,95 @@ TEST_CASE("Each one-shot verb family is named by one predicate that routing and 
             CHECK(IsOneShotVerb(cfg, verb) == (row.family == verb));
         CHECK(AimsAtScheduler(cfg) == row.family.has_value());
     }
+}
+
+namespace
+{
+/// The office's pin as `fastcache-cli node` prints it: its cluster and the keys of @p voters.
+/// @param voters Whose `TestKeyPair` it names.
+/// @return The text `--fleet-id` takes.
+[[nodiscard]] std::string OfficePinText(std::initializer_list<std::string_view> voters = { "n-office" })
+{
+    auto fleet = Cluster::PinnedFleet { .clusterId = "0123456789abcdef0123456789abcdef", .voterKeys = {} };
+    for (auto const voter: voters)
+        fleet.voterKeys.push_back(Testing::TestKeyPair(std::string { voter }).PublicKey());
+    return Cluster::FormatPinnedFleet(fleet);
+}
+} // namespace
+
+TEST_CASE("A fleet pin is a cluster id and its voters' keys, and anything else is refused by name", "[node][config][pin]")
+{
+    CHECK_FALSE(Unwrap(ParseNodeArgv({})).fleetPin.has_value()); // absent: trust on first use
+
+    // One voter and two, round-tripping through the one formatter.
+    for (auto const& text: { OfficePinText(), OfficePinText({ "n-office", "n-desk" }) })
+    {
+        INFO("pin: " << text);
+        auto const token = std::format("--fleet-id={}", text);
+        auto const parsed = Unwrap(ParseNodeArgv({ token.c_str() })).fleetPin;
+        REQUIRE(parsed.has_value());
+        CHECK(Cluster::FormatPinnedFleet(Unwrap(parsed)) == text);
+    }
+
+    // WHICH refusal, each named: an id with no key is NEVER a pin by name; a truncated or capitalised
+    // id; a key that is not one; a key twice.
+    auto const key = FormatEd25519PublicKey(Testing::TestKeyPair("n-office").PublicKey());
+    struct Row
+    {
+        std::string value; ///< What the operator typed.
+        std::string says;  ///< What the refusal must say.
+    };
+    for (auto const& row:
+         { Row { .value = "0123456789abcdef0123456789abcdef", .says = "and no voter key" },
+           Row { .value = "0123456789abcdef0123456789abcdef@", .says = "and no voter key" },
+           Row { .value = std::format("0123456789abcdef0123456789abcde@{}", key), .says = "32 lowercase hex digits" },
+           Row { .value = std::format("0123456789ABCDEF0123456789ABCDEF@{}", key), .says = "32 lowercase hex digits" },
+           Row { .value = "0123456789abcdef0123456789abcdef@not-a-key", .says = "voter key 1" },
+           Row { .value = std::format("0123456789abcdef0123456789abcdef@{},{}", key, key), .says = "twice" } })
+    {
+        INFO("value: '" << row.value << "'");
+        auto const token = std::format("--fleet-id={}", row.value);
+        auto const refused = ParseNodeArgv({ token.c_str() });
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().field == "--fleet-id");
+        CHECK(refused.error().context.contains(row.says));
+    }
+
+    // A restart judges the record against a new pin by name; a reload could not.
+    auto const rows = NodeOptions();
+    auto const row =
+        std::ranges::find_if(rows, [](OptionSpec<NodeConfig> const& option) { return option.primary == "--fleet-id"; });
+    REQUIRE(row != rows.end());
+    CHECK(row->reloadable == Reloadable::No);
+    CHECK(row->yamlKey == "fleet_id");
+}
+
+TEST_CASE("A configuration file's fleet_id pins the node, and the command line's wins", "[node][config][pin]")
+{
+    std::vector<YamlSetting> const file { Setting("fleet_id", { OfficePinText() }) };
+    auto const fromFile = FromFileAndArgv(file, {});
+    REQUIRE(fromFile.has_value());
+    REQUIRE(fromFile->fleetPin.has_value());
+    CHECK(Cluster::FormatPinnedFleet(Unwrap(fromFile->fleetPin)) == OfficePinText());
+
+    auto const typed = std::format("--fleet-id={}", OfficePinText({ "n-desk" }));
+    auto const replaced = FromFileAndArgv(file, { typed.c_str() });
+    REQUIRE(replaced.has_value());
+    REQUIRE(replaced->fleetPin.has_value());
+    CHECK(Cluster::FormatPinnedFleet(Unwrap(replaced->fleetPin)) == OfficePinText({ "n-desk" }));
+}
+
+TEST_CASE("A registration carries the pin exactly when one was given, and comes back pinned", "[node][config][pin][service]")
+{
+    auto const exe = std::filesystem::path { "fastcache-compile-node" };
+    auto const bare = MakeNodeServiceSpec(exe, Testing::FirstStart(NodeConfig {}), Testing::InstallerPathProbe());
+    CHECK(std::ranges::none_of(bare.arguments, [](std::string const& a) { return a.starts_with("--fleet-id"); }));
+
+    auto const token = std::format("--fleet-id={}", OfficePinText({ "n-office", "n-desk" }));
+    auto const pinned = MakeNodeServiceSpec(exe, Unwrap(ParseNodeArgv({ token.c_str() })), Testing::InstallerPathProbe());
+    CHECK(std::ranges::count(pinned.arguments, token) == 1);
+    auto const reparsed = ReparseSpec(pinned);
+    REQUIRE(reparsed.has_value());
+    REQUIRE(reparsed->fleetPin.has_value());
+    CHECK(Cluster::FormatPinnedFleet(Unwrap(reparsed->fleetPin)) == OfficePinText({ "n-office", "n-desk" }));
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "ConsensusStanding.hpp"
 #include "FrameEndpoint.hpp"
 
 #include <FastCache/Core/Ed25519.hpp>
@@ -70,6 +71,10 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
     /// @param identity This node's identity key pair, read once at startup; must outlive this.
     /// @param roster Which identity keys the cluster holds live and which it revoked -- the node's
     ///        admission oracle, whose `ExplainKey` is the one door to that answer; must outlive this.
+    /// @param consensus Whether the state that roster is published from has caught up with the log
+    ///        this node recovered at start: a key it lacks while it has not is refused
+    ///        `RosterNotYetApplied`, never `NodeKeyUnknown`. The node's `ConsensusStandingSlot`, which
+    ///        answers `Unknown` until the tier is attached; must outlive this.
     /// @param random Where a handshake's nonce and ephemeral key come from; must outlive this. A
     ///        test scripts it to fail, which is how a challenge this node cannot draw is shown to
     ///        be refused.
@@ -79,12 +84,14 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
     NodeProofResponder(std::string nodeId,
                        Ed25519KeyPair const& identity,
                        Distributed::IMembershipOracle const& roster,
+                       IConsensusStandingSource const& consensus,
                        ISecureRandom& random,
                        IMetricsSink& metrics,
                        ILogger& logger) noexcept:
         _nodeId { std::move(nodeId) },
         _identity { identity },
         _roster { roster },
+        _consensus { consensus },
         _random { random },
         _metrics { metrics },
         _logger { logger }
@@ -243,6 +250,7 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
     std::string _nodeId;
     Ed25519KeyPair const& _identity;
     Distributed::IMembershipOracle const& _roster;
+    IConsensusStandingSource const& _consensus;
     ISecureRandom& _random;
     IMetricsSink& _metrics;
 

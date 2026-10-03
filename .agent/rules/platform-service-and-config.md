@@ -471,8 +471,8 @@ readable and silently ignored. Every rule below has already been one of them.
     refusals are of several kinds, so each `*OrExplain` refusal carries a `NodeRefusalCause`
     (`NodeRefusal.hpp`) and `main` ends with that cause's exit. The census names the cause
     every refusal site spells, one site per arm; `NodeRefusal_test` holds each cause to its
-    exit. A kept roster or a credential file that was read and cannot be used is `Refused`;
-    one that could not be read (`KeptRosterIo`, `CredentialIo`), a port, a store, TLS
+    exit. A credential file that was read and cannot be used is `Refused`; one that could
+    not be read (`CredentialIo`), a port, a store, TLS
     material, a scratch root and the toolchain survey are `Failed`. **An identity file that is
     there and cannot be read is not an absent one**: it used to be read as absent and MINTED
     over.
@@ -674,9 +674,12 @@ readable and silently ignored. Every rule below has already been one of them.
   start -- so the OPTIONAL properties are REMEMBERED (the WiX remember-property pattern: saved
   before `AppSearch`, read back from `HKLM\SOFTWARE\fastcached\Installer`, restored, written
   again by a deferred `FastCacheRemember*` action on every transaction that registers; a root-feature
-  component only OWNS the key, since a feature change reinstalls no component). Three of them:
-  `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_NODE_ADVERTISE` and `FASTCACHE_FLEET_SEED`, each a row of
-  `check-wix-service-table` and of the remember case. Not remembering them failed OPEN: a repair that left out
+  component only OWNS the key, since a feature change reinstalls no component). Four of them:
+  `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_NODE_ADVERTISE`, `FASTCACHE_FLEET_SEED` and `FASTCACHE_FLEET_ID`
+  (passed VERBATIM, a pin being security material), each a row of `check-wix-service-table` and of the
+  remember case. **The writes run BEFORE either registration**: `Return="check"` exists to fail the
+  transaction loudly, and a failure AFTER the registrations rolled the files back under services it
+  had already registered and started. Not remembering them failed OPEN: a repair that left out
   `FASTCACHE_FIREWALL_ALLOW` opened the rules to any address. The `[msi]` remember case runs the
   fragment's own rows across install, repair, upgrade and repair. `FASTCACHE_NODE_ADVERTISE` is OPTIONAL and reaches
   the command line only through the derived `FastCacheNodeAdvertiseArgument`, so an absent one is

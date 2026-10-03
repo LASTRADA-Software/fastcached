@@ -101,8 +101,9 @@ struct EnrollRoleRow
     CompileCacheWire::EnrollRole role; ///< The wire role.
     std::string_view name;             ///< Its one spelling in a list and in a sentence.
 
-    /// Whether a request in this role states an endpoint. A learner does not: it dials the
-    /// leader rather than being dialled.
+    /// Whether a request in this role states an endpoint -- where its `0xFC` port answers, which the
+    /// approval records as the member's `schedulerEndpoint`. A learner does: its record is how any
+    /// machine of the fleet resolves it, though nobody dials its consensus port.
     bool statesEndpoint;
 
     /// The seat `ClusterAdmit` records the joiner in. A learner's is `Learner`: it dials in, so it
@@ -118,7 +119,7 @@ struct EnrollRoleRow
 inline constexpr std::array EnrollRoleTable {
     EnrollRoleRow { .role = CompileCacheWire::EnrollRole::Learner,
                     .name = "learner",
-                    .statesEndpoint = false,
+                    .statesEndpoint = true,
                     .seat = Cluster::MemberSeat::Learner },
 };
 
@@ -179,6 +180,15 @@ struct JoinerClaim
     std::string_view nodeEndpoint;                                                ///< The `0xFC` endpoint it claims.
     CompileCacheWire::EnrollRole role { CompileCacheWire::EnrollRole::Learner };  ///< What it asks to be.
     std::array<std::byte, CompileCacheWire::IdentityPublicKeyBytes> publicKey {}; ///< The key it asks under.
+
+    /// The leader's challenge the request signed over, or none: what decides whether it may REFRESH
+    /// its row -- only an answer to the challenge the row holds now (`EnrollRequest::challenge`).
+    std::optional<CompileCacheWire::EnrollChallenge> answered {};
+
+    /// What the leader drew for this request: the row's challenge from here on when the request
+    /// creates the row or refreshes it, and unused otherwise. Drawn by the caller, from a secure
+    /// source, so this class stays free of one.
+    CompileCacheWire::EnrollChallenge issue {};
 };
 
 /// What an operator's decision did.
@@ -269,6 +279,12 @@ class EnrollmentWindow
     /// @param peerId The host the kernel says the request came from.
     /// @return What to answer.
     [[nodiscard]] EnrollDecision Offer(JoinerClaim const& claim, std::string_view peerId);
+
+    /// The challenge @p nodeId's row holds now: what its joiner's next request must sign over to
+    /// refresh it, and what a `Pending` answer hands it.
+    /// @param nodeId Who to look for.
+    /// @return The challenge, or nothing when no row carries the id.
+    [[nodiscard]] std::optional<CompileCacheWire::EnrollChallenge> ChallengeFor(std::string_view nodeId) const;
 
     /// Record the fingerprint of the roster just handed to @p nodeId.
     ///
@@ -476,6 +492,11 @@ class EnrollmentWindow
     /// row nobody's deadline admitted. Guarded by `_mutex`, beside the list for `_firstSeen`'s
     /// reason.
     mutable std::vector<std::optional<core::platform::SteadyTimePoint>> _autoApprovedArmedAt;
+
+    /// The challenge each row holds now, parallel to `_pending`: a refresh must sign over it and
+    /// replaces it. Guarded by `_mutex`; beside the list because the list is the WIRE's, and a
+    /// challenge is nobody's to read but the joiner it was issued to.
+    mutable std::vector<CompileCacheWire::EnrollChallenge> _challenges;
 
     /// The armed auto-approve deadline, or nothing. Guarded by `_mutex`; `mutable` for `LapseLocked`.
     mutable std::optional<core::platform::SteadyTimePoint> _autoApproveUntil;

@@ -56,6 +56,9 @@ class FakeCluster final: public IClusterAdmin
         return _state;
     }
 
+    /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
+    void NoteAnnouncedEndpoint(Consensus::NodeId const& /*member*/, std::string /*endpoint*/) override {}
+
     [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& /*command*/) override
     {
         return {};

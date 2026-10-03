@@ -39,8 +39,8 @@ namespace
     /// A dash where a value is absent, so a column is never blank.
     ///
     /// An empty cell reads as "nothing was rendered here" while a dash reads as
-    /// "this member has not said" -- which for a scheduler endpoint is the ordinary
-    /// state of every node that has never led, and not a fault.
+    /// "this member has not said" -- which for a scheduler endpoint is the state of
+    /// a member that has announced none, and not a fault.
     constexpr std::string_view Absent = "-";
 
     /// What a receipt says for an admission that stated no key (#178). Not `Absent`: the
@@ -102,8 +102,9 @@ std::string RenderClusterState(Cluster::ClusterState const& state)
         out += "  (none)\n";
     for (auto const& member: state.members)
     {
-        // An absent endpoint says WHY (#1340): a member that never led and one a
-        // re-admit cleared both carry none, and only the second had one to lose. The
+        // An absent endpoint says WHY (#1340): a member that announced none and one a
+        // record re-proposed with none cleared both carry none, and only the second had
+        // one to lose. The
         // word comes from the table every member renderer spells it from.
         auto const scheduler = member.schedulerEndpoint.empty()
                                    ? std::format("{} ({})", Absent, Cluster::SchedulerEndpointStateName(member))
@@ -238,8 +239,8 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
                                "\n"
                                "Compare the first three lines against the machine itself -- the id it minted\n"
                                "into --cluster-dir, the consensus endpoint its own --print-surfaces prints,\n"
-                               "and the identity key its --node-status prints (or `fastcache-cli node`\n"
-                               "against it). Each is one thing spelled on two machines, and nothing else\n"
+                               "and the identity key `fastcache-cli node` prints against it. Each is one\n"
+                               "thing spelled on two machines, and nothing else\n"
                                "compares them.\n",
                                "member id",
                                ReceiptLabelColumn,

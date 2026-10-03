@@ -6,6 +6,7 @@
 
 #include <FastCache/Cluster/ProvenFleet.hpp>
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
@@ -76,6 +77,7 @@ class EnrollmentResponder final: public IFrameResponder
     ///        the one its FLEET-SUMMARY answer states, so the key a joiner proved and the cluster it
     ///        proved it for are one reading. Must outlive this.
     /// @param identity This node's identity key, which signs every admission; must outlive this.
+    /// @param random Where each pending row's challenge is drawn; must outlive this.
     /// @param metrics Where refusals and admissions served are recorded; must outlive this.
     /// @param logger Where a reject of an already-admitted machine is said out loud.
     ///
@@ -89,6 +91,7 @@ class EnrollmentResponder final: public IFrameResponder
                         Distributed::IMembershipOracle const& membership,
                         Cluster::IFleetSummarySource const& self,
                         Ed25519KeyPair const& identity,
+                        ISecureRandom& random,
                         IMetricsSink& metrics,
                         ILogger& logger):
         _window { window },
@@ -96,6 +99,7 @@ class EnrollmentResponder final: public IFrameResponder
         _membership { membership },
         _self { self },
         _identity { identity },
+        _random { random },
         _metrics { metrics },
         _logger { logger }
     {
@@ -350,6 +354,11 @@ class EnrollmentResponder final: public IFrameResponder
     Distributed::IMembershipOracle const& _membership;
     Cluster::IFleetSummarySource const& _self;
     Ed25519KeyPair const& _identity;
+
+    /// Where each pending row's challenge is drawn (`EnrollChallenge`): the operating system's
+    /// generator, so a replay cannot predict the challenge a refresh must answer (#1527).
+    ISecureRandom& _random;
+
     IMetricsSink& _metrics;
 
     /// Where the one condition no counter can carry is said out loud: a machine rejected

@@ -1031,8 +1031,8 @@ Consequences that are each load-bearing:
   and here the separator argument is not hypothetical — an endpoint is `host:port`,
   so `{endpoint="a", key="b:1"}` and `{endpoint="a:b", key="1"}` would authenticate
   identically. The message is prefixed with its own **domain label**
-  (`fastcache-lease-v3`), because the same key signs Raft handshakes and roster
-  endorsements and one key serving two constructions is how a signature made for one
+  (`fastcache-lease-v3`), because the same key signs Raft handshakes and node proofs,
+  and one key serving two constructions is how a signature made for one
   comes to pass for the other. The token wraps the `LeaseTable` serial rather than
   replacing it, which is what keeps that component pure — no key, no wall clock, no
   crypto in the thing whose whole job is a deterministic unit test. See
@@ -1111,8 +1111,8 @@ Consequences that are each load-bearing:
   under all of them.** The pre-shared key's seam for this -- `Cluster/ClusterSigning.hpp`, its
   `SigningDomainTable` and `ctest -R psk-signing-seam` -- was DELETED with the key at #178 PR 6
   (#402 is why it existed). The question it answered did not go: a scheduler's node key signs
-  its leases, its challenge replies, its Raft proofs and verdicts, its discovery proof and its
-  roster endorsements, so a construction whose label another shares is a credential valid on
+  its leases, its challenge replies, its Raft proofs and verdicts and its discovery proof, so a
+  construction whose label another shares is a credential valid on
   the other surface. `NodeProof_test` asserts the labels distinct ACROSS constructions; the
   argument is in `consensus-and-cluster.md`.
 - **Asymmetric cryptography has ONE seam too: `Core/Ed25519`, `Core/X25519` and `Core/Hkdf`,
@@ -1357,8 +1357,8 @@ Consequences that are each load-bearing:
   question the ratchet was standing in for.
 
 - **A scheduler IS a consensus member, alone or not, so no grant is unsigned.** It signs
-  with its own identity key, which a consensus node always holds, and hands its workers a
-  roster its voters certify, which is replicated state (#178, owner decision 3). One
+  with its own identity key, which a consensus node always holds, and every worker checks the
+  grant against the replicated state its own consensus applied (#178, owner decision 3). One
   without `--listen-raft` is refused by name (`SchedulerNeedsConsensusRefusal`), and
   that is a refusal of the SCHEDULER, not of a single-machine install: a pure worker
   runs no consensus. It closed #303, whose objection -- a refusal would break every
@@ -1367,42 +1367,41 @@ Consequences that are each load-bearing:
   never a bind, so the socket-activation hole the worker's rule below has to backstop
   does not exist here. The row it replaced -- a non-clustered scheduler with no member
   set -- describes a node that can no longer be configured.
-- **A signature is only as good as the answer to "is this signer an unrevoked voter", and a
-  worker that runs no consensus cannot read the state that answers it -- so it holds a
-  CERTIFIED ROSTER** (#178). A consensus member asks the state it applies
-  (`StateLeaseRoster`); every other worker asks `RosterTrust`. Both are `ILeaseRoster`, and
-  `SignedLeaseValidator` takes one and never a key.
-  - **A worker adopts v' >= v only if a STRICT MAJORITY of the voters in the roster it HOLDS
-    endorse it, unexpired** (`CertifyRoster`: `needed = voters / 2 + 1`, every voter in the
-    denominator). Its anchors root only the FIRST roster, and are never read again once
-    one is held -- as the replicated state wins over the keys a formation record names. So a
-    revoked ex-leader that withholds the roster revoking it and serves one of its own, with
-    itself as the only voter, is ONE endorsement of three and is refused. **A majority of
-    the voters the worker already trusts, never of the voters the offered roster names**:
-    counting the offer's own voters is a roster certifying itself.
-  - **A voter endorses `[clusterId, version, SHA-256(roster), notAfter]`, every 15 minutes
-    for an hour** (owner decision 4), and the endorsement rides NODE-ANNOUNCE, whose reply
-    carries the newest roster a majority endorsed. The version is DERIVED in `Apply` from the
-    projection, never bumped per verb: a verb that changes the roster only sometimes must not
-    move it on a no-op, and every voter applying one log must reach one number.
-  - **Past `notAfter` plus the skew slack, every grant is refused `RosterExpired`** -- the
-    bound on a worker cut off with a withholding ex-leader, which otherwise goes on honouring
-    the revoked machine's grants forever. `NoRoster` shares the wire code and not the counter:
-    one never reached a leader its anchors endorse, the other did and was cut off. Both are
-    facts about THIS worker, so answering them before the signature is no oracle.
-    `SignerRevoked` shares `LeaseUnauthorized`'s code and keeps a counter, for
-    `ClusterMismatch`'s reason. The gauge is `fastcache_node_roster_expires_in_seconds`,
-    ABSENT on a consensus member, whose roster never expires.
-  - **The presence round follows a redirect before it reads the reply**
-    (`AnnouncePresence`, reached by the node's loop and by `FleetHarness` alike), so a worker
-    whose remembered leader was deposed adopts the new leader's roster in the SAME round. A
-    worker holding no current roster asks every `RosterWantingInterval`, not every
-    `NodeAnnounceInterval`: it is compiling nothing until one arrives.
-  - **A roster is kept only with `--cluster-dir`, and a kept one that cannot be used REFUSES
-    the start** (`NodeRoster::Build`) -- it may be all that stands between this worker and a
-    voter revoked since. No start reaches this worker any more: one with its consensus closed
-    is refused (`WorkerConsensusClosed`), so every worker checks the state it applies, and the
-    kept roster awaits its deletion.
+- **A worker checks a grant against the ROSTER ITS OWN CONSENSUS APPLIED** (`StateLeaseRoster`,
+  #178). Principal mode is retired: every machine in a fleet is a member, a voter or a learner,
+  that applies the replicated state, so the certified roster, its endorsements, the
+  `--voter-key` anchors, the roster store and `RosterExpired` existed for a machine that no
+  longer exists, and they are removed rather than kept dormant. A learner whose machine was off
+  for days verifies against the state it last applied and catches up through Raft (a snapshot if
+  it fell behind compaction); a grant from a voter forgotten meanwhile is refused as soon as the
+  learner applies the forget.
+  - **The threat that survives Raft, and its bound.** A worker cut off from its fleet with a voter
+    the fleet has since FORGOTTEN still lists that voter, so the voter's fresh grants verify; the
+    certified roster bounded that at its hour, and nothing replaced the bound until it was taken
+    from the node's OWN consensus: past `LeaderSilenceBound` (65 minutes, chosen on purpose --
+    too short refuses work during a consensus-only partition, too long widens the window) without
+    a leader its APPLIED configuration counts, every grant is refused `Isolated`, a `NoRoster`-class
+    fact about THIS worker with a counter of its own, and `consensus-leader-silent` is raised. The
+    contact is the driver's (`RaftNode::LastLeaderContact`, read raw per reconcile pass through
+    `LeaderReadingOf`), on the steady clock, so an NTP step neither lapses nor revives it -- and
+    whether its leader COUNTS is asked of the voters the ROSTER applied
+    (`StateLeaseRoster::NoteLeaderReading`), never of the driver's configuration: that is the
+    ACTIVE one, which an uncommitted entry can move, so a learner promoting itself there would
+    otherwise refresh the bound.
+  - **The residual, and the direction it fails in**: WITHIN the bound, a worker isolated with a
+    revoked voter honours that voter's grants until it next applies; and a forgotten voter that
+    keeps the worker's session alive and goes on speaking AS a leader its stale configuration
+    counts -- altered code, since an honest one alone loses its quorum and stops leading -- is not
+    bounded at all. It fails OPEN in that direction; only reaching the fleet ends it. And the
+    START counts as contact, so a node starting cut off has the bound to find its fleet -- which
+    means every restart, and every reform, re-opens the window for a worker that stays isolated.
+  - `SignedLeaseValidator` takes an `ILeaseRoster` and never a key, and
+  `KeysOf` answers VOTERS only: a grant is a voter's, and a learner never leads. `NoRoster` is
+  the state that records no voter's key yet -- a fact about THIS worker, so answering it before
+  the signature is no oracle -- and `SignerRevoked` shares `LeaseUnauthorized`'s code and keeps a
+  counter, for `ClusterMismatch`'s reason. A worker that runs no consensus holds no roster, so
+  one other machines can reach is refused at startup (`RosterlessWorkerRefusal`) and a reload
+  may not widen admission onto it.
 - **Whether a worker CHECKS a lease is a startup decision, never a per-request
   fallback.** The two are not the same rule written twice. "No key, so skip the
   check" taken per request is silent degradation of exactly the kind this file
@@ -3329,9 +3328,11 @@ and logged: it makes room and bans nobody, since a machine still asking is recor
 
 **No secret crosses, and a test proves it against the whole frame.** The joiner sends
 its role and its public key; `Approved` carries `Cluster::EncodeRoster(ProjectRoster(state))`
--- members with seat and key, principals and revoked keys, in a versioned encoding shared
-with #178 PR 5's certified roster -- which carries nothing an election moves, so its
-fingerprint does not move when somebody leads. The acceptance case scans the WHOLE approve frame for
+-- members with seat, key and recorded `0xFC` endpoint, principals and revoked keys, in a
+versioned encoding. The endpoint is what the joiner remembers its fleet's voters at, so a
+fleet serving another port is reached where it RECORDED, never at a guess from the consensus
+host; and it moves the fingerprint when a member announces a move, which only mattered while
+voters certified a roster per digest. The acceptance case scans the WHOLE approve frame for
 the leader's seed, its 64-byte signing layout and a cluster key -- raw, and as base64,
 base64url and hex in both cases, because a hand-over that forwarded a key FILE carries no
 raw run of the key's bytes -- beside POSITIVE controls: a seed planted where a roster
@@ -3354,6 +3355,28 @@ would let whoever polled last swap a key in the minutes between `--enroll-list` 
 `--enroll-approve`, which are the minutes an operator's comparison is supposed to cover.
 A joiner that genuinely re-minted (a wiped state directory) enrolls again once its old row
 is forgotten.
+
+**And the address a row refreshes is the KEY HOLDER's word, because the request is SIGNED**
+(`Cluster::SignEnrollRequest`, label `fastcache-enroll-request-v1`, over every field the request
+states). The id and the key are public -- a beacon carries the key, the roster both -- and the
+pending row's `0xFC` endpoint is what an approval RECORDS, so an unsigned request let any host
+poll under a joiner's pair with its own endpoint and the last poll before the approval was the
+member record (T26 review I-1). The responder verifies before the window records or refreshes
+anything, and before any other claim is reported on -- a forged request under a REVOKED key is
+told `NodeProofRejected`, never that the key is revoked -- counted
+(`EnrollmentRequestsRefusedForged`).
+
+**And a REFRESH is fresh for the leader, not only for the joiner** (T26 re-check I-1). The
+joiner's nonce binds the ANSWER to one ask; nothing bound the REQUEST to one, so a genuine
+request recorded on the way and replayed later rolled a pending row back to an endpoint the
+joiner had left. Each row holds a challenge the leader drew from `ISecureRandom` (a failed draw
+is refused `NoCluster`, uncounted), every `Pending` answer hands it out inside the admission
+signature, and only a request signed over the challenge the row holds NOW refreshes the row --
+replacing it. A stale answer is still answered and keeps the row alive; it moves nothing, and an
+endpoint it states that the row does not hold counts in `claimsChanged`. The list goes with the
+leadership, so every challenge does too. What remains: a replay may CREATE a row on a leader whose
+list is empty (it states an endpoint the joiner itself once stated), and the joiner's next two
+polls take the row over.
 
 **And the approval NAMES the key it admits** (`--enroll-approve=<id>@<key>`, verb `0x09`;
 `0x04`, the id alone, is retired). Keeping the first key covers a row that lives; it does
@@ -3619,6 +3642,18 @@ prevent. The signature is checked BEFORE the roster is consulted, so a caller wh
 learns nothing about which ids and keys the cluster holds. Admission is re-asked of the roster
 on every verb (`IMembershipOracle::ExplainKey`), never frozen at the handshake, so a key revoked
 while the connection is open refuses its very next verb.
+
+**"Holds for no one" is a claim about the APPLIED state, so it is not made before that state has
+caught up** (batch 3's M3, measured on every start). A lone voter before its election commits, and
+a follower before its leader first speaks, hold a roster that lacks keys their cluster holds; they
+answered a genuine member `NodeKeyUnknown`, whose remedy tells an operator to ADMIT it, and the
+prover waited a whole announce interval. While the node has not applied the log it recovered
+(`AppliedStateOf`, through the SHORTER of the recovered log and the log it holds now, or a truncated
+tail would read "not yet" forever), a key the roster lacks is `RosterNotYetApplied` (0x32, retriable,
+`NodeProofsRefusedRosterNotYetApplied`) and the prover backs off from `RecordAwaitedInterval`,
+doubling to `NodeAnnounceInterval` (`DeferredProofWait`). It replaces ONLY the refusal that may be
+wrong: a key the roster holds, or revoked, is answered as ever. Publishing uncommitted state early
+to close the window instead was REJECTED as unsafe.
 
 **The fold lives in ONE function and every gate reaches it**, `Node::RefuseUnlessMember` over
 `Distributed::ExplainConnection(oracle, host, proven)`. The alternative — folding at each surface

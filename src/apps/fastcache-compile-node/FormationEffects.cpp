@@ -34,16 +34,21 @@ namespace
 
     /// Where a client dials @p member of the fleet @p target names.
     ///
-    /// **A HINT, never an identity.** The fleet's leader said where it answers the `0xFC` port, and
-    /// that is used as it said it; any other voter's is its consensus host at the default node port --
-    /// a guess until members record the endpoint they answer at. It fails closed: whoever answers
-    /// there must still prove the key the roster holds, so a wrong guess costs a dial, never trust.
+    /// **A HINT, never an identity**, and the cluster's own record first: every member record states
+    /// where its `0xFC` port answers (set at join, moved by a proven announcement), and the roster an
+    /// approval hands over carries it -- so a fleet serving another port, the socket unit's among
+    /// them, is reached where it said. Then the leader's own word from the summary; only a voter whose
+    /// record states none is guessed at its consensus host on the default node port. Every answer fails
+    /// closed: whoever answers there must still prove the key the roster holds, so a wrong one costs a
+    /// dial, never trust.
     /// @param member A voter of the roster.
     /// @param target What the fleet said about itself when this node asked it.
     /// @return The endpoint, or empty when the voter names no host.
     [[nodiscard]] std::string NodeEndpointOf(Cluster::RosterMember const& member,
                                              CompileCacheWire::FleetSummary const& target)
     {
+        if (IsPeerDialableEndpoint(member.schedulerEndpoint))
+            return member.schedulerEndpoint;
         if (member.id == target.leaderId && !target.leaderNodeEndpoint.empty())
             return target.leaderNodeEndpoint;
         auto const split = SplitHostPort(member.raftEndpoint);
@@ -132,6 +137,7 @@ std::expected<void, std::string> CheckAdmission(JoinerIdentity const& self,
 
 std::expected<Cluster::FormationRecord, std::string> DissolveInto(Cluster::FormationRecord const& pending,
                                                                   std::span<std::byte const> roster,
+                                                                  Ed25519PublicKey const& admittedBy,
                                                                   JoinerIdentity const& self,
                                                                   Cluster::IFormationStore& store,
                                                                   Cluster::FleetEndpointsFile& endpoints,
@@ -156,7 +162,8 @@ std::expected<Cluster::FormationRecord, std::string> DissolveInto(Cluster::Forma
     next.mode = Cluster::NodeMode::Learner;
     next.fleet = Cluster::FleetMembership { .clusterId = target.clusterId,
                                             .roster = { roster.begin(), roster.end() },
-                                            .createdAtUnixSeconds = target.createdAtUnixSeconds };
+                                            .createdAtUnixSeconds = target.createdAtUnixSeconds,
+                                            .admittedBy = admittedBy };
     next.archivePending = Cluster::CurrentClusterId(pending);
     // The memo of this ask becomes one no later ask displaces: the fleet admitted this node under it.
     Cluster::RememberAdmitted(next, target.clusterId, pending.joining->provenKey);

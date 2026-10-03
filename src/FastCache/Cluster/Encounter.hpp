@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Cluster/ProvenFleetSummary.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -138,6 +139,9 @@ enum class Encounter : std::uint8_t
     Stay,         ///< This node keeps its fleet; the seen one is expected to yield.
     ForeignFleet, ///< Two established fleets with no split evidence: neither yields, and an operator is told.
     Follow,       ///< The seen node is pending: the fleet it names is asked for itself, and nothing is yielded to yet.
+    /// The table would have this node yield, and `--fleet-id` pins it to another cluster: it stays,
+    /// and an operator is told (`foreign-fleet-visible`).
+    PinnedElsewhere,
     Last,
 };
 
@@ -241,6 +245,54 @@ static_assert(EvidenceDecidesOnlyForeignPairs(),
 
 static_assert(EveryStatePairHasOneRule(), "every (own, seen) fleet-state pair needs exactly one EncounterTable row");
 
+namespace Detail
+{
+    /// What the encounter table says about a pair of different clusters, before the pin restricts it.
+    /// @param own This node's summary.
+    /// @param seen The other node's summary, as proven.
+    /// @param evidence Whether the other fleet is proven a split of this one.
+    /// @param speaker The key that signed @p seen.
+    /// @param pin This node's pin, which decides a tiebreak it names the winner of.
+    /// @return The table's answer.
+    [[nodiscard]] constexpr Encounter ByTable(CompileCacheWire::FleetSummary const& own,
+                                              CompileCacheWire::FleetSummary const& seen,
+                                              Ed25519PublicKey const& speaker,
+                                              SplitEvidence evidence,
+                                              FleetPin const& pin) noexcept
+    {
+        for (auto const& row: EncounterTable)
+        {
+            if (row.own != own.state || row.seen != seen.state)
+                continue;
+            switch (HealingOf(evidence) == SplitHealing::Automatically ? row.split : row.rule)
+            {
+                case EncounterRule::Yield:
+                    return Encounter::Yield;
+                case EncounterRule::Stay:
+                    return Encounter::Stay;
+                case EncounterRule::ForeignFleet:
+                    return Encounter::ForeignFleet;
+                case EncounterRule::Follow:
+                    return Encounter::Follow;
+                case EncounterRule::TieBreak:
+                    // The fleet this node is pinned to wins every tiebreak this node is in: a pinned
+                    // node whose own cluster happens to be the older would otherwise stay, waiting to
+                    // be joined by a fleet it could never join back, and never reach the one it was
+                    // told to. The pinned fleet AS ITS VOTERS SIGN IT: a fleet claiming the id under any
+                    // other key wins nothing here.
+                    if (pin.fleet.has_value() && AdmitsFleet(pin, seen.clusterId, speaker))
+                        return Encounter::Yield;
+                    if (own.createdAtUnixSeconds != seen.createdAtUnixSeconds)
+                        return own.createdAtUnixSeconds > seen.createdAtUnixSeconds ? Encounter::Yield : Encounter::Stay;
+                    return own.clusterId > seen.clusterId ? Encounter::Yield : Encounter::Stay;
+            }
+        }
+        // Unreachable while `EveryStatePairHasOneRule` holds. Staying is the side that fails closed: a
+        // node that stays keeps serving its own fleet, while one that yields leaves it.
+        return Encounter::Stay;
+    }
+} // namespace Detail
+
 /// Decide what meeting @p proven means for this node.
 ///
 /// A summary claiming this node's own cluster id is never yielded to, whatever the other fields
@@ -251,41 +303,31 @@ static_assert(EveryStatePairHasOneRule(), "every (own, seen) fleet-state pair ne
 /// creation time wins and a tie in the second goes to the lower cluster id; the ids differ, so the order is strict and
 /// exactly one side yields. A creation time of `UnbelievableClockCreatedAt` is compared as the number it is -- the newest
 /// possible -- so a node whose clock read before the epoch yields to every sane one.
+///
+/// **The pin is asked HERE, so no caller decides a yield without it** (`FleetPin`), of the cluster id
+/// AND the key that signed the summary -- a fleet claiming the pinned id under a key the pin does not
+/// name is an impostor, whatever else it says. It restricts what moves a node and never widens it: a
+/// yield the pin does not admit is `PinnedElsewhere`, and the one answer it turns the other way is a
+/// TIEBREAK whose winner is the pinned fleet itself, signed by one of its pinned voters. A
+/// pinned pair is therefore no longer a mirror of itself -- the asymmetry the operator asked for.
 /// @param own This node's summary.
 /// @param proven The other node's summary, as its verified signature states it.
 /// @param evidence Whether the other fleet is proven a split of this one (`SplitEvidenceFor`); a first
 ///        join, which only solitary rows decide, passes `SplitEvidence::None`.
+/// @param pin The cluster and voter keys `--fleet-id` pins this node to, or none.
 /// @return What this node does.
 [[nodiscard]] constexpr Encounter ClassifyEncounter(CompileCacheWire::FleetSummary const& own,
                                                     ProvenFleetSummary const& proven,
-                                                    SplitEvidence evidence) noexcept
+                                                    SplitEvidence evidence,
+                                                    FleetPin const& pin) noexcept
 {
     auto const& seen = proven.Summary();
     if (own.clusterId == seen.clusterId)
         return Encounter::SameFleet;
-    for (auto const& row: EncounterTable)
-    {
-        if (row.own != own.state || row.seen != seen.state)
-            continue;
-        switch (HealingOf(evidence) == SplitHealing::Automatically ? row.split : row.rule)
-        {
-            case EncounterRule::Yield:
-                return Encounter::Yield;
-            case EncounterRule::Stay:
-                return Encounter::Stay;
-            case EncounterRule::ForeignFleet:
-                return Encounter::ForeignFleet;
-            case EncounterRule::Follow:
-                return Encounter::Follow;
-            case EncounterRule::TieBreak:
-                if (own.createdAtUnixSeconds != seen.createdAtUnixSeconds)
-                    return own.createdAtUnixSeconds > seen.createdAtUnixSeconds ? Encounter::Yield : Encounter::Stay;
-                return own.clusterId > seen.clusterId ? Encounter::Yield : Encounter::Stay;
-        }
-    }
-    // Unreachable while `EveryStatePairHasOneRule` holds. Staying is the side that fails closed: a
-    // node that stays keeps serving its own fleet, while one that yields leaves it.
-    return Encounter::Stay;
+    auto const decided = Detail::ByTable(own, seen, proven.Key(), evidence, pin);
+    if (decided == Encounter::Yield && !AdmitsFleet(pin, seen.clusterId, proven.Key()))
+        return Encounter::PinnedElsewhere;
+    return decided;
 }
 
 /// What decided the tiebreak between @p own and @p seen, as an operator reads it.
@@ -304,12 +346,14 @@ static_assert(EveryStatePairHasOneRule(), "every (own, seen) fleet-state pair ne
 /// @param own This node's summary.
 /// @param proven The other node's summary, as its verified signature states it.
 /// @param evidence Whether the other fleet is proven a split of this one.
+/// @param pin The cluster `--fleet-id` pins this node to, or none.
 /// @return True exactly when `ClassifyEncounter` answers `Yield`.
 [[nodiscard]] constexpr bool YieldTo(CompileCacheWire::FleetSummary const& own,
                                      ProvenFleetSummary const& proven,
-                                     SplitEvidence evidence) noexcept
+                                     SplitEvidence evidence,
+                                     FleetPin const& pin) noexcept
 {
-    return ClassifyEncounter(own, proven, evidence) == Encounter::Yield;
+    return ClassifyEncounter(own, proven, evidence, pin) == Encounter::Yield;
 }
 
 } // namespace FastCache::Cluster

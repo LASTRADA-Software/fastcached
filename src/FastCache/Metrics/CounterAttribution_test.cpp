@@ -97,7 +97,6 @@ constexpr std::array WriterFiles {
     SurfaceWriterFile { .surface = MetricsSurface::CompileScheduler,
                         .path = "src/FastCache/Distributed/SchedulerService.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/FastCache/Distributed/LeaseToken.hpp" },
-    SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/FastCache/Distributed/RosterTrust.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-cc/CodecEnvelope.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-cc/WorkerProtocol.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker,
@@ -106,7 +105,6 @@ constexpr std::array WriterFiles {
                         .path = "src/apps/fastcache-compile-node/CompileResponder.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker,
                         .path = "src/apps/fastcache-compile-node/CompileResponder.hpp" },
-    SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-compile-node/NodeRoster.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::CompileWorker, .path = "src/apps/fastcache-compile-node/WorkerTier.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::ConsensusPeerWire,
                         .path = "src/FastCache/Consensus/RaftPeerRefusals.hpp" },
@@ -738,7 +736,7 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // a sentence with nothing watching it -- did not get. Unaffected by the exemption above: none
     // of these five sets can contain a counter with no writer, exempt or not.
     CHECK(incremented.size() == 58);
-    CHECK(refusalRow.size() == 141);
+    CHECK(refusalRow.size() == 143);
     CHECK(outcomeRow.size() == 10);
     CHECK(returned.size() == 4);
     // Ten members of the private tier's profile and six of the shared tier's, which leaves its
@@ -751,9 +749,9 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // catalogue minus the exemptions, not a count: a row nobody writes and nobody has excused is a
     // row whose surface was guessed.
     CHECK(anyWriter.size() == nonExempt.size());
-    CHECK(nonExempt.size() - incremented.size() == 167);
+    CHECK(nonExempt.size() - incremented.size() == 169);
 
-    // 141 rows have a refusal row; 140 of them have no increment site. Two figures one apart
+    // 143 rows have a refusal row; 142 of them have no increment site. Two figures one apart
     // measuring different things is how a census gets quoted wrong -- the first draft of the
     // comment beside `CounterSoleWriterTable` said 101 for both -- so the REACH of a
     // SurfaceRefusal-only reading is asserted separately from the row count.
@@ -761,9 +759,11 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     for (auto const& name: refusalRow)
         if (!incremented.contains(name))
             reachedByRefusalRowsAlone.insert(name);
-    CHECK(reachedByRefusalRowsAlone.size() == 140);
+    CHECK(reachedByRefusalRowsAlone.size() == 142);
 
-    // And four rows are written two ways, which is why the column sums to 228 over 224 rows.
+    // And four rows are written two ways, which is why the column sums to four more than the rows.
+    // Said in words rather than as two totals: the totals were a second claim nothing checked, and
+    // they had drifted one off the sets above them.
     CHECK(incremented.size() + refusalRow.size() + outcomeRow.size() + returned.size() + profileRow.size()
           == nonExempt.size() + 4);
 }

@@ -19,6 +19,7 @@
 #include <string_view>
 #include <vector>
 
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>

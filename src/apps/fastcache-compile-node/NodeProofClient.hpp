@@ -11,6 +11,7 @@
 #include <FastCache/Protocol/SealedFrameSocket.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -189,7 +190,7 @@ class NamedMachineTrust final: public IServerTrust
 
 /// What one attempt to prove this machine's identity over one connection learned.
 ///
-/// **Four outcomes, and the reason is the rulebook's**: the four call for four different actions,
+/// **Five outcomes, and the reason is the rulebook's**: the five call for five different actions,
 /// and a `bool` would fold the one an operator acts on into the others.
 enum class NodeProofResult : std::uint8_t
 {
@@ -201,6 +202,9 @@ enum class NodeProofResult : std::uint8_t
     Untrusted,
     /// The server refused the proof, or the exchange did not complete.
     Refused,
+    /// The server could not judge the proof YET (`RosterNotYetApplied`): its consensus has not applied
+    /// the log it recovered at start. Nobody acts; the round is asked again soon (`DeferredProofWait`).
+    Deferred,
 };
 
 /// Whether this machine's OWN cluster has recorded it yet, as the roster it applies says.
@@ -241,7 +245,7 @@ enum class OwnRecord : std::uint8_t
 /// commit -- so the first hold is ordinary and said at `Info`. One still held after this many asks
 /// is the other cause: a machine joining a cluster that never admitted it, or a cluster that cannot
 /// elect. Counted in ASKS, from every loop that announces -- the worker's heartbeat and the presence
-/// loop share one client -- so at `RosterWantingInterval` it is well under a minute.
+/// loop share one client -- so at `RecordAwaitedInterval` it is well under a minute.
 inline constexpr std::size_t OwnRecordPatience = 15;
 
 /// What the attempt learned, and what to say about it.
@@ -345,7 +349,20 @@ class NodeProofClient
         return _nodeId;
     }
 
+    /// How many proofs in a row a server answered `Deferred`, across every loop sharing this client:
+    /// zero once any proof ends any other way. What `NextAnnounceWait` backs off by.
+    /// @return The count.
+    [[nodiscard]] std::size_t ConsecutiveDeferrals() const noexcept
+    {
+        return _deferrals.load(std::memory_order_relaxed);
+    }
+
   private:
+    /// Count @p attempt into `ConsecutiveDeferrals`, and hand it back.
+    /// @param attempt What one proof came to.
+    /// @return @p attempt.
+    [[nodiscard]] NodeProofAttempt Noted(NodeProofAttempt attempt) const noexcept;
+
     /// Say and raise what @p record means for a round that holds. Caller holds `_holdMutex`.
     /// @param record `Awaited` or `OtherKey`.
     /// @param logger Where it is said.
@@ -366,6 +383,8 @@ class NodeProofClient
     mutable std::size_t _heldAsks { 0 };
     /// What the current hold is for; `NotAsked` when nothing is held.
     mutable OwnRecord _heldFor { OwnRecord::NotAsked };
+    /// `ConsecutiveDeferrals`. Mutable for `_holdMutex`'s reason; atomic, since both loops prove.
+    mutable std::atomic<std::size_t> _deferrals { 0 };
 };
 
 } // namespace FastCache::Node

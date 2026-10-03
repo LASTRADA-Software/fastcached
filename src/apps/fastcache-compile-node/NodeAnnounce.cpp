@@ -495,11 +495,15 @@ std::size_t WithdrawOnce(HeartbeatRound const& round, SchedulerLink const& link,
     return WithdrawQueued(round, **proved, target);
 }
 
-std::chrono::seconds NextAnnounceWait(NodeProofClient const* prover, bool rosterWanting)
+std::chrono::seconds NextAnnounceWait(NodeProofClient const* prover)
 {
-    auto const recordAwaited = prover != nullptr && prover->OwnRecordNow() == OwnRecord::Awaited;
-    return rosterWanting || recordAwaited ? std::chrono::duration_cast<std::chrono::seconds>(RosterWantingInterval)
-                                          : NodeAnnounceInterval;
+    if (prover == nullptr)
+        return NodeAnnounceInterval;
+    if (prover->OwnRecordNow() == OwnRecord::Awaited)
+        return RecordAwaitedInterval;
+    if (auto const deferrals = prover->ConsecutiveDeferrals(); deferrals > 0)
+        return DeferredProofWait(deferrals);
+    return NodeAnnounceInterval;
 }
 
 } // namespace FastCache::Node

@@ -621,6 +621,12 @@ using Node::NodeReloader;
     }
     auto const& activatedNodeEndpoint = *activatedNodeEndpointOrError;
 
+    // Where the worker's heartbeat and the presence loop register, ONE for the process and re-read at
+    // every round: this node's own scheduler, or the voters its applied state records -- told by the
+    // consensus tier below at every apply -- else the formation record's answer (`AppliedSchedulers`).
+    // Declared before every tier that reads it or tells it, so it outlives them all.
+    Node::AppliedSchedulers appliedSchedulers { cfg, activatedNodeEndpoint };
+
     // The ONE derivation, shared with the startup refusal that judges it. This value
     // goes to the worker tier's lease validator and to its REGISTER, and a lease's MAC is
     // taken over exactly this string -- so the endpoint the scheduler
@@ -679,11 +685,13 @@ using Node::NodeReloader;
     Node::EvaluateHostNameCondition(conditions, cfg);
 
     // How a state file here is replaced, said -- and counted -- once per body when it falls back to the
-    // classic rename, which on Windows a reader holding the file open refuses (`ReportReplaceRoute`).
+    // classic rename, which on Windows a reader holding the file open refuses, and when its filesystem
+    // cannot sync a directory, which degrades every replace there (`ReportReplaceRoute`).
     if (auto const stateDirectory = Node::ChosenStateDirectory(cfg); stateDirectory.has_value())
     {
+        Consensus::SystemDurableFiles durableFiles;
         Platform::SystemReplacingRename const replacingRename;
-        static_cast<void>(Node::ReportReplaceRoute(stateDirectory->path, replacingRename, logger, metrics));
+        static_cast<void>(Node::ReportReplaceRoute(stateDirectory->path, durableFiles, replacingRename, logger, metrics));
     }
 
     // One policy for all THREE surfaces -- the compile port here, the scheduler and
@@ -696,16 +704,17 @@ using Node::NodeReloader;
     Node::NodeMembership membership { cfg, logger };
 
     // **The roster every lease grant is verified against** (#178), built before anything that
-    // reads it: the worker's validator borrows it, consensus feeds it every applied state and
-    // every endorsement this node signs, and the presence loop carries the endorsement out and
-    // the certified roster back. A WALL clock, because a certificate's lapse was stamped on
-    // another machine.
+    // reads it: the worker's validator borrows it, and consensus feeds it every applied state.
     //
-    // Refusing here is where `RosterlessWorkerRefusal` is answered, since only the state
-    // directory knows whether it holds a roster, and a kept roster this build cannot use -- never
-    // a quiet fall back to no roster at all, which would check nothing.
-    core::platform::SystemWallClock const rosterWallClock;
-    auto rosterOrRefusal = Node::NodeRoster::Build(cfg, rosterWallClock, metrics, logger);
+    // Refusing here is where `RosterlessWorkerRefusal` is answered: a node that runs no consensus
+    // holds no roster, so a worker on it that other machines can reach could verify nothing. The
+    // startup table refused that shape already, so this is its belt.
+    //
+    // Its clock is the ONE silence is measured on: consensus reports how long ago a leader spoke,
+    // an age, and past `LeaderSilenceBound` without a leader its applied state counts every grant is
+    // refused (`consensus-leader-silent`).
+    core::platform::SteadyClock const rosterClock;
+    auto rosterOrRefusal = Node::NodeRoster::Build(cfg, rosterClock, &conditions);
     if (!rosterOrRefusal.has_value())
     {
         logger.Logf(LogLevel::Error, "{}; refusing to start", rosterOrRefusal.error().reason);
@@ -789,7 +798,8 @@ using Node::NodeReloader;
     // proven fleet goes to, and what consensus tells the applied state. Declared after the scheduler,
     // whose service holds the join memos it reads, and before every tier that reads it, so it
     // outlives them all. Its beat begins once consensus runs, below.
-    auto formationOrRefusal = Node::MakeFormationRuntime(cfg, formation, schedulerTier.get(), metrics, logger, &conditions);
+    auto formationOrRefusal = Node::MakeFormationRuntime(
+        cfg, identityKey, formation, announced, schedulerTier.get(), metrics, logger, &conditions);
     if (!formationOrRefusal.has_value())
     {
         logger.Logf(LogLevel::Error, "{}; refusing to start", formationOrRefusal.error());
@@ -949,6 +959,7 @@ using Node::NodeReloader;
                                                                            .capacity = capacity,
                                                                            .announced = announced,
                                                                            .activatedNodeEndpoint = activatedNodeEndpoint,
+                                                                           .schedulers = appliedSchedulers,
                                                                            .membership = membership.Oracle(),
                                                                            .locality = locality,
                                                                            .io = nodeIo,
@@ -1027,7 +1038,14 @@ using Node::NodeReloader;
     // nothing, and an unsigned admission is one every joiner refuses. Every configuration holds one
     // (`AdoptNodeKey`), so the clause narrows nothing that runs -- it is here so the surface and what
     // `NodeStatus` reports stay one condition if that ever changes.
-    auto const servesEnrollment = Node::ServesEnrollment(cfg, schedulerTier != nullptr) && identityKey.has_value();
+    //
+    // And WHY when it does not: the reason is the joiner's answer (`EnrollmentAbsenceTable`), derived
+    // by the same function `ServesEnrollment` answers from, so the surface and its refusal cannot
+    // disagree about whether -- or why.
+    auto enrollmentAbsence = Node::EnrollmentAbsenceOf(cfg, schedulerTier != nullptr);
+    if (!enrollmentAbsence.has_value() && !identityKey.has_value())
+        enrollmentAbsence = Node::EnrollmentAbsence::NoIdentityKey;
+    auto const servesEnrollment = !enrollmentAbsence.has_value();
 
     // Where this node sits in its consensus configuration (#1449), for `NodeStatus`. A SLOT,
     // because the tier that answers is built below and this surface is built now -- see
@@ -1050,8 +1068,10 @@ using Node::NodeReloader;
     // above, so a node with no list reports those rows NOT EVALUATED rather than a reassuring
     // `clear` for a list nothing can reach (#1364). A row forgotten undecided is counted in the
     // node's own sink.
+    // A WALL clock: the instants an armed window's condition names are read against it.
+    core::platform::SystemWallClock const enrollmentWallClock;
     Node::EnrollmentWindow enrollmentWindow {
-        statusClock, AddressWhen(servesEnrollment, conditions), &metrics, rosterWallClock
+        statusClock, AddressWhen(servesEnrollment, conditions), &metrics, enrollmentWallClock
     };
 
     // What `--node-status` says about the fleet's shared cache: the directory for where it is, the
@@ -1193,6 +1213,9 @@ using Node::NodeReloader;
     // computed for a node whose consensus is closed, which moves nowhere.
     Node::FixedFleetSummary const answeredSummary { Node::AnsweredFleetSummary(cfg) };
     auto const& summary = Node::SummarySourceOf(formationRuntime.get(), &answeredSummary);
+    // Where each pending row's challenge is drawn: the operating system's generator, its own
+    // instance for `proofRandom`'s reason -- a lifetime of its own.
+    SystemSecureRandom enrollmentChallengeRandom;
     std::optional<Node::EnrollmentResponder> enrollmentResponder;
     if (servesEnrollment && identityKey.has_value())
         enrollmentResponder.emplace(enrollmentWindow,
@@ -1200,6 +1223,7 @@ using Node::NodeReloader;
                                     membership.Oracle(),
                                     summary,
                                     *identityKey,
+                                    enrollmentChallengeRandom,
                                     metrics,
                                     logger);
 
@@ -1210,7 +1234,7 @@ using Node::NodeReloader;
     // holds an identity key, as every node does.
     std::optional<Node::NodeProofResponder> nodeProofResponder;
     if (Node::RunsConsensus(cfg) && identityKey.has_value())
-        nodeProofResponder.emplace(cfg.nodeId, *identityKey, membership, proofRandom, metrics, logger);
+        nodeProofResponder.emplace(cfg.nodeId, *identityKey, membership, consensusStanding, proofRandom, metrics, logger);
 
     // Which fleet this node is in, answered to anybody who asks: every node holds an identity key,
     // and one that runs no consensus answers `NoCluster` itself rather than leaving the family
@@ -1221,32 +1245,34 @@ using Node::NodeReloader;
     if (identityKey.has_value())
         fleetSummaryResponder.emplace(summary, *identityKey);
 
-    auto nodeSurfaceOrRefusal =
-        Node::StartNodeSurfaceOrExplain(nodeIo,
-                                        cfg,
-                                        // Composed where the wiring test composes it: every component a required parameter
-                                        // of its own type, so one left out, or two transposed, fails the build here.
-                                        Node::ComposeSurfaceComponents(cacheTier.get(),
-                                                                       schedulerTier.get(),
-                                                                       workerTier.get(),
-                                                                       nodeStatusResponder,
-                                                                       AddressOrNull(enrollmentResponder),
-                                                                       liveStatsResponder,
-                                                                       fleetTextResponder,
-                                                                       AddressOrNull(nodeProofResponder),
-                                                                       AddressOrNull(fleetSummaryResponder),
-                                                                       sessionResponder,
-                                                                       sharedCache),
-                                        activated,
-                                        metrics,
-                                        logger,
-                                        // Asked of the RUNNER rather than of a captured copy of the map, so a
-                                        // re-survey that replaces the set is reflected in the very next line
-                                        // (#238). The tier outlives the surface -- declared above it, destroyed
-                                        // after -- which is what makes the pointer safe to hold.
-                                        [worker = workerTier.get()](std::string_view fingerprint) {
-                                            return worker != nullptr ? worker->CompilerFor(fingerprint) : std::string {};
-                                        });
+    auto nodeSurfaceOrRefusal = Node::StartNodeSurfaceOrExplain(
+        nodeIo,
+        cfg,
+        // Composed where the wiring test composes it: every component a required parameter
+        // of its own type, so one left out, or two transposed, fails the build here.
+        Node::ComposeSurfaceComponents(cacheTier.get(),
+                                       schedulerTier.get(),
+                                       workerTier.get(),
+                                       nodeStatusResponder,
+                                       enrollmentResponder.has_value() ? Node::EnrollmentOwner { &*enrollmentResponder }
+                                                                       : std::unexpected { enrollmentAbsence.value_or(
+                                                                             Node::EnrollmentAbsence::NoIdentityKey) },
+                                       liveStatsResponder,
+                                       fleetTextResponder,
+                                       AddressOrNull(nodeProofResponder),
+                                       AddressOrNull(fleetSummaryResponder),
+                                       sessionResponder,
+                                       sharedCache),
+        activated,
+        metrics,
+        logger,
+        // Asked of the RUNNER rather than of a captured copy of the map, so a
+        // re-survey that replaces the set is reflected in the very next line
+        // (#238). The tier outlives the surface -- declared above it, destroyed
+        // after -- which is what makes the pointer safe to hold.
+        [worker = workerTier.get()](std::string_view fingerprint) {
+            return worker != nullptr ? worker->CompilerFor(fingerprint) : std::string {};
+        });
     if (!nodeSurfaceOrRefusal.has_value())
     {
         // No flag prefix: this can fail over --listen-node or over the scheduler,
@@ -1301,14 +1327,14 @@ using Node::NodeReloader;
     auto consensusOrRefusal = Node::StartConsensusOrExplain(
         cfg,
         schedulerTier,
-        nodeSurface != nullptr ? nodeSurface->BoundEndpoint() : std::string {},
+        announced,
         identityKey,
         membership,
         *nodeRoster,
+        appliedSchedulers,
         Node::SharedCacheListeners { .directory = sharedCache.Directory(),
                                      .host = sharedCache.Host(),
                                      .upstream = cacheTier != nullptr ? &cacheTier->Upstream() : nullptr },
-        rosterWallClock,
         metrics,
         logger,
         &conditions,
@@ -1409,9 +1435,7 @@ using Node::NodeReloader;
             // scrape say NO cluster rather than a cluster of nobody. The tier is
             // declared above, so it outlives the provider: locals are destroyed in
             // reverse.
-            .consensus = Node::ConsensusScrapeSource(consensusTier.get()),
-            // The roster's lapse (#178), declared above the provider for the tier's reason.
-            .roster = nodeRoster.get() },
+            .consensus = Node::ConsensusScrapeSource(consensusTier.get()) },
         startedAt);
 
     // Absent when this node runs no scheduler: there is then no registry to report,
@@ -1550,7 +1574,7 @@ using Node::NodeReloader;
     Node::BlockingEndpointDialer presenceDialer { Node::PresenceIoTimeout };
     auto const presence =
         Node::NodePresence::Start(Node::NodePresenceParts { .cfg = cfg,
-                                                            .activatedNodeEndpoint = activatedNodeEndpoint,
+                                                            .schedulers = appliedSchedulers,
                                                             .capacity = capacity,
                                                             .announced = announced,
                                                             .cacheTier = cacheTier.get(),
@@ -1558,7 +1582,6 @@ using Node::NodeReloader;
                                                             .sampler = sampler,
                                                             .logger = logger,
                                                             .conditions = conditions,
-                                                            .roster = nodeRoster.get(),
                                                             .prover = AddressOrNull(prover),
                                                             .reachability = schedulerReachability,
                                                             .dialer = presenceDialer,

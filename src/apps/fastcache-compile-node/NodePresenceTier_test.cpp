@@ -156,6 +156,8 @@ struct PresenceFixture
     core::platform::ManualClock clock;
     SchedulerReachability reachability { clock, &conditions };
     Cluster::IAskedJoinsSource const* askedJoins { nullptr }; ///< What the machine once asked; none by default.
+    /// Where each loop built over this fixture registers, kept for as long as the fixture.
+    std::vector<std::unique_ptr<AppliedSchedulers>> schedulers;
 
     PresenceFixture()
     {
@@ -181,7 +183,6 @@ struct PresenceFixture
                                .endpoint = ThisMachine,
                                .logger = logger,
                                .conditions = conditions,
-                               .roster = nullptr,
                                // Nothing proves: the scripted fleet serves no handshake (#178).
                                .prover = nullptr,
                                .reachability = reachability,
@@ -376,7 +377,6 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
                                                               .endpoint = ThisMachine,
                                                               .logger = logger,
                                                               .conditions = conditions,
-                                                              .roster = nullptr,
                                                               .prover = nullptr,
                                                               .reachability = reachability,
                                                               .askedJoins = nullptr },
@@ -559,17 +559,16 @@ class ThreadNotingDialer final: public IEndpointDialer
 /// @param announced Where it answers.
 /// @param dialer How its rounds dial.
 /// @param events Where the host's events arrive.
-/// @param roster The roster half; null for none.
 /// @return The parts.
 [[nodiscard]] NodePresenceParts PartsOver(PresenceFixture& fix,
                                           Distributed::NodeCapacity const& capacity,
                                           AnnouncedEndpoint const& announced,
                                           IEndpointDialer& dialer,
-                                          IHostEvents& events,
-                                          IPresenceRoster* roster = nullptr)
+                                          IHostEvents& events)
 {
+    fix.schedulers.push_back(std::make_unique<AppliedSchedulers>(fix.cfg, AsConfigured));
     return NodePresenceParts { .cfg = fix.cfg,
-                               .activatedNodeEndpoint = AsConfigured,
+                               .schedulers = *fix.schedulers.back(),
                                .capacity = capacity,
                                .announced = announced,
                                .cacheTier = nullptr,
@@ -577,81 +576,13 @@ class ThreadNotingDialer final: public IEndpointDialer
                                .sampler = fix.sampler,
                                .logger = fix.logger,
                                .conditions = fix.conditions,
-                               .roster = roster,
                                .prover = nullptr,
                                .reachability = fix.reachability,
                                .dialer = dialer,
                                .hostEvents = events };
 }
 
-/// A roster that lapsed while its machine slept: it wants one until a scheduler offers it a
-/// certified roster, and endorses nothing. Safe to read while the loop offers.
-class LapsedRoster final: public IPresenceRoster
-{
-  public:
-    /// @copydoc IPresenceRoster::Endorsement
-    [[nodiscard]] std::vector<std::byte> Endorsement() const override
-    {
-        return {};
-    }
-
-    /// @copydoc IPresenceRoster::Offered
-    void Offered(std::span<std::byte const> certified) override
-    {
-        if (!certified.empty())
-            _recovered.store(true, std::memory_order_release);
-    }
-
-    /// @copydoc IPresenceRoster::Wanting
-    [[nodiscard]] bool Wanting() const override
-    {
-        return !Recovered();
-    }
-
-    /// @return Whether a scheduler has offered it a roster.
-    [[nodiscard]] bool Recovered() const noexcept
-    {
-        return _recovered.load(std::memory_order_acquire);
-    }
-
-  private:
-    std::atomic<bool> _recovered { false };
-};
-
 } // namespace
-
-TEST_CASE("With no host event at all the presence loop keeps running rounds until the roster recovers",
-          "[node][presence][host-events][roster]")
-{
-    // A sleep nobody reported -- a Modern Standby machine -- is one where no event will ever end the
-    // wait, so recovery must come from the loop's own schedule: its waits ELAPSE and it runs the next
-    // round anyway. The scheduler is unreachable for two rounds and answers the third with a
-    // certified roster; nothing is fired at `events`, so only two elapsed waits can get the loop
-    // there. A loop that ends, or waits for an event, after an elapsed wait never recovers.
-    PresenceFixture fix;
-    Testing::ScriptedHostEvents events;
-    auto const certified = std::vector<std::byte> { std::byte { 0xC0 }, std::byte { 0xDE } };
-    // Spare failures past the answering round, because a dial past the script would FAIL on the
-    // loop's thread, where no assertion may run.
-    Testing::ScriptedDialer dialer { { {}, {}, Wire::EncodeReply(Wire::Status::Ok, certified), {}, {} } };
-    LapsedRoster roster;
-    Distributed::NodeCapacity const capacity { .logicalCores = 4 };
-    AnnouncedEndpoint const announced { ThisMachine };
-    // The first round runs at once and each wait lasts `RosterWantingInterval` while the roster is
-    // wanting, so the answering round comes well inside this wait's bound.
-    static_assert(2 * RosterWantingInterval < Testing::WaitHangGuard);
-    {
-        auto const presence = NodePresence::Start(PartsOver(fix, capacity, announced, dialer, events, &roster));
-        REQUIRE(presence != nullptr);
-        CHECK(Testing::WaitUntil(
-            "the roster to recover with no host event",
-            [&roster] { return roster.Recovered(); },
-            [&roster] { return std::format("recovered: {}", roster.Recovered()); }));
-    }
-    // Three rounds: two that did not reach the scheduler, each followed by an elapsed wait, and the
-    // one that recovered. Read once the loop has joined.
-    CHECK(dialer.Dialed().size() == 3);
-}
 
 TEST_CASE("A presence loop hears the host's events for as long as it runs", "[node][presence][host-events]")
 {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Cluster/AnnouncedEndpoints.hpp>
 #include <FastCache/Cluster/BeaconDestinations.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/DiscoveryService.hpp>
@@ -51,6 +52,7 @@
 #include <apps/fastcache-compile-node/FormationRuntime.hpp>
 #include <apps/fastcache-compile-node/LiveStatsResponder.hpp>
 #include <apps/fastcache-compile-node/MachineStandingTestUtils.hpp>
+#include <apps/fastcache-compile-node/NodeAnnounce.hpp>
 #include <apps/fastcache-compile-node/NodeConditions.hpp>
 #include <apps/fastcache-compile-node/NodeConfig.hpp>
 #include <apps/fastcache-compile-node/NodeFormation.hpp>
@@ -190,6 +192,18 @@ class LanSocket final: public core::net::IDatagramSocket
     bool const& _onLan;
 };
 
+/// @p self with the pin @p cfg carries, as production's `SelfFactsOf` derives it: the machine's facts
+/// are fixed, and its `--fleet-id` is the configuration's -- one source, so a case pins a machine by
+/// setting `base.fleetPin` alone.
+/// @param self Who the machine says it is.
+/// @param cfg The configuration a body was adopted into.
+/// @return The facts the body's controller acts on.
+[[nodiscard]] inline Node::SelfFacts PinnedAs(Node::SelfFacts self, Node::NodeConfig const& cfg)
+{
+    self.pin = Node::FleetPinOf(cfg);
+    return self;
+}
+
 /// Machines on one simulated LAN, formed by the real formation pieces. See the file comment.
 class FormationHarness
 {
@@ -265,7 +279,7 @@ class FormationHarness
     /// @param seedNodeId The machine whose `0xFC` endpoint it is told.
     void Seed(std::string const& nodeId, std::string const& seedNodeId)
     {
-        At(nodeId).typedSeeds.push_back(At(seedNodeId).self.nodeEndpoint);
+        At(nodeId).typedSeeds.push_back(At(seedNodeId).advertised.Current());
     }
 
     /// Plug @p nodeId into the LAN or pull it out: beacons, probes and polls reach it or not.
@@ -323,7 +337,41 @@ class FormationHarness
             Serve(*machine);
             DialAsForgotten(*machine);
         }
+        if (_clock.now() >= _nextAnnounce)
+        {
+            Announce();
+            _nextAnnounce = _clock.now() + Node::NodeAnnounceInterval;
+        }
         RunReforms();
+    }
+
+    /// Move where @p nodeId's `0xFC` port answers, as an accepted reload of `--advertise` does.
+    /// @param nodeId The machine.
+    /// @param endpoint Its new endpoint.
+    void SetAdvertised(std::string const& nodeId, std::string endpoint)
+    {
+        At(nodeId).advertised.Publish(std::move(endpoint));
+    }
+
+    /// @param nodeId A machine.
+    /// @return Where it says its `0xFC` port answers.
+    [[nodiscard]] std::string AdvertisedOf(std::string const& nodeId)
+    {
+        return At(nodeId).advertised.Current();
+    }
+
+    /// What @p atNodeId's cluster records as @p nodeId's `0xFC` endpoint -- named by the machine whose
+    /// cluster is asked, since a joiner is in its own solitary cluster until it adopts the fleet's.
+    /// @param atNodeId The machine whose cluster's state is read.
+    /// @param nodeId The member.
+    /// @return The endpoint, or empty when that state records none for it.
+    [[nodiscard]] std::string RecordedEndpointOf(std::string const& atNodeId, std::string const& nodeId) const
+    {
+        auto const found = _clusters.find(ClusterOf(atNodeId));
+        if (found == _clusters.end())
+            return {};
+        auto const* const member = core::findOrNull(found->second.state.members, nodeId, &Cluster::ClusterMember::id);
+        return member != nullptr ? member->schedulerEndpoint : std::string {};
     }
 
     /// Run beats for @p span.
@@ -443,6 +491,14 @@ class FormationHarness
     }
 
     /// @param nodeId The machine.
+    /// @param counter A counter.
+    /// @return What the machine's counter reads.
+    [[nodiscard]] std::uint64_t CounterOf(std::string const& nodeId, IMetricsSink::Counter counter) const
+    {
+        return At(nodeId).metrics.Read(counter);
+    }
+
+    /// @param nodeId The machine.
     /// @return Every line it logged, one per line: what a failing case prints to say why.
     [[nodiscard]] std::string LogOf(std::string const& nodeId) const
     {
@@ -541,6 +597,20 @@ class FormationHarness
         {
             _harness.Propose(_harness.ClusterOf(_machine.self.nodeId), command);
             return {};
+        }
+
+        /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
+        ///
+        /// Standing in for the tier's reconcile pass, through the functions it calls: the announced
+        /// desire (`Cluster::AnnouncedEndpointDesires`), then `Cluster::MembershipProposals`, each
+        /// proposal committed at once -- so nothing is ever in flight here.
+        void NoteAnnouncedEndpoint(Consensus::NodeId const& member, std::string endpoint) override
+        {
+            auto const state = ClusterState();
+            auto const desires = Cluster::AnnouncedEndpointDesires(
+                state, Cluster::AnnouncedEndpointMap { { member, std::move(endpoint) } }, {});
+            for (auto const& command: Cluster::MembershipProposals(state, ConfigurationOf(state), desires).proposals)
+                static_cast<void>(ProposeToCluster(command));
         }
 
       private:
@@ -682,7 +752,8 @@ class FormationHarness
     ///
     /// Each surface is built where production builds it, by production's predicates over the adopted
     /// configuration: a scheduler only where `ServesScheduler` says, the enrollment surface only
-    /// where `ServesEnrollment` says, and the fleet-summary responder on every body.
+    /// where `EnrollmentAbsenceOf` names no reason -- the one `ServesEnrollment` answers from, and the
+    /// reason the family is refused with otherwise -- and the fleet-summary responder on every body.
     struct Body
     {
         /// Build a body for @p machine from @p cfg and @p record, as `main` builds one after the adoption.
@@ -709,9 +780,10 @@ class FormationHarness
                                                 .logger = machine.logger,
                                                 .judge = judge,
                                                 .conditions = &machine.conditions },
-                         machine.self,
+                         PinnedAs(machine.self, cfg),
                          std::move(record) },
-            watch { controller, controller, machine.harness._clock, machine.conditions, controller, BeaconEvery },
+            watch { controller, controller,  machine.harness._clock, machine.conditions,
+                    controller, BeaconEvery, Node::FleetPinOf(cfg) },
             keys { TestKeyPair(machine.self.nodeId), Node::BootstrapMembersOf(cfg) },
             directory { machine.harness._clock, controller, keys },
             discovery { *machine.socket,
@@ -731,7 +803,7 @@ class FormationHarness
                      &machine.metrics,
                      machine.harness._wall },
             summary { controller, machine.identity },
-            audience { machine.self.nodeEndpoint },
+            audience { machine.self.advertised.Current() },
             session { verifier, Node::SessionKeys {}, machine.random, machine.harness._wall, machine.metrics },
             sharedCache { cfg,     machine.membership,       machine.harness._clock, machine.metrics, machine.logger,
                           nullptr, Node::ReconcileOn::Caller },
@@ -754,24 +826,34 @@ class FormationHarness
                                  run.leaderId == machine.self.nodeId ? std::string_view {} : run.leaderNodeEndpoint,
                                  Distributed::StandaloneSchedulerTerm);
             }
-            if (Node::ServesEnrollment(cfg, serving != nullptr))
-                responder.emplace(
-                    window, *serving, machine.membership, controller, machine.identity, machine.metrics, machine.logger);
+            auto const absence = Node::EnrollmentAbsenceOf(cfg, serving != nullptr);
+            if (!absence.has_value())
+                responder.emplace(window,
+                                  *serving,
+                                  machine.membership,
+                                  controller,
+                                  machine.identity,
+                                  machine.random,
+                                  machine.metrics,
+                                  machine.logger);
             // Composed by production's own function, over the owners this body built. It builds no
             // TIER -- no cache, scheduler or worker tier, and no consensus to verify a node proof against
             // -- so those families are absent here as on a node running none of them, and the surface's
             // ceiling is the fold of what it does merge.
-            merged.emplace(Node::ComposeSurfaceComponents(nullptr,
-                                                          nullptr,
-                                                          nullptr,
-                                                          machine.nodeStatus,
-                                                          responder.has_value() ? &*responder : nullptr,
-                                                          machine.liveStats,
-                                                          machine.fleetText,
-                                                          nullptr,
-                                                          &summary,
-                                                          session,
-                                                          sharedCache));
+            merged.emplace(Node::ComposeSurfaceComponents(
+                nullptr,
+                nullptr,
+                nullptr,
+                machine.nodeStatus,
+                responder.has_value()
+                    ? Node::EnrollmentOwner { &*responder }
+                    : Node::EnrollmentOwner { std::unexpected { absence.value_or(Node::EnrollmentAbsence::NoConsensus) } },
+                machine.liveStats,
+                machine.fleetText,
+                nullptr,
+                &summary,
+                session,
+                sharedCache));
         }
 
         /// @return What its node port answers with: built by every constructor, after the surfaces
@@ -825,18 +907,21 @@ class FormationHarness
         Machine(FormationHarness& owner, std::string const& nodeId, std::string ownHost, std::size_t seed):
             harness { owner },
             host { std::move(ownHost) },
+            advertised { std::format("{}:6674", host) },
             self { .nodeId = nodeId,
                    .publicKey = TestKeyPair(nodeId).PublicKey(),
-                   .nodeEndpoint = std::format("{}:6674", host),
-                   .raftEndpoint = std::format("{}:6680", host) },
+                   .advertised = advertised,
+                   .raftEndpoint = std::format("{}:6680", host),
+                   // Its `--fleet-id` is the configuration's, stated per body (`PinnedAs`).
+                   .pin = {} },
             random { seed },
             socket { std::make_unique<LanSocket>(
                 owner._bus.open(core::net::DatagramAddress { .host = host, .port = TestBeaconPort }), onLan) },
+            identity { TestKeyPair(nodeId) },
             dialer { owner, *this },
-            enroll { dialer },
+            enroll { dialer, identity },
             probe { dialer, random, owner._clock },
-            admin { owner, *this },
-            identity { TestKeyPair(nodeId) }
+            admin { owner, *this }
         {
             base.nodeId = nodeId;
             base.identityPublicKey = self.publicKey;
@@ -854,8 +939,11 @@ class FormationHarness
             return seeds;
         }
 
-        FormationHarness& harness;                                ///< Where it lives.
-        std::string host;                                         ///< Its address on the LAN.
+        FormationHarness& harness; ///< Where it lives.
+        std::string host;          ///< Its address on the LAN.
+        /// Where its `0xFC` port answers: what every summary, `Enroll` and announcement states.
+        /// `SetAdvertised` moves it, as an accepted reload of `--advertise` does.
+        Node::AnnouncedEndpoint advertised;
         Node::SelfFacts self;                                     ///< Who it says it is.
         bool onLan { true };                                      ///< Whether its beacons cross the segment.
         bool routable { true };                                   ///< Whether a dialled exchange reaches it.
@@ -866,6 +954,7 @@ class FormationHarness
         ScratchDirectory scratch { "formation-harness" };         ///< Where its fleet endpoints are remembered.
         Cluster::FleetEndpointsFile endpoints { scratch.Path() }; ///< The remembered endpoints.
         ScriptedAnnouncedMemos announced;                         ///< What its members announced: nothing, in this harness.
+        Ed25519KeyPair identity;                                  ///< What its responders and its `Enroll` sign with.
         MachineDialer dialer;                                     ///< What it dials through.
         Node::DialledEnrollChannel enroll;                        ///< Production's polls, over the dialer.
         Node::DialledFleetProbe probe;                            ///< Production's probes, over the dialer.
@@ -874,7 +963,6 @@ class FormationHarness
         Node::NodeConditions conditions;                          ///< Its rows; outlive every body.
         AtomicMetricsSink metrics;                                ///< Its counters.
         CapturingLogger logger;                                   ///< Its log, which `LogOf` reads back.
-        Ed25519KeyPair identity;                                  ///< What its responders sign with.
         /// Its operator, admitted to the control verbs from `OperatorAddress`. `MachineTicket`: an
         /// operator's control verb needs a route that IDENTIFIES the caller, and `--fleet-open` admits
         /// nobody to it -- the list stands in for the ticket the operator's own node mints.
@@ -938,7 +1026,7 @@ class FormationHarness
     [[nodiscard]] Machine* Reach(Machine const& from, std::string_view endpoint)
     {
         for (auto& [id, machine]: _machines)
-            if (machine->self.nodeEndpoint == endpoint && from.routable && machine->routable && machine->body != nullptr)
+            if (machine->advertised.Current() == endpoint && from.routable && machine->routable && machine->body != nullptr)
                 return machine.get();
         return nullptr;
     }
@@ -992,17 +1080,19 @@ class FormationHarness
         auto adopted = Unwrap(machine.running);
 
         // A cluster this machine runs alone exists from its first body: its founder, recorded under
-        // its key, which an admission's roster must hold for the proven key to vouch for it.
+        // its key, which an admission's roster must hold for the proven key to vouch for it -- and at
+        // its `0xFC` endpoint, as the tier's founding record states it.
         auto const clusterId = Cluster::CurrentClusterId(adopted.record);
         if (!_clusters.contains(clusterId))
         {
-            auto run =
-                ClusterRun { .state = {}, .leaderId = machine.self.nodeId, .leaderNodeEndpoint = machine.self.nodeEndpoint };
+            auto run = ClusterRun { .state = {},
+                                    .leaderId = machine.self.nodeId,
+                                    .leaderNodeEndpoint = machine.advertised.Current() };
             run.state.members.push_back(
                 Cluster::ClusterMember { .id = machine.self.nodeId,
                                          .raftEndpoint = machine.self.raftEndpoint,
-                                         .schedulerEndpoint = {},
-                                         .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                         .schedulerEndpoint = machine.advertised.Current(),
+                                         .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
                                          .seat = Cluster::MemberSeat::Voter,
                                          .publicKey = machine.self.publicKey });
             _clusters.emplace(clusterId, std::move(run));
@@ -1049,6 +1139,33 @@ class FormationHarness
                 Tell(*machine, run, clusterId);
     }
 
+    /// Every serving machine announces where its `0xFC` port answers to its cluster's leader, under the
+    /// id it PROVED -- what the presence loop's NODE-ANNOUNCE carries, through the leader scheduler's own
+    /// `AnnounceNode`, which notes a member's endpoint that differs from its record.
+    void Announce()
+    {
+        for (auto& [id, machine]: _machines)
+        {
+            if (machine->body == nullptr)
+                continue;
+            auto const run = _clusters.find(ClusterOf(id));
+            if (run == _clusters.end())
+                continue;
+            auto const leader = _machines.find(run->second.leaderId);
+            if (leader == _machines.end() || leader->second->body == nullptr)
+                continue;
+            auto& scheduler = leader->second->body->scheduler;
+            if (!scheduler.has_value())
+                continue;
+            auto const endpoint = machine->advertised.Current();
+            static_cast<void>(scheduler->AnnounceNode(
+                Distributed::CallerContext {
+                    .membership = Distributed::Membership::Member, .peerId = machine->host, .provenNodeId = id },
+                Distributed::NodePresence { .endpoint = endpoint },
+                {}));
+        }
+    }
+
     /// Ask @p machine's own scheduler, if its body built one, for a lease on its own worker -- the
     /// work a node serving its own builds does -- and count a grant made while the record says pending.
     /// @param machine The machine.
@@ -1063,7 +1180,7 @@ class FormationHarness
         static_cast<void>(scheduler->Register(
             local,
             Distributed::WorkerRegistration {
-                .fingerprint = "harness-cc", .endpoint = machine.self.nodeEndpoint, .slots = 1, .codecs = {} }));
+                .fingerprint = "harness-cc", .endpoint = machine.advertised.Current(), .slots = 1, .codecs = {} }));
         auto const granted = scheduler->Lease(
             local, CompileCacheWire::LeaseRequest { .fingerprint = "harness-cc", .key = "tu", .acceptedCodecs = {} });
         if (granted.status != CompileCacheWire::Status::Ok)
@@ -1168,6 +1285,7 @@ class FormationHarness
     core::platform::ManualWallClock& _wall;
     core::net::testing::TestLoop _loop { _clock }; ///< What a live-stats owner is bound to; never turned.
     core::net::testing::DatagramBus _bus;
+    core::platform::SteadyTimePoint _nextAnnounce {}; ///< When every member next announces its endpoint.
     std::map<std::string, ClusterRun> _clusters;
     std::map<std::string, std::unique_ptr<Machine>> _machines;
 };

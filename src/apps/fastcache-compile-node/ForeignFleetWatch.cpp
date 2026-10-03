@@ -4,6 +4,7 @@
 #include <FastCache/Cluster/Encounter.hpp>
 #include <FastCache/Cluster/PeerDirectory.hpp>
 
+#include <algorithm>
 #include <format>
 #include <string>
 #include <string_view>
@@ -19,12 +20,30 @@ namespace
     ///
     /// "No machine in common" is a statement about the WHOLE list, so it is made only of a whole one: a
     /// fleet recording more machines than its summary carried (`memberTotal`) is said to share none of
-    /// the ones it listed, with the cut named -- a machine of this fleet may be among the rest.
-    /// @param seen The other fleet's summary, as it was proven.
+    /// the ones it listed, with the cut named -- a machine of this fleet may be among the rest. A fleet
+    /// the pin keeps this node out of says that first: what it lists is not why nobody moves.
+    /// @param proven The other fleet, as it was proven: its summary and the key that signed it.
     /// @param reading What this node could say about it.
+    /// @param encounter What this node decided.
+    /// @param pin This node's pin.
     /// @return The reason.
-    [[nodiscard]] std::string WhyForeign(CompileCacheWire::FleetSummary const& seen, Cluster::SplitReading const& reading)
+    [[nodiscard]] std::string WhyForeign(Cluster::ProvenFleetSummary const& proven,
+                                         Cluster::SplitReading const& reading,
+                                         Cluster::Encounter encounter,
+                                         Cluster::FleetPin const& pin)
     {
+        auto const& seen = proven.Summary();
+        // The pin by its cluster and its count of keys, never its whole text: a condition's detail has
+        // a ceiling, and sixteen keys would not fit beside the fleets it names.
+        if (encounter == Cluster::Encounter::PinnedElsewhere && pin.fleet.has_value())
+            return seen.clusterId == pin.fleet->clusterId
+                       ? std::format("claims the pinned cluster id under key {}, which none of the {} pinned voter "
+                                     "key(s) is -- an impostor, or a voter to add to --fleet-id",
+                                     FormatEd25519PublicKey(proven.Key()),
+                                     pin.fleet->voterKeys.size())
+                       : std::format("would be joined, and --fleet-id pins this node to {} ({} voter key(s))",
+                                     pin.fleet->clusterId,
+                                     pin.fleet->voterKeys.size());
         if (!reading.claimedMember.empty())
             return std::format("claims to record {}, not verified by any key this fleet holds, so neither merges",
                                reading.claimedMember);
@@ -63,13 +82,15 @@ ForeignFleetWatch::ForeignFleetWatch(Cluster::IFleetSummarySource const& self,
                                      core::platform::IClock const& clock,
                                      NodeConditions& conditions,
                                      Cluster::IFleetObserver& next,
-                                     std::chrono::seconds listenFor):
+                                     std::chrono::seconds listenFor,
+                                     Cluster::FleetPin pin):
     _self { self },
     _evidence { evidence },
     _clock { clock },
     _conditions { conditions },
     _next { next },
     _listenFor { listenFor },
+    _pin { std::move(pin) },
     _startedAt { clock.now() }
 {
     // Answered as the component starts, so neither row reads `undecided` on a node that runs this --
@@ -122,14 +143,19 @@ std::pair<ForeignFleetWatch::Verdict, ForeignFleetWatch::Seen> ForeignFleetWatch
 {
     auto const own = _self.Current();
     auto const reading = _evidence.ReadSplit(fleet.Proven());
-    auto const encounter = Cluster::ClassifyEncounter(own, fleet.Proven(), reading.evidence);
+    auto const encounter = Cluster::ClassifyEncounter(own, fleet.Proven(), reading.evidence, _pin);
     auto seen = Seen { .fleet = fleet, .provenAt = provenAt, .reading = reading, .encounter = encounter };
+
+    // A fleet the pin keeps this node out of first, whatever else is true of it: it is not joined and
+    // not healed into, so neither "it yields to this fleet" nor "this fleet yields to it" describes it.
+    if (encounter == Cluster::Encounter::PinnedElsewhere)
+        return { Verdict::Foreign, std::move(seen) };
 
     // A pair is a split exactly when there is evidence for one and, without it, the encounter table
     // would call the pair foreign -- whether the evidence heals it by the tiebreak or only an operator
     // can. The table and the evidence's own row decide both, so a watch and the controller that acts
     // cannot disagree.
-    auto const bare = Cluster::ClassifyEncounter(own, fleet.Proven(), Cluster::SplitEvidence::None);
+    auto const bare = Cluster::ClassifyEncounter(own, fleet.Proven(), Cluster::SplitEvidence::None, _pin);
     if (bare == Cluster::Encounter::ForeignFleet && Cluster::IsSplit(reading.evidence))
         return { Verdict::Healing, std::move(seen) };
     if (encounter == Cluster::Encounter::ForeignFleet)
@@ -229,6 +255,23 @@ void ForeignFleetWatch::PublishForeign(std::string const& own)
     // fleet each belongs to, forgotten from the other.
     constexpr auto Remedy = std::string_view { "they will not merge. Decide which one each machine belongs to, and "
                                                "--cluster-forget it from the other" };
+    constexpr auto PinRemedy = std::string_view {
+        "if it is the fleet this node belongs to, add its voters' keys to --fleet-id; if not, the pin is keeping this "
+        "node out of a fleet it must not trust"
+    };
+    auto const pinned = std::ranges::any_of(
+        _foreign, [](auto const& entry) { return entry.second.encounter == Cluster::Encounter::PinnedElsewhere; });
+    if (_foreign.size() == 1 && pinned)
+    {
+        auto const& [id, seen] = *_foreign.begin();
+        _conditions.Raise(NodeCondition::ForeignFleetVisible,
+                          std::format("this node ({}) will not join the fleet {}: it {}; {}",
+                                      own,
+                                      id,
+                                      WhyForeign(seen.fleet.Proven(), seen.reading, seen.encounter, _pin),
+                                      PinRemedy));
+        return;
+    }
     if (_foreign.size() == 1)
     {
         auto const& [id, seen] = *_foreign.begin();
@@ -236,20 +279,27 @@ void ForeignFleetWatch::PublishForeign(std::string const& own)
                           std::format("this fleet ({}) and another established fleet ({}: {}) can see each other; {}",
                                       own,
                                       id,
-                                      WhyForeign(seen.fleet.Summary(), seen.reading),
+                                      WhyForeign(seen.fleet.Proven(), seen.reading, seen.encounter, _pin),
                                       Remedy));
         return;
     }
     auto others = std::vector<std::string> {};
     others.reserve(_foreign.size());
     for (auto const& [id, seen]: _foreign)
-        others.push_back(std::format("{}: {}", id, WhyForeign(seen.fleet.Summary(), seen.reading)));
+        others.push_back(std::format("{}: {}", id, WhyForeign(seen.fleet.Proven(), seen.reading, seen.encounter, _pin)));
     _conditions.Raise(NodeCondition::ForeignFleetVisible,
-                      ListDetail(std::format("this fleet ({}) and {} other established fleets can see each other; {}. "
-                                             "The others:",
-                                             own,
-                                             others.size(),
-                                             Remedy),
+                      ListDetail(pinned ? std::format("this node ({}) can see {} other fleets it neither merges with nor "
+                                                      "joins. Two established fleets {}; for a fleet --fleet-id keeps "
+                                                      "this node out of, {}. The others:",
+                                                      own,
+                                                      others.size(),
+                                                      Remedy,
+                                                      PinRemedy)
+                                        : std::format("this fleet ({}) and {} other established fleets can see each "
+                                                      "other; {}. The others:",
+                                                      own,
+                                                      others.size(),
+                                                      Remedy),
                                  others));
 }
 

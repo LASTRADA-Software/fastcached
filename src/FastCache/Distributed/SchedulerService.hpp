@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Cluster/SplitEvidence.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
@@ -706,36 +705,12 @@ class SchedulerService final: public Cluster::IAnnouncedJoinMemos
     ///        endpoint a worker's batch would be -- history belongs to the MACHINE, never to a
     ///        worker id, and this is the verb that makes that true where there is no worker.
     ///
-    /// **And the roster travels on it (#178).** A voter's announcement carries its endorsement
-    /// of the roster it applied, taken here through `AcceptEndorsement`; the `Ok` carries the
-    /// roster a strict majority of the current voters endorse, unexpired -- or nothing until
-    /// they have, since a worker refuses anything less and a half-certified roster would only
-    /// be counted as refused.
-    /// @return `Ok` carrying the certified roster or nothing, or a refusal.
+    /// A certified roster used to ride on it (#178), and is gone from the grammar: every node
+    /// verifies grants against the state its own consensus applied.
+    /// @return `Ok` with an empty payload, or a refusal.
     [[nodiscard]] SchedulerReply AnnounceNode(CallerContext const& caller,
                                               NodePresence const& presence,
                                               std::span<FleetBucket const> history = {});
-
-    /// What taking one endorsement did.
-    ///
-    /// **PRIVATE: persisted and transmitted nowhere.**
-    enum class EndorsementOutcome : std::uint8_t
-    {
-        Accepted, ///< A voter's endorsement of the current roster, kept.
-        Stale,    ///< Of a roster other than the one this state holds: ordinary during a change.
-        Refused,  ///< Not a voter's, or its signature does not verify; counted.
-        NoState,  ///< This node administers no cluster, so it certifies nothing.
-    };
-
-    /// Take one voter's endorsement of the roster.
-    ///
-    /// The door a node's OWN endorsement comes through as well as every one NODE-ANNOUNCE
-    /// carries -- a lone scheduler certifies its roster without dialling itself. The endorser
-    /// must be a voter in this node's applied state with a key, the signature must verify under
-    /// that key, and it must name this fleet and the roster this state holds.
-    /// @param endorsement The endorsement.
-    /// @return What it did.
-    EndorsementOutcome AcceptEndorsement(Cluster::RosterEndorsement const& endorsement);
 
     /// Every join memo a recorded member announced, each under the id it PROVED.
     ///
@@ -744,18 +719,6 @@ class SchedulerService final: public Cluster::IAnnouncedJoinMemos
     /// as the announced half of `Cluster::SplitEvidenceFor`.
     /// @return The memos, one entry per (member, fleet asked).
     [[nodiscard]] std::vector<Cluster::AskedJoinBy> AnnouncedJoinMemos() const override;
-
-    /// The roster this node would hand a worker now.
-    /// @param now This machine's wall clock.
-    /// @return It, with every unexpired endorsement of it, or nothing until a strict majority
-    ///         of the current voters has endorsed it -- or when this node runs no cluster.
-    [[nodiscard]] std::optional<Cluster::CertifiedRoster> CertifiedRosterNow(
-        std::chrono::system_clock::time_point now) const;
-
-    /// `CertifiedRosterNow` at this node's own wall clock: what an approved enrollment hands a
-    /// worker as its trust root (#178), by the clock every endorsement here is judged at.
-    /// @return The certified roster, or nothing until a majority of the voters has endorsed it.
-    [[nodiscard]] std::optional<Cluster::CertifiedRoster> CurrentCertifiedRoster() const;
 
     /// Retire one registration at the worker's own request.
     ///
@@ -877,9 +840,14 @@ class SchedulerService final: public Cluster::IAnnouncedJoinMemos
     /// One verb for adding and for moving, because they are one intention — a node
     /// that moved has the same identity and a new address, and making an operator
     /// remove it first would leave a window in which the cluster has agreed it does
-    /// not exist. The scheduler endpoint is not a parameter: a member announces its
-    /// own once elected, and a value typed here about somebody else would be a
-    /// guess that outranks what they say about themselves.
+    /// not exist.
+    ///
+    /// **The `0xFC` endpoint is the MEMBER's word, never an operator's.** An enrollment approval
+    /// passes the one the joiner stated in its `Enroll`; an operator's verb passes none, which keeps
+    /// whatever is recorded -- a promotion of a learner is the same machine at the same port, and
+    /// clearing its endpoint would hide it from every resolver until it next announced. A member
+    /// that MOVED says so itself: its next proven NODE-ANNOUNCE re-proposes its record
+    /// (`AnnounceNode`, `Cluster::AnnouncedEndpointDesires`).
     ///
     /// **The reply carries a `Wire::ClusterAdmitReceipt`: what was RECORDED, never
     /// what is in force.** `Offer` reports only that a command was appended, and that
@@ -909,6 +877,8 @@ class SchedulerService final: public Cluster::IAnnouncedJoinMemos
     /// @param caller Who is asking.
     /// @param memberId The member's identity.
     /// @param raftEndpoint host:port its consensus port answers on.
+    /// @param schedulerEndpoint host:port its `0xFC` port answers on, as the member itself stated it;
+    ///        nullopt for a caller with no opinion, which keeps whatever is recorded.
     /// @param publicKey The member's identity key as its 43-character text, or nullopt for a
     ///        caller with no opinion, which keeps whatever key is recorded.
     /// @param seat Which set of the configuration to record it in; nullopt for a caller
@@ -917,6 +887,7 @@ class SchedulerService final: public Cluster::IAnnouncedJoinMemos
     [[nodiscard]] SchedulerReply ClusterAdmit(CallerContext const& caller,
                                               std::string_view memberId,
                                               std::string_view raftEndpoint,
+                                              std::optional<std::string_view> schedulerEndpoint,
                                               std::optional<std::string_view> publicKey,
                                               std::optional<Cluster::MemberSeat> seat);
 
@@ -1022,6 +993,11 @@ class SchedulerService final: public Cluster::IAnnouncedJoinMemos
     }
 
   private:
+    /// Note where a PROVEN member says its `0xFC` port answers, when that differs from its record.
+    /// @param caller Who announced; only its PROVEN id is read.
+    /// @param endpoint Where it says its `0xFC` port answers.
+    void NoteAnnouncedEndpoint(CallerContext const& caller, std::string_view endpoint);
+
     /// File @p memos under @p caller's proven id, replacing what it announced before, and drop
     /// every machine's memos this node's state no longer records.
     /// @param caller Who announced; nothing is filed for a caller that proved no id.
@@ -1258,15 +1234,6 @@ class SchedulerService final: public Cluster::IAnnouncedJoinMemos
 
     /// The cluster, when this node runs one. Null is a legitimate state.
     IClusterAdmin* _admin { nullptr };
-
-    /// The latest endorsement each voter sent, by endorser (#178).
-    ///
-    /// Bounded by the voters: only a verified voter's endorsement is kept, one per voter. One of
-    /// an older roster is replaced as soon as that voter endorses the current one, and is never
-    /// served meanwhile: `CertifiedRosterNow` serves only endorsements of the roster this state
-    /// holds.
-    mutable std::mutex _endorsementsMutex;
-    std::map<std::string, Cluster::RosterEndorsement, std::less<>> _endorsements; ///< Guarded by `_endorsementsMutex`.
 
     /// The join memos each recorded member last announced, by the id it proved.
     ///

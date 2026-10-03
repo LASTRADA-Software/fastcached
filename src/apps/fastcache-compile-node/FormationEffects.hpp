@@ -60,11 +60,13 @@ namespace FastCache::Node
 /// In order, stopping at the first failure: `CheckAdmission` (a refusal writes nothing); remember the
 /// fleet's voters as seeds (a hint -- a failure is logged, never fatal), BEFORE the record, because
 /// the record's save is where the move is judged and the judge derives the learner's schedulers from
-/// that file; save the learner record, the fleet's roster and age in it and `archivePending` naming
-/// the solitary cluster. The solitary store stays where it is: `ResumeFormation` moves it before the
-/// learner's tier opens the directory.
+/// that file; save the learner record, the fleet's roster and age in it, the key that signed the
+/// admission, and `archivePending` naming the solitary cluster. The solitary store stays where it is:
+/// `ResumeFormation` moves it before the learner's tier opens the directory.
 /// @param pending The pending node's record; its `joining` names the fleet.
 /// @param roster The roster the fleet handed over.
+/// @param admittedBy The key the admission was verified under -- one this node PROVED at the endpoint
+///                   it asked -- recorded as `FleetMembership::admittedBy`, which the pin judges.
 /// @param self Who this node asked to be admitted as.
 /// @param store Where the record is kept.
 /// @param endpoints Where the fleet's voters are remembered.
@@ -73,6 +75,7 @@ namespace FastCache::Node
 ///         was written.
 [[nodiscard]] std::expected<Cluster::FormationRecord, std::string> DissolveInto(Cluster::FormationRecord const& pending,
                                                                                 std::span<std::byte const> roster,
+                                                                                Ed25519PublicKey const& admittedBy,
                                                                                 JoinerIdentity const& self,
                                                                                 Cluster::IFormationStore& store,
                                                                                 Cluster::FleetEndpointsFile& endpoints,

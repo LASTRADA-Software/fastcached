@@ -1148,6 +1148,16 @@ class IMetricsSink
         /// as `fastcache_raft_peer_connections_refused_revoked_key_total` on the peer wire.
         EnrollmentRequestsRefusedRevokedKey,
 
+        /// ENROLL requests refused because their signature does not verify under the key they ask
+        /// with -- a request the key's holder did not make.
+        ///
+        /// The id and the key are public, so anybody can poll under a joiner's pair; what they
+        /// cannot do is sign, and an unsigned poll is what once let a stranger set the endpoint a
+        /// joiner's member record kept. Not ordinary on any deployment: a joiner of this tree signs
+        /// every request with the key it states. A rise is somebody polling under another machine's
+        /// identity -- or a joiner whose key file and stated key disagree.
+        EnrollmentRequestsRefusedForged,
+
         /// ENROLL-CONTROL requests refused because the caller is not a fleet member.
         ///
         /// **Somebody trying to approve themselves.** The window admits strangers by
@@ -1348,18 +1358,13 @@ class IMetricsSink
         /// reconnected, or -- at a steady rate -- two machines sharing one identity key.
         RaftInboundSessionsSuperseded,
 
-        /// A grant refused because this worker holds no roster its trust anchors certify. (#178)
+        /// A grant refused because the state this worker applied records no voter's key yet. (#178)
         WorkerJobsRefusedLeaseNoRoster,
-        /// A grant refused because this worker's roster has not been re-certified in time. (#178)
-        WorkerJobsRefusedLeaseRosterExpired,
+        /// A grant refused because this worker has heard from no leader its applied configuration
+        /// counts for longer than `Distributed::LeaderSilenceBound`. (#178)
+        WorkerJobsRefusedLeaseIsolated,
         /// A grant whose signature verifies under a key the cluster revoked. (#178)
         WorkerJobsRefusedLeaseSignerRevoked,
-        /// A roster offered to this worker that a majority of its voters did not endorse. (#178)
-        WorkerRostersRefusedUncertified,
-        /// A roster offered to this worker whose majority of endorsements had already lapsed. (#178)
-        WorkerRostersRefusedExpired,
-        /// A roster endorsement the leader refused: not a voter's, or not signed by one. (#178)
-        SchedulerRosterEndorsementsRefused,
 
         /// A node proof whose signature verified under a key this cluster does not hold for the id
         /// it named: a machine nobody admitted, or one presenting a key other than its own. (#178)
@@ -1512,10 +1517,30 @@ class IMetricsSink
         /// fleet. Each counts as no answer. A roster is public, so this -- not the roster's content --
         /// is what stops an answer the fleet did not give.
         FormationAdmissionsUnverified,
+        /// Proven fleets a solitary node would have asked to admit it and did not, because
+        /// `--fleet-id` pins it to another cluster. Once per proof, so a fleet that keeps beaconing
+        /// keeps counting: the attack the pin stops looks like exactly this.
+        FormationYieldsRefusedPin,
+        /// Moves into another cluster a pinned node refused: an approval from a fleet its pin does
+        /// not admit, or its fleet's order to dissolve into one. No state changes; once per answer
+        /// or per order.
+        FormationAdmissionsRefusedPin,
         /// Serving bodies that found, at their start, that a state file in this node's directory is
         /// replaced by the classic rename: the POSIX-semantics one was refused (`ProbeReplaceRoute`).
         /// On Windows a reader holding a state file open then makes its replace fail.
         StateFileReplacesFellBack,
+
+        /// Serving bodies that found, as they started, that the filesystem holding this node's state
+        /// directory cannot sync a directory at all, so a replaced state file is not known to survive a
+        /// power loss there (`Consensus::MeansDirectorySyncUnsupported`). Every replace still lands --
+        /// such a volume used to refuse them all -- and the warning names the directory and the answer.
+        StateDirectorySyncsUnsupported,
+
+        /// A node proof this node could not judge YET, answered `RosterNotYetApplied` rather than
+        /// `NodeProofsRefusedUnknownKey`: its consensus had not applied the log it recovered at start,
+        /// so its key roster could lack a key its cluster holds. A few at every start are the boot
+        /// order; a count that keeps rising is a node that cannot elect, or cannot hear its leader.
+        NodeProofsRefusedRosterNotYetApplied,
 
         Last,
     };

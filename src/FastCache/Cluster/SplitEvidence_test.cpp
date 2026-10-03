@@ -176,7 +176,7 @@ TEST_CASE("An older fleet listing this fleet's leader, proven by a key nobody he
                                        .state = FleetState::Established,
                                        .createdAtUnixSeconds = 1'790'000'000,
                                        .nodeId = "n-office" };
-    CHECK(ClassifyEncounter(office, evil, SplitEvidenceFor(state, "n-office", asked, announced, evil))
+    CHECK(ClassifyEncounter(office, evil, SplitEvidenceFor(state, "n-office", asked, announced, evil), FleetPin {})
           == Encounter::ForeignFleet);
 }
 

@@ -114,13 +114,15 @@ class ScriptedAnswer
             return reading;
         auto const& poll = asked.back();
         auto const& signedOver = asked[_signing->overPoll.value_or(asked.size() - 1)];
-        reading.signature = Cluster::SignAdmission(TestKeyPair(_signing->signer),
-                                                   Cluster::AdmissionClaim { .nonce = signedOver.nonce,
-                                                                             .joinerId = poll.self.nodeId,
-                                                                             .joinerKey = poll.self.publicKey,
-                                                                             .clusterId = _signing->clusterId,
-                                                                             .outcome = *outcome,
-                                                                             .roster = reading.roster });
+        reading.signature = Cluster::SignAdmission(
+            TestKeyPair(_signing->signer),
+            Cluster::AdmissionClaim { .nonce = signedOver.nonce,
+                                      .joinerId = poll.self.nodeId,
+                                      .joinerKey = poll.self.publicKey,
+                                      .clusterId = _signing->clusterId,
+                                      .outcome = *outcome,
+                                      .roster = reading.roster,
+                                      .challenge = CompileCacheWire::ChallengeBytes(reading.challenge) });
         return reading;
     }
 
@@ -164,9 +166,7 @@ class ScriptedEnrollChannel final: public Node::IEnrollChannel
         }
         if (_forever.has_value())
             return _forever->Answer(_asked);
-        return Node::EnrollReading {
-            .progress = Node::EnrollProgress::Waiting, .detail = "nothing scripted", .roster = {}, .certificate = {}
-        };
+        return Node::EnrollReading { .progress = Node::EnrollProgress::Waiting, .detail = "nothing scripted", .roster = {} };
     }
 
     /// @return Where every poll went, in order.
@@ -381,6 +381,9 @@ class RecordingClusterAdmin final: public Distributed::IClusterAdmin
         std::scoped_lock const lock { _lock };
         return _state;
     }
+
+    /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
+    void NoteAnnouncedEndpoint(Consensus::NodeId const& /*member*/, std::string /*endpoint*/) override {}
 
     /// @copydoc Distributed::IClusterAdmin::ProposeToCluster
     [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& command) override

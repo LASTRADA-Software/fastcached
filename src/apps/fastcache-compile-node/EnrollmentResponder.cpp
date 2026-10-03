@@ -4,8 +4,8 @@
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/EnrollAdmissionSignature.hpp>
+#include <FastCache/Cluster/EnrollRequestSignature.hpp>
 #include <FastCache/Cluster/Roster.hpp>
-#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
@@ -114,6 +114,16 @@ namespace
     /// two thirds of the time, and it is an INSTRUCTION a client follows rather than an
     /// event. The message is the leader's endpoint and must stay parseable as one --
     /// `LeaderRedirectTarget` reads it -- so nothing is added to it.
+    /// This node's generator could not draw a row's challenge (#1527): `NoCluster`, for
+    /// `NodeProofResponder`'s reason -- this node cannot run the exchange right now, the joiner did
+    /// nothing wrong, and a challenge drawn from anywhere weaker is the replay a challenge exists to stop.
+    constexpr Cc::UncountedRefusal NoChallenge {
+        .code = Wire::ErrorCode::NoCluster,
+        .rationale = "this node's own random source cannot draw a challenge, which is a fact about this machine "
+                     "rather than about the joiner or the fleet; the sentence names what the primitive answered, and "
+                     "a counter could carry neither",
+    };
+
     constexpr Cc::UncountedRefusal NotLeaderRefusal {
         .code = Wire::ErrorCode::NotLeader,
         .rationale = "a healthy cluster answers this whenever a joiner reaches a follower, which is most of the "
@@ -267,15 +277,20 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
 
     // An empty id, or an endpoint that does not suit the role, is refused here rather than at
     // the approval, because the list is what a PERSON reads and a row they cannot act on is
-    // one they should never be shown. Neither live role states one, so an endpoint here is a
-    // claim the record it becomes has nowhere to keep.
-    if (nodeId.empty() || role.statesEndpoint == nodeEndpoint.empty())
+    // one they should never be shown. A learner states where its `0xFC` port answers, and the
+    // approval records it, so it must be one ANOTHER machine could dial -- the one rule every route
+    // into a member record asks (`IsPeerDialableEndpoint`); a worker principal is dialled by
+    // nobody, so an endpoint from one is a claim the record it becomes has nowhere to keep.
+    if (nodeId.empty() || role.statesEndpoint == nodeEndpoint.empty()
+        || (role.statesEndpoint && !IsPeerDialableEndpoint(nodeEndpoint)))
         return Cc::Refuse(_metrics,
                           { .code = Wire::ErrorCode::MalformedFrame,
                             .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed },
-                          std::format("an enroll request names an id, and a {} {} an endpoint",
+                          std::format("an enroll request names an id, and a {} {}",
                                       role.name,
-                                      role.statesEndpoint ? "must name" : "names no"));
+                                      role.statesEndpoint ? "must name an endpoint another machine can dial -- never "
+                                                            "a loopback, localhost or wildcard one"
+                                                          : "names no endpoint"));
 
     // A key no signature can PROVE anything under -- a small-order point, or a non-canonical
     // spelling of one -- is refused at the door too, before the window records a row an operator
@@ -289,6 +304,24 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
                           std::format("{} cannot be enrolled: {}",
                                       FormatEd25519PublicKey(fields->publicKey),
                                       DescribePublicKeyFault(*fault)));
+
+    // **Signed by the key it asks with, or nothing about it is believed.** The id and the key are
+    // public -- a beacon carries the key, the roster both -- so without this any host could poll
+    // under a joiner's pair with an endpoint of its own, and the last poll before the approval was
+    // what the record kept. Checked before any other claim is reported on, the revocation below
+    // included: a request nobody holding the key made learns nothing about that key here.
+    if (!Cluster::VerifyEnrollRequest(Cluster::EnrollRequestClaim { .nodeId = nodeId,
+                                                                    .nodeEndpoint = nodeEndpoint,
+                                                                    .role = fields->role,
+                                                                    .publicKey = fields->publicKey,
+                                                                    .nonce = fields->nonce,
+                                                                    .challenge = Wire::ChallengeBytes(fields->challenge) },
+                                      fields->signature))
+        return Cc::Refuse(_metrics,
+                          { .code = Wire::ErrorCode::NodeProofRejected,
+                            .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedForged },
+                          "an enroll request is signed by the key it asks with, over everything it states; "
+                          "this one's signature does not verify");
 
     // A key the cluster has REVOKED is refused at the door (#1555), before the window records
     // anything. No approval could admit it -- `Cluster::ValidateAgainst` refuses it by name --
@@ -320,8 +353,19 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
                && RosterRecordsJoiner(Cluster::ProjectRoster(*state), nodeId, fields->publicKey, fields->role);
     }();
 
-    auto const claim =
-        JoinerClaim { .nodeId = nodeId, .nodeEndpoint = nodeEndpoint, .role = fields->role, .publicKey = fields->publicKey };
+    // A challenge for the row this request may create or refresh, drawn BEFORE the window decides,
+    // so the decision and its challenge are one step under the window's lock. A failed draw is a
+    // refusal, never a weaker challenge (#1527).
+    auto issue = Wire::EnrollChallenge {};
+    if (auto const drawn = _random.Fill(issue); !drawn.has_value())
+        return Cc::RefuseWithoutCounter(
+            NoChallenge, std::format("this node cannot draw an enrollment challenge: {}", drawn.error().ToString()));
+    auto const claim = JoinerClaim { .nodeId = nodeId,
+                                     .nodeEndpoint = nodeEndpoint,
+                                     .role = fields->role,
+                                     .publicKey = fields->publicKey,
+                                     .answered = fields->challenge,
+                                     .issue = issue };
     // **Every answer is signed, over the joiner's own nonce, by this node's identity key** -- a
     // refusal and a "not yet" as well as an approval. The roster is public, so nothing in an answer's
     // content can tell it from a copy anybody at the polled endpoint could make; and a refusal sends
@@ -334,17 +378,22 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
     // the verb is pre-auth, and nothing but its payload cap and the header window bounds who asks.
     // That is the work a stranger buys per request here -- small, and the reason a full list and a
     // capped host are refused BEFORE this lambda runs and sign nothing.
-    auto const answer = [&](Wire::EnrollOutcome outcome,
-                            std::span<std::byte const> roster = {},
-                            std::span<std::byte const> certificate = {}) {
+    //
+    // A `Pending` answer hands the joiner its row's CURRENT challenge -- the one its next request must
+    // sign over to refresh the row -- inside what is signed; every other outcome leaves no row to
+    // refresh, and hands none.
+    auto const answer = [&](Wire::EnrollOutcome outcome, std::span<std::byte const> roster = {}) {
+        auto const challenge = outcome == Wire::EnrollOutcome::Pending ? _window.ChallengeFor(nodeId) : std::nullopt;
+        auto const challengeBytes = Wire::ChallengeBytes(challenge);
         auto const signature = Cluster::SignAdmission(_identity,
                                                       Cluster::AdmissionClaim { .nonce = fields->nonce,
                                                                                 .joinerId = nodeId,
                                                                                 .joinerKey = fields->publicKey,
                                                                                 .clusterId = _self.Current().clusterId,
                                                                                 .outcome = outcome,
-                                                                                .roster = roster });
-        return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(outcome, roster, certificate, signature));
+                                                                                .roster = roster,
+                                                                                .challenge = challengeBytes });
+        return Wire::EncodeReply(Wire::Status::Ok, Wire::EncodeEnrollReply(outcome, roster, challengeBytes, signature));
     };
     switch (recorded ? EnrollDecision::Approved : _window.Offer(claim, peer))
     {
@@ -399,15 +448,7 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
     _window.NoteServed(nodeId, Cluster::DigestOfRoster(roster));
     _metrics.Increment(IMetricsSink::Counter::EnrollmentRostersServed);
 
-    // And the roster a majority of the voters has CERTIFIED, when there is one, because the
-    // approved reply still has the field. No joiner keeps it any more: a learner applies its
-    // fleet's state, which needs no certificate. Empty until the voters have endorsed one.
-    auto const certificate =
-        _scheduler.CurrentCertifiedRoster()
-            .transform([](Cluster::CertifiedRoster const& certified) { return Cluster::EncodeCertifiedRoster(certified); })
-            .value_or(std::vector<std::byte> {});
-
-    return answer(Wire::EnrollOutcome::Approved, roster, certificate);
+    return answer(Wire::EnrollOutcome::Approved, roster);
 }
 
 std::vector<std::byte> EnrollmentResponder::AnswerClear(PeerIdentity const& peer)
@@ -530,8 +571,11 @@ Distributed::SchedulerReply EnrollmentResponder::AdmitRow(Wire::EnrollmentPendin
                                                           Distributed::CallerContext const& caller)
 {
     auto const& role = EnrollRoleRowFor(entry.role);
+    // A learner dials in, so it is recorded with no consensus endpoint; the endpoint its `Enroll`
+    // stated is where its `0xFC` port answers, and that is the record's `schedulerEndpoint` -- the
+    // member's own word, from the FIRST row it asked with, the row an operator compared.
     return _scheduler.ClusterAdmit(
-        caller, entry.nodeId, entry.nodeEndpoint, FormatEd25519PublicKey(entry.publicKey), role.seat);
+        caller, entry.nodeId, {}, entry.nodeEndpoint, FormatEd25519PublicKey(entry.publicKey), role.seat);
 }
 
 std::optional<std::string_view> EnrollmentResponder::RecordedSeatOf(std::string_view subject) const

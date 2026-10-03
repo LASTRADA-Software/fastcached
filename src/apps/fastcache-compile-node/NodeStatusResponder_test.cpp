@@ -2,9 +2,14 @@
 #include "EnrollmentWindow.hpp"
 #include "MachineStandingTestUtils.hpp"
 #include "NodeConfig.hpp"
+#include "NodeFormation.hpp"
+#include "NodeRoster.hpp"
 #include "NodeStatusResponder.hpp"
 #include "Responders.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/FleetPin.hpp>
+#include <FastCache/Cluster/NodeMode.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/WireFrame.hpp>
@@ -27,6 +32,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -36,6 +42,7 @@
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/MembershipFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -272,6 +279,8 @@ struct DirectSources
     EnrollmentWindow const* enrollment { nullptr };
     /// What the node says about the fleet's shared cache; null is a build that carries none.
     ISharedCacheStatusSource const* sharedCache { nullptr };
+    /// The roster the node verifies grants against; null is nothing wired.
+    NodeRoster const* roster { nullptr };
 };
 
 /// A `ConfiguredNodeStatus` beside the configuration it holds a reference to.
@@ -311,6 +320,7 @@ struct Fixture
                                       .enrollment = direct.enrollment,
                                       .consensus = direct.consensus,
                                       .conditions = direct.conditions,
+                                      .roster = direct.roster,
                                       .sharedCache = direct.sharedCache } }
     {
     }
@@ -1298,6 +1308,12 @@ struct ScriptedStanding final: IConsensusStandingSource
     {
         return standing;
     }
+
+    /// Caught up: nothing here asks about the applied state.
+    [[nodiscard]] AppliedStateReading CurrentAppliedState() const override
+    {
+        return AppliedStateReading::CaughtUp;
+    }
 };
 } // namespace
 
@@ -1514,4 +1530,63 @@ TEST_CASE("A node reports the shared cache its status source describes, and noth
     // Nothing wired is ABSENT -- a sender too old to say -- never a `none` it did not state.
     Fixture const bare { {}, clock, { .cacheTier = true } };
     CHECK_FALSE(bare.status.Describe().runtime.sharedCache.has_value());
+}
+
+TEST_CASE("A node reports the fleet id to paste, with its voters' keys, and the pin it trusts by",
+          "[node][node-status][pin]")
+{
+    core::platform::ManualClock clock;
+    // A consensus member's roster -- the applied state -- built as `main` builds it.
+    auto member = NodeConfig {};
+    member.nodeId = "n1";
+    member.raftListen = "127.0.0.1:6680";
+    member.raftSelf = "127.0.0.1";
+    auto const roster = NodeRoster::Build(Testing::FirstStart(member), clock, nullptr);
+    REQUIRE(roster.has_value());
+    REQUIRE(Unwrap(roster) != nullptr);
+    Fixture node { {}, clock, {}, std::nullopt, DirectSources { .roster = Unwrap(roster).get() } };
+
+    // No formation record and no voters: nothing to paste, and the pin still answered -- unpinned is
+    // the answer, never an absence.
+    auto const bare = node.status.Describe();
+    CHECK_FALSE(bare.runtime.fleetId.has_value());
+    CHECK(bare.runtime.fleetPin == std::optional { Wire::NodeFleetPinFields {} });
+
+    // The applied state's voters, the ones with a key, in id order -- a learner's key is not one a pin
+    // should name.
+    auto const office = Testing::TestKeyPair("n-office").PublicKey();
+    auto const desk = Testing::TestKeyPair("n-desk").PublicKey();
+    auto state = Cluster::ClusterState {};
+    for (auto const& [id, seat, key]:
+         { std::tuple { "n-office", Cluster::MemberSeat::Voter, office },
+           std::tuple { "n-laptop", Cluster::MemberSeat::Learner, Testing::TestKeyPair("n-laptop").PublicKey() },
+           std::tuple { "n-desk", Cluster::MemberSeat::Voter, desk } })
+        state.members.push_back(
+            Cluster::ClusterMember { .id = id,
+                                     .raftEndpoint = std::string { id } + ":6680",
+                                     .schedulerEndpoint = {},
+                                     .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                     .seat = seat,
+                                     .publicKey = key });
+    std::ranges::sort(state.members, {}, &Cluster::ClusterMember::id);
+    Unwrap(roster)->Applied(state);
+    REQUIRE(Unwrap(roster)->Summary().has_value());
+    node.cfg.formation = NodeFormationView { .mode = Cluster::NodeMode::Voter,
+                                             .clusterId = "0123456789abcdef0123456789abcdef",
+                                             .createdAtUnixSeconds = 100,
+                                             .foundedHere = true,
+                                             .fleetMembers = {},
+                                             .fleetSchedulers = {} };
+    node.cfg.fleetPin = Cluster::PinnedFleet { .clusterId = "fedcba9876543210fedcba9876543210", .voterKeys = { desk } };
+    auto const pinned = node.status.Describe();
+    auto const paste =
+        std::format("0123456789abcdef0123456789abcdef@{},{}", FormatEd25519PublicKey(desk), FormatEd25519PublicKey(office));
+    CHECK(pinned.runtime.fleetId == std::optional { paste });
+    // What is printed is what --fleet-id reads back.
+    auto const reread = Cluster::ParsePinnedFleet(paste);
+    REQUIRE(reread.has_value());
+    CHECK(Unwrap(reread).voterKeys == std::vector { desk, office });
+    CHECK(pinned.runtime.fleetPin
+          == std::optional { Wire::NodeFleetPinFields {
+              .fleet = std::format("fedcba9876543210fedcba9876543210@{}", FormatEd25519PublicKey(desk)) } });
 }

@@ -425,9 +425,6 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
                                                         // (#1364). Off the load record, the one
                                                         // variable-arity carrier this verb has.
                                                         .conditions = fields->load.conditions,
-                                                        // A voter's roster endorsement (#178),
-                                                        // opaque until the service verifies it.
-                                                        .endorsement = fields->endorsement,
                                                         // Borrowed from the decoded frame, which
                                                         // outlives the call.
                                                         .joinMemos = fields->joinMemos },
@@ -500,6 +497,7 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             return _service.ClusterAdmit(caller,
                                          Wire::AsStringView(fields->memberId),
                                          Wire::AsStringView(fields->raftEndpoint),
+                                         std::nullopt,
                                          fields->publicKey.transform(Wire::AsStringView),
                                          Cluster::MemberSeat::Voter);
         }
@@ -511,6 +509,7 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             return _service.ClusterAdmit(caller,
                                          Wire::AsStringView(fields->memberId),
                                          Wire::AsStringView(fields->raftEndpoint),
+                                         std::nullopt,
                                          fields->publicKey.transform(Wire::AsStringView),
                                          Cluster::MemberSeat::Learner);
         }

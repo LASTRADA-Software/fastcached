@@ -5,8 +5,8 @@
 // `FrameEndpoint_test`; where the keys seal frames is `SealedFrameSocket_test`.
 #include <FastCache/Cluster/DiscoveryWire.hpp>
 #include <FastCache/Cluster/EnrollAdmissionSignature.hpp>
+#include <FastCache/Cluster/EnrollRequestSignature.hpp>
 #include <FastCache/Cluster/FleetSummarySignature.hpp>
-#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Consensus/IRaftPeerIdentity.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/IdentityKeyLabel.hpp>
@@ -246,12 +246,6 @@ constexpr EnumTable<IdentityKeyPurpose, ConstructionBuilder> ConstructionBuilder
           [](ConstructionSamples const& samples) {
               return Cluster::FleetSummaryMessage(samples.nonce, samples.summary, samples.key);
           } },
-    { .purpose = IdentityKeyPurpose::RosterEndorsement,
-      .build =
-          [](ConstructionSamples const& /*samples*/) {
-              return Cluster::EndorsementMessage(
-                  Cluster::RosterEndorsement { .clusterId = "c-sample", .endorser = "n-sample" });
-          } },
     { .purpose = IdentityKeyPurpose::Lease,
       .build = [](ConstructionSamples const& samples) { return Distributed::Detail::SignedLeaseMessage(samples.field); } },
     { .purpose = IdentityKeyPurpose::RaftDiallerProof,
@@ -297,7 +291,19 @@ constexpr EnumTable<IdentityKeyPurpose, ConstructionBuilder> ConstructionBuilder
                                             .joinerKey = samples.key,
                                             .clusterId = "c-sample",
                                             .outcome = CompileCacheWire::EnrollOutcome::Approved,
-                                            .roster = samples.field });
+                                            .roster = samples.field,
+                                            .challenge = {} });
+          } },
+    { .purpose = IdentityKeyPurpose::EnrollRequest,
+      .build =
+          [](ConstructionSamples const& samples) {
+              return Cluster::EnrollRequestMessage(
+                  Cluster::EnrollRequestClaim { .nodeId = "n-joiner",
+                                                .nodeEndpoint = "joiner:6674",
+                                                .role = CompileCacheWire::EnrollRole::Learner,
+                                                .publicKey = samples.key,
+                                                .nonce = samples.nonce,
+                                                .challenge = {} });
           } },
 } };
 

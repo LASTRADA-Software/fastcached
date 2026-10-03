@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "EnrollClient.hpp"
+#include "EnrollmentAbsence.hpp"
 #include "EnrollmentWindow.hpp"
 
+#include <FastCache/Cluster/EnrollRequestSignature.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/PeerText.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Protocol/LeaderRedirect.hpp>
 
 #include <algorithm>
@@ -31,6 +35,16 @@ namespace Wire = CompileCacheWire;
 
 namespace
 {
+    /// The most of a seed's own refusal words a joiner reports: room for the longest
+    /// `EnrollmentAbsenceTable` sentence, and a bound on what a peer can make this node log.
+    constexpr std::size_t MaxSeedRefusalText = 512;
+
+    static_assert(std::ranges::all_of(EnrollmentAbsenceTable,
+                                      [](EnrollmentAbsenceRow const& row) {
+                                          return row.detail.size() <= MaxSeedRefusalText;
+                                      }),
+                  "a joiner reports every reason a seed of this build gives, whole");
+
     /// Which wire verb each operator action sends.
     struct EnrollVerbRow
     {
@@ -183,16 +197,22 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
                                                  "address as it records from one host; one being decided makes room",
                                        .roster = {} };
             case Wire::ErrorCode::NoCluster:
-                // **Not a version problem.** A seed that runs no consensus is the
-                // commonest mistake, and it used to arrive as `UnknownOpcode` and be
-                // reported as *the seed is running an older build*, sending somebody to
-                // upgrade a node that was already current. Fatal, because a node that runs
-                // no consensus will not start running it while a joiner polls, and the
-                // remedy is a different ADDRESS rather than a different moment.
+                // **Not a version problem.** A seed that records no joiner is the commonest
+                // mistake, and it used to arrive as `UnknownOpcode` and be reported as *the seed
+                // is running an older build*, sending somebody to upgrade a node that was already
+                // current. Fatal, because the seed will not start recording joiners while a joiner
+                // polls, and the remedy is a different ADDRESS -- or a change on the seed -- rather
+                // than a different moment.
+                //
+                // **The SEED's words, never a reason guessed here.** It records nobody for a
+                // reason only it knows -- no consensus, consensus confined to its own machine,
+                // no scheduler, a pin that does not name it (`EnrollmentAbsenceTable`) -- and
+                // this end saying *runs no consensus* to a node that runs it sends the
+                // operator to the wrong fix. Bounded, since they are a peer's.
                 return EnrollReading { .progress = EnrollProgress::Fatal,
-                                       .detail = "that node runs no consensus, so it belongs to no cluster and there "
-                                                 "is nothing there to join. Point --fleet-seed at a node that runs "
-                                                 "consensus; --node-status names the components a node serves",
+                                       .detail = std::format("the seed records no joiner, and it is not a version "
+                                                             "problem: {}",
+                                                             BoundedPeerText(outcome.message, MaxSeedRefusalText)),
                                        .roster = {} };
             case Wire::ErrorCode::UnknownOpcode:
                 // The one refusal that says the SEED is the problem rather than this
@@ -229,14 +249,14 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
             return EnrollReading { .progress = EnrollProgress::Waiting,
                                    .detail = "recorded; waiting to be admitted",
                                    .roster = {},
-                                   .certificate = {},
-                                   .signature = reply->signature };
+                                   .signature = reply->signature,
+                                   .challenge = reply->challenge };
         case Wire::EnrollOutcome::Rejected:
             return EnrollReading { .progress = EnrollProgress::Refused,
                                    .detail = "an operator refused this machine",
                                    .roster = {},
-                                   .certificate = {},
-                                   .signature = reply->signature };
+                                   .signature = reply->signature,
+                                   .challenge = reply->challenge };
         case Wire::EnrollOutcome::Approved:
             break;
     }
@@ -251,8 +271,8 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
     return EnrollReading { .progress = EnrollProgress::Admitted,
                            .detail = "approved",
                            .roster = std::vector<std::byte> { reply->roster.begin(), reply->roster.end() },
-                           .certificate = std::vector<std::byte> { reply->certificate.begin(), reply->certificate.end() },
-                           .signature = reply->signature };
+                           .signature = reply->signature,
+                           .challenge = reply->challenge };
 }
 
 std::string RenderEnrollmentReport(Wire::EnrollmentReport const& report, std::string_view scheduler)
@@ -337,6 +357,28 @@ std::string RenderEnrollmentReport(Wire::EnrollmentReport const& report, std::st
                                Cluster::RenderRosterFingerprint(*entry.rosterFingerprint));
     }
     return out;
+}
+
+std::vector<std::byte> EncodeSignedEnroll(JoinerIdentity const& self,
+                                          Ed25519KeyPair const& identity,
+                                          std::span<std::byte const> nonce)
+{
+    auto const key = identity.PublicKey();
+    auto const challenge = Wire::ChallengeBytes(self.challenge);
+    auto const signature = Cluster::SignEnrollRequest(identity,
+                                                      Cluster::EnrollRequestClaim { .nodeId = self.nodeId,
+                                                                                    .nodeEndpoint = self.nodeEndpoint,
+                                                                                    .role = self.role,
+                                                                                    .publicKey = key,
+                                                                                    .nonce = nonce,
+                                                                                    .challenge = challenge });
+    return Wire::EncodeEnroll(Wire::EnrollRequest { .nodeId = self.nodeId,
+                                                    .nodeEndpoint = self.nodeEndpoint,
+                                                    .role = self.role,
+                                                    .publicKey = key,
+                                                    .nonce = nonce,
+                                                    .challenge = challenge,
+                                                    .signature = signature });
 }
 
 std::expected<std::string, std::string> DescribeAdmission(JoinerIdentity const& self,

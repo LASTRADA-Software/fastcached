@@ -4,6 +4,7 @@
 #include "EnrollClient.hpp"
 
 #include <FastCache/Cluster/EnrollAdmissionSignature.hpp>
+#include <FastCache/Cluster/EnrollRequestSignature.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -71,15 +72,17 @@ namespace
     return !std::ranges::search(sent, bytes).empty();
 }
 
-/// One channel over @p dialer, as `main` builds it: from the dialer alone, since it presents nothing.
+/// One channel over @p dialer, as `main` builds it: from the dialer and the laptop's identity key,
+/// which signs every request -- and nothing else, since it presents no credential.
 struct Channel
 {
     /// @param dialer How it reaches an endpoint.
     explicit Channel(Testing::ScriptedDialer& dialer):
-        channel { dialer }
+        channel { dialer, identity }
     {
     }
 
+    Ed25519KeyPair identity { Testing::TestKeyPair("n-laptop") }; ///< Declared first: the channel holds it.
     DialledEnrollChannel channel;
 };
 
@@ -118,7 +121,8 @@ TEST_CASE("An enroll poll reads one exchange with the endpoint it names", "[node
                                                                 .joinerKey = Laptop().publicKey,
                                                                 .clusterId = "c-office",
                                                                 .outcome = outcome,
-                                                                .roster = signedRoster });
+                                                                .roster = signedRoster,
+                                                                .challenge = {} });
     };
     auto const signature = signedAs(Wire::EnrollOutcome::Approved, roster);
     auto const refusal = signedAs(Wire::EnrollOutcome::Rejected, {});
@@ -187,4 +191,36 @@ TEST_CASE("An enroll poll presents no credential and the one frame it writes is 
 
     REQUIRE(dialer.Dialed() == std::vector<std::string> { "office:6674" });
     CHECK(RequestOpsOf(dialer.SentOn(0)) == std::vector<std::uint8_t> { std::to_underlying(Wire::Op::Enroll) });
+}
+
+TEST_CASE("An enroll poll is signed by the key it asks under, over every field it states",
+          "[node][formation][enroll-channel][enroll-signature]")
+{
+    // The id and the key are public, so what makes the stated endpoint THIS machine's word is a
+    // signature only the key's holder can make -- read back out of what actually left, and checked
+    // the way the leader checks it.
+    Testing::ScriptedDialer dialer { { Answer(Wire::EnrollOutcome::Pending) } };
+    Channel poll { dialer };
+    auto const nonce = PollNonce();
+    static_cast<void>(poll.channel.Poll("office:6674", Laptop(), nonce));
+
+    auto const sent = dialer.SentOn(0);
+    REQUIRE(sent.size() >= Wire::RequestHeaderSize);
+    auto const request = Wire::DecodeEnrollPayload(sent.subspan(Wire::RequestHeaderSize));
+    REQUIRE(request.has_value());
+    auto const& view = Testing::Unwrap(request);
+    CHECK(view.publicKey == Laptop().publicKey);
+    auto const claim = Cluster::EnrollRequestClaim { .nodeId = Wire::AsStringView(view.nodeId),
+                                                     .nodeEndpoint = Wire::AsStringView(view.nodeEndpoint),
+                                                     .role = view.role,
+                                                     .publicKey = view.publicKey,
+                                                     .nonce = view.nonce,
+                                                     .challenge = {} };
+    CHECK(claim.nodeEndpoint == Laptop().nodeEndpoint);
+    CHECK(Cluster::VerifyEnrollRequest(claim, view.signature));
+
+    // And the signature covers the endpoint: the same request stating another one does not verify.
+    auto moved = claim;
+    moved.nodeEndpoint = "attacker:6674";
+    CHECK_FALSE(Cluster::VerifyEnrollRequest(moved, view.signature));
 }

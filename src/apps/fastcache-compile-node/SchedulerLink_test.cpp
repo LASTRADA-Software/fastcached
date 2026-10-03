@@ -282,6 +282,87 @@ TEST_CASE("A remembered leader that stops answering walks the whole configured l
     CHECK_FALSE(link.Lost().has_value());
 }
 
+namespace
+{
+/// Where a node registers, as a case scripts it: what `Current` answers until the case moves it.
+class ScriptedSchedulers final: public ISchedulerEndpointSource
+{
+  public:
+    /// @param endpoints What it answers first.
+    explicit ScriptedSchedulers(std::vector<std::string> endpoints):
+        _endpoints { std::move(endpoints) }
+    {
+    }
+
+    [[nodiscard]] std::vector<std::string> Current() const override
+    {
+        ++reads;
+        return _endpoints;
+    }
+
+    /// Answer @p endpoints from now on.
+    /// @param endpoints The new list.
+    void Move(std::vector<std::string> endpoints)
+    {
+        _endpoints = std::move(endpoints);
+    }
+
+    mutable int reads { 0 }; ///< How many times the link asked.
+
+  private:
+    std::vector<std::string> _endpoints;
+};
+} // namespace
+
+TEST_CASE("A link over a source re-reads it at every round, and a moved list is walked from the next one",
+          "[node][schedulerlink][retarget]")
+{
+    // T26's carry: a voter that moves its 0xFC endpoint is recorded in the applied state, and the next
+    // round -- not the next reform -- dials it. The read is in `BeginRound`, which every round makes.
+    ScriptedSchedulers source { { std::string { Configured } } };
+    auto built = SchedulerLink::Over(source);
+    REQUIRE(built.has_value());
+    auto link = Unwrap(std::move(built));
+    CHECK(NextRoundOpensAt(link) == Configured);
+    link.Accepted();
+    auto const readsAfterFirst = source.reads;
+
+    source.Move({ std::string { Second } });
+    CHECK(NextRoundOpensAt(link) == Second);
+    CHECK(source.reads == readsAfterFirst + 1);
+    CHECK(link.Configured() == std::vector<std::string> { std::string { Second } });
+
+    // A source that knows nothing for a moment forgets nothing the link knew.
+    source.Move({});
+    CHECK(NextRoundOpensAt(link) == Second);
+    CHECK_FALSE(SchedulerLink::Over(source).has_value());
+}
+
+TEST_CASE("A retargeted walk keeps its place by endpoint, and keeps a remembered leader", "[node][schedulerlink][retarget]")
+{
+    // The endpoint that last accepted stays where a round opens when it is still listed, wherever it
+    // now sits; one that is gone hands the opening to the list's first entry.
+    auto link = LinkTo({ Configured, Second });
+    link.BeginRound();
+    REQUIRE(link.Lost() == std::optional { std::string { Second } });
+    link.Accepted();
+
+    link.Retarget({ std::string { Third }, std::string { Second } });
+    CHECK(NextRoundOpensAt(link) == Second);
+    CHECK(link.Lost() == std::optional { std::string { Third } });
+
+    link.Retarget({ std::string { Third }, std::string { Configured } });
+    CHECK(NextRoundOpensAt(link) == Third);
+
+    // A remembered leader is no configured endpoint, and a moved list says nothing about who leads.
+    link.BeginRound();
+    REQUIRE(link.Redirect(std::string { Leader }));
+    link.Accepted();
+    link.Retarget({ std::string { Other } });
+    CHECK(NextRoundOpensAt(link) == Leader);
+    CHECK(link.Lost() == std::optional { std::string { Other } });
+}
+
 TEST_CASE("DescribeAnnounceRound: a steady heartbeat round does not claim a registration", "[node][scheduler]")
 {
     using namespace FastCache::Node;

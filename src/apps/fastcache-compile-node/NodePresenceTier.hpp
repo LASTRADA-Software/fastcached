@@ -6,7 +6,7 @@
 #include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
-#include "NodeRoster.hpp"
+#include "NodeProofClient.hpp"
 #include "SchedulerLink.hpp"
 #include "SchedulerReachability.hpp"
 
@@ -35,10 +35,10 @@ namespace FastCache::Node
 /// What the presence loop borrows from the node. All of it outlives the loop.
 struct NodePresenceParts
 {
-    NodeConfig const& cfg; ///< Where the schedulers are.
-    /// Where a supervisor handed the node surface over, or `AsConfigured`: where this node's own
-    /// scheduler answers when its mode serves one (`SchedulersOf`).
-    ActivatedNodeEndpoint activatedNodeEndpoint;
+    NodeConfig const& cfg; ///< The configuration the node started with.
+    /// Where the loop registers, re-read at every round (`AppliedSchedulers`): the process's one,
+    /// shared with the worker's heartbeat and told every applied state by the consensus tier.
+    ISchedulerEndpointSource const& schedulers;
     Distributed::NodeCapacity const& capacity;      ///< What this machine is.
     Cc::IAdvertisedEndpointSource const& announced; ///< Where it answers; the key its row is filed under.
     CacheTier const* cacheTier {};                  ///< Null on a node with no cache.
@@ -48,10 +48,6 @@ struct NodePresenceParts
     /// What is wrong with this machine (#1364), read per round and handed to the leader's fleet
     /// page. The one verb every node sends is the one that carries it.
     NodeConditions const& conditions;
-    /// The roster half of the verb (#178): this node's endorsement out, the certified roster
-    /// back. Null on a node that neither endorses nor verifies anything.
-    IPresenceRoster* roster {};
-
     /// How this machine proves itself on each connection (#178); null where nothing proves.
     NodeProofClient const* prover {};
     /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
@@ -87,7 +83,6 @@ struct PresenceRound
     std::string_view endpoint;                        ///< Where it answers; the key its row is filed under.
     ILogger& logger;                                  ///< Where a refusal is named.
     NodeConditions const& conditions;                 ///< What is wrong with this machine, as of this round.
-    IPresenceRoster* roster;                          ///< The roster half of the verb; may be null.
     NodeProofClient const* prover;                    ///< How this machine proves itself; null where nothing proves.
     /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
     SchedulerReachability& reachability;
@@ -119,22 +114,15 @@ struct PresenceMessage
     std::span<CompileCacheWire::JoinMemoFields const> joinMemos; ///< The fleets it once asked, as the wire carries them.
 };
 
-/// Make one presence announcement: dial, follow a redirect, fall back, and carry the roster both
-/// ways (#178).
+/// Make one presence announcement: dial, follow a redirect, and fall back.
 ///
 /// The part of a round below the sampling, so a fleet harness exercises exactly what a node
-/// runs: `DialAndAnnounce`'s rules for WHICH scheduler, this node's endorsement out, and the
-/// reply handed to @p roster -- from whichever scheduler the round reached, which is what lets a
-/// worker whose remembered leader was deposed adopt the new leader's roster in the same round.
+/// runs: `DialAndAnnounce`'s rules for WHICH scheduler, and whether one recorded this machine.
 /// @param message What to say.
-/// @param roster The roster half, or null on a node that neither endorses nor verifies.
 /// @param link Which scheduler to try, and what an answer teaches it.
 /// @param dialer How a connection is made.
 /// @return Whether a scheduler recorded this machine.
-[[nodiscard]] bool AnnouncePresence(PresenceMessage const& message,
-                                    IPresenceRoster* roster,
-                                    SchedulerLink& link,
-                                    IEndpointDialer& dialer);
+[[nodiscard]] bool AnnouncePresence(PresenceMessage const& message, SchedulerLink& link, IEndpointDialer& dialer);
 
 /// Why the wait between two presence rounds ended.
 ///
@@ -244,9 +232,8 @@ class NodePresence
     /// nothing can cancel is a thread a `SIGTERM` has to sit through. One helper rather than
     /// the lock dance at each of the two exits, which is where the two come to differ.
     ///
-    /// The interval is `NextAnnounceWait`'s, shared with the worker's heartbeat: shorter while
-    /// this node holds no roster it could verify a grant against (#178), or while its own cluster
-    /// has not recorded it yet.
+    /// The interval is `NextAnnounceWait`'s, shared with the worker's heartbeat: shorter while this
+    /// node's own cluster has not recorded it yet.
     /// @param stop Requested when the node is shutting down.
     /// @return True when the loop should end.
     [[nodiscard]] bool WaitOutInterval(std::stop_token const& stop);
@@ -260,7 +247,6 @@ class NodePresence
     FleetSampler& _sampler;
     ILogger& _logger;
     NodeConditions const& _conditions;
-    IPresenceRoster* _roster;
     NodeProofClient const* _prover;
     SchedulerReachability& _reachability;
     Cluster::IAskedJoinsSource const* _askedJoins;

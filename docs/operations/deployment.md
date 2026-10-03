@@ -41,8 +41,8 @@ is the default on Linux.
 
 A start the daemon **refuses** — a flag it does not know, a configuration file
 it read that does not load, a combination of settings a rule forbids, and for
-`fastcache-compile-node` also a credential file it read and found empty, or a
-kept roster in its state directory it read and cannot use — exits **78**
+`fastcache-compile-node` also a credential file it read and found empty, or an
+identity key in its state directory it read and cannot use — exits **78**
 (`EX_CONFIG`; `systemctl status` shows `status=78/CONFIG`) and is **not**
 restarted: the unit says `RestartPreventExitStatus=78`, because the next start
 would refuse the same configuration the same way. A start that finds a defect in
@@ -51,7 +51,7 @@ for the same reason: no configuration causes it, and every start meets it. The u
 the reason in the journal until you fix it and start it. Every other failure —
 a port still held by a process that was exiting, a store another process holds,
 and **any named file that could not be read**, whatever the reason: a
-configuration file, a credential, a key or a kept roster that is not there, or
+configuration file, a credential or a key that is not there, or
 that the service account may not read, or that lives on a share or a mount
 that is not back yet — exits 1 and is restarted after a second
 (`Restart=on-failure`), within systemd's default start limit of five starts in

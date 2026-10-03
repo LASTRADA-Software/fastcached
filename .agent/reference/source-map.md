@@ -115,13 +115,9 @@ src/FastCache/
                 peer port". `Apply` is total because it runs after commitment, when
                 refusing is no longer an option; `Validate` is where a change can be
                 refused, and it runs on the proposer.
-                Roster + RosterCertificate (#178): the roster a lease is checked
-                against -- voters, principals and revoked keys, projected from the
-                state at a version `Apply` derives -- and a voter's endorsement of
-                it, `[cluster, version, SHA-256(roster), notAfter]` signed with that
-                voter's identity key. `CertifyRoster` is the one majority rule: a
-                roster is adopted only if a strict majority of the voters the
-                ADOPTER already trusts endorse it, never of the voters it names.
+                Roster (#178): the roster a lease is checked against -- voters,
+                principals and revoked keys, projected from the state at a version
+                `Apply` derives.
   Distributed/  WorkerRegistry (the worker set: exact-fingerprint grouping,
                 most-free-slots pick tie-broken by utilization, heartbeat
                 expiry over IClock) and
@@ -151,12 +147,9 @@ src/FastCache/
                 FleetChart derives every series from those buckets -- a rate is a
                 delta between adjacent buckets that can both ANSWER for it -- and
                 renders them as standalone SVG.
-                RosterTrust is what a worker that runs no consensus checked a lease
-                against (#178): a certified roster it held, with RosterStore keeping
-                it in `--cluster-dir`. No start reaches it since a worker with its
-                consensus closed is refused (`WorkerConsensusClosed`), so every
-                worker uses StateLeaseRoster -- its applied state IS the roster --
-                and RosterTrust awaits its deletion with the kept roster.
+                StateLeaseRoster is what every worker checks a lease against (#178):
+                the state its own consensus applied IS the roster, so there is no
+                certificate, no endorsement and no lapse.
                 NodeProof is the handshake a machine joining the fleet proves its
                 identity key with on the 0xFC surface (#178): the server signs its
                 challenge first, the caller signs the whole transcript, and both

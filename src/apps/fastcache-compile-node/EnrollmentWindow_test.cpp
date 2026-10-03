@@ -42,16 +42,35 @@ namespace
     return KeyOf(0x11);
 }
 
+/// A challenge whose every byte is @p fill, so a case can tell two apart at a glance.
+/// @param fill The byte.
+/// @return The challenge.
+[[nodiscard]] Wire::EnrollChallenge Challenge(std::uint8_t fill)
+{
+    auto challenge = Wire::EnrollChallenge {};
+    challenge.fill(std::byte { fill });
+    return challenge;
+}
+
 /// A learner's claim under @p key.
 /// @param id The identity it claims.
 /// @param endpoint The endpoint it claims.
 /// @param key The key it asks under.
+/// @param answered The leader's challenge it answers; none, as on a first ask, unless a case says so.
+/// @param issue What the leader drew for this request.
 /// @return The claim.
 [[nodiscard]] JoinerClaim Claim(std::string_view id,
                                 std::string_view endpoint,
-                                std::array<std::byte, Wire::IdentityPublicKeyBytes> const& key)
+                                std::array<std::byte, Wire::IdentityPublicKeyBytes> const& key,
+                                std::optional<Wire::EnrollChallenge> answered = std::nullopt,
+                                Wire::EnrollChallenge issue = {})
 {
-    return JoinerClaim { .nodeId = id, .nodeEndpoint = endpoint, .role = Wire::EnrollRole::Learner, .publicKey = key };
+    return JoinerClaim { .nodeId = id,
+                         .nodeEndpoint = endpoint,
+                         .role = Wire::EnrollRole::Learner,
+                         .publicKey = key,
+                         .answered = answered,
+                         .issue = issue };
 }
 
 /// The detail a raised condition carries, or empty.
@@ -241,9 +260,14 @@ TEST_CASE("A joiner polls, so repeat offers count attempts and refresh what it c
     core::platform::ManualClock clock;
     EnrollmentWindow window { clock };
 
-    REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey()), "10.0.0.9") == EnrollDecision::Pending);
-    REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey()), "10.0.0.9") == EnrollDecision::Pending);
-    REQUIRE(window.Offer(Claim("joiner-a", "node-a.example:7100", TheKey()), "198.51.100.4") == EnrollDecision::Pending);
+    // Each poll answers the challenge the one before it was handed, as a joiner does.
+    REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey(), std::nullopt, Challenge(0xA1)), "10.0.0.9")
+            == EnrollDecision::Pending);
+    REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey(), Challenge(0xA1), Challenge(0xA2)), "10.0.0.9")
+            == EnrollDecision::Pending);
+    REQUIRE(
+        window.Offer(Claim("joiner-a", "node-a.example:7100", TheKey(), Challenge(0xA2), Challenge(0xA3)), "198.51.100.4")
+        == EnrollDecision::Pending);
 
     // One row for one id, however many times it asked.
     REQUIRE(window.Summary().second == 1);
@@ -257,6 +281,73 @@ TEST_CASE("A joiner polls, so repeat offers count attempts and refresh what it c
     CHECK(Unwrap(entry).nodeEndpoint == "node-a.example:7100");
     CHECK(Unwrap(entry).peerId == "198.51.100.4");
     CHECK(Unwrap(entry).claimsChanged == 0);
+    CHECK(window.ChallengeFor("joiner-a") == Challenge(0xA3)); // each refresh replaced it
+}
+
+TEST_CASE("Only a poll answering the row's CURRENT challenge refreshes it, so a replay rolls nothing back",
+          "[enrollment][window][security]")
+{
+    // The joiner's nonce gives the JOINER freshness; this gives the LEADER some. A genuine request
+    // recorded on the way answers a challenge the row has since moved past, so replaying it later
+    // must not put back an endpoint the joiner has left -- which it did while every signed poll
+    // refreshed the row.
+    core::platform::ManualClock clock;
+    EnrollmentWindow window { clock };
+    REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey(), std::nullopt, Challenge(0xB1)), "10.0.0.9")
+            == EnrollDecision::Pending);
+    REQUIRE(
+        window.Offer(Claim("joiner-a", "node-a.example:7100", TheKey(), Challenge(0xB1), Challenge(0xB2)), "198.51.100.4")
+        == EnrollDecision::Pending);
+    REQUIRE(Unwrap(window.Find("joiner-a")).nodeEndpoint == "node-a.example:7100");
+
+    // The first request again, verbatim -- no challenge -- and a later one answering the challenge the
+    // row held BEFORE: both are still answered, and neither moves the row or its challenge. Each states
+    // an endpoint the row does not hold, so each is shown to the person as a disagreement.
+    CHECK(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey(), std::nullopt, Challenge(0xB3)), "10.0.0.9")
+          == EnrollDecision::Pending);
+    CHECK(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey(), Challenge(0xB1), Challenge(0xB4)), "10.0.0.9")
+          == EnrollDecision::Pending);
+    auto const entry = window.Find("joiner-a");
+    REQUIRE(entry.has_value());
+    CHECK(Unwrap(entry).nodeEndpoint == "node-a.example:7100");
+    CHECK(Unwrap(entry).peerId == "198.51.100.4");
+    CHECK(Unwrap(entry).claimsChanged == 2);
+    CHECK(Unwrap(entry).attempts == 4); // still polls: a stale answer keeps the row alive
+    CHECK(window.ChallengeFor("joiner-a") == Challenge(0xB2));
+
+    // The control: the joiner answering the challenge the row holds now refreshes it.
+    CHECK(window.Offer(Claim("joiner-a", "node-a.corp.example:7100", TheKey(), Challenge(0xB2), Challenge(0xB5)),
+                       "198.51.100.4")
+          == EnrollDecision::Pending);
+    CHECK(Unwrap(window.Find("joiner-a")).nodeEndpoint == "node-a.corp.example:7100");
+    CHECK(window.ChallengeFor("joiner-a") == Challenge(0xB5));
+    CHECK_FALSE(window.ChallengeFor("nobody").has_value());
+}
+
+TEST_CASE("A leadership change re-challenges every row, so no challenge outlives the list it was issued for",
+          "[enrollment][window][security]")
+{
+    core::platform::ManualClock clock;
+    EnrollmentWindow window { clock };
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {});
+    REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey(), std::nullopt, Challenge(0xC1)), "10.0.0.9")
+            == EnrollDecision::Pending);
+    REQUIRE(window.ChallengeFor("joiner-a") == Challenge(0xC1));
+
+    // Demoted and leading again: the list went with the leadership, and with it every challenge.
+    window.OnRoleChanged(Distributed::SchedulerRole::Follower, "10.0.0.1:6674");
+    CHECK_FALSE(window.ChallengeFor("joiner-a").has_value());
+    window.OnRoleChanged(Distributed::SchedulerRole::Leader, {});
+
+    // So the challenge this node issued before is answered as none: the row is recorded afresh under
+    // the challenge drawn now, and the old one refreshes nothing from here on.
+    REQUIRE(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey(), Challenge(0xC1), Challenge(0xC2)), "10.0.0.9")
+            == EnrollDecision::Pending);
+    CHECK(window.ChallengeFor("joiner-a") == Challenge(0xC2));
+    CHECK(window.Offer(Claim("joiner-a", "evil.example:7100", TheKey(), Challenge(0xC1), Challenge(0xC3)), "10.0.0.9")
+          == EnrollDecision::Pending);
+    CHECK(Unwrap(window.Find("joiner-a")).nodeEndpoint == "10.0.0.9:7100");
+    CHECK(window.ChallengeFor("joiner-a") == Challenge(0xC2));
 }
 
 TEST_CASE("A decided row stops tracking the machine, so what was approved is what travels", "[enrollment][window]")
@@ -367,8 +458,11 @@ TEST_CASE("A roster records a joiner only as a member under the key it asked wit
     // The one question both ends ask -- the leader before it answers `Approved`, the joiner before
     // it believes it -- so it is pinned once, here, in every direction it can be wrong.
     auto roster = Cluster::Roster {};
-    roster.members.push_back(Cluster::RosterMember {
-        .id = "n1", .raftEndpoint = "10.0.0.1:6680", .seat = Cluster::MemberSeat::Voter, .publicKey = KeyOf(0x01) });
+    roster.members.push_back(Cluster::RosterMember { .id = "n1",
+                                                     .raftEndpoint = "10.0.0.1:6680",
+                                                     .seat = Cluster::MemberSeat::Voter,
+                                                     .publicKey = KeyOf(0x01),
+                                                     .schedulerEndpoint = {} });
 
     CHECK(RosterRecordsJoiner(roster, "n1", KeyOf(0x01), Wire::EnrollRole::Learner));
 
@@ -393,7 +487,7 @@ TEST_CASE("The role table has one row and it seats a learner", "[enrollment][win
     auto const& learner = EnrollRoleTable.front();
     CHECK(learner.role == Wire::EnrollRole::Learner);
     CHECK(learner.name == "learner");
-    CHECK_FALSE(learner.statesEndpoint);
+    CHECK(learner.statesEndpoint); // recorded as its member endpoint at approval
     CHECK(learner.seat == Cluster::MemberSeat::Learner);
 
     // Every other role the wire still decodes is one this build refuses, and the learner is not.
@@ -787,8 +881,11 @@ TEST_CASE("Re-polling rows from a second address does not move them out of the f
     for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollmentsPerHost))
     {
         auto const id = std::format("junk-{}", index);
-        REQUIRE(window.Offer(Claim(id, "", KeyOf(0x66)), "198.51.100.7") == EnrollDecision::Pending);
-        REQUIRE(window.Offer(Claim(id, "", KeyOf(0x66)), "2001:db8::7") == EnrollDecision::Pending);
+        // The second poll is the row's own joiner -- it answers the row's challenge -- so it moves the row.
+        REQUIRE(window.Offer(Claim(id, "", KeyOf(0x66), std::nullopt, Challenge(0xE1)), "198.51.100.7")
+                == EnrollDecision::Pending);
+        REQUIRE(window.Offer(Claim(id, "", KeyOf(0x66), Challenge(0xE1), Challenge(0xE2)), "2001:db8::7")
+                == EnrollDecision::Pending);
         REQUIRE(Unwrap(window.Find(id)).peerId == "2001:db8::7");
         // The row says where it FIRST asked from, which is what the bound charges it to.
         CHECK(Unwrap(window.Find(id)).firstPeerId == "198.51.100.7");

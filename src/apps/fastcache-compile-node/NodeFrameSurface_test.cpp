@@ -91,6 +91,7 @@
 #include <utility>
 #include <vector>
 
+#include <tests/ConsensusStandingFakes.hpp>
 #include <tests/HalfClose.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/LocalityFakes.hpp>
@@ -1409,7 +1410,7 @@ TEST_CASE("The surface main composes routes each family to the component it was 
                                                      nullptr,
                                                      nullptr,
                                                      every.node,
-                                                     nullptr,
+                                                     std::unexpected { EnrollmentAbsence::NoConsensus },
                                                      every.live,
                                                      every.fleet,
                                                      nullptr,
@@ -1497,11 +1498,12 @@ TEST_CASE("With every component present, the surface main composes routes each f
     EnrollmentWindow window { fix.clock };
     // One summary for the enrollment surface and the FLEET-SUMMARY answer, as `main` holds one.
     FixedFleetSummary const answered { Wire::FleetSummary { .clusterId = "c-office", .nodeId = "n1" } };
-    EnrollmentResponder enrollment {
-        window, (*scheduler)->ServiceForSurfaces(), fix.membership, answered, *identityKey, fix.metrics, fix.logger
-    };
     SystemSecureRandom random;
-    NodeProofResponder nodeProof { "n1", *identityKey, fix.membership, random, fix.metrics, fix.logger };
+    EnrollmentResponder enrollment {
+        window, (*scheduler)->ServiceForSurfaces(), fix.membership, answered, *identityKey, random, fix.metrics, fix.logger
+    };
+    Testing::ScriptedAppliedState const consensus { AppliedStateReading::CaughtUp };
+    NodeProofResponder nodeProof { "n1", *identityKey, fix.membership, consensus, random, fix.metrics, fix.logger };
     FleetSummaryResponder formation { answered, *identityKey };
     EveryNodeResponders every { nodeCfg, fix.io, fix.metrics };
 
@@ -1574,7 +1576,7 @@ TEST_CASE("A node's port answers FLEET-SUMMARY over the probe's own nonce and on
                                                                       nullptr,
                                                                       nullptr,
                                                                       every.node,
-                                                                      nullptr,
+                                                                      std::unexpected { EnrollmentAbsence::NoConsensus },
                                                                       every.live,
                                                                       every.fleet,
                                                                       nullptr,

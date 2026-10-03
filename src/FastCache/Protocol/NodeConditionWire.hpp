@@ -237,14 +237,16 @@ struct ConditionFieldRow
 /// peer reads one fact as the next.
 ///
 /// The ceilings are what a node honours and a receiver enforces. The vocabulary words are short by
-/// construction; the id is a kebab-case name; the detail is clamped by the node at the moment it
-/// is raised, and every remedy in the node's table is `static_assert`ed below its ceiling.
+/// construction; the id is a kebab-case name; every remedy in the node's table is `static_assert`ed
+/// below its ceiling, which the longest of them nearly meets. The detail is the one free choice:
+/// the node CLAMPS it at the moment it is raised, so its ceiling is how much of a long detail
+/// travels, and it is the field the row count is bought with (`MaxNodeConditions`).
 inline constexpr std::array ConditionFieldTable {
     ConditionFieldRow { .member = &NodeConditionFields::id, .maxBytes = 64, .name = "id" },
     ConditionFieldRow { .member = &NodeConditionFields::persistence, .maxBytes = 32, .name = "persistence" },
     ConditionFieldRow { .member = &NodeConditionFields::severity, .maxBytes = 32, .name = "severity" },
     ConditionFieldRow { .member = &NodeConditionFields::state, .maxBytes = 32, .name = "state" },
-    ConditionFieldRow { .member = &NodeConditionFields::detail, .maxBytes = 512, .name = "detail" },
+    ConditionFieldRow { .member = &NodeConditionFields::detail, .maxBytes = 448, .name = "detail" },
     ConditionFieldRow { .member = &NodeConditionFields::remedy, .maxBytes = 512, .name = "remedy" },
 };
 
@@ -270,16 +272,17 @@ inline constexpr std::size_t MaxConditionIdBytes = ConditionFieldCeiling(&NodeCo
 
 /// The most rows one list may carry.
 ///
-/// Every row of a node's table travels, and the node asserts its table fits, so a list is never cut
-/// short to honour this. Its cost, `MaxNodeConditionListBytes`, is checked against
-/// `CompileCacheWire::ConditionPayloadShare` in one sum with everything else a NODE-ANNOUNCE
-/// carries. It is the most full rows that share holds -- `ConditionPayloadShare /
+/// Every row of a node's table travels, and the node asserts its table fits WITH A ROW TO SPARE
+/// (`NodeConditionTableFitsTheWire`), so a list is never cut short to honour this and the next
+/// condition is not, by itself, a decision about the share. Its cost, `MaxNodeConditionListBytes`,
+/// is checked against `CompileCacheWire::ConditionPayloadShare` in one sum with everything else a
+/// NODE-ANNOUNCE carries. It is the most full rows that share holds -- `ConditionPayloadShare /
 /// MaxNodeConditionRowBytes()`, asserted equal in `CompileCacheWire.hpp`, which derives the share
-/// and so is the one header that can -- and one row more than this overruns the share, so the next
-/// row is a decision about the share and not only about this number (`CompileCacheWire_test`
-/// asserts both sides). A DECODER bound, so it moves with lane 0's version bump; the flag day
-/// re-derives it and the share from the final row count.
-inline constexpr std::size_t MaxNodeConditions = 21;
+/// and so is the one header that can -- so one row more than this overruns the share
+/// (`CompileCacheWire_test` asserts both sides). When the table's spare row is spent, the detail
+/// ceiling above is what buys another, before the history share is asked to give anything. A
+/// DECODER bound, so it moves with lane 0's version bump.
+inline constexpr std::size_t MaxNodeConditions = 23;
 
 /// What one encoded row costs at most, framing included: every field at its ceiling behind its
 /// length prefix, plus the prefix on the row itself.

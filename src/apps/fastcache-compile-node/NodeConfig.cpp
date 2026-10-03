@@ -11,6 +11,7 @@
 #include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Duration.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Cluster/ProvenFleet.hpp>
 #include <FastCache/Cluster/SeedSources.hpp>
 #include <FastCache/Config/ByteSize.hpp>
@@ -583,6 +584,24 @@ namespace
         if (!parsed.has_value())
             return std::unexpected(parsed.error());
         return static_cast<std::uint64_t>(*parsed);
+    }
+
+    /// The fleet `--fleet-id` pins this node to: text, then `Cluster::ParsePinnedFleet`'s grammar.
+    ///
+    /// Refused by name here rather than accepted and matched by nothing: a truncated copy of what
+    /// `fastcache-cli node` printed would pin the node to a fleet that cannot exist and withhold every
+    /// real one -- and an id with no key is refused rather than read as a pin by name, which every
+    /// beacon would defeat while the node reported itself pinned.
+    /// @param sv Text to parse.
+    /// @return The pinned fleet, or why the text is not one.
+    [[nodiscard]] std::expected<std::optional<Cluster::PinnedFleet>, ConfigError> ParseFleetPin(std::string_view sv)
+    {
+        if (auto const text = ParseUtf8Text(sv); !text.has_value())
+            return std::unexpected(text.error());
+        auto fleet = Cluster::ParsePinnedFleet(sv);
+        if (!fleet.has_value())
+            return std::unexpected(ArgvError(ConfigErrorCode::ParseError, std::move(fleet).error()));
+        return std::optional { *std::move(fleet) };
     }
 
     /// One fleet seed, from the `<host>` or `<host>:<port>` an operator typed.
@@ -1281,6 +1300,28 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .yamlKey = "fleet_seed",
             .same = FieldEq<&NodeConfig::fleetSeeds>(),
             .clear = ClearList<&NodeConfig::fleetSeeds>(),
+        },
+        {
+            .primary = "--fleet-id",
+            .arity = Arity::Value,
+            .operand = "=<cluster-id>@<key>[,<key>...]",
+            .apply = AssignFrom<&NodeConfig::fleetPin, ParseFleetPin>(),
+            .description = "the ONE fleet this node may belong to, and the voters\n"
+                           "whose key it takes that fleet's word from: paste the\n"
+                           "fleet-id `fastcache-cli node` prints on a machine of\n"
+                           "that fleet. Without it discovery is trust-on-first-use:\n"
+                           "anybody on the segment can prove an older fleet and be\n"
+                           "joined. Pinned, the node joins no other fleet, and on its\n"
+                           "way in takes no summary, answer or leader its fleet's\n"
+                           "pinned voters did not sign; once joined, the fleet's\n"
+                           "agreed state decides. An id with no key is refused:\n"
+                           "every beacon carries the id.",
+            .yamlKey = "fleet_id",
+            // A new pin changes which fleet the running node may be in, and the formation it holds
+            // was decided under the old one: a restart judges the record against it by name.
+            .reloadable = Reloadable::No,
+            .same = FieldEq<&NodeConfig::fleetPin>(),
+            .present = PresentIn<&NodeConfig::fleetPin>(),
         },
         {
             .primary = "--admin-listen",
@@ -2350,6 +2391,8 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // produces from it.
     for (auto const& seed: cfg.fleetSeeds)
         argv.push_back(std::format("--fleet-seed={}", seed));
+    if (cfg.fleetPin.has_value())
+        argv.push_back(std::format("--fleet-id={}", Cluster::FormatPinnedFleet(*cfg.fleetPin)));
     emitIfExplicit("drain-timeout", FormatDuration(cfg.drainTimeout), cfg.drainTimeoutExplicit);
     emitIfExplicit("log-level", LogLevelName(cfg.logLevel), cfg.logLevelExplicit);
 
@@ -2620,15 +2663,6 @@ bool RunsConsensus(NodeConfig const& cfg) noexcept
     if (!ModeOpensRaftPort(cfg.formation->mode))
         return true;
     return !RowFor(NodeSurface::Raft).Resolve(cfg).empty();
-}
-
-bool AdmitsByKey(NodeConfig const& cfg)
-{
-    // The state directory this node KEEPS, never the typed flag alone: `NodeRoster::Build` reads a
-    // kept roster through `ChosenStateDirectory`, so a defaulted directory may hold one too. No
-    // `--voter-key` term: the flag is gone, so no configuration could set it -- dropping it from an
-    // OR narrows nothing that could still be true.
-    return RunsConsensus(cfg) || ChosenStateDirectory(cfg).has_value();
 }
 
 std::string RaftSelfEndpoint(NodeConfig const& cfg)
@@ -3170,9 +3204,9 @@ bool AdvertisedNameAwaited(NodeConfig const& cfg)
 ///
 /// The gate all four reachability rows share. Admitting another machine is only ever so
 /// that it can dial this worker, so a row that tells it to dial somewhere it cannot is
-/// worth firing exactly when some route admits it. A key route counts (`AdmitsByKey`): a
-/// roster admits ticket holders and proven keys whatever address they dial from, so a
-/// worker that could hold one tells them where to dial as surely as an open one does.
+/// worth firing exactly when some route admits it. A key route counts: a roster -- the state a
+/// consensus node applies -- admits ticket holders and proven keys whatever address they dial
+/// from, so a worker that holds one tells them where to dial as surely as an open one does.
 ///
 /// Positive and self-contained, never "what the other rows are not": the hazard the
 /// sibling predicates document is a row defined by NEGATING its neighbours, which
@@ -3182,9 +3216,8 @@ bool AdvertisedNameAwaited(NodeConfig const& cfg)
 ///
 /// It is `AdmitsRemotePeers` asked with `RosterPresence::Unknown`, and deliberately that
 /// reading rather than a spelling of its own: these rows are asked of a configuration
-/// before any roster is read, so a key route counts whenever the configuration could give
-/// this node a roster (`AdmitsByKey`), and a node its formation record puts in a fleet, or
-/// asking into one, counts too. Every node that runs consensus answers yes, which is the
+/// before any roster is read, so a key route counts whenever this node runs consensus, and a
+/// node its formation record puts in a fleet, or asking into one, counts too. Every node that runs consensus answers yes, which is the
 /// point: it admits ticket holders and proven keys, and each of them is told where to dial.
 /// @param cfg The parsed configuration.
 /// @return Whether `--fleet-open` was given, a key could admit another machine, or the

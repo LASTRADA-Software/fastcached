@@ -807,6 +807,14 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "after forgetting a machine that is still running; a steady rate is a removed "
               "machine nobody stopped. It can come back only under a new identity.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedForged,
+      .prometheusName = "fastcache_enrollment_requests_refused_forged_total",
+      .help = "Enrollment requests refused because their signature does not verify under the key "
+              "they ask with -- a request the key's holder did not make. A joiner's id and key are "
+              "public, so anybody can poll under them; only the holder can sign. Not ordinary on any "
+              "deployment: a rise is somebody polling under another machine's identity, or a joiner "
+              "whose key file and stated key disagree.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::EnrollmentControlRefusedNotAMember,
       .prometheusName = "fastcache_enrollment_control_refused_not_a_member_total",
       .help = "Enrollment control verbs refused because the caller is not a fleet member -- "
@@ -1165,42 +1173,22 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster,
       .prometheusName = "fastcache_worker_jobs_refused_lease_no_roster_total",
-      .help = "Grants refused because this worker holds no roster to verify them against: it has not yet been "
-              "handed one the roster it holds certifies, and kept none from an earlier run. A few at startup are "
-              "ordinary; a rise that does not stop means no leader it can reach is endorsed by the voters it "
-              "trusts.",
+      .help = "Grants refused because the state this worker applied records no voter's key yet, so no grant "
+              "from anybody could verify. A few while a node starts or joins are ordinary; a rise that does not "
+              "stop means this node never applied its fleet's state.",
       .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseRosterExpired,
-      .prometheusName = "fastcache_worker_jobs_refused_lease_roster_expired_total",
-      .help = "Grants refused because this worker's roster has not been re-certified by a majority of its voters "
-              "within its lifetime and the clock-skew slack, so it cannot tell a live voter from a revoked one. The "
-              "worker is cut off from the leader, or reaches only an ex-leader that withholds newer rosters; "
-              "fastcache_node_roster_expires_in_seconds reached 0 first.",
+    { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseIsolated,
+      .prometheusName = "fastcache_worker_jobs_refused_lease_isolated_total",
+      .help = "Grants refused because this worker has heard from no leader its fleet counts for longer than it "
+              "may trust the state it applied (65 minutes), so a voter the fleet forgot meanwhile could still be "
+              "in it. Should read zero; a rise means this worker is cut off from its fleet's consensus -- check "
+              "its Raft sessions -- while something still hands it grants.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseSignerRevoked,
       .prometheusName = "fastcache_worker_jobs_refused_lease_signer_revoked_total",
       .help = "Grants refused because their signature verifies under a key the cluster has revoked: the removed "
               "machine itself, still leasing out work. Should read zero; a rise names a machine somebody removed and "
               "nobody stopped.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::WorkerRostersRefusedUncertified,
-      .prometheusName = "fastcache_worker_rosters_refused_uncertified_total",
-      .help = "Rosters a scheduler handed this worker that a strict majority of the voters it trusts did not "
-              "endorse, so it kept the one it holds. Expected zero: a rise is a scheduler serving a roster the "
-              "cluster did not agree -- a revoked ex-leader keeping itself on it -- or a worker so far behind that "
-              "none of its voters remain.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::WorkerRostersRefusedExpired,
-      .prometheusName = "fastcache_worker_rosters_refused_expired_total",
-      .help = "Rosters a scheduler handed this worker whose endorsements had lapsed before they arrived, so it kept "
-              "the one it holds. The scheduler that answered is serving a roster its voters stopped re-endorsing: an "
-              "ex-leader, or voters whose clocks are far behind this one.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::SchedulerRosterEndorsementsRefused,
-      .prometheusName = "fastcache_scheduler_roster_endorsements_refused_total",
-      .help = "Roster endorsements this scheduler refused because they were not signed by a voter it holds a key "
-              "for. Endorsements of an older roster are dropped without counting: they are what a change looks like "
-              "for a few seconds. A rise names a machine claiming to vote that does not.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeProofsRefusedUnknownKey,
       .prometheusName = "fastcache_node_proofs_refused_unknown_key_total",
@@ -1431,6 +1419,19 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "waiting. A rise is something answering at the endpoint this node polls that is not that fleet. "
               "Nothing was archived; the node stays in its own cluster, and gives the join up if it goes on.",
       .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FormationYieldsRefusedPin,
+      .prometheusName = "fastcache_formation_yields_refused_pin_total",
+      .help = "Proven fleets this node would have asked to admit it and did not, because --fleet-id pins it to "
+              "another cluster. Counted per proof: a fleet that keeps beaconing keeps counting. A steady rise is a "
+              "fleet on this segment the pin keeps this node out of -- a second office, or somebody proving an older "
+              "fleet to be joined; foreign-fleet-visible names it.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FormationAdmissionsRefusedPin,
+      .prometheusName = "fastcache_formation_admissions_refused_pin_total",
+      .help = "Moves into another cluster this node refused because --fleet-id pins it elsewhere: an admission from a "
+              "fleet the pin does not name, or its own fleet's order to dissolve into one. Nothing changed; the node "
+              "stays where it is, and the log names both ids.",
+      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::StateFileReplacesFellBack,
       .prometheusName = "fastcache_state_file_replaces_fell_back_total",
       .help = "Serving bodies that found, as they started, that the state files in this node's directory are "
@@ -1438,6 +1439,20 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "without it, or a path form it will not take. Every replace still lands; on Windows a reader "
               "holding a state file open then makes its replace fail. The warning names the directory and the "
               "refusal.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::StateDirectorySyncsUnsupported,
+      .prometheusName = "fastcache_state_directory_syncs_unsupported_total",
+      .help = "Serving bodies that found, as they started, that the filesystem holding this node's state directory "
+              "cannot sync a directory at all, so a replaced state file is not known to survive a power loss there. "
+              "Every replace still lands and is used. The warning names the directory and the answer; a local "
+              "volume syncs.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied,
+      .prometheusName = "fastcache_node_proofs_refused_roster_not_yet_applied_total",
+      .help = "Node proofs this node could not judge yet, because its consensus had not applied the log it recovered "
+              "at start: answered roster-not-yet-applied, and retried by the prover, rather than node-key-unknown. A "
+              "few at every start are the boot order; a steady rise is a node that cannot elect or cannot hear its "
+              "leader.",
       .type = MetricType::Counter },
 } };
 

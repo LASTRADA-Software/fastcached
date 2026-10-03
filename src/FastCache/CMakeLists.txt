@@ -53,6 +53,7 @@ target_sources(FastCache
         Core/SessionSeal.cpp
         Core/Sha256.cpp
         Core/X25519.cpp
+        Cluster/AnnouncedEndpoints.cpp
         Cluster/BeaconDestinations.cpp
         Cluster/ClusterState.cpp
         Cluster/ClusterStateMachine.cpp
@@ -60,11 +61,11 @@ target_sources(FastCache
         Cluster/SharedCacheTarget.cpp
         Cluster/DiscoveryService.cpp
         Cluster/FleetEndpoints.cpp
+        Cluster/FleetPin.cpp
         Cluster/FormationRecord.cpp
         Cluster/MembershipPolicy.cpp
         Cluster/PeerDirectory.cpp
         Cluster/Roster.cpp
-        Cluster/RosterCertificate.cpp
         Cluster/RosterKeys.cpp
         Cluster/SeedSources.cpp
         Core/Logger.cpp
@@ -72,9 +73,8 @@ target_sources(FastCache
         Distributed/WorkerRegistry.cpp
         Distributed/UnservedToolchains.cpp
         Distributed/FleetVersions.cpp
-        Distributed/RosterStore.cpp
         Distributed/NodeProof.cpp
-        Distributed/RosterTrust.cpp
+        Distributed/StateLeaseRoster.cpp
         Distributed/TicketVerifier.cpp
         Distributed/SchedulerService.cpp
         Distributed/SchedulerProtocol.cpp

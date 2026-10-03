@@ -43,17 +43,17 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
         if (activation == SocketActivation::Yes && AdmitsRemotePeers(cfg, RosterPresence::Absent))
             return std::unexpected { std::string {
                 "a socket-activated worker that admits peers on other machines needs a roster to verify "
-                "leases against -- run consensus (--listen-raft), so it applies its fleet's state: the socket "
-                "unit chose the address this port answers on, so --bind describes nothing and cannot show the "
-                "port is local. Without one this node cannot check the lease a client presents, and would "
-                "compile for anybody who can reach it" } };
+                "leases against, and the only roster is the state consensus applies -- so run consensus "
+                "(--listen-raft) or admit only this machine: the socket unit chose the address this port answers "
+                "on, so --bind describes nothing and cannot show the port is local. Without one this node cannot "
+                "check the lease a client presents, and would compile for anybody who can reach it" } };
 
         // Warn rather than Info, and said once at startup rather than per request:
         // the configuration is legitimate for a node no other machine can dial, and
         // an operator who did not intend it has exactly one chance to find out.
         logger.Logf(LogLevel::Warn,
-                    "compiling WITHOUT verifying lease signatures: this node runs no consensus and keeps no "
-                    "roster, so a grant cannot be checked. The startup rules refuse every "
+                    "compiling WITHOUT verifying lease signatures: this node runs no consensus and so keeps no "
+                    "roster, and a grant cannot be checked. The startup rules refuse every "
                     "configuration in which a machine that is not this one could reach the compile verbs -- on "
                     "--bind and on --listen-node, which answers them too -- but no lease is being enforced");
         inForce.Record(BuiltLeaseCheck::Unchecked);
@@ -65,9 +65,8 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
     // REACH -- and the identity it ends up pinned to is reported when it registers, which is
     // the moment that fact first exists.
     logger.Logf(LogLevel::Info,
-                "verifying lease signatures against {}, for grants naming {}; the fleet is adopted from the "
-                "scheduler's registration reply",
-                RunsConsensus(cfg) ? "the roster this node applies" : "the roster the cluster's voters certify",
+                "verifying lease signatures against the state this node's consensus applies, for grants naming {}; "
+                "the fleet is adopted from the scheduler's registration reply",
                 // What is advertised NOW, which at this moment is what the process
                 // started with -- the seam's value can move later, and this line is a
                 // statement about startup. The move itself is announced where it

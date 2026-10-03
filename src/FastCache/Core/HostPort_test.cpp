@@ -259,6 +259,34 @@ TEST_CASE("A host names no one machine when every machine answers to it", "[core
     }
 }
 
+TEST_CASE("An endpoint a peer may be told to dial names a host that is neither this machine nor every interface",
+          "[core][hostport]")
+{
+    for (auto const* const endpoint: { "office:6674", "10.0.0.7:6674", "[fd00::7]:6674", "build.example.:6676" })
+    {
+        INFO(endpoint);
+        CHECK(IsPeerDialableEndpoint(endpoint));
+        CHECK(PeerDialableOrNone(endpoint) == endpoint);
+    }
+
+    // Each one sends whoever dials it back to itself, or names nobody at all.
+    for (auto const* const endpoint: { "127.0.0.1:6674",
+                                       "[::1]:6674",
+                                       "localhost:6674",
+                                       "build.localhost:6674",
+                                       "0.0.0.0:6674",
+                                       "[::]:6674",
+                                       ":6674",
+                                       "6674",
+                                       "office",
+                                       "" })
+    {
+        INFO(endpoint);
+        CHECK_FALSE(IsPeerDialableEndpoint(endpoint));
+        CHECK(PeerDialableOrNone(endpoint).empty());
+    }
+}
+
 TEST_CASE("An endpoint gives up its host without dropping a bare one", "[core][hostport]")
 {
     // The two shapes `SplitHostPort` answers for.

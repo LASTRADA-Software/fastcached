@@ -259,14 +259,14 @@ TEST_CASE("Each way a ticket fails is refused by its own name", "[distributed][t
         REQUIRE(bounded.Verify(Ticket({ .nonce = 4 }), Noon).has_value()); // the forged one took no room
         CHECK(RefusalOf(bounded.Verify(Ticket({ .nonce = 5 }), Noon)) == std::optional { TicketRefusal::SpentSetFull });
     }
-    SECTION("a node holding no roster at all, and one whose roster lapsed")
+    SECTION("a node holding no roster at all, and one whose state records no voter yet")
     {
         Verifying fix;
         auto const rosterless = TicketVerifier { nullptr, fix.audience, fix.spent };
         CHECK(RefusalOf(rosterless.Verify(Ticket({}), Noon)) == std::optional { TicketRefusal::NoRoster });
-        fix.roster.SetStanding(RosterStanding::Expired, Noon - 2h);
+        fix.roster.SetStanding(RosterStanding::Absent);
         CHECK(RefusalOf(fix.verifier.Verify(Ticket({}), Noon)) == std::optional { TicketRefusal::NoRoster });
-        // Recovery needs nothing but a current roster: no power event, no restart.
+        // Recovery needs nothing but a voter applied: no power event, no restart.
         fix.roster.SetStanding(RosterStanding::Current);
         CHECK(fix.verifier.Verify(Ticket({ .nonce = 3 }), Noon).has_value());
     }

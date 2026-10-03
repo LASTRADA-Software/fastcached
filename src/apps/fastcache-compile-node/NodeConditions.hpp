@@ -47,19 +47,21 @@ enum class NodeCondition : std::uint8_t
     UnqualifiedHostName,            ///< Peers are told to dial a host name with no domain.
     HostNameReachesOnlyThisMachine, ///< This machine's name reaches only itself, so nothing offers it.
     EnrollmentRequestsWaiting,      ///< Machines have asked to join and nobody has decided about them.
-    ForeignFleetVisible,            ///< Another established fleet proves itself on this segment; neither will merge.
-    SharedCacheUnavailable,         ///< The fleet names this machine its shared cache, and its shared tier will not open.
-    SharedCacheUnproven,            ///< The fleet names another machine its shared cache, and this node is not reaching it.
-    SchedulerUnreachable,           ///< A scheduler this node registers with does not answer a dial.
-    UnservedToolchain,              ///< Clients asked the leader for a toolchain no live worker serves.
-    MixedNodeVersions,              ///< The leader sees one wire served by more than one build.
-    OwnRecordAwaited,               ///< Its own cluster has not recorded this node's key, so it announces to nobody.
-    RefusedCompileArguments,        ///< The worker refused compiles over arguments it will not pass to its compiler.
-    SurfaceNotAccepting,            ///< A serving surface's accept loop has ended: its port listens and refuses.
-    SurfaceAcceptDegraded,          ///< A serving surface's accept loop is backing off on failures nothing classifies.
+    ForeignFleetVisible,     ///< Another fleet proves itself on this segment that this node will not merge with or join.
+    SharedCacheUnavailable,  ///< The fleet names this machine its shared cache, and its shared tier will not open.
+    SharedCacheUnproven,     ///< The fleet names another machine its shared cache, and this node is not reaching it.
+    SchedulerUnreachable,    ///< A scheduler this node registers with does not answer a dial.
+    UnservedToolchain,       ///< Clients asked the leader for a toolchain no live worker serves.
+    MixedNodeVersions,       ///< The leader sees one wire served by more than one build.
+    OwnRecordAwaited,        ///< Its own cluster has not recorded this node's key, so it announces to nobody.
+    RefusedCompileArguments, ///< The worker refused compiles over arguments it will not pass to its compiler.
+    SurfaceNotAccepting,     ///< A serving surface's accept loop has ended: its port listens and refuses.
+    SurfaceAcceptDegraded,   ///< A serving surface's accept loop is backing off on failures nothing classifies.
     FleetSplitHealing, ///< This fleet and another are one fleet split in two: healing by itself, or waiting on an operator.
-    FormationMoveRefused, ///< A move of this node's formation was refused: the startup rules refuse the shape it moves to.
-    Last,                 ///< Not a condition.
+    FormationMoveRefused,  ///< A move of this node's formation was refused: the startup rules refuse the shape it moves to.
+    ConsensusLeaderSilent, ///< No leader this node's applied configuration counts has spoken for too long to trust its
+                           ///< grants.
+    Last,                  ///< Not a condition.
 };
 
 /// Which of this node's components evaluates a row.
@@ -224,11 +226,11 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .persistence = CompileCacheWire::ConditionPersistence::Live,
       .severity = CompileCacheWire::ConditionSeverity::Warning,
       .scope = ConditionScope::Consensus,
-      .remedy = "Decide which fleet each machine named here belongs to, and --cluster-forget it from the other: two "
-                "established fleets merge only when a key this fleet already holds proves them one fleet split in "
-                "two, so these keep building apart and caching twice. A fleet that merely CLAIMS a machine of this "
-                "one is named as such and never merges. If both fleets are meant to stay, this clears a few minutes "
-                "after the other stops being heard; separate segments stop hearing it." },
+      .remedy = "Decide which fleet each machine named here belongs to, and --cluster-forget it from the other: "
+                "established fleets merge only when a key this fleet holds proves them one fleet split in two, and "
+                "one that merely CLAIMS a machine of this one never merges. For a fleet --fleet-id keeps this node "
+                "out of, change the pin if it names the wrong fleet. It clears a few minutes after the other fleet "
+                "stops being heard." },
     { .condition = NodeCondition::SharedCacheUnavailable,
       .id = "shared-cache-unavailable",
       .persistence = CompileCacheWire::ConditionPersistence::Live,
@@ -342,16 +344,26 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .scope = ConditionScope::Consensus,
       .remedy = "Fix the rule the detail names and restart this node; until then it keeps the mode it is in rather "
                 "than serve a shape its next restart would refuse." },
+    { .condition = NodeCondition::ConsensusLeaderSilent,
+      .id = "consensus-leader-silent",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Consensus,
+      .remedy = "Restore this node's Raft sessions to its fleet -- check the network path to its voters and "
+                "--cluster-status on one of them. Until a leader the fleet counts speaks to it again, every grant it is "
+                "handed is refused and the compiles fall back to their own machines; a voter its fleet forgot meanwhile is "
+                "what this protects against. It clears at the first leader contact." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");
 
-/// Whether every row of the table can travel: at most `MaxNodeConditions` of them, each with an id
-/// and a remedy inside their ceilings, no id empty or spelled twice, every remedy non-empty.
+/// Whether every row of the table can travel: FEWER than `MaxNodeConditions` of them -- one row to
+/// spare, so the next condition costs a row of the table rather than a re-derived share -- each with
+/// an id and a remedy inside their ceilings, no id empty or spelled twice, every remedy non-empty.
 /// @return True when the table fits the wire.
 [[nodiscard]] consteval bool NodeConditionTableFitsTheWire() noexcept
 {
-    if (NodeConditionTable.empty() || NodeConditionTable.size() > CompileCacheWire::MaxNodeConditions)
+    if (NodeConditionTable.empty() || NodeConditionTable.size() >= CompileCacheWire::MaxNodeConditions)
         return false;
     for (auto const& row: NodeConditionTable)
     {
@@ -364,8 +376,8 @@ static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condi
     return true;
 }
 static_assert(NodeConditionTableFitsTheWire(),
-              "every condition must fit the wire: at most MaxNodeConditions rows, each with a unique id and a remedy "
-              "inside their ceilings");
+              "every condition must fit the wire with a row to spare: fewer than MaxNodeConditions rows, each with a "
+              "unique id and a remedy inside their ceilings");
 
 /// The row describing @p condition.
 /// @param condition The condition.

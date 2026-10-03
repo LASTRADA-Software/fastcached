@@ -77,13 +77,11 @@ inline void PublishClusterKeys(Distributed::KeyRosterMembership& keys, Cluster::
 /// compile port, every refusal counter at zero, and a fleet green from both ends.
 ///
 /// **The route the rulebook promised has arrived, and it is a CREDENTIAL**: a roster admits
-/// machines by proof and by ticket, whatever address they dial from. So the question now needs
-/// to know whether a roster exists, which the configuration alone cannot answer -- a state
-/// directory may keep one -- and the caller states what it knows. `Held` counts the key routes,
-/// `Absent` does not, and `Unknown` asks `AdmitsByKey`, which reads a key route as live whenever
-/// the configuration could give this node a roster: the fail-closed reading for a question
-/// asked before any roster was read. `Formed` is consensus's own roster, which admits exactly
-/// the members the formation half below names. Removing a route fails OPEN through exactly this function,
+/// machines by proof and by ticket, whatever address they dial from. So the question needs to
+/// know what the caller counts of that route, and the caller states it: `Absent` counts none,
+/// `Unknown` counts it on every node running consensus -- the only node that holds a roster, its
+/// applied state -- which is the fail-closed reading a guard wants, and `Formed` is consensus's own
+/// roster, which admits exactly the members the formation half below names. Removing a route fails OPEN through exactly this function,
 /// because a worker that reads it as false builds a lease check that verifies nothing.
 ///
 /// It cannot be answered by asking the oracle, which is why it is a separate function rather
@@ -114,7 +112,7 @@ inline void PublishClusterKeys(Distributed::KeyRosterMembership& keys, Cluster::
 
     // The key routes: a proof or a VERIFIED ticket admits only against a roster -- never an AUTH
     // that merely answered `Ok`, which is why the question is the roster's presence.
-    return roster == RosterPresence::Held || (roster == RosterPresence::Unknown && AdmitsByKey(cfg));
+    return roster == RosterPresence::Unknown && RunsConsensus(cfg);
 }
 
 /// This node's admission policy, as the seam every surface holds.

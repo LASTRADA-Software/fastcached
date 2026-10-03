@@ -340,7 +340,7 @@ function Read-LiveText([string]$path) {
 # pass every case below -- its compiles still run. So the line is WAITED for -- the worker tier is
 # built after the scheduler that logs `scheduling for the fleet` -- and its opposite asserted absent.
 function Assert-ChecksLeases([string]$path, [string]$what) {
-    $text = Wait-ForLine $path ([regex]::Escape("verifying lease signatures against the roster this node applies")) 60 $what
+    $text = Wait-ForLine $path ([regex]::Escape("verifying lease signatures against the state this node's consensus applies")) 60 $what
     if ($text -match [regex]::Escape("compiling WITHOUT verifying")) {
         Write-Host $text
         throw "$what compiles WITHOUT verifying lease signatures"

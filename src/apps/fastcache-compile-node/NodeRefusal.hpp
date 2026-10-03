@@ -33,11 +33,9 @@ enum class NodeRefusalCause : std::uint8_t
 {
     EarlierRule,         ///< A rule the startup table, `main` or an option parser answers first.
     HandedOverListeners, ///< The listeners a supervisor handed over, against `--advertise`.
-    KeptRoster,          ///< The roster this node's state directory keeps, read and unusable, or its absence.
     CredentialFile,      ///< A credential file a flag names that was read, and holds nothing.
     LeaseValidation,     ///< How this worker would check a lease, against how it is reached.
     ConsensusState,      ///< A Raft state this build cannot read.
-    KeptRosterIo,        ///< The kept roster is there, and could not be read.
     CredentialIo,        ///< A credential file that could not be opened, or whose read failed part way.
     Listener,            ///< A port that does not bind, or a listener that does not start.
     CacheStore,          ///< The `--cache-dir` and the store in it.
@@ -63,9 +61,6 @@ inline constexpr auto NodeRefusalCauses = EnumTable<NodeRefusalCause, NodeRefusa
     { .cause = NodeRefusalCause::HandedOverListeners,
       .exit = ProcessExit::Refused,
       .reads = "the socket unit that handed the listeners over, and --advertise" },
-    { .cause = NodeRefusalCause::KeptRoster,
-      .exit = ProcessExit::Refused,
-      .reads = "the bytes of the roster this node keeps, and whether it keeps one" },
     { .cause = NodeRefusalCause::CredentialFile,
       .exit = ProcessExit::Refused,
       .reads = "the bytes of a file the operator named" },
@@ -75,9 +70,6 @@ inline constexpr auto NodeRefusalCauses = EnumTable<NodeRefusalCause, NodeRefusa
     { .cause = NodeRefusalCause::ConsensusState,
       .exit = ProcessExit::Refused,
       .reads = "what this node's own Raft store holds, against this build" },
-    { .cause = NodeRefusalCause::KeptRosterIo,
-      .exit = ProcessExit::Failed,
-      .reads = "a read of the kept roster: a permission, a mount, whatever the errno" },
     { .cause = NodeRefusalCause::CredentialIo,
       .exit = ProcessExit::Failed,
       .reads = "an open or a read of a credential file: a permission, a mount, a provisioner not done yet" },

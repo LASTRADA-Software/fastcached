@@ -160,6 +160,16 @@ class RaftNode
     /// @return The known leader, or nullopt.
     [[nodiscard]] std::optional<NodeId> const& KnownLeader() const noexcept;
 
+    /// When a leader last spoke to this node: the last `AppendEntries` or `InstallSnapshot` it
+    /// accepted from the leader of its current term.
+    ///
+    /// A RECORD, never a decision here: this node answers a pre-vote from its election deadline, not
+    /// from this (issue #117). What reads it is a worker bounding how long it honours grants against
+    /// a state no leader has refreshed (`Distributed::StateLeaseRoster`), and a learner -- which runs
+    /// no election and so never forgets `KnownLeader` -- has no other evidence that one still speaks.
+    /// @return The instant, or nullopt before any leader has spoken.
+    [[nodiscard]] std::optional<core::platform::SteadyTimePoint> LastLeaderContact() const noexcept;
+
     /// @return The node's log.
     [[nodiscard]] RaftLog const& Log() const noexcept;
 
@@ -656,12 +666,14 @@ class RaftNode
     /// When this node would stand for election, and — since issue #117 — also
     /// what it answers a challenger's pre-vote from, together with `_knownLeader`.
     ///
-    /// It replaced a separate `_lastLeaderContact` timestamp, which after that
-    /// change nothing read. Keeping a written-but-unread record of "when did a
-    /// leader last speak" would be worse than not having one: the next person to
-    /// need that question answered would reach for it without noticing it no
-    /// longer decides anything.
+    /// It replaced a separate `_lastLeaderContact` timestamp for THIS question, which
+    /// it no longer answers; `_lastLeaderContact` below is back for another reader
+    /// and decides nothing about an election.
     core::platform::SteadyTimePoint _electionDeadline {};
+
+    /// When a leader last spoke to this node; see `LastLeaderContact`. Read by the
+    /// lease roster's isolation bound, never by an election.
+    std::optional<core::platform::SteadyTimePoint> _lastLeaderContact;
     core::platform::SteadyTimePoint _heartbeatDeadline {};
 
     LogIndex _commitIndex {}; ///< Highest index known committed.

@@ -162,6 +162,7 @@ class DiscoveryTier
         PeerObserver onPeers;                               ///< Told the authenticated set.
         IMetricsSink& metrics;                              ///< Where refusals and bounds are counted.
         ILogger& logger;                                    ///< Where beacons, joins and rejections are reported.
+        Cluster::FleetPin pin;                              ///< `--fleet-id`, which the watch explains by.
     };
 
     /// How often a beacon the local stack refused at every destination is said, at most, and a

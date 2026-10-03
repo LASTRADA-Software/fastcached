@@ -4,6 +4,7 @@
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Distributed/MachineStanding.hpp>
@@ -556,6 +557,18 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
         fields.runtime.stateDirectoryReason = std::string { DescribeStateDirectoryOrigin(chosen->origin) };
     }
 
+    // Which pin this node trusts by, and the one another machine is to paste to trust THIS fleet: its
+    // cluster and the keys of the voters its applied state records, through the one formatter
+    // `--fleet-id` parses back. The pin is stated on every node, unpinned included -- that IS the
+    // answer an operator asks for. The fleet id needs a roster to name voters from.
+    if (auto const roster = _sources.roster != nullptr ? _sources.roster->Summary() : std::nullopt;
+        roster.has_value() && !roster->voterKeys.empty() && _cfg.formation.has_value() && !_cfg.formation->clusterId.empty())
+        fields.runtime.fleetId = Cluster::FormatPinnedFleet(
+            Cluster::PinnedFleet { .clusterId = _cfg.formation->clusterId, .voterKeys = roster->voterKeys });
+    fields.runtime.fleetPin = CompileCacheWire::NodeFleetPinFields {
+        .fleet = _cfg.fleetPin.has_value() ? std::optional { Cluster::FormatPinnedFleet(*_cfg.fleetPin) } : std::nullopt
+    };
+
     // Where this node sits in the configuration consensus holds (#1449): a learner and a
     // following voter are one role and one component mask, and only one of them stands
     // when the leader goes. Absent on a node with no source, which is a node running no
@@ -571,19 +584,12 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
     if (_sources.conditions != nullptr)
         fields.runtime.conditions = _sources.conditions->Snapshot();
 
-    // The roster, when this node holds one (#178). Its lapse travels as an INSTANT rather than a
-    // countdown, so a reader far from this node renders it against its own clock and a copy
-    // taken a minute ago still says when it lapses rather than how long it had then.
+    // The roster, when this node holds one (#178): the state it applied.
     if (auto const summary = _sources.roster != nullptr ? _sources.roster->Summary() : std::nullopt)
         fields.runtime.roster = CompileCacheWire::NodeRosterFields {
             .version = summary->version,
             .voters = summary->voters,
-            .principals = summary->principals,
             .revoked = summary->revoked,
-            .certifiedUntilMillis = summary->certifiedUntil.transform([](std::chrono::system_clock::time_point until) {
-                return static_cast<std::uint64_t>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(until.time_since_epoch()).count());
-            }),
         };
 
     // What this node reads through to, or serves, as the fleet's shared cache -- asked per request,

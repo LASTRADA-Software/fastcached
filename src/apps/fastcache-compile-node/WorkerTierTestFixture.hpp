@@ -174,6 +174,10 @@ struct WorkerTierFixture
     ActivatedNodeEndpoint activatedNodeEndpoint = AsConfigured;
     /// Where the tier records the lease check it built; a case reads it after `Start`.
     LeaseCheckInForce leaseCheck;
+    /// Where each started tier registers, one per `Start` -- built from `cfg` and
+    /// `activatedNodeEndpoint` as they stand THEN, as `main` builds the process's one -- and kept for
+    /// as long as the fixture, since a tier borrows it.
+    std::vector<std::unique_ptr<AppliedSchedulers>> schedulers;
 
     /// Start a tier for `cfg` on a machine of sixteen cores.
     [[nodiscard]] std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> Start()
@@ -190,11 +194,13 @@ struct WorkerTierFixture
                                    .claimant = MakeLockFileScratchClaimant(),
                                    .scratchBase = scratchBase.empty() ? scratch.Path() : scratchBase };
         };
+        schedulers.push_back(std::make_unique<AppliedSchedulers>(cfg, activatedNodeEndpoint));
         return WorkerTier::Start(WorkerTierParts { .cfg = cfg,
                                                    .reloader = nullptr,
                                                    .capacity = capacity,
                                                    .announced = announced,
                                                    .activatedNodeEndpoint = activatedNodeEndpoint,
+                                                   .schedulers = *schedulers.back(),
                                                    .membership = membership,
                                                    .locality = locality,
                                                    .io = io,

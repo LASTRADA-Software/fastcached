@@ -442,6 +442,49 @@ namespace Detail
     return std::pair { split->first, *port };
 }
 
+/// Whether @p host names every interface rather than a machine.
+///
+/// The two spellings of "every interface", plus the empty host -- which reaches `getaddrinfo`
+/// as nullptr under AI_PASSIVE and is therefore the wildcard as well, the case
+/// `--listen-node=:6674` is refused for. Brackets are the caller's to strip (`HostOfEndpoint`
+/// does), so `[::]` arrives here as `::`.
+/// @param host A host, unbracketed.
+/// @return True for a wildcard.
+[[nodiscard]] constexpr bool IsWildcardHost(std::string_view host) noexcept
+{
+    return host.empty() || host == "0.0.0.0" || host == "::";
+}
+
+/// Whether @p endpoint is one ANOTHER machine may be told to dial to reach this one: an endpoint
+/// `ParseDialEndpoint` accepts, whose host singles out one machine -- neither a name that reaches
+/// only the dialler's own machine nor a wildcard, which is `NamesNoOneMachine`'s question, asked
+/// rather than restated so a ticket's audience and a member's record cannot disagree about a host.
+///
+/// **The one rule for an endpoint that is RECORDED or STATED for peers**, asked wherever one is
+/// produced -- what a joiner states in `Enroll`, what a member announces, what a leader records for
+/// itself -- and again where the record is decided (`Cluster::Validate`), so no route into a member
+/// record accepts what another refuses. A peer told to dial `127.0.0.1:6674`, `localhost:6674` or
+/// `0.0.0.0:6674` reaches ITSELF, confidently and with no error at either end, which is worse than
+/// being told nothing.
+/// @param endpoint `host:port`, or `[v6]:port`.
+/// @return True when a peer dialling it could reach this machine.
+[[nodiscard]] inline bool IsPeerDialableEndpoint(std::string_view endpoint)
+{
+    auto const dial = ParseDialEndpoint(endpoint);
+    return dial.has_value() && !NamesNoOneMachine(dial->first);
+}
+
+/// @p endpoint when another machine may be told to dial it (`IsPeerDialableEndpoint`), else empty.
+///
+/// Empty rather than the spelling, because a record's empty endpoint is the stated "has none" and
+/// every reader treats it so, while a loopback or wildcard one is dialled.
+/// @param endpoint What this node would state.
+/// @return The endpoint to state or record, or empty.
+[[nodiscard]] inline std::string PeerDialableOrNone(std::string_view endpoint)
+{
+    return IsPeerDialableEndpoint(endpoint) ? std::string { endpoint } : std::string {};
+}
+
 /// Join a host and a port into text `SplitHostPort` reads back.
 ///
 /// The inverse of the parser, and it lives beside it for the reason the parser

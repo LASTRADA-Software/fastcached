@@ -83,13 +83,10 @@ class FixedLeaseRoster final: public Distributed::ILeaseRoster
 
     /// Set what `Read` answers from now on.
     /// @param standing The standing.
-    /// @param certifiedUntil When its certification lapses, if it has one.
-    void SetStanding(Distributed::RosterStanding standing,
-                     std::optional<std::chrono::system_clock::time_point> certifiedUntil = std::nullopt)
+    void SetStanding(Distributed::RosterStanding standing)
     {
         std::scoped_lock const lock { _lock };
         _standing = standing;
-        _certifiedUntil = certifiedUntil;
     }
 
     [[nodiscard]] Distributed::LeaseSignerKeys KeysOf(std::string_view signer) const override
@@ -106,7 +103,7 @@ class FixedLeaseRoster final: public Distributed::ILeaseRoster
     [[nodiscard]] Distributed::RosterReading Read(std::chrono::system_clock::time_point /*now*/) const override
     {
         std::scoped_lock const lock { _lock };
-        return Distributed::RosterReading { .standing = _standing, .certifiedUntil = _certifiedUntil };
+        return Distributed::RosterReading { .standing = _standing };
     }
 
     [[nodiscard]] Distributed::LeaseSignerKeys MachineKeysOf(std::string_view machine) const override
@@ -126,7 +123,6 @@ class FixedLeaseRoster final: public Distributed::ILeaseRoster
     std::vector<std::string> _machines; ///< Members admitted beside the voters, by `AdmitMachine`.
     std::vector<std::string> _revoked;
     Distributed::RosterStanding _standing { Distributed::RosterStanding::Current };
-    std::optional<std::chrono::system_clock::time_point> _certifiedUntil;
 };
 
 } // namespace FastCache::Testing

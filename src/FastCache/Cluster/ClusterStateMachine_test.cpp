@@ -34,7 +34,7 @@ namespace
 /// @param kind What it does.
 /// @param key The member id or setting name.
 /// @param value The consensus endpoint or setting value.
-/// @param scheduler Where clients reach this member while it leads.
+/// @param scheduler Where this member's `0xFC` port answers.
 /// @return The command.
 [[nodiscard]] Command Cmd(CommandKind kind, std::string key, std::string value = {}, std::string scheduler = {})
 {

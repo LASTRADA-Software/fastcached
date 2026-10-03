@@ -415,6 +415,40 @@ constexpr std::chrono::seconds NodeAnnounceInterval { 20 };
 // stop meaning "still being asked" and start meaning "asked once, a while ago".
 static_assert(NodeAnnounceInterval < SchedulerUnreachableCadence);
 
+/// How often a node whose own cluster has not recorded it yet announces, instead of waiting a whole
+/// `NodeAnnounceInterval`.
+///
+/// Short, because until the record lands the machine is one the fleet cannot use -- a node that has
+/// just started is a node compiling nothing -- and bounded below by what a scheduler can bear: one
+/// announcement per such node every few seconds.
+inline constexpr std::chrono::seconds RecordAwaitedInterval { 2 };
+
+// This interval feeds `SchedulerReachability` exactly as `NodeAnnounceInterval` does -- the loops
+// substitute it for the ordinary one, never run both -- so it owes the tracker the same bound:
+// strictly below the cadence, or a held node's rounds would each read as due for a reminder.
+static_assert(RecordAwaitedInterval < SchedulerUnreachableCadence);
+
+/// How long a loop waits after @p deferrals proofs in a row a scheduler answered `Deferred`
+/// (`RosterNotYetApplied`): `RecordAwaitedInterval`, doubling with each further deferral, and never
+/// past `NodeAnnounceInterval`.
+///
+/// **Short**, because a deferral is a scheduler that has just started -- an election or its leader's
+/// first word away from judging this machine -- and a whole interval of waiting is a machine the fleet
+/// cannot use for no reason. **Bounded**, by the ordinary interval, so a scheduler that never catches
+/// up is asked no more often than every other one, and doubling so that it gets there in a few rounds.
+/// @param deferrals Consecutive deferrals; at least one.
+/// @return The wait.
+[[nodiscard]] constexpr std::chrono::seconds DeferredProofWait(std::size_t deferrals) noexcept
+{
+    // Doublings past the ceiling change nothing, so the shift is capped where the ceiling is
+    // reached -- which also keeps it far from overflowing however long the deferrals run.
+    constexpr std::size_t CeilingDoublings = 4;
+    static_assert(RecordAwaitedInterval * (1 << CeilingDoublings) >= NodeAnnounceInterval,
+                  "the capped doubling must reach the ordinary interval");
+    auto const doublings = std::min(deferrals > 0 ? deferrals - 1 : 0, CeilingDoublings);
+    return std::min(RecordAwaitedInterval * (std::int64_t { 1 } << doublings), NodeAnnounceInterval);
+}
+
 /// The load record describing this MACHINE, sampled once.
 ///
 /// Extracted rather than copied because both announcements describe ONE host: sampling twice in
@@ -568,14 +602,13 @@ struct AnnounceProof
 ///
 /// One answer for both loops, for `DialAndAnnounce`'s reason: the worker's heartbeat and the
 /// presence loop wait on different primitives, and the rule deciding HOW LONG must not be two.
-/// `RosterWantingInterval` while this node holds no roster it could verify a grant against, or
-/// while its own cluster has not recorded it yet -- each of which leaves the machine unusable to
-/// the fleet until it clears, and a whole `NodeAnnounceInterval` of that after every start is a node
-/// nobody can use -- and `NodeAnnounceInterval` otherwise.
+/// `DeferredProofWait` while a scheduler answers that it cannot judge this machine yet, and
+/// `RecordAwaitedInterval` while this node's own cluster has not recorded it yet -- which leaves the
+/// machine unusable to the fleet until it clears, and a whole `NodeAnnounceInterval` of that after
+/// every start is a node nobody can use -- and `NodeAnnounceInterval` otherwise.
 /// @param prover Who this machine is; null where nothing proves.
-/// @param rosterWanting Whether this node wants a roster it does not hold.
 /// @return The wait.
-[[nodiscard]] std::chrono::seconds NextAnnounceWait(NodeProofClient const* prover, bool rosterWanting);
+[[nodiscard]] std::chrono::seconds NextAnnounceWait(NodeProofClient const* prover);
 
 [[nodiscard]] std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEndpointDialer& dialer);
 

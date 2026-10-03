@@ -847,6 +847,53 @@ TEST_CASE("A registration refusal the scheduler actually answered never raises s
     CHECK(LinesAt(fix.logger, LogLevel::Warn, "did not register") == 1);
 }
 
+TEST_CASE("A learner's next round registers where its applied state records a voter NOW, without a reform",
+          "[node][announce][presence][fleet]")
+{
+    // T26's carry, end to end through the round: the formation remembers the voter's endpoint as the
+    // approval carried it; the voter moves and announces its new one, proven, and the leader records
+    // it; the learner applies that state. Its NEXT presence round dials the new endpoint -- the link
+    // re-reads `AppliedSchedulers` at `BeginRound` -- rather than the remembered one until a restart.
+    AnnounceFixture fix;
+    auto const remembered = SchedulersOf(fix.cfg, AsConfigured);
+    REQUIRE(remembered.size() == 1);
+    AppliedSchedulers schedulers { fix.cfg, AsConfigured };
+    auto built = SchedulerLink::Over(schedulers);
+    REQUIRE(built.has_value());
+    auto link = Testing::Unwrap(std::move(built));
+
+    auto const recorded = Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {});
+    Testing::ScriptedDialer dialer { { recorded, recorded } };
+    auto const capacity = Wire::CapacityFields {};
+    auto const load = Wire::LoadFields {};
+    auto const announce = [&] {
+        return AnnouncePresence(PresenceMessage { .endpoint = ThisNode,
+                                                  .capacity = capacity,
+                                                  .load = load,
+                                                  .logger = fix.logger,
+                                                  .prover = nullptr,
+                                                  .reachability = fix.reachability,
+                                                  .joinMemos = {} },
+                                link,
+                                dialer);
+    };
+    REQUIRE(announce());
+
+    // The voter moved: the state the learner applies records it at its new endpoint.
+    constexpr std::string_view Moved = "scheduler-moved.example:6676";
+    auto state = Cluster::ClusterState {};
+    state.members.push_back(
+        Cluster::ClusterMember { .id = "office",
+                                 .raftEndpoint = "office.example:6680",
+                                 .schedulerEndpoint = std::string { Moved },
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
+                                 .seat = Cluster::MemberSeat::Voter,
+                                 .publicKey = {} });
+    schedulers.Applied(state);
+    CHECK(announce());
+    CHECK(dialer.Dialed() == std::vector<std::string> { remembered.front(), std::string { Moved } });
+}
+
 TEST_CASE("A worker's success at a scheduler does not end the presence loop's refusal there",
           "[node][announce][presence][reachability]")
 {
@@ -873,7 +920,6 @@ TEST_CASE("A worker's success at a scheduler does not end the presence loop's re
                                                   .prover = nullptr,
                                                   .reachability = fix.reachability,
                                                   .joinMemos = {} },
-                                nullptr,
                                 presenceLink,
                                 dialer);
     };
@@ -1421,7 +1467,7 @@ TEST_CASE("Only a consensus node whose own cluster has no opinion of its key is 
         CHECK(client.OwnRecordNow() == OwnRecord::NotAsked);
         CHECK_FALSE(client.HoldUntilRecorded(logger));
         CHECK(logger.Snapshot().empty());
-        CHECK(NextAnnounceWait(&client, false) == NodeAnnounceInterval);
+        CHECK(NextAnnounceWait(&client) == NodeAnnounceInterval);
     }
 
     SECTION("a REVOKED key is an opinion: the scheduler refuses it by name, so the round is not held back")
@@ -1440,18 +1486,34 @@ TEST_CASE("Only a consensus node whose own cluster has no opinion of its key is 
     }
 }
 
+TEST_CASE("A deferred proof is asked again on a short backoff that doubles up to the ordinary interval",
+          "[node][announce][boot-order]")
+{
+    // Batch 3's M3: a scheduler that has just started cannot judge this machine for an election or
+    // its leader's first word, and a whole interval of waiting is a machine nobody can use for no
+    // reason. Bounded by the ordinary interval, so one that never catches up is asked no more often
+    // than any other scheduler.
+    CHECK(DeferredProofWait(1) == RecordAwaitedInterval);
+    CHECK(DeferredProofWait(2) == 2 * RecordAwaitedInterval);
+    CHECK(DeferredProofWait(3) == 4 * RecordAwaitedInterval);
+    CHECK(DeferredProofWait(4) == 8 * RecordAwaitedInterval);
+    CHECK(DeferredProofWait(5) == NodeAnnounceInterval);
+    CHECK(DeferredProofWait(1'000'000) == NodeAnnounceInterval);
+    // The arithmetic the doublings rest on, stated rather than assumed.
+    STATIC_REQUIRE(8 * RecordAwaitedInterval < NodeAnnounceInterval);
+    STATIC_REQUIRE(16 * RecordAwaitedInterval >= NodeAnnounceInterval);
+}
+
 TEST_CASE("Both announcing loops wait the short interval while this node's own record is awaited",
           "[node][announce][self-record]")
 {
     OwnRecordFixture fix;
-    auto const shortWait = std::chrono::duration_cast<std::chrono::seconds>(RosterWantingInterval);
+    auto const shortWait = std::chrono::duration_cast<std::chrono::seconds>(RecordAwaitedInterval);
     REQUIRE(shortWait < NodeAnnounceInterval);
 
-    CHECK(NextAnnounceWait(&fix.client, false) == shortWait);
-    CHECK(NextAnnounceWait(nullptr, false) == NodeAnnounceInterval);
-    CHECK(NextAnnounceWait(nullptr, true) == shortWait);
+    CHECK(NextAnnounceWait(&fix.client) == shortWait);
+    CHECK(NextAnnounceWait(nullptr) == NodeAnnounceInterval);
 
     Testing::PublishKeyRoster(fix.ownCluster, { std::string { SelfNode } });
-    CHECK(NextAnnounceWait(&fix.client, false) == NodeAnnounceInterval);
-    CHECK(NextAnnounceWait(&fix.client, true) == shortWait);
+    CHECK(NextAnnounceWait(&fix.client) == NodeAnnounceInterval);
 }

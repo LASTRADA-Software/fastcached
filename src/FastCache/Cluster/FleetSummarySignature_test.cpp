@@ -116,6 +116,23 @@ TEST_CASE("A fleet summary verifies only as it was signed: every field and the k
     CHECK_FALSE(VerifyFleetSummarySignature(nonce, unnamed));
 }
 
+TEST_CASE("A fleet summary under a small-order key and an all-zero signature verifies nothing",
+          "[cluster][formation][summary][security]")
+{
+    // Under the cofactored equation a small-order key, a small-order R and S = 0 verify EVERY
+    // message, so a summary claiming the all-zero key would be a forgery anybody can make. The seam
+    // refuses such a key before the curve is asked (`Ed25519Verify`); this pins that the summary's
+    // verifier goes through it, for the key a stranger on the segment would pick first.
+    auto const nonce = NonceOf(std::byte { 5 });
+    auto forged = FleetSummaryReply { .summary = Office() };
+    forged.publicKey = Ed25519PublicKey {};
+    forged.signature = Ed25519Signature {};
+    CHECK_FALSE(VerifyFleetSummarySignature(nonce, forged));
+
+    // The control: the same summary, honestly signed, verifies -- so the refusal above is the key's.
+    CHECK(VerifyFleetSummarySignature(nonce, Answered(nonce, Office(), "n-office")));
+}
+
 TEST_CASE("A discovery proof never verifies as a fleet summary answer", "[cluster][formation][summary]")
 {
     // One identity key signs both; only the label keeps them apart. A proof over the same nonce,

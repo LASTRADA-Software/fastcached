@@ -320,19 +320,18 @@ namespace
             .project = [](Cluster::ClusterMember const& m) { return FleetCell::Of(m.raftEndpoint); } },
         FleetColumn<Cluster::ClusterMember> {
             .name = "scheduler-endpoint",
-            .help = "Where clients reach the fleet while this member leads. Absent until it has led.",
+            .help = "Where this member's 0xFC port answers. Absent until it has announced one.",
             .format = CellFormat::Text,
             // Absent, not an empty string presented as a fact: a member that has
-            // never led has not said, which is the normal state rather than a
-            // fault.
+            // announced none has not said, which is a state rather than a fault.
             .project =
                 [](Cluster::ClusterMember const& m) {
                     return m.schedulerEndpoint.empty() ? FleetCell::Nothing() : FleetCell::Of(m.schedulerEndpoint);
                 } },
         FleetColumn<Cluster::ClusterMember> {
             .name = "scheduler-endpoint-state",
-            .help = "Whether that endpoint is announced, never announced, or cleared by a re-admit; it returns when "
-                    "the member next leads.",
+            .help = "Whether that endpoint is announced, never announced, or cleared by a record re-proposed with "
+                    "none; it returns when the member next announces.",
             .format = CellFormat::Text,
             // Always present, and a column of its own rather than a word in the endpoint
             // cell, so that cell stays an address or absent in the JSON (#1340). Spelled

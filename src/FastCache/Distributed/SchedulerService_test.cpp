@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/Roster.hpp>
-#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Distributed/DialHint.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
@@ -24,6 +23,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <core/platform/Clock.hpp>
@@ -1736,6 +1736,9 @@ class StubCluster final: public IClusterAdmin
         return state;
     }
 
+    /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
+    void NoteAnnouncedEndpoint(Consensus::NodeId const& /*member*/, std::string /*endpoint*/) override {}
+
     [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& /*command*/) override
     {
         return {};
@@ -1896,9 +1899,18 @@ class RecordingCluster final: public IClusterAdmin
     /// What the cluster has agreed, as a scheduler reads it -- empty unless a case says.
     Cluster::ClusterState state;
 
+    /// Every `(member, endpoint)` the scheduler noted, in order; nothing is applied.
+    std::vector<std::pair<std::string, std::string>> announced;
+
     [[nodiscard]] Cluster::ClusterState ClusterState() const override
     {
         return state;
+    }
+
+    /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
+    void NoteAnnouncedEndpoint(Consensus::NodeId const& member, std::string endpoint) override
+    {
+        announced.emplace_back(member, std::move(endpoint));
     }
 
     [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& command) override
@@ -1971,8 +1983,12 @@ TEST_CASE("An admission answers with what the leader RECORDED, so a typed addres
     // no round trip, is put its own half on the screen, and this is that half.
     Admitting fleet;
 
-    auto const reply = fleet.Service().ClusterAdmit(
-        Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
+    auto const reply = fleet.Service().ClusterAdmit(Insider,
+                                                    "node-c",
+                                                    "10.0.0.9:6675",
+                                                    std::nullopt,
+                                                    std::string_view { KeyTextOf("node-c") },
+                                                    Cluster::MemberSeat::Voter);
     REQUIRE(reply.status == Wire::Status::Ok);
 
     auto const receipt = ReceiptOf(reply);
@@ -2011,8 +2027,8 @@ TEST_CASE("The operator's surface judges an admission against the roster before 
     fleet.cluster.state.principals.push_back(
         Cluster::ClusterPrincipal { .id = "worker-1", .publicKey = {}, .role = Cluster::PrincipalRole::Worker });
 
-    auto const refused =
-        fleet.Service().ClusterAdmit(Insider, "worker-1", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+    auto const refused = fleet.Service().ClusterAdmit(
+        Insider, "worker-1", "10.0.0.9:6675", std::nullopt, std::nullopt, Cluster::MemberSeat::Voter);
     REQUIRE(refused.status == Wire::Status::Error);
     CHECK(refused.error == Wire::ErrorCode::InvalidClusterChange);
     CHECK(refused.message.contains("is a principal"));
@@ -2020,8 +2036,12 @@ TEST_CASE("The operator's surface judges an admission against the roster before 
     CHECK(refused.payload.empty());
 
     // The control: the same verb for an id the roster does not hold is proposed as before.
-    auto const accepted = fleet.Service().ClusterAdmit(
-        Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
+    auto const accepted = fleet.Service().ClusterAdmit(Insider,
+                                                       "node-c",
+                                                       "10.0.0.9:6675",
+                                                       std::nullopt,
+                                                       std::string_view { KeyTextOf("node-c") },
+                                                       Cluster::MemberSeat::Voter);
     CHECK(accepted.status == Wire::Status::Ok);
     CHECK(fleet.cluster.proposed.size() == 1);
 }
@@ -2035,8 +2055,12 @@ TEST_CASE("A revoked key's refusal reaches the wire as a permanent refusal of th
     Admitting fleet;
     fleet.cluster.refusal = KeyRevoked("that key was revoked");
 
-    auto const reply = fleet.Service().ClusterAdmit(
-        Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
+    auto const reply = fleet.Service().ClusterAdmit(Insider,
+                                                    "node-c",
+                                                    "10.0.0.9:6675",
+                                                    std::nullopt,
+                                                    std::string_view { KeyTextOf("node-c") },
+                                                    Cluster::MemberSeat::Voter);
     REQUIRE(reply.status == Wire::Status::Error);
     CHECK(reply.error == Wire::ErrorCode::InvalidClusterChange);
     CHECK(reply.message == "that key was revoked");
@@ -2057,7 +2081,7 @@ TEST_CASE("An admission's key is recorded, and its receipt names the key the com
     {
         Admitting fleet;
         auto const reply = fleet.Service().ClusterAdmit(
-            Insider, "node-c", "10.0.0.9:6675", std::string_view { keyText }, Cluster::MemberSeat::Voter);
+            Insider, "node-c", "10.0.0.9:6675", std::nullopt, std::string_view { keyText }, Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Ok);
         REQUIRE(fleet.cluster.proposed.size() == 1);
         CHECK(fleet.cluster.proposed.front().publicKey == std::optional { key });
@@ -2079,8 +2103,8 @@ TEST_CASE("An admission's key is recorded, and its receipt names the key the com
                                      .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
                                      .seat = Cluster::MemberSeat::Voter,
                                      .publicKey = key });
-        auto const reply =
-            fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+        auto const reply = fleet.Service().ClusterAdmit(
+            Insider, "node-c", "10.0.0.9:6675", std::nullopt, std::nullopt, Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Ok);
         REQUIRE(fleet.cluster.proposed.size() == 1);
         CHECK_FALSE(fleet.cluster.proposed.front().publicKey.has_value());
@@ -2096,8 +2120,8 @@ TEST_CASE("An admission's key is recorded, and its receipt names the key the com
         // machine is forgotten by revoking its key, so one admitted without a key could never
         // be forgotten for good.
         Admitting fleet;
-        auto const reply =
-            fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+        auto const reply = fleet.Service().ClusterAdmit(
+            Insider, "node-c", "10.0.0.9:6675", std::nullopt, std::nullopt, Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Error);
         CHECK(reply.error == Wire::ErrorCode::InvalidClusterChange);
         CHECK(reply.message.contains("no identity key"));
@@ -2128,7 +2152,7 @@ TEST_CASE("An admission whose key is not one is refused and counted before anyth
     {
         INFO("text: " << text);
         auto const reply = fleet.Service().ClusterAdmit(
-            Insider, "node-c", "10.0.0.9:6675", std::string_view { text }, Cluster::MemberSeat::Voter);
+            Insider, "node-c", "10.0.0.9:6675", std::nullopt, std::string_view { text }, Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Error);
         CHECK(reply.error == Wire::ErrorCode::InvalidClusterChange);
         CHECK(reply.message.contains("not one"));
@@ -2139,7 +2163,7 @@ TEST_CASE("An admission whose key is not one is refused and counted before anyth
 
     // The control: the canonical text of the same key is proposed, and counts nothing.
     auto const accepted = fleet.Service().ClusterAdmit(
-        Insider, "node-c", "10.0.0.9:6675", std::string_view { keyText }, Cluster::MemberSeat::Voter);
+        Insider, "node-c", "10.0.0.9:6675", std::nullopt, std::string_view { keyText }, Cluster::MemberSeat::Voter);
     CHECK(accepted.status == Wire::Status::Ok);
     CHECK(fleet.cluster.proposed.size() == 1);
     CHECK(counted(fleet) == expected);
@@ -2165,7 +2189,7 @@ TEST_CASE("An admission under a small-order or non-canonical key is refused by n
         auto const text = FormatEd25519PublicKey(key);
         if (door == "member")
             return service.ClusterAdmit(
-                Insider, "node-c", "10.0.0.9:6675", std::string_view { text }, Cluster::MemberSeat::Voter);
+                Insider, "node-c", "10.0.0.9:6675", std::nullopt, std::string_view { text }, Cluster::MemberSeat::Voter);
         if (door == "worker")
             return service.ClusterAdmitWorker(Insider, "worker-c", text);
         return service.AdmitPrincipal(Insider, "worker-c", key, Cluster::PrincipalRole::Worker);
@@ -2211,7 +2235,7 @@ TEST_CASE("An admission naming a revoked key is refused by the roster, and is no
 
     auto const revokedText = FormatEd25519PublicKey(revoked);
     auto const refused = fleet.Service().ClusterAdmit(
-        Insider, "node-c", "10.0.0.9:6675", std::string_view { revokedText }, Cluster::MemberSeat::Voter);
+        Insider, "node-c", "10.0.0.9:6675", std::nullopt, std::string_view { revokedText }, Cluster::MemberSeat::Voter);
     REQUIRE(refused.status == Wire::Status::Error);
     CHECK(refused.error == Wire::ErrorCode::InvalidClusterChange);
     CHECK(refused.message.contains("revoked"));
@@ -2222,7 +2246,7 @@ TEST_CASE("An admission naming a revoked key is refused by the roster, and is no
     // The control: another key for the same member is proposed.
     auto const freshText = FormatEd25519PublicKey(fresh);
     auto const accepted = fleet.Service().ClusterAdmit(
-        Insider, "node-c", "10.0.0.9:6675", std::string_view { freshText }, Cluster::MemberSeat::Voter);
+        Insider, "node-c", "10.0.0.9:6675", std::nullopt, std::string_view { freshText }, Cluster::MemberSeat::Voter);
     CHECK(accepted.status == Wire::Status::Ok);
     CHECK(fleet.cluster.proposed.size() == 1);
 }
@@ -2244,8 +2268,8 @@ TEST_CASE("An admission refused before a command exists carries no receipt", "[d
     {
         Admitting fleet;
 
-        auto const reply =
-            fleet.Service().ClusterAdmit(Outsider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+        auto const reply = fleet.Service().ClusterAdmit(
+            Outsider, "node-c", "10.0.0.9:6675", std::nullopt, std::nullopt, Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Error);
         CHECK(reply.payload.empty());
         CHECK(fleet.cluster.proposed.empty());
@@ -2257,8 +2281,8 @@ TEST_CASE("An admission refused before a command exists carries no receipt", "[d
         // seam at all, which is the one arrangement `Admitting` cannot express.
         Leading bare;
 
-        auto const reply =
-            bare.service.ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+        auto const reply = bare.service.ClusterAdmit(
+            Insider, "node-c", "10.0.0.9:6675", std::nullopt, std::nullopt, Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Error);
         CHECK(reply.error == Wire::ErrorCode::NoCluster);
         CHECK(reply.payload.empty());
@@ -2277,8 +2301,12 @@ TEST_CASE("An admission refused once the command exists carries no receipt", "[d
                                                  .context = "somebody else leads",
                                                  .knownLeader = std::string { "10.0.0.2:6675" } };
 
-        auto const reply = fleet.Service().ClusterAdmit(
-            Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
+        auto const reply = fleet.Service().ClusterAdmit(Insider,
+                                                        "node-c",
+                                                        "10.0.0.9:6675",
+                                                        std::nullopt,
+                                                        std::string_view { KeyTextOf("node-c") },
+                                                        Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Error);
         CHECK(reply.payload.empty());
     }
@@ -2290,7 +2318,8 @@ TEST_CASE("An admission refused once the command exists carries no receipt", "[d
         // after it would be attached to a command nothing proposed.
         Admitting fleet;
 
-        auto const reply = fleet.Service().ClusterAdmit(Insider, "node-c", "", std::nullopt, Cluster::MemberSeat::Voter);
+        auto const reply =
+            fleet.Service().ClusterAdmit(Insider, "node-c", "", std::nullopt, std::nullopt, Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Error);
         CHECK(reply.payload.empty());
         CHECK(fleet.cluster.proposed.empty());
@@ -2312,8 +2341,12 @@ TEST_CASE("The receipt says what was recorded and the reply says nothing about c
     // in prose, and prose is what would end up claiming the member is in force.
     Admitting fleet;
 
-    auto const reply = fleet.Service().ClusterAdmit(
-        Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
+    auto const reply = fleet.Service().ClusterAdmit(Insider,
+                                                    "node-c",
+                                                    "10.0.0.9:6675",
+                                                    std::nullopt,
+                                                    std::string_view { KeyTextOf("node-c") },
+                                                    Cluster::MemberSeat::Voter);
     REQUIRE(reply.status == Wire::Status::Ok);
     CHECK(reply.message.empty());
 }
@@ -2341,8 +2374,12 @@ TEST_CASE("The two verbs that share Offer answer exactly as they did", "[distrib
 
     // And the admission beside them, in the same case, so "all three are empty" and
     // "all three carry a receipt" are both red rather than one of them passing.
-    auto const admit = fleet.Service().ClusterAdmit(
-        Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
+    auto const admit = fleet.Service().ClusterAdmit(Insider,
+                                                    "node-c",
+                                                    "10.0.0.9:6675",
+                                                    std::nullopt,
+                                                    std::string_view { KeyTextOf("node-c") },
+                                                    Cluster::MemberSeat::Voter);
     REQUIRE(admit.status == Wire::Status::Ok);
     CHECK_FALSE(admit.payload.empty());
 }
@@ -2369,7 +2406,8 @@ TEST_CASE("An admission proposes the verb its seat names, and no opinion keeps t
     auto const proposedFor = [&fleet](std::string const& id, std::optional<Cluster::MemberSeat> seat) {
         fleet.cluster.proposed.clear();
         auto const keyText = KeyTextOf(id);
-        auto const reply = fleet.Service().ClusterAdmit(Insider, id, "10.0.0.9:6675", std::string_view { keyText }, seat);
+        auto const reply =
+            fleet.Service().ClusterAdmit(Insider, id, "10.0.0.9:6675", std::nullopt, std::string_view { keyText }, seat);
         REQUIRE(reply.status == Wire::Status::Ok);
         REQUIRE(fleet.cluster.proposed.size() == 1);
         return fleet.cluster.proposed.front().kind;
@@ -2381,6 +2419,43 @@ TEST_CASE("An admission proposes the verb its seat names, and no opinion keeps t
 
     CHECK(proposedFor("laptop", std::nullopt) == Cluster::CommandKind::AddLearner);
     CHECK(proposedFor("node-c", std::nullopt) == Cluster::CommandKind::AddMember);
+}
+
+TEST_CASE("An operator's re-admit keeps the recorded 0xFC endpoint for the same machine and clears it for a replaced one",
+          "[distributed][scheduler][cluster-admit][endpoint]")
+{
+    // An operator's verb states no endpoint, and `AddMember` applies wholesale, so it carries the
+    // recorded one -- but only while the record is the SAME machine. Under another key it is a
+    // replaced one, and the old endpoint is where a resolver would dial expecting the new key.
+    auto const oldKey = Testing::TestKeyPair("laptop").PublicKey();
+    auto const newKey = Testing::TestKeyPair("laptop-replaced").PublicKey();
+    Admitting fleet;
+    fleet.cluster.state.members.push_back(
+        Cluster::ClusterMember { .id = "laptop",
+                                 .raftEndpoint = "10.0.0.9:6675",
+                                 .schedulerEndpoint = "laptop:6674",
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
+                                 .seat = Cluster::MemberSeat::Learner,
+                                 .publicKey = oldKey });
+
+    auto const proposedEndpointFor = [&fleet](std::optional<Ed25519PublicKey> const& key) {
+        fleet.cluster.proposed.clear();
+        auto const keyText = key.has_value() ? std::optional { FormatEd25519PublicKey(*key) } : std::nullopt;
+        auto const reply =
+            fleet.Service().ClusterAdmit(Insider,
+                                         "laptop",
+                                         "10.0.0.9:6675",
+                                         std::nullopt,
+                                         keyText.has_value() ? std::optional<std::string_view> { *keyText } : std::nullopt,
+                                         Cluster::MemberSeat::Voter);
+        REQUIRE(reply.status == Wire::Status::Ok);
+        REQUIRE(fleet.cluster.proposed.size() == 1);
+        return fleet.cluster.proposed.front().schedulerEndpoint;
+    };
+
+    CHECK(proposedEndpointFor(std::nullopt) == "laptop:6674"); // a promotion: the recorded key stays
+    CHECK(proposedEndpointFor(oldKey) == "laptop:6674");       // the same key, named
+    CHECK(proposedEndpointFor(newKey).empty());                // a replaced machine: none until it announces
 }
 
 namespace
@@ -2400,62 +2475,13 @@ namespace
     state.rosterVersion = version;
     return state;
 }
-
-/// @p voter's endorsement of @p state's roster, lapsing at @p notAfter, signed with @p signerKey.
-[[nodiscard]] Cluster::RosterEndorsement EndorsementOf(std::string const& voter,
-                                                       Cluster::ClusterState const& state,
-                                                       std::chrono::system_clock::time_point notAfter,
-                                                       std::string const& signerKey = {})
-{
-    auto const key = Testing::TestKeyPair(signerKey.empty() ? voter : signerKey);
-    return Cluster::SignEndorsement(
-        Cluster::RosterEndorsement { .clusterId = std::string { Signing::TestCluster },
-                                     .version = state.rosterVersion,
-                                     .rosterDigest = Cluster::DigestOfRoster(Cluster::ProjectRoster(state)),
-                                     .notAfter = notAfter,
-                                     .endorser = voter,
-                                     .signature = {} },
-        [&key](LabelledMessage const& message) { return SignLabelled(key, message); });
-}
 } // namespace
 
-TEST_CASE("A scheduler takes only a current voter's endorsement of the roster it holds", "[distributed][scheduler][roster]")
+TEST_CASE("NODE-ANNOUNCE's Ok carries nothing", "[distributed][scheduler][roster]")
 {
-    // #178. The endorser selects the key and nothing else is read before the signature
-    // verifies under it; a verified endorsement of another roster is ordinary during a change
-    // and kept out, never counted; a node with no cluster certifies nothing.
-    Signing fleet;
-    fleet.wallClock.setNow(Noon);
-    auto const state = VotersState({ "n1", "n2", "n3" }, 4);
-
-    CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n1", state, Noon + 1h))
-          == SchedulerService::EndorsementOutcome::NoState);
-
-    StubCluster cluster;
-    // Move-assigned from a copy: a plain copy-assign trips GCC 14's arm64 -O3 -Wnull-dereference false positive.
-    cluster.state = Cluster::ClusterState { state };
-    fleet.service.AdministerWith(cluster);
-
-    CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n1", state, Noon + 1h))
-          == SchedulerService::EndorsementOutcome::Accepted);
-    // Another machine's key under n2's name, and a stranger: refused and counted.
-    CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n2", state, Noon + 1h, "n1"))
-          == SchedulerService::EndorsementOutcome::Refused);
-    CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n9", state, Noon + 1h))
-          == SchedulerService::EndorsementOutcome::Refused);
-    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused) == 2);
-    // A voter one change behind: stale, not counted.
-    CHECK(fleet.service.AcceptEndorsement(EndorsementOf("n3", VotersState({ "n1", "n2", "n3" }, 3), Noon + 1h))
-          == SchedulerService::EndorsementOutcome::Stale);
-    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused) == 2);
-}
-
-TEST_CASE("A scheduler hands out a roster only once a strict majority of its voters endorse it",
-          "[distributed][scheduler][roster]")
-{
-    // What NODE-ANNOUNCE's reply carries (#178): nothing until a majority of the current voters
-    // have endorsed the roster this state holds, unexpired -- a worker refuses anything less,
-    // so anything less is bytes on every announcement for nobody.
+    // The certified roster is retired (#178): every node verifies grants against the state its own
+    // consensus applied, so a leader certifies nothing and an announcement is answered with an empty
+    // `Ok`.
     Signing fleet;
     fleet.wallClock.setNow(Noon);
     StubCluster cluster;
@@ -2463,40 +2489,11 @@ TEST_CASE("A scheduler hands out a roster only once a strict majority of its vot
     fleet.service.AdministerWith(cluster);
     fleet.service.SetRole(SchedulerRole::Leader, {}, 7);
 
-    REQUIRE(fleet.service.AcceptEndorsement(EndorsementOf("n1", cluster.state, Noon + 1h))
-            == SchedulerService::EndorsementOutcome::Accepted);
-    CHECK_FALSE(fleet.service.CertifiedRosterNow(Noon).has_value());
-
-    // The second endorsement arrives the way every voter's does: on NODE-ANNOUNCE.
-    auto const second = Cluster::EncodeEndorsement(EndorsementOf("n2", cluster.state, Noon + 50min));
-    auto const reply = fleet.service.AnnounceNode(Insider,
-                                                  NodePresence { .endpoint = "n2:6674",
-                                                                 .version = "test",
-                                                                 .capacity = {},
-                                                                 .load = {},
-                                                                 .conditions = std::nullopt,
-                                                                 .endorsement = second });
-    REQUIRE(reply.status == Wire::Status::Ok);
-    auto const certified = Cluster::DecodeCertifiedRoster(reply.payload);
-    REQUIRE(certified.has_value());
-    CHECK(Unwrap(certified).version == 4);
-    CHECK(Unwrap(certified).endorsements.size() == 2);
-    CHECK(Unwrap(certified).roster == Cluster::EncodeRoster(Cluster::ProjectRoster(cluster.state)));
-
-    // An endorsement that has lapsed is not served: past n2's, one voter remains.
-    CHECK_FALSE(fleet.service.CertifiedRosterNow(Noon + 55min).has_value());
-
-    // And a machine whose endorsement is not one still lands: its presence is true whoever it is.
-    auto const garbage = std::vector<std::byte>(5, std::byte { 0x5A });
-    auto const landed = fleet.service.AnnounceNode(Insider,
-                                                   NodePresence { .endpoint = "n3:6674",
-                                                                  .version = "test",
-                                                                  .capacity = {},
-                                                                  .load = {},
-                                                                  .conditions = std::nullopt,
-                                                                  .endorsement = garbage });
-    CHECK(landed.status == Wire::Status::Ok);
-    CHECK(fleet.metrics.Read(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused) == 1);
+    auto const reply = fleet.service.AnnounceNode(
+        Insider,
+        NodePresence { .endpoint = "n2:6674", .version = "test", .capacity = {}, .load = {}, .conditions = std::nullopt });
+    CHECK(reply.status == Wire::Status::Ok);
+    CHECK(reply.payload.empty());
 }
 
 namespace
@@ -3052,8 +3049,7 @@ TEST_CASE("A machine's announcement field longer than a scheduler records is ref
                                            .version = "1.2.3",
                                            .capacity = {},
                                            .load = {},
-                                           .conditions = std::vector { OrdinaryCondition() },
-                                           .endorsement = {} };
+                                           .conditions = std::vector { OrdinaryCondition() } };
             field.set(presence, value);
             return fleet.service.AnnounceNode(Insider, presence, {});
         };
@@ -3106,7 +3102,6 @@ TEST_CASE("A member's announced join memos are filed under the id it proved, and
                                                          .capacity = {},
                                                          .load = {},
                                                          .conditions = std::nullopt,
-                                                         .endorsement = {},
                                                          .joinMemos = carried });
     };
 
@@ -3134,4 +3129,51 @@ TEST_CASE("A member's announced join memos are filed under the id it proved, and
     cluster.state = VotersState({ "n1" }, 2);
     REQUIRE(announce(provenAs("n1"), {}).status == Wire::Status::Ok);
     CHECK(fleet.service.AnnouncedJoinMemos().empty());
+}
+
+TEST_CASE("A proven member announcing a new endpoint is noted and an unproven announce moves nothing",
+          "[distributed][scheduler][endpoint]")
+{
+    // A member's record moves only on its own word: the id is the one the caller PROVED on this
+    // connection, never a field of what it sent and never the address it dialled from, and what it is
+    // compared with is the record this fleet holds.
+    Admitting fleet;
+    fleet.cluster.state.members.push_back(
+        Cluster::ClusterMember { .id = "laptop",
+                                 .raftEndpoint = {},
+                                 .schedulerEndpoint = "laptop:6674",
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
+                                 .seat = Cluster::MemberSeat::Learner,
+                                 .publicKey = Testing::TestKeyPair("laptop").PublicKey() });
+    auto const provenAs = [](std::string id) {
+        return CallerContext { .membership = Membership::Member, .peerId = "laptop", .provenNodeId = std::move(id) };
+    };
+    auto const announce = [&fleet](CallerContext const& caller, std::string_view endpoint) {
+        return fleet.leading.service.AnnounceNode(
+            caller,
+            NodePresence {
+                .endpoint = endpoint, .version = "test", .capacity = {}, .load = {}, .conditions = std::nullopt });
+    };
+
+    REQUIRE(announce(provenAs("laptop"), "10.9.0.4:6674").status == Wire::Status::Ok);
+    REQUIRE(fleet.cluster.announced.size() == 1);
+    CHECK(fleet.cluster.announced[0] == std::pair<std::string, std::string> { "laptop", "10.9.0.4:6674" });
+
+    // The recorded endpoint again: nothing to change, nothing noted.
+    REQUIRE(announce(provenAs("laptop"), "laptop:6674").status == Wire::Status::Ok);
+    CHECK(fleet.cluster.announced.size() == 1);
+
+    // A caller that proved nothing moves nothing, even dialling from the recorded machine's own
+    // host. The surface refuses it `NodeIdentityRequired` before it gets here (`ProvenNodeOnly`);
+    // this is the service's own guard, which does not lean on that.
+    auto const unproven =
+        CallerContext { .membership = Membership::Member, .peerId = "laptop", .provenNodeId = std::nullopt };
+    REQUIRE(announce(unproven, "10.9.0.66:6674").status == Wire::Status::Ok);
+    CHECK(fleet.cluster.announced.size() == 1);
+
+    // A proven machine the state does not record is not a member: noted by nobody. Measured
+    // against what was noted before it, so this line answers about the stranger alone.
+    auto const noted = fleet.cluster.announced.size();
+    REQUIRE(announce(provenAs("stranger"), "10.9.0.7:6674").status == Wire::Status::Ok);
+    CHECK(fleet.cluster.announced.size() == noted);
 }

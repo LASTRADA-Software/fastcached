@@ -39,7 +39,8 @@ struct DesiredMember
     /// Empty for a seat that IS dialled is half a record, which `MembershipProposals` drops.
     std::string raftEndpoint;
 
-    /// Where clients reach it while it leads; absent when this node has no opinion.
+    /// Where its `0xFC` port answers, as the record keeps it for every member (`ClusterMember::schedulerEndpoint`);
+    /// absent when this node has no opinion.
     ///
     /// **Absent is not empty**, and that distinction is what keeps discovery from
     /// undoing a leader's own announcement. `AddMember` applies wholesale, so a

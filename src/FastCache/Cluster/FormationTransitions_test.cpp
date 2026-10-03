@@ -125,13 +125,13 @@ TEST_CASE("A fleet named by --fleet-seed is preferred over an older fleet a beac
     REQUIRE(beaconOld.Origin() == FleetOrigin::Beacon);
 
     auto const seen = std::array { beaconOld, seeded };
-    CHECK(ChosenId(PreferredTarget(own, seen)) == "office");
+    CHECK(ChosenId(PreferredTarget(own, seen, FleetPin {})) == "office");
     auto const reversed = std::array { seeded, beaconOld };
-    CHECK(ChosenId(PreferredTarget(own, reversed)) == "office"); // by rank, never by arrival order
+    CHECK(ChosenId(PreferredTarget(own, reversed, FleetPin {})) == "office"); // by rank, never by arrival order
 
     // The control: with the seed gone, the beacon's older fleet is the one asked.
     auto const beaconOnly = std::array { beaconOld };
-    CHECK(ChosenId(PreferredTarget(own, beaconOnly)) == "rogue");
+    CHECK(ChosenId(PreferredTarget(own, beaconOnly, FleetPin {})) == "rogue");
 }
 
 TEST_CASE("The preferred target is established first then older then the lower id", "[cluster][formation][transitions]")
@@ -143,11 +143,11 @@ TEST_CASE("The preferred target is established first then older then the lower i
     auto const younger = Testing::ProvenBeacon(Fleet("c", FleetState::Solitary, 900));
 
     auto const seen = std::array { oldSolitary, youngFleet, sameAgeLower, younger };
-    CHECK(ChosenId(PreferredTarget(own, seen)) == "b");
+    CHECK(ChosenId(PreferredTarget(own, seen, FleetPin {})) == "b");
     auto const noFleet = std::array { oldSolitary, younger };
-    CHECK(ChosenId(PreferredTarget(own, noFleet)) == "a");
+    CHECK(ChosenId(PreferredTarget(own, noFleet, FleetPin {})) == "a");
     auto const nothingToYieldTo = std::array { younger };
-    CHECK_FALSE(PreferredTarget(own, nothingToYieldTo).has_value());
+    CHECK_FALSE(PreferredTarget(own, nothingToYieldTo, FleetPin {}).has_value());
 }
 
 TEST_CASE("An established node never picks a target, however old the fleet it sees", "[cluster][formation][transitions]")
@@ -157,7 +157,7 @@ TEST_CASE("An established node never picks a target, however old the fleet it se
     auto const own = Fleet("mine", FleetState::Established, 500);
     auto const older =
         std::array { Testing::ProvenSeed(Fleet("office", FleetState::Established, 1), SeedSource::FleetSeedFlag) };
-    CHECK_FALSE(PreferredTarget(own, older).has_value());
+    CHECK_FALSE(PreferredTarget(own, older, FleetPin {}).has_value());
 }
 
 TEST_CASE("Every fleet origin has a rank of its own, typed seed first and beacon last", "[cluster][formation][transitions]")
@@ -174,5 +174,30 @@ TEST_CASE("Every fleet origin has a rank of its own, typed seed first and beacon
     auto const remembered = Testing::ProvenSeed(Fleet("home", FleetState::Established, 400), SeedSource::Remembered);
     auto const dns = Testing::ProvenSeed(Fleet("dns", FleetState::Established, 1), SeedSource::DnsSrv);
     auto const seen = std::array { dns, remembered };
-    CHECK(ChosenId(PreferredTarget(own, seen)) == "home");
+    CHECK(ChosenId(PreferredTarget(own, seen, FleetPin {})) == "home");
+}
+
+TEST_CASE("A pinned node picks only the pinned fleet, however it was found", "[cluster][formation][transitions][pin]")
+{
+    // The pin is asked of every candidate, so an older fleet from a better origin does not outrank it:
+    // the typed seed, the remembered fleet, DNS SRV and a beacon are all one decision.
+    auto const own = Fleet("m", FleetState::Solitary, 500);
+    auto const pin = FleetPin { .fleet = PinnedFleet { .clusterId = "office",
+                                                       .voterKeys = { Testing::TestKeyPair("office").PublicKey() } } };
+    auto const office = Testing::ProvenBeacon(Fleet("office", FleetState::Established, 400));
+    auto const strangers = std::array {
+        Testing::ProvenSeed(Fleet("typed", FleetState::Established, 1), SeedSource::FleetSeedFlag),
+        Testing::ProvenSeed(Fleet("home", FleetState::Established, 2), SeedSource::Remembered),
+        Testing::ProvenSeed(Fleet("dns", FleetState::Established, 3), SeedSource::DnsSrv),
+        Testing::ProvenBeacon(Fleet("rogue", FleetState::Established, 0)),
+    };
+    for (auto const& stranger: strangers)
+    {
+        INFO("against " << stranger.Summary().clusterId);
+        auto const both = std::array { stranger, office };
+        CHECK(ChosenId(PreferredTarget(own, both, FleetPin {})) == stranger.Summary().clusterId); // the control
+        CHECK(ChosenId(PreferredTarget(own, both, pin)) == "office");
+        auto const alone = std::array { stranger };
+        CHECK_FALSE(PreferredTarget(own, alone, pin).has_value());
+    }
 }

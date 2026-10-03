@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "EnrollmentAbsence.hpp"
+#include "SchedulerLink.hpp"
+
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/FleetEndpoints.hpp>
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/NodeMode.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 
 #include <cstdint>
 #include <expected>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -57,6 +62,12 @@ struct NodeFormationView
 /// record, and a learner started with no members would dial nobody and report nothing -- the
 /// record's own rule, that a record that cannot be read refuses the start by name, arriving at
 /// the one field its decoder does not open.
+///
+/// **A record the pin does not admit is a refusal too** (`--fleet-id`, `Cluster::CommittedClusterId`):
+/// a pending node asking, or a learner or voter in, a cluster other than the pinned one. Judged here
+/// because every shape the node takes passes through: the start refuses it by name with the remedy,
+/// a reload cannot reach it (the pin is `Reloadable::No`), and every formation move is judged by the
+/// same call (`StartupShapeJudge`), so no transition writes a record the pin forbids.
 /// @param cfg The configuration to shape.
 /// @param record The formation record, as loaded or minted.
 /// @param remembered The fleet endpoints this node last knew; empty when there is no file.
@@ -64,6 +75,11 @@ struct NodeFormationView
 [[nodiscard]] std::expected<void, std::string> ApplyFormation(NodeConfig& cfg,
                                                               Cluster::FormationRecord const& record,
                                                               Cluster::FleetEndpoints const& remembered);
+
+/// The pin @p cfg carries: `--fleet-id`, or none.
+/// @param cfg The configuration.
+/// @return The pin every formation decision asks (`Cluster::AdmitsFleet`).
+[[nodiscard]] Cluster::FleetPin FleetPinOf(NodeConfig const& cfg);
 
 /// Whether @p mode binds the Raft surface: its row's `raftListener` column.
 /// @param mode The mode.
@@ -96,10 +112,30 @@ struct NodeFormationView
 /// surface a test builds is the one production builds: a fixture that gave every body a responder
 /// answered `Enroll` on a learner, which production never does. No key file is a clause: since #178
 /// an approval hands over no key.
+///
+/// **And the cluster it would admit into is one its own `--fleet-id` admits, under its own key.** A
+/// node pinned to another fleet is on its way there, one whose key its pin does not name signs answers
+/// its pinned joiners refuse, so a machine it admitted would found a fleet its own pin then
+/// refuses at its next start -- and an unpinned machine that tie-breaks towards it would be left in
+/// a cluster about to be abandoned. So it records nobody: a joiner reads the family's `NoCluster`
+/// and gives the join up, while the pinned node asks the fleet it is pinned to.
 /// @param cfg The configuration.
 /// @param schedulerRuns Whether this node's scheduler tier was built.
-/// @return True when all three hold.
-[[nodiscard]] bool ServesEnrollment(NodeConfig const& cfg, bool schedulerRuns) noexcept;
+/// @return True when all three hold: exactly when `EnrollmentAbsenceOf` names no reason.
+[[nodiscard]] bool ServesEnrollment(NodeConfig const& cfg, bool schedulerRuns);
+
+/// Why @p cfg serves no enrollment surface, or nothing when it serves one: the ONE derivation
+/// `ServesEnrollment` answers from, so the surface and the words a joiner is refused with
+/// (`EnrollmentAbsenceTable`) cannot disagree about whether, or why.
+///
+/// In the order the clauses are asked: consensus (and, when it does not run, whether it stood down
+/// for want of an address rather than being closed), the scheduler tier, then the pin -- one pinned
+/// to another cluster told apart from one pinned to its own under keys that are not its own, through
+/// the one predicate, because the two remedies are on different machines.
+/// @param cfg The configuration.
+/// @param schedulerRuns Whether this node's scheduler tier was built.
+/// @return The reason, or nothing when the surface is served.
+[[nodiscard]] std::optional<EnrollmentAbsence> EnrollmentAbsenceOf(NodeConfig const& cfg, bool schedulerRuns);
 
 /// Where a supervisor handed this node's `0xFC` surface over (socket activation), read off the
 /// adopted socket. Only the socket can say it: the unit chose the address AND the port, so
@@ -134,6 +170,52 @@ inline constexpr std::nullopt_t AsConfigured = std::nullopt;
 /// @param activated Where a supervisor handed the node surface over, or `AsConfigured`.
 /// @return The endpoints, in the order they are tried.
 [[nodiscard]] std::vector<std::string> SchedulersOf(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated);
+
+/// The `0xFC` endpoints @p state records for its voters, in the state's order -- every voter but
+/// @p self, and none whose record holds no endpoint yet.
+///
+/// Voters, because only a voter serves a scheduler; a learner's recorded endpoint is where its
+/// compile port answers, never a scheduler to register with.
+/// @param state An applied state.
+/// @param self This node's id.
+/// @return The endpoints.
+[[nodiscard]] std::vector<std::string> RecordedSchedulersOf(Cluster::ClusterState const& state, std::string_view self);
+
+/// Where this node's worker and presence loop register, re-read at every round
+/// (`SchedulerLink::Over`).
+///
+/// A node that serves a scheduler registers at its own (`SchedulersOf`), whatever the state says.
+/// One that serves none registers at the voters its APPLIED state records (`RecordedSchedulersOf`),
+/// told every applied state by the consensus tier's apply callback (`StartConsensusOrExplain`) -- so
+/// a voter that moves its `0xFC` endpoint, proven, is reached at the next round rather than after a
+/// reform or a restart (T26's carry). Until the state records one, and on a node that runs no
+/// consensus, the formation's answer (`SchedulersOf`): the voters the approval remembered.
+///
+/// **The state REPLACES the formation's list rather than joining it**: a voter that moved left its old
+/// endpoint behind in the formation record, and a round that walked both would pay the dead one's
+/// connect timeout whenever the live one failed first. Thread-safe: told on the consensus apply
+/// thread, read on each loop's own.
+class AppliedSchedulers final: public ISchedulerEndpointSource
+{
+  public:
+    /// @param cfg The configuration, its formation applied; read here and never kept.
+    /// @param activated Where a supervisor handed the node surface over, or `AsConfigured`.
+    AppliedSchedulers(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated);
+
+    /// Take what @p state records.
+    /// @param state The state the cluster just applied.
+    void Applied(Cluster::ClusterState const& state);
+
+    /// @copydoc ISchedulerEndpointSource::Current
+    [[nodiscard]] std::vector<std::string> Current() const override;
+
+  private:
+    std::string _self;                   ///< This node's id, never a scheduler it registers with.
+    bool _servesScheduler;               ///< Whether it registers at its own scheduler, whatever is applied.
+    std::vector<std::string> _formation; ///< `SchedulersOf`'s answer: the fallback.
+    mutable std::mutex _lock;            ///< Guards `_recorded`.
+    std::vector<std::string> _recorded;  ///< The applied state's voters' endpoints; empty until one is.
+};
 
 /// The members consensus starts with.
 ///

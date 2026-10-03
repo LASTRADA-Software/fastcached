@@ -32,14 +32,12 @@ namespace
         PresenceAnnouncement(std::string_view endpoint,
                              Wire::CapacityFields const& capacity,
                              Wire::LoadFields const& load,
-                             std::span<std::byte const> endorsement,
                              std::span<Wire::JoinMemoFields const> joinMemos,
                              ILogger& logger,
                              SchedulerReachability& reachability) noexcept:
             _endpoint { endpoint },
             _capacity { capacity },
             _load { load },
-            _endorsement { endorsement },
             _joinMemos { joinMemos },
             _logger { logger },
             _reachability { reachability }
@@ -48,11 +46,10 @@ namespace
 
         [[nodiscard]] AnnounceOutcome Attempt(core::net::ISocket& client, std::string_view endpoint) override
         {
-            auto sent = Cc::AnnounceNodePresence(client, _endpoint, _capacity, _load, _endorsement, _joinMemos);
+            auto sent = Cc::AnnounceNodePresence(client, _endpoint, _capacity, _load, _joinMemos);
             if (sent.has_value())
             {
                 _accepted = true;
-                _reply = *std::move(sent);
                 if (auto const back = _reachability.Succeeded(AnnounceStage::Announcement, endpoint); back.has_value())
                     _logger.Log(back->level, back->message);
                 return AnnounceOutcome { .accepted = 1, .leader = std::nullopt };
@@ -95,23 +92,14 @@ namespace
             return _accepted;
         }
 
-        /// @return What the scheduler that recorded this machine answered with: an encoded
-        ///         certified roster, or empty.
-        [[nodiscard]] std::span<std::byte const> Reply() const noexcept
-        {
-            return _reply;
-        }
-
       private:
         std::string_view _endpoint;
         Wire::CapacityFields const& _capacity;
         Wire::LoadFields const& _load;
-        std::span<std::byte const> _endorsement;
         std::span<Wire::JoinMemoFields const> _joinMemos;
         ILogger& _logger;
         SchedulerReachability& _reachability;
         bool _accepted = false;
-        std::vector<std::byte> _reply;
     };
 } // namespace
 
@@ -154,7 +142,6 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
             .reachability = round.reachability,
             .joinMemos = memos,
         },
-        round.roster,
         link,
         dialer);
 
@@ -163,19 +150,12 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
     return accepted;
 }
 
-bool AnnouncePresence(PresenceMessage const& message, IPresenceRoster* roster, SchedulerLink& link, IEndpointDialer& dialer)
+bool AnnouncePresence(PresenceMessage const& message, SchedulerLink& link, IEndpointDialer& dialer)
 {
-    // The roster rides the same verb (#178): a voter's endorsement out, and back whatever roster
-    // the leader can certify -- which a node that holds none adopts in this same round, from
-    // whichever scheduler the round's redirects and fallbacks reached.
-    auto const endorsement = roster != nullptr ? roster->Endorsement() : std::vector<std::byte> {};
-    PresenceAnnouncement announcement { message.endpoint,  message.capacity, message.load,        endorsement,
+    PresenceAnnouncement announcement { message.endpoint,  message.capacity, message.load,
                                         message.joinMemos, message.logger,   message.reachability };
     (void) DialAndAnnounce(
         link, message.reachability, dialer, message.logger, announcement, AnnounceProof { .prover = message.prover });
-
-    if (announcement.Accepted() && roster != nullptr)
-        roster->Offered(announcement.Reply());
     return announcement.Accepted();
 }
 
@@ -191,7 +171,7 @@ bool AwaitsItsOwnRecord(NodeConfig const& cfg, ActivatedNodeEndpoint const& acti
 
 std::unique_ptr<NodePresence> NodePresence::Start(NodePresenceParts const& parts)
 {
-    auto link = SchedulerLink::For(SchedulersOf(parts.cfg, parts.activatedNodeEndpoint));
+    auto link = SchedulerLink::Over(parts.schedulers);
     if (!link.has_value())
         return nullptr;
 
@@ -207,7 +187,6 @@ NodePresence::NodePresence(NodePresenceParts const& parts, SchedulerLink link):
     _sampler { parts.sampler },
     _logger { parts.logger },
     _conditions { parts.conditions },
-    _roster { parts.roster },
     _prover { parts.prover },
     _reachability { parts.reachability },
     _askedJoins { parts.askedJoins },
@@ -249,7 +228,6 @@ void NodePresence::Loop(std::stop_token const& stop)
                                                        .endpoint = endpoint,
                                                        .logger = _logger,
                                                        .conditions = _conditions,
-                                                       .roster = _roster,
                                                        .prover = _prover,
                                                        .reachability = _reachability,
                                                        .askedJoins = _askedJoins },
@@ -263,8 +241,7 @@ void NodePresence::Loop(std::stop_token const& stop)
 
 bool NodePresence::WaitOutInterval(std::stop_token const& stop)
 {
-    auto const interval = std::chrono::duration_cast<std::chrono::milliseconds>(
-        NextAnnounceWait(_prover, _roster != nullptr && _roster->Wanting()));
+    auto const interval = std::chrono::duration_cast<std::chrono::milliseconds>(NextAnnounceWait(_prover));
     return _presenceWake.WaitOut(stop, interval) == PresenceWakeReason::Stopped;
 }
 

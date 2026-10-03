@@ -225,27 +225,6 @@ void ReportInstallRefusal(std::optional<Consensus::RaftDriver::InstallRefusal> c
         conditions->Raise(NodeCondition::UnreadableLeaderSnapshot, said);
 }
 
-std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::string_view schedulerBound)
-{
-    // Nothing to advertise when this node serves no scheduler surface, which is a
-    // legitimate shape: a member that contributes CPU and consensus without handing
-    // out anybody's work. Recording an endpoint for it would redirect clients at a
-    // port nothing is listening on.
-    if (schedulerBound.empty() || raftEndpoint.empty())
-        return {};
-
-    auto const scheduler = SplitHostPort(schedulerBound);
-    auto const consensus = SplitHostPort(raftEndpoint);
-    if (!scheduler.has_value() || !consensus.has_value())
-        return {};
-
-    // A v6 host arrives from `SplitHostPort` without its brackets, and every
-    // consumer of this string splits it again -- so it has to go back the way it
-    // came or the next split takes the wrong colon. That is the defect
-    // `Core/HostPort` exists to hold in one place, and this is one of the places.
-    return FormatHostPort(consensus->first, scheduler->second);
-}
-
 std::expected<Cluster::ClusterMember, std::string> ConsensusSelfMemberOf(NodeConfig const& cfg,
                                                                          std::span<Cluster::MemberSpec const> members,
                                                                          Ed25519PublicKey const& publicKey)
@@ -306,16 +285,34 @@ std::vector<Consensus::NodeId> DialInPeers(Cluster::ClusterState const& state, C
     return peers;
 }
 
+Distributed::LeaderReading LeaderReadingOf(Consensus::RaftDriver::Progress const& progress,
+                                           core::platform::SteadyTimePoint now)
+{
+    // A leader hears from no leader: while it leads, CheckQuorum is its evidence and deposes it
+    // once a quorum stops answering, so leading IS contact, at this instant.
+    auto const leads = progress.role == Consensus::Role::Leader;
+    // NOT judged here against `progress.configuration`: that is the driver's ACTIVE configuration,
+    // which an uncommitted entry can move. Whether the leader counts is the roster's question,
+    // asked of the voters it applied (`Distributed::StateLeaseRoster::NoteLeaderReading`).
+    // An AGE on this tier's clock, for the roster to take back from its own (`LeaderReading`).
+    auto silentFor = std::optional<core::platform::SteadyTimePoint::duration> {};
+    if (leads)
+        silentFor = core::platform::SteadyTimePoint::duration::zero();
+    else if (progress.lastLeaderContact.has_value())
+        silentFor = now - *progress.lastLeaderContact;
+    return Distributed::LeaderReading { .leads = leads, .leader = progress.knownLeader, .silentFor = silentFor };
+}
+
 ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
+                             Cc::IAdvertisedEndpointSource const& advertised,
                              Consensus::FileRaftStorage storage,
                              Ed25519KeyPair identityKey,
                              std::span<Cluster::MemberSpec const> knownMembers,
                              std::string boundEndpoint,
                              RoleObserver onRole,
                              MembersObserver onMembers,
-                             core::platform::WallClockRef wallClock,
+                             LeaderContactObserver onLeaderContact,
                              std::string clusterId,
-                             EndorsementObserver onEndorsement,
                              IMetricsSink& metrics,
                              ILogger& logger,
                              NodeConditions* conditions,
@@ -334,11 +331,11 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
     _onRole { std::move(onRole) },
     _boundEndpoint { std::move(boundEndpoint) },
     _self { std::move(self) },
+    _advertised { advertised },
     _onMembers { std::move(onMembers) },
+    _onLeaderContact { std::move(onLeaderContact) },
     _conditions { conditions },
-    _wallClock { wallClock },
     _clusterId { std::move(clusterId) },
-    _onEndorsement { std::move(onEndorsement) },
     _hooks { std::move(hooks) }
 {
     // Seeded with this node's own record, and its scheduler endpoint travels as a
@@ -364,12 +361,11 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
 
 std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> ConsensusTier::Start(
     NodeConfig const& cfg,
-    std::string_view schedulerBound,
+    Cc::IAdvertisedEndpointSource const& advertised,
     std::optional<Ed25519KeyPair> const& identityKey,
     RoleObserver onRole,
     MembersObserver onMembers,
-    core::platform::WallClockRef wallClock,
-    EndorsementObserver onEndorsement,
+    LeaderContactObserver onLeaderContact,
     IMetricsSink& metrics,
     ILogger& logger,
     NodeConditions* conditions,
@@ -488,21 +484,24 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> ConsensusTier::Start(
     // entry `ApplyNodeIdentity` synthesised carries the same key, but the pair is the source.
     // Its seat is the one `ConsensusSelfMemberOf` read off its mode -- a learner announces a
     // learner, never the voter a bootstrap set of voters would have implied.
+    //
+    // Never one only this machine reaches (`PeerDialableOrNone`): a record is what OTHER machines
+    // are sent to, and `Cluster::Validate` refuses such an endpoint on every route into it.
     auto announced = *self;
-    announced.schedulerEndpoint = AdvertisedSchedulerEndpoint(self->raftEndpoint, schedulerBound);
+    announced.schedulerEndpoint = PeerDialableOrNone(advertised.Current());
     announced.publicKey = identityKey->PublicKey();
 
     auto tier = std::unique_ptr<ConsensusTier> { new ConsensusTier {
         std::move(announced),
+        advertised,
         *std::move(storage),
         *identityKey,
         members,
         bind.has_value() ? std::format("{}:{}", bind->host, bind->port) : std::string {},
         std::move(onRole),
         std::move(onMembers),
-        wallClock,
+        std::move(onLeaderContact),
         cfg.clusterId,
-        std::move(onEndorsement),
         metrics,
         logger,
         conditions,
@@ -716,6 +715,7 @@ std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
         return std::unexpected { Refusal(NodeRefusalCause::ConsensusState,
                                          UnreadableConsensusStateRefusal(NodeStateDirectory(cfg), driver.error())) };
     _driver = *std::move(driver);
+    _recoveredLastIndex = _driver->CurrentProgress().lastLogIndex;
 
     // Pushed, not polled. A poll interval is a window in which this node has stopped
     // leading and is still handing out other machines' capacity, and the driver knows
@@ -928,9 +928,24 @@ std::optional<Consensus::Standing> ConsensusTier::CurrentStanding() const
     return Consensus::Membership::StandingOf(_driver->CurrentProgress().configuration, _self.id);
 }
 
+AppliedStateReading ConsensusTier::CurrentAppliedState() const
+{
+    auto const progress = _driver->CurrentProgress();
+    return AppliedStateOf(progress.appliedIndex, progress.lastLogIndex, _recoveredLastIndex);
+}
+
 std::expected<void, ConsensusError> ConsensusTier::ProposeToCluster(Cluster::Command const& command)
 {
     return Propose(command).transform([](Consensus::LogIndex) {});
+}
+
+void ConsensusTier::NoteAnnouncedEndpoint(Consensus::NodeId const& member, std::string endpoint)
+{
+    // Kept, never proposed here: the scheduler's thread calls this, a proposal is a durability
+    // write, and the reconcile pass already decides every record in one place -- including whether
+    // this member's record differs at all and whether a change for it is still in flight.
+    auto const guard = std::unique_lock { _desiredMutex };
+    _announced.insert_or_assign(member, std::move(endpoint));
 }
 
 void ConsensusTier::Desire(std::span<Cluster::DesiredMember const> records)
@@ -966,6 +981,11 @@ void ConsensusTier::Reconcile()
 {
     auto const state = _application.State();
 
+    // Every pass, before anything below can return early: how long this node's applied state has
+    // gone unrefreshed by a leader it counts is what bounds the grants its worker honours.
+    if (_onLeaderContact)
+        _onLeaderContact(LeaderReadingOf(_driver->CurrentProgress(), _clock.now()));
+
     // Every node, leader or not, and BEFORE anything is proposed. A member the
     // cluster agreed to admit has to be dialable by everybody -- the leader
     // replicates to it and every other member sends it votes -- and a member
@@ -975,10 +995,22 @@ void ConsensusTier::Reconcile()
     // -- discovery lands on its own interval -- so a leader could dial one set and
     // propose from another.
     auto desired = std::vector<Cluster::DesiredMember> {};
+    auto announced = Cluster::AnnouncedEndpointMap {};
     {
         auto const guard = std::unique_lock { _desiredMutex };
         desired = _desired;
+        // Dropped with the leadership it was announced to -- at the transition (`PublishRole`), and
+        // here again for an announcement that raced it in while this node did not lead.
+        if (!_leads.load(std::memory_order_relaxed))
+            _announced.clear();
+        announced = _announced;
     }
+
+    // This node's own `0xFC` endpoint, read NOW: an accepted reload of `--advertise` reaches the
+    // record at the next pass this node leads. Its own word, so it is an assertion even empty --
+    // and empty when only this machine could dial it, by the rule every route into the record asks.
+    if (auto const self = std::ranges::find(desired, _self.id, &Cluster::DesiredMember::id); self != desired.end())
+        self->schedulerEndpoint = PeerDialableOrNone(_advertised.Current());
 
     LearnMembers(state, desired);
 
@@ -986,15 +1018,36 @@ void ConsensusTier::Reconcile()
     // answer anywhere. See `ReportQuorum`.
     ReportQuorum();
 
-    // Every node, and before the leadership test below, for the reason `LearnMembers` is: a
-    // roster is certified by a majority of the VOTERS, and a leader cannot endorse for them.
-    Endorse(state);
-
     // Only a leader may propose, and asking here rather than letting `Propose`
     // refuse is what keeps a follower from logging a `NotLeader` every interval for
     // as long as it is a follower -- which is most of a healthy cluster's life.
     if (!_leads.load(std::memory_order_relaxed))
+    {
+        _endpointsInFlight.clear();
         return;
+    }
+    // And dropped at every change of leadership since the last pass, however briefly it lasted: a
+    // proposal made under an earlier leadership is not one this leadership is waiting on. The map is
+    // this thread's alone, so the transition is SEEN here through its count (`PublishRole`).
+    if (auto const changes = _leadershipChanges.load(std::memory_order_acquire); changes != _inFlightLeadership)
+    {
+        _endpointsInFlight.clear();
+        _inFlightLeadership = changes;
+    }
+
+    // Every member's `0xFC` endpoint as it PROVED and announced it, folded into what this node
+    // desires, so the proposal is the ordinary re-proposal of that member's record: its seat and
+    // key kept. One change in flight per member, held until its index commits in the term it was
+    // made in -- a proposal a new term will never commit frees the member at once.
+    auto const progress = _driver->CurrentProgress();
+    std::erase_if(_endpointsInFlight, [&progress](auto const& entry) {
+        return !QuorumProposalPending(entry.second.at, entry.second.in, progress.commitIndex, progress.term);
+    });
+    auto inFlight = Cluster::MembersInFlight {};
+    for (auto const& [id, proposal]: _endpointsInFlight)
+        inFlight.insert(id);
+    auto const announcements = Cluster::AnnouncedEndpointDesires(state, announced, inFlight);
+    desired = Cluster::WithAnnouncedEndpoints(std::move(desired), announcements);
 
     // Outside the lock, both the decision and the proposals: a proposal is a
     // durability write and a broadcast, and holding a lock across one would stall
@@ -1009,7 +1062,7 @@ void ConsensusTier::Reconcile()
     // names it -- is filled
     // in for this pass only (`Cluster::WithLiveKeys`).
     auto const keyed = Cluster::WithLiveKeys(state, desired, _roster);
-    auto const plan = Cluster::MembershipProposals(state, _driver->CurrentProgress().configuration, keyed);
+    auto const plan = Cluster::MembershipProposals(state, progress.configuration, keyed);
     ReportForgottenDesires(state, plan.forgotten);
 
     for (auto const& command: plan.proposals)
@@ -1065,6 +1118,9 @@ void ConsensusTier::Reconcile()
                 LogLevel::Warn, "cluster: {} can never be recorded as it stands: {}", command.key, proposed.error().context);
             continue;
         }
+
+        if (std::ranges::contains(announcements, command.key, &Cluster::DesiredMember::id))
+            _endpointsInFlight.insert_or_assign(command.key, EndpointProposal { .at = *proposed, .in = progress.term });
 
         _logger.Logf(LogLevel::Info,
                      "cluster: recorded {} {}{}",
@@ -1397,42 +1453,6 @@ void ConsensusTier::PublishRole(Consensus::RaftDriver::RoleChange const& change)
         TellFormation(_application.State());
 }
 
-void ConsensusTier::Endorse(Cluster::ClusterState const& state)
-{
-    // A voter the state records under the key this node HOLDS. A learner does not vote, a
-    // node the state does not record yet is not a voter of it, and one recorded under another
-    // key would sign an endorsement that verifies nowhere -- the state's key is what every
-    // verifier asks.
-    auto const self = std::ranges::find(state.members, _self.id, &Cluster::ClusterMember::id);
-    if (self == state.members.end() || self->seat != Cluster::MemberSeat::Voter || self->publicKey != _roster.OwnPublicKey())
-        return;
-
-    auto const digest = Cluster::DigestOfRoster(Cluster::ProjectRoster(state));
-    auto const now = _wallClock.now();
-
-    // Re-signed when the roster moved, and when a refresh is due. "Due" is measured from when
-    // the last one was SIGNED, which its lapse states; a clock stepped backwards past that
-    // instant re-signs too, rather than holding an endorsement stamped in the future.
-    if (_endorsement.has_value() && _endorsement->clusterId == _clusterId && _endorsement->version == state.rosterVersion
-        && _endorsement->rosterDigest == digest)
-    {
-        auto const signedAt = _endorsement->notAfter - Cluster::RosterEndorsementLifetime;
-        if (signedAt <= now && now - signedAt < Cluster::RosterEndorsementRefresh)
-            return;
-    }
-
-    _endorsement =
-        Cluster::SignEndorsement(Cluster::RosterEndorsement { .clusterId = _clusterId,
-                                                              .version = state.rosterVersion,
-                                                              .rosterDigest = digest,
-                                                              .notAfter = now + Cluster::RosterEndorsementLifetime,
-                                                              .endorser = _self.id,
-                                                              .signature = {} },
-                                 [this](LabelledMessage const& message) { return _roster.SignAsSelf(message); });
-    if (_onEndorsement)
-        _onEndorsement(*_endorsement);
-}
-
 void ConsensusTier::OnStateChanged(Cluster::ClusterState const& state)
 {
     // The roster FIRST, so the keys every peer connection is judged by are the committed
@@ -1512,7 +1532,23 @@ void ConsensusTier::Republish()
 
     _publishedRole = scheduled;
     _publishedEndpoint = leaderEndpoint;
-    _leads.store(scheduled == Distributed::SchedulerRole::Leader, std::memory_order_relaxed);
+
+    // The announced endpoints go WITH the leadership they were announced to, at the transition
+    // rather than at the next pass that samples it: a leader that lost and regained leadership
+    // between two passes would otherwise re-propose a map older than whatever the leader in between
+    // recorded. Either direction clears -- one gained is a map nobody announced to this node -- and
+    // the reconciler's in-flight endpoints go at its next pass, through the change count.
+    //
+    // Keyed on the TERM as well as the flag: a leadership lost and regained that this observer sees
+    // only as Leader(t5) then Leader(t7) never flips the flag, and a leader's term never moves while
+    // it leads -- so a moved term while leading is a new leadership too.
+    auto const leads = scheduled == Distributed::SchedulerRole::Leader;
+    if (auto const flipped = _leads.exchange(leads, std::memory_order_relaxed) != leads; flipped || (leads && termMoved))
+    {
+        auto const guard = std::unique_lock { _desiredMutex };
+        _announced.clear();
+        _leadershipChanges.fetch_add(1, std::memory_order_release);
+    }
 
     if (_onRole)
         // .value, because Term is a distinct type here and a plain integer on the
@@ -1524,12 +1560,12 @@ void ConsensusTier::Republish()
 std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExplain(
     NodeConfig const& cfg,
     std::unique_ptr<SchedulerTier> const& schedulerTier,
-    std::string_view schedulerBound,
+    Cc::IAdvertisedEndpointSource const& advertised,
     std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
     NodeRoster& roster,
+    AppliedSchedulers& schedulers,
     SharedCacheListeners sharedCache,
-    core::platform::WallClockRef wallClock,
     IMetricsSink& metrics,
     ILogger& logger,
     NodeConditions* conditions,
@@ -1546,7 +1582,7 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
 
     auto tier = ConsensusTier::Start(
         cfg,
-        schedulerBound,
+        advertised,
         identityKey,
         [&schedulerTier](Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t term) {
             // Null when this node runs no scheduler surface, which is a legitimate
@@ -1556,7 +1592,7 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
             if (schedulerTier != nullptr)
                 schedulerTier->SetRole(role, leaderEndpoint, term);
         },
-        [&membership, &roster, sharedCache](Cluster::ClusterState const& state) {
+        [&membership, &roster, &schedulers, sharedCache](Cluster::ClusterState const& state) {
             // The member set no longer joins admission; its KEYS do. A machine the cluster
             // agreed to admit is served by every surface at once by the key it proves or
             // presents, never by the address it dials from. `--fleet-open` is this node's own
@@ -1573,22 +1609,19 @@ std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExpla
             // the committed voters and revocations, the moment they are committed.
             roster.Applied(state);
 
+            // And where this node registers: the voters' `0xFC` endpoints as the state records
+            // them, so a voter that moved, proven, is reached at the next round (T26's carry).
+            schedulers.Applied(state);
+
             // And the fleet's shared cache: where it is, and whether this machine is it -- recorded
             // and handed to the host's own thread, never opened here: opening a store may walk it,
             // and this is the apply callback a voter's heartbeats wait behind. Then the private
             // tier's upstream, which re-judges what it reports from what the directory now says.
             sharedCache.Applied(state);
         },
-        wallClock,
-        [&schedulerTier, &roster](Cluster::RosterEndorsement const& endorsement) {
-            // Both readers, and neither waits for the other. The presence loop carries the
-            // latest one to whoever leads; this node's own scheduler takes it directly, so a
-            // lone scheduler certifies its roster without dialling itself, and a follower
-            // already holds its own endorsement on the day it is elected.
-            roster.Endorsed(endorsement);
-            if (schedulerTier != nullptr)
-                schedulerTier->Endorse(endorsement);
-        },
+        // And how long that state has gone without a leader it counts speaking: past
+        // `LeaderSilenceBound`, every grant is refused (`consensus-leader-silent`).
+        [&roster](Distributed::LeaderReading const& reading) { roster.ConsensusPass(reading); },
         metrics,
         logger,
         conditions,

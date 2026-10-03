@@ -16,8 +16,11 @@
 #include <format>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Distributed
 {
@@ -882,6 +885,7 @@ SchedulerReply SchedulerService::ClusterForget(CallerContext const& caller, std:
 SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
                                               std::string_view memberId,
                                               std::string_view raftEndpoint,
+                                              std::optional<std::string_view> schedulerEndpoint,
                                               std::optional<std::string_view> publicKey,
                                               std::optional<Cluster::MemberSeat> seat)
 {
@@ -909,25 +913,33 @@ SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
         key = *parsed;
     }
 
-    // `schedulerEndpoint` left empty, which `AddMember` applies wholesale -- so
-    // re-admitting a member that has moved clears whatever it had announced, and it
-    // announces the new one on its next election. That is the right way round: a
-    // node that moved has moved both ports, and keeping the old scheduler endpoint
-    // would redirect clients to an address that member no longer answers. The member
-    // still records that it HAD one, so a report says *cleared* rather than *never
-    // announced* (#1340) -- which `Apply` derives, so this command carries nothing more.
+    // The `0xFC` endpoint is the member's word: the one its `Enroll` stated, or -- for an
+    // operator's verb, which states none -- the one already recorded, since `AddMember` applies
+    // wholesale and an absent value would CLEAR it. A promotion is the same machine at the same
+    // port; a member that moved announces its new endpoint itself, proven, and the leader
+    // re-proposes its record (`AnnounceNode`).
     //
+    // **Kept only for the SAME machine** -- the key unchanged, or absent, which keeps the recorded
+    // key. A re-admit naming ANOTHER key records a REPLACED machine, and the old one's endpoint is
+    // where a resolver would then dial expecting the new key: so it clears, and `Cleared` means
+    // exactly "a machine was replaced and has not announced yet" until the new one does.
+    auto const state = _admin->ClusterState();
+    auto const* const recorded = core::findOrNull(state.members, memberId, &Cluster::ClusterMember::id);
+    auto const sameMachine = recorded != nullptr && (!key.has_value() || recorded->publicKey == key);
+    auto const kept = sameMachine ? std::string_view { recorded->schedulerEndpoint } : std::string_view {};
+    auto endpoint = std::string { schedulerEndpoint.value_or(kept) };
+
     // The verb is the seat's (#1449): `MemberSeatTable` is the one statement of which
     // command records which set, so a promotion is this call with `Voter` on a learner
     // and a demotion is this call with `Learner` on a voter. A caller with no opinion --
     // an enrollment approval, which recovery repeats -- keeps the seat already recorded,
     // or a voter for a member there is no record of: absent is not `Voter`, or a
     // re-approval would promote a member the operator demoted.
-    auto const resolved = seat.has_value() ? *seat : Cluster::RecordedSeatOf(_admin->ClusterState(), memberId);
+    auto const resolved = seat.has_value() ? *seat : Cluster::RecordedSeatOf(state, memberId);
     auto const command = Cluster::Command { .kind = Cluster::MemberSeatTable[static_cast<std::size_t>(resolved)].admittedBy,
                                             .key = std::string { memberId },
                                             .value = std::string { raftEndpoint },
-                                            .schedulerEndpoint = {},
+                                            .schedulerEndpoint = std::move(endpoint),
                                             .publicKey = key,
                                             .role = std::nullopt };
 
@@ -1228,25 +1240,28 @@ SchedulerReply SchedulerService::AnnounceNode(CallerContext const& caller,
     if (_history != nullptr && !history.empty())
         _history->AcceptHistory(std::string { presence.endpoint }, history);
 
-    // The fleets it once asked, filed apart from the rest for the endorsement's reason: they are the
-    // evidence a split of THIS fleet is told to an operator on, not a reading of the machine.
+    // The fleets it once asked, filed apart from the history above and under the id the caller
+    // PROVED rather than the endpoint it names: they are the evidence a split of THIS fleet is told
+    // to an operator on, not a reading of the machine, and evidence is worth only whose it provably is.
     RecordJoinMemos(caller, presence.joinMemos);
 
-    // A voter's endorsement rides beside the rest and is judged APART from it: an endorsement
-    // this node refuses is counted, and the machine's load and history still land -- they are
-    // true whoever it is, and refusing them would hide the machine that is misbehaving.
-    if (!presence.endorsement.empty())
-    {
-        auto const endorsement = Cluster::DecodeEndorsement(presence.endorsement);
-        if (!endorsement.has_value())
-            _metrics.Increment(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused);
-        else
-            std::ignore = AcceptEndorsement(*endorsement);
-    }
+    // Where its `0xFC` port answers, under the id it PROVED -- never one the payload names, so a
+    // member only ever speaks for itself -- and only for a member the state records: an
+    // announcement admits nobody. Noted when it differs from the record; the leader's reconcile
+    // re-proposes the record (`IClusterAdmin::NoteAnnouncedEndpoint`).
+    NoteAnnouncedEndpoint(caller, presence.endpoint);
+    return SchedulerReply::Success();
+}
 
-    auto const certified = CertifiedRosterNow(_wallClock.now());
-    return SchedulerReply::Success(certified.has_value() ? Cluster::EncodeCertifiedRoster(*certified)
-                                                         : std::vector<std::byte> {});
+void SchedulerService::NoteAnnouncedEndpoint(CallerContext const& caller, std::string_view endpoint)
+{
+    if (!caller.provenNodeId.has_value() || _admin == nullptr)
+        return;
+    auto const state = _admin->ClusterState();
+    auto const* const recorded = core::findOrNull(state.members, *caller.provenNodeId, &Cluster::ClusterMember::id);
+    if (recorded == nullptr || recorded->schedulerEndpoint == endpoint)
+        return;
+    _admin->NoteAnnouncedEndpoint(*caller.provenNodeId, std::string { endpoint });
 }
 
 void SchedulerService::RecordJoinMemos(CallerContext const& caller, std::span<Wire::JoinMemoFields const> memos)
@@ -1280,72 +1295,6 @@ std::vector<Cluster::AskedJoinBy> SchedulerService::AnnouncedJoinMemos() const
     for (auto const& [asker, memos]: _joinMemos)
         all.insert(all.end(), memos.begin(), memos.end());
     return all;
-}
-
-SchedulerService::EndorsementOutcome SchedulerService::AcceptEndorsement(Cluster::RosterEndorsement const& endorsement)
-{
-    if (_admin == nullptr)
-        return EndorsementOutcome::NoState;
-
-    // The signature first, against the key THIS node's state records for the claimed voter: the
-    // claimed endorser only selects the key, and nothing else about an endorsement that does
-    // not verify is looked at.
-    auto const state = _admin->ClusterState();
-    auto const voter = std::ranges::find(state.members, endorsement.endorser, &Cluster::ClusterMember::id);
-    if (voter == state.members.end() || voter->seat != Cluster::MemberSeat::Voter
-        || !Cluster::VerifyEndorsement(endorsement, voter->publicKey))
-    {
-        _metrics.Increment(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused);
-        return EndorsementOutcome::Refused;
-    }
-
-    // A voter a change ahead of this node, or one behind it, endorsed a roster this state does
-    // not hold. Ordinary for the seconds a change takes, and it will send the next one.
-    if (endorsement.clusterId != _clusterId || endorsement.version != state.rosterVersion
-        || endorsement.rosterDigest != Cluster::DigestOfRoster(Cluster::ProjectRoster(state)))
-        return EndorsementOutcome::Stale;
-
-    std::scoped_lock const lock { _endorsementsMutex };
-    auto const [held, inserted] = _endorsements.try_emplace(endorsement.endorser, endorsement);
-    if (!inserted && (held->second.version != endorsement.version || held->second.notAfter < endorsement.notAfter))
-        held->second = endorsement;
-    return EndorsementOutcome::Accepted;
-}
-
-std::optional<Cluster::CertifiedRoster> SchedulerService::CurrentCertifiedRoster() const
-{
-    return CertifiedRosterNow(_wallClock.now());
-}
-
-std::optional<Cluster::CertifiedRoster> SchedulerService::CertifiedRosterNow(std::chrono::system_clock::time_point now) const
-{
-    if (_admin == nullptr)
-        return std::nullopt;
-
-    auto const state = _admin->ClusterState();
-    auto roster = Cluster::EncodeRoster(Cluster::ProjectRoster(state));
-    auto const digest = Cluster::DigestOfRoster(roster);
-    auto const voters = static_cast<std::size_t>(
-        std::ranges::count(state.members, Cluster::MemberSeat::Voter, &Cluster::ClusterMember::seat));
-
-    // Only endorsements of THIS roster that have not lapsed -- a worker counts nothing else, so
-    // anything more is bytes on every announcement for nobody. And only once they are a strict
-    // majority of the current voters, which is the least a worker holding the current roster
-    // could adopt; a worker holding an older one counts its own voters, which is its business.
-    std::vector<Cluster::RosterEndorsement> current;
-    {
-        std::scoped_lock const lock { _endorsementsMutex };
-        for (auto const& [endorser, endorsement]: _endorsements)
-            if (endorsement.clusterId == _clusterId && endorsement.version == state.rosterVersion
-                && endorsement.rosterDigest == digest && now <= endorsement.notAfter)
-                current.push_back(endorsement);
-    }
-    if (voters == 0 || current.size() * 2 <= voters)
-        return std::nullopt;
-    return Cluster::CertifiedRoster { .clusterId = _clusterId,
-                                      .version = state.rosterVersion,
-                                      .roster = std::move(roster),
-                                      .endorsements = std::move(current) };
 }
 
 SchedulerReply SchedulerService::Heartbeat(CallerContext const& caller,

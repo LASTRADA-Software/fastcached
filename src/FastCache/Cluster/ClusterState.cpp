@@ -810,7 +810,7 @@ namespace
                 auto const it = std::ranges::find(state.members, command.key, &ClusterMember::id);
 
                 // The endpoint is replaced wholesale and its HISTORY is not, which is what
-                // lets a report say *cleared* rather than *never announced* after a re-admit
+                // lets a report say *cleared* rather than *never announced* after a record re-proposed with none
                 // (#1340). Derived here from what the state already records, so no command
                 // carries it. Only a removal forgets it: a forget is a positive act, and an
                 // id admitted from absence has announced nothing yet.
@@ -1237,6 +1237,16 @@ std::expected<void, ConsensusError> Validate(Command const& command)
             if (command.value.empty() && SeatNeedsEndpoint(SeatAdmittedBy(command.kind).value_or(MemberSeat::Voter)))
                 return std::unexpected(
                     InvalidConfiguration("a voter must be admitted with an endpoint every member can dial"));
+            // The `0xFC` endpoint is what OTHER machines are sent to, so the record holds one a peer
+            // can dial or states none. Asked HERE, where every route into the record meets -- an
+            // approval, an operator's admit, an announcement, a leader's own word -- so no route
+            // accepts what another refuses: a loopback, `localhost` or wildcard endpoint would send
+            // whoever resolves it back to itself.
+            if (!command.schedulerEndpoint.empty() && !IsPeerDialableEndpoint(command.schedulerEndpoint))
+                return std::unexpected(InvalidConfiguration(
+                    std::format("{} is no endpoint another machine can dial -- a loopback, localhost or wildcard "
+                                "host reaches only the dialler -- so a member record states it as none instead",
+                                command.schedulerEndpoint)));
             return {};
 
         case CommandKind::Forget:

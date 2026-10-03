@@ -960,7 +960,8 @@ TEST_CASE("Forged proofs are all counted and said at most once a minute", "[clus
 {
     // A forgery costs its sender one spoofed beacon to aim, so its line is throttled like every
     // rejected proof; the counter takes every one. A real key and a signature it never made: an
-    // all-zero key is a different subject, since the seam does not refuse a small-order key yet.
+    // all-zero key is a different subject -- the seam refuses a small-order key before the curve is
+    // asked (`Ed25519Verify`), which `FleetSummarySignature_test` pins.
     core::net::testing::DatagramBus bus;
     core::platform::ManualClock clock;
     SystemSecureRandom random;

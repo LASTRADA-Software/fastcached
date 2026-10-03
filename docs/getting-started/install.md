@@ -94,7 +94,11 @@ qualified name. So is `FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8`, which limits the fi
 registrations create to that remote range; left out, they admit any address. So is
 `FASTCACHE_FLEET_SEED=office-a.vpn.example`, one machine of the fleet for the node to ask when no
 discovery beacon reaches it, as across a VPN; it is registered as the node's `--fleet-seed`, and a
-node that needs more than one names them under `fleet_seed:` in its configuration file. The package also
+node that needs more than one names them under `fleet_seed:` in its configuration file. So is
+`FASTCACHE_FLEET_ID`, the one fleet the node may join, pasted as `fastcache-cli node` prints it on a
+machine of that fleet (`<cluster-id>@<key>[,<key>...]`); it is registered VERBATIM as the node's
+`--fleet-id`, and a value the node cannot read fails the node's registration by name rather than
+registering a node that trusts whichever fleet proves itself first. The package also
 pins the node's discovery reply port, `FASTCACHE_DISCOVERY_REPLY_PORT=6682` unless you pass another
 (or pass it empty), so its firewall opens UDP 6682 rather than every local UDP port. A node run by
 hand leaves that port to the kernel, because two nodes on one machine each need one of their own;
@@ -111,7 +115,8 @@ they are removed, and a major upgrade removes the old version first. The new ins
 `FastCached` and the node again from the table, the node with no property needed.
 
 Every transaction that keeps a service registers it again, and the optional properties are
-remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_NODE_ADVERTISE` and `FASTCACHE_FLEET_SEED` are written to
+remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_NODE_ADVERTISE`, `FASTCACHE_FLEET_SEED` and
+`FASTCACHE_FLEET_ID` are written to
 `HKLM\SOFTWARE\fastcached\Installer` and read back by the next repair or upgrade, so one that
 leaves them out registers what was installed. A transaction that states a new value replaces the
 remembered one. An empty value counts as leaving the property out, so a remembered scope is kept;

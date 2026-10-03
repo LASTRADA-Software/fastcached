@@ -39,7 +39,7 @@ namespace
 /// @param kind What it does.
 /// @param key The member id or setting name.
 /// @param value The consensus endpoint or setting value.
-/// @param scheduler Where clients reach this member while it leads.
+/// @param scheduler Where this member's `0xFC` port answers.
 /// @return The command.
 [[nodiscard]] Command Keyless(CommandKind kind, std::string key, std::string value = {}, std::string scheduler = {})
 {
@@ -700,6 +700,25 @@ TEST_CASE("A dissolve names a survivor every member can dial and nothing else, a
     auto led = admit;
     led.leaderKey = KeyOf(0x1F);
     CHECK_FALSE(Validate(led).has_value());
+}
+
+TEST_CASE("A member record holds a 0xFC endpoint another machine can dial or states none", "[cluster][state][endpoint]")
+{
+    // Every route into the record meets here -- an approval, an operator's admit, an announcement,
+    // a leader's own word -- so none may record what another refuses.
+    for (auto const kind: { CommandKind::AddMember, CommandKind::AddLearner })
+    {
+        for (auto const* const only: { "127.0.0.1:7000", "[::1]:7000", "localhost:7000", "0.0.0.0:7000", "[::]:7000" })
+        {
+            INFO(only);
+            auto const refused = Validate(Cmd(kind, "n1", "10.0.0.1:6675", only));
+            REQUIRE_FALSE(refused.has_value());
+            CHECK(refused.error().context.contains("no endpoint another machine can dial"));
+        }
+        // The controls: a dialable endpoint, and none at all -- the stated "has none".
+        CHECK(Validate(Cmd(kind, "n1", "10.0.0.1:6675", "10.0.0.1:7000")).has_value());
+        CHECK(Validate(Cmd(kind, "n1", "10.0.0.1:6675", "")).has_value());
+    }
 }
 
 TEST_CASE("A state carrying more than one dissolve order is damage", "[cluster][state][formation]")

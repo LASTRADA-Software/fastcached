@@ -91,16 +91,16 @@ struct EnrollReading
     /// ends could disagree about. No secret, so a plain vector (#178).
     std::vector<std::byte> roster;
 
-    /// The leader's CERTIFIED roster, exactly as sent: `Cluster::EncodeCertifiedRoster`'s bytes,
-    /// or empty -- for every outcome but `Admitted`, and on an admission while the leader holds no
-    /// certified roster yet (#178).
-    std::vector<std::byte> certificate {};
-
     /// The answering node's signature over its answer -- an approval, a refusal or a "not yet" alike
     /// (`SignedOutcomeTable`) -- as sent, and DISENGAGED when it carried none. Read here and judged by
     /// the caller, which alone knows the nonce it sent and the key it proved for the fleet it asked
     /// (`Cluster::VerifyAdmission`).
     std::optional<CompileCacheWire::EnrollReplySignature> signature {};
+
+    /// The challenge the answer issued for this joiner's next request, as sent -- engaged for a
+    /// `Pending` answer, which alone leaves a row to refresh. Covered by `signature`, so it is held
+    /// to the same key before the joiner signs over it (`JoinerIdentity::challenge`).
+    std::optional<CompileCacheWire::EnrollChallenge> challenge {};
 };
 
 /// Which reading an answer's OUTCOME became, for the outcomes the answering node signs.
@@ -149,8 +149,28 @@ struct JoinerIdentity
     std::string nodeId;       ///< The id it minted.
     std::string nodeEndpoint; ///< The `0xFC` endpoint it states; empty while no live role states one.
     CompileCacheWire::EnrollRole role { CompileCacheWire::EnrollRole::Learner }; ///< What it asks to be.
-    Ed25519PublicKey publicKey {};                                               ///< The key it asks under.
+
+    /// The key it asks under: the public half of the pair its requests are signed with
+    /// (`EncodeSignedEnroll`), and what an answer is held to.
+    Ed25519PublicKey publicKey {};
+
+    /// The leader's latest challenge for this joiner (`EnrollReading::challenge`), answered so the
+    /// request may refresh the row it holds there; none on a first ask, or after asking elsewhere.
+    std::optional<CompileCacheWire::EnrollChallenge> challenge {};
 };
+
+/// The `Enroll` @p self sends, SIGNED by @p identity over every field it states.
+///
+/// The one encoder an `Enroll` is sent through -- the formation's poll, the only sender left -- so
+/// no sender can send a request its leader refuses as forged. The key the request states is @p identity's own, never
+/// a second copy of it: a frame naming one key and signed by another verifies under neither.
+/// @param self Who it asks as; its `publicKey` must be @p identity's, which every caller derives it from.
+/// @param identity This node's identity key pair.
+/// @param nonce What it drew for this one request.
+/// @return The framed request.
+[[nodiscard]] std::vector<std::byte> EncodeSignedEnroll(JoinerIdentity const& self,
+                                                        Ed25519KeyPair const& identity,
+                                                        std::span<std::byte const> nonce);
 
 /// What to tell the operator once a roster has been handed over, or why it cannot be believed.
 ///

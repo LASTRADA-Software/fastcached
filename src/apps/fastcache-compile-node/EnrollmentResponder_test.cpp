@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "EnrollmentAbsence.hpp"
 #include "EnrollmentResponder.hpp"
+#include "EnrollmentWindow.hpp"
 #include "Responders.hpp"
 
 #include <FastCache/Cluster/EnrollAdmissionSignature.hpp>
+#include <FastCache/Cluster/EnrollRequestSignature.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Core/Base64.hpp>
 #include <FastCache/Core/Ed25519.hpp>
+#include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -23,11 +27,13 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <core/async/SyncRun.hpp>
 #include <core/async/Task.hpp>
 #include <core/platform/Clock.hpp>
@@ -36,6 +42,7 @@
 #include <tests/MembershipFakes.hpp>
 #include <tests/NodeConditionFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -106,6 +113,9 @@ class RecordingCluster final: public Distributed::IClusterAdmin
         return _state;
     }
 
+    /// @copydoc Distributed::IClusterAdmin::NoteAnnouncedEndpoint
+    void NoteAnnouncedEndpoint(Consensus::NodeId const& /*member*/, std::string /*endpoint*/) override {}
+
     [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& command) override
     {
         _proposed.push_back(command);
@@ -136,11 +146,46 @@ class RecordingCluster final: public Distributed::IClusterAdmin
     return bytes;
 }
 
-/// The key the joiner mints and asks under. Any 32 bytes: nothing on this surface verifies
-/// a signature under it, and the roster records whatever the approval names.
+/// The key pairs a joiner in this file signs its `Enroll` with, one per byte value: REAL keys,
+/// because the responder verifies every request's signature under the key it states. Derived once
+/// and never changed after.
+/// @return Every pair, indexed by the byte that names it.
+[[nodiscard]] std::vector<Ed25519KeyPair> const& JoinerPairs()
+{
+    static auto const pairs = [] {
+        auto all = std::vector<Ed25519KeyPair> {};
+        for (auto const which: std::views::iota(0, 256))
+            all.push_back(Testing::TestKeyPair(std::format("enroll-joiner-{}", which)));
+        return all;
+    }();
+    return pairs;
+}
+
+/// A joiner's public key, named by one byte: one of `JoinerPairs`, so a request under it can be signed.
+/// @param which The byte that names it.
+/// @return The key.
+[[nodiscard]] Ed25519PublicKey KeyOf(std::uint8_t which)
+{
+    return JoinerPairs()[which].PublicKey();
+}
+
+/// The pair behind @p key, which every `Enroll` this file sends is signed with.
+/// @param key One of `KeyOf`'s.
+/// @return Its pair.
+[[nodiscard]] Ed25519KeyPair const& PairBehind(Ed25519PublicKey const& key)
+{
+    auto const* const pair =
+        core::findIfOrNull(JoinerPairs(), [&key](Ed25519KeyPair const& one) { return one.PublicKey() == key; });
+    if (pair == nullptr)
+        throw std::logic_error { "every Enroll here is signed, so it asks under a key KeyOf names" };
+    return *pair;
+}
+
+/// The key the joiner mints and asks under. The roster records whatever the approval names; the
+/// request is signed with its pair.
 [[nodiscard]] Ed25519PublicKey JoinerKey()
 {
-    return Filled(0x42);
+    return KeyOf(0x42);
 }
 
 /// The machine asking to join. Deliberately NOT on any member list.
@@ -209,7 +254,10 @@ struct Seed
                                                                .leaderId = std::string { LeaderId },
                                                                .nodeId = std::string { LeaderId } } };
     Ed25519KeyPair const identity = Testing::TestKeyPair(std::string { LeaderId });
-    EnrollmentResponder responder { window, service, membership, self, identity, metrics, logger };
+    // Where each row's challenge is drawn: eight distinct 32-byte draws before the script cycles,
+    // more than any case here asks for, so two challenges a case compares are two different ones.
+    Testing::ScriptedSecureRandom random { Testing::ScriptedSecureRandom::Ascending(256) };
+    EnrollmentResponder responder { window, service, membership, self, identity, random, metrics, logger };
 };
 
 /// Drive one frame through the responder as a peer at @p peer.
@@ -261,21 +309,72 @@ struct Seed
     return std::string { Unwrap(refusal).second };
 }
 
-/// An `Enroll` frame.
+/// An `Enroll` frame, signed by the pair behind @p key as a joiner signs it.
 /// @param id The identity claimed.
 /// @param endpoint The endpoint claimed; empty for every live role.
 /// @param role What it asks to be.
-/// @param key The key it asks under.
+/// @param key The key it asks under: one of `KeyOf`'s.
 /// @param nonce What it drew for the request; zeroes unless a case says otherwise.
+/// @param challenge The leader's challenge it answers; none, as on a first ask, unless a case says otherwise.
 /// @return The frame.
 [[nodiscard]] std::vector<std::byte> EnrollFrame(std::string_view id,
                                                  std::string_view endpoint,
                                                  Wire::EnrollRole role,
                                                  Ed25519PublicKey const& key,
-                                                 std::array<std::byte, Wire::NodeChallengeBytes> const& nonce = {})
+                                                 std::array<std::byte, Wire::NodeChallengeBytes> const& nonce = {},
+                                                 std::optional<Wire::EnrollChallenge> const& challenge = std::nullopt)
 {
-    return Wire::EncodeEnroll(
-        Wire::EnrollRequest { .nodeId = id, .nodeEndpoint = endpoint, .role = role, .publicKey = key, .nonce = nonce });
+    auto const signature =
+        Cluster::SignEnrollRequest(PairBehind(key),
+                                   Cluster::EnrollRequestClaim { .nodeId = id,
+                                                                 .nodeEndpoint = endpoint,
+                                                                 .role = role,
+                                                                 .publicKey = key,
+                                                                 .nonce = nonce,
+                                                                 .challenge = Wire::ChallengeBytes(challenge) });
+    return Wire::EncodeEnroll(Wire::EnrollRequest { .nodeId = id,
+                                                    .nodeEndpoint = endpoint,
+                                                    .role = role,
+                                                    .publicKey = key,
+                                                    .nonce = nonce,
+                                                    .challenge = Wire::ChallengeBytes(challenge),
+                                                    .signature = signature });
+}
+
+/// An `Enroll` under a key no pair stands behind -- a small-order point, a non-canonical spelling --
+/// so it carries an all-zero signature. What it tests is refused before any signature is read.
+/// @param id The identity claimed.
+/// @param key The key it asks under, as a LEARNER stating its own `0xFC` port.
+/// @return The frame.
+[[nodiscard]] std::vector<std::byte> UnsignableJoinFrame(std::string_view id, Ed25519PublicKey const& key)
+{
+    auto const endpoint = std::format("{}:6674", id);
+    auto const nonce = std::array<std::byte, Wire::NodeChallengeBytes> {};
+    auto const signature = std::array<std::byte, Wire::NodeSignatureBytes> {};
+    return Wire::EncodeEnroll(Wire::EnrollRequest { .nodeId = id,
+                                                    .nodeEndpoint = endpoint,
+                                                    .role = Wire::EnrollRole::Learner,
+                                                    .publicKey = key,
+                                                    .nonce = nonce,
+                                                    .signature = signature });
+}
+
+/// An `Enroll` from a joiner stating what its role states: its own `0xFC` port, on the host its id
+/// names, exactly when the role's row says it states one -- the column the responder judges by.
+/// @param id The identity it claims.
+/// @param role The role it asks for.
+/// @param key The key it asks under.
+/// @param nonce The challenge it asks the approval be signed over.
+/// @param challenge The leader's challenge it answers; none, as on a first ask, unless a case says otherwise.
+/// @return The encoded request.
+[[nodiscard]] std::vector<std::byte> JoinFrame(std::string_view id,
+                                               Wire::EnrollRole role,
+                                               Ed25519PublicKey const& key,
+                                               std::array<std::byte, Wire::NodeChallengeBytes> const& nonce = {},
+                                               std::optional<Wire::EnrollChallenge> const& challenge = std::nullopt)
+{
+    auto const endpoint = EnrollRoleRowFor(role).statesEndpoint ? std::format("{}:6674", id) : std::string {};
+    return EnrollFrame(id, endpoint, role, key, nonce, challenge);
 }
 
 /// One `Enroll` from the joiner, in its role and under its own key.
@@ -283,7 +382,7 @@ struct Seed
 /// @return The encoded reply.
 [[nodiscard]] std::vector<std::byte> Enroll(Seed& seed)
 {
-    return AnswerNow(seed.responder, EnrollFrame(JoinerId, "", JoinerRole, JoinerKey()), JoinerAddress);
+    return AnswerNow(seed.responder, JoinFrame(JoinerId, JoinerRole, JoinerKey()), JoinerAddress);
 }
 
 /// One approval from the operator, naming @p id and @p key.
@@ -324,7 +423,7 @@ struct Seed
 /// @return The encoded reply.
 [[nodiscard]] std::vector<std::byte> LearnerRequest(Seed& seed, std::string_view id, Ed25519PublicKey const& key)
 {
-    return AnswerNow(seed.responder, EnrollFrame(id, "", Wire::EnrollRole::Learner, key), JoinerAddress);
+    return AnswerNow(seed.responder, JoinFrame(id, Wire::EnrollRole::Learner, key), JoinerAddress);
 }
 
 /// Record the joiner, and approve it.
@@ -419,7 +518,7 @@ TEST_CASE("A request in a role no row serves is refused at the door and nothing 
     CHECK(seed.cluster.Proposed().empty());
 
     // The control: the same request as a learner is recorded, so the refusal is the role's.
-    CHECK(RefusalIn(AnswerNow(seed.responder, EnrollFrame("w", "", Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
+    CHECK(RefusalIn(AnswerNow(seed.responder, JoinFrame("w", Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
           == std::nullopt);
     CHECK(seed.window.Summary().second == 1);
 }
@@ -428,26 +527,39 @@ TEST_CASE("A role that does not suit the endpoint is refused before it reaches t
 {
     Seed seed;
 
-    // A learner states no endpoint: it dials the leader rather than being dialled. One that
-    // states one is refused where it enters, because the list is what a person reads.
-    CHECK(RefusalIn(AnswerNow(
-              seed.responder, EnrollFrame("l", "10.0.0.9:6674", Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
+    // A learner states where its `0xFC` port answers, which the approval records as its member
+    // endpoint. A learner stating none, or one that names no machine, is refused where it enters,
+    // because the list is what a person reads and the record is what every resolver dials.
+    CHECK(RefusalIn(AnswerNow(seed.responder, EnrollFrame("l", "", Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
           == Wire::ErrorCode::MalformedFrame);
-    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed) == 1);
+    CHECK(RefusalIn(
+              AnswerNow(seed.responder, EnrollFrame("l", ":6674", Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
+          == Wire::ErrorCode::MalformedFrame);
+    // An endpoint that parses but sends whoever dials it back to ITSELF is no endpoint either: the
+    // rule the record is held to (`IsPeerDialableEndpoint`), asked where the claim enters.
+    for (auto const* const only: { "127.0.0.1:6674", "localhost:6674", "0.0.0.0:6674" })
+    {
+        INFO(only);
+        CHECK(RefusalIn(
+                  AnswerNow(seed.responder, EnrollFrame("l", only, Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
+              == Wire::ErrorCode::MalformedFrame);
+    }
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed) == 5);
     CHECK(seed.window.Summary().second == 0);
 
-    // The control: the same learner stating none is recorded, so the refusal above is about
-    // the endpoint and not about the role.
-    CHECK(RefusalIn(AnswerNow(seed.responder, EnrollFrame("l", "", Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
+    // The control: the same learner stating a dialable endpoint is recorded, so the refusals above
+    // are about the endpoint and not about the role.
+    CHECK(RefusalIn(AnswerNow(
+              seed.responder, EnrollFrame("l", "10.0.0.9:6674", Wire::EnrollRole::Learner, JoinerKey()), JoinerAddress))
           == std::nullopt);
     CHECK(seed.window.Summary().second == 1);
 }
 
-TEST_CASE("Approving a learner admits it as a learner with no endpoint under the key it asked with",
+TEST_CASE("Approving a learner admits it as a learner at the endpoint it stated under the key it asked with",
           "[enrollment][responder][formation]")
 {
     Seed seed;
-    auto const laptopKey = Filled(0x6C);
+    auto const laptopKey = KeyOf(0x6C);
     REQUIRE(RefusalIn(LearnerRequest(seed, "laptop", laptopKey)) == std::nullopt);
     REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, "laptop")) == std::nullopt);
 
@@ -459,6 +571,7 @@ TEST_CASE("Approving a learner admits it as a learner with no endpoint under the
     CHECK(proposed[0].kind == Cluster::CommandKind::AddLearner);
     CHECK(proposed[0].key == "laptop");
     CHECK(proposed[0].value.empty());
+    CHECK(proposed[0].schedulerEndpoint == "laptop:6674"); // what its `Enroll` stated
     CHECK(proposed[0].publicKey == std::optional { laptopKey });
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentApprovalsManual) == 1);
 
@@ -468,6 +581,7 @@ TEST_CASE("Approving a learner admits it as a learner with no endpoint under the
     REQUIRE(member != state.members.end());
     CHECK(member->seat == Cluster::MemberSeat::Learner);
     CHECK(member->raftEndpoint.empty());
+    CHECK(member->schedulerEndpoint == "laptop:6674"); // every resolver's answer for this machine
     auto const reply = LearnerRequest(seed, "laptop", laptopKey);
     CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(reply))).outcome == Wire::EnrollOutcome::Approved);
 }
@@ -479,28 +593,37 @@ TEST_CASE("An approval is signed over the joiner's own nonce by this node's key,
     // over the nonce the joiner drew, naming the joiner and its key, the cluster id the FLEET-SUMMARY
     // answer states -- the one a joiner proves this key for -- the outcome and the roster sent.
     Seed seed;
-    auto const laptopKey = Filled(0x6C);
+    auto const laptopKey = KeyOf(0x6C);
     auto const waiting = LearnerRequest(seed, "laptop", laptopKey);
     auto const pending = Wire::DecodeEnrollReply(PayloadOf(waiting));
     REQUIRE(pending.has_value());
     REQUIRE(Unwrap(pending).outcome == Wire::EnrollOutcome::Pending);
     // A "not yet" is signed too, as a "not yet": it keeps a joiner waiting, so it is the fleet's word
-    // or none. `LearnerRequest` asks over a nonce of zeroes.
+    // or none. `LearnerRequest` asks over a nonce of zeroes. It hands the row's challenge INSIDE what
+    // is signed, so nobody between the ends can swap the one the joiner signs over next.
     auto const zeroes = std::array<std::byte, Wire::NodeChallengeBytes> {};
+    REQUIRE(Unwrap(pending).challenge.has_value());
+    CHECK(Unwrap(pending).challenge == seed.window.ChallengeFor("laptop"));
     auto const pendingClaim = Cluster::AdmissionClaim { .nonce = zeroes,
                                                         .joinerId = "laptop",
                                                         .joinerKey = laptopKey,
                                                         .clusterId = SeedClusterId,
                                                         .outcome = Wire::EnrollOutcome::Pending,
-                                                        .roster = {} };
+                                                        .roster = {},
+                                                        .challenge = Wire::ChallengeBytes(Unwrap(pending).challenge) };
     CHECK(Cluster::VerifyAdmission(pendingClaim, Unwrap(pending).signature, seed.identity.PublicKey())
           == Cluster::AdmissionSignature::Verified);
+    auto swapped = pendingClaim;
+    auto const otherChallenge = Wire::EnrollChallenge {};
+    swapped.challenge = otherChallenge;
+    CHECK(Cluster::VerifyAdmission(swapped, Unwrap(pending).signature, seed.identity.PublicKey())
+          == Cluster::AdmissionSignature::Forged);
     REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, "laptop")) == std::nullopt);
 
     auto nonce = std::array<std::byte, Wire::NodeChallengeBytes> {};
     nonce.fill(std::byte { 0x3C });
     auto const reply =
-        AnswerNow(seed.responder, EnrollFrame("laptop", "", Wire::EnrollRole::Learner, laptopKey, nonce), JoinerAddress);
+        AnswerNow(seed.responder, JoinFrame("laptop", Wire::EnrollRole::Learner, laptopKey, nonce), JoinerAddress);
     auto const decoded = Wire::DecodeEnrollReply(PayloadOf(reply));
     REQUIRE(decoded.has_value());
     REQUIRE(Unwrap(decoded).outcome == Wire::EnrollOutcome::Approved);
@@ -512,7 +635,8 @@ TEST_CASE("An approval is signed over the joiner's own nonce by this node's key,
                                                  .joinerKey = laptopKey,
                                                  .clusterId = SeedClusterId,
                                                  .outcome = Wire::EnrollOutcome::Approved,
-                                                 .roster = Unwrap(decoded).roster };
+                                                 .roster = Unwrap(decoded).roster,
+                                                 .challenge = {} };
     CHECK(Cluster::VerifyAdmission(claim, Unwrap(decoded).signature, seed.identity.PublicKey())
           == Cluster::AdmissionSignature::Verified);
 
@@ -535,7 +659,7 @@ TEST_CASE("Approving an id the cluster already seats is refused by name and chan
     // A learner row under the VOTER's id, asked under another key: an approval of it must neither
     // demote the voter nor read as succeeding while it changes nothing (#1449).
     Seed seed;
-    REQUIRE(RefusalIn(LearnerRequest(seed, LeaderId, Filled(0x5E))) == std::nullopt);
+    REQUIRE(RefusalIn(LearnerRequest(seed, LeaderId, KeyOf(0x5E))) == std::nullopt);
     auto const reply = Control(seed, Wire::EnrollControlVerb::Approve, LeaderId);
     CHECK(RefusalIn(reply) == Wire::ErrorCode::InvalidClusterChange);
     auto const refusal = Wire::DecodeErrorPayload(PayloadOf(reply));
@@ -565,17 +689,16 @@ TEST_CASE("A machine the cluster already records is answered the roster with no 
                                  .schedulerEndpoint = {},
                                  .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
                                  .seat = Cluster::MemberSeat::Learner,
-                                 .publicKey = Filled(0x6C) });
+                                 .publicKey = KeyOf(0x6C) });
     seed.cluster.SetState(std::move(state));
 
-    auto const reply = LearnerRequest(seed, "laptop", Filled(0x6C));
+    auto const reply = LearnerRequest(seed, "laptop", KeyOf(0x6C));
     CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(reply))).outcome == Wire::EnrollOutcome::Approved);
     CHECK_FALSE(seed.window.Find("laptop").has_value());
 
-    // The control: the same id under ANOTHER key is recorded and waits for a person -- and
-    // "another" is exact: a key one bit away from the recorded one is another key.
-    auto nearMiss = Filled(0x6C);
-    nearMiss.back() ^= std::byte { 0x01 };
+    // The control: the same id under ANOTHER key -- signed by that key's holder -- is recorded and
+    // waits for a person.
+    auto const nearMiss = KeyOf(0x6D);
     auto const other = LearnerRequest(seed, "laptop", nearMiss);
     CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(other))).outcome == Wire::EnrollOutcome::Pending);
     REQUIRE(seed.window.Find("laptop").has_value());
@@ -583,7 +706,7 @@ TEST_CASE("A machine the cluster already records is answered the roster with no 
 
     // And once that row exists it decides, whatever the cluster records: the recorded key asking
     // again is ANOTHER MACHINE to this row, counted in `claimsChanged` and answered `Pending`.
-    auto const recordedAgain = LearnerRequest(seed, "laptop", Filled(0x6C));
+    auto const recordedAgain = LearnerRequest(seed, "laptop", KeyOf(0x6C));
     CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(recordedAgain))).outcome == Wire::EnrollOutcome::Pending);
     CHECK(Unwrap(seed.window.Find("laptop")).claimsChanged == 1);
 }
@@ -751,7 +874,7 @@ TEST_CASE("A poll under the approved id with another key is told nothing", "[enr
     Seed seed;
     RecordAndApprove(seed);
 
-    auto const impostor = AnswerNow(seed.responder, EnrollFrame(JoinerId, "", JoinerRole, Filled(0x99)), JoinerAddress);
+    auto const impostor = AnswerNow(seed.responder, JoinFrame(JoinerId, JoinerRole, KeyOf(0x99)), JoinerAddress);
     auto const decoded = Wire::DecodeEnrollReply(PayloadOf(impostor));
     REQUIRE(decoded.has_value());
     CHECK(Unwrap(decoded).outcome == Wire::EnrollOutcome::Pending);
@@ -784,7 +907,8 @@ TEST_CASE("A rejected joiner is told so and stays rejected until somebody change
                                                    .joinerKey = JoinerKey(),
                                                    .clusterId = SeedClusterId,
                                                    .outcome = Wire::EnrollOutcome::Rejected,
-                                                   .roster = {} };
+                                                   .roster = {},
+                                                   .challenge = {} };
     CHECK(Cluster::VerifyAdmission(refusal, Unwrap(decoded).signature, seed.identity.PublicKey())
           == Cluster::AdmissionSignature::Verified);
 
@@ -804,7 +928,7 @@ TEST_CASE("The pending list fills, refuses the next machine by name, and keeps t
     {
         auto const id = std::format("crowd-{}", index);
         auto const host = std::format("203.0.113.{}", index);
-        REQUIRE(RefusalIn(AnswerNow(seed.responder, EnrollFrame(id, "", Wire::EnrollRole::Learner, Filled(0x66)), host))
+        REQUIRE(RefusalIn(AnswerNow(seed.responder, JoinFrame(id, Wire::EnrollRole::Learner, KeyOf(0x66)), host))
                 == std::nullopt);
     }
 
@@ -886,7 +1010,7 @@ TEST_CASE("A joiner that names itself in bytes that are not text is refused wher
     auto const reply = AnswerNow(seed.responder,
                                  EnrollFrame("joiner-\xff"
                                              "a",
-                                             "",
+                                             "10.0.0.9:6674",
                                              Wire::EnrollRole::Learner,
                                              JoinerKey()),
                                  JoinerAddress);
@@ -908,13 +1032,13 @@ TEST_CASE("A joiner's id is held to the one id bound where it enters", "[enrollm
     auto const atBound = std::string(Wire::MaxIdBytes, 'a');
     auto const pastBound = std::string(Wire::MaxIdBytes + 1, 'b');
 
-    auto const accepted = LearnerRequest(seed, atBound, Filled(0x41));
+    auto const accepted = LearnerRequest(seed, atBound, KeyOf(0x41));
     REQUIRE(RefusalIn(accepted) == std::nullopt);
     auto const reply = Wire::DecodeEnrollReply(PayloadOf(accepted));
     REQUIRE(reply.has_value()); // a default reply reads Pending, so an undecodable one must not pass as one
     CHECK(Unwrap(reply).outcome == Wire::EnrollOutcome::Pending);
 
-    auto const refused = LearnerRequest(seed, pastBound, Filled(0x42));
+    auto const refused = LearnerRequest(seed, pastBound, KeyOf(0x42));
     CHECK(RefusalIn(refused) == Wire::ErrorCode::MalformedFrame);
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedIdTooLong) == 1);
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed) == 0); // its own row
@@ -931,7 +1055,7 @@ TEST_CASE("An armed window admits a learner as the leader and counts it apart fr
           "[enrollment][auto-approve][formation]")
 {
     Seed seed;
-    auto const laptopKey = Filled(0x6C);
+    auto const laptopKey = KeyOf(0x6C);
     REQUIRE(RefusalIn(AnswerNow(seed.responder, Wire::EncodeEnrollAutoApprove(std::chrono::minutes { 10 }), OperatorAddress))
             == std::nullopt);
 
@@ -971,7 +1095,7 @@ TEST_CASE("A demoted leader's window is disarmed and stays disarmed when it lead
     seed.service.SetRole(Distributed::SchedulerRole::Follower, LeaderEndpoint, Distributed::StandaloneSchedulerTerm);
     seed.service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 
-    auto const reply = LearnerRequest(seed, "laptop", Filled(0x6C));
+    auto const reply = LearnerRequest(seed, "laptop", KeyOf(0x6C));
     CHECK(Unwrap(Wire::DecodeEnrollReply(PayloadOf(reply))).outcome == Wire::EnrollOutcome::Pending);
     CHECK(seed.cluster.Proposed().empty());
     CHECK(seed.window.Summary().first == Wire::WireEnrollmentState::Manual);
@@ -1052,7 +1176,7 @@ TEST_CASE("A node with no enrollment component refuses the whole family at the d
         CHECK(RefusalIn(Unwrap(refused)) == Wire::ErrorCode::NoCluster);
         CHECK(RefusalIn(Unwrap(refused)) != Wire::UnimplementedVerb);
 
-        CHECK(RefusalIn(AnswerNow(merged, EnrollFrame(JoinerId, "", JoinerRole, JoinerKey()), JoinerAddress))
+        CHECK(RefusalIn(AnswerNow(merged, JoinFrame(JoinerId, JoinerRole, JoinerKey()), JoinerAddress))
               == Wire::ErrorCode::NoCluster);
     }
 
@@ -1063,6 +1187,40 @@ TEST_CASE("A node with no enrollment component refuses the whole family at the d
                                              static_cast<std::uint8_t>(Wire::Op::Fetch));
     REQUIRE(cacheVerb.has_value());
     CHECK(RefusalIn(Unwrap(cacheVerb)) == Wire::UnimplementedVerb);
+}
+
+TEST_CASE("A node with no enrollment component tells a joiner the reason it knows, on both routes",
+          "[enrollment][responder][merged][pin]")
+{
+    // A node pinned elsewhere, or a promoted voter its own pin does not name, RUNS consensus: told
+    // *runs no consensus*, its joiner's operator goes looking in the wrong place. Each reason reaches
+    // the joiner in its own words, and those words name no flag this node does not have.
+    for (auto const absence: Enumerators<EnrollmentAbsence>())
+    {
+        INFO(static_cast<int>(absence));
+        auto components = SurfaceComponents {};
+        components.enrollmentAbsence = absence;
+        MergedResponder merged { components };
+        auto const atTheDoor = merged.RefusePeer(PeerIdentity { .host = std::string { JoinerAddress } },
+                                                 static_cast<std::uint8_t>(Wire::Op::Enroll));
+        REQUIRE(atTheDoor.has_value());
+        CHECK(RefusalIn(Unwrap(atTheDoor)) == Wire::ErrorCode::NoCluster);
+        CHECK(RefusalSentenceIn(Unwrap(atTheDoor)) == EnrollmentAbsenceDetail(absence));
+
+        auto const answered = AnswerNow(merged, JoinFrame(JoinerId, JoinerRole, JoinerKey()), JoinerAddress);
+        CHECK(RefusalIn(answered) == Wire::ErrorCode::NoCluster);
+        CHECK(RefusalSentenceIn(answered) == EnrollmentAbsenceDetail(absence));
+        CHECK_FALSE(RefusalSentenceIn(answered).contains("--node-status"));
+    }
+
+    // WHICH words, for the two the pin produces: neither claims the node runs no consensus.
+    for (auto const absence: { EnrollmentAbsence::PinnedToAnotherCluster, EnrollmentAbsence::NotAPinnedVoter })
+    {
+        INFO(static_cast<int>(absence));
+        CHECK(EnrollmentAbsenceDetail(absence).contains("--fleet-id"));
+        CHECK_FALSE(EnrollmentAbsenceDetail(absence).contains("runs no consensus"));
+    }
+    CHECK(EnrollmentAbsenceDetail(EnrollmentAbsence::NotAPinnedVoter).contains("add its own key"));
 }
 
 TEST_CASE("Rejecting a machine that was already approved says the cluster still holds it",
@@ -1079,7 +1237,7 @@ TEST_CASE("Rejecting a machine that was already approved says the cluster still 
     Seed seed;
     CapturingLogger logger { LogLevel::Trace };
     EnrollmentResponder responder { seed.window,   seed.service, seed.membership, seed.self,
-                                    seed.identity, seed.metrics, logger };
+                                    seed.identity, seed.random,  seed.metrics,    logger };
 
     auto const control = [&](Wire::EnrollControlVerb verb, std::string_view subject = {}) {
         // An approval names the key the row holds, as the line `--enroll-list` prints does.
@@ -1091,8 +1249,7 @@ TEST_CASE("Rejecting a machine that was already approved says the cluster still 
         return AnswerNow(responder, Wire::EncodeEnrollControl(verb, subject), OperatorAddress);
     };
 
-    REQUIRE(RefusalIn(AnswerNow(responder, EnrollFrame(JoinerId, "", JoinerRole, JoinerKey()), JoinerAddress))
-            == std::nullopt);
+    REQUIRE(RefusalIn(AnswerNow(responder, JoinFrame(JoinerId, JoinerRole, JoinerKey()), JoinerAddress)) == std::nullopt);
     REQUIRE(RefusalIn(control(Wire::EnrollControlVerb::Approve, JoinerId)) == std::nullopt);
 
     // The approval really did commit it, or the rest of this case would be asserting
@@ -1125,9 +1282,9 @@ TEST_CASE("A forgotten learner's key is revoked: its next enrollment is refused 
     // member record and revokes its key. The neuter is a forget that leaves the member where it
     // was, under which the next poll is answered `Approved`, roster and all -- still admitted.
     Seed seed;
-    auto const laptopKey = Filled(0x57);
+    auto const laptopKey = KeyOf(0x57);
     auto const enroll = [&](std::string_view id) {
-        return AnswerNow(seed.responder, EnrollFrame(id, "", Wire::EnrollRole::Learner, laptopKey), JoinerAddress);
+        return AnswerNow(seed.responder, JoinFrame(id, Wire::EnrollRole::Learner, laptopKey), JoinerAddress);
     };
     auto const recorded = [&seed](std::string_view id) {
         return std::ranges::any_of(seed.cluster.ClusterState().members,
@@ -1200,8 +1357,9 @@ TEST_CASE("A joiner asking under a small-order or non-canonical key is refused a
                                      std::pair { nonCanonical, PublicKeyFault::NonCanonical } })
     {
         INFO("key " << FormatEd25519PublicKey(key));
-        auto const refused =
-            AnswerNow(seed.responder, EnrollFrame("joiner-x", "", Wire::EnrollRole::Learner, key), JoinerAddress);
+        // Unsigned, since nothing can sign under such a key -- and refused as MALFORMED rather than
+        // forged: the key's shape is judged before its signature.
+        auto const refused = AnswerNow(seed.responder, UnsignableJoinFrame("joiner-x", key), JoinerAddress);
         CHECK(RefusalIn(refused) == Wire::ErrorCode::MalformedFrame);
         auto const message = Unwrap(Wire::DecodeErrorPayload(PayloadOf(refused))).second;
         CHECK(message.contains(DescribePublicKeyFault(fault)));
@@ -1211,7 +1369,7 @@ TEST_CASE("A joiner asking under a small-order or non-canonical key is refused a
     }
 
     auto const control =
-        AnswerNow(seed.responder, EnrollFrame("joiner-x", "", Wire::EnrollRole::Learner, Filled(0x59)), JoinerAddress);
+        AnswerNow(seed.responder, JoinFrame("joiner-x", Wire::EnrollRole::Learner, KeyOf(0x59)), JoinerAddress);
     CHECK(RefusalIn(control) == std::nullopt);
     CHECK(seed.window.Find("joiner-x").has_value());
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed) == refusals);
@@ -1243,7 +1401,7 @@ TEST_CASE("Rejecting a machine that was only waiting says nothing, so the warnin
     Seed seed;
     CapturingLogger logger { LogLevel::Trace };
     EnrollmentResponder responder { seed.window,   seed.service, seed.membership, seed.self,
-                                    seed.identity, seed.metrics, logger };
+                                    seed.identity, seed.random,  seed.metrics,    logger };
 
     auto const control = [&](Wire::EnrollControlVerb verb, std::string_view subject = {}) {
         // An approval names the key the row holds, as the line `--enroll-list` prints does.
@@ -1255,8 +1413,7 @@ TEST_CASE("Rejecting a machine that was only waiting says nothing, so the warnin
         return AnswerNow(responder, Wire::EncodeEnrollControl(verb, subject), OperatorAddress);
     };
 
-    REQUIRE(RefusalIn(AnswerNow(responder, EnrollFrame(JoinerId, "", JoinerRole, JoinerKey()), JoinerAddress))
-            == std::nullopt);
+    REQUIRE(RefusalIn(AnswerNow(responder, JoinFrame(JoinerId, JoinerRole, JoinerKey()), JoinerAddress)) == std::nullopt);
 
     // Straight to `Reject`, so the row never left `Pending`.
     REQUIRE(RefusalIn(control(Wire::EnrollControlVerb::Reject, JoinerId)) == std::nullopt);
@@ -1295,12 +1452,11 @@ TEST_CASE("One host past its cap is refused by its own code and counter while an
     constexpr std::string_view Flooder = "203.0.113.7";
     for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollmentsPerHost))
         REQUIRE(RefusalIn(AnswerNow(seed.responder,
-                                    EnrollFrame(std::format("junk-{}", index), "", Wire::EnrollRole::Learner, Filled(0x66)),
+                                    JoinFrame(std::format("junk-{}", index), Wire::EnrollRole::Learner, KeyOf(0x66)),
                                     Flooder))
                 == std::nullopt);
 
-    auto const refused =
-        AnswerNow(seed.responder, EnrollFrame("junk-more", "", Wire::EnrollRole::Learner, Filled(0x66)), Flooder);
+    auto const refused = AnswerNow(seed.responder, JoinFrame("junk-more", Wire::EnrollRole::Learner, KeyOf(0x66)), Flooder);
     CHECK(RefusalIn(refused) == Wire::ErrorCode::EnrollmentHostFull);
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedHostCap) == 1);
     // Not the full list's: the two send an operator to different places.
@@ -1318,7 +1474,7 @@ TEST_CASE("The clear verb drops the undecided rows, keeps an approved one, and c
     RecordAndApprove(seed);
     for (auto const index: std::views::iota(0, 3))
         REQUIRE(RefusalIn(AnswerNow(seed.responder,
-                                    EnrollFrame(std::format("junk-{}", index), "", Wire::EnrollRole::Learner, Filled(0x66)),
+                                    JoinFrame(std::format("junk-{}", index), Wire::EnrollRole::Learner, KeyOf(0x66)),
                                     std::format("203.0.113.{}", index)))
                 == std::nullopt);
 
@@ -1343,8 +1499,8 @@ TEST_CASE("An approval naming the key of a row that lapsed is refused once anoth
     // machine asked under the same id with `second`. An approval naming `first` must admit
     // nothing -- by id alone it would have admitted `second`, which nobody compared.
     Seed seed;
-    auto const first = Filled(0x6A);
-    auto const second = Filled(0x6B);
+    auto const first = KeyOf(0x6A);
+    auto const second = KeyOf(0x6B);
     REQUIRE(RefusalIn(LearnerRequest(seed, "laptop", first)) == std::nullopt);
     seed.clock.advance(PendingRowLifetime + std::chrono::seconds { 1 });
     REQUIRE(RefusalIn(LearnerRequest(seed, "laptop", second)) == std::nullopt);
@@ -1391,7 +1547,8 @@ TEST_CASE("A surface built after its scheduler took a role answers the rows by t
         EnrollmentWindow window { clock, &conditions, &metrics, wallClock };
         Testing::ScriptedSummarySource self { Wire::FleetSummary { .clusterId = std::string { SeedClusterId } } };
         Ed25519KeyPair const identity = Testing::TestKeyPair(std::string { LeaderId });
-        EnrollmentResponder const responder { window, service, membership, self, identity, metrics, logger };
+        Testing::ScriptedSecureRandom random;
+        EnrollmentResponder const responder { window, service, membership, self, identity, random, metrics, logger };
 
         auto const expected =
             role == Distributed::SchedulerRole::Leader ? Wire::ConditionState::Clear : Wire::ConditionState::NotEvaluated;
@@ -1441,11 +1598,11 @@ TEST_CASE("A revoked key never qualifies for the recorded-joiner answer, even wh
                                  .schedulerEndpoint = {},
                                  .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
                                  .seat = Cluster::MemberSeat::Learner,
-                                 .publicKey = Filled(0x6C) });
-    state.revokedKeys.push_back(Cluster::RevokedKey { .id = "laptop", .publicKey = Filled(0x6C) });
+                                 .publicKey = KeyOf(0x6C) });
+    state.revokedKeys.push_back(Cluster::RevokedKey { .id = "laptop", .publicKey = KeyOf(0x6C) });
     seed.cluster.SetState(std::move(state));
 
-    auto const reply = LearnerRequest(seed, "laptop", Filled(0x6C));
+    auto const reply = LearnerRequest(seed, "laptop", KeyOf(0x6C));
     CHECK(RefusalIn(reply) == Wire::ErrorCode::InvalidClusterChange);
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedRevokedKey) == 1);
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRostersServed) == 0);
@@ -1460,7 +1617,7 @@ TEST_CASE("A joiner admitted just before a change of leader is answered the rost
     // poll would be recorded afresh, and approving it refused as *already a member* -- a machine
     // the cluster admitted, polling forever.
     Seed seed;
-    auto const key = Filled(0x6C);
+    auto const key = KeyOf(0x6C);
     REQUIRE(RefusalIn(LearnerRequest(seed, "laptop", key)) == std::nullopt);
     REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, "laptop")) == std::nullopt);
     REQUIRE(std::ranges::any_of(seed.cluster.ClusterState().members,
@@ -1486,12 +1643,15 @@ TEST_CASE("A machine that re-polls its rows from a second address is still refus
     Seed seed;
     for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollmentsPerHost))
     {
-        auto const frame = EnrollFrame(std::format("junk-{}", index), "", Wire::EnrollRole::Learner, Filled(0x66));
-        REQUIRE(RefusalIn(AnswerNow(seed.responder, frame, "198.51.100.7")) == std::nullopt);
-        REQUIRE(RefusalIn(AnswerNow(seed.responder, frame, "2001:db8::7")) == std::nullopt);
+        // The second poll is the row's own joiner, answering the challenge the first was handed.
+        auto const id = std::format("junk-{}", index);
+        REQUIRE(RefusalIn(AnswerNow(seed.responder, JoinFrame(id, Wire::EnrollRole::Learner, KeyOf(0x66)), "198.51.100.7"))
+                == std::nullopt);
+        auto const again = JoinFrame(id, Wire::EnrollRole::Learner, KeyOf(0x66), {}, seed.window.ChallengeFor(id));
+        REQUIRE(RefusalIn(AnswerNow(seed.responder, again, "2001:db8::7")) == std::nullopt);
     }
     auto const again =
-        AnswerNow(seed.responder, EnrollFrame("junk-more", "", Wire::EnrollRole::Learner, Filled(0x66)), "198.51.100.7");
+        AnswerNow(seed.responder, JoinFrame("junk-more", Wire::EnrollRole::Learner, KeyOf(0x66)), "198.51.100.7");
     CHECK(RefusalIn(again) == Wire::ErrorCode::EnrollmentHostFull);
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedHostCap) == 1);
 
@@ -1518,11 +1678,11 @@ TEST_CASE("A host refused at its cap is named as the list shows it, an IPv4-mapp
     Seed seed;
     for (auto const index: std::views::iota(std::size_t { 0 }, MaxPendingEnrollmentsPerHost))
         REQUIRE(RefusalIn(AnswerNow(seed.responder,
-                                    EnrollFrame(std::format("m-{}", index), "", Wire::EnrollRole::Learner, Filled(0x66)),
+                                    JoinFrame(std::format("m-{}", index), Wire::EnrollRole::Learner, KeyOf(0x66)),
                                     "198.51.100.9"))
                 == std::nullopt);
     auto const refused =
-        AnswerNow(seed.responder, EnrollFrame("m-more", "", Wire::EnrollRole::Learner, Filled(0x66)), "::ffff:198.51.100.9");
+        AnswerNow(seed.responder, JoinFrame("m-more", Wire::EnrollRole::Learner, KeyOf(0x66)), "::ffff:198.51.100.9");
     REQUIRE(RefusalIn(refused) == Wire::ErrorCode::EnrollmentHostFull);
     CHECK(RefusalSentenceIn(refused).starts_with("198.51.100.9 already has"));
     CHECK_FALSE(RefusalSentenceIn(refused).contains("::ffff:"));
@@ -1538,9 +1698,8 @@ TEST_CASE("An enrollment decision is refused a caller only --fleet-open admitted
     Seed seed;
     Testing::OpenFleetFold fold;
     NullLogger logger;
-    EnrollmentResponder responder {
-        seed.window, seed.service, fold.admitted, seed.self, seed.identity, seed.metrics, logger
-    };
+    EnrollmentResponder responder { seed.window,   seed.service, fold.admitted, seed.self,
+                                    seed.identity, seed.random,  seed.metrics,  logger };
     auto const control = static_cast<std::uint8_t>(Wire::Op::EnrollControl);
     auto const counted = [&seed] {
         return seed.metrics.Read(IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired);
@@ -1601,4 +1760,166 @@ TEST_CASE("A stranger reaching enrollment control through Answer is told not-a-m
     }
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentControlRefusedNotAMember) == 2);
     CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired) == 0);
+}
+
+TEST_CASE("An Enroll its key's holder did not sign is refused before it is listed or refreshes a row",
+          "[enrollment][responder][enroll-signature]")
+{
+    // The id and the key are public -- a beacon carries the key, the roster both -- so a host that
+    // polls under a joiner's pair with an endpoint of its own must not set what the record keeps.
+    // Only the key's holder can sign; a request it did not sign is refused, and nothing is recorded.
+    Seed seed;
+    auto const laptopKey = KeyOf(0x6C);
+    REQUIRE(RefusalIn(LearnerRequest(seed, "laptop", laptopKey)) == std::nullopt);
+    REQUIRE(Unwrap(seed.window.Find("laptop")).nodeEndpoint == "laptop:6674");
+
+    // A forger: the laptop's id and key, an endpoint of its own, signed by the only key it holds.
+    auto const forged = [&laptopKey](std::string_view id, std::string_view endpoint) {
+        auto const nonce = std::array<std::byte, Wire::NodeChallengeBytes> {};
+        auto const signature = Cluster::SignEnrollRequest(PairBehind(KeyOf(0x99)),
+                                                          Cluster::EnrollRequestClaim { .nodeId = id,
+                                                                                        .nodeEndpoint = endpoint,
+                                                                                        .role = Wire::EnrollRole::Learner,
+                                                                                        .publicKey = laptopKey,
+                                                                                        .nonce = nonce,
+                                                                                        .challenge = {} });
+        return Wire::EncodeEnroll(Wire::EnrollRequest { .nodeId = id,
+                                                        .nodeEndpoint = endpoint,
+                                                        .role = Wire::EnrollRole::Learner,
+                                                        .publicKey = laptopKey,
+                                                        .nonce = nonce,
+                                                        .challenge = {},
+                                                        .signature = signature });
+    };
+    CHECK(RefusalIn(AnswerNow(seed.responder, forged("laptop", "attacker:6674"), "203.0.113.9"))
+          == Wire::ErrorCode::NodeProofRejected);
+    CHECK(Unwrap(seed.window.Find("laptop")).nodeEndpoint == "laptop:6674"); // the row did not move
+    CHECK(Unwrap(seed.window.Find("laptop")).attempts == 1);                 // nor was it even counted
+
+    // A genuine signature over a request somebody changed on the way verifies over nothing.
+    auto altered = EnrollFrame("laptop", "laptop:6674", Wire::EnrollRole::Learner, laptopKey);
+    auto const at = std::ranges::search(altered, Wire::AsBytes("laptop:6674"));
+    REQUIRE_FALSE(at.empty());
+    at.front() = std::byte { 'L' };
+    CHECK(RefusalIn(AnswerNow(seed.responder, altered, "203.0.113.9")) == Wire::ErrorCode::NodeProofRejected);
+
+    // A stranger's row is never created from a forgery either.
+    CHECK(RefusalIn(AnswerNow(seed.responder, forged("desk", "desk:6674"), "203.0.113.9"))
+          == Wire::ErrorCode::NodeProofRejected);
+    CHECK_FALSE(seed.window.Find("desk").has_value());
+
+    // The holder's own signature replayed under another nonce verifies over nothing: the nonce is
+    // one of the fields it covers.
+    auto drawn = std::array<std::byte, Wire::NodeChallengeBytes> {};
+    drawn.fill(std::byte { 0x11 });
+    auto replayed = EnrollFrame("laptop", "laptop:6674", Wire::EnrollRole::Learner, laptopKey, drawn);
+    auto const nonceAt = std::ranges::search(replayed, drawn);
+    REQUIRE_FALSE(nonceAt.empty());
+    nonceAt.front() = std::byte { 0x12 };
+    CHECK(RefusalIn(AnswerNow(seed.responder, replayed, "203.0.113.9")) == Wire::ErrorCode::NodeProofRejected);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedForged) == 4);
+    CHECK(Unwrap(seed.window.Find("laptop")).nodeEndpoint == "laptop:6674");
+
+    // The control: the HOLDER refreshing its endpoint, signed over the row's current challenge, is
+    // accepted and moves the row -- the refresh is still what keeps a pending row current, only now it
+    // is the holder's alone.
+    REQUIRE(RefusalIn(AnswerNow(seed.responder,
+                                EnrollFrame("laptop",
+                                            "laptop.corp.example:6674",
+                                            Wire::EnrollRole::Learner,
+                                            laptopKey,
+                                            {},
+                                            seed.window.ChallengeFor("laptop")),
+                                JoinerAddress))
+            == std::nullopt);
+    CHECK(Unwrap(seed.window.Find("laptop")).nodeEndpoint == "laptop.corp.example:6674");
+
+    // So what the approval records is the endpoint the laptop itself last stated.
+    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, "laptop")) == std::nullopt);
+    REQUIRE(seed.cluster.Proposed().size() == 1);
+    CHECK(seed.cluster.Proposed()[0].schedulerEndpoint == "laptop.corp.example:6674");
+}
+
+TEST_CASE("A genuine Enroll replayed after its row moved on rolls nothing back", "[enrollment][responder][enroll-signature]")
+{
+    // The holder's own signature, verbatim, with nothing changed: it verifies, and before the leader
+    // issued challenges it refreshed the row to whatever endpoint the joiner stated back then. Each
+    // `Pending` answer hands the row's challenge out, signed, and only a request over the challenge the
+    // row holds NOW refreshes it -- so a recording is worth nothing once the joiner has asked again.
+    Seed seed;
+    auto const laptopKey = KeyOf(0x6C);
+    auto const ask = [&](std::string_view endpoint, std::optional<Wire::EnrollChallenge> const& challenge) {
+        return EnrollFrame("laptop", endpoint, Wire::EnrollRole::Learner, laptopKey, {}, challenge);
+    };
+    auto const handed = [](std::span<std::byte const> reply) {
+        auto const decoded = Wire::DecodeEnrollReply(PayloadOf(reply));
+        REQUIRE(decoded.has_value());
+        REQUIRE(Unwrap(decoded).outcome == Wire::EnrollOutcome::Pending);
+        return Unwrap(decoded).challenge;
+    };
+
+    auto const first = handed(AnswerNow(seed.responder, ask("laptop:6674", std::nullopt), JoinerAddress));
+    REQUIRE(first.has_value());
+    auto const recorded = ask("laptop.old.example:6674", first); // what somebody on the way keeps
+    auto const second = handed(AnswerNow(seed.responder, recorded, JoinerAddress));
+    REQUIRE(second.has_value());
+    CHECK(second != first); // the refresh replaced the challenge it answered
+    auto const third = handed(AnswerNow(seed.responder, ask("laptop.new.example:6674", second), JoinerAddress));
+    REQUIRE(Unwrap(seed.window.Find("laptop")).nodeEndpoint == "laptop.new.example:6674");
+
+    // The recording, verbatim: still a genuine request, so answered and never counted forged -- and the
+    // row keeps the endpoint the joiner states now, and the challenge it holds now.
+    auto const replayed = handed(AnswerNow(seed.responder, recorded, "203.0.113.9"));
+    CHECK(replayed == third);
+    CHECK(Unwrap(seed.window.Find("laptop")).nodeEndpoint == "laptop.new.example:6674");
+    CHECK(Unwrap(seed.window.Find("laptop")).claimsChanged == 1);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedForged) == 0);
+
+    // So what an approval records is what the laptop itself said LAST.
+    REQUIRE(RefusalIn(Control(seed, Wire::EnrollControlVerb::Approve, "laptop")) == std::nullopt);
+    REQUIRE(seed.cluster.Proposed().size() == 1);
+    CHECK(seed.cluster.Proposed()[0].schedulerEndpoint == "laptop.new.example:6674");
+}
+
+TEST_CASE("A leader that cannot draw a challenge records nothing and says why", "[enrollment][responder][security]")
+{
+    // A challenge drawn from anywhere weaker is the replay a challenge exists to stop, so a failed draw
+    // is a refusal -- `NoCluster`, uncounted, as `NodeProofResponder`'s failed nonce is.
+    Seed seed;
+    Testing::ScriptedSecureRandom denied { Testing::ScriptedSecureRandom::DeniedFailure() };
+    EnrollmentResponder responder { seed.window,   seed.service, seed.membership, seed.self,
+                                    seed.identity, denied,       seed.metrics,    seed.logger };
+    auto const reply = AnswerNow(responder, JoinFrame("laptop", Wire::EnrollRole::Learner, KeyOf(0x6C)), JoinerAddress);
+    CHECK(RefusalIn(reply) == Wire::ErrorCode::NoCluster);
+    CHECK(RefusalSentenceIn(reply).contains("scripted-getrandom"));
+    CHECK_FALSE(seed.window.Find("laptop").has_value());
+    CHECK(denied.FillCount() == 1);
+}
+
+TEST_CASE("A forged Enroll under a revoked key is told it is forged, not that the key is revoked",
+          "[enrollment][responder][enroll-signature][forget]")
+{
+    // The signature is checked before any other claim is reported on: a request nobody holding the key
+    // made learns nothing about that key here, its revocation included.
+    Seed seed;
+    auto const revoked = KeyOf(0x6C);
+    auto state = seed.cluster.ClusterState();
+    state.revokedKeys.push_back(Cluster::RevokedKey { .id = "laptop", .publicKey = revoked });
+    seed.cluster.SetState(std::move(state));
+
+    auto const nonce = std::array<std::byte, Wire::NodeChallengeBytes> {};
+    auto const unsignedBytes = std::array<std::byte, Wire::NodeSignatureBytes> {};
+    auto const frame = Wire::EncodeEnroll(Wire::EnrollRequest { .nodeId = "laptop",
+                                                                .nodeEndpoint = "laptop:6674",
+                                                                .role = Wire::EnrollRole::Learner,
+                                                                .publicKey = revoked,
+                                                                .nonce = nonce,
+                                                                .challenge = {},
+                                                                .signature = unsignedBytes });
+    CHECK(RefusalIn(AnswerNow(seed.responder, frame, JoinerAddress)) == Wire::ErrorCode::NodeProofRejected);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedRevokedKey) == 0);
+
+    // The control: the holder asking is told the key is revoked.
+    CHECK(RefusalIn(LearnerRequest(seed, "laptop", revoked)) == Wire::ErrorCode::InvalidClusterChange);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentRequestsRefusedRevokedKey) == 1);
 }

@@ -6,6 +6,7 @@
 #include "NodeKey.hpp"
 
 #include <FastCache/Cli/Options.hpp>
+#include <FastCache/Cluster/FleetPin.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -695,6 +696,7 @@ TEST_CASE("The MSI's node registration installs with no property, with an advert
         std::string_view replyRule;         ///< The discovery-reply rule the install must open.
         std::string_view seed;              ///< `FASTCACHE_FLEET_SEED`; empty for none.
         std::string_view seeded;            ///< The seed the registration must carry, normalized; empty for none.
+        std::string_view fleetId {};        ///< `FASTCACHE_FLEET_ID`, passed VERBATIM; empty for none.
     };
     // The package's default reply port, as the fragment's Property row spells it.
     constexpr std::string_view PackagedReplyPort = "6682";
@@ -746,6 +748,18 @@ TEST_CASE("The MSI's node registration installs with no property, with an advert
           .replyRule = "FastCacheCompileNode discovery-reply udp/6682",
           .seed = "office-a.vpn.example",
           .seeded = "office-a.vpn.example:6674" },
+        // A machine pinned to the one fleet it may join: the pin `fastcache-cli node` prints, passed
+        // and replayed verbatim -- it is security material, so nothing re-spells it.
+        { .what = "FASTCACHE_FLEET_ID=<cluster-id>@<key>",
+          .advertiseArgument = "",
+          .advertised = "",
+          .allowArgument = "",
+          .allowed = "",
+          .replyPort = PackagedReplyPort,
+          .replyRule = "FastCacheCompileNode discovery-reply udp/6682",
+          .seed = "",
+          .seeded = "",
+          .fleetId = "0123456789abcdef0123456789abcdef@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo" },
     });
     // The default the shapes assume is the one the fragment declares.
     CHECK(std::filesystem::exists(root / "packaging" / "windows" / "service-actions.xml"));
@@ -774,6 +788,10 @@ TEST_CASE("The MSI's node registration installs with no property, with an advert
                               "FastCacheFleetSeedArgument",
                               shape.seed.empty() ? std::string {} : std::format("--fleet-seed={}", shape.seed));
         formatted = Formatted(std::move(formatted), "FASTCACHE_FLEET_SEED", shape.seed);
+        formatted = Formatted(std::move(formatted),
+                              "FastCacheFleetIdArgument",
+                              shape.fleetId.empty() ? std::string {} : std::format("--fleet-id={}", shape.fleetId));
+        formatted = Formatted(std::move(formatted), "FASTCACHE_FLEET_ID", shape.fleetId);
         INFO(formatted);
         // A property this case does not format would reach the parser as text in brackets.
         REQUIRE_FALSE(formatted.contains('['));
@@ -808,6 +826,12 @@ TEST_CASE("The MSI's node registration installs with no property, with an advert
         // The seed is worker state: the registration replays it, one token, as the parser stored it.
         CHECK(std::ranges::count_if(spec.arguments, [](std::string const& a) { return a.starts_with("--fleet-seed"); })
               == (shape.seeded.empty() ? 0 : 1));
+        // The pin too, VERBATIM: the registration replays exactly what the operator pasted.
+        CHECK(cfg.fleetPin.has_value() == !shape.fleetId.empty());
+        if (!shape.fleetId.empty())
+            CHECK(std::ranges::contains(spec.arguments, std::format("--fleet-id={}", shape.fleetId)));
+        else
+            CHECK(std::ranges::none_of(spec.arguments, [](std::string const& a) { return a.starts_with("--fleet-id"); }));
         // The rules the install opens, through the install's own derivation: the reply port is
         // the flag's, so the discovery-reply rule names it and no rule admits any local port.
         Testing::RecordingFirewall firewall;
@@ -1091,6 +1115,55 @@ using MsiRegistry = std::map<std::pair<std::string, std::string>, std::string>;
 
 } // namespace
 
+namespace
+{
+/// Two fleet pins as `fastcache-cli node` prints them: a cluster id and one voter's key each (the
+/// RFC 8032 test-vector keys, which are points).
+constexpr std::string_view FirstPin = "0123456789abcdef0123456789abcdef@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+constexpr std::string_view SecondPin = "fedcba9876543210fedcba9876543210@_FHNjmIYoaONpH7QAjDwWAgW7RO6MwOsXeuRFUiQgCU";
+
+/// @param cfg A parsed configuration.
+/// @return Its fleet pin as `--fleet-id` spells it, or empty when it has none.
+[[nodiscard]] std::string PinTextOf(NodeConfig const& cfg)
+{
+    return cfg.fleetPin.has_value() ? Cluster::FormatPinnedFleet(*cfg.fleetPin) : std::string {};
+}
+} // namespace
+
+TEST_CASE("An MSI fleet pin the node's parser refuses fails the registration by name, never registering no pin",
+          "[node][docs][service][msi]")
+{
+    // A pin is security material: an operator who typed one meant the node to join that fleet and no
+    // other, so a value the parser cannot read must not register a node that trusts on first use. The
+    // registration action's command, formatted as Windows Installer formats it, is refused by the parse
+    // that `--install-service` runs before anything is registered -- WHICH refusal, the pin's.
+    std::filesystem::path const root { FASTCACHED_SOURCE_DIR };
+    auto const command = MsiNodeInstallCommand(root);
+    for (std::string_view const bad:
+         { std::string_view { "0123456789abcdef0123456789abcdef" }, std::string_view { "office@not-a-key" } })
+    {
+        INFO(bad);
+        auto formatted = Formatted(command, "INSTALL_ROOT", R"(C:\Program Files\fastcached\)");
+        for (std::string_view const unset: { "FastCacheNodeAdvertiseArgument",
+                                             "FASTCACHE_NODE_ADVERTISE",
+                                             "FastCacheFirewallAllowArgument",
+                                             "FASTCACHE_FIREWALL_ALLOW",
+                                             "FastCacheNodeDiscoveryReplyArgument",
+                                             "FASTCACHE_DISCOVERY_REPLY_PORT",
+                                             "FastCacheFleetSeedArgument",
+                                             "FASTCACHE_FLEET_SEED" })
+            formatted = Formatted(std::move(formatted), unset, "");
+        formatted = Formatted(std::move(formatted), "FastCacheFleetIdArgument", std::format("--fleet-id={}", bad));
+        formatted = Formatted(std::move(formatted), "FASTCACHE_FLEET_ID", bad);
+        REQUIRE_FALSE(formatted.contains('['));
+        auto const arguments = SplitArguments(formatted);
+        REQUIRE(arguments.size() > 1);
+        auto const parsed = ParsedFirstStart(std::span { arguments }.subspan(1));
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error().ToString().contains("--fleet-id"));
+    }
+}
+
 TEST_CASE(
     "The MSI remembers its optional properties: a repair or upgrade that leaves them out re-registers what was installed",
     "[node][docs][service][msi]")
@@ -1109,7 +1182,8 @@ TEST_CASE(
                      rows.writes.size()));
     // The premise, so an emptied fragment cannot pass by remembering nothing at all -- and the key the
     // actions write is the key the searches read, or nothing written is ever read back.
-    for (std::string_view const property: { "FASTCACHE_FIREWALL_ALLOW", "FASTCACHE_NODE_ADVERTISE", "FASTCACHE_FLEET_SEED" })
+    for (std::string_view const property:
+         { "FASTCACHE_FIREWALL_ALLOW", "FASTCACHE_NODE_ADVERTISE", "FASTCACHE_FLEET_SEED", "FASTCACHE_FLEET_ID" })
     {
         INFO(property);
         CHECK(std::ranges::any_of(rows.searches, [&](MsiRemembered const& row) { return row.property == property; }));
@@ -1134,45 +1208,51 @@ TEST_CASE(
     };
 
     {
-        INFO("the install states a scope, an advertised endpoint and a fleet seed");
+        INFO("the install states a scope, an advertised endpoint, a fleet seed and a fleet pin");
         auto const installed = MsiTransact(rows,
                                            { { "FASTCACHE_FIREWALL_ALLOW", "10.0.0.0/8" },
                                              { "FASTCACHE_NODE_ADVERTISE", "worker-01.internal:6674" },
-                                             { "FASTCACHE_FLEET_SEED", "office-a.vpn.example" } },
+                                             { "FASTCACHE_FLEET_SEED", "office-a.vpn.example" },
+                                             { "FASTCACHE_FLEET_ID", std::string { FirstPin } } },
                                            registry);
         auto const cfg = parsed(node(installed));
         CHECK(cfg.firewallAllow == std::vector<std::string> { "10.0.0.0/8" });
         CHECK(cfg.advertise == "worker-01.internal:6674");
         CHECK(cfg.fleetSeeds == std::vector<std::string> { "office-a.vpn.example:6674" });
+        CHECK(PinTextOf(cfg) == FirstPin);
     }
     {
-        INFO("a repair states nothing, and registers all three again");
+        INFO("a repair states nothing, and registers all four again");
         auto const repaired = MsiTransact(rows, {}, registry);
         auto const cfg = parsed(node(repaired));
         CHECK(cfg.firewallAllow == std::vector<std::string> { "10.0.0.0/8" });
         CHECK(cfg.advertiseExplicit);
         CHECK(cfg.advertise == "worker-01.internal:6674");
         CHECK(cfg.fleetSeeds == std::vector<std::string> { "office-a.vpn.example:6674" });
+        CHECK(PinTextOf(cfg) == FirstPin);
         // fastcached's registration takes the same scope from the same remembered value.
         CHECK(daemon(repaired).contains("--firewall-allow=10.0.0.0/8"));
     }
     {
-        INFO("an upgrade that states a NEW scope and a NEW seed gets them, and keeps the remembered endpoint");
-        auto const upgraded = MsiTransact(
-            rows,
-            { { "FASTCACHE_FIREWALL_ALLOW", "192.168.0.0/16" }, { "FASTCACHE_FLEET_SEED", "office-b.vpn.example" } },
-            registry);
+        INFO("an upgrade that states a NEW scope, seed and pin gets them, and keeps the remembered endpoint");
+        auto const upgraded = MsiTransact(rows,
+                                          { { "FASTCACHE_FIREWALL_ALLOW", "192.168.0.0/16" },
+                                            { "FASTCACHE_FLEET_SEED", "office-b.vpn.example" },
+                                            { "FASTCACHE_FLEET_ID", std::string { SecondPin } } },
+                                          registry);
         auto const cfg = parsed(node(upgraded));
         CHECK(cfg.firewallAllow == std::vector<std::string> { "192.168.0.0/16" });
         CHECK(cfg.advertise == "worker-01.internal:6674");
         CHECK(cfg.fleetSeeds == std::vector<std::string> { "office-b.vpn.example:6674" });
+        CHECK(PinTextOf(cfg) == SecondPin);
     }
     {
-        INFO("and the next repair registers the new scope and seed, not the first ones");
+        INFO("and the next repair registers the new scope, seed and pin, not the first ones");
         auto const repaired = MsiTransact(rows, {}, registry);
         auto const cfg = parsed(node(repaired));
         CHECK(cfg.firewallAllow == std::vector<std::string> { "192.168.0.0/16" });
         CHECK(cfg.fleetSeeds == std::vector<std::string> { "office-b.vpn.example:6674" });
+        CHECK(PinTextOf(cfg) == SecondPin);
     }
     {
         // The control: a machine that never had a scope remembers none, so a repair adds nothing.
@@ -1183,5 +1263,6 @@ TEST_CASE(
         CHECK(cfg.firewallAllow.empty());
         CHECK_FALSE(cfg.advertiseExplicit);
         CHECK(cfg.fleetSeeds.empty());
+        CHECK_FALSE(cfg.fleetPin.has_value());
     }
 }

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
+#include "EnrollClient.hpp"
+#include "EnrollmentResponder.hpp"
+#include "EnrollmentWindow.hpp"
 #include "LocalCache.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodeFormation.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeMembership.hpp"
@@ -11,15 +15,14 @@
 #include "SharedCacheTier.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/MembershipPolicy.hpp>
 #include <FastCache/Cluster/Roster.hpp>
-#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Consensus/RaftPeerSession.hpp>
 #include <FastCache/Consensus/RaftPeerTransport.hpp>
 #include <FastCache/Consensus/RaftWire.hpp>
 #include <FastCache/Core/Ed25519.hpp>
-#include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/SessionSeal.hpp>
@@ -55,15 +58,21 @@
 #include <utility>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <core/async/SyncRun.hpp>
 #include <core/async/Task.hpp>
 #include <core/net/BlockingConnector.hpp>
 #include <core/net/BlockingSocket.hpp>
+#include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
+#include <tests/FormationFakes.hpp>
+#include <tests/LeaseRosterFakes.hpp>
+#include <tests/MembershipFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/PreviousClusterState.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/SharedTierFakes.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -138,6 +147,25 @@ using FastCache::Testing::Unwrap;
 
 namespace
 {
+/// Where a tier under test says its `0xFC` port answers: what its founding record states. One object
+/// for the whole binary, so it outlives every tier a case starts. A name another machine could dial,
+/// because a member record holds no other (`IsPeerDialableEndpoint`); nothing in this file dials it.
+/// @return The source.
+[[nodiscard]] FastCache::Cc::IAdvertisedEndpointSource const& TestAdvertised()
+{
+    static FastCache::Node::AnnouncedEndpoint const advertised { "office:6674" };
+    return advertised;
+}
+
+/// The steady clock a roster under test measures leader silence on. One object for the whole
+/// binary, so it outlives every roster a case builds; no case here waits out the bound.
+/// @return The clock.
+[[nodiscard]] ::core::platform::IClock const& RosterClock()
+{
+    static ::core::platform::SteadyClock const clock;
+    return clock;
+}
+
 /// What a refusal said, for the line that asserts there was none.
 ///
 /// A bare `REQUIRE(x.has_value())` prints `false` and drops the one fact a failure on another
@@ -227,53 +255,10 @@ TEST_CASE("Two threads drawing scratch paths at once never draw the same one", "
     CHECK(std::ranges::adjacent_find(all) == all.end());
 }
 
-TEST_CASE("A leader advertises the port a client speaks to, at an address it can reach", "[node][consensus]")
-{
-    // Neither half can supply the other, which is the whole reason this is a
-    // function. A scheduling node's `--listen-node` binds the WILDCARD for a bare
-    // port -- peers are
-    // on other machines by definition -- so what the surface bound names no address a
-    // client can dial. The consensus endpoint is dialable by construction, every peer
-    // opening a socket to it, and names the wrong port.
-    CHECK(AdvertisedSchedulerEndpoint("10.0.0.1:6680", "0.0.0.0:7000") == "10.0.0.1:7000");
-
-    // A scheduler bound to one interface keeps its port and nothing else: the host is
-    // the one peers have proved they can reach.
-    CHECK(AdvertisedSchedulerEndpoint("10.0.0.1:6680", "127.0.0.1:7100") == "10.0.0.1:7100");
-}
-
 TEST_CASE("A log line says a learner has no consensus endpoint rather than leaving a blank", "[node][consensus][learner]")
 {
     CHECK(DescribeConsensusEndpoint("10.0.0.1:6680") == "at 10.0.0.1:6680");
     CHECK(DescribeConsensusEndpoint("") == "with no consensus endpoint");
-}
-
-TEST_CASE("A node with no scheduler surface advertises nothing", "[node][consensus]")
-{
-    // A legitimate shape rather than a misconfiguration: a member that contributes
-    // CPU and consensus without handing out anybody's work. Recording an endpoint for
-    // it would redirect clients at a port nothing is listening on, which is worse
-    // than redirecting them nowhere -- they would wait for a connect that cannot
-    // succeed instead of compiling locally at once.
-    CHECK(AdvertisedSchedulerEndpoint("10.0.0.1:6680", "").empty());
-    CHECK(AdvertisedSchedulerEndpoint("", "0.0.0.0:7000").empty());
-    CHECK(AdvertisedSchedulerEndpoint("10.0.0.1", "0.0.0.0:7000").empty());
-    CHECK(AdvertisedSchedulerEndpoint("10.0.0.1:6680", "7000").empty());
-}
-
-TEST_CASE("An IPv6 advertisement is bracketed, so it splits back the way it went in", "[node][consensus]")
-{
-    // `SplitHostPort` hands back a v6 host WITHOUT its brackets, and every consumer
-    // of this string splits it again -- so it has to go back the way it came or the
-    // next split takes the wrong colon. That is the defect `Core/HostPort` exists to
-    // hold in one place, and this is one of the places.
-    auto const advertised = AdvertisedSchedulerEndpoint("[2001:db8::1]:6680", "[::]:7000");
-    CHECK(advertised == "[2001:db8::1]:7000");
-
-    auto const split = SplitHostPort(advertised);
-    REQUIRE(split.has_value());
-    CHECK(Unwrap(split).first == "2001:db8::1");
-    CHECK(Unwrap(split).second == "7000");
 }
 
 TEST_CASE("A role line names the term it happened in", "[node][consensus]")
@@ -389,13 +374,14 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
 
     // Never reached by any case: one returns before consensus exists, the others are
     // refused before anything is wired. A roster for a node that holds none.
-    auto const roster =
-        NodeRoster::Build(Testing::FirstStart(NodeConfig {}), core::platform::defaultSystemWallClock(), metrics, logger);
+    auto const roster = NodeRoster::Build(Testing::FirstStart(NodeConfig {}), RosterClock(), nullptr);
     REQUIRE(roster.has_value());
     // Never asked to open: these cases' clusters name no shared cache.
     Testing::MemoryOpener opener;
     SharedCacheHost sharedCache { "n1", opener, nullptr, logger, ReconcileOn::Caller };
     SharedCacheDirectory directory { "n1", {} };
+    // Never told anything: no tier here applies a state.
+    AppliedSchedulers schedulers { Testing::FirstStart(NodeConfig {}), AsConfigured };
 
     SECTION("--node-id with no --listen-raft builds no tier")
     {
@@ -408,12 +394,12 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         auto const tier = StartConsensusOrExplain(
             cfg,
             noScheduler,
-            "127.0.0.1:6674",
+            TestAdvertised(),
             std::nullopt,
             membership,
             *Unwrap(roster),
+            schedulers,
             SharedCacheListeners { .directory = directory, .host = sharedCache, .upstream = nullptr },
-            core::platform::defaultSystemWallClock(),
             metrics,
             logger,
             nullptr,
@@ -438,12 +424,12 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         auto const tier = StartConsensusOrExplain(
             cfg,
             noScheduler,
-            "127.0.0.1:6674",
+            TestAdvertised(),
             identity,
             membership,
             *Unwrap(roster),
+            schedulers,
             SharedCacheListeners { .directory = directory, .host = sharedCache, .upstream = nullptr },
-            core::platform::defaultSystemWallClock(),
             metrics,
             logger,
             nullptr,
@@ -466,12 +452,12 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         auto const tier = StartConsensusOrExplain(
             cfg,
             noScheduler,
-            "127.0.0.1:6674",
+            TestAdvertised(),
             identity,
             membership,
             *Unwrap(roster),
+            schedulers,
             SharedCacheListeners { .directory = directory, .host = sharedCache, .upstream = nullptr },
-            core::platform::defaultSystemWallClock(),
             metrics,
             logger,
             nullptr,
@@ -501,23 +487,24 @@ TEST_CASE("A consensus tier refuses to start without an identity key", "[node][c
     cfg.raftListen = "6680";
     cfg.raftSelf = "10.0.0.1";
     NodeMembership membership { cfg, membershipLog };
-    auto const roster =
-        NodeRoster::Build(Testing::FirstStart(NodeConfig {}), core::platform::defaultSystemWallClock(), metrics, logger);
+    auto const roster = NodeRoster::Build(Testing::FirstStart(NodeConfig {}), RosterClock(), nullptr);
     REQUIRE(roster.has_value());
     // Never asked to open: these cases' clusters name no shared cache.
     Testing::MemoryOpener opener;
     SharedCacheHost sharedCache { "n1", opener, nullptr, logger, ReconcileOn::Caller };
     SharedCacheDirectory directory { "n1", {} };
+    // Never told anything: no tier here applies a state.
+    AppliedSchedulers schedulers { Testing::FirstStart(NodeConfig {}), AsConfigured };
 
     auto const tier =
         StartConsensusOrExplain(cfg,
                                 noScheduler,
-                                "127.0.0.1:6674",
+                                TestAdvertised(),
                                 std::nullopt,
                                 membership,
                                 *Unwrap(roster),
+                                schedulers,
                                 SharedCacheListeners { .directory = directory, .host = sharedCache, .upstream = nullptr },
-                                core::platform::defaultSystemWallClock(),
                                 metrics,
                                 logger,
                                 nullptr,
@@ -566,12 +553,11 @@ TEST_CASE("A listener handed to consensus is served only on the configured addre
     auto const start = [&](std::unique_ptr<BlockingListener> listener) {
         return ConsensusTier::Start(
             cfg,
-            {},
+            TestAdvertised(),
             Testing::TestKeyPair("n1"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [](Cluster::ClusterState const&) {},
-            core::platform::defaultSystemWallClock(),
-            {},
+            ConsensusTier::LeaderContactObserver {},
             metrics,
             logger,
             nullptr,
@@ -642,8 +628,11 @@ TEST_CASE("What a node reports about its own quorum is one read of the driver", 
                                           .term = Consensus::Term { .value = 4 },
                                           .role = Consensus::Role::Leader,
                                           .knownLeader = Consensus::NodeId { "n1" },
+                                          .lastLeaderContact = std::nullopt,
                                           .matchIndex = {},
-                                          .installRefusal = std::nullopt };
+                                          .installRefusal = std::nullopt,
+                                          .appliedIndex = {},
+                                          .lastLogIndex = {} };
 
     auto const status = ConsensusStatusFrom(progress);
 
@@ -656,6 +645,84 @@ TEST_CASE("What a node reports about its own quorum is one read of the driver", 
     CHECK(status.term.value == 4);
     CHECK(status.commitIndex.value == 12);
     CHECK(status.role == Consensus::Role::Leader);
+}
+
+TEST_CASE("A pass reads who leads and when it last spoke, and leaves whether it counts to the roster",
+          "[node][consensus][isolation]")
+{
+    // RAW: leading is contact at the pass's instant (CheckQuorum deposes a leader whose quorum stops
+    // answering); otherwise the leader the driver names and its last accepted contact -- whatever
+    // the driver's ACTIVE configuration says of that leader, since the rule counts a leader against
+    // the APPLIED configuration, which only the roster holds.
+    auto const now = ::core::platform::SteadyTimePoint { std::chrono::hours { 3 } };
+    auto const heard = now - std::chrono::minutes { 7 };
+    auto const progress = [&heard](Consensus::Role role, std::optional<Consensus::NodeId> leader) {
+        return Consensus::RaftDriver::Progress { .configuration = { .voters = { "n1", "n2" }, .learners = { "n5" } },
+                                                 .commitIndex = Consensus::LogIndex { .value = 9 },
+                                                 .term = Consensus::Term { .value = 3 },
+                                                 .role = role,
+                                                 .knownLeader = std::move(leader),
+                                                 .lastLeaderContact = heard,
+                                                 .matchIndex = {},
+                                                 .installRefusal = std::nullopt,
+                                                 .appliedIndex = {},
+                                                 .lastLogIndex = {} };
+    };
+
+    auto const leading = LeaderReadingOf(progress(Consensus::Role::Leader, Consensus::NodeId { "n1" }), now);
+    CHECK(leading.leads);
+    CHECK(leading.silentFor == std::optional { ::core::platform::SteadyTimePoint::duration::zero() });
+    auto const following = LeaderReadingOf(progress(Consensus::Role::Follower, Consensus::NodeId { "n2" }), now);
+    CHECK_FALSE(following.leads);
+    CHECK(following.leader == std::optional<std::string> { "n2" });
+    CHECK(following.silentFor == std::optional<::core::platform::SteadyTimePoint::duration> { now - heard });
+    // A leader the ACTIVE configuration seats as a learner, or does not hold at all, is passed on as
+    // read: the roster, not the driver's configuration, decides whether it counts.
+    CHECK(LeaderReadingOf(progress(Consensus::Role::Follower, Consensus::NodeId { "n5" }), now).leader
+          == std::optional<std::string> { "n5" });
+    CHECK(LeaderReadingOf(progress(Consensus::Role::Follower, Consensus::NodeId { "n9" }), now).leader
+          == std::optional<std::string> { "n9" });
+    // Nobody known to lead.
+    CHECK_FALSE(LeaderReadingOf(progress(Consensus::Role::Follower, std::nullopt), now).leader.has_value());
+}
+
+TEST_CASE("Silence is measured on the roster's clock, whatever clock the driver stamps contact on",
+          "[node][consensus][isolation]")
+{
+    // The driver stamps contact on its own reactor clock and the roster measures on the clock it was
+    // given: the reading crosses as an AGE, so two clocks that disagree about the instant agree about
+    // the silence. Here the driver's clock reads ten minutes and its leader spoke a minute ago, while
+    // the roster's reads three hours: an instant handed across would be two hours fifty-one minutes
+    // stale -- isolated -- where the leader in fact spoke a minute ago.
+    auto const driverNow = ::core::platform::SteadyTimePoint { std::chrono::minutes { 10 } };
+    auto const progress = Consensus::RaftDriver::Progress { .configuration = { .voters = { "n1" }, .learners = {} },
+                                                            .commitIndex = Consensus::LogIndex { .value = 9 },
+                                                            .term = Consensus::Term { .value = 3 },
+                                                            .role = Consensus::Role::Follower,
+                                                            .knownLeader = Consensus::NodeId { "n1" },
+                                                            .lastLeaderContact = driverNow - std::chrono::minutes { 1 },
+                                                            .matchIndex = {},
+                                                            .installRefusal = std::nullopt,
+                                                            .appliedIndex = {},
+                                                            .lastLogIndex = {} };
+    ::core::platform::ManualClock rosterClock;
+    Distributed::StateLeaseRoster roster { rosterClock };
+    Cluster::ClusterState state;
+    state.members = { Cluster::ClusterMember { .id = "n1",
+                                               .raftEndpoint = "n1:6680",
+                                               .schedulerEndpoint = {},
+                                               .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                               .seat = Cluster::MemberSeat::Voter,
+                                               .publicKey = FastCache::Testing::TestKeyPair("n1").PublicKey() } };
+    roster.Adopt(state);
+    rosterClock.advance(std::chrono::hours { 3 });
+    REQUIRE(roster.Isolated());
+
+    roster.NoteLeaderReading(LeaderReadingOf(progress, driverNow));
+    CHECK_FALSE(roster.Isolated());
+    // ...and it is a minute old on the roster's clock: the bound runs out a minute early.
+    rosterClock.advance(Distributed::LeaderSilenceBound - std::chrono::minutes { 1 } + std::chrono::seconds { 1 });
+    CHECK(roster.Isolated());
 }
 
 TEST_CASE("A node that has adopted no configuration reports an empty set, not a leader-less nothing",
@@ -674,8 +741,11 @@ TEST_CASE("A node that has adopted no configuration reports an empty set, not a 
                                                                               .term = Consensus::Term {},
                                                                               .role = Consensus::Role::Follower,
                                                                               .knownLeader = Consensus::NodeId { "n1" },
+                                                                              .lastLeaderContact = std::nullopt,
                                                                               .matchIndex = {},
-                                                                              .installRefusal = std::nullopt });
+                                                                              .installRefusal = std::nullopt,
+                                                                              .appliedIndex = {},
+                                                                              .lastLogIndex = {} });
 
     CHECK(status.configuration.voters.empty());
     CHECK(status.configuration.learners.empty());
@@ -739,12 +809,11 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
 
     auto started = ConsensusTier::Start(
         cfg,
-        {},
+        TestAdvertised(),
         Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
-        core::platform::defaultSystemWallClock(),
-        {},
+        ConsensusTier::LeaderContactObserver {},
         metrics,
         logger,
         nullptr,
@@ -825,23 +894,24 @@ TEST_CASE("Every state a consensus tier applies reaches the shared-cache directo
     cfg.clusterDir = scratch.Path() / "state";
 
     NodeMembership membership { cfg, membershipLog };
-    auto const roster =
-        NodeRoster::Build(Testing::FirstStart(NodeConfig {}), core::platform::defaultSystemWallClock(), metrics, logger);
+    core::platform::ManualClock rosterClock;
+    auto const roster = NodeRoster::Build(Testing::FirstStart(NodeConfig {}), rosterClock, nullptr);
     REQUIRE(roster.has_value());
     Testing::MemoryOpener opener;
     SharedCacheHost sharedCache { "n1", opener, nullptr, logger, ReconcileOn::Caller };
     SharedCacheDirectory directory { "n1", {} };
     RecordingUpstream upstream { directory };
+    AppliedSchedulers schedulers { cfg, AsConfigured };
 
     auto started =
         StartConsensusOrExplain(cfg,
                                 noScheduler,
-                                {},
+                                TestAdvertised(),
                                 Testing::TestKeyPair("n1"),
                                 membership,
                                 *Unwrap(roster),
+                                schedulers,
                                 SharedCacheListeners { .directory = directory, .host = sharedCache, .upstream = &upstream },
-                                core::platform::defaultSystemWallClock(),
                                 metrics,
                                 logger,
                                 nullptr,
@@ -890,6 +960,73 @@ TEST_CASE("Every state a consensus tier applies reaches the shared-cache directo
     CHECK(seen.back() == CompileCacheWire::WireSharedCacheSource::ThisMachine);
 }
 
+TEST_CASE("Every applied state reaches where this node registers, so a voter's recorded endpoint is its next round's",
+          "[node][consensus][announce]")
+{
+    // T26's carry, at the door it is wired through: a node that serves no scheduler registers at the
+    // voters its APPLIED state records (`AppliedSchedulers`), and the consensus tier's apply callback is
+    // what tells it. A real one-voter tier records itself with the `0xFC` endpoint it advertises, and a
+    // learner's source handed to that callback -- a learner whose formation remembered another endpoint
+    // -- answers the recorded one from then on. Without the callback the source would answer the
+    // remembered endpoint forever, and a voter that moved would be reached only after a reform.
+    NullLogger logger;
+    AtomicMetricsSink metrics;
+    std::unique_ptr<SchedulerTier> const noScheduler;
+
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->boundPort();
+    probe.reset();
+
+    Testing::ScratchDirectory const scratch { "consensus-applied-schedulers" };
+    auto cfg = Testing::FirstStart(NodeConfig {});
+    cfg.nodeId = "n1";
+    cfg.raftListen = std::format("127.0.0.1:{}", port);
+    cfg.raftSelf = "127.0.0.1";
+    cfg.clusterDir = scratch.Path() / "state";
+
+    NodeMembership membership { cfg, membershipLog };
+    core::platform::ManualClock rosterClock;
+    auto const roster = NodeRoster::Build(Testing::FirstStart(NodeConfig {}), rosterClock, nullptr);
+    REQUIRE(roster.has_value());
+    Testing::MemoryOpener opener;
+    SharedCacheHost sharedCache { "n1", opener, nullptr, logger, ReconcileOn::Caller };
+    SharedCacheDirectory directory { "n1", {} };
+
+    auto learner = Testing::FirstStart(NodeConfig {});
+    learner.nodeId = "n2";
+    learner = Testing::LearnerRegisteringWith(std::move(learner), { "remembered.example:6674" });
+    AppliedSchedulers schedulers { learner, AsConfigured };
+    REQUIRE(schedulers.Current() == std::vector<std::string> { "remembered.example:6674" });
+
+    auto started =
+        StartConsensusOrExplain(cfg,
+                                noScheduler,
+                                TestAdvertised(),
+                                Testing::TestKeyPair("n1"),
+                                membership,
+                                *Unwrap(roster),
+                                schedulers,
+                                SharedCacheListeners { .directory = directory, .host = sharedCache, .upstream = nullptr },
+                                metrics,
+                                logger,
+                                nullptr,
+                                FormationHooks {});
+    REQUIRE(started.has_value());
+    auto const& tier = *started;
+    REQUIRE(tier != nullptr);
+
+    auto const recorded = std::vector<std::string> { std::string { TestAdvertised().Current() } };
+    CHECK(Testing::WaitUntil(
+        "the voter's recorded 0xFC endpoint to reach where the learner registers",
+        [&schedulers, &recorded] { return schedulers.Current() == recorded; },
+        [&schedulers, &tier] {
+            return std::format(
+                "registers at {} (commit {})", schedulers.Current().front(), tier->Status().commitIndex.value);
+        }));
+}
+
 TEST_CASE("A leader counts its sends to a learner with no endpoint as a learner with no session",
           "[node][consensus][learner][formation]")
 {
@@ -917,12 +1054,11 @@ TEST_CASE("A leader counts its sends to a learner with no endpoint as a learner 
 
     auto started = ConsensusTier::Start(
         cfg,
-        {},
+        TestAdvertised(),
         Testing::TestKeyPair("n1"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
-        core::platform::defaultSystemWallClock(),
-        {},
+        ConsensusTier::LeaderContactObserver {},
         metrics,
         logger,
         nullptr,
@@ -1029,12 +1165,11 @@ TEST_CASE("A restarted leader counts its sends to a learner it has not re-applie
     auto const start = [&cfg, &logger](IMetricsSink& metrics) {
         return ConsensusTier::Start(
             cfg,
-            {},
+            TestAdvertised(),
             Testing::TestKeyPair("n1"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [](Cluster::ClusterState const&) {},
-            core::platform::defaultSystemWallClock(),
-            {},
+            ConsensusTier::LeaderContactObserver {},
             metrics,
             logger,
             nullptr,
@@ -1086,116 +1221,6 @@ TEST_CASE("A restarted leader counts its sends to a learner it has not re-applie
                                metrics.Read(IMetricsSink::Counter::RaftSendsDroppedUnknownPeer));
         }));
     CHECK(metrics.Read(IMetricsSink::Counter::RaftSendsDroppedUnknownPeer) == 0);
-}
-
-TEST_CASE("A lone voter endorses the roster it applied, under its own key, and re-signs when it changes",
-          "[node][consensus][roster]")
-{
-    // #178, owner decision 3: a lone scheduler runs a one-member consensus, and so it is the
-    // one voter whose endorsement certifies the roster its workers adopt. A real tier -- real
-    // listener, state directory and a driver that elected itself -- because an endorsement
-    // produced by a function nothing calls is the bug it was written to fix.
-    NullLogger logger;
-    AtomicMetricsSink metrics;
-
-    // Held, never released: the tier is handed this socket, so the port is not free for anything
-    // else on the host between choosing it and serving it.
-    auto held = BlockingListener::Bind("127.0.0.1", 0);
-    REQUIRE(held);
-    REQUIRE(held->IsBound());
-    auto const port = held->boundPort();
-
-    Testing::ScratchDirectory const scratchDirectory { "consensus-endorse" };
-    scratchDirectory.Write("cluster.key", std::string(32, 'k'));
-    auto const& scratch = scratchDirectory.Path();
-
-    auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.nodeId = "n1";
-    cfg.clusterId = "fleet";
-    cfg.raftListen = std::format("127.0.0.1:{}", port);
-    cfg.raftSelf = "127.0.0.1";
-    cfg.clusterDir = scratch / "state";
-
-    // Collected off the reconciler thread, read on this one.
-    struct Seen
-    {
-        std::mutex lock;
-        std::vector<Cluster::RosterEndorsement> endorsements;
-    };
-    auto const seen = std::make_shared<Seen>();
-    auto started = ConsensusTier::Start(
-        cfg,
-        {},
-        Testing::TestKeyPair("n1"),
-        [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
-        [](Cluster::ClusterState const&) {},
-        core::platform::defaultSystemWallClock(),
-        [seen](Cluster::RosterEndorsement const& endorsement) {
-            std::scoped_lock const guard { seen->lock };
-            seen->endorsements.push_back(endorsement);
-        },
-        metrics,
-        logger,
-        nullptr,
-        FormationHooks {},
-        std::move(held));
-    INFO("start refused: " << RefusalOf(started));
-    REQUIRE(started.has_value());
-    auto const& tier = *started;
-
-    auto const latest = [&seen] {
-        std::scoped_lock const guard { seen->lock };
-        return seen->endorsements.empty() ? std::optional<Cluster::RosterEndorsement> {}
-                                          : std::optional { seen->endorsements.back() };
-    };
-    auto const count = [&seen] {
-        std::scoped_lock const guard { seen->lock };
-        return seen->endorsements.size();
-    };
-
-    REQUIRE(Testing::WaitUntil(
-        "the lone voter to endorse the roster recording itself",
-        [&tier, &latest] {
-            auto const endorsement = latest();
-            return endorsement.has_value() && endorsement->version == tier->ClusterState().rosterVersion;
-        },
-        [&tier, &count] {
-            return std::format("{} endorsement(s), roster version {}", count(), tier->ClusterState().rosterVersion);
-        }));
-
-    // What a worker checks, and what distinguishes an endorsement of THIS roster from one of
-    // any: the fleet, the digest of the applied state's roster, a lapse one lifetime ahead,
-    // and a signature under this node's own key -- not under another machine's.
-    auto const first = Unwrap(latest());
-    auto const state = tier->ClusterState();
-    CHECK(first.clusterId == "fleet");
-    CHECK(first.endorser == "n1");
-    CHECK(first.rosterDigest == Cluster::DigestOfRoster(Cluster::ProjectRoster(state)));
-    CHECK(Cluster::VerifyEndorsement(first, Testing::TestKeyPair("n1").PublicKey()));
-    CHECK_FALSE(Cluster::VerifyEndorsement(first, Testing::TestKeyPair("n2").PublicKey()));
-    auto const now = std::chrono::system_clock::now();
-    CHECK(first.notAfter > now + Cluster::RosterEndorsementLifetime - std::chrono::minutes { 5 });
-    CHECK(first.notAfter <= now + Cluster::RosterEndorsementLifetime);
-
-    // An unchanged roster is NOT re-signed every pass: the next endorsement is due a refresh
-    // from now. A changed one is re-signed at once -- admitting a learner moves the roster.
-    auto const before = count();
-    REQUIRE(tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
-                                                      .key = "w1",
-                                                      .value = {},
-                                                      .schedulerEndpoint = {},
-                                                      .publicKey = Testing::TestKeyPair("w1").PublicKey(),
-                                                      .role = std::nullopt })
-                .has_value());
-    REQUIRE(Testing::WaitUntil(
-        "the lone voter to endorse the roster that admits w1",
-        [&latest, &first] {
-            auto const endorsement = latest();
-            return endorsement.has_value() && endorsement->version > first.version;
-        },
-        [&count] { return std::format("{} endorsement(s)", count()); }));
-    CHECK(count() == before + 1);
-    CHECK(Unwrap(latest()).rosterDigest != first.rosterDigest);
 }
 
 namespace
@@ -1315,12 +1340,11 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
     auto const start = [&] {
         return ConsensusTier::Start(
             cfg,
-            {},
+            TestAdvertised(),
             Testing::TestKeyPair("n1"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [published](Cluster::ClusterState const&) { published->fetch_add(1); },
-            core::platform::defaultSystemWallClock(),
-            {},
+            ConsensusTier::LeaderContactObserver {},
             metrics,
             logger,
             nullptr,
@@ -1650,12 +1674,11 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
 
     auto started = ConsensusTier::Start(
         cfg,
-        {},
+        TestAdvertised(),
         Testing::TestKeyPair("n2"),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
-        core::platform::defaultSystemWallClock(),
-        {},
+        ConsensusTier::LeaderContactObserver {},
         metrics,
         logger,
         &conditions,
@@ -1736,12 +1759,11 @@ TEST_CASE("Only a node that founded its cluster bootstraps it; one that joined a
     auto const start = [&logger, &metrics](NodeConfig const& cfg) {
         return ConsensusTier::Start(
             cfg,
-            {},
+            TestAdvertised(),
             Testing::TestKeyPair("n2"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [](Cluster::ClusterState const&) {},
-            core::platform::defaultSystemWallClock(),
-            {},
+            ConsensusTier::LeaderContactObserver {},
             metrics,
             logger,
             nullptr,
@@ -1838,12 +1860,11 @@ TEST_CASE("A node announces the seat its mode holds: a learner is never announce
     auto const start = [&logger, &metrics](NodeConfig const& cfg) {
         return ConsensusTier::Start(
             cfg,
-            {},
+            TestAdvertised(),
             Testing::TestKeyPair("n2"),
             [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
             [](Cluster::ClusterState const&) {},
-            core::platform::defaultSystemWallClock(),
-            {},
+            ConsensusTier::LeaderContactObserver {},
             metrics,
             logger,
             nullptr,
@@ -1853,10 +1874,9 @@ TEST_CASE("A node announces the seat its mode holds: a learner is never announce
     SECTION("a learner's own record carries a learner's seat")
     {
         // Asked of `ConsensusSelfMemberOf`, the record `Start` announces verbatim, rather than of a
-        // started tier: a learner binds no consensus port, and `Start` for a mode whose listener is
-        // closed is lane 2a's Task 19, which has not landed -- today it refuses before it builds a
-        // record. The voter section below is the real tier; the two together pin that the seat
-        // follows the mode, and Task 19 owes the learner section its real-tier form.
+        // started tier: a learner binds no consensus port, so the record it would announce is the
+        // observable. The voter section below is the real tier; the two together pin that the seat
+        // follows the mode.
         auto const cfg = joinedAs(Cluster::NodeMode::Learner, "consensus-seat-learner");
         auto const members = BootstrapMembersOf(cfg);
         auto const self = ConsensusSelfMemberOf(cfg, members, Testing::TestKeyPair("n2").PublicKey());
@@ -2008,12 +2028,11 @@ void StopTierOrExit(std::unique_ptr<ConsensusTier> tier, std::string_view who)
 {
     return ConsensusTier::Start(
         cfg,
-        {},
+        TestAdvertised(),
         Testing::TestKeyPair(cfg.nodeId),
         [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
         [](Cluster::ClusterState const&) {},
-        core::platform::defaultSystemWallClock(),
-        {},
+        ConsensusTier::LeaderContactObserver {},
         metrics,
         logger,
         nullptr,
@@ -2199,8 +2218,9 @@ TEST_CASE("A tier tells its formation every applied state with its cluster and w
     }
 
     // Where the leader answers is the STATE's to say -- the one argument a controller follows a leader
-    // by -- so once the cluster records n1's endpoint, the formation is told it.
-    auto const leaderNodeEndpoint = std::string { "127.0.0.1:6674" };
+    // by -- so once the cluster records n1's endpoint, the formation is told it. The one its own
+    // reconcile asserts, so the two never contend for the record.
+    auto const leaderNodeEndpoint = std::string { TestAdvertised().Current() };
     REQUIRE(tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                                                       .key = "n1",
                                                       .value = cfg.raftListen,
@@ -2256,13 +2276,11 @@ struct TwoTierFleet
     std::unique_ptr<ConsensusTier> joinerTier;                                   ///< `n2`, joined.
 };
 
-/// Start a founder, have it record `n2` in @p seat under `n2`'s key, and start `n2` as a member of
-/// that fleet in that seat. Returns once both tiers run; what they converge to is the caller's to
-/// wait for.
-/// @param fleet Where the two tiers and their directories live.
-/// @param seat Where the joiner sits.
-/// @param joinerHooks What the joiner's formation is told.
-void StartTwoTierFleet(TwoTierFleet& fleet, Cluster::MemberSeat seat, FormationHooks joinerHooks)
+/// Start `n1` as a founder, and return once it leads its cluster of one: the half of a two-tier
+/// fleet both ways in share -- an admission proposed directly (`StartTwoTierFleet`) and one that
+/// travels the enrollment route.
+/// @param fleet Where the founder's tier and directory live.
+void StartTwoTierFounder(TwoTierFleet& fleet)
 {
     fleet.founder = Testing::FirstStart(NodeConfig {});
     fleet.founder.nodeId = "n1";
@@ -2278,7 +2296,17 @@ void StartTwoTierFleet(TwoTierFleet& fleet, Cluster::MemberSeat seat, FormationH
         "the founder to lead its cluster of one",
         [&founderTier] { return founderTier->Status().role == Consensus::Role::Leader; },
         [&founderTier] { return std::format("role {}", static_cast<int>(founderTier->Status().role)); }));
+}
 
+/// Start a founder, have it record `n2` in @p seat under `n2`'s key, and start `n2` as a member of
+/// that fleet in that seat. Returns once both tiers run; what they converge to is the caller's to
+/// wait for.
+/// @param fleet Where the two tiers and their directories live.
+/// @param seat Where the joiner sits.
+/// @param joinerHooks What the joiner's formation is told.
+void StartTwoTierFleet(TwoTierFleet& fleet, Cluster::MemberSeat seat, FormationHooks joinerHooks)
+{
+    StartTwoTierFounder(fleet);
     auto const joinerRaft =
         seat == Cluster::MemberSeat::Voter ? std::format("127.0.0.1:{}", UnansweredPort()) : std::string {};
     auto const admitted = fleet.founderTier->ProposeToCluster(Cluster::Command {
@@ -2345,6 +2373,122 @@ TEST_CASE("A joined voter is counted by its founder's quorum and follows its lea
     CHECK_FALSE(joiner->BoundEndpoint().empty());
 }
 
+TEST_CASE("A node's applied state is behind while short of the log it recovered, and caught up through the shorter",
+          "[node][consensus][boot-order]")
+{
+    // Batch 3's M3, as the rule a proof surface asks (`AppliedStateOf`): what decides whether a key
+    // absent from the roster is absent from the cluster or only not applied yet.
+    auto const at = [](std::uint64_t value) {
+        return Consensus::LogIndex { .value = value };
+    };
+    // Just restarted -- a lone voter before its election commits, a follower before its leader's
+    // first word: nothing applied, a log recovered.
+    CHECK(AppliedStateOf(at(0), at(12), at(12)) == AppliedStateReading::Behind);
+    // The leader's no-op committed, and everything before it applied with it.
+    CHECK(AppliedStateOf(at(13), at(13), at(12)) == AppliedStateReading::CaughtUp);
+    // A follower whose recovered tail no leader committed: truncated to 8, applied through 8. Measured
+    // against the recovered 10 alone it would answer "not yet" until the log grew past it -- forever,
+    // in a quiet fleet.
+    CHECK(AppliedStateOf(at(8), at(8), at(10)) == AppliedStateReading::CaughtUp);
+    CHECK(AppliedStateOf(at(7), at(8), at(10)) == AppliedStateReading::Behind);
+    // A first start recovered nothing, so there is nothing to catch up with.
+    CHECK(AppliedStateOf(at(0), at(0), at(0)) == AppliedStateReading::CaughtUp);
+
+    // And the slot a proof surface is built over answers `Unknown` until a tier is attached -- which
+    // the surface treats as not caught up, since nothing has been applied at all.
+    ConsensusStandingSlot const slot;
+    CHECK(slot.CurrentAppliedState() == AppliedStateReading::Unknown);
+}
+
+TEST_CASE("A restarted follower is behind until its leader speaks, then caught up, over real tiers",
+          "[node][consensus][formation][fleet][boot-order]")
+{
+    // The follower half of M3, MEASURED on a scratch fleet before the fix: a restarted follower
+    // answered its fleet's proofs `node-key-unknown` for the 234 ms before its leader's first
+    // AppendEntries. Over real tiers: a two-voter fleet forms, both stop -- the founder FIRST, so the
+    // follower's port is left with no connection it closed and it rebinds at once -- and the follower
+    // restarts alone. With half the voters it can elect nobody and hears nobody, so it STAYS behind,
+    // which is the window, held open. Then the founder returns, a leader commits, and it catches up.
+    TwoTierFleet fleet;
+    StartTwoTierFleet(fleet, Cluster::MemberSeat::Voter, FormationHooks {});
+    REQUIRE(Testing::WaitUntil(
+        "the joined voter to follow the founder and hold the state that records it",
+        [&fleet] {
+            return fleet.joinerTier->Status().knownLeader == std::optional<Consensus::NodeId> { "n1" }
+                   && RecordsJoiner(fleet.joinerTier->ClusterState(), Cluster::MemberSeat::Voter);
+        },
+        [&fleet] { return std::format("commit {}", fleet.joinerTier->Status().commitIndex.value); }));
+    CHECK(fleet.joinerTier->CurrentAppliedState() == AppliedStateReading::CaughtUp);
+
+    REQUIRE(StopTierWithin(std::move(fleet.founderTier), nullptr));
+    REQUIRE(StopTierWithin(std::move(fleet.joinerTier), nullptr));
+
+    auto restarted = StartTier(fleet.joiner, fleet.joinerMetrics, fleet.logger);
+    INFO("the follower's restart refused: " << RefusalOf(restarted));
+    REQUIRE(restarted.has_value());
+    fleet.joinerTier = std::move(*restarted);
+    auto const& joiner = fleet.joinerTier;
+    CHECK(joiner->CurrentAppliedState() == AppliedStateReading::Behind);
+    // Still behind two reconcile passes later: no quorum, so no leader and nothing applied. A fixed
+    // wait, because what is asserted is that NOTHING moves; the leader check beside it is the reason.
+    std::this_thread::sleep_for(2 * ConsensusTier::ReconcileInterval);
+    CHECK(joiner->CurrentAppliedState() == AppliedStateReading::Behind);
+    CHECK_FALSE(joiner->Status().knownLeader.has_value());
+
+    auto founder = StartTier(fleet.founder, fleet.founderMetrics, fleet.logger);
+    INFO("the founder's restart refused: " << RefusalOf(founder));
+    REQUIRE(founder.has_value());
+    fleet.founderTier = std::move(*founder);
+    CHECK(Testing::WaitUntil(
+        "the restarted follower to catch up once a leader commits",
+        [&joiner] { return joiner->CurrentAppliedState() == AppliedStateReading::CaughtUp; },
+        [&joiner] {
+            return std::format("known leader {}, commit {}",
+                               joiner->Status().knownLeader.value_or("(none)"),
+                               joiner->Status().commitIndex.value);
+        }));
+}
+
+TEST_CASE("A two-voter fleet's follower holds its leader as a voter, under its key, in the state it applied",
+          "[node][consensus][formation][fleet]")
+{
+    // H7, checked on the merged tree (batch 3, B3-R4): measured on master-era --raft-peer formation, a
+    // two-voter fleet's FOLLOWER never registered -- its roster answered `NotVoter` for the leader,
+    // because consensus counted two voters while the replicated state recorded one. Formation by record
+    // records every voter WITH its key (the founder at its first pass, a joiner at its admission), so
+    // the follower's own roster -- built the way `main` builds it, fed the state the follower applied --
+    // holds the leader as a voter. Kept as the production-seam control the ruling asks for.
+    TwoTierFleet fleet;
+    StartTwoTierFleet(fleet, Cluster::MemberSeat::Voter, FormationHooks {});
+    auto const recordsVoter = [](Cluster::ClusterState const& state, std::string const& id) {
+        return std::ranges::any_of(state.members, [&id](Cluster::ClusterMember const& member) {
+            return member.id == id && member.seat == Cluster::MemberSeat::Voter
+                   && member.publicKey == std::optional { Testing::TestKeyPair(id).PublicKey() };
+        });
+    };
+    auto const& joiner = fleet.joinerTier;
+    REQUIRE(Testing::WaitUntil(
+        "the follower to apply a state recording both voters under their keys",
+        [&joiner, &recordsVoter] {
+            auto const state = joiner->ClusterState();
+            // And the configuration counting both, which the leader proposes once the joiner is
+            // dialable and caught up (#1537) -- a moment after the record, so it is waited for too.
+            return joiner->Status().knownLeader == std::optional<Consensus::NodeId> { "n1" } && recordsVoter(state, "n1")
+                   && recordsVoter(state, "n2") && joiner->Status().configuration.voters.size() == 2;
+        },
+        [&joiner] {
+            return std::format("{} member(s) recorded, {} voter(s) counted",
+                               joiner->ClusterState().members.size(),
+                               joiner->Status().configuration.voters.size());
+        }));
+
+    auto const roster = NodeRoster::Build(fleet.joiner, RosterClock(), nullptr);
+    INFO("the follower's roster refused: " << (roster.has_value() ? std::string {} : roster.error().reason));
+    REQUIRE(roster.has_value());
+    Unwrap(roster)->Applied(joiner->ClusterState());
+    CHECK(Unwrap(roster)->StandingOf("n1", Testing::TestKeyPair("n1").PublicKey()) == ServerStanding::Voter);
+}
+
 TEST_CASE("A joined learner is replicated to over the session it dialled and is counted by no quorum",
           "[node][consensus][formation][fleet][learner]")
 {
@@ -2366,6 +2510,199 @@ TEST_CASE("A joined learner is replicated to over the session it dialled and is 
         },
         [&joiner] { return std::format("commit {}", joiner->Status().commitIndex.value); }));
     CHECK(founder->Status().configuration.voters == std::vector<Consensus::NodeId> { "n1" });
+}
+
+namespace
+{
+/// The founder's half of the enrollment route, wired the way `main` wires it over a REAL tier: its
+/// scheduler administers the founder's consensus, and the responder answers a joiner's `Enroll` and an
+/// operator's approval through that scheduler -- so an approval is a proposal to the founder's own
+/// Raft log, committed and applied there, never a fake's copy of `Apply`.
+struct FounderEnrollment
+{
+    /// @param fleet The fleet whose founder answers; its tier must lead.
+    explicit FounderEnrollment(TwoTierFleet& fleet):
+        self { CompileCacheWire::FleetSummary { .clusterId = fleet.founder.clusterId,
+                                                .state = CompileCacheWire::FleetState::Established,
+                                                .leaderId = "n1",
+                                                .nodeId = "n1" } }
+    {
+        service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
+        service.AdministerWith(*fleet.founderTier);
+    }
+
+    /// The machine asking to join: on no member list.
+    static constexpr std::string_view JoinerAddress = "198.51.100.4";
+
+    /// The operator's machine: on the member list, so it may decide.
+    static constexpr std::string_view OperatorAddress = "10.0.0.7";
+
+    core::platform::ManualClock clock;                                         ///< The window's clock.
+    core::platform::ManualWallClock wallClock;                                 ///< The scheduler's wall clock.
+    AtomicMetricsSink metrics;                                                 ///< What the route counts.
+    NullLogger logger;                                                         ///< Where it says what it does.
+    Distributed::KeyPairLeaseSigner const signer = Testing::TestLeaseSigner(); ///< What the scheduler signs with.
+    Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} }; ///< The founder's scheduler.
+    Testing::ListedMembership membership { { std::string { OperatorAddress } },
+                                           Distributed::MembershipParticipant::MachineTicket }; ///< Who may decide.
+    NodeConditions conditions;                                                                  ///< What the window raises.
+    EnrollmentWindow window { clock, &conditions, &metrics, wallClock };                        ///< The pending list.
+    Testing::ScriptedSummarySource self;                        ///< What the founder says about itself.
+    Ed25519KeyPair const identity = Testing::TestKeyPair("n1"); ///< The founder's identity key.
+    Testing::ScriptedSecureRandom random { Testing::ScriptedSecureRandom::Ascending(256) }; ///< Each row's challenge.
+    EnrollmentResponder responder { window, service, membership, self, identity, random, metrics, logger };
+
+    /// Put @p frame to the responder as a peer at @p peer, and return the reply's ENROLL payload.
+    /// @param frame The request.
+    /// @param peer Who asks.
+    /// @return The reply, its payload copied out; a refusal fails the case.
+    [[nodiscard]] std::vector<std::byte> Ask(std::span<std::byte const> frame, std::string_view peer)
+    {
+        auto const reply =
+            core::async::syncRun(responder.Answer(frame, PeerIdentity { .host = std::string { peer } })).bytes;
+        auto const header = CompileCacheWire::DecodeReplyHeader(reply);
+        REQUIRE(header.has_value());
+        REQUIRE(reply.size() >= CompileCacheWire::ReplyHeaderSize + Unwrap(header).payloadLength);
+        auto const payload =
+            std::span<std::byte const> { reply }.subspan(CompileCacheWire::ReplyHeaderSize, Unwrap(header).payloadLength);
+        if (Unwrap(header).status == CompileCacheWire::Status::Error)
+        {
+            auto const refusal = CompileCacheWire::DecodeErrorPayload(payload);
+            REQUIRE(refusal.has_value());
+            FAIL("refused: " << Unwrap(refusal).second);
+        }
+        return { payload.begin(), payload.end() };
+    }
+};
+} // namespace
+
+TEST_CASE("A learner enrolled through its leader's own route is recorded under the key it enrolled with, "
+          "and a keyless desire keeps it",
+          "[node][consensus][formation][fleet][learner][enrollment]")
+{
+    // The record half of the enrollment route over REAL tiers (step 20's C-5, carried to batch 3):
+    // a signed `Enroll`, the leader's challenge, an operator's approval proposed to the founder's own
+    // log, and the joiner started from the roster that approval answered -- the roster's bytes, read
+    // the way `ApplyFormation` reads a formation record, never a member list the case typed.
+    TwoTierFleet fleet;
+    StartTwoTierFounder(fleet);
+    // The founder records ITSELF at its first reconcile pass as leader, long before an operator
+    // approves anybody in a real fleet -- and an approval's roster is the state's, so one answered
+    // before then would name no voter for the joiner to dial.
+    REQUIRE(Testing::WaitUntil(
+        "the founder to record itself",
+        [&fleet] {
+            return std::ranges::contains(fleet.founderTier->ClusterState().members, "n1", &Cluster::ClusterMember::id);
+        },
+        [&fleet] { return std::format("commit {}", fleet.founderTier->Status().commitIndex.value); }));
+    FounderEnrollment seed { fleet };
+
+    auto const joinerPair = Testing::TestKeyPair("n2");
+    auto self = JoinerIdentity { .nodeId = "n2",
+                                 .nodeEndpoint = "n2.fleet.test:6674",
+                                 .role = CompileCacheWire::EnrollRole::Learner,
+                                 .publicKey = joinerPair.PublicKey() };
+    auto nonce = std::array<std::byte, CompileCacheWire::NodeChallengeBytes> {};
+    nonce.fill(std::byte { 0x5A });
+    auto const poll = [&] {
+        auto const payload = seed.Ask(EncodeSignedEnroll(self, joinerPair, nonce), FounderEnrollment::JoinerAddress);
+        auto const reply = CompileCacheWire::DecodeEnrollReply(payload);
+        REQUIRE(reply.has_value());
+        // A `Pending` answer hands the row's challenge, and the joiner's next request signs over it.
+        if (Unwrap(reply).challenge.has_value())
+            self.challenge = Unwrap(reply).challenge;
+        return std::pair { Unwrap(reply).outcome,
+                           std::vector<std::byte> { Unwrap(reply).roster.begin(), Unwrap(reply).roster.end() } };
+    };
+
+    REQUIRE(poll().first == CompileCacheWire::EnrollOutcome::Pending);
+    REQUIRE(self.challenge.has_value());
+    static_cast<void>(
+        seed.Ask(CompileCacheWire::EncodeEnrollApprove("n2", joinerPair.PublicKey()), FounderEnrollment::OperatorAddress));
+
+    // Answered `Approved` only once the founder's own state RECORDS the joiner, which is the commit.
+    auto roster = std::vector<std::byte> {};
+    REQUIRE(Testing::WaitUntil(
+        "the founder to answer the approved joiner with its roster",
+        [&] {
+            auto [outcome, bytes] = poll();
+            if (outcome != CompileCacheWire::EnrollOutcome::Approved)
+                return false;
+            roster = std::move(bytes);
+            return true;
+        },
+        [&fleet] { return std::format("commit {}", fleet.founderTier->Status().commitIndex.value); }));
+    auto const admitted = DescribeAdmission(self, roster, fleet.joinerDirectory / "state");
+    INFO("the roster was refused: " << (admitted.has_value() ? std::string {} : admitted.error()));
+    REQUIRE(admitted.has_value());
+
+    // The record carries the ENROLLED key and the 0xFC endpoint the `Enroll` stated, in a learner's
+    // seat -- and the voters are the founder alone.
+    auto const recordsEnrolled = [&self](Cluster::ClusterState const& state) {
+        return std::ranges::any_of(state.members, [&self](Cluster::ClusterMember const& member) {
+            return member.id == "n2" && member.seat == Cluster::MemberSeat::Learner && member.publicKey == self.publicKey
+                   && member.schedulerEndpoint == self.nodeEndpoint;
+        });
+    };
+    CHECK(recordsEnrolled(fleet.founderTier->ClusterState()));
+
+    // The joiner, started from the roster the approval carried, signed by the founder's key.
+    fleet.joiner = Testing::FirstStart(NodeConfig {});
+    fleet.joiner.nodeId = "n2";
+    fleet.joiner.raftListen = std::format("127.0.0.1:{}", UnansweredPort());
+    fleet.joiner.raftSelf = "127.0.0.1";
+    fleet.joiner.clusterDir = fleet.joinerDirectory / "state";
+    auto const record = Cluster::FormationRecord {
+        .mode = Cluster::NodeMode::Learner,
+        .own = {},
+        .joining = std::nullopt,
+        .fleet = Cluster::FleetMembership { .clusterId = fleet.founder.clusterId,
+                                            .roster = roster,
+                                            .createdAtUnixSeconds = 0,
+                                            .admittedBy = seed.identity.PublicKey() },
+    };
+    auto const applied = ApplyFormation(fleet.joiner, record, Cluster::FleetEndpoints {});
+    INFO("the formation was refused: " << (applied.has_value() ? std::string {} : applied.error()));
+    REQUIRE(applied.has_value());
+    auto joined = StartTier(fleet.joiner, fleet.joinerMetrics, fleet.logger);
+    INFO("the joiner's start refused: " << RefusalOf(joined));
+    REQUIRE(joined.has_value());
+    fleet.joinerTier = std::move(*joined);
+    auto const& joiner = fleet.joinerTier;
+    REQUIRE(Testing::WaitUntil(
+        "the enrolled learner to follow its leader and apply the state that records it",
+        [&joiner, &recordsEnrolled] {
+            return joiner->Status().knownLeader == std::optional<Consensus::NodeId> { "n1" }
+                   && recordsEnrolled(joiner->ClusterState());
+        },
+        [&joiner] { return std::format("commit {}", joiner->Status().commitIndex.value); }));
+    CHECK(fleet.founderTier->Status().configuration.voters == std::vector<Consensus::NodeId> { "n1" });
+
+    // A KEYLESS desire for the learner, shaped as discovery hands one over (`ConsensusTier::Desire`):
+    // where it answers consensus, no `0xFC` opinion, and no key. It MOVES the record -- the reconciler
+    // re-proposes the learner at the stated endpoint, which is what this case waits on -- and the key
+    // the enrollment recorded stands: a command with no key keeps the recorded one (`KeyToRecord`).
+    // For a member the state already records, that rule is the whole of the protection;
+    // `WithLiveKeys` fills a key only for an id the state does not record.
+    auto const desiredRaft = std::format("127.0.0.1:{}", UnansweredPort());
+    auto const desire = std::array { Cluster::DesiredMember {
+        .id = "n2", .raftEndpoint = desiredRaft, .schedulerEndpoint = std::nullopt, .publicKey = std::nullopt } };
+    fleet.founderTier->Desire(desire);
+    auto const moved = [&desiredRaft](Cluster::ClusterState const& state) {
+        auto const* const member = core::findOrNull(state.members, std::string_view { "n2" }, &Cluster::ClusterMember::id);
+        return member != nullptr && member->raftEndpoint == desiredRaft;
+    };
+    REQUIRE(Testing::WaitUntil(
+        "the founder to re-propose the learner its keyless desire names",
+        [&fleet, &moved] { return moved(fleet.founderTier->ClusterState()); },
+        [&fleet] { return std::format("commit {}", fleet.founderTier->Status().commitIndex.value); }));
+    auto const after = fleet.founderTier->ClusterState();
+    auto const* const kept = core::findOrNull(after.members, std::string_view { "n2" }, &Cluster::ClusterMember::id);
+    REQUIRE(kept != nullptr);
+    CHECK(kept->publicKey == self.publicKey);
+    CHECK(kept->seat == Cluster::MemberSeat::Learner);
+    CHECK(kept->schedulerEndpoint == self.nodeEndpoint);
+    CHECK(fleet.founderTier->Status().configuration.voters == std::vector<Consensus::NodeId> { "n1" });
 }
 
 TEST_CASE("A forgotten learner hears its key revoked through its own tier, from the voter it dials",

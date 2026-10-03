@@ -49,11 +49,12 @@ struct AdmissionClaim
     std::string_view clusterId;              ///< The cluster that answers.
     CompileCacheWire::EnrollOutcome outcome; ///< What it answered.
     std::span<std::byte const> roster; ///< The roster's bytes, exactly as the reply carries them; empty but for an approval.
+    std::span<std::byte const> challenge; ///< The challenge it issues for the joiner's next ask; empty but for `Pending`.
 };
 
 /// The bytes an answer signs: its label (`IdentityKeyPurpose::EnrollAdmission`), then the joiner's
-/// nonce, its id, its key, the answering cluster's id, the outcome byte and a digest of the roster
-/// bytes, in this project's length-prefixed field grammar.
+/// nonce, its id, its key, the answering cluster's id, the outcome byte, a digest of the roster
+/// bytes and the challenge it issues, in this project's length-prefixed field grammar.
 ///
 /// **The joiner's id and key are inside**, so an admission of one machine is no admission of
 /// another asking with the same nonce; **the cluster id is inside**, so a key proven for one fleet
@@ -72,7 +73,8 @@ struct AdmissionClaim
                                  std::span<std::byte const> { claim.joinerKey },
                                  WireFields::AsBytes(claim.clusterId),
                                  std::span<std::byte const> { outcome },
-                                 std::span<std::byte const> { digest } });
+                                 std::span<std::byte const> { digest },
+                                 claim.challenge });
 }
 
 /// Sign an answer as @p identity.

@@ -161,7 +161,8 @@ namespace
                     "port binds the wildcard on every node, because every node is a fleet participant -- and "
                     "the cache verbs answer this machine alone whatever the bind, while every other verb refuses a "
                     "caller that is not a member. Bound by every node that starts, whatever "
-                    "components it runs: --node-status and live stats are answered here. Scheduling is answered "
+                    "components it runs: node status (`fastcache-cli node`) and live stats are answered here. "
+                    "Scheduling is answered "
                     "only while this node LEADS; a follower redirects and an election in progress refuses, so "
                     "the port is open on every member whether or not it is answering today",
         },
@@ -642,6 +643,16 @@ std::string RenderSurfaces(NodeConfig const& cfg)
     // and a hand-started node's), and the reason is what tells an operator which one this is.
     out += std::format("\nstate directory:\n  {}\n", DescribeNodeStateDirectory(cfg));
 
+    // Which cluster this node is in and which one `--fleet-id` lets it be in, indented for the same
+    // reason. The id is what another machine's pin names; `none` under the pin is the answer an
+    // operator asks for -- discovery is trust-on-first-use -- and is said, never left blank.
+    out +=
+        std::format("\nfleet:\n  cluster    {}\n  pinned to  {}\n",
+                    cfg.formation.has_value() && !cfg.formation->clusterId.empty() ? cfg.formation->clusterId
+                                                                                   : std::string { "none minted yet" },
+                    cfg.fleetPin.has_value() ? Cluster::FormatPinnedFleet(*cfg.fleetPin)
+                                             : std::string { "none (--fleet-id unset: discovery is trust-on-first-use)" });
+
     // The notes last and separately, because they are prose while the table above is
     // something an operator transcribes into firewall rules. Mixing them would rag the
     // columns for the rows that carry one -- and the compile port's note says this list
@@ -685,8 +696,9 @@ ServedSurfaces NodeServedSurfacesFor(NodeConfig const& cfg)
         bool served;
     };
 
-    // `ServesScheduler`, the one predicate `main` builds the tier under, and `ServesEnrollment` handed
-    // that answer in place of a started tier, which does not exist when a scrape asks this question.
+    // `ServesScheduler`, the one predicate `main` builds the tier under. Enrollment asks
+    // `ServesEnrollment` itself, stating the scheduler by that same predicate: a started tier does not
+    // exist when a scrape asks this question, and a copy of its clauses here missed the pin's.
     auto const servesScheduler = ServesScheduler(cfg);
     std::array const rows {
         // Never: this binary constructs no `Server`/`ReactorServerLoop`, so

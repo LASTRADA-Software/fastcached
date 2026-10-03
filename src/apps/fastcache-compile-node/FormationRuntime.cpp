@@ -29,6 +29,12 @@ std::expected<void, ConsensusError> LateClusterAdmin::ProposeToCluster(Cluster::
     return admin->ProposeToCluster(command);
 }
 
+void LateClusterAdmin::NoteAnnouncedEndpoint(Consensus::NodeId const& member, std::string endpoint)
+{
+    if (auto* const admin = _admin.load(std::memory_order_acquire); admin != nullptr)
+        admin->NoteAnnouncedEndpoint(member, std::move(endpoint));
+}
+
 std::vector<Cluster::SeedCandidate> SeedsNow(Cluster::FleetEndpointsFile& endpoints,
                                              std::span<std::string const> typed,
                                              ISrvResolver const& srv,
@@ -55,15 +61,19 @@ namespace
     /// Who this node is, as every summary it announces and every `Enroll` it sends says it.
     /// @param cfg The configuration its record shaped.
     /// @param identityKey This node's identity key.
+    /// @param advertised Where its `0xFC` port answers, read at every use.
     /// @return The facts; the Raft endpoint EMPTY for a mode nobody dials.
-    [[nodiscard]] SelfFacts SelfFactsOf(NodeConfig const& cfg, Ed25519PublicKey const& identityKey)
+    [[nodiscard]] SelfFacts SelfFactsOf(NodeConfig const& cfg,
+                                        Ed25519PublicKey const& identityKey,
+                                        Cc::IAdvertisedEndpointSource const& advertised)
     {
         return SelfFacts { .nodeId = cfg.nodeId,
                            .publicKey = identityKey,
-                           .nodeEndpoint = AdvertisedEndpoint(cfg),
+                           .advertised = advertised,
                            .raftEndpoint = ConsensusDialAddressOf(cfg).value_or(std::string {}),
                            .reach = ConsensusConfinedToThisMachine(cfg) ? FleetReachability::ThisMachineAlone
-                                                                        : FleetReachability::Open };
+                                                                        : FleetReachability::Open,
+                           .pin = FleetPinOf(cfg) };
     }
 } // namespace
 
@@ -86,10 +96,11 @@ std::optional<std::string> StartupShapeJudge::RefusalOf(Cluster::FormationRecord
 }
 
 FormationRuntime::FormationRuntime(NodeConfig const& cfg,
-                                   Ed25519PublicKey const& identityKey,
+                                   Ed25519KeyPair const& identityKey,
                                    Cluster::FormationRecord record,
                                    FormationDurables durables,
                                    NodeReloader const* reloader,
+                                   Cc::IAdvertisedEndpointSource const& advertised,
                                    Cluster::IAnnouncedJoinMemos const* memos,
                                    IMetricsSink& metrics,
                                    ILogger& logger,
@@ -98,7 +109,7 @@ FormationRuntime::FormationRuntime(NodeConfig const& cfg,
     _durables { durables },
     _live { cfg, reloader },
     _judge { _live, durables.endpoints, StartupPolicyRejection },
-    _enroll { durables.parts.dialer },
+    _enroll { durables.parts.dialer, identityKey },
     _probe { durables.parts.dialer, durables.parts.random, durables.parts.wait.Clock() },
     _controller { FormationParts {
                       .store = durables.store,
@@ -122,7 +133,7 @@ FormationRuntime::FormationRuntime(NodeConfig const& cfg,
                       .logger = logger,
                       .judge = _judge,
                       .conditions = conditions },
-                  SelfFactsOf(cfg, identityKey),
+                  SelfFactsOf(cfg, identityKey.PublicKey(), advertised),
                   std::move(record) }
 {
 }
@@ -169,21 +180,24 @@ void FormationRuntime::Start(Distributed::IClusterAdmin* tier)
     } };
 }
 
-std::expected<std::unique_ptr<FormationRuntime>, std::string> MakeFormationRuntime(NodeConfig const& cfg,
-                                                                                   FormationBody const& body,
-                                                                                   SchedulerTier* scheduler,
-                                                                                   IMetricsSink& metrics,
-                                                                                   ILogger& logger,
-                                                                                   NodeConditions* conditions)
+std::expected<std::unique_ptr<FormationRuntime>, std::string> MakeFormationRuntime(
+    NodeConfig const& cfg,
+    std::optional<Ed25519KeyPair> const& identityKey,
+    FormationBody const& body,
+    Cc::IAdvertisedEndpointSource const& advertised,
+    SchedulerTier* scheduler,
+    IMetricsSink& metrics,
+    ILogger& logger,
+    NodeConditions* conditions)
 {
     if (!RunsConsensus(cfg))
         return std::unique_ptr<FormationRuntime> {};
-    if (!cfg.identityPublicKey.has_value())
+    if (!identityKey.has_value())
         return std::unexpected { std::string { FormationNeedsIdentityKey } };
     auto const* const memos =
         scheduler != nullptr ? static_cast<Cluster::IAnnouncedJoinMemos const*>(&scheduler->Service()) : nullptr;
     return std::make_unique<FormationRuntime>(
-        cfg, *cfg.identityPublicKey, body.record, body.durables, body.reloader, memos, metrics, logger, conditions);
+        cfg, *identityKey, body.record, body.durables, body.reloader, advertised, memos, metrics, logger, conditions);
 }
 
 Cluster::IFleetSummarySource const& SummarySourceOf(FormationRuntime* runtime,

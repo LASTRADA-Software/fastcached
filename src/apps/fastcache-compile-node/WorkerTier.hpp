@@ -138,6 +138,9 @@ struct WorkerTierParts
     /// check asks, and where this node's own scheduler answers, which the registration asks -- so
     /// the two cannot disagree.
     ActivatedNodeEndpoint activatedNodeEndpoint;
+    /// Where the heartbeat registers, re-read at every round (`AppliedSchedulers`): the process's one,
+    /// shared with the presence loop and told every applied state by the consensus tier.
+    ISchedulerEndpointSource const& schedulers;
     Distributed::IMembershipOracle const& membership; ///< Who may send a compile at all.
     /// Who may cordon this worker, and what each heartbeat reports it answers on: ONE set, the
     /// one the ticket audience checks, so a dial hint never names an address this node refuses.
@@ -286,8 +289,9 @@ class WorkerTier
     /// @return The running heartbeat.
     [[nodiscard]] WorkerHeartbeat Launch(core::platform::IClock const& statusClock, SchedulerReachability& reachability);
 
-    /// @return Where this worker registers, in the order its heartbeat tries them: its
-    ///         formation record's answer, fixed when the tier was built.
+    /// @return Where this worker's next round registers, in the order it tries them, as the
+    ///         heartbeat last read them (`ISchedulerEndpointSource`). Read it before `Launch`: a round
+    ///         re-reads it on the heartbeat's own thread.
     [[nodiscard]] std::vector<std::string> const& RegistersWith() const noexcept
     {
         return _link.Configured();

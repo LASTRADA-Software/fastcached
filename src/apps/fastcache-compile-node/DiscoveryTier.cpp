@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "DiscoveryTier.hpp"
+#include "NodeFormation.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
@@ -128,7 +129,7 @@ DiscoveryTier::DiscoveryTier(Parts parts):
     _socket { std::move(parts.socket) },
     _clock { parts.clock },
     _directory { _clock, parts.self, parts.keys },
-    _watch { parts.self, parts.evidence, _clock, parts.conditions, parts.fleets, parts.config.beaconInterval },
+    _watch { parts.self, parts.evidence, _clock, parts.conditions, parts.fleets, parts.config.beaconInterval, parts.pin },
     _beaconInterval { parts.config.beaconInterval },
     // Due immediately rather than one interval from now: a node that waited would be
     // invisible to a segment that is already up for as long as its own interval, and
@@ -255,7 +256,8 @@ std::expected<std::unique_ptr<DiscoveryTier>, NodeRefusal> DiscoveryTier::Start(
                              .fleets = formation.fleets != nullptr ? *formation.fleets : production->fleets,
                              .onPeers = std::move(onPeers),
                              .metrics = metrics,
-                             .logger = logger });
+                             .logger = logger,
+                             .pin = FleetPinOf(cfg) });
     tier->_production = std::move(production);
 
     tier->_thread = std::jthread { [tier = tier.get()](std::stop_token const& stop) {

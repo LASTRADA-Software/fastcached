@@ -299,6 +299,53 @@ TEST_CASE("A replace whose directory cannot be synced is reported, never taken a
     CHECK(TextAt(path) == "new");
 }
 
+TEST_CASE("A filesystem that cannot sync a directory degrades the replace, and every other sync failure refuses it",
+          "[consensus][storage][durable]")
+{
+    // Each of this platform's "not supported here" answers lands the replace and carries the answer back;
+    // an answer outside the table is a sync that failed, and fails the replace (the case above).
+    REQUIRE_FALSE(UnsupportedDirectorySyncAnswers().empty());
+    for (auto const answer: UnsupportedDirectorySyncAnswers())
+    {
+        INFO(answer.message());
+        CHECK(MeansDirectorySyncUnsupported(answer));
+        auto const scratch = Testing::ScratchDirectory { "durable-file-unsynced" };
+        auto const path = scratch / "formation";
+
+        /// This machine's files, with a directory sync that answers `answer`.
+        class Unsynced final: public IDurableFiles
+        {
+          public:
+            explicit Unsynced(std::error_code said) noexcept:
+                _said { said }
+            {
+            }
+
+            std::expected<std::unique_ptr<IDurableSink>, std::error_code> Create(std::filesystem::path const& file,
+                                                                                 StateFile which) override
+            {
+                return _system.Create(file, which);
+            }
+
+            std::error_code SyncDirectory(std::filesystem::path const& /*directory*/) override
+            {
+                return _said;
+            }
+
+          private:
+            std::error_code _said;
+            SystemDurableFiles _system;
+        } files { answer };
+        auto const rename = Platform::SystemReplacingRename {};
+        auto const replaced = ReplaceFileWith(path, WireFields::AsBytes("new"), StateFile::Formation, files, rename);
+        REQUIRE(replaced.has_value());
+        CHECK(Testing::Unwrap(replaced).directoryUnsynced == answer);
+        CHECK(TextAt(path) == "new");
+    }
+    CHECK_FALSE(MeansDirectorySyncUnsupported(std::make_error_code(std::errc::io_error)));
+    CHECK_FALSE(MeansDirectorySyncUnsupported(std::error_code {}));
+}
+
 TEST_CASE("This machine's directory sync succeeds on a directory and is refused for one that is not there",
           "[consensus][storage][durable]")
 {

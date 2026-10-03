@@ -256,9 +256,9 @@ address, never by whether it is empty: an empty one never reaches the wire.
 table in its own right and this tool's unit is a table `--format=json` can carry.
 
 In `cluster-members`, `scheduler` is an address or absent, and `scheduler-state`
-says which: `announced`, `never-announced` (a member that has not led, which is
-ordinary), or `cleared` (a re-admit wiped the endpoint it had; it returns when that
-member next leads).
+says which: `announced`, `never-announced` (a member that has announced none, such
+as a bootstrap peer before its first announcement), or `cleared` (a record re-proposed
+with none wiped the endpoint it had; it returns when that member next announces).
 
 `seat` is `voter` or `learner`: the set the member was **admitted into**, which is
 the record the leader moves consensus towards one change at a time. A learner is
@@ -274,9 +274,10 @@ the cluster has agreed and this build does not know keeps its row too, with no
 summary: a fleet is permanently mid-upgrade, and dropping the row would hide a live
 fact because the reader is the older binary.
 
-Absent is not empty in either table. A member that has never led carries no
-scheduler endpoint — a leader announces its own record on election — so that cell
-reads as absent rather than as an address nothing answers at.
+Absent is not empty in either table. A member that has announced none carries no
+scheduler endpoint — every member's record carries the endpoint its join stated, and
+moves when it announces a new one — so that cell reads as absent rather than as an
+address nothing answers at.
 
 Two of the three changing verbs report **accepted**, never committed. The leader
 cannot know the difference until a majority answers.
@@ -428,14 +429,21 @@ Beside them, what that worker is offering and whether anyone knows about it:
   configuration names others and not it). A learner and a following voter report the
   same `scheduler-role`, and only one of them stands for election when the leader
   goes. A node running no consensus reports no such field.
-- **`roster-version`, `roster-voters`, `roster-principals`, `roster-revoked`,
-  `roster-certified-until`** — the roster this node checks lease grants against
-  ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)): which one, how
-  many voters sign it, how many machines it admits by key, how many keys the cluster
-  revoked, and until when a majority of its voters vouch for it, in UTC. A node that
-  checks no grant reports none of them rather than a roster of nobody, and a consensus
-  member reports `roster-certified-until` as absent: its roster is the state it applies
-  and never lapses.
+- **`roster-version`, `roster-voters`, `roster-revoked`** — the roster this node checks
+  lease grants against ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)):
+  which one, how many voters sign grants under it, and how many keys the cluster revoked.
+  It is the state this node's own consensus applied, so it never lapses. A node that
+  checks no grant reports none of them rather than a roster of nobody.
+- **`fleet-id`** and **`fleet-pin`** — the pin to paste, and the pin this node trusts by.
+  `fleet-id` is `<cluster-id>@<key>[,<key>...]`: this node's cluster and the identity key of
+  every voter its state records, exactly what another machine's `--fleet-id` (and the
+  installer's `FASTCACHE_FLEET_ID`) takes, so this is where an operator copies it from.
+  When `--fleet-id` would refuse it -- a fleet with more than 16 voters, which a pin may not
+  all name -- the cell says so after the string; any 16 of those keys make a pin.
+  `fleet-pin` reads `none` on a node that trusts on first use -- the answer, not an absence:
+  zero-config discovery joins whichever fleet proves itself oldest. A node too old to say
+  reports neither, and one with no cluster or no roster to name voters from reports no
+  `fleet-id`.
 - **`shared-cache`, `shared-cache-machine`, `shared-cache-endpoint`,
   `shared-cache-state`, `shared-cache-detail`** — what this node reads through to, or
   serves, as the fleet's shared cache. `shared-cache` says where that comes from:

@@ -10,14 +10,12 @@
 #include <FastCache/Cluster/FleetEndpoints.hpp>
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/Roster.hpp>
-#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
-#include <FastCache/Distributed/RosterStore.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/FileTrust.hpp>
 
@@ -151,8 +149,7 @@ TEST_CASE("Every state file the node acts on refuses the start when another acco
                             Consensus::RaftStateFileName,
                             Consensus::RaftLogFileName,
                             Consensus::RaftSnapshotFileName,
-                            Cluster::FleetEndpointsFileName,
-                            Distributed::RosterFileName })
+                            Cluster::FleetEndpointsFileName })
         CHECK(visited.contains(name));
 }
 
@@ -543,14 +540,6 @@ TEST_CASE("Every file the node's writers leave in its state directory has a row,
                                                              .state = {} })
                     .has_value());
     }
-    REQUIRE(Distributed::FileRosterStore { dir / Distributed::RosterFileName }
-                .Save(Cluster::PersistedRoster {
-                    .certificate = Cluster::CertifiedRoster { .clusterId = "mine",
-                                                              .version = 1,
-                                                              .roster = Cluster::EncodeRoster(Cluster::Roster {}),
-                                                              .endorsements = {} },
-                    .certifiedUntil = std::chrono::system_clock::time_point { std::chrono::hours { 500'000 } } })
-                .has_value());
     auto cfg = NodeConfig {};
     cfg.clusterDir = dir;
     Testing::PlacedWallClock clock;
@@ -679,7 +668,7 @@ TEST_CASE("A state file an elevated operator writes stays readable by the servic
     // `--print-identity` may run elevated before the service ever starts, and writes as
     // `Administrators`; the install then grants the service's account the directory, inheritably
     // (`GrantPathAccess`). A file with a protected list of its own takes that grant neither before
-    // nor after, and the service is refused its own roster with no remedy. So every state file
+    // nor after, and the service is refused its own state with no remedy. So every state file
     // but the key takes the directory's list, and the grant reaches it whichever came first --
     // reproduced with the grant the review measured, `SERVICE` full control, inheritable.
     ScratchDirectory const scratch { "node-state-service-grant" };
@@ -688,15 +677,9 @@ TEST_CASE("A state file an elevated operator writes stays readable by the servic
     FileTrustNodeKeyGuard guard;
     REQUIRE(ResolveNodeKey(dir, random, guard).has_value());
 
-    // Before the grant: the roster, as an earlier run saves it.
-    REQUIRE(Distributed::FileRosterStore { dir / Distributed::RosterFileName }
-                .Save(Cluster::PersistedRoster {
-                    .certificate = Cluster::CertifiedRoster { .clusterId = "mine",
-                                                              .version = 1,
-                                                              .roster = Cluster::EncodeRoster(Cluster::Roster {}),
-                                                              .endorsements = {} },
-                    .certifiedUntil = std::chrono::system_clock::time_point { std::chrono::hours { 500'000 } } })
-                .has_value());
+    // Before the grant: the fleet's endpoints, as an approval saves them.
+    REQUIRE(
+        Cluster::FleetEndpointsFile { dir }.Save(Cluster::FleetEndpoints { .clusterId = "mine", .voters = {} }).has_value());
     REQUIRE(Testing::RunCommandLine(std::format(R"(icacls "{}" /grant *S-1-5-6:(OI)(CI)F)", dir.string()))
             == std::optional<DWORD> { 0 });
     // After it: the formation record.
@@ -710,7 +693,7 @@ TEST_CASE("A state file an elevated operator writes stays readable by the servic
                                                  .askedJoins = {} })
                 .has_value());
 
-    for (auto const name: { Distributed::RosterFileName, Cluster::FormationRecordFileName })
+    for (auto const name: { Cluster::FleetEndpointsFileName, Cluster::FormationRecordFileName })
     {
         CAPTURE(name, Testing::AccessListOf(dir / name));
         CHECK(Testing::AccessListOf(dir / name).contains("(A;ID;FA;;;SU)"));
@@ -871,9 +854,10 @@ TEST_CASE("A replace whose POSIX rename is refused as unsupported still lands, a
     auto const scratch = ScratchDirectory { "replace-route" };
     CapturingLogger logger;
     AtomicMetricsSink metrics;
+    Consensus::SystemDurableFiles files;
     auto const refused = std::error_code { InvalidParameter, std::system_category() };
     auto const rename = ScriptedReplacingRename { refused };
-    auto const route = ReportReplaceRoute(scratch.Path(), rename, logger, metrics);
+    auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics);
 
     // Only Windows reads that answer as "no such rename here": `rename(2)` has the semantics, so a
     // POSIX build treats any refusal as the failure it is.
@@ -896,13 +880,84 @@ TEST_CASE("A replace whose POSIX rename is refused as unsupported still lands, a
     CHECK_FALSE(std::filesystem::exists(scratch / Consensus::ReplaceProbeFileName));
 }
 
+namespace
+{
+/// This machine's files, with a directory sync that answers @p answer instead of syncing: a volume
+/// whose filesystem cannot sync a directory, or one where a sync it could do failed.
+class UnsyncedDirectoryFiles final: public Consensus::IDurableFiles
+{
+  public:
+    /// @param answer What every directory sync answers.
+    explicit UnsyncedDirectoryFiles(std::error_code answer) noexcept:
+        _answer { answer }
+    {
+    }
+
+    [[nodiscard]] std::expected<std::unique_ptr<Consensus::IDurableSink>, std::error_code> Create(
+        std::filesystem::path const& path, StateFile which) override
+    {
+        return _system.Create(path, which);
+    }
+
+    [[nodiscard]] std::error_code SyncDirectory(std::filesystem::path const& /*directory*/) override
+    {
+        return _answer;
+    }
+
+  private:
+    std::error_code _answer;
+    Consensus::SystemDurableFiles _system;
+};
+} // namespace
+
+TEST_CASE("A state directory whose filesystem cannot sync a directory is said and counted once, and still serves",
+          "[node][state-files][durable]")
+{
+    // A volume that cannot sync a directory refused EVERY state write while a failed sync failed the
+    // replace (step 20 recheck, R-A). Now each of this platform's "not supported here" answers lands the
+    // replace DEGRADED, and the start probe says so once and counts it -- WHICH counter, and not the
+    // fallback's.
+    for (auto const answer: Consensus::UnsupportedDirectorySyncAnswers())
+    {
+        INFO(answer.message());
+        auto const scratch = ScratchDirectory { "replace-route-unsynced" };
+        CapturingLogger logger;
+        AtomicMetricsSink metrics;
+        UnsyncedDirectoryFiles files { answer };
+        auto const rename = ScriptedReplacingRename { std::error_code {} };
+        auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics);
+        REQUIRE(route.has_value());
+        CHECK(metrics.Read(IMetricsSink::Counter::StateDirectorySyncsUnsupported) == 1);
+        CHECK(metrics.Read(IMetricsSink::Counter::StateFileReplacesFellBack) == 0);
+        auto const said = logger.Snapshot();
+        CHECK(std::ranges::count_if(said,
+                                    [&](auto const& record) {
+                                        return record.level == LogLevel::Warn
+                                               && record.message.contains(scratch.Path().string())
+                                               && record.message.contains("cannot sync a directory");
+                                    })
+              == 1);
+    }
+
+    // The control: a sync that FAILED -- an I/O error, which a retry may not repeat -- is no degradation.
+    // The probe cannot be written, and nothing is counted as unsupported.
+    auto const scratch = ScratchDirectory { "replace-route-sync-failed" };
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    UnsyncedDirectoryFiles files { std::make_error_code(std::errc::io_error) };
+    auto const rename = ScriptedReplacingRename { std::error_code {} };
+    CHECK_FALSE(ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics).has_value());
+    CHECK(metrics.Read(IMetricsSink::Counter::StateDirectorySyncsUnsupported) == 0);
+}
+
 TEST_CASE("A replace whose POSIX rename works is neither said nor counted", "[node][state-files]")
 {
     auto const scratch = ScratchDirectory { "replace-route-posix" };
     CapturingLogger logger;
     AtomicMetricsSink metrics;
+    Consensus::SystemDurableFiles files;
     auto const rename = ScriptedReplacingRename { std::error_code {} };
-    auto const route = ReportReplaceRoute(scratch.Path(), rename, logger, metrics);
+    auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics);
     REQUIRE(route.has_value());
     CHECK(Testing::Unwrap(route) == Platform::ReplaceRoute::PosixSemantics);
     CHECK(rename.Asked() > 0);
@@ -929,7 +984,8 @@ TEST_CASE("What a crash during the replace probe leaves is no reason to refuse t
         CapturingLogger logger;
         AtomicMetricsSink metrics;
         auto const rename = ScriptedReplacingRename { std::error_code {} };
-        auto const route = ReportReplaceRoute(scratch.Path(), rename, logger, metrics);
+        Consensus::SystemDurableFiles files;
+        auto const route = ReportReplaceRoute(scratch.Path(), files, rename, logger, metrics);
         REQUIRE(route.has_value());
         for (auto const name: NodeStateProbeLeftovers())
         {
@@ -960,4 +1016,27 @@ TEST_CASE("What a crash during the replace probe leaves is no reason to refuse t
         REQUIRE_FALSE(walked.has_value());
         CHECK(walked.error().fault == NodeKeyFault::UnknownEntry);
     }
+}
+
+TEST_CASE("A link named like the replace probe is no leftover of it, whatever it points to", "[node][state-files]")
+{
+    // Judged by the ENTRY, never by what a link resolves to: a symlink of that name pointing at a regular
+    // file is something this build never wrote, as a directory of that name is.
+    // The target lives OUTSIDE the state directory and is a live regular file, so a judge asking what
+    // the link resolves to would read it as a leftover -- the reading this case exists to refuse.
+    ScratchDirectory const elsewhere { "replace-probe-link-target" };
+    auto const target = elsewhere.Path() / "a-regular-file";
+    WriteText(target, "a regular file somewhere");
+    ScratchDirectory const scratch { "replace-probe-link" };
+    auto made = std::error_code {};
+    std::filesystem::create_symlink(
+        target, scratch.Path() / std::filesystem::path { std::string { Consensus::ReplaceProbeFileName } }, made);
+    if (made)
+        SKIP("this host lets this process create no symbolic link: " << made.message());
+    REQUIRE(std::filesystem::is_regular_file(scratch.Path()
+                                             / std::filesystem::path { std::string { Consensus::ReplaceProbeFileName } }));
+    auto guard = ScriptedNodeKeyGuard::OwnerOnly();
+    auto const walked = RefuseForeignStateFiles(scratch.Path(), guard);
+    REQUIRE_FALSE(walked.has_value());
+    CHECK(walked.error().fault == NodeKeyFault::UnknownEntry);
 }

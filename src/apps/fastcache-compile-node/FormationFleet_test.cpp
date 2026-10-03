@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ForeignFleetWatch.hpp"
 #include "FormationController.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 #include "SharedCacheResponder.hpp"
 
@@ -460,4 +461,105 @@ TEST_CASE("A forgotten learner returns to solitary under a new cluster and does 
     CHECK(lan.ClusterOf("n-laptop") != lan.ClusterOf("n-office"));
     lan.RunFor(5min);
     CHECK(lan.ModeOf("n-laptop") != Cluster::NodeMode::Learner); // it asks again, and nobody approved it
+}
+
+TEST_CASE("Joining records the machine's endpoint and a reload moves it", "[node][formation][fleet][endpoint]")
+{
+    // What every resolver dials for a machine is the record its fleet keeps: written at the approval
+    // from the endpoint the joiner's `Enroll` stated, and moved only by that machine's own proven
+    // announcement -- here after an accepted reload of `--advertise`, on the presence loop.
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wall;
+    Lan lan { clock, wall };
+    lan.AddMachine("n-office", 100);
+    lan.AddMachine("n-laptop", 500);
+    lan.RunFor(Lan::MeetWithin);
+    lan.Approve("n-office", "n-laptop");
+
+    // At the approval itself, before any announcement could have said it.
+    CHECK(lan.RecordedEndpointOf("n-office", "n-laptop") == lan.AdvertisedOf("n-laptop"));
+    lan.RunFor(Adopted);
+    REQUIRE(lan.ModeOf("n-laptop") == Cluster::NodeMode::Learner);
+    REQUIRE(lan.ClusterOf("n-laptop") == lan.ClusterOf("n-office"));
+
+    lan.SetAdvertised("n-laptop", "10.9.0.4:6674");
+    lan.RunFor(2 * NodeAnnounceInterval);
+    CHECK(lan.RecordedEndpointOf("n-office", "n-laptop") == "10.9.0.4:6674");
+}
+
+TEST_CASE("A pinned office ignores an older fleet on its LAN and joins the fleet it is pinned to",
+          "[node][formation][fleet][pin][security]")
+{
+    // n-rogue minted first, so on trust on first use the office and the laptop both yield to it -- the
+    // attack the pin exists for. Pinned -- the founder to its own cluster, the laptop to the founder's --
+    // neither moves towards it, and the laptop joins the office.
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wall;
+    auto const pinTo = [](std::string clusterId) {
+        return [clusterId = std::move(clusterId)](Node::NodeConfig& cfg) {
+            // The office's cluster under the founder's own key: what `fastcache-cli node` prints on it.
+            cfg.fleetPin = Cluster::PinnedFleet { .clusterId = clusterId,
+                                                  .voterKeys = { Testing::TestKeyPair("n-office").PublicKey() } };
+        };
+    };
+
+    SECTION("unpinned, the control: every machine yields to the oldest, rogue or not")
+    {
+        Lan lan { clock, wall };
+        lan.AddMachine("n-rogue", 1);
+        lan.AddMachine("n-office", 300);
+        lan.AddMachine("n-laptop", 500);
+        lan.RunFor(Lan::MeetWithin);
+        INFO("n-office said:\n" << lan.LogOf("n-office") << "n-laptop said:\n" << lan.LogOf("n-laptop"));
+        CHECK(lan.ModeOf("n-office") == Cluster::NodeMode::Pending);
+        CHECK(lan.ModeOf("n-laptop") == Cluster::NodeMode::Pending);
+        lan.Approve("n-rogue", "n-laptop");
+        lan.RunFor(Adopted);
+        CHECK(lan.ClusterOf("n-laptop") == "c-n-rogue");
+    }
+    SECTION("pinned: the rogue is counted and raised, and the laptop joins the office")
+    {
+        Lan lan { clock, wall };
+        lan.AddMachine("n-rogue", 1);
+        lan.AddMachine("n-office", 300, pinTo("c-n-office"));
+        lan.AddMachine("n-laptop", 500, pinTo("c-n-office"));
+        lan.RunFor(Lan::MeetWithin);
+        INFO("n-office said:\n" << lan.LogOf("n-office") << "n-laptop said:\n" << lan.LogOf("n-laptop"));
+        CHECK(lan.ModeOf("n-office") == Cluster::NodeMode::Solitary);
+        REQUIRE(lan.ModeOf("n-laptop") == Cluster::NodeMode::Pending);
+        CHECK(lan.CounterOf("n-office", IMetricsSink::Counter::FormationYieldsRefusedPin) > 0);
+        CHECK(lan.CounterOf("n-laptop", IMetricsSink::Counter::FormationYieldsRefusedPin) > 0);
+        CHECK(lan.ConditionsOf("n-office").StateOf(NodeCondition::ForeignFleetVisible) == Wire::ConditionState::Raised);
+
+        lan.Approve("n-office", "n-laptop");
+        lan.RunFor(Adopted);
+        CHECK(lan.ModeOf("n-laptop") == Cluster::NodeMode::Learner);
+        CHECK(lan.ClusterOf("n-laptop") == "c-n-office");
+    }
+}
+
+TEST_CASE("A pinned machine older than the founder it is pinned to still ends in the founder's fleet",
+          "[node][formation][fleet][pin]")
+{
+    // n-desk minted first and is pinned to n-office's cluster; n-office is unpinned. The tiebreak sends
+    // the office towards the desk, and the desk -- pinned -- towards the office. The desk records
+    // nobody, so the office's ask goes unanswered, and the desk's ask is what the office's operator
+    // approves: one fleet, the one the pin names.
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wall;
+    Lan lan { clock, wall };
+    lan.AddMachine("n-desk", 100, [](Node::NodeConfig& cfg) {
+        cfg.fleetPin = Cluster::PinnedFleet { .clusterId = "c-n-office",
+                                              .voterKeys = { Testing::TestKeyPair("n-office").PublicKey() } };
+    });
+    lan.AddMachine("n-office", 300);
+    lan.RunFor(Lan::MeetWithin);
+    INFO("n-office said:\n" << lan.LogOf("n-office") << "n-desk said:\n" << lan.LogOf("n-desk"));
+    REQUIRE(lan.ModeOf("n-desk") == Cluster::NodeMode::Pending);
+
+    lan.Approve("n-office", "n-desk");
+    lan.RunFor(Adopted);
+    CHECK(lan.ModeOf("n-desk") == Cluster::NodeMode::Learner);
+    CHECK(lan.ClusterOf("n-desk") == "c-n-office");
+    CHECK(lan.ClusterOf("n-office") == "c-n-office");
 }

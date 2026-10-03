@@ -2,6 +2,7 @@
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeDefaults.hpp"
+#include "NodeMembership.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeKey.hpp"
 #include "NodeSurfaces.hpp"
@@ -244,24 +245,27 @@ TEST_CASE("The state directory is named with why it is that one, and asking befo
     CHECK(RenderSurfaces(cfg).contains(DescribeNodeStateDirectory(cfg)));
 }
 
-TEST_CASE("A state directory the start resolved is a key route though nobody typed --cluster-dir",
+TEST_CASE("A state directory the start resolved is no key route for a node that runs no consensus",
           "[node][formation][defaults]")
 {
-    // The worker 3d040a99b was about: no consensus, no --voter-key, no --cluster-dir -- and an
-    // enrollment that saved its roster into the DEFAULT state directory, which `NodeRoster::Build`
-    // reads back through `ChosenStateDirectory`. Asked before that read, the fail-closed answer
-    // has to count that directory as one that may hold a roster, exactly as a typed one does.
+    // 3d040a99b counted a resolved state directory as one that may keep a roster, because an
+    // enrollment once saved a worker's roster there. Since T25 a node's roster is the state its own
+    // consensus applies and nothing is kept for one that runs none, so a directory -- typed or
+    // defaulted -- admits nobody by key. Removing that clause narrowed nothing that could still be
+    // true; a node that RUNS consensus still counts, which is the control.
     auto cfg = Testing::FirstStart(Unwrap(Parse({ "--listen-raft=" })));
     REQUIRE_FALSE(RunsConsensus(cfg));
     REQUIRE(cfg.clusterDir.empty());
-
-    // The control: nothing resolved, so nothing could hold a roster yet.
-    CHECK_FALSE(AdmitsByKey(cfg));
+    CHECK_FALSE(AdmitsRemotePeers(cfg, RosterPresence::Unknown));
 
     ApplyNodeStateDirectory(cfg, ScriptedConfigPathProbe { EveryBase(), Privilege::Unprivileged });
     REQUIRE(ChosenStateDirectory(cfg).has_value());
     REQUIRE(Unwrap(ChosenStateDirectory(cfg)).origin != StateDirectoryOrigin::Named);
-    CHECK(AdmitsByKey(cfg));
+    CHECK_FALSE(AdmitsRemotePeers(cfg, RosterPresence::Unknown));
+
+    auto const clustered = Testing::FirstStart(NodeConfig {});
+    REQUIRE(RunsConsensus(clustered));
+    CHECK(AdmitsRemotePeers(clustered, RosterPresence::Unknown));
 }
 
 TEST_CASE("Only an invocation that writes into the state directory is refused for having none",

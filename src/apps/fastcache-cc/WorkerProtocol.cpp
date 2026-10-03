@@ -133,19 +133,6 @@ namespace
                       RefusedVerbs, [](Wire::Op op) { return op == Wire::Op::Compile; }, &Wire::RefusedVerb::op),
                   "a refusal row for COMPILE is dead: the lookup never reaches it");
 
-    /// What a worker whose roster lapsed says about when it did.
-    /// @param reading The roster's standing, `Expired`.
-    /// @param now This machine's clock.
-    /// @return The detail.
-    [[nodiscard]] std::string RosterLapsedDetail(Distributed::RosterReading const& reading,
-                                                 std::chrono::system_clock::time_point now)
-    {
-        if (!reading.certifiedUntil.has_value() || now <= *reading.certifiedUntil)
-            return "this worker's roster is not certified by a majority of its voters, so it can verify no grant";
-        return std::format("this worker's roster lost its certification {} seconds ago and no leader it reaches has "
-                           "re-certified it, so it can verify no grant",
-                           std::chrono::duration_cast<std::chrono::seconds>(now - *reading.certifiedUntil).count());
-    }
 } // namespace
 
 LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
@@ -187,20 +174,15 @@ LeaseValidator SignedLeaseValidator(Distributed::ILeaseRoster const& roster,
         auto const advertised = endpoint->Current();
 
         // The roster FIRST, because nothing below means anything without it (#178): a grant
-        // is verified against the keys the roster holds, and a roster nobody re-certified in
-        // time may still name a voter the cluster has since revoked. A fact about THIS WORKER,
-        // like `Unregistered` below, so answering it before the signature is no oracle.
-        auto const reading = signers->Read(now);
-        if (reading.standing == Distributed::RosterStanding::Absent)
-            return LeaseDecision { .refusal =
-                                       Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::NoRoster,
-                                                                   .detail = "this worker holds no roster its trust anchors "
-                                                                             "certify, so it can verify no grant yet" },
-                                   .remaining = std::nullopt };
-        if (reading.standing == Distributed::RosterStanding::Expired)
-            return LeaseDecision { .refusal =
-                                       Distributed::LeaseRefusal { .reason = Distributed::LeaseRefusalReason::RosterExpired,
-                                                                   .detail = RosterLapsedDetail(reading, now) },
+        // is verified against the voters the state this node applied records, and before it
+        // records any -- or once no leader that state counts has spoken for too long -- there is
+        // nothing a grant could safely be checked against. A fact about THIS WORKER, like
+        // `Unregistered` below, so answering it before the signature is no oracle. The standing's
+        // ROW says which refusal (`RosterStandingTable`).
+        if (auto const& standing = Distributed::RosterStandingTable[static_cast<std::size_t>(signers->Read(now).standing)];
+            standing.refusal.has_value())
+            return LeaseDecision { .refusal = Distributed::LeaseRefusal { .reason = *standing.refusal,
+                                                                          .detail = std::string { standing.detail } },
                                    .remaining = std::nullopt };
 
         // The fleet is READ per request rather than captured at construction, because
@@ -724,18 +706,17 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocke
     return {};
 }
 
-std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(core::net::ISocket& scheduler,
-                                                                            std::string_view endpoint,
-                                                                            Wire::CapacityFields const& capacity,
-                                                                            Wire::LoadFields const& load,
-                                                                            std::span<std::byte const> endorsement,
-                                                                            std::span<Wire::JoinMemoFields const> joinMemos)
+std::expected<void, AnnounceRefusal> AnnounceNodePresence(core::net::ISocket& scheduler,
+                                                          std::string_view endpoint,
+                                                          Wire::CapacityFields const& capacity,
+                                                          Wire::LoadFields const& load,
+                                                          std::span<Wire::JoinMemoFields const> joinMemos)
 {
-    auto const frame = Wire::EncodeNodeAnnounce(Wire::NodeAnnounceRequest {
-        .endpoint = endpoint, .capacity = capacity, .load = load, .endorsement = endorsement, .joinMemos = joinMemos });
+    auto const frame = Wire::EncodeNodeAnnounce(
+        Wire::NodeAnnounceRequest { .endpoint = endpoint, .capacity = capacity, .load = load, .joinMemos = joinMemos });
     auto outcome = ExchangeWithScheduler(scheduler, frame);
     if (outcome.IsHit())
-        return std::move(outcome.value);
+        return {};
 
     // No `UnknownLease` arm, and its absence is the point rather than an omission: there is no
     // id to forget. A registrar clears its worker id on that refusal so the caller's retry

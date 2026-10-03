@@ -7,7 +7,6 @@
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
-#include <FastCache/Distributed/RosterStore.hpp>
 #include <FastCache/Platform/FileTrust.hpp>
 
 #include <algorithm>
@@ -151,11 +150,6 @@ namespace
                            .trusting = "dial, and prove itself to, an endpoint somebody else chose",
                            .remedy = "Remove it, and this node finds its cluster through its configuration",
                            .answer = ForeignStateFileAnswer::RefuseStart },
-        NodeStateFileRow { .file = StateFile::Roster,
-                           .holds = "the roster this machine verifies grants against",
-                           .trusting = "accept grants signed by keys somebody else chose",
-                           .remedy = "Remove it only if this machine should verify no grant until it runs consensus again",
-                           .answer = ForeignStateFileAnswer::RefuseStart },
         NodeStateFileRow { .file = StateFile::NodeHistory,
                            .holds = "this node's own history",
                            .trusting = "chart readings somebody else wrote",
@@ -279,10 +273,11 @@ std::expected<void, NodeKeyRefusal> RefuseForeignStateFiles(std::filesystem::pat
         auto const name = entry.path().filename().string();
         // The replace probe's leftovers, by name and only as regular files: nothing reads them, and
         // the next probe clears them. Refusing them would turn one crash during a start into a node
-        // that never starts again until somebody deletes a file.
+        // that never starts again until somebody deletes a file. Asked of the ENTRY, never of what it
+        // points to: a link of that name is not a leftover the probe wrote.
         auto isFile = std::error_code {};
         if (walk.depth() == 0 && std::ranges::contains(NodeStateProbeLeftovers(), std::string_view { name })
-            && entry.is_regular_file(isFile))
+            && std::filesystem::is_regular_file(entry.symlink_status(isFile)))
         {
             walk.increment(failure);
             if (failure)
@@ -395,11 +390,12 @@ std::expected<KeptFormation, std::string> ReadStateDirectoryFormation(std::files
 }
 
 std::optional<Platform::ReplaceRoute> ReportReplaceRoute(std::filesystem::path const& directory,
+                                                         Consensus::IDurableFiles& files,
                                                          Platform::IReplacingRename const& rename,
                                                          ILogger& logger,
                                                          IMetricsSink& metrics)
 {
-    auto const probed = Consensus::ProbeReplaceRoute(directory, rename);
+    auto const probed = Consensus::ProbeReplaceRoute(directory, files, rename);
     if (!probed.has_value())
     {
         logger.Logf(LogLevel::Warn,
@@ -407,6 +403,19 @@ std::optional<Platform::ReplaceRoute> ReportReplaceRoute(std::filesystem::path c
                     directory.string(),
                     probed.error().context);
         return std::nullopt;
+    }
+    if (probed->directoryUnsynced)
+    {
+        metrics.Increment(IMetricsSink::Counter::StateDirectorySyncsUnsupported);
+        logger.Logf(LogLevel::Warn,
+                    "the filesystem holding {} cannot sync a directory ({} {}: {}), so a replaced state file is "
+                    "not known to survive a power loss there: every replace still lands and is used, and one a "
+                    "power cut takes back is read as the file before it. Move --cluster-dir to a local volume "
+                    "for durable replaces",
+                    directory.string(),
+                    probed->directoryUnsynced.category().name(),
+                    probed->directoryUnsynced.value(),
+                    probed->directoryUnsynced.message());
     }
     if (probed->route == Platform::ReplaceRoute::Classic)
     {

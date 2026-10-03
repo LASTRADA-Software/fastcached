@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeConditions.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeMembership.hpp"
 #include "NodeRoster.hpp"
@@ -7,9 +8,8 @@
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/NodeMode.hpp>
 #include <FastCache/Cluster/Roster.hpp>
-#include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Logger.hpp>
-#include <FastCache/Distributed/RosterStore.hpp>
+#include <FastCache/Distributed/StateLeaseRoster.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -24,19 +24,29 @@
 
 #include <core/Ranges.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/NodeConditionFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
-#include <tests/UnreadablePath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Node;
 using namespace std::chrono_literals;
+
+namespace Wire = CompileCacheWire;
 using FastCache::Testing::TestKeyPair;
 
 namespace
 {
+/// The steady clock a roster under test measures leader silence on. One object for the whole
+/// binary, so it outlives every roster a case builds; no case here waits out the bound.
+/// @return The clock.
+[[nodiscard]] ::core::platform::IClock const& RosterClock()
+{
+    static ::core::platform::SteadyClock const clock;
+    return clock;
+}
 
 /// The instant every case is decided at.
 constexpr auto Noon = std::chrono::system_clock::time_point { std::chrono::hours { 500'000 } };
@@ -45,8 +55,9 @@ constexpr auto Noon = std::chrono::system_clock::time_point { std::chrono::hours
 [[nodiscard]] NodeConfig Worker()
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
+    cfg.schedulers = { "127.0.0.1:6674" };
     cfg.clusterId = "fleet";
-    // A worker that runs no consensus -- the only kind that holds a roster of its own.
+    // A worker that runs no consensus, which holds no roster at all.
     cfg.raftListen.clear();
     return cfg;
 }
@@ -68,59 +79,22 @@ constexpr auto Noon = std::chrono::system_clock::time_point { std::chrono::hours
         roster.members.push_back(Cluster::RosterMember { .id = id,
                                                          .raftEndpoint = std::string { id } + ":6680",
                                                          .seat = Cluster::MemberSeat::Voter,
-                                                         .publicKey = TestKeyPair(id).PublicKey() });
+                                                         .publicKey = TestKeyPair(id).PublicKey(),
+                                                         .schedulerEndpoint = {} });
     return roster;
-}
-
-/// @p roster at @p version, endorsed by @p endorsers until @p notAfter.
-[[nodiscard]] Cluster::CertifiedRoster Certified(Cluster::Roster const& roster,
-                                                 std::uint64_t version,
-                                                 std::vector<std::string> const& endorsers,
-                                                 std::chrono::system_clock::time_point notAfter = Noon + 1h)
-{
-    auto certified = Cluster::CertifiedRoster {
-        .clusterId = "fleet", .version = version, .roster = Cluster::EncodeRoster(roster), .endorsements = {}
-    };
-    for (auto const& endorser: endorsers)
-    {
-        auto const key = TestKeyPair(endorser);
-        certified.endorsements.push_back(
-            Cluster::SignEndorsement(Cluster::RosterEndorsement { .clusterId = "fleet",
-                                                                  .version = version,
-                                                                  .rosterDigest = Cluster::DigestOfRoster(certified.roster),
-                                                                  .notAfter = notAfter,
-                                                                  .endorser = endorser,
-                                                                  .signature = {} },
-                                     [&key](LabelledMessage const& message) { return SignLabelled(key, message); }));
-    }
-    return certified;
-}
-
-/// Keep, in @p cfg's state directory, the roster version 3 that n1 and n2 certified until an hour
-/// past noon: what an earlier run of a worker that ran no consensus adopted. Nothing typed on a
-/// command line roots a roster any more, so a kept one is the only trust root such a worker has.
-/// @param cfg The worker whose state directory receives it.
-void KeepRoster(NodeConfig const& cfg)
-{
-    REQUIRE(Distributed::FileRosterStore { NodeStateDirectory(cfg) / Distributed::RosterFileName }
-                .Save(Cluster::PersistedRoster { .certificate = Certified(ThreeVoters(), 3, { "n1", "n2" }),
-                                                 .certifiedUntil = Noon + 1h })
-                .has_value());
 }
 
 } // namespace
 
-TEST_CASE("A consensus member verifies grants against the state it applies, which never lapses", "[node][roster]")
+TEST_CASE("A node's lease roster is the state it applied, which the wall clock never lapses", "[node][roster]")
 {
     auto cfg = Worker();
     cfg.raftListen = "127.0.0.1:6680";
-    core::platform::ManualWallClock const clock { Noon };
-    AtomicMetricsSink metrics;
-    NullLogger logger;
-    auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
+    auto const roster = NodeRoster::Build(cfg, RosterClock(), nullptr);
     REQUIRE(roster.has_value());
     auto& node = *Testing::Unwrap(roster);
-    REQUIRE(node.Lease() != nullptr);
+    // The one roster there is: the state this node's own consensus applied.
+    REQUIRE(dynamic_cast<Distributed::StateLeaseRoster const*>(node.Lease()) != nullptr);
 
     Cluster::ClusterState state;
     state.members = { Cluster::ClusterMember { .id = "n1",
@@ -137,13 +111,52 @@ TEST_CASE("A consensus member verifies grants against the state it applies, whic
     REQUIRE(summary.has_value());
     CHECK(Testing::Unwrap(summary).version == 4);
     CHECK(Testing::Unwrap(summary).voters == 1);
-    // No certificate on a consensus member: absent, never a lapse far in the future.
-    CHECK_FALSE(Testing::Unwrap(summary).certifiedUntil.has_value());
-    CHECK_FALSE(node.ExpiresInSeconds().has_value());
-    CHECK_FALSE(node.Wanting());
+    // The wall clock lapses nothing: a learner whose machine was shut for days reads the state it
+    // last applied. Only silence on the STEADY clock while it runs does (`LeaderSilenceBound`).
+    CHECK(node.Lease()->Read(Noon + std::chrono::days { 30 }).standing == Distributed::RosterStanding::Current);
 
     // And the roster `explain-admission <machine>` answers from is the state's own projection.
     CHECK(node.HeldRoster() == std::optional { Cluster::ProjectRoster(state) });
+}
+
+TEST_CASE("A consensus pass past the silence bound raises consensus-leader-silent, and one contact clears it",
+          "[node][roster][conditions][isolation]")
+{
+    // The row and the refusals it explains read ONE fact -- the roster's own standing -- so they
+    // cannot disagree: raised exactly while every grant is refused `Isolated`, cleared at the first
+    // contact from a leader the applied configuration counts.
+    auto cfg = Worker();
+    cfg.raftListen = "127.0.0.1:6680";
+    core::platform::ManualClock clock;
+    NodeConditions conditions;
+    auto const roster = NodeRoster::Build(cfg, clock, &conditions);
+    REQUIRE(roster.has_value());
+    auto& node = *Testing::Unwrap(roster);
+    Cluster::ClusterState state;
+    state.members = { Cluster::ClusterMember { .id = "n1",
+                                               .raftEndpoint = "n1:6680",
+                                               .schedulerEndpoint = {},
+                                               .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                               .seat = Cluster::MemberSeat::Voter,
+                                               .publicKey = TestKeyPair("n1").PublicKey() } };
+    node.Applied(state);
+
+    auto const silent = Distributed::LeaderReading {};
+    clock.advance(Distributed::LeaderSilenceBound - std::chrono::seconds { 1 });
+    node.ConsensusPass(silent);
+    CHECK(conditions.StateOf(NodeCondition::ConsensusLeaderSilent) == Wire::ConditionState::Clear);
+    CHECK(node.Lease()->Read(Noon).standing == Distributed::RosterStanding::Current);
+
+    clock.advance(std::chrono::seconds { 2 });
+    node.ConsensusPass(silent);
+    CHECK(conditions.StateOf(NodeCondition::ConsensusLeaderSilent) == Wire::ConditionState::Raised);
+    CHECK(Testing::DetailOf(conditions, NodeCondition::ConsensusLeaderSilent).contains("every lease grant is refused"));
+    CHECK(node.Lease()->Read(Noon).standing == Distributed::RosterStanding::Isolated);
+
+    node.ConsensusPass(
+        Distributed::LeaderReading { .leads = false, .leader = "n1", .silentFor = std::chrono::seconds { 0 } });
+    CHECK(conditions.StateOf(NodeCondition::ConsensusLeaderSilent) == Wire::ConditionState::Clear);
+    CHECK(node.Lease()->Read(Noon).standing == Distributed::RosterStanding::Current);
 }
 
 TEST_CASE("A consensus member places a server only once its applied state names a voter's key", "[node][roster][proof]")
@@ -155,16 +168,11 @@ TEST_CASE("A consensus member places a server only once its applied state names 
     // itself to itself until a heartbeat round after that commit, with a warning at every start.
     auto cfg = Worker();
     cfg.raftListen = "127.0.0.1:6680";
-    core::platform::ManualWallClock const clock { Noon };
-    AtomicMetricsSink metrics;
-    NullLogger logger;
-    auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
+    auto const roster = NodeRoster::Build(cfg, RosterClock(), nullptr);
     REQUIRE(roster.has_value());
     auto& node = *Testing::Unwrap(roster);
 
     CHECK(node.StandingOf("n1", TestKeyPair("n1").PublicKey()) == ServerStanding::Unchecked);
-    // What a refusal says this node expected: a scheduler is any voter, never one id.
-    CHECK(node.Expected() == "a voter");
 
     Cluster::ClusterState state;
     state.members = { Cluster::ClusterMember { .id = "n1",
@@ -185,14 +193,11 @@ TEST_CASE("A consensus member places a server only once its applied state names 
 
 TEST_CASE("A consensus member names a revoked server as revoked before it knows any voter's key", "[node][roster][proof]")
 {
-    // What a member has NOT learned yet -- any voter's key -- never excuses a machine the state it
-    // applied says was forgotten.
+    // The control on the rule above: what a member has NOT learned yet excuses a stranger, never a
+    // machine the state it applied says was forgotten.
     auto cfg = Worker();
     cfg.raftListen = "127.0.0.1:6680";
-    core::platform::ManualWallClock const clock { Noon };
-    AtomicMetricsSink metrics;
-    NullLogger logger;
-    auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
+    auto const roster = NodeRoster::Build(cfg, RosterClock(), nullptr);
     REQUIRE(roster.has_value());
     auto& node = *Testing::Unwrap(roster);
 
@@ -206,135 +211,34 @@ TEST_CASE("A consensus member names a revoked server as revoked before it knows 
 
 TEST_CASE("A worker no other machine can reach holds no roster and checks no grant", "[node][roster]")
 {
-    core::platform::ManualWallClock const clock { Noon };
-    AtomicMetricsSink metrics;
-    NullLogger logger;
-    auto const roster = NodeRoster::Build(Worker(), clock, metrics, logger);
+    auto const roster = NodeRoster::Build(Worker(), RosterClock(), nullptr);
     REQUIRE(roster.has_value());
     auto& node = *Testing::Unwrap(roster);
     CHECK(node.Lease() == nullptr);
     CHECK_FALSE(node.Summary().has_value());
     CHECK_FALSE(node.HeldRoster().has_value());
-    CHECK_FALSE(node.Wanting());
 }
 
-TEST_CASE("A worker restarts from the roster it kept, lapse included, and adopts one its voters certify", "[node][roster]")
+TEST_CASE("A worker other machines can reach refuses to start when it runs no consensus", "[node][roster]")
 {
-    auto const scratch = Testing::ScratchDirectory { "node-roster-keep" };
-    auto cfg = Worker();
-    cfg.clusterDir = scratch.Path();
-    KeepRoster(cfg);
-    core::platform::ManualWallClock clock { Noon + 30min };
-    AtomicMetricsSink metrics;
-    NullLogger logger;
-
-    // A restart reads what it kept -- lapse included, which a restart must not reset.
-    auto const again = NodeRoster::Build(cfg, clock, metrics, logger);
-    REQUIRE(again.has_value());
-    auto& restarted = *Testing::Unwrap(again);
-    REQUIRE(restarted.Lease() != nullptr);
-    CHECK(restarted.Lease()->Read(Noon + 30min).standing == Distributed::RosterStanding::Current);
-    CHECK(restarted.ExpiresInSeconds() == std::optional<std::uint64_t> { 1800 });
-    CHECK(restarted.HeldRoster() == std::optional { ThreeVoters() });
-
-    // And the roster it holds certifies its successor: a majority of ITS voters endorsing the next
-    // version, for one endorsement lifetime from now, is adopted.
-    restarted.Offered(Cluster::EncodeCertifiedRoster(Certified(ThreeVoters(), 4, { "n1", "n2" }, Noon + 90min)));
-    auto const summary = restarted.Summary();
-    REQUIRE(summary.has_value());
-    CHECK(Testing::Unwrap(summary).version == 4);
-    CHECK(restarted.ExpiresInSeconds() == std::optional<std::uint64_t> { 3600 });
-}
-
-TEST_CASE("A kept roster this machine cannot use refuses the start, never falls back to none", "[node][roster]")
-{
-    auto const scratch = Testing::ScratchDirectory { "node-roster-bad" };
-    auto cfg = Worker();
-    cfg.clusterDir = scratch.Path();
-    core::platform::ManualWallClock const clock { Noon };
-    AtomicMetricsSink metrics;
-    NullLogger logger;
-
-    SECTION("bytes that are not a roster")
-    {
-        scratch.Write(Distributed::RosterFileName, "not a roster");
-        auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
-        REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().reason.contains(Distributed::RosterFileName));
-        // An unusable kept roster is still there at the next start: `Refused`, never restarted.
-        CHECK(refused.error().cause == NodeRefusalCause::KeptRoster);
-        CHECK(ExitCodeFor(refused.error().cause) == ExitCodeOf(ProcessExit::Refused));
-    }
-
-    SECTION("a kept roster that is there and cannot be read")
-    {
-        // The I/O arm, and not a verdict: nothing was read, so nothing was judged, and the next
-        // start may read it -- a permission restored, a mount back. So it is a FAILURE a
-        // supervisor restarts, where the arm above is a refusal it never does. Measured before
-        // this: a mode-000 roster exited 78, and systemd never tried it again.
-        Testing::UnreadablePath const held { scratch / Distributed::RosterFileName, "not read" };
-        if (!held.Held())
-            SKIP("this process reads the file anyway (root), so the read arm cannot be reached here");
-        auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
-        REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().reason.contains("cannot be read"));
-        CHECK(refused.error().cause == NodeRefusalCause::KeptRosterIo);
-        CHECK(ExitCodeFor(refused.error().cause) == ExitCodeOf(ProcessExit::Failed));
-    }
-}
-
-TEST_CASE("A worker other machines can reach refuses to start holding no roster", "[node][roster]")
-{
-    // Where `RosterlessWorkerRefusal` is answered, since only the state directory can: the table
-    // lets this configuration through because it names a `--cluster-dir`, which might have held
-    // a roster. It holds none.
+    // Where `RosterlessWorkerRefusal` is answered: the only roster is the state a node's own
+    // consensus applies, so a worker that runs none, reachable from other machines, could verify
+    // no grant -- whatever its state directory holds.
     auto const scratch = Testing::ScratchDirectory { "node-roster-none" };
     auto cfg = NetworkFacingWorker();
     cfg.clusterDir = scratch.Path();
-    core::platform::ManualWallClock const clock { Noon };
-    AtomicMetricsSink metrics;
-    NullLogger logger;
 
-    auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
+    auto const refused = NodeRoster::Build(cfg, RosterClock(), nullptr);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().reason == RosterlessWorkerRefusal);
-    CHECK(refused.error().cause == NodeRefusalCause::KeptRoster);
+    // The configuration decides, and the startup table refuses this shape first: a belt.
+    CHECK(refused.error().cause == NodeRefusalCause::EarlierRule);
 
-    // The control: the same worker running consensus starts -- its roster is the state it
-    // applies, which needs nothing kept.
-    auto clustered = cfg;
-    clustered.raftListen = "127.0.0.1:6680";
-    REQUIRE(RunsConsensus(clustered));
-    CHECK(NodeRoster::Build(clustered, clock, metrics, logger).has_value());
-}
-
-TEST_CASE("A worker started with no configuration reads the roster its enrollment kept in the default directory",
-          "[node][roster]")
-{
-    // A worker that names no `--cluster-dir`: the roster an earlier run kept, in the state
-    // directory the start resolved, is its only trust root. Asked of the typed flag alone, nothing
-    // was read, and a worker other machines can reach was refused as holding no roster at all.
-    auto const scratch = Testing::ScratchDirectory { "node-roster-default-dir" };
-    auto cfg = NetworkFacingWorker();
-    REQUIRE(cfg.clusterDir.empty());
-    cfg.stateDirectory = NodeStateDirectoryChoice { .path = scratch.Path(), .origin = StateDirectoryOrigin::PerUser };
-    core::platform::ManualWallClock const clock { Noon };
-    AtomicMetricsSink metrics;
-    NullLogger logger;
-
-    // The control first: the same configuration with nothing kept is the refusal.
-    auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().reason == RosterlessWorkerRefusal);
-
-    // Kept where an earlier run keeps it.
-    KeepRoster(cfg);
-    auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
-    REQUIRE(roster.has_value());
-    auto& node = *Testing::Unwrap(roster);
-    REQUIRE(node.Lease() != nullptr);
-    CHECK(node.Lease()->Read(Noon).standing == Distributed::RosterStanding::Current);
-    CHECK(node.Lease()->KeysOf("n2").live == TestKeyPair("n2").PublicKey());
+    // The control: the same worker running consensus starts, verifying against its state.
+    cfg.raftListen = "127.0.0.1:6680";
+    auto const started = NodeRoster::Build(cfg, RosterClock(), nullptr);
+    REQUIRE(started.has_value());
+    CHECK(Testing::Unwrap(started)->Lease() != nullptr);
 }
 
 TEST_CASE("Whether a worker must hold a roster is its mode's row, under every mode", "[node][roster][formation][mode]")
@@ -375,20 +279,19 @@ TEST_CASE("Whether a worker must hold a roster is its mode's row, under every mo
         if (row.consensus == Cluster::ConsensusScope::Fleet && row.raftListener == Cluster::RaftListenerState::Closed)
             record.fleet = Cluster::FleetMembership { .clusterId = "fleet-c",
                                                       .roster = Cluster::EncodeRoster(ThreeVoters()),
-                                                      .createdAtUnixSeconds = 0 };
+                                                      .createdAtUnixSeconds = 0,
+                                                      .admittedBy = {} };
         auto cfg = NodeConfig {};
+        cfg.schedulers = { "127.0.0.1:6674" };
         cfg.raftListen.clear();
         cfg.nodeListen = "0.0.0.0:6674";
         cfg.clusterDir = scratch.Path();
         REQUIRE(ApplyFormation(cfg, record, {}).has_value());
-        core::platform::ManualWallClock const clock { Noon };
-        AtomicMetricsSink metrics;
-        NullLogger logger;
 
         auto const joined = expected->joined;
         CHECK((row.members == Cluster::FleetReach::Beyond) == joined);
         CHECK(AdmitsRemotePeers(cfg, RosterPresence::Absent) == joined);
-        auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
+        auto const roster = NodeRoster::Build(cfg, RosterClock(), nullptr);
         if (RunsConsensus(cfg))
         {
             CHECK(row.raftListener == Cluster::RaftListenerState::Closed);
@@ -406,72 +309,4 @@ TEST_CASE("Whether a worker must hold a roster is its mode's row, under every mo
             CHECK(Testing::Unwrap(roster)->Lease() == nullptr);
         }
     }
-}
-
-TEST_CASE("A network-facing worker whose directory holds no roster starts, admitting nobody remote",
-          "[node][roster][admission]")
-{
-    // The same directory with nothing in it, and the only difference from the case above is
-    // `--fleet-open`. Having read the directory, `Build` KNOWS there is no roster, so the key
-    // routes admit nobody and the compile port, though it faces the network, reaches no other
-    // machine: the unchecked validator is safe. Asked as if the roster were unknown, the state
-    // directory would count as a key route and refuse a worker nobody remote can use.
-    auto const scratch = Testing::ScratchDirectory { "node-roster-none-closed" };
-    auto cfg = NetworkFacingWorker();
-    cfg.fleetOpen = false;
-    cfg.clusterDir = scratch.Path();
-    core::platform::ManualWallClock const clock { Noon };
-    AtomicMetricsSink metrics;
-    NullLogger logger;
-
-    auto const started = NodeRoster::Build(cfg, clock, metrics, logger);
-    REQUIRE(started.has_value());
-    CHECK(Testing::Unwrap(started)->Lease() == nullptr);
-
-    // And `--fleet-open` is what makes the same worker one other machines reach.
-    cfg.fleetOpen = true;
-    auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().reason == RosterlessWorkerRefusal);
-}
-
-TEST_CASE("A node carries the endorsement it last signed, and counts a roster it cannot read", "[node][roster]")
-{
-    auto const scratch = Testing::ScratchDirectory { "node-roster-endorse" };
-    auto cfg = Worker();
-    cfg.clusterDir = scratch.Path();
-    KeepRoster(cfg);
-    core::platform::ManualWallClock const clock { Noon };
-    AtomicMetricsSink metrics;
-    NullLogger logger;
-    auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
-    REQUIRE(roster.has_value());
-    auto& node = *Testing::Unwrap(roster);
-
-    CHECK(node.Endorsement().empty());
-    auto const key = TestKeyPair("n1");
-    auto const endorsement =
-        Cluster::SignEndorsement(Cluster::RosterEndorsement { .clusterId = "fleet",
-                                                              .version = 1,
-                                                              .rosterDigest = {},
-                                                              .notAfter = Noon + 1h,
-                                                              .endorser = "n1",
-                                                              .signature = {} },
-                                 [&key](LabelledMessage const& message) { return SignLabelled(key, message); });
-    node.Endorsed(endorsement);
-    CHECK(node.Endorsement() == Cluster::EncodeEndorsement(endorsement));
-
-    auto const garbage = std::vector<std::byte>(7, std::byte { 0x5A });
-    REQUIRE_FALSE(node.Wanting());
-    node.Offered(garbage);
-    CHECK(metrics.Read(IMetricsSink::Counter::WorkerRostersRefusedUncertified) == 1);
-    // Refused, and the roster it held is still the one it holds.
-    CHECK_FALSE(node.Wanting());
-    auto const held = node.Summary();
-    REQUIRE(held.has_value());
-    CHECK(Testing::Unwrap(held).version == 3);
-
-    // An empty reply is a scheduler with no roster to hand out yet: not counted.
-    node.Offered({});
-    CHECK(metrics.Read(IMetricsSink::Counter::WorkerRostersRefusedUncertified) == 1);
 }

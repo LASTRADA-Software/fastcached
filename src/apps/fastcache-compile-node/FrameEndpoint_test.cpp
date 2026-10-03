@@ -39,7 +39,7 @@
 #include <FastCache/Distributed/MachineTicket.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/NodeProof.hpp>
-#include <FastCache/Distributed/RosterTrust.hpp>
+#include <FastCache/Distributed/StateLeaseRoster.hpp>
 #include <FastCache/Distributed/TicketVerifier.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
@@ -93,6 +93,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/AbortiveClient.hpp>
 #include <tests/BoundedWait.hpp>
+#include <tests/ConsensusStandingFakes.hpp>
 #include <tests/ExactAudience.hpp>
 #include <tests/FormationFakes.hpp>
 #include <tests/HalfClose.hpp>
@@ -3967,7 +3968,11 @@ struct ProvingFleet
     SchedulerResponder scheduler { fleet.protocol, oracle, fleet.metrics };
     Ed25519KeyPair const identity = Testing::TestKeyPair(std::string { ServerName });
     Testing::ScriptedSecureRandom random { Testing::ServerHandshakeScript() };
-    NodeProofResponder prover { std::string { ServerName }, identity, oracle, random, fleet.metrics, fleet.logger };
+    /// Caught up, unless a case says otherwise: a key the roster lacks is one the cluster lacks.
+    Testing::ScriptedAppliedState consensus { AppliedStateReading::CaughtUp };
+    NodeProofResponder prover {
+        std::string { ServerName }, identity, oracle, consensus, random, fleet.metrics, fleet.logger
+    };
     MergedResponder merged { SurfaceComponents { .scheduler = &scheduler, .nodeProof = &prover } };
 
     /// Start an endpoint on a free port, serving this node's surface.
@@ -4282,8 +4287,9 @@ struct SharedCacheProvingFleet
     SchedulerResponder scheduler { fleet.protocol, oracle, fleet.metrics };
     Ed25519KeyPair const identity = Testing::TestKeyPair(std::string { ProvingFleet::ServerName });
     Testing::ScriptedSecureRandom random { Testing::ScriptedSecureRandom::Ascending(4 * NonceBytes, 0x00) };
+    Testing::ScriptedAppliedState consensus { AppliedStateReading::CaughtUp };
     NodeProofResponder prover {
-        std::string { ProvingFleet::ServerName }, identity, oracle, random, fleet.metrics, fleet.logger
+        std::string { ProvingFleet::ServerName }, identity, oracle, consensus, random, fleet.metrics, fleet.logger
     };
     NeverNamedOpener opener;
     SharedCacheHost host { "cache-c", opener, nullptr, fleet.logger, ReconcileOn::Caller };
@@ -4617,6 +4623,10 @@ constexpr std::string_view TicketMachine = "pc-07";
 /// Where the ticketed node answers, as its callers dial it: the audience every ticket here names.
 constexpr std::string_view TicketedEndpoint = "node.corp:6674";
 
+/// The voter every state the ticketed node applies records: a state naming no voter is one this
+/// node has not applied yet, and a verifier over it answers `NoRoster` to every ticket.
+constexpr std::string_view TicketedVoter = "scheduler.corp";
+
 /// What every relabelled connection reports as its peer: on no list, and not this machine unless
 /// a case builds the node as answering there too (leg 3 of #235).
 constexpr std::string_view RemoteHost = "10.0.0.7";
@@ -4666,7 +4676,9 @@ struct TicketedNode
     NodeConfig const cfg {};
     NodeMembership membership { cfg, fleet.logger };
 
-    Distributed::StateLeaseRoster roster;
+    /// On the fleet's clock, which nothing here advances: the start counts as leader contact, so a
+    /// case never reaches `LeaderSilenceBound`.
+    Distributed::StateLeaseRoster roster { fleet.clock };
     Distributed::SpentTickets spent;
     Testing::ExactAudience const audience { std::string { TicketedEndpoint } };
     Distributed::TicketVerifier const verifier { &roster, audience, spent };
@@ -4706,8 +4718,9 @@ struct TicketedNode
     /// What this node says about itself, and the key every admission it answers is signed with.
     Testing::ScriptedSummarySource const self { Wire::FleetSummary { .clusterId = "c-ticketed", .nodeId = "n-ticketed" } };
     Ed25519KeyPair const signingKey = Testing::TestKeyPair("n-ticketed");
+    Testing::ScriptedSecureRandom enrollRandom;
     EnrollmentResponder enrollment { window,     fleet.service, membership.Oracle(), self,
-                                     signingKey, fleet.metrics, fleet.logger };
+                                     signingKey, enrollRandom,  fleet.metrics,       fleet.logger };
 
     MergedResponder merged { SurfaceComponents { .cache = &cacheTier,
                                                  .compile = &compile,
@@ -4725,11 +4738,24 @@ struct TicketedNode
         Publish(AdmittedState());
     }
 
-    /// The cluster as this node applied it: `pc-07` a learner under its test key.
+    /// The voter every applied state records, under its test key.
+    /// @return Its record.
+    [[nodiscard]] static Cluster::ClusterMember VoterRecord()
+    {
+        return Cluster::ClusterMember { .id = std::string { TicketedVoter },
+                                        .raftEndpoint = std::string { TicketedVoter },
+                                        .schedulerEndpoint = {},
+                                        .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                        .seat = Cluster::MemberSeat::Voter,
+                                        .publicKey = Testing::TestKeyPair(std::string { TicketedVoter }).PublicKey() };
+    }
+
+    /// The cluster as this node applied it: `pc-07` a learner under its test key, beside the voter.
     /// @return The state.
     [[nodiscard]] static Cluster::ClusterState AdmittedState()
     {
         auto state = Cluster::ClusterState {};
+        state.members.push_back(VoterRecord());
         state.members.push_back(
             Cluster::ClusterMember { .id = std::string { TicketMachine },
                                      .raftEndpoint = std::string { TicketMachine },
@@ -4742,11 +4768,12 @@ struct TicketedNode
     }
 
     /// The cluster once an applied forget removed `pc-07`: its record gone and its key revoked in
-    /// the same entry (#1555).
+    /// the same entry (#1555). The voter stays.
     /// @return The state.
     [[nodiscard]] static Cluster::ClusterState ForgottenState()
     {
         auto state = Cluster::ClusterState {};
+        state.members.push_back(VoterRecord());
         state.revokedKeys.push_back(
             Cluster::RevokedKey { .id = std::string { TicketMachine },
                                   .publicKey = Testing::TestKeyPair(std::string { TicketMachine }).PublicKey() });
@@ -5379,8 +5406,10 @@ struct SelfSchedulingNode
     SchedulerResponder scheduler { fleet.protocol, oracle, fleet.metrics };
     Ed25519KeyPair const identity = Testing::TestKeyPair(std::string { SelfSchedulingMachine });
     Testing::ScriptedSecureRandom serverRandom { Testing::ServerHandshakeScript() };
+    /// Whether this node's consensus has applied the log it recovered: caught up unless a case says not.
+    Testing::ScriptedAppliedState consensus { AppliedStateReading::CaughtUp };
     NodeProofResponder responder {
-        std::string { SelfSchedulingMachine }, identity, oracle, serverRandom, fleet.metrics, fleet.logger
+        std::string { SelfSchedulingMachine }, identity, oracle, consensus, serverRandom, fleet.metrics, fleet.logger
     };
     MergedResponder merged { SurfaceComponents { .scheduler = &scheduler, .nodeProof = &responder } };
     NodeConditions conditions; ///< Where the node's prover answers `own-record-awaited`.
@@ -5488,6 +5517,93 @@ TEST_CASE("A node that schedules for itself does not announce before its own con
     CHECK(LoggedAt(logger, LogLevel::Warn) == 0);
     // An ordinary hold, one ask long, raises nothing an operator must act on.
     CHECK(node.conditions.StateOf(NodeCondition::OwnRecordAwaited) == Wire::ConditionState::Clear);
+}
+
+TEST_CASE("A machine proving to a scheduler that has not caught up is told not yet, and asks again soon",
+          "[node][frame][proof][client][boot-order]")
+{
+    // Batch 3's M3 end to end, over the node's real endpoint and responder and through
+    // `DialAndAnnounce`, the one seam both loops dial through. Another machine proves to a scheduler
+    // whose consensus has not applied the log it recovered: the answer is `roster-not-yet-applied`,
+    // never `node-key-unknown` -- nothing is counted as an unknown key and no operator is told to
+    // admit anybody -- and the prover's next round comes after `DeferredProofWait`, not a whole
+    // interval. Then the scheduler catches up and holds the key, and the next round proves.
+    SelfSchedulingNode node;
+    node.consensus.Set(AppliedStateReading::Behind);
+    auto const [endpoint, port] = node.Serve();
+
+    constexpr std::string_view Other = "learner-01";
+    auto const configured = SchedulerLink::For({ std::format("127.0.0.1:{}", port) });
+    REQUIRE(configured.has_value());
+    auto link = Unwrap(configured);
+    BlockingEndpointDialer dialer { 5s };
+    CapturingLogger logger;
+    Testing::ScriptedSecureRandom callerRandom { Testing::CallerHandshakeScript() };
+    auto const trust = FixedServerTrust { ServerStanding::Unchecked };
+    auto const otherKey = Testing::TestKeyPair(std::string { Other });
+    // No cluster of its own to hold it back: what decides here is the SCHEDULER's answer.
+    auto const client = NodeProofClient { std::string { Other }, otherKey, trust, nullptr, nullptr, callerRandom };
+    auto const proof = AnnounceProof { .prover = &client };
+    core::platform::ManualClock reachabilityClock;
+    SchedulerReachability reachability { reachabilityClock };
+
+    CountingAnnouncement early;
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, early, proof) == 0);
+    CHECK(early.attempts == 0);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied) == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 0);
+    CHECK(client.ConsecutiveDeferrals() == 1);
+    CHECK(NextAnnounceWait(&client) == DeferredProofWait(1));
+    CHECK(Logged(logger, "cannot judge this machine's identity yet"));
+    CHECK_FALSE(Logged(logger, "--enroll-approve"));
+
+    // Still behind: the backoff doubles.
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, early, proof) == 0);
+    CHECK(client.ConsecutiveDeferrals() == 2);
+    CHECK(NextAnnounceWait(&client) == DeferredProofWait(2));
+
+    // Caught up, and the state it applied holds this machine's key: the next round proves, and the
+    // ordinary interval returns -- the half without which a responder that never deferred anything
+    // would pass the first half by refusing for some other reason.
+    Testing::PublishKeyRoster(node.keys, { std::string { Other } });
+    node.consensus.Set(AppliedStateReading::CaughtUp);
+    CountingAnnouncement late;
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, late, proof) == 1);
+    CHECK(late.attempts == 1);
+    CHECK(client.ConsecutiveDeferrals() == 0);
+    CHECK(NextAnnounceWait(&client) == NodeAnnounceInterval);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 0);
+}
+
+TEST_CASE("A scheduler that has caught up and lacks the key still answers unknown, and the wait is the ordinary one",
+          "[node][frame][proof][client][boot-order]")
+{
+    // The control: once the state has caught up, an absent key IS an absent member, and the remedy
+    // is the operator's -- so `node-key-unknown`, and no short backoff hammering a refusal no retry
+    // clears.
+    SelfSchedulingNode node;
+    auto const [endpoint, port] = node.Serve();
+
+    constexpr std::string_view Other = "learner-01";
+    auto const configured = SchedulerLink::For({ std::format("127.0.0.1:{}", port) });
+    REQUIRE(configured.has_value());
+    auto link = Unwrap(configured);
+    BlockingEndpointDialer dialer { 5s };
+    CapturingLogger logger;
+    Testing::ScriptedSecureRandom callerRandom { Testing::CallerHandshakeScript() };
+    auto const trust = FixedServerTrust { ServerStanding::Unchecked };
+    auto const otherKey = Testing::TestKeyPair(std::string { Other });
+    auto const client = NodeProofClient { std::string { Other }, otherKey, trust, nullptr, nullptr, callerRandom };
+    auto const proof = AnnounceProof { .prover = &client };
+    core::platform::ManualClock reachabilityClock;
+    SchedulerReachability reachability { reachabilityClock };
+
+    CountingAnnouncement refused;
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, refused, proof) == 0);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied) == 0);
+    CHECK(client.ConsecutiveDeferrals() == 0);
+    CHECK(NextAnnounceWait(&client) == NodeAnnounceInterval);
 }
 
 namespace
@@ -5658,6 +5774,8 @@ TEST_CASE("The cluster-status verb reads a live node's cluster over its node por
         {
             return {};
         }
+
+        void NoteAnnouncedEndpoint(Consensus::NodeId const& /*member*/, std::string /*endpoint*/) override {}
     };
     Fleet fleet;
     LiveCluster cluster;

@@ -2451,15 +2451,12 @@ TEST_CASE("A worker that has not registered honours no grant, however authentic"
     }
 }
 
-TEST_CASE("A worker whose roster is absent or lapsed refuses every grant, and says which",
-          "[worker-protocol][lease][roster]")
+TEST_CASE("A worker whose roster is absent refuses every grant, and says so", "[worker-protocol][lease][roster]")
 {
-    // #178. A grant is verified against the roster, so a worker with none -- or one whose
-    // certification has lapsed -- has nothing it could honour a grant against, however
-    // perfect the grant. Both answers travel on ONE wire code, `roster-expired`, because the
-    // client's move is the same (compile locally), and on two counters, because the
-    // operator's is not: NO roster never reached a leader its anchors certify, an EXPIRED one
-    // did and has since been cut off.
+    // #178. A grant is verified against the roster -- the state this node applied -- so a worker
+    // whose state records no voter's key has nothing it could honour a grant against, however
+    // perfect the grant, and says so on its own wire code and counter: the fact is about THIS
+    // worker, never the grant.
     //
     // The control is the same grant through the same validator once the roster is current:
     // accepted. Without it both refusals would pass against a validator that refused
@@ -2477,29 +2474,14 @@ TEST_CASE("A worker whose roster is absent or lapsed refuses every grant, and sa
         auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::NoRoster);
-        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).code == Wire::ErrorCode::RosterExpired);
+        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).code == Wire::ErrorCode::GrantUnverifiable);
         CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).workerCounter
               == IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster);
     }
 
-    SECTION("a roster whose certification lapsed")
-    {
-        auto const lapsed = LeaseClock.now() - std::chrono::hours { 1 };
-        roster.SetStanding(Distributed::RosterStanding::Expired, lapsed);
-        auto const refusal = validator(GrantFor(ThisWorker), "gcc-13").refusal;
-        REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::RosterExpired);
-        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).code == Wire::ErrorCode::RosterExpired);
-        CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).workerCounter
-              == IMetricsSink::Counter::WorkerJobsRefusedLeaseRosterExpired);
-        // The detail names WHEN, because the actionable version of "expired" is "this worker
-        // has not heard a certified roster since then".
-        CHECK_FALSE(Unwrap(refusal).detail.empty());
-    }
-
     SECTION("the control: a current roster accepts the same grant")
     {
-        roster.SetStanding(Distributed::RosterStanding::Current, LeaseClock.now() + std::chrono::minutes { 45 });
+        roster.SetStanding(Distributed::RosterStanding::Current);
         CHECK_FALSE(validator(GrantFor(ThisWorker), "gcc-13").refusal.has_value());
     }
 }
@@ -2525,6 +2507,73 @@ TEST_CASE("A grant from a scheduler the cluster revoked is refused by name at th
     REQUIRE(refusal.has_value());
     CHECK(Unwrap(refusal).reason == Distributed::LeaseRefusalReason::SignerRevoked);
     CHECK(Distributed::DescribeLeaseRefusal(Unwrap(refusal).reason).code == Wire::ErrorCode::LeaseUnauthorized);
+}
+
+namespace
+{
+/// A worker over a roster the case OWNS, so it can revoke a signer or silence the leader without
+/// touching the shared `TestRoster` -- the surface that answers, refusal counters and all.
+struct RosterWorker
+{
+    StubRunner runner;
+    FastCache::Testing::ScratchDirectory scratch { "fc-wp-roster" };
+    CompileJobRunner jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, ToolchainSurvey::Completed() };
+    AtomicMetricsSink metrics;
+    Testing::FixedLeaseRoster roster { { "scheduler" } }; ///< Declared before `worker`, which borrows it.
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+    MovingEndpoint endpoint { ThisWorker };
+    WorkerProtocol worker { jobs,
+                            [this] {
+                                lease.fleet.Pin(std::string { ThisCluster });
+                                return SignedLeaseValidator(roster, endpoint, LeaseClock, lease, metrics);
+                            }(),
+                            AvailableCodecs(),
+                            metrics,
+                            IgnoreJobRefusals() };
+};
+} // namespace
+
+TEST_CASE("A revoked signer's grant moves the SignerRevoked counter at the surface that refuses it",
+          "[worker-protocol][lease][roster]")
+{
+    // The validator chooses the row; the SURFACE spends it. A case on the row alone passes with the
+    // increment unwired, so this one asks the counter the operator reads -- and that no other moved.
+    RosterWorker fix;
+    fix.roster.Revoke("scheduler");
+    auto const answer =
+        fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor(ThisWorker)));
+    REQUIRE(answer.has_value());
+    CHECK(ErrorOf(Unwrap(answer)) == Wire::ErrorCode::LeaseUnauthorized);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseSignerRevoked) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseUnauthorized) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+}
+
+TEST_CASE("A worker no counted leader has spoken to refuses every grant as isolated, and counts it",
+          "[worker-protocol][lease][roster][isolation]")
+{
+    // `Isolated` is a fact about THIS worker, answered before the signature: WHICH refusal is
+    // asserted, not merely that one happened -- `NoRoster` shares its wire code and is a different
+    // operator action. The control is the same grant once a leader speaks again.
+    RosterWorker fix;
+    fix.roster.SetStanding(Distributed::RosterStanding::Isolated);
+    auto const refused =
+        fix.worker.Answer(CompileFrame("gcc-13", DefaultSource, { Wire::IdentityCodec }, GrantFor(ThisWorker)));
+    REQUIRE(refused.has_value());
+    CHECK(ErrorOf(Unwrap(refused)) == Wire::ErrorCode::GrantUnverifiable);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseIsolated) == 1);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster) == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsStarted) == 0);
+
+    fix.roster.SetStanding(Distributed::RosterStanding::Current);
+    auto const honoured = fix.worker.Answer(
+        CompileFrame("gcc-13",
+                     DefaultSource,
+                     { Wire::IdentityCodec },
+                     GrantFor(ThisWorker, "gcc-13", std::chrono::minutes { 10 }, ThisCluster, GrantTerm, "77")));
+    REQUIRE(honoured.has_value());
+    CHECK(Decode(Unwrap(honoured)).status != Wire::Status::Error);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedLeaseIsolated) == 1);
 }
 
 TEST_CASE("A worker that learns a new address verifies grants naming it, and stops honouring the old one",

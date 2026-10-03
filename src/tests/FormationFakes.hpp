@@ -275,11 +275,13 @@ inline constexpr std::uint64_t OfficeCreatedAt = 100;
         .members = { Cluster::RosterMember { .id = voter,
                                              .raftEndpoint = voter.substr(2) + ":6680",
                                              .seat = Cluster::MemberSeat::Voter,
-                                             .publicKey = TestKeyPair(voter).PublicKey() },
+                                             .publicKey = TestKeyPair(voter).PublicKey(),
+                                             .schedulerEndpoint = {} },
                      Cluster::RosterMember { .id = id,
                                              .raftEndpoint = "",
                                              .seat = Cluster::MemberSeat::Learner,
-                                             .publicKey = TestKeyPair(id).PublicKey() } },
+                                             .publicKey = TestKeyPair(id).PublicKey(),
+                                             .schedulerEndpoint = {} } },
         .principals = {},
         .revoked = {},
     };
@@ -297,7 +299,7 @@ inline constexpr std::uint64_t OfficeCreatedAt = 100;
 }
 
 /// The record of a node that minted @p own and is a learner of @p fleet, admitted by the office's
-/// roster.
+/// roster under `n-office`'s key -- the member that proved the office's summary.
 /// @param own Its own cluster.
 /// @param fleet The fleet it joined.
 /// @return The record.
@@ -307,7 +309,8 @@ inline constexpr std::uint64_t OfficeCreatedAt = 100;
     record.mode = Cluster::NodeMode::Learner;
     record.fleet = Cluster::FleetMembership { .clusterId = std::string { fleet },
                                               .roster = OfficeRosterWith("n-laptop"),
-                                              .createdAtUnixSeconds = OfficeCreatedAt };
+                                              .createdAtUnixSeconds = OfficeCreatedAt,
+                                              .admittedBy = Testing::TestKeyPair("n-office").PublicKey() };
     return record;
 }
 

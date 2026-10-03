@@ -26,11 +26,12 @@ namespace
     constexpr std::uint8_t UpstreamPresent = 1U << 2U;  ///< `MetricsSnapshot::upstreamConfigured`.
     constexpr std::uint8_t ConsensusPresent = 1U << 3U; ///< `MetricsSnapshot::consensus`.
     constexpr std::uint8_t HostLoadPresent = 1U << 4U;  ///< `MetricsSnapshot::hostLoad`.
-    constexpr std::uint8_t RosterPresent = 1U << 5U;    ///< `MetricsSnapshot::rosterExpiresInSeconds`.
+    // Bit 5 is RETIRED and never reused: it carried a certified roster's lapse, and no roster has
+    // one any more. A reading that sets it is `Malformed`, as any unknown bit is.
 
     /// Every bit a presence byte may carry; anything else is `Malformed`.
     constexpr std::uint8_t KnownPresenceBits =
-        StoragePresent | HostPresent | UpstreamPresent | ConsensusPresent | HostLoadPresent | RosterPresent;
+        StoragePresent | HostPresent | UpstreamPresent | ConsensusPresent | HostLoadPresent;
 
     // Presence bits inside a host-load block, in the order its figures travel.
     constexpr std::uint8_t CpuPresent = 1U << 0U;             ///< `HostLoadReading::cpu`.
@@ -254,13 +255,12 @@ std::vector<std::byte> EncodeStatsReading(StatsReading const& reading)
 
     // Structured bindings, so a field added to either struct stops this compiling until it is
     // given a place in the grammar and a name in `SnapshotFieldNames` / `ConsensusFieldNames`.
-    auto const& [storage, storageTiers, host, hostLoad, upstreamConfigured, consensus, rosterExpiresInSeconds, uptime] =
-        snapshot;
+    auto const& [storage, storageTiers, host, hostLoad, upstreamConfigured, consensus, uptime] = snapshot;
 
-    out.U8(static_cast<std::uint8_t>(
-        (storage.has_value() ? StoragePresent : 0U) | (host.has_value() ? HostPresent : 0U)
-        | (upstreamConfigured.has_value() ? UpstreamPresent : 0U) | (consensus.has_value() ? ConsensusPresent : 0U)
-        | (hostLoad.has_value() ? HostLoadPresent : 0U) | (rosterExpiresInSeconds.has_value() ? RosterPresent : 0U)));
+    out.U8(static_cast<std::uint8_t>((storage.has_value() ? StoragePresent : 0U) | (host.has_value() ? HostPresent : 0U)
+                                     | (upstreamConfigured.has_value() ? UpstreamPresent : 0U)
+                                     | (consensus.has_value() ? ConsensusPresent : 0U)
+                                     | (hostLoad.has_value() ? HostLoadPresent : 0U)));
 
     if (storage.has_value())
         WriteStorage(out, *storage);
@@ -312,9 +312,6 @@ std::vector<std::byte> EncodeStatsReading(StatsReading const& reading)
         out.U64(commitIndex.value);
         out.U8(static_cast<std::uint8_t>(role));
     }
-
-    if (rosterExpiresInSeconds.has_value())
-        out.U64(*rosterExpiresInSeconds);
 
     out.U64(static_cast<std::uint64_t>(uptime.value.count()));
     out.Text(version);
@@ -376,8 +373,7 @@ std::expected<StatsReading, StatsReadingFault> DecodeStatsReading(std::span<std:
                                                           : CounterAbsence::NoSlotInThisBuild);
     }
 
-    auto& [storage, storageTiers, host, hostLoad, upstreamConfigured, consensus, rosterExpiresInSeconds, uptime] =
-        reading.snapshot;
+    auto& [storage, storageTiers, host, hostLoad, upstreamConfigured, consensus, uptime] = reading.snapshot;
 
     auto presence = std::uint8_t { 0 };
     if (!in.ReadU8(presence))
@@ -423,9 +419,6 @@ std::expected<StatsReading, StatsReadingFault> DecodeStatsReading(std::span<std:
         if (auto const fault = ReadConsensus(in, consensus.emplace()); fault.has_value())
             return std::unexpected { *fault };
     }
-
-    if ((presence & RosterPresent) != 0 && !in.ReadU64(rosterExpiresInSeconds.emplace()))
-        return truncated;
 
     std::uint64_t seconds = 0;
     if (!in.ReadU64(seconds))

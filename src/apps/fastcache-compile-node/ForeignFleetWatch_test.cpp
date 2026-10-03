@@ -34,7 +34,9 @@ TEST_CASE("Two established fleets that see each other raise foreign-fleet-visibl
     Testing::ScriptedSummarySource self { FleetSummary { .clusterId = "c-office", .state = FleetState::Established } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
     CHECK(conditions.StateOf(NodeCondition::ForeignFleetVisible) == Wire::ConditionState::NotEvaluated);
 
     watch.OnFleetProven(Testing::ProvenBeacon(FleetSummary { .clusterId = "c-lab", .state = FleetState::Established }));
@@ -65,7 +67,9 @@ TEST_CASE("Another fleet's cluster id that is not text is rendered escaped", "[n
     Testing::ScriptedSummarySource self { FleetSummary { .clusterId = "c-office", .state = FleetState::Established } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
 
     watch.OnFleetProven(Testing::ProvenBeacon(FleetSummary { .clusterId = "c-\xFF"
                                                                           "lab",
@@ -85,7 +89,9 @@ TEST_CASE("A solitary node seeing an established fleet raises nothing", "[node][
     Testing::ScriptedSummarySource self { FleetSummary { .clusterId = "c-laptop", .state = FleetState::Solitary } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
 
     watch.OnFleetProven(Testing::ProvenBeacon(FleetSummary { .clusterId = "c-office", .state = FleetState::Established }));
     CHECK(conditions.StateOf(NodeCondition::ForeignFleetVisible) == Wire::ConditionState::Clear);
@@ -103,7 +109,9 @@ TEST_CASE("foreign-fleet-visible follows the encounter decision, not the two sta
     Testing::ScriptedSummarySource self { FleetSummary { .clusterId = "c-office", .state = FleetState::Established } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
 
     auto const lab = Testing::ProvenBeacon(FleetSummary { .clusterId = "c-lab", .state = FleetState::Established });
     watch.OnFleetProven(lab);
@@ -141,7 +149,9 @@ TEST_CASE("foreign-fleet-visible names every fleet it sees, and each is forgotte
     Testing::ScriptedSummarySource self { FleetSummary { .clusterId = "c-office", .state = FleetState::Established } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
 
     watch.OnFleetProven(Testing::ProvenBeacon(FleetSummary { .clusterId = "c-lab", .state = FleetState::Established }));
     clock.advance(1min);
@@ -169,7 +179,9 @@ TEST_CASE("foreign-fleet-visible remembers at most MaxForeignFleets fleets", "[n
     Testing::ScriptedSummarySource self { FleetSummary { .clusterId = "c-office", .state = FleetState::Established } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
 
     for (auto const index: std::views::iota(std::size_t { 0 }, Cluster::MaxForeignFleets + 1))
         watch.OnFleetProven(Testing::ProvenBeacon(
@@ -192,7 +204,9 @@ TEST_CASE("A fleet proven to be this one split is healing and never foreign, and
         .clusterId = "c-office", .state = FleetState::Established, .createdAtUnixSeconds = 100 } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
     CHECK(conditions.StateOf(NodeCondition::FleetSplitHealing) == Wire::ConditionState::NotEvaluated);
 
     evidence.Set("c-lab",
@@ -242,7 +256,9 @@ TEST_CASE("A split only an operator heals is raised as healing and says an opera
         .clusterId = "c-office", .state = FleetState::Established, .createdAtUnixSeconds = 900 } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
 
     for (auto const kind: { Cluster::SplitEvidence::WeAskedAndTheyListUs, Cluster::SplitEvidence::TheirSpeakerIsOurLearner })
     {
@@ -271,7 +287,9 @@ TEST_CASE("A foreign fleet's entry says whether it claims a machine of this one,
     Testing::ScriptedSummarySource self { FleetSummary { .clusterId = "c-office", .state = FleetState::Established } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
 
     watch.OnFleetProven(Testing::ProvenBeacon(FleetSummary { .clusterId = "c-lab", .state = FleetState::Established }));
     CHECK(Testing::DetailOf(conditions, NodeCondition::ForeignFleetVisible).contains("c-lab: no machine in common"));
@@ -294,7 +312,9 @@ TEST_CASE("A foreign fleet whose member list was cut is never said to share no m
     Testing::ScriptedSummarySource self { FleetSummary { .clusterId = "c-office", .state = FleetState::Established } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
 
     auto cut = FleetSummary { .clusterId = "c-big", .state = FleetState::Established };
     for (auto const index: std::views::iota(std::size_t { 0 }, Wire::MaxFleetSummaryMembers))
@@ -318,7 +338,9 @@ TEST_CASE("An empty watch reads not-evaluated until it has listened a beacon int
     Testing::ScriptedSummarySource self { FleetSummary { .clusterId = "c-office", .state = FleetState::Established } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
     for (auto const condition: ForeignFleetWatch::WatchedConditions)
     {
         CHECK(conditions.StateOf(condition) == Wire::ConditionState::NotEvaluated);
@@ -353,7 +375,9 @@ TEST_CASE("A watch that never hears a discovery reply says so rather than readin
     Testing::ScriptedSummarySource self { FleetSummary { .clusterId = "c-office", .state = FleetState::Established } };
     Testing::ScriptedSplitEvidence evidence;
     Testing::RecordingFleets next;
-    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval };
+    ForeignFleetWatch watch {
+        self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+    };
     clock.advance(Cluster::DefaultBeaconInterval);
     watch.Tick();
     for (auto const condition: ForeignFleetWatch::WatchedConditions)
@@ -361,4 +385,110 @@ TEST_CASE("A watch that never hears a discovery reply says so rather than readin
         CHECK(conditions.StateOf(condition) == Wire::ConditionState::NotEvaluated);
         CHECK(Testing::DetailOf(conditions, condition).contains("no discovery reply heard in the"));
     }
+}
+
+namespace
+{
+/// The office's pin: its cluster, and the key its summaries are signed with.
+/// @return The pin.
+[[nodiscard]] Cluster::FleetPin OfficePin()
+{
+    return Cluster::FleetPin { .fleet =
+                                   Cluster::PinnedFleet { .clusterId = "c-office",
+                                                          .voterKeys = { Testing::TestKeyPair("c-office").PublicKey() } } };
+}
+} // namespace
+
+TEST_CASE("A fleet the pin keeps a solitary node out of raises foreign-fleet-visible naming it and the pin",
+          "[node][formation][conditions][pin][security]")
+{
+    // A node that sits alone beside a fleet it would have joined must say why -- and the attack the pin
+    // stops, a fleet proving itself older, looks like exactly this.
+    core::platform::ManualClock clock;
+    NodeConditions conditions;
+    Testing::ScriptedSummarySource self { FleetSummary {
+        .clusterId = "c-laptop", .state = FleetState::Solitary, .createdAtUnixSeconds = 500 } };
+    Testing::ScriptedSplitEvidence evidence;
+    Testing::RecordingFleets next;
+    auto const rogue = Testing::ProvenBeacon(
+        FleetSummary { .clusterId = "c-rogue", .state = FleetState::Established, .createdAtUnixSeconds = 0 });
+
+    SECTION("unpinned, the control: a fleet it joins is nothing to raise")
+    {
+        ForeignFleetWatch watch {
+            self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+        };
+        watch.OnFleetProven(rogue);
+        CHECK(conditions.StateOf(NodeCondition::ForeignFleetVisible) == Wire::ConditionState::Clear);
+    }
+    SECTION("pinned elsewhere: raised, naming both ids and the remedy")
+    {
+        ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, OfficePin() };
+        watch.OnFleetProven(rogue);
+        REQUIRE(conditions.StateOf(NodeCondition::ForeignFleetVisible) == Wire::ConditionState::Raised);
+        auto const detail = Testing::DetailOf(conditions, NodeCondition::ForeignFleetVisible);
+        CHECK(detail.contains("this node (c-laptop) will not join the fleet c-rogue"));
+        CHECK(detail.contains("--fleet-id pins this node to c-office (1 voter key(s))"));
+        CHECK(detail.contains("add its voters' keys to --fleet-id"));
+        CHECK(next.proven.size() == 1); // forwarded all the same: formation counts it
+    }
+}
+
+TEST_CASE("A split the pin keeps a fleet out of is raised as foreign, never as healing in either direction",
+          "[node][formation][conditions][pin][split]")
+{
+    // A voter's key proves the older fleet a split of this one, so unpinned the tiebreak heals it by
+    // moving THIS fleet. Pinned to itself, nothing moves -- and "this fleet yields to it" would be a
+    // confident wrong signal.
+    core::platform::ManualClock clock;
+    NodeConditions conditions;
+    Testing::ScriptedSummarySource self { FleetSummary {
+        .clusterId = "c-office", .state = FleetState::Established, .createdAtUnixSeconds = 900 } };
+    Testing::ScriptedSplitEvidence evidence;
+    evidence.Set("c-lab",
+                 Cluster::SplitReading {
+                     .evidence = Cluster::SplitEvidence::TheirSpeakerIsOurVoter, .claimedMember = {}, .witness = "n-desk" });
+    Testing::RecordingFleets next;
+    auto const lab = Testing::ProvenBeacon(
+        FleetSummary { .clusterId = "c-lab", .state = FleetState::Established, .createdAtUnixSeconds = 100 });
+
+    SECTION("unpinned, the control: healing, this fleet yielding")
+    {
+        ForeignFleetWatch watch {
+            self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, Cluster::FleetPin {}
+        };
+        watch.OnFleetProven(lab);
+        REQUIRE(conditions.StateOf(NodeCondition::FleetSplitHealing) == Wire::ConditionState::Raised);
+        CHECK(Testing::DetailOf(conditions, NodeCondition::FleetSplitHealing).contains("this fleet yields to it"));
+    }
+    SECTION("pinned to itself: foreign, and nothing says either side yields")
+    {
+        ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, OfficePin() };
+        watch.OnFleetProven(lab);
+        CHECK(conditions.StateOf(NodeCondition::FleetSplitHealing) == Wire::ConditionState::Clear);
+        REQUIRE(conditions.StateOf(NodeCondition::ForeignFleetVisible) == Wire::ConditionState::Raised);
+        auto const detail = Testing::DetailOf(conditions, NodeCondition::ForeignFleetVisible);
+        CHECK(detail.contains("c-lab"));
+        CHECK(detail.contains("--fleet-id pins this node to c-office"));
+        CHECK_FALSE(detail.contains("yields"));
+    }
+}
+
+TEST_CASE("A fleet claiming the pinned cluster id under another key is raised as an impostor, naming its key",
+          "[node][formation][conditions][pin][security]")
+{
+    core::platform::ManualClock clock;
+    NodeConditions conditions;
+    Testing::ScriptedSummarySource self { FleetSummary {
+        .clusterId = "c-laptop", .state = FleetState::Solitary, .createdAtUnixSeconds = 500 } };
+    Testing::ScriptedSplitEvidence evidence;
+    Testing::RecordingFleets next;
+    ForeignFleetWatch watch { self, evidence, clock, conditions, next, Cluster::DefaultBeaconInterval, OfficePin() };
+    watch.OnFleetProven(Cluster::ProvenFleet::FromBeaconProof(Testing::ProvenBy(
+        FleetSummary { .clusterId = "c-office", .state = FleetState::Established, .createdAtUnixSeconds = 0 }, "n-rogue")));
+    REQUIRE(conditions.StateOf(NodeCondition::ForeignFleetVisible) == Wire::ConditionState::Raised);
+    auto const detail = Testing::DetailOf(conditions, NodeCondition::ForeignFleetVisible);
+    CHECK(detail.contains(std::format("claims the pinned cluster id under key {}",
+                                      FormatEd25519PublicKey(Testing::TestKeyPair("n-rogue").PublicKey()))));
+    CHECK(detail.contains("an impostor, or a voter to add to --fleet-id"));
 }

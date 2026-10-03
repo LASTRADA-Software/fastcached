@@ -68,6 +68,15 @@ struct FleetMembership
     /// is and win every tie-break it enters, which is why a node that knows the age says it.
     std::uint64_t createdAtUnixSeconds { 0 };
 
+    /// The key that SIGNED the admission this node acted on: one it PROVED at the endpoint it asked,
+    /// through the chain from the key that proved the fleet's summary.
+    ///
+    /// What `--fleet-id` judges a joined node's record by (`Cluster::AdmitsFleet`), at every start and
+    /// every move -- never the voters the roster above lists. A roster is public keys, and an approval
+    /// signed by some other key could list a pinned voter's as easily as its own: judged by what the
+    /// roster CLAIMS, the record would be no check of its own on the answer it came from.
+    Ed25519PublicKey admittedBy {};
+
     /// Field-wise equality.
     [[nodiscard]] friend bool operator==(FleetMembership const&, FleetMembership const&) = default;
 };
@@ -156,13 +165,23 @@ struct FormationRecord
 /// grew from seven fields to ten: a format 2 record is intact and holds a seven-field summary, which
 /// read as this build's would be reported as damage that is not there.
 ///
-/// **Format 3 is this branch's own, UNRELEASED definition, and is FINAL only at the lane-0 flag
-/// day.** It has changed twice since it was named -- an asked-fleet memo went from three fields to
-/// four, and the nested summary from ten fields to eleven -- without moving, because no build that
-/// wrote the earlier shapes ever shipped: a record one of them left decodes as `MalformedFrame`
-/// rather than `UnsupportedFormatVersion`, and that is accepted for an unreleased format only. From
-/// the flag day on, every change to this layout moves this number.
-inline constexpr std::uint8_t FormationRecordFormat = 3;
+/// 4 because a fleet membership EMBEDS its approval's roster as the roster's own codec writes it
+/// (`FleetMembership::roster`), and that moved to `Cluster::RosterFormatVersion` 2 when a member
+/// gained its recorded `0xFC` endpoint: a format 3 record is intact and holds a version-1 roster,
+/// which this build refuses here, by the record's own number, before anything decodes the roster.
+///
+/// 5 because a fleet membership gained a fourth field, the PROVEN key that signed the admission
+/// (`FleetMembership::admittedBy`), which the fleet pin judges a joined node's record by: a format 4
+/// record is intact and holds a membership of three fields, and nothing in it says which key signed
+/// the approval, so it is refused by number rather than judged by the roster's claims.
+///
+/// **Format 5 is this branch's own, UNRELEASED definition, and is FINAL only at the lane-0 flag
+/// day.** Format 3 changed twice without moving -- an asked-fleet memo went from three fields to
+/// four, and the nested summary from ten fields to eleven -- because no build that wrote those
+/// shapes ever shipped; the embedded roster moved it to 4, and the admitting key to 5, because a
+/// learner's record is on disk on the one installation there is. From the flag day on, every change
+/// to this layout -- nested codecs included -- moves this number.
+inline constexpr std::uint8_t FormationRecordFormat = 5;
 
 /// The four bytes every formation record starts with, so a file that is not one is told apart
 /// from one in another layout.
@@ -225,6 +244,16 @@ inline constexpr std::uint64_t UnbelievableClockCreatedAt = std::numeric_limits<
 ///         would let two machines imaged from one disk mint the same cluster.
 [[nodiscard]] std::expected<std::string, SecureRandomError> MintClusterId(ISecureRandom& random);
 
+/// Whether @p clusterId is spelled the way `MintClusterId` spells every id it mints: `ClusterIdBytes`
+/// as lowercase hex, nothing shorter, longer or upper-case.
+///
+/// The grammar an operator's `--fleet-id` is held to, so a pin is refused by name where it is typed
+/// rather than matching no fleet ever: a truncated copy, a pasted space, an id in capitals. One
+/// predicate beside the mint, never a copy of it at the flag.
+/// @param clusterId The text.
+/// @return True when a mint could have produced it.
+[[nodiscard]] bool IsMintedClusterId(std::string_view clusterId) noexcept;
+
 /// Mint the record of a node that has formed nothing yet: solitary, in a cluster of its own.
 /// @param random The generator the cluster id is drawn from.
 /// @param wall The clock the creation time is read from, as whole seconds since the Unix epoch;
@@ -267,6 +296,16 @@ void RememberAdmitted(FormationRecord& record, std::string_view clusterId, Ed255
 /// @param record The record.
 /// @return The joined fleet's id when there is one, else the node's own.
 [[nodiscard]] std::string const& CurrentClusterId(FormationRecord const& record) noexcept;
+
+/// The cluster @p record commits this node to that it did not mint for itself: the fleet a pending
+/// node asked, or the one whose consensus a learner or a voter runs (`ConsensusScope::Fleet`).
+///
+/// What `--fleet-id` is judged against (`Cluster::AdmitsFleet`). A solitary node is committed to
+/// nothing -- its own cluster is the one every node starts in, and a pin to another names where it
+/// is going, not where it is.
+/// @param record The record.
+/// @return The id, or nothing for a node in a cluster of its own that asked nobody.
+[[nodiscard]] std::optional<std::string_view> CommittedClusterId(FormationRecord const& record) noexcept;
 
 /// The seam every formation change is written through, BEFORE the node acts on it.
 class IFormationStore

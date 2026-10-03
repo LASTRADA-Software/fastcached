@@ -12,7 +12,7 @@
 ///
 /// Header-only and in Core, because the files are written from four layers -- consensus
 /// (`FileRaftStorage`), cluster (`FileFormationStore`, `FleetEndpointsFile`), distributed
-/// (`FileRosterStore`, the histories) and the node itself (its key and id) -- and a name spelled
+/// (the histories) and the node itself (its key and id) -- and a name spelled
 /// in any one of them would be a state file the node's table of them (`Node::NodeStateFiles()`)
 /// does not know. Every writer takes its name from here, the node's table is keyed by the same
 /// enum, and both tables are asserted complete: a new file is a new enumerator, and an enumerator
@@ -39,7 +39,6 @@ enum class StateFile : std::uint8_t
     RaftLog,         ///< Its consensus log.
     RaftSnapshot,    ///< Its consensus snapshot.
     FleetEndpoints,  ///< The endpoints it remembers its cluster at.
-    Roster,          ///< The roster it verifies grants against.
     NodeHistory,     ///< Its own history.
     FleetHistory,    ///< The fleet's history, recorded while leading.
     ReceivedHistory, ///< What the other machines handed over.
@@ -104,7 +103,6 @@ inline constexpr EnumTable<StateFile, StateFileNameRow> StateFileNames { {
     { .file = StateFile::RaftLog, .name = "raft-log", .access = StateFileAccess::OthersRead },
     { .file = StateFile::RaftSnapshot, .name = "raft-snapshot", .access = StateFileAccess::OthersRead },
     { .file = StateFile::FleetEndpoints, .name = "fleet-endpoints", .access = StateFileAccess::OthersRead },
-    { .file = StateFile::Roster, .name = "roster", .access = StateFileAccess::OthersRead },
     { .file = StateFile::NodeHistory, .name = "node-history.bin", .access = StateFileAccess::OthersRead },
     { .file = StateFile::FleetHistory, .name = "fleet-history.bin", .access = StateFileAccess::OthersRead },
     { .file = StateFile::ReceivedHistory, .name = "received-history.bin", .access = StateFileAccess::OthersRead },

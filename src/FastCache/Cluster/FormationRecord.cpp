@@ -39,8 +39,9 @@ namespace
     /// Fields in a pending node's join target: the summary, the key that proved it, when it asked.
     constexpr std::size_t JoinTargetFields = 3;
 
-    /// Fields in a fleet membership: the fleet's id, the roster and the fleet's creation time.
-    constexpr std::size_t FleetMembershipFields = 3;
+    /// Fields in a fleet membership: the fleet's id, the roster, the fleet's creation time and the key
+    /// that signed the admission.
+    constexpr std::size_t FleetMembershipFields = 4;
 
     /// Fields in one asked fleet: its id, the key that proved it, when this node asked, and whether it
     /// admitted this node (one byte, 0 or 1).
@@ -132,7 +133,8 @@ namespace
         return target;
     }
 
-    /// A fleet membership's body: the fleet's id, then the roster bytes as they were approved.
+    /// A fleet membership's body: the fleet's id, the roster bytes as they were approved, the fleet's
+    /// creation time and the key that signed the admission.
     /// @param fleet The membership.
     /// @return The body.
     [[nodiscard]] std::vector<std::byte> EncodeFleetMembership(FleetMembership const& fleet)
@@ -140,7 +142,8 @@ namespace
         auto const created = WireFields::ToBigEndian<std::uint64_t>(fleet.createdAtUnixSeconds);
         return WireFields::Encode({ WireFields::AsBytes(fleet.clusterId),
                                     std::span<std::byte const> { fleet.roster },
-                                    std::span<std::byte const> { created } });
+                                    std::span<std::byte const> { created },
+                                    std::span<std::byte const> { fleet.admittedBy } });
     }
 
     /// Read a body `EncodeFleetMembership` wrote.
@@ -152,11 +155,14 @@ namespace
         if (!fields.has_value())
             return std::nullopt;
         auto const created = WireFields::FromBigEndian<std::uint64_t>((*fields)[2]);
-        if (!created.has_value())
+        if (!created.has_value() || (*fields)[3].size() != Ed25519PublicKeyBytes)
             return std::nullopt;
-        return FleetMembership { .clusterId = OwnedText((*fields)[0]),
-                                 .roster = std::vector<std::byte> { (*fields)[1].begin(), (*fields)[1].end() },
-                                 .createdAtUnixSeconds = *created };
+        auto fleet = FleetMembership { .clusterId = OwnedText((*fields)[0]),
+                                       .roster = std::vector<std::byte> { (*fields)[1].begin(), (*fields)[1].end() },
+                                       .createdAtUnixSeconds = *created,
+                                       .admittedBy = {} };
+        std::ranges::copy((*fields)[3], fleet.admittedBy.begin());
+        return fleet;
     }
 
     /// A pending archive's body: the cluster id, as it stands.
@@ -416,6 +422,12 @@ std::expected<std::string, SecureRandomError> MintClusterId(ISecureRandom& rando
     return id;
 }
 
+bool IsMintedClusterId(std::string_view clusterId) noexcept
+{
+    return clusterId.size() == 2 * ClusterIdBytes
+           && std::ranges::all_of(clusterId, [](char const c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
 std::expected<FormationRecord, SecureRandomError> MintSolitary(ISecureRandom& random, core::platform::IWallClock const& wall)
 {
     // A clock set before 1970 is a broken clock; see `UnbelievableClockCreatedAt`.
@@ -466,6 +478,15 @@ bool FoundedHere(FormationRecord const& record) noexcept
 std::string const& CurrentClusterId(FormationRecord const& record) noexcept
 {
     return record.fleet.has_value() ? record.fleet->clusterId : record.own.clusterId;
+}
+
+std::optional<std::string_view> CommittedClusterId(FormationRecord const& record) noexcept
+{
+    if (record.joining.has_value())
+        return std::string_view { record.joining->summary.clusterId };
+    if (NodeModeRowFor(record.mode).consensus == ConsensusScope::Fleet)
+        return std::string_view { CurrentClusterId(record) };
+    return std::nullopt;
 }
 
 FileFormationStore::FileFormationStore(std::filesystem::path directory):

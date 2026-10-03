@@ -2,6 +2,7 @@
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/NodeMode.hpp>
 #include <FastCache/Consensus/DurableFile.hpp>
+#include <FastCache/Core/WireFields.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -15,6 +16,7 @@
 #include <limits>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -110,6 +112,35 @@ TEST_CASE("A failed draw mints no cluster", "[cluster][formation][record]")
     CHECK_FALSE(MintSolitary(random, wall).has_value());
 }
 
+TEST_CASE("Every id a mint produces is one the cluster-id grammar accepts, and nothing near one is",
+          "[cluster][formation][record][pin]")
+{
+    // Every nibble, so a grammar missing a digit or a letter is refused by its own mint.
+    auto drawn = std::vector<std::byte> {};
+    for (auto const byte: { 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF })
+        drawn.push_back(static_cast<std::byte>(byte));
+    auto const half = drawn;
+    drawn.insert(drawn.end(), half.begin(), half.end());
+    REQUIRE(drawn.size() == ClusterIdBytes);
+    Testing::ScriptedSecureRandom random { drawn };
+    auto const minted = MintClusterId(random);
+    REQUIRE(minted.has_value());
+    CHECK(Unwrap(minted) == "0123456789abcdef0123456789abcdef");
+    CHECK(IsMintedClusterId(Unwrap(minted)));
+
+    auto const& id = Unwrap(minted);
+    for (auto const& almost: { id.substr(1),
+                               id + "0",
+                               std::string { "0123456789ABCDEF0123456789ABCDEF" },
+                               id.substr(1) + "g",
+                               id.substr(1) + " ",
+                               std::string {} })
+    {
+        INFO("'" << almost << "'");
+        CHECK_FALSE(IsMintedClusterId(almost));
+    }
+}
+
 TEST_CASE("A formation record round-trips every optional part", "[cluster][formation][record]")
 {
     auto record = FormationRecord { .mode = NodeMode::Learner,
@@ -117,11 +148,13 @@ TEST_CASE("A formation record round-trips every optional part", "[cluster][forma
                                     .joining = std::nullopt,
                                     .fleet = FleetMembership { .clusterId = "fleet-c",
                                                                .roster = { std::byte { 1 }, std::byte { 2 } },
-                                                               .createdAtUnixSeconds = 0 },
+                                                               .createdAtUnixSeconds = 0,
+                                                               .admittedBy = {} },
                                     .archivePending = std::string { "own-c" },
                                     .rejectedBy = RejectionMemo { .clusterId = "other", .atUnixSeconds = 5 },
                                     .askedJoins = {} };
     record.fleet->createdAtUnixSeconds = 1'700'000'000;
+    record.fleet->admittedBy.fill(std::byte { 0x5A }); // the admitting key round-trips byte for byte
     record.askedJoins.push_back(AskedJoin { .clusterId = "fleet-c", .provenKey = {}, .askedAtUnixSeconds = 42 });
     record.askedJoins.back().provenKey.fill(std::byte { 0x3D });
     auto const first = DecodeFormationRecord(EncodeFormationRecord(record));
@@ -184,7 +217,9 @@ TEST_CASE("A formation record naming a cluster id past its bound is refused as d
         { .what = "fleet membership",
           .place =
               [](FormationRecord& record, std::string id) {
-                  record.fleet = FleetMembership { .clusterId = std::move(id), .roster = {}, .createdAtUnixSeconds = 0 };
+                  record.fleet = FleetMembership {
+                      .clusterId = std::move(id), .roster = {}, .createdAtUnixSeconds = 0, .admittedBy = {}
+                  };
               } },
         { .what = "pending archive",
           .place = [](FormationRecord& record, std::string id) { record.archivePending = std::move(id); } },
@@ -447,14 +482,16 @@ TEST_CASE("A record holding more asked fleets than any build keeps is damage", "
 TEST_CASE("An earlier record format is another layout, refused by name, and never read as damage",
           "[cluster][formation][record]")
 {
-    // Format 2 added the fleet's age and the asked fleets; format 3 is this branch's unreleased layout
-    // -- a nested summary of eleven fields, memos of four -- FINAL only at the lane-0 flag day (see
-    // `FormationRecordFormat`). An earlier record is intact and belongs to the build that wrote it:
-    // `UnsupportedFormatVersion`, which is what monitoring sees, never `MalformedFrame`.
-    static_assert(FormationRecordFormat == 3,
-                  "this case pins format 3, unreleased and final only at the lane-0 flag day; from then on a "
+    // Format 2 added the fleet's age and the asked fleets; format 3 nested a summary of eleven fields
+    // and memos of four; format 4 embedded a version-2 roster in a fleet membership; format 5 is this
+    // branch's unreleased layout -- the membership keeps the key that signed the admission -- FINAL only
+    // at the lane-0 flag day (see `FormationRecordFormat`). An earlier record is intact and belongs to
+    // the build that wrote it: `UnsupportedFormatVersion`, which is what monitoring sees, never
+    // `MalformedFrame`.
+    static_assert(FormationRecordFormat == 5,
+                  "this case pins format 5, unreleased and final only at the lane-0 flag day; from then on a "
                   "layout change moves the number and adds the old one below");
-    for (auto const format: { std::uint8_t { 1 }, std::uint8_t { 2 } })
+    for (auto const format: { std::uint8_t { 1 }, std::uint8_t { 2 }, std::uint8_t { 3 }, std::uint8_t { 4 } })
     {
         INFO("format " << int { format });
         auto older = EncodeFormationRecord(SolitaryRecord("c", 1));
@@ -464,4 +501,36 @@ TEST_CASE("An earlier record format is another layout, refused by name, and neve
         CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
         CHECK(refused.error().context.contains(std::format("format {}", format)));
     }
+}
+
+TEST_CASE("A learner's record holding the previous roster layout is refused by the record's own number",
+          "[cluster][formation][record]")
+{
+    // A learner's record keeps its approval's roster (`FleetMembership::roster`), and a roster member
+    // gained a fifth field -- its recorded `0xFC` endpoint -- under `RosterFormatVersion` 2. A record
+    // written before holds a version-1 roster of four fields a member: built here by hand as that
+    // build wrote it, and refused by NAME at the record, before anything reads the roster, so the
+    // operator is told which build wrote the file and never that it is damaged.
+    auto const member = WireFields::Encode({ WireFields::AsBytes(std::string_view { "n1" }),
+                                             WireFields::AsBytes(std::string_view { "n1:6680" }),
+                                             std::span<std::byte const> { std::array { std::byte { 0x00 } } },
+                                             std::span<std::byte const> {} });
+    auto const members = WireFields::Encode({ std::span<std::byte const> { member } });
+    auto const empty = WireFields::Encode(WireFields::FieldList {});
+    auto const oldRoster = WireFields::Encode({ std::span<std::byte const> { std::array { std::byte { 0x01 } } },
+                                                std::span<std::byte const> { members },
+                                                std::span<std::byte const> { empty },
+                                                std::span<std::byte const> { empty } });
+    auto record = SolitaryRecord("c-laptop", 1);
+    record.mode = NodeMode::Learner;
+    record.fleet =
+        FleetMembership { .clusterId = "c-office", .roster = oldRoster, .createdAtUnixSeconds = 1, .admittedBy = {} };
+    auto written = EncodeFormationRecord(record);
+    written[FormationRecordFormatOffset] = std::byte { 3 }; // as the build before the roster moved wrote it
+
+    auto const refused = DecodeFormationRecord(written);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().code == ConsensusErrorCode::UnsupportedFormatVersion);
+    CHECK(refused.error().context.contains(
+        std::format("written in format 3; this build reads format {}", FormationRecordFormat)));
 }

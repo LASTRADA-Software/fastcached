@@ -541,7 +541,7 @@ started_log=""
 # @param 3 the node's log
 assert_checks_leases() {
     local pid="$1" tag="$2" log="$3"
-    wait_for_log "verifying lease signatures against the roster this node applies" "$pid" "$tag" "$log"
+    wait_for_log "verifying lease signatures against the state this node's consensus applies" "$pid" "$tag" "$log"
     if grep -qF "compiling WITHOUT verifying" "$log"; then
         cat "$log" >&2
         fail "the ${tag} worker compiles WITHOUT verifying lease signatures"

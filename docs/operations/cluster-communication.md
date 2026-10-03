@@ -703,6 +703,10 @@ dialled at:
 state directory:
   <state directory> (per-user: this process is not privileged, so it keeps its identity apart from the machine's service)
 
+fleet:
+  cluster    none minted yet
+  pinned to  none (--fleet-id unset: discovery is trust-on-first-use)
+
 notes:
   …
 ```
@@ -1022,7 +1026,7 @@ refusal counter reads zero, and the fleet looks healthy from both ends. So the
 decision is made once, before anything is served:
 
 - A node that **another machine could dial** and has no way to check a lease — it
-  runs no consensus and keeps no roster in its `--cluster-dir`
+  runs no consensus, so it applies no roster
   — is refused at startup, by name. Both halves have to be true — a node bound to
   loopback answers nobody else whatever the roster or `--fleet-open` say, and
   a node admitting only its own machine escalates nobody however it is bound.

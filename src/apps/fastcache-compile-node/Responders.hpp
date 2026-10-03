@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CacheProxy.hpp"
+#include "EnrollmentAbsence.hpp"
 #include "FrameEndpoint.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
@@ -835,6 +836,12 @@ struct SurfaceComponents
     /// may not run rather than a surface that is always present and always refuses.
     IFrameResponder* enrollment { nullptr };
 
+    /// Why `enrollment` is null, read only while it is: the reason this node KNOWS, so a joiner
+    /// pointed here is told it (`EnrollmentAbsenceTable`) rather than a guess -- *runs no consensus*
+    /// from a node that runs it is a confident wrong signal. `NoConsensus`, the ordinary reason, for a
+    /// composition that names none; `ComposeSurfaceComponents` always names one.
+    EnrollmentAbsence enrollmentAbsence { EnrollmentAbsence::NoConsensus };
+
     /// Answers `Subscribe`: live stats as a stream rather than a poll (#1399).
     ///
     /// Like `node`, **never null on a built node**, and for its reason: watching a node must not
@@ -1368,7 +1375,9 @@ class MergedResponder final: public IFrameResponder
     {
         CompileCacheWire::VerbFamily family; ///< Whose verbs this row answers.
         Cc::UncountedRefusal refusal;        ///< What the client is told, and why nothing rises.
-        std::string_view detail;             ///< Words for the operator who sent it.
+        /// Words for the operator who sent it, chosen from what this node knows -- which, for the
+        /// enrollment family, is WHY it records nobody (`SurfaceComponents::enrollmentAbsence`).
+        std::string_view (*detail)(SurfaceComponents const& components) noexcept;
     };
 
     /// Every family with an answer of its own; any other unserved family is unimplemented.
@@ -1378,32 +1387,39 @@ class MergedResponder final: public IFrameResponder
                        .rationale = "what a node without consensus answers every enrolment attempt aimed at it, which "
                                     "is an ordinary misdirection rather than an event; counted, it would bury the scan "
                                     "it would be read for, exactly as the unserved-family answer below would" },
-          .detail = "this node runs no consensus, so it belongs to no cluster and there is nothing here to join; ask a "
-                    "node that runs consensus -- --node-status names the components a node serves" },
+          .detail =
+              [](SurfaceComponents const& components) noexcept {
+                  return EnrollmentAbsenceDetail(components.enrollmentAbsence);
+              } },
         { .family = CompileCacheWire::VerbFamily::Compile,
           .refusal = { .code = CompileCacheWire::NoCompileWorker::Code,
                        .rationale = "what a node running no worker answers a compile or a cordon aimed at it: nothing "
                                     "leases this node, so each one is a person or a script at the wrong machine, "
                                     "which is a misdirection rather than an event a series should count" },
-          .detail = "this endpoint runs no compile worker: it was started with --slots=0, so nothing here compiles "
-                    "and there is nothing to cordon; ask a node that runs one -- --node-status names the components "
-                    "a node serves" },
+          .detail = [](SurfaceComponents const&) noexcept -> std::string_view {
+              return "this endpoint runs no compile worker: it was started with --slots=0, so nothing here compiles "
+                     "and there is nothing to cordon; ask a node that runs one -- `fastcache-cli node` names the "
+                     "components a node serves";
+          } },
         { .family = CompileCacheWire::VerbFamily::NodeProof,
           .refusal = { .code = CompileCacheWire::ErrorCode::NoCluster,
                        .rationale = "what a node running no consensus answers every proof aimed at it: it is no "
                                     "scheduler, so a proof here is a node registering at the wrong machine; counted, "
                                     "one misdirected node would dominate the series that says whether an identity is "
                                     "WRONG somewhere" },
-          .detail = "this node runs no consensus, so it holds no roster to prove an identity against and is no "
-                    "scheduler of any fleet; admission at this endpoint is decided by your address -- --node-status "
-                    "names the components a node serves" },
+          .detail = [](SurfaceComponents const&) noexcept -> std::string_view {
+              return "this node runs no consensus, so it holds no roster to prove an identity against and is no "
+                     "scheduler of any fleet; admission at this endpoint is decided by your address -- "
+                     "`fastcache-cli node` names the components a node serves";
+          } },
     });
 
     // The compile row says `CompileCacheWire::NoCompileWorker`'s fact, which the daemon answers too, so
     // neither endpoint can reword it or move its code without the other (#206).
     static_assert(CompileCacheWire::SaysNoCompileWorker(
         core::findOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->refusal.code,
-        core::findOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)->detail));
+        core::findOrNull(UnservedFamilies, CompileCacheWire::VerbFamily::Compile, &UnservedFamily::family)
+            ->detail(SurfaceComponents {})));
 
     /// What a verb this node serves nowhere is answered with.
     ///
@@ -1463,11 +1479,11 @@ class MergedResponder final: public IFrameResponder
     /// condition, as the enrollment row does with `NoCluster`.
     /// @param opRaw The third header byte, as received.
     /// @return The encoded refusal.
-    [[nodiscard]] static std::vector<std::byte> UnservedReply(std::uint8_t opRaw)
+    [[nodiscard]] std::vector<std::byte> UnservedReply(std::uint8_t opRaw) const
     {
         auto const family = CompileCacheWire::FamilyOf(opRaw);
         if (auto const* const row = core::findOrNull(UnservedFamilies, family, &UnservedFamily::family))
-            return Cc::RefuseWithoutCounter(row->refusal, row->detail);
+            return Cc::RefuseWithoutCounter(row->refusal, row->detail(_components));
 
         return Cc::RefuseWithoutCounter({ .code = CompileCacheWire::UnimplementedVerb,
                                           .rationale =

@@ -5,6 +5,7 @@
 #include <FastCache/Core/Errors/ConsensusError.hpp>
 
 #include <expected>
+#include <string>
 
 namespace FastCache::Distributed
 {
@@ -48,6 +49,17 @@ class IClusterAdmin
     /// @param command The change.
     /// @return Nothing, or why it was refused.
     [[nodiscard]] virtual std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& command) = 0;
+
+    /// A member PROVED its identity on its connection and announced where its `0xFC` port answers.
+    ///
+    /// Called by the leader's scheduler only, and only under the id the caller PROVED -- never one a
+    /// payload names, so a member can only ever speak for itself. An implementation RECONCILES: it
+    /// keeps the latest announcement per member and proposes on its own pass
+    /// (`Cluster::AnnouncedEndpointDesires`), never inline, so an announcement costs a log entry only
+    /// when the record differs and no change for that member is already in flight.
+    /// @param member The id the caller proved.
+    /// @param endpoint Where it says its `0xFC` port answers.
+    virtual void NoteAnnouncedEndpoint(Consensus::NodeId const& member, std::string endpoint) = 0;
 };
 
 } // namespace FastCache::Distributed

@@ -160,6 +160,15 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# No C++20 module scanning, whatever builds this tree. This project has no module units, so the
+# scan is pure overhead -- and it is not only overhead: under it Ninja runs dyndep edges, and the
+# ninja 1.13.2 Visual Studio 18 ships asserts in them (`edge && !edge->outputs_ready()`,
+# build.cc:435) and then hangs on the assertion dialog. It used to be off only while a compiler
+# launcher was in use (`cmake/portable/CompileCache.cmake`, which keeps its own reason), so every
+# reference build -- `-DUSE_COMPILER_CACHE=OFF`, the local gate among them -- scanned and could
+# hang. A normal variable, so a cache entry cannot turn it back on.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 

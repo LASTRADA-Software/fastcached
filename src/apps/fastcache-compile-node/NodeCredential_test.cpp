@@ -564,7 +564,6 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
                                                        .prover = nullptr,
                                                        .reachability = reachability,
                                                        .joinMemos = {} },
-                                     nullptr,
                                      link,
                                      dialer));
         CheckBare(dialer.SentOn(0), Wire::Op::NodeAnnounce);
@@ -704,7 +703,6 @@ enum class HolderKind : std::uint8_t
     Seam,     ///< Declares the source, or builds the one production instance of it.
     Upstream, ///< The `--upstream` leg: the cache behind it is what checks `--requirepass`.
     Fixture,  ///< A test helper that is not a `_test.cpp`.
-    Retiring, ///< A leg that still presents it, to an endpoint an operator or the fleet named.
 };
 
 /// A file allowed to hold a credential -- a source, or a `Cc::Credential` value -- and why.
@@ -724,8 +722,9 @@ struct CredentialHolderRow
 /// (`Cc::ICredentialFor`), which shows each one this machine's node's ticket and keeps the password
 /// for `--upstream` alone; a file holding that seam is a holder too. A file absent from this list
 /// is refused by name, so a new holder is a new ROW with a reason rather than a forgotten argument;
-/// and a row whose file names no source any more is refused as stale, so a `Retiring` row leaves
-/// with the leg it describes.
+/// and a row whose file names no source any more is refused as stale, so a row leaves with the leg
+/// it describes. An operator's verb that asks the per-endpoint seam is that seam's caller, and a
+/// `Seam` row: it presents nothing the seam did not choose for the endpoint it reached.
 constexpr auto CredentialHolders = std::array {
     CredentialHolderRow { .file = "NodeCredential.hpp",
                           .kind = HolderKind::Seam,
@@ -750,19 +749,19 @@ constexpr auto CredentialHolders = std::array {
                           .kind = HolderKind::Seam,
                           .why = "builds that per-endpoint seam from the configuration the verb was invoked with" },
     CredentialHolderRow { .file = "ClusterAdminCli.hpp",
-                          .kind = HolderKind::Retiring,
+                          .kind = HolderKind::Seam,
                           .why = "an operator's cluster verb, asking per endpoint what each is shown" },
     CredentialHolderRow { .file = "ClusterAdminCli.cpp",
-                          .kind = HolderKind::Retiring,
+                          .kind = HolderKind::Seam,
                           .why = "an operator's cluster verb, asking per endpoint what each is shown" },
     CredentialHolderRow {
         .file = "EnrollClient.hpp",
-        .kind = HolderKind::Retiring,
+        .kind = HolderKind::Seam,
         .why = "the operator's enrollment verbs, asking per endpoint -- the one dialled AND each one an unsigned "
                "NotLeader redirect names -- what each is shown; a joiner's polls present none" },
     CredentialHolderRow {
         .file = "EnrollClient.cpp",
-        .kind = HolderKind::Retiring,
+        .kind = HolderKind::Seam,
         .why = "the operator's enrollment verbs, asking per endpoint -- the one dialled AND each one an unsigned "
                "NotLeader redirect names -- what each is shown; a joiner's polls present none" },
 };

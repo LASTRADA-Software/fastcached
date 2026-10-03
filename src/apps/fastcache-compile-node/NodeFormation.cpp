@@ -8,6 +8,9 @@
 
 #include <algorithm>
 #include <format>
+#include <optional>
+#include <span>
+#include <string>
 #include <utility>
 
 #include <core/Ranges.hpp>
@@ -64,12 +67,53 @@ namespace
             add(record.joining->summary.leaderNodeEndpoint);
         return out;
     }
+
+    /// The key that vouches for the cluster @p record commits this node to, as the pin asks it
+    /// (`Cluster::AdmitsFleet`) -- always one this node PROVED, never one a peer's bytes merely list:
+    /// the key that proved the fleet a pending node asked; the key that signed the admission a joined
+    /// node acted on (`FleetMembership::admittedBy`), never the voters its roster claims; this node's
+    /// own key for a cluster it founded.
+    ///
+    /// Which is what makes this check one of its own rather than a restatement of the poll's: an
+    /// approval signed by another key whose roster lists a pinned voter is refused here too.
+    /// Deterministic over the record and this node's key, so a restart judges what the move did -- and
+    /// a fleet that later forgets every pinned voter still starts, since the admission is what is
+    /// judged and the fleet's applied state is the authority from then on.
+    /// @param record The formation record.
+    /// @param cfg The configuration, for this node's own key.
+    /// @return The key; nothing when none can be named, which no pin admits.
+    [[nodiscard]] std::optional<Ed25519PublicKey> CommitmentSigner(Cluster::FormationRecord const& record,
+                                                                   NodeConfig const& cfg)
+    {
+        if (record.joining.has_value())
+            return record.joining->provenKey;
+        if (record.fleet.has_value())
+            return record.fleet->admittedBy;
+        return cfg.identityPublicKey;
+    }
 } // namespace
 
 std::expected<void, std::string> ApplyFormation(NodeConfig& cfg,
                                                 Cluster::FormationRecord const& record,
                                                 Cluster::FleetEndpoints const& remembered)
 {
+    // Before anything is shaped: a record the pin refuses describes a node this one must not be.
+    if (auto const committed = Cluster::CommittedClusterId(record); committed.has_value())
+    {
+        auto const signer = CommitmentSigner(record, cfg);
+        auto const signers =
+            signer.has_value() ? std::span<Ed25519PublicKey const> { &*signer, 1 } : std::span<Ed25519PublicKey const> {};
+        if (!Cluster::AdmitsFleet(FleetPinOf(cfg), *committed, signers))
+            return std::unexpected { std::format(
+                "the formation record commits this node to cluster {1} (it is {0}) under key {3}, which --fleet-id "
+                "does not name, and --fleet-id pins it to {2}: if that is the fleet this node belongs to, reset its "
+                "state directory so it starts alone and joins it; if {1} is, change --fleet-id",
+                Cluster::NodeModeRowFor(record.mode).name,
+                *committed,
+                Cluster::PinText(FleetPinOf(cfg)),
+                signer.has_value() ? FormatEd25519PublicKey(*signer) : std::string { "none" }) };
+    }
+
     auto view = NodeFormationView { .mode = record.mode,
                                     .clusterId = Cluster::CurrentClusterId(record),
                                     .createdAtUnixSeconds = record.own.createdAtUnixSeconds,
@@ -93,6 +137,11 @@ std::expected<void, std::string> ApplyFormation(NodeConfig& cfg,
     return {};
 }
 
+Cluster::FleetPin FleetPinOf(NodeConfig const& cfg)
+{
+    return Cluster::FleetPin { .fleet = cfg.fleetPin };
+}
+
 bool ModeOpensRaftPort(Cluster::NodeMode mode) noexcept
 {
     return Cluster::NodeModeRowFor(mode).raftListener == Cluster::RaftListenerState::Open;
@@ -103,11 +152,35 @@ bool ModeServesConsensusToPeers(Cluster::NodeMode mode) noexcept
     return ModeOpensRaftPort(mode) && Cluster::NodeModeRowFor(mode).consensus == Cluster::ConsensusScope::Fleet;
 }
 
-bool ServesEnrollment(NodeConfig const& cfg, bool schedulerRuns) noexcept
+bool ServesEnrollment(NodeConfig const& cfg, bool schedulerRuns)
 {
+    return !EnrollmentAbsenceOf(cfg, schedulerRuns).has_value();
+}
+
+std::optional<EnrollmentAbsence> EnrollmentAbsenceOf(NodeConfig const& cfg, bool schedulerRuns)
+{
+    if (!RunsConsensus(cfg) || !cfg.formation.has_value())
+        return EnrollmentAbsence::NoConsensus;
     // Not while its consensus is confined to this machine: a member admitted there would be told to
     // dial a loopback address, which reaches itself.
-    return RunsConsensus(cfg) && schedulerRuns && !ConsensusConfinedToThisMachine(cfg);
+    if (ConsensusConfinedToThisMachine(cfg))
+        return EnrollmentAbsence::ConfinedToThisMachine;
+    if (!schedulerRuns)
+        return EnrollmentAbsence::NoScheduler;
+    // Under this node's OWN key: what it would sign every answer with, which a pinned joiner takes
+    // only from a pinned voter.
+    auto const pin = FleetPinOf(cfg);
+    auto const& clusterId = cfg.formation->clusterId;
+    auto const ownKey = cfg.identityPublicKey.has_value() ? std::span<Ed25519PublicKey const> { &*cfg.identityPublicKey, 1 }
+                                                          : std::span<Ed25519PublicKey const> {};
+    if (Cluster::AdmitsFleet(pin, clusterId, ownKey))
+        return std::nullopt;
+    // Refused, so pinned: whether the pin admits this cluster under ANY of its own keys tells the
+    // cluster it names apart from the key it does not -- the same predicate, never an id compared here.
+    auto const pinnedKeys = pin.fleet.has_value() ? std::span<Ed25519PublicKey const> { pin.fleet->voterKeys }
+                                                  : std::span<Ed25519PublicKey const> {};
+    return Cluster::AdmitsFleet(pin, clusterId, pinnedKeys) ? EnrollmentAbsence::NotAPinnedVoter
+                                                            : EnrollmentAbsence::PinnedToAnotherCluster;
 }
 
 bool ServesScheduler(NodeConfig const& cfg) noexcept
@@ -142,6 +215,38 @@ std::vector<std::string> SchedulersOf(NodeConfig const& cfg, ActivatedNodeEndpoi
     if (node.empty())
         return {};
     return { dialledAt(node.front().host, node.front().port) };
+}
+
+std::vector<std::string> RecordedSchedulersOf(Cluster::ClusterState const& state, std::string_view self)
+{
+    auto endpoints = std::vector<std::string> {};
+    for (auto const& member: state.members)
+        if (member.seat == Cluster::MemberSeat::Voter && member.id != self && !member.schedulerEndpoint.empty()
+            && !std::ranges::contains(endpoints, member.schedulerEndpoint))
+            endpoints.push_back(member.schedulerEndpoint);
+    return endpoints;
+}
+
+AppliedSchedulers::AppliedSchedulers(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated):
+    _self { cfg.nodeId },
+    _servesScheduler { ServesScheduler(cfg) },
+    _formation { SchedulersOf(cfg, activated) }
+{
+}
+
+void AppliedSchedulers::Applied(Cluster::ClusterState const& state)
+{
+    auto recorded = RecordedSchedulersOf(state, _self);
+    auto const guard = std::scoped_lock { _lock };
+    _recorded = std::move(recorded);
+}
+
+std::vector<std::string> AppliedSchedulers::Current() const
+{
+    if (_servesScheduler)
+        return _formation;
+    auto const guard = std::scoped_lock { _lock };
+    return _recorded.empty() ? _formation : _recorded;
 }
 
 std::vector<Cluster::MemberSpec> BootstrapMembersOf(NodeConfig const& cfg)

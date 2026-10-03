@@ -217,6 +217,7 @@ if(FASTCACHED_BUILD_TESTS)
         NodeFrameSurface_test.cpp
         AuthRefusalContract_test.cpp
         FleetMachinePresence_test.cpp
+        FleetRoster_test.cpp
         FleetTickets_test.cpp
         FleetLeaseRouting_test.cpp
         FleetExclusion_test.cpp

@@ -15,8 +15,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
+#include <format>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <tests/RaftPeerKeyFakes.hpp>
@@ -40,12 +44,13 @@ constexpr auto ThisNode = "this-pc";
     return Cluster::Roster { .members = { Cluster::RosterMember { .id = "office",
                                                                   .raftEndpoint = "office:6680",
                                                                   .seat = Cluster::MemberSeat::Voter,
-                                                                  .publicKey = Testing::TestKeyPair("office").PublicKey() },
+                                                                  .publicKey = Testing::TestKeyPair("office").PublicKey(),
+                                                                  .schedulerEndpoint = {} },
                                           Cluster::RosterMember { .id = ThisNode,
                                                                   .raftEndpoint = {},
                                                                   .seat = Cluster::MemberSeat::Learner,
-                                                                  .publicKey =
-                                                                      Testing::TestKeyPair(ThisNode).PublicKey() } },
+                                                                  .publicKey = Testing::TestKeyPair(ThisNode).PublicKey(),
+                                                                  .schedulerEndpoint = {} } },
                              .principals = {},
                              .revoked = {} };
 }
@@ -65,7 +70,8 @@ constexpr auto ThisNode = "this-pc";
     if (mode == Cluster::NodeMode::Learner)
         record.fleet = Cluster::FleetMembership { .clusterId = "fleet-c",
                                                   .roster = Cluster::EncodeRoster(OfficeRoster()),
-                                                  .createdAtUnixSeconds = 0 };
+                                                  .createdAtUnixSeconds = 0,
+                                                  .admittedBy = Testing::TestKeyPair("office").PublicKey() };
     return record;
 }
 
@@ -157,6 +163,56 @@ TEST_CASE("A pending node keeps serving exactly what it served while solitary", 
     CHECK(BootstrapMembersOf(pending).size() == 1);
     CHECK(Unwrap(pending.formation).clusterId == Unwrap(solitary.formation).clusterId);
     CHECK(pending.clusterId == "own-c");
+}
+
+TEST_CASE("A node serving no scheduler registers at the voters its applied state records, else where its formation says",
+          "[node][formation][announce]")
+{
+    // T26's carry: the formation record remembers the voters' endpoints as the approval carried them,
+    // and a voter that moved announces its new one, proven, which the leader records. So the applied
+    // state answers, REPLACING the remembered list rather than joining it -- a moved voter's old
+    // endpoint is dead -- and the remembered list answers only until the state names a voter.
+    auto const self = FormedBy(
+        RecordIn(Cluster::NodeMode::Learner),
+        Cluster::FleetEndpoints { .clusterId = "fleet-c",
+                                  .voters = { Cluster::FleetEndpoint {
+                                      .id = "office", .raftEndpoint = "office:6680", .nodeEndpoint = "office:6674" } } });
+    REQUIRE_FALSE(ServesScheduler(self));
+    auto const remembered = SchedulersOf(self, AsConfigured);
+    REQUIRE(remembered == std::vector<std::string> { "office:6674" });
+    AppliedSchedulers schedulers { self, AsConfigured };
+    CHECK(schedulers.Current() == remembered);
+
+    auto const member = [](std::string id, std::string endpoint, Cluster::MemberSeat seat) {
+        return Cluster::ClusterMember { .id = std::move(id),
+                                        .raftEndpoint = {},
+                                        .schedulerEndpoint = std::move(endpoint),
+                                        .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
+                                        .seat = seat,
+                                        .publicKey = {} };
+    };
+    auto state = Cluster::ClusterState {};
+    state.members = { member("office", "office.example:6674", Cluster::MemberSeat::Voter),
+                      member("desk", "desk.example:6674", Cluster::MemberSeat::Learner),
+                      member(ThisNode, "this-pc.example:6674", Cluster::MemberSeat::Voter),
+                      member("annex", "", Cluster::MemberSeat::Voter),
+                      member("lab", "lab.example:6674", Cluster::MemberSeat::Voter) };
+    // Voters only, in the state's order: never a learner, never this node, never a voter that has
+    // announced no endpoint yet.
+    auto const recorded = std::vector<std::string> { "office.example:6674", "lab.example:6674" };
+    CHECK(RecordedSchedulersOf(state, ThisNode) == recorded);
+    schedulers.Applied(state);
+    CHECK(schedulers.Current() == recorded);
+
+    // A state naming no voter's endpoint hands the answer back to the formation.
+    schedulers.Applied(Cluster::ClusterState {});
+    CHECK(schedulers.Current() == remembered);
+
+    // A node serving its own scheduler registers there, whatever any state records.
+    auto const solitary = FormedBy(RecordIn(Cluster::NodeMode::Solitary));
+    AppliedSchedulers own { solitary, AsConfigured };
+    own.Applied(state);
+    CHECK(own.Current() == SchedulersOf(solitary, AsConfigured));
 }
 
 TEST_CASE("A node serving its own scheduler registers at the port it serves, a handed-over one included",
@@ -275,7 +331,8 @@ TEST_CASE("A founder voter bootstraps itself and a promoted voter does not", "[n
     auto promotedRecord = RecordIn(Cluster::NodeMode::Voter);
     promotedRecord.fleet = Cluster::FleetMembership { .clusterId = "fleet-c",
                                                       .roster = Cluster::EncodeRoster(OfficeRoster()),
-                                                      .createdAtUnixSeconds = 0 };
+                                                      .createdAtUnixSeconds = 0,
+                                                      .admittedBy = Testing::TestKeyPair("office").PublicKey() };
     auto const promoted = FormedBy(promotedRecord);
     CHECK_FALSE(Unwrap(promoted.formation).foundedHere);
     auto const members = BootstrapMembersOf(promoted);
@@ -294,7 +351,8 @@ TEST_CASE("A record whose roster does not decode refuses rather than forming an 
     auto record = RecordIn(Cluster::NodeMode::Learner);
     record.fleet = Cluster::FleetMembership { .clusterId = "fleet-c",
                                               .roster = { std::byte { 0xFF }, std::byte { 0x00 } },
-                                              .createdAtUnixSeconds = 0 };
+                                              .createdAtUnixSeconds = 0,
+                                              .admittedBy = Testing::TestKeyPair("office").PublicKey() };
     auto cfg = NodeConfig {};
     auto const applied = ApplyFormation(cfg, record, {});
     REQUIRE_FALSE(applied.has_value());
@@ -521,10 +579,12 @@ TEST_CASE("A learner and a voter whose fleet records a learner pass every startu
     roster.members.push_back(Cluster::RosterMember { .id = "laptop",
                                                      .raftEndpoint = {},
                                                      .seat = Cluster::MemberSeat::Learner,
-                                                     .publicKey = Testing::TestKeyPair("laptop").PublicKey() });
+                                                     .publicKey = Testing::TestKeyPair("laptop").PublicKey(),
+                                                     .schedulerEndpoint = {} });
     voterRecord.fleet = Cluster::FleetMembership { .clusterId = "fleet-c",
                                                    .roster = Cluster::EncodeRoster(roster),
-                                                   .createdAtUnixSeconds = 0 };
+                                                   .createdAtUnixSeconds = 0,
+                                                   .admittedBy = Testing::TestKeyPair("office").PublicKey() };
     auto const voter = named(FormedBy(voterRecord));
     REQUIRE(RunsConsensus(voter));
     REQUIRE(Unwrap(voter.formation).fleetMembers.size() == 2); // office and laptop, never this node
@@ -554,4 +614,243 @@ TEST_CASE("The surface map says when no record shaped the configuration and when
     CHECK_FALSE(text.contains("not served (no formation record yet)"));
     // An unminted record names no cluster, and the flag's value is left as it was.
     CHECK(prospective.clusterId == NodeConfig {}.clusterId);
+}
+
+TEST_CASE("A record committing this node to a cluster the pin does not name refuses the start, by name",
+          "[node][formation][pin][security]")
+{
+    // What each mode commits the node to: nothing for a solitary node, the fleet it asked for a pending
+    // one, the fleet it is in for a learner, its own cluster for a founding voter.
+    auto pending = RecordIn(Cluster::NodeMode::Pending);
+    pending.joining = Cluster::JoinTarget { .summary = CompileCacheWire::FleetSummary { .clusterId = "asked-c" },
+                                            .provenKey = Testing::TestKeyPair("office").PublicKey(),
+                                            .askedAtUnixSeconds = 42 };
+    struct Row
+    {
+        std::string_view name;           ///< What the row pins.
+        Cluster::FormationRecord record; ///< The record.
+        std::string_view committed;      ///< The cluster it commits the node to; empty for none.
+        std::string_view signer;         ///< Whose key vouches for it: the proven key, a voter's, its own.
+    };
+    auto const rows = std::array {
+        Row { .name = "solitary", .record = RecordIn(Cluster::NodeMode::Solitary), .committed = {}, .signer = {} },
+        Row { .name = "pending", .record = pending, .committed = "asked-c", .signer = "office" },
+        Row {
+            .name = "learner", .record = RecordIn(Cluster::NodeMode::Learner), .committed = "fleet-c", .signer = "office" },
+        Row { .name = "founding voter",
+              .record = RecordIn(Cluster::NodeMode::Voter),
+              .committed = "own-c",
+              .signer = ThisNode },
+    };
+    auto const pinned = [](std::string_view clusterId, std::string_view voter) {
+        auto cfg = NodeConfig {};
+        cfg.nodeId = ThisNode;
+        cfg.identityPublicKey = Testing::TestKeyPair(ThisNode).PublicKey();
+        cfg.fleetPin = Cluster::PinnedFleet { .clusterId = std::string { clusterId },
+                                              .voterKeys = { Testing::TestKeyPair(std::string { voter }).PublicKey() } };
+        return cfg;
+    };
+    for (auto const& row: rows)
+    {
+        INFO(row.name);
+        CHECK(Cluster::CommittedClusterId(row.record).value_or("") == row.committed);
+
+        // Unpinned, the control: every record shapes a configuration.
+        auto unpinned = NodeConfig {};
+        unpinned.nodeId = ThisNode;
+        CHECK(ApplyFormation(unpinned, row.record, {}).has_value());
+
+        // Pinned to the cluster it commits the node to, under the key that vouches for it: shaped.
+        if (!row.committed.empty())
+        {
+            auto there = pinned(row.committed, row.signer);
+            CHECK(ApplyFormation(there, row.record, {}).has_value());
+        }
+
+        // Pinned elsewhere, and pinned to the right cluster under a key nothing in the record vouches
+        // with: both refused by name, with the remedy -- unless the record commits the node to nothing,
+        // which a pin to another cluster names where it is GOING.
+        for (auto [clusterId, voter]: { std::pair { std::string_view { "pinned-c" }, row.signer },
+                                        std::pair { row.committed, std::string_view { "n-rogue" } } })
+        {
+            INFO("pinned to " << clusterId << " under " << voter << "'s key");
+            auto refusedCfg = pinned(clusterId, voter);
+            auto const applied = ApplyFormation(refusedCfg, row.record, {});
+            if (row.committed.empty())
+            {
+                CHECK(applied.has_value());
+                continue;
+            }
+            REQUIRE_FALSE(applied.has_value());
+            CHECK(applied.error().contains(std::format("commits this node to cluster {}", row.committed)));
+            CHECK(applied.error().contains(std::format("--fleet-id pins it to {}@", clusterId)));
+            CHECK(applied.error().contains("reset its state directory"));
+            CHECK_FALSE(refusedCfg.formation.has_value()); // nothing shaped from a record the pin refuses
+        }
+    }
+}
+
+TEST_CASE("A joined record is judged by the key that signed its admission, never by the voters its roster lists",
+          "[node][formation][pin][security]")
+{
+    // An approval forged under n-rogue's key, its roster listing the pinned voter's: a roster is public
+    // keys, so it lists whichever it likes. The start is a check of its own on the answer the record
+    // came from, so it asks the key that SIGNED it.
+    auto const pinnedToOffice = [] {
+        auto cfg = NodeConfig {};
+        cfg.nodeId = ThisNode;
+        cfg.identityPublicKey = Testing::TestKeyPair(ThisNode).PublicKey();
+        cfg.fleetPin =
+            Cluster::PinnedFleet { .clusterId = "fleet-c", .voterKeys = { Testing::TestKeyPair("office").PublicKey() } };
+        return cfg;
+    };
+    auto forged = RecordIn(Cluster::NodeMode::Learner);
+    REQUIRE(forged.fleet.has_value());
+    auto fleet = Unwrap(forged.fleet);
+    auto const roster = Cluster::DecodeRoster(fleet.roster);
+    REQUIRE(roster.has_value());
+    REQUIRE(std::ranges::any_of(roster->members, [](Cluster::RosterMember const& member) {
+        return member.seat == Cluster::MemberSeat::Voter
+               && member.publicKey == std::optional { Testing::TestKeyPair("office").PublicKey() };
+    })); // the pinned voter IS in the roster: what a check of the roster would wave through
+    fleet.admittedBy = Testing::TestKeyPair("n-rogue").PublicKey();
+    forged.fleet = fleet;
+
+    auto refusedCfg = pinnedToOffice();
+    auto const refused = ApplyFormation(refusedCfg, forged, {});
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().contains("commits this node to cluster fleet-c"));
+    CHECK(refused.error().contains(
+        std::format("under key {}", FormatEd25519PublicKey(Testing::TestKeyPair("n-rogue").PublicKey()))));
+    CHECK_FALSE(refusedCfg.formation.has_value());
+
+    // The control: the same record admitted under the pinned voter's key starts.
+    auto genuine = forged;
+    fleet.admittedBy = Testing::TestKeyPair("office").PublicKey();
+    genuine.fleet = fleet;
+    auto genuineCfg = pinnedToOffice();
+    CHECK(ApplyFormation(genuineCfg, genuine, {}).has_value());
+}
+
+TEST_CASE("The surface map names the cluster this node is in and the pin, or says there is none",
+          "[node][formation][surfaces][pin]")
+{
+    auto unpinned = FormedBy(RecordIn(Cluster::NodeMode::Learner));
+    auto const text = RenderSurfaces(unpinned);
+    CHECK(text.contains("\nfleet:\n  cluster    fleet-c\n"));
+    CHECK(text.contains("  pinned to  none (--fleet-id unset: discovery is trust-on-first-use)\n"));
+
+    auto pinned = NodeConfig {};
+    pinned.nodeId = ThisNode;
+    pinned.fleetPin =
+        Cluster::PinnedFleet { .clusterId = "fleet-c", .voterKeys = { Testing::TestKeyPair("office").PublicKey() } };
+    REQUIRE(ApplyFormation(pinned, RecordIn(Cluster::NodeMode::Learner), {}).has_value());
+    CHECK(RenderSurfaces(pinned).contains(
+        std::format("  pinned to  {}\n", Cluster::FormatPinnedFleet(Unwrap(pinned.fleetPin)))));
+
+    // Before the first start has minted anything, the cluster is said to be none yet, never blank.
+    auto prospective = NodeConfig {};
+    REQUIRE(ApplyFormation(prospective, Cluster::FormationRecord {}, {}).has_value());
+    CHECK(RenderSurfaces(prospective).contains("  cluster    none minted yet\n"));
+}
+
+TEST_CASE("A node pinned to another fleet records nobody, and one pinned to its own does",
+          "[node][formation][pin][enrollment]")
+{
+    // A solitary node serves enrollment for the cluster it minted -- unless its pin names another,
+    // which it is on its way to: anybody it admitted would found a fleet its own pin then refuses.
+    auto cfg = FormedBy(RecordIn(Cluster::NodeMode::Solitary));
+    cfg.identityPublicKey = Testing::TestKeyPair(ThisNode).PublicKey();
+    REQUIRE(RunsConsensus(cfg));
+    CHECK(ServesEnrollment(cfg, true)); // unpinned, the control
+
+    auto const pinTo = [](std::string_view clusterId, std::string_view voter) {
+        return Cluster::PinnedFleet { .clusterId = std::string { clusterId },
+                                      .voterKeys = { Testing::TestKeyPair(std::string { voter }).PublicKey() } };
+    };
+    cfg.fleetPin = pinTo("own-c", ThisNode);
+    CHECK(ServesEnrollment(cfg, true));
+
+    cfg.fleetPin = pinTo("pinned-c", ThisNode);
+    CHECK_FALSE(ServesEnrollment(cfg, true));
+
+    // Its own cluster, but not under its own key: every answer it signed would be refused by the
+    // joiners that pin, so it records nobody.
+    cfg.fleetPin = pinTo("own-c", "n-office");
+    CHECK_FALSE(ServesEnrollment(cfg, true));
+}
+
+TEST_CASE("A node that records nobody knows which reason, and serves exactly when it names none",
+          "[node][formation][pin][enrollment]")
+{
+    // The reason is what a joiner pointed here is told (`EnrollmentAbsenceTable`), so each one is
+    // derived from the configuration that produces it -- and `ServesEnrollment` agrees with every row.
+    auto const solitary = [] {
+        auto cfg = FormedBy(RecordIn(Cluster::NodeMode::Solitary));
+        cfg.identityPublicKey = Testing::TestKeyPair(ThisNode).PublicKey();
+        return cfg;
+    };
+    auto const pinTo = [](std::string_view clusterId, std::string_view voter) {
+        return Cluster::PinnedFleet { .clusterId = std::string { clusterId },
+                                      .voterKeys = { Testing::TestKeyPair(std::string { voter }).PublicKey() } };
+    };
+    struct Row
+    {
+        std::string_view name;                     ///< What the row configures.
+        NodeConfig cfg;                            ///< The configuration.
+        bool schedulerRuns;                        ///< Whether a scheduler tier was built.
+        std::optional<EnrollmentAbsence> expected; ///< The reason; nothing when it serves.
+    };
+    auto unformed = NodeConfig {};
+    unformed.nodeId = ThisNode;
+    auto closed = solitary();
+    closed.raftListen.clear(); // `--listen-raft=`: consensus closed by the operator
+    closed.raftListenExplicit = true;
+    auto confined = solitary();
+    ApplyHostNames(confined, Withheld());
+    auto const learner = FormedBy(RecordIn(Cluster::NodeMode::Learner));
+    REQUIRE(RunsConsensus(learner));
+    auto pinnedElsewhere = solitary();
+    pinnedElsewhere.fleetPin = pinTo("pinned-c", ThisNode);
+    auto notItsKey = solitary();
+    notItsKey.fleetPin = pinTo("own-c", "n-office");
+    auto pinnedHere = solitary();
+    pinnedHere.fleetPin = pinTo("own-c", ThisNode);
+
+    auto const rows = std::array {
+        Row { .name = "no formation record",
+              .cfg = unformed,
+              .schedulerRuns = false,
+              .expected = EnrollmentAbsence::NoConsensus },
+        Row {
+            .name = "consensus closed", .cfg = closed, .schedulerRuns = false, .expected = EnrollmentAbsence::NoConsensus },
+        Row { .name = "a name that reaches only this machine",
+              .cfg = confined,
+              .schedulerRuns = false,
+              .expected = EnrollmentAbsence::ConfinedToThisMachine },
+        Row { .name = "a learner", .cfg = learner, .schedulerRuns = false, .expected = EnrollmentAbsence::NoScheduler },
+        Row { .name = "pinned to another cluster",
+              .cfg = pinnedElsewhere,
+              .schedulerRuns = true,
+              .expected = EnrollmentAbsence::PinnedToAnotherCluster },
+        Row { .name = "pinned to its own cluster under another key",
+              .cfg = notItsKey,
+              .schedulerRuns = true,
+              .expected = EnrollmentAbsence::NotAPinnedVoter },
+        Row { .name = "pinned to its own cluster under its own key",
+              .cfg = pinnedHere,
+              .schedulerRuns = true,
+              .expected = std::nullopt },
+        Row { .name = "unpinned", .cfg = solitary(), .schedulerRuns = true, .expected = std::nullopt },
+    };
+    for (auto const& row: rows)
+    {
+        INFO(row.name);
+        CHECK(EnrollmentAbsenceOf(row.cfg, row.schedulerRuns) == row.expected);
+        CHECK(ServesEnrollment(row.cfg, row.schedulerRuns) == !row.expected.has_value());
+    }
+    // The confined row runs its consensus alone on loopback rather than being closed: the reason is
+    // the confinement's, never `NoConsensus`.
+    CHECK(ConsensusConfinedToThisMachine(confined));
+    CHECK(RunsConsensus(confined));
 }

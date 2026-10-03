@@ -53,6 +53,13 @@ namespace
                             .publicKey = Testing::TestKeyPair("n-laptop").PublicKey() };
 }
 
+/// The key the office's admission is verified under: `n-office`'s, the member that proved its summary.
+/// @return The key.
+[[nodiscard]] Ed25519PublicKey OfficeKey()
+{
+    return Testing::TestKeyPair("n-office").PublicKey();
+}
+
 /// Write a consensus store into @p directory whose every file holds @p tag.
 /// @param directory The state directory.
 /// @param tag What each file holds, so a case can tell two stores apart.
@@ -144,8 +151,13 @@ TEST_CASE("Dissolving refuses a roster that does not name this node under its ke
     Cluster::FleetEndpointsFile endpoints { scratch.Path() };
     CapturingLogger logger;
 
-    auto const dissolved = DissolveInto(
-        Pending("c-laptop", 500, "c-office", "office:6674"), OfficeRosterWith("n-desk"), Laptop(), store, endpoints, logger);
+    auto const dissolved = DissolveInto(Pending("c-laptop", 500, "c-office", "office:6674"),
+                                        OfficeRosterWith("n-desk"),
+                                        OfficeKey(),
+                                        Laptop(),
+                                        store,
+                                        endpoints,
+                                        logger);
     REQUIRE_FALSE(dissolved.has_value());
     CHECK(dissolved.error().contains("n-laptop"));
     CHECK(store.Saves().empty());
@@ -162,6 +174,7 @@ TEST_CASE("Dissolving refuses a roster no key of the proven fleet vouches for, a
 
     auto const dissolved = DissolveInto(Pending("c-laptop", 500, "c-office", "office:6674"),
                                         Testing::RosterWith("n-evil", "n-laptop"),
+                                        OfficeKey(),
                                         Laptop(),
                                         store,
                                         endpoints,
@@ -180,6 +193,7 @@ TEST_CASE("Dissolving refuses a fleet whose id could not name the archive of its
 
     auto const dissolved = DissolveInto(Pending("c-laptop", 500, "../office", "office:6674"),
                                         OfficeRosterWith("n-laptop"),
+                                        OfficeKey(),
                                         Laptop(),
                                         store,
                                         endpoints,
@@ -199,6 +213,7 @@ TEST_CASE("Dissolving records the learner with its old store still to move, and 
 
     auto const dissolved = DissolveInto(Pending("c-laptop", 500, "c-office", "office:6674"),
                                         OfficeRosterWith("n-laptop"),
+                                        OfficeKey(),
                                         Laptop(),
                                         store,
                                         endpoints,
@@ -207,6 +222,10 @@ TEST_CASE("Dissolving records the learner with its old store still to move, and 
     CHECK(Unwrap(dissolved).mode == NodeMode::Learner);
     CHECK_FALSE(Unwrap(dissolved).joining.has_value());
     CHECK(Unwrap(dissolved).archivePending == std::optional<std::string> { "c-laptop" }); // for the next start
+    // The key that SIGNED the admission, which the pin judges at every later start -- not a voter the
+    // roster lists.
+    REQUIRE(Unwrap(dissolved).fleet.has_value());
+    CHECK(Unwrap(Unwrap(dissolved).fleet).admittedBy == OfficeKey());
 
     REQUIRE(store.Saves().size() == 1);
     CHECK(store.Saves()[0] == Unwrap(dissolved));
@@ -216,6 +235,53 @@ TEST_CASE("Dissolving records the learner with its old store still to move, and 
     CHECK(loaded.endpoints.clusterId == "c-office");
     // The leader's node endpoint as the fleet stated it; the learner being admitted is no voter.
     CHECK(Cluster::RememberedSeeds(loaded.endpoints) == std::vector<std::string> { "office:6674" });
+}
+
+TEST_CASE("An approval remembers each voter where the cluster recorded its 0xFC endpoint, and guesses only for none",
+          "[node][formation][archive][endpoint]")
+{
+    // A fleet serving another port -- the packaged socket unit's 6676 -- is reachable at the endpoint
+    // each member RECORDED, which the roster an approval hands over carries; the consensus host on
+    // the default node port is a guess, left for a voter whose record states none.
+    auto const voter = [](std::string id, std::string recorded) {
+        auto host = id.substr(2);
+        return Cluster::RosterMember { .id = std::move(id),
+                                       .raftEndpoint = host + ":6680",
+                                       .seat = Cluster::MemberSeat::Voter,
+                                       .publicKey = Testing::TestKeyPair("n-" + host).PublicKey(),
+                                       .schedulerEndpoint = std::move(recorded) };
+    };
+    auto roster = Cluster::Roster {
+        .members = { voter("n-desk", "desk.corp.example:6676"),
+                     voter("n-lab", ""),
+                     Cluster::RosterMember { .id = "n-laptop",
+                                             .raftEndpoint = "",
+                                             .seat = Cluster::MemberSeat::Learner,
+                                             .publicKey = Testing::TestKeyPair("n-laptop").PublicKey(),
+                                             .schedulerEndpoint = "laptop:6674" },
+                     voter("n-office", "office.corp.example:6676") },
+        .principals = {},
+        .revoked = {},
+    };
+    Testing::InMemoryFormationStore store;
+    ScratchDirectory const scratch { "dissolve-recorded" };
+    Cluster::FleetEndpointsFile endpoints { scratch.Path() };
+    CapturingLogger logger;
+    REQUIRE(DissolveInto(Pending("c-laptop", 500, "c-office", "office:6674"),
+                         Cluster::EncodeRoster(roster),
+                         OfficeKey(),
+                         Laptop(),
+                         store,
+                         endpoints,
+                         logger)
+                .has_value());
+
+    auto loaded = Cluster::FleetEndpointsFile { scratch.Path() }.Load();
+    REQUIRE(loaded.outcome == Cluster::FleetEndpointsLoad::Loaded);
+    // Roster order: the recorded endpoints as recorded -- the leader's record over its summary's word
+    // -- and the guess only for the voter that recorded none.
+    CHECK(Cluster::RememberedSeeds(loaded.endpoints)
+          == std::vector<std::string> { "desk.corp.example:6676", "lab:6674", "office.corp.example:6676" });
 }
 
 TEST_CASE("A cluster left twice keeps both of its stores, each in an archive of its own", "[node][formation][archive]")
@@ -249,7 +315,8 @@ TEST_CASE("A cluster left twice keeps both of its stores, each in an archive of 
     rejoining.joining = Cluster::JoinTarget { .summary = Testing::OfficeSummary("c-office", "office:6674"),
                                               .provenKey = Testing::TestKeyPair("n-office").PublicKey(),
                                               .askedAtUnixSeconds = 42 };
-    auto const rejoined = finish(DissolveInto(rejoining, OfficeRosterWith("n-laptop"), Laptop(), store, endpoints, logger));
+    auto const rejoined =
+        finish(DissolveInto(rejoining, OfficeRosterWith("n-laptop"), OfficeKey(), Laptop(), store, endpoints, logger));
 
     WriteStore(scratch.Path(), "office-second");
     (void) finish(ArchiveAndMint(rejoined, store, random, wall));
@@ -364,6 +431,7 @@ TEST_CASE("A store its tier is still writing is moved only at the next start, wi
 
     auto const dissolved = DissolveInto(Pending("c-laptop", 500, "c-office", "office:6674"),
                                         OfficeRosterWith("n-laptop"),
+                                        OfficeKey(),
                                         Laptop(),
                                         store,
                                         endpoints,

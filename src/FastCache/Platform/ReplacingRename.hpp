@@ -75,6 +75,12 @@ struct ReplacedBy
 {
     ReplaceRoute route { ReplaceRoute::PosixSemantics }; ///< How the file moved into place.
     std::error_code posixRefusal;                        ///< What refused the POSIX rename; empty unless `Classic`.
+
+    /// What refused the directory sync after the rename, on a filesystem that cannot sync a directory
+    /// at all (`Consensus::MeansDirectorySyncUnsupported`): the replace landed and is reported, and its
+    /// survival of a power loss is as good as that filesystem makes it. Empty when the directory was
+    /// synced -- every other refusal of the sync fails the replace instead.
+    std::error_code directoryUnsynced;
 };
 
 /// Move @p from over @p to: through @p rename, and through the classic rename when the refusal says

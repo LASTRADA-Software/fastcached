@@ -3773,15 +3773,19 @@ jobs:
           # The firewall scope is REMEMBERED: every transaction re-registers the node, so a repair
           # that states no scope must register the one an earlier transaction stated, never open the
           # rules to any address. Scoped in a repair, then repaired with no property at all.
-          # The fleet seed rides the same repair, and is the node registration's own argument.
-          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'scope-node.log' -What 'a repair stating a scope and a seed' `
-            -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus', 'FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8', 'FASTCACHE_FLEET_SEED=seed.example.invalid'
+          # The fleet seed and the fleet pin ride the same repair, each the node registration's own
+          # argument -- the pin VERBATIM, since it is security material nothing re-spells.
+          $pin = '0123456789abcdef0123456789abcdef@11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo'
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'scope-node.log' -What 'a repair stating a scope, a seed and a pin' `
+            -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus', 'FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8', 'FASTCACHE_FLEET_SEED=seed.example.invalid', "FASTCACHE_FLEET_ID=$pin"
           Assert-NodeFirewallScope -Scope '10.0.0.0/8'
           Assert-NodeRegistrationArgument -Argument '--fleet-seed=seed.example.invalid:6674'
-          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'repair-scope.log' -What 'a repair stating neither' `
+          Assert-NodeRegistrationArgument -Argument "--fleet-id=$pin"
+          Invoke-Msiexec -Operation '/i' -Package $msi -Log 'repair-scope.log' -What 'a repair stating none of them' `
             -Properties 'REINSTALL=ALL', 'REINSTALLMODE=vomus'
           Assert-NodeFirewallScope -Scope '10.0.0.0/8'
           Assert-NodeRegistrationArgument -Argument '--fleet-seed=seed.example.invalid:6674'
+          Assert-NodeRegistrationArgument -Argument "--fleet-id=$pin"
 
           Invoke-Msiexec -Operation '/i' -Package $msi -Log 'remove-node.log' -Properties 'REMOVE=CM_C_Node' `
             -What 'removing the node feature'

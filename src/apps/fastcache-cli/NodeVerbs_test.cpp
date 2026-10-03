@@ -6,6 +6,7 @@
 #include "StatsGatherer.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/FleetPin.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
 #include <FastCache/Distributed/MembershipWire.hpp>
@@ -997,8 +998,8 @@ namespace
 TEST_CASE("cluster-members reports who the cluster agreed on, and an unled member as ABSENT", "[cli][node][cluster]")
 {
     // The two states a `schedulerEndpoint` has, side by side in one reply. A member that
-    // has never led carries none -- a leader announces its own record on election -- so
-    // the empty string is the ORDINARY case and rendering it as a value would hand an
+    // has announced none carries none -- a bootstrap peer before its first announcement --
+    // so the empty string is a state of its own and rendering it as a value would hand an
     // operator an address to paste that reaches nothing. Built through `Apply`, which is how a
     // leader acquires the state this reply carries: a member literal with an endpoint and no
     // announcement recorded is a state `DecodeState` refuses, because `Apply` never makes it.
@@ -2944,4 +2945,72 @@ TEST_CASE("`node` reports the identity key whole, and absent on a node that hold
     auto const none = RunNodeVerb("node", keyless);
     CHECK(none.outcome == Outcome::Affirmative);
     CHECK(RequiredCell(none, "public-key").kind == CellKind::Absent);
+}
+
+TEST_CASE("`node` reports the fleet id to paste and the pin it trusts by, `none` when unpinned", "[cli][node][verbs][pin]")
+{
+    // `fleet-id` is what another machine's --fleet-id takes, verbatim; `none` under the pin is the
+    // answer an operator asks for: this node trusts on first use.
+    auto voter = Ed25519PublicKey {};
+    voter.fill(std::byte { 0x51 });
+    auto const pasteText = Cluster::FormatPinnedFleet(
+        Cluster::PinnedFleet { .clusterId = "0123456789abcdef0123456789abcdef", .voterKeys = { voter } });
+    auto const Paste = std::string_view { pasteText };
+    for (auto const& [pin, shown]:
+         { std::pair { CacheWire::NodeFleetPinFields {}, std::string_view { "none" } },
+           std::pair { CacheWire::NodeFleetPinFields { .fleet = "fedcba9876543210fedcba9876543210@another-voter-key" },
+                       std::string_view { "fedcba9876543210fedcba9876543210@another-voter-key" } } })
+    {
+        INFO("pin: " << shown);
+        ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                    .nodeId = "node-a",
+                                                    .uptimeSeconds = 5,
+                                                    .surfaces = {},
+                                                    .components = CacheWire::NodeComponentBit::Consensus,
+                                                    .runtime = { .fleetId = std::string { Paste }, .fleetPin = pin } }) } };
+        auto const answer = RunNodeVerb("node", node);
+        CHECK(RequiredCell(answer, "fleet-id").lexical == Paste);
+        CHECK(RequiredCell(answer, "fleet-pin").lexical == shown);
+    }
+
+    // A node too old to say has neither cell, rather than a pin of `none` it never stated.
+    ScriptedNodeExchange old { { StatusReply({ .version = "1.2.3",
+                                               .nodeId = "node-a",
+                                               .uptimeSeconds = 5,
+                                               .surfaces = {},
+                                               .components = CacheWire::NodeComponentBit::Consensus,
+                                               .runtime = {} }) } };
+    auto const answer = RunNodeVerb("node", old);
+    CHECK(answer.outcome == Outcome::Affirmative);
+    CHECK(CellOf(answer, "fleet-id") == nullptr);
+    CHECK(CellOf(answer, "fleet-pin") == nullptr);
+}
+
+TEST_CASE("`node` says a fleet id --fleet-id would refuse is not one to paste, rather than printing it bare",
+          "[cli][node][verbs][pin]")
+{
+    // A fleet with more voters than a pin may name: the string the node builds names every one, and the
+    // parser refuses it. Printed bare it reads as a pin to paste, which every machine then refuses.
+    auto fleet = Cluster::PinnedFleet { .clusterId = "0123456789abcdef0123456789abcdef", .voterKeys = {} };
+    for (auto const index: std::views::iota(std::size_t { 0 }, Cluster::MaxPinnedVoterKeys + 1))
+    {
+        auto key = Ed25519PublicKey {};
+        key.fill(static_cast<std::byte>(index + 1));
+        fleet.voterKeys.push_back(key);
+    }
+    auto const tooMany = Cluster::FormatPinnedFleet(fleet);
+    REQUIRE_FALSE(Cluster::ParsePinnedFleet(tooMany).has_value());
+    ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                .nodeId = "node-a",
+                                                .uptimeSeconds = 5,
+                                                .surfaces = {},
+                                                .components = CacheWire::NodeComponentBit::Consensus,
+                                                .runtime = { .fleetId = tooMany } }) } };
+    auto const answer = RunNodeVerb("node", node);
+    auto const cell = RequiredCell(answer, "fleet-id").lexical;
+    CHECK(cell != tooMany);
+    CHECK(cell.starts_with(tooMany)); // the keys are still there to choose a pin from
+    CHECK(cell.contains("--fleet-id refuses this as it stands"));
+    CHECK(cell.contains(std::format("more than {} voter keys", Cluster::MaxPinnedVoterKeys)));
+    CHECK(cell.contains("name at most"));
 }

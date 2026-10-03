@@ -21,6 +21,11 @@
 #      with "1". Those properties are written 0 and then 1, so a bare truth test
 #      reads "0" as true.
 #
+# The After= rows also pin that the remembered values are written BEFORE either
+# registration: a write that fails then rolls the transaction back before a service
+# is registered, where after them it left the services registered, and started,
+# over files the rollback removed.
+#
 # What it does NOT see: whether Windows Installer evaluates a condition the way it
 # reads, and anything about sequencing beyond the After= values pinned below. The
 # `Package (Windows .msi)` job is the only thing that runs the package. This fails
@@ -75,7 +80,7 @@ set(_table [=[
 <Custom Action="FastCachedDeleteLeftover"|/>|!~><
 <Custom Action="FastCachedDeleteLeftover"|/>|After="FastCacheNodeDeleteLeftover"
 
-<CustomAction Id="FastCacheNodeInstallService"|/>|--service-start=auto [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedArgument]"
+<CustomAction Id="FastCacheNodeInstallService"|/>|--service-start=auto [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedArgument] [FastCacheFleetIdArgument]"
 <CustomAction Id="FastCacheNodeInstallService"|/>|!--discovery-reply-port=
 <CustomAction Id="FastCacheNodeInstallService"|/>|!--scheduler
 <CustomAction Id="FastCachedInstallService"|/>|!DiscoveryReply
@@ -86,10 +91,12 @@ set(_table [=[
 <CustomAction Id="FastCacheNodeInstallService"|/>|!--cluster-dir
 <CustomAction Id="FastCacheNodeInstallService"|/>|!--advertise=
 <CustomAction Id="FastCacheNodeInstallService"|/>|!--fleet-seed=
+<CustomAction Id="FastCacheNodeInstallService"|/>|!--fleet-id=
 <Custom Action="FastCacheNodeInstallService"|/>|Condition="FASTCACHE_NODE_SELECTED = "1""
 <Custom Action="FastCacheNodeInstallService"|/>|!FASTCACHE_NODE_SCHEDULER
 <Custom Action="FastCacheNodeInstallService"|/>|!FASTCACHE_NODE_ADVERTISE
 <Custom Action="FastCacheNodeInstallService"|/>|!FASTCACHE_FLEET_SEED
+<Custom Action="FastCacheNodeInstallService"|/>|!FASTCACHE_FLEET_ID
 <SetProperty Action="SetFastCacheNodeAdvertiseArgument"|/>|Id="FastCacheNodeAdvertiseArgument"
 <SetProperty Action="SetFastCacheNodeAdvertiseArgument"|/>|Value="--advertise=[FASTCACHE_NODE_ADVERTISE]"
 <SetProperty Action="SetFastCacheNodeAdvertiseArgument"|/>|Condition="FASTCACHE_NODE_ADVERTISE"
@@ -106,6 +113,10 @@ set(_table [=[
 <SetProperty Action="SetFastCacheFleetSeedArgument"|/>|Value="--fleet-seed=[FASTCACHE_FLEET_SEED]"
 <SetProperty Action="SetFastCacheFleetSeedArgument"|/>|Condition="FASTCACHE_FLEET_SEED"
 <SetProperty Action="SetFastCacheFleetSeedArgument"|/>|After="SetFastCacheNodeDiscoveryReplyArgument"
+<SetProperty Action="SetFastCacheFleetIdArgument"|/>|Id="FastCacheFleetIdArgument"
+<SetProperty Action="SetFastCacheFleetIdArgument"|/>|Value="--fleet-id=[FASTCACHE_FLEET_ID]"
+<SetProperty Action="SetFastCacheFleetIdArgument"|/>|Condition="FASTCACHE_FLEET_ID"
+<SetProperty Action="SetFastCacheFleetIdArgument"|/>|After="SetFastCacheFleetSeedArgument"
 
 <Property Id="FASTCACHE_FIREWALL_ALLOW"|</Property>|Key="SOFTWARE\fastcached\Installer"
 <Property Id="FASTCACHE_FIREWALL_ALLOW"|</Property>|Name="FirewallAllow"
@@ -116,6 +127,9 @@ set(_table [=[
 <Property Id="FASTCACHE_FLEET_SEED"|</Property>|Key="SOFTWARE\fastcached\Installer"
 <Property Id="FASTCACHE_FLEET_SEED"|</Property>|Name="FleetSeed"
 <Property Id="FASTCACHE_FLEET_SEED"|</Property>|Root="HKLM"
+<Property Id="FASTCACHE_FLEET_ID"|</Property>|Key="SOFTWARE\fastcached\Installer"
+<Property Id="FASTCACHE_FLEET_ID"|</Property>|Name="FleetId"
+<Property Id="FASTCACHE_FLEET_ID"|</Property>|Root="HKLM"
 <SetProperty Action="SaveTypedFastCacheFirewallAllow"|/>|Value="[FASTCACHE_FIREWALL_ALLOW]"
 <SetProperty Action="SaveTypedFastCacheFirewallAllow"|/>|Before="AppSearch" Sequence="both"
 <SetProperty Action="SaveTypedFastCacheFirewallAllow"|/>|Condition="FASTCACHE_FIREWALL_ALLOW"
@@ -134,6 +148,12 @@ set(_table [=[
 <SetProperty Action="RestoreTypedFastCacheFleetSeed"|/>|Id="FASTCACHE_FLEET_SEED"
 <SetProperty Action="RestoreTypedFastCacheFleetSeed"|/>|After="AppSearch" Sequence="both"
 <SetProperty Action="RestoreTypedFastCacheFleetSeed"|/>|Condition="FastCacheFleetSeedTyped"
+<SetProperty Action="SaveTypedFastCacheFleetId"|/>|Value="[FASTCACHE_FLEET_ID]"
+<SetProperty Action="SaveTypedFastCacheFleetId"|/>|Before="AppSearch" Sequence="both"
+<SetProperty Action="SaveTypedFastCacheFleetId"|/>|Condition="FASTCACHE_FLEET_ID"
+<SetProperty Action="RestoreTypedFastCacheFleetId"|/>|Id="FASTCACHE_FLEET_ID"
+<SetProperty Action="RestoreTypedFastCacheFleetId"|/>|After="AppSearch" Sequence="both"
+<SetProperty Action="RestoreTypedFastCacheFleetId"|/>|Condition="FastCacheFleetIdTyped"
 <Component Id="FastCacheRememberedProperties"|</Component>|Guid="87BB5EEE-8B9E-4401-9367-C86DB5061258"
 <Component Id="FastCacheRememberedProperties"|</Component>|Action="removeOnUninstall"
 <ComponentRef Id="FastCacheRememberedProperties"|/>|ComponentRef
@@ -149,10 +169,19 @@ set(_table [=[
 <CustomAction Id="FastCacheRememberFleetSeed"|/>|Execute="deferred"
 <CustomAction Id="FastCacheRememberFleetSeed"|/>|Impersonate="no"
 <CustomAction Id="FastCacheRememberFleetSeed"|/>|Return="check"
+<CustomAction Id="FastCacheRememberFleetId"|/>|reg.exe" add HKLM\SOFTWARE\fastcached\Installer /v FleetId /t REG_SZ /d "[FASTCACHE_FLEET_ID]" /f /reg:64"
+<CustomAction Id="FastCacheRememberFleetId"|/>|Execute="deferred"
+<CustomAction Id="FastCacheRememberFleetId"|/>|Impersonate="no"
+<CustomAction Id="FastCacheRememberFleetId"|/>|Return="check"
 <Custom Action="FastCacheRememberFirewallAllow"|/>|Condition="FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1""
 <Custom Action="FastCacheRememberNodeAdvertise"|/>|Condition="FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1""
 <Custom Action="FastCacheRememberFleetSeed"|/>|Condition="FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1""
 <Custom Action="FastCacheRememberFleetSeed"|/>|After="FastCacheRememberNodeAdvertise"
+<Custom Action="FastCacheRememberFleetId"|/>|Condition="FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCacheRememberFleetId"|/>|After="FastCacheRememberFleetSeed"
+<Custom Action="FastCacheRememberFirewallAllow"|/>|After="FastCacheNodeSeedConfig"
+<Custom Action="FastCacheRememberNodeAdvertise"|/>|After="FastCacheRememberFirewallAllow"
+<Custom Action="FastCachedInstallService"|/>|After="FastCacheRememberFleetId"
 
 <SetProperty Action="SetFastCacheOwnImagePathPrefix"|/>|Value=""[INSTALL_ROOT]"
 <SetProperty Action="SetFastCacheOwnImagePathPrefix"|/>|After="CostFinalize"

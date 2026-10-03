@@ -39,18 +39,24 @@ namespace FastCache::Node
 {
 
 /// Probe how the state files in @p directory are replaced, and say so when the replace FALLS BACK:
-/// a Warn naming the directory and the refusal, and `StateFileReplacesFellBack`.
+/// a Warn naming the directory and the refusal, and `StateFileReplacesFellBack`. And when its
+/// filesystem cannot sync a directory at all (`Consensus::MeansDirectorySyncUnsupported`): a Warn
+/// naming the directory and the answer, and `StateDirectorySyncsUnsupported` -- every replace there
+/// lands DEGRADED rather than refused.
 ///
 /// A fallback is the classic rename, which every replace still lands with -- but on Windows a reader
 /// holding the file open then refuses it, which is the failure the POSIX-semantics rename exists to
 /// close. `MeansNoPosixRename` is broad enough to take a path form the rename refuses for a
 /// filesystem that has it, so the degraded property is said where it is found, once per body.
 /// @param directory The node's state directory.
+/// @param files How every replace there creates, syncs and closes its temporary and syncs the
+///        directory: this machine's (`Consensus::SystemDurableFiles`) in production.
 /// @param rename The POSIX-semantics rename every replace tries first.
 /// @param logger Where a fallback, or a probe that could not run, is said.
-/// @param metrics Where a fallback is counted.
+/// @param metrics Where a fallback, or a directory that cannot be synced, is counted.
 /// @return The route, or nothing when the probe could not be written.
 std::optional<Platform::ReplaceRoute> ReportReplaceRoute(std::filesystem::path const& directory,
+                                                         Consensus::IDurableFiles& files,
                                                          Platform::IReplacingRename const& rename,
                                                          ILogger& logger,
                                                          IMetricsSink& metrics);

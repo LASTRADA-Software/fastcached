@@ -2033,15 +2033,19 @@ TEST_CASE("An enroll request round-trips, and a payload of the wrong arity is re
     key.fill(std::byte { 0x42 });
     auto nonce = std::array<std::byte, NodeChallengeBytes> {};
     nonce.fill(std::byte { 0x77 });
+    auto signature = std::array<std::byte, NodeSignatureBytes> {};
+    signature.fill(std::byte { 0x5C });
     auto const frame = EncodeEnroll(EnrollRequest { .nodeId = "joiner-a",
                                                     .nodeEndpoint = "10.0.0.9:6674",
                                                     .role = EnrollRole::Worker,
                                                     .publicKey = key,
-                                                    .nonce = nonce });
+                                                    .nonce = nonce,
+                                                    .challenge = {},
+                                                    .signature = signature });
     auto const header = DecodeRequestHeader(frame);
     REQUIRE(header.has_value());
     CHECK(Unwrap(header).opRaw == static_cast<std::uint8_t>(Op::Enroll));
-    CHECK(OpFieldCount(Op::Enroll) == 5);
+    CHECK(OpFieldCount(Op::Enroll) == 7);
 
     auto const fields = DecodeEnrollPayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
     REQUIRE(fields.has_value());
@@ -2050,37 +2054,71 @@ TEST_CASE("An enroll request round-trips, and a payload of the wrong arity is re
     CHECK(Unwrap(fields).role == EnrollRole::Worker);
     CHECK(Unwrap(fields).publicKey == key);
     CHECK(Unwrap(fields).nonce == nonce);
+    CHECK_FALSE(Unwrap(fields).challenge.has_value()); // a first ask answers none
+    CHECK(Unwrap(fields).signature == signature);
+
+    // And the leader's challenge, when a request answers one, travels whole.
+    auto answered = EnrollChallenge {};
+    answered.fill(std::byte { 0x2B });
+    auto const refresh = EncodeEnroll(EnrollRequest { .nodeId = "joiner-a",
+                                                      .nodeEndpoint = "10.0.0.9:6674",
+                                                      .role = EnrollRole::Learner,
+                                                      .publicKey = key,
+                                                      .nonce = nonce,
+                                                      .challenge = answered,
+                                                      .signature = signature });
+    auto const refreshed = DecodeEnrollPayload(std::span<std::byte const> { refresh }.subspan(RequestHeaderSize));
+    REQUIRE(refreshed.has_value());
+    CHECK(Unwrap(refreshed).challenge == answered);
 
     // The role's BYTES, since they travel: a symbol both ends spell tests only the name.
     CHECK(static_cast<std::uint8_t>(EnrollRole::Worker) == 0x02);
     CHECK(static_cast<std::uint8_t>(EnrollRole::Learner) == 0x03);
 
-    // Two fields where five are declared -- a version-11 request's shape -- refused on the
+    // Two fields where seven are declared -- a version-11 request's shape -- refused on the
     // count alone, which is what keeps a peer speaking a shape this build does not know
     // from being read as a short one. So is the four-field request of the grammar before the
-    // nonce: a request an admission cannot be signed over.
+    // nonce, a request an admission cannot be signed over, the five-field one before the
+    // joiner's signature, a request whose endpoint is anybody's word -- and the six-field one
+    // before the leader's challenge, a request a recording can replay.
     auto const id = AsBytes(std::string_view { "joiner-a" });
     auto const endpoint = AsBytes(std::string_view { "10.0.0.9:6674" });
     auto const learner = std::array { static_cast<std::byte>(EnrollRole::Learner) };
     CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint })).has_value());
     CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key })).has_value());
+    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key, nonce })).has_value());
+    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key, nonce, signature })).has_value());
 
-    // A role this build cannot name, and a key or a nonce that is not 32 bytes, are refused rather
-    // than defaulted: a joiner recorded under a key it did not send is admitted under a key nobody
-    // holds, a role guessed is a machine admitted as something it did not ask to be, and a nonce cut
-    // short is one both ends would sign and verify over different bytes.
+    // A role this build cannot name, a key or a nonce that is not 32 bytes, a challenge that is
+    // neither absent nor 32 bytes and a signature that is not 64 are refused rather than defaulted:
+    // a joiner recorded under a key it did not send is admitted under a key nobody holds, a role
+    // guessed is a machine admitted as something it did not ask to be, a nonce or a challenge cut
+    // short is one both ends would sign and verify over different bytes, and a prefix of a
+    // signature verifies nothing.
+    auto const none = std::span<std::byte const> {};
     auto const unknownRole = std::array { std::byte { 0x7F } };
     auto const shortKey = std::span<std::byte const> { key }.first(IdentityPublicKeyBytes - 1);
     auto const shortNonce = std::span<std::byte const> { nonce }.first(NodeChallengeBytes - 1);
-    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, unknownRole, key, nonce })).has_value());
-    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, shortKey, nonce })).has_value());
-    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key, shortNonce })).has_value());
-    CHECK(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key, nonce })).has_value());
+    auto const shortChallenge = std::span<std::byte const> { answered }.first(NodeChallengeBytes - 1);
+    auto const shortSignature = std::span<std::byte const> { signature }.first(NodeSignatureBytes - 1);
+    CHECK_FALSE(
+        DecodeEnrollPayload(WireFields::Encode({ id, endpoint, unknownRole, key, nonce, none, signature })).has_value());
+    CHECK_FALSE(
+        DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, shortKey, nonce, none, signature })).has_value());
+    CHECK_FALSE(
+        DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key, shortNonce, none, signature })).has_value());
+    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key, nonce, shortChallenge, signature }))
+                    .has_value());
+    CHECK_FALSE(
+        DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key, nonce, none, shortSignature })).has_value());
+    CHECK(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key, nonce, none, signature })).has_value());
+    CHECK(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, learner, key, nonce, answered, signature })).has_value());
 
     // The RETIRED role byte is refused like any unknown one, never read as its successor: 0x01
     // was `Member`, and a joiner still sending it asks for a seat this build no longer grants.
     auto const retiredMember = std::array { std::byte { 0x01 } };
-    CHECK_FALSE(DecodeEnrollPayload(WireFields::Encode({ id, endpoint, retiredMember, key, nonce })).has_value());
+    CHECK_FALSE(
+        DecodeEnrollPayload(WireFields::Encode({ id, endpoint, retiredMember, key, nonce, none, signature })).has_value());
 }
 
 TEST_CASE("A pending enroll reply carries a zero-length roster field rather than an absent one", "[wire][enrollment]")
@@ -2565,11 +2603,14 @@ TEST_CASE("An enroll request carries the joiner's node endpoint as its second fi
     auto key = std::array<std::byte, IdentityPublicKeyBytes> {};
     key.fill(std::byte { 0x42 });
     auto const nonce = std::array<std::byte, NodeChallengeBytes> {};
+    auto const signature = std::array<std::byte, NodeSignatureBytes> {};
     auto const frame = EncodeEnroll(EnrollRequest { .nodeId = "laptop",
                                                     .nodeEndpoint = "laptop.corp.example:6674",
                                                     .role = EnrollRole::Learner,
                                                     .publicKey = key,
-                                                    .nonce = nonce });
+                                                    .nonce = nonce,
+                                                    .challenge = {},
+                                                    .signature = signature });
     auto const view = DecodeEnrollPayload(std::span { frame }.subspan(RequestHeaderSize));
     REQUIRE(view.has_value());
     CHECK(AsStringView(Unwrap(view).nodeEndpoint) == "laptop.corp.example:6674");
@@ -3652,7 +3693,7 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
                                                           .remedy = "name one" } };
     sent.identityPublicKey.emplace();
     sent.identityPublicKey->fill(std::byte { 0xA5 });
-    sent.roster = NodeRosterFields { .version = 9, .voters = 3, .principals = 4, .revoked = 1, .certifiedUntilMillis = 42 };
+    sent.roster = NodeRosterFields { .version = 9, .voters = 3, .revoked = 1 };
     sent.enrollment = WireEnrollmentState::AutoApprove;
     sent.enrollmentAutoApproveSecondsLeft = 600;
     sent.stateDirectory = "/var/lib/fastcache-node";
@@ -3662,18 +3703,20 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
                                                  .endpoint = "10.0.0.9:6674",
                                                  .state = WireSharedCacheState::Proven,
                                                  .detail = {} };
+    sent.fleetId = "0123456789abcdef0123456789abcdef@a-voter-key";
+    sent.fleetPin = NodeFleetPinFields { .fleet = "fedcba9876543210fedcba9876543210@another-voter-key" };
     // Kept in a local: `SplitAll` hands back spans INTO it.
     auto const emitted = EncodeNodeRuntime(sent);
     auto const parts = WireFields::SplitAll(emitted);
     REQUIRE(parts.has_value());
-    // Twenty-two: thirteen that predate #1328, the endpoint it added, #1449's consensus standing,
-    // #1364's condition list, #178's identity key, the roster #178 certifies, the auto-approve
-    // seconds left, the state directory with the reason it is that one, and the shared-cache
-    // record. Pinned, since every cut below is counted from it and a record that grew
-    // or shrank would move what "older" means -- which is how this case caught each append, and
-    // the retirement of #1471's applied-tombstone count, rather than letting any of them shift
-    // the cuts silently.
-    REQUIRE(Unwrap(parts).size() == 22);
+    // Twenty-four: thirteen that predate #1328, the endpoint it added, #1449's consensus standing,
+    // #1364's condition list, #178's identity key, the roster #178 reports, the auto-approve seconds
+    // left, the state directory with the reason it is that one, the shared-cache record, and the
+    // cluster id with the fleet pin. Pinned, since every cut below is counted from it and a record
+    // that grew or shrank would move what "older" means -- which is how this case caught each
+    // append, and the retirement of #1471's applied-tombstone count, rather than letting any of them
+    // shift the cuts silently.
+    REQUIRE(Unwrap(parts).size() == 24);
 
     SECTION("a record cut after field 13: the endpoint is absent, and the cordon still read")
     {
@@ -3786,7 +3829,20 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(Unwrap(back).stateDirectory == sent.stateDirectory);
     }
 
-    SECTION("the whole record, twenty-two fields: every fact engaged")
+    SECTION("twenty-two fields, as a build after the shared-cache record and before the fleet pin emits: the "
+            "fleet id and the pin are absent")
+    {
+        // ABSENT, never "unpinned": a node too old to say must not read as one trusting on first
+        // use, which is the answer an operator asks the pin for.
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 22 };
+        auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
+        REQUIRE(back.has_value());
+        CHECK_FALSE(Unwrap(back).fleetId.has_value());
+        CHECK_FALSE(Unwrap(back).fleetPin.has_value());
+        CHECK(Unwrap(back).stateDirectoryReason == sent.stateDirectoryReason);
+    }
+
+    SECTION("the whole record, twenty-four fields: every fact engaged")
     {
         auto const current = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { current }));
@@ -3801,9 +3857,11 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(runtime.stateDirectory == sent.stateDirectory);
         CHECK(runtime.stateDirectoryReason == sent.stateDirectoryReason);
         CHECK(runtime.sharedCache == sent.sharedCache);
+        CHECK(runtime.fleetId == sent.fleetId);
+        CHECK(runtime.fleetPin == sent.fleetPin);
     }
 
-    SECTION("twenty-three fields, one past the record: the surplus is skipped")
+    SECTION("twenty-five fields, one past the record: the surplus is skipped")
     {
         auto ahead = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const extra = AsBytes(std::string_view { "a fact from the future" });
@@ -3819,6 +3877,52 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(runtime.stateDirectory == sent.stateDirectory);
         CHECK(runtime.stateDirectoryReason == sent.stateDirectoryReason);
         CHECK(runtime.sharedCache == sent.sharedCache);
+        CHECK(runtime.fleetPin == sent.fleetPin);
+    }
+}
+
+TEST_CASE("A fleet pin travels as three answers: pinned to an id, pinned to nothing, and not said",
+          "[wire][node-status][pin]")
+{
+    // The bytes, not only the names: the tag is transmitted.
+    CHECK(static_cast<std::uint8_t>(WireFleetPinTag::Unpinned) == 0x00);
+    CHECK(static_cast<std::uint8_t>(WireFleetPinTag::Pinned) == 0x01);
+
+    // Unpinned is an ANSWER and must come back engaged: it is what an operator asks the pin for.
+    for (auto const& pin:
+         { NodeFleetPinFields {}, NodeFleetPinFields { .fleet = "0123456789abcdef0123456789abcdef@a-voter-key" } })
+    {
+        INFO("pinned to " << pin.fleet.value_or("nothing"));
+        NodeRuntimeFields sent {};
+        sent.fleetPin = pin;
+        auto const back = DecodeNodeRuntime(EncodeNodeRuntime(sent));
+        REQUIRE(back.has_value());
+        CHECK(Unwrap(back).fleetPin == std::optional { pin });
+    }
+    auto const silent = DecodeNodeRuntime(EncodeNodeRuntime(NodeRuntimeFields {}));
+    REQUIRE(silent.has_value());
+    CHECK_FALSE(Unwrap(silent).fleetPin.has_value());
+
+    // A pin record this build cannot read refuses the record rather than reading as half an answer:
+    // an unknown tag, an id beside "unpinned", no id beside "pinned", a tag of the wrong width.
+    auto const id = AsBytes(std::string_view { "0123" });
+    auto const unpinned = std::array { std::byte { 0x00 } };
+    auto const pinned = std::array { std::byte { 0x01 } };
+    auto const unknown = std::array { std::byte { 0x02 } };
+    auto const wide = std::array { std::byte { 0x01 }, std::byte { 0x00 } };
+    auto const malformed = std::array {
+        WireFields::Encode({ std::span<std::byte const> { unknown }, std::span<std::byte const> {} }),
+        WireFields::Encode({ std::span<std::byte const> { unpinned }, id }),
+        WireFields::Encode({ std::span<std::byte const> { pinned }, std::span<std::byte const> {} }),
+        WireFields::Encode({ std::span<std::byte const> { wide }, id }),
+    };
+    for (auto const& record: malformed)
+    {
+        auto emitted = EncodeNodeRuntime(NodeRuntimeFields {});
+        auto parts = Unwrap(WireFields::SplitAll(emitted));
+        REQUIRE(parts.size() == 24);
+        parts[23] = record;
+        CHECK_FALSE(DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts })).has_value());
     }
 }
 
@@ -3848,7 +3952,7 @@ TEST_CASE("An identity key travels as its 32 bytes, absent as nothing, and any o
     {
         auto emitted = EncodeNodeRuntime(NodeRuntimeFields {});
         auto parts = Unwrap(WireFields::SplitAll(emitted));
-        REQUIRE(parts.size() == 22);
+        REQUIRE(parts.size() == 24);
         auto const wrong = std::vector<std::byte>(width, std::byte { 0x11 });
         parts[16] = wrong;
         CHECK_FALSE(DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts })).has_value());
@@ -3883,12 +3987,12 @@ TEST_CASE("A consensus standing travels as its pinned byte, and one this build c
     sent.consensusEndpoint = "10.0.0.4:6680";
     auto emitted = EncodeNodeRuntime(sent);
     auto parts = Unwrap(WireFields::SplitAll(emitted));
-    // Twenty-two: #1364 and #178 appended the condition list, the identity key and the roster
-    // behind the standing, and the auto-approve seconds, the state directory with its reason and
-    // the shared-cache record behind those, while the applied-tombstone count ahead of it was
-    // retired -- so the standing is the fifteenth field, and the byte replaced below is the one
-    // under test.
-    REQUIRE(parts.size() == 22);
+    // Twenty-four: #1364 and #178 appended the condition list, the identity key and the roster
+    // behind the standing, and the auto-approve seconds, the state directory with its reason, the
+    // shared-cache record and the cluster id with the fleet pin behind those, while the
+    // applied-tombstone count ahead of it was retired -- so the standing is the fifteenth field, and
+    // the byte replaced below is the one under test.
+    REQUIRE(parts.size() == 24);
     auto const unknown = std::array { std::byte { 0x7F } };
     parts[14] = unknown;
     auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts }));
@@ -4343,33 +4447,30 @@ TEST_CASE("A condition list this build cannot read is refused, never read short"
     CHECK_FALSE(out.has_value());
 }
 
-TEST_CASE("NODE-ANNOUNCE carries a voter's endorsement as its fourth field, empty when there is none", "[wire][roster]")
+TEST_CASE("NODE-ANNOUNCE carries an endpoint, a capacity, a load and its join memos, and nothing else", "[wire][roster]")
 {
-    // #178. The endorsement is opaque here -- the scheduler decodes and verifies it -- and the
-    // arity is exact whether or not there is one: absent is a zero-length FOURTH field, never a
-    // three-field payload an older reader would have accepted.
-    CHECK(OpFieldCount(Op::NodeAnnounce) == 5);
+    // The retired certified roster's endorsement (#178) is gone from the grammar, not sent empty:
+    // four fields, and the five-field request that carried one is refused on its count -- never read
+    // with the endorsement's bytes taken for the join memos.
+    CHECK(OpFieldCount(Op::NodeAnnounce) == 4);
+    auto const frame = EncodeNodeAnnounce(NodeAnnounceRequest { .endpoint = "10.0.0.2:6674", .capacity = {}, .load = {} });
+    REQUIRE(frame.size() > RequestHeaderSize);
+    CHECK(std::to_integer<unsigned>(frame[1]) == 14);
+    auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
+    auto const fields = WireFields::SplitExactly(payload, 4);
+    REQUIRE(fields.has_value());
+    REQUIRE(DecodeNodeAnnouncePayload(payload).has_value());
+
     auto const endorsement = std::vector<std::byte> { std::byte { 0x01 }, std::byte { 0x02 }, std::byte { 0x03 } };
-
-    for (auto const& carried: { std::span<std::byte const> {}, std::span<std::byte const> { endorsement } })
-    {
-        auto const frame = EncodeNodeAnnounce(
-            NodeAnnounceRequest { .endpoint = "10.0.0.2:6674", .capacity = {}, .load = {}, .endorsement = carried });
-        REQUIRE(frame.size() > RequestHeaderSize);
-        CHECK(std::to_integer<unsigned>(frame[1]) == 14);
-        auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
-        REQUIRE(WireFields::SplitExactly(payload, 5).has_value());
-
-        auto const decoded = DecodeNodeAnnouncePayload(payload);
-        REQUIRE(decoded.has_value());
-        CHECK(std::ranges::equal(Unwrap(decoded).endorsement, carried));
-    }
+    auto const& four = Unwrap(fields);
+    auto const withEndorsement = WireFields::Encode({ four[0], four[1], four[2], endorsement, four[3] });
+    CHECK_FALSE(DecodeNodeAnnouncePayload(withEndorsement).has_value());
 }
 
-TEST_CASE("NODE-ANNOUNCE carries the fleets a node once asked as its fifth field", "[wire][formation]")
+TEST_CASE("NODE-ANNOUNCE carries the fleets a node once asked as its fourth field", "[wire][formation]")
 {
     // The evidence a split of a fleet is told on reaches the leader in the verb every node sends. The
-    // fifth field is present whether or not there are memos: none is a zero-length field.
+    // fourth field is present whether or not there are memos: none is a zero-length field.
     STATIC_REQUIRE(MaxAnnouncedJoinMemos == 8);
     auto memos = std::vector<JoinMemoFields> {};
     for (auto const index: std::views::iota(std::size_t { 0 }, MaxAnnouncedJoinMemos))
@@ -4418,21 +4519,42 @@ TEST_CASE("A join memo list is refused as malformed for each way it can be wrong
     CHECK_FALSE(DecodeJoinMemos(listOf(std::vector(MaxAnnouncedJoinMemos + 1, good))).has_value());
 }
 
-TEST_CASE("roster-expired is its own wire code, pinned as a byte", "[wire][roster]")
+TEST_CASE("grant-unverifiable is its own wire code, pinned as a byte, and roster-expired's is burnt", "[wire][roster]")
 {
-    // #178: a worker whose roster is absent or has lapsed refuses every grant with it. A client
-    // reads it as any refused compile -- compile locally -- and an operator reads the worker's
-    // counters for which of the two it was.
-    CHECK(static_cast<std::uint8_t>(ErrorCode::RosterExpired) == 0x28);
-    auto const* const row = Describe(ErrorCode::RosterExpired);
+    // #178: a worker that can verify nobody's grant -- its applied state names no voter, or it has
+    // not heard from a leader it counts -- refuses every grant with it. A client reads it as any
+    // refused compile -- compile locally -- and an operator reads the worker's counters for which
+    // of the two it was.
+    CHECK(static_cast<std::uint8_t>(ErrorCode::GrantUnverifiable) == 0x31);
+    auto const* const row = Describe(ErrorCode::GrantUnverifiable);
     REQUIRE(row != nullptr);
-    CHECK(row->name == "roster-expired");
+    CHECK(row->name == "grant-unverifiable");
+
+    // 0x28 was roster-expired, named for a lapse that no longer exists: retired, and never answered
+    // by a row a peer built before the retirement would report under the old name.
+    CHECK(std::ranges::contains(RetiredErrorCodes, std::uint8_t { 0x28 }));
+    CHECK(Describe(static_cast<ErrorCode>(0x28)) == nullptr);
+}
+
+TEST_CASE("roster-not-yet-applied is its own wire code, pinned as a byte, and a retriable one", "[wire][proof]")
+{
+    // Batch 3's M3: a node proof the answering node cannot judge YET, because its consensus has not
+    // applied the log it recovered at start. Pinned as a byte beside the raw enumerator, since a peer
+    // of another build reads the byte; and retriable, since the prover asks again on a backoff.
+    CHECK(static_cast<std::uint8_t>(ErrorCode::RosterNotYetApplied) == 0x32);
+    auto const* const row = Describe(ErrorCode::RosterNotYetApplied);
+    REQUIRE(row != nullptr);
+    CHECK(row->name == "roster-not-yet-applied");
+    CHECK(row->retry.MayHelp());
+    CHECK(std::ranges::contains(RetriableErrorCodes, ErrorCode::RosterNotYetApplied));
+    // Not the refusal it replaces while the state catches up, which tells an operator to admit.
+    CHECK(ErrorCode::RosterNotYetApplied != ErrorCode::NodeKeyUnknown);
+    CHECK_FALSE(Describe(ErrorCode::NodeKeyUnknown)->retry.MayHelp());
 }
 
 TEST_CASE("A node's roster travels in its runtime record, absent when it holds none", "[wire][roster]")
 {
-    // Field 18 of the nested record (#178). Absent and a roster of nobody are different
-    // answers, and a consensus member's roster has no lapse to report -- absent at the field.
+    // Field 18 of the nested record (#178). Absent and a roster of nobody are different answers.
     auto runtime = NodeRuntimeFields {};
     SECTION("absent")
     {
@@ -4440,25 +4562,48 @@ TEST_CASE("A node's roster travels in its runtime record, absent when it holds n
         REQUIRE(decoded.has_value());
         CHECK_FALSE(Unwrap(decoded).roster.has_value());
     }
-    SECTION("a worker's, certified until an instant")
+    SECTION("a roster")
     {
-        runtime.roster = NodeRosterFields {
-            .version = 7, .voters = 3, .principals = 2, .revoked = 1, .certifiedUntilMillis = 1'767'225'600'000ULL
-        };
+        runtime.roster = NodeRosterFields { .version = 7, .voters = 3, .revoked = 1 };
         auto const decoded = DecodeNodeRuntime(EncodeNodeRuntime(runtime));
         REQUIRE(decoded.has_value());
         CHECK(Unwrap(decoded).roster == runtime.roster);
     }
-    SECTION("a consensus member's, with no lapse")
-    {
-        runtime.roster = NodeRosterFields {
-            .version = 7, .voters = 3, .principals = 0, .revoked = 0, .certifiedUntilMillis = std::nullopt
-        };
-        auto const decoded = DecodeNodeRuntime(EncodeNodeRuntime(runtime));
-        REQUIRE(decoded.has_value());
-        REQUIRE(Unwrap(decoded).roster.has_value());
-        CHECK_FALSE(Unwrap(Unwrap(decoded).roster).certifiedUntilMillis.has_value());
-    }
+}
+
+TEST_CASE("A roster record keeps the retired principal count's position, empty, and drops the lapse", "[wire][roster]")
+{
+    // The record is read POSITIONALLY with surplus ignored, so the principal count's field stays as a
+    // RESERVED, empty position: closing the gap would have a reader take it for the revoked count.
+    auto const encoded = EncodeNodeRoster(NodeRosterFields { .version = 7, .voters = 3, .revoked = 1 });
+    auto const parts = WireFields::SplitAll(encoded);
+    REQUIRE(parts.has_value());
+    REQUIRE(Unwrap(parts).size() == NodeRosterFieldCount);
+    STATIC_REQUIRE(NodeRosterFieldCount == 4);
+    STATIC_REQUIRE(NodeRosterReservedField == 2);
+    CHECK(Unwrap(parts)[NodeRosterReservedField].empty());
+
+    // The five-field record of the grammar before -- a principal count third, a lapse fifth -- reads
+    // its revoked count from the fourth position, whatever the third held, and ignores the lapse.
+    auto const version = WireFields::ToBigEndian<std::uint64_t>(7);
+    auto const voters = WireFields::ToBigEndian<std::uint32_t>(3);
+    auto const principals = WireFields::ToBigEndian<std::uint32_t>(9);
+    auto const revoked = WireFields::ToBigEndian<std::uint32_t>(1);
+    auto const lapse = WireFields::ToBigEndian<std::uint64_t>(42);
+    auto const older = WireFields::Encode({ std::span<std::byte const> { version },
+                                            std::span<std::byte const> { voters },
+                                            std::span<std::byte const> { principals },
+                                            std::span<std::byte const> { revoked },
+                                            std::span<std::byte const> { lapse } });
+    auto read = std::optional<NodeRosterFields> {};
+    REQUIRE(ReadNodeRoster(older, read));
+    CHECK(read == std::optional { NodeRosterFields { .version = 7, .voters = 3, .revoked = 1 } });
+
+    // And three fields is not a roster.
+    auto const three = WireFields::Encode(
+        { std::span<std::byte const> { version }, std::span<std::byte const> { voters }, std::span<std::byte const> {} });
+    auto none = std::optional<NodeRosterFields> {};
+    CHECK_FALSE(ReadNodeRoster(three, none));
 }
 
 // --- The node identity handshake (#178) -------------------------------------
@@ -4602,25 +4747,24 @@ TEST_CASE("A node proof carries an id, a key and a signature, the last two exact
     CHECK_FALSE(DecodeProveNodePayload(WireFields::Encode({ {}, key })).has_value());
 }
 
-TEST_CASE("An enroll reply carries the certified roster as its third field, empty when there is none", "[wire][enrollment]")
+TEST_CASE("An enroll reply is five fields, and the one that carried a certified roster is refused", "[wire][enrollment]")
 {
-    // Named payloads, for the borrowing reason the pending-reply case gives.
+    // The certified roster (#178) is gone from the grammar: the outcome, the roster, the challenge,
+    // the key and the signature. Named payloads, for the borrowing reason the pending-reply case gives.
     auto const roster = AsBytes(std::string_view { "roster" });
-    auto const certificate = AsBytes(std::string_view { "certificate" });
-    auto const withPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster, certificate, std::nullopt);
-    auto const with = DecodeEnrollReply(withPayload);
-    REQUIRE(with.has_value());
-    CHECK(AsStringView(Unwrap(with).certificate) == "certificate");
+    auto const payload = EncodeEnrollReply(EnrollOutcome::Approved, roster, {}, std::nullopt);
+    REQUIRE(WireFields::SplitExactly(payload, 5).has_value());
+    auto const reply = DecodeEnrollReply(payload);
+    REQUIRE(reply.has_value());
+    CHECK(AsStringView(Unwrap(reply).roster) == "roster");
 
-    // No certificate is a zero-length THIRD field, never a two-field payload.
-    auto const withoutPayload = EncodeEnrollReply(EnrollOutcome::Approved, roster, {}, std::nullopt);
-    REQUIRE(WireFields::SplitExactly(withoutPayload, 5).has_value());
-    auto const without = DecodeEnrollReply(withoutPayload);
-    REQUIRE(without.has_value());
-    CHECK(Unwrap(without).certificate.empty());
-
-    // The two-field reply an older build sent is refused rather than read as one with no certificate.
+    // The six-field reply that carried a certificate third is refused on its count, never read with the
+    // certificate's bytes taken for the challenge -- and so is the two-field reply of an older build.
     auto const tag = std::array { static_cast<std::byte>(EnrollOutcome::Approved) };
+    auto const certificate = AsBytes(std::string_view { "certificate" });
+    CHECK_FALSE(
+        DecodeEnrollReply(WireFields::Encode({ std::span<std::byte const> { tag }, roster, certificate, {}, {}, {} }))
+            .has_value());
     CHECK_FALSE(DecodeEnrollReply(WireFields::Encode({ std::span<std::byte const> { tag }, roster })).has_value());
 }
 
@@ -4666,6 +4810,35 @@ TEST_CASE("An enroll reply carries its signature as two fields, both or neither,
 
     // And the three-field reply of the grammar before the signature is refused, never read as unsigned.
     CHECK_FALSE(DecodeEnrollReply(WireFields::Encode({ std::span<std::byte const> { tag }, roster, {} })).has_value());
+}
+
+TEST_CASE("An enroll reply hands a challenge as its third field, exactly one wide or empty", "[wire][enrollment]")
+{
+    // Named payloads, for the borrowing reason the pending-reply case gives; the challenge is COPIED
+    // out, so it outlives its payload by design.
+    auto challenge = EnrollChallenge {};
+    challenge.fill(std::byte { 0x4D });
+    auto decoded = std::optional<EnrollChallenge> {};
+    {
+        auto const pendingPayload = EncodeEnrollReply(EnrollOutcome::Pending, {}, challenge, std::nullopt);
+        auto const pending = DecodeEnrollReply(pendingPayload);
+        REQUIRE(pending.has_value());
+        decoded = Unwrap(pending).challenge;
+    }
+    CHECK(decoded == std::optional { challenge });
+
+    // None is a zero-length field, and decodes as none rather than as a challenge of zeroes.
+    auto const nonePayload = EncodeEnrollReply(EnrollOutcome::Rejected, {}, {}, std::nullopt);
+    auto const none = DecodeEnrollReply(nonePayload);
+    REQUIRE(none.has_value());
+    CHECK_FALSE(Unwrap(none).challenge.has_value());
+
+    // A width that is not one challenge is refused: a joiner signing over a prefix signs over bytes the
+    // leader's row does not hold, and would never refresh it.
+    auto const tag = std::array { static_cast<std::byte>(EnrollOutcome::Pending) };
+    auto const cut = std::span<std::byte const> { challenge }.first(NodeChallengeBytes - 1);
+    CHECK_FALSE(DecodeEnrollReply(WireFields::Encode({ std::span<std::byte const> { tag }, {}, cut, {}, {} })).has_value());
+    CHECK(DecodeEnrollReply(WireFields::Encode({ std::span<std::byte const> { tag }, {}, challenge, {}, {} })).has_value());
 }
 
 TEST_CASE("cluster-admit-worker carries the worker's id and its key as text", "[wire][nodeproof]")
@@ -5025,15 +5198,11 @@ TEST_CASE("The longest NODE-ANNOUNCE is exactly the budget its constants add up 
     load.conditions = std::vector<NodeConditionFields>(MaxNodeConditions, row);
     load.interfaceAddresses = addresses;
 
-    auto const endorsement = std::vector<std::byte>(MaxRosterEndorsementBytes, std::byte { 0x5e });
     auto memo = JoinMemoFields { .clusterId = fill(MaxIdBytes, 'm') };
     memo.provenKey.fill(std::byte { 0x6b });
     auto const memos = std::vector<JoinMemoFields>(MaxAnnouncedJoinMemos, memo);
-    auto const frame = EncodeNodeAnnounce(NodeAnnounceRequest { .endpoint = fill(MaxEndpointBytes, 'e'),
-                                                                .capacity = capacity,
-                                                                .load = load,
-                                                                .endorsement = endorsement,
-                                                                .joinMemos = memos });
+    auto const frame = EncodeNodeAnnounce(NodeAnnounceRequest {
+        .endpoint = fill(MaxEndpointBytes, 'e'), .capacity = capacity, .load = load, .joinMemos = memos });
     auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
 
     CHECK(payload.size()
@@ -5052,6 +5221,5 @@ TEST_CASE("The longest NODE-ANNOUNCE is exactly the budget its constants add up 
     auto const& conditions = Unwrap(Unwrap(decoded).load.conditions);
     REQUIRE(conditions.size() == MaxNodeConditions);
     CHECK(conditions.back().remedy.size() == MaxConditionRemedyBytes);
-    CHECK(Unwrap(decoded).endorsement.size() == MaxRosterEndorsementBytes);
     CHECK(Unwrap(decoded).joinMemos == memos);
 }

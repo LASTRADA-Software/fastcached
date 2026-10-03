@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "EndpointDialerTestUtils.hpp"
 #include "EnrollClient.hpp"
+#include "EnrollmentAbsence.hpp"
+#include "NodeIdentity.hpp"
+#include "NodeKey.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/EnrollRequestSignature.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -198,7 +202,8 @@ TEST_CASE("A seed that runs no consensus is told apart from a seed that is too o
     // `UnknownOpcode`, and this client reported *the seed is running a build older than
     // this one*: somebody is sent to upgrade a node that is already current, and the
     // real remedy -- a different ADDRESS -- is never mentioned.
-    auto const noCluster = ReadEnrollReply(Refused(Wire::ErrorCode::NoCluster));
+    auto const seedSays = EnrollmentAbsenceDetail(EnrollmentAbsence::NoConsensus);
+    auto const noCluster = ReadEnrollReply(Refused(Wire::ErrorCode::NoCluster, std::string { seedSays }));
 
     // Fatal rather than a wait: a node that runs no consensus will not start running it
     // while this loop polls, so retrying for ten minutes helps nobody.
@@ -208,15 +213,31 @@ TEST_CASE("A seed that runs no consensus is told apart from a seed that is too o
     // sentence, so a case checking only the progress passes under the defect this is
     // named for. What separates them is which machine the operator is sent to look at,
     // so the text is the assertion: this one must NOT blame the seed's build, and must
-    // name the remedy.
+    // carry the seed's own reason and remedy.
     CHECK(!noCluster.detail.contains("older"));
-    CHECK(noCluster.detail.contains("consensus"));
-    CHECK(noCluster.detail.contains("--fleet-seed"));
+    CHECK(noCluster.detail.contains(seedSays));
 
     // And the two codes really do reach different sentences, which is the property one
     // arm alone cannot show -- a build that folded them would pass every check above
     // for whichever text it kept.
     CHECK(noCluster.detail != ReadEnrollReply(Refused(Wire::ErrorCode::UnknownOpcode)).detail);
+}
+
+TEST_CASE("A seed that records no joiner is reported in its own words, never a reason guessed here",
+          "[enrollment][client][pin]")
+{
+    // A seed pinned elsewhere RUNS consensus; a joiner that said *runs no consensus* for every
+    // `NoCluster` sent its operator to the wrong fix. The seed knows which reason applies, so its words
+    // are what is reported -- bounded, since a peer chose them.
+    auto const pinned = EnrollmentAbsenceDetail(EnrollmentAbsence::NotAPinnedVoter);
+    auto const reading = ReadEnrollReply(Refused(Wire::ErrorCode::NoCluster, std::string { pinned }));
+    CHECK(reading.progress == EnrollProgress::Fatal);
+    CHECK(reading.detail.contains(pinned));
+    CHECK_FALSE(reading.detail.contains("runs no consensus"));
+    CHECK_FALSE(reading.detail.contains("--node-status"));
+
+    auto const flood = ReadEnrollReply(Refused(Wire::ErrorCode::NoCluster, std::string(64 * 1024, 'x')));
+    CHECK(flood.detail.size() < 1024);
 }
 
 TEST_CASE("A NotLeader naming an endpoint is followed, and one naming a sentence is not", "[enrollment][client]")

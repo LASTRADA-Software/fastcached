@@ -24,6 +24,7 @@
 #include <vector>
 
 #include <core/async/SyncRun.hpp>
+#include <tests/ConsensusStandingFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/Unwrap.hpp>
@@ -89,7 +90,9 @@ struct ProvingNode
 
     Ed25519KeyPair const identity = TestKeyPair("scheduler");
     Testing::ScriptedSecureRandom random { Testing::ServerHandshakeScript() };
-    NodeProofResponder prover { "scheduler", identity, membership, random, metrics, logger };
+    /// Caught up unless a case says otherwise: then a key the roster lacks is one the cluster lacks.
+    Testing::ScriptedAppliedState consensus { AppliedStateReading::CaughtUp };
+    NodeProofResponder prover { "scheduler", identity, membership, consensus, random, metrics, logger };
 
     ProvingNode()
     {
@@ -334,7 +337,8 @@ TEST_CASE("A signature that does not verify is refused, and counted apart from a
         auto const first = Challenge(node);
         auto const recorded = ProofOver(first, AdmittedNode, AdmittedNode);
         Testing::ScriptedSecureRandom fresh { Testing::ScriptedSecureRandom::Ascending(2 * NonceBytes, 0x40) };
-        NodeProofResponder second { "scheduler", node.identity, node.membership, fresh, node.metrics, node.logger };
+        NodeProofResponder second { "scheduler", node.identity, node.membership, node.consensus,
+                                    fresh,       node.metrics,  node.logger };
         Testing::ScriptedSecureRandom callerRandom { Testing::CallerHandshakeScript() };
         auto const opening = Testing::OpenHandshake(callerRandom);
         auto const issued = second.Challenge(Testing::RequestPayloadOf(Wire::EncodeNodeChallenge(opening.request)));
@@ -597,4 +601,65 @@ TEST_CASE("A node running no consensus refuses the whole node-proof family, and 
                     .RefusePeer(PeerIdentity { .host = std::string { StrangerAddress } },
                                 static_cast<std::uint8_t>(Wire::Op::ProveNode))
                     .has_value());
+}
+
+TEST_CASE("A key this node lacks while its state has not caught up is not yet judged, never unknown",
+          "[node][proof][boot-order]")
+{
+    // Batch 3's M3, measured on every start: a lone voter before its election commits, and a follower
+    // before its leader first speaks, hold a roster that lacks keys their cluster holds -- and answered
+    // a genuine member `node-key-unknown`, telling an operator to ADMIT it, while the prover waited a
+    // whole announce interval. While the state is not caught up (or there is no tier to ask yet) the
+    // answer is `roster-not-yet-applied`, counted apart; once caught up, `node-key-unknown` stands.
+    struct Reading
+    {
+        AppliedStateReading reading;
+        Wire::ErrorCode expected;
+        IMetricsSink::Counter counted;
+    };
+    for (auto const& [reading, expected, counted]: { Reading { AppliedStateReading::Behind,
+                                                               Wire::ErrorCode::RosterNotYetApplied,
+                                                               IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied },
+                                                     Reading { AppliedStateReading::Unknown,
+                                                               Wire::ErrorCode::RosterNotYetApplied,
+                                                               IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied },
+                                                     Reading { AppliedStateReading::CaughtUp,
+                                                               Wire::ErrorCode::NodeKeyUnknown,
+                                                               IMetricsSink::Counter::NodeProofsRefusedUnknownKey } })
+    {
+        INFO("reading " << static_cast<int>(reading));
+        ProvingNode node;
+        node.consensus.Set(reading);
+        auto const challenged = Challenge(node);
+        auto const verdict =
+            node.prover.Verify(challenged.issued.handshake, ProofOver(challenged, UnknownNode, UnknownNode));
+        CHECK(ErrorOf(verdict.reply) == expected);
+        CHECK_FALSE(verdict.identity.has_value());
+        CHECK(verdict.keys.has_value()); // sealed whatever it says
+        CHECK(node.metrics.Read(counted) == 1);
+        auto const other = counted == IMetricsSink::Counter::NodeProofsRefusedUnknownKey
+                               ? IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied
+                               : IMetricsSink::Counter::NodeProofsRefusedUnknownKey;
+        CHECK(node.metrics.Read(other) == 0);
+    }
+}
+
+TEST_CASE("A key this node holds is accepted while its state catches up, and a revoked one refused by name",
+          "[node][proof][boot-order]")
+{
+    // "Not yet" replaces only the refusal that may be wrong: a key the roster already holds was
+    // applied, and one it revoked was too, so neither waits for the rest of the log.
+    ProvingNode node;
+    node.consensus.Set(AppliedStateReading::Behind);
+
+    auto const admitted = Challenge(node);
+    auto const accepted = node.prover.Verify(admitted.issued.handshake, ProofOver(admitted, AdmittedNode, AdmittedNode));
+    CHECK(StatusOf(accepted.reply) == Wire::Status::Ok);
+    CHECK(accepted.identity.has_value());
+
+    auto const forgotten = Challenge(node);
+    auto const revoked = node.prover.Verify(forgotten.issued.handshake, ProofOver(forgotten, ForgottenNode, ForgottenNode));
+    CHECK(ErrorOf(revoked.reply) == Wire::ErrorCode::NodeKeyRevoked);
+
+    CHECK(node.metrics.Read(IMetricsSink::Counter::NodeProofsRefusedRosterNotYetApplied) == 0);
 }
