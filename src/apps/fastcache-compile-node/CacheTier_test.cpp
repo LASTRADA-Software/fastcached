@@ -2,6 +2,7 @@
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
 #include "LiveStatsSources.hpp"
+#include "MachineStandingTestUtils.hpp"
 #include "NodeIoLoop.hpp"
 #include "NodeStatusResponder.hpp"
 #include "StatsSource.hpp"
@@ -151,17 +152,6 @@ template <typename Table>
     return std::vector<std::byte>(bytes, std::byte { 0x41 });
 }
 
-/// A node identity nothing reads: `NodeMetrics` answers the cache subject, which is the counters and
-/// the snapshot only.
-class NoIdentity final: public INodeStatusSource
-{
-  public:
-    [[nodiscard]] Wire::NodeStatusFields Describe() const override
-    {
-        return {};
-    }
-};
-
 /// Write all of @p bytes.
 /// @param socket Where; must outlive the task.
 /// @param bytes What; must outlive the task.
@@ -218,7 +208,7 @@ class MetricsDoors
                                         .history = nullptr,
                                         .endpoint = {},
                                         .surfaces = _served } },
-        _responder { _identity, _sources, _membership, metrics }
+        _responder { _identity, _sources, _membership, _standing, metrics }
     {
     }
 
@@ -266,7 +256,9 @@ class MetricsDoors
   private:
     Testing::ScriptedHostFacts _host;
     Testing::FixedHostCounters _load;
-    NoIdentity _identity;
+    /// Nothing reads it: `NodeMetrics` answers the cache subject, which is the counters and the
+    /// snapshot only.
+    Testing::SilentNodeStatus _identity;
     Distributed::OpenMembership _membership;
     IMetricsSink& _metrics;
     AdminHttpServer::SnapshotProvider _provider;
@@ -277,6 +269,8 @@ class MetricsDoors
     /// make the case assert absences as well, which is `NodeStatusResponder_test`'s subject.
     ServedSurfaces _served {};
     NodeLiveStatsSources _sources;
+    /// No roster: this fixture asks no machine question.
+    Testing::FixedStanding _standing {};
     NodeStatusResponder _responder;
 };
 

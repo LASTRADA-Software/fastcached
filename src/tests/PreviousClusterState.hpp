@@ -13,8 +13,8 @@
 namespace FastCache::Testing
 {
 
-/// The `ClusterState` version the build before #178's certified roster wrote.
-inline constexpr std::uint8_t PreviousClusterStateVersion = 6;
+/// The `ClusterState` version the build before a machine was forgotten by its key alone wrote.
+inline constexpr std::uint8_t PreviousClusterStateVersion = 7;
 
 /// The `Command` version the build before #1555 wrote: this build's layout, and other meanings.
 inline constexpr std::uint8_t PreviousClusterCommandVersion = 3;
@@ -22,15 +22,17 @@ inline constexpr std::uint8_t PreviousClusterCommandVersion = 3;
 /// The last `Command` version laid out differently: before #178 a command was four fields.
 inline constexpr std::uint8_t FourFieldClusterCommandVersion = 2;
 
-/// A one-member cluster state, encoded as the build before #178's certified roster laid it out.
+/// A one-member cluster state, encoded as the build before the client and forgotten-host groups
+/// were removed laid it out.
 ///
 /// **A BUILDER shared by every case that needs one, for the reason `ForeignGenerationValue.hpp`
 /// is**: each such case asserts a REFUSAL, and a copy that drifted into building something else
 /// is refused too -- so every copy goes on passing under a name for what it no longer builds.
 /// The one fact that matters lives here alone: the previous LAYOUT, which is not the current
-/// one with its version byte changed. Version 6 wrote seven header fields rather than eight --
-/// no roster version -- so a decoder that judged the arity before the version refuses this as
-/// damage while passing a test that only flips the byte of a current encoding.
+/// one with its version byte changed. Version 7 wrote eight header fields rather than six -- the
+/// client and forgotten-host counts beside the member, setting, principal and revoked-key counts
+/// and the roster version -- so a decoder that judged the arity before the version refuses this
+/// as damage while passing a test that only flips the byte of a current encoding.
 ///
 /// Member `n1` at `10.0.0.1:6675`: never announced a scheduler endpoint, seated as a voter,
 /// stating no key.
@@ -44,6 +46,8 @@ inline constexpr std::uint8_t FourFieldClusterCommandVersion = 2;
     auto const version = std::array { std::byte { PreviousClusterStateVersion } };
     auto const members = count(1);
     auto const none = count(0);
+    auto const rosterVersionBytes = WireFields::ToBigEndian<std::uint64_t>(1);
+    auto const rosterVersion = std::vector<std::byte> { rosterVersionBytes.begin(), rosterVersionBytes.end() };
     auto const neverAnnounced = std::array { std::byte { 0 } };
     auto const voter = std::array { std::byte { 0 } };
     return WireFields::Encode({ std::span<std::byte const> { version },
@@ -53,6 +57,7 @@ inline constexpr std::uint8_t FourFieldClusterCommandVersion = 2;
                                 std::span<std::byte const> { none }, // forgotten hosts
                                 std::span<std::byte const> { none }, // principals
                                 std::span<std::byte const> { none }, // revoked keys
+                                std::span<std::byte const> { rosterVersion },
                                 WireFields::AsBytes(std::string_view { "n1" }),
                                 WireFields::AsBytes(std::string_view { "10.0.0.1:6675" }),
                                 WireFields::AsBytes(std::string_view {}),

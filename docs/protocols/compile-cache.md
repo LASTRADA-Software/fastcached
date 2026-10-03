@@ -116,9 +116,11 @@ diagnostic — the build merely got slower, forever, with nothing to show for it
 | `0x27` | node-proof-rejected | A node proof's signature did not verify under the identity key it presented. One answer for every way that happens, since naming the field would be an oracle, and asked **before** the roster is consulted. |
 | `0x28` | roster-expired | The worker can check nobody's lease right now: it holds no roster of the cluster's voters, or the one it holds has not been re-certified within its lifetime and the clock-skew slack. A statement about the worker, never about the lease — a fresh grant would get the same answer. |
 | `0x29` | node-key-unknown | A node proof verified, under a key this cluster does not hold for the id it named: a machine nobody admitted, or one presenting a key other than the one admitted under its id. The remedy is an admission, not a new key. |
-| `0x2a` | node-key-revoked | A node proof verified under a key the cluster has **revoked** — the forgotten machine itself. The connection is kept and marked, and every later verb on it is refused as the forgotten machine's, even from a host `--fleet-member` still names. |
-| `0x2b` | node-identity-required | A verb only a machine that **proved** its identity may send — REGISTER, NODE-ANNOUNCE, HEARTBEAT, WITHDRAW — arrived on a connection that has not. An address admits a client; it no longer admits a machine into the fleet, loopback included. |
+| `0x2a` | node-key-revoked | A node proof verified under a key the cluster has **revoked** — the forgotten machine itself. The connection is kept and marked, and every later verb on it is refused as the forgotten machine's, from any address, this machine's included. |
+| `0x2b` | node-identity-required | A verb only a machine that **proved** its identity may send — REGISTER, NODE-ANNOUNCE, HEARTBEAT, WITHDRAW — arrived on a connection that has not, loopback included. A machine ticket admits a client and never satisfies these: a ticketed connection is not sealed. |
 | `0x2c` | enrollment-host-full | The request came from an address that already has as many enrollment requests waiting as one host may hold, counted by the address each request first came from, so it was not recorded. Its own code rather than enrollment-full, because one address asking a lot and many machines waiting are different problems; a joiner treats both as a wait. |
+| `0x2d` | ticket-refused | An AUTH presenting a machine ticket this node did not accept: a signature that does not verify, a machine the roster does not hold, a revoked key, an audience that is not this node, or an expiry passed. One code for all of them. The message names the reason when the caller could have checked it itself -- malformed bytes, a wrong audience, an expiry -- or when it is the node's own state; a forgery, a machine the roster does not hold and a revoked key all read `not admitted by this node`, because AUTH answers any address and those three would tell a stranger which ids the roster holds. The node still counts each of them apart. Not `unauthenticated`, which says a credential is still owed; this one says a credential was presented and judged. |
+| `0x2e` | identified-caller-required | An operator's **control** verb -- `CLUSTER-ADMIT` in every form, `CLUSTER-FORGET`, `CLUSTER-SET`, `ENROLL-CONTROL` -- from a caller admitted by `--fleet-open` alone. `--fleet-open` admits a caller to what the fleet serves and never to what decides the fleet; a caller on this machine, one that proved a node key, or one presenting a verified machine ticket is admitted to these verbs. Not `not-a-member`: the caller is admitted, and the remedy is to identify itself. |
 
 Every one of these is a **refusal the client answers by compiling locally**,
 never by failing. They are distinct codes rather than one "no" because they mean
@@ -153,12 +155,76 @@ client localizes it to its own layout.
 ### AUTH
 
 ```
-[0xFC][ver][0x03][u32 len]  payload: [username][secret]
+[0xFC][ver][0x03][u32 len]  payload: [kind][username][secret]
 ```
+
+`kind` is one byte naming the credential: `0x01` a password, `0x02` a machine
+ticket, whose bytes are the `secret` and whose `username` must be empty. Any
+other byte, or a ticket with a username, is a malformed frame.
 
 An empty `username` asks to be verified against the secret alone — the redis
 `requirepass` form, and the usual one. The field is always present so the frame
 arity does not depend on which credential style a client uses.
+
+`fastcached` holds no roster and so can verify no machine: against
+`--requirepass` a ticket is refused as a wrong credential would be, and with no
+credential configured it is answered `Ok` and verifies nothing, like any other.
+
+A compile node checks no password — the one it may hold, `--requirepass`, it only
+presents to the `fastcached` behind its `--upstream` — so it verifies a **ticket** and
+nothing else: a password `AUTH` is answered `Ok` and establishes nothing, and the declared `kind`
+decides what is verified — a genuine ticket's bytes under the password kind establish
+nothing either. A ticket it accepts says which machine the connection speaks for; one it
+refuses is `ticket-refused` and **clears** whatever an earlier `AUTH` on the connection
+established, so the command pipelined behind it is judged as a stranger's — or, for a
+revoked key, as the forgotten machine's, which no later `AUTH` lifts.
+
+A ticket is its claims, then an Ed25519 signature over them by the machine's own
+identity key, as two length-prefixed fields. The claims are a label, the machine id, the
+**audience** — the one endpoint it may be presented to, as the presenter dialled it — a
+big-endian `u64` expiry in Unix seconds, and a nonce, each length-prefixed. A node accepts
+one only for an audience that is itself, within a minute of its minting and the clock-skew
+slack, and once: it remembers every ticket it has spent until it could no longer be
+accepted anyway.
+
+### MINT-TICKET
+
+```
+[0xFC][ver][0x1e][u32 len]  payload: [audience]
+```
+
+Asks a compile node to mint a ticket, signed with its identity key, for `audience`. The
+reply payload is the ticket, ready to be the `secret` of an `AUTH` of kind `0x02`.
+
+Served **over loopback only**, judged from the connection's peer address: a ticket is this
+machine vouching for its caller, so a caller on another machine is refused `not-a-member`
+before anything is signed. An audience naming no one machine — loopback, a wildcard, no
+host — is refused `malformed-frame`, since such a ticket would be spendable at any node
+that heard it. A node that holds no identity key refuses it `no-cluster`.
+
+### EXPLAIN-ADMISSION
+
+```
+[0xFC][ver][0x1b][u32 len]  payload: [subject]
+reply:                               [verdict][u32 decidedBy][standing][subject]
+```
+
+Asks a node to fold its admission decision and report it. A non-empty `subject` is a
+**machine**, named by its id or by its identity key: the answer is where it stands in the
+roster this node holds and which routes a connection proving its key, or presenting its
+ticket, would take. That question is about a third party, so it is gated like any member's
+verb. An empty `subject` asks about **the connection asking**, and is answered even to a
+caller the node refuses — it says only what that connection established.
+
+`verdict` is one byte: `0x01` refused by no route, `0x02` admitted, `0x03` forgotten — a
+revoked key, which outranks every route. `decidedBy` is every route that produced it,
+OR-ed: `0x08` `--fleet-open`, `0x10` a proven key, `0x20` a revoked key, `0x40` loopback,
+`0x80` a machine ticket; `0x01`, `0x02` and `0x04` are retired and never reused.
+`standing` is one byte for a machine question — `0x01` voter, `0x02` learner, `0x03`
+pending in the enrollment window, `0x04` revoked, `0x05` unknown — and an **empty** field
+for the question about the connection. A reader refuses a verdict or a standing it cannot
+name and keeps a route bit it cannot name, so a newer node's answer is never misreported as
+a healthy one.
 
 ## Distributed execution
 
@@ -368,8 +434,9 @@ since it carries a whole translation unit.
 A machine that **joins the fleet** — registers a worker, announces itself, heartbeats,
 withdraws — proves which machine it is before it sends any of those verbs, and every frame
 after that proof is sealed ([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
-A client asking for a lease or a cache entry proves nothing: it is admitted by its address
-or its credential exactly as before, and pays no round trip for any of this.
+A client asking for a lease or a cache entry runs no handshake and pays no round trip for
+any of this. A remote one proves its machine with a machine ticket instead (`AUTH`, below);
+only a loopback caller is admitted by its address, and `--fleet-open` admits everyone.
 
 ```
 NODE-CHALLENGE 0x18  [nonceC(32)][ephC(32)]

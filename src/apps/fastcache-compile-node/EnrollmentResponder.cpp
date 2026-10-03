@@ -45,11 +45,6 @@ namespace
         "the byte budget says this surface is momentarily full, which the peer sees and retries; summed into a "
         "series read as somebody probing the enrollment list it is what makes that series unreadable";
 
-    /// Why a credential refusal here belongs to the scheduler.
-    constexpr std::string_view CredentialIsTheSchedulersRationale =
-        "the credential is the scheduler's -- AUTH is a Session verb and MergedResponder routes it there -- so the "
-        "peer that presented it is counted against the component that checked it, once";
-
     /// One row per `EndpointRefusal`: what this surface does about it.
     struct EnrollmentEndpointRefusal
     {
@@ -60,11 +55,11 @@ namespace
 
     /// This surface counts none of the endpoint's own refusals.
     ///
-    /// **And that is four separate claims rather than one shrug.** The byte budget and
+    /// **And that is five separate claims rather than one shrug.** The byte budget and
     /// the answer deadline are uncounted for reasons every surface here shares; the two
-    /// credential rows are uncounted because the credential belongs to the scheduler,
-    /// which checks it and counts it -- a second tally here would be one AUTH failure
-    /// reported twice to whoever met both series.
+    /// credential rows are uncounted because `AUTH` is the session component's, which
+    /// checks it and counts it -- a second tally here would be one AUTH failure reported
+    /// twice to whoever met both series.
     ///
     /// The counted refusals on this surface are all decided INSIDE `Answer`, where the
     /// verb and the window's state are both known, which is why this table has no
@@ -73,10 +68,10 @@ namespace
         { .refusal = EndpointRefusal::InFlightBudget, .answer = std::nullopt, .rationale = ByteBudgetRationale },
         { .refusal = EndpointRefusal::CredentialMalformed,
           .answer = std::nullopt,
-          .rationale = CredentialIsTheSchedulersRationale },
+          .rationale = CredentialIsTheSessionsRationale },
         { .refusal = EndpointRefusal::CredentialRejected,
           .answer = std::nullopt,
-          .rationale = CredentialIsTheSchedulersRationale },
+          .rationale = CredentialIsTheSessionsRationale },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .answer = std::nullopt,
           .rationale = AnswerDeadlineIsTheEndpointsRationale },
@@ -98,6 +93,18 @@ namespace
     // answer is.
     static_assert(RowsInEnumeratorOrder(EnrollmentEndpointRefusals, &EnrollmentEndpointRefusal::refusal),
                   "EnrollmentEndpointRefusals must hold one row per EndpointRefusal, in enumerator order");
+
+    /// An operator's control verb from a caller only `--fleet-open` admitted: the enrollment surface's
+    /// own row for `Distributed::IdentityRequirements`' refusal, so the rule is the table's and the
+    /// counter this surface's.
+    constexpr Cc::SurfaceRefusal ControlUnidentified {
+        .code = Wire::ErrorCode::IdentifiedCallerRequired,
+        .counter = IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired,
+    };
+
+    static_assert(Distributed::RequirementRowOf(CompileCacheWire::IdentityRequirement::IdentifiedCaller).refusal
+                      == ControlUnidentified.code,
+                  "the enrollment surface refuses an unidentified caller under the code the requirement names");
 
     /// The refusal answered when this node is not the leader.
     ///
@@ -161,24 +168,41 @@ std::optional<std::vector<std::byte>> EnrollmentResponder::RefusePeer(PeerIdenti
     if (static_cast<Wire::Op>(opRaw) == Wire::Op::Enroll)
         return std::nullopt;
 
-    return RefuseUnlessMember(
-        _membership,
-        _metrics,
-        peer,
-        { .code = Wire::ErrorCode::NotAMember, .counter = IMetricsSink::Counter::EnrollmentControlRefusedNotAMember },
-        "deciding who joins this cluster is a member's verb");
+    if (auto refusal = RefuseUnlessMember(
+            _membership,
+            _metrics,
+            peer,
+            { .code = Wire::ErrorCode::NotAMember, .counter = IMetricsSink::Counter::EnrollmentControlRefusedNotAMember },
+            "deciding who joins this cluster is a member's verb");
+        refusal.has_value())
+        return refusal;
+    return RefuseUnidentified(peer, opRaw);
+}
+
+std::optional<std::vector<std::byte>> EnrollmentResponder::RefuseUnidentified(PeerIdentity const& peer,
+                                                                              std::uint8_t opRaw) const
+{
+    // Asked of a caller the surface ADMITS, as the scheduler's `RefuseUnlessIdentified` is: one it
+    // does not is membership's refusal, and a stranger must be told what the door tells it.
+    auto const* const descriptor = Wire::FindOp(opRaw);
+    auto const caller = Context(peer);
+    if (descriptor == nullptr || caller.membership != Distributed::Membership::Member)
+        return std::nullopt;
+    auto const& row = Distributed::RequirementRowOf(descriptor->identity);
+    if (row.satisfiedBy(caller))
+        return std::nullopt;
+    return Cc::Refuse(_metrics, ControlUnidentified, std::format("{} {}", descriptor->name, row.remedy));
 }
 
 std::vector<std::byte> EnrollmentResponder::RefusalReply(Wire::PrePayloadDecision decision,
                                                          std::uint8_t /*opRaw*/,
                                                          std::string_view detail) const
 {
-    if (decision == Wire::PrePayloadDecision::Unauthenticated)
-        return Cc::Refuse(_metrics,
-                          { .code = Wire::ErrorCodeFor(decision),
-                            .counter = IMetricsSink::Counter::EnrollmentControlRefusedUnauthenticated },
-                          detail);
-    return Cc::RefuseWithoutCounter({ .code = Wire::ErrorCodeFor(decision), .rationale = ShapeRefusalRationale }, detail);
+    return Cc::RefuseWithoutCounter({ .code = Wire::ErrorCodeFor(decision),
+                                      .rationale = decision == Wire::PrePayloadDecision::Unauthenticated
+                                                       ? NodeChecksNoPasswordRationale
+                                                       : ShapeRefusalRationale },
+                                    detail);
 }
 
 std::vector<std::byte> EnrollmentResponder::EndpointRefusalReply(EndpointRefusal refusal,
@@ -415,6 +439,11 @@ std::vector<std::byte> EnrollmentResponder::AnswerAutoApprove(std::string_view n
 
 std::vector<std::byte> EnrollmentResponder::AnswerControl(std::span<std::byte const> payload, PeerIdentity const& peer)
 {
+    // The door's whole question -- membership, then the verb's identity column -- asked again, for a
+    // caller of `Answer` that never asked the door: a stranger is told `NotAMember` here as there.
+    if (auto refusal = RefusePeer(peer, static_cast<std::uint8_t>(Wire::Op::EnrollControl)); refusal.has_value())
+        return *std::move(refusal);
+
     auto const fields = Wire::DecodeEnrollControlPayload(payload);
     if (!fields.has_value())
         return Cc::RefuseWithoutCounter({ .code = Wire::ErrorCode::MalformedFrame,

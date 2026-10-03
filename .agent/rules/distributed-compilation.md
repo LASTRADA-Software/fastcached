@@ -311,12 +311,13 @@ Consequences that are each load-bearing:
   a fleet peer could `FETCH` every object this machine had ever compiled. The docs
   promised exactly that ("its own machine and its cluster"), which is why the fix is
   a breaking change rather than a bug fix.
-  - **The two lists were one list answering two questions.** `--fleet-member` names a
-    machine that may spend this node's **CPU** and be leased its slots. The cache
-    tier is this machine's entire **build output**. Contributing capacity does not
-    make another host entitled to read it, and there is no configuration in which it
-    should — so the responder does not take an `IMembershipOracle` at all. Its
-    absence is the fix; a flag it consulted would be a flag somebody could set wrong.
+  - **Admission and locality are two questions.** Admission -- a proven key, a verified
+    ticket, `--fleet-open` -- says which machine may spend this node's **CPU** and be
+    leased its slots. The cache tier is this machine's entire **build output**.
+    Contributing capacity does not make another machine entitled to read it, and there
+    is no configuration in which it should — so the responder does not take an
+    `IMembershipOracle` at all. Its absence is the fix; a flag it consulted would be a
+    flag somebody could set wrong. A ticket widens it no more than a proof does.
   - **"It is only bound to loopback" is not a policy, and since #290 it is not even
     available.** The default bind closed this by accident, and the accident evaporated
     the moment `--listen-node` was widened — or, now that the cache and scheduler
@@ -364,39 +365,20 @@ Consequences that are each load-bearing:
   cannot reach — and is refused only the fleet's CPU time, which is the thing
   membership pays for. Hence `NotAMember` rather than `Unauthenticated`: one is
   about a credential an endpoint requires, the other about contribution.
-  - **An empty member set refuses everybody, and "admit everybody" is a named type
-    somebody constructs.** `ClusterMembership` with nothing in it is the state of a
-    node whose discovery has not run, has the wrong key, or is misconfigured — and a
-    scheduler that answered "member" there would silently become an open one, which
-    is invisible from both ends because the fleet keeps working and merely serves
-    strangers too. `OpenMembership` is the right answer for one machine or a fleet
-    whose reachability is its boundary, but it is never a *default*: "no policy" and
-    "a policy that admits everybody" have to be the same explicit decision, which is
-    also why `Membership::Outsider` is the zero value. Matching is whole-string, not
-    by prefix — `10.0.0.1` must not admit `10.0.0.10` — and the port is part of the
-    identity, because the proof a peer gave covered the `(node, endpoint)` pair.
-  - **The identity is a HOST, and the two vocabularies are collapsed in the
-    constructor rather than left to each caller.** Discovery admits a peer at a
-    `(node, endpoint)` pair, so the obvious member set is endpoints — and matching a
-    caller against it would never succeed even once: a peer *connecting* to the
-    scheduler comes from an **ephemeral source port**, which is not its Raft endpoint,
-    so `ISocket::PeerAddress()` reports a bare host and there is nothing to compare a
-    port against. An endpoint-keyed set refuses every legitimate member while looking
-    entirely correct, and the fleet silently never distributes anything. So
-    `ClusterMembership` takes endpoints and stores their host parts, and `Classify`
-    takes a host; there is no way to publish one vocabulary and query the other. It
-    splits through `Core/HostPort` rather than locally, because `rfind(':')` on
-    `[::1]:7000` splits at the wrong colon — the defect that header exists to hold in
-    one place. An endpoint with no port is kept whole rather than dropped: a member the
-    set cannot represent must not silently stop being one. What this gives up is
-    recorded rather than hidden — two nodes behind one NAT are indistinguishable here,
-    which is acceptable because this refuses *strangers* rather than co-located peers,
-    and separating them needs a credential in the frame.
+  - **An empty key roster refuses everybody but this machine, and "admit everybody" is
+    a named type somebody constructs.** A roster with nothing in it is the state of a
+    node whose consensus has not formed, that names no `--voter-key`, or that is
+    misconfigured — and a scheduler that answered "member" there would silently become
+    an open one, which is invisible from both ends because the fleet keeps working and
+    merely serves strangers too. `OpenMembership` is the right answer for one machine or
+    a fleet whose reachability is its boundary, but it is never a *default*: "no policy"
+    and "a policy that admits everybody" have to be the same explicit decision, which is
+    also why `Membership::Outsider` is the zero value.
   - **A membership flag is the NODE's, not the scheduler's, and a startup rule that
     assumed otherwise closed every worker.** One `NodeMembership` serves all three
     surfaces — the scheduler, the cache tier and the compile port — and `WorkerServer`
-    is constructed unconditionally, so `--fleet-member` / `--fleet-open` are consulted
-    on every node there is. `StartupPolicyRejection` nonetheless refused them without
+    is constructed unconditionally, so the admission policy — `--fleet-open` and, since
+    #178, the key routes — is consulted on every node there is. `StartupPolicyRejection` nonetheless refused them without
     `--serve-scheduler`, reasoning that "a policy nothing consults is a policy an
     operator believes is in force" — and the premise was simply false. What the row
     achieved was pinning every non-scheduler node's oracle to an *empty list*, which
@@ -410,11 +392,11 @@ Consequences that are each load-bearing:
     back to `--listen-node`, which is the wildcard on a scheduler — which the scheduler
     hands to clients verbatim, so a client on another machine dials `0.0.0.0` and
     reaches itself. `NodeServiceRejection` had always refused that for an *install*;
-    letting a worker carry a membership flag at all is what made it reachable from a
+    letting a worker admit other machines at all is what made it reachable from a
     hand-started one, so the startup table gained the row in the same change.
     Deliberately scoped: a node that registers **nowhere** and admits peers to its
-    cache tier is reached at `--listen-node` and needs no advertise, and a node with
-    no membership flags is the one-machine deployment and is correct as it stands.
+    cache tier is reached at `--listen-node` and needs no advertise, and a node that
+    admits no other machine is the one-machine deployment and is correct as it stands.
     Only the wildcard is refused, never an address that might not resolve — a host
     that is down today can be right at the next boot (#208), while the wildcard is
     wrong on every machine and forever.
@@ -471,199 +453,143 @@ Consequences that are each load-bearing:
       caller cannot forge. A comment asserting a check is impossible is worth more
       than a missing check: it stops the next person looking.
     - **Hosts only, never ports, and unmapped on both sides.** A peer dials from an
-      ephemeral source port, so `peerId` carries none — the reason `ClusterMembership`
-      keys on hosts too. And `::ffff:10.0.0.1` versus `10.0.0.1` is a property of how
+      ephemeral source port, so `peerId` carries none — the reason no admission rule
+      here ever keyed on a caller's port. And `::ffff:10.0.0.1` versus `10.0.0.1` is a property of how
       the *listener was bound*, so `Core/HostPort::UnmappedHost` folds them or two
       identically configured nodes disagree about one machine.
   - **The oracle is a seam and not a call into `Cluster::PeerDirectory`.** The
     dependency would run the wrong way — `Distributed` is the policy, `Cluster` is
     one way of establishing the fact it needs — and the answer is *deployment*-shaped
-    rather than universal, which is what an interface is for. `Publish` is a setter
-    and one of the documented carve-outs to configuration-at-construction: membership
+    rather than universal, which is what an interface is for. `PublishCluster` is a
+    setter and one of the documented carve-outs to configuration-at-construction: membership
     is precisely what changes while the object lives, and rebuilding the oracle per
     join would mean handing a new one to a running server.
-  - **Cluster membership is a SOURCE of admissions, never the whole policy — one
-    list answering two questions revoked an operator's by agreeing anything.**
-    `NodeMembership::Publish`, driven from `ConsensusTier`'s state observer, replaced
-    the `--fleet-member` hosts with the cluster's member set. The two answer different
-    questions: who may spend this node's CPU and read its cache tier — which is mostly
-    **clients**, developer laptops and CI runners, machines that never join consensus
-    and never should — and who is in the cluster, which is peers only. So on any node
-    running consensus the first replicated membership commit discarded every host an
-    operator listed, and agreeing something is *routine*: a node joining, a node being
-    forgotten, a settings change. A client machine admitted by name worked right up
-    until the fleet agreed anything at all and then stopped, with no configuration
-    having changed on either machine and nothing in the log tying the two events
-    together (#251). Four things about the shape that closes it:
-    - **It is the admission-layer reading of a rule consensus already has.** *Absence
-      from `ClusterState` is not removal* — a `--raft-peer` member is in the
-      configuration and in no state, and is never proposed for removal. An operator's
-      `--fleet-member` list is the same fact one layer up, and an empty agreed member
-      set — which is what every clustered node sees before the first entry naming
-      anybody commits — must therefore take nothing away.
-    - **The union is composed at the SEAM, not inside one oracle.**
-      `AnyOfMembership` holds participants and admits whoever any of them admits;
-      `ClusterMembership` keeps its single list and its wholesale `Publish`, which is
-      right for the one question its owner gave it. The obvious alternative — teaching
-      that class to hold a table of lists keyed by where each came from — cannot hold
-      the route that is coming: a signed lease token is a *credential check* with no
-      host set to add a row to, and it **adds** to an address policy rather than
-      replacing it, because that policy is what still gates the cache tier and what an
-      operator sets on a worker taking no leases at all. An enumeration of host lists
-      would have had to be taken apart again to admit it; a participant list does not.
-    - **Which list is written is decided by the owner, not passed in.**
-      `NodeMembership` holds one `ClusterMembership` per question and `Publish` writes
-      the cluster's, so the observer consensus installs cannot name the wrong one —
-      the same defence the host/endpoint collapse gets from being done in the
-      constructor, and for the same reason: the failure is silent. The participants are
-      borrowed, which is safe only because that type owns them, is declared before the
-      composite and is neither copyable nor movable.
-    - **`AdmissionSummary` had encoded the defect as advice.** It refused to name
-      `--fleet-member` on a clustered node, on the reasoning that the flag was about to
-      be overwritten — which was true and was the bug. A line that steers an operator
-      around a defect is one more thing to correct when the defect is fixed.
-    - **Addition is dynamic; REMOVAL is the direction that fails open**
-      ([#265](https://github.com/LASTRADA-Software/fastcached/issues/265),
-      [#405](https://github.com/LASTRADA-Software/fastcached/issues/405)).
-      `AnyOfMembership` folds its participants, and a host on both lists is
-      not revoked by `--cluster-forget`: that takes it out of the quorum and it keeps the
-      right to spend that machine's CPU and read its cache tier. Revoking it that way is a
-      config change on every node that lists it — which #265 recorded as needing a
-      **restart** and which is a **reload** since #405, `--fleet-member` and
-      `--fleet-open` both being `Reloadable::Yes` now.
-      - **For a CLIENT that gap is closed, and by a different verb**
-        ([#1309](https://github.com/LASTRADA-Software/fastcached/issues/1309)).
-        `--cluster-forget` names a member *id*; `--cluster-forget-client` names a *host*
-        and records a TOMBSTONE, which is why it reaches a list consensus does not own.
-        `Membership` grew `Forgotten`, `PrecedenceOf` makes it outrank `Member`, and
-        `AnyOfMembership` folds on that precedence rather than admitting on `any_of` —
-        the old fold flattened every non-`Member` answer to `Outsider`, so a forget
-        reached no surface as itself and no counted refusal could fire. The safety
-        survived and the DISTINCTION did not, with nothing to warn anybody.
-      - **The forget reaches an open node too**, and that is a decision about what
-        `--fleet-open` MEANS: it says *I have not enumerated who may use this fleet* — a
-        blanket over hosts nobody named — and a forget names one. Letting the blanket win
-        would make a local flag resurrect a machine the cluster positively removed, on
-        exactly the node nobody has reconfigured yet. The directions are not comparable:
-        honouring the forget wrongly refuses a machine, fails closed, and is visible from
-        the refused end. A MEMBER forget still revokes nothing under the flag, because
-        there is no set to remove anybody from; dropping the flag and reloading is what
-        closes the node to everybody.
-      - **The tombstone is published from `PublishCluster` and never from `Adopt`.** A
-        forget is the cluster's fact, and a reload that rebuilt the participants from a
-        config file would erase every tombstone agreed since startup — #251's shape in
-        the one direction where the erasure fails open.
-      - **This machine is never forgotten.** `ForgottenVerdicts::onLoopback` is
-        `Outsider`, which is silence rather than an opinion. `Cluster::Validate` already
-        refuses a loopback host to `ForgetClient`, so the guard is never reached — a
-        reason it is never REACHED, not a reason to leave it out, because the consequence
-        is a node refusing the local builds it exists for, on every surface at once, with
-        nothing saying why. The refusal's own reason in `Validate` was corrected with it:
-        it said such a record decides nothing, which stopped being true the moment a
-        tombstone started outranking every admission route.
-      - **The asymmetry did not go away, it moved.** Adding a member fails CLOSED: the
-        machine is refused until the reload lands, which is annoying, self-healing and
-        visible from the machine being refused. Removing one fails **OPEN**: a revoked
-        machine keeps being served and nothing reports it, because admission succeeding
-        is the ordinary case. Only the second is worth a live path, and it is the one a
-        test naturally skips — so the acceptance is the removal, and the addition case
-        is there only to stop a change that satisfies the easy half from passing.
-        - **It moved AGAIN with #1309's client forget, and the same asymmetry decides
-          what gets logged.** A member on a build predating the verbs skips the committed
-          entry by name: for `AdmitClient` that fails closed and the upgrade heals it, for
-          `ForgetClient` it fails open. So the forget warns at offer time and the admit is
-          SILENT, and that silence is what the case asserts — one that checked only that
-          the forget warns is green under an implementation warning on both, which trains
-          whoever reads the log to ignore the line that matters. The warning names no
-          members: a version string cannot say which builds implement a verb, and a model
-          of the fleet more permissive than the fleet produces confident wrong agreement,
-          so it states the consequence and sends the reader to the members' own logs,
-          where the skip is recorded with its index and verb byte.
-        - **The refusal is counted APART from a stranger's**, one counter for every
-          surface (`NodeRequestsRefusedHostForgotten`). A host an operator removed and a
-          host nobody ever listed are opposite diagnoses — one is to investigate, the
-          other is already decided and means the far end has not been told. One counter
-          and not six because the remedy is the host's, never the door's: split per
-          surface it would have to be summed by hand to answer the only question anybody
-          asks of it, and five of six would sit at zero looking like coverage.
-      - **`NodeMembership` IS the oracle rather than handing one out, and that is what
-        makes `--fleet-open` live at all.** Surfaces take an `IMembershipOracle const&`
-        once, at construction, and hold it for their lifetime; an `Oracle()` returning
-        one of two owned objects chosen by a flag read once would leave every surface
-        bound to whichever was right at startup. A test that re-asks `Oracle()` after
-        the reload passes under precisely that defect — so bind the reference BEFORE the
-        reload and classify through it after, which is what the fixture does and what
-        the production call sites do.
-      - **A reload may not WIDEN admission on a worker that runs no consensus and names no
-        `--voter-key`** (on a node with no `--cluster-key-file` until #178 PR 6 deleted it).
-        Such a node may have built `Cc::UncheckedLeaseValidator()` at startup, which is safe only
-        while no machine but this one is admitted — and neither guard for that can see a
-        reload. `StartupPolicyRejection` decides reachability from the listen flags,
-        which describe nothing under socket activation, and
-        `MakeWorkerLeaseValidator`'s backstop for exactly that has already run. Widening
-        would hand it an open unauthenticated compile port with every refusal counter
-        reading zero, which is
-        [#282](https://github.com/LASTRADA-Software/fastcached/issues/282) arriving
-        through the door #405 opens. Asked as a TRANSITION — the candidate admits remote
-        peers and the previous configuration did not — because a keyless worker that
-        already admits them passed its own startup rules, is running today, and must
-        stay free to NARROW: a guard refusing its reloads would punish the one edit that
-        makes it safer. A `PairRule` row in `ValidateNodeReloadable`, so the second rule
-        about a transition is a row rather than another `if`.
-      - **`Adopt` writes `--fleet-member`'s list and only that**, exactly as `Publish`
-        writes the cluster's and only that. Two publishers, one per question — #251
-        reached from the other side, and the reason the worsen-direction pin on
-        `Publish` still stands rather than being what #405 relaxed.
-      - **It does not contradict *absence from `ClusterState` is not removal*.** That
-        rule is about ABSENCE — a member the state never named, which must not be read
-        as a removal — while a forget is a positive act and does revoke what consensus
-        granted. What it cannot reach is a second route a different operator asserted by
-        hand. The two look contradictory to a reader meeting them cold, which is why
-        both are written down here rather than left to be re-derived.
-      - The machine an operator most wants to revoke is the one they stopped trusting,
-        and that is precisely the machine most likely to be in BOTH lists — so this is
-        not an academic corner.
-      - **Pinned by a test rather than only by prose**, and the direction that matters is
-        *worsen*: a change making `Publish` write `_listed` would look like a fix and
-        would discard every client machine the operator named, which is #251 exactly. The
-        case asserts both halves — a listed host survives the forget, a cluster-only host
-        does not — because one alone passes on a node whose `Publish` does nothing.
-      - The real fix is a credential, not a third list: an address list cannot be revoked
-        centrally and cannot describe a host whose address is not stable (a VPN peer,
-        DHCP, a container). Same conclusion #242 reached from the other direction, and
-        it is [#977](https://github.com/LASTRADA-Software/fastcached/issues/977).
-      - **A fold that is right and unaskable is half a feature**
-        ([#1471](https://github.com/LASTRADA-Software/fastcached/issues/1471)). Every rule
-        above decides admission correctly and NONE of them could be asked about: an operator
-        who drops a host from `--fleet-member` and finds it still served had no way to learn
-        the cluster admits it too. So the decision is a `MembershipDecision` — a verdict and
-        the SET of routes that produced it — `IMembershipOracle`'s one virtual returns it,
-        and `Op::ExplainAdmission` reports it through the SAME oracle the surfaces enforce.
-        Never a second walk over the same participants: two folds kept in step by discipline
-        is the defect this verb exists to make visible rather than one more instance of it.
-        - **A set, never a winner.** Two routes may admit one host and reporting either
-          alone answers a question nobody asked, sending the operator to edit a file that
-          changes nothing. `Outsider` is attributed to NOBODY (`DecidedBy`): an oracle
-          answering it has no opinion rather than an answer it produced, and naming the
-          author of a silence is the confident wrong signal.
-        - **The verdict must be known and the route set may be partial**, which is one
-          decision per field rather than one rule twice. `DecodeAdmissionExplanation`
-          REFUSES a verdict byte this build cannot name — defaulting it to `Outsider`
-          would report *refused by nobody* on a build that learned a fourth answer, and
-          that reads exactly like the healthy case — and KEEPS a route bit it cannot
-          name, because dropping it under-reports authorship on a fleet mid-upgrade. The
-          renderer counts the leftovers rather than dropping them, for the same reason.
-        - **The library↔wire mirror has ONE mapping**, `Distributed/MembershipWire.hpp`.
-          `CompileCacheWire.hpp` must stay dependency-free so it MIRRORS `Membership` and
-          `MembershipParticipant`, and a mirror needs a reader at each end — the node
-          ENCODES an answer and `fastcache-cli` RENDERS one. Two copies are two things
-          that can disagree about which bit means which route, inside the verb whose whole
-          subject is attributing a decision. The client's SPELLINGS are keyed on the
-          participant rather than on the wire bit, and that is the guard rather than a
-          preference: a bitmask enum has no `Last`, so a table keyed on one cannot be
-          checked for completeness, and a route added without a spelling would render as
-          *a route this client is too old to name* — blaming the node's version for the
-          client's omission.
+  - **Admission is decided by a machine's KEY, never by a list of addresses — so the
+    derivations that kept two address lists apart are gone with the lists.** The #251
+    two-lists argument, the `ForgottenMembership` precedence argument and the reload
+    asymmetry of a host list were all about keeping an address list right; since #178's
+    tickets there is none to keep. What replaced them is *Admission without addresses*,
+    under the node proof below. What carries over is these rules:
+    - **The forget reaches an open node too, by the key.** `--fleet-open` says *I have
+      not enumerated who may use this fleet* -- a blanket over callers nobody named -- and
+      a forget names one machine by its key, so a connection presenting that key, as a
+      proof or as a ticket, is refused under the flag like anywhere else. What the flag
+      still serves is a caller presenting NOTHING: it is anonymous by design, and a
+      forgotten machine that presents nothing is served as a stranger is. Letting the
+      blanket outrank the forget would make a local flag resurrect a machine the cluster
+      positively removed, on exactly the node nobody has reconfigured yet.
+    - **On an open node the forget reaches a machine by its CREDENTIAL, and that is also
+      its limit** (#1555). One that presents a revoked credential -- a proof, or a ticket
+      refused (and counted) as revoked -- is refused as itself on every later verb of that
+      connection, the verbs it pipelined behind the AUTH included. **Only the PROVEN path
+      names it**: a proof shows possession, so it gets `KeyForgottenWhy`; a revoked key a
+      TICKET showed is refused on the same row and counter in the surface's STRANGER
+      words, and the self form of `explain-admission` answers it as a stranger (host,
+      refused, by nobody) -- a ticket may be a captured one. How the key was shown travels
+      WITH the verdict (`MembershipDecision::revokedBy`, read by `RevocationIsProven`),
+      never inferred from which facts a connection lacks. **Except on an open node, which
+      discloses it**: an unknown ticket is served there and a revoked one refused, and the
+      self form answers the revoked ticket `Outsider` where a stranger gets `Member` by
+      `fleet-open` -- so a captured ticket's holder DOES learn its machine was forgotten,
+      the price of the forget biting under the flag at all; forged and unknown stay alike,
+      both served. The ticket's half is `ConnectionFacts::revokedMachine`: a
+      `RevokedKeyEvidence` whose ONLY operation answers `Forgotten`
+      (`Distributed::DecisionOf`), recorded by the endpoint and never cleared. It is never
+      asked of a key roster, because the lease roster that refused the ticket and the
+      fold's key roster publish at different moments, and asking the second could read
+      the key LIVE and admit the machine the first just refused. **A refused ticket grants
+      no admission, and a revoked one refuses.**
+    - **The revocation is published from `PublishCluster` and never from `Adopt`.** A
+      forget is the cluster's fact, and a reload that rebuilt the participants from a
+      config file would erase every revocation agreed since startup -- #251's shape in the
+      one direction where the erasure fails open. `Adopt` writes `--fleet-open` and only
+      that. **No ADDRESS is ever forgotten, loopback included**: a revoked key is refused
+      from this machine too, and what loopback keeps is the admission of a connection that
+      presents nothing -- the local builds a node exists for.
+    - **The refusal is counted APART from a stranger's**, one counter for every surface
+      (`NodeRequestsRefusedKeyRevoked`). A machine an operator removed and a machine nobody
+      ever admitted are opposite diagnoses -- one is to investigate, the other is already
+      decided and means the far end has not been told. One counter and not six because the
+      remedy is the machine's, never the door's: split per surface it would have to be
+      summed by hand to answer the only question anybody asks of it.
+    - **`NodeMembership` IS the oracle rather than handing one out, and that is what
+      makes `--fleet-open` live at all.** Surfaces take an `IMembershipOracle const&`
+      once, at construction, and hold it for their lifetime; an `Oracle()` returning
+      one of two owned objects chosen by a flag read once would leave every surface
+      bound to whichever was right at startup. A test that re-asks `Oracle()` after
+      the reload passes under precisely that defect -- so bind the reference BEFORE the
+      reload and classify through it after, which is what the fixture does and what
+      the production call sites do.
+    - **A reload may not WIDEN admission on a worker that runs no consensus and names no
+      `--voter-key`.** Such a node may have built `Cc::UncheckedLeaseValidator()` at
+      startup, which is safe only while no machine but this one is admitted -- and neither
+      guard for that can see a reload. `StartupPolicyRejection` decides reachability from
+      the listen flags, which describe nothing under socket activation, and
+      `MakeWorkerLeaseValidator`'s backstop for exactly that has already run. Widening
+      would hand it an open unauthenticated compile port with every refusal counter
+      reading zero, which is
+      [#282](https://github.com/LASTRADA-Software/fastcached/issues/282) arriving
+      through the door #405 opens. Asked as a TRANSITION -- the candidate admits remote
+      peers and the previous configuration did not -- because a keyless worker that
+      already admits them passed its own startup rules, is running today, and must
+      stay free to NARROW: a guard refusing its reloads would punish the one edit that
+      makes it safer. A `PairRule` row in `ValidateNodeReloadable`, so the second rule
+      about a transition is a row rather than another `if`.
+    - **It does not contradict *absence from `ClusterState` is not removal*.** That
+      rule is about ABSENCE -- a member the state never named, which must not be read
+      as a removal -- while a forget is a positive act, and it revokes the key the
+      removed record held. The two look contradictory to a reader meeting them cold,
+      which is why both are written down here rather than left to be re-derived.
+  - **A fold that is right and unaskable is half a feature**
+    ([#1471](https://github.com/LASTRADA-Software/fastcached/issues/1471)). Every rule
+    above decides admission correctly and NONE of them could be asked about: an operator
+    who finds a machine still served had no way to learn which route admits it -- the
+    key it proved, a ticket it presented, or `--fleet-open`. So the decision is a `MembershipDecision` — a verdict and
+    the SET of routes that produced it — `IMembershipOracle`'s one virtual returns it,
+    and `Op::ExplainAdmission` reports it through the SAME oracle the surfaces enforce.
+    Never a second walk over the same participants: two folds kept in step by discipline
+    is the defect this verb exists to make visible rather than one more instance of it.
+    - **A set, never a winner.** Two routes may admit one host and reporting either
+      alone answers a question nobody asked, sending the operator to edit a file that
+      changes nothing. `Outsider` is attributed to NOBODY (`DecidedBy`): an oracle
+      answering it has no opinion rather than an answer it produced, and naming the
+      author of a silence is the confident wrong signal.
+    - **The question about the caller's OWN connection is answered to a caller the node
+      refuses** -- an empty subject. Gated, it would leave the refused machine the one
+      caller that could never ask why. It answers only what that connection established
+      (its host, the key it proved, the ticket it presented), which a gated verb's
+      refusal already tells a stranger, so `Op::ExplainAdmission` is `OpenBeforeAuth`,
+      bounded by `MaxExplainAdmissionPayload`, and `NodeStatusResponder::RefusePeer`
+      passes it. The MACHINE form reads the roster and so describes a third party: it
+      is gated inside `Answer`, counted on the non-member row. A machine's route set is
+      `ExplainConnection` over its roster key presented as a proof AND a ticket -- the
+      enforced fold, never a second walk.
+    - **A verb answered before admission must not answer the machine form's question
+      either**, and AUTH did: a ticket is checked under the ROSTER's key for the id it
+      claims, so `forged` against `unknown-machine` told a stranger signing with its own key
+      whether an id is admitted, and `revoked` told a captured ticket's holder the machine
+      was forgotten. The three travel as ONE message (`TicketRefusalSays::NotAdmitted`)
+      with their counters kept apart; what a caller can check itself, or the node's own
+      state, still names itself. The node proof gets the same property the other way
+      round -- the signature under the key the CALLER presented, the roster only after.
+    - **The verdict must be known and the route set may be partial**, which is one
+      decision per field rather than one rule twice. `DecodeAdmissionExplanation`
+      REFUSES a verdict byte this build cannot name — defaulting it to `Outsider`
+      would report *refused by nobody* on a build that learned a fourth answer, and
+      that reads exactly like the healthy case — and KEEPS a route bit it cannot
+      name, because dropping it under-reports authorship on a fleet mid-upgrade. The
+      renderer counts the leftovers rather than dropping them, for the same reason.
+    - **The library↔wire mirror has ONE mapping**, `Distributed/MembershipWire.hpp`.
+      `CompileCacheWire.hpp` must stay dependency-free so it MIRRORS `Membership` and
+      `MembershipParticipant`, and a mirror needs a reader at each end — the node
+      ENCODES an answer and `fastcache-cli` RENDERS one. Two copies are two things
+      that can disagree about which bit means which route, inside the verb whose whole
+      subject is attributing a decision. The client's SPELLINGS are keyed on the
+      participant rather than on the wire bit, and that is the guard rather than a
+      preference: a bitmask enum has no `Last`, so a table keyed on one cannot be
+      checked for completeness, and a route added without a spelling would render as
+      *a route this client is too old to name* — blaming the node's version for the
+      client's omission.
 - **An unbounded wait does not avoid an ending, it only chooses who picks it — and
   the supervisor picks `SIGKILL` with no diagnostic.** `~WorkerServer` drained on an
   unbounded condition variable, and the comment defending that was right about its
@@ -1317,8 +1243,8 @@ Consequences that are each load-bearing:
   (`StateLeaseRoster`); every other worker asks `RosterTrust`. Both are `ILeaseRoster`, and
   `SignedLeaseValidator` takes one and never a key.
   - **A worker adopts v' >= v only if a STRICT MAJORITY of the voters in the roster it HOLDS
-    endorse it, unexpired** (`CertifyRoster`: `needed = voters / 2 + 1`, keyless voters in
-    the denominator). `--voter-key` roots only the FIRST roster, and is never read again once
+    endorse it, unexpired** (`CertifyRoster`: `needed = voters / 2 + 1`, every voter in the
+    denominator). `--voter-key` roots only the FIRST roster, and is never read again once
     one is held -- as the replicated state wins over the keys `--raft-peer` typed. So a
     revoked ex-leader that withholds the roster revoking it and serves one of its own, with
     itself as the only voter, is ONE endorsement of three and is refused. **A majority of
@@ -1362,11 +1288,18 @@ Consequences that are each load-bearing:
   has **two halves and either one closes it**: the socket (a loopback
   `--listen-node` answers no other machine whatever the policy says — which is what
   keeps this repository's own `--fleet-open` e2e fleets working) and the policy
-  (`--fleet-open`, a non-loopback `--fleet-member`, or consensus). **Consensus
-  counts**, because a clustered node's admitted set GROWS at runtime: the agreed
-  member list is published into the same oracle the compile port consults, so such a
-  node admits machines nobody typed. `CompilePortFacesTheNetwork` and
+  (`--fleet-open`, a roster, or consensus). **A roster counts**, because a node that
+  verifies keys admits machines by proof and by ticket whatever address they dial from,
+  and a clustered node's admitted set GROWS at runtime: the agreed keys are published
+  into the same oracle the compile port consults, so such a node admits machines nobody
+  typed. `CompilePortFacesTheNetwork` and
   `AdmitsRemotePeers` in `NodeConfig.cpp` (#282).
+  - **"Loopback" is an IP LITERAL -- `127.0.0.0/8` parsed as four octets, or `::1` -- and a
+    NAME never is.** `IsLoopbackHost` matched `127.` as a PREFIX, so a bind spelled
+    `127.cache.example.com` read as unreachable from the network whatever it resolved to and
+    switched the lease check OFF: the socket half failing OPEN. A name is judged by what it is,
+    and every rule asking the question now fails closed (`localhost` included, which the
+    usability rows that want it spell out themselves).
 - **A validator returns a REASON, not a `bool`, and it does not take the endpoint.**
   Three refusals are distinguishable on the wire and counted apart, so a boolean
   collapses the one distinction an operator needs — somebody probing the port, a
@@ -1427,8 +1360,8 @@ Consequences that are each load-bearing:
   `fastcache-compile-node.socket` says `ListenStream=6676`, every interface -- and
   `--bind`/`--port` are read by nothing. The value is still *in* the configuration;
   it has simply stopped describing anything. So a keyless node carrying a stale
-  `--bind=127.0.0.1` in its configuration, plus `--fleet-open` or a remote
-  `--fleet-member`, passed the startup table, built `UncheckedLeaseValidator` and
+  `--bind=127.0.0.1` in its configuration, plus `--fleet-open`, passed the startup
+  table, built `UncheckedLeaseValidator` and
   served an unauthenticated compile port to the network with all three
   `worker_jobs_refused_lease_*` counters reading zero. #282 recurring inside the fix
   for #282, and found by review rather than by CI.
@@ -1633,9 +1566,9 @@ Consequences that are each load-bearing:
 - **An OUTBOUND credential is read at the moment it is presented, through one seam,
   and a site that captures one is invisible until somebody rotates**
   ([#404](https://github.com/LASTRADA-Software/fastcached/issues/404)). On this worker
-  `--requirepass` is presented and never required — to the shared `fastcached`, to the
-  scheduler, and by a cluster admin verb — and each of the three built its own
-  `Cc::Credential` from `cfg.token` at construction. Marking the row `Reloadable::Yes`
+  `--requirepass` is presented and never required, and each of the three sites that
+  presented it — the shared `fastcached`, the scheduler round, a cluster admin verb —
+  built its own `Cc::Credential` from `cfg.token` at construction. Marking the row `Reloadable::Yes`
   publishes a snapshot none of them reads, which is the "green while doing nothing"
   failure in the one area where the symptom is an authentication failure nobody can
   reproduce, on a machine nobody is watching. **A rotation that reaches two of three is
@@ -1662,6 +1595,16 @@ Consequences that are each load-bearing:
     a case could assert the other two and the missed one was structurally
     undemonstrable. Both halves of that are the fix: the type makes the defect
     unwritable, the move makes the absence of it provable.
+  - **And it goes to `--upstream` ALONE, since the scheduler never checked it.** A
+    scheduler answers a password `AUTH` `Ok` and establishes nothing, so the rounds #404
+    kept current were handing the upstream's secret, in the clear and pipelined ahead of
+    any seal, to every `--scheduler` and to every endpoint a `NotLeader` named. A node's
+    credential with a scheduler is its PROOF: every verb it sends one goes through
+    `Cc::ExchangeWithScheduler`, which takes no credential, so presenting one again is a
+    new parameter rather than a forgotten argument. `NodeCredential_test` reads the bytes
+    of a proof, a registration and a presence round with a secret configured, and finds no
+    `AUTH` frame in any. An operator verb chooses per endpoint (`OperatorCredentials`) and
+    a cordon asks this machine's own node, which checks none.
 - **A file's MODE is in no configuration, so the worker's secret-file check follows
   the RELOAD and not only the start** ([#868](https://github.com/LASTRADA-Software/fastcached/issues/868)).
   One of this binary's five secret settings is `Reloadable::Yes` since
@@ -1675,7 +1618,7 @@ Consequences that are each load-bearing:
   answer: an operator edits `log_level:`, sends SIGHUP, the reload is accepted, and
   nothing re-asks the filesystem, so a `--cluster-key-file` that went to 0644 an hour
   after the node started is silent for the rest of the process's life. That key MACed
-  node proofs AND lease grants until #178 PR 6 retired it; `--scheduler-token-file` is the
+  node proofs AND lease grants until #178 PR 6 retired it; `--dashboard-token-file` is the
   same case today. `SecretExposureWatcher` re-asks and remembers
   `(path, exposure)`, so a standing exposure is said once; an implementation reasoning
   from the reloader's previous-and-current pair concludes nothing changed and never
@@ -1867,7 +1810,8 @@ symptom was that they were slow.
 
   This is the consumption test from the claim-record rule below, arriving at the
   opposite answer. `NotLeader`'s message was diagnostics for as long as
-  `ClusterAdminCli` merely PRINTED it, and a loose test cost a confusing sentence.
+  `ClusterAdminCli` merely PRINTED it, and a loose test cost a confusing sentence. It
+  follows the redirect now, through the one loop every operator verb shares (`AskTheLeader`).
   A launcher DIALS it, so it became a dependency record in that same moment — the
   bullet below says *"the moment something did, it would stop being diagnostics and
   this bullet would be wrong"*, and this is that moment, for a different field.
@@ -2171,7 +2115,7 @@ Six more about what the tier IS and who gets to see it:
   **A bare `--listen-node` follows `--serve-scheduler` and nothing else, and that is a
   decision rather than an omission**
   ([#463](https://github.com/LASTRADA-Software/fastcached/issues/463)). Widening it for
-  a *fleet participant* -- `--scheduler`, `--fleet-member`, `--fleet-open` -- restores
+  a *fleet participant* -- `--scheduler`, `--fleet-open` -- restores
   no ergonomics: the wider bind is what makes `CompilePortFacesTheNetwork` true, so
   a way to check a lease becomes required, and the wider bind *becomes* the advertised
   endpoint, so `AdvertisesWildcard` requires `--advertise` too. It costs three things.
@@ -3320,16 +3264,15 @@ earns its place.
 <!-- agent-tripwire: a caller that PROVES a live identity key is a member wherever it dialled from -->
 
 Node-to-node admission on the `0xFC` surface was decided by the caller's SOURCE ADDRESS and
-nothing else — `ClusterMembership` against the committed endpoints, `--fleet-member` against a
-local list. An address is a stand-in for *this is one of our nodes*, and it stops being one the
+nothing else — the committed endpoints of the cluster's members, and a host list an operator
+typed. An address is a stand-in for *this is one of our nodes*, and it stops being one the
 moment an address is not stable: a worker that joins over a VPN gets a different one each
 session and no literal host match can follow it (#178 item 1). #1428 let a caller PROVE the
 cluster's pre-shared key instead; #178 PR 6 made it prove WHICH machine it is, by signing with
 its own identity key, and sealed every frame after the proof. Each rule below is what some
 plausible simpler design gets wrong.
 
-**An address admits CLIENTS; it no longer admits a machine into the fleet.** The verbs a machine
-joins with -- `Register`, `NodeAnnounce`, `Heartbeat`, `Withdraw` -- decide where the fleet's work
+**No address admits another machine, and the verbs a machine JOINS with need a proof.** They -- `Register`, `NodeAnnounce`, `Heartbeat`, `Withdraw` -- decide where the fleet's work
 is sent, and they are `IdentityRequirement::ProvenNodeOnly`, a COLUMN of `OpTable` pinned by
 `JoiningVerbsNeedAnIdentity`, refused `NodeIdentityRequired` and counted
 (`SchedulerRequestsRefusedNodeIdentityRequired`). Loopback is NOT exempt: a process on the
@@ -3345,7 +3288,30 @@ registration states the same variable (`ServiceSpec::serviceAccountEnvironment`)
 service would take the per-user default in its account's home -- a second identity, or on the
 packaged unit (`ProtectSystem=strict`, home `/`) an unwritable one. The Windows service is
 privileged by its service SID and takes `%ProgramData%\fastcache-node` by itself. A client
-asking for a lease or a cache entry proves nothing and is admitted exactly as before.
+asking for a lease presents a machine ticket instead (*Machine tickets*, below), and a ticket
+never satisfies `ProvenNodeOnly`: a ticketed connection is not sealed.
+
+**An operator's CONTROL verbs need a caller a route IDENTIFIES, and `--fleet-open` identifies
+nobody.** `--fleet-open` admits a caller to what the fleet SERVES -- a lease, a status, a cache
+request -- and never to what DECIDES the fleet. With the scheduler's password gone, membership was
+the only gate on `CLUSTER-ADMIT` and on `ENROLL-CONTROL`, so on an open node an anonymous remote
+caller could approve its own enrollment or arm an auto-approve window. Two columns decide it,
+never an `if` at a handler:
+- `OpDescriptor::identity` names the verbs: `IdentityRequirement::IdentifiedCaller` on
+  `ClusterSet`, `ClusterForget`, `ClusterAdmit`, `ClusterAdmitLearner`, `ClusterAdmitWorker` and
+  `EnrollControl`, pinned by `ControlVerbsNeedAnIdentifiedCaller`.
+- `Distributed::MembershipRoutes` names the routes: loopback, a proven key and a verified ticket
+  identify their caller; `OpenPolicy` does not.
+
+`CallerContextOf` reads the second off the same fold that admitted the connection
+(`RestsOnIdentifiedCaller`). One table, `Distributed::IdentityRequirements`, answers the first for
+the scheduler (`RefuseUnlessIdentified`) and for the enrollment surface (`RefuseUnidentified`, at
+the door and again in `AnswerControl`).
+
+The refusal is `IdentifiedCallerRequired` (0x2e), not `NotAMember`, because the caller IS admitted
+and the remedy is to identify itself. It is counted on each surface's own row. `Cordon` and
+`MintTicket` are not rows: each already answers this machine alone. A reviewer's neuter --
+`OpenPolicy` made to identify -- turns the refusal cases red.
 
 **A proof is worth nothing unless every frame after it is SEALED.** Without the seal, a machine on
 the path relays a genuine worker's handshake to the scheduler, watches it succeed, and writes a
@@ -3372,7 +3338,7 @@ keys before it sends a verb. Only a refusal decided before any key exists (a pay
 not decode) leaves the connection unsealed. **A connection proves ONCE**: either verb on one that
 has proved or is sealed closes it, because a second handshake would re-key mid-stream and a
 revoked machine re-proving under another key on the connection its tombstone marks would be
-asking to be judged afresh by the one fact that condemns it. Bytes pipelined past `ProveNode`
+asking to be judged afresh by the one fact that condemns it -- the revocation its key carries. Bytes pipelined past `ProveNode`
 close the connection too: they arrived in the clear, before the seal existed.
 
 **The SERVER signs first, and a caller that holds a roster checks it** (`NodeProofClient`). A
@@ -3386,7 +3352,7 @@ holds live for that id admits (`ProvenIdentity`); one it holds for no one is `No
 (`NodeProofsRefusedUnknownKey`), whose remedy is the operator's -- an admission -- rather than the
 caller's; one it REVOKED is `NodeKeyRevoked` (`NodeProofsRefusedRevokedKey`), and the connection
 KEEPS that identity, marked: every later verb on it is `Forgotten` through `KeyTombstone`, which
-outranks every address route on `PrecedenceOf` -- a host still on `--fleet-member` included --
+outranks every other route on `PrecedenceOf` -- loopback and `--fleet-open` included --
 and is counted at the gate (`NodeRequestsRefusedKeyRevoked`). Dropping the identity instead would
 hand the forgotten machine back to its address, which is the one outcome a forget exists to
 prevent. The signature is checked BEFORE the roster is consulted, so a caller who cannot sign
@@ -3398,9 +3364,9 @@ while the connection is open refuses its very next verb.
 `Distributed::ExplainConnection(oracle, host, proven)`. The alternative — folding at each surface
 — is the shape this file already records for the membership verdict itself: five copies of a
 one-armed decision were exactly as correct as one until a second arm arrived, and then five files
-each had to grow it. A tie unions rather than choosing, for `AnyOfMembership`'s reason: a host in
-`--fleet-member` that also proved a live key is admitted by both, and an operator who drops it
-from the list has to be told the key still admits it.
+each had to grow it. A tie unions rather than choosing, for `AnyOfMembership`'s reason: a
+connection on this machine under `--fleet-open`, or one that proved a live key AND presented a
+ticket, is admitted by both routes, and an operator asking why has to be told every one of them.
 
 **Every gate INCLUDES the live-stats one since #1512, and how that came about is the transferable
 part.** It was the one exception, and the reason was never about subscriptions: a subscription is
@@ -3454,6 +3420,71 @@ description**: `CompileResponder`, `EnrollmentResponder`, `FleetTextResponder`,
 `NodeStatusResponder`, `SchedulerResponder` and -- since #1512 -- `LiveStatsResponder` at BOTH
 its door and its per-tick re-gate. There is no spelling that refuses to widen, so a seventh
 surface folds by reaching the one function rather than by remembering to.
+
+### Machine tickets
+
+A proof admits a NODE, over a sealed connection it holds; a launcher on a laptop holds no such
+connection and should not -- it dials a scheduler, a worker and a cache once per exchange. So a
+machine proves itself per exchange with a **ticket**: a claim set (label, machine id, audience,
+expiry, nonce, each length-prefixed) signed by the machine's OWN identity key, minted by this
+machine's node over loopback (`MINT-TICKET`) and presented in an `AUTH` pipelined ahead of the
+command. Each rule is what a simpler ticket gets wrong.
+
+- **Admission keys on a VERIFIED ticket, never on an `AUTH` answered `Ok`.** A node with no
+  password answers a password `AUTH` `Ok` so a token-configured launcher is not broken by it --
+  `NoPolicy`, which establishes nothing. The declared KIND decides what is verified: a genuine
+  ticket's bytes under the password kind establish nothing either.
+- **A refused `AUTH` CLEARS what an earlier one established** (Review Focus 3). A connection must
+  not keep a machine it can no longer vouch for by presenting something worse afterwards, so the
+  endpoint resets the fact when an `AUTH`'s header is read -- a header refusal never reaches the
+  verifier -- and `AnswerAuth` ASSIGNS what a served one established. Only a revocation is merged:
+  it is permanent, and a later `AUTH` must not lift it.
+- **Audience-bound and spent once, because an `AUTH` is sent on an unsealed connection.** A
+  captured ticket is replayable by whoever saw it, so it names the ONE endpoint it may be presented
+  to -- never loopback or a wildcard, which every node is -- lives `MachineTicketLifetime`, and is
+  spent at the node that accepts it (`SpentTickets`, bounded by count and refusing
+  `spent-set-full` by name rather than evicting an entry that could still be replayed).
+- **Refused by REASON, signature first** (`TicketRefusalTable`). The signature is checked before
+  any claim is reported on, so a caller who cannot sign learns nothing; `forged`,
+  `unknown-machine` and `revoked` travel as ONE message with their counters apart, since telling
+  them apart would tell a stranger which ids the roster admits.
+- **`no-roster` is its own reason, never `unknown-machine`** (Review Focus 5). A worker whose
+  certified roster lapsed while its machine slept admits the machine as soon as a voter
+  re-endorses; answered `unknown-machine`, it would send an operator to re-admit a machine that is
+  admitted.
+- **A pure worker verifies against the roster its voters CERTIFIED**, the same `NodeRoster` its
+  lease check reads, so a forget reaches it on its next round with no restart.
+
+### Admission without addresses (spec 2026-09-26 §5)
+
+**Why an address stopped being evidence.** An address list was a stand-in for *this is one of
+our machines*, and it stopped being one twice. A roaming machine -- a laptop on a VPN, DHCP, a
+container -- has no address to list, so the list either chased it or was opened to everybody.
+And #235 showed the other half: loopback is admitted before every other route is asked, so a
+suite whose clients are all local never reached the list at all, and a worker that admitted
+nobody else passed it. Removing an address from a list also failed OPEN: the list lived on N
+machines, and the one an operator forgot kept serving the machine.
+
+**Five participants, one fold** (`Distributed::ExplainConnection`, reached only through
+`Node::RefuseUnlessMember`): a REVOKED key, which refuses and outranks everything; loopback;
+a proven key; a verified machine ticket; `--fleet-open`. The four admitting routes tie and are
+unioned, so `explain-admission` can name every one; `MembershipParticipant` 0 is reserved.
+
+**Removal by key cannot fail open where removal by address did.** The key lives in ONE
+replicated state and the fold asks it on EVERY verb, so `--cluster-forget` -- which drops the
+record and revokes its key in one entry -- reaches every node as it applies, every surface, and
+every connection already open, with nothing to edit on any machine. What it still cannot reach
+is a caller that presents nothing on an open node, which is `--fleet-open`'s stated meaning.
+The fail-open predicates (`AdmitsRemotePeers`, `CompileVerbsReachOtherMachines`,
+`NamesAnAdmissionRoute`) COUNT the key routes, each call site stating what it knows about the
+roster (`RosterPresence`) -- a worker that read a key route as absent would build a lease check
+that verifies nothing.
+
+**Adding a machine fails CLOSED and self-heals; removing one fails OPEN and reports nothing**,
+because admission succeeding is the ordinary case -- so the removal is the direction every case
+here asserts first, with the addition beside it only to stop a change that satisfies the easy
+half from passing. The in-process fleet asserts it from addresses nobody listed
+(`FleetTickets_test`, `FrameEndpoint_test`'s relabelled-peer cases).
 
 ## Open work
 

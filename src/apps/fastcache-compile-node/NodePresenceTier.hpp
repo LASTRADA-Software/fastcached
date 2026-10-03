@@ -6,7 +6,6 @@
 #include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
-#include "NodeCredential.hpp"
 #include "NodeRoster.hpp"
 #include "SchedulerLink.hpp"
 
@@ -36,7 +35,6 @@ struct NodePresenceParts
     CacheTier const* cacheTier;                     ///< Null on a node with no cache.
     IMetricsSink const& metrics;                    ///< Where the cache figures are read.
     FleetSampler& sampler;                          ///< This machine's own series, and its history.
-    ICredentialSource const& credential;            ///< What the announcement presents.
     ILogger& logger;                                ///< Where a refusal is named.
     /// What is wrong with this machine (#1364), read per round and handed to the leader's fleet
     /// page. The one verb every node sends is the one that carries it.
@@ -62,8 +60,6 @@ struct PresenceRound
     CacheTier const* cacheTier;                       ///< Null on a node with no cache.
     IMetricsSink const& metrics;                      ///< Where the cache figures are read.
     FleetSampler& sampler;                            ///< This machine's series, and its history.
-    ICredentialSource const& credential;              ///< What the announcement presents.
-    Cc::CredentialNotice& notice;                     ///< Where an unwanted credential is reported.
     CompileCacheWire::CapacityFields const& capacity; ///< What this machine is.
     std::string_view endpoint;                        ///< Where it answers; the key its row is filed under.
     ILogger& logger;                                  ///< Where a refusal is named.
@@ -90,8 +86,6 @@ struct PresenceMessage
     std::string_view endpoint;                        ///< Where this machine answers; its row's key.
     CompileCacheWire::CapacityFields const& capacity; ///< What this machine is.
     CompileCacheWire::LoadFields const& load;         ///< What it is doing, and the history it hands over.
-    ICredentialSource const& credential;              ///< What the announcement presents.
-    Cc::CredentialNotice& notice;                     ///< Where an unwanted credential is reported.
     ILogger& logger;                                  ///< Where a refusal is named.
     NodeProofClient const* prover;                    ///< How this machine proves itself; null where nothing proves.
 };
@@ -181,14 +175,10 @@ class NodePresence
     CacheTier const* _cacheTier;
     IMetricsSink const& _metrics;
     FleetSampler& _sampler;
-    ICredentialSource const& _credential;
     ILogger& _logger;
     NodeConditions const& _conditions;
     IPresenceRoster* _roster;
     NodeProofClient const* _prover;
-
-    /// Where a credential the scheduler did not want is reported, once for this loop.
-    Cc::CredentialNotice _notice;
 
     /// This machine's capacity record, converted once: it is compiled-in and configured
     /// state, and nothing about it changes between rounds.

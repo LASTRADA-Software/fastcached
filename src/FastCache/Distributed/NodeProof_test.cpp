@@ -13,6 +13,7 @@
 #include <FastCache/Core/SessionSeal.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
+#include <FastCache/Distributed/MachineTicket.hpp>
 #include <FastCache/Distributed/NodeProof.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -277,6 +278,14 @@ constexpr EnumTable<IdentityKeyPurpose, ConstructionBuilder> ConstructionBuilder
           [](ConstructionSamples const& samples) {
               auto const transcript = TranscriptOf(samples);
               return NodeProofSignedMessage(NodeProofSignature::NodeProof, transcript);
+          } },
+    { .purpose = IdentityKeyPurpose::MachineTicket,
+      .build =
+          [](ConstructionSamples const& samples) {
+              return MachineTicketMessage(MachineTicketClaims { .machineId = samples.summary.nodeId,
+                                                                .audience = "office.corp:6674",
+                                                                .expiresAtUnixSeconds = 1,
+                                                                .nonce = {} });
           } },
 } };
 

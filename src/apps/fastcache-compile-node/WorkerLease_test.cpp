@@ -388,3 +388,34 @@ TEST_CASE("A socket-activated worker that admits remote peers and holds no roste
                                    state.logger)
               .has_value());
 }
+
+TEST_CASE("A socket-activated worker with no roster is opened only by --fleet-open, and refused then",
+          "[node][lease][admission]")
+{
+    // No roster means no proof and no ticket can admit anybody, so the factory asks
+    // `AdmitsRemotePeers` with `Absent`: only `--fleet-open` or a fleet the formation record
+    // puts it in widens such a node. Asked with `Unknown` instead, a state directory -- which
+    // every worker naming a scheduler keeps -- would count as a key route and refuse every
+    // activated worker the directory turned out to hold no roster for, although nobody remote
+    // is admitted there.
+    NodeConfig cfg;
+    cfg.clusterDir = "cluster";
+    WorkerState state;
+
+    auto validator = MakeWorkerLeaseValidator(
+        cfg, nullptr, state.advertised, SocketActivation::Yes, LeaseClock, state.lease, state.metrics, state.logger);
+    REQUIRE(validator.has_value());
+    // The unchecked validator: nobody remote is admitted, so it refuses nothing and spends
+    // nothing.
+    state.lease.fleet.Pin(std::string { ThisCluster });
+    CHECK_FALSE((*validator)(GrantUnder(CurrentTerm), "gcc-13").refusal.has_value());
+    CHECK(state.lease.spent.Size() == 0);
+
+    // And `--fleet-open` admits every caller, so the same node is refused, naming the remedy.
+    cfg.fleetOpen = true;
+    WorkerState opened;
+    auto const refused = MakeWorkerLeaseValidator(
+        cfg, nullptr, opened.advertised, SocketActivation::Yes, LeaseClock, opened.lease, opened.metrics, opened.logger);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().contains("--voter-key"));
+}

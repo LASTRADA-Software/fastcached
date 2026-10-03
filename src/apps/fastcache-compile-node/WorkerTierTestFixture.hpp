@@ -7,7 +7,6 @@
 
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
-#include "NodeCredential.hpp"
 #include "NodeIoLoop.hpp"
 #include "ScratchClaim.hpp"
 #include "WorkerTier.hpp"
@@ -85,7 +84,6 @@ struct WorkerTierFixture
     AnnouncedEndpoint announced { "127.0.0.1:6674" };
     /// What the next `Start` builds from; a case edits it first.
     NodeConfig cfg = Worker();
-    ConfiguredCredential credential { cfg, nullptr };
     /// Where the tier answers its conditions; a case reads it after `Start`.
     NodeConditions conditions;
     int discoveryCalls = 0;
@@ -122,7 +120,6 @@ struct WorkerTierFixture
                                                    .io = io,
                                                    .host = *host,
                                                    .cacheTier = nullptr,
-                                                   .credential = credential,
                                                    // Nothing proves: every case here is about the worker tier
                                                    // itself, against a scripted fleet that serves no handshake.
                                                    .prover = nullptr,

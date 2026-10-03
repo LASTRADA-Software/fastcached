@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -520,6 +521,16 @@ inline constexpr std::array DeclineCauseTable {
     // it would need, or only reaching an ex-leader that withholds it. Not `NotPermitted`,
     // which points at this client's configuration, which is fine.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::RosterExpired, .cause = DeclineCause::WorkerRefused },
+    // A machine ticket refused: this machine is not admitted, its key was revoked, or the ticket
+    // named another node or has lapsed. Usually fixed where this client stands rather than by
+    // adding machines, so `NotPermitted`. The exception is one worker whose roster is stale and
+    // does not yet hold this machine -- `RosterExpired`'s case, which another worker would not
+    // share.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::TicketRefused, .cause = DeclineCause::NotPermitted },
+    // An operator's control verb from a caller only `--fleet-open` admitted. The launcher sends no
+    // control verb, so a compile cannot reach it; were one to, no retry clears it, which is
+    // `NotPermitted`'s answer.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::IdentifiedCallerRequired, .cause = DeclineCause::NotPermitted },
 };
 
 /// Whether every refusal this build's wire header knows carries a classification.
@@ -560,6 +571,20 @@ static_assert(DeclineCausesAreTotal(),
     return DeclineCause::Unrecognised;
 }
 
+/// Which exchange of a dispatch a refusal came from: the endpoint it dialled, and the verb it asked.
+///
+/// Both halves, because one endpoint answers several exchanges of one dispatch: a node serving the
+/// scheduler and a worker on one merged surface is asked for the LEASE, refuses the COMPILE, and is
+/// sent the RELEASE -- three exchanges at one address, and only the second declined the dispatch.
+struct ExchangeSite
+{
+    std::string endpoint;   ///< Where the frame went, as `host:port`.
+    std::uint8_t opcode {}; ///< The request's opcode byte, as the frame carried it.
+
+    /// @return True when both name the same endpoint and verb.
+    [[nodiscard]] bool operator==(ExchangeSite const&) const = default;
+};
+
 /// The result of one dispatch attempt.
 struct DispatchResult
 {
@@ -579,6 +604,10 @@ struct DispatchResult
     std::string stderrText;        ///< The remote compiler's stderr.
     std::string detail;            ///< Why it was declined or unavailable; empty on success.
     std::string workerEndpoint;    ///< Which worker ran it, for diagnostics.
+    /// The exchange whose refusal declined the dispatch, when `status` is `Declined`: the LEASE at
+    /// whoever answered it, or the COMPILE at the worker the grant named. Never the RELEASE, which
+    /// runs after a refused compile too and decides nothing about it.
+    std::optional<ExchangeSite> declinedAt {};
 
     /// @return True when a worker actually ran the compiler.
     [[nodiscard]] bool Ran() const noexcept

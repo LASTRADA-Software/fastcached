@@ -91,15 +91,6 @@ std::vector<std::byte> EncodeClusterRequest(ClusterRequest const& request)
             return Wire::EncodeClusterAdmitWorker(
                 Wire::ClusterAdmitWorkerRequest { .workerId = request.key, .publicKey = keyText });
         }
-
-        // One encoder for the pair, and the verb is a TEMPLATE argument rather than a
-        // value: naming a third verb here does not compile. That is the obligation the
-        // type system can hold, and it is why `CompileCacheWire.hpp` needed no
-        // `<cassert>` to keep the pair honest.
-        case ClusterAction::AdmitClient:
-            return Wire::EncodeClusterClientVerb<Wire::Op::ClusterAdmitClient>(request.key);
-        case ClusterAction::ForgetClient:
-            return Wire::EncodeClusterClientVerb<Wire::Op::ClusterForgetClient>(request.key);
     }
 
     return {};
@@ -133,16 +124,14 @@ std::string RenderClusterState(Cluster::ClusterState const& state)
         // never an empty `raft=`.
         //
         // The key WHOLE (#178), in the one spelling `--node-status` prints on the member, so
-        // an operator compares two identical strings from two machines. Absent is a member
-        // that has not stated one, which is not a key anybody could type.
-        out +=
-            std::format("  {:<{}} seat={} raft={} scheduler={} key={}\n",
-                        member.id,
-                        IdColumn,
-                        Cluster::MemberSeatName(member.seat),
-                        member.raftEndpoint.empty() ? std::string { Absent } : member.raftEndpoint,
-                        scheduler,
-                        member.publicKey.has_value() ? FormatEd25519PublicKey(*member.publicKey) : std::string { Absent });
+        // an operator compares two identical strings from two machines.
+        out += std::format("  {:<{}} seat={} raft={} scheduler={} key={}\n",
+                           member.id,
+                           IdColumn,
+                           Cluster::MemberSeatName(member.seat),
+                           member.raftEndpoint.empty() ? std::string { Absent } : member.raftEndpoint,
+                           scheduler,
+                           FormatEd25519PublicKey(member.publicKey));
     }
 
     // Said out loud when empty, for the members' reason: an operator reading this after a
@@ -204,21 +193,6 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
             // Appended, not committed, and the wording says so: the leader cannot know
             // the difference until a majority answers, and claiming otherwise would be
             // the one thing a report like this must not do.
-            return std::string { "accepted; the change is replicating\n" };
-
-        case ClusterAction::AdmitClient:
-        case ClusterAction::ForgetClient:
-            // The same claim as the two above, and nothing more. No echo of the host:
-            // these verbs answer a bare acknowledgement with no receipt to read a
-            // committed value back out of, so anything printed here would be what this
-            // process SENT wearing the authority of what the leader RECORDED -- which is
-            // #1296's defect exactly, and a confident wrong signal is worse than a vague
-            // right one.
-            //
-            // What an operator needs before typing -- that a port is ignored, because
-            // admission compares a host and a client dials from an ephemeral one -- is in
-            // the two flags' own descriptions, where it is read in time to matter rather
-            // than after the change has replicated.
             return std::string { "accepted; the change is replicating\n" };
 
         case ClusterAction::Admit:
@@ -317,11 +291,11 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
     return std::unexpected { std::string { "unknown cluster request" } };
 }
 
-std::expected<std::string, std::string> PutClusterRequest(core::net::ISocket& client,
-                                                          Cc::CredentialNotice& notice,
-                                                          ClusterRequest const& request,
-                                                          ICredentialSource const& credential,
-                                                          std::string_view scheduler)
+ClusterExchange PutClusterRequest(core::net::ISocket& client,
+                                  Cc::CredentialNotice& notice,
+                                  ClusterRequest const& request,
+                                  Cc::ICredentialFor& credentials,
+                                  std::string_view scheduler)
 {
     // Through the launcher's own exchange rather than a second copy of it. That
     // function exists precisely so the distributed verbs do not grow one: the
@@ -329,50 +303,53 @@ std::expected<std::string, std::string> PutClusterRequest(core::net::ISocket& cl
     // the command" fall-through are each subtle enough that two implementations
     // would differ, and the one that differed would be the untested one.
     //
-    // `Current()` is asked HERE, at the exchange, rather than folded into a value the
-    // caller assembled. There is nothing between the two today -- this verb dials and
-    // exchanges in one breath -- and that is precisely why it is worth spelling: a
-    // site that reads the secret where it SENDS it cannot acquire a gap later without
+    // The credential is asked for HERE, at the exchange and for the endpoint it goes to, rather
+    // than folded into a value the caller assembled. There is nothing between the two today --
+    // this verb dials and exchanges in one breath -- and that is precisely why it is worth
+    // spelling: a site that reads the secret where it SENDS it cannot acquire a gap later without
     // somebody deliberately putting one there.
-    auto const outcome =
-        core::async::syncRun(Cc::ExchangeFramed(&client, &notice, EncodeClusterRequest(request), credential.Current()));
+    auto const presented = credentials.Present(scheduler);
+    return ClusterExchange { .outcome = core::async::syncRun(
+                                 Cc::ExchangeFramed(&client, &notice, EncodeClusterRequest(request), presented.credential)),
+                             .missing = presented.missing };
+}
 
+std::expected<std::string, std::string> InterpretClusterAnswer(ClusterAction action,
+                                                               ClusterExchange const& answer,
+                                                               std::string_view scheduler)
+{
+    auto const& outcome = answer.outcome;
     if (outcome.kind == Cc::CacheOutcomeKind::Transport)
         return std::unexpected { std::format("the scheduler at {} did not answer", scheduler) };
 
     if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
     {
-        // `NotLeader` carries the leader's endpoint as its message, so the refusal is
-        // turned into the instruction it actually is. WHETHER it carries one is
-        // `Cc::RedirectTarget`'s question and no longer this file's: the launcher
-        // asks the same thing of the same replies, and this was the second author
-        // of a rule that only works while both agree (#237). The reasoning -- why an
-        // empty message never reaches the wire, and why one that splits is still not
-        // necessarily an address -- lives there in full.
+        // A redirect is here only when the bound ran out: every one before it was followed
+        // (`AskTheLeader`). WHETHER it carries an address is `Cc::RedirectTarget`'s question,
+        // shared with the launcher (#237).
         if (auto const leader = Cc::RedirectTarget(outcome); leader.has_value())
-            return std::unexpected { std::format("this node does not lead the cluster; ask --scheduler={} instead",
+            return std::unexpected { std::format("gave up after {} leader redirect(s); the last, from {}, named {}",
+                                                 MaxLeaderRedirects,
+                                                 scheduler,
                                                  *leader) };
         if (outcome.code == Wire::ErrorCode::NotLeader)
             // An election in progress, which is a different fact from "somebody else
             // leads" and has no address to offer.
             return std::unexpected { std::string { "the cluster has no leader right now; try again shortly" } };
-        return std::unexpected { Cc::DescribeOutcome(outcome) };
+        // A refusal THIS exchange's missing ticket explains is said as WHY no ticket was presented.
+        return std::unexpected { Cc::RecordedReason(outcome, answer.missing) };
     }
 
-    return InterpretClusterReply(request.action, outcome.value);
+    return InterpretClusterReply(action, outcome.value);
 }
 
 std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg,
                                                         ClusterRequest const& request,
-                                                        ICredentialSource const& credential,
+                                                        Cc::ICredentialFor& credentials,
                                                         IEndpointDialer& dialer)
 {
     if (cfg.schedulers.empty())
         return std::unexpected { std::string { "--scheduler names where to ask; a cluster command needs one" } };
-
-    auto reached = DialFirstReachable(dialer, cfg.schedulers, core::net::DialOptions { .connectTimeout = DialTimeout });
-    if (!reached.has_value())
-        return std::unexpected { std::format("cannot reach the scheduler at {}", JoinEndpoints(cfg.schedulers)) };
 
     // Owned here rather than threaded in: this is a one-shot CLI verb, so "once per
     // process" and "once per invocation" are the same thing, and the admin surface
@@ -383,7 +360,22 @@ std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg,
     auto notice =
         Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
 
-    return PutClusterRequest(*reached->socket, notice, request, credential, reached->endpoint);
+    // What the exchange that produced the final answer presented: asked per endpoint, so a
+    // redirect's leader is shown a ticket naming it.
+    std::optional<Cc::MintFailure> missing;
+    auto answered = AskTheLeader(dialer,
+                                 cfg.schedulers,
+                                 core::net::DialOptions { .connectTimeout = DialTimeout },
+                                 "the scheduler",
+                                 [&](core::net::ISocket& socket, std::string_view endpoint) {
+                                     auto exchanged = PutClusterRequest(socket, notice, request, credentials, endpoint);
+                                     missing = exchanged.missing;
+                                     return std::move(exchanged.outcome);
+                                 });
+    if (!answered.has_value())
+        return std::unexpected { std::move(answered).error() };
+    return InterpretClusterAnswer(
+        request.action, ClusterExchange { .outcome = std::move(answered->outcome), .missing = missing }, answered->endpoint);
 }
 
 } // namespace FastCache::Node

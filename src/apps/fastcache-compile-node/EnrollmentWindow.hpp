@@ -160,8 +160,7 @@ static_assert(EveryEnrollRoleHasARow(), "every enrollment role needs one EnrollR
 ///
 /// What the leader asks of its own roster before it answers `Approved`, and what the joiner asks
 /// of the roster it is handed before it believes it was admitted: one question, so the two ends
-/// cannot come to mean different things by "admitted". A member row with no key recorded records
-/// no key, and a principal is not a member.
+/// cannot come to mean different things by "admitted". A principal is not a member.
 /// @param roster The roster.
 /// @param nodeId The joiner's id.
 /// @param key The key it asked under.

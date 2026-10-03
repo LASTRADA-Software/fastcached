@@ -374,10 +374,13 @@ names the reason directly:
 fastcache-cc: not dispatched (rejected (no-worker)); compiling locally
 ```
 
-Rule out the cheap thing first: **`FASTCACHE_TOKEN` must not be set on a client
-that dispatches.** A compile node accepts no credential today, so a token makes
-every lease refused and every compile local, behind a perfectly green build
-([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)).
+Rule out the cheap thing first: **is this machine admitted to the fleet?** A client is
+admitted by the machine ticket its own node mints, so the machine needs a node running
+at `FASTCACHE_ADDR` and that node's key admitted to the cluster; otherwise every lease is
+refused `not-a-member` and every compile is local, behind a perfectly green build.
+`fastcache-cli explain-admission <machine>` on the scheduler says where it stands.
+(`FASTCACHE_TOKEN` is not the cause any more: it is sent to the cache at
+`FASTCACHE_ADDR` alone.)
 
 Otherwise it is a fingerprint mismatch. Compare the two machines as above; if they
 differ, their toolchains genuinely differ, and the fix is to make them the same

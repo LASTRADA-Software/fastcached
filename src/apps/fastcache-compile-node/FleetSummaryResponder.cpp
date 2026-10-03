@@ -51,18 +51,13 @@ namespace
         std::string_view rationale; ///< Why nothing is counted.
     };
 
-    /// Why neither credential arm is this surface's.
-    constexpr std::string_view CredentialIsTheSchedulersRationale =
-        "AUTH is the Session family, which MergedResponder routes to the scheduler, and this verb requires no "
-        "credential; no credential outcome is ever decided against this surface";
-
     /// What this surface does about each endpoint-decided refusal: none is counted.
     constexpr EnumTable<EndpointRefusal, EndpointRefusalRow> EndpointRefusals { {
         { .refusal = EndpointRefusal::InFlightBudget,
           .rationale = "the byte budget says this surface is momentarily full; a joiner's probe sees it and asks the "
                        "next seed, and nothing about the fleet has happened" },
-        { .refusal = EndpointRefusal::CredentialMalformed, .rationale = CredentialIsTheSchedulersRationale },
-        { .refusal = EndpointRefusal::CredentialRejected, .rationale = CredentialIsTheSchedulersRationale },
+        { .refusal = EndpointRefusal::CredentialMalformed, .rationale = CredentialIsTheSessionsRationale },
+        { .refusal = EndpointRefusal::CredentialRejected, .rationale = CredentialIsTheSessionsRationale },
         { .refusal = EndpointRefusal::AnswerDeadline, .rationale = AnswerDeadlineIsTheEndpointsRationale },
         { .refusal = EndpointRefusal::NodeProofUnchallenged, .rationale = NodeProofIsTheProversRationale },
     } };

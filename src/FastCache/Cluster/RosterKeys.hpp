@@ -29,8 +29,8 @@ namespace FastCache::Cluster
 ///
 /// A bootstrap key the state has REVOKED is revoked, whatever the command line says: a
 /// revocation that a restart with the original command line could undo would be removal
-/// failing open. A member the state records with no key -- admitted before it stated one --
-/// falls back to its bootstrap key only when that key is not revoked.
+/// failing open. A member the state does not record falls back to its bootstrap key only when
+/// that key is not revoked.
 ///
 /// ## A forgotten member keeps its key here until the configuration drops it
 ///
@@ -68,7 +68,7 @@ class RosterKeys final: public Consensus::IRaftPeerKeys
     /// @param own This node's identity key pair. Its secret half never leaves this object.
     /// @param bootstrap Every member this node's command line names, with the keys it typed
     ///        for them where it typed any. This node's own entry is ignored: its key is @p own.
-    RosterKeys(Ed25519KeyPair own, std::span<ClusterMember const> bootstrap);
+    RosterKeys(Ed25519KeyPair own, std::span<MemberSpec const> bootstrap);
 
     /// Adopt what the cluster now says. Called on every applied change.
     /// @param state The replicated state.

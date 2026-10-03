@@ -460,6 +460,13 @@ class ILeaseRoster: public ILeaseSignerKeys
     /// @param now This machine's wall clock.
     /// @return Whether the roster may be trusted at @p now, and until when.
     [[nodiscard]] virtual RosterReading Read(std::chrono::system_clock::time_point now) const = 0;
+
+    /// Who the roster admits as a MACHINE, which is a wider question than who may sign a grant:
+    /// `KeysOf` answers for a voter alone, this for every member of either seat with a live key.
+    /// @param machine The machine id a ticket names.
+    /// @return The key the roster holds LIVE for it -- a member of either seat -- and every revoked
+    ///         key, whatever id each was revoked under.
+    [[nodiscard]] virtual LeaseSignerKeys MachineKeysOf(std::string_view machine) const = 0;
 };
 
 /// How far a verifier's wall clock may trail the minting scheduler's.

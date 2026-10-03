@@ -31,21 +31,13 @@ constexpr auto Now = std::chrono::system_clock::time_point { std::chrono::hours 
 /// The clock skew every case tolerates.
 constexpr auto Slack = std::chrono::seconds { 30 };
 
-/// A roster of voters named by @p voters, each with its test key unless it is in @p keyless.
-[[nodiscard]] Roster RosterOf(std::vector<std::string> const& voters,
-                              std::vector<std::string> const& keyless = {},
-                              std::vector<std::string> const& revoked = {})
+/// A roster of voters named by @p voters, each under its test key, with @p revoked revoked.
+[[nodiscard]] Roster RosterOf(std::vector<std::string> const& voters, std::vector<std::string> const& revoked = {})
 {
     Roster roster;
     for (auto const& id: voters)
-    {
-        auto const hasKey = std::ranges::find(keyless, id) == keyless.end();
-        roster.members.push_back(
-            RosterMember { .id = id,
-                           .raftEndpoint = id + ":6680",
-                           .seat = MemberSeat::Voter,
-                           .publicKey = hasKey ? std::optional { TestKeyPair(id).PublicKey() } : std::nullopt });
-    }
+        roster.members.push_back(RosterMember {
+            .id = id, .raftEndpoint = id + ":6680", .seat = MemberSeat::Voter, .publicKey = TestKeyPair(id).PublicKey() });
     for (auto const& id: revoked)
         roster.revoked.push_back(RevokedKey { .id = id, .publicKey = TestKeyPair(id).PublicKey() });
     return roster;
@@ -217,7 +209,7 @@ TEST_CASE("A voter the trusted roster revoked cannot help certify its successor"
 {
     // n2 is revoked in the roster the worker holds. Its endorsement verifies -- it still holds
     // its key -- and counts for nothing; the majority is still of all three voters.
-    auto const voters = VotersOf(RosterOf({ "n1", "n2", "n3" }, {}, { "n2" }));
+    auto const voters = VotersOf(RosterOf({ "n1", "n2", "n3" }, { "n2" }));
     CHECK(voters.voters == 3);
     CHECK(voters.endorsers.size() == 2);
 
@@ -227,16 +219,6 @@ TEST_CASE("A voter the trusted roster revoked cannot help certify its successor"
 
     // The control: the same roster endorsed by the two voters still trusted is adopted.
     CHECK(Decide(Offer(RosterOf({ "n1", "n2" }), 9, { "n1", "n3" }), voters).has_value());
-}
-
-TEST_CASE("A keyless voter counts toward the majority it can never help reach", "[cluster][roster]")
-{
-    auto const voters = VotersOf(RosterOf({ "n1", "n2", "n3", "n4" }, { "n3", "n4" }));
-    CHECK(voters.voters == 4);
-
-    auto const refused = Decide(Offer(RosterOf({ "n1" }), 3, { "n1", "n2" }), voters);
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error() == RosterRefusal::Uncertified);
 }
 
 TEST_CASE("One voter is one vote, however often it endorses", "[cluster][roster]")

@@ -9,6 +9,7 @@
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Consensus/RaftMembership.hpp>
 #include <FastCache/Consensus/RaftNode.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/StopAwareWait.hpp>
@@ -23,6 +24,7 @@
 #include <span>
 #include <utility>
 
+#include <core/Ranges.hpp>
 #include <core/net/IConnector.hpp>
 #include <core/net/PlatformLoop.hpp>
 #include <core/net/Sockets.hpp>
@@ -242,7 +244,8 @@ std::string AdvertisedSchedulerEndpoint(std::string_view raftEndpoint, std::stri
 }
 
 std::expected<Cluster::ClusterMember, std::string> ConsensusSelfMemberOf(NodeConfig const& cfg,
-                                                                         std::span<Cluster::ClusterMember const> members)
+                                                                         std::span<Cluster::MemberSpec const> members,
+                                                                         Ed25519PublicKey const& publicKey)
 {
     if (cfg.nodeId.empty())
         return std::unexpected { std::string { ConsensusNeedsNodeIdRefusal } };
@@ -251,21 +254,23 @@ std::expected<Cluster::ClusterMember, std::string> ConsensusSelfMemberOf(NodeCon
     // dials, so an empty one is the ordinary case rather than a gap.
     auto dial = ConsensusDialAddressOf(cfg);
     auto const dialsIn = !dial.has_value() && dial.error() == ConsensusDialGap::DialsIn;
-    for (auto const& member: members)
-        if (member.id == cfg.nodeId && (dialsIn || !member.raftEndpoint.empty()))
-            return member;
+    auto const* const named = core::findIfOrNull(members, [&cfg, dialsIn](Cluster::MemberSpec const& member) {
+        return member.id == cfg.nodeId && (dialsIn || !member.raftEndpoint.empty());
+    });
 
-    if (!dialsIn && !dial.has_value())
+    if (named == nullptr && !dialsIn && !dial.has_value())
         return std::unexpected { std::string { ConsensusNamesNoDialAddressRefusal } };
 
     // A mode nobody dials holds a learner's seat, the one seat that needs no endpoint
-    // (`Cluster::SeatNeedsEndpoint`); every other is the voter it founded or was promoted to.
+    // (`Cluster::SeatNeedsEndpoint`); every other is the voter it founded or was promoted to --
+    // which is the seat the approved roster records for this node too, since the mode follows it.
+    // The key is the one this node proves itself with: a record always holds one.
     return Cluster::ClusterMember { .id = cfg.nodeId,
-                                    .raftEndpoint = dial.value_or(std::string {}),
+                                    .raftEndpoint = named != nullptr ? named->raftEndpoint : dial.value_or(std::string {}),
                                     .schedulerEndpoint = {},
                                     .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
                                     .seat = dialsIn ? Cluster::MemberSeat::Learner : Cluster::MemberSeat::Voter,
-                                    .publicKey = cfg.identityPublicKey };
+                                    .publicKey = publicKey };
 }
 
 std::string DescribeConsensusEndpoint(std::string_view raftEndpoint)
@@ -293,7 +298,7 @@ std::vector<Consensus::NodeId> DialInPeers(Cluster::ClusterState const& state, C
 ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                              Consensus::FileRaftStorage storage,
                              Ed25519KeyPair identityKey,
-                             std::span<Cluster::ClusterMember const> knownMembers,
+                             std::span<Cluster::MemberSpec const> knownMembers,
                              std::string boundEndpoint,
                              RoleObserver onRole,
                              MembersObserver onMembers,
@@ -362,14 +367,6 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // could disagree with it.
     auto const members = BootstrapMembersOf(cfg);
 
-    // This node's own record (`ConsensusSelfMemberOf`). A node whose id names no member it can be
-    // reached at could never win a vote and could never be voted for: it would stand for election
-    // forever against a cluster that has never heard of it, which from the outside is a node that
-    // simply never becomes ready.
-    auto self = ConsensusSelfMemberOf(cfg, members);
-    if (!self.has_value())
-        return std::unexpected { std::move(self).error() };
-
     // The identity key, before anything is bound or dialled (#178). Every peer connection
     // proves each end's OWN key, so there is no unauthenticated consensus to fall back to --
     // #1308's rule, carried from the pre-shared key to the key that replaced it on this wire.
@@ -377,6 +374,14 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // the key there before this tier exists, so this is the answer to a caller that did not.
     if (!identityKey.has_value())
         return std::unexpected { std::string { ConsensusNeedsIdentityKeyRefusal } };
+
+    // This node's own record (`ConsensusSelfMemberOf`). A node whose id names no member it can be
+    // reached at could never win a vote and could never be voted for: it would stand for election
+    // forever against a cluster that has never heard of it, which from the outside is a node that
+    // simply never becomes ready.
+    auto self = ConsensusSelfMemberOf(cfg, members, identityKey->PublicKey());
+    if (!self.has_value())
+        return std::unexpected { std::move(self).error() };
 
     // Only a node that FOUNDED its cluster bootstraps it. One that joined another's starts with
     // an empty bootstrap set and waits to be admitted -- the only shape a cluster can admit,
@@ -388,7 +393,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // only walks back to the beginning when the joiner REFUSES. A joiner that could not send
     // that refusal is admitted, dialled, and permanently silent.
     auto const foundedHere = cfg.formation.has_value() && cfg.formation->foundedHere;
-    auto const bootstrap = foundedHere ? members : std::vector<Cluster::ClusterMember> {};
+    auto const bootstrap = foundedHere ? members : std::vector<Cluster::MemberSpec> {};
 
     // The wildcard for a bare port, like the scheduler's and unlike the cache's:
     // peers are on other machines by definition, so a loopback default would be one
@@ -433,6 +438,8 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     //
     // Its key is the one it proves itself with, and nobody else can state that: the member
     // entry `ApplyNodeIdentity` synthesised carries the same key, but the pair is the source.
+    // Its seat is the one `ConsensusSelfMemberOf` read off its mode -- a learner announces a
+    // learner, never the voter a bootstrap set of voters would have implied.
     auto announced = *self;
     announced.schedulerEndpoint = AdvertisedSchedulerEndpoint(self->raftEndpoint, schedulerBound);
     announced.publicKey = identityKey->PublicKey();
@@ -465,8 +472,8 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
 }
 
 std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
-                                                       std::vector<Cluster::ClusterMember> const& dialable,
-                                                       std::vector<Cluster::ClusterMember> const& bootstrap,
+                                                       std::vector<Cluster::MemberSpec> const& dialable,
+                                                       std::vector<Cluster::MemberSpec> const& bootstrap,
                                                        std::string_view bindAddress,
                                                        std::uint16_t bindPort)
 {
@@ -563,18 +570,18 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     //
     // Read BEFORE the driver exists, and that order is #1542's: building the driver
     // restores a recovered snapshot into `_application`, whose observer publishes the
-    // state -- the member set, the tombstones, and a role announcement through
+    // state -- the member set, the revoked keys, and a role announcement through
     // `Republish`. Read after, that first announcement would name term 0.
     _lastTerm = node->CurrentTerm();
 
     // `Create` hands a recovered snapshot to `_application` before anything can apply an
-    // entry above it, so the replicated member set, settings and tombstones are back --
+    // entry above it, so the replicated member set, settings and revoked keys are back --
     // and published -- before either loop below starts.
     //
     // Or it REFUSES, and then this node does not start (#1542): its own snapshot, or a
     // command its own log holds, is one this build cannot read, and the application was
     // handed nothing. Running on what it could read would be running without the
-    // members, the settings and the forget tombstones -- removal failing OPEN, loudly or
+    // members, the settings and the revoked keys -- removal failing OPEN, loudly or
     // not. Named here, where the directory is known: the refusal says where in the state
     // and which versions, and the remedy is the store's own, since the three files go
     // aside together whichever of them could not be read.
@@ -717,13 +724,15 @@ std::expected<Consensus::LogIndex, ConsensusError> ConsensusTier::Propose(Cluste
     // A forget is PREPARED here first, by the one node that can (#1539, #1555): against
     // the configuration consensus holds, so forgetting the only voter is refused by name
     // while the operator who typed it is reading the answer; and with the key THIS node
-    // holds live for the id, so a member its own bootstrap roster names with a key --
-    // recorded nowhere, or recorded without one -- has that key revoked too.
+    // holds live for the id, so a member its own bootstrap roster names with a key and the
+    // state records nowhere has that key revoked too.
     auto proposal = command;
     if (command.kind == Cluster::CommandKind::Forget)
     {
-        auto prepared =
-            Cluster::PrepareForget(_driver->CurrentProgress().configuration, command.key, _roster.KeysOf(command.key).live);
+        // Against the state this node has applied, which is what says whether anything records
+        // a key for the id: a forget that would revoke nothing is refused here, by name.
+        auto prepared = Cluster::PrepareForget(
+            _application.State(), _driver->CurrentProgress().configuration, command.key, _roster.KeysOf(command.key).live);
         if (!prepared.has_value())
             return std::unexpected { prepared.error() };
         proposal = *std::move(prepared);
@@ -852,7 +861,13 @@ void ConsensusTier::Reconcile()
     // With the configuration consensus holds, because a member the state does not
     // record may still be counted there -- every bootstrap member is -- and
     // recording one as the newcomer it is not would demote it (#1535).
-    auto const plan = Cluster::MembershipProposals(state, _driver->CurrentProgress().configuration, desired);
+    //
+    // A desire discovery handed over states no key, and a member is never admitted without one,
+    // so the key this node holds live for the id -- a bootstrap member's, as the formation record
+    // names it -- is filled
+    // in for this pass only (`Cluster::WithLiveKeys`).
+    auto const keyed = Cluster::WithLiveKeys(state, desired, _roster);
+    auto const plan = Cluster::MembershipProposals(state, _driver->CurrentProgress().configuration, keyed);
     ReportForgottenDesires(state, plan.forgotten);
 
     for (auto const& command: plan.proposals)
@@ -937,14 +952,19 @@ void ConsensusTier::ReportForgottenDesires(Cluster::ClusterState const& state,
         if (std::ranges::find(_reportedForgotten, member.id) != _reportedForgotten.end())
             continue;
         _reportedForgotten.push_back(member.id);
-        auto const host = HostOfEndpoint(member.raftEndpoint);
-        auto const forgot =
-            state.HasForgotten(host) ? std::format("host {}", host) : std::format("{} and revoked its key", member.id);
+
+        // The key the forget revoked, which is what the machine is forgotten BY: an address is
+        // not an identity, and the desire's endpoint says only where it asked from this time.
+        auto revoked = std::string {};
+        for (auto const& entry: state.revokedKeys)
+            if (entry.id == member.id)
+                revoked += std::format("{}{}", revoked.empty() ? "" : ", ", FormatEd25519PublicKey(entry.publicKey));
         _logger.Logf(LogLevel::Info,
-                     "cluster: not recording {} {}: the cluster forgot {}, and only --cluster-admit undoes a forget",
+                     "cluster: not recording {} {}: the cluster forgot it and revoked its key ({}), and only "
+                     "--cluster-admit under a new key undoes a forget",
                      member.id,
                      DescribeConsensusEndpoint(member.raftEndpoint),
-                     forgot);
+                     revoked);
     }
 
     // A member no longer refused is forgotten here too, so forgetting it a SECOND time --
@@ -1265,8 +1285,8 @@ void ConsensusTier::OnStateChanged(Cluster::ClusterState const& state)
     // frame (#178, #1555).
     _roster.Adopt(state);
 
-    // The member set reaches the fleet's oracle from here, so admitting a peer and
-    // serving it are one decision rather than two facts that can disagree.
+    // The keys reach the fleet's oracle from here, so admitting a machine and serving it are
+    // one decision rather than two facts that can disagree.
     if (_onMembers)
         _onMembers(state);
 
@@ -1366,11 +1386,10 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
                 schedulerTier->SetRole(role, leaderEndpoint, term);
         },
         [&membership, &roster](Cluster::ClusterState const& state) {
-            // The replicated member set joins the fleet's admission policy, so a node
-            // the cluster agreed to admit is served by every surface at once. It does
-            // not *become* that policy: `--fleet-member` answers a different question
-            // -- who may spend this node's CPU, clients included -- and survives every
-            // commit (#251).
+            // The member set no longer joins admission; its KEYS do. A machine the cluster
+            // agreed to admit is served by every surface at once by the key it proves or
+            // presents, never by the address it dials from. `--fleet-open` is this node's own
+            // answer and survives every commit (#251).
             //
             // The whole STATE, because the `fleet-open` row is an admission decision
             // too and had no reader at all until #1112. `NodeMembership` resolves it

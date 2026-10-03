@@ -237,8 +237,8 @@ CertifyingVoters VotersOf(Roster const& roster)
         if (member.seat != MemberSeat::Voter)
             continue;
         ++voters.voters;
-        if (member.publicKey.has_value() && !revoked(*member.publicKey))
-            voters.endorsers.push_back(TrustedEndorser { .id = member.id, .key = *member.publicKey });
+        if (!revoked(member.publicKey))
+            voters.endorsers.push_back(TrustedEndorser { .id = member.id, .key = member.publicKey });
     }
     return voters;
 }

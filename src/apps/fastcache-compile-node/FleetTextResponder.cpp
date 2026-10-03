@@ -96,10 +96,7 @@ namespace
                          .rationale = "MergedResponder routes only the Fleet family here, and an opcode with no "
                                       "OpTable row belongs to no family, so it is answered at the door" };
             case Wire::PrePayloadDecision::Unauthenticated:
-                return { .counter = std::nullopt,
-                         .rationale =
-                             "AuthRequired() is false here by decision -- the listener's credential is the "
-                             "scheduler's -- and DecidePrePayload yields this only for a surface that requires one" };
+                return { .counter = std::nullopt, .rationale = NodeChecksNoPasswordRationale };
             case Wire::PrePayloadDecision::Serve:
                 break;
         }
@@ -123,11 +120,6 @@ namespace
         RefusalPolicy policy;    ///< What this surface does about it.
     };
 
-    /// Why neither credential arm counts here.
-    constexpr std::string_view CredentialIsTheSchedulersRationale =
-        "AUTH is the Session family, which MergedResponder routes to the scheduler; no credential outcome is ever "
-        "decided against this surface";
-
     /// What this surface does about each endpoint-decided refusal.
     constexpr EnumTable<EndpointRefusal, EndpointRefusalRow> EndpointRefusals { {
         { .refusal = EndpointRefusal::InFlightBudget,
@@ -135,9 +127,9 @@ namespace
           // turned away at the moment the leader is busiest.
           .policy = { .counter = IMetricsSink::Counter::FleetTextRequestsRefusedEndpointBusy, .rationale = {} } },
         { .refusal = EndpointRefusal::CredentialMalformed,
-          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
+          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSessionsRationale } },
         { .refusal = EndpointRefusal::CredentialRejected,
-          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSchedulersRationale } },
+          .policy = { .counter = std::nullopt, .rationale = CredentialIsTheSessionsRationale } },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .policy = { .counter = std::nullopt, .rationale = AnswerDeadlineIsTheEndpointsRationale } },
         { .refusal = EndpointRefusal::NodeProofUnchallenged,

@@ -436,7 +436,7 @@ TEST_CASE("Enrollment refuses a consensus store another account wrote for that, 
     guard.OwnedByAnother(Consensus::RaftStateFileName);
     ScriptedSecureRandom random { ScriptedSecureRandom::Ascending(Ed25519SeedBytes) };
 
-    auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, guard);
+    auto const refused = RunEnrollClient(cfg, random, guard);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().contains("consensus term and vote"));
     CHECK(refused.error().contains("scripted-owner"));

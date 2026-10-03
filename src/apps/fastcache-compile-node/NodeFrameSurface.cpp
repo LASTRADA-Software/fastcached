@@ -11,6 +11,7 @@
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 #include "SchedulerTier.hpp"
+#include "SessionResponder.hpp"
 #include "WorkerTier.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
@@ -30,7 +31,8 @@ SurfaceComponents ComposeSurfaceComponents(CacheTier* cache,
                                            LiveStatsResponder& live,
                                            FleetTextResponder& fleet,
                                            NodeProofResponder* nodeProof,
-                                           FleetSummaryResponder* formation) noexcept
+                                           FleetSummaryResponder* formation,
+                                           SessionResponder& session) noexcept
 {
     // Designated, so the NAME travels with each pointer: two of these are one family's owner
     // placed in another's slot otherwise, and a transposed pair routes every cache verb to the
@@ -47,7 +49,8 @@ SurfaceComponents ComposeSurfaceComponents(CacheTier* cache,
                                // Absent on a node running no consensus: the router then answers
                                // the node-proof family `NoCluster`.
                                .nodeProof = nodeProof,
-                               .formation = formation };
+                               .formation = formation,
+                               .session = &session };
 }
 
 std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,

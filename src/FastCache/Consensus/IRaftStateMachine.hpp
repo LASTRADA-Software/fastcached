@@ -97,8 +97,8 @@ static_assert(RowsInEnumeratorOrder(SnapshotOriginTable, &SnapshotOriginTraits::
 /// own log still holds, is something this machine cannot read refuses to start --
 /// `CanRead` and `RestoreSnapshot` answer for it, and `RaftDriver::Create` asks both
 /// before anything is applied. The alternative is a node running on part of its own
-/// state: a snapshot left unread takes the members, the settings and the forget
-/// tombstones with it, and a removal that fails OPEN reports nothing.
+/// state: a snapshot left unread takes the members, the settings and the revoked keys
+/// with it, and a removal that fails OPEN reports nothing.
 class IRaftStateMachine
 {
   public:

@@ -163,6 +163,14 @@ src/FastCache/
                 derive one session key per direction from an ephemeral X25519
                 exchange -- pure functions over the transcript, so every field a
                 signature covers is a unit test that changes it.
+                MachineTicket is what a machine presents per exchange instead of
+                a proof: a claim set signed by its own identity key for ONE
+                audience, header-only so the launcher mints nothing and reads
+                nothing it could not parse. TicketVerifier checks one against
+                the roster a node holds -- signature first, then the roster,
+                audience, expiry and a per-node spent set -- and names every
+                refusal by reason; MachineStanding says where a machine stands in
+                that roster, for `explain-admission <machine>`.
   Protocol/     IProtocolHandler, ProtocolAutodetect,
                 Framing/ByteReader (line and length-prefixed), MemcachedText,
                 MemcachedMeta (1.6 mg/ms/md/ma/me/mn), MemcachedBinary,
@@ -261,12 +269,17 @@ src/apps/
                             `Compile` on its own port. It may also BE the scheduler,
                             hold a cache tier for this machine's clients, and run
                             consensus — four surfaces, each off unless asked for
-                            except the cache, and all four admitting this machine and
-                            `--fleet-member` peers only. Carries its own daemon shell:
+                            except the cache, and all four admitting this machine,
+                            a proven key or a machine ticket its roster holds, and
+                            nobody else unless `--fleet-open`. Carries its own daemon shell:
                             `NodeConfig` and its option table live in their own
                             translation unit (main.cpp is in no test target) so
                             `MakeNodeServiceSpec` and the install-time
-                            `NodeServiceRejection` can be tested. It takes a *fingerprint* from a job
+                            `NodeServiceRejection` can be tested. SessionResponder owns
+                            the `Session` family on every node -- AUTH, which a
+                            verified ticket answers, and loopback-only MINT-TICKET --
+                            and NodeAudience says which endpoints a ticket may name
+                            to be presented here. It takes a *fingerprint* from a job
                             and never a program: the compiler comes from this
                             node's own `--toolchain` table, which is what keeps a
                             build accelerator from being a remote shell. Links

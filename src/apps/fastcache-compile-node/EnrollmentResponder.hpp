@@ -4,7 +4,6 @@
 #include "EnrollmentWindow.hpp"
 #include "FrameEndpoint.hpp"
 
-#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
@@ -16,7 +15,6 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
-#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -34,16 +32,14 @@ namespace FastCache::Node
 ///
 /// `Op::Enroll` is `OpenBeforeAuth` and must admit a machine that is not a member --
 /// a machine this cluster has never heard of is the entire population it serves.
-/// Every other verb on this wire but `AUTH` requires a credential, and the two
-/// surfaces that could have hosted this pair both answer *may this peer be here* once
-/// for every verb they own: `SchedulerResponder::AuthRequired` ignores the opcode and
-/// its `RefusePeer` delegates to the one membership check the scheduler's gate uses.
-/// So folding `Enroll` in would either put the verb behind the answer that refuses it,
-/// or relax that answer for the nine verbs beside it.
+/// The surface that could have hosted this pair answers *may this peer be here* through
+/// the one membership check the scheduler's gate uses. So folding `Enroll` in would
+/// either put the verb behind the answer that refuses it, or relax that answer for the
+/// verbs beside it.
 ///
 /// Separated, the change is purely ADDITIVE and that is checkable rather than argued:
-/// no existing responder's `RefusePeer`, `AuthRequired` or gate is touched, and the one
-/// door held open is the one verb whose row in `OpTable` says so.
+/// no existing responder's `RefusePeer` or gate is touched, and the one door held open
+/// is the one verb whose row in `OpTable` says so.
 ///
 /// ## What it does not decide
 ///
@@ -76,9 +72,6 @@ class EnrollmentResponder final: public IFrameResponder
     /// @param membership Who may reach `EnrollControl`; must outlive this.
     /// @param metrics Where refusals and admissions served are recorded; must outlive this.
     /// @param logger Where a reject of an already-admitted machine is said out loud.
-    /// @param policy The credential this surface requires, or nullptr for none. Shared
-    ///        rather than referenced because "there is no credential" has to be
-    ///        representable, and a null reference is not.
     ///
     /// **It wires the window to leadership**, here rather than in `main`, so a test that
     /// builds this surface drives the wiring that ships: every role the scheduler is told
@@ -89,14 +82,12 @@ class EnrollmentResponder final: public IFrameResponder
                         Distributed::SchedulerService& scheduler,
                         Distributed::IMembershipOracle const& membership,
                         IMetricsSink& metrics,
-                        ILogger& logger,
-                        std::shared_ptr<AuthPolicy const> policy = nullptr):
+                        ILogger& logger):
         _window { window },
         _scheduler { scheduler },
         _membership { membership },
         _metrics { metrics },
-        _logger { logger },
-        _policy { std::move(policy) }
+        _logger { logger }
     {
         _scheduler.ObserveRole([&window](Distributed::SchedulerRole role) { window.OnRoleChanged(role); });
     }
@@ -123,27 +114,12 @@ class EnrollmentResponder final: public IFrameResponder
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                    std::uint8_t opRaw) const override;
 
-    /// @copydoc IFrameResponder::AuthRequired
-    ///
-    /// The surface-wide answer, and the opcode is deliberately ignored: which verb is
-    /// reachable before a credential is `OpTable::preAuth`'s column and
-    /// `DecidePrePayload` reads it, so answering per verb here would be a second
-    /// spelling of the pre-auth set -- one a reviewer cannot see from the table, and
-    /// one that can disagree with it.
-    [[nodiscard]] bool AuthRequired(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return _policy != nullptr && _policy->Enabled();
-    }
-
     /// @copydoc IFrameResponder::CheckCredential
     ///
-    /// Delegates to this surface's own policy, which is the scheduler's object. It is
-    /// unreachable through `MergedResponder` -- `AUTH` is a `Session` verb and routes to
-    /// the scheduler -- and answered properly rather than stubbed, because a surface
-    /// that inherits an answer inherits an open door by saying nothing.
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    /// `NoPolicy`: AUTH is the Session family's; this surface is never routed one.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
     {
-        return FastCache::CheckCredential(_policy.get(), payload);
+        return NotTheSessionSurface();
     }
 
     /// @copydoc IFrameResponder::RefusalReply
@@ -295,6 +271,20 @@ class EnrollmentResponder final: public IFrameResponder
     /// @return The encoded reply.
     [[nodiscard]] std::vector<std::byte> AnswerEnroll(std::span<std::byte const> payload, std::string_view peer);
 
+    /// Refuse a verb whose identity column this ADMITTED caller does not meet, or nullopt
+    /// (`IdentityRequirements`). A caller the surface does not admit is membership's refusal.
+    ///
+    /// `EnrollControl` is an operator's control verb: `--fleet-open` admits a caller to the
+    /// window's open door (`Enroll`) and never to the decision behind it, or an anonymous caller on
+    /// an open node approves itself. Asked at the door, after membership, and `AnswerControl` asks
+    /// the door's whole question again, for `SchedulerProtocol`'s reason: a caller of `Answer` need
+    /// not have asked `RefusePeer` first.
+    /// @param peer The caller.
+    /// @param opRaw The verb.
+    /// @return The refusal, counted, or nullopt when the caller meets the verb's requirement.
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefuseUnidentified(PeerIdentity const& peer,
+                                                                           std::uint8_t opRaw) const;
+
     /// Answer one `EnrollControl`.
     /// @param payload The request payload.
     /// @param peer The host the kernel reports.
@@ -336,7 +326,7 @@ class EnrollmentResponder final: public IFrameResponder
     /// @return The context.
     [[nodiscard]] Distributed::CallerContext Context(PeerIdentity peer) const
     {
-        return Distributed::CallerContextOf(_membership, std::move(peer.host), peer.proven);
+        return Distributed::CallerContextOf(_membership, std::move(peer));
     }
 
     EnrollmentWindow& _window;
@@ -349,8 +339,6 @@ class EnrollmentResponder final: public IFrameResponder
     /// operator meets it in the log at the moment they go looking -- a counter would be a
     /// second tally with no second audience.
     ILogger& _logger;
-
-    std::shared_ptr<AuthPolicy const> _policy;
 };
 
 } // namespace FastCache::Node

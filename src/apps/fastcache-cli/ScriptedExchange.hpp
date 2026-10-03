@@ -303,6 +303,25 @@ class ScriptedNodeExchange final: public INodeExchange
         return _endpoint;
     }
 
+    [[nodiscard]] std::span<std::string const> Advisories() const override
+    {
+        return _advisories;
+    }
+
+    [[nodiscard]] std::optional<Cc::MintFailure> MissingTicket() const override
+    {
+        return _missingTicket;
+    }
+
+    /// Open as a connection whose mint failed would: presenting nothing, and saying why.
+    /// @param failure Why no ticket was presented.
+    /// @param advisory What the connection said about it.
+    void OpenedWithoutTicket(Cc::MintFailure failure, std::string advisory)
+    {
+        _missingTicket = failure;
+        _advisories.push_back(std::move(advisory));
+    }
+
     /// What was sent, in order.
     /// @return One framed request per call, verbatim.
     [[nodiscard]] std::vector<std::vector<std::byte>> const& Sent() const noexcept
@@ -322,6 +341,8 @@ class ScriptedNodeExchange final: public INodeExchange
     std::size_t _at { 0 };
     std::vector<std::vector<std::byte>> _sent;
     std::string _endpoint;
+    std::vector<std::string> _advisories;
+    std::optional<Cc::MintFailure> _missingTicket;
 };
 
 /// A scripted node outcome that fails instead of replying.

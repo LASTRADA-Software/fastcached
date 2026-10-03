@@ -42,8 +42,9 @@ std::expected<std::unique_ptr<NodeRoster>, std::string> NodeRoster::Build(NodeCo
     {
         // Nothing to verify a grant against. Legal only where no other machine can present one
         // -- the table refused the rest before any state directory was asked, and this is the
-        // same rule answered for a node whose directory turned out to hold nothing.
-        if (RunsWorker(cfg) && CompileVerbsReachOtherMachines(cfg))
+        // same rule answered for a node whose directory turned out to hold nothing. `Absent`
+        // is what this branch has just found out, at the one place that read the directory.
+        if (RunsWorker(cfg) && CompileVerbsReachOtherMachines(cfg, RosterPresence::Absent))
             return std::unexpected { std::string { RosterlessWorkerRefusal } };
         return std::unique_ptr<NodeRoster> { new NodeRoster { wallClock, nullptr, nullptr, nullptr, metrics, logger } };
     }
@@ -156,6 +157,15 @@ std::optional<Distributed::RosterSummary> NodeRoster::Summary() const
         return _state->Summary();
     if (_trust != nullptr)
         return _trust->Summary();
+    return std::nullopt;
+}
+
+std::optional<Cluster::Roster> NodeRoster::HeldRoster() const
+{
+    if (_state != nullptr)
+        return _state->Held();
+    if (_trust != nullptr)
+        return _trust->Held();
     return std::nullopt;
 }
 

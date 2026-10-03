@@ -12,10 +12,12 @@
 #include <FastCache/CompileCache/PathCanon.hpp>
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Distributed/LeaseTable.hpp>
 #include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/StatsReadingCodec.hpp>
+#include <FastCache/Protocol/CompileCacheAuth.hpp>
 #include <FastCache/Protocol/CompileCacheHandler.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 #include <FastCache/Protocol/KeyspaceNotifier.hpp>
@@ -501,6 +503,40 @@ TEST_CASE("An unknown opcode is rejected but the connection survives", "[compile
     CHECK_FALSE(replies.at(1).payload.empty());
 }
 
+TEST_CASE("A retired opcode is refused UnknownOpcode at the surface, counted, and the connection survives",
+          "[compile-cache][handler][retired]")
+{
+    // `RetiredOpcodes` pins that no ROW claims 0x16 or 0x17; this pins what a SURFACE answers a
+    // frame naming one: `UnknownOpcode`, as for any byte no row claims -- never a friendlier
+    // refusal special-cased for the retired verbs, which a peer built before the retirement
+    // would read under the old verb's name.
+    for (auto const byte: Wire::RetiredOpcodes)
+    {
+        INFO("opcode " << static_cast<int>(byte));
+        CcFixture fix;
+        AtomicMetricsSink metrics;
+        SessionContext session {};
+        session.metrics = &metrics;
+
+        CompileValue value;
+        value.objectBlob = { std::byte { 0x42 } };
+        REQUIRE(fix.engine.Set("k", EncodeCompileValue(value), /*flags=*/0, /*exptime=*/0).has_value());
+
+        auto retired = FetchFrame("payload-the-server-must-skip");
+        retired[2] = std::byte { byte };
+
+        auto const replies = SplitReplies(ExchangeWith(fix, Concat({ retired, FetchFrame("k") }), session));
+        REQUIRE(replies.size() == 2);
+        auto const error = ErrorOf(replies.at(0));
+        REQUIRE(error.present);
+        CHECK(error.code == Wire::ErrorCode::UnknownOpcode);
+        CHECK(metrics.Read(IMetricsSink::Counter::CacheFramesRefusedUnknownOpcode) == 1);
+
+        // The frame was stepped over by its declared length, so the request behind it is served.
+        CHECK(replies.at(1).status == Wire::Status::Ok);
+    }
+}
+
 TEST_CASE("A FETCH miss and a rejected FETCH are distinguishable", "[compile-cache][handler][version]")
 {
     // Both were the byte 0x00 before the format carried a status space, so a
@@ -785,7 +821,7 @@ TEST_CASE("The daemon refuses an admission explanation by name and sends it to a
     // through -- so a client told `NoCluster` goes looking for consensus it does not need,
     // when the answer is that it asked the wrong binary.
     CcFixture fix;
-    auto const reply = SoleReply(Exchange(fix, Wire::EncodeExplainAdmissionRequest("10.0.0.42")));
+    auto const reply = SoleReply(Exchange(fix, Wire::EncodeExplainAdmissionRequest("pc-07")));
     REQUIRE(reply.present);
     auto const error = ErrorOf(reply);
     REQUIRE(error.present);
@@ -809,6 +845,20 @@ TEST_CASE("The daemon refuses a fleet summary by name and sends it to a compile 
     REQUIRE(error.present);
     CHECK(error.code == Wire::ErrorCode::NoCluster);
     CHECK(error.code != Wire::UnimplementedVerb);
+    CHECK(error.message.contains("fastcache-compile-node"));
+}
+
+TEST_CASE("The daemon refuses a ticket mint by name and sends it to a compile node", "[compile-cache][handler]")
+{
+    // A cache holds no machine identity to sign a ticket from, so this endpoint answers the
+    // same way it answers every other verb that asks about the PROCESS rather than about a
+    // cached object: `DispatchNotPermitted`, naming the compile node that does hold one.
+    CcFixture fix;
+    auto const reply = SoleReply(Exchange(fix, Wire::EncodeMintTicketRequest("office.corp:6674")));
+    REQUIRE(reply.present);
+    auto const error = ErrorOf(reply);
+    REQUIRE(error.present);
+    CHECK(error.code == Wire::ErrorCode::DispatchNotPermitted);
     CHECK(error.message.contains("fastcache-compile-node"));
 }
 
@@ -981,6 +1031,30 @@ struct AuthedSession
 }
 
 } // namespace
+
+TEST_CASE("The daemon cannot verify a machine, so a ticket is no password", "[protocol][auth][ticket]")
+{
+    // The ticket's bytes ARE the configured password, so only the kind can refuse it: a ticket
+    // whose bytes differ would be rejected by the password comparison alone, and the case could
+    // not tell the two rules apart.
+    auto const ticket =
+        Wire::EncodeAuth(Wire::AuthRequest { .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = "s3cret" });
+    auto const payload = std::span { ticket }.subspan(Wire::RequestHeaderSize);
+    auto const policy = AuthPolicy { std::string {}, SecureString { std::string_view { "s3cret" } } };
+    CHECK(CheckCredential(&policy, payload) == CredentialOutcome::Rejected);
+    CHECK(CheckCredential(nullptr, payload) == CredentialOutcome::NoPolicy);
+
+    // A kind this build does not know is a frame it could not parse, never a wrong password: a
+    // client of another release must not read as somebody guessing.
+    auto const unknownKind = std::array { std::byte { 0x03 } };
+    auto const unknown = WireFields::Encode(
+        { std::span<std::byte const> { unknownKind }, WireFields::AsBytes(""), WireFields::AsBytes("s3cret") });
+    CHECK(CheckCredential(&policy, unknown) == CredentialOutcome::Malformed);
+
+    // The control: the same bytes as a password are accepted.
+    auto const password = Wire::EncodeAuth(Wire::AuthRequest { .username = {}, .secret = "s3cret" });
+    CHECK(CheckCredential(&policy, std::span { password }.subspan(Wire::RequestHeaderSize)) == CredentialOutcome::Accepted);
+}
 
 TEST_CASE("Every gated verb is refused before AUTH, and the connection survives", "[compile-cache][handler][auth]")
 {
@@ -1249,12 +1323,14 @@ TEST_CASE("An oversize AUTH is refused on its own ceiling, not the session's", "
 TEST_CASE("A credential right up against the ceiling is still accepted", "[compile-cache][handler][auth]")
 {
     // The bound must be a bound, not an off-by-one that quietly rejects the
-    // largest legal credential.
+    // largest legal credential. The overhead is measured off the encoder rather than
+    // counted by hand, so a field added to AUTH moves it here too.
     CcFixture fix;
-    std::string const secret(Wire::MaxAuthPayload - (2 * sizeof(std::uint32_t)), 'x');
-    auto authed = RequireSecret("", secret);
+    auto const overhead = AuthFrame("", "").size() - Wire::RequestHeaderSize;
+    std::string const atTheCeiling(Wire::MaxAuthPayload - overhead, 'x');
+    auto authed = RequireSecret("", atTheCeiling);
 
-    auto const reply = ExchangeWith(fix, AuthFrame("", secret), authed.session);
+    auto const reply = ExchangeWith(fix, AuthFrame("", atTheCeiling), authed.session);
     CHECK(SoleReply(reply).status == Wire::Status::Ok);
 }
 

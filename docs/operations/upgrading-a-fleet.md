@@ -118,6 +118,14 @@ before upgrading. A member upgraded from a build that had them starts as a clust
 and rejoins its fleet by admission, as any machine does — see
 [adding a machine to a running cluster](../tools/fastcache-compile-node.md#adding-a-machine-to-a-running-cluster).
 
+The flags that admitted by **address** are gone too, because an address admits nobody any
+more: `--fleet-member`, `--scheduler-token-file`, `--cluster-admit-client` and
+`--cluster-forget-client`, with their keys `fleet_member`, `scheduler_token_file`,
+`cluster_admit_client` and `cluster_forget_client`. A machine is admitted by its identity
+key -- a node by the key it proves, a client by the machine ticket its own node mints -- and
+forgotten by that key with `--cluster-forget`. Each is refused by name, with the step that
+replaces it, on a command line, in a configuration file and in a service registration.
+
 ## Signed leases and the certified roster
 
 **#178 signs every lease with the issuing scheduler's own identity key and has every

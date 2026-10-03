@@ -4,6 +4,7 @@
 #include "NodeConfig.hpp"
 #include "NodeFormation.hpp"
 #include "NodeKey.hpp"
+#include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
 
@@ -394,13 +395,6 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         // Same rule (#178): a registration carrying it would re-admit a worker's key at every
         // boot, so a worker forgotten since would be admitted again by this node's restart.
         "--cluster-admit-worker",
-        // The client pair (#1309), same rule and one sharper consequence: a registration
-        // carrying `--cluster-forget-client` would re-forget the host at every boot, so a
-        // host re-admitted from anywhere else would be removed again by this node's next
-        // restart -- a revocation that comes back from the dead, which is worse than one
-        // that never took.
-        "--cluster-admit-client",
-        "--cluster-forget-client",
         // The cordon, for the same rule with the consequence #1303 names: a registration
         // carrying one would re-cordon the worker at every boot -- a machine that silently
         // never comes back to the fleet.
@@ -456,7 +450,6 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     // each other -- but this case exists to give every field a non-default value
     // so every emitter fires, and it asserts nothing about coherence.
     cfg.tlsSelfSigned = true;
-    cfg.fleetMembers = { "10.0.0.1:6676", "10.0.0.2:6676" };
     cfg.fleetOpen = true;
     // Derived from the default rather than written out, because the default is a
     // fraction of HOST RAM now: any literal here is one that silently equals the
@@ -480,10 +473,6 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
     cfg.discoveryAddress = "255.255.255.255:6681";
     cfg.discoveryReplyPort = 6682;
     cfg.fleetSeeds = { "office-a:6674", "office-b:7000" };
-    // A PATH, which is why it belongs in a registration at all: the case below asserts the SECRET is never written, and
-    // the two rules only stay compatible because what travels is where to read the
-    // credential rather than the credential.
-    cfg.schedulerTokenFile = "scheduler.token";
     cfg.logLevel = LogLevel::Debug;
     // Worker state, so it has to survive a registration: a service installed with
     // timestamps on must come back with them on, or the operator who turned them on
@@ -658,6 +647,232 @@ TEST_CASE("NodeConfig: --cluster-key-file is gone, and naming it is refused as a
 
     // Nor from a configuration file, where the key is refused as naming no row.
     CHECK(std::ranges::none_of(NodeOptions(), [](auto const& row) { return row.yamlKey == "cluster_key_file"; }));
+}
+
+TEST_CASE("NodeConfig: --fleet-member is gone, and naming it is refused as a flag this node does not have", "[node][config]")
+{
+    // An address admits nobody any more: a machine is admitted by the key it proves or the
+    // ticket it presents. Refused rather than accepted and ignored, because a list an
+    // operator still maintains and believes is in force, read by nothing, is the silent
+    // no-op this table exists to refuse. The same parse is what a supervisor replaying an
+    // old registration's `--fleet-member=` reaches, so that is refused by name too.
+    auto const parsed = ParseNodeArgv(std::vector<char const*> { "--scheduler=s:1", "--fleet-member=10.0.0.7" });
+    REQUIRE_FALSE(parsed.has_value());
+    CHECK(parsed.error().code == ConfigErrorCode::UnknownKey);
+    CHECK(parsed.error().field.contains("--fleet-member"));
+    // Refused by NAME, with its remedy, as every retired flag is (`RetiredNodeFlags`) -- through the
+    // door `main` parses with, which is where the explanation is attached.
+    auto productionCfg = Testing::FirstStart(NodeConfig {});
+    auto const typed = std::vector<char const*> { "--fleet-member=10.0.0.7" };
+    auto const explained = ParseNodeCommandLine(std::span<char const* const> { typed }, productionCfg);
+    REQUIRE_FALSE(explained.has_value());
+    CHECK(explained.error().context.starts_with("--fleet-member was retired"));
+    CHECK(explained.error().context.contains("--enroll-from"));
+
+    // And no row answers to it from a file either; the file case is asserted below, beside
+    // the other file refusals.
+    CHECK(std::ranges::none_of(
+        NodeOptions(), [](auto const& row) { return row.primary == "--fleet-member" || row.yamlKey == "fleet_member"; }));
+}
+
+TEST_CASE("NodeConfig: --scheduler-token-file is gone, and naming it is refused as a flag this node does not have",
+          "[node][config]")
+{
+    // The node checks no password: a machine is admitted by the key it proves or the ticket it
+    // presents. Refused rather than accepted and ignored, because a token an operator still
+    // provisions and believes guards the scheduler verbs, read by nothing, is the silent no-op
+    // this table exists to refuse -- and it is what a supervisor replaying an old registration
+    // reaches, so that is refused by name too.
+    auto const parsed = ParseNodeArgv(std::vector<char const*> { "--scheduler=s:1", "--scheduler-token-file=s.token" });
+    REQUIRE_FALSE(parsed.has_value());
+    CHECK(parsed.error().code == ConfigErrorCode::UnknownKey);
+    CHECK(parsed.error().field.contains("--scheduler-token-file"));
+    auto productionCfg = Testing::FirstStart(NodeConfig {});
+    auto const typed = std::vector<char const*> { "--scheduler-token-file=s.token" };
+    auto const explained = ParseNodeCommandLine(std::span<char const* const> { typed }, productionCfg);
+    REQUIRE_FALSE(explained.has_value());
+    CHECK(explained.error().context.starts_with("--scheduler-token-file was retired"));
+    CHECK(explained.error().context.contains("checks no password"));
+
+    CHECK(std::ranges::none_of(NodeOptions(), [](auto const& row) {
+        return row.primary == "--scheduler-token-file" || row.yamlKey == "scheduler_token_file";
+    }));
+    // Nor is it a secret file this node asks about any more.
+    CHECK(std::ranges::none_of(NodeSecretFileTable(), [](auto const& row) { return row.flag == "--scheduler-token-file"; }));
+}
+
+TEST_CASE("A node with no roster admits by key nobody, so only --fleet-open or its fleet reach another machine",
+          "[node][config][admission]")
+{
+    NodeConfig cfg;
+    cfg.nodeListen = "0.0.0.0:6674";
+    CHECK_FALSE(AdmitsRemotePeers(cfg, RosterPresence::Absent));
+    CHECK(AdmitsRemotePeers(cfg, RosterPresence::Held));
+    // Unknown asks the configuration, and nothing in this one can hold a roster...
+    CHECK_FALSE(AdmitsRemotePeers(cfg, RosterPresence::Unknown));
+    // ...until something can: a state directory may keep one.
+    cfg.clusterDir = "cluster";
+    CHECK(AdmitsRemotePeers(cfg, RosterPresence::Unknown));
+    CHECK_FALSE(AdmitsRemotePeers(cfg, RosterPresence::Absent));
+    cfg.fleetOpen = true;
+    CHECK(AdmitsRemotePeers(cfg, RosterPresence::Absent));
+
+    // Each clause that may give this node a roster is a key route on its own.
+    NodeConfig anchored;
+    anchored.voterKeys = { AVoterKey() };
+    CHECK(AdmitsByKey(anchored));
+    CHECK(AdmitsRemotePeers(anchored, RosterPresence::Unknown));
+    // Consensus is one, on a solitary node too: it admits nobody else yet, but an approval makes
+    // it a fleet's founder without a restart, and its roster then admits machines by key.
+    auto const clustered = Testing::FirstStart(NodeConfig {});
+    REQUIRE(RunsConsensus(clustered));
+    CHECK(AdmitsByKey(clustered));
+    CHECK(AdmitsRemotePeers(clustered, RosterPresence::Unknown));
+    CHECK_FALSE(AdmitsByKey(NodeConfig {}));
+
+    // And the fleet the formation record puts this node in widens whatever is known about a
+    // roster: a pending node is about to be handed a member set, and a joined one's members are
+    // other machines. A solitary node's are not, until it founds a fleet.
+    for (auto const mode:
+         { Cluster::NodeMode::Solitary, Cluster::NodeMode::Pending, Cluster::NodeMode::Learner, Cluster::NodeMode::Voter })
+    {
+        INFO(Cluster::NodeModeRowFor(mode).name);
+        auto formed = Testing::FirstStart(NodeConfig {});
+        REQUIRE(formed.formation.has_value());
+        if (formed.formation.has_value())
+            formed.formation->mode = mode;
+        CHECK(AdmitsRemotePeers(formed, RosterPresence::Absent) == (mode != Cluster::NodeMode::Solitary));
+    }
+}
+
+TEST_CASE("A network-facing worker with a roster reaches other machines through the ticket route",
+          "[node][config][admission]")
+{
+    // The first fail-open guard: the ticket route must reach the question that decides
+    // whether a worker may build `UncheckedLeaseValidator`, or removing `--fleet-member`
+    // made every roster-holding worker look single-machine.
+    NodeConfig cfg;
+    cfg.nodeListen = "0.0.0.0:6674";
+    cfg.voterKeys = { AVoterKey() };
+    CHECK(CompileVerbsReachOtherMachines(cfg, RosterPresence::Held));
+    CHECK(CompileVerbsReachOtherMachines(cfg, RosterPresence::Unknown));
+    CHECK_FALSE(CompileVerbsReachOtherMachines(cfg, RosterPresence::Absent));
+    cfg.nodeListen = "127.0.0.1:6674"; // the port faces nothing
+    CHECK_FALSE(CompileVerbsReachOtherMachines(cfg, RosterPresence::Held));
+}
+
+TEST_CASE("A compile port bound by NAME faces the network, whatever the name begins with", "[node][config][admission]")
+{
+    // The lease check is decided syntactically and never resolved, so a name is judged by what
+    // it IS -- a name -- and a name may resolve anywhere. `127.cache.example.com` read as
+    // loopback while `IsLoopbackHost` matched a prefix, which switched the lease check OFF for a
+    // port that could be facing the network: the fail-open direction. Every name now faces it.
+    NodeConfig cfg;
+    cfg.voterKeys = { AVoterKey() };
+    for (auto const* named: { "127.cache.example.com:6674", "localhost:6674", "worker-01.internal:6674" })
+    {
+        INFO(named);
+        cfg.nodeListen = named;
+        CHECK(CompileVerbsReachOtherMachines(cfg, RosterPresence::Held));
+    }
+    // The control: a loopback LITERAL anywhere in 127.0.0.0/8 faces nothing.
+    for (auto const* literal: { "127.0.0.1:6674", "127.5.5.5:6674", "[::1]:6674" })
+    {
+        INFO(literal);
+        cfg.nodeListen = literal;
+        CHECK_FALSE(CompileVerbsReachOtherMachines(cfg, RosterPresence::Held));
+    }
+}
+
+TEST_CASE("The four advertise rows fire on a key route, with no membership flag anywhere", "[node][config][admission]")
+{
+    // The second fail-open guard. Before this, their gate was `--fleet-member || --fleet-open`,
+    // and with the list gone a worker that tells ticket holders to dial themselves started
+    // silently.
+    auto keyed = [] {
+        NodeConfig cfg;
+        cfg.schedulers = { "scheduler.internal:6675" };
+        cfg.clusterDir = "cluster"; // a key route: a kept roster may admit ticket holders
+        return cfg;
+    };
+    auto wildcard = keyed();
+    wildcard.advertise = "0.0.0.0:6676";
+    // Each bind is TYPED, and says so: a parse sets the provenance bit with the value, and the
+    // bind/advertise disagreement is judged only for a bind the operator named (#770).
+    auto loopbackFromReachable = keyed();
+    loopbackFromReachable.nodeListen = "0.0.0.0:6674";
+    loopbackFromReachable.nodeListenExplicit = true;
+    loopbackFromReachable.advertise = "127.0.0.1:6674";
+    auto pastLoopbackBind = keyed();
+    pastLoopbackBind.nodeListen = "127.0.0.1:6674";
+    pastLoopbackBind.nodeListenExplicit = true;
+    pastLoopbackBind.advertise = "worker-01.internal:6674";
+    auto loopbackToRemote = keyed();
+    loopbackToRemote.nodeListen = "127.0.0.1:6674";
+    loopbackToRemote.nodeListenExplicit = true;
+
+    struct Row
+    {
+        char const* what;
+        NodeConfig cfg;
+        char const* phrase;
+    };
+    auto const rows = std::to_array<Row>({
+        { .what = "wildcard", .cfg = wildcard, .phrase = "the wildcard resolves to" },
+        { .what = "loopback from a reachable bind", .cfg = loopbackFromReachable, .phrase = "every peer is told to dial" },
+        { .what = "past a loopback bind", .cfg = pastLoopbackBind, .phrase = "--listen-node binds loopback" },
+        { .what = "loopback to a remote scheduler", .cfg = loopbackToRemote, .phrase = "would register LOOPBACK" },
+    });
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        auto const refusal = StartupPolicyRejection(row.cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains(row.phrase));
+        CHECK(Unwrap(refusal).contains("by key, or by --fleet-open"));
+
+        // The control: the same shape with no route at all is not refused by THIS row.
+        auto routeless = row.cfg;
+        routeless.clusterDir.clear();
+        auto const other = StartupPolicyRejection(routeless);
+        INFO("routeless refusal: " << other.value_or("<none>"));
+        CHECK_FALSE(other.value_or("").contains(row.phrase));
+
+        // And consensus alone is a route, so the node every zero-config start forms answers
+        // the same row with nothing else named.
+        auto const formed = Testing::FirstStart(routeless);
+        REQUIRE(RunsConsensus(formed));
+        auto const consensus = StartupPolicyRejection(formed);
+        INFO("consensus refusal: " << consensus.value_or("<none>"));
+        CHECK(consensus.value_or("").contains(row.phrase));
+    }
+}
+
+TEST_CASE("A reload may not open a worker that checks no lease, whatever route it names", "[node][config][admission]")
+{
+    // A worker that could start: a state directory for its identity, and a bind and an
+    // advertise other machines can reach, so no startup row answers in the guard's place.
+    NodeConfig closed;
+    closed.schedulers = { "scheduler.internal:6675" };
+    closed.clusterDir = "cluster";
+    closed.nodeListen = "0.0.0.0:6674";
+    closed.advertise = "worker-01.internal:6674";
+    REQUIRE_FALSE(StartupPolicyRejection(closed).has_value());
+
+    // The rule asks the configuration with no roster in view, so the state directory -- which
+    // `Unknown` would read as a live key route on both sides -- must not silence it.
+    auto opened = closed;
+    opened.fleetOpen = true;
+    auto const refused = ValidateNodeReloadable(closed, opened);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().context.contains("--fleet-open"));
+    CHECK(refused.error().context.contains("may not widen"));
+    CHECK_FALSE(refused.error().context.contains("--fleet-member"));
+
+    // And the narrowing direction is always allowed.
+    auto const narrowed = ValidateNodeReloadable(opened, closed);
+    INFO((narrowed.has_value() ? std::string {} : narrowed.error().context));
+    CHECK(narrowed.has_value());
 }
 
 TEST_CASE("NodeConfig: a later enrollment verb drops the earlier one's subject", "[node][config]")
@@ -1291,19 +1506,19 @@ TEST_CASE("NodeConfig: the consensus switch is --listen-raft, not --node-id", "[
         CHECK(RunsConsensus(cfg) == !RowFor(NodeSurface::Raft).Resolve(cfg).empty());
     }
 
-    SECTION("the ready line follows the switch too")
+    SECTION("the ready line reads no spelling of the switch")
     {
-        // `AdmissionSummary` spelled `nodeId.empty()` for itself, which is a third
-        // author of the same rule: after the switch moved it would have told an
-        // operator running a clustered node that it admits this machine only, while
-        // consensus was about to admit hosts nobody typed.
+        // `AdmissionSummary` spelled `nodeId.empty()` for itself once, a third author of
+        // the same rule. It now reads no consensus predicate at all: a key admits a
+        // machine on a clustered node and on a lone one alike, since a lone worker's
+        // state directory may keep a roster, so both lines name the key routes.
         auto clustered = Installable();
         clustered.raftListen = "6680";
-        CHECK(AdmissionSummary(clustered).contains("the cluster's members"));
+        CHECK(AdmissionSummary(clustered).contains("by key or ticket"));
 
         auto lone = Installable();
         lone.nodeId = "n1";
-        CHECK_FALSE(AdmissionSummary(lone).contains("the cluster's members"));
+        CHECK(AdmissionSummary(lone) == AdmissionSummary(clustered));
     }
 }
 
@@ -1351,6 +1566,60 @@ TEST_CASE("NodeConfig: the packaged socket-activated worker starts", "[node][pol
     CHECK_FALSE(NodeInstallRejection(packaged).has_value());
 }
 
+TEST_CASE("A defaulted wildcard bind under a loopback advertise is judged on a node that admits other machines now",
+          "[node][policy][admission]")
+{
+    // The #770 shape -- a bind nobody typed, a loopback advertise, a loopback `--scheduler` -- on
+    // each kind of node. Solitary and closed it is the packaged single-machine install and starts;
+    // on a node whose peers are ALREADY real, `--fleet-open` or a formation record whose mode
+    // reaches beyond this machine, each of them would be leased `127.0.0.1`, so the row answers
+    // whatever the bind's provenance.
+    auto const packaged = [] {
+        auto cfg = Testing::FirstStart(NodeConfig {});
+        cfg.schedulers = { "127.0.0.1:6675" };
+        cfg.clusterDir = "cluster";
+        cfg.advertise = "127.0.0.1:6676";
+        cfg.toolchains = { "/usr/bin/g++" };
+        REQUIRE_FALSE(cfg.nodeListenExplicit);
+        REQUIRE(cfg.formation.has_value());
+        return cfg;
+    };
+    auto const withMode = [&packaged](Cluster::NodeMode mode) {
+        auto cfg = packaged();
+        if (cfg.formation.has_value())
+            cfg.formation->mode = mode;
+        return cfg;
+    };
+
+    // The control: the packaged install, solitary and closed.
+    auto const control = packaged();
+    REQUIRE(control.formation.has_value());
+    CHECK(Unwrap(control.formation).mode == Cluster::NodeMode::Solitary);
+    CHECK_FALSE(StartupPolicyRejection(control).has_value());
+
+    struct Row
+    {
+        char const* what;
+        NodeConfig cfg;
+    };
+    auto openPackaged = packaged();
+    openPackaged.fleetOpen = true;
+    auto const rows = std::to_array<Row>({
+        { .what = "#770 with --fleet-open", .cfg = openPackaged },
+        { .what = "a voter", .cfg = withMode(Cluster::NodeMode::Voter) },
+        { .what = "a learner", .cfg = withMode(Cluster::NodeMode::Learner) },
+        { .what = "a pending joiner", .cfg = withMode(Cluster::NodeMode::Pending) },
+    });
+    for (auto const& row: rows)
+    {
+        INFO(row.what);
+        REQUIRE_FALSE(row.cfg.nodeListenExplicit);
+        auto const refusal = StartupPolicyRejection(row.cfg);
+        REQUIRE(refusal.has_value());
+        CHECK(Unwrap(refusal).contains("every peer is told to dial"));
+    }
+}
+
 TEST_CASE("NodeConfig: --advertise naming this machine at a port it does not serve is refused", "[node][policy]")
 {
     // **The startup reachability rules judged the advertised HOST and never its port**,
@@ -1360,16 +1629,18 @@ TEST_CASE("NodeConfig: --advertise naming this machine at a port it does not ser
     // `fastcached` cache daemon -- while the registration succeeds and every counter
     // reads normally.
     //
-    // Reachable on a node with NO membership flags, which is the single-machine
-    // deployment: the three advertise rows are scoped to `NamesAMembershipPolicy`, so
-    // they answer a loopback advertise before this can. Measured with the binary, and
-    // the fixtures below are the same shapes.
+    // Reachable on the single-machine deployment, which names its scheduler on
+    // loopback: the four advertise rows are gated on `NamesAnAdmissionRoute`, which a
+    // worker keeping a state directory always names, so with a scheduler on ANOTHER
+    // machine the fourth row answers a loopback advertise before this can.
     auto const worker = [] {
         auto cfg = Testing::FirstStart(NodeConfig {});
-        cfg.schedulers = { std::string { SchedulerEndpoint } };
+        cfg.schedulers = { "127.0.0.1:6685" };
         cfg.clusterDir = "cluster";
         cfg.toolchains = { "/usr/bin/g++" };
-        cfg.nodeListen = "6675";
+        // On loopback by NAME: a bare port takes the wildcard since the zero-config defaults, and
+        // this fixture is the single-machine fleet, whose bind and advertise agree on loopback.
+        cfg.nodeListen = "127.0.0.1:6675";
         // **Set together, because a parse cannot produce one without the other.** The
         // rule only judges a port the operator NAMED (#770), and a fixture assigning
         // the value while leaving the provenance bit false models a configuration no
@@ -1450,8 +1721,11 @@ TEST_CASE("NodeConfig: --advertise naming this machine at a port it does not ser
         // reach -- NAT, a proxy, a container publishing a different external port -- and
         // `AdvertisesPastALoopbackBind`'s earlier draft was wrong for exactly this
         // reason. Without this section, "the advertised port must equal --listen-node"
-        // would pass the section above.
+        // would pass the section above. The bind faces the network, because the worker's
+        // state directory is a key route and a routable advertise over a loopback bind is
+        // refused by its own row.
         auto cfg = worker();
+        cfg.nodeListen = "0.0.0.0:6675";
         cfg.advertise = "nat.example.com:9999";
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
     }
@@ -1476,13 +1750,14 @@ TEST_CASE("NodeConfig: --advertise naming this machine at a port it does not ser
 
     SECTION("the host rows still answer first when both apply")
     {
-        // Ordering, asserted rather than left to the reader. A membership node that
-        // advertises loopback is unreachable by any peer, which is a bigger problem than
-        // reaching it at the wrong port -- so that sentence is the one an operator gets.
+        // Ordering, asserted rather than left to the reader. A node admitting other
+        // machines that advertises loopback is unreachable by any of them, which is a
+        // bigger problem than reaching it at the wrong port -- so that sentence is the
+        // one an operator gets.
         auto cfg = worker();
         cfg.nodeListen = "0.0.0.0:6675";
         cfg.advertise = "127.0.0.1:6674";
-        cfg.fleetMembers = { "10.0.0.2" };
+        cfg.fleetOpen = true;
 
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
@@ -1544,7 +1819,7 @@ TEST_CASE("NodeConfig: a listen flag whose value is not an endpoint is refused b
           [] {
               auto cfg = Installable();
               cfg.nodeListen = "nope";
-              cfg.fleetOpen = true; // else the fleet-membership rule answers first
+              cfg.fleetOpen = true;
               return cfg;
           }() },
         { "--admin-listen",
@@ -1764,85 +2039,26 @@ TEST_CASE("A node says who it admits in the line an operator reads at startup", 
     // One function rather than a phrase per surface, because a node running both
     // must state one policy rather than two, and because `main.cpp` is in no test
     // target -- a phrase built there could not be asserted on at all.
-    struct Row
-    {
-        char const* what;                 ///< The shape, for the failure message.
-        std::vector<std::string> members; ///< `--fleet-member`, if any.
-        bool open;                        ///< Whether `--fleet-open` was given.
-        std::string raftListen;           ///< `--listen-raft`, i.e. whether consensus runs (#1022).
-        char const* says;                 ///< What the line must contain.
-        char const* saysNot { nullptr };  ///< What it must NOT contain, if anything.
-    };
+    //
+    // Two sentences, and only two: admission by address is gone, so the line no longer
+    // depends on consensus or on a list. What it names on EVERY node is the key routes,
+    // since a state directory can keep a roster no configuration shows -- a line saying
+    // "this machine only" there would be a confident wrong answer.
+    NodeConfig closed;
+    CHECK(AdmissionSummary(closed) == "admits this machine, and machines the roster admits by key or ticket");
 
-    auto const rows = std::to_array<Row>({
-        { .what = "no policy at all", .members = {}, .open = false, .raftListen = {}, .says = "this machine only" },
-        // Naming the remedy is the point of that row: an operator who reads "this
-        // machine only" and is not told the two flags has been informed of a symptom.
-        { .what = "no policy names the flags that give one",
-          .members = {},
-          .open = false,
-          .raftListen = {},
-          .says = "--fleet-member" },
-        // A node running consensus is about to admit hosts nobody typed, so a line
-        // reading as a final answer would mislead -- but both flags are still named,
-        // because the agreed member set ADDS to the listed one rather than replacing
-        // it (#251). `--fleet-member` therefore keeps working on such a node, and it
-        // is the only route by which a client machine, which is no cluster peer, is
-        // admitted at all.
-        { .what = "no policy, with consensus running, says the cluster will supply members",
-          .members = {},
-          .open = false,
-          .raftListen = "6680",
-          .says = "the cluster's members",
-          // And never the unclustered phrase: "this machine only" is a final answer,
-          // and on a node whose cluster is about to agree a member set it is wrong.
-          .saysNot = "this machine only" },
-        { .what = "no policy, with consensus running, still names --fleet-member",
-          .members = {},
-          .open = false,
-          .raftListen = "6680",
-          .says = "--fleet-member" },
-        { .what = "no policy, with consensus running, still names --fleet-open",
-          .members = {},
-          .open = false,
-          .raftListen = "6680",
-          .says = "--fleet-open" },
-        // And a node that HAS a list says the cluster adds to it, so an operator
-        // reading a bare count does not conclude that is the whole policy.
-        { .what = "a member list, with consensus running",
-          .members = { "10.0.0.1:6676" },
-          .open = false,
-          .raftListen = "6680",
-          .says = "the cluster's members" },
-        { .what = "a member list",
-          .members = { "10.0.0.1:6676", "10.0.0.2:6676" },
-          .open = false,
-          .raftListen = {},
-          .says = "2 member" },
-        // "This machine" out loud even when a list exists: that admission is
-        // unconditional, and an operator reading a bare count would not know their
-        // own builds were covered.
-        { .what = "a member list still says this machine",
-          .members = { "10.0.0.1:6676" },
-          .open = false,
-          .raftListen = {},
-          .says = "this machine" },
-        { .what = "--fleet-open", .members = {}, .open = true, .raftListen = {}, .says = "every caller" },
-    });
+    auto open = closed;
+    open.fleetOpen = true;
+    CHECK(AdmissionSummary(open)
+          == "admits this machine, and machines the roster admits by key or ticket, and every other caller "
+             "(--fleet-open)");
 
-    for (auto const& row: rows)
-    {
-        INFO(row.what);
-        auto cfg = Testing::FirstStart(NodeConfig {});
-        cfg.fleetMembers = row.members;
-        cfg.fleetOpen = row.open;
-        cfg.raftListen = row.raftListen;
-
-        auto const summary = AdmissionSummary(cfg);
-        CHECK(summary.contains(row.says));
-        if (row.saysNot != nullptr)
-            CHECK_FALSE(summary.contains(row.saysNot));
-    }
+    // Consensus changes neither: a clustered node admits by key exactly as a lone one does.
+    auto clustered = Testing::FirstStart(closed);
+    REQUIRE(RunsConsensus(clustered));
+    CHECK(AdmissionSummary(clustered) == AdmissionSummary(closed));
+    clustered.fleetOpen = true;
+    CHECK(AdmissionSummary(clustered) == AdmissionSummary(open));
 }
 
 TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[node][scheduler][policy]")
@@ -1859,47 +2075,9 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // clustered -- it signs every grant with its identity key and hands its workers a
         // roster its voters certify, so it holds replicated state even alone -- and since
         // the mode decides the duty, a node whose consensus is closed serves none: there is
-        // no such scheduler left to refuse. Consensus supplies the member set, as it always
-        // did for a clustered scheduler (#262), and its replicated client list
-        // (`--cluster-admit-client`) is a route to admission no startup rule can read.
+        // no such scheduler left to refuse. Its roster admits machines by key, which is a
+        // route to admission no startup rule can read.
         CHECK_FALSE(ServesScheduler(NoConsensus()));
-    }
-
-    SECTION("the two policies contradicting each other")
-    {
-        // Silently preferring either would make the narrower one a no-op an operator
-        // believes is in force -- which is worse than refusing, because it is the
-        // permissive half that would win by accident.
-        auto cfg = Testing::FirstStart(NodeConfig {});
-        cfg.fleetOpen = true;
-        // Derived from the default rather than written out, because the default is a
-        // fraction of HOST RAM now: any literal here is one that silently equals the
-        // default on some machine, and this case exists precisely to give every field
-        // a value that differs from it.
-        cfg.cacheMemoryBytes = NodeConfig {}.cacheMemoryBytes + 1;
-        // Emitted on whether it was *typed*, not on whether it differs -- so a
-        // fixture that assigns the field has to say so too.
-        cfg.cacheMemoryExplicit = true;
-        cfg.cacheDir = "cache";
-        cfg.nodeListen = "127.0.0.1:6679";
-        cfg.upstream = "cache.internal:6674";
-        cfg.fleetMembers = { "10.0.0.1:6676" };
-
-        REQUIRE(StartupPolicyRejection(cfg).has_value());
-
-        // And on a node running no scheduler at all, which is where the rest of
-        // this group stopped applying (#235): this row never depended on one, and
-        // the permissive half is the one that would have won by accident.
-        auto worker = Testing::FirstStart(NodeConfig {});
-        worker.fleetMembers = { "10.0.0.1:6676" };
-        worker.fleetOpen = true;
-
-        // Named rather than merely counted: with the mirror row gone this shape is
-        // refused by exactly one rule, and a bare `has_value()` would stay green if
-        // some unrelated row started answering in its place.
-        auto const refusal = StartupPolicyRejection(worker);
-        REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).contains("contradict"));
     }
 
     SECTION("peers admitted to a worker that advertises the wildcard")
@@ -2022,8 +2200,8 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // And the three shapes that must NOT be refused, each of which would be a
         // working deployment this rule had broken.
 
-        // The one-machine deployment: no membership flags, so no peer is admitted,
-        // so nothing is told to dial anything. This is what an operator gets by
+        // The one-machine deployment: its scheduler is on this machine and so is
+        // everything it advertises, so nothing is told to dial anywhere it cannot. This is what an operator gets by
         // installing the package and starting a node, and it is correct.
         auto alone = Testing::FirstStart(NodeConfig {});
         alone.schedulers = { "127.0.0.1:6675" };
@@ -2048,7 +2226,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // anything at startup, which is recorded here rather than changed, being
         // nobody's ticket yet.
         auto cacheOnly = NoConsensus();
-        cacheOnly.fleetMembers = { "10.0.0.1:6676" };
+        cacheOnly.fleetOpen = true;
         cacheOnly.voterKeys = { AVoterKey() }; // it admits another machine (#282, #178)
         auto const cacheOnlyRefusal = StartupPolicyRejection(cacheOnly);
         REQUIRE(cacheOnlyRefusal.has_value());
@@ -2093,6 +2271,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         bare.clusterDir = "cluster";
         bare.fleetOpen = true;
         bare.nodeListen = "127.0.0.1:6674";
+        bare.nodeListenExplicit = true; // typed, as the parse would record it
 
         auto const refusal = StartupPolicyRejection(bare);
         REQUIRE(refusal.has_value());
@@ -2101,14 +2280,16 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         CHECK(Unwrap(refusal).contains("dial ITSELF"));
         CHECK(NodeInstallRejection(bare).has_value());
 
-        // A listed member set rather than `--fleet-open` reaches the same row: the
-        // admission gate is the siblings' and answers either spelling.
-        auto listed = NoConsensus();
-        listed.schedulers = { "scheduler.internal:6675" };
-        listed.clusterDir = "cluster";
-        listed.nodeListen = "127.0.0.1:6674";
-        listed.fleetMembers = { "10.0.0.1:6674" };
-        CHECK(StartupPolicyRejection(listed).has_value());
+        // A key route alone, with no `--fleet-open`, reaches the same row: the state
+        // directory may keep a roster that admits ticket holders, and each of them would
+        // be told to dial itself.
+        auto keyed = NoConsensus();
+        keyed.schedulers = { "scheduler.internal:6675" };
+        keyed.clusterDir = "cluster";
+        keyed.nodeListen = "127.0.0.1:6674";
+        auto const keyedRefusal = StartupPolicyRejection(keyed);
+        REQUIRE(keyedRefusal.has_value());
+        CHECK(Unwrap(keyedRefusal).contains("dial ITSELF"));
 
         // #1310: ANY configured scheduler on another machine, not the first. The
         // heartbeat falls back through all of them, so a loopback first entry says
@@ -2134,7 +2315,10 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // from each other: the way this regresses is one predicate widening to cover
         // several, which leaves an operator reading about a flag they never wrote.
         NodeConfig wide = bare;
-        wide.nodeListen = "0.0.0.0:6674";
+        // The bind DEFAULTED, not typed: this node is `--fleet-open`, so it admits other machines
+        // now and the defaulted wildcard is judged like a typed one.
+        wide.nodeListen = std::string { DefaultNodeListen };
+        wide.nodeListenExplicit = false;
         wide.advertise = "127.0.0.1:6674"; // a loopback advertise over a NETWORK bind
         wide.voterKeys = { AVoterKey() };
         auto const wideRefusal = StartupPolicyRejection(wide);
@@ -2201,11 +2385,10 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // scheduler included, and it names itself. These fixtures did not, so the
         // shapes they called "accepted" were shapes the binary refuses; the rule was an
         // inline `if` in `main.cpp` and no test could see it (#386).
-        auto listed = Testing::FirstStart(NodeConfig {});
-        listed.schedulers = { std::string { SelfScheduler } };
-        listed.fleetMembers = { "10.0.0.1:6676" };
-        RunConsensusAlone(listed);
-        CHECK_FALSE(StartupPolicyRejection(listed).has_value());
+        auto keyed = Testing::FirstStart(NodeConfig {});
+        keyed.schedulers = { std::string { SelfScheduler } };
+        RunConsensusAlone(keyed);
+        CHECK_FALSE(StartupPolicyRejection(keyed).has_value());
 
         auto open = Testing::FirstStart(NodeConfig {});
         open.schedulers = { std::string { SelfScheduler } };
@@ -2237,25 +2420,20 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         auto const bare = StartupPolicyRejection(Testing::FirstStart(NodeConfig {}));
         REQUIRE(bare.has_value());
         CHECK(Unwrap(bare).contains("--scheduler"));
-        CHECK_FALSE(Unwrap(bare).contains("--fleet-member"));
+        CHECK_FALSE(Unwrap(bare).contains("--fleet-open"));
         CHECK_FALSE(Unwrap(bare).contains("--raft-self"));
 
-        // Including one that names a membership policy, which is the whole of #235.
-        // A mirror row used to refuse exactly this, reasoning that "a policy nothing
-        // consults is a policy an operator believes is in force" -- and the premise
-        // was false: one `NodeMembership` serves the scheduler, the cache tier AND
-        // the compile port, and the compile port is built unconditionally. What the
-        // row achieved was pinning every worker to an empty member list, which
-        // admits loopback alone, so the worker the getting-started page documents
-        // refused every dispatched compile with `NotAMember`.
-        auto listedWorker = NoConsensus();
-        listedWorker.schedulers = { "scheduler.internal:6675" };
-        listedWorker.clusterDir = "cluster";
-        listedWorker.nodeListen = "0.0.0.0:6674";
-        listedWorker.advertise = "worker-01.internal:6674";
-        listedWorker.fleetMembers = { "10.0.0.1:6674" };
-        listedWorker.voterKeys = { AVoterKey() };
-        CHECK_FALSE(StartupPolicyRejection(listedWorker).has_value());
+        // Including a worker that admits other machines by key, which is the whole of
+        // #235: one `NodeMembership` serves the scheduler, the cache tier AND the compile
+        // port, and the compile port is built unconditionally, so a worker that could
+        // admit nobody refused every dispatched compile with `NotAMember`.
+        auto keyedWorker = NoConsensus();
+        keyedWorker.schedulers = { "scheduler.internal:6675" };
+        keyedWorker.clusterDir = "cluster";
+        keyedWorker.nodeListen = "0.0.0.0:6674";
+        keyedWorker.advertise = "worker-01.internal:6674";
+        keyedWorker.voterKeys = { AVoterKey() };
+        CHECK_FALSE(StartupPolicyRejection(keyedWorker).has_value());
 
         auto openWorker = NoConsensus();
         openWorker.schedulers = { "scheduler.internal:6675" };
@@ -3207,12 +3385,12 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // install into a service that registers cleanly and refuses at every boot.
     //
     // Asserted rather than reasoned about. The lease rule reads `voterKeys`,
-    // `nodeListen` and the membership fields and none of the cache ones, so by
+    // `nodeListen` and the admission fields and none of the cache ones, so by
     // inspection it cannot refuse these -- but "by inspection" is what this file
     // exists to replace, and the next rule added to either table gets this case for
     // free.
     auto cfg = Installable();
-    cfg.fleetMembers = { "10.0.0.1:6676" };
+    cfg.fleetOpen = true;
     cfg.voterKeys = { AVoterKey() }; // the lease rule's own requirement (#282, #178)
 
     // Both provenance-bearing flags typed at exactly their defaults, which is the
@@ -3223,10 +3401,10 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     cfg.nodeListenExplicit = true;
 
     // The default `--listen-node` is the WILDCARD, so `Installable()`'s routable advertise
-    // and remote scheduler already agree with it: the ordinary fleet worker. The MEMBER
-    // LIST stays remote, which is what keeps this case about its own subject:
-    // `AdmitsRemotePeers` is what makes #282's lease rule apply at all, and the voters'
-    // keys above are that rule's requirement, satisfied.
+    // and remote scheduler already agree with it: the ordinary fleet worker. `--fleet-open`
+    // stays, which is what keeps this case about its own subject: `AdmitsRemotePeers` is
+    // what makes #282's lease rule apply at all, and the voters' keys above are that rule's
+    // requirement, satisfied.
     cfg.cacheMemoryBytes = defaults.cacheMemoryBytes;
     cfg.cacheMemoryExplicit = true;
 
@@ -3268,8 +3446,7 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a roster to che
     SECTION("consensus, whose member set grows to machines nobody typed")
     {
         // The admitted set is published into the same oracle the compile port
-        // consults, so a clustered node's peers reach it without appearing in
-        // `--fleet-member` at all.
+        // consults, so a clustered node's peers reach it without any flag naming them.
         //
         // Consensus IS the roster: a member verifies every grant against the state it applies,
         // so it starts with nothing else named -- the pre-shared key it needed until #178 is
@@ -3321,17 +3498,18 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a roster to che
         // has this host's compiler, so a lease check there escalates nobody.
         // Refusing it would break every developer's laptop to prevent nothing.
         CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
-
-        auto loopback = Installable();
-        loopback.fleetMembers = { "127.0.0.1", "127.0.0.2:6676", "[::1]:6676" };
-        CHECK_FALSE(StartupPolicyRejection(loopback).has_value());
     }
 
     SECTION("the voters' keys root a directory that holds no roster yet")
     {
         auto cfg = Installable();
-        cfg.fleetMembers = { "10.0.0.1:6676" };
+        cfg.fleetOpen = true;
         cfg.voterKeys = { AVoterKey() };
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+
+        // And with no flag at all: the keys alone are a route, since a roster they root
+        // admits machines by proof and by ticket.
+        cfg.fleetOpen = false;
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
     }
 
@@ -3340,7 +3518,7 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a roster to che
         // It may hold a roster an earlier run adopted, which no configuration can see --
         // so the table lets it through and `NodeRoster::Build` asks the directory itself.
         auto cfg = Installable();
-        cfg.fleetMembers = { "10.0.0.1:6676" };
+        cfg.fleetOpen = true;
         REQUIRE(cfg.clusterDir == "cluster");
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
     }
@@ -3433,8 +3611,6 @@ TEST_CASE("Every cluster verb names itself in a refusal by its own spelling, das
         Row { .flag = "--cluster-admit-learner", .refusedValue = "no-endpoint", .says = "not <id>=<host>:<port>" },
         Row { .flag = "--cluster-admit-worker", .refusedValue = "no-key", .says = "is <id>@<key>" },
         Row { .flag = "--cluster-forget", .refusedValue = "", .says = "names no member" },
-        Row { .flag = "--cluster-admit-client", .refusedValue = "", .says = "names no host" },
-        Row { .flag = "--cluster-forget-client", .refusedValue = "", .says = "names no host" },
     };
     for (auto const& row: rows)
     {
@@ -3632,6 +3808,31 @@ TEST_CASE("NodeConfig: a command line naming --scheduler replaces the file's lis
     }
 }
 
+TEST_CASE("NodeConfig: a file naming fleet_member refuses to start, naming the key", "[node][config]")
+{
+    // The file twin of the retired flag: a key naming no row is refused by name, so a
+    // configuration file still listing hosts cannot start a node that silently ignores it.
+    auto const merged = FromFileAndArgv({ Setting("fleet_member", { "10.0.0.7" }) }, {});
+
+    REQUIRE_FALSE(merged.has_value());
+    CHECK(merged.error().code == ConfigErrorCode::UnknownKey);
+    CHECK(merged.error().field == "fleet_member");
+    CHECK(merged.error().source == "/etc/n.yaml");
+    CHECK(merged.error().context.starts_with("fleet_member was retired"));
+}
+
+TEST_CASE("NodeConfig: a file naming scheduler_token_file refuses to start, naming the key", "[node][config]")
+{
+    // The file twin of the retired flag, for its reason.
+    auto const merged = FromFileAndArgv({ Setting("scheduler_token_file", { "/etc/fastcached/scheduler.token" }) }, {});
+
+    REQUIRE_FALSE(merged.has_value());
+    CHECK(merged.error().code == ConfigErrorCode::UnknownKey);
+    CHECK(merged.error().field == "scheduler_token_file");
+    CHECK(merged.error().source == "/etc/n.yaml");
+    CHECK(merged.error().context.starts_with("scheduler_token_file was retired"));
+}
+
 TEST_CASE("NodeConfig: a file naming an unknown setting refuses to start", "[node][config]")
 {
     auto const merged = FromFileAndArgv({ Setting("schedular", { "typo:6675" }) }, {});
@@ -3755,6 +3956,14 @@ namespace
 /// configuration name the same one. Never read -- validation asks the configuration, not the disk.
 constexpr std::string_view RunnableStateDirectory = "node-state";
 
+/// The scheduler a node that could actually be running registers with: one on its own machine.
+///
+/// Loopback, because that state directory is a key route -- it may keep a roster that admits
+/// other machines -- and a worker that admits them while registering its loopback default with
+/// a scheduler ELSEWHERE is refused by the fourth advertise row, which no reload case here is
+/// about. The single-machine install names its scheduler this way.
+constexpr std::string_view RunnableScheduler = "127.0.0.1:6675";
+
 /// Write a configuration file for a node that could actually be running.
 ///
 /// `WriteNodeConfigFile` plus the `scheduler:` and `cluster_dir:` lines, so a fixture about reload MECHANICS
@@ -3768,7 +3977,7 @@ constexpr std::string_view RunnableStateDirectory = "node-state";
 [[nodiscard]] std::filesystem::path WriteRunnableNodeConfigFile(std::filesystem::path const& dir, std::string_view body)
 {
     return WriteNodeConfigFile(
-        dir, std::format("scheduler: {}\ncluster_dir: {}\n{}", SchedulerEndpoint, RunnableStateDirectory, body));
+        dir, std::format("scheduler: {}\ncluster_dir: {}\n{}", RunnableScheduler, RunnableStateDirectory, body));
 }
 
 /// The live configuration of a node that could actually be running.
@@ -3776,7 +3985,7 @@ constexpr std::string_view RunnableStateDirectory = "node-state";
 [[nodiscard]] NodeConfig RunningNode()
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.schedulers = { std::string { SchedulerEndpoint } };
+    cfg.schedulers = { std::string { RunnableScheduler } };
     cfg.clusterDir = RunnableStateDirectory;
     return cfg;
 }
@@ -4295,18 +4504,15 @@ TEST_CASE("NodeSecretFiles: a path-reached secret is not provenance-gated", "[no
     // provenance gate would silently skip every argv-named key file -- a change no test
     // asserting merely that "some warning arrives" could see.
     auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.schedulerTokenFile = "/etc/fastcached/scheduler.token";
     cfg.dashboardTokenFile = "/etc/fastcached/dashboard.token";
     cfg.tlsKeyFile = "/etc/fastcached/admin.key";
     cfg.tlsCertFile = "/etc/fastcached/admin.crt";
 
     SECTION("named in argv, with no configuration file at all")
     {
-        // The provenance gate answers "no file" here, and all three must still be asked
-        // about.
+        // The provenance gate answers "no file" here, and both must still be asked about.
         auto const files = NodeSecretFiles(cfg, {}, /*secretNamedOnCommandLine*/ true);
-        CHECK(files
-              == std::vector<std::filesystem::path> { cfg.schedulerTokenFile, cfg.dashboardTokenFile, cfg.tlsKeyFile });
+        CHECK(files == std::vector<std::filesystem::path> { cfg.dashboardTokenFile, cfg.tlsKeyFile });
     }
 
     SECTION("the certificate is never asked about")
@@ -4318,8 +4524,8 @@ TEST_CASE("NodeSecretFiles: a path-reached secret is not provenance-gated", "[no
     SECTION("an unnamed flag contributes nothing")
     {
         auto bare = Testing::FirstStart(NodeConfig {});
-        bare.schedulerTokenFile = "/etc/fastcached/scheduler.token";
-        CHECK(NodeSecretFiles(bare, {}, false) == std::vector<std::filesystem::path> { bare.schedulerTokenFile });
+        bare.dashboardTokenFile = "/etc/fastcached/dashboard.token";
+        CHECK(NodeSecretFiles(bare, {}, false) == std::vector<std::filesystem::path> { bare.dashboardTokenFile });
     }
 
     SECTION("the identity key is asked about wherever the node holds one, and nowhere else")
@@ -4416,9 +4622,9 @@ TEST_CASE("NodeSecretFiles: the configuration file is gated on provenance", "[no
     {
         // It is the file an operator most often has open, and the order is the
         // caller's rather than the filesystem's.
-        cfg.schedulerTokenFile = "/etc/fastcached/scheduler.token";
+        cfg.dashboardTokenFile = "/etc/fastcached/dashboard.token";
         CHECK(NodeSecretFiles(cfg, configFile, false)
-              == std::vector<std::filesystem::path> { configFile, cfg.schedulerTokenFile });
+              == std::vector<std::filesystem::path> { configFile, cfg.dashboardTokenFile });
     }
 }
 
@@ -4528,9 +4734,8 @@ TEST_CASE("A reload re-asks the filesystem about the worker's key files", "[node
     // is `Reloadable::Yes`, so a node file cannot GAIN a secret across a reload and
     // `ValidateNodeReloadable` refuses such a candidate by name. The other half is the
     // half no snapshot can answer -- a file's MODE is in no configuration, so an
-    // operator who loosens `--scheduler-token-file` an hour in produced two byte-identical
-    // snapshots and total silence, for the credential the scheduler requires of every
-    // caller.
+    // operator who loosens `--dashboard-token-file` an hour in produced two byte-identical
+    // snapshots and total silence, for the credential the fleet dashboard requires.
     //
     // Driven against the REAL `ConfigReloaderOf<NodeConfig>` and a real file on disk,
     // through the same `MakeNodeReloader` recipe `main` wires: the two things that
@@ -4541,11 +4746,21 @@ TEST_CASE("A reload re-asks the filesystem about the worker's key files", "[node
     // `key` is what the case is about; the configuration file itself stays 0600 and
     // carries no `token:`, so it can contribute no warning of its own and anything
     // `said` holds came from the key.
-    scratch.Write("scheduler.token", "not-a-real-token\n");
-    auto const key = scratch / "scheduler.token";
+    //
+    // The admin surface's TLS key, and on loopback: a key file a node that could be running
+    // actually holds. `--dashboard-token-file` was this row until the configuration table began
+    // refusing it on a node that runs no scheduler -- a secret nobody reads -- and a refused reload
+    // is no key-watch outcome at all. The certificate is public and is not asked about.
+    scratch.Write("admin.key", "not-a-real-key\n");
+    scratch.Write("admin.crt", "not-a-real-certificate\n");
+    auto const key = scratch / "admin.key";
+    auto const certificate = scratch / "admin.crt";
     REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR) == 0);
+    constexpr std::string_view AdminListen = "127.0.0.1:6690";
 
-    auto const path = WriteRunnableNodeConfigFile(scratch.Path(), std::format("scheduler_token_file: {}\n", key.string()));
+    auto const path = WriteRunnableNodeConfigFile(
+        scratch.Path(),
+        std::format("admin_listen: {}\ntls_cert: {}\ntls_key: {}\n", AdminListen, certificate.string(), key.string()));
     REQUIRE(::chmod(path.c_str(), S_IRUSR | S_IWUSR) == 0);
 
     // **Declared before the reloader**, so it is destroyed after it: the report closure
@@ -4555,10 +4770,12 @@ TEST_CASE("A reload re-asks the filesystem about the worker's key files", "[node
     std::vector<std::string> said;
 
     NodeConfig initial = RunningNode();
-    // Matching the file, because `scheduler_token_file` is `Reloadable::No` -- a seed that
+    // Matching the file, because none of the three is `Reloadable::Yes` -- a seed that
     // disagreed would make the FIRST reload refuse by name, which looks nothing like
     // the case under test.
-    initial.schedulerTokenFile = key;
+    initial.adminListen = AdminListen;
+    initial.tlsCertFile = certificate;
+    initial.tlsKeyFile = key;
 
     auto reloader = MakeNodeReloader(initial, path);
     WatchSecretExposure<NodeConfig>(
@@ -4568,12 +4785,22 @@ TEST_CASE("A reload re-asks the filesystem about the worker's key files", "[node
         [](NodeConfig const& live) { return NodeSecretFileSubjects(live, {}, false); },
         [&said](std::string_view warning) { said.emplace_back(warning); });
 
+    // Every reload here must be APPLIED, and says why when it is not: the watch is asked at an
+    // ACCEPTED reload only, so a refused one would leave `said` empty for a reason that has
+    // nothing to do with the key file.
+    auto const reloadApplied = [&reloader, &key] {
+        auto const reloaded = reloader.Reload();
+        INFO("reload refused: " << (reloaded.has_value() ? std::string {} : reloaded.error().ToString()));
+        REQUIRE(reloaded.has_value());
+        CHECK(reloader.Current()->tlsKeyFile == key);
+    };
+
     SECTION("a mode that loosens while the node runs is reported at the next reload")
     {
         REQUIRE(said.empty());
 
         REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) == 0);
-        REQUIRE(reloader.Reload().has_value());
+        reloadApplied();
 
         REQUIRE(said.size() == 1);
         CHECK(said.front().contains(key.string()));
@@ -4584,8 +4811,8 @@ TEST_CASE("A reload re-asks the filesystem about the worker's key files", "[node
 
         // **Asserted on the COUNT**, because a repeating implementation warns here as
         // well. Said once is what stops this becoming an alarm at every SIGHUP.
-        REQUIRE(reloader.Reload().has_value());
-        REQUIRE(reloader.Reload().has_value());
+        reloadApplied();
+        reloadApplied();
         CHECK(said.size() == 1);
     }
 
@@ -4595,8 +4822,8 @@ TEST_CASE("A reload re-asks the filesystem about the worker's key files", "[node
         // anything: without it, "reports a transition" and "reports at every reload"
         // are told apart by nothing, and a rule that warned about the ORDINARY 0600
         // key would fire on every deployment there is.
-        REQUIRE(reloader.Reload().has_value());
-        REQUIRE(reloader.Reload().has_value());
+        reloadApplied();
+        reloadApplied();
         CHECK(said.empty());
     }
 }
@@ -4619,8 +4846,14 @@ TEST_CASE("The identity key is watched at the start and at every reload, and onl
 
     // Written here rather than through `WriteRunnableNodeConfigFile`, whose state directory is a
     // fixed name: this case's directory is the one it minted a key into.
+    //
+    // The scheduler is on THIS machine, and that is load-bearing rather than incidental: a worker
+    // holding a key admits other machines by it, so a REMOTE scheduler with the loopback advertise
+    // this configuration falls back to is a real misconfiguration the reload rules refuse -- and
+    // a refused reload is no key-watch outcome at all. The same-host shape is the single-machine
+    // fleet, which those rules leave alone.
     auto const path = WriteNodeConfigFile(
-        scratch.Path(), std::format("scheduler: {}\ncluster_dir: {}\n", SchedulerEndpoint, stateDir.string()));
+        scratch.Path(), std::format("scheduler: {}\ncluster_dir: {}\n", RunnableScheduler, stateDir.string()));
     REQUIRE(::chmod(path.c_str(), S_IRUSR | S_IWUSR) == 0);
 
     std::vector<std::string> said;
@@ -4634,13 +4867,23 @@ TEST_CASE("The identity key is watched at the start and at every reload, and onl
         [](NodeConfig const& live) { return NodeSecretFileSubjects(live, {}, false); },
         [&said](std::string_view warning) { said.emplace_back(warning); });
 
+    // Every reload here must be APPLIED, and says why when it is not: the watch is asked at an
+    // ACCEPTED reload only, so a refused one would leave `said` empty for a reason that has
+    // nothing to do with the key -- the shape that let this case pass while it tested nothing.
+    auto const reloadApplied = [&reloader, &stateDir] {
+        auto const reloaded = reloader.Reload();
+        INFO("reload refused: " << (reloaded.has_value() ? std::string {} : reloaded.error().ToString()));
+        REQUIRE(reloaded.has_value());
+        CHECK(reloader.Current()->clusterDir == stateDir);
+    };
+
     SECTION("minted 0600, it is quiet at the start and at every reload")
     {
         // The control. Without it, "reports an exposed key" and "reports every key" are told
         // apart by nothing, and a row that warned about the ordinary minted file would fire on
         // every node there is.
         CHECK(said.empty());
-        REQUIRE(reloader.Reload().has_value());
+        reloadApplied();
         CHECK(said.empty());
     }
 
@@ -4648,7 +4891,7 @@ TEST_CASE("The identity key is watched at the start and at every reload, and onl
     {
         REQUIRE(said.empty());
         REQUIRE(::chmod(key.c_str(), S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) == 0);
-        REQUIRE(reloader.Reload().has_value());
+        reloadApplied();
 
         REQUIRE(said.size() == 1);
         CHECK(said.front().contains(key.string()));
@@ -4737,54 +4980,6 @@ TEST_CASE("A cache the operator NAMED is refused when no node surface can serve 
     }
 }
 
-TEST_CASE("A clustered scheduler needs no --fleet-member", "[node-config]")
-{
-    // #262. The refusal's premise -- that an empty member set declines everybody --
-    // is false on a clustered node, because consensus supplies the set. It was
-    // pushing operators toward `--fleet-open`, which admits the entire network: a
-    // security downgrade taken to satisfy a startup check.
-    //
-    // Both directions, because relaxing this must not relax it for a STANDALONE
-    // scheduler, which is what the rule was written for and where it is still right.
-
-    SECTION("a clustered scheduler with no member list starts")
-    {
-        auto cfg = Installable();
-        cfg.fleetMembers.clear();
-        cfg.fleetOpen = false;
-        cfg.raftListen = "6680"; // what RunsConsensus asks about (#1022)
-        // A clustered node must name the endpoint its peers dial, and this section is
-        // about the MEMBER list rather than about that -- so it is named here rather
-        // than left out. Without it the configuration can fail to start at all: it is
-        // refused by `ConsensusNamesNoDialAddressRefusal`, which is a different rule
-        // saying something true. The conditional this section used to carry absorbed
-        // exactly that -- `refusal.has_value()` was TRUE, the text did not contain
-        // the fleet-member sentence, and the section passed while its name claimed a
-        // configuration that this tree refuses (#1039).
-        cfg.raftSelf = "scheduler-01.internal";
-        REQUIRE(ServesScheduler(cfg));
-        // And the key, for the same reason: consensus needs one (#1308), and that
-        // refusal would otherwise answer in the fleet-member rule's place.
-        auto const refusal = StartupPolicyRejection(cfg);
-        INFO("refusal: " << refusal.value_or("<none>"));
-        CHECK_FALSE(refusal.has_value());
-    }
-
-    SECTION("a STANDALONE scheduler no longer exists to refuse")
-    {
-        // The node the rule was written for no longer exists: since #178 a scheduler runs
-        // consensus even alone, and since the mode decides the duty, a node whose consensus
-        // is closed serves no scheduler at all -- so there is no standalone one left for the
-        // member-list rule, or any other, to refuse.
-        auto cfg = Installable();
-        cfg.fleetMembers.clear();
-        cfg.fleetOpen = false;
-        REQUIRE_FALSE(RunsConsensus(cfg));
-        CHECK_FALSE(ServesScheduler(cfg));
-        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
-    }
-}
-
 TEST_CASE("An --advertise that clients cannot dial is refused at startup", "[node-config]")
 {
     // #208. The flag is `host:port clients should reach this worker on`, and nothing
@@ -4831,7 +5026,9 @@ TEST_CASE("An --advertise that clients cannot dial is refused at startup", "[nod
     // nobody can satisfy: every shape an operator legitimately types still starts.
     SECTION("well-formed values are accepted")
     {
-        for (auto const* good: { "worker.example:6675", "10.0.0.4:6675", "[::1]:6675" })
+        // A bracketed IPv6 literal other machines can dial: this worker binds the network
+        // and admits other machines by key, so a LOOPBACK advertise is refused by its own row.
+        for (auto const* good: { "worker.example:6675", "10.0.0.4:6675", "[2001:db8::4]:6675" })
         {
             auto cfg = Installable();
             cfg.advertise = good;
@@ -4849,7 +5046,12 @@ TEST_CASE("An --advertise that clients cannot dial is refused at startup", "[nod
         // something was refused it was not this rule -- and nothing is refused on
         // this configuration, so the assertion never ran and a rule that started
         // answering here would not have been noticed (#1039).
+        //
+        // The single-machine shape first, where an empty value is simply the fallback
+        // to a loopback bind and nothing is refused at all.
         auto cfg = Installable();
+        cfg.schedulers = { "127.0.0.1:6675" };
+        cfg.nodeListen = "127.0.0.1:6674";
         cfg.advertise = {};
         auto const refusal = StartupPolicyRejection(cfg);
         INFO("refusal: " << refusal.value_or("<none>"));
@@ -4857,15 +5059,16 @@ TEST_CASE("An --advertise that clients cannot dial is refused at startup", "[nod
 
         // And the arrangement where the emptiness question DOES bite, which is what
         // makes the sentence above mean something: an empty `--advertise` on a node
-        // that admits peers is refused -- by the wildcard rule, in its own words,
-        // naming the flags the operator actually typed. Asserting the refusal's text
-        // rather than its presence is the point: both rules refuse, and only the
-        // words say which one did.
-        cfg.fleetMembers = { "peer.example" };
+        // that admits other machines and binds the wildcard is refused -- by the
+        // wildcard rule, in its own words. Asserting the refusal's text rather than
+        // its presence is the point: both rules refuse, and only the words say which
+        // one did. The fixture's state directory is the key route that admits them.
+        auto admittingCfg = Installable();
+        admittingCfg.advertise = {};
         // And a host name that resolved to nothing, so the wildcard the node binds is what it
         // would advertise -- before the name resolves the wildcard is awaited, not advertised.
-        ApplyHostNames(cfg, NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = {} });
-        auto const admitting = StartupPolicyRejection(cfg);
+        ApplyHostNames(admittingCfg, NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = {} });
+        auto const admitting = StartupPolicyRejection(admittingCfg);
         REQUIRE(admitting.has_value());
         CHECK(Unwrap(admitting).contains("the wildcard resolves to"));
         CHECK_FALSE(Unwrap(admitting).contains("clients can dial"));
@@ -4880,15 +5083,21 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
     // `NodeSurfaceTable()`, and a surface is a port this process BINDS -- so every
     // address the node asks somebody ELSE about was unjudged except `--advertise`.
     //
-    // **The distinguishing assertion is that the rows do NOT share a grammar.** One
-    // widened predicate would pass every case below that expects a refusal and then
-    // refuse `--fleet-member=worker-01`, which is documented as legal and is what
-    // discovery produces. So each direction is asserted for every row.
+    // **The distinguishing assertion is that each direction is asserted for every
+    // row.** One widened predicate would pass every case below that expects a refusal
+    // and then refuse a value the rows accept.
+    //
+    // The worker binds and advertises a routable address, because its state directory
+    // is a key route: a worker that admits other machines and registers loopback with a
+    // scheduler elsewhere is refused by the fourth advertise row, which is not this
+    // case's subject.
     auto const base = [] {
         auto cfg = NoConsensus();
         cfg.schedulers = { std::string { SchedulerEndpoint } };
         cfg.clusterDir = "cluster";
         cfg.toolchains = { "/usr/bin/g++" };
+        cfg.nodeListen = "0.0.0.0:6674";
+        cfg.advertise = "worker-01.internal:6674";
         return cfg;
     };
 
@@ -4964,7 +5173,6 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
         // that has nothing to do with shape.
         auto cfg = base();
         cfg.upstream.clear();
-        cfg.fleetMembers.clear();
         auto const refusal = StartupPolicyRejection(cfg);
         INFO("refusal: " << refusal.value_or("<none>"));
         CHECK_FALSE(refusal.has_value());
@@ -4977,62 +5185,6 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
         auto const required = StartupPolicyRejection(missing);
         REQUIRE(required.has_value());
         CHECK(Unwrap(required).contains("--scheduler is required"));
-    }
-
-    SECTION("--fleet-member keeps its OWN grammar: a bare host is legal")
-    {
-        // The case a widened predicate breaks. `--fleet-member` is never dialled: it
-        // is matched against a peer's source address through `HostOfEndpoint`, which
-        // keeps an unsplittable value whole because a bare host is a legitimate
-        // spelling for a peer whose port nobody recorded.
-        auto const value = GENERATE(as<std::string> {}, "worker-01", "worker-01.internal:6674", "10.0.0.7");
-        INFO("--fleet-member=" << value);
-
-        // Admitting a peer on ANOTHER machine turns on two rules that have nothing to
-        // do with `--fleet-member`'s spelling: the three advertise rows, because such
-        // a node has told peers to dial it, and the lease rule, because it will have to
-        // check the lease signature of a client it did not vouch for (#178). Both are
-        // satisfied here rather than worked around -- a fixture that tripped either
-        // would report a red for a row this case is not about, which is the trap
-        // `SelfScheduler`'s own comment records one fixture up.
-        auto cfg = base();
-        cfg.nodeListen = "0.0.0.0:6674";
-        cfg.nodeListenExplicit = true;
-        cfg.advertise = "worker-99.internal:6674";
-        cfg.advertiseExplicit = true;
-        cfg.voterKeys = { AVoterKey() };
-        cfg.fleetMembers = { value };
-
-        auto const refusal = StartupPolicyRejection(cfg);
-        INFO("refusal: " << refusal.value_or("<none>"));
-        CHECK_FALSE(refusal.has_value());
-    }
-
-    SECTION("an EMPTY --fleet-member element is refused, and that is the silent one")
-    {
-        // `--fleet-member=` appends `""`. It matches no peer the kernel ever reports,
-        // and it makes `fleetMembers` NON-empty -- so `HasMembershipPolicy` answers
-        // yes and the "a scheduler with no membership policy" rule below does not
-        // fire. The node starts, serves a scheduler, and admits nobody but its own
-        // machine, with no error at either end. #208's silent shape, one flag along.
-        auto cfg = base();
-        cfg.schedulers = { std::string { SelfScheduler } };
-        RunConsensusAlone(cfg);
-        REQUIRE(ServesScheduler(cfg));
-        cfg.fleetMembers = { "" };
-
-        auto const refusal = StartupPolicyRejection(cfg);
-        REQUIRE(refusal.has_value());
-        CHECK(Unwrap(refusal).contains("--fleet-member"));
-
-        // **And it must be refused for ITS OWN reason.** The same configuration with
-        // no membership flags at all starts -- a clustered scheduler needs no member list
-        // (#262) -- so the empty ELEMENT is what is refused, and nothing else about it.
-        auto uncovered = cfg;
-        uncovered.fleetMembers.clear();
-        auto const other = StartupPolicyRejection(uncovered);
-        INFO("refusal: " << other.value_or("<none>"));
-        CHECK_FALSE(other.has_value());
     }
 }
 
@@ -5251,6 +5403,8 @@ TEST_CASE("The advertise row is reloadable, and is the ADDRESS kind rather than 
     auto previous = Testing::FirstStart(NodeConfig {});
     previous.schedulers = { std::string { SchedulerEndpoint } };
     previous.clusterDir = "cluster";
+    previous.nodeListen = "0.0.0.0:6674";
+    previous.advertise = "worker-01.internal:6674";
     auto candidate = previous;
     candidate.advertise = "nat.example:7700";
 
@@ -5273,12 +5427,11 @@ TEST_CASE("A reload may not advertise what the startup rules refuse", "[node][co
     auto previous = NoConsensus();
     previous.schedulers = { std::string { SchedulerEndpoint } };
     previous.clusterDir = "cluster";
-    // A member list is what makes the advertised endpoint TRAVEL, and therefore what
-    // scopes the wildcard rule: a node admitting nobody is reached at `--listen-node`
-    // and needs no advertise at all. The voters' keys come with it because admitting
-    // peers without a roster root is refused by a DIFFERENT startup rule (#178) -- which
-    // is the refusal the control below would otherwise be reporting.
-    previous.fleetMembers = { "10.0.0.7" };
+    // Admitting other machines is what makes the advertised endpoint TRAVEL, and
+    // therefore what scopes the wildcard rule: a node admitting nobody is reached at
+    // `--listen-node` and needs no advertise at all. `--fleet-open` states it outright,
+    // and the voters' keys root the roster that checks the grants those machines bring.
+    previous.fleetOpen = true;
     previous.voterKeys = { AVoterKey() };
     // And a listener peers could actually reach, because the table ALSO refuses an
     // advertise that names a dialable address while `--listen-node` binds loopback --
@@ -5388,50 +5541,63 @@ TEST_CASE("ObservabilityAnnouncement tells a fleet node it opens no admin surfac
 
     // **Every case names `--scheduler`, and that is the point.** It is required of
     // every startable node, one that only schedules included, so it is no evidence
-    // of a fleet -- a predicate reading it would fire on every node there is, which is
-    // exactly the single-machine install this remark has to stay off.
+    // of a fleet -- a predicate reading it would fire on every node there is. Nor is a
+    // state directory, which every node naming a scheduler keeps, nor a wildcard node
+    // port, which every node binds by default.
+    //
+    // A "fleet node" is one another machine can reach AND a route admits: its node port
+    // faces the network, and a key, `--fleet-open` or the fleet its formation record puts
+    // it in could admit a caller there. `base()` is such a port on a solitary node, whose
+    // consensus holds a roster of this machine alone.
     auto const base = [] {
         auto cfg = Testing::FirstStart(NodeConfig {});
         cfg.schedulers = { std::string { SchedulerEndpoint } };
-        cfg.clusterDir = "cluster";
+        cfg.nodeListen = "0.0.0.0:6674";
+        cfg.advertise = "worker-01.internal:6674";
         return cfg;
     };
 
-    SECTION("a single-machine install says nothing")
+    SECTION("the single-machine install says nothing")
     {
+        // THE control: a configuration that STARTS, as the package installs it -- its
+        // scheduler on this machine, a solitary formation record, its node port on the
+        // wildcard default. It runs consensus, and its roster is this machine alone, so the
+        // remark would be a false statement.
+        auto single = Testing::FirstStart(NodeConfig {});
+        single.schedulers = { "127.0.0.1:6675" };
+        REQUIRE(RunsConsensus(single));
+        REQUIRE_FALSE(StartupPolicyRejection(single).has_value());
+        CHECK_FALSE(ObservabilityAnnouncement(single).has_value());
+
+        // Even opened on a loopback port: `--fleet-open` there admits every caller that can
+        // reach it, which is this machine alone.
+        single.nodeListen = "127.0.0.1:6674";
+        single.fleetOpen = true;
+        REQUIRE_FALSE(StartupPolicyRejection(single).has_value());
+        CHECK_FALSE(ObservabilityAnnouncement(single).has_value());
+    }
+
+    SECTION("a reachable port that no route admits through says nothing")
+    {
+        // The other half of the question: the port faces the network, and nothing could
+        // admit a remote caller on it -- a solitary node's consensus included, and a node
+        // running none that names nothing that could hold a roster.
         CHECK_FALSE(ObservabilityAnnouncement(base()).has_value());
-    }
-
-    SECTION("a loopback-only member list is still one machine")
-    {
-        // This is what picks `AdmitsRemotePeers` out of the three spellings of *is this
-        // a fleet participant* that deliberately disagree: the reachability rows' gate
-        // answers YES here, because `--fleet-member` was given at all.
-        auto cfg = base();
-        cfg.fleetMembers = { "127.0.0.1" };
-        CHECK_FALSE(ObservabilityAnnouncement(cfg).has_value());
-    }
-
-    SECTION("a member named `localhost` is told, because nothing here may trust a name")
-    {
-        // **Not a hole, and not an oversight either way round.** `IsLoopbackHost`
-        // deliberately does not call `localhost` loopback -- it answers security
-        // questions, where a name a resolver decides must not be trusted -- so
-        // `AdmitsRemotePeers` reads such a member as another machine and the remark
-        // fires. That is the safe direction for a REMARK: the worst it costs a
-        // one-machine install spelled this way is one line it did not need, where the
-        // other reading would silence a real fleet whose member list happens to be
-        // written with names. Asserted rather than left to be discovered, because it
-        // is the one input where this case and the one above disagree.
-        auto cfg = base();
-        cfg.fleetMembers = { "localhost" };
-        CHECK(ObservabilityAnnouncement(cfg).has_value());
+        auto closed = base();
+        closed.raftListen.clear();
+        REQUIRE_FALSE(RunsConsensus(closed));
+        CHECK_FALSE(ObservabilityAnnouncement(closed).has_value());
     }
 
     SECTION("a node admitting another machine is told, and told what to type")
     {
+        // A state directory, which may keep a roster that admits machines by key, on a
+        // port another machine can reach -- asked of a node running no consensus, whose
+        // roster is whatever that directory keeps.
         auto cfg = base();
-        cfg.fleetMembers = { "10.0.0.2" };
+        cfg.raftListen.clear();
+        cfg.clusterDir = "cluster";
+        REQUIRE_FALSE(StartupPolicyRejection(cfg).has_value());
         auto const said = ObservabilityAnnouncement(cfg);
         REQUIRE(said.has_value());
 
@@ -5454,9 +5620,9 @@ TEST_CASE("ObservabilityAnnouncement tells a fleet node it opens no admin surfac
 
     SECTION("--fleet-open and a joined fleet reach it too")
     {
-        // Three routes into `AdmitsRemotePeers` with no member list between them, so a
-        // predicate written against `--fleet-member` alone passes the case above and
-        // fails both of these.
+        // More routes into `AdmitsRemotePeers` with no state directory between them, so
+        // a predicate written against `--cluster-dir` alone passes the case above and
+        // fails these.
         auto open = base();
         open.fleetOpen = true;
         CHECK(ObservabilityAnnouncement(open).has_value());
@@ -5471,6 +5637,17 @@ TEST_CASE("ObservabilityAnnouncement tells a fleet node it opens no admin surfac
             joined.formation->foundedHere = false;
         }
         CHECK(ObservabilityAnnouncement(joined).has_value());
+
+        // And one that asked a fleet to take it: other machines are about to be its members.
+        auto pending = base();
+        if (pending.formation.has_value())
+            pending.formation->mode = Cluster::NodeMode::Pending;
+        CHECK(ObservabilityAnnouncement(pending).has_value());
+
+        auto anchored = base();
+        anchored.raftListen.clear();
+        anchored.voterKeys = { AVoterKey() };
+        CHECK(ObservabilityAnnouncement(anchored).has_value());
     }
 
     SECTION("the same node with an admin surface says nothing")
@@ -5773,15 +5950,14 @@ TEST_CASE("A registration carries the codec by name, not by number", "[node][con
 namespace
 {
 
-/// A machine that only schedules (#206): no worker, a scheduler, a member list, and
-/// the default cache tier. Everything a worker would need -- a `--scheduler` to
+/// A machine that only schedules (#206): no worker, a scheduler, and the default
+/// cache tier. Everything a worker would need -- a `--scheduler` to
 /// register with, an `--advertise`, a toolchain -- deliberately absent.
 [[nodiscard]] NodeConfig SchedulerOnly()
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.slots = 0;
     cfg.nodeListen = "0.0.0.0:6674";
-    cfg.fleetMembers = { "10.0.0.2" };
     // A scheduler is a consensus member, alone or not (#178).
     RunConsensusAlone(cfg);
     return cfg;
@@ -5846,7 +6022,9 @@ TEST_CASE("NodeConfig: a node running no worker is refused every setting only a 
     // The two bases, each accepted on its own, so a refusal below is the flag's doing.
     // A node running no worker needs something else to run, and the default cache tier is
     // that; the worker needs a scheduler, a state directory to keep the identity it proves to
-    // that scheduler (#178) and, for `--no-toolchain-discovery`, a toolchain.
+    // that scheduler (#178) and, for `--no-toolchain-discovery`, a toolchain. Its scheduler is
+    // on this machine, because that state directory is a key route and a worker admitting
+    // other machines while registering loopback with a scheduler elsewhere is refused.
     auto const noWorkerBase = ParseNodeArgv({ "--slots=0" });
     REQUIRE(noWorkerBase.has_value());
     REQUIRE_FALSE(StartupPolicyRejection(*noWorkerBase).has_value());
@@ -5972,8 +6150,8 @@ TEST_CASE("NodeConfig: a node running no worker may name a scheduler", "[node][c
     // #206. On a node running no worker `--scheduler` registers nothing: it is where the
     // `--cluster-*` and `--enroll-*` commands run on this machine ask, and a machine-wide
     // file carries it for them. So a scheduling machine naming its own scheduler starts
-    // and installs -- on a wildcard bind with a member list, which is the shape the four
-    // advertise rows judge for a worker.
+    // and installs -- on a wildcard bind with a key route (it runs consensus), which is the
+    // shape the four advertise rows judge for a worker.
     auto schedulerOnly = SchedulerOnly();
     schedulerOnly.schedulers = { std::string { SelfScheduler } };
     CHECK_FALSE(StartupPolicyRejection(schedulerOnly).has_value());
@@ -6002,7 +6180,6 @@ TEST_CASE("NodeConfig: a node running nothing at all is refused", "[node][config
     auto nothing = SchedulerOnly();
     nothing.raftListen.clear(); // consensus is a component too, and the scheduler's (#178)
     nothing.raftSelf.clear();
-    nothing.fleetMembers.clear();
     nothing.cacheMemoryBytes = 0;
     auto const refusal = StartupPolicyRejection(nothing);
     REQUIRE(refusal.has_value());
@@ -6104,15 +6281,15 @@ TEST_CASE("A localhost --advertise is judged as loopback, whichever way the name
     // judge the name the way they judge the address (`NamesOnlyThisMachine`, never
     // `IsLoopbackHost`). Each spelling in each direction, asserting WHICH row answers.
     constexpr std::string_view ReachableBindRow =
-        "--fleet-member and --fleet-open admit peers so that they can dial this worker";
-    constexpr std::string_view PastALoopbackBindRow = "--advertise names an address peers can dial, but --listen-node";
+        "this node admits other machines -- by key, or by --fleet-open -- so that they can dial this worker, "
+        "--listen-node";
+    constexpr std::string_view PastALoopbackBindRow = "--advertise names an address they can dial, but --listen-node";
     for (auto const host: { std::string_view { "localhost" }, std::string_view { "box.localhost" } })
     {
         CAPTURE(host);
         auto worker = NoConsensus();
         worker.clusterDir = "cluster";
         worker.toolchains = { "/usr/bin/g++" };
-        worker.fleetMembers = { "10.0.0.2" };
         worker.voterKeys = { AVoterKey() };
         worker.advertise = std::format("{}:6674", host);
         worker.advertiseExplicit = true;
@@ -6148,7 +6325,7 @@ TEST_CASE("The flags that carried a cluster's shape are refused as flags this no
     //
     // Through the door `main` parses with, and each refusal names its row's step: a service
     // replaying one fails at every boot, and `unrecognised argument` is all its log would say.
-    CHECK(RetiredNodeFlags().size() == 4);
+    CHECK(RetiredNodeFlags().size() == 8);
     for (auto const& row: RetiredNodeFlags())
     {
         INFO(row.flag);

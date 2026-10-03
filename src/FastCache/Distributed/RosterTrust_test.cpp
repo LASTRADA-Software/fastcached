@@ -34,19 +34,17 @@ namespace
 
 constexpr auto Noon = std::chrono::system_clock::time_point { std::chrono::hours { 500'000 } };
 
-/// A roster of voters @p voters, keyed, with @p revoked's keys revoked as `Apply` revokes them.
+/// A roster of voters @p voters, keyed, with @p revoked's keys revoked as `Apply` revokes them:
+/// the record goes and the key joins the revoked list, so a revoked id is no member.
 [[nodiscard]] Cluster::Roster RosterOf(std::vector<std::string> const& voters, std::vector<std::string> const& revoked = {})
 {
     Cluster::Roster roster;
     for (auto const& id: voters)
-    {
-        auto const isRevoked = std::ranges::find(revoked, id) != revoked.end();
-        roster.members.push_back(
-            Cluster::RosterMember { .id = id,
-                                    .raftEndpoint = id + ":6680",
-                                    .seat = Cluster::MemberSeat::Voter,
-                                    .publicKey = isRevoked ? std::nullopt : std::optional { TestKeyPair(id).PublicKey() } });
-    }
+        if (!std::ranges::contains(revoked, id))
+            roster.members.push_back(Cluster::RosterMember { .id = id,
+                                                             .raftEndpoint = id + ":6680",
+                                                             .seat = Cluster::MemberSeat::Voter,
+                                                             .publicKey = TestKeyPair(id).PublicKey() });
     for (auto const& id: revoked)
         roster.revoked.push_back(Cluster::RevokedKey { .id = id, .publicKey = TestKeyPair(id).PublicKey() });
     return roster;
@@ -311,4 +309,56 @@ TEST_CASE("A grant signed by a voter the cluster has since forgotten is refused 
     // And the control: a voter still in good standing signs exactly as before.
     auto const kept = KeyPairLeaseSigner { "n1", TestKeyPair("n1") };
     CHECK(AuthenticateLeaseToken(roster, MintLeaseToken(kept, grant)).has_value());
+}
+
+TEST_CASE("A roster answers for every machine it admits, in either seat, and for none it revoked",
+          "[distributed][roster][ticket]")
+{
+    auto roster = RosterOf({ "v1" }, { "gone" });
+    roster.members.push_back(Cluster::RosterMember {
+        .id = "l1", .raftEndpoint = {}, .seat = Cluster::MemberSeat::Learner, .publicKey = TestKeyPair("l1").PublicKey() });
+
+    auto const check = [](ILeaseRoster const& subject) {
+        CHECK(subject.MachineKeysOf("v1").live == TestKeyPair("v1").PublicKey());
+        CHECK(subject.MachineKeysOf("l1").live == TestKeyPair("l1").PublicKey());
+        CHECK_FALSE(subject.MachineKeysOf("gone").live.has_value());
+        CHECK_FALSE(subject.MachineKeysOf("stranger").live.has_value());
+        CHECK(std::ranges::contains(subject.MachineKeysOf("stranger").revoked, TestKeyPair("gone").PublicKey()));
+        // A GRANT is still a voter's alone: the new question does not widen the old one.
+        CHECK_FALSE(subject.KeysOf("l1").live.has_value());
+    };
+
+    SECTION("a worker's certified roster")
+    {
+        AtomicMetricsSink metrics;
+        NullLogger logger;
+        RosterTrust trust { std::nullopt, Anchors({ "v1" }), std::nullopt, nullptr, metrics, logger };
+        REQUIRE(trust.Offer(Certified(roster, 1, { "v1" }), Noon) == RosterOfferOutcome::Adopted);
+        check(trust);
+    }
+    SECTION("a consensus member's applied state")
+    {
+        Cluster::ClusterState state;
+        for (auto const& member: roster.members)
+            state.members.push_back(
+                Cluster::ClusterMember { .id = member.id,
+                                         .raftEndpoint = member.raftEndpoint,
+                                         .schedulerEndpoint = {},
+                                         .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                         .seat = member.seat,
+                                         .publicKey = member.publicKey });
+        state.revokedKeys = roster.revoked;
+        StateLeaseRoster applied;
+        applied.Adopt(state);
+        check(applied);
+    }
+}
+
+TEST_CASE("A roster that holds nothing answers for no machine", "[distributed][roster][ticket]")
+{
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    RosterTrust trust { std::nullopt, Anchors({ "v1" }), std::nullopt, nullptr, metrics, logger };
+    CHECK_FALSE(trust.MachineKeysOf("v1").live.has_value());
+    CHECK(trust.MachineKeysOf("v1").revoked.empty());
 }

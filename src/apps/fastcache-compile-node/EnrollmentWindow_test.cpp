@@ -374,8 +374,6 @@ TEST_CASE("A roster records a joiner only under the key and the role it asked fo
     auto roster = Cluster::Roster {};
     roster.members.push_back(Cluster::RosterMember {
         .id = "n1", .raftEndpoint = "10.0.0.1:6680", .seat = Cluster::MemberSeat::Voter, .publicKey = KeyOf(0x01) });
-    roster.members.push_back(Cluster::RosterMember {
-        .id = "n2", .raftEndpoint = "10.0.0.2:6680", .seat = Cluster::MemberSeat::Voter, .publicKey = std::nullopt });
     roster.principals.push_back(
         Cluster::ClusterPrincipal { .id = "w1", .publicKey = KeyOf(0x11), .role = Cluster::PrincipalRole::Worker });
 
@@ -389,9 +387,6 @@ TEST_CASE("A roster records a joiner only under the key and the role it asked fo
     // quorum is a vote nobody can collect.
     CHECK_FALSE(RosterRecordsJoiner(roster, "w1", KeyOf(0x11), Wire::EnrollRole::Learner));
     CHECK_FALSE(RosterRecordsJoiner(roster, "n1", KeyOf(0x01), Wire::EnrollRole::Worker));
-
-    // A member with no key recorded records no key, whatever the joiner holds.
-    CHECK_FALSE(RosterRecordsJoiner(roster, "n2", KeyOf(0x02), Wire::EnrollRole::Learner));
 }
 
 TEST_CASE("Each enrollment role says whether it states an endpoint and what an approval records", "[enrollment][window]")

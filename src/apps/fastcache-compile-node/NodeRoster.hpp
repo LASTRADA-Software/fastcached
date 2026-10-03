@@ -127,6 +127,11 @@ class NodeRoster final: public IPresenceRoster, public IServerTrust
     ///         none. `certifiedUntil` is absent on a consensus member, whose roster is its state.
     [[nodiscard]] std::optional<Distributed::RosterSummary> Summary() const;
 
+    /// The roster held, which `explain-admission <machine>` answers from.
+    /// @return A consensus member's applied state, projected; a worker's certified roster; nothing
+    ///         on a node that holds none.
+    [[nodiscard]] std::optional<Cluster::Roster> HeldRoster() const;
+
     /// @return Whole seconds until the held roster's certification lapses, 0 once it has; nothing
     ///         on a node whose roster has no certificate to lapse -- a consensus member, or one
     ///         that holds none.

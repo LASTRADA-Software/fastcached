@@ -46,6 +46,8 @@
 #include <core/async/ThreadPoolExecutor.hpp>
 #include <core/net/BlockingConnector.hpp>
 #include <core/net/BlockingSocket.hpp>
+#include <tests/LocalityFakes.hpp>
+#include <tests/MembershipFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -100,28 +102,6 @@ class ThreadRecordingRunner final: public Cc::IProcessRunner
     std::atomic<std::size_t> _runs { 0 };
 };
 
-/// Answers `IsThisMachine` for exactly one host.
-///
-/// A stand-in rather than `CachedLocalityOracle`, because what these cases ask is WHICH
-/// question the responder puts, not how this machine's addresses are found.
-class ThisMachineIs final: public ILocalityOracle
-{
-  public:
-    /// @param host The one host that is this machine.
-    explicit ThisMachineIs(std::string host):
-        _host { std::move(host) }
-    {
-    }
-
-    [[nodiscard]] bool IsThisMachine(std::string_view host) const override
-    {
-        return host == _host;
-    }
-
-  private:
-    std::string _host;
-};
-
 /// Everything a compile responder needs, and nothing that decides a thread.
 ///
 /// The two executors are deliberately NOT members: which one is the reactor and which
@@ -143,7 +123,7 @@ struct Fixture
     /// This machine is `127.0.0.1` and nothing else, which is what a cordon asks. The
     /// cordon's own locality case uses a member that is NOT this machine, so a gate asking
     /// membership instead would admit it.
-    ThisMachineIs locality { "127.0.0.1" };
+    Testing::ThisMachineIs locality { "127.0.0.1" };
 
     Fixture():
         jobs { runner, scratch.Path(), { { "gcc-13", "g++" } }, Cc::ToolchainSurvey::Completed() },
@@ -248,12 +228,13 @@ enum class ReplyHold : std::uint8_t
 /// @param responder Who to ask.
 /// @param reactor The loop standing in for the node's own.
 /// @param frame The request.
-/// @param peer The caller's host.
+/// @param peer What the caller's connection established.
+/// @param holding Whether the reply's hold is released before the answer is handed over.
 /// @return What was answered, and on which threads.
 [[nodiscard]] Answered AnswerFrom(CompileResponder& responder,
                                   core::async::IExecutor& reactor,
                                   std::vector<std::byte> frame,
-                                  std::string peer = "127.0.0.1",
+                                  ConnectionFacts peer,
                                   ReplyHold holding = ReplyHold::Release)
 {
     std::promise<Answered> done;
@@ -264,7 +245,7 @@ enum class ReplyHold : std::uint8_t
     [](CompileResponder* target,
        core::async::IExecutor* loop,
        std::vector<std::byte> request,
-       std::string caller,
+       ConnectionFacts caller,
        ReplyHold keep,
        std::promise<Answered> out) -> core::async::DetachedTask {
         co_await core::async::ResumeOn { *loop };
@@ -273,7 +254,7 @@ enum class ReplyHold : std::uint8_t
         // `request` is a local of THIS frame, which stays alive across the suspension
         // inside `Answer` -- the contract `IFrameResponder::Answer` states for the span
         // it borrows, and the same way the endpoint's own connection task holds it.
-        auto reply = co_await target->Answer(request, PeerIdentity { .host = std::move(caller) });
+        auto reply = co_await target->Answer(request, std::move(caller));
 
         // What the reply held is released BEFORE the answer is handed over, as the
         // endpoint releases it once the reply is written: released after, a case reading
@@ -287,6 +268,22 @@ enum class ReplyHold : std::uint8_t
         co_return;
     }(&responder, &reactor, std::move(frame), std::move(peer), holding, std::move(done));
     return future.get();
+}
+
+/// `AnswerFrom` for a caller known only by its host.
+/// @param responder Who to ask.
+/// @param reactor The loop standing in for the node's own.
+/// @param frame The request.
+/// @param peer The caller's host.
+/// @param holding Whether the reply's hold is released before the answer is handed over.
+/// @return What was answered, and on which threads.
+[[nodiscard]] Answered AnswerFrom(CompileResponder& responder,
+                                  core::async::IExecutor& reactor,
+                                  std::vector<std::byte> frame,
+                                  std::string peer = "127.0.0.1",
+                                  ReplyHold holding = ReplyHold::Release)
+{
+    return AnswerFrom(responder, reactor, std::move(frame), ConnectionFacts { .host = std::move(peer) }, holding);
 }
 
 } // namespace
@@ -382,8 +379,9 @@ TEST_CASE("The merged surface applies the worker's own membership rule", "[node]
     core::async::ThreadPoolExecutor reactor { 1 };
     core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
-    Distributed::ClusterMembership const listed { Distributed::MembershipParticipant::FleetMemberList, { "10.0.0.1:6676" } };
-    CompileResponder responder { fix.protocol, capacity, listed, fix.locality, jobs, reactor, fix.metrics, fix.logger };
+    Testing::RosterFold const listed { { "pc-01" } };
+    CompileResponder responder { fix.protocol, capacity, listed.admitted, fix.locality,
+                                 jobs,         reactor,  fix.metrics,     fix.logger };
 
     auto const stranger = AnswerFrom(responder, reactor, CompileFrame(), "10.9.9.9");
     CHECK(ErrorOf(stranger.reply) == Wire::ErrorCode::NotAMember);
@@ -396,8 +394,12 @@ TEST_CASE("The merged surface applies the worker's own membership rule", "[node]
                                             static_cast<std::uint8_t>(Wire::Op::Compile));
     CHECK(early.has_value());
 
-    // And a member is served.
-    auto const member = AnswerFrom(responder, reactor, CompileFrame(), "10.0.0.1");
+    // And a machine admitted by a verified ticket for a key the roster holds is served.
+    auto const member =
+        AnswerFrom(responder,
+                   reactor,
+                   CompileFrame(),
+                   ConnectionFacts { .host = "10.0.0.1", .authenticatedMachine = Testing::IdentityOf("pc-01") });
     CHECK(StatusOf(member.reply) == Wire::Status::Ok);
     CHECK(fix.runner.Runs() == 1);
 }
@@ -485,31 +487,14 @@ TEST_CASE("A compile declaring more than the budget is refused, not charged", "[
     CHECK(capacity.InFlight() == 0);
 }
 
-TEST_CASE("The compile surface requires no connection credential", "[node][compile-responder]")
+TEST_CASE("The compile surface advertises the worker's own ceilings", "[node][compile-responder]")
 {
-    // `Op::Compile` is a `RequiresAuth` row, so this answer is what decides whether the
-    // merged listener demands a credential before it. It must not: a compile already
-    // carries one, per job rather than per connection -- the lease token the scheduler
-    // signed for this worker's endpoint, checked inside `WorkerProtocol`. Answering
-    // `true` here would refuse every client the dedicated port serves today.
     Fixture fix;
     core::async::ThreadPoolExecutor reactor { 1 };
     core::async::ThreadPoolExecutor jobs { 1 };
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 5 }, fix.logger };
     CompileResponder const responder { fix.protocol, capacity, fix.membership, fix.locality,
                                        jobs,         reactor,  fix.metrics,    fix.logger };
-
-    CHECK_FALSE(responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Compile)));
-
-    // Which is the whole reason the question takes the verb: the scheduler verbs on
-    // this same listener still require what #289 added, and a surface-wide answer has
-    // no correct value.
-    CHECK(Wire::DecidePrePayload({ .opRaw = static_cast<std::uint8_t>(Wire::Op::Compile),
-                                   .declaredLength = 1024,
-                                   .sessionCap = responder.MaxRequestBytes(),
-                                   .authRequired = responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Compile)),
-                                   .credentialAccepted = false })
-          == Wire::PrePayloadDecision::Serve);
 
     // The ceilings it advertises are the worker's own, not a second set: the request cap
     // is the constant `WorkerProtocol` was built with, and the in-flight budget is the
@@ -636,11 +621,7 @@ class ShortWindowResponder final: public IFrameResponder
     {
         return _inner.RefusePeer(peer, opRaw);
     }
-    [[nodiscard]] bool AuthRequired(std::uint8_t opRaw) const noexcept override
-    {
-        return _inner.AuthRequired(opRaw);
-    }
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> payload) const override
     {
         return _inner.CheckCredential(payload);
     }

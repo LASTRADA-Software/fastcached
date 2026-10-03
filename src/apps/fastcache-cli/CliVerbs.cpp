@@ -14,7 +14,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -1234,18 +1233,6 @@ namespace
                 { .name = "consensus-standing",
                   .value = TextCell(std::string { NameOfConsensusStanding(*fields.runtime.consensusStanding) }) });
 
-        // How many `--cluster-forget-client` tombstones this node is ENFORCING (#1471), which
-        // is the field an operator reads after issuing one. Through `AddOptionalNumber`, so
-        // absent renders no row at all rather than a `0`: a node running no consensus has no
-        // committed set for a forget to have reached, and a zero there answers a different
-        // question than "the cluster forgets nobody".
-        //
-        // It is also how a forget that has not PROPAGATED is visible. A node behind on the log
-        // reports a lower number than the leader, and both report one -- so an operator
-        // comparing two machines sees a difference rather than two plausible zeroes, which is
-        // the reading the counters cannot give them.
-        AddOptionalNumber(record, "forgotten-clients", fields.runtime.forgottenClients);
-
         // **The roster this node verifies lease grants against** (#178): which one, how many
         // vote, how many machines are admitted by key, how many keys the cluster revoked, and
         // until when a majority of its voters vouch for it. ABSENT on a node that holds none --
@@ -1421,8 +1408,8 @@ namespace
 
     /// How each admission route is spelled for a person.
     ///
-    /// **The flag or the act, never the enumerator.** An operator told `--fleet-member` knows
-    /// which line to edit; one told `FleetMemberList` has to go and look it up.
+    /// **The setting or the act, never the enumerator.** An operator told `fleet-open` knows which
+    /// setting to change; one told `OpenPolicy` has to go and look it up.
     ///
     /// Keyed on the PARTICIPANT rather than on the wire bit, and that is the guard rather than a
     /// preference: a bitmask enum has no `Last`, so a table keyed on one cannot be checked for
@@ -1431,12 +1418,13 @@ namespace
     /// route this client cannot name*, blaming the node's version for this client's omission.
     /// That is the confident wrong signal the verb exists to remove, arriving inside the verb.
     constexpr EnumTable<Distributed::MembershipParticipant, AdmissionRouteName> AdmissionRouteNames { {
-        { .route = Distributed::MembershipParticipant::FleetMemberList, .name = "--fleet-member" },
-        { .route = Distributed::MembershipParticipant::ClusterMembers, .name = "the cluster's member set" },
-        { .route = Distributed::MembershipParticipant::ClientTombstone, .name = "--cluster-forget-client" },
-        { .route = Distributed::MembershipParticipant::OpenPolicy, .name = "--fleet-open" },
-        { .route = Distributed::MembershipParticipant::ProvenIdentity, .name = "proved its identity key" },
-        { .route = Distributed::MembershipParticipant::KeyTombstone, .name = "a revoked identity key (--cluster-forget)" },
+        // Never printed: `Reserved` travels as no bit, so no answer can carry it.
+        { .route = Distributed::MembershipParticipant::Reserved, .name = "reserved" },
+        { .route = Distributed::MembershipParticipant::Loopback, .name = "loopback" },
+        { .route = Distributed::MembershipParticipant::OpenPolicy, .name = "fleet-open" },
+        { .route = Distributed::MembershipParticipant::ProvenIdentity, .name = "proven-key" },
+        { .route = Distributed::MembershipParticipant::MachineTicket, .name = "ticket" },
+        { .route = Distributed::MembershipParticipant::KeyTombstone, .name = "key-revoked" },
     } };
 
     static_assert(RowsInEnumeratorOrder(AdmissionRouteNames, &AdmissionRouteName::route),
@@ -1465,22 +1453,47 @@ namespace
             described += AdmissionRouteNames[static_cast<std::size_t>(row.route)].name;
         }
 
-        if (auto const unnamed = decidedBy & ~named; unnamed != 0)
+        // Each bit this build cannot name, as its NUMBER: the operator can then ask a client of the
+        // node's own version which route that is, which a count alone would not let them do.
+        for (auto const bit: std::views::iota(0U, 32U))
         {
+            auto const value = std::uint32_t { 1 } << bit;
+            if ((decidedBy & ~named & value) == 0)
+                continue;
             if (!described.empty())
                 described += ", ";
-            described += std::format("{} route(s) this client is too old to name", std::popcount(unnamed));
+            described += std::format("{:#x}", value);
         }
         return described;
     }
 
-    /// `explain-admission <host>` -- which routes admit or refuse that host, as THIS node folds it.
+    /// One row of `MachineStandingNames`.
+    struct MachineStandingName
+    {
+        Distributed::MachineStanding standing; ///< The standing.
+        std::string_view name;                 ///< What an operator calls it.
+    };
+
+    /// How each standing is spelled for a person: the seat, or why there is none.
+    constexpr EnumTable<Distributed::MachineStanding, MachineStandingName> MachineStandingNames { {
+        { .standing = Distributed::MachineStanding::Voter, .name = "voter" },
+        { .standing = Distributed::MachineStanding::Learner, .name = "learner" },
+        { .standing = Distributed::MachineStanding::Pending, .name = "pending" },
+        { .standing = Distributed::MachineStanding::Revoked, .name = "revoked" },
+        { .standing = Distributed::MachineStanding::Unknown, .name = "unknown" },
+    } };
+
+    static_assert(RowsInEnumeratorOrder(MachineStandingNames, &MachineStandingName::standing),
+                  "MachineStandingNames must hold one row per MachineStanding, in enumerator order");
+
+    /// `explain-admission [<machine-id|key>]` -- which routes admit or refuse a machine, or this
+    /// very connection when no subject is given, as THIS node folds it.
     ///
     /// **Every route that decided, not just the winner**
     /// ([#1471](https://github.com/LASTRADA-Software/fastcached/issues/1471)). An operator who
-    /// drops a host from `--fleet-member` and finds it still served needs to know the cluster
-    /// admits it too; naming only the winning route answers a question they did not ask, and
-    /// sends them to edit a file that will change nothing.
+    /// closes a node and finds a machine still served needs to know its key admits it too; naming
+    /// only the winning route answers a question they did not ask, and sends them to change a
+    /// setting that will change nothing.
     ///
     /// The verdict does NOT reach the exit code. `refused` is a successful answer to *why is this
     /// host refused*, and mapping it to a non-zero status would fail a script that was only
@@ -1490,7 +1503,10 @@ namespace
     /// @return The answer.
     [[nodiscard]] Answer ExplainAdmission(VerbContext const& context)
     {
-        auto const reply = AskNode(context, CompileCacheWire::EncodeExplainAdmissionRequest(context.operands[0]));
+        // No operand asks about this connection itself, which is the one question a refused caller
+        // can still have answered.
+        auto const subject = context.operands.empty() ? std::string_view {} : std::string_view { context.operands[0] };
+        auto const reply = AskNode(context, CompileCacheWire::EncodeExplainAdmissionRequest(subject));
         if (!reply.has_value())
             return reply.error();
 
@@ -1501,8 +1517,16 @@ namespace
                 std::format("{} answered explain-admission with a body this client cannot read", context.node->Address()));
 
         auto routes = DescribeAdmissionRoutes(fields->decidedBy);
+        // The standing is ABSENT for a question about this connection, which has no place in the
+        // roster -- not `unknown`, which is an answer about a machine.
+        auto const standing = fields->standing.has_value() ? Distributed::StandingOnTheWire(*fields->standing)
+                                                           : std::optional<Distributed::MachineStanding> {};
         auto answer = Answered(RecordValue(
-            { Field { .name = "host", .value = TextCell(std::string { context.operands[0] }) },
+            { Field { .name = "subject", .value = TextCell(fields->subject) },
+              Field { .name = "standing",
+                      .value = standing.has_value()
+                                   ? TextCell(std::string { MachineStandingNames[static_cast<std::size_t>(*standing)].name })
+                                   : AbsentCell() },
               Field { .name = "verdict", .value = TextCell(std::string { NameOfMembership(fields->verdict) }) },
               // An empty set is a READING -- no route had an opinion -- so the field is present
               // and ABSENT, exactly as `leader` is when no leader is known. Dropping the field
@@ -1512,8 +1536,8 @@ namespace
 
         if (fields->verdict == CompileCacheWire::WireMembership::Forgotten)
             answer.advisories.emplace_back(
-                "a forgotten client outranks every admission route, so listing this host in `--fleet-member` will "
-                "not bring it back; `--cluster-admit-client` on the node binary clears the tombstone");
+                "a forgotten machine's revoked key outranks every admission route, so opening the node with "
+                "`--fleet-open` will not bring it back; only `--cluster-admit` under a NEW key does");
         return answer;
     }
 
@@ -1697,8 +1721,8 @@ namespace
     // natural way to run cluster admin on machines 2..40 is from the machine being
     // provisioned, and `RunClusterAdmin` needs `--scheduler`, which is ALSO a startup
     // flag -- so getting it into the unit file once points that node at one scheduler
-    // forever, because a registration replays its command line. A `--fleet-member`
-    // client (a laptop, a CI runner) has no node binary at all and could never ask.
+    // forever, because a registration replays its command line. A client machine (a
+    // laptop, a CI runner) has no node binary at all and could never ask.
     //
     // **Lifted, not duplicated, and the lift is smaller than it looks.** The encoders
     // are already `CompileCacheWire`'s and the decoder is already `Cluster::`, both of
@@ -1737,16 +1761,13 @@ namespace
             // `raft` is ABSENT for a learner recorded with none: it dials in, so nobody needs
             // its address, and an empty text cell would be a blank rather than an absence.
             //
-            // `key` is the member's identity key WHOLE (#178), through the one encoder, and
-            // ABSENT for a member that has not stated one -- which is not a key anybody could
-            // type after `@`.
-            rows.push_back(
-                { TextCell(member.id),
-                  TextCell(std::string { Cluster::MemberSeatName(member.seat) }),
-                  member.raftEndpoint.empty() ? AbsentCell() : TextCell(member.raftEndpoint),
-                  member.schedulerEndpoint.empty() ? AbsentCell() : TextCell(member.schedulerEndpoint),
-                  TextCell(std::string { Cluster::SchedulerEndpointStateName(member) }),
-                  member.publicKey.has_value() ? TextCell(FormatEd25519PublicKey(*member.publicKey)) : AbsentCell() });
+            // `key` is the member's identity key WHOLE (#178), through the one encoder.
+            rows.push_back({ TextCell(member.id),
+                             TextCell(std::string { Cluster::MemberSeatName(member.seat) }),
+                             member.raftEndpoint.empty() ? AbsentCell() : TextCell(member.raftEndpoint),
+                             member.schedulerEndpoint.empty() ? AbsentCell() : TextCell(member.schedulerEndpoint),
+                             TextCell(std::string { Cluster::SchedulerEndpointStateName(member) }),
+                             TextCell(FormatEd25519PublicKey(member.publicKey)) });
 
         return TableValue({ "id", "seat", "raft", "scheduler", "scheduler-state", "key" }, std::move(rows));
     }
@@ -1972,16 +1993,33 @@ namespace
     {
         NodeReply reply;                ///< The leader's `Ok`.
         std::vector<std::string> asked; ///< Where the request went, in order; the last one answered.
+        /// What the connections a redirect OPENED said while opening, a failed mint among them. The
+        /// first node's are not here: whoever opened that one reports them.
+        std::vector<std::string> advisories;
     };
 
     /// How a refusal a fleet read does not follow is told.
+    ///
+    /// **A `NotAMember` to a connection that presented no ticket is worded as the mint that
+    /// failed**, the launcher's rule (`Cc::RecordedReason`): a node admits another machine by its
+    /// ticket, so the thing to fix is this machine's node, not the refusal it caused. Any other
+    /// refusal keeps its own words -- one answered to a valid ticket included.
     /// @param context What was run.
-    /// @param endpoint Who refused.
+    /// @param node The connection that refused.
     /// @param reply The refusal.
     /// @return The answer.
-    [[nodiscard]] Answer FleetRefusal(VerbContext const& context, std::string_view endpoint, NodeReply const& reply)
+    [[nodiscard]] Answer FleetRefusal(VerbContext const& context, INodeExchange const& node, NodeReply const& reply)
     {
+        auto const endpoint = node.Address();
         auto const code = reply.code.value_or(CompileCacheWire::ErrorCode::MalformedFrame);
+
+        if (auto const missing = node.MissingTicket();
+            missing.has_value() && code == CompileCacheWire::ErrorCode::NotAMember)
+            return Concluded(Outcome::Refused,
+                             std::format("{} refused `{}` as a machine it does not know: {}",
+                                         endpoint,
+                                         context.verb->name,
+                                         Cc::ReasonFor(*missing)));
 
         // The leader's own words, as they are: they list every key this build serves, one per
         // line, which a parenthesised suffix would mangle.
@@ -2013,37 +2051,48 @@ namespace
         std::unique_ptr<INodeExchange> dialled;
         auto* at = context.node;
         std::vector<std::string> asked;
+        // What each connection a redirect opened said while opening -- a failed mint among them --
+        // carried on every way out, since nothing else holds those connections.
+        std::vector<std::string> advisories;
+        auto const withAdvisories = [&advisories](Answer answer) {
+            answer.advisories.insert(answer.advisories.begin(), advisories.begin(), advisories.end());
+            return answer;
+        };
         for (auto const hopsTaken: std::views::iota(0, MaxLeaderRedirects + 1))
         {
             asked.emplace_back(at->Address());
             auto reply = at->Send(request);
             if (!reply.has_value())
-                return std::unexpected(FromExchangeError(reply.error()));
+                return std::unexpected(withAdvisories(FromExchangeError(reply.error())));
             if (reply->status == CompileCacheWire::Status::Ok)
-                return LeaderReply { .reply = *std::move(reply), .asked = std::move(asked) };
+                return LeaderReply { .reply = *std::move(reply),
+                                     .asked = std::move(asked),
+                                     .advisories = std::move(advisories) };
 
             auto const hop =
                 DecideLeaderHop(reply->code.value_or(CompileCacheWire::ErrorCode::MalformedFrame), reply->detail, hopsTaken);
             if (hop.kind == LeaderHopKind::NotARedirect || context.dial == nullptr)
-                return std::unexpected(FleetRefusal(context, at->Address(), *reply));
+                return std::unexpected(withAdvisories(FleetRefusal(context, *at, *reply)));
             if (hop.kind == LeaderHopKind::Exhausted)
                 break;
 
             auto next = context.dial->Dial(hop.next);
             if (!next.has_value())
-                return std::unexpected(FromExchangeError(next.error()));
+                return std::unexpected(withAdvisories(FromExchangeError(next.error())));
             dialled = *std::move(next);
             at = dialled.get();
+            auto const said = at->Advisories();
+            advisories.insert(advisories.end(), said.begin(), said.end());
         }
 
         // Past the bound: every node asked, in order, so an operator sees which name each other.
         std::string path;
         for (auto const& each: asked)
             path += path.empty() ? each : std::format(" -> {}", each);
-        return std::unexpected(Concluded(
+        return std::unexpected(withAdvisories(Concluded(
             Outcome::Unreachable,
             std::format(
-                "followed {} leader redirects without an answer ({}); none of them leads", MaxLeaderRedirects, path)));
+                "followed {} leader redirects without an answer ({}); none of them leads", MaxLeaderRedirects, path))));
     }
 
     /// `fleet <section>` -- one of the leader's fleet tables, in a terminal.
@@ -2068,6 +2117,7 @@ namespace
             return Concluded(Outcome::Protocol, std::format("the fleet table could not be read: {}", table.error()));
 
         auto answer = Answered(*std::move(table));
+        answer.advisories = std::move(read->advisories);
 
         // Which section's column tables scale these columns, said by the verb that fetched them
         // (#1488). Before this the human table printed the leader's raw integers, so
@@ -2393,7 +2443,7 @@ namespace
           // `the fleet verb offers every section the server serves` in
           // `CliVerbs_test.cpp`, which walks that table: a section added and not
           // spelled here reddens rather than going quietly missing from the help.
-          .operands = " <kpi|machines|workers|leases|members|forgotten|conditions|tiers|series>",
+          .operands = " <kpi|machines|workers|leases|members|revoked|conditions|tiers|series>",
           .summary = "one of the leader's fleet tables, read over 0xFC from\n"
                      "the node that leads -- no admin surface, browser or JSON parser",
           .protocolCommand = "fleet-text",
@@ -2402,16 +2452,17 @@ namespace
           // No fallback: an endpoint that is not a node has no fleet to report.
           .nodeFallback = nullptr,
           .session = nullptr },
-        // Asked of ANY node, about any host: the answer is that node's own fold, which is the
-        // point -- two nodes disagreeing about one host is the finding, and a verb that could
+        // Asked of ANY node, about any machine: the answer is that node's own fold, which is the
+        // point -- two nodes disagreeing about one machine is the finding, and a verb that could
         // only be asked of one of them could not surface it.
         { .name = "explain-admission",
           .wire = Wire::Node,
-          .minOperands = 1,
+          .minOperands = 0,
           .maxOperands = 1,
-          .operands = " <host>",
-          .summary = "why this node admits or refuses a host, naming every\n"
-                     "route that decided rather than only the winning one",
+          .operands = " [<machine-id|key>]",
+          .summary = "why this node admits or refuses a machine -- or, with no\n"
+                     "operand, this very connection -- naming every route that\n"
+                     "decided rather than only the winning one",
           .protocolCommand = "explain-admission",
           .modifiers = Modifier::None,
           .handler = &ExplainAdmission,

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Distributed/MachineTicket.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -542,9 +544,10 @@ TEST_CASE("EncodeAuth emits the specified bytes exactly", "[wire]")
     auto const frame = EncodeAuth(AuthRequest { .username = "bob", .secret = "hunter2" });
 
     auto const expected = Bytes({
-        0xFC, 0x0E, 0x03,       // magic, version, op=Auth
-        0x00, 0x00, 0x00, 0x12, // payload length: (4+3) + (4+7) = 18
-        0x00, 0x00, 0x00, 0x03, 'b', 'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
+        0xFC, 0x0E, 0x03,             // magic, version, op=Auth
+        0x00, 0x00, 0x00, 0x17,       // payload length: (4+1) + (4+3) + (4+7) = 23
+        0x00, 0x00, 0x00, 0x01, 0x01, // kind = Password
+        0x00, 0x00, 0x00, 0x03, 'b',  'o', 'b', 0x00, 0x00, 0x00, 0x07, 'h', 'u', 'n', 't', 'e', 'r', '2',
     });
     CHECK(frame == expected);
 }
@@ -559,17 +562,97 @@ TEST_CASE("DecodeAuthPayload round-trips, including the empty-username form", "[
 
     auto const decoded = DecodeAuthPayload(payload);
     REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).kind == AuthKind::Password);
     CHECK(Unwrap(decoded).username.empty());
     CHECK(AsStringView(Unwrap(decoded).secret) == "s3cret");
 }
 
 TEST_CASE("DecodeAuthPayload rejects a payload with the wrong field count", "[wire]")
 {
-    // A FETCH payload is one field; AUTH demands two. Decoding one as the other
+    // A FETCH payload is one field; AUTH demands three. Decoding one as the other
     // must fail rather than silently read the key as a username with no secret.
     auto const fetch = EncodeFetch("some-key");
     std::span<std::byte const> const payload = std::span { fetch }.subspan(RequestHeaderSize);
     CHECK_FALSE(DecodeAuthPayload(payload).has_value());
+}
+
+TEST_CASE("The credential kinds keep the bytes they were assigned", "[wire][auth][ticket]")
+{
+    CHECK(static_cast<std::uint8_t>(AuthKind::Password) == 0x01);
+    CHECK(static_cast<std::uint8_t>(AuthKind::MachineTicket) == 0x02);
+    CHECK(static_cast<std::uint8_t>(ErrorCode::TicketRefused) == 0x2D);
+    auto const* const described = Describe(ErrorCode::TicketRefused);
+    REQUIRE(described != nullptr);
+    CHECK(described->name == "ticket-refused");
+    CHECK(OpFieldCount(Op::Auth) == 3);
+}
+
+TEST_CASE("An operator's control verb is refused an unidentified caller under its own byte", "[wire][admission]")
+{
+    // The byte and the name, both: a symbol both ends spell tests only the first.
+    CHECK(static_cast<std::uint8_t>(ErrorCode::IdentifiedCallerRequired) == 0x2E);
+    auto const* const described = Describe(ErrorCode::IdentifiedCallerRequired);
+    REQUIRE(described != nullptr);
+    CHECK(described->name == "identified-caller-required");
+
+    // The column, asked of the rows one at a time so a failure names the verb; the set itself is
+    // `ControlVerbsNeedAnIdentifiedCaller`'s, a build failure.
+    for (auto const op: { Op::ClusterSet,
+                          Op::ClusterForget,
+                          Op::ClusterAdmit,
+                          Op::ClusterAdmitLearner,
+                          Op::ClusterAdmitWorker,
+                          Op::EnrollControl })
+    {
+        auto const* const row = FindOp(static_cast<std::uint8_t>(op));
+        REQUIRE(row != nullptr);
+        INFO(row->name);
+        CHECK(row->identity == IdentityRequirement::IdentifiedCaller);
+    }
+    // And the verbs a client sends are not: a launcher on an open node leases and reads as before.
+    for (auto const op: { Op::Lease, Op::Release, Op::ClusterStatus, Op::NodeStatus, Op::Fetch, Op::Enroll })
+    {
+        auto const* const row = FindOp(static_cast<std::uint8_t>(op));
+        REQUIRE(row != nullptr);
+        INFO(row->name);
+        CHECK(row->identity == IdentityRequirement::AddressAdmits);
+    }
+}
+
+TEST_CASE("A machine ticket travels in AUTH with its kind, and the kind is read back", "[wire][auth][ticket]")
+{
+    auto const ticket = std::string { "\x00\x01\x02opaque", 9 };
+    auto const frame = EncodeAuth(AuthRequest { .kind = AuthKind::MachineTicket, .username = {}, .secret = ticket });
+    auto const decoded = DecodeAuthPayload(std::span { frame }.subspan(RequestHeaderSize));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).kind == AuthKind::MachineTicket);
+    CHECK(Unwrap(decoded).username.empty());
+    CHECK(AsStringView(Unwrap(decoded).secret) == ticket);
+}
+
+TEST_CASE("The largest ticket a decoder reads fits AUTH's pre-auth ceiling", "[wire][auth][ticket]")
+{
+    // AUTH is served before anything is proved, so its payload ceiling is fixed and small. A
+    // ticket the node would accept but the frame ceiling refused would read as a malformed frame
+    // at every worker, whatever the ticket said.
+    auto const largest = std::string(Distributed::MaxMachineTicketBytes, 't');
+    auto const frame = EncodeAuth(AuthRequest { .kind = AuthKind::MachineTicket, .username = {}, .secret = largest });
+    CHECK(frame.size() - RequestHeaderSize <= MaxAuthPayload);
+}
+
+TEST_CASE("An AUTH whose kind this build does not know, or a ticket with a username, is malformed", "[wire][auth][ticket]")
+{
+    auto rawAuth = [](std::byte kind, std::string_view username, std::string_view secret) {
+        auto const kindField = std::array { kind };
+        return WireFields::Encode({ std::span<std::byte const> { kindField }, AsBytes(username), AsBytes(secret) });
+    };
+    CHECK_FALSE(DecodeAuthPayload(rawAuth(std::byte { 0x00 }, "", "s")).has_value());
+    CHECK_FALSE(DecodeAuthPayload(rawAuth(std::byte { 0x03 }, "", "s")).has_value());
+    CHECK_FALSE(DecodeAuthPayload(rawAuth(std::byte { 0x02 }, "bob", "ticket")).has_value());
+    // A two-field payload -- the layout before the kind was carried -- is refused rather than read
+    // as a kind.
+    CHECK_FALSE(DecodeAuthPayload(WireFields::Encode({ AsBytes("bob"), AsBytes("s3cret") })).has_value());
+    CHECK(DecodeAuthPayload(rawAuth(std::byte { 0x01 }, "bob", "s3cret")).has_value()); // the control
 }
 
 TEST_CASE("Exactly the verbs meant to be reachable before AUTH are reachable", "[wire]")
@@ -598,10 +681,17 @@ TEST_CASE("Exactly the verbs meant to be reachable before AUTH are reachable", "
     // hands a stranger nothing it could not read off the network.
     CHECK(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::FleetSummary)));
 
-    // The COUNT lives here and nowhere else, so another verb arriving reddens exactly
+    // `Op::ExplainAdmission` is the FOURTH, and the reviewed decision is this: its SELF form must
+    // reach a caller the node refuses, or it could never report the refusal. It answers only about
+    // the caller's own connection -- "refused, by no route" is what every gated verb already tells
+    // a stranger -- while its MACHINE form, which reads the roster, stays gated by membership in
+    // the node. Bounded by its own ceiling, as `PreAuthVerbsAreBounded` requires of every one.
+    CHECK(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::ExplainAdmission)));
+
+    // The COUNT lives here and nowhere else, so a fifth verb arriving reddens exactly
     // one case rather than being argued about in two.
     auto const openVerbs = std::ranges::count_if(OpTable, [](auto const& row) { return row.preAuth.Allowed(); });
-    CHECK(openVerbs == 3);
+    CHECK(openVerbs == 4);
 }
 
 TEST_CASE("An unknown opcode is never reachable before AUTH", "[wire]")
@@ -1535,61 +1625,6 @@ TEST_CASE("A toolchain state this build cannot name is skipped rather than refus
     CHECK_FALSE(Unwrap(back).toolchains.has_value());
     // And the fields it DID understand are still reported.
     CHECK(Unwrap(back).toolchainsServed == 5);
-}
-
-TEST_CASE("An applied-tombstone count survives the wire, and its ABSENCE does too", "[wire][node-status][forget]")
-{
-    // #1471. The count answers "has my `--cluster-forget-client` reached this machine", so the
-    // two readings an operator must be able to tell apart are *this node has no committed
-    // tombstone set at all* and *the cluster forgets nobody*. Both are encodable; only one is a
-    // number.
-    SECTION("a count is carried")
-    {
-        auto fields = NodeRuntimeFields {};
-        fields.forgottenClients = 3;
-        fields.registrarsTotal = 7;
-
-        auto const back = DecodeNodeRuntime(EncodeNodeRuntime(fields));
-        REQUIRE(back.has_value());
-        auto const runtime = Unwrap(back);
-        REQUIRE(runtime.forgottenClients.has_value());
-        CHECK(Unwrap(runtime.forgottenClients) == 3);
-        // A neighbour, so a decoder reading the wrong POSITION cannot pass by returning the
-        // right number from the wrong field.
-        REQUIRE(runtime.registrarsTotal.has_value());
-        CHECK(Unwrap(runtime.registrarsTotal) == 7);
-    }
-
-    SECTION("a zero is carried as a zero, not as absence")
-    {
-        // The direction that gets skipped. `0` is a real reading -- the cluster has agreed no
-        // forgets -- and an encoder that treats it as "nothing to say" destroys the distinction
-        // the field was added for while every value-carrying case still passes.
-        auto fields = NodeRuntimeFields {};
-        fields.forgottenClients = 0;
-
-        auto const back = DecodeNodeRuntime(EncodeNodeRuntime(fields));
-        REQUIRE(back.has_value());
-        auto const runtime = Unwrap(back);
-        REQUIRE(runtime.forgottenClients.has_value());
-        CHECK(Unwrap(runtime.forgottenClients) == 0);
-    }
-
-    SECTION("absence survives, and the fields around it still decode")
-    {
-        // A node running no consensus says nothing here. The neighbour assertion is what
-        // distinguishes this from an implementation that blanked the tail of the record.
-        auto fields = NodeRuntimeFields {};
-        fields.registrarsTotal = 7;
-        REQUIRE_FALSE(fields.forgottenClients.has_value());
-
-        auto const back = DecodeNodeRuntime(EncodeNodeRuntime(fields));
-        REQUIRE(back.has_value());
-        auto const runtime = Unwrap(back);
-        CHECK_FALSE(runtime.forgottenClients.has_value());
-        REQUIRE(runtime.registrarsTotal.has_value());
-        CHECK(Unwrap(runtime.registrarsTotal) == 7);
-    }
 }
 
 TEST_CASE("A runtime record shorter than this build expects keeps its defaults", "[wire][node-status]")
@@ -3032,15 +3067,18 @@ TEST_CASE("The consensus endpoint has one name, spelled as prose and as a record
 TEST_CASE("The consensus address rides the runtime record's variable arity, in both directions",
           "[wire][consensus][node-status]")
 {
-    // **Why the field costs no wire version**, proved rather than inherited from the
+    // **Why an APPENDED field costs no wire version**, proved rather than inherited from the
     // enrollment case above: the decoder answers an index past the end as empty and ignores
-    // a surplus. Three arities, because a decoder that expected EXACTLY fourteen would pass
-    // the round trip and fail both of the others.
+    // a surplus. Several arities, because a decoder that expected EXACTLY one of them would
+    // pass the round trip and fail the others. The cuts are THIS grammar's records cut short,
+    // labelled by where they end, and a shorter record is legal only within this grammar
+    // version: a REMOVED field moves every later one up a place, so the applied-tombstone
+    // count's retirement is a grammar change, and a build from before it is refused by version
+    // before any field is read.
     NodeRuntimeFields sent {};
     sent.toolchainsServed = 4;
     sent.cordon = WireCordonState::Draining;
     sent.consensusEndpoint = "10.0.0.4:6680";
-    sent.forgottenClients = 2;
     sent.consensusStanding = WireConsensusStanding::Learner;
     sent.conditions = std::vector { NodeConditionFields { .id = "scratch-root-unmappable",
                                                           .persistence = "latched",
@@ -3059,83 +3097,58 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
     auto const emitted = EncodeNodeRuntime(sent);
     auto const parts = WireFields::SplitAll(emitted);
     REQUIRE(parts.has_value());
-    // Twenty-two: thirteen that predate #1328, the endpoint it added, #1471's applied-tombstone
-    // count, #1449's consensus standing, #1364's condition list, #178's identity key, the
-    // roster #178 certifies, the auto-approve seconds left, and the state directory with the
-    // reason it is that one. Pinned, since every cut below is counted from it and a record that
-    // grew would move what "older" means -- which is how this case caught #1471's append, then
-    // #1449's, #1364's, both of #178's, the auto-approve one and the state directory's, rather
-    // than letting any of them shift the cuts silently. #1364 and #178 each appended behind the
-    // standing on their own; the integration orders them, the conditions first.
-    REQUIRE(Unwrap(parts).size() == 22);
+    // Twenty-one: thirteen that predate #1328, the endpoint it added, #1449's consensus standing,
+    // #1364's condition list, #178's identity key, the roster #178 certifies, the auto-approve
+    // seconds left, and the state directory with the reason it is that one. Pinned, since every
+    // cut below is counted from it and a record that grew or shrank would move what "older"
+    // means -- which is how this case caught each append, and the retirement of #1471's
+    // applied-tombstone count, rather than letting any of them shift the cuts silently.
+    REQUIRE(Unwrap(parts).size() == 21);
 
-    SECTION("thirteen fields, as a build before #1328 emits: both disengaged, and the cordon still read")
+    SECTION("a record cut after field 13: the endpoint is absent, and the cordon still read")
     {
         auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 13 };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
         REQUIRE(back.has_value());
         CHECK_FALSE(Unwrap(back).consensusEndpoint.has_value());
-        CHECK_FALSE(Unwrap(back).forgottenClients.has_value());
+        CHECK_FALSE(Unwrap(back).consensusStanding.has_value());
         // The field before it survives the cut, so the cut is where it was meant to be.
         CHECK(Unwrap(back).cordon == std::optional { WireCordonState::Draining });
         CHECK(Unwrap(back).toolchainsServed == 4);
     }
 
-    SECTION("fourteen fields, as a build after #1328 and before #1471 emits: the count is absent")
+    SECTION("a record cut after field 14: the standing is absent")
     {
-        // **The cut #1471 has to survive**, and the direction a version-bump argument gets
-        // tested in only by accident: a peer that knows the consensus endpoint and has never
-        // heard of the tombstone count. Its record is SHORTER, and the count must come back
-        // "did not say" rather than taking the reply with it -- which is the whole claim that
-        // appending to this record costs no wire version.
+        // The standing comes back "did not say" rather than taking the reply -- or the endpoint
+        // before it -- with it.
         auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 14 };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
         REQUIRE(back.has_value());
-        CHECK_FALSE(Unwrap(back).forgottenClients.has_value());
+        CHECK_FALSE(Unwrap(back).consensusStanding.has_value());
+        CHECK_FALSE(Unwrap(back).conditions.has_value());
         // And everything that build DID send is still read, so the cut removed one fact rather
         // than truncating the record.
         CHECK(Unwrap(back).consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
         CHECK(Unwrap(back).cordon == std::optional { WireCordonState::Draining });
     }
 
-    SECTION("fifteen fields, as a build after #1471 and before #1449 emits: the standing is absent")
+    SECTION("a record cut after field 15: the conditions are absent")
     {
-        // The cut #1449 has to survive, for #1471's reason: a peer that has never heard of a
-        // learner answers with a shorter record, and the standing comes back "did not say"
-        // rather than taking the reply -- or the tombstone count before it -- with it.
+        // The list must come back ABSENT -- which every renderer shows as its absent marker --
+        // and never as an empty list, which would read as a node with nothing raised.
         auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 15 };
-        auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
-        REQUIRE(back.has_value());
-        CHECK_FALSE(Unwrap(back).consensusStanding.has_value());
-        CHECK_FALSE(Unwrap(back).conditions.has_value());
-        auto const runtime = Unwrap(back);
-        REQUIRE(runtime.forgottenClients.has_value());
-        CHECK(Unwrap(runtime.forgottenClients) == 2);
-    }
-
-    SECTION("sixteen fields, as a build after #1449 and before #1364 emits: the conditions are absent")
-    {
-        // The cut #1364 has to survive: a peer that knows the standing and has never heard of
-        // conditions. Its list must come back ABSENT -- a node too old to say, which every
-        // renderer shows as its absent marker -- and never as an empty list, which would read as a
-        // node with nothing raised.
-        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 16 };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
         REQUIRE(back.has_value());
         CHECK_FALSE(Unwrap(back).conditions.has_value());
         CHECK_FALSE(Unwrap(back).identityPublicKey.has_value());
-        auto const runtime = Unwrap(back);
-        REQUIRE(runtime.forgottenClients.has_value());
-        CHECK(Unwrap(runtime.forgottenClients) == 2);
-        CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
+        CHECK(Unwrap(back).consensusStanding == std::optional { WireConsensusStanding::Learner });
     }
 
-    SECTION("seventeen fields, as a build after #1364 and before #178 emits: the key is absent")
+    SECTION("a record cut after field 16: the key is absent")
     {
-        // The cut #178 has to survive, for #1449's reason: a node that has never held a key
-        // answers with a shorter record, and the key comes back "did not say" rather than taking
-        // the conditions before it -- or the reply -- with it.
-        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 17 };
+        // The key comes back "did not say" rather than taking the conditions before it -- or the
+        // reply -- with it.
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 16 };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
         REQUIRE(back.has_value());
         CHECK_FALSE(Unwrap(back).identityPublicKey.has_value());
@@ -3143,22 +3156,22 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(Unwrap(back).conditions == sent.conditions);
     }
 
-    SECTION("eighteen fields, as a build after the key and before the roster emits: the roster is absent")
+    SECTION("a record cut after field 17: the roster is absent")
     {
-        // A node holding no roster answers exactly so, and a record from before the field must
-        // read the same: absent, never a roster of nobody.
-        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 18 };
+        // A node holding no roster answers exactly so, and a record that ends before the field
+        // must read the same: absent, never a roster of nobody.
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 17 };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
         REQUIRE(back.has_value());
         CHECK_FALSE(Unwrap(back).roster.has_value());
         CHECK(Unwrap(back).identityPublicKey == sent.identityPublicKey);
     }
 
-    SECTION("nineteen fields, as a build after the roster and before the auto-approve seconds emits")
+    SECTION("a record cut after field 18: the auto-approve seconds are absent")
     {
-        // No deadline armed is what a record from before the field must read as: absent, never
-        // a zero that would read as a deadline in its last second.
-        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 19 };
+        // No deadline armed is what a record that ends before the field must read as: absent,
+        // never a zero that would read as a deadline in its last second.
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 18 };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
         REQUIRE(back.has_value());
         CHECK_FALSE(Unwrap(back).enrollmentAutoApproveSecondsLeft.has_value());
@@ -3166,11 +3179,11 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(Unwrap(back).enrollment == sent.enrollment);
     }
 
-    SECTION("twenty fields, as a build after the auto-approve seconds and before the state directory emits")
+    SECTION("a record cut after field 19: the state directory is absent")
     {
-        // Both absent -- a node too old to say where it keeps its identity -- and the field
+        // Both absent -- a node that does not say where it keeps its identity -- and the field
         // before them survives the cut, so the cut is where it was meant to be.
-        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 20 };
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 19 };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
         REQUIRE(back.has_value());
         CHECK_FALSE(Unwrap(back).stateDirectory.has_value());
@@ -3183,7 +3196,7 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         // One alone is not half an answer: a path without its reason cannot be told from the
         // machine's other identity. Refused, in either direction, as a shape this build does not
         // know -- and the control, both present, is the round trip below.
-        for (auto const dropped: { std::size_t { 20 }, std::size_t { 21 } })
+        for (auto const dropped: { std::size_t { 19 }, std::size_t { 20 } })
         {
             INFO("field " << dropped << " sent empty");
             auto lopsided = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
@@ -3192,15 +3205,13 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         }
     }
 
-    SECTION("twenty-two fields, this build: every fact engaged")
+    SECTION("the whole record, twenty-one fields: every fact engaged")
     {
         auto const current = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { current }));
         REQUIRE(back.has_value());
-        CHECK(Unwrap(back).consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
         auto const runtime = Unwrap(back);
-        REQUIRE(runtime.forgottenClients.has_value());
-        CHECK(Unwrap(runtime.forgottenClients) == 2);
+        CHECK(runtime.consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
         CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
         CHECK(runtime.conditions == sent.conditions);
         CHECK(runtime.identityPublicKey == sent.identityPublicKey);
@@ -3210,17 +3221,15 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(runtime.stateDirectoryReason == sent.stateDirectoryReason);
     }
 
-    SECTION("twenty-three fields, from a build ahead of this one: the surplus is skipped")
+    SECTION("twenty-two fields, one past the record: the surplus is skipped")
     {
         auto ahead = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const extra = AsBytes(std::string_view { "a fact from the future" });
         ahead.emplace_back(extra);
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { ahead }));
         REQUIRE(back.has_value());
-        CHECK(Unwrap(back).consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
         auto const runtime = Unwrap(back);
-        REQUIRE(runtime.forgottenClients.has_value());
-        CHECK(Unwrap(runtime.forgottenClients) == 2);
+        CHECK(runtime.consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
         CHECK(runtime.consensusStanding == std::optional { WireConsensusStanding::Learner });
         CHECK(runtime.conditions == sent.conditions);
         CHECK(runtime.identityPublicKey == sent.identityPublicKey);
@@ -3250,15 +3259,15 @@ TEST_CASE("An identity key travels as its 32 bytes, absent as nothing, and any o
 
     // A PREFIX of a key is another key, so a short field is refused rather than padded, and a
     // long one rather than truncated: either would print a string an operator compares against
-    // a machine that holds no such key. The key is the eighteenth field, behind #1364's
+    // a machine that holds no such key. The key is the seventeenth field, behind #1364's
     // conditions and ahead of the roster.
     for (auto const width: { std::size_t { 31 }, std::size_t { 33 } })
     {
         auto emitted = EncodeNodeRuntime(NodeRuntimeFields {});
         auto parts = Unwrap(WireFields::SplitAll(emitted));
-        REQUIRE(parts.size() == 22);
+        REQUIRE(parts.size() == 21);
         auto const wrong = std::vector<std::byte>(width, std::byte { 0x11 });
-        parts[17] = wrong;
+        parts[16] = wrong;
         CHECK_FALSE(DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts })).has_value());
     }
 }
@@ -3288,25 +3297,44 @@ TEST_CASE("A consensus standing travels as its pinned byte, and one this build c
     // A byte from a build ahead of this one is left DISENGAGED, never refused -- the rule
     // every enum in this record keeps, so an older client still reads the rest of the reply.
     NodeRuntimeFields sent {};
-    sent.forgottenClients = 3;
+    sent.consensusEndpoint = "10.0.0.4:6680";
     auto emitted = EncodeNodeRuntime(sent);
     auto parts = Unwrap(WireFields::SplitAll(emitted));
-    // Twenty-two since #1364 and #178 appended the condition list, the identity key and the
-    // roster behind the standing, and the auto-approve seconds and the state directory with its
-    // reason behind those; the standing is still the sixteenth field, so the byte replaced below
-    // is still the one under test.
-    REQUIRE(parts.size() == 22);
+    // Twenty-one: #1364 and #178 appended the condition list, the identity key and the roster
+    // behind the standing, and the auto-approve seconds and the state directory with its reason
+    // behind those, while the applied-tombstone count ahead of it was retired -- so the standing
+    // is the fifteenth field, and the byte replaced below is the one under test.
+    REQUIRE(parts.size() == 21);
     auto const unknown = std::array { std::byte { 0x7F } };
-    parts[15] = unknown;
+    parts[14] = unknown;
     auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts }));
     REQUIRE(back.has_value());
     CHECK_FALSE(Unwrap(back).consensusStanding.has_value());
-    CHECK(Unwrap(back).forgottenClients == std::optional<std::uint32_t> { 3 });
+    // The neighbour before it still reads, so the skip took one byte rather than the record.
+    CHECK(Unwrap(back).consensusEndpoint == std::optional<std::string> { "10.0.0.4:6680" });
+}
+
+TEST_CASE("The retired client verbs' bytes are claimed by no row, and never will be", "[wire][retired]")
+{
+    // 0x16 was CLUSTER-ADMIT-CLIENT and 0x17 CLUSTER-FORGET-CLIENT (#1309). The bytes are
+    // pinned as well as the table's silence about them: a table that forgot the array would
+    // pass the loop over nothing.
+    CHECK(RetiredOpcodes == std::array<std::uint8_t, 2> { 0x16, 0x17 });
+    for (auto const byte: RetiredOpcodes)
+    {
+        INFO(static_cast<int>(byte));
+        CHECK(FindOp(byte) == nullptr);
+        CHECK(std::ranges::none_of(OpTable,
+                                   [byte](OpDescriptor const& row) { return static_cast<std::uint8_t>(row.code) == byte; }));
+    }
+    // The control: a byte a live row claims is found, so `FindOp`'s nullptr above is an answer
+    // about those bytes rather than about the function.
+    REQUIRE(FindOp(static_cast<std::uint8_t>(Op::ClusterAdmit)) != nullptr);
 }
 
 // --- Explaining an admission (#1471) ----------------------------------------
 
-TEST_CASE("The explain-admission verb occupies the byte it was assigned, in the node family", "[wire][admission]")
+TEST_CASE("explain-admission keeps its byte, and its standing and route bytes are pinned", "[wire][admission]")
 {
     // The value as well as the name, for the cordon byte's reason: a consistent
     // renumbering keeps every in-tree test agreeing while a deployed CLI breaks.
@@ -3316,100 +3344,156 @@ TEST_CASE("The explain-admission verb occupies the byte it was assigned, in the 
     // The node family, because the question is about THIS node's own fold rather than
     // about the cluster's agreed state -- so a node running no consensus still answers it.
     CHECK(FamilyOf(static_cast<std::uint8_t>(Op::ExplainAdmission)) == VerbFamily::Node);
-    // Never pre-auth: the answer describes who this node admits, which is the one thing a
-    // caller it does not admit must not be able to read.
-    CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::ExplainAdmission)));
+
+    // Reachable before admission, because its SELF form must reach a caller the node refuses, or
+    // it could never report the refusal. Not a leak: the self form answers only about the caller's
+    // own connection, and the machine form, which reads the roster, is gated in the node. What
+    // bounds a stranger here is the verb's own ceiling, which `PreAuthVerbsAreBounded` requires.
+    CHECK(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::ExplainAdmission)));
+    CHECK(OpPayloadCap(static_cast<std::uint8_t>(Op::ExplainAdmission), MaxControlPayload) == MaxExplainAdmissionPayload);
+    CHECK(MaxExplainAdmissionPayload == 512);
 
     // And the bytes a client of another build reads back.
     CHECK(static_cast<std::uint8_t>(WireMembership::Outsider) == 0x01);
     CHECK(static_cast<std::uint8_t>(WireMembership::Member) == 0x02);
     CHECK(static_cast<std::uint8_t>(WireMembership::Forgotten) == 0x03);
-    CHECK(WireMembershipRoute::FleetMemberList == 0x01);
-    CHECK(WireMembershipRoute::ClusterMembers == 0x02);
-    CHECK(WireMembershipRoute::ClientTombstone == 0x04);
+    CHECK(static_cast<std::uint8_t>(WireMachineStanding::Voter) == 0x01);
+    CHECK(static_cast<std::uint8_t>(WireMachineStanding::Learner) == 0x02);
+    CHECK(static_cast<std::uint8_t>(WireMachineStanding::Pending) == 0x03);
+    CHECK(static_cast<std::uint8_t>(WireMachineStanding::Revoked) == 0x04);
+    CHECK(static_cast<std::uint8_t>(WireMachineStanding::Unknown) == 0x05);
     CHECK(WireMembershipRoute::OpenPolicy == 0x08);
     CHECK(WireMembershipRoute::ProvenIdentity == 0x10);
     CHECK(WireMembershipRoute::KeyTombstone == 0x20);
+    CHECK(WireMembershipRoute::Loopback == 0x40);
+    CHECK(WireMembershipRoute::MachineTicket == 0x80);
+
+    // The retired bits stay reserved: a deployed client may still render them by their old names.
+    CHECK(RetiredWireMembershipRoutes == std::array<std::uint32_t, 3> { 0x01, 0x02, 0x04 });
+    for (auto const retired: RetiredWireMembershipRoutes)
+        for (auto const live: LiveWireMembershipRoutes)
+            CHECK((retired & live) == 0);
 }
 
-TEST_CASE("An explain-admission request carries exactly one host, and anything else is refused", "[wire][admission]")
+TEST_CASE("Every admission route bit is one bit, and no two routes share one", "[wire][admission]")
 {
-    auto const frame = EncodeExplainAdmissionRequest("10.0.0.42");
-    auto const header = DecodeRequestHeader(frame);
+    for (auto const bit: LiveWireMembershipRoutes)
+        CHECK(std::popcount(bit) == 1);
+    auto combined = std::uint32_t { 0 };
+    for (auto const bit: LiveWireMembershipRoutes)
+    {
+        CHECK((combined & bit) == 0);
+        combined |= bit;
+    }
+}
+
+TEST_CASE("An empty subject asks about the caller, a machine question names one, and nothing else is read",
+          "[wire][admission]")
+{
+    auto const self = EncodeExplainAdmissionRequest("");
+    auto const header = DecodeRequestHeader(self);
     REQUIRE(header.has_value());
     CHECK(Unwrap(header).opRaw == 0x1B);
-    auto const payload = std::span<std::byte const> { frame }.subspan(RequestHeaderSize);
-    CHECK(DecodeExplainAdmissionPayload(payload) == std::optional<std::string> { "10.0.0.42" });
+    CHECK(DecodeExplainAdmissionPayload(std::span { self }.subspan(RequestHeaderSize)) == std::optional<std::string> { "" });
 
-    // An EMPTY host is a legal field and is not the same as no field: the node decides
-    // what to make of it, and a decoder that refused here would refuse a frame whose
-    // arity is exactly right.
-    CHECK(DecodeExplainAdmissionPayload(
-              std::span<std::byte const> { EncodeExplainAdmissionRequest("") }.subspan(RequestHeaderSize))
-          == std::optional<std::string> { "" });
+    auto const machine = EncodeExplainAdmissionRequest("pc-07");
+    CHECK(DecodeExplainAdmissionPayload(std::span { machine }.subspan(RequestHeaderSize))
+          == std::optional<std::string> { "pc-07" });
 
-    // Two fields is a different question arriving under this verb's name -- refused
-    // rather than answered about the first of them.
-    auto const first = AsBytes(std::string_view { "10.0.0.42" });
-    auto const second = AsBytes(std::string_view { "10.0.0.43" });
+    // Two fields is a different question arriving under this verb's name -- refused rather than
+    // answered about the first of them -- and no field is not an empty subject.
+    auto const first = AsBytes(std::string_view { "a" });
+    auto const second = AsBytes(std::string_view { "b" });
     CHECK_FALSE(DecodeExplainAdmissionPayload(WireFields::Encode({ first, second })).has_value());
     CHECK_FALSE(DecodeExplainAdmissionPayload({}).has_value());
 }
 
-TEST_CASE("An admission explanation round-trips every verdict and the whole route set", "[wire][admission]")
+TEST_CASE("An admission explanation round-trips both shapes and every verdict", "[wire][admission]")
 {
-    // A different route set per verdict, so an encoder that dropped either half cannot
-    // agree with all three.
-    for (auto const& sent: { AdmissionExplanationFields { .verdict = WireMembership::Member,
-                                                          .decidedBy = WireMembershipRoute::FleetMemberList
-                                                                       | WireMembershipRoute::ClusterMembers },
-                             AdmissionExplanationFields { .verdict = WireMembership::Forgotten,
-                                                          .decidedBy = WireMembershipRoute::ClientTombstone },
-                             // The silence: refused, and no route claims authorship. Zero is the READING
-                             // here rather than a missing field.
-                             AdmissionExplanationFields { .verdict = WireMembership::Outsider, .decidedBy = 0 } })
+    for (auto const& sent: {
+             // A machine question: its standing and its name ride with the routes.
+             AdmissionExplanationFields { .verdict = WireMembership::Member,
+                                          .decidedBy =
+                                              WireMembershipRoute::ProvenIdentity | WireMembershipRoute::MachineTicket,
+                                          .standing = WireMachineStanding::Learner,
+                                          .subject = "pc-07" },
+             AdmissionExplanationFields { .verdict = WireMembership::Forgotten,
+                                          .decidedBy = WireMembershipRoute::KeyTombstone,
+                                          .standing = WireMachineStanding::Revoked,
+                                          .subject = "gone" },
+             // The caller itself: no standing, and the silence -- refused, and no route claims
+             // authorship. Zero is the READING here rather than a missing field.
+             AdmissionExplanationFields {
+                 .verdict = WireMembership::Outsider, .decidedBy = 0, .standing = std::nullopt, .subject = "10.0.0.7" },
+             AdmissionExplanationFields { .verdict = WireMembership::Member,
+                                          .decidedBy = WireMembershipRoute::Loopback,
+                                          .standing = std::nullopt,
+                                          .subject = "127.0.0.1" },
+         })
     {
+        INFO(sent.subject);
         auto const back = DecodeAdmissionExplanation(EncodeAdmissionExplanation(sent));
         REQUIRE(back.has_value());
         CHECK(Unwrap(back) == sent);
     }
 }
 
-TEST_CASE("An unknown VERDICT is refused and an unknown ROUTE is kept, which is not one rule twice", "[wire][admission]")
+TEST_CASE("An unknown VERDICT or STANDING is refused and an unknown ROUTE is kept, which is not one rule twice",
+          "[wire][admission]")
 {
-    auto const routes = WireFields::ToBigEndian<std::uint32_t>(WireMembershipRoute::FleetMemberList);
+    auto const machine = AdmissionExplanationFields { .verdict = WireMembership::Member,
+                                                      .decidedBy = WireMembershipRoute::ProvenIdentity,
+                                                      .standing = WireMachineStanding::Learner,
+                                                      .subject = "pc-07" };
 
     SECTION("a verdict byte this build cannot name is refused, never read as a refusal nobody authored")
     {
-        // Falling back to `Outsider` would report a host as refused-by-nobody on a build
-        // that had learned a fourth answer -- which reads exactly like the healthy case.
-        auto const unnamed = std::array { std::byte { 0x7F } };
-        CHECK_FALSE(DecodeAdmissionExplanation(WireFields::Encode({ std::span<std::byte const> { unnamed },
-                                                                    std::span<std::byte const> { routes } }))
-                        .has_value());
+        // Falling back to `Outsider` would report a caller as refused-by-nobody on a build that had
+        // learned a fourth answer -- which reads exactly like the healthy case.
+        auto encoded = EncodeAdmissionExplanation(machine);
+        // [4-byte len][verdict] ...
+        encoded[4] = std::byte { 0x7F };
+        CHECK_FALSE(DecodeAdmissionExplanation(encoded).has_value());
         CHECK_FALSE(DecodeAdmissionExplanation({}).has_value());
+    }
+
+    SECTION("a standing byte this build cannot name is refused, never read as some other standing")
+    {
+        // [4-byte len][verdict][4-byte len][u32 routes][4-byte len][standing] ...
+        auto encoded = EncodeAdmissionExplanation(machine);
+        REQUIRE(encoded[17] == static_cast<std::byte>(WireMachineStanding::Learner));
+        encoded[17] = static_cast<std::byte>(static_cast<std::uint8_t>(WireMachineStanding::Unknown) + 1);
+        CHECK_FALSE(DecodeAdmissionExplanation(encoded).has_value());
     }
 
     SECTION("a route bit this build cannot name is KEPT, so authorship is not under-reported")
     {
-        // The opposite decision, deliberately: the routes are a SET, so a bit this build
-        // cannot name still says *something decided*. Dropping it would say fewer things
-        // decided this than did, on a fleet mid-upgrade -- and the reader can tell,
-        // because the bit it does not know is still there to count.
+        // The opposite decision, deliberately: the routes are a SET, so a bit this build cannot name
+        // still says *something decided*. Dropping it would say fewer things decided this than did,
+        // on a fleet mid-upgrade -- and the reader can tell, because the bit is still there.
         constexpr auto ahead = std::uint32_t { 0x8000'0000 };
-        auto const sent = AdmissionExplanationFields { .verdict = WireMembership::Member,
-                                                       .decidedBy = WireMembershipRoute::FleetMemberList | ahead };
+        auto sent = machine;
+        sent.decidedBy |= ahead;
         auto const back = DecodeAdmissionExplanation(EncodeAdmissionExplanation(sent));
         REQUIRE(back.has_value());
         CHECK(Unwrap(back).decidedBy == sent.decidedBy);
-        CHECK((Unwrap(back).decidedBy & ahead) == ahead);
     }
 
-    SECTION("a verdict field that is not one byte is refused rather than read from its first")
+    SECTION("a verdict or standing field that is not one byte is refused rather than read from its first")
     {
+        auto const verdict = std::array { std::byte { 0x02 } };
         auto const wide = std::array { std::byte { 0x02 }, std::byte { 0x02 } };
-        CHECK_FALSE(DecodeAdmissionExplanation(
-                        WireFields::Encode({ std::span<std::byte const> { wide }, std::span<std::byte const> { routes } }))
+        auto const routes = WireFields::ToBigEndian<std::uint32_t>(WireMembershipRoute::ProvenIdentity);
+        auto const subject = AsBytes(std::string_view { "pc-07" });
+        CHECK_FALSE(DecodeAdmissionExplanation(WireFields::Encode({ std::span<std::byte const> { wide },
+                                                                    std::span<std::byte const> { routes },
+                                                                    std::span<std::byte const> {},
+                                                                    subject }))
+                        .has_value());
+        CHECK_FALSE(DecodeAdmissionExplanation(WireFields::Encode({ std::span<std::byte const> { verdict },
+                                                                    std::span<std::byte const> { routes },
+                                                                    std::span<std::byte const> { wide },
+                                                                    subject }))
                         .has_value());
     }
 }
@@ -3433,7 +3517,7 @@ TEST_CASE("The learner admission occupies the byte it was assigned, beside the v
 
     CHECK(IsMemberAdmission(Op::ClusterAdmit));
     CHECK(IsMemberAdmission(Op::ClusterAdmitLearner));
-    CHECK_FALSE(IsMemberAdmission(Op::ClusterAdmitClient));
+    CHECK_FALSE(IsMemberAdmission(Op::ClusterForget));
 }
 
 TEST_CASE("Both member admissions frame one payload under their own byte", "[wire][cluster][learner]")
@@ -3900,4 +3984,29 @@ TEST_CASE("cluster-admit-worker carries the worker's id and its key as text", "[
 
     auto const idOnly = WireFields::Encode({ AsBytes(std::string_view { "w-1" }) });
     CHECK_FALSE(DecodeClusterAdmitWorkerPayload(idOnly).has_value());
+}
+
+TEST_CASE("The ticket mint occupies the byte it was assigned, in the session family", "[wire][ticket]")
+{
+    CHECK(static_cast<std::uint8_t>(Op::MintTicket) == 0x1E);
+    CHECK(std::ranges::count(OpTable, Op::MintTicket, &OpDescriptor::code) == 1);
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::MintTicket)) == VerbFamily::Session);
+    CHECK_FALSE(IsPreAuthAllowed(static_cast<std::uint8_t>(Op::MintTicket)));
+    CHECK(OpFieldCount(Op::MintTicket) == 1);
+}
+
+TEST_CASE("A mint request carries exactly one audience, and anything else is refused", "[wire][ticket]")
+{
+    auto const frame = EncodeMintTicketRequest("office.corp:6674");
+    auto const header = DecodeRequestHeader(frame);
+    REQUIRE(header.has_value());
+    CHECK(Unwrap(header).opRaw == 0x1E);
+    CHECK(DecodeMintTicketPayload(std::span { frame }.subspan(RequestHeaderSize))
+          == std::optional<std::string> { "office.corp:6674" });
+    CHECK_FALSE(DecodeMintTicketPayload(WireFields::Encode({ AsBytes("a"), AsBytes("b") })).has_value());
+    CHECK_FALSE(DecodeMintTicketPayload({}).has_value());
+
+    // An empty audience is a well-formed field count but names nobody a ticket could be
+    // scoped to, so it is refused here rather than left for whatever mints the ticket.
+    CHECK_FALSE(DecodeMintTicketPayload(WireFields::Encode({ AsBytes(std::string_view {}) })).has_value());
 }

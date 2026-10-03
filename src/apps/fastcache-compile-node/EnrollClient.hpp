@@ -3,7 +3,6 @@
 
 #include "EndpointDialer.hpp"
 #include "NodeConfig.hpp"
-#include "NodeCredential.hpp"
 #include "NodeKey.hpp"
 
 #include <FastCache/Core/BoundedDrain.hpp>
@@ -22,6 +21,7 @@
 #include <string_view>
 #include <vector>
 
+#include <TicketCredentials.hpp>
 #include <core/net/IConnector.hpp>
 #include <core/net/ISocket.hpp>
 #include <core/platform/Clock.hpp>
@@ -78,8 +78,10 @@ inline constexpr std::chrono::milliseconds EnrollDialTimeout { 10'000 };
 /// Bounded because two nodes each holding a stale `_knownLeader` can name each other forever -- the
 /// same reason the worker's heartbeat bounds its own following. Three is a cluster in the middle of
 /// an election, which settles. A chain bound, never a total: a node that answered on its own behalf
-/// resets it. One constant for `RunEnrollClient`, `RunEnrollAdmin` and a formation controller.
-inline constexpr int MaxEnrollRedirects = 3;
+/// resets it. One constant for `RunEnrollClient`, `RunEnrollAdmin` and a formation controller, and
+/// the operator verbs' own bound: `RunEnrollAdmin` asks through `AskTheLeader`, so two numbers here
+/// would be two answers to one question.
+inline constexpr int MaxEnrollRedirects = MaxLeaderRedirects;
 
 /// What one exchange with the seed said, once the wire's vocabulary has been mapped
 /// onto what this client does next.
@@ -265,23 +267,30 @@ struct JoinerIdentity
 ///
 /// The OPERATOR's half of this pair. It asks `--scheduler`, like every other cluster
 /// verb -- the first of them that connects, as `DialFirstReachable` decides -- follows
-/// a `NotLeader` redirect the way `RunClusterAdmin` does, and exits.
+/// a `NotLeader` redirect to the leader it names through `AskTheLeader`, the one bounded
+/// loop `RunClusterAdmin` follows too, and exits. Safe for `--enroll-approve`: a `NotLeader`
+/// is a refusal, so nothing was applied where it landed.
+///
+/// Each ask presents what @p credentials answers for the endpoint it went to, so the
+/// leader a redirect names is shown a ticket naming IT.
 /// @param cfg The resolved configuration; `schedulers` is the field read.
 /// @param request What to do.
-/// @param credential What to present, read where it is presented.
+/// @param credentials What each endpoint is shown, asked where it is presented.
 /// @param dialer How each endpoint is reached. Defaulted for `RunEnrollClient`'s
 ///        reason: production never varies it, and a test always does.
 /// @return What to print on success, or what to print on failure.
 [[nodiscard]] std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
                                                                      EnrollCommand const& request,
-                                                                     ICredentialSource const& credential,
+                                                                     Cc::ICredentialFor& credentials,
                                                                      IEndpointDialer& dialer = DefaultOneShotDialer());
 
 /// Run `--enroll-from` to completion.
 ///
+/// **It presents NOTHING to the seed**, and that is the verb rather than an omission: `ENROLL`
+/// is answered before authentication (`OpenBeforeAuth`), and the machine asking is one no roster
+/// holds yet, so there is no ticket this machine's node could mint that the seed would admit.
 /// @param cfg The resolved configuration; `enrollFrom` and the state directory are the fields
 ///        read.
-/// @param credential What to present to the seed, read where it is presented.
 /// @param random Where a minted identity's bits come from, the id's and the key's alike.
 /// @param keyGuard Who may read the identity key file, asked of one that is there and
 ///        established on one minted here.
@@ -295,7 +304,6 @@ struct JoinerIdentity
 /// @return What to print on success, or what to print on failure.
 [[nodiscard]] std::expected<std::string, std::string> RunEnrollClient(
     NodeConfig const& cfg,
-    ICredentialSource const& credential,
     ISecureRandom& random,
     INodeKeyFileGuard& keyGuard,
     IDrainWait& wait = DefaultDrainWait(),

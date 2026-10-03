@@ -9,11 +9,15 @@
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/LeaseSigner.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
+#include <FastCache/Distributed/MachineTicket.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
+#include <FastCache/Distributed/RosterTrust.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
+#include <FastCache/Distributed/TicketVerifier.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Protocol/ProvenIdentity.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -34,13 +38,14 @@
 #include <WorkerProtocol.hpp>
 #include <apps/fastcache-compile-node/EndpointDialer.hpp>
 #include <apps/fastcache-compile-node/NodeConfig.hpp>
-#include <apps/fastcache-compile-node/NodeCredential.hpp>
+#include <apps/fastcache-compile-node/NodeMembership.hpp>
 #include <apps/fastcache-compile-node/NodePresenceTier.hpp>
 #include <apps/fastcache-compile-node/NodeRoster.hpp>
 #include <apps/fastcache-compile-node/SchedulerLink.hpp>
 #include <core/async/SyncRun.hpp>
 #include <core/async/Task.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/ExactAudience.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
@@ -113,6 +118,16 @@ namespace FastCache::Testing
 /// `SetWorkerReply` was given.
 ///
 /// Time moves only in `Step`.
+///
+/// ## Machine tickets
+///
+/// A request presenting a `MachineTicket` credential to a scheduler is decided as production's
+/// session surface decides it: that node's production `Distributed::TicketVerifier`, over a
+/// `StateLeaseRoster` adopting the node's own cluster state, a per-node spent set and an audience
+/// that is exactly the endpoint dialled. The AUTH reply is scripted ahead of the command's, and the
+/// command's caller is `Distributed::CallerContextOf` over the node's oracle with the ticket's
+/// machine folded in -- so a case sets a production `NodeMembership` (`PublishMembershipAt`) and a
+/// non-loopback caller host (`SetCallerHost`) before it asserts anything about admission.
 ///
 /// ## Rosters (#178)
 ///
@@ -187,13 +202,27 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// Where every subsequent request appears to come from.
     ///
     /// **A constant here cannot carry a membership property.** The default is `127.0.0.1`, and
-    /// loopback is never forgotten -- deliberately, so a node always admits its own machine --
-    /// so a forget published against the default caller applies to nobody and a case asserting
-    /// a refusal goes green having exercised nothing. Any case about admission sets this first.
+    /// loopback admits every caller that shows no key -- deliberately, so a node always admits
+    /// its own machine -- so a case asserting a refusal from the default caller goes green having
+    /// exercised nothing. (A forget names a KEY, never an address: a revoked key is refused from
+    /// loopback too.) Any case about admission sets this first.
     /// @param host The caller's host, as `core::net::ISocket::PeerAddress()` would report it.
     void SetCallerHost(std::string host)
     {
         _callerHost = std::move(host);
+    }
+
+    /// The identity every subsequent request's connection PROVED, or nothing for the default.
+    ///
+    /// **A machine is forgotten by its key, so a forget is falsifiable here only through one.**
+    /// With an identity set, a node that has an oracle decides the caller exactly as production's
+    /// endpoint does -- `Distributed::CallerContextOf`, the address routes folded with the key --
+    /// so a revoked key is refused wherever `SetCallerHost` says it dials from. Without one, the
+    /// caller is decided by its address alone, as every case predating the key roster assumes.
+    /// @param identity The proven identity, or nullopt to go back to the address alone.
+    void SetCallerIdentity(std::optional<ProvenIdentity> identity)
+    {
+        _callerIdentity = std::move(identity);
     }
 
     /// Let one node's admission oracle decide what its callers are.
@@ -361,6 +390,113 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         return _metrics;
     }
 
+    /// Admit @p machine to every scheduler's cluster, under `TestKeyPair(machine)`, as a LEARNER --
+    /// the seat a machine that is not a voter holds.
+    ///
+    /// Every node at once, and its roster version moved, as an applied admission would; each voter
+    /// endorses the changed roster at once, as a voter does (`Cluster::RosterEndorsementRefresh`
+    /// is for one that has NOT changed), so a `RosterWorker` adopts it on its next round. A node
+    /// whose membership was published (`PublishMembershipAt`) is republished.
+    /// @param machine The machine's id, which is also the id its tickets name.
+    void AdmitMachine(std::string const& machine)
+    {
+        for (auto const& node: _nodes)
+        {
+            node->cluster.state.members.push_back(
+                Cluster::ClusterMember { .id = machine,
+                                         .raftEndpoint = machine,
+                                         .schedulerEndpoint = {},
+                                         .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
+                                         .seat = Cluster::MemberSeat::Learner,
+                                         .publicKey = TestKeyPair(machine).PublicKey() });
+            ++node->cluster.state.rosterVersion;
+            Republish(*node);
+        }
+        EndorseAll();
+    }
+
+    /// Forget @p machine everywhere at once, as an applied `Forget` does (#1555): its record goes
+    /// and its key joins the revoked list in the same entry. Endorsed and republished as
+    /// `AdmitMachine` is.
+    /// @param machine The machine's id.
+    void ForgetMachine(std::string const& machine)
+    {
+        for (auto const& node: _nodes)
+        {
+            std::erase_if(node->cluster.state.members,
+                          [&machine](Cluster::ClusterMember const& member) { return member.id == machine; });
+            node->cluster.state.revokedKeys.push_back(
+                Cluster::RevokedKey { .id = machine, .publicKey = TestKeyPair(machine).PublicKey() });
+            ++node->cluster.state.rosterVersion;
+            Republish(*node);
+        }
+        EndorseAll();
+    }
+
+    /// A ticket @p machine would mint for @p audience, now, with its own test key.
+    /// @param machine Who it speaks for.
+    /// @param audience The endpoint it may be presented to.
+    /// @param nonce Distinguishes two tickets otherwise equal: a node spends each once.
+    /// @return The credential a launcher would present.
+    [[nodiscard]] Cc::Credential TicketFor(std::string const& machine, std::string const& audience, std::uint8_t nonce = 1)
+    {
+        auto claims = Distributed::MachineTicketClaims {
+            .machineId = machine,
+            .audience = audience,
+            .expiresAtUnixSeconds =
+                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                               (_wallClock.now() + Distributed::MachineTicketLifetime).time_since_epoch())
+                                               .count()),
+            .nonce = {},
+        };
+        claims.nonce.front() = std::byte { nonce };
+        return Cc::Credential { .kind = CompileCacheWire::AuthKind::MachineTicket,
+                                .username = {},
+                                .secret = Distributed::MintMachineTicket(TestKeyPair(machine), claims) };
+    }
+
+    /// The same claims as @p ticket, signed by @p signer's key instead: a ticket nobody the claims
+    /// name could have minted.
+    /// @param ticket A ticket `TicketFor` minted.
+    /// @param signer Whose key signs the copy.
+    /// @return The forgery.
+    [[nodiscard]] static Cc::Credential ForgeAs(Cc::Credential const& ticket, std::string const& signer)
+    {
+        auto const decoded = Distributed::DecodeMachineTicket(CompileCacheWire::AsBytes(ticket.secret.View()));
+        if (!decoded.has_value())
+            throw std::runtime_error { "FleetHarness: ForgeAs was handed something that is not a ticket" };
+        return Cc::Credential { .kind = CompileCacheWire::AuthKind::MachineTicket,
+                                .username = {},
+                                .secret = Distributed::MintMachineTicket(TestKeyPair(signer), decoded->claims) };
+    }
+
+    /// Every scheduler that is a voter in the state it applied endorses that roster, now, at
+    /// itself -- what the voters' periodic refresh does -- through `EndorseAt`.
+    void EndorseAll()
+    {
+        for (auto const& node: _nodes)
+        {
+            auto const isVoter =
+                std::ranges::any_of(node->cluster.state.members, [&node](Cluster::ClusterMember const& member) {
+                    return member.id == node->endpoint && member.seat == Cluster::MemberSeat::Voter;
+                });
+            if (isVoter)
+                EndorseAt(node->endpoint, node->endpoint, node->cluster.state);
+        }
+    }
+
+    /// Let a production `NodeMembership` decide @p endpoint's callers, published with that node's
+    /// cluster state now and again at every `AdmitMachine` and `ForgetMachine`.
+    /// @param endpoint Which node; must have been added.
+    /// @param membership The node's admission policy; borrowed, and must outlive the harness's use.
+    void PublishMembershipAt(std::string_view endpoint, FastCache::Node::NodeMembership& membership)
+    {
+        auto& node = NodeAt(endpoint);
+        node.published = &membership;
+        node.membership = &membership.Oracle();
+        Republish(node);
+    }
+
     /// The cluster's state as @p scheduler has applied it.
     ///
     /// Per node, because the case #178 is about is two nodes disagreeing: an ex-leader that
@@ -495,8 +631,6 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
             return FastCache::Node::AnnouncePresence(FastCache::Node::PresenceMessage { .endpoint = endpoint,
                                                                                         .capacity = capacity,
                                                                                         .load = load,
-                                                                                        .credential = _credential,
-                                                                                        .notice = Unwatched(),
                                                                                         .logger = _fleet._logger,
                                                                                         // Nothing proves over this
                                                                                         // harness's transport; see
@@ -522,6 +656,17 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
             return _roster->Summary();
         }
 
+        /// What this worker's session surface answers a machine ticket with: the production
+        /// verifier over the roster it holds, for an audience that is exactly this worker.
+        /// @param credential The ticket a launcher presents.
+        /// @return The machine it speaks for, or why it is refused.
+        [[nodiscard]] std::expected<ProvenIdentity, Distributed::TicketRefusal> CheckTicket(Cc::Credential const& credential)
+        {
+            auto const verifier = Distributed::TicketVerifier { _roster->Lease(), _audience, _spent };
+            return verifier.Verify(CompileCacheWire::AsBytes(credential.secret.View()), _fleet._wallClock.now())
+                .transform_error([](Distributed::TicketRejection const& rejection) { return rejection.Reason(); });
+        }
+
       private:
         /// Where this worker answers: fixed, since nothing here moves an address.
         struct Advertised final: Cc::IAdvertisedEndpointSource
@@ -537,15 +682,6 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
             }
 
             std::string endpoint;
-        };
-
-        /// No `--requirepass`: the harness's schedulers ask for none.
-        struct NoCredential final: FastCache::Node::ICredentialSource
-        {
-            [[nodiscard]] Cc::Credential Current() const override
-            {
-                return {};
-            }
         };
 
         /// The production roster for a worker trusting @p anchors, with no state directory.
@@ -566,11 +702,12 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
 
         FleetHarness& _fleet;
         Advertised _advertised;
-        NoCredential _credential;
         std::unique_ptr<FastCache::Node::NodeRoster> _roster;
         FastCache::Node::SchedulerLink _link;
         Distributed::WorkerLeaseState _lease;
         Cc::LeaseValidator _validator;
+        ExactAudience _audience { _advertised.Current() };
+        Distributed::SpentTickets _spent;
     };
 
     /// Dial a scheduler in this fleet, as a node's presence round would.
@@ -592,7 +729,9 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// @param hostPort The endpoint the client chose. **This is the fact most of
     ///        these tests are about**: which machine the client decided to ask.
     /// @param frame The complete request.
-    /// @param credential Ignored; see the class comment.
+    /// @param credential What the client presents: a machine ticket to a scheduler is decided by that
+    ///        node's verifier (see the class comment); anything else is answered `Ok` and admits
+    ///        nothing, as a surface with nothing to verify answers it.
     /// @param budget Ignored; nothing here blocks.
     /// @return The outcome, decoded by the launcher's own client code.
     [[nodiscard]] Cc::CacheOutcome Exchange(std::string_view hostPort,
@@ -611,7 +750,7 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                                 .kind = Cc::CacheOutcomeKind::Transport,
                                 .code = CompileCacheWire::ErrorCode::MalformedFrame });
 
-        auto reply = Answer(hostPort, frame);
+        auto reply = credential.Configured() ? AnswerAuthenticated(hostPort, frame, credential) : Answer(hostPort, frame);
         // The launcher's own framing, over a socket that replays what the addressed
         // scheduler actually produced. Asserting against hand-written reply bytes
         // would let the two ends drift apart independently, which is the failure
@@ -673,7 +812,65 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         /// Who decides this node's callers, or null to admit everybody (the default, and what
         /// every case predating #1471 relies on). Borrowed -- see `SetMembershipAt`.
         Distributed::IMembershipOracle const* membership { nullptr };
+        /// The production policy `membership` is, when `PublishMembershipAt` set one; republished
+        /// whenever this node's state changes.
+        FastCache::Node::NodeMembership* published { nullptr };
+        /// What this node verifies a machine ticket against: its own applied state, re-adopted at
+        /// every exchange; a spent set of its own; and the one endpoint it answers to.
+        Distributed::StateLeaseRoster roster;
+        Distributed::SpentTickets spent;
+        ExactAudience audience { endpoint };
+        Distributed::TicketVerifier verifier { &roster, audience, spent };
     };
+
+    /// Hand @p node's applied state to the policy published for it, if any.
+    /// @param node Which node.
+    static void Republish(Node& node)
+    {
+        if (node.published != nullptr)
+            node.published->PublishCluster(node.cluster.state);
+    }
+
+    /// The replies to AUTH presenting @p credential and then @p frame, from @p hostPort.
+    ///
+    /// A machine ticket to a scheduler is verified by that node, and its outcome decides the
+    /// command's caller through the production fold; the AUTH reply is `Ok` or the counted refusal
+    /// (`Distributed::AnswerTicket`). Anything else is answered `Ok` and changes nothing.
+    /// @param hostPort The addressed endpoint.
+    /// @param frame The command.
+    /// @param credential What was presented.
+    /// @return AUTH's reply, then the command's.
+    [[nodiscard]] std::vector<std::byte> AnswerAuthenticated(std::string_view hostPort,
+                                                             std::span<std::byte const> frame,
+                                                             Cc::Credential const& credential)
+    {
+        auto const scheduler =
+            std::ranges::find_if(_nodes, [hostPort](auto const& node) { return node->endpoint == hostPort; });
+        if (credential.kind != CompileCacheWire::AuthKind::MachineTicket || scheduler == _nodes.end())
+        {
+            auto replies = CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok, {});
+            auto const command = Answer(hostPort, frame);
+            replies.insert(replies.end(), command.begin(), command.end());
+            return replies;
+        }
+
+        auto& node = **scheduler;
+        node.roster.Adopt(node.cluster.state);
+        auto const answer = Distributed::AnswerTicket(
+            _metrics, node.verifier.Verify(CompileCacheWire::AsBytes(credential.secret.View()), _wallClock.now()));
+        auto replies = answer.machine.has_value() ? CompileCacheWire::EncodeReply(CompileCacheWire::Status::Ok, {})
+                                                  : answer.refusalReply;
+        auto const context = node.membership != nullptr
+                                 ? Distributed::CallerContextOf(*node.membership,
+                                                                ConnectionFacts { .host = _callerHost,
+                                                                                  .proven = _callerIdentity,
+                                                                                  .authenticatedMachine = answer.machine,
+                                                                                  .revokedMachine = answer.revoked })
+                                 : Caller(node);
+        auto const command = node.protocol.Answer(frame, context);
+        replies.insert(replies.end(), command.begin(), command.end());
+        return replies;
+    }
 
     /// The scheduler at @p endpoint.
     /// @param endpoint Who to find.
@@ -722,7 +919,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     {
         return Distributed::CallerContext { .membership = Distributed::Membership::Member,
                                             .peerId = "127.0.0.1",
-                                            .provenNodeId = std::string { ProvenMachine } };
+                                            .provenNodeId = std::string { ProvenMachine },
+                                            .identified = true };
     }
 
     /// The context handed to @p node's service for the current caller.
@@ -744,13 +942,17 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// only for a caller the oracle admits, as `CallerContextOf` does.
     [[nodiscard]] Distributed::CallerContext Caller(Node const& node) const
     {
+        if (node.membership != nullptr && _callerIdentity.has_value())
+            return Distributed::CallerContextOf(*node.membership,
+                                                ConnectionFacts { .host = _callerHost, .proven = _callerIdentity });
         auto const verdict =
             node.membership != nullptr ? node.membership->Classify(_callerHost) : Distributed::Membership::Member;
-        auto proven =
-            verdict == Distributed::Membership::Member ? std::optional { std::string { ProvenMachine } } : std::nullopt;
-        return Distributed::CallerContext { .membership = verdict,
-                                            .peerId = _callerHost,
-                                            .provenNodeId = std::move(proven) };
+        auto const admitted = verdict == Distributed::Membership::Member;
+        auto proven = admitted ? std::optional { std::string { ProvenMachine } } : std::nullopt;
+        // A proof identifies its caller, so an admitted -- and therefore proven -- caller is identified.
+        return Distributed::CallerContext {
+            .membership = verdict, .peerId = _callerHost, .provenNodeId = std::move(proven), .identified = admitted
+        };
     }
 
     /// The id every admitted caller of this harness proved.
@@ -844,6 +1046,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     /// Where requests appear to come from. Loopback by default, which is what every case
     /// predating #1471 assumed and what a node always admits.
     std::string _callerHost { "127.0.0.1" };
+    /// What requests' connections proved; nothing by default. See `SetCallerIdentity`.
+    std::optional<ProvenIdentity> _callerIdentity;
     std::vector<std::unique_ptr<Node>> _nodes;
     std::vector<std::string> _workerEndpoints;
     std::vector<std::byte> _workerReply;

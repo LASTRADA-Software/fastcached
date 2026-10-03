@@ -294,9 +294,10 @@ fault.
   is the sum (those are different jobs).
 - **The dashboard's credential is separate from `--requirepass`, and the surface
   is refused rather than served without one.** `--requirepass` is what a node
-  *presents* to the scheduler and every member of the fleet holds it, so reusing it
+  *presents* to the shared cache and every member of the fleet holds it, so reusing it
   would let any worker read every other node's fleet map -- wrong direction and
-  wrong grain. It is a file for the reason `--scheduler-token-file` is one, and a
+  wrong grain. It is a file because a secret on a command line is readable by every
+  process on the machine, and a
   non-loopback `--admin-listen` with `--dashboard` and no token file is a **startup
   refusal**: the page lists every member's hostname, endpoint and capacity, and
   HTTPS does not substitute, because TLS authenticates the server to the browser
@@ -845,9 +846,9 @@ looks exactly like a port nobody is talking to.
   values, in BOTH directions, since the one-directional half passes for a router that
   sends nothing to the surface at all.
 - **The other two reasons not to count**, from the same pass: a rise that would be
-  ORDINARY TRAFFIC (the cache's `AUTH` refusal is what a `FASTCACHE_TOKEN` launcher
-  gets once per exchange for a whole build — `UnservedReply`'s argument, one surface
-  over), and an event ALREADY COUNTED somewhere better placed to see it (a failed
+  ORDINARY TRAFFIC (a node with no cache tier answers every local `FETCH`
+  `unimplemented-verb`, once per exchange for a whole build — `UnservedReply`'s argument,
+  one surface over), and an event ALREADY COUNTED somewhere better placed to see it (a failed
   local write moves `NodeCacheStoreFailures` inside `LocalCache::Store`, where every
   caller is visible and not only the ones that arrived over the wire; a second row
   would count one write twice). Neither is "this refusal does not matter".
@@ -868,10 +869,8 @@ looks exactly like a port nobody is talking to.
   operator. The types keep them apart rather than a comment asking somebody to.
 - **Not every refusal is an EVENT, and one that ordinary traffic produces must not be
   counted.** The merged listener answers `UnimplementedVerb` to a verb this node runs
-  no component for — and that is what a *healthy* deployment gets: a worker with no
-  scheduler refuses every `AUTH` a `FASTCACHE_TOKEN` launcher sends, once per exchange
-  for a whole build, and a node with no cache tier refuses every local `FETCH` the same
-  way. Counted, the series is a build's traffic and a port scan is invisible inside it
+  no component for — and that is what a *healthy* deployment gets: a node with no cache
+  tier refuses every local `FETCH`, once per exchange for a whole build. Counted, the series is a build's traffic and a port scan is invisible inside it
   — which is this rule's own failure reached from the opposite side: a signal nothing
   can be read out of is no better than a counter that never moves. The test is not "is
   this a refusal" but "would a rise mean something happened". Splitting such an answer

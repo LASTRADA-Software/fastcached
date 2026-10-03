@@ -283,7 +283,7 @@ readable and silently ignored. Every rule below has already been one of them.
   wildcard and `--advertise` defaulting to loopback are that pair.
 
   What stayed out needs stating carefully, because the easy reason is the wrong one.
-  `--advertise`, `--scheduler`, `--upstream` and `--fleet-member` are addresses on
+  `--advertise`, `--scheduler`, `--upstream` and `--enroll-from` are addresses on
   the same command line, and it is tempting to say they are excluded
   because they fail at `bind()` or `connect()` -- but that is about **reachability**,
   and their *grammar* is every bit as much a pure function of the command line as a
@@ -306,17 +306,6 @@ readable and silently ignored. Every rule below has already been one of them.
     empty one included: for a scalar, empty means never given, while an empty ELEMENT
     is a value somebody typed — and a fallback that can never answer is found on the
     day the entries before it are gone.
-  - `--fleet-member` is NOT dialled and must not be judged as if it were. It is matched
-    against a peer's source address through `HostOfEndpoint`, which keeps an
-    unsplittable value WHOLE on purpose — a bare host is a legitimate spelling for a
-    peer whose port nobody recorded — so `worker-01` is legal there and refusing it
-    would break the documented setup and what discovery produces. No check can tell a
-    hostname from a typo of one.
-  - What IS refusable there is an EMPTY element, and it is the row worth having:
-    `--fleet-member=` appends `""`, which matches no peer any kernel reports, while
-    making the list NON-empty — so `HasMembershipPolicy` answers yes, the "a scheduler
-    with no membership policy" rule does not fire, and the node starts, serves, and
-    admits nobody but its own machine. #208's silent shape reached through another flag.
   - **Shape and presence are different rules.** `--scheduler` is REQUIRED, by a rule of
     its own; the shape row is "parses when GIVEN", exactly as the surface loop is. A
     shape row that also demanded presence would answer "is not an address to dial" for

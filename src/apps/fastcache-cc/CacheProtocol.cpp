@@ -241,8 +241,8 @@ namespace
             co_return co_await RecvReply(client, liveness, asked);
         }
 
-        auto const authFrame =
-            Wire::EncodeAuth(Wire::AuthRequest { .username = credential.username, .secret = credential.secret });
+        auto const authFrame = Wire::EncodeAuth(Wire::AuthRequest {
+            .kind = credential.kind, .username = credential.username, .secret = credential.secret.View() });
         if (!co_await core::net::sendAll(client, authFrame) || !co_await core::net::sendAll(client, frame))
             co_return Plain(CacheOutcomeKind::Transport);
         NoteRequestSent(liveness);

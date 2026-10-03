@@ -322,33 +322,6 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "accepts, refused without being read. The cheapest probe there is: it "
               "needs only a header, where the envelope series needs a whole frame.",
       .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::WorkerFramesRefusedMalformedCredential,
-      .prometheusName = "fastcache_worker_frames_refused_malformed_credential_total",
-      .help = "AUTH payloads on a compile surface that would not decode. Never sum "
-              "with malformed_payload: they share a wire code and nothing else -- that "
-              "one is a request body, this one is a credential, and an operator cannot "
-              "tell a client version skew from somebody malforming AUTH at the door if "
-              "the two are added up. Flat at zero BY CONSTRUCTION: the Session verb "
-              "family is routed to the scheduler, so a compile surface is never asked "
-              "for a credential.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::WorkerFramesRefusedRejectedCredential,
-      .prometheusName = "fastcache_worker_frames_refused_rejected_credential_total",
-      .help = "AUTH payloads on a compile surface that decoded and did not verify. "
-              "Never sum with frames_refused_unauthenticated: they share a wire code "
-              "and nothing else -- that one never presented a credential, this one "
-              "presented the wrong one. Flat at zero BY CONSTRUCTION: the Session verb "
-              "family is routed to the scheduler.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::WorkerFramesRefusedUnauthenticated,
-      .prometheusName = "fastcache_worker_frames_refused_unauthenticated_total",
-      .help = "Frames refused for reaching a compile verb before a credential. Flat at "
-              "zero BY CONSTRUCTION, not for want of anybody probing: the compile "
-              "surface answers AuthRequired false -- a compile carries its own per-job "
-              "lease instead -- so the pre-payload gate never reaches this. Do not read "
-              "the flat line as 'nothing is asking'. A rise means that answer changed, "
-              "which is a change to who may compile here.",
-      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedEnvelopeMalformed,
       .prometheusName = "fastcache_worker_jobs_refused_envelope_malformed_total",
       .help = "Jobs refused because the request's codec envelope could not be "
@@ -481,30 +454,26 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember,
       .prometheusName = "fastcache_node_status_requests_refused_not_a_member_total",
-      .help = "Operator verbs (node-status, node-metrics) refused because the caller is not a "
-              "fleet member. These report this node's version, uptime, components and its "
-              "surface PORT MAP, which is why they are gated at all rather than being pre-auth. "
-              "Unlike the cache tier's not-local refusal this is not ordinary on any deployment: "
-              "an operator asking is either listed or is being told to be, so a steady rise is a "
-              "member list that has fallen behind whoever is running fastcache-cli, and a burst "
-              "from one host is somebody scanning. Zero on a node nobody has asked, which is the "
+      .help = "Operator verbs refused because the caller is not a fleet member: node-status, "
+              "node-metrics, and explain-admission asked about a MACHINE (asked about the caller's "
+              "own connection it is answered to anyone). These report this node's version, "
+              "uptime, components, its surface PORT MAP and where machines stand in its roster, "
+              "which is why they are gated at all rather than being pre-auth. Unlike the cache "
+              "tier's not-local refusal this is not ordinary on any deployment: an operator asking "
+              "is either admitted or is being told to be, so a steady rise is fastcache-cli run "
+              "from a machine the cluster has not admitted, or has forgotten, and a burst from one "
+              "host is somebody scanning. Zero on a node nobody has asked, which is the "
               "common case and is not evidence the gate works.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::NodeRequestsRefusedHostForgotten,
-      .prometheusName = "fastcache_node_requests_refused_host_forgotten_total",
-      .help = "Requests refused on any surface because the cluster has forgotten "
-              "the calling host. A rise means a machine somebody decommissioned is "
-              "still configured to use this fleet. Never sum with the "
-              "not_a_member rows: those are hosts nobody listed, this one is a "
-              "host an operator removed.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedPayloadTooLarge,
       .prometheusName = "fastcache_node_status_requests_refused_payload_too_large_total",
       .help = "Operator verbs refused because the header declared more payload than they may "
-              "carry, so nothing was read. Both of them are FIELDLESS -- there is nothing to ask "
-              "node-status or node-metrics with -- and their wire rows bound them to the control "
-              "payload cap rather than the session cap, so a header declaring megabytes against "
-              "one of them came from no client of this tree at any version. Never sum with "
+              "carry, so nothing was read. node-status and node-metrics are FIELDLESS -- there is "
+              "nothing to ask them with -- and their wire rows bound them to the control payload "
+              "cap, so a header declaring more against either came from no client of this tree at "
+              "any version. explain-admission carries one subject, a machine id or a 43-character "
+              "key, under its own 512-byte ceiling, and is reachable before admission: a rise from "
+              "it is an operand no roster could name, or a stranger probing the port. Never sum with "
               "fastcache_node_cache_requests_refused_payload_too_large_total: that one is what a "
               "launcher storing large objects produces and has an innocent explanation, and this "
               "one does not.",
@@ -522,7 +491,7 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
     { .counter = IMetricsSink::Counter::NodeAdmissionExplanationsRefusedMalformed,
       .prometheusName = "fastcache_node_admission_explanations_refused_malformed_total",
       .help = "explain-admission requests refused because the payload was not exactly one field "
-              "naming a host. No shipped client can build one: the CLI encodes this verb through "
+              "naming its subject. No shipped client can build one: the CLI encodes this verb through "
               "EncodeExplainAdmissionRequest. So a rise is a client of another build or somebody "
               "probing the port by hand, and the two are told apart by whether anything else on "
               "this surface refuses at the same time. Kept apart from the node-status refusals, "
@@ -572,28 +541,6 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "is also the only view of what refusing costs: the launcher sees a miss and "
               "compiles locally, so the build stays correct and merely stops being fast.",
       .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedUnauthenticated,
-      .prometheusName = "fastcache_scheduler_requests_refused_unauthenticated_total",
-      .help = "Scheduler requests refused because the connection presented no "
-              "accepted credential. Zero while no --scheduler-token-file is set, "
-              "because there is then nothing to fail -- so zero here on a "
-              "non-loopback bind means the port is open, not that it is quiet.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::SchedulerCredentialsRejected,
-      .prometheusName = "fastcache_scheduler_credentials_rejected_total",
-      .help = "AUTH attempts on the scheduler surface that decoded and did not "
-              "verify: a rotated key, or somebody guessing. Never sum with "
-              "requests_refused_unauthenticated -- that one is a peer that never "
-              "authenticated at all, which is a misconfigured member rather than a "
-              "probe.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::SchedulerCredentialsMalformed,
-      .prometheusName = "fastcache_scheduler_credentials_malformed_total",
-      .help = "AUTH payloads on the scheduler surface that would not decode: a "
-              "version or client-library mismatch. Kept apart from "
-              "credentials_rejected so an old client in the fleet cannot hide a peer "
-              "presenting wrong secrets.",
-      .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeFrameConnectionsRefusedAtCapacity,
       .prometheusName = "fastcache_node_frame_connections_refused_at_capacity_total",
       .help = "Connections turned away because the node's 0xFC listener already holds "
@@ -613,8 +560,7 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .prometheusName = "fastcache_node_proofs_rejected_total",
       .help = "Node proofs whose signature does not verify under the key they presented: a client of another "
               "build, or somebody forging one. Asked before the roster, so it says nothing about which keys the "
-              "cluster holds. Never sum with scheduler_credentials_rejected -- that is a wrong --requirepass, an "
-              "operator's token.",
+              "cluster holds.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeProofsUnchallenged,
       .prometheusName = "fastcache_node_proofs_unchallenged_total",
@@ -626,8 +572,8 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
     { .counter = IMetricsSink::Counter::NodeProofsMalformed,
       .prometheusName = "fastcache_node_proofs_malformed_total",
       .help = "node-challenge and prove-node payloads that would not decode into their fixed-width fields: a "
-              "version or client-library mismatch, kept apart from node_proofs_rejected for "
-              "scheduler_credentials_malformed's reason.",
+              "version or client-library mismatch, kept apart from node_proofs_rejected so an old client "
+              "cannot hide a forgery.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::KeyspaceReclaimEventsDropped,
       .prometheusName = "fastcached_keyspace_reclaim_events_dropped_total",
@@ -796,16 +742,6 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "ask for the decision too. Not ordinary on any deployment. Never sum with "
               "fastcache_node_status_requests_refused_not_a_member_total, which shares the wire "
               "code and describes somebody asking a node what it is.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::EnrollmentControlRefusedUnauthenticated,
-      .prometheusName = "fastcache_enrollment_control_refused_unauthenticated_total",
-      .help = "Enrollment control verbs refused because the connection presented no accepted "
-              "credential. The third of three outcomes on this verb and separate from the other "
-              "two for the reason the scheduler's three are: a peer that never authenticated is a "
-              "misconfigured operator, one whose token was rejected is on the scheduler's own "
-              "credential series, and a non-member that authenticated correctly is the row above. "
-              "Zero while no --scheduler-token-file is set, so zero here does not mean the verb "
-              "is protected -- it means membership is the only gate on it.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::EnrollmentRostersServed,
       .prometheusName = "fastcache_enrollment_rosters_served_total",
@@ -1065,9 +1001,9 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
     { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedUnknownKey,
       .prometheusName = "fastcache_raft_peer_connections_refused_unknown_key_total",
       .help = "Raft peer connections refused because this node holds no key for the id the proof claims, so "
-              "nothing could be verified and nothing was answered. A member whose key was never given -- one "
-              "admitted without @<key> -- or a machine that is not a member "
-              "at all. The address is in the log line and the claimed id is not: nobody proved it.",
+              "nothing could be verified and nothing was answered. A machine that is not a member at all -- every "
+              "member the roster records holds its key. The address is in the log line and the claimed id is not: "
+              "nobody proved it.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::RaftPeerConnectionsRefusedRevokedKey,
       .prometheusName = "fastcache_raft_peer_connections_refused_revoked_key_total",
@@ -1207,8 +1143,10 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
     { .counter = IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked,
       .prometheusName = "fastcache_node_requests_refused_key_revoked_total",
       .help = "Requests refused at any door because their connection proved an identity key the cluster revoked, "
-              "whatever address it came from -- --fleet-member included. Never sum with "
-              "node_requests_refused_host_forgotten: that is a forgotten address, this is the removed machine.",
+              "or presented a ticket signed by one, whatever address it came from: a machine somebody forgot is "
+              "still configured to use this fleet, or somebody holds one of its tickets. Only a PROOF is told why; "
+              "a ticket's holder gets the words a stranger gets, so off --fleet-open this counter is where the difference "
+              "shows; under --fleet-open the refusal itself shows it, since a stranger is served.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeSealedFramesRefused,
       .prometheusName = "fastcache_node_sealed_frames_refused_total",
@@ -1280,6 +1218,108 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
       .help = "Admissions this node did not believe: the roster it was handed does not record it under its own key, "
               "or records no member under the key that proved the fleet it asked -- whoever answered is not that "
               "fleet. Nothing was archived; the node stays in its own cluster, and gives the join up if it goes on.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsAccepted,
+      .prometheusName = "fastcache_node_tickets_accepted_total",
+      .help = "Machine tickets this node verified and spent, so AUTH on that connection speaks for the machine the "
+              "ticket names. The positive half of every node_tickets_refused row.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsRefusedMalformed,
+      .prometheusName = "fastcache_node_tickets_refused_malformed_total",
+      .help = "Machine tickets whose bytes are not a ticket: a client of another version, or something that is not one "
+              "of ours.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsRefusedNotUtf8,
+      .prometheusName = "fastcache_node_tickets_refused_not_utf8_total",
+      .help = "Genuine machine tickets whose machine id or audience is not UTF-8, refused before it is compared, "
+              "logged or rendered. A forged ticket counts as forged whatever its claims say, so a rise names an "
+              "admitted machine minting claims that are not text.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsRefusedNoRoster,
+      .prometheusName = "fastcache_node_tickets_refused_no_roster_total",
+      .help = "Machine tickets refused because this node holds no roster, or one past its certification: nothing was "
+              "checked. Not unknown_machine -- the remedy is this node reaching a leader, not an admission.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsRefusedUnknownMachine,
+      .prometheusName = "fastcache_node_tickets_refused_unknown_machine_total",
+      .help = "Machine tickets naming a machine this node's current roster holds no live key for, and signed by no "
+              "key it revoked. Two causes: a machine not admitted, or an enrolled principal, which this node does "
+              "not check tickets against, so find out which before admitting anything. Distinct from no_roster, "
+              "which checked nothing.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsRefusedForged,
+      .prometheusName = "fastcache_node_tickets_refused_forged_total",
+      .help = "Machine tickets naming an admitted machine and not signed by its key. Should read zero; a rise is "
+              "somebody presenting tickets in another machine's name.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsRefusedRevoked,
+      .prometheusName = "fastcache_node_tickets_refused_revoked_total",
+      .help = "Machine tickets signed by a key the cluster revoked: the forgotten machine itself, still minting. Should"
+              " read zero once it is switched off.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsRefusedWrongAudience,
+      .prometheusName = "fastcache_node_tickets_refused_wrong_audience_total",
+      .help = "Genuine machine tickets minted for an endpoint that is not this node: a stale name or address, or a "
+              "ticket captured elsewhere and presented here.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsRefusedExpired,
+      .prometheusName = "fastcache_node_tickets_refused_expired_total",
+      .help = "Genuine machine tickets past their expiry and the clock-skew slack, further ahead than any minter "
+              "issues, or expiring no later than a spend this node has already let go of. A steady rise from one "
+              "machine is its clock; a burst from every machine just after this node's clock was corrected is the "
+              "last case, and clears by itself within ten minutes, or, if this node accepted tickets while its "
+              "clock was ahead, once real time reaches that reading; restarting the node clears it at once.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsRefusedReplayed,
+      .prometheusName = "fastcache_node_tickets_refused_replayed_total",
+      .help = "Genuine machine tickets this node had already spent. A ticket is presented once, so a rise is a captured"
+              " ticket being replayed.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsRefusedSpentSetFull,
+      .prometheusName = "fastcache_node_tickets_refused_spent_set_full_total",
+      .help = "Genuine machine tickets refused because this node already remembers its capacity of spent tickets that "
+              "are all still acceptable. A rise says resize the set; nothing is admitted while it is full.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketsMinted,
+      .prometheusName = "fastcache_node_tickets_minted_total",
+      .help = "Machine tickets this node signed for a process on this machine. Every ticket another node accepts was "
+              "minted by some node's row here.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketMintsRefusedNotLocal,
+      .prometheusName = "fastcache_node_ticket_mints_refused_not_local_total",
+      .help = "MINT-TICKET asked from anywhere but loopback and refused before anything was signed: a ticket is minted "
+              "for this machine's own processes only. Another machine asking this node to vouch for it, or a local "
+              "launcher dialling its node by a LAN address.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketMintsRefusedMalformed,
+      .prometheusName = "fastcache_node_ticket_mints_refused_malformed_total",
+      .help = "MINT-TICKET whose audience would not decode, was not UTF-8 text, or named no one machine -- loopback, a "
+              "wildcard or no host -- so the ticket would be spendable at any node. A client configured with a "
+              "loopback endpoint.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketMintsRefusedNoKey,
+      .prometheusName = "fastcache_node_ticket_mints_refused_no_key_total",
+      .help = "MINT-TICKET on a node that holds no identity key, so it has nothing to sign with. The remedy is this "
+              "node's own state directory, not the client.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::NodeTicketMintsRefusedNoRandom,
+      .prometheusName = "fastcache_node_ticket_mints_refused_no_random_total",
+      .help = "MINT-TICKET this node could not draw a nonce for: its own random source failed, which is a fact about "
+              "this machine. Refused rather than signed with a weaker nonce.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::SchedulerRequestsRefusedIdentifiedCallerRequired,
+      .prometheusName = "fastcache_scheduler_requests_refused_identified_caller_required_total",
+      .help = "Cluster control verbs -- admit, forget, set -- refused because only --fleet-open admitted the caller. "
+              "--fleet-open admits a caller to what the fleet serves, never to what decides it; send the verb from "
+              "this machine or from one whose node presents a machine ticket. On an open node a rise is somebody "
+              "trying to change the fleet anonymously.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired,
+      .prometheusName = "fastcache_enrollment_control_refused_identified_caller_required_total",
+      .help = "Enrollment control verbs -- approve, reject, auto-approve, clear, list -- refused because only "
+              "--fleet-open admitted the caller: an anonymous caller trying to decide who joins, the one this "
+              "refusal exists for. Never sum with fastcache_enrollment_control_refused_not_a_member_total, a "
+              "caller nothing admitted at all.",
       .type = MetricType::Counter },
 } };
 

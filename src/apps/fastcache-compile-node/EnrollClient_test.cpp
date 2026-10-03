@@ -31,6 +31,7 @@
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
+#include <tests/TicketFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -482,7 +483,7 @@ TEST_CASE("A seed address that is not an address to dial is refused before any s
 
     SystemSecureRandom random;
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
-    auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, keyGuard);
+    auto const refused = RunEnrollClient(cfg, random, keyGuard);
     REQUIRE(!refused.has_value());
     CHECK(refused.error().contains("--enroll-from"));
 
@@ -742,7 +743,7 @@ TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[
     InstantWait wait;
     SystemSecureRandom random;
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
-    auto const outcome = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, keyGuard, wait, dialer);
+    auto const outcome = RunEnrollClient(cfg, random, keyGuard, wait, dialer);
 
     REQUIRE(!outcome.has_value());
 
@@ -796,7 +797,7 @@ TEST_CASE("A consecutive redirect chain is still bounded", "[enrollment][client]
     InstantWait wait;
     SystemSecureRandom random;
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
-    auto const outcome = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, keyGuard, wait, dialer);
+    auto const outcome = RunEnrollClient(cfg, random, keyGuard, wait, dialer);
 
     REQUIRE(!outcome.has_value());
 
@@ -881,8 +882,7 @@ TEST_CASE("A joiner asks under the key it minted and believes a roster that reco
     InstantWait wait;
     SystemSecureRandom random;
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
-    auto const admitted =
-        RunEnrollClient(joiner.cfg, ConfiguredCredential { joiner.cfg, nullptr }, random, keyGuard, wait, dialer);
+    auto const admitted = RunEnrollClient(joiner.cfg, random, keyGuard, wait, dialer);
 
     INFO("result: " << admitted.value_or(admitted.error_or("")));
     REQUIRE(admitted.has_value());
@@ -896,6 +896,9 @@ TEST_CASE("A joiner asks under the key it minted and believes a roster that reco
         auto const sent = dialer.SentOn(index);
         auto const header = Wire::DecodeRequestHeader(sent);
         REQUIRE(header.has_value());
+        // No AUTH ahead of it: `ENROLL` is answered before authentication, and a machine no
+        // roster holds has no ticket to present.
+        CHECK(Unwrap(header).opRaw == static_cast<std::uint8_t>(Wire::Op::Enroll));
         auto const request = Wire::DecodeEnrollPayload(sent.subspan(Wire::RequestHeaderSize));
         REQUIRE(request.has_value());
         CHECK(Unwrap(request).publicKey == joiner.key);
@@ -917,8 +920,7 @@ TEST_CASE("A joiner handed a roster naming it under another key is not admitted"
     InstantWait wait;
     SystemSecureRandom random;
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
-    auto const refused =
-        RunEnrollClient(joiner.cfg, ConfiguredCredential { joiner.cfg, nullptr }, random, keyGuard, wait, dialer);
+    auto const refused = RunEnrollClient(joiner.cfg, random, keyGuard, wait, dialer);
 
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().contains("does not record"));
@@ -954,9 +956,9 @@ TEST_CASE("An enrollment command asks the next --scheduler when the first cannot
     // passes every case whose first entry answers.
     auto const cfg = TwoSchedulers();
     Testing::ScriptedDialer dialer { { {}, QuietWindow() } };
+    Testing::PresentsNothing nothing;
 
-    auto const listed = RunEnrollAdmin(
-        cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, ConfiguredCredential { cfg, nullptr }, dialer);
+    auto const listed = RunEnrollAdmin(cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, nothing, dialer);
 
     INFO("result: " << listed.value_or(listed.error_or("")));
     REQUIRE(listed.has_value());
@@ -974,12 +976,10 @@ TEST_CASE("An enrollment command that reached a scheduler is never sent to anoth
     // then answers nothing readable; a second dial would run this script out, which the fake reports in its own voice.
     auto const cfg = TwoSchedulers();
     Testing::ScriptedDialer dialer { { std::vector<std::byte> { std::byte { 0xFF } } } };
+    Testing::PresentsNothing nothing;
 
-    auto const approved =
-        RunEnrollAdmin(cfg,
-                       EnrollCommand { .action = EnrollAction::Approve, .subject = "n9", .key = Ed25519PublicKey {} },
-                       ConfiguredCredential { cfg, nullptr },
-                       dialer);
+    auto const approved = RunEnrollAdmin(
+        cfg, EnrollCommand { .action = EnrollAction::Approve, .subject = "n9", .key = Ed25519PublicKey {} }, nothing, dialer);
 
     REQUIRE_FALSE(approved.has_value());
     INFO("refusal: " << approved.error());
@@ -991,9 +991,9 @@ TEST_CASE("An enrollment command that reaches no --scheduler names every one it 
 {
     auto const cfg = TwoSchedulers();
     Testing::ScriptedDialer dialer { { {}, {} } };
+    Testing::PresentsNothing nothing;
 
-    auto const listed = RunEnrollAdmin(
-        cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, ConfiguredCredential { cfg, nullptr }, dialer);
+    auto const listed = RunEnrollAdmin(cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, nothing, dialer);
 
     REQUIRE_FALSE(listed.has_value());
     CHECK(listed.error().contains(std::format("{}, {}", FirstScheduler, SecondScheduler)));
@@ -1006,9 +1006,9 @@ TEST_CASE("A NotLeader sends an enrollment command to the leader it names, not d
     // to `SecondScheduler`, which the first has just said does not lead.
     auto const cfg = TwoSchedulers();
     Testing::ScriptedDialer dialer { { RedirectTo("10.0.0.9:7000"), QuietWindow() } };
+    Testing::PresentsNothing nothing;
 
-    auto const listed = RunEnrollAdmin(
-        cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, ConfiguredCredential { cfg, nullptr }, dialer);
+    auto const listed = RunEnrollAdmin(cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, nothing, dialer);
 
     REQUIRE(listed.has_value());
     CHECK(dialer.Dialed() == std::vector<std::string> { std::string { FirstScheduler }, "10.0.0.9:7000" });
@@ -1120,4 +1120,61 @@ TEST_CASE("The list shows where each row first asked from and marks a row asked 
     CHECK(lineFor("moved").contains("asked since from another address"));
     CHECK_FALSE(lineFor("stayed").contains("asked since from another address"));
     CHECK_FALSE(lineFor("mapped").contains("asked since from another address"));
+}
+
+TEST_CASE("An enrollment command presents a ticket for each endpoint it asks, the leader a redirect names included",
+          "[enrollment][client][ticket]")
+{
+    // A ticket names ONE audience, so the leader a `NotLeader` names is shown a ticket naming
+    // IT: the scheduler's would be refused there as minted for somebody else.
+    auto const cfg = TwoSchedulers();
+    auto const authOk = Wire::EncodeReply(Wire::Status::Ok, {});
+    auto behindAuth = [&](std::vector<std::byte> const& reply) {
+        auto replies = authOk;
+        replies.insert(replies.end(), reply.begin(), reply.end());
+        return replies;
+    };
+    Testing::ScriptedDialer dialer { { behindAuth(RedirectTo("10.0.0.9:7000")), behindAuth(QuietWindow()) } };
+    Testing::MintsForItsAudience node;
+    Cc::TicketCredentials tickets {
+        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {}, {}
+    };
+
+    auto const listed = RunEnrollAdmin(cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, tickets, dialer);
+
+    INFO("result: " << listed.value_or(listed.error_or("")));
+    REQUIRE(listed.has_value());
+    auto const asked = std::vector<std::string> { std::string { FirstScheduler }, "10.0.0.9:7000" };
+    REQUIRE(dialer.Dialed() == asked);
+    CHECK(node.audiences == asked);
+    for (auto const index: { std::size_t { 0 }, std::size_t { 1 } })
+    {
+        INFO(asked[index]);
+        auto const sent = dialer.SentOn(index);
+        auto const header = Wire::DecodeRequestHeader(sent);
+        REQUIRE(header.has_value());
+        REQUIRE(Unwrap(header).opRaw == static_cast<std::uint8_t>(Wire::Op::Auth));
+        auto const auth = Wire::DecodeAuthPayload(sent.subspan(Wire::RequestHeaderSize, Unwrap(header).payloadLength));
+        REQUIRE(auth.has_value());
+        CHECK(Unwrap(auth).kind == Wire::AuthKind::MachineTicket);
+        CHECK(Wire::AsStringView(Unwrap(auth).secret) == Testing::TicketFor(asked[index]));
+    }
+}
+
+TEST_CASE("An enrollment command refused for want of a ticket says why there was none", "[enrollment][client][ticket]")
+{
+    // The mint failed, so the ask went out unauthenticated and was refused `NotAMember`: what the
+    // operator is told is the thing to fix -- this machine's node -- not the refusal it caused.
+    auto const cfg = TwoSchedulers();
+    Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, {}) } };
+    Testing::MintsForItsAudience node;
+    node.unreachableAfter = 0;
+    Cc::TicketCredentials tickets {
+        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {}, {}
+    };
+
+    auto const refused = RunEnrollAdmin(cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, tickets, dialer);
+
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == Cc::ReasonFor(Cc::MintFailure::Unreachable));
 }

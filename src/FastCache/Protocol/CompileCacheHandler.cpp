@@ -148,6 +148,13 @@ namespace
                             .code = Wire::NoCompileWorker::Code,
                             .why = "this endpoint runs no compile worker: it is a cache, so there is nothing here to "
                                    "cordon; ask the fastcache-compile-node on this machine" },
+        // With the node rows and for their reason: a machine ticket is minted from THIS
+        // machine's own identity, which a cache holds none of. A client told this goes to
+        // the compile node on its machine, which is the only place that identity lives.
+        Wire::RefusedVerb { .op = Wire::Op::MintTicket,
+                            .code = Wire::ErrorCode::DispatchNotPermitted,
+                            .why = "this endpoint is a cache, not a compile node: it mints no tickets; ask the "
+                                   "fastcache-compile-node on this machine to mint one" },
         // **`NoCluster`, with the cluster rows and NOT with the node rows
         // above.** `Enroll` is a self-service `ClusterAdmit` -- it asks to be written
         // into the replicated membership configuration, and `EnrollControl`'s `Approve`
@@ -1240,8 +1247,6 @@ core::async::Task<void> CompileCacheHandler::Run(core::net::ISocket* socket,
             case Wire::Op::ClusterStatus:
             case Wire::Op::ClusterSet:
             case Wire::Op::ClusterForget:
-            case Wire::Op::ClusterAdmitClient:
-            case Wire::Op::ClusterForgetClient:
             case Wire::Op::ClusterAdmit:
             case Wire::Op::ClusterAdmitLearner:
             case Wire::Op::ClusterAdmitWorker:
@@ -1259,6 +1264,7 @@ core::async::Task<void> CompileCacheHandler::Run(core::net::ISocket* socket,
             case Wire::Op::NodeMetrics:
             case Wire::Op::ExplainAdmission:
             case Wire::Op::Cordon:
+            case Wire::Op::MintTicket:
             // The enrollment pair, answered by a compile node that runs consensus. Same
             // arm for the same reason: `RefusalFor` is the one place the code and the
             // sentence are decided.

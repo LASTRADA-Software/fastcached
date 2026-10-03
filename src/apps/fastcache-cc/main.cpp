@@ -68,6 +68,7 @@
 #include "ReplayGuard.hpp"
 #include "RootReconciler.hpp"
 #include "Stats.hpp"
+#include "TicketCredentials.hpp"
 #include "ToolchainHost.hpp"
 #include "ToolchainProbe.hpp"
 
@@ -198,10 +199,11 @@ struct Config
     /// compile, which is the same shape every other cache failure has here.
     std::string schedulerAddr;
 
-    /// Credential presented to the daemon, empty when none is configured. Held
-    /// here rather than read at each exchange so every round trip on one
-    /// invocation presents the same thing — and so there is exactly one place
-    /// that decides whether this build authenticates at all.
+    /// The PASSWORD configured for the cache at `addr` (`FASTCACHE_TOKEN`), empty when none
+    /// is. Presented to that one endpoint alone: every other machine is shown a machine
+    /// ticket this machine's node mints per exchange (`Tickets`), and a token sent there
+    /// would stand in for a ticket and admit nobody. Held here rather than read at each
+    /// exchange so every round trip on one invocation presents the same thing.
     Cc::Credential credential;
     /// Deadline for one whole exchange with the daemon or the scheduler. The
     /// default keeps a wedged peer from hanging a build while staying far
@@ -826,16 +828,19 @@ void TraceOutcome(InvocationRecord& record, std::string_view outcome, std::strin
 /// useless for an entire build with nothing at all to show for it.
 /// @param record The invocation record; read here, never written.
 /// @param outcome The completed exchange.
+/// @param missing Why that exchange presented no ticket, when one was due; `RecordedReason` says
+///        it in place of the refusal it caused.
 /// @param what Short label for the operation, e.g. "STORE (raw)".
 /// @param key The key involved.
 void WarnIfRejected(InvocationRecord const& record,
                     Cc::CacheOutcome const& outcome,
+                    std::optional<Cc::MintFailure> missing,
                     std::string_view what,
                     std::string_view key)
 {
     if (outcome.kind != Cc::CacheOutcomeKind::Rejected)
         return;
-    Note(record.verbose, std::format("{} key={} {}", what, key, Cc::DescribeOutcome(outcome)));
+    Note(record.verbose, std::format("{} key={} {}", what, key, Cc::RecordedReason(outcome, missing)));
 }
 
 /// Report a compile whose roots do not describe it at all.
@@ -1220,6 +1225,27 @@ void ReportVerification(InvocationRecord const& record, Cc::HitComparison const&
     return DispatchBudgetsOf(cfg).control;
 }
 
+/// What each exchange this invocation makes presents: the password to the cache it was
+/// configured for, nothing over loopback, and to every other machine a ticket this machine's
+/// node mints for that exchange alone.
+///
+/// A function-local `static` for `Notice`'s reason: one process serves one compile, so the
+/// first call's configuration is the only one there is. A failed mint is said once through
+/// `Note`, and travels with the exchange it failed for (`PresentedCredential::missing`) into
+/// `RecordedReason`, so the record names it only against a refusal it caused. The mint runs
+/// over its own RAW exchange, at the cache's budget: a loopback round trip.
+/// @param cfg The launcher configuration.
+/// @param verbose Whether FASTCACHE_VERBOSE was set; `InvocationRecord::verbose`.
+/// @return The credentials.
+[[nodiscard]] Cc::TicketCredentials& Tickets(Config const& cfg, bool verbose)
+{
+    static auto const raw = Cc::MakeTcpExchange(Notice(verbose));
+    static Cc::TicketCredentials tickets { *raw,           Cc::TicketSourceFor(cfg.addr),
+                                           cfg.credential, cfg.addr,
+                                           BudgetOf(cfg),  [verbose](std::string_view text) { Note(verbose, text); } };
+    return tickets;
+}
+
 /// The grammar to tag a stored TEXT REGION with, per compiler flavor.
 ///
 /// `ShowIncludes` for the MSVC family and a diagnostics grammar for the GNU one,
@@ -1598,11 +1624,12 @@ struct ProbedDependencies
                                                              Config const& cfg,
                                                              std::string const& key)
 {
+    auto const presented = Tickets(cfg, record.verbose).Present(cfg.addr);
     auto outcome =
-        Cc::RunOneExchange(cfg.addr, Notice(record.verbose), Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
+        Cc::RunOneExchange(cfg.addr, Notice(record.verbose), Wire::EncodeFetch(key), presented.credential, BudgetOf(cfg));
     if (!outcome.IsHit())
     {
-        WarnIfRejected(record, outcome, "manifest fetch", key);
+        WarnIfRejected(record, outcome, presented.missing, "manifest fetch", key);
         return std::nullopt;
     }
     return std::move(outcome.value);
@@ -1630,6 +1657,7 @@ void StoreRaw(InvocationRecord const& record,
     // Check the outcome rather than discarding it: a rejected STORE is silent
     // otherwise, and a manifest that never lands makes direct mode look simply
     // ineffective.
+    auto const presented = Tickets(cfg, record.verbose).Present(addr);
     auto const outcome = Cc::RunOneExchange(addr,
                                             Notice(record.verbose),
                                             Wire::EncodeStore(Wire::StoreRequest { .key = key,
@@ -1637,9 +1665,9 @@ void StoreRaw(InvocationRecord const& record,
                                                                                    .srcRoot = cfg.srcRoot,
                                                                                    .buildTree = cfg.buildTree,
                                                                                    .value = Wire::AsBytes(body) }),
-                                            cfg.credential,
+                                            presented.credential,
                                             BudgetOf(cfg));
-    WarnIfRejected(record, outcome, "STORE (raw)", key);
+    WarnIfRejected(record, outcome, presented.missing, "STORE (raw)", key);
 }
 
 /// What became of a cache hit we tried to honour.
@@ -2343,8 +2371,13 @@ void RecordManifest(InvocationRecord const& record,
                                 : std::string_view {};
     auto const sourceRootReplacement = sourceRoot.empty() ? std::string_view {} : std::string_view { sourceName };
 
+    // Every endpoint the dispatch dials -- the scheduler, the worker its grant names, whoever
+    // issued the lease -- is shown a ticket minted for it, so the credential handed to
+    // `Dispatch` is none: the decorator asks per dial.
     auto const exchange = Cc::MakeTcpExchange(Notice(record.verbose));
-    auto const outcome = Cc::Dispatch(*exchange,
+    auto& tickets = Tickets(cfg, record.verbose);
+    Cc::CredentialedExchange credentialed { *exchange, tickets };
+    auto const outcome = Cc::Dispatch(credentialed,
                                       Cc::DispatchRequest { .schedulerEndpoint = cfg.schedulerAddr,
                                                             .fingerprint = identity.fingerprint,
                                                             .objectKey = key,
@@ -2356,10 +2389,11 @@ void RecordManifest(InvocationRecord const& record,
                                                             .sourceRoot = sourceRoot,
                                                             .sourceRootReplacement = sourceRootReplacement },
                                       DispatchBudgetsOf(cfg),
-                                      cfg.credential);
-    // What the fleet's own answer means on the statistics axis, decided once and in
-    // `Stats`, which is where it can be asserted -- `main.cpp` is in no test target.
-    auto const fleetAnswer = Cc::RecordingFor(outcome.status, outcome.decline);
+                                      Cc::Credential {});
+    // What the fleet's own answer means on the statistics axis, decided once and in a
+    // tested file -- `main.cpp` is in no test target. A decline whose DECLINING exchange
+    // presented no ticket is recorded under WHY, which names the thing to fix.
+    auto const fleetAnswer = Cc::RecordedReason(outcome, credentialed.Refusals());
 
     if (outcome.status == Cc::DispatchStatus::Mismatched)
     {
@@ -2783,8 +2817,9 @@ void RecordManifest(InvocationRecord const& record,
 
     // FETCH.
     {
-        auto const outcome =
-            Cc::RunOneExchange(cfg.addr, Notice(record.verbose), Wire::EncodeFetch(key), cfg.credential, BudgetOf(cfg));
+        auto const presented = Tickets(cfg, record.verbose).Present(cfg.addr);
+        auto const outcome = Cc::RunOneExchange(
+            cfg.addr, Notice(record.verbose), Wire::EncodeFetch(key), presented.credential, BudgetOf(cfg));
         fetchKind = outcome.kind;
         if (!Cc::CacheIsServing(fetchKind))
         {
@@ -2797,7 +2832,9 @@ void RecordManifest(InvocationRecord const& record,
             // string so the tally gets a row per cause rather than one per compile.
             if (fetchKind == Cc::CacheOutcomeKind::Rejected)
             {
-                WarnAndCarryOn(record, Cc::DescribeOutcome(outcome));
+                // A refusal THIS exchange's missing ticket explains is recorded under WHY no
+                // ticket was presented -- the thing to fix -- rather than the refusal it caused.
+                WarnAndCarryOn(record, Cc::RecordedReason(outcome, presented.missing));
 
                 // A refusal that will be true of every unit of this build is said out
                 // loud, once per interval, whatever the verbosity (#181). The tally
@@ -3085,6 +3122,7 @@ void RecordManifest(InvocationRecord const& record,
     // now with the daemon's own reason, which the bare acknowledgement byte the
     // old framing carried could never express. An unreachable daemon lands here as
     // a transport failure, which reads the same way it always did.
+    auto const presented = Tickets(cfg, record.verbose).Present(cfg.addr);
     auto const outcome =
         Cc::RunOneExchange(cfg.addr,
                            Notice(record.verbose),
@@ -3093,12 +3131,13 @@ void RecordManifest(InvocationRecord const& record,
                                                                   .srcRoot = cfg.srcRoot,
                                                                   .buildTree = cfg.buildTree,
                                                                   .value = std::span<std::byte const> { encoded } }),
-                           cfg.credential,
+                           presented.credential,
                            BudgetOf(cfg));
     if (outcome.IsHit())
         Note(record.verbose, std::format("STORED key={} bytes={}", key, encoded.size()));
     else if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
-        Note(record.verbose, std::format("STORE key={} bytes={} {}", key, encoded.size(), Cc::DescribeOutcome(outcome)));
+        Note(record.verbose,
+             std::format("STORE key={} bytes={} {}", key, encoded.size(), Cc::RecordedReason(outcome, presented.missing)));
     else
         Note(record.verbose, std::format("STORE exchange failed key={}", key));
 

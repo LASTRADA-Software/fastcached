@@ -305,7 +305,6 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
     _cfg { parts.cfg },
     _reloader { parts.reloader },
     _cacheTier { parts.cacheTier },
-    _credential { parts.credential },
     _prover { parts.prover },
     _metrics { parts.metrics },
     _logger { parts.logger },
@@ -342,8 +341,6 @@ WorkerTier::WorkerTier(WorkerTierParts const& parts,
                                   .served = 0,
                                   .discovered = static_cast<std::uint32_t>(_discovered.entries.size()) } },
     _advertisedWire { Distributed::CapacityToWire(parts.capacity) },
-    _registrarNotice { [&logger =
-                            parts.logger](std::string_view text) { logger.Logf(LogLevel::Warn, "scheduler: {}", text); } },
     _dialer { HeartbeatIoTimeout },
     _link { std::move(link) }
 {
@@ -387,7 +384,7 @@ std::vector<Cc::WorkerRegistrar> WorkerTier::RegistrarsFor(std::map<std::string,
         // node-wide (#194).
         auto perToolchain = _advertisedWire;
         perToolchain.toolchainLabel = toolchain.label;
-        built.emplace_back(_registrarNotice, fingerprint, advertised, _slots, Cc::AvailableCodecs(), perToolchain);
+        built.emplace_back(fingerprint, advertised, _slots, Cc::AvailableCodecs(), perToolchain);
     }
     return built;
 }
@@ -444,8 +441,6 @@ void WorkerTier::Heartbeat(std::stop_token const& stop, core::platform::IClock c
                                  .loadSampler = *loadSampler,
                                  .cacheTier = _cacheTier,
                                  .metrics = _metrics,
-                                 .credential = _credential,
-                                 .notice = _registrarNotice,
                                  .prover = _prover,
                                  .lease = *_leaseState,
                                  .logger = _logger };

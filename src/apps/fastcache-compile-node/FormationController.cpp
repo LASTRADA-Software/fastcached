@@ -328,7 +328,7 @@ void FormationController::OnClusterState(Cluster::ClusterState const& state,
 
         // Forgotten first: a state that forgot this node says nothing more about it, and whatever
         // else it holds is about a cluster this node is leaving.
-        if (Cluster::IsSelfForgotten(state, _self.nodeId, HostOfEndpoint(_self.raftEndpoint)))
+        if (Cluster::IsSelfForgotten(state, _self.nodeId))
             triggers.emplace_back(FormationTrigger::SelfForgotten, "the cluster forgot this node");
         else
         {

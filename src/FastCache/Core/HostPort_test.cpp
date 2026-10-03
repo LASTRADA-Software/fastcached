@@ -205,6 +205,60 @@ TEST_CASE("A name every machine resolves to itself is told apart from one a peer
     CHECK_FALSE(IsLoopbackHost("localhost"));
 }
 
+TEST_CASE("Loopback is an IP literal inside 127.0.0.0/8 or ::1, and a name never is", "[core][hostport]")
+{
+    // The whole /8, as literals.
+    for (auto const* literal: { "127.0.0.1", "127.5.5.5", "127.255.255.255", "127.0.0.0", "::1", "::ffff:127.5.5.5" })
+    {
+        INFO(literal);
+        CHECK(IsLoopbackHost(literal));
+    }
+
+    // A NAME beginning `127.` was loopback while this matched a prefix, and that direction
+    // is fail-OPEN wherever the answer decides whether a port faces other machines. So is
+    // every text that is not four decimal octets.
+    for (auto const* notLiteral: { "127.cache.example.com",
+                                   "127.0.0.1.example.com",
+                                   "127.",
+                                   "127.1",
+                                   "127.0.1",
+                                   "127.0.0.1.",
+                                   "127.0.0.256",
+                                   "127.0.0.-1",
+                                   "127.0.0.0001",
+                                   "127..0.1",
+                                   "::ffff:127.cache.example.com",
+                                   "0:0:0:0:0:0:0:1x" })
+    {
+        INFO(notLiteral);
+        CHECK_FALSE(IsLoopbackHost(notLiteral));
+    }
+}
+
+TEST_CASE("A host names no one machine when every machine answers to it", "[core][hostport]")
+{
+    for (auto const* everybody: { "127.0.0.1",
+                                  "127.5.5.5",
+                                  "::1",
+                                  "::ffff:127.0.0.1",
+                                  "localhost",
+                                  "LOCALHOST",
+                                  "LocalHost",
+                                  "build.localhost",
+                                  "localhost.",
+                                  "0.0.0.0",
+                                  "::" })
+    {
+        INFO(everybody);
+        CHECK(NamesNoOneMachine(everybody));
+    }
+    for (auto const* one: { "office.corp", "10.0.0.7", "2001:db8::5", "127.cache.example.com", "localhost.corp" })
+    {
+        INFO(one);
+        CHECK_FALSE(NamesNoOneMachine(one));
+    }
+}
+
 TEST_CASE("An endpoint gives up its host without dropping a bare one", "[core][hostport]")
 {
     // The two shapes `SplitHostPort` answers for.

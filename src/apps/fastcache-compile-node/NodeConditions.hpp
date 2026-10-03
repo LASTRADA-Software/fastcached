@@ -41,7 +41,6 @@ enum class NodeCondition : std::uint8_t
     ScratchRootUnmappable,          ///< The worker's scratch root cannot be written into a debug-prefix-map rule (#810).
     GeneratedTlsCertificate,        ///< The admin surface serves a certificate generated at startup.
     EnrollmentWindowOpen,           ///< An armed auto-approve window admits whoever asks, unexamined (#1298).
-    ForgottenFleetMember,           ///< `--fleet-member` names a host the cluster has forgotten (#1309).
     UnreadableLeaderSnapshot,       ///< This build cannot read the snapshot its leader sends, so it stays behind (#1552).
     UnqualifiedHostName,            ///< Peers are told to dial a host name with no domain.
     HostNameReachesOnlyThisMachine, ///< This machine's name reaches only itself, so nothing offers it.
@@ -165,14 +164,6 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .remedy = "Check who got in with --enroll-list, which marks each auto-approved row with when the window was "
                 "armed, and compare each key with the one its machine printed. --enroll-auto-approve=off ends the "
                 "window; so does a restart or a change of leader, since it is held in the leader's memory alone." },
-    { .condition = NodeCondition::ForgottenFleetMember,
-      .id = "forgotten-fleet-member",
-      .persistence = CompileCacheWire::ConditionPersistence::Live,
-      .severity = CompileCacheWire::ConditionSeverity::Warning,
-      .scope = ConditionScope::Consensus,
-      .remedy = "Remove these hosts from this node's --fleet-member list (fleet_member in its configuration file) and "
-                "reload it. They are refused either way, because the cluster's forget outranks the listing; if the "
-                "forget was a mistake, --cluster-admit-client undoes it for every node instead." },
     { .condition = NodeCondition::UnreadableLeaderSnapshot,
       .id = "unreadable-leader-snapshot",
       .persistence = CompileCacheWire::ConditionPersistence::Live,

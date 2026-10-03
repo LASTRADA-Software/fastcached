@@ -1045,8 +1045,8 @@ function Invoke-SelfTest {
     # so a decision that always surveys, or never throws, fails a row rather than passing
     # the two it happens to agree with. The ready lines are the node's own shape
     # (`main.cpp`'s ready line, `WorkerReadinessPhrase`).
-    $workerReady = "[INFO] compile node ready on 127.0.0.1:22207, advertising 127.0.0.1:22207, 1 slot(s) as a workstation node, identifying 1 toolchain(s), every caller admitted"
-    $noWorkerReady = "[INFO] compile node ready on 127.0.0.1:22207, advertising 127.0.0.1:22207, running no worker, every caller admitted"
+    $workerReady = "[INFO] compile node ready on 127.0.0.1:22207, advertising 127.0.0.1:22207, 1 slot(s) as a workstation node, identifying 1 toolchain(s), admits this machine, and machines the roster admits by key or ticket, and every other caller (--fleet-open)"
+    $noWorkerReady = "[INFO] compile node ready on 127.0.0.1:22207, advertising 127.0.0.1:22207, running no worker, admits this machine, and machines the roster admits by key or ticket, and every other caller (--fleet-open)"
     $surveyCases = @(
         @{  Name = "a worker expected and reported is surveyed"
             Got = (Get-SurveyDecision "workerA" $workerReady $true)

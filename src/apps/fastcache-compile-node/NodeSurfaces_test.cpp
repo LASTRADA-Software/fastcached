@@ -28,15 +28,17 @@ using FastCache::Testing::Unwrap;
 namespace
 {
 
-/// The documented worker command line, minus `--cluster-dir`.
+/// The documented worker command line, with an admin surface asked to serve TLS two ways.
 ///
 /// **A configuration with exactly one thing wrong**, which is what #582's cases need: a
 /// fixture broken two ways would assert nothing about which rule answered. It used to be the
-/// documented scheduler line minus the cluster's pre-shared key; #178 retired the key, and a
-/// worker that names a scheduler with nowhere to keep its identity is the shape a
-/// `StartupPolicyRejection` row now refuses. Every other field is present.
+/// documented scheduler line minus the cluster's pre-shared key, which #178 retired; then a
+/// worker admitting everybody AND a list, which went with `--fleet-member` when admission came
+/// to follow the machine. `--tls-self-signed` beside `--tls-cert` is a `StartupPolicyRejection`
+/// row that opens no port of its own, so the worksheet cannot differ between it and its repair
+/// (`WithoutTheContradiction`). Every other field is present.
 /// @return The config.
-[[nodiscard]] NodeConfig WorkerAdmittingTwoWays()
+[[nodiscard]] NodeConfig WorkerServingTlsTwoWays()
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.nodeListen = "0.0.0.0:6674";
@@ -45,10 +47,19 @@ namespace
     cfg.advertiseExplicit = true;
     cfg.toolchains = { "/usr/bin/g++" };
     cfg.clusterDir = "cluster";
-    // `--fleet-open` beside `--fleet-member`: a contradiction the startup table refuses, and
-    // one that opens no port, so the worksheet cannot differ between it and its repair.
-    cfg.fleetOpen = true;
-    cfg.fleetMembers = { "10.0.0.1:6676" };
+    cfg.adminListen = "127.0.0.1:9100";
+    cfg.tlsSelfSigned = true;
+    cfg.tlsCertFile = "admin.pem";
+    cfg.tlsKeyFile = "admin.key";
+    return cfg;
+}
+
+/// @param cfg A `WorkerServingTlsTwoWays` configuration.
+/// @return It with the named certificate dropped, so the generated one is the only one asked for.
+[[nodiscard]] NodeConfig WithoutTheContradiction(NodeConfig cfg)
+{
+    cfg.tlsCertFile.clear();
+    cfg.tlsKeyFile.clear();
     return cfg;
 }
 
@@ -394,9 +405,9 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
 
     SECTION("a configuration that would not start is printed AND refused")
     {
-        // The documented worker line, admitting both everybody and a list -- a
+        // The documented worker line, asking for a generated certificate AND naming one -- a
         // `StartupPolicyRejection` row.
-        auto cfg = WorkerAdmittingTwoWays();
+        auto cfg = WorkerServingTlsTwoWays();
 
         auto const report = ReportSurfaces(cfg);
 
@@ -408,7 +419,7 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
 
         // And refused, which is what the exit code follows from.
         REQUIRE(report.refusal.has_value());
-        CHECK(Unwrap(report.refusal).starts_with("--fleet-open and --fleet-member contradict each other"));
+        CHECK(Unwrap(report.refusal).starts_with("--tls-self-signed and --tls-cert contradict each other"));
 
         // **The table's own words, byte for byte.** A second phrasing here would be a
         // second thing to be wrong, and an operator who met one sentence from this flag
@@ -421,8 +432,7 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
     {
         // The control, and the ticket names it explicitly: without it, a flag that
         // always fails satisfies the section above.
-        auto cfg = WorkerAdmittingTwoWays();
-        cfg.fleetMembers.clear();
+        auto const cfg = WithoutTheContradiction(WorkerServingTlsTwoWays());
 
         auto const report = ReportSurfaces(cfg);
         CHECK(report.text.contains("0.0.0.0:6674")); // the RESOLVED endpoint, which is what the flag exists to print
@@ -434,12 +444,12 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
         // The map does not change shape according to the verdict: judging and rendering
         // are two answers about one configuration, and a reader comparing a broken run
         // with a fixed one should see the map differ only where the configuration does.
-        auto broken = WorkerAdmittingTwoWays();
-        auto fixed = broken;
-        fixed.fleetMembers.clear();
+        auto const broken = WorkerServingTlsTwoWays();
+        auto const fixed = WithoutTheContradiction(broken);
 
-        // Admission opens no port, so it appears in no surface row -- which is what makes this
-        // comparison exact rather than approximate.
+        // Both serve the admin surface over TLS on the one port, and which certificate it presents
+        // appears in no surface row -- which is what makes this comparison exact rather than
+        // approximate.
         CHECK(ReportSurfaces(broken).text == ReportSurfaces(fixed).text);
     }
 }

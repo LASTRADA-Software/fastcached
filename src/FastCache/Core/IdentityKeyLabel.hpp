@@ -26,8 +26,9 @@ namespace FastCache
 ///
 /// ONE enum for every construction rather than one per construction, because the question a label
 /// answers is asked ACROSS them: one key signs a node's discovery proofs, its fleet summaries, its
-/// roster endorsements, its leases, both halves of its Raft handshake and both halves of its node
-/// proof, so a label is the only thing keeping a signature made for one from verifying as another.
+/// roster endorsements, its leases, both halves of its Raft handshake, both halves of its node
+/// proof and its machine tickets, so a label is the only thing keeping a signature made for one
+/// from verifying as another.
 enum class IdentityKeyPurpose : std::uint8_t
 {
     DiscoveryProof,      ///< A discovery proof: the answer to a challenge this node was sent.
@@ -38,6 +39,7 @@ enum class IdentityKeyPurpose : std::uint8_t
     RaftAcceptorVerdict, ///< A Raft peer acceptor's verdict on that proof.
     NodeServerChallenge, ///< A node-proof server's challenge.
     NodeProof,           ///< A node-proof caller's proof.
+    MachineTicket,       ///< A machine ticket: this machine speaks, to ONE audience, for a minute.
     Last,                ///< Not a construction, and has no row: the length of a table keyed by one.
 };
 
@@ -62,6 +64,8 @@ struct IdentityKeyLabel
 ///   transcript one field longer is another construction whatever its arity, since a
 ///   length-prefixed grammar separates fields and not field LISTS.
 /// - `node-challenge-v2`, `node-proof-v2`: `node-proof-v1` was the pre-shared key's MAC label.
+/// - `ticket-v1`: new with its construction (spec §5), and the label tickets were first signed
+///   under, so routing them through this table moved no byte on the wire.
 inline constexpr EnumTable<IdentityKeyPurpose, IdentityKeyLabel> IdentityKeyLabels { {
     { .purpose = IdentityKeyPurpose::DiscoveryProof, .label = "fastcache-discovery-proof-v3" },
     { .purpose = IdentityKeyPurpose::FleetSummary, .label = "fastcache-fleet-summary-v1" },
@@ -71,6 +75,7 @@ inline constexpr EnumTable<IdentityKeyPurpose, IdentityKeyLabel> IdentityKeyLabe
     { .purpose = IdentityKeyPurpose::RaftAcceptorVerdict, .label = "fastcache-raft-verdict-v3" },
     { .purpose = IdentityKeyPurpose::NodeServerChallenge, .label = "fastcache-node-challenge-v2" },
     { .purpose = IdentityKeyPurpose::NodeProof, .label = "fastcache-node-proof-v2" },
+    { .purpose = IdentityKeyPurpose::MachineTicket, .label = "fastcache-ticket-v1" },
 } };
 
 static_assert(RowsInEnumeratorOrder(IdentityKeyLabels, &IdentityKeyLabel::purpose),

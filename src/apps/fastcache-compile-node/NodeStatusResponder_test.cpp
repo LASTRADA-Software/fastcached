@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "EnrollmentWindow.hpp"
+#include "MachineStandingTestUtils.hpp"
 #include "NodeConfig.hpp"
 #include "NodeStatusResponder.hpp"
 #include "Responders.hpp"
 
+#include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -112,8 +114,9 @@ class CapturedReadings final: public ILiveStatsSources
 
 /// The peer every `AnswerNow` below arrives from.
 ///
-/// Named rather than spelled at each site, because half these cases turn on it being on
-/// a member list and the other half on it not being.
+/// Named rather than spelled at each site, because half these cases turn on it being admitted
+/// and the other half on it not being. Not this machine, so a fake admitting it stands for the
+/// open policy -- the one route that admits a remote host by address.
 constexpr std::string_view CallerAddress = "10.0.0.7";
 
 /// Which port each surface is given, so an assertion can name one number.
@@ -131,6 +134,9 @@ constexpr std::uint32_t DiscoveryPort = 9103;
     return frame;
 }
 
+/// What every case that does not ask `explain-admission` about a machine is handed: no roster.
+Testing::FixedStanding const HoldsNoRoster {};
+
 /// Run a responder's `Answer` to completion.
 ///
 /// Every arm here is synchronous -- these verbs read nothing and suspend nowhere -- so
@@ -141,6 +147,18 @@ constexpr std::uint32_t DiscoveryPort = 9103;
 [[nodiscard]] std::vector<std::byte> AnswerNow(IFrameResponder& responder, std::span<std::byte const> frame)
 {
     return core::async::syncRun(responder.Answer(frame, PeerIdentity { .host = std::string { CallerAddress } })).bytes;
+}
+
+/// Run a responder's `Answer` to completion, from @p peer.
+/// @param responder What to ask.
+/// @param frame The request.
+/// @param peer Who asks, and what its connection established.
+/// @return The reply bytes.
+[[nodiscard]] std::vector<std::byte> AnswerFrom(IFrameResponder& responder,
+                                                std::span<std::byte const> frame,
+                                                PeerIdentity peer)
+{
+    return core::async::syncRun(responder.Answer(frame, std::move(peer))).bytes;
 }
 
 /// The bytes following a reply header.
@@ -246,8 +264,6 @@ struct DirectSources
 {
     CompileCapacity const* capacity { nullptr };                ///< Live slot accounting.
     Distributed::SchedulerService const* scheduler { nullptr }; ///< Role and known leader.
-    /// The admission oracle, for its applied-tombstone count; null is a node with no cluster.
-    NodeMembership const* membership { nullptr };
     /// Where consensus counts this node; null is a node running no consensus (#1449).
     IConsensusStandingSource const* consensus { nullptr };
     /// The node's condition registry; null is a build that reports none (#1364).
@@ -291,7 +307,6 @@ struct Fixture
                                       .capacity = direct.capacity,
                                       .scheduler = direct.scheduler,
                                       .enrollment = direct.enrollment,
-                                      .membership = direct.membership,
                                       .consensus = direct.consensus,
                                       .conditions = direct.conditions } }
     {
@@ -772,11 +787,10 @@ TEST_CASE("NodeStatus answers a member with what the node is", "[node][node-stat
     // admits everyone cannot tell *the gate is wired* from *the gate admits everyone*, which
     // is the shape a loopback-only fixture already cost this tree once (#235). The route is
     // named at the site because which route admits is this case's fact (#1497).
-    ListedMembership const membership { { std::string { CallerAddress } },
-                                        Distributed::MembershipParticipant::FleetMemberList };
+    ListedMembership const membership { { std::string { CallerAddress } }, Distributed::MembershipParticipant::OpenPolicy };
     Fixture const fixture { { .admin = true, .raft = true }, clock, { .cacheTier = true, .worker = true } };
     CapturedReadings const readings { metrics, {} };
-    NodeStatusResponder responder { fixture.status, readings, membership, metrics };
+    NodeStatusResponder responder { fixture.status, readings, membership, HoldsNoRoster, metrics };
 
     clock.advance(5s);
     auto const reply = AnswerNow(responder, HeaderFor(Wire::Op::NodeStatus));
@@ -807,14 +821,13 @@ TEST_CASE("NodeMetrics answers the reading /metrics renders, the cache tier's fi
     // could not see.
     core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { std::string { CallerAddress } },
-                                        Distributed::MembershipParticipant::FleetMemberList };
+    ListedMembership const membership { { std::string { CallerAddress } }, Distributed::MembershipParticipant::OpenPolicy };
     Fixture const fixture { {}, clock };
 
     auto snapshot = MetricsSnapshot {};
     snapshot.storage = StorageStats { .itemCount = 3, .deleteHits = 2, .deleteMisses = 1 };
     CapturedReadings readings { metrics, snapshot };
-    NodeStatusResponder responder { fixture.status, readings, membership, metrics };
+    NodeStatusResponder responder { fixture.status, readings, membership, HoldsNoRoster, metrics };
 
     metrics.Increment(IMetricsSink::Counter::WorkerJobsCompleted, 7);
 
@@ -864,78 +877,16 @@ TEST_CASE("NodeMetrics answers the reading /metrics renders, the cache tier's fi
     }
 }
 
-TEST_CASE("the applied-tombstone count is absent with no cluster, zero with one, and a number after a forget",
-          "[node][node-status][forget]")
-{
-    // #1471's second acceptance clause. THREE readings, because two would not distinguish the
-    // field working from the field always saying nothing: an implementation that reports absent
-    // unconditionally passes any case that only checks the unwired arm.
-    core::platform::ManualClock clock;
-
-    SECTION("a node with no cluster reports NOTHING, not zero")
-    {
-        // The source is null, which is how this node reports a fact it has no component for --
-        // `NodeRuntimeSources`' own rule. A `0` here would be a reassuring claim about a
-        // committed set that does not exist on this machine.
-        Fixture fix { ConfigShape {}, clock };
-        auto const fields = fix.status.Describe();
-
-        CHECK_FALSE(fields.runtime.forgottenClients.has_value());
-    }
-
-    SECTION("a node with a cluster that forgets nobody reports ZERO")
-    {
-        // The arm the ticket names, and the direction that gets skipped. Zero is the truth
-        // about a cluster that has agreed no forgets, and it is a different answer from the
-        // section above -- which is the whole distinction being tested.
-        NullLogger logger;
-        auto const cfg = NodeConfigOf(ConfigShape {});
-        NodeMembership membership { cfg, logger };
-
-        Fixture fix { ConfigShape {}, clock, {}, std::nullopt, DirectSources { .membership = &membership } };
-        auto const fields = fix.status.Describe();
-
-        REQUIRE(fields.runtime.forgottenClients.has_value());
-        CHECK(Unwrap(fields.runtime.forgottenClients) == 0);
-    }
-
-    SECTION("and the count is what a forget produces")
-    {
-        // Read per request, so an entry applied a moment ago is visible on the next
-        // `--node-status` rather than at the next restart -- asserted by publishing AFTER the
-        // status object was built and bound.
-        NullLogger logger;
-        auto const cfg = NodeConfigOf(ConfigShape {});
-        NodeMembership membership { cfg, logger };
-
-        Fixture fix { ConfigShape {}, clock, {}, std::nullopt, DirectSources { .membership = &membership } };
-        // Bound to a named local before unwrapping: `Unwrap` returns a REFERENCE, so reaching
-        // through a `Describe()` temporary would read a value whose owner has already died --
-        // the same hazard this file's own fixture exists to make unspellable.
-        auto const before = fix.status.Describe();
-        REQUIRE(before.runtime.forgottenClients.has_value());
-        REQUIRE(Unwrap(before.runtime.forgottenClients) == 0);
-
-        auto state = Cluster::ClusterState {};
-        state.forgotten = { "10.0.0.7", "10.0.0.8" };
-        membership.PublishCluster(state);
-
-        auto const fields = fix.status.Describe();
-        REQUIRE(fields.runtime.forgottenClients.has_value());
-        CHECK(Unwrap(fields.runtime.forgottenClients) == 2);
-    }
-}
-
 TEST_CASE("The operator verbs are refused by name to a non-member, and counted once", "[node][node-status]")
 {
     core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { "10.0.0.9" }, Distributed::MembershipParticipant::FleetMemberList };
+    ListedMembership const membership { { "10.0.0.9" }, Distributed::MembershipParticipant::OpenPolicy };
     Fixture const fixture { { .admin = true }, clock };
     CapturedReadings const readings { metrics, {} };
-    NodeStatusResponder responder { fixture.status, readings, membership, metrics };
+    NodeStatusResponder responder { fixture.status, readings, membership, HoldsNoRoster, metrics };
 
-    // `CallerAddress` is not on that list.
+    // `CallerAddress` is not one the policy admits.
     auto const shape = ShapeOf(AnswerNow(responder, HeaderFor(Wire::Op::NodeStatus)));
 
     // WHICH refusal, not merely that one happened: `NotAMember` and `Unauthenticated`
@@ -964,9 +915,8 @@ TEST_CASE("The operator verbs are refused by name to a non-member, and counted o
 
     SECTION("and a listed member is served, so the gate is not simply refusing everyone")
     {
-        ListedMembership const listed { { std::string { CallerAddress } },
-                                        Distributed::MembershipParticipant::FleetMemberList };
-        NodeStatusResponder served { fixture.status, readings, listed, metrics };
+        ListedMembership const listed { { std::string { CallerAddress } }, Distributed::MembershipParticipant::OpenPolicy };
+        NodeStatusResponder served { fixture.status, readings, listed, HoldsNoRoster, metrics };
         CHECK(ShapeOf(AnswerNow(served, HeaderFor(Wire::Op::NodeStatus))).status == Wire::Status::Ok);
         CHECK(metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 1);
     }
@@ -985,11 +935,10 @@ TEST_CASE("A verb this component does not own is UnimplementedVerb and is not co
     // is one a later caller walks around.
     core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { std::string { CallerAddress } },
-                                        Distributed::MembershipParticipant::FleetMemberList };
+    ListedMembership const membership { { std::string { CallerAddress } }, Distributed::MembershipParticipant::OpenPolicy };
     Fixture const fixture { {}, clock };
     CapturedReadings const readings { metrics, {} };
-    NodeStatusResponder responder { fixture.status, readings, membership, metrics };
+    NodeStatusResponder responder { fixture.status, readings, membership, HoldsNoRoster, metrics };
 
     auto const shape = ShapeOf(AnswerNow(responder, HeaderFor(Wire::Op::Fetch)));
     CHECK(shape.status == Wire::Status::Error);
@@ -1002,48 +951,6 @@ TEST_CASE("A verb this component does not own is UnimplementedVerb and is not co
     CHECK(std::ranges::all_of(CounterTable, [&metrics](auto const& row) { return metrics.Read(row.counter) == 0; }));
 }
 
-TEST_CASE("The operator surface requires no credential, so a plain worker can answer", "[node][node-status]")
-{
-    // **The property that keeps these verbs usable at all.** The credential on this
-    // listener is the SCHEDULER's -- `MergedResponder` routes `CheckCredential` there --
-    // so a node running no scheduler has none to check. `CredentialOutcome::NoPolicy`
-    // answers `Ok` and marks NOTHING, so a surface answering `AuthRequired` true here
-    // would leave every operator verb permanently `Unauthenticated` on exactly the
-    // deployment they exist for: one machine, one node, no fleet.
-    //
-    // Asserted through `DecidePrePayload`, which is what actually decides it, rather than
-    // by reading the getter back -- the getter agrees with itself under any
-    // implementation.
-    core::platform::ManualClock clock;
-    AtomicMetricsSink metrics;
-    ListedMembership const membership { { std::string { CallerAddress } },
-                                        Distributed::MembershipParticipant::FleetMemberList };
-    Fixture const fixture { {}, clock };
-    CapturedReadings const readings { metrics, {} };
-    NodeStatusResponder const responder { fixture.status, readings, membership, metrics };
-
-    auto const opRaw = static_cast<std::uint8_t>(Wire::Op::NodeStatus);
-    CHECK_FALSE(responder.AuthRequired(opRaw));
-    CHECK(Wire::DecidePrePayload({ .opRaw = opRaw,
-                                   .declaredLength = 0,
-                                   .sessionCap = Wire::MaxControlPayload,
-                                   .authRequired = responder.AuthRequired(opRaw),
-                                   .credentialAccepted = false })
-          == Wire::PrePayloadDecision::Serve);
-
-    // And the control, which is what says the assertion above measures anything: the verb
-    // is NOT on the pre-auth allowlist, so a surface that DOES hold a policy still makes
-    // it wait for one. Without this, *these verbs never need a credential* and *this
-    // surface holds none* are one passing test.
-    CHECK_FALSE(Wire::IsPreAuthAllowed(opRaw));
-    CHECK(Wire::DecidePrePayload({ .opRaw = opRaw,
-                                   .declaredLength = 0,
-                                   .sessionCap = Wire::MaxControlPayload,
-                                   .authRequired = true,
-                                   .credentialAccepted = false })
-          == Wire::PrePayloadDecision::Unauthenticated);
-}
-
 TEST_CASE("A frame-ceiling probe against the operator verbs is counted; an unknown opcode is not", "[node][node-status]")
 {
     // Both verbs are FIELDLESS and bounded to the control cap, so a header declaring
@@ -1052,11 +959,10 @@ TEST_CASE("A frame-ceiling probe against the operator verbs is counted; an unkno
     // `MergedResponder` and counting it would put a port scan and a probe in one series.
     core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { std::string { CallerAddress } },
-                                        Distributed::MembershipParticipant::FleetMemberList };
+    ListedMembership const membership { { std::string { CallerAddress } }, Distributed::MembershipParticipant::OpenPolicy };
     Fixture const fixture { {}, clock };
     CapturedReadings const readings { metrics, {} };
-    NodeStatusResponder const responder { fixture.status, readings, membership, metrics };
+    NodeStatusResponder const responder { fixture.status, readings, membership, HoldsNoRoster, metrics };
 
     auto const opRaw = static_cast<std::uint8_t>(Wire::Op::NodeStatus);
 
@@ -1087,11 +993,10 @@ TEST_CASE("MergedResponder routes the Node family to the node responder and nowh
     // verb answered *served nowhere* on the one platform this was developed on.
     core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
-    ListedMembership const membership { { std::string { CallerAddress } },
-                                        Distributed::MembershipParticipant::FleetMemberList };
+    ListedMembership const membership { { std::string { CallerAddress } }, Distributed::MembershipParticipant::OpenPolicy };
     Fixture const fixture { {}, clock };
     CapturedReadings const readings { metrics, {} };
-    NodeStatusResponder node { fixture.status, readings, membership, metrics };
+    NodeStatusResponder node { fixture.status, readings, membership, HoldsNoRoster, metrics };
 
     MergedResponder responder { SurfaceComponents { .node = &node } };
     CHECK(ShapeOf(AnswerNow(responder, HeaderFor(Wire::Op::NodeStatus))).status == Wire::Status::Ok);
@@ -1113,116 +1018,217 @@ TEST_CASE("MergedResponder routes the Node family to the node responder and nowh
     }
 }
 
-TEST_CASE("explain-admission names every route that decided, and attributes a silence to nobody",
-          "[node][node-status][forget]")
+/// An `explain-admission` reply, decoded; REQUIREs an `Ok` reply that decodes.
+/// @param reply The reply bytes.
+/// @return The explanation.
+[[nodiscard]] Wire::AdmissionExplanationFields ExplanationOf(std::span<std::byte const> reply)
 {
-    // #1471's remaining half. `MembershipDecision` has computed the deciding route since #1309,
-    // and until now `Explain()` had exactly ONE production caller and it was internal: the fold
-    // was right and no operator could ask it.
+    REQUIRE(ShapeOf(reply).status == Wire::Status::Ok);
+    auto const header = Wire::DecodeReplyHeader(reply);
+    REQUIRE(header.has_value());
+    auto const decoded = Wire::DecodeAdmissionExplanation(PayloadOf(reply, Unwrap(header)));
+    REQUIRE(decoded.has_value());
+    return Unwrap(decoded);
+}
+
+/// The roster the explain-admission cases hold, and the key roster their fold holds, from one
+/// state: pc-07 a learner and `gone` forgotten. `new-pc` waits in the enrollment window.
+/// @return The roster.
+[[nodiscard]] Cluster::Roster OfficeRoster()
+{
+    auto roster = Cluster::Roster {};
+    roster.members.push_back(Cluster::RosterMember { .id = "pc-07",
+                                                     .raftEndpoint = {},
+                                                     .seat = Cluster::MemberSeat::Learner,
+                                                     .publicKey = Testing::TestKeyPair("pc-07").PublicKey() });
+    roster.revoked.push_back(Cluster::RevokedKey { .id = "gone", .publicKey = Testing::TestKeyPair("gone").PublicKey() });
+    return roster;
+}
+
+TEST_CASE("explain-admission about the caller names the route that admitted it -- loopback, a ticket, or nothing",
+          "[node][node-status][admission]")
+{
+    // The SELF form, and the reason it passes the membership door: a caller the node refuses can
+    // ask WHY, and is told only what its own connection established. Over the production fold --
+    // this machine and a key roster -- where pc-07's key is live.
     //
-    // The acceptance is explicit that asserting *admitted* is not enough -- a reader that
-    // answered `Member` for both routes is green while the attribution is wrong -- so every
-    // section below asserts WHICH route, and the two-route section is the one that discriminates.
+    // On a node that HOLDS a roster, with a waiting machine in its window: a roster the fixture
+    // does not hold cannot leak, so a self form that reported roster standing or a third party's
+    // routes would pass over `HoldsNoRoster`. Every caller below gets no standing and exactly the
+    // routes its own connection established.
     core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
-    Fixture const fixture { { .admin = true }, clock };
+    Fixture const fixture { {}, clock };
+    CapturedReadings const readings { metrics, {} };
+    Testing::RosterFold const fold { { "pc-07" }, { "gone" } };
+    Testing::FixedStanding const standing { OfficeRoster(), { "new-pc" } };
+    NodeStatusResponder responder { fixture.status, readings, fold.admitted, standing, metrics };
+    auto const self = Wire::EncodeExplainAdmissionRequest("");
+
+    auto const onThisMachine = ExplanationOf(AnswerFrom(responder, self, PeerIdentity { .host = "127.0.0.1" }));
+    CHECK(onThisMachine.verdict == Wire::WireMembership::Member);
+    CHECK(onThisMachine.decidedBy == Wire::WireMembershipRoute::Loopback);
+    CHECK_FALSE(onThisMachine.standing.has_value());
+    CHECK(onThisMachine.subject == "127.0.0.1");
+
+    // pc-07 is a learner with a live key, and its PROVEN routes would add `proven-key`: the ticket
+    // this connection presented is the only route it established.
+    auto const ticketed = ExplanationOf(AnswerFrom(
+        responder, self, PeerIdentity { .host = "10.0.0.7", .authenticatedMachine = Testing::IdentityOf("pc-07") }));
+    CHECK(ticketed.verdict == Wire::WireMembership::Member);
+    CHECK(ticketed.decidedBy == Wire::WireMembershipRoute::MachineTicket);
+    CHECK_FALSE(ticketed.standing.has_value());
+    CHECK(ticketed.subject == "pc-07");
+
+    // A connection that presented a forgotten machine's revoked TICKET is answered as a stranger
+    // is: its host, refused, by nobody. The ticket may be a captured one, and naming `gone` or
+    // `key-revoked` would tell its holder a third party was forgotten.
+    auto const captured = ExplanationOf(AnswerFrom(
+        responder,
+        self,
+        PeerIdentity { .host = "10.0.0.7", .revokedMachine = RevokedKeyEvidence { Testing::IdentityOf("gone") } }));
+    CHECK(captured.verdict == Wire::WireMembership::Outsider);
+    CHECK(captured.decidedBy == 0);
+    CHECK_FALSE(captured.standing.has_value());
+    CHECK(captured.subject == "10.0.0.7");
+
+    // The machine itself -- a connection that PROVED the revoked key -- is told, by name.
+    auto const forgotten = ExplanationOf(
+        AnswerFrom(responder, self, PeerIdentity { .host = "10.0.0.7", .proven = Testing::IdentityOf("gone") }));
+    CHECK(forgotten.verdict == Wire::WireMembership::Forgotten);
+    CHECK(forgotten.decidedBy == Wire::WireMembershipRoute::KeyTombstone);
+    CHECK_FALSE(forgotten.standing.has_value());
+    CHECK(forgotten.subject == "gone");
+
+    // And a stranger is ANSWERED, not refused: refused by no route, which is what every gated verb
+    // already tells it -- and nothing is counted, since nothing was refused.
+    auto const stranger = ExplanationOf(AnswerFrom(responder, self, PeerIdentity { .host = "10.0.0.7" }));
+    CHECK(stranger.verdict == Wire::WireMembership::Outsider);
+    CHECK(stranger.decidedBy == 0);
+    CHECK_FALSE(stranger.standing.has_value());
+    CHECK(stranger.subject == "10.0.0.7");
+
+    // The lookup path: a stranger whose subject -- its host, since its connection proved and
+    // presented nothing -- is spelled like a recorded id, a pending one and a revoked one. A self
+    // form that looked its subject up in the roster would report a seat or a third party's routes.
+    for (auto const* host: { "pc-07", "new-pc", "gone" })
+    {
+        INFO(host);
+        auto const named = ExplanationOf(AnswerFrom(responder, self, PeerIdentity { .host = host }));
+        CHECK(named.verdict == Wire::WireMembership::Outsider);
+        CHECK(named.decidedBy == 0);
+        CHECK_FALSE(named.standing.has_value());
+        CHECK(named.subject == host);
+    }
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 0);
+
+    // The door agrees: it admits the verb, and still refuses a stranger every other one.
+    CHECK_FALSE(
+        responder.RefusePeer(PeerIdentity { .host = "10.0.0.7" }, static_cast<std::uint8_t>(Wire::Op::ExplainAdmission))
+            .has_value());
+    CHECK(responder.RefusePeer(PeerIdentity { .host = "10.0.0.7" }, static_cast<std::uint8_t>(Wire::Op::NodeStatus))
+              .has_value());
+}
+
+TEST_CASE("explain-admission about a machine answers from the roster through the enforced fold, and is refused to a "
+          "stranger",
+          "[node][node-status][admission]")
+{
+    core::platform::ManualClock clock;
+    AtomicMetricsSink metrics;
+    Fixture const fixture { {}, clock };
     CapturedReadings const readings { metrics, {} };
 
-    // NOT `CallerAddress`, which is also 10.0.0.7: the subject has to be a third party, or every
-    // section below would be asking the node about the very caller the gate just admitted -- and
-    // the forgotten section would forget the caller and be refused before the verb ran.
-    constexpr auto Subject = std::string_view { "10.0.0.42" };
+    // The roster this node holds and the key roster its fold holds, from one state: pc-07 a
+    // learner, `gone` forgotten, and `new-pc` waiting in the enrollment window.
+    Testing::FixedStanding const standing { OfficeRoster(), { "new-pc" } };
+    Testing::RosterFold const fold { { "pc-07" }, { "gone" } };
 
-    auto const ask = [&](Distributed::IMembershipOracle const& oracle, std::string_view host) {
-        NodeStatusResponder responder { fixture.status, readings, oracle, metrics };
-        auto const reply = AnswerNow(responder, Wire::EncodeExplainAdmissionRequest(host));
-        REQUIRE(ShapeOf(reply).status == Wire::Status::Ok);
-        auto const header = Wire::DecodeReplyHeader(reply);
-        REQUIRE(header.has_value());
-        auto const decoded = Wire::DecodeAdmissionExplanation(PayloadOf(reply, Unwrap(header)));
-        REQUIRE(decoded.has_value());
-        return Unwrap(decoded);
+    auto const ask = [&](Distributed::IMembershipOracle const& oracle, std::string_view subject) {
+        NodeStatusResponder responder { fixture.status, readings, oracle, standing, metrics };
+        return ExplanationOf(
+            AnswerFrom(responder, Wire::EncodeExplainAdmissionRequest(subject), PeerIdentity { .host = "127.0.0.1" }));
     };
 
-    // The caller must itself be admitted, or the membership gate refuses before the verb runs --
-    // so every oracle below lists `CallerAddress` as well as its subject.
-    ListedMembership const fleetList { { std::string { CallerAddress }, std::string { Subject } },
-                                       Distributed::MembershipParticipant::FleetMemberList };
-    ListedMembership const clusterSet { { std::string { CallerAddress }, std::string { Subject } },
-                                        Distributed::MembershipParticipant::ClusterMembers };
-
-    SECTION("a host on --fleet-member alone is attributed to that list and to nothing else")
+    SECTION("a live machine reports its seat and both key routes, and nothing else")
     {
-        auto const answer = ask(fleetList, Subject);
+        auto const answer = ask(fold.admitted, "pc-07");
+        CHECK(answer.standing == std::optional { Wire::WireMachineStanding::Learner });
         CHECK(answer.verdict == Wire::WireMembership::Member);
-        CHECK(answer.decidedBy == Wire::WireMembershipRoute::FleetMemberList);
+        CHECK(answer.decidedBy == (Wire::WireMembershipRoute::ProvenIdentity | Wire::WireMembershipRoute::MachineTicket));
+        CHECK(answer.subject == "pc-07");
+
+        // By key as well as by id.
+        auto const byKey = ask(fold.admitted, FormatEd25519PublicKey(Testing::TestKeyPair("pc-07").PublicKey()));
+        CHECK(byKey.standing == std::optional { Wire::WireMachineStanding::Learner });
+        CHECK(byKey.decidedBy == answer.decidedBy);
     }
 
-    SECTION("a host the CLUSTER admits is attributed to the cluster, which the section above cannot show")
+    SECTION("a forgotten machine is revoked, refused by its tombstone")
     {
-        // The pair is the point: either section alone passes against a reader that hardcodes one
-        // bit, and the two together cannot.
-        auto const answer = ask(clusterSet, Subject);
-        CHECK(answer.verdict == Wire::WireMembership::Member);
-        CHECK(answer.decidedBy == Wire::WireMembershipRoute::ClusterMembers);
-    }
-
-    SECTION("a host on BOTH reports BOTH, which is the question an operator actually has")
-    {
-        // The acceptance clause. An operator who drops a host from `--fleet-member` and finds it
-        // still served needs to know the cluster admits it; a reader that reported only the
-        // winner would answer a question nobody asked and send them to the wrong file.
-        Distributed::AnyOfMembership const both { { &fleetList, &clusterSet } };
-        auto const answer = ask(both, Subject);
-
-        CHECK(answer.verdict == Wire::WireMembership::Member);
-        CHECK((answer.decidedBy & Wire::WireMembershipRoute::FleetMemberList) != 0);
-        CHECK((answer.decidedBy & Wire::WireMembershipRoute::ClusterMembers) != 0);
-    }
-
-    SECTION("a forgotten host is Forgotten and attributed to the TOMBSTONE, outranking the listing")
-    {
-        // Forgotten beats member, and the attribution must follow the VERDICT rather than the
-        // first participant asked: reporting `FleetMemberList` beside a `Forgotten` verdict would
-        // name the wrong file twice over. `FixedMembership` exists because a host list cannot
-        // spell `Forgotten` at all.
-        // Through the REAL oracle and a published cluster state rather than a fake, because a
-        // fake that answers `Forgotten` to everything forgets the caller too and the membership
-        // gate then refuses before the verb runs -- the case would pass its setup and test
-        // nothing. `listedCaller` keeps the caller admitted while the tombstone names the
-        // subject alone.
-        NullLogger logger;
-        auto const cfg = NodeConfigOf(ConfigShape {});
-        NodeMembership tombstone { cfg, logger };
-        auto state = Cluster::ClusterState {};
-        state.forgotten = { std::string { Subject } };
-        tombstone.PublishCluster(state);
-
-        ListedMembership const listedCaller { { std::string { CallerAddress } },
-                                              Distributed::MembershipParticipant::FleetMemberList };
-        Distributed::AnyOfMembership const both { { &listedCaller, &tombstone } };
-
-        auto const answer = ask(both, Subject);
+        auto const answer = ask(fold.admitted, "gone");
+        CHECK(answer.standing == std::optional { Wire::WireMachineStanding::Revoked });
         CHECK(answer.verdict == Wire::WireMembership::Forgotten);
-        CHECK((answer.decidedBy & Wire::WireMembershipRoute::ClientTombstone) != 0);
+        CHECK(answer.decidedBy == Wire::WireMembershipRoute::KeyTombstone);
     }
 
-    SECTION("a host nobody has an opinion about is Outsider, attributed to NOBODY")
+    SECTION("a waiting and an unknown machine are admitted by nothing")
     {
-        // The silence case, and the one this verb exists for: `DecidedBy` never attributes
-        // `Outsider`, because an oracle answering it has no opinion rather than an answer it
-        // produced. Naming an author here would report the tombstone as the reason a host was
-        // refused when the tombstone never mentioned it -- a confident wrong signal.
-        auto const answer = ask(fleetList, "10.0.0.250");
-        CHECK(answer.verdict == Wire::WireMembership::Outsider);
-        CHECK(answer.decidedBy == 0);
+        auto const waiting = ask(fold.admitted, "new-pc");
+        CHECK(waiting.standing == std::optional { Wire::WireMachineStanding::Pending });
+        CHECK(waiting.verdict == Wire::WireMembership::Outsider);
+        CHECK(waiting.decidedBy == 0);
+
+        auto const unknown = ask(fold.admitted, "nobody");
+        CHECK(unknown.standing == std::optional { Wire::WireMachineStanding::Unknown });
+        CHECK(unknown.verdict == Wire::WireMembership::Outsider);
+        CHECK(unknown.decidedBy == 0);
     }
 
-    SECTION("a payload that is not one field is refused by name and counted")
+    SECTION("on an open node the open policy joins the key routes, and admits even an unknown machine")
     {
-        NodeStatusResponder responder { fixture.status, readings, fleetList, metrics };
+        // The route set is the fold's, not a second walk: a reader that computed the key routes on
+        // its own would miss `fleet-open` here, which is the operator's actual answer.
+        Distributed::OpenMembership const open;
+        Distributed::AnyOfMembership const openly { { &fold.loopback, &open, &fold.keys } };
+        auto const live = ask(openly, "pc-07");
+        CHECK(live.decidedBy
+              == (Wire::WireMembershipRoute::ProvenIdentity | Wire::WireMembershipRoute::MachineTicket
+                  | Wire::WireMembershipRoute::OpenPolicy));
+        auto const unknown = ask(openly, "nobody");
+        CHECK(unknown.verdict == Wire::WireMembership::Member);
+        CHECK(unknown.decidedBy == Wire::WireMembershipRoute::OpenPolicy);
+        // And a revoked key still outranks it.
+        CHECK(ask(openly, "gone").verdict == Wire::WireMembership::Forgotten);
+    }
+
+    SECTION("a stranger asking about a machine is refused, counted once, and told nothing about it")
+    {
+        NodeStatusResponder responder { fixture.status, readings, fold.admitted, standing, metrics };
+        auto const reply =
+            AnswerFrom(responder, Wire::EncodeExplainAdmissionRequest("pc-07"), PeerIdentity { .host = "10.0.0.7" });
+        auto const shape = ShapeOf(reply);
+        CHECK(shape.status == Wire::Status::Error);
+        CHECK(shape.code == Wire::ErrorCode::NotAMember);
+        CHECK(metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 1);
+    }
+
+    SECTION("a node that holds no roster says so rather than calling every machine unknown")
+    {
+        NodeStatusResponder responder { fixture.status, readings, fold.admitted, HoldsNoRoster, metrics };
+        auto const shape = ShapeOf(
+            AnswerFrom(responder, Wire::EncodeExplainAdmissionRequest("pc-07"), PeerIdentity { .host = "127.0.0.1" }));
+        CHECK(shape.status == Wire::Status::Error);
+        CHECK(shape.code == Wire::ErrorCode::NoCluster);
+    }
+
+    SECTION("a payload that is not one field is refused by name and counted, even from a stranger")
+    {
+        // Asked from `CallerAddress`, which this fold does NOT admit: the verb passes the door, so a
+        // stranger's malformed request is refused as malformed -- counted on its own row -- rather
+        // than as a stranger's. The counter's documentation says a refused caller can move it.
+        NodeStatusResponder responder { fixture.status, readings, fold.admitted, standing, metrics };
         auto const shape = ShapeOf(AnswerNow(responder, HeaderFor(Wire::Op::ExplainAdmission)));
-
         CHECK(shape.status == Wire::Status::Error);
         CHECK(shape.code == Wire::ErrorCode::MalformedFrame);
         CHECK(metrics.Read(IMetricsSink::Counter::NodeAdmissionExplanationsRefusedMalformed) == 1);
@@ -1235,14 +1241,14 @@ TEST_CASE("an admission explanation survives the wire, and an unknown verdict is
     // the route set to its winner would round-trip a value that compares equal to itself.
     auto const original = Wire::AdmissionExplanationFields {
         .verdict = Wire::WireMembership::Member,
-        .decidedBy = Wire::WireMembershipRoute::FleetMemberList | Wire::WireMembershipRoute::ClusterMembers,
+        .decidedBy = Wire::WireMembershipRoute::Loopback | Wire::WireMembershipRoute::MachineTicket,
     };
 
     auto const decoded = Wire::DecodeAdmissionExplanation(Wire::EncodeAdmissionExplanation(original));
     REQUIRE(decoded.has_value());
     CHECK(Unwrap(decoded) == original);
     CHECK(Unwrap(decoded).verdict == Wire::WireMembership::Member);
-    CHECK((Unwrap(decoded).decidedBy & Wire::WireMembershipRoute::ClusterMembers) != 0);
+    CHECK((Unwrap(decoded).decidedBy & Wire::WireMembershipRoute::MachineTicket) != 0);
 
     SECTION("a verdict byte this build cannot name is REFUSED, never defaulted to Outsider")
     {
@@ -1250,7 +1256,7 @@ TEST_CASE("an admission explanation survives the wire, and an unknown verdict is
         // fourth answer, which reads exactly like the healthy case -- and this verb exists to
         // remove a confident wrong signal rather than to add one.
         auto damaged = Wire::EncodeAdmissionExplanation(original);
-        auto const fields = WireFields::SplitExactly(damaged, 2);
+        auto const fields = WireFields::SplitExactly(damaged, 4);
         REQUIRE(fields.has_value());
 
         // The verdict is the first field's single byte; 0x7F names no `WireMembership`.
@@ -1267,7 +1273,7 @@ TEST_CASE("an admission explanation survives the wire, and an unknown verdict is
         // mid-upgrade -- reporting fewer deciders than there were.
         auto const withUnknown = Wire::AdmissionExplanationFields {
             .verdict = Wire::WireMembership::Member,
-            .decidedBy = Wire::WireMembershipRoute::FleetMemberList | 0x8000U,
+            .decidedBy = Wire::WireMembershipRoute::Loopback | 0x8000U,
         };
         auto const back = Wire::DecodeAdmissionExplanation(Wire::EncodeAdmissionExplanation(withUnknown));
         REQUIRE(back.has_value());

@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -117,7 +119,7 @@ namespace FastCache
 ///
 /// The other half of comparing an advertised endpoint against a peer, and the same
 /// argument puts it here: this rule already had three authors before it was named
-/// -- `ClusterMembership::Publish`, `AdvertisesWildcard`, and the scheduler's
+/// -- a host-list admission oracle since retired, `AdvertisesWildcard`, and the scheduler's
 /// endpoint check (#242) -- each re-deriving that an endpoint which will not split
 /// is a legitimate bare host rather than a parse failure. Dropping such a host
 /// instead is how a member the set cannot represent silently stops being one.
@@ -173,6 +175,44 @@ namespace FastCache
     return !bare.empty() && bare == UnmappedHost(right);
 }
 
+namespace Detail
+{
+    /// @param text One dotted-quad octet.
+    /// @return Its value, or nullopt when it is not one to three decimal digits naming 0..255.
+    [[nodiscard]] inline std::optional<unsigned> ParseOctet(std::string_view text) noexcept
+    {
+        constexpr std::size_t MaxDigits = 3;
+        constexpr unsigned MaxOctet = 255;
+        if (text.empty() || text.size() > MaxDigits)
+            return std::nullopt;
+        auto value = 0U;
+        for (auto const c: text)
+        {
+            if (c < '0' || c > '9')
+                return std::nullopt;
+            value = (value * 10U) + static_cast<unsigned>(c - '0');
+        }
+        return value <= MaxOctet ? std::optional { value } : std::nullopt;
+    }
+
+    /// @param text A host.
+    /// @return Whether it is an IPv4 LITERAL -- exactly four decimal octets -- inside 127.0.0.0/8.
+    [[nodiscard]] inline bool IsIpv4LoopbackLiteral(std::string_view text) noexcept
+    {
+        constexpr std::size_t Octets = 4;
+        constexpr unsigned LoopbackNet = 127;
+        auto seen = std::size_t { 0 };
+        for (auto const part: std::views::split(text, '.'))
+        {
+            auto const octet = ParseOctet(std::string_view { part.begin(), part.end() });
+            if (!octet.has_value() || (seen == 0 && *octet != LoopbackNet))
+                return false;
+            ++seen;
+        }
+        return seen == Octets;
+    }
+} // namespace Detail
+
 /// Whether a host names this machine over the loopback interface.
 ///
 /// The one test for "is this caller on the same machine as me", spelled once
@@ -188,6 +228,14 @@ namespace FastCache
 /// The literal name `localhost` is **not** among them: it is whatever a resolver
 /// says it is, and a resolver is not something a security decision may depend on.
 ///
+/// **An IP LITERAL, parsed, and never a NAME.** This matched `127.` as a PREFIX, which a
+/// name satisfies too: `127.cache.example.com` read as loopback, so a bind spelled that
+/// way was judged unreachable from the network whatever it resolved to -- the fail-OPEN
+/// direction for every rule asking whether a port faces other machines. Now the host
+/// is four decimal octets inside `127.0.0.0/8`, or `::1`, or the mapped form of the
+/// first; anything else, every name included, is not loopback, so every decision this
+/// answers fails CLOSED.
+///
 /// An **empty** host is not local either, and that direction is deliberate. It is
 /// what `core::net::formatPeerAddress` answers for a peer it could not identify — a family it
 /// does not know, or a `getpeername` that failed — and a caller this machine cannot
@@ -199,15 +247,25 @@ namespace FastCache
 /// @return True when the peer is on this machine.
 [[nodiscard]] inline bool IsLoopbackHost(std::string_view host) noexcept
 {
-    // Any 127.x.x.x, not 127.0.0.1 alone: the whole /8 is loopback, and a client
-    // bound to 127.0.0.2 is no less local for it.
-    constexpr std::string_view V4Prefix = "127.";
-
     // Unmapped first, so `::ffff:127.0.0.1` and `127.0.0.1` take the same branch
     // rather than each needing one. `::1` is not a mapped form and survives it
-    // unchanged, which is why the equality still holds.
+    // unchanged, which is why the equality still holds. Any address in 127.0.0.0/8,
+    // not 127.0.0.1 alone: the whole /8 is loopback, and a client bound to 127.0.0.2
+    // is no less local for it.
     auto const bare = UnmappedHost(host);
-    return bare == "::1" || bare.starts_with(V4Prefix);
+    return bare == "::1" || Detail::IsIpv4LoopbackLiteral(bare);
+}
+
+/// @param left One name.
+/// @param right The other.
+/// @return True when they differ in ASCII case at most, which is how DNS compares names.
+///         Locale-free on purpose.
+[[nodiscard]] constexpr bool EqualsIgnoringAsciiCase(std::string_view left, std::string_view right) noexcept
+{
+    constexpr auto lower = [](char c) {
+        return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    return std::ranges::equal(left, right, [lower](char a, char b) { return lower(a) == lower(b); });
 }
 
 /// Whether a host NAME reaches this machine and no other, wherever it is resolved.
@@ -231,16 +289,33 @@ namespace FastCache
         host.remove_suffix(1);
 
     constexpr std::string_view Localhost = "localhost";
-    auto const lower = [](char c) {
-        return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
-    };
-    auto const sameText = [&lower](std::string_view a, std::string_view b) {
-        return std::ranges::equal(a, b, {}, lower, lower);
-    };
-    if (sameText(host, Localhost))
+    if (EqualsIgnoringAsciiCase(host, Localhost))
         return true;
     return host.size() > Localhost.size() + 1 && host[host.size() - Localhost.size() - 1] == '.'
-           && sameText(host.substr(host.size() - Localhost.size()), Localhost);
+           && EqualsIgnoringAsciiCase(host.substr(host.size() - Localhost.size()), Localhost);
+}
+
+/// Whether @p host names NO ONE machine, because every machine answers to it: a host
+/// `NamesOnlyThisMachine` answers for, or a wildcard.
+///
+/// **The one rule for "an audience a ticket may name"**, asked by the node that mints a ticket, the
+/// node that spends one (`Distributed::AudienceNamesOneMachine`) and the launcher deciding whether
+/// to ask for one at all (`Cc::ChooseCredential`). Every node is its own loopback and no node is the
+/// wildcard, so a ticket naming one would be spendable at any node that heard it presented -- the
+/// minter refuses it, and a launcher that asked anyway would move the minter's refusal counter for
+/// every exchange. Here, header-only, because the launcher does not link the library.
+///
+/// The loopback NAMES count though `IsLoopbackHost` does not: this is not a question about where a
+/// caller IS, which a name must never answer, but about whether a name could single out one machine,
+/// and RFC 6761 reserves `localhost` and every name under `.localhost` to resolve to loopback
+/// everywhere -- the same reading `NamesOnlyThisMachine` gives an advertised endpoint, so the two
+/// questions cannot disagree about a name.
+/// @param host A host, without a port or brackets.
+/// @return True when every machine would answer to it.
+[[nodiscard]] inline bool NamesNoOneMachine(std::string_view host) noexcept
+{
+    auto const unmapped = UnmappedHost(host);
+    return NamesOnlyThisMachine(unmapped) || unmapped == "0.0.0.0" || unmapped == "::";
 }
 
 /// Split an endpoint that may name only a port.

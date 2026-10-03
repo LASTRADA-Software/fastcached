@@ -54,19 +54,6 @@ enum class ClusterAction : std::uint8_t
     Forget,   ///< Remove a member.
     Admit,    ///< Add a member, or record that one has moved.
 
-    /// Admit a client host to the fleet, and clear any tombstone for it (#1309).
-    ///
-    /// A CLIENT, never a member: it never joins consensus and is never counted towards
-    /// quorum, so this takes a bare host where `Admit` takes `<id>=<host>:<port>`.
-    AdmitClient,
-
-    /// Forget a client host, so every node refuses it from the next commit (#1309).
-    ///
-    /// The replicated alternative to editing `--fleet-member` on every other machine,
-    /// which is the direction that fails OPEN -- miss one and it serves the retired host
-    /// indefinitely, with admission succeeding being the ordinary case.
-    ForgetClient,
-
     /// `Admit`, recording the member as a LEARNER (#1449): replicated to, counted by no
     /// quorum, never a candidate. On a voter this demotes it; `Admit` on a learner
     /// promotes it.
@@ -84,8 +71,7 @@ struct ClusterRequest
     ClusterAction action { ClusterAction::None };
 
     /// The setting name for `Set`, the member id for `Forget`, `Admit` and
-    /// `AdmitLearner`, the worker's id for `AdmitWorker`, the client's host for `AdmitClient`
-    /// and `ForgetClient`.
+    /// `AdmitLearner`, and the worker's id for `AdmitWorker`.
     std::string key;
 
     /// The setting's new value for `Set`, the consensus endpoint for `Admit` and
@@ -294,28 +280,6 @@ struct NodeConfig
     /// accident.
     std::filesystem::path dashboardTokenFile;
 
-    /// File holding the credential the SCHEDULER verbs require, or empty for none.
-    ///
-    /// The inbound half of `--requirepass`, which is outbound only -- that flag is
-    /// the secret this node *presents* when it registers, and until #289 nothing on
-    /// the receiving side ever checked one. So a scheduler port reachable from the
-    /// network served `Register`, `Lease` and the cluster verbs to anyone who could
-    /// open a socket to it; membership is an anti-leeching rule about which hosts an
-    /// operator listed, not a credential.
-    ///
-    /// A FILE for the reason `dashboardTokenFile` is one: a command line is readable
-    /// through `ps`. Unlike the dashboard's, this secret is deliberately the SAME one
-    /// every member already holds as `--requirepass` -- that is what it is for, and a
-    /// separate one would mean distributing two.
-    ///
-    /// **A bearer token, so its confidentiality rests on the transport.** Anyone who
-    /// can read the wire can replay it, exactly as for `--requirepass` and the
-    /// dashboard credential. That is a property of the scheme rather than a defect in
-    /// it, and a MAC would not fix it: this credential authenticates a connection
-    /// this process terminates, so there is nothing for a signature to bind that the
-    /// connection does not already establish.
-    std::filesystem::path schedulerTokenFile;
-
     /// Certificate the admin surface serves TLS with, or empty for plaintext.
     ///
     /// Spelled as the daemon spells it, because an operator copies these between
@@ -326,26 +290,6 @@ struct NodeConfig
 
     /// Private key for `tlsCertFile`. Both or neither.
     std::filesystem::path tlsKeyFile;
-
-    /// Peers this node serves, as `host:port`; repeatable.
-    ///
-    /// Gates **all three** of this node's surfaces through one `NodeMembership`: the
-    /// scheduler decides who may spend the fleet's CPU, the compile port decides who
-    /// may spend *this machine's*, and the cache tier decides who may read what those
-    /// compiles produced. So a plain worker running no scheduler needs this exactly
-    /// as much as a scheduler does -- without it, its compile port admits its own
-    /// machine and refuses every dispatched job (#235).
-    ///
-    /// Only the host part is used -- a peer connecting comes from an ephemeral source
-    /// port, so an endpoint is not something a connection can be matched against. The
-    /// endpoint form is accepted because it is what discovery produces and what an
-    /// operator has written down.
-    ///
-    /// Kept for the process's life on a clustered node too: consensus ADDS its member
-    /// set to what is listed here rather than replacing it, because this list is how a
-    /// machine that never joins consensus -- a developer's laptop, a CI runner -- is
-    /// admitted at all (#251).
-    std::vector<std::string> fleetMembers;
 
     /// Where this node keeps its own cache tier, or empty for memory only.
     ///
@@ -450,10 +394,9 @@ struct NodeConfig
     /// The credential this node PRESENTS, from `--requirepass`.
     ///
     /// Outbound only: it is what the launcher half of this binary sends to an
-    /// upstream `fastcached`, and what a worker sends when it registers. What this
-    /// node REQUIRES of its own callers is `--scheduler-token-file`, and the two are
-    /// deliberately separate settings -- a node that presented and demanded the same
-    /// secret would make every client of its cache a peer of its scheduler.
+    /// upstream `fastcached`, and what a worker sends when it registers. This node
+    /// REQUIRES no password of its own callers: a machine is admitted by the key it proves
+    /// or the ticket it presents, never by a shared secret.
     ///
     /// There is no username beside it. One was declared here, parsed by nothing and
     /// read by nothing, and it is removed rather than left: a dead field next to a
@@ -785,15 +728,14 @@ struct NodeConfig
     /// off loopback for exactly that reason.
     bool tlsSelfSigned { false };
 
-    /// Admit every caller to this node, rather than only `--fleet-member` hosts.
+    /// Admit every caller to this node, keyed or not, rather than only this machine and
+    /// the machines the roster admits by key or ticket.
     ///
-    /// The right answer for a fleet whose network reachability is already its
-    /// boundary. Like `--fleet-member` it governs every surface this node serves,
-    /// worker included. It is a *flag* rather than the behaviour you get by listing
-    /// no members, because "no policy" and "a policy that admits everybody" have to
-    /// be the same explicit decision -- listing nobody refuses everybody, and a node
-    /// that quietly served strangers would look identical to a healthy one from both
-    /// ends.
+    /// The right answer for one machine, or for a fleet whose network reachability is
+    /// already its boundary. It governs every surface this node serves, worker
+    /// included. It is a *flag* rather than the behaviour an absent roster decays to,
+    /// because a node that quietly served strangers would look identical to a healthy
+    /// one from both ends. A revoked key is still refused under it.
     bool fleetOpen { false };
 
     bool daemon { false };           ///< Fork into the background / run under the SCM.
@@ -1153,13 +1095,13 @@ inline constexpr std::array<std::string_view, 1> AddressReloadableFlags { "--adv
 /// include trees at the same moment is the one way to turn a routine rotation into
 /// an incident.
 ///
-/// `--fleet-member` and `--fleet-open` are local for the reason `--allow-compile-arg`
-/// is, and the parallel is exact: both decide what this worker will do for a caller,
-/// and a registration describes the TOOLCHAINS it serves rather than whom it serves
-/// them to. The scheduler has no field for either, so re-registering on a change would
-/// tell the fleet nothing it could act on -- at the price of an include-tree walk.
-inline constexpr std::array<std::string_view, 5> LocalReloadableFlags {
-    "--log-level", "--allow-compile-arg", "--requirepass", "--fleet-member", "--fleet-open"
+/// `--fleet-open` is local for the reason `--allow-compile-arg` is, and the parallel is
+/// exact: both decide what this worker will do for a caller, and a registration
+/// describes the TOOLCHAINS it serves rather than whom it serves them to. The scheduler
+/// has no field for it, so re-registering on a change would tell the fleet nothing it
+/// could act on -- at the price of an include-tree walk.
+inline constexpr std::array<std::string_view, 4> LocalReloadableFlags {
+    "--log-level", "--allow-compile-arg", "--requirepass", "--fleet-open"
 };
 
 /// Both reloadable-flag lists, so the guards walk a derived SET rather than naming
@@ -1247,19 +1189,19 @@ enum class AllowlistMoment : std::uint8_t
 ///
 /// **The narrowing half is what this is for, and it is the half a silent
 /// implementation drops** ([#405](https://github.com/LASTRADA-Software/fastcached/issues/405)).
-/// An operator who ADDS a member finds out it worked the moment that machine's build
-/// is distributed. An operator who REVOKES one has no such signal: admission
-/// succeeding is the ordinary case, so a revocation that did not take looks exactly
-/// like one that did, forever. So the hosts that are no longer admitted are named
-/// individually, and the ones added are only counted -- what a reader needs to check
-/// is the list they meant to shorten.
+/// The one admission setting a reload can move is `--fleet-open`, and both directions
+/// are said. Turning it ON announces itself the moment a stranger's build is served.
+/// Turning it OFF has no such signal: admission succeeding is the ordinary case, so a
+/// narrowing that did not take looks exactly like one that did, forever -- and every
+/// caller the roster does not admit has just been refused, which no list can
+/// enumerate. So that direction says so in words.
 ///
 /// A pure function, here rather than an expression in `main.cpp`, for
 /// `AllowlistAnnouncement`'s reason: that file is in no test target (#909), so a rule
 /// written there can only be checked by reading it. And this is a SECURITY
 /// announcement, the kind that is wrong silently.
 ///
-/// A reload that touched neither flag says nothing, because a reload is a routine
+/// A reload that left the flag alone says nothing, because a reload is a routine
 /// event and a `--log-level` change must not narrate a policy nobody edited.
 /// @param previous The admission policy that was in force.
 /// @param current The one just adopted.
@@ -1293,7 +1235,16 @@ enum class AllowlistMoment : std::uint8_t
 /// exact subject. It is also what keeps the remark off the single-machine install:
 /// `--scheduler` is required of EVERY shape -- a scheduler registers with itself --
 /// so naming one says nothing about a fleet, and a predicate reading it would fire on
-/// every node there is.
+/// every node there is. And a key route alone is no evidence either: every node naming
+/// `--scheduler` keeps a state directory, so it could hold a roster on the single-machine
+/// install too. So it asks `CompileVerbsReachOtherMachines`, which adds that the node port
+/// faces the network. That is no longer the difference on its own, since every node binds
+/// the wildcard by default; what makes a node a fleet's is its members, and a node running
+/// consensus knows them from its formation record (`RosterPresence::Formed`): a solitary
+/// node serves its own machine only, a pending, learner or voter node serves a fleet. Any
+/// other node is asked with `RosterPresence::Unknown`: this is said at startup, before any
+/// roster has been read, and a remark erring towards being said costs one line where erring
+/// the other way costs the probe an operator never set up.
 ///
 /// Whether the surface is on is asked of its own ROW, for the reason the
 /// dashboard-credential rule gives: a second reader of that question eventually judges
@@ -1342,7 +1293,7 @@ inline constexpr std::string_view NodeSurfaceDefaultHost = "0.0.0.0";
 ///
 /// **One derivation, because three consumers must agree or the fleet breaks in a way
 /// none of them can see.** What a lease's MAC covers is this endpoint, so the property
-/// the compile surface's `AuthRequired == false` rests on is:
+/// the compile surface's needing no connection credential rests on is:
 ///
 ///   the endpoint the scheduler SIGNS == the endpoint the worker VERIFIES ==
 ///   the endpoint clients actually REACH
@@ -1590,6 +1541,34 @@ inline constexpr std::string_view NodeRunsNothingRefusal =
 /// @return True when a consensus driver will run and report a role.
 [[nodiscard]] bool RunsConsensus(NodeConfig const& cfg) noexcept;
 
+/// What a caller of a fleet predicate knows about the roster this node verifies keys against.
+///
+/// PRIVATE: never transmitted and never persisted. Three answers because the configuration
+/// cannot see a roster a state directory kept: only `NodeRoster::Build` and what runs after it
+/// know `Held` or `Absent`, and a question asked before that is `Unknown`. A fourth for a node
+/// running consensus, whose roster is the state it applies and whose members its formation
+/// record already names: `Formed` asks the record, where `Unknown` would count the fleet the
+/// node MAY found later -- the fail-closed reading a guard wants and a statement about the
+/// present must not make.
+enum class RosterPresence : std::uint8_t
+{
+    Held,    ///< A roster is held, so a proof or a ticket can admit another machine.
+    Absent,  ///< No roster is held, so no key can admit anybody.
+    Unknown, ///< Asked before any roster was read; the configuration decides (`AdmitsByKey`).
+    Formed,  ///< Consensus's own roster: it admits exactly the members the formation record's mode names.
+};
+
+/// Whether a key -- a proof or a ticket -- could ever admit a machine that is not this one.
+///
+/// A key admits only against a roster, and three things in a configuration may give this node
+/// one: consensus, whose roster is the state it applies; `--voter-key`, the anchors a roster is
+/// adopted against; and `--cluster-dir`, a state directory that may hold a roster an earlier run
+/// adopted. It answers "may", never "does": a directory that turns out empty is `NodeRoster::Build`'s
+/// finding, and until that runs the fail-closed reading is that a key route is live.
+/// @param cfg The parsed configuration.
+/// @return Whether any clause of the configuration may give this node a roster.
+[[nodiscard]] bool AdmitsByKey(NodeConfig const& cfg) noexcept;
+
 /// Whether this node runs a compile worker: surveys its toolchains, claims a scratch
 /// root, serves the compile verbs and registers with a scheduler.
 ///
@@ -1698,23 +1677,15 @@ enum class ConsensusDialGap : std::uint8_t
 /// One spelling for two callers -- the scheduler tier's ready line and the worker's
 /// -- because the policy is the **node's** rather than any one surface's, and a
 /// phrase each of them built separately is one that drifts. Read off the
-/// configuration rather than off the oracle: the count is a property of what the
-/// operator wrote, and the oracle is shared by three surfaces and no longer any one
-/// tier's to inspect.
+/// configuration rather than off the oracle: the oracle is shared by three surfaces
+/// and no longer any one tier's to inspect.
 ///
-/// It says "this machine" out loud, because that admission is unconditional and an
-/// operator reading "2 member host(s)" would otherwise not know their own builds
-/// were covered. And it names the flag that would fix it when there is no policy at
-/// all, which is the whole of #235's second half: such a worker starts, logs a
-/// healthy line and refuses every dispatched compile, so the one line an operator
-/// reads has to say that the port is closed.
-///
-/// *What* it says depends on whether `--node-id` turned consensus on, because such a
-/// node is about to admit hosts nobody typed and a line reading as a final answer
-/// would mislead. Both remedies are named either way: the agreed member set ADDS to
-/// what an operator listed rather than replacing it (#251), so `--fleet-member` is a
-/// working answer on a clustered node too -- and it is the only route by which a
-/// client machine, which is no cluster peer, is admitted at all.
+/// It says "this machine" out loud, because that admission is unconditional. It names
+/// the key routes on every node rather than only where a roster is visible in the
+/// configuration, because a state directory can keep a roster no configuration can
+/// see, and a line claiming "this machine only" on such a node would be a confident
+/// wrong answer. `--fleet-open` is the one admission a flag states, so it is the one
+/// tail the sentence grows.
 /// @param cfg The parsed configuration.
 /// @return A phrase naming who this node admits.
 [[nodiscard]] std::string AdmissionSummary(NodeConfig const& cfg);
@@ -1742,9 +1713,17 @@ enum class ConsensusDialGap : std::uint8_t
 /// the startup table of a configuration and by `NodeRoster::Build` of a state directory -- two
 /// moments, one predicate. It reads `--bind`, so under socket activation it describes nothing,
 /// and `MakeWorkerLeaseValidator` keeps the backstop for that case.
+///
+/// **The key routes count**, through `AdmitsRemotePeers`: a roster admits machines by
+/// proof and by ticket, so a network-facing worker holding one reaches other machines
+/// although no flag names any of them. Asked with `Absent` it answers for a node known
+/// to hold no roster; with `Unknown`, for a configuration asked before any roster was
+/// read, and then a key route counts as live; with `Formed`, for a node running consensus,
+/// whose roster admits the members its formation record names.
 /// @param cfg The parsed configuration.
+/// @param roster What the caller knows about the roster this node verifies keys against.
 /// @return True when another machine could present a lease here.
-[[nodiscard]] bool CompileVerbsReachOtherMachines(NodeConfig const& cfg);
+[[nodiscard]] bool CompileVerbsReachOtherMachines(NodeConfig const& cfg, RosterPresence roster);
 
 /// One path-valued worker flag whose file holds a secret.
 ///

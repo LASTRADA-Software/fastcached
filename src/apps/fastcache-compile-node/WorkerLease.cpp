@@ -34,7 +34,11 @@ std::expected<Cc::LeaseValidator, std::string> MakeWorkerLeaseValidator(NodeConf
         // Only the activated case: an ordinary node's `--bind` was already judged, and
         // repeating that judgement here would refuse the loopback fleets this
         // repository's own fixtures run.
-        if (activation == SocketActivation::Yes && AdmitsRemotePeers(cfg))
+        //
+        // `Absent`, because that is what `roster == nullptr` states: with no roster no
+        // proof or ticket admits anybody, so only `--fleet-open` or a fleet the formation
+        // record puts this node in widens it.
+        if (activation == SocketActivation::Yes && AdmitsRemotePeers(cfg, RosterPresence::Absent))
             return std::unexpected { std::string {
                 "a socket-activated worker that admits peers on other machines needs a roster to verify "
                 "leases against -- name the cluster's voters with --voter-key, or run consensus: the socket "

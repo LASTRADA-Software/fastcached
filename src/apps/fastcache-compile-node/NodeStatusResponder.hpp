@@ -6,7 +6,7 @@
 #include "EnrollmentWindow.hpp"
 #include "FrameEndpoint.hpp"
 #include "NodeConditions.hpp"
-#include "NodeMembership.hpp"
+#include "NodeMachineStanding.hpp"
 #include "NodeRoster.hpp"
 
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -84,18 +84,24 @@ class INodeStatusSource
     [[nodiscard]] virtual CompileCacheWire::NodeStatusFields Describe() const = 0;
 };
 
-/// Answers `NodeStatus` and `NodeMetrics`.
+/// Answers `NodeStatus`, `NodeMetrics` and `ExplainAdmission`.
 ///
 /// **Gated on membership, not on locality.** The cache tier is served to this machine
 /// only because it IS this machine's build output; these verbs report configuration
 /// rather than hand anything over, and an operator diagnosing a fleet is by construction
 /// not sitting on every node in it. Membership is the same posture the cluster verbs
-/// take, and it is what `--fleet-member` is for.
+/// take, and a machine the roster admits by key is exactly that operator's.
 ///
 /// It still reports a **port map**, which is worth saying out loud rather than treating
 /// as harmless: that is why the gate is here at all rather than the verbs being
 /// pre-auth. The `OpTable` rows say `RequiresAuth`, so a credentialled surface demands
 /// one as well.
+///
+/// **`ExplainAdmission` is the one exception at the door**, because its SELF form must reach a
+/// caller this node refuses -- otherwise it could never report the refusal. It answers only what
+/// that connection established, so a stranger learns "refused, by no route", which every gated
+/// verb already tells it. The MACHINE form reads the roster and so describes third parties; it is
+/// gated inside `Answer` by the same membership rule, and counted on the same row.
 class NodeStatusResponder final: public IFrameResponder
 {
   public:
@@ -107,14 +113,18 @@ class NodeStatusResponder final: public IFrameResponder
     ///        the way every surface binds it -- an implementation that re-asked for
     ///        an oracle per request could never see `--fleet-open` change, and a test
     ///        that re-acquired it would pass under exactly that defect.
+    /// @param standing Where `explain-admission <machine>` reads a machine's standing: the roster
+    ///        this node holds and its enrollment window. Must outlive this.
     /// @param metrics Where a refusal is counted; must outlive this.
     NodeStatusResponder(INodeStatusSource const& identity,
                         ILiveStatsSources const& readings,
                         Distributed::IMembershipOracle const& membership,
+                        IMachineStandingSource const& standing,
                         IMetricsSink& metrics) noexcept:
         _identity { identity },
         _readings { readings },
         _membership { membership },
+        _standing { standing },
         _metrics { metrics }
     {
     }
@@ -126,53 +136,17 @@ class NodeStatusResponder final: public IFrameResponder
     ///
     /// The one implementation of the rule, called by `Answer` as well as by the door, so
     /// the early refusal and the authoritative one cannot disagree and the counter moves
-    /// exactly once per refused request whichever path reached it.
+    /// exactly once per refused request whichever path reached it. `ExplainAdmission` passes
+    /// the door, and its machine form is refused inside `Answer` by the same rule.
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                    std::uint8_t opRaw) const override;
 
-    /// @copydoc IFrameResponder::AuthRequired
-    ///
-    /// **No, and membership is the whole gate.** Three reasons, and the first is the
-    /// one that decides it: the credential on this listener belongs to the SCHEDULER --
-    /// `MergedResponder` routes `CheckCredential` there -- so a node running no
-    /// scheduler has none to check. `NoPolicy` answers `Ok` and marks NOTHING, so
-    /// answering `true` here would leave every operator verb permanently
-    /// `Unauthenticated` on a plain worker, which is the deployment these verbs exist
-    /// for. A surface must not require a secret it cannot verify.
-    ///
-    /// Second, what is handed over is strictly less than what this node already serves
-    /// unauthenticated: `/metrics` short-circuits above `AdminHttpServer`'s route loop
-    /// and needs no `AdminCredential` at all, and the port map is what
-    /// `--print-surfaces` prints. Gating on membership makes the `0xFC` route the
-    /// STRICTER of the two rather than a new door.
-    ///
-    /// Third, #289's argument does not transfer: it is about verbs that spend this
-    /// machine's CPU or hand over its objects, and these spend a `Describe()` and one
-    /// walk of the counter table.
-    ///
-    /// **The `RequiresAuth` in the `OpTable` rows is a different question** and is not
-    /// contradicted. That column says these verbs are not on the pre-auth allowlist, so
-    /// on a surface that DOES hold a policy they wait for one; this answers whether
-    /// this surface holds one.
-    ///
-    /// Verb-blind, like every sibling below: `MergedResponder` routes by verb FAMILY,
-    /// so every verb arriving here is a node verb, and answering per-verb would restate
-    /// the family table somewhere it could disagree with itself.
-    [[nodiscard]] bool AuthRequired(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return false;
-    }
-
     /// @copydoc IFrameResponder::CheckCredential
     ///
-    /// `NoPolicy` for every payload, per `AuthRequired` above. Unreachable in practice
-    /// -- `AUTH` is a `Session` verb and `MergedResponder` sends the credential to the
-    /// scheduler -- and written down rather than inherited, for the reason the
-    /// interface is pure virtual: a surface that inherits an answer inherits an open
-    /// door by saying nothing.
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    /// `NoPolicy`: AUTH is the Session family's; this surface is never routed one.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
     {
-        return FastCache::CheckCredential(nullptr, payload);
+        return NotTheSessionSurface();
     }
 
     /// @copydoc IFrameResponder::RefusalReply
@@ -292,9 +266,23 @@ class NodeStatusResponder final: public IFrameResponder
     }
 
   private:
+    /// Refuse @p peer unless this node's oracle admits its connection.
+    /// @param peer The caller.
+    /// @return The refusal, counted, or nullopt for a member.
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefuseStranger(PeerIdentity const& peer) const;
+
+    /// Answer `ExplainAdmission`: about the caller's own connection when the subject is empty,
+    /// and about a machine in the roster otherwise.
+    /// @param payload The request payload, when the frame carried all of it.
+    /// @param peer The caller.
+    /// @return The reply.
+    [[nodiscard]] std::vector<std::byte> ExplainAdmission(std::optional<std::span<std::byte const>> payload,
+                                                          PeerIdentity const& peer) const;
+
     INodeStatusSource const& _identity;
     ILiveStatsSources const& _readings;
     Distributed::IMembershipOracle const& _membership;
+    IMachineStandingSource const& _standing;
     IMetricsSink& _metrics;
 };
 
@@ -512,32 +500,15 @@ struct NodeRuntimeSources
     /// reading that stops them looking.
     EnrollmentWindow const* enrollment { nullptr };
 
-    /// This node's admission oracle, for the count of client tombstones it has applied;
-    /// null on a node that runs no consensus (#1471).
-    ///
-    /// Null is ABSENT and not `0`, for this record's stated reason and with the same force it
-    /// has for `enrollment` above: a node with no cluster has no committed tombstone set, so a
-    /// `0` there is a reassuring claim about a set that does not exist. The reading an operator
-    /// wants after `--cluster-forget-client` is whether the entry REACHED this machine, and a
-    /// zero meaning "no cluster here" answers a different question than a zero meaning "the
-    /// cluster forgets nobody".
-    ///
-    /// Null on a keyless node even though `NodeMembership` exists on EVERY node -- the object is
-    /// always there, the committed SET only exists where consensus runs, so the wiring draws the
-    /// distinction rather than the type.
-    ///
-    /// Appended rather than inserted, matching the wire half of this change: a designated
-    /// initializer must follow declaration order, so a member added in the middle silently
-    /// breaks every call site that named the ones after it.
-    NodeMembership const* membership { nullptr };
-
     /// Where this node sits in its own consensus configuration; null on a node that runs
     /// no consensus (#1449).
     ///
     /// Null is ABSENT for this record's reason: a standing is a claim about a
     /// configuration, and a node with none to hold has nothing to claim. A slot in
     /// production, because the tier is built after this surface -- see
-    /// `ConsensusStandingSlot`. Appended, for `membership`'s reason.
+    /// `ConsensusStandingSlot`. Appended rather than inserted: a designated initializer must
+    /// follow declaration order, so a member added in the middle silently breaks every call
+    /// site that named the ones after it.
     IConsensusStandingSource const* consensus { nullptr };
 
     /// This node's conditions (#1364); null only where nothing was wired, which reports the

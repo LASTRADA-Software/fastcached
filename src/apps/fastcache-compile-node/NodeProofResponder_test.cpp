@@ -40,11 +40,9 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 
-/// The address every case here dials from: on no member list, which is the whole subject.
+/// The address every case here dials from: not this machine, so no address admits it and every
+/// admission is attributable to the identity.
 constexpr std::string_view StrangerAddress = "10.9.9.9";
-
-/// The one address this fixture's `--fleet-member` list admits, so a refusal is about WHO asked.
-constexpr std::string_view ListedAddress = "10.0.0.1";
 
 /// A machine the cluster admitted: its key is live under its own id.
 constexpr std::string_view AdmittedNode = "node-7";
@@ -66,11 +64,11 @@ constexpr std::string_view UnknownNode = "stranger";
     return ProvenIdentity { .id = std::string { machine }, .key = TestKeyPair(std::string { machine }).PublicKey() };
 }
 
-/// One scheduler, its `--fleet-member` list, the cluster's key roster, and the prover beside them.
+/// One scheduler, this machine, the cluster's key roster, and the prover beside them.
 ///
-/// The oracle is composed exactly as `NodeMembership` composes it -- the listed hosts and the key
-/// roster under one fold -- so what a case learns about a proven identity is what every surface
-/// that binds the node's oracle would learn.
+/// The oracle is composed exactly as `NodeMembership` composes a closed node's -- this machine and
+/// the key roster under one fold -- so what a case learns about a proven identity is what every
+/// surface that binds the node's oracle would learn.
 struct ProvingNode
 {
     AtomicMetricsSink metrics;
@@ -81,12 +79,11 @@ struct ProvingNode
     Distributed::SchedulerService service { clock, wallClock, metrics, logger, signer, {} };
     Distributed::SchedulerProtocol protocol { service, metrics };
 
-    /// One listed host, and it is NOT the address most cases dial from. That is what makes every
-    /// admission below attributable to the identity rather than to the list.
-    Distributed::ClusterMembership listed { Distributed::MembershipParticipant::FleetMemberList,
-                                            { std::string { ListedAddress } + ":7000" } };
+    /// This machine, which is NOT the address most cases dial from. That is what makes every
+    /// admission below attributable to the identity rather than to the address.
+    Distributed::LoopbackMembership loopback;
     Distributed::KeyRosterMembership keys;
-    Distributed::AnyOfMembership membership { { &listed, &keys } };
+    Distributed::AnyOfMembership membership { { &loopback, &keys } };
     SchedulerResponder scheduler { protocol, membership, metrics };
 
     Ed25519KeyPair const identity = TestKeyPair("scheduler");
@@ -140,7 +137,7 @@ struct Challenged
     return Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
 }
 
-/// The row a surface answers a host nobody listed with, for the gate cases.
+/// The row a surface answers a stranger with, for the gate cases.
 constexpr Cc::SurfaceRefusal Stranger {
     .code = Wire::ErrorCode::NotAMember,
     .counter = IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember,
@@ -188,98 +185,83 @@ TEST_CASE("A machine proving an admitted identity is admitted at an address on n
 
 TEST_CASE("A proven identity names every route that admitted it", "[node][proof][admission]")
 {
-    // The fold UNIONS on a tie rather than choosing: a host on `--fleet-member` that also proves an
-    // admitted identity is admitted by both, and an operator who removes it from the list has to be
-    // told the identity still admits it.
+    // The fold UNIONS on a tie rather than choosing: a caller on this machine that also proves an
+    // admitted identity is admitted by both, and an operator asking why it was served has to be
+    // told both.
     ProvingNode node;
 
-    auto const provedOnly = Distributed::ExplainConnection(node.membership, StrangerAddress, IdentityOf(AdmittedNode));
+    auto const provedOnly = Distributed::ExplainConnection(
+        node.membership, ConnectionFacts { .host = std::string { StrangerAddress }, .proven = IdentityOf(AdmittedNode) });
     CHECK(provedOnly.verdict == Distributed::Membership::Member);
     CHECK(provedOnly.decidedBy.Has(Distributed::MembershipParticipant::ProvenIdentity));
-    CHECK_FALSE(provedOnly.decidedBy.Has(Distributed::MembershipParticipant::FleetMemberList));
+    CHECK_FALSE(provedOnly.decidedBy.Has(Distributed::MembershipParticipant::Loopback));
     CHECK(Distributed::RestsOnProvenIdentity(provedOnly));
 
-    auto const both = Distributed::ExplainConnection(node.membership, ListedAddress, IdentityOf(AdmittedNode));
+    auto const both = Distributed::ExplainConnection(
+        node.membership, ConnectionFacts { .host = "127.0.0.1", .proven = IdentityOf(AdmittedNode) });
     CHECK(both.verdict == Distributed::Membership::Member);
     CHECK(both.decidedBy.Has(Distributed::MembershipParticipant::ProvenIdentity));
-    CHECK(both.decidedBy.Has(Distributed::MembershipParticipant::FleetMemberList));
+    CHECK(both.decidedBy.Has(Distributed::MembershipParticipant::Loopback));
     CHECK(both.decidedBy.Count() == 2);
 
     // The control: the same address with nothing proved is an outsider whom NO route decided.
-    auto const neither = Distributed::ExplainConnection(node.membership, StrangerAddress, std::nullopt);
+    auto const neither =
+        Distributed::ExplainConnection(node.membership, ConnectionFacts { .host = std::string { StrangerAddress } });
     CHECK(neither.verdict == Distributed::Membership::Outsider);
     CHECK(neither.decidedBy.Empty());
 
     // A key live under ANOTHER id is not that id's: the roster holds a key per id, so node-9
     // claiming node-7's id with node-9's key is nobody the cluster admitted.
     auto const borrowed = ProvenIdentity { .id = std::string { AdmittedNode }, .key = IdentityOf(OtherNode).key };
-    CHECK(Distributed::ExplainConnection(node.membership, StrangerAddress, borrowed).verdict
+    CHECK(Distributed::ExplainConnection(node.membership,
+                                         ConnectionFacts { .host = std::string { StrangerAddress }, .proven = borrowed })
+              .verdict
           == Distributed::Membership::Outsider);
 }
 
-TEST_CASE("A revoked key is Forgotten although its host is on --fleet-member", "[node][proof][admission][revoke]")
+TEST_CASE("A revoked key is Forgotten although the node is --fleet-open", "[node][proof][admission][revoke]")
 {
     // **#178's revocation, and the reason a forget no longer means rotating a key on every other
-    // machine.** The forgotten machine dials from an address `--fleet-member` still lists -- the
-    // operator has not edited every node's list, and must not have to -- and proves the key the
-    // cluster revoked. The key outranks the listing: `Forgotten`, decided by the key's tombstone.
+    // machine.** The node admits every caller -- the operator opened it -- and the forgotten
+    // machine proves the key the cluster revoked. The key outranks the policy: `Forgotten`,
+    // decided by the key's tombstone.
     ProvingNode node;
+    Distributed::OpenMembership const open;
+    Distributed::AnyOfMembership const openly { { &node.loopback, &open, &node.keys } };
+    SchedulerResponder scheduler { node.protocol, openly, node.metrics };
+    auto const forgotten = ConnectionFacts { .host = std::string { StrangerAddress }, .proven = IdentityOf(ForgottenNode) };
 
-    auto const decision = Distributed::ExplainConnection(node.membership, ListedAddress, IdentityOf(ForgottenNode));
+    auto const decision = Distributed::ExplainConnection(openly, forgotten);
     CHECK(decision.verdict == Distributed::Membership::Forgotten);
     CHECK(decision.decidedBy.Has(Distributed::MembershipParticipant::KeyTombstone));
-    CHECK_FALSE(decision.decidedBy.Has(Distributed::MembershipParticipant::FleetMemberList));
+    CHECK_FALSE(decision.decidedBy.Has(Distributed::MembershipParticipant::OpenPolicy));
     CHECK_FALSE(Distributed::RestsOnProvenIdentity(decision));
 
-    // Loopback too: this machine's own address admits it on every list, and a revoked key is still
+    // Loopback too: this machine's own address always admits it, and a revoked key is still
     // refused -- the one case where "the address always admits" and "the key is revoked" meet.
-    CHECK(Distributed::ExplainConnection(node.membership, "127.0.0.1", IdentityOf(ForgottenNode)).verdict
-          == Distributed::Membership::Forgotten);
+    CHECK(
+        Distributed::ExplainConnection(openly, ConnectionFacts { .host = "127.0.0.1", .proven = IdentityOf(ForgottenNode) })
+            .verdict
+        == Distributed::Membership::Forgotten);
 
     // At every gate that folds the connection, counted as the removed MACHINE rather than as a
-    // forgotten host or a stranger -- the diagnoses are opposite.
-    auto const refusal =
-        RefuseUnlessMember(node.membership,
-                           node.metrics,
-                           PeerIdentity { .host = std::string { ListedAddress }, .proven = IdentityOf(ForgottenNode) },
-                           Stranger,
-                           "members only");
+    // stranger -- the diagnoses are opposite.
+    auto const refusal = RefuseUnlessMember(openly, node.metrics, forgotten, Stranger, "members only");
     REQUIRE(refusal.has_value());
     CHECK(ErrorOf(Unwrap(refusal)) == Wire::ErrorCode::NotAMember);
     CHECK(node.metrics.Read(IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked) == 1);
-    CHECK(node.metrics.Read(HostForgotten.counter) == 0);
     CHECK(node.metrics.Read(Stranger.counter) == 0);
 
     // And the scheduler, which reads the same fold: refused.
-    auto const lease = core::async::syncRun(node.scheduler.Answer(LeaseFrame(),
-                                                                  PeerIdentity { .host = std::string { ListedAddress },
-                                                                                 .proven = IdentityOf(ForgottenNode) }))
-                           .bytes;
+    auto const lease = core::async::syncRun(scheduler.Answer(LeaseFrame(), forgotten)).bytes;
     CHECK(ErrorOf(lease) == Wire::ErrorCode::NotAMember);
 
     // The control, which is what says the KEY decided: the same address, proving nothing, is
-    // admitted by the list -- as a client, which is all an address admits since #178.
-    CHECK(Distributed::ExplainConnection(node.membership, ListedAddress, std::nullopt).verdict
-          == Distributed::Membership::Member);
-    auto const listedClient =
-        core::async::syncRun(node.scheduler.Answer(LeaseFrame(), PeerIdentity { .host = std::string { ListedAddress } }))
-            .bytes;
-    CHECK(ErrorOf(listedClient) == Wire::ErrorCode::NoWorker);
-}
-
-TEST_CASE("A forgotten host is refused although it proves an admitted key", "[node][proof][admission]")
-{
-    // The precedence is unchanged by an identity: a host tombstone outranks a live key exactly as
-    // it outranks a listing, so a machine an operator forgot BY ADDRESS stays forgotten there.
-    Distributed::ForgottenMembership tombstoned;
-    tombstoned.Publish({ std::string { StrangerAddress } });
-    Distributed::KeyRosterMembership keys;
-    Testing::PublishKeyRoster(keys, { std::string { AdmittedNode } });
-    Distributed::AnyOfMembership const oracle { { &tombstoned, &keys } };
-
-    auto const decision = Distributed::ExplainConnection(oracle, StrangerAddress, IdentityOf(AdmittedNode));
-    CHECK(decision.verdict == Distributed::Membership::Forgotten);
-    CHECK(decision.decidedBy.Has(Distributed::MembershipParticipant::ClientTombstone));
+    // admitted by the policy -- as a client, which is all an address admits since #178.
+    auto const anonymous = ConnectionFacts { .host = std::string { StrangerAddress } };
+    CHECK(Distributed::ExplainConnection(openly, anonymous).verdict == Distributed::Membership::Member);
+    auto const openClient = core::async::syncRun(scheduler.Answer(LeaseFrame(), anonymous)).bytes;
+    CHECK(ErrorOf(openClient) == Wire::ErrorCode::NoWorker);
 }
 
 TEST_CASE("An admitted key proves its identity, and the answer carries the keys that seal the connection", "[node][proof]")
@@ -444,7 +426,7 @@ TEST_CASE("A revoked key is refused by name, and the connection keeps the identi
     // The forgotten machine itself, still holding its key and still dialling. Refused -- and the
     // identity is KEPT on the connection rather than dropped, so every later request on it is
     // refused as the forgotten machine's; a connection that forgot what it proved would be judged
-    // by its address again, which `--fleet-member` may still admit.
+    // by its address again, which loopback or `--fleet-open` may still admit.
     ProvingNode node;
     auto const challenged = Challenge(node);
     auto const verdict =
@@ -498,9 +480,9 @@ TEST_CASE("A challenge that will not decode is refused and counted as malformed"
     CHECK(node.random.FillCount() == 0);
 }
 
-TEST_CASE("The node-proof surface refuses nobody at its door, and requires the credential when one is set", "[node][proof]")
+TEST_CASE("The node-proof surface refuses nobody at its door", "[node][proof]")
 {
-    // The one hole this surface opens, and the gate beside it. The machine asking is on no list
+    // The one hole this surface opens. The machine asking is on no list
     // -- being on none is the problem being solved -- so a membership test at the door would
     // refuse the population the verbs exist for.
     ProvingNode node;
@@ -511,13 +493,6 @@ TEST_CASE("The node-proof surface refuses nobody at its door, and requires the c
                 .has_value());
         CHECK_FALSE(Wire::FindOp(static_cast<std::uint8_t>(op))->preAuth.Allowed());
     }
-
-    CHECK_FALSE(node.prover.AuthRequired(static_cast<std::uint8_t>(Wire::Op::ProveNode)));
-
-    auto const policy = std::make_shared<AuthPolicy const>(std::string {}, std::string { "token" });
-    NodeProofResponder gated { "scheduler", node.identity, node.membership, node.random, node.metrics, node.logger, policy };
-    CHECK(gated.AuthRequired(static_cast<std::uint8_t>(Wire::Op::ProveNode)));
-    CHECK(gated.AuthRequired(static_cast<std::uint8_t>(Wire::Op::NodeChallenge)));
 }
 
 TEST_CASE("A node running no consensus refuses the whole node-proof family, and says so", "[node][proof]")

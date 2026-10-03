@@ -500,9 +500,9 @@ address comparison — the mechanism
 [cluster discovery](../getting-started/cluster-discovery.md) already uses.
 
 Until that lands, a fleet's boundary is the one described under [what is
-authenticated, and what is not](#what-is-authenticated-and-what-is-not): keep
-`--fleet-member` tight, and do not put a scheduler where machines you do not
-operate can reach it.
+authenticated, and what is not](#what-is-authenticated-and-what-is-not): admit only
+machines you operate, and do not put a scheduler where machines you do not operate
+can reach it.
 
 ## What the cluster says to itself
 
@@ -545,125 +545,83 @@ exchange.
 
 ## Who a node admits
 
-The scheduler verbs and the compile verbs ask membership of a caller, and the answer
-comes from two independent lists. A host on **either** is admitted:
+The scheduler verbs and the compile verbs ask membership of a caller, and the answer is
+about the caller's **machine**, never its address. One fold decides it, with five
+participants:
 
-| List | Set by | Answers |
+| Route | What admits | Set by |
 |---|---|---|
-| What the operator listed | `--fleet-member`, repeatable | Who may spend this node's CPU |
-| What the cluster agreed | consensus, on every committed membership change | Who is in the cluster |
+| Loopback | A process on this machine, presenting nothing | always on |
+| A proven key | A node that signs this connection's handshake with an identity key the roster holds live | the cluster, by admitting the key |
+| A machine ticket | A client that presents a ticket signed by such a key, for this endpoint, once | the cluster, by admitting the key |
+| `--fleet-open` | Any caller at all | the operator, on this node |
+| A revoked key | Nobody: it **refuses**, and outranks every route above | `--cluster-forget` |
 
 The **cache tier is not one of them** and asks a different question entirely —
-"is this caller on this machine" — which neither list can answer and neither is
-consulted for. That is
-[#287](https://github.com/LASTRADA-Software/fastcached/issues/287), below.
+"is this caller on this machine" — which no route can answer and none is consulted
+for. That is [#287](https://github.com/LASTRADA-Software/fastcached/issues/287), below.
 
-They are separate because they answer different questions. Cluster members are
-**peers**; the machines that spend a fleet's capacity are mostly not — a
-developer's laptop, a CI runner, anything running `fastcache-cc` against the
-fleet. Such a machine never joins consensus and never should, so `--fleet-member`
-is the only route by which it is admitted at all.
-
-Consensus therefore **adds** its member set rather than replacing what was listed.
-A `--fleet-member` host stays admitted across every membership commit, and a
-cluster peer is admitted without anybody listing it. This was not always so: until
-[#251](https://github.com/LASTRADA-Software/fastcached/issues/251) the first
-replicated commit — a node joining, a node being forgotten, a settings change —
-discarded the operator's list, so a client machine stopped being served with no
-configuration having changed anywhere.
+**An address admits nobody but this machine.** A machine on a VPN, behind NAT or on
+DHCP has no address worth listing, so every machine is admitted by the key it holds in
+its state directory: a node proves it, and a machine that only asks — a laptop, a CI
+runner running `fastcache-cc` — has its own node mint a ticket per exchange. Either way
+the machine's key is admitted to the cluster once, as a member or as a learner that never
+votes, and every node admits it from whatever address it dials. See [a machine that only
+asks](../tools/fastcache-compile-node.md#a-machine-that-only-asks-tickets).
 
 Two rules that have not moved:
 
-- **This machine is always admitted**, whatever either list says. A node that
-  refused its own operator's builds would be a fleet that looks configured and
-  serves nobody locally.
-- **An empty policy refuses the network.** A node given neither flag admits itself
-  and whatever its cluster has agreed — on a node running no consensus, that is
-  itself and nothing else — rather than becoming an open scheduler by omission.
-  `--fleet-open` admits every caller and is a decision somebody makes, never what
-  an unset field decays to.
+- **This machine is always admitted**, with nothing to present. A node that refused its
+  own operator's builds would be a fleet that looks configured and serves nobody
+  locally.
+- **An empty policy refuses the network.** A node with no roster and no `--fleet-open`
+  admits itself and nothing else, rather than becoming an open scheduler by omission.
+  `--fleet-open` admits every caller and is a decision somebody makes, never what an
+  unset field decays to.
 
-The node's ready line states which of these it is, so an operator sees the policy
-at the one moment they are watching.
+The node's ready line states which of these it is, so an operator sees the policy at the
+one moment they are watching, and `fastcache-cli explain-admission` answers the same
+question about any one connection or machine.
 
-### Revocation, and why a restart is part of it
+### Revocation
 
-Admission is fully dynamic and **removal is not**, and the asymmetry is worth stating
-plainly because the machine an operator most wants to revoke is the one most likely to
-be in both lists.
+**`--cluster-forget=<id>` revokes the machine's key, and that reaches everything.** The
+record leaves the cluster and the key it held is revoked in the same entry
+([#1555](https://github.com/LASTRADA-Software/fastcached/issues/1555)). Every node asks
+the replicated keys on every request, so the forget reaches every node as it applies the
+entry — every surface, every connection already open, from any address, including this
+machine's own loopback — with nothing to edit or reload on any machine. A connection that
+presents the revoked key, by a proof or by a ticket, is refused as the forgotten machine's
+on every later request, and counted apart from a stranger's
+(`fastcache_node_requests_refused_key_revoked_total`), because *a machine an operator
+removed* and *a machine nobody ever admitted* are opposite diagnoses. Only a **new** key
+brings the machine back: re-admitting the key it still holds is refused by name.
 
-**Two verbs, and they revoke different things.** `--cluster-forget` names an *id* — a
-member's, or a worker's that enrolled — takes it out of the cluster, and revokes the
-identity key it was admitted under ([#1555](https://github.com/LASTRADA-Software/fastcached/issues/1555)),
-so it is never admitted as itself again. `--cluster-forget-client` names a *host* and
-records that the fleet has forgotten it ([#1309](https://github.com/LASTRADA-Software/fastcached/issues/1309));
-a client never joins consensus, so it has no id for the first verb to name.
+**Removal used to fail open, and a key is why it no longer does.** When admission was an
+address list, the list lived on every node that named the host, and the one an operator
+forgot to edit went on serving it with nothing reporting it — admission succeeding is the
+ordinary case. A key lives in one replicated state, so there is no second copy to forget.
 
-| Admitted via | `--cluster-forget <id>` | `--cluster-forget-client <host>` |
-|---|---|---|
-| the cluster only | **yes**, on the committed membership change | **yes** |
-| `--fleet-member` only | **no** — consensus does not speak for that list | **yes** — the tombstone outranks the listing |
-| **both** | **no** — the static list keeps admitting it | **yes** |
-| under `--fleet-open` | **no** — there is no set to remove anybody from | **yes** — a blanket does not outrank a named host |
-
-The right-hand column is why the left-hand one is no longer the whole story. A forget of
-a *client* is recorded as a positive act rather than as an erasure, so a node whose own
-`--fleet-member` list still names the machine refuses it anyway, from the commit onward,
-with nobody editing a file on any other machine. The refusal is counted apart from a
-stranger's (`fastcache_node_requests_refused_host_forgotten_total`), because *a host an
-operator removed* and *a host nobody ever listed* are opposite diagnoses.
-
-`--fleet-member` is a **reloadable** setting, so removing a host from it takes a
-configuration change on every node that lists it and a `SIGHUP` — not a restart. Drop
-the host from `fleet_member:` and run `systemctl reload fastcache-compile-node`, and
-that machine is refused from the next connection onward -- on the compile verbs, on
-the cache tier and on the scheduler, which all ask one oracle. The
-worker logs the change at `WARN`, naming the hosts that are no longer admitted, because
-a revocation that did not take looks exactly like one that did.
-
-It is still a change on **every** node that lists the host: the list is per-node
-configuration, and a `--cluster-forget` on the leader speaks for the cluster's set and
-not for anybody's `--fleet-member`. That is what makes a listed client machine survive
-every membership commit in the first place.
-
-Under **`--fleet-open` a MEMBER forget revokes nothing at all.** The flag says "admit
-everybody", so there is no set for a membership change to remove anybody from. That is
-the flag working rather than a limitation, and an operator who wants that kind of
-revocation has to turn it off — which is itself a reload: drop `fleet_open:` from the
-file and `SIGHUP`, and the node closes to everybody its `fleet_member:` list does not
-name.
-
-**A client forget reaches an open node.** `--fleet-open` says *I have not enumerated who
-may use this fleet* — a blanket over hosts nobody named — and `--cluster-forget-client`
-names one. Letting the blanket win would make a local flag resurrect a machine the
-cluster positively removed, on exactly the node nobody has reconfigured yet. The two
-directions are not comparable: honouring the forget wrongly refuses a machine, which
-fails closed and is visible from the refused end, while ignoring it serves a
-decommissioned host indefinitely with admission succeeding as the ordinary case and
-nothing reporting it.
+**Under `--fleet-open` the forget still bites, on the key.** The flag says *I have not
+enumerated who may use this fleet*, and a forget names one machine, so a connection that
+presents the revoked key is refused there too. What such a node still serves is a caller
+presenting NOTHING — the flag admits anonymous callers by design, and a forgotten machine
+that presents nothing is one of them. Closing a node to those is dropping `fleet_open:` from
+its file and `SIGHUP`. A forgotten machine's ticket on an open node is refused where a
+stranger's is served, so there its holder can tell that the machine was forgotten.
 
 **One thing a reload will not do is widen a worker that runs no consensus and names no
 `--voter-key`.** Such a worker may have chosen at startup to verify no lease signatures,
 which is only safe while no machine but its own is admitted, and a roster kept in its state
 directory is not something any configuration can see -- so a reload that would newly admit
-a remote host is refused by name and nothing is applied. Name the cluster's voters and
+another machine is refused by name and nothing is applied. Name the cluster's voters and
 restart it, or leave the policy alone. Narrowing is always allowed — that is the direction
 that closes it.
 
-This is [#265](https://github.com/LASTRADA-Software/fastcached/issues/265), and it was
-never a regression: before #251 a forget *appeared* to revoke, as a side effect of the
-defect that also ejected every client laptop the moment the fleet agreed anything. What
-#251 exposed is that there was no revocation path for a statically listed host —
-**which is what `--cluster-forget-client` now is.** The sentence that used to close this
-paragraph said there *never* had been one, and a rule stated as permanent is the
-expensive kind to leave standing: it instructs whoever reads it not to look.
-
 **It does not contradict the rule that absence from `ClusterState` is not removal.**
 That rule is about *absence* — a member the state has never named, which a node must
-not read as a removal. An explicit `--cluster-forget` is a positive act, and it does
-revoke the admission consensus granted. What it cannot reach is a second, independent
-route that a different operator asserted by hand; a forget speaks for one list because
-it is the only one consensus owns.
+not read as a removal. An explicit `--cluster-forget` is a positive act, and it revokes
+the key the removed record held.
 
 ## The node's own cache, and the shared one
 
@@ -676,10 +634,9 @@ questions are:
   machine's own build output, and its verbs answer this machine alone whatever the bind.
 
     It is served to **this machine and to nothing else**, always
-    ([#287](https://github.com/LASTRADA-Software/fastcached/issues/287)). Not to
-    `--fleet-member` hosts and not to cluster members, both of which used to be
-    admitted here: a peer that may spend this machine's CPU is not thereby entitled
-    to read everything it has ever compiled. The rule belongs to the **verb**, so
+    ([#287](https://github.com/LASTRADA-Software/fastcached/issues/287)). Not to a
+    machine the cluster admitted, by proof or by ticket: a peer that may spend this
+    machine's CPU is not thereby entitled to read everything it has ever compiled. The rule belongs to the **verb**, so
     widening the bind does not widen who is served, and every off-box `FETCH` is
     refused `not-a-member` and counted in
     `fastcache_node_cache_requests_refused_not_local_total`.
@@ -836,10 +793,10 @@ open.
 
 | What you see | Which leg | What to check |
 |---|---|---|
-| A worker never appears in the fleet at all | node → scheduler | Is `--requirepass` set on the node? It refuses `REGISTER`. Is the machine a `--fleet-member` of the scheduler? Does `--advertise` name an address others can reach? |
+| A worker never appears in the fleet at all | node → scheduler | Is the worker's key admitted to the cluster? A `REGISTER` from a key the cluster does not hold is refused, and `fastcache_scheduler_requests_refused_node_identity_required_total` or `fastcache_node_proofs_refused_unknown_key_total` climbs on the scheduler. Does `--advertise` name an address others can reach? |
 | Workers appear, then vanish, then reappear | node → scheduler | Heartbeats are not arriving inside 90 s. On the dashboard, registrations and expiries both climbing is this, not a growing fleet |
-| Every compile happens locally, build stays green | client → scheduler | Is `FASTCACHE_SCHEDULER` set? Is `FASTCACHE_TOKEN` *also* set — that declines every lease. Run with `FASTCACHE_VERBOSE=1`, which names the refusal |
-| A lease is granted, then the compile runs locally anyway | client → node | The worker refused the client `not-a-member`. Give that worker `--fleet-member` or `--fleet-open`: membership gates its compile port, not only a scheduler's. The scheduler's counters stay correct and flat — the lease *was* granted — so look at the **worker**: its ready line names who it admits, and `fastcache_worker_jobs_refused_not_a_member_total` counts each turned-away client ([#235](https://github.com/LASTRADA-Software/fastcached/issues/235)) |
+| Every compile happens locally, build stays green | client → scheduler | Is `FASTCACHE_SCHEDULER` set? Is this machine admitted — does a node run here, at `FASTCACHE_ADDR`, to mint its tickets, and is that node's key admitted to the cluster? `fastcache-cli explain-admission <machine>` on the scheduler says. Run with `FASTCACHE_VERBOSE=1`, which names the refusal |
+| A lease is granted, then the compile runs locally anyway | client → node | The worker refused the client `not-a-member`. Give that worker a roster (`--voter-key`), so it admits the machines the cluster admitted, or `--fleet-open`: membership gates its compile port, not only a scheduler's. The scheduler's counters stay correct and flat — the lease *was* granted — so look at the **worker**: its ready line names who it admits, and `fastcache_worker_jobs_refused_not_a_member_total` counts each turned-away client ([#235](https://github.com/LASTRADA-Software/fastcached/issues/235)) |
 | `no-worker`, though the toolchain looks identical | client → scheduler | Fingerprints must match byte for byte. Compare the node's `serving …` startup lines against the client's |
 | `/fleet` answers `503` | operator → dashboard | You are asking a follower. The reply names the leader |
 | Peers are seen but never authenticated | node → segment | The reply port is being dropped while the beacon port passes. Pin `--discovery-reply-port` and open it. If `fastcache_discovery_proofs_refused_unknown_key_total` climbs instead, the handshake completes and the key is one the cluster does not hold: discovery admits nobody, so enrol the machine or `--cluster-admit` it under the key the warning names |
@@ -854,11 +811,12 @@ open.
 
 --8<-- "node-credential-gap.md"
 
-Until that closes, a fleet's boundary on those surfaces is **network reachability plus
-membership** — `--fleet-member`, or `--fleet-open` to drop the list — and that gate
-matches on the peer's source address alone. A network where addresses can be spoofed
-is not a boundary it can hold. For anything beyond a trusted build network, put mTLS
-in front of every port.
+A fleet's boundary on those surfaces is **network reachability plus membership**, and
+membership is a machine's key: a proof, or a ticket signed with it. No source address
+admits anybody but this machine, so a spoofed one buys a stranger nothing. A ticket
+travels in the clear, which is why it names one endpoint, lives a minute and is spent
+once; `--fleet-open` drops the check altogether. For anything beyond a trusted build
+network, put mTLS in front of every port.
 
 The credentials that are real and unaffected: `--dashboard-token-file` for the fleet
 page, and `fastcached`'s own `--requirepass` for the shared cache. **Each member's own
@@ -966,7 +924,7 @@ same misconfiguration usually shows on both ends of the connection:
 
 | You see | On the accepting node | On the dialling node | Meaning |
 |---|---|---|---|
-| A key never given | `..._connections_refused_unknown_key_total` | `..._dials_ended_by_acceptor_total` | The acceptor holds no key for the id the dialler claims: a member admitted without `@<key>`, or a machine that is not a member. It cannot sign a verdict for a proof it could not check, so the dialler sees the connection close |
+| A key never given | `..._connections_refused_unknown_key_total` | `..._dials_ended_by_acceptor_total` | The acceptor holds no key for the id the dialler claims: a machine that is not a member, since every member the roster records holds its key. It cannot sign a verdict for a proof it could not check, so the dialler sees the connection close |
 | A member's id, claimed by another machine | `..._connections_refused_proof_total` | `..._dials_ended_by_acceptor_total` | The proof did not verify under the key the acceptor holds for that id |
 | A key this node was never given | — | `..._dials_refused_acceptor_key_unknown_total` | The member that answered signed its verdict, and this node holds no key to check it with. Nothing was sent to it |
 | An impostor at a member's address | — (it is not a member) | `..._dials_refused_acceptor_proof_total` | Whatever answers there signed its verdict with a key that is not the member's. Nothing was sent to it |
@@ -1050,7 +1008,7 @@ decision is made once, before anything is served:
 - A node that **another machine could dial** and has no way to check a lease — it
   runs no consensus, names no `--voter-key` and keeps no roster in its `--cluster-dir`
   — is refused at startup, by name. Both halves have to be true — a node bound to
-  loopback answers nobody else whatever `--fleet-member` or `--fleet-open` say, and
+  loopback answers nobody else whatever the roster or `--fleet-open` say, and
   a node admitting only its own machine escalates nobody however it is bound.
 - A node that **nothing else can dial** runs without the check and logs a warning
   saying so, once, at startup. This is the ordinary single-machine install: a

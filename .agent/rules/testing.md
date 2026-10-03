@@ -1627,9 +1627,11 @@ with what it tests.
 **A body of assertions with a prerequisite the host may lack becomes its own ctest
 test**, not another case in an existing one. A script exits once, so a case inside a
 suite can do no more than print a line and let the run go green, and skipped and
-passed are then the same result. `dist-compile-membership-e2e` is that shape — one
-script, two registrations, `--case membership` — and the reasoning is under *A
-fixture whose client is always local cannot test who is admitted*, below.
+passed are then the same result. The better answer, where one exists, is to remove the
+prerequisite: the #235 pair needed a non-loopback address of this host's own, and was
+a script mode of its own for that reason until a relabelled socket gave every host one
+in process — see *A fixture whose client is always local cannot test who is admitted*,
+below.
 
 ## A shared failure message describes one caller, and lies to the others
 
@@ -2155,10 +2157,10 @@ All three are named failures.
 <!-- agent-tripwire: A fixture whose client is always LOCAL cannot test who is admitted -->
 
 `scripts/dist-compile-e2e.sh` had twelve cases, three real processes each, and every
-leg of every one of them was loopback. `ClusterMembership::Classify` admits loopback
-**before** it consults a member list — deliberately, because that is what makes an
-unconfigured node useful on its own machine — so the branch underneath was reached by
-nothing:
+leg of every one of them was loopback. Admission asked loopback **before** it consulted
+anything else — deliberately, because that is what makes an unconfigured node useful on
+its own machine — and it still does: the fold's loopback participant answers first, so
+every route behind it was reached by nothing. At #235 the route behind it was a host list:
 
 ```cpp
 if (IsLoopbackHost(peerAddress))
@@ -2166,6 +2168,8 @@ if (IsLoopbackHost(peerAddress))
 ...
 return any_of(_hosts, SameHost) ? Member : Outsider;      // nothing at all
 ```
+
+Today it is a proven key and a verified ticket, and the shape of the trap is unchanged.
 
 That is how [#235](https://github.com/LASTRADA-Software/fastcached/issues/235)
 survived. A worker that admitted **only** its own machine — and therefore refused
@@ -2175,45 +2179,62 @@ proved dispatch works and could not have noticed that dispatch works for nobody 
 
 **The cheap fix does not work, and it looks exactly like it does.** A second loopback
 address is the obvious move and was the ticket's own first suggestion:
-`IsLoopbackHost` matches `127.` rather than `127.0.0.1`, and says so in its own
-comment, so a client on `127.0.0.2` takes the same early return. The fixture would
+`IsLoopbackHost` answers for the whole of `127.0.0.0/8` rather than `127.0.0.1`, and says so in
+its own comment, so a client on `127.0.0.2` takes the same early return. The fixture would
 change, the addresses in the log would differ, and the test would go on proving what
 it proved before — which is the shape of the defect, applied to its own repair.
 
-**What reaches the branch is the host's own non-loopback address**, and it needs no
-second machine: bind the worker there, let the scheduler grant that endpoint, and the
-connection the worker accepts arrives from outside `127/8`.
+**What reaches the branch is a peer that is not this machine**, and it needs neither a
+second machine nor a second address: `src/tests/RelabelledPeerListener.hpp` hands the
+endpoint real loopback sockets whose `peerAddress()` reports a fixed non-loopback host.
+Every read, write, deadline and half-close is the kernel's, so the endpoint's own framing
+and AUTH state machine run unchanged, and only the question admission starts from gets a
+different answer. The pair lives in `FrameEndpoint_test.cpp` (*(#235, rebuilt)*); the
+fleet-wide cases in `FleetTickets_test.cpp` reach the same branch through
+`FleetHarness::SetCallerHost`, set FIRST in every case.
 
-Four things about the shape, and the last two are the ones that generalise.
+It replaced a mode of `dist-compile-e2e.sh`, since deleted, that bound a worker
+on the host's own LAN address and was registered as a ctest test of its own because a
+host without such an address had to report SKIPPED. The relabelled socket has no such
+prerequisite, so nothing is skipped and the mode is gone rather than kept beside it.
 
-- **Assert both directions; only the pair proves anything.** Listed in
-  `--fleet-member` → dispatched and served. Absent → refused `not-a-member`, the build
-  compiles locally, and `fastcache_worker_jobs_refused_not_a_member_total` **moves** —
-  the assertion #235 needed and did not have. The admitted leg alone passes over
-  loopback too, since loopback is admitted above the list, so it cannot show the
-  address ever reached the list; the refusing leg is what shows it, because a loopback
-  peer would have been admitted there as well. Measured, with the address forced back
-  to `127.0.0.1`: the admitting leg stays **green** and the refusing leg goes red. That
-  asymmetry is the finding — one of the two legs cannot tell the difference, which is
-  why a suite made of legs like it reported nothing for twelve cases.
-- **The scheduler admits the client in both legs.** #235's shape is a lease that is
-  granted and then a worker that refuses it, which is invisible from the side anybody
-  watches — no scheduler counter moves. A refusal arriving from the scheduler instead
-  is a different test passing under the same name, so the client-side assertion matches
-  `refused the job: rejected (not-a-member)` rather than the error code alone.
-- **The baseline is not zero, and pretending it is hides the instrument.** The
-  fixture's own `wait_for_port` dials the compile port from that same address, so the
-  refusing leg has already refused one caller before its compile runs. That reading is
-  taken *after* startup and the compile is asserted as a **delta** from it — and its
-  being at least one is itself an assertion, because a zero there would mean the probe
-  arrived as a loopback caller and the leg proves nothing.
-- **A machine with no non-loopback address reports SKIPPED, loudly.** This is the only
-  body of assertions in that file with a prerequisite a host may lack, which is why it
-  is its own ctest test (`ctest -R dist-compile-membership-e2e`) rather than a
-  thirteenth case: a script exits once, so a case inside the suite could do no more
-  than print a line and let the run go green. A quiet fall back to loopback would be a
-  pass reported for a case that never ran — this ticket's own failure mode, wearing the
-  hat of its fix.
+Its three legs have three homes now, and two of them moved in meaning as well as place.
+
+- **Leg 1's route is a ticket, not `--fleet-open`.** The mode opened its admitting worker
+  with the flag because a caller presenting no key had no other way in; since #178 no
+  address admits anybody, and the route a launcher on another machine takes is the ticket
+  its own node minted, so that is what the rebuilt admitted leg presents.
+- **Leg 2's launcher half lives in the Dispatch tests.** The node refusing `not-a-member`
+  is the rebuilt pair's second leg; that the launcher then compiles LOCALLY is the
+  launcher's decision, not the node's: a worker's refusal is `DispatchStatus::Declined`
+  (`Dispatch_test.cpp`, *A worker refusing the job is a decline, not a compile*), and a
+  declined dispatch is a local compile.
+- **Leg 3 is the SERVED direction of #290**, and has a case of its own: *(#235, rebuilt)
+  the same peer on the same listener is served the cache as this machine*. The node's
+  locality oracle names the relabelled host, so the caller IS this machine: its FETCH
+  returns the stored bytes with `NodeCacheRequestsRefusedNotLocal` flat, and its COMPILE
+  on the same connection is refused by membership. The refusing direction needs a peer
+  that is genuinely somebody else and stays `NodeFrameSurface_test`'s *(#290) one peer on
+  one listener*.
+
+Three things about the shape, and they generalise.
+
+- **Assert both directions; only the pair proves anything.** A ticket for an admitted
+  machine → the COMPILE is served. No ticket, same address → refused `not-a-member`,
+  nothing compiled, and `WorkerJobsRefusedNotAMember` **moves** — the assertion #235
+  needed and did not have. The admitted leg alone passes over loopback too, since
+  loopback is admitted before any other route is asked, so it cannot show the peer ever
+  reached the other routes; the refusing leg is what shows it, because a loopback peer
+  would have been admitted there as well.
+- **Keep a control on the SAME fixture that is not relabelled.** The refusing leg sent
+  through a listener that is not relabelled is served as this machine's. Neutering the
+  relabelling (`peerAddress()` forwarding the real peer) turns the refusal legs red and
+  leaves the control green — the asymmetry that says the relabelling is live rather than
+  assumed.
+- **A refusal is asserted by the counter of the rule that refused, not by the code.**
+  Several rules answer `not-a-member`; a revoked machine's verb, for one, is refused with
+  that code and counted on `NodeRequestsRefusedKeyRevoked`, never on the door's stranger
+  row, and the revoked-door case asserts both counters for that reason.
 
 ## A fixture must state which PATH it exercised
 

@@ -100,7 +100,7 @@ struct NodeFormationView
 /// joined, whose seat is the leader's to replicate.
 /// @param cfg The configuration.
 /// @return The members; empty for an unformed configuration.
-[[nodiscard]] std::vector<Cluster::ClusterMember> BootstrapMembersOf(NodeConfig const& cfg);
+[[nodiscard]] std::vector<Cluster::MemberSpec> BootstrapMembersOf(NodeConfig const& cfg);
 
 /// Why the formation keeps the Raft surface closed, for `--print-surfaces`.
 /// @param cfg The configuration.

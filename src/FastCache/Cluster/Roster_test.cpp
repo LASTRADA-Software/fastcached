@@ -6,8 +6,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cstddef>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -23,29 +25,42 @@ using FastCache::Testing::TestKeyPair;
 namespace
 {
 
-/// A member of @p seat, with the test key of @p id or none.
-[[nodiscard]] ClusterMember Member(std::string const& id, MemberSeat seat, bool keyed)
+/// A member of @p seat, under the test key of @p id.
+[[nodiscard]] ClusterMember Member(std::string const& id, MemberSeat seat)
 {
     return ClusterMember { .id = id,
                            .raftEndpoint = id + ".example:6680",
                            .schedulerEndpoint = {},
                            .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
                            .seat = seat,
-                           .publicKey = keyed ? std::optional { TestKeyPair(id).PublicKey() } : std::nullopt };
+                           .publicKey = TestKeyPair(id).PublicKey() };
 }
 
-/// Two keyed voters, a keyless voter, a learner, a worker principal and one revocation.
+/// Three voters, a learner, a worker principal and one revocation.
 [[nodiscard]] ClusterState SampleState()
 {
     ClusterState state;
-    state.members = { Member("n1", MemberSeat::Voter, true),
-                      Member("n2", MemberSeat::Voter, true),
-                      Member("n3", MemberSeat::Voter, false),
-                      Member("n4", MemberSeat::Learner, true) };
+    state.members = { Member("n1", MemberSeat::Voter),
+                      Member("n2", MemberSeat::Voter),
+                      Member("n3", MemberSeat::Voter),
+                      Member("n4", MemberSeat::Learner) };
     state.principals = { ClusterPrincipal {
         .id = "w1", .publicKey = TestKeyPair("w1").PublicKey(), .role = PrincipalRole::Worker } };
     state.revokedKeys = { RevokedKey { .id = "n0", .publicKey = TestKeyPair("n0").PublicKey() } };
     return state;
+}
+
+/// A small-order point that is NOT the all-zero key: the identity, y = 1.
+///
+/// The all-zero key is small-order too, but this project reads it first as a key nobody named --
+/// what a command built without one carries -- and refuses it as "no identity key" before the curve
+/// is asked. So a case about the SMALL-ORDER refusal names a point only that refusal can answer.
+/// @return The key.
+[[nodiscard]] Ed25519PublicKey SmallOrderIdentityPoint()
+{
+    auto key = Ed25519PublicKey {};
+    key.front() = std::byte { 0x01 };
+    return key;
 }
 
 } // namespace
@@ -59,13 +74,13 @@ TEST_CASE("A roster is projected from the state it describes, seats and keys inc
     CHECK(roster.members[0].id == "n1");
     CHECK(roster.members[0].raftEndpoint == "n1.example:6680");
     CHECK(roster.members[0].publicKey == TestKeyPair("n1").PublicKey());
-    CHECK_FALSE(roster.members[2].publicKey.has_value());
+    CHECK(roster.members[2].publicKey == TestKeyPair("n3").PublicKey());
     CHECK(roster.members[3].seat == MemberSeat::Learner);
     CHECK(roster.principals == state.principals);
     CHECK(roster.revoked == state.revokedKeys);
 }
 
-TEST_CASE("A roster survives its own encoding, a keyless member included", "[cluster][roster]")
+TEST_CASE("A roster survives its own encoding", "[cluster][roster]")
 {
     auto const roster = ProjectRoster(SampleState());
     auto const decoded = DecodeRoster(EncodeRoster(roster));
@@ -137,14 +152,14 @@ TEST_CASE("A roster holding a small-order or non-canonical live key is refused, 
           "[cluster][roster][identity][security]")
 {
     // A roster is what a worker checks grants and endorsements against, so a small-order voter key
-    // in one is a voter anybody can sign as -- under it the all-zero signature verifies every
+    // in one is a voter anybody can sign as -- under it a small-order signature verifies every
     // message. Refused on decode by the holder's name, as a member's key and as a principal's; the
     // control is the same key REVOKED, which grants nothing and is kept.
     auto nonCanonical = Ed25519PublicKey {};
     nonCanonical.fill(std::byte { 0xFF });
     nonCanonical.back() = std::byte { 0x7F };
 
-    for (auto const& [key, fault]: { std::pair { Ed25519PublicKey {}, PublicKeyFault::SmallOrder },
+    for (auto const& [key, fault]: { std::pair { SmallOrderIdentityPoint(), PublicKeyFault::SmallOrder },
                                      std::pair { nonCanonical, PublicKeyFault::NonCanonical } })
     {
         INFO("key " << FormatEd25519PublicKey(key));
@@ -169,6 +184,88 @@ TEST_CASE("A roster holding a small-order or non-canonical live key is refused, 
         REQUIRE(kept.has_value());
         CHECK(*kept == revoked);
     }
+}
+
+TEST_CASE("A roster member with an empty or all-zero key is refused by name", "[cluster][roster]")
+{
+    // A member holds a key by type, so no `Roster` can carry one without -- and the bytes still
+    // can, since the field is a length-prefixed run like every other. Built from the bytes: one
+    // member, no principals, no revocations.
+    auto const version = std::array { static_cast<std::byte>(RosterFormatVersion) };
+    auto const seat = std::array { static_cast<std::byte>(MemberSeat::Voter) };
+    auto const key = TestKeyPair("n1").PublicKey();
+    auto const encodeWith = [&](std::span<std::byte const> keyField) {
+        auto const member = WireFields::Encode({ WireFields::AsBytes(std::string_view { "n1" }),
+                                                 WireFields::AsBytes(std::string_view { "n1.example:6680" }),
+                                                 std::span<std::byte const> { seat },
+                                                 keyField });
+        auto const members = WireFields::Encode({ std::span<std::byte const> { member } });
+        return WireFields::Encode({ std::span<std::byte const> { version },
+                                    std::span<std::byte const> { members },
+                                    std::span<std::byte const> {},
+                                    std::span<std::byte const> {} });
+    };
+
+    // WHAT DISTINGUISHES: the same bytes with the key in place decode, so the key field is the
+    // whole cause of the refusals below.
+    auto const keyed = DecodeRoster(encodeWith(std::span<std::byte const> { key }));
+    REQUIRE(keyed.has_value());
+    CHECK(Testing::Unwrap(keyed).members.at(0).publicKey == key);
+
+    // Named apart from every other malformed entry, as `DecodeState` names its own: a kept roster
+    // that holds one says so in its own words.
+    auto const zero = Ed25519PublicKey {};
+    for (auto const keyField: { std::span<std::byte const> {}, std::span<std::byte const> { zero } })
+    {
+        INFO("key field of " << keyField.size() << " bytes");
+        auto const refused = DecodeRoster(encodeWith(keyField));
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::MalformedFrame);
+        CHECK(refused.error().context.contains("a roster member holds no identity key"));
+    }
+
+    // And a member entry malformed some other way is not reported as keyless.
+    auto const shortKey = std::span<std::byte const> { key }.first(Ed25519PublicKeyBytes - 1);
+    auto const damaged = DecodeRoster(encodeWith(shortKey));
+    REQUIRE_FALSE(damaged.has_value());
+    CHECK(damaged.error().context.contains("a roster entry is malformed"));
+}
+
+TEST_CASE("A roster principal with an empty or all-zero key is refused by name", "[cluster][roster]")
+{
+    // The state never records a principal without a key or under the all-zero one, so no roster
+    // projected out of one carries it -- and a kept roster that does is named, as a member is.
+    // Built from the bytes: no members, one principal, no revocations.
+    auto const version = std::array { static_cast<std::byte>(RosterFormatVersion) };
+    auto const role = std::array { static_cast<std::byte>(PrincipalRole::Worker) };
+    auto const key = TestKeyPair("w1").PublicKey();
+    auto const encodeWith = [&](std::span<std::byte const> keyField) {
+        auto const principal = WireFields::Encode(
+            { WireFields::AsBytes(std::string_view { "w1" }), keyField, std::span<std::byte const> { role } });
+        auto const principals = WireFields::Encode({ std::span<std::byte const> { principal } });
+        return WireFields::Encode({ std::span<std::byte const> { version },
+                                    std::span<std::byte const> {},
+                                    std::span<std::byte const> { principals },
+                                    std::span<std::byte const> {} });
+    };
+
+    // WHAT DISTINGUISHES: the same bytes under a real key decode.
+    REQUIRE(DecodeRoster(encodeWith(std::span<std::byte const> { key })).has_value());
+
+    auto const zero = Ed25519PublicKey {};
+    for (auto const keyField: { std::span<std::byte const> {}, std::span<std::byte const> { zero } })
+    {
+        INFO("key field of " << keyField.size() << " bytes");
+        auto const refused = DecodeRoster(encodeWith(keyField));
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::MalformedFrame);
+        CHECK(refused.error().context.contains("a roster principal holds no identity key"));
+    }
+
+    // And a principal entry malformed some other way is not reported as keyless.
+    auto const damaged = DecodeRoster(encodeWith(std::span<std::byte const> { key }.first(Ed25519PublicKeyBytes - 1)));
+    REQUIRE_FALSE(damaged.has_value());
+    CHECK(damaged.error().context.contains("a roster entry is malformed"));
 }
 
 TEST_CASE("A roster fingerprint is the whole digest, in one spelling", "[cluster][roster]")

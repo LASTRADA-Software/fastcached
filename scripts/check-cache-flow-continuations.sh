@@ -49,7 +49,7 @@ Table='
 missing FASTCACHE_ADDR|Warn|cache not configured: nothing was reached, so nothing to replace
 preprocess failed|Warn|no preprocessed text means no key, so nothing to replace
 FetchObservation::HitUnusable|Warn|the STORED entry is good; the local write failed
-DescribeOutcome|WarnAndCarryOn|the daemon refused: carry on so a MISS can store
+RecordedReason|WarnAndCarryOn|the daemon refused: carry on so a MISS can store
 fetch exchange failed|WarnAndCarryOn|unreached: carry on so a MISS can store
 DecodeFailureReason|WarnAndCarryOn|an UNUSABLE value sits under this key and must be overwritten
 '
@@ -174,7 +174,7 @@ if [ "$selftest" -eq 1 ]; then
 return Warn(record, "missing FASTCACHE_ADDR/SOURCE_DIR/BINARY_DIR");
 return Warn(record, "preprocess failed");
 return Warn(record, Cc::CacheActionReason(Cc::FetchObservation::HitUnusable));
-WarnAndCarryOn(record, Cc::DescribeOutcome(outcome));
+WarnAndCarryOn(record, Cc::RecordedReason(outcome, presented.missing));
 WarnAndCarryOn(record, "fetch exchange failed");
 WarnAndCarryOn(record, DecodeFailureReason(decoded.error()));
 SRC

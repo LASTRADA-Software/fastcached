@@ -188,7 +188,12 @@ struct Seed
     // to admit everyone -- so a fixture that could not see the difference would report the
     // hole as correct. The route is named HERE rather than defaulted in the shared fake,
     // because which route admits is this case's fact to state (#1497).
-    ListedMembership membership { { std::string { OperatorAddress } }, Distributed::MembershipParticipant::FleetMemberList };
+    //
+    // `MachineTicket`: an operator on another machine sends the enrollment decisions with the
+    // ticket its own node mints, and an operator's control verb needs a route that IDENTIFIES the
+    // caller -- `--fleet-open` admits nobody to it. The list stands in for the ticket the endpoint
+    // verified; the open-policy caller is its own case below.
+    ListedMembership membership { { std::string { OperatorAddress } }, Distributed::MembershipParticipant::MachineTicket };
     NodeConditions conditions;
     // Bound as `main` binds it: the node's own sink and the wall clock the scheduler reads, never
     // the defaults a fixture finds more convenient.
@@ -1465,4 +1470,77 @@ TEST_CASE("A host refused at its cap is named as the list shows it, an IPv4-mapp
     REQUIRE(RefusalIn(refused) == Wire::ErrorCode::EnrollmentHostFull);
     CHECK(RefusalSentenceIn(refused).starts_with("198.51.100.9 already has"));
     CHECK_FALSE(RefusalSentenceIn(refused).contains("::ffff:"));
+}
+
+TEST_CASE("An enrollment decision is refused a caller only --fleet-open admitted, by name and counted",
+          "[enrollment][responder][admission][security]")
+{
+    // The window's open door is `Enroll`; the decision behind it is an operator's control verb. On
+    // a --fleet-open node an anonymous caller is a member, and without the verb column it could
+    // approve its own request or arm an auto-approve window. Asked of the production fold, so the
+    // route that admitted each caller is the route production would name.
+    Seed seed;
+    Testing::OpenFleetFold fold;
+    NullLogger logger;
+    EnrollmentResponder responder { seed.window, seed.service, fold.admitted, seed.metrics, logger };
+    auto const control = static_cast<std::uint8_t>(Wire::Op::EnrollControl);
+    auto const counted = [&seed] {
+        return seed.metrics.Read(IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired);
+    };
+
+    // At the door, before a payload is read.
+    auto const refused = responder.RefusePeer(Testing::OpenFleetFold::Anonymous(), control);
+    REQUIRE(refused.has_value());
+    CHECK(RefusalIn(Unwrap(refused)) == Wire::ErrorCode::IdentifiedCallerRequired);
+    CHECK(counted() == 1);
+    // Not the stranger's row: the caller IS admitted, and that series is for one nothing admitted.
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentControlRefusedNotAMember) == 0);
+
+    // And after it, for a caller of `Answer` that never asked the door: every decision the verb
+    // carries -- approve, arm auto-approve, the list -- is refused the same way, counted once each.
+    auto const frames = std::array {
+        Wire::EncodeEnrollControl(Wire::EnrollControlVerb::Approve, std::string { JoinerId }),
+        Wire::EncodeEnrollControl(Wire::EnrollControlVerb::List, {}),
+    };
+    auto expected = std::uint64_t { 1 };
+    for (auto const& frame: frames)
+    {
+        auto const reply = core::async::syncRun(responder.Answer(frame, Testing::OpenFleetFold::Anonymous())).bytes;
+        CHECK(RefusalIn(reply) == Wire::ErrorCode::IdentifiedCallerRequired);
+        CHECK(counted() == ++expected);
+    }
+
+    // What identifies a caller passes the door: a ticket, a proof, this machine.
+    for (auto const& [what, facts]: { std::pair { "a ticket", Testing::OpenFleetFold::Ticketed() },
+                                      std::pair { "a proof", Testing::OpenFleetFold::Proven() },
+                                      std::pair { "loopback", Testing::OpenFleetFold::Local() } })
+    {
+        INFO(what);
+        CHECK_FALSE(responder.RefusePeer(facts, control).has_value());
+    }
+    CHECK(counted() == expected);
+
+    // And the open door stays open to the anonymous caller: `Enroll` is the one verb meant to admit it.
+    CHECK_FALSE(
+        responder.RefusePeer(Testing::OpenFleetFold::Anonymous(), static_cast<std::uint8_t>(Wire::Op::Enroll)).has_value());
+}
+
+TEST_CASE("A stranger reaching enrollment control through Answer is told not-a-member, as at the door",
+          "[enrollment][responder][admission]")
+{
+    // The identity column is asked only of a caller the surface ADMITS. A caller of `Answer` that
+    // never asked the door is told what the door tells it -- `NotAMember`, on the not-a-member
+    // series -- and the identified-caller series, which counts ADMITTED callers trying the
+    // decision, does not move. Neutered to the old order (the identity column asked first), the
+    // stranger is told identified-caller-required and that series moves.
+    Seed seed;
+    auto const stranger = PeerIdentity { .host = std::string { JoinerAddress } };
+    for (auto const& frame: { Wire::EncodeEnrollControl(Wire::EnrollControlVerb::List, {}),
+                              Wire::EncodeEnrollControl(Wire::EnrollControlVerb::Approve, std::string { JoinerId }) })
+    {
+        auto const reply = core::async::syncRun(seed.responder.Answer(frame, stranger)).bytes;
+        CHECK(RefusalIn(reply) == Wire::ErrorCode::NotAMember);
+    }
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentControlRefusedNotAMember) == 2);
+    CHECK(seed.metrics.Read(IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired) == 0);
 }

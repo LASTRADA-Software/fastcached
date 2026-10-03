@@ -613,13 +613,19 @@ std::vector<std::byte> WorkerProtocol::Compile(std::span<std::byte const> payloa
                                                         .correlation = Wire::AsBytes(outcome->correlation) }));
 }
 
-WorkerRegistrar::WorkerRegistrar(CredentialNotice& notice,
-                                 std::string fingerprint,
+CacheOutcome ExchangeWithScheduler(core::net::ISocket& scheduler, std::vector<std::byte> frame)
+{
+    // Silent and never consulted: a notice reports a credential the peer ignored, and this
+    // exchange presents none.
+    auto notice = CredentialNotice::Silent();
+    return core::async::syncRun(ExchangeFramed(&scheduler, &notice, std::move(frame)));
+}
+
+WorkerRegistrar::WorkerRegistrar(std::string fingerprint,
                                  std::string endpoint,
                                  std::uint32_t slots,
                                  Wire::CodecList acceptedCodecs,
                                  Wire::CapacityFields capacity):
-    _notice { notice },
     _fingerprint { std::move(fingerprint) },
     _endpoint { std::move(endpoint) },
     _slots { slots },
@@ -631,14 +637,14 @@ WorkerRegistrar::WorkerRegistrar(CredentialNotice& notice,
 {
 }
 
-std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocket& scheduler, Credential const& credential)
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocket& scheduler)
 {
     auto const frame = Wire::EncodeRegister(Wire::RegisterRequest { .fingerprint = _fingerprint,
                                                                     .endpoint = _endpoint,
                                                                     .slots = _slots,
                                                                     .acceptedCodecs = _acceptedCodecs,
                                                                     .capacity = _capacity });
-    auto const outcome = core::async::syncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
+    auto const outcome = ExchangeWithScheduler(scheduler, frame);
     if (!outcome.IsHit())
         // The scheduler's own words, code and message both, which is the whole
         // reason this is not a bool: "not a member of this cluster" and "fingerprint
@@ -681,16 +687,14 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Register(core::net::ISocke
 }
 
 std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(core::net::ISocket& scheduler,
-                                                                            CredentialNotice& notice,
                                                                             std::string_view endpoint,
                                                                             Wire::CapacityFields const& capacity,
                                                                             Wire::LoadFields const& load,
-                                                                            std::span<std::byte const> endorsement,
-                                                                            Credential const& credential)
+                                                                            std::span<std::byte const> endorsement)
 {
     auto const frame = Wire::EncodeNodeAnnounce(
         Wire::NodeAnnounceRequest { .endpoint = endpoint, .capacity = capacity, .load = load, .endorsement = endorsement });
-    auto outcome = core::async::syncRun(ExchangeFramed(&scheduler, &notice, frame, credential));
+    auto outcome = ExchangeWithScheduler(scheduler, frame);
     if (outcome.IsHit())
         return std::move(outcome.value);
 
@@ -703,8 +707,7 @@ std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(core
 
 std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(core::net::ISocket& scheduler,
                                                                 std::uint32_t inFlight,
-                                                                Wire::LoadFields const& load,
-                                                                Credential const& credential)
+                                                                Wire::LoadFields const& load)
 {
     if (_workerId.empty())
         // Never registered; nothing to refresh. Named rather than silent, because
@@ -714,7 +717,7 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(core::net::ISock
         return std::unexpected { AnnounceRefusal { .reason = "not registered", .leader = std::nullopt } };
 
     auto const frame = Wire::EncodeHeartbeat(_workerId, inFlight, load);
-    auto const outcome = core::async::syncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
+    auto const outcome = ExchangeWithScheduler(scheduler, frame);
     if (outcome.IsHit())
         return {};
 
@@ -733,7 +736,7 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Heartbeat(core::net::ISock
     return std::unexpected { AnnounceRefusal { .reason = DescribeOutcome(outcome), .leader = RedirectTarget(outcome) } };
 }
 
-std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(core::net::ISocket& scheduler, Credential const& credential)
+std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(core::net::ISocket& scheduler)
 {
     if (_workerId.empty())
         // Never registered, so there is nothing on the other end to retire. Named
@@ -742,7 +745,7 @@ std::expected<void, AnnounceRefusal> WorkerRegistrar::Withdraw(core::net::ISocke
         return std::unexpected { AnnounceRefusal { .reason = "not registered", .leader = std::nullopt } };
 
     auto const frame = Wire::EncodeWithdraw(_workerId);
-    auto const outcome = core::async::syncRun(ExchangeFramed(&scheduler, &_notice, frame, credential));
+    auto const outcome = ExchangeWithScheduler(scheduler, frame);
     if (outcome.IsHit())
         return {};
 

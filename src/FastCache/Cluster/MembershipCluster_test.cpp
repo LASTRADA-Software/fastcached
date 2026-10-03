@@ -59,14 +59,10 @@ constexpr std::array<char const*, 5> EveryMachine { "n1", "n2", "n3", "n4", "n5"
 /// @return The rosters, by machine.
 [[nodiscard]] std::map<Consensus::NodeId, std::unique_ptr<RosterKeys>> Rosters()
 {
-    auto typed = std::vector<ClusterMember> {};
+    auto typed = std::vector<MemberSpec> {};
     for (auto const* const id: EveryMachine)
-        typed.push_back(ClusterMember { .id = id,
-                                        .raftEndpoint = EndpointOf(id),
-                                        .schedulerEndpoint = {},
-                                        .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
-                                        .seat = MemberSeat::Voter,
-                                        .publicKey = Testing::TestKeyPair(id).PublicKey() });
+        typed.push_back(
+            MemberSpec { .id = id, .raftEndpoint = EndpointOf(id), .publicKey = Testing::TestKeyPair(id).PublicKey() });
 
     auto rosters = std::map<Consensus::NodeId, std::unique_ptr<RosterKeys>> {};
     for (auto const* const id: EveryMachine)
@@ -85,12 +81,12 @@ constexpr std::array<char const*, 5> EveryMachine { "n1", "n2", "n3", "n4", "n5"
     };
 }
 
-/// The host a forget of `id` tombstones.
+/// The identity key a forget of `id` revokes: the one its roster admits it under.
 /// @param id The member.
-/// @return Its host.
-[[nodiscard]] std::string HostOf(Consensus::NodeId const& id)
+/// @return Its public key.
+[[nodiscard]] Ed25519PublicKey KeyOf(Consensus::NodeId const& id)
 {
-    return std::format("10.0.0.{}", id.substr(1));
+    return Testing::TestKeyPair(id).PublicKey();
 }
 
 /// Whether `state` records `id`.
@@ -162,7 +158,7 @@ class Fleet
 
     /// One reconcile pass on whoever leads: the leader half of `ConsensusTier::Reconcile`,
     /// through the two functions it calls.
-    /// @return What the pass refused because its host was forgotten.
+    /// @return What the pass refused because the cluster forgot the id and revoked its key.
     std::vector<DesiredMember> Pass()
     {
         AdoptRosters();
@@ -176,7 +172,10 @@ class Fleet
         auto const state = StateAt(*leader);
         auto const progress = _cluster.At(*leader).driver->CurrentProgress();
         auto const& configuration = progress.configuration;
-        auto const plan = MembershipProposals(state, configuration, DesiredBy(*leader));
+        // Keyed as the tier keys them: a discovered peer's desire states no key, and the leader
+        // fills in the one its roster holds live for it (`WithLiveKeys`).
+        auto const plan =
+            MembershipProposals(state, configuration, WithLiveKeys(state, DesiredBy(*leader), *_rosters.at(*leader)));
         for (auto const& command: plan.proposals)
             std::ignore = _cluster.ProposeOnLeader(Encode(command));
 
@@ -185,7 +184,7 @@ class Fleet
                                           .schedulerEndpoint = {},
                                           .schedulerEndpointHistory = SchedulerEndpointHistory::NeverAnnounced,
                                           .seat = MemberSeat::Voter,
-                                          .publicKey = std::nullopt };
+                                          .publicKey = KeyOf(*leader) };
         auto const quorum =
             NextQuorumChange(state,
                              configuration,
@@ -208,8 +207,10 @@ class Fleet
             return std::unexpected { ConsensusError {
                 .code = ConsensusErrorCode::NotLeader, .context = "nobody leads", .knownLeader = std::nullopt } };
 
-        auto prepared = PrepareForget(
-            _cluster.At(*leader).driver->CurrentProgress().configuration, id, _rosters.at(*leader)->KeysOf(id).live);
+        auto prepared = PrepareForget(StateAt(*leader),
+                                      _cluster.At(*leader).driver->CurrentProgress().configuration,
+                                      id,
+                                      _rosters.at(*leader)->KeysOf(id).live);
         if (!prepared.has_value())
             return std::unexpected { prepared.error() };
 
@@ -227,7 +228,7 @@ class Fleet
                                               .key = id,
                                               .value = EndpointOf(id),
                                               .schedulerEndpoint = {},
-                                              .publicKey = std::nullopt,
+                                              .publicKey = KeyOf(id),
                                               .role = std::nullopt }))
             .has_value();
     }
@@ -280,7 +281,10 @@ class Fleet
                 DesiredMember { .id = id,
                                 .raftEndpoint = EndpointOf(id),
                                 .schedulerEndpoint = id == who ? std::optional { std::string {} } : std::nullopt,
-                                .publicKey = std::nullopt });
+                                // A node is the authority on its own key and states it; a peer
+                                // it only discovered has no opinion stated, as discovery gives
+                                // none (`DiscoveryTier`).
+                                .publicKey = id == who ? std::optional { KeyOf(id) } : std::nullopt });
         return desired;
     }
 
@@ -409,7 +413,7 @@ TEST_CASE("A cluster that forgets its leader commits a configuration without it,
     // It never re-entered the record, and the new leader said why it would not.
     auto const state = fleet.StateAt(successor);
     CHECK_FALSE(Records(state, forgotten));
-    CHECK(state.HasForgotten(HostOf(forgotten)));
+    CHECK(state.IsRevoked(KeyOf(forgotten)));
     CHECK(std::ranges::contains(state.revokedKeys, forgotten, &RevokedKey::id));
     CHECK(refusedBySuccessor);
 
@@ -458,7 +462,7 @@ TEST_CASE("A cluster that forgets a follower keeps its leader, and takes the fol
 
     auto const state = fleet.StateAt(leader);
     CHECK_FALSE(Records(state, follower));
-    CHECK(state.HasForgotten(HostOf(follower)));
+    CHECK(state.IsRevoked(KeyOf(follower)));
     CHECK(std::ranges::contains(state.revokedKeys, follower, &RevokedKey::id));
     auto const& active = fleet.Cluster().At(leader).driver->Node().ActiveConfiguration();
     CHECK_FALSE(Consensus::Membership::IsMember(active, follower));
@@ -545,7 +549,7 @@ TEST_CASE("Forgetting the only voter is refused by name, and the cluster keeps i
 
     fleet.Cluster().Run(50);
     CHECK(Records(fleet.StateAt("n1"), "n1"));
-    CHECK_FALSE(fleet.StateAt("n1").HasForgotten(HostOf("n1")));
+    CHECK_FALSE(fleet.StateAt("n1").IsRevoked(KeyOf("n1")));
     CHECK(fleet.Cluster().Leader() == Consensus::NodeId { "n1" });
     RequireNoViolations(fleet.Cluster());
 }

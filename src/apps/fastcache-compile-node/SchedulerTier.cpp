@@ -22,8 +22,7 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
                              ILogger& logger,
                              std::string signerId,
                              Ed25519KeyPair identityKey,
-                             std::string_view clusterId,
-                             std::shared_ptr<AuthPolicy const> policy):
+                             std::string_view clusterId):
     _signer { std::move(signerId), std::move(identityKey) },
     _service { clock, wallClock, metrics, logger, _signer, clusterId },
     _protocol { _service, metrics },
@@ -32,13 +31,7 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
     // two surfaces would admit a peer to the fleet and refuse it the objects that
     // fleet produced. It also outlives this tier, which is what lets a node serve a
     // cache with no scheduler at all.
-    // Kept as well as handed on, because the enrollment surface requires the SAME
-    // credential rather than one of its own: `AUTH` is a `Session` verb and the merged
-    // listener routes it to the scheduler, so a second policy object would be one this
-    // node never checks anything against. A `shared_ptr` copy, so neither holder owns
-    // the other's lifetime.
-    _policy { policy },
-    _responder { _protocol, membership, metrics, std::move(policy) }
+    _responder { _protocol, membership, metrics }
 {
     // No standalone leadership any more (#178). Every scheduler runs consensus -- a lone one
     // is a cluster of one -- so the service keeps its own `Undecided` default until the
@@ -63,23 +56,8 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     if (!identityKey.has_value())
         return std::unexpected { std::string { SchedulerNeedsIdentityKeyRefusal } };
 
-    // The credential this surface REQUIRES, which is the inbound half of
-    // `--requirepass` (#289). Absent is legal and means membership is the only gate;
-    // unreadable is fatal, for the reason the key file is -- an operator who named a
-    // token file and got an unauthenticated scheduler has a port that looks guarded.
-    std::shared_ptr<AuthPolicy const> policy;
-    if (!cfg.schedulerTokenFile.empty())
-    {
-        auto secret = ReadSecretFile(cfg.schedulerTokenFile);
-        if (!secret.has_value())
-            return std::unexpected { std::format("--scheduler-token-file {}", secret.error()) };
-        // No username: every in-tree client presents the `requirepass` form, and
-        // `CheckCredential` matches on the secret alone when none is given.
-        policy = std::make_shared<AuthPolicy const>(std::string {}, std::move(*secret));
-    }
-
     auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier {
-        membership, clock, wallClock, metrics, logger, cfg.nodeId, *identityKey, cfg.clusterId, std::move(policy) } };
+        membership, clock, wallClock, metrics, logger, cfg.nodeId, *identityKey, cfg.clusterId } };
 
     // No address in this line since #290: the scheduler verbs are answered on the
     // node's one 0xFC listener, and that listener names itself when it binds.

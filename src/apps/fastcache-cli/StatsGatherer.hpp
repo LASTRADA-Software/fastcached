@@ -24,9 +24,6 @@ class LadderGatherer final: public IStatsGatherer, public IEndpointIdentity
     /// @param admin Where `/metrics` is; an unconfigured endpoint means *do not ask*,
     ///        which is reported as `asked == false` rather than as a failure.
     /// @param timeouts How long to wait.
-    /// @param bearer A credential for the admin surface, or nullopt. `/metrics` needs
-    ///        none today -- it short-circuits above the credential gate -- but a
-    ///        deployment may still sit behind something that does.
     /// @param resp The already-open cache connection, or null when there is none.
     /// @param node The already-open `0xFC` connection, or null when there is none. It
     ///        serves two rungs rather than one: it answers `NodeMetrics` itself, and it
@@ -35,12 +32,7 @@ class LadderGatherer final: public IStatsGatherer, public IEndpointIdentity
     /// @param cache Where this invocation dialled. The HOST half is what a discovered
     ///        admin port is dialled on, and the PORT half is what a discovered one is
     ///        checked against -- see `ResolveAdmin`.
-    LadderGatherer(Endpoint admin,
-                   Endpoint cache,
-                   DialTimeouts timeouts,
-                   std::optional<std::string> bearer,
-                   IExchange* resp,
-                   INodeExchange* node) noexcept;
+    LadderGatherer(Endpoint admin, Endpoint cache, DialTimeouts timeouts, IExchange* resp, INodeExchange* node) noexcept;
 
     [[nodiscard]] std::vector<StatsAttempt> Gather() override;
 
@@ -114,7 +106,6 @@ class LadderGatherer final: public IStatsGatherer, public IEndpointIdentity
     Endpoint _admin;
     Endpoint _cache;
     DialTimeouts _timeouts;
-    std::optional<std::string> _bearer;
     IExchange* _resp;
     INodeExchange* _node;
     /// `Identified`'s answer, computed on first use. Cached because it is the SAME fact

@@ -7,7 +7,6 @@
 #include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
-#include "NodeCredential.hpp"
 #include "NodeReload.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeToolchains.hpp"
@@ -108,7 +107,6 @@ struct WorkerTierParts
     NodeIoLoop& io;                                   ///< The reactor a compile's reply returns to.
     IHostFactsSource const& host;                     ///< The hostname a registration labels.
     CacheTier const* cacheTier;                       ///< Null on a node with no cache.
-    ICredentialSource const& credential;              ///< What the heartbeat presents.
     /// How this machine proves WHICH machine it is to a scheduler (#178), or null where nothing
     /// proves -- a test whose scripted fleet serves no handshake. One instance per process,
     /// shared with the presence loop.
@@ -302,7 +300,6 @@ class WorkerTier
     NodeConfig const& _cfg;
     NodeReloader const* _reloader;
     CacheTier const* _cacheTier;
-    ICredentialSource const& _credential;
 
     /// How this machine proves itself, or null where nothing proves. Borrowed, and it outlives
     /// this tier: `main` declares it above the tier and destroys it after.
@@ -328,7 +325,6 @@ class WorkerTier
     CompileResponder _responder;
     NodeRuntimeState _runtime;
     CompileCacheWire::CapacityFields _advertisedWire;
-    Cc::CredentialNotice _registrarNotice;
     std::vector<Cc::WorkerRegistrar> _registrars;
     std::vector<Cc::WorkerRegistrar> _withdrawals;
     BlockingEndpointDialer _dialer;

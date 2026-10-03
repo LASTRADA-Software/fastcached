@@ -165,7 +165,7 @@ TEST_CASE("A learner starts from the approved roster and registers with the flee
     auto const members = BootstrapMembersOf(cfg);
     // Never itself: its own seat is the leader's to replicate.
     CHECK(std::ranges::none_of(members, [&](auto const& m) { return m.id == cfg.nodeId; }));
-    CHECK(std::ranges::contains(members, std::string { "office" }, &Cluster::ClusterMember::id));
+    CHECK(std::ranges::contains(members, std::string { "office" }, &Cluster::MemberSpec::id));
 }
 
 TEST_CASE("Remembered endpoints of another fleet are not registered with", "[node][formation][mode]")
@@ -283,10 +283,10 @@ TEST_CASE("Consensus runs as a member of its own under every mode, and only a mo
 
             // From the members the formation starts with, and from none -- which is where the
             // record is built rather than found.
-            for (auto const& members: { BootstrapMembersOf(cfg), std::vector<Cluster::ClusterMember> {} })
+            for (auto const& members: { BootstrapMembersOf(cfg), std::vector<Cluster::MemberSpec> {} })
             {
                 INFO("members: " << members.size());
-                auto const self = ConsensusSelfMemberOf(cfg, members);
+                auto const self = ConsensusSelfMemberOf(cfg, members, Testing::TestKeyPair(ThisNode).PublicKey());
                 if (!statesAnAddress)
                 {
                     REQUIRE_FALSE(self.has_value());

@@ -433,7 +433,7 @@ std::string KeepEnrolledRoster(std::span<std::byte const> roster,
 
 std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
                                                        EnrollCommand const& request,
-                                                       ICredentialSource const& credential,
+                                                       Cc::ICredentialFor& credentials,
                                                        IEndpointDialer& dialer)
 {
     if (cfg.schedulers.empty())
@@ -442,48 +442,35 @@ std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
     auto notice =
         Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
 
-    auto const options = core::net::DialOptions { .connectTimeout = EnrollDialTimeout };
-    std::optional<std::string> leader;
-    // `MaxEnrollRedirects + 1` because the bound was inclusive and `iota` is half-open: three
-    // redirects means four asks, which is what this loop has always done.
-    for (auto const hop: std::views::iota(0, MaxEnrollRedirects + 1))
-    {
-        // The first ask walks the configured list and takes whichever CONNECTS; a
-        // redirect names one endpoint and is followed there, never back into the list
-        // (#1310). A fallback only where nothing was sent -- `DialFirstReachable` says
-        // why that is the line, and `--enroll-approve` is why it matters here.
-        auto const targets = leader.has_value() ? std::span<std::string const> { &*leader, 1 }
-                                                : std::span<std::string const> { cfg.schedulers };
-        auto reached = DialFirstReachable(dialer, targets, options);
-        if (!reached.has_value())
-            return std::unexpected { std::format("cannot reach the cluster at {}", JoinEndpoints(targets)) };
-        auto const& endpoint = reached->endpoint;
+    // The first ask walks the configured list and takes whichever CONNECTS; a redirect names one
+    // endpoint and is followed there, never back into the list (#1310) -- `AskTheLeader`, the one
+    // loop the cluster verbs share. Each ask presents what @p credentials answers for the endpoint
+    // it reached, so a redirect's leader is shown a ticket naming the leader.
+    std::optional<Cc::MintFailure> missing;
+    auto answered = AskTheLeader(dialer,
+                                 cfg.schedulers,
+                                 core::net::DialOptions { .connectTimeout = EnrollDialTimeout },
+                                 "the cluster",
+                                 [&](core::net::ISocket& socket, std::string_view endpoint) {
+                                     auto const presented = credentials.Present(endpoint);
+                                     missing = presented.missing;
+                                     return core::async::syncRun(Cc::ExchangeFramed(
+                                         &socket,
+                                         &notice,
+                                         EnrollControlFrame(request),
+                                         presented.credential));
+                                 });
+    if (!answered.has_value())
+        return std::unexpected { std::move(answered).error() };
 
-        auto const outcome = core::async::syncRun(
-            Cc::ExchangeFramed(reached->socket.get(), &notice, EnrollControlFrame(request), credential.Current()));
+    auto const& outcome = answered->outcome;
+    if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
+        return std::unexpected { Cc::RecordedReason(outcome, missing) };
 
-        if (outcome.kind == Cc::CacheOutcomeKind::Transport)
-            return std::unexpected { std::format("the cluster at {} did not answer", endpoint) };
-
-        if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
-        {
-            // Followed rather than reported, and BOUNDED: two nodes each holding a
-            // stale `_knownLeader` name each other forever.
-            if (auto const named = Cc::RedirectTarget(outcome); named.has_value() && hop < MaxEnrollRedirects)
-            {
-                leader = *named;
-                continue;
-            }
-            return std::unexpected { Cc::DescribeOutcome(outcome) };
-        }
-
-        auto const report = Wire::DecodeEnrollmentReport(outcome.value);
-        if (!report.has_value())
-            return std::unexpected { std::format("{} answered with a body this client cannot read", endpoint) };
-        return RenderEnrollmentReport(*report, endpoint);
-    }
-
-    return std::unexpected { std::format("gave up after {} leader redirect(s)", MaxEnrollRedirects) };
+    auto const report = Wire::DecodeEnrollmentReport(outcome.value);
+    if (!report.has_value())
+        return std::unexpected { std::format("{} answered with a body this client cannot read", answered->endpoint) };
+    return RenderEnrollmentReport(*report, answered->endpoint);
 }
 
 std::expected<ConsensusHistory, std::string> ReadConsensusHistory(std::filesystem::path const& stateDirectory)
@@ -534,7 +521,6 @@ std::expected<std::pair<std::string, std::string>, std::string> EnrollClaim(Node
 }
 
 std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
-                                                        ICredentialSource const& credential,
                                                         ISecureRandom& random,
                                                         INodeKeyFileGuard& keyGuard,
                                                         IDrainWait& wait,
@@ -666,12 +652,15 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
         if (client == nullptr)
             return std::unexpected { std::format("cannot reach the seed at {}", seed) };
 
-        auto reading = ReadEnrollReply(core::async::syncRun(Cc::ExchangeFramed(
-            client.get(),
-            &notice,
-            Wire::EncodeEnroll(Wire::EnrollRequest {
-                .nodeId = self.nodeId, .nodeEndpoint = self.nodeEndpoint, .role = self.role, .publicKey = self.publicKey }),
-            credential.Current())));
+        auto reading = ReadEnrollReply(core::async::syncRun(
+            Cc::ExchangeFramed(client.get(),
+                               &notice,
+                               // No credential: `ENROLL` is answered before authentication, and no roster holds this
+                               // machine's key yet, so no ticket it could present would be admitted.
+                               Wire::EncodeEnroll(Wire::EnrollRequest { .nodeId = self.nodeId,
+                                                                        .nodeEndpoint = self.nodeEndpoint,
+                                                                        .role = self.role,
+                                                                        .publicKey = self.publicKey }))));
 
         switch (reading.progress)
         {

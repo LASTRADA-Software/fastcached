@@ -72,6 +72,7 @@ target_sources(FastCache
         Distributed/RosterStore.cpp
         Distributed/NodeProof.cpp
         Distributed/RosterTrust.cpp
+        Distributed/TicketVerifier.cpp
         Distributed/SchedulerService.cpp
         Distributed/SchedulerProtocol.cpp
         Distributed/FleetHistory.cpp

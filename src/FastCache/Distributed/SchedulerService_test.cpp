@@ -5,6 +5,7 @@
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -25,6 +26,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/FleetHistoryFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
+#include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -293,6 +295,35 @@ TEST_CASE("A non-member is refused the fleet but not the cache", "[distributed][
     // the worker in the registry, or the next Lease would hand out an endpoint the
     // policy just declined.
     CHECK(fleet.service.Workers().LiveWorkers().empty());
+}
+
+TEST_CASE("A machine admitted by ticket is still refused the verbs a machine joins the fleet with",
+          "[distributed][scheduler][admission]")
+{
+    // A ticket admits a CLIENT: it says which machine vouched for the caller, never that the
+    // caller proved a key of its own over this connection. So the context is the one
+    // `CallerContextOf` builds for a ticketed connection -- derived through the fold rather than
+    // written by hand, because a hand-written `provenNodeId = nullopt` would pass however the fold
+    // treated a ticket.
+    Leading fleet;
+    Testing::RosterFold const fold { { "pc-07" } };
+    auto const ticketed = CallerContextOf(
+        fold.admitted,
+        FastCache::ConnectionFacts { .host = "10.0.0.7", .authenticatedMachine = Testing::IdentityOf("pc-07") });
+    REQUIRE(ticketed.membership == Membership::Member);
+    REQUIRE_FALSE(ticketed.provenNodeId.has_value());
+
+    for (auto const op: { Wire::Op::Register, Wire::Op::NodeAnnounce, Wire::Op::Heartbeat, Wire::Op::Withdraw })
+    {
+        INFO(Wire::FindOp(static_cast<std::uint8_t>(op))->name);
+        auto const refused = fleet.service.RefuseUnlessIdentified(ticketed, op);
+        REQUIRE(refused.has_value());
+        CHECK(Unwrap(refused).error == Wire::ErrorCode::NodeIdentityRequired);
+    }
+
+    // ...and a client verb is not an identity verb: the ticket is enough for a LEASE.
+    CHECK_FALSE(fleet.service.RefuseUnlessIdentified(ticketed, Wire::Op::Lease).has_value());
+    CHECK(fleet.service.Lease(ticketed, Ask("gcc-14", "abc")).error == Wire::ErrorCode::NoWorker);
 }
 
 TEST_CASE("Membership is checked after leadership", "[distributed][scheduler]")
@@ -1332,8 +1363,8 @@ TEST_CASE("An endpoint is measured against the caller's own address, not refused
         // And the mismatches. This is the one the ticket is about: a third host,
         // named by a caller that is neither of them.
         { .what = "a third host entirely", .peer = "10.0.0.2", .endpoint = "10.0.0.9:7100", .mismatches = 1 },
-        // Whole-string, never a prefix -- the rule `ClusterMembership` records for
-        // the same reason: `10.0.0.2` must not pass for `10.0.0.20`.
+        // Whole-string, never a prefix -- the rule host comparison keeps everywhere
+        // here, for the same reason: `10.0.0.2` must not pass for `10.0.0.20`.
         { .what = "a host the caller's is a prefix of", .peer = "10.0.0.2", .endpoint = "10.0.0.20:7100", .mismatches = 1 },
         // The shape this project's own getting-started page builds: a node
         // registering with its own scheduler over loopback while advertising a name
@@ -1854,6 +1885,16 @@ class RecordingCluster final: public IClusterAdmin
     }
 };
 
+/// The identity key text @p id is admitted under, as `--cluster-admit=<id>=<endpoint>@<key>`
+/// types it: a member is never admitted without a key, so every admission a case expects to
+/// reach consensus names one.
+/// @param id The member.
+/// @return Its test key, in `FormatEd25519PublicKey`'s spelling.
+[[nodiscard]] std::string KeyTextOf(std::string const& id)
+{
+    return FormatEd25519PublicKey(Testing::TestKeyPair(id).PublicKey());
+}
+
 /// The receipt out of a CLUSTER-ADMIT reply.
 /// @param reply What `ClusterAdmit` answered.
 /// @return The decoded receipt, or nullopt when the body is not one.
@@ -1905,8 +1946,8 @@ TEST_CASE("An admission answers with what the leader RECORDED, so a typed addres
     // no round trip, is put its own half on the screen, and this is that half.
     Admitting fleet;
 
-    auto const reply =
-        fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+    auto const reply = fleet.Service().ClusterAdmit(
+        Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
     REQUIRE(reply.status == Wire::Status::Ok);
 
     auto const receipt = ReceiptOf(reply);
@@ -1954,8 +1995,8 @@ TEST_CASE("The operator's surface judges an admission against the roster before 
     CHECK(refused.payload.empty());
 
     // The control: the same verb for an id the roster does not hold is proposed as before.
-    auto const accepted =
-        fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+    auto const accepted = fleet.Service().ClusterAdmit(
+        Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
     CHECK(accepted.status == Wire::Status::Ok);
     CHECK(fleet.cluster.proposed.size() == 1);
 }
@@ -1969,8 +2010,8 @@ TEST_CASE("A revoked key's refusal reaches the wire as a permanent refusal of th
     Admitting fleet;
     fleet.cluster.refusal = KeyRevoked("that key was revoked");
 
-    auto const reply =
-        fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+    auto const reply = fleet.Service().ClusterAdmit(
+        Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
     REQUIRE(reply.status == Wire::Status::Error);
     CHECK(reply.error == Wire::ErrorCode::InvalidClusterChange);
     CHECK(reply.message == "that key was revoked");
@@ -2001,9 +2042,18 @@ TEST_CASE("An admission's key is recorded, and its receipt names the key the com
         CHECK(Unwrap(receipt).publicKey == std::optional { keyText });
     }
 
-    SECTION("sent none, it records none and says none")
+    SECTION("sent none for a member recorded with a key, it records none and says none")
     {
+        // No opinion keeps the recorded key, so the command carries none -- and the receipt
+        // says so rather than naming the key the state already held.
         Admitting fleet;
+        fleet.cluster.state.members.push_back(
+            Cluster::ClusterMember { .id = "node-c",
+                                     .raftEndpoint = "10.0.0.8:6675",
+                                     .schedulerEndpoint = {},
+                                     .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                     .seat = Cluster::MemberSeat::Voter,
+                                     .publicKey = key });
         auto const reply =
             fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Ok);
@@ -2013,6 +2063,22 @@ TEST_CASE("An admission's key is recorded, and its receipt names the key the com
         auto const receipt = ReceiptOf(reply);
         REQUIRE(receipt.has_value());
         CHECK_FALSE(Unwrap(receipt).publicKey.has_value());
+    }
+
+    SECTION("sent none for a machine nothing records a key for, it is refused and names the remedy")
+    {
+        // The operator's surface refuses a keyless admission before anything is proposed: a
+        // machine is forgotten by revoking its key, so one admitted without a key could never
+        // be forgotten for good.
+        Admitting fleet;
+        auto const reply =
+            fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+        REQUIRE(reply.status == Wire::Status::Error);
+        CHECK(reply.error == Wire::ErrorCode::InvalidClusterChange);
+        CHECK(reply.message.contains("no identity key"));
+        CHECK(reply.message.contains("--cluster-admit=node-c@<key>"));
+        CHECK(fleet.cluster.proposed.empty());
+        CHECK(reply.payload.empty());
     }
 }
 
@@ -2186,8 +2252,8 @@ TEST_CASE("An admission refused once the command exists carries no receipt", "[d
                                                  .context = "somebody else leads",
                                                  .knownLeader = std::string { "10.0.0.2:6675" } };
 
-        auto const reply =
-            fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+        auto const reply = fleet.Service().ClusterAdmit(
+            Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
         REQUIRE(reply.status == Wire::Status::Error);
         CHECK(reply.payload.empty());
     }
@@ -2221,8 +2287,8 @@ TEST_CASE("The receipt says what was recorded and the reply says nothing about c
     // in prose, and prose is what would end up claiming the member is in force.
     Admitting fleet;
 
-    auto const reply =
-        fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+    auto const reply = fleet.Service().ClusterAdmit(
+        Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
     REQUIRE(reply.status == Wire::Status::Ok);
     CHECK(reply.message.empty());
 }
@@ -2250,70 +2316,10 @@ TEST_CASE("The two verbs that share Offer answer exactly as they did", "[distrib
 
     // And the admission beside them, in the same case, so "all three are empty" and
     // "all three carry a receipt" are both red rather than one of them passing.
-    auto const admit =
-        fleet.Service().ClusterAdmit(Insider, "node-c", "10.0.0.9:6675", std::nullopt, Cluster::MemberSeat::Voter);
+    auto const admit = fleet.Service().ClusterAdmit(
+        Insider, "node-c", "10.0.0.9:6675", std::string_view { KeyTextOf("node-c") }, Cluster::MemberSeat::Voter);
     REQUIRE(admit.status == Wire::Status::Ok);
     CHECK_FALSE(admit.payload.empty());
-}
-
-TEST_CASE("A client forget warns that older members will ignore it; an admit says nothing",
-          "[distributed][scheduler][forget]")
-{
-    // #1309. The two verbs were added without moving `CommandVersion`, so a member on an
-    // older build DECODES the entry and meets a verb byte it lacks -- it skips by name
-    // and holds the state as if nothing had been proposed.
-    //
-    // **The silence on the admit is the assertion**, not decoration. Both directions are
-    // the same skip, and they are not the same event: an admit that is skipped fails
-    // CLOSED, so that client is simply not admitted at that member and the upgrade heals
-    // it, while a forget that is skipped fails OPEN and the member goes on serving a host
-    // the fleet agreed to stop serving. A case asserting only that the forget warns is
-    // green under an implementation that warns on both -- which would train an operator
-    // to ignore the line that matters.
-    Admitting fleet;
-
-    auto const admit = fleet.Service().ClusterAdmitClient(Insider, "10.0.0.7");
-    REQUIRE(admit.status == Wire::Status::Ok);
-    CHECK(fleet.leading.logger.Snapshot().empty());
-
-    auto const forget = fleet.Service().ClusterForgetClient(Insider, "10.0.0.7");
-    REQUIRE(forget.status == Wire::Status::Ok);
-
-    auto const records = fleet.leading.logger.Snapshot();
-    REQUIRE(records.size() == 1);
-    CHECK(records.front().level == LogLevel::Warn);
-
-    // It names the host, or an operator forgetting three machines cannot tell which line
-    // is about which.
-    CHECK(records.front().message.contains("10.0.0.7"));
-
-    // It says where the evidence is, because this side cannot produce it: the leader
-    // cannot tell which builds carry the verb, so it sends the reader to the members'
-    // own logs rather than naming members from a version string it would be guessing at.
-    CHECK(records.front().message.contains("its own log"));
-
-    // And it names a remedy that exists. `--fleet-member` is the per-node list, and
-    // dropping the host there is what closes the gap on a member that cannot apply the
-    // entry at all.
-    CHECK(records.front().message.contains("--fleet-member"));
-}
-
-TEST_CASE("Each client forget warns again, because each is about a different host", "[distributed][scheduler][forget]")
-{
-    // Not `_warnedLeaseLifetime`'s shape. That one states a fact about the cluster's
-    // configuration, where a repeat says nothing new and a once-per-process latch is
-    // right. A forget is a decision about one host, so an operator retiring three
-    // machines is owed three lines -- and a latch here would report the first and go
-    // quiet for the two that followed, which reads as two forgets that were safe.
-    Admitting fleet;
-
-    for (auto const* const host: { "10.0.0.7", "10.0.0.8", "10.0.0.9" })
-        REQUIRE(fleet.Service().ClusterForgetClient(Insider, host).status == Wire::Status::Ok);
-
-    auto const records = fleet.leading.logger.Snapshot();
-    REQUIRE(records.size() == 3);
-    for (auto const* const host: { "10.0.0.7", "10.0.0.8", "10.0.0.9" })
-        CHECK(std::ranges::any_of(records, [host](auto const& record) { return record.message.contains(host); }));
 }
 
 TEST_CASE("An admission proposes the verb its seat names, and no opinion keeps the recorded seat",
@@ -2333,11 +2339,12 @@ TEST_CASE("An admission proposes the verb its seat names, and no opinion keeps t
                                  .schedulerEndpoint = {},
                                  .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
                                  .seat = Cluster::MemberSeat::Learner,
-                                 .publicKey = std::nullopt });
+                                 .publicKey = Testing::TestKeyPair("laptop").PublicKey() });
 
-    auto const proposedFor = [&fleet](std::string_view id, std::optional<Cluster::MemberSeat> seat) {
+    auto const proposedFor = [&fleet](std::string const& id, std::optional<Cluster::MemberSeat> seat) {
         fleet.cluster.proposed.clear();
-        auto const reply = fleet.Service().ClusterAdmit(Insider, id, "10.0.0.9:6675", std::nullopt, seat);
+        auto const keyText = KeyTextOf(id);
+        auto const reply = fleet.Service().ClusterAdmit(Insider, id, "10.0.0.9:6675", std::string_view { keyText }, seat);
         REQUIRE(reply.status == Wire::Status::Ok);
         REQUIRE(fleet.cluster.proposed.size() == 1);
         return fleet.cluster.proposed.front().kind;

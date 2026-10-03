@@ -298,10 +298,9 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     EvaluateProcessConditions(conditions, metrics);
     EvaluateHostNameCondition(conditions, Testing::FirstStart(NodeConfig {}));
 
-    // The consensus scope: the membership a consensus node builds, with the registry.
+    // The consensus scope: the membership a consensus node builds.
     auto clustered = Testing::FirstStart(NodeConfig {});
-    clustered.fleetMembers = { "10.0.0.7:6674" };
-    NodeMembership membership { clustered, membershipLog, &conditions };
+    NodeMembership membership { clustered, membershipLog };
 
     // The scheduler scope: a scheduler, signing with its identity key (#178). It answers no row
     // of its own since unsigned grants went; it is started so a row joining its scope later is

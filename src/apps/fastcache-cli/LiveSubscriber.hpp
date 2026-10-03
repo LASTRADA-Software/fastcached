@@ -138,17 +138,17 @@ class NodeSubscription final: public ILiveSubscription
     /// A seam for one reason: a leave that arrives WHILE a dial is out has no exchange to half-close,
     /// and only a dial a case can stand inside shows that the leave is still owed once it connects.
     using StreamDial = std::function<std::expected<std::unique_ptr<NodeExchange>, ExchangeError>(
-        Endpoint const& endpoint, DialTimeouts timeouts, Credential const& credential)>;
+        Endpoint const& endpoint, DialTimeouts timeouts, NodeCredentials const& credentials)>;
 
     /// Dial with `NodeExchange::Open`.
     /// @param timeouts How long a dial may take, and the first frame's read.
-    /// @param credential What to present on every dial; nothing when unconfigured.
-    NodeSubscription(DialTimeouts timeouts, Credential credential);
+    /// @param credentials What each endpoint dialled is shown -- the leader a refusal names included.
+    NodeSubscription(DialTimeouts timeouts, NodeCredentials credentials);
 
     /// @param timeouts How long a dial may take, and the first frame's read.
-    /// @param credential What to present on every dial; nothing when unconfigured.
+    /// @param credentials What each endpoint dialled is shown -- the leader a refusal names included.
     /// @param dial How to dial; not empty.
-    NodeSubscription(DialTimeouts timeouts, Credential credential, StreamDial dial);
+    NodeSubscription(DialTimeouts timeouts, NodeCredentials credentials, StreamDial dial);
     ~NodeSubscription() override;
 
     NodeSubscription(NodeSubscription const&) = delete;
@@ -164,7 +164,7 @@ class NodeSubscription final: public ILiveSubscription
 
   private:
     DialTimeouts _timeouts;
-    Credential _credential;
+    NodeCredentials _credentials;
     StreamDial _dial;
 
     /// Guards `_exchange` against `Leave`, and `_left`.

@@ -30,23 +30,18 @@ namespace
                              Wire::CapacityFields const& capacity,
                              Wire::LoadFields const& load,
                              std::span<std::byte const> endorsement,
-                             ICredentialSource const& credential,
-                             Cc::CredentialNotice& notice,
                              ILogger& logger) noexcept:
             _endpoint { endpoint },
             _capacity { capacity },
             _load { load },
             _endorsement { endorsement },
-            _credential { credential },
-            _notice { notice },
             _logger { logger }
         {
         }
 
         [[nodiscard]] AnnounceOutcome Attempt(core::net::ISocket& client, std::string_view endpoint) override
         {
-            auto sent =
-                Cc::AnnounceNodePresence(client, _notice, _endpoint, _capacity, _load, _endorsement, _credential.Current());
+            auto sent = Cc::AnnounceNodePresence(client, _endpoint, _capacity, _load, _endorsement);
             if (sent.has_value())
             {
                 _accepted = true;
@@ -86,8 +81,6 @@ namespace
         Wire::CapacityFields const& _capacity;
         Wire::LoadFields const& _load;
         std::span<std::byte const> _endorsement;
-        ICredentialSource const& _credential;
-        Cc::CredentialNotice& _notice;
         ILogger& _logger;
         bool _accepted = false;
         std::vector<std::byte> _reply;
@@ -121,8 +114,6 @@ bool AnnounceMachineOnce(PresenceRound const& round, SchedulerLink& link, IEndpo
             .endpoint = round.endpoint,
             .capacity = round.capacity,
             .load = load,
-            .credential = round.credential,
-            .notice = round.notice,
             .logger = round.logger,
             .prover = round.prover,
         },
@@ -141,14 +132,8 @@ bool AnnouncePresence(PresenceMessage const& message, IPresenceRoster* roster, S
     // the leader can certify -- which a node that holds none adopts in this same round, from
     // whichever scheduler the round's redirects and fallbacks reached.
     auto const endorsement = roster != nullptr ? roster->Endorsement() : std::vector<std::byte> {};
-    PresenceAnnouncement announcement { message.endpoint,   message.capacity, message.load,  endorsement,
-                                        message.credential, message.notice,   message.logger };
-    (void) DialAndAnnounce(
-        link,
-        dialer,
-        message.logger,
-        announcement,
-        AnnounceProof { .prover = message.prover, .credential = &message.credential, .notice = &message.notice });
+    PresenceAnnouncement announcement { message.endpoint, message.capacity, message.load, endorsement, message.logger };
+    (void) DialAndAnnounce(link, dialer, message.logger, announcement, AnnounceProof { .prover = message.prover });
 
     if (announcement.Accepted() && roster != nullptr)
         roster->Offered(announcement.Reply());
@@ -171,14 +156,10 @@ NodePresence::NodePresence(NodePresenceParts const& parts, SchedulerLink link):
     _cacheTier { parts.cacheTier },
     _metrics { parts.metrics },
     _sampler { parts.sampler },
-    _credential { parts.credential },
     _logger { parts.logger },
     _conditions { parts.conditions },
     _roster { parts.roster },
     _prover { parts.prover },
-    // Reported at Warn and once, exactly as the registrars' notice is: a credential the
-    // scheduler did not want is a configuration fact, not a per-round event.
-    _notice { [&logger = parts.logger](std::string_view text) { logger.Logf(LogLevel::Warn, "scheduler: {}", text); } },
     _capacityWire { Distributed::CapacityToWire(parts.capacity) },
     _loadSampler { MakeHostLoadSampler(MakeSystemCounterSource()) },
     _dialer { PresenceIoTimeout },
@@ -209,8 +190,6 @@ void NodePresence::Loop(std::stop_token const& stop)
                                                        .cacheTier = _cacheTier,
                                                        .metrics = _metrics,
                                                        .sampler = _sampler,
-                                                       .credential = _credential,
-                                                       .notice = _notice,
                                                        .capacity = _capacityWire,
                                                        .endpoint = endpoint,
                                                        .logger = _logger,

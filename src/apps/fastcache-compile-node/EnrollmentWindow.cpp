@@ -25,9 +25,8 @@ bool RosterRecordsJoiner(Cluster::Roster const& roster,
         return std::ranges::any_of(roster.principals, [&](Cluster::ClusterPrincipal const& principal) {
             return principal.id == nodeId && principal.publicKey == key && principal.role == *row.principal;
         });
-    return std::ranges::any_of(roster.members, [&](Cluster::RosterMember const& member) {
-        return member.id == nodeId && member.publicKey == std::optional { key };
-    });
+    return std::ranges::any_of(
+        roster.members, [&](Cluster::RosterMember const& member) { return member.id == nodeId && member.publicKey == key; });
 }
 
 EnrollDecision EnrollmentWindow::Offer(JoinerClaim const& claim, std::string_view peerId)

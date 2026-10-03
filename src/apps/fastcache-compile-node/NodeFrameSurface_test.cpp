@@ -11,25 +11,35 @@
 #include "FleetSummaryResponder.hpp"
 #include "FleetTextResponder.hpp"
 #include "LiveStatsResponder.hpp"
+#include "MachineStandingTestUtils.hpp"
+#include "MembershipGate.hpp"
+#include "NodeAnnounce.hpp"
+#include "NodeAudience.hpp"
 #include "NodeConfig.hpp"
+#include "NodeCredential.hpp"
 #include "NodeFormation.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeMembership.hpp"
 #include "NodeProofResponder.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 #include "Responders.hpp"
 #include "SchedulerTier.hpp"
+#include "SessionResponder.hpp"
 #include "WorkerTierTestFixture.hpp"
 
 #include <FastCache/Cache/CacheEngine.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
+#include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Distributed/MachineTicket.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
+#include <FastCache/Distributed/TicketVerifier.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
 #include <FastCache/Platform/LocalAddressesTestUtils.hpp>
@@ -62,9 +72,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <expected>
 #include <format>
 #include <memory>
 #include <optional>
@@ -76,10 +89,13 @@
 #include <vector>
 
 #include <tests/HalfClose.hpp>
+#include <tests/LeaseRosterFakes.hpp>
+#include <tests/LocalityFakes.hpp>
 #include <tests/MembershipFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -92,6 +108,7 @@ using FastCache::Testing::Unwrap;
 // stays local -- it reads the error payload's TEXT, which is a different question the
 // shared header deliberately does not answer.
 using FastCache::Testing::ErrorOf;
+using FastCache::Testing::StatusOf;
 
 namespace Wire = FastCache::CompileCacheWire;
 
@@ -118,21 +135,28 @@ class NamedResponder final: public IFrameResponder
         co_return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedValue, _name);
     }
 
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& /*peer*/,
+    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                    std::uint8_t opRaw) const override
     {
         _admitted.push_back(opRaw);
-        return std::nullopt;
+        _peers.push_back(peer);
+        if (_gate.membership == nullptr)
+            return std::nullopt;
+        return RefuseUnlessMember(*_gate.membership,
+                                  *_gate.metrics,
+                                  peer,
+                                  { .code = Wire::ErrorCode::NotAMember, .counter = _gate.strangerCounter },
+                                  _name);
     }
 
-    [[nodiscard]] bool AuthRequired(std::uint8_t /*opRaw*/) const noexcept override
+    /// The next scripted verdict, or `NoPolicy` once the script is spent.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
     {
-        return _authRequired;
-    }
-
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> /*payload*/) const override
-    {
-        return CredentialOutcome::Accepted;
+        if (_verdicts.empty())
+            return CredentialVerdict { .outcome = CredentialOutcome::NoPolicy };
+        auto verdict = std::move(_verdicts.front());
+        _verdicts.pop_front();
+        return verdict;
     }
 
     [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision,
@@ -253,11 +277,24 @@ class NamedResponder final: public IFrameResponder
         _ownBudget = own;
     }
 
-    /// Require a credential for every verb this fake is asked about.
-    /// @param required What `AuthRequired` should answer.
-    void RequireAuth(bool required) noexcept
+    /// Admit callers as every production surface does, through `RefuseUnlessMember` over @p membership,
+    /// rather than admitting everybody.
+    /// @param membership The node's oracle; must outlive this.
+    /// @param metrics Where a refusal is counted; must outlive this.
+    /// @param strangerCounter The row a caller nothing admits is counted on.
+    void GateBy(Distributed::IMembershipOracle const& membership,
+                IMetricsSink& metrics,
+                IMetricsSink::Counter strangerCounter) noexcept
     {
-        _authRequired = required;
+        _gate = Gate { .membership = &membership, .metrics = &metrics, .strangerCounter = strangerCounter };
+    }
+
+    /// Script the verdicts `CheckCredential` answers, one per `AUTH`, in order.
+    /// @param verdicts What the next checks establish.
+    void AnswerAuthWith(std::vector<CredentialVerdict> verdicts)
+    {
+        for (auto& verdict: verdicts)
+            _verdicts.push_back(std::move(verdict));
     }
 
     /// Place the three session ceilings this fake reports.
@@ -283,6 +320,12 @@ class NamedResponder final: public IFrameResponder
         return _admitted;
     }
 
+    /// @return What each connection had established when this fake was asked to admit it, in order.
+    [[nodiscard]] std::vector<PeerIdentity> const& Peers() const noexcept
+    {
+        return _peers;
+    }
+
     /// @return The name recorded once per frame this fake answered.
     [[nodiscard]] std::vector<std::string> const& Answered() const noexcept
     {
@@ -290,8 +333,16 @@ class NamedResponder final: public IFrameResponder
     }
 
   private:
+    /// The membership gate `GateBy` placed; none admits everybody.
+    struct Gate
+    {
+        Distributed::IMembershipOracle const* membership { nullptr };
+        IMetricsSink* metrics { nullptr };
+        IMetricsSink::Counter strangerCounter { IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember };
+    };
+
     std::string _name;
-    bool _authRequired { false };
+    Gate _gate {};
     std::size_t _maxRequest { 1024 };
     std::size_t _maxOpen { 8 };
     std::size_t _maxInFlight { 4096 };
@@ -305,7 +356,9 @@ class NamedResponder final: public IFrameResponder
     // a mutator, which is the thing `RefusePeer`'s own signature refuses to do.
     mutable std::vector<std::string> _refusals;
     mutable std::vector<std::uint8_t> _admitted;
+    mutable std::vector<PeerIdentity> _peers;
     mutable std::vector<std::string> _answered;
+    mutable std::deque<CredentialVerdict> _verdicts;
 };
 
 /// The message an error reply carries, or nothing when the frame is not one.
@@ -321,6 +374,27 @@ class NamedResponder final: public IFrameResponder
         return {};
     auto const text = reply.subspan(Wire::ReplyHeaderSize + 1, header->payloadLength - 1);
     return std::string { reinterpret_cast<char const*>(text.data()), text.size() };
+}
+
+/// Send one request on a real connection and read its whole reply.
+/// @param socket The connection.
+/// @param request The encoded request.
+/// @return The reply frame, header included.
+[[nodiscard]] std::vector<std::byte> Exchange(core::net::ISocket* socket, std::span<std::byte const> request)
+{
+    REQUIRE(core::async::syncRun(core::net::sendAll(socket, request)));
+    auto const head = core::async::syncRun(core::net::receiveExactly(socket, Wire::ReplyHeaderSize));
+    REQUIRE(head.has_value());
+    auto const header = Wire::DecodeReplyHeader(Unwrap(head));
+    REQUIRE(header.has_value());
+    auto reply = Unwrap(head);
+    if (Unwrap(header).payloadLength > 0)
+    {
+        auto const payload = core::async::syncRun(core::net::receiveExactly(socket, Unwrap(header).payloadLength));
+        REQUIRE(payload.has_value());
+        reply.insert(reply.end(), Unwrap(payload).begin(), Unwrap(payload).end());
+    }
+    return reply;
 }
 
 /// One request header with no payload.
@@ -384,7 +458,8 @@ TEST_CASE("Each verb family reaches the component that owns it", "[node][merged-
     // listener cannot decide that by existing.
     NamedResponder cache { "cache" };
     NamedResponder scheduler { "scheduler" };
-    MergedResponder responder { SurfaceComponents { .cache = &cache, .scheduler = &scheduler } };
+    NamedResponder session { "session" };
+    MergedResponder responder { SurfaceComponents { .cache = &cache, .scheduler = &scheduler, .session = &session } };
 
     CHECK(MessageOf(AnswerNow(responder, HeaderFor(Wire::Op::Fetch))) == "cache");
     CHECK(MessageOf(AnswerNow(responder, HeaderFor(Wire::Op::Store))) == "cache");
@@ -392,13 +467,13 @@ TEST_CASE("Each verb family reaches the component that owns it", "[node][merged-
     CHECK(MessageOf(AnswerNow(responder, HeaderFor(Wire::Op::Register))) == "scheduler");
     CHECK(MessageOf(AnswerNow(responder, HeaderFor(Wire::Op::ClusterStatus))) == "scheduler");
 
-    // AUTH follows the credential, which is the scheduler's: the cache requires none,
-    // so an AUTH routed there would answer "no policy" and a peer holding the
-    // scheduler's secret could never present it.
-    CHECK(MessageOf(AnswerNow(responder, HeaderFor(Wire::Op::Auth))) == "scheduler");
+    // AUTH is the Session family's, which is its own component on every node: the node holds
+    // no password, and what an AUTH establishes must not depend on whether it schedules.
+    CHECK(MessageOf(AnswerNow(responder, HeaderFor(Wire::Op::Auth))) == "session");
 
     CHECK(cache.Answered().size() == 2);
-    CHECK(scheduler.Answered().size() == 4);
+    CHECK(scheduler.Answered().size() == 3);
+    CHECK(session.Answered().size() == 1);
 }
 
 TEST_CASE("A progress cadence is routed to the surface that does the slow work", "[node][merged-responder][progress]")
@@ -478,9 +553,10 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     // another on the same listener` uses `RefuseOnlyVerb` and says so, which proves the
     // seam can carry the question rather than that the real rules produce it.
     //
-    // The peer is `10.0.0.1`, and the two things that make this case mean anything are
-    // asserted rather than assumed: it IS an admitted member, so the FETCH refusal
-    // cannot be membership, and it is NOT this machine, so the refusal is locality.
+    // The peer is `10.0.0.1`, admitted by a verified ticket for a key the roster holds, and
+    // the two things that make this case mean anything are asserted rather than assumed: it
+    // IS an admitted member, so the FETCH refusal cannot be membership, and it is NOT this
+    // machine, so the refusal is locality.
     // Never invoked. This case stops at the peer gate, which is decided from the
     // caller's host before a payload byte is read -- so no compiler is spawned and a
     // runner that refuses to spawn is the honest stand-in for one that is not asked.
@@ -512,9 +588,10 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     // Admitted. Without this the FETCH would be refused for membership and the case
     // would pass having tested nothing about the merge -- and the compile would be
     // refused too, so there would be no contrast at all.
-    Distributed::ClusterMembership const membership { Distributed::MembershipParticipant::FleetMemberList,
-                                                      { "10.0.0.1:7000" } };
-    REQUIRE(membership.Classify("10.0.0.1") == Distributed::Membership::Member);
+    Testing::RosterFold const fold { { "pc-01" } };
+    auto const& membership = fold.admitted;
+    auto const ticketed = ConnectionFacts { .host = "10.0.0.1", .authenticatedMachine = Testing::IdentityOf("pc-01") };
+    REQUIRE(Distributed::ExplainConnection(membership, ticketed).verdict == Distributed::Membership::Member);
     REQUIRE_FALSE(locality.IsThisMachine("10.0.0.1"));
 
     NodeIoLoop io;
@@ -530,8 +607,6 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     CompileResponder compileResponder { protocol, capacity, membership, locality, pool, io.Reactor(), metrics, logger };
     MergedResponder responder { SurfaceComponents { .cache = &cacheResponder, .compile = &compileResponder } };
 
-    constexpr auto* peer = "10.0.0.1";
-
     // --- the cache verb: refused, and refused FOR LOCALITY ------------------------
     //
     // The REASON is asserted, not merely that it was refused: "was it refused" is
@@ -546,8 +621,7 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     // one socket, so the counter is the only thing here that says WHICH rule fired:
     // delete the increment in `CacheResponder::RefusePeer` and the code assertion below
     // still passes, with only the counter going red.
-    auto const fetchRefusal =
-        responder.RefusePeer(PeerIdentity { .host = std::string { peer } }, static_cast<std::uint8_t>(Wire::Op::Fetch));
+    auto const fetchRefusal = responder.RefusePeer(ticketed, static_cast<std::uint8_t>(Wire::Op::Fetch));
     REQUIRE(fetchRefusal.has_value());
     CHECK(ErrorOf(Unwrap(fetchRefusal)) == Wire::ErrorCode::NotAMember);
     CHECK(metrics.Read(IMetricsSink::Counter::NodeCacheRequestsRefusedNotLocal) == 1);
@@ -556,9 +630,7 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     //
     // No refusal at the peer gate, which is as far as this layer decides: a lease and
     // a compiler are the next questions and belong to the fixture that has both.
-    CHECK_FALSE(
-        responder.RefusePeer(PeerIdentity { .host = std::string { peer } }, static_cast<std::uint8_t>(Wire::Op::Compile))
-            .has_value());
+    CHECK_FALSE(responder.RefusePeer(ticketed, static_cast<std::uint8_t>(Wire::Op::Compile)).has_value());
 
     // And the cache tier still answers THIS machine, which is the other direction of
     // the same rule and the one a widened bind is most likely to break in silence.
@@ -679,25 +751,6 @@ TEST_CASE("An unowned verb is refused before its payload is read", "[node][merge
     auto const budget =
         schedulerOnly.EndpointRefusalReply(EndpointRefusal::InFlightBudget, static_cast<std::uint8_t>(Wire::Op::Fetch), {});
     CHECK(ErrorOf(budget) == Wire::UnimplementedVerb);
-}
-
-TEST_CASE("The credential answer follows the verb, not the surface", "[node][merged-responder]")
-{
-    // The reason `AuthRequired` had to take the verb at all. The two components answer
-    // it oppositely and both are right, so a surface-wide answer has no correct value:
-    // `true` refuses every local fastcache-cc FETCH, `false` undoes #289.
-    NamedResponder cache { "cache" };
-    NamedResponder scheduler { "scheduler" };
-    scheduler.RequireAuth(true);
-    MergedResponder responder { SurfaceComponents { .cache = &cache, .scheduler = &scheduler } };
-
-    CHECK_FALSE(responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Fetch)));
-    CHECK(responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Lease)));
-
-    // Unowned -- this node runs no worker -- answers false and is unreachable anyway:
-    // `RefusePeer` has already refused it, and requiring a credential for a verb nobody
-    // serves would tell a stranger that one exists.
-    CHECK_FALSE(responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::Compile)));
 }
 
 TEST_CASE("A refusal is counted against the component that owned the verb", "[node][merged-responder]")
@@ -924,6 +977,497 @@ TEST_CASE("A node running only consensus opens the 0xFC port it is watched throu
     CHECK(MessageOf(reply) == "node");
 }
 
+TEST_CASE("An AUTH establishes a machine for the connection, and a refused one clears it", "[node][node-surface][session]")
+{
+    // Over a real listener, because what is under test is the ENDPOINT's per-connection state: the
+    // verdict is ASSIGNED on every AUTH rather than merged, so a connection cannot keep a machine it
+    // can no longer vouch for by presenting something worse afterwards. The operator verbs stand in
+    // for any surface asked `RefusePeer` -- what they were handed is what admission folds.
+    NodeIoLoop io;
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    NamedResponder node { "node" };
+    NamedResponder session { "session" };
+    auto const machine = Testing::IdentityOf("pc-07");
+    session.AnswerAuthWith({
+        CredentialVerdict { .outcome = CredentialOutcome::Accepted, .machine = machine },
+        // A refusal the surface encoded and counted itself: written as it stands.
+        CredentialVerdict { .outcome = CredentialOutcome::Rejected,
+                            .machine = machine,
+                            .refusalReply = Wire::EncodeErrorReply(Wire::ErrorCode::Unauthenticated, "scripted refusal") },
+        CredentialVerdict { .outcome = CredentialOutcome::Accepted, .machine = machine },
+        // A refusal the surface left to its endpoint row.
+        CredentialVerdict { .outcome = CredentialOutcome::Rejected },
+        CredentialVerdict { .outcome = CredentialOutcome::Accepted, .machine = machine },
+    });
+    // A surface ceiling above `AUTH`'s own, so an oversize `AUTH` is refused by its verb's cap and
+    // stepped over rather than closing the connection.
+    node.PlaceCeilings(64ULL * 1024ULL, 8, 1024ULL * 1024ULL);
+    auto [cfg, port] = BaseConfig();
+    cfg.slots = 0;
+    cfg.cacheMemoryBytes = 0;
+    cfg.cacheDir.clear();
+
+    auto surface = StartNodeSurfaceOrExplain(
+        io, cfg, SurfaceComponents { .node = &node, .session = &session }, std::nullopt, metrics, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(*surface != nullptr);
+    io.Start();
+
+    core::net::BlockingConnector connector;
+    auto socket = core::async::syncRun(
+        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    REQUIRE(socket.has_value());
+    auto const exchange = [&socket](std::span<std::byte const> request) {
+        return Exchange(socket->get(), request);
+    };
+    auto const auth =
+        Wire::EncodeAuth(Wire::AuthRequest { .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = "t" });
+    auto const status = HeaderFor(Wire::Op::NodeStatus);
+
+    // Before any AUTH, nothing is established -- and a verb that is NOT pre-auth is served all
+    // the same: the node checks no password, so no surface waits for one.
+    REQUIRE_FALSE(Wire::IsPreAuthAllowed(static_cast<std::uint8_t>(Wire::Op::NodeStatus)));
+    (void) exchange(status);
+    // ANSWERED, not merely replied to: this fake names itself in its refusals too, so only its
+    // `Answer` having run separates "served" from "refused Unauthenticated at the door".
+    CHECK(node.Answered().size() == 1);
+    REQUIRE(node.Peers().size() == 1);
+    CHECK_FALSE(node.Peers().back().authenticatedMachine.has_value());
+
+    // Accepted: the machine rides every later frame on this connection.
+    CHECK(StatusOf(exchange(auth)) == Wire::Status::Ok);
+    (void) exchange(status);
+    REQUIRE(node.Peers().size() == 2);
+    CHECK(node.Peers().back().authenticatedMachine == std::optional { machine });
+
+    // Refused, with the surface's own reply -- written verbatim, and the machine is GONE although
+    // the refusing verdict carried one: only `Accepted` establishes anything.
+    CHECK(MessageOf(exchange(auth)) == "scripted refusal");
+    (void) exchange(status);
+    REQUIRE(node.Peers().size() == 3);
+    CHECK_FALSE(node.Peers().back().authenticatedMachine.has_value());
+    CHECK(session.Refusals().empty());
+
+    // And refused with no reply of its own, after being re-established: the endpoint row answers,
+    // routed to the session component, and the machine is gone again.
+    CHECK(StatusOf(exchange(auth)) == Wire::Status::Ok);
+    CHECK(MessageOf(exchange(auth)) == "session");
+    (void) exchange(status);
+    REQUIRE(node.Peers().size() == 4);
+    CHECK_FALSE(node.Peers().back().authenticatedMachine.has_value());
+    CHECK(session.Refusals().size() == 1);
+
+    // And refused at the HEADER, which never reaches the verdict: an `AUTH` over its own ceiling is
+    // answered `PayloadTooLarge` and stepped over, and the machine established before it is gone
+    // all the same.
+    CHECK(StatusOf(exchange(auth)) == Wire::Status::Ok);
+    (void) exchange(status);
+    REQUIRE(node.Peers().size() == 5);
+    REQUIRE(node.Peers().back().authenticatedMachine == std::optional { machine });
+    std::vector<std::byte> oversize(Wire::RequestHeaderSize + Wire::MaxAuthPayload + 16);
+    WireFrame::PutHeader(std::span { oversize }.first(Wire::RequestHeaderSize),
+                         Wire::Magic,
+                         Wire::CurrentVersion,
+                         static_cast<std::uint8_t>(Wire::Op::Auth),
+                         static_cast<std::uint32_t>(Wire::MaxAuthPayload + 16));
+    CHECK(ErrorOf(exchange(oversize)) == Wire::ErrorCode::PayloadTooLarge);
+    (void) exchange(status);
+    REQUIRE(node.Peers().size() == 6);
+    CHECK_FALSE(node.Peers().back().authenticatedMachine.has_value());
+}
+
+TEST_CASE("A forgotten machine's tickets are refused, and the connection presenting one speaks for nobody",
+          "[node][node-surface][session][ticket]")
+{
+    // The real session component behind a real endpoint, verifying against a roster the case then
+    // revokes the machine from, as an applied forget does (#1555). What is under test is that the
+    // roster is asked PER TICKET: a machine admitted a minute ago is refused the moment it is not,
+    // by name and counted, and the connection that presented the refused ticket holds no machine.
+    using namespace std::chrono_literals;
+    constexpr auto noon = std::chrono::system_clock::time_point { std::chrono::hours { 500'000 } };
+    constexpr std::string_view office = "office.corp:6674";
+
+    NodeIoLoop io;
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    NamedResponder node { "node" };
+    core::platform::ManualWallClock const wallClock { noon };
+    Testing::FixedLeaseRoster roster { { "office" } };
+    roster.AdmitMachine("pc-07");
+    Testing::ThisMachineIs const locality { "127.0.0.1" };
+    AnnouncedEndpoint const announced { office };
+    NodeAudience const audience { announced, {}, {}, locality };
+    Distributed::SpentTickets spent;
+    Distributed::TicketVerifier const verifier { &roster, audience, spent };
+    Testing::ScriptedSecureRandom random;
+    SessionResponder session { verifier, SessionKeys {}, random, wallClock, metrics };
+
+    auto [cfg, port] = BaseConfig();
+    cfg.slots = 0;
+    cfg.cacheMemoryBytes = 0;
+    cfg.cacheDir.clear();
+    auto surface = StartNodeSurfaceOrExplain(
+        io, cfg, SurfaceComponents { .node = &node, .session = &session }, std::nullopt, metrics, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(*surface != nullptr);
+    io.Start();
+
+    core::net::BlockingConnector connector;
+    auto socket = core::async::syncRun(
+        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    REQUIRE(socket.has_value());
+
+    // pc-07's own tickets for this node, one per AUTH: a ticket is spent once, so the second must
+    // differ, and it differs in its nonce alone.
+    auto const ticketAuth = [office, noon](std::uint8_t nonce) {
+        auto claims = Distributed::MachineTicketClaims {
+            .machineId = "pc-07",
+            .audience = std::string { office },
+            .expiresAtUnixSeconds = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>((noon + 30s).time_since_epoch()).count()),
+            .nonce = {}
+        };
+        claims.nonce.front() = std::byte { nonce };
+        auto const ticket = Distributed::MintMachineTicket(Testing::TestKeyPair("pc-07"), claims);
+        return Wire::EncodeAuth(
+            Wire::AuthRequest { .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = ticket.View() });
+    };
+    auto const status = HeaderFor(Wire::Op::NodeStatus);
+
+    // Admitted: the ticket establishes pc-07 on this connection.
+    CHECK(StatusOf(Exchange(socket->get(), ticketAuth(1))) == Wire::Status::Ok);
+    (void) Exchange(socket->get(), status);
+    REQUIRE(node.Peers().size() == 1);
+    REQUIRE(node.Peers().back().authenticatedMachine.has_value());
+    CHECK(Unwrap(node.Peers().back().authenticatedMachine).id == "pc-07");
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeTicketsAccepted) == 1);
+
+    // Forgotten: its next ticket, good in every other respect, is refused and counted as revoked --
+    // told only that it is not admitted, as a stranger is -- and the machine the first one
+    // established is gone from the connection.
+    roster.Revoke("pc-07");
+    auto const refused = Exchange(socket->get(), ticketAuth(2));
+    CHECK(ErrorOf(refused) == Wire::ErrorCode::TicketRefused);
+    CHECK(MessageOf(refused) == Distributed::TicketNotAdmittedMessage);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeTicketsRefusedRevoked) == 1);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeTicketsAccepted) == 1);
+    (void) Exchange(socket->get(), status);
+    REQUIRE(node.Peers().size() == 2);
+    CHECK_FALSE(node.Peers().back().authenticatedMachine.has_value());
+}
+
+TEST_CASE("On an open fleet, a forgotten machine's revoked ticket refuses the verb pipelined behind it",
+          "[node][node-surface][session][ticket][forget]")
+{
+    // The reviewer's measurement at the production seam: a `--fleet-open` node, whose address route
+    // admits anybody, and pc-07 -- forgotten, its key revoked -- sending AUTH with its ticket and a
+    // command behind it in ONE write, as a launcher does. The AUTH is refused `revoked`; what this
+    // case is about is the COMMAND, which must be refused as the forgotten machine's rather than
+    // admitted by the open address route.
+    //
+    // The fold's key roster is deliberately BEHIND the lease roster here -- it still holds pc-07
+    // live -- because the two are published at different moments: the refusal must come from the
+    // evidence the ticket carried, which can only ever answer `Forgotten`, and not from asking a
+    // roster that has not heard of the forget yet.
+    using namespace std::chrono_literals;
+    constexpr auto noon = std::chrono::system_clock::time_point { std::chrono::hours { 500'000 } };
+    constexpr std::string_view office = "office.corp:6674";
+
+    NodeIoLoop io;
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    core::platform::ManualWallClock const wallClock { noon };
+    Testing::FixedLeaseRoster roster { { "office" } };
+    roster.Revoke("pc-07");
+    Testing::ThisMachineIs const locality { "127.0.0.1" };
+    AnnouncedEndpoint const announced { office };
+    NodeAudience const audience { announced, {}, {}, locality };
+    Distributed::SpentTickets spent;
+    Distributed::TicketVerifier const verifier { &roster, audience, spent };
+    Testing::ScriptedSecureRandom random;
+    SessionResponder session { verifier, SessionKeys {}, random, wallClock, metrics };
+
+    auto [cfg, port] = BaseConfig();
+    cfg.slots = 0;
+    cfg.cacheMemoryBytes = 0;
+    cfg.cacheDir.clear();
+    cfg.fleetOpen = true;
+    NodeMembership membership { cfg, logger };
+    auto state = Cluster::ClusterState {};
+    Cluster::Apply(state,
+                   Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
+                                      .key = "pc-07",
+                                      .value = "10.0.0.7:6676",
+                                      .schedulerEndpoint = {},
+                                      .publicKey = Testing::TestKeyPair("pc-07").PublicKey(),
+                                      .role = std::nullopt });
+    membership.PublishCluster(state);
+
+    NamedResponder node { "node" };
+    node.GateBy(membership.Oracle(), metrics, IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember);
+    auto surface = StartNodeSurfaceOrExplain(
+        io, cfg, SurfaceComponents { .node = &node, .session = &session }, std::nullopt, metrics, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(*surface != nullptr);
+    io.Start();
+
+    core::net::BlockingConnector connector;
+    auto socket = core::async::syncRun(
+        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    REQUIRE(socket.has_value());
+
+    auto const ticketAuth = [office, noon](std::string const& machine, std::uint8_t nonce) {
+        auto claims = Distributed::MachineTicketClaims {
+            .machineId = machine,
+            .audience = std::string { office },
+            .expiresAtUnixSeconds = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>((noon + 30s).time_since_epoch()).count()),
+            .nonce = {}
+        };
+        claims.nonce.front() = std::byte { nonce };
+        auto const ticket = Distributed::MintMachineTicket(Testing::TestKeyPair(machine), claims);
+        return Wire::EncodeAuth(
+            Wire::AuthRequest { .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = ticket.View() });
+    };
+    auto const status = HeaderFor(Wire::Op::NodeStatus);
+
+    // The control that makes the refusal below about the TICKET: before it, this connection's
+    // command is served -- the open address route admits it.
+    (void) Exchange(socket->get(), status);
+    REQUIRE(node.Answered().size() == 1);
+
+    // AUTH and the command in ONE write, then both replies.
+    auto pipelined = ticketAuth("pc-07", 1);
+    pipelined.insert(pipelined.end(), status.begin(), status.end());
+    REQUIRE(core::async::syncRun(core::net::sendAll(socket->get(), pipelined)));
+    auto const readReply = [&socket] {
+        auto const head = core::async::syncRun(core::net::receiveExactly(socket->get(), Wire::ReplyHeaderSize));
+        REQUIRE(head.has_value());
+        auto const header = Wire::DecodeReplyHeader(Unwrap(head));
+        REQUIRE(header.has_value());
+        auto reply = Unwrap(head);
+        auto const payload = core::async::syncRun(core::net::receiveExactly(socket->get(), Unwrap(header).payloadLength));
+        REQUIRE(payload.has_value());
+        reply.insert(reply.end(), Unwrap(payload).begin(), Unwrap(payload).end());
+        return reply;
+    };
+    auto const authReply = readReply();
+    CHECK(ErrorOf(authReply) == Wire::ErrorCode::TicketRefused);
+    CHECK(MessageOf(authReply) == Distributed::TicketNotAdmittedMessage);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeTicketsRefusedRevoked) == 1);
+
+    // The command: refused as the FORGOTTEN machine's, counted on that row and not as a stranger's,
+    // and never answered.
+    auto const commandReply = readReply();
+    CHECK(ErrorOf(commandReply) == Wire::ErrorCode::NotAMember);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked) == 1);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 0);
+    CHECK(node.Answered().size() == 1);
+
+    // And no later AUTH lifts it: a genuine ticket for another admitted machine on the same
+    // connection is accepted, and the connection is still the forgotten machine's.
+    roster.AdmitMachine("pc-08");
+    CHECK(StatusOf(Exchange(socket->get(), ticketAuth("pc-08", 2))) == Wire::Status::Ok);
+    CHECK(ErrorOf(Exchange(socket->get(), status)) == Wire::ErrorCode::NotAMember);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked) == 2);
+    CHECK(node.Answered().size() == 1);
+}
+
+namespace
+{
+
+/// Readings nobody reads, for the same reason.
+class NoReadings final: public ILiveStatsSources
+{
+  public:
+    [[nodiscard]] std::optional<LiveCapture> Capture(Wire::LiveSubject /*subject*/) const override
+    {
+        return std::nullopt;
+    }
+    [[nodiscard]] std::optional<LiveLeadership> Leadership() const override
+    {
+        return std::nullopt;
+    }
+    [[nodiscard]] std::string AnsweringEndpoint() const override
+    {
+        return {};
+    }
+    [[nodiscard]] std::expected<FleetTextDocument, FleetTextDeclined> FleetText(std::string_view /*section*/,
+                                                                                std::string_view /*range*/) const override
+    {
+        return std::unexpected(FleetTextDeclined { .refusal = FleetTextRefusal::NoFleet, .detail = {} });
+    }
+};
+
+/// @param reply A reply.
+/// @return Whether its bytes spell `revoked` in any case.
+[[nodiscard]] bool SaysRevoked(std::span<std::byte const> reply)
+{
+    auto text = std::string {};
+    for (auto const byte: reply)
+        text.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(byte))));
+    return text.contains("revoked");
+}
+
+} // namespace
+
+TEST_CASE("A captured ticket of a forgotten machine is answered as a stranger's at AUTH, at a gated verb and at "
+          "explain-admission",
+          "[node][node-surface][session][ticket][forget][admission]")
+{
+    // The three roster-dependent refusals end to end, through the production session, gate and
+    // responder, one connection each: a genuine ticket of `gone`, whose key the cluster revoked (a
+    // captured ticket); a ticket for `nobody`, signed by the prober's own key (unknown machine); and
+    // a ticket for `pc-07`, a LIVE machine, signed by the prober's own key (forged). A stranger must
+    // not tell them apart -- not at AUTH, not at the gated `node-status` behind it, not at the self
+    // form of `explain-admission` -- while the node counts each on its own row.
+    //
+    // The oracle is the key roster ALONE: over loopback, `Loopback` would admit B and refuse A, a
+    // difference that is this machine's and not the one under test.
+    using namespace std::chrono_literals;
+    constexpr auto noon = std::chrono::system_clock::time_point { std::chrono::hours { 500'000 } };
+    constexpr std::string_view office = "office.corp:6674";
+
+    NodeIoLoop io;
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    core::platform::ManualWallClock const wallClock { noon };
+    Testing::FixedLeaseRoster roster { { "office" } };
+    roster.AdmitMachine("gone");
+    roster.Revoke("gone");
+    roster.AdmitMachine("pc-07");
+    Testing::ThisMachineIs const locality { "127.0.0.1" };
+    AnnouncedEndpoint const announced { office };
+    NodeAudience const audience { announced, {}, {}, locality };
+    Distributed::SpentTickets spent;
+    Distributed::TicketVerifier const verifier { &roster, audience, spent };
+    Testing::ScriptedSecureRandom random;
+    SessionResponder session { verifier, SessionKeys {}, random, wallClock, metrics };
+
+    Distributed::KeyRosterMembership keys;
+    keys.Publish({}, { Testing::TestKeyPair("gone").PublicKey() });
+    Distributed::AnyOfMembership const byKeyAlone { { &keys } };
+    Testing::SilentNodeStatus const identity;
+    NoReadings const readings;
+    Testing::FixedStanding const standing {};
+    NodeStatusResponder node { identity, readings, byKeyAlone, standing, metrics };
+
+    auto [cfg, port] = BaseConfig();
+    cfg.slots = 0;
+    cfg.cacheMemoryBytes = 0;
+    cfg.cacheDir.clear();
+    auto surface = StartNodeSurfaceOrExplain(
+        io, cfg, SurfaceComponents { .node = &node, .session = &session }, std::nullopt, metrics, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(*surface != nullptr);
+    io.Start();
+
+    auto const ticketAuth = [office, noon](std::string const& claimed, std::string const& signer) {
+        auto const claims = Distributed::MachineTicketClaims {
+            .machineId = claimed,
+            .audience = std::string { office },
+            .expiresAtUnixSeconds = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>((noon + 30s).time_since_epoch()).count()),
+            .nonce = {}
+        };
+        auto const ticket = Distributed::MintMachineTicket(Testing::TestKeyPair(signer), claims);
+        return Wire::EncodeAuth(
+            Wire::AuthRequest { .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = ticket.View() });
+    };
+
+    /// AUTH with one ticket, then `node-status`, then the self form, on one connection.
+    auto const probe = [&](std::string const& claimed, std::string const& signer) {
+        core::net::BlockingConnector connector;
+        auto socket = core::async::syncRun(
+            connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+        REQUIRE(socket.has_value());
+        auto answers = std::array<std::vector<std::byte>, 3> {};
+        answers[0] = Exchange(socket->get(), ticketAuth(claimed, signer));
+        answers[1] = Exchange(socket->get(), HeaderFor(Wire::Op::NodeStatus));
+        answers[2] = Exchange(socket->get(), Wire::EncodeExplainAdmissionRequest(""));
+        return answers;
+    };
+
+    // Each probe moves its own ticket row, and the gated verb behind it the row its connection
+    // earned: the forgotten machine's for the revoked ticket, the stranger's for the other two.
+    auto const captured = probe("gone", "gone");
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeTicketsRefusedRevoked) == 1);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked) == 1);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 0);
+
+    auto const unknown = probe("nobody", "prober");
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeTicketsRefusedUnknownMachine) == 1);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 1);
+
+    auto const forged = probe("pc-07", "prober");
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeTicketsRefusedForged) == 1);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 2);
+
+    // And no probe moved another's row.
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeTicketsRefusedRevoked) == 1);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeTicketsRefusedUnknownMachine) == 1);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked) == 1);
+
+    // What each connection was told, answer by answer.
+    CHECK(ErrorOf(captured[0]) == Wire::ErrorCode::TicketRefused);
+    CHECK(ErrorOf(captured[1]) == Wire::ErrorCode::NotAMember);
+    auto const self = Wire::DecodeAdmissionExplanation(Testing::PayloadOf(captured[2]));
+    REQUIRE(self.has_value());
+    CHECK(Unwrap(self).verdict == Wire::WireMembership::Outsider);
+    CHECK(Unwrap(self).decidedBy == 0);
+    CHECK(Unwrap(self).subject == "127.0.0.1");
+    for (auto const index: std::views::iota(std::size_t { 0 }, captured.size()))
+    {
+        INFO("answer " << index);
+        CHECK_FALSE(SaysRevoked(captured[index]));
+        // And byte for byte what the other two were told, which is the claim itself.
+        CHECK(captured[index] == unknown[index]);
+        CHECK(forged[index] == unknown[index]);
+    }
+}
+
+TEST_CASE("An explain-admission above its own ceiling is refused before any component reads it",
+          "[node][node-surface][admission]")
+{
+    // The verb is reachable before admission, so its own ceiling is the only thing bounding what a
+    // stranger makes the node read: an oversized request is refused `PayloadTooLarge` by the
+    // endpoint, stepped over, and never reaches the component that owns the verb.
+    NodeIoLoop io;
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    NamedResponder node { "node" };
+    node.PlaceCeilings(64ULL * 1024ULL, 8, 1024ULL * 1024ULL);
+    auto [cfg, port] = BaseConfig();
+    cfg.slots = 0;
+    cfg.cacheMemoryBytes = 0;
+    cfg.cacheDir.clear();
+    auto surface = StartNodeSurfaceOrExplain(io, cfg, SurfaceComponents { .node = &node }, std::nullopt, metrics, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(*surface != nullptr);
+    io.Start();
+
+    core::net::BlockingConnector connector;
+    auto socket = core::async::syncRun(
+        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    REQUIRE(socket.has_value());
+
+    std::vector<std::byte> oversize(Wire::RequestHeaderSize + Wire::MaxExplainAdmissionPayload + 1);
+    WireFrame::PutHeader(std::span { oversize }.first(Wire::RequestHeaderSize),
+                         Wire::Magic,
+                         Wire::CurrentVersion,
+                         static_cast<std::uint8_t>(Wire::Op::ExplainAdmission),
+                         static_cast<std::uint32_t>(Wire::MaxExplainAdmissionPayload + 1));
+    CHECK(ErrorOf(Exchange(socket->get(), oversize)) == Wire::ErrorCode::PayloadTooLarge);
+    CHECK(node.Answered().empty());
+
+    // The control: at its ceiling it is read and reaches the component, on the same connection.
+    auto atCeiling = Wire::EncodeExplainAdmissionRequest(std::string(Wire::MaxExplainAdmissionPayload - 4, 'x'));
+    REQUIRE(atCeiling.size() == Wire::RequestHeaderSize + Wire::MaxExplainAdmissionPayload);
+    (void) Exchange(socket->get(), atCeiling);
+    CHECK(node.Answered().size() == 1);
+}
+
 TEST_CASE("A node running only consensus still answers its status with every live subscription held", "[node][node-surface]")
 {
     // #206 review. The operator families coexist on one port, so their connection
@@ -995,7 +1539,7 @@ TEST_CASE("A node running only consensus still answers its status with every liv
 
 namespace
 {
-/// The three responders every node builds, over nothing wired: what `main` passes
+/// The four responders every node builds, over nothing wired: what `main` passes
 /// `ComposeSurfaceComponents` for the families no node may lack.
 struct EveryNodeResponders
 {
@@ -1004,19 +1548,31 @@ struct EveryNodeResponders
     /// @param metrics Where a refusal is counted; must outlive this.
     EveryNodeResponders(NodeConfig const& cfg, NodeIoLoop& io, IMetricsSink& metrics):
         status { cfg, clock, clock.now(), "test", "n-office", NodeComponents {} },
-        node { status, sources, membership, metrics },
+        node { status, sources, membership, standing, metrics },
         live { sources, membership, AdminCredential {}, io.Reactor(), metrics },
-        fleet { sources, membership, AdminCredential {}, metrics }
+        fleet { sources, membership, AdminCredential {}, metrics },
+        session { verifier, SessionKeys {}, random, wallClock, metrics }
     {
     }
 
     core::platform::ManualClock clock;
     LiveStatsSourceSlot sources;
-    Testing::ListedMembership membership { { "127.0.0.1" }, Distributed::MembershipParticipant::FleetMemberList };
+    Testing::ListedMembership membership { { "127.0.0.1" }, Distributed::MembershipParticipant::Loopback };
     ConfiguredNodeStatus status;
+    Testing::FixedStanding const standing {};
     NodeStatusResponder node;
     LiveStatsResponder live;
     FleetTextResponder fleet;
+    // The session component over a node that holds no roster: every ticket it is shown is refused,
+    // which is all a routing case needs of it.
+    AnnouncedEndpoint const announced { "office.corp:6674" };
+    Testing::ThisMachineIs const locality { "127.0.0.1" };
+    NodeAudience const audience { announced, {}, {}, locality };
+    Distributed::SpentTickets spent;
+    Distributed::TicketVerifier const verifier { nullptr, audience, spent };
+    Testing::ScriptedSecureRandom random;
+    core::platform::ManualWallClock wallClock;
+    SessionResponder session;
 };
 } // namespace
 
@@ -1038,7 +1594,7 @@ TEST_CASE("The surface main composes routes each family to the component it was 
     EveryNodeResponders every { cfg, io, metrics };
 
     auto const components = ComposeSurfaceComponents(
-        nullptr, nullptr, nullptr, every.node, nullptr, every.live, every.fleet, nullptr, &formation);
+        nullptr, nullptr, nullptr, every.node, nullptr, every.live, every.fleet, nullptr, &formation, every.session);
 
     struct Expected
     {
@@ -1046,7 +1602,7 @@ TEST_CASE("The surface main composes routes each family to the component it was 
         IFrameResponder const* owner;
     };
     auto const expected = std::array {
-        Expected { .family = Wire::VerbFamily::Session, .owner = nullptr },
+        Expected { .family = Wire::VerbFamily::Session, .owner = &every.session },
         Expected { .family = Wire::VerbFamily::Cache, .owner = nullptr },
         Expected { .family = Wire::VerbFamily::Scheduler, .owner = nullptr },
         Expected { .family = Wire::VerbFamily::Compile, .owner = nullptr },
@@ -1078,7 +1634,9 @@ TEST_CASE("With every component present, the surface main composes routes each f
     REQUIRE(*worker != nullptr);
 
     auto const nodeCfg = BaseConfig().first;
-    auto cache = StartCacheTierOrExplain(fix.io, nodeCfg, fix.credential, fix.locality, fix.clock, fix.metrics, fix.logger);
+    ConfiguredCredential const upstreamCredential { nodeCfg, nullptr };
+    auto cache =
+        StartCacheTierOrExplain(fix.io, nodeCfg, upstreamCredential, fix.locality, fix.clock, fix.metrics, fix.logger);
     REQUIRE(cache.has_value());
     REQUIRE(*cache != nullptr);
 
@@ -1109,7 +1667,8 @@ TEST_CASE("With every component present, the surface main composes routes each f
                                                      every.live,
                                                      every.fleet,
                                                      &nodeProof,
-                                                     &formation);
+                                                     &formation,
+                                                     every.session);
 
     struct Expected
     {
@@ -1118,7 +1677,7 @@ TEST_CASE("With every component present, the surface main composes routes each f
     };
     IFrameResponder const* const schedulerResponder = &(*scheduler)->Responder();
     auto const expected = std::array {
-        Expected { .family = Wire::VerbFamily::Session, .owner = schedulerResponder },
+        Expected { .family = Wire::VerbFamily::Session, .owner = &every.session },
         Expected { .family = Wire::VerbFamily::Cache, .owner = &(*cache)->Responder() },
         Expected { .family = Wire::VerbFamily::Scheduler, .owner = schedulerResponder },
         Expected { .family = Wire::VerbFamily::Compile, .owner = &(*worker)->Responder() },
@@ -1165,7 +1724,7 @@ TEST_CASE("A node's port answers FLEET-SUMMARY over the probe's own nonce and on
         io,
         cfg,
         ComposeSurfaceComponents(
-            nullptr, nullptr, nullptr, every.node, nullptr, every.live, every.fleet, nullptr, &formation),
+            nullptr, nullptr, nullptr, every.node, nullptr, every.live, every.fleet, nullptr, &formation, every.session),
         std::nullopt,
         metrics,
         logger);

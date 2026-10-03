@@ -3,6 +3,7 @@
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Core/WireFrame.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 
@@ -21,6 +22,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/FleetHistoryFakes.hpp>
 #include <tests/LeaseRosterFakes.hpp>
+#include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -43,8 +45,11 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 /// A machine the fleet has admitted by the identity it proved, which is what every verb a machine
-/// joins the fleet with needs since #178.
-CallerContext const Insider { .membership = Membership::Member, .peerId = "peer-1", .provenNodeId = "node-1" };
+/// joins the fleet with needs since #178 -- and a proof identifies its caller, as an operator's
+/// control verbs require.
+CallerContext const Insider {
+    .membership = Membership::Member, .peerId = "peer-1", .provenNodeId = "node-1", .identified = true
+};
 
 /// A caller the fleet admits by its ADDRESS and that proved nothing: a client, which may lease and
 /// may not join.
@@ -1015,4 +1020,56 @@ TEST_CASE("Exactly the verbs a machine joins the fleet with require a proven ide
         INFO(row.name);
         CHECK((row.identity == Wire::IdentityRequirement::ProvenNodeOnly) == joins);
     }
+}
+
+TEST_CASE("An operator's control verb is refused a caller only --fleet-open admitted, by name and counted",
+          "[distributed][scheduler][protocol][admission][security]")
+{
+    // With the scheduler's password gone, what stood between an anonymous caller on a --fleet-open
+    // node and `CLUSTER-ADMIT` was membership -- and --fleet-open makes everybody a member. So the
+    // control verbs ask the verb column (`IdentityRequirement::IdentifiedCaller`) of a context the
+    // production fold built, and the route table says --fleet-open identifies nobody.
+    Fixture fixture;
+    Testing::OpenFleetFold fold;
+    auto const contextOf = [&fold](ConnectionFacts facts) {
+        return CallerContextOf(fold.admitted, std::move(facts));
+    };
+    auto const anonymous = contextOf(Testing::OpenFleetFold::Anonymous());
+    REQUIRE(anonymous.membership == Membership::Member); // admitted: the open policy is working
+    CHECK_FALSE(anonymous.identified);
+
+    constexpr auto ControlVerbs = std::array {
+        Wire::Op::ClusterSet,          Wire::Op::ClusterForget,      Wire::Op::ClusterAdmit,
+        Wire::Op::ClusterAdmitLearner, Wire::Op::ClusterAdmitWorker,
+    };
+    auto refused = std::uint64_t { 0 };
+    for (auto const op: ControlVerbs)
+    {
+        INFO("op " << static_cast<int>(op));
+        auto const refusal = fixture.protocol.RefusePeer(anonymous, static_cast<std::uint8_t>(op));
+        REQUIRE(refusal.has_value());
+        CHECK(ErrorOf(Unwrap(refusal)) == Wire::ErrorCode::IdentifiedCallerRequired);
+        ++refused;
+        CHECK(fixture.metrics.Read(IMetricsSink::Counter::SchedulerRequestsRefusedIdentifiedCallerRequired) == refused);
+    }
+
+    // The same refusal after the payload is read, for a caller of `Answer` that never asked the door.
+    auto const late =
+        fixture.protocol.Answer(Wire::EncodeClusterSet(Wire::ClusterSetRequest { .name = "k", .value = "v" }), anonymous);
+    CHECK(ErrorOf(late) == Wire::ErrorCode::IdentifiedCallerRequired);
+
+    // What identifies a caller is admitted to every one of them: a ticket, a proof, this machine.
+    for (auto const& [what, facts]: { std::pair { "a ticket", Testing::OpenFleetFold::Ticketed() },
+                                      std::pair { "a proof", Testing::OpenFleetFold::Proven() },
+                                      std::pair { "loopback", Testing::OpenFleetFold::Local() } })
+    {
+        INFO(what);
+        auto const caller = contextOf(facts);
+        CHECK(caller.identified);
+        for (auto const op: ControlVerbs)
+            CHECK_FALSE(fixture.protocol.RefusePeer(caller, static_cast<std::uint8_t>(op)).has_value());
+    }
+
+    // And the verbs a client sends are not control verbs: the anonymous caller still leases.
+    CHECK_FALSE(fixture.protocol.RefusePeer(anonymous, static_cast<std::uint8_t>(Wire::Op::Lease)).has_value());
 }

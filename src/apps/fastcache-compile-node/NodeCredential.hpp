@@ -15,11 +15,19 @@ namespace FastCache::Node
 ///
 /// `fastcached` REQUIRES a credential of its clients and answers that question with
 /// a shared auth source behind its protocol handlers. This worker does the opposite:
-/// `--requirepass` here is presented to the shared cache, to the scheduler and to a
-/// cluster verb, and is never checked against anybody. The two are different shapes
-/// of the same word, and reaching for the daemon's type would put an inbound policy
-/// object on an outbound path
+/// `--requirepass` here is presented to the shared cache behind `--upstream` and is never
+/// checked against anybody. The two are different shapes of the same word, and reaching
+/// for the daemon's type would put an inbound policy object on an outbound path
 /// ([#404](https://github.com/LASTRADA-Software/fastcached/issues/404)).
+///
+/// ## To `--upstream` alone
+///
+/// It is that cache's secret, so it goes nowhere else. A scheduler checks no password --
+/// this machine's credential there is its node proof -- and a round that presented one
+/// anyway handed the secret, in the clear, to every scheduler it dialled and to every
+/// endpoint a `NotLeader` named; `Cc::ExchangeWithScheduler` takes no credential for that
+/// reason. An operator verb chooses per endpoint (`OperatorCredentials`) and hands this to
+/// `--upstream` alone, and a cordon asks this machine's own node, which checks none.
 ///
 /// ## Why a seam rather than three values
 ///
@@ -47,8 +55,8 @@ namespace FastCache::Node
 /// guarded; a scan implemented as a Catch2 case walking the sources is simply invisible
 /// to a search shaped for `scripts/check-*`.
 ///
-/// Implementations must be safe to call from several threads at once: the heartbeat
-/// thread, the node's reactor and the process main thread each reach one.
+/// Implementations must be safe to call from several threads at once: the node's reactor
+/// and the process main thread each reach one.
 class ICredentialSource
 {
   public:
@@ -104,15 +112,10 @@ class ConfiguredCredential final: public ICredentialSource
     ///        process has no configuration file and therefore no second moment.
     ///        Borrowed; must outlive this object.
     ConfiguredCredential(NodeConfig const& startup, NodeReloader const* reloader):
-        // `std::string` at the boundary (#1125). NOT because `CacheProtocol.hpp` cannot
-        // name a `Core/` type -- it already includes `Net/ISocket.hpp`, and
-        // `Core/SecureBytes.cpp` is already a `_fc_cc_core` row -- but because retyping
-        // `Cc::Credential::secret` would RELOCATE this copy rather than remove it, to
-        // `Wire::AuthRequest` and into the RESP `AUTH` vector `SocketExchange` encodes
-        // -- both heap residue, so #1125's own subject (#1578). The secret is protected
-        // everywhere this process HOLDS it; `fastcache-cli/main.cpp` carries the full
-        // argument at the sibling boundary.
-        _startup { .username = {}, .secret = std::string { startup.requirePass.View() } },
+        // `SecureString` to `SecureString`: `Cc::Credential::secret` is one since the launcher began
+        // presenting machine tickets, so this copy is protected too. Where it lands on the way out --
+        // the encoded AUTH frame -- is the boundary `check-credential-containers.sh` states.
+        _startup { .kind = CompileCacheWire::AuthKind::Password, .username = {}, .secret = startup.requirePass },
         _reloader { reloader }
     {
     }
@@ -127,7 +130,7 @@ class ConfiguredCredential final: public ICredentialSource
         // hands back an immutable `shared_ptr`, so the secret cannot change underneath
         // this expression however the reload races it.
         auto const live = _reloader->Current();
-        return Cc::Credential { .username = {}, .secret = std::string { live->requirePass.View() } };
+        return Cc::Credential { .kind = CompileCacheWire::AuthKind::Password, .username = {}, .secret = live->requirePass };
     }
 
   private:

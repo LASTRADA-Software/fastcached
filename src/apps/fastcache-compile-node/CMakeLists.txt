@@ -30,6 +30,7 @@ set(_fc_node_shared
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ParallelFor.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ProcessRunner.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/Stats.cpp"
+    "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/TicketCredentials.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainDiscovery.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainFingerprint.cpp"
     "${CMAKE_SOURCE_DIR}/src/apps/fastcache-cc/ToolchainHost.cpp"
@@ -61,6 +62,7 @@ add_executable(fastcache-compile-node
     NodeProofResponder.cpp
     SchedulerLink.cpp
     SchedulerTier.cpp
+    SessionResponder.cpp
     ScratchClaim.cpp
     LocalCache.cpp
     NodeAnnounce.cpp
@@ -77,6 +79,7 @@ add_executable(fastcache-compile-node
     NodeStateFiles.cpp
     NodeSurfaces.cpp
     NodeToolchains.cpp
+    OperatorCredentials.cpp
     RemoteUpstream.cpp
     FrameEndpoint.cpp
     NodeIoLoop.cpp
@@ -154,17 +157,22 @@ if(FASTCACHED_BUILD_TESTS)
         EnrollTrap_test.cpp
         ExchangeLog_test.cpp
         NodeAnnounce_test.cpp
+        NodeAudience_test.cpp
         NodePresenceTier_test.cpp
         SchedulerLink.cpp
         SchedulerLink_test.cpp
         SchedulerTier.cpp
         SchedulerTier_test.cpp
+        SessionResponder.cpp
+        SessionResponder_test.cpp
         ScratchClaim.cpp
         ScratchClaim_test.cpp
         LocalCache.cpp
         LocalCache_test.cpp
         RemoteUpstream.cpp
         RemoteUpstream_test.cpp
+        OperatorCredentials.cpp
+        OperatorCredentials_test.cpp
         NodeAnnounce.cpp
         NodePresenceTier.cpp
         NodeRoster.cpp
@@ -182,6 +190,7 @@ if(FASTCACHED_BUILD_TESTS)
         AuthRefusalContract_test.cpp
         FleetMachinePresence_test.cpp
         FleetRoster_test.cpp
+        FleetTickets_test.cpp
         FleetLeaseRouting_test.cpp
         NodeConfig_test.cpp
         NodeDefaults.cpp

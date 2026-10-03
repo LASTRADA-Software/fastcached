@@ -9,17 +9,22 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <format>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
+#include <tests/TicketFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -34,8 +39,12 @@ namespace Wire = FastCache::CompileCacheWire;
 
 namespace
 {
-/// A caller the fleet has admitted.
-Distributed::CallerContext const Insider { .membership = Distributed::Membership::Member, .peerId = "peer-1" };
+/// A caller the fleet has admitted by a route that IDENTIFIES it -- the operator's machine, presenting
+/// the ticket its node mints -- which an operator's control verbs require (`IdentifiedCaller`). The
+/// caller only `--fleet-open` admits is `SchedulerProtocol_test`'s and `EnrollmentResponder_test`'s case.
+Distributed::CallerContext const Insider {
+    .membership = Distributed::Membership::Member, .peerId = "peer-1", .provenNodeId = std::nullopt, .identified = true
+};
 
 /// A cluster whose answers a test scripts.
 ///
@@ -126,6 +135,42 @@ struct Fixture
                               .role = std::nullopt };
 }
 
+/// The identity key a case admits @p id under: a member is never admitted without one.
+/// @param id The member.
+/// @return A key distinct per id.
+[[nodiscard]] Ed25519PublicKey KeyOf(std::string_view id)
+{
+    auto key = Ed25519PublicKey {};
+    key.fill(static_cast<std::byte>(id.size() + static_cast<std::size_t>(id.back())));
+    return key;
+}
+
+/// @p command carrying @p key: what an admission that stated one proposes.
+/// @param command The command.
+/// @param key The key.
+/// @return The same command, keyed.
+[[nodiscard]] Cluster::Command WithKey(Cluster::Command command, Ed25519PublicKey const& key)
+{
+    command.publicKey = key;
+    return command;
+}
+
+/// A member admission as a leader commits it: stating the member's key, since `Apply` drops one
+/// that would leave a member holding none.
+/// @param kind `AddMember` or `AddLearner`.
+/// @param key The member id.
+/// @param value The consensus endpoint.
+/// @param scheduler Where clients reach this member while it leads.
+/// @return The command.
+[[nodiscard]] Cluster::Command Admitted(Cluster::CommandKind kind,
+                                        std::string key,
+                                        std::string value,
+                                        std::string scheduler = {})
+{
+    auto const id = key;
+    return WithKey(Cmd(kind, std::move(key), std::move(value), std::move(scheduler)), KeyOf(id));
+}
+
 /// A cluster-administration request, spelled once so a field added to
 /// `ClusterRequest` lands in one place rather than in every case.
 /// @param action What to do.
@@ -146,8 +191,8 @@ struct Fixture
 [[nodiscard]] Cluster::ClusterState Agreed()
 {
     Cluster::ClusterState state;
-    Apply(state, Cmd(Cluster::CommandKind::AddMember, "n1", "10.0.0.1:6680", "10.0.0.1:6675"));
-    Apply(state, Cmd(Cluster::CommandKind::AddMember, "n2", "10.0.0.2:6680"));
+    Apply(state, Admitted(Cluster::CommandKind::AddMember, "n1", "10.0.0.1:6680", "10.0.0.1:6675"));
+    Apply(state, Admitted(Cluster::CommandKind::AddMember, "n2", "10.0.0.2:6680"));
     Apply(state, Cmd(Cluster::CommandKind::SetSetting, "lease-lifetime", "20min"));
     return state;
 }
@@ -245,8 +290,8 @@ TEST_CASE("A status report says whether an absent scheduler endpoint was never a
     // the report acquires the state: a history the encoder dropped would render both
     // alike from here and from nowhere else.
     Cluster::ClusterState state;
-    Apply(state, Cmd(Cluster::CommandKind::AddMember, "quiet", "10.0.0.1:6680"));
-    Apply(state, Cmd(Cluster::CommandKind::AddMember, "moved", "10.0.0.2:6680", "10.0.0.2:6675"));
+    Apply(state, Admitted(Cluster::CommandKind::AddMember, "quiet", "10.0.0.1:6680"));
+    Apply(state, Admitted(Cluster::CommandKind::AddMember, "moved", "10.0.0.2:6680", "10.0.0.2:6675"));
     Apply(state, Cmd(Cluster::CommandKind::AddMember, "moved", "10.0.0.2:6680"));
 
     auto const rendered = InterpretClusterReply(ClusterAction::Status, Cluster::Encode(state));
@@ -458,11 +503,11 @@ TEST_CASE("A member can be admitted, which is what --cluster-forget had no count
     Fixture fixture;
     fixture.service.AdministerWith(cluster);
 
-    auto const reply = fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680"));
+    auto const reply = fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680", KeyOf("n4")));
     CHECK(StatusOf(reply) == Wire::Status::Ok);
 
     REQUIRE(cluster.proposed.size() == 1);
-    CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::AddMember, "n4", "10.0.0.4:6680"));
+    CHECK(cluster.proposed[0] == WithKey(Cmd(Cluster::CommandKind::AddMember, "n4", "10.0.0.4:6680"), KeyOf("n4")));
 
     // The scheduler endpoint is deliberately empty: a member announces its own once
     // elected, and a value typed here about somebody else would be a guess that
@@ -507,7 +552,7 @@ TEST_CASE("An admission prints back the id and the endpoint the leader recorded"
     Fixture fixture;
     fixture.service.AdministerWith(cluster);
 
-    auto const reply = fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680"));
+    auto const reply = fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680", KeyOf("n4")));
     REQUIRE(StatusOf(reply) == Wire::Status::Ok);
 
     auto const rendered = InterpretClusterReply(ClusterAction::Admit, PayloadOf(reply));
@@ -552,9 +597,19 @@ TEST_CASE("An admission carries the member's key from the command line and print
         CHECK_FALSE(rendered->contains("none stated"));
     }
 
-    SECTION("no key is recorded as none, and says what none means")
+    SECTION("no key, for a member already recorded with one, is recorded as none and says what none means")
     {
+        // No opinion keeps the recorded key -- a machine that moves keeps its identity -- so
+        // the command carries none, and the receipt says so rather than naming the key the
+        // state already held.
         FakeCluster cluster;
+        cluster.state.members.push_back(
+            Cluster::ClusterMember { .id = "n4",
+                                     .raftEndpoint = "10.0.0.3:6680",
+                                     .schedulerEndpoint = {},
+                                     .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                     .seat = Cluster::MemberSeat::Voter,
+                                     .publicKey = KeyOf("n4") });
         Fixture fixture;
         fixture.service.AdministerWith(cluster);
 
@@ -569,6 +624,21 @@ TEST_CASE("An admission carries the member's key from the command line and print
         CHECK(rendered->contains("none stated"));
         CHECK_FALSE(rendered->contains(keyText));
     }
+
+    SECTION("no key, for a machine nothing records a key for, is refused and names the remedy")
+    {
+        // A machine is forgotten by revoking its key, so one admitted without a key could
+        // never be forgotten for good: refused at the leader before anything is proposed.
+        FakeCluster cluster;
+        Fixture fixture;
+        fixture.service.AdministerWith(cluster);
+
+        auto const reply = fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680"));
+        CHECK(StatusOf(reply) == Wire::Status::Error);
+        CHECK(MessageOf(reply).contains("no identity key"));
+        CHECK(MessageOf(reply).contains("--cluster-admit=n4@<key>"));
+        CHECK(cluster.proposed.empty());
+    }
 }
 
 TEST_CASE("An admission is reported as recorded and appended, never as in force", "[node][clusteradmin]")
@@ -582,7 +652,7 @@ TEST_CASE("An admission is reported as recorded and appended, never as in force"
     Fixture fixture;
     fixture.service.AdministerWith(cluster);
 
-    auto const reply = fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680"));
+    auto const reply = fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680", KeyOf("n4")));
     auto const rendered = InterpretClusterReply(ClusterAction::Admit, PayloadOf(reply));
     REQUIRE(rendered.has_value());
 
@@ -662,7 +732,7 @@ TEST_CASE("A cluster command asks the next --scheduler when the first cannot be 
 
     NodeConfig cfg;
     cfg.schedulers = { "sched-a.internal:6675", "sched-b.internal:6675" };
-    ConfiguredCredential const credential { cfg, nullptr };
+    Testing::PresentsNothing credential;
 
     SECTION("the first is unreachable: the second is asked and its answer rendered")
     {
@@ -708,84 +778,19 @@ TEST_CASE("A cluster command asks the next --scheduler when the first cannot be 
     }
 }
 
-TEST_CASE("The two client flags select their action and carry a host", "[node][clusteradmin][forget]")
+TEST_CASE("The retired client flags are no flags at all", "[node][clusteradmin][forget]")
 {
-    // #1309. A CLIENT, so a bare host: it never joins consensus and has no id for
-    // `--cluster-admit` to name.
-    auto const admit = ParsedFrom({ "--cluster-admit-client=10.0.0.7" });
-    CHECK(admit.cluster.action == ClusterAction::AdmitClient);
-    CHECK(admit.cluster.key == "10.0.0.7");
-    CHECK(admit.cluster.value.empty());
-
-    auto const forget = ParsedFrom({ "--cluster-forget-client=ci-runner-3.example" });
-    CHECK(forget.cluster.action == ClusterAction::ForgetClient);
-    CHECK(forget.cluster.key == "ci-runner-3.example");
-
-    // An endpoint is accepted and reaches the wire whole; `Cluster::Validate` is where
-    // the port is dropped, so the flag is not a second place that decision is made.
-    CHECK(ParsedFrom({ "--cluster-forget-client=10.0.0.7:6674" }).cluster.key == "10.0.0.7:6674");
-
-    // Both refuse an empty operand, naming themselves rather than the flag beside them:
-    // a parser that stamped one spelling for both would send an operator to the wrong
-    // flag, and the two differ by six characters.
-    for (auto const* const spelling: { "--cluster-admit-client=", "--cluster-forget-client=" })
+    // A machine is admitted and forgotten by its key (`--cluster-admit`, `--cluster-forget`),
+    // so the two host verbs went outright rather than lingering as accepted spellings: a flag
+    // that parsed and did nothing would be a forget that failed OPEN.
+    for (auto const* const spelling: { "--cluster-admit-client=10.0.0.7", "--cluster-forget-client=10.0.0.7" })
     {
+        INFO("spelling " << spelling);
         NodeConfig cfg;
         std::vector<char const*> const argv { spelling };
-        auto const parsed = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, cfg);
-        REQUIRE_FALSE(parsed.has_value());
-        INFO("spelling " << spelling);
-        // `field` names the flag and `context` carries the reason -- two fields, because
-        // an operator needs both and a message that merges them can only be searched.
-        // Asserting the NAME is what catches the copy-paste these two flags invite: they
-        // differ by six characters, and a wrong stamp sends somebody to the other one.
-        CHECK(parsed.error().field.contains(std::string_view { spelling }.substr(2, 20)));
-        CHECK(parsed.error().context.contains("names no host"));
+        CHECK_FALSE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, cfg).has_value());
+        CHECK(cfg.cluster.action == ClusterAction::None);
     }
-}
-
-TEST_CASE("A client ADMIT is text-gated and a client FORGET is deliberately not", "[node][clusteradmin][forget]")
-{
-    // **The assertion is the asymmetry**, and it is issue #159's trap one verb along.
-    // An admit COMMITS a host every renderer of the state prints, so text that is not
-    // UTF-8 is refused where the operator is watching. A forget's operand IS the
-    // offending host -- so gating it would make a client recorded by a peer that did
-    // not check it permanently unremovable, and it would go on being served forever.
-    //
-    // A test asserting only that both parse, or only that both refuse, passes under
-    // either half being wrong. What distinguishes them is that one refuses this input
-    // and the other takes it.
-    auto const* const bad = "--cluster-admit-client=\xffhost";
-    NodeConfig admitCfg;
-    std::vector<char const*> const admitArgv { bad };
-    CHECK_FALSE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { admitArgv }, admitCfg).has_value());
-
-    NodeConfig forgetCfg;
-    std::vector<char const*> const forgetArgv { "--cluster-forget-client=\xffhost" };
-    auto const forgetParsed = ParseOptionsInto(NodeOptions(), std::span<char const* const> { forgetArgv }, forgetCfg);
-    REQUIRE(forgetParsed.has_value());
-    CHECK(forgetCfg.cluster.action == ClusterAction::ForgetClient);
-    CHECK(forgetCfg.cluster.key == "\xffhost");
-}
-
-TEST_CASE("Each client verb encodes as its own op, over one encoder", "[node][clusteradmin][forget]")
-{
-    // The bytes, not the symbol: both ends spell `Op::ClusterAdmitClient`, so a test
-    // comparing the enumerator to itself cannot see a value that moved. The op sits in
-    // the request header, which `DecodeRequestHeader` reads back.
-    auto const admit = EncodeClusterRequest(Ask(ClusterAction::AdmitClient, "10.0.0.7"));
-    auto const admitHeader = Wire::DecodeRequestHeader(admit);
-    REQUIRE(admitHeader.has_value());
-    CHECK(Unwrap(admitHeader).opRaw == 0x16);
-
-    auto const forget = EncodeClusterRequest(Ask(ClusterAction::ForgetClient, "10.0.0.7"));
-    auto const forgetHeader = Wire::DecodeRequestHeader(forget);
-    REQUIRE(forgetHeader.has_value());
-    CHECK(Unwrap(forgetHeader).opRaw == 0x17);
-
-    // And they are not the same frame, which is what a shared encoder could get wrong
-    // while both cases above still passed.
-    CHECK(admit != forget);
 }
 
 // --------------------------------------------------------------------------
@@ -829,10 +834,10 @@ TEST_CASE("A learner admission reaches the cluster as AddLearner and says which 
     Fixture fixture;
     fixture.service.AdministerWith(cluster);
 
-    auto const reply = fixture.Ask(Ask(ClusterAction::AdmitLearner, "laptop", "10.0.0.9:6680"));
+    auto const reply = fixture.Ask(Ask(ClusterAction::AdmitLearner, "laptop", "10.0.0.9:6680", KeyOf("laptop")));
     REQUIRE(StatusOf(reply) == Wire::Status::Ok);
     REQUIRE(cluster.proposed.size() == 1);
-    CHECK(cluster.proposed[0] == Cmd(Cluster::CommandKind::AddLearner, "laptop", "10.0.0.9:6680"));
+    CHECK(cluster.proposed[0] == WithKey(Cmd(Cluster::CommandKind::AddLearner, "laptop", "10.0.0.9:6680"), KeyOf("laptop")));
 
     auto const rendered = InterpretClusterReply(ClusterAction::AdmitLearner, PayloadOf(reply));
     REQUIRE(rendered.has_value());
@@ -844,8 +849,8 @@ TEST_CASE("A learner admission reaches the cluster as AddLearner and says which 
 
     // And the voter admission names its own seat, so a renderer spelling one seat for
     // both verbs is red here.
-    auto const voter = InterpretClusterReply(ClusterAction::Admit,
-                                             PayloadOf(fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680"))));
+    auto const voter = InterpretClusterReply(
+        ClusterAction::Admit, PayloadOf(fixture.Ask(Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680", KeyOf("n4")))));
     REQUIRE(voter.has_value());
     CHECK(voter->contains("voter (the verb this request was sent as)"));
 }
@@ -853,7 +858,7 @@ TEST_CASE("A learner admission reaches the cluster as AddLearner and says which 
 TEST_CASE("A status report names the seat each member was admitted into", "[node][clusteradmin][learner]")
 {
     auto state = Agreed();
-    Apply(state, Cmd(Cluster::CommandKind::AddLearner, "laptop", "10.0.0.9:6680"));
+    Apply(state, Admitted(Cluster::CommandKind::AddLearner, "laptop", "10.0.0.9:6680"));
 
     auto const rendered = RenderClusterState(state);
     CHECK(rendered.contains("seat=learner raft=10.0.0.9:6680"));
@@ -867,7 +872,8 @@ TEST_CASE("A status report shows a learner recorded with no consensus endpoint a
     // A learner dials in and is recorded with no endpoint, which is the dash every absent field
     // here is -- never an empty `raft=` an operator reads as a rendering fault.
     auto state = Agreed();
-    Apply(state, Cmd(Cluster::CommandKind::AddLearner, "laptop", ""));
+    // Under its key, as every member is admitted: a keyless admission records nothing at all.
+    Apply(state, Admitted(Cluster::CommandKind::AddLearner, "laptop", ""));
 
     auto const rendered = RenderClusterState(state);
     CHECK(rendered.contains("seat=learner raft=- "));
@@ -897,9 +903,9 @@ TEST_CASE("A status report shows each member's key, the principals and the revok
     SECTION("an empty roster says so")
     {
         Cluster::ClusterState state;
-        Apply(state, Cmd(Cluster::CommandKind::AddMember, "plain", "10.0.0.2:6680"));
+        Apply(state, Admitted(Cluster::CommandKind::AddMember, "plain", "10.0.0.2:6680"));
         auto const rendered = RenderClusterState(state);
-        CHECK(rendered.contains("key=-"));
+        CHECK(rendered.contains(std::format("key={}", FormatEd25519PublicKey(KeyOf("plain")))));
         CHECK(rendered.contains("principals (0):\n  (none)"));
         CHECK(rendered.contains("revoked keys (0):\n  (none)"));
     }
@@ -919,5 +925,183 @@ TEST_CASE("A status report shows each member's key, the principals and the revok
         CHECK(rendered->contains(std::format("role=worker key={}", FormatEd25519PublicKey(*principal.publicKey))));
         CHECK(rendered->contains("revoked keys (1):"));
         CHECK(rendered->contains(std::format("key={}", FormatEd25519PublicKey(*revoked.publicKey))));
+    }
+}
+
+TEST_CASE("A cluster command presents a ticket minted for the scheduler it reached, not the first one configured",
+          "[node][clusteradmin][ticket]")
+{
+    // The fallback over an unreachable first scheduler: nothing was sent there, so nothing is
+    // minted for it. A ticket names ONE audience: minted for the first, it would be refused at the
+    // second.
+    Fixture fixture;
+    FakeCluster cluster;
+    cluster.state = Agreed();
+    fixture.service.AdministerWith(cluster);
+    auto const answer = fixture.Ask(Ask(ClusterAction::Status));
+    REQUIRE(StatusOf(answer) == Wire::Status::Ok);
+
+    NodeConfig cfg;
+    cfg.schedulers = { "sched-a.internal:6675", "sched-b.internal:6675" };
+    auto replies = Wire::EncodeReply(Wire::Status::Ok, {});
+    replies.insert(replies.end(), answer.begin(), answer.end());
+    Testing::ScriptedDialer dialer { { {}, replies } };
+    Testing::MintsForItsAudience node;
+    Cc::TicketCredentials tickets {
+        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {}, {}
+    };
+
+    auto const rendered = RunClusterAdmin(cfg, Ask(ClusterAction::Status), tickets, dialer);
+
+    INFO("result: " << rendered.value_or(rendered.error_or("")));
+    REQUIRE(rendered.has_value());
+    REQUIRE(dialer.Dialed() == std::vector<std::string> { "sched-a.internal:6675", "sched-b.internal:6675" });
+    CHECK(node.audiences == std::vector<std::string> { "sched-b.internal:6675" });
+    CHECK(node.sources == std::vector<std::string> { "127.0.0.1:6674" });
+    auto const sent = dialer.SentOn(1);
+    auto const header = Wire::DecodeRequestHeader(sent);
+    REQUIRE(header.has_value());
+    REQUIRE(Unwrap(header).opRaw == static_cast<std::uint8_t>(Wire::Op::Auth));
+    auto const auth = Wire::DecodeAuthPayload(sent.subspan(Wire::RequestHeaderSize, Unwrap(header).payloadLength));
+    REQUIRE(auth.has_value());
+    CHECK(Unwrap(auth).kind == Wire::AuthKind::MachineTicket);
+    CHECK(Wire::AsStringView(Unwrap(auth).secret) == Testing::TicketFor("sched-b.internal:6675"));
+}
+
+TEST_CASE("A cluster command refused for want of a ticket says why there was none", "[node][clusteradmin][ticket]")
+{
+    NodeConfig cfg;
+    cfg.schedulers = { "sched-a.internal:6675" };
+    Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, {}) } };
+    Testing::MintsForItsAudience node;
+    node.unreachableAfter = 0;
+    Cc::TicketCredentials tickets {
+        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {}, {}
+    };
+
+    auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), tickets, dialer);
+
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == Cc::ReasonFor(Cc::MintFailure::Unreachable));
+}
+
+namespace
+{
+
+/// @param reply A command's reply.
+/// @return What a connection that presented a credential reads: AUTH's `Ok`, then @p reply.
+[[nodiscard]] std::vector<std::byte> BehindAuth(std::vector<std::byte> const& reply)
+{
+    auto replies = Wire::EncodeReply(Wire::Status::Ok, {});
+    replies.insert(replies.end(), reply.begin(), reply.end());
+    return replies;
+}
+
+/// @param sent What one connection was sent.
+/// @return The secret of the AUTH that opened it.
+[[nodiscard]] std::string TicketPresentedIn(std::span<std::byte const> sent)
+{
+    auto const header = Wire::DecodeRequestHeader(sent);
+    REQUIRE(header.has_value());
+    REQUIRE(Unwrap(header).opRaw == static_cast<std::uint8_t>(Wire::Op::Auth));
+    auto const auth = Wire::DecodeAuthPayload(sent.subspan(Wire::RequestHeaderSize, Unwrap(header).payloadLength));
+    REQUIRE(auth.has_value());
+    CHECK(Unwrap(auth).kind == Wire::AuthKind::MachineTicket);
+    return std::string { Wire::AsStringView(Unwrap(auth).secret) };
+}
+
+/// @param haystack Bytes a connection was sent.
+/// @param needle A frame.
+/// @return True when @p needle appears in @p haystack.
+[[nodiscard]] bool Carries(std::span<std::byte const> haystack, std::span<std::byte const> needle)
+{
+    return !std::ranges::search(haystack, needle).empty();
+}
+
+} // namespace
+
+TEST_CASE("A cluster command to a remote leader presents a ticket minted for that leader, and for the leader a "
+          "redirect names",
+          "[node][clusteradmin][ticket][redirect]")
+{
+    // `NotLeader` is an instruction: the verb follows it, and a ticket names ONE audience, so the
+    // leader it names is shown a ticket naming IT.
+    Fixture fixture;
+    FakeCluster cluster;
+    cluster.state = Agreed();
+    fixture.service.AdministerWith(cluster);
+    auto const answer = fixture.Ask(Ask(ClusterAction::Status));
+    REQUIRE(StatusOf(answer) == Wire::Status::Ok);
+
+    NodeConfig cfg;
+    cfg.schedulers = { "sched-a:6675" };
+    Testing::ScriptedDialer dialer { { BehindAuth(Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "sched-b:6675")),
+                                       BehindAuth(answer) } };
+    Testing::MintsForItsAudience node;
+    Cc::TicketCredentials tickets {
+        node, std::string { "127.0.0.1:6674" }, Cc::Credential {}, std::string {}, Cc::ExchangeBudget {}, {}
+    };
+
+    auto const rendered = RunClusterAdmin(cfg, Ask(ClusterAction::Status), tickets, dialer);
+
+    INFO("result: " << rendered.value_or(rendered.error_or("")));
+    REQUIRE(rendered.has_value());
+    auto const asked = std::vector<std::string> { "sched-a:6675", "sched-b:6675" };
+    REQUIRE(dialer.Dialed() == asked);
+    CHECK(node.audiences == asked);
+    CHECK(TicketPresentedIn(dialer.SentOn(0)) == Testing::TicketFor("sched-a:6675"));
+    CHECK(TicketPresentedIn(dialer.SentOn(1)) == Testing::TicketFor("sched-b:6675"));
+}
+
+TEST_CASE("A mutating cluster command follows a NotLeader, and is sent once to each endpoint it asks",
+          "[node][clusteradmin][redirect]")
+{
+    // Following is safe for `--cluster-admit` because a `NotLeader` is a REFUSAL: nothing was
+    // proposed where it landed. The request goes to the refusing scheduler once and to the leader
+    // once, and the list is not consulted for the redirect.
+    NodeConfig cfg;
+    cfg.schedulers = { "sched-a:6675", "sched-c:6675" };
+    auto const admit = Ask(ClusterAction::Admit, "n4", "10.0.0.4:6680");
+    Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "sched-b:6675"),
+                                       Wire::EncodeReply(Wire::Status::Ok, {}) } };
+    Testing::PresentsNothing nothing;
+
+    std::ignore = RunClusterAdmin(cfg, admit, nothing, dialer);
+
+    REQUIRE(dialer.Dialed() == std::vector<std::string> { "sched-a:6675", "sched-b:6675" });
+    auto const frame = EncodeClusterRequest(admit);
+    CHECK(Carries(dialer.SentOn(0), frame));
+    CHECK(Carries(dialer.SentOn(1), frame));
+}
+
+TEST_CASE("A cluster command follows NotLeader a bounded number of times, and not at all without an address",
+          "[node][clusteradmin][redirect]")
+{
+    NodeConfig cfg;
+    cfg.schedulers = { "sched-a:6675" };
+    Testing::PresentsNothing nothing;
+
+    SECTION("two nodes naming each other: the bound ends it, and says so")
+    {
+        auto const ping = Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "sched-b:6675");
+        auto const pong = Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "sched-a:6675");
+        Testing::ScriptedDialer dialer { { ping, pong, ping, pong } };
+
+        auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), nothing, dialer);
+
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().contains(std::format("gave up after {} leader redirect(s)", MaxLeaderRedirects)));
+        CHECK(std::cmp_equal(dialer.Dialed().size(), MaxLeaderRedirects + 1));
+    }
+
+    SECTION("an election in progress names nobody, and nobody is dialled")
+    {
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, {}) } };
+
+        auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), nothing, dialer);
+
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().contains("no leader right now"));
+        CHECK(dialer.Dialed() == std::vector<std::string> { "sched-a:6675" });
     }
 }

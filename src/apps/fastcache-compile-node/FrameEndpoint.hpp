@@ -162,10 +162,60 @@ inline constexpr std::string_view AnswerDeadlineIsTheEndpointsRationale =
     "the answer deadline is the endpoint's decision and the endpoint counts it, in the sweep row and the "
     "refusal-sent row; a per-surface copy would be a third tally of one event";
 
+/// What an `AUTH` frame established on one connection.
+///
+/// A verdict rather than a `CredentialOutcome`, because an accepted `AUTH` on a node says WHO:
+/// a verified ticket speaks for a machine, and that machine is what admission folds as
+/// `ConnectionFacts::authenticatedMachine`. The endpoint clears it on every `AUTH` it reads a
+/// header for and ASSIGNS it on every one it answers, so a refused one -- at the header or by
+/// its verdict -- clears whatever an earlier one established.
+///
+/// **A refused ticket grants no admission, and one refused for a REVOKED key says so**: its
+/// `revokedMachine` is recorded on the connection and never cleared, because the connection is the
+/// forgotten machine's and every later verb on it is refused as that machine's
+/// (`ConnectionFacts::revokedMachine`) -- on a `--fleet-open` node too, where its address alone
+/// would admit it.
+struct CredentialVerdict
+{
+    CredentialOutcome outcome { CredentialOutcome::Malformed }; ///< Only Accepted admits anything.
+    /// The machine a VERIFIED ticket speaks for; engaged only when `outcome == Accepted`.
+    std::optional<ProvenIdentity> machine {};
+    /// The revoked key a refused ticket verified under; engaged only when it was refused for that.
+    std::optional<RevokedKeyEvidence> revokedMachine {};
+    /// The refusal the surface already encoded AND counted; empty unless it refused.
+    std::vector<std::byte> refusalReply {};
+};
+
+/// Why no surface but the session component counts a credential refusal, stated once for
+/// every surface that has to say it.
+///
+/// Here rather than beside one responder for `EndpointRefusalCodes`' reason: this is a
+/// property of the ROUTING -- `AUTH` is `VerbFamily::Session`, which `MergedResponder` sends
+/// to the session component -- so no other surface is ever asked to check a credential.
+inline constexpr std::string_view CredentialIsTheSessionsRationale =
+    "AUTH is the Session family, which MergedResponder routes to the session component; no credential outcome is "
+    "ever decided against this surface";
+
+/// Why no node surface counts `PrePayloadDecision::Unauthenticated`, stated once.
+///
+/// The node checks no password, so the endpoint asks `DecidePrePayload` with `authRequired`
+/// false for every verb -- and that is the only road to this decision. A surface counting it
+/// would own a row no event can move.
+inline constexpr std::string_view NodeChecksNoPasswordRationale =
+    "the node checks no password: the endpoint asks DecidePrePayload with authRequired false for every verb, which "
+    "is the only road to this decision";
+
+/// The answer every surface but the session component gives an `AUTH` it is never routed.
+/// @return `NoPolicy`, establishing nothing.
+[[nodiscard]] inline CredentialVerdict NotTheSessionSurface() noexcept
+{
+    return CredentialVerdict { .outcome = CredentialOutcome::NoPolicy };
+}
+
 /// Why no surface but the identity prover's counts a node-proof refusal, stated once for
 /// every surface that has to say it.
 ///
-/// `CredentialIsTheSchedulersRationale`'s exact counterpart, and it is here rather than beside
+/// `CredentialIsTheSessionsRationale`'s exact counterpart, and it is here rather than beside
 /// one responder for `EndpointRefusalCodes`' reason: this is a property of the ROUTING -- the
 /// two proof verbs are `VerbFamily::NodeProof`, which `MergedResponder` sends to the one
 /// component that verifies identities -- so no other surface can ever be asked about them. Six
@@ -519,44 +569,24 @@ class IFrameResponder
     [[nodiscard]] virtual std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                            std::uint8_t opRaw) const = 0;
 
-    /// Does this surface require a credential before this verb?
-    ///
-    /// Asked once per frame rather than cached, because a surface may be
-    /// reconfigured and a connection already open must not keep an answer from
-    /// before. It is a field read behind a virtual call, not a probe.
-    ///
-    /// **Takes the verb, since #290.** Every implementation today ignores it, because
-    /// each surface serves one verb family -- but a merged 0xFC listener has no
-    /// surface-wide answer available. The two production responders answer this
-    /// oppositely and both are right: the scheduler requires a credential when one is
-    /// configured, and the cache requires none because *a credential readable by every
-    /// local build is not a credential*. A merged surface answering `true` refuses
-    /// every local `fastcache-cc` FETCH; answering `false` undoes #289. The cache's
-    /// reason is a property of its VERBS rather than of the port they arrive on, so it
-    /// survives the merge and the answer follows the verb.
-    ///
-    /// Still not folded into `RefusePeer`, which now also takes the verb: that one
-    /// answers before the payload is read and returns an encoded refusal, this one
-    /// feeds `DecidePrePayload` alongside the declared length and the connection's
-    /// credential state. Two questions at one point in the loop, not one wider one
-    /// ([#289](https://github.com/LASTRADA-Software/fastcached/issues/289)).
-    ///
-    /// @param opRaw The third header byte, as received; not necessarily a known verb.
-    /// @return True when unauthenticated peers must be refused this verb.
-    [[nodiscard]] virtual bool AuthRequired(std::uint8_t opRaw) const noexcept = 0;
-
-    /// Check an `AUTH` payload against this surface's credential.
+    /// Check an `AUTH` payload.
     ///
     /// The endpoint terminates `AUTH` rather than passing it to `Answer`, because
     /// what the verb changes is **connection state**, and the responder is shared by
     /// every connection on this surface -- exactly as the daemon's handler keeps
     /// `credentialAccepted` in its own loop rather than in the policy.
     ///
+    /// **The node checks no password.** There is no credential to require before a verb, so
+    /// nothing here gates a frame: admission is `RefusePeer`'s. What an `AUTH` can still
+    /// establish is which MACHINE a verified ticket speaks for, and only the session
+    /// component -- the `Session` family's owner -- can answer that; every other surface is
+    /// never routed an `AUTH` and says so.
+    ///
     /// @param payload The `AUTH` request payload, already bounded by `MaxAuthPayload`
     ///        through the pre-payload gate.
-    /// @return What was established. Only `Accepted` may mark the connection
-    ///         authenticated -- `NoPolicy` is answered `Ok` and verifies nothing.
-    [[nodiscard]] virtual CredentialOutcome CheckCredential(std::span<std::byte const> payload) const = 0;
+    /// @return What was established. Only `Accepted` carries a machine -- `NoPolicy` is
+    ///         answered `Ok` and establishes nothing.
+    [[nodiscard]] virtual CredentialVerdict CheckCredential(std::span<std::byte const> payload) const = 0;
 
     /// Encode -- and count -- a pre-payload refusal `DecidePrePayload` decided.
     ///

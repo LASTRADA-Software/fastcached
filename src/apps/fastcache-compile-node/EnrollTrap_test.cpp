@@ -106,7 +106,7 @@ TEST_CASE("A node whose state directory has run consensus is refused at enrol ti
 
     SystemSecureRandom random;
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
-    auto const refused = RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, keyGuard);
+    auto const refused = RunEnrollClient(cfg, random, keyGuard);
     REQUIRE(!refused.has_value());
 
     // **Assert what DISTINGUISHES.** Every refusal this mode can produce is a
@@ -157,6 +157,10 @@ TEST_CASE("The same state directory is fine at ordinary startup, which is why th
     cfg.raftSelf = "198.51.100.4";
     cfg.schedulers = { "10.0.0.1:7000" };
     cfg.nodeId = "node-a";
+    // A worker admitting other machines by key -- consensus holds a roster -- registers an
+    // address they can dial, or the startup table refuses it for that before the question here.
+    cfg.nodeListen = "0.0.0.0:7200";
+    cfg.advertise = "198.51.100.4:7200";
 
     // The startup table is what judges a serving configuration, and it is asked here
     // exactly as `main` asks it. It must have nothing to say about a self-elected state
@@ -170,5 +174,5 @@ TEST_CASE("The same state directory is fine at ordinary startup, which is why th
     cfg.enrollFrom = "10.0.0.1:7000";
     SystemSecureRandom random;
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
-    CHECK(!RunEnrollClient(cfg, ConfiguredCredential { cfg, nullptr }, random, keyGuard).has_value());
+    CHECK(!RunEnrollClient(cfg, random, keyGuard).has_value());
 }

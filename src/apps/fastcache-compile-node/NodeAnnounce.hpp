@@ -6,7 +6,6 @@
 #include "CompileCapacity.hpp"
 #include "EndpointDialer.hpp"
 #include "NodeConfig.hpp"
-#include "NodeCredential.hpp"
 #include "NodeProofClient.hpp"
 #include "SchedulerLink.hpp"
 
@@ -153,15 +152,15 @@ struct EndpointChange
 [[nodiscard]] std::optional<EndpointChange> AdvertisedEndpointChange(std::string_view inForce,
                                                                      std::shared_ptr<NodeConfig const> const& live);
 
-// Out of `main.cpp` since #404, and the credential is what forced it.
+// Out of `main.cpp` since #404, so a test can drive the round against a scripted socket and
+// read the bytes that went out.
 //
-// The round used to hold a `Cc::Credential` copied once in `WorkerBody`, so a rotated
-// `--requirepass` reached the shared cache and the cluster verbs and never the
-// scheduler -- and the one translation unit no test can reach is where that could not
-// be shown. It now holds the SEAM, which cannot go stale, and the round lives where a
-// test can drive it against a scripted socket and read the bytes that went out. Both
-// halves matter: the type makes the defect unwritable, the move makes the fix
-// demonstrable.
+// It holds NO credential, and that is the fix rather than an omission. #404 gave it the
+// `--requirepass` seam so a rotation reached registrations too; but a scheduler checks no
+// password, and presenting one handed the upstream cache's secret, in the clear, to every
+// scheduler this node dialled and every endpoint a `NotLeader` named. This machine's
+// credential with a scheduler is its PROOF (`prover`), and `Cc::ExchangeWithScheduler` takes
+// no credential at all.
 
 /// Everything one heartbeat round reads, so the round itself is a function rather
 /// than a hundred lines nested three deep inside `WorkerBody`.
@@ -189,20 +188,6 @@ struct HeartbeatRound
     IHostLoadSampler& loadSampler;   ///< CPU, memory and scratch.
     CacheTier const* cacheTier;      ///< Null on a node with no cache.
     IMetricsSink const& metrics;     ///< Where the cache figures are read.
-    /// What this worker PRESENTS to the scheduler, asked at each exchange.
-    ///
-    /// The seam and never a value, which is the whole of #404 in one member
-    /// declaration: a `Cc::Credential` here is a copy taken when `WorkerBody` built
-    /// the round, so an operator who rotated `--requirepass` and reloaded got a
-    /// worker whose cache tier presented the new secret and whose registrations went
-    /// on presenting the old one -- until it was restarted, which is the thing the
-    /// reload exists to avoid. There is no field here for a stale secret to sit in.
-    ICredentialSource const& credential;
-
-    /// Where a credential the scheduler did not want is reported once, as every other exchange
-    /// on this wire reports it. The tier's own, shared with the registrars, so a node says it
-    /// once rather than once per verb.
-    Cc::CredentialNotice& notice;
 
     /// How this machine proves WHICH machine it is on every connection the round dials (#178),
     /// or null where nothing proves -- a test whose scripted fleet serves no handshake.
@@ -397,13 +382,12 @@ class IAnnouncement
 
 /// How a round proves this machine on each connection it dials (#178).
 ///
-/// Pointers, because the proof is absent only where nothing proves -- a test's scripted fleet --
-/// and a null reference is not a thing.
+/// A pointer, because the proof is absent only where nothing proves -- a test's scripted fleet --
+/// and a null reference is not a thing. No password rides beside it: the proof IS this machine's
+/// credential with a scheduler.
 struct AnnounceProof
 {
-    NodeProofClient const* prover;       ///< Who this machine is; null where nothing proves.
-    ICredentialSource const* credential; ///< What the handshake presents where a credential gate asks.
-    Cc::CredentialNotice* notice;        ///< Where an unwanted credential is reported.
+    NodeProofClient const* prover; ///< Who this machine is; null where nothing proves.
 };
 
 /// Dial a scheduler, prove this machine to it, and make @p announcement, following a redirect

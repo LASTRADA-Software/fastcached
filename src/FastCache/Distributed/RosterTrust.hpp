@@ -91,8 +91,13 @@ class RosterTrust final: public ILeaseRoster
 
     [[nodiscard]] RosterReading Read(std::chrono::system_clock::time_point now) const override;
 
+    [[nodiscard]] LeaseSignerKeys MachineKeysOf(std::string_view machine) const override;
+
     /// @return The roster held, summarised, or nothing before the first adoption.
     [[nodiscard]] std::optional<RosterSummary> Summary() const;
+
+    /// @return The roster held, as a copy, or nothing before the first adoption.
+    [[nodiscard]] std::optional<Cluster::Roster> Held() const;
 
   private:
     /// Who certifies the next roster: the held roster's voters, or the anchors before one.
@@ -133,8 +138,13 @@ class StateLeaseRoster final: public ILeaseRoster
 
     [[nodiscard]] RosterReading Read(std::chrono::system_clock::time_point now) const override;
 
+    [[nodiscard]] LeaseSignerKeys MachineKeysOf(std::string_view machine) const override;
+
     /// @return The roster applied, summarised, with no certificate.
     [[nodiscard]] RosterSummary Summary() const;
+
+    /// @return The roster applied, as a copy: the state's own projection (`Cluster::ProjectRoster`).
+    [[nodiscard]] Cluster::Roster Held() const;
 
     /// Whether the state applied names any voter's key yet (#178).
     ///
@@ -146,9 +156,11 @@ class StateLeaseRoster final: public ILeaseRoster
 
   private:
     mutable std::shared_mutex _lock;
-    std::map<std::string, Ed25519PublicKey, std::less<>> _voters; ///< Voters with a key, by id.
-    std::vector<Ed25519PublicKey> _revoked;                       ///< Every revoked key.
-    RosterSummary _summary;                                       ///< For `--node-status`.
+    std::map<std::string, Ed25519PublicKey, std::less<>> _voters;   ///< Voters with a key, by id.
+    std::map<std::string, Ed25519PublicKey, std::less<>> _machines; ///< Every member of either seat with a key, by id.
+    std::vector<Ed25519PublicKey> _revoked;                         ///< Every revoked key.
+    RosterSummary _summary;                                         ///< For `--node-status`.
+    Cluster::Roster _roster;                                        ///< For `explain-admission`.
 };
 
 } // namespace FastCache::Distributed

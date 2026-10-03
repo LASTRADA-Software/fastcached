@@ -1,511 +1,416 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
+#include <FastCache/Distributed/MembershipWire.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Protocol/ProvenIdentity.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/MembershipFakes.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 
-using namespace FastCache::Distributed;
-using FastCache::Testing::FixedMembership;
+using namespace FastCache;
 
-TEST_CASE("An empty cluster admits nobody but this machine", "[distributed][membership]")
+namespace
 {
-    // The direction a mistake has to fail in. A node that has not yet discovered a
-    // peer -- or whose discovery is misconfigured, or whose key is wrong -- must not
-    // silently become an open scheduler: that failure is invisible from both ends,
-    // because the fleet keeps working and simply serves strangers too.
-    ClusterMembership const cluster { MembershipParticipant::ClusterMembers };
 
-    CHECK(cluster.Size() == 0);
-    CHECK(cluster.Classify("10.0.0.9") == Membership::Outsider);
-    CHECK(cluster.Classify("") == Membership::Outsider);
+/// The fold a node composes -- this machine and a key roster -- over real oracles.
+using Fold = Testing::RosterFold;
 
-    // This machine is the one exception, and it is unconditional -- see the case
-    // below for why an unconfigured node still has to serve its own builds.
-    CHECK(cluster.Classify("127.0.0.1") == Membership::Member);
+/// The identity a machine establishes under its own test key.
+using Testing::IdentityOf;
+
+} // namespace
+
+TEST_CASE("No address admits a machine that is not this one", "[distributed][membership][admission]")
+{
+    // The address route is gone: a machine whose key the roster holds is still a stranger when its
+    // connection established nothing, wherever it dials from.
+    Fold const fold { { "pc-07" } };
+    auto const decision = Distributed::ExplainConnection(fold.admitted, ConnectionFacts { .host = "10.0.0.7" });
+    CHECK(decision.verdict == Distributed::Membership::Outsider);
+    CHECK(decision.decidedBy.Empty());
 }
 
-TEST_CASE("A member is admitted by host, whatever port it dials from", "[distributed][membership]")
+TEST_CASE("This machine is admitted as itself, and says so", "[distributed][membership][admission]")
 {
-    // The whole reason the constructor takes endpoints and stores hosts. Discovery
-    // admits a peer at a (node, endpoint) pair, but a peer *connecting* to the
-    // scheduler comes from an ephemeral source port -- so an endpoint-keyed set would
-    // refuse every legitimate member while looking entirely correct, and the fleet
-    // would silently never distribute anything.
-    ClusterMembership const cluster { MembershipParticipant::ClusterMembers, { "10.0.0.1:7000", "10.0.0.2:7000" } };
-
-    CHECK(cluster.Classify("10.0.0.1") == Membership::Member);
-    CHECK(cluster.Classify("10.0.0.2") == Membership::Member);
-    CHECK(cluster.Classify("10.0.0.3") == Membership::Outsider);
-
-    // Matched whole, not by prefix. A prefix test would admit `10.0.0.10` on the
-    // strength of `10.0.0.1`, which is a different machine.
-    CHECK(cluster.Classify("10.0.0.10") == Membership::Outsider);
-
-    // And an endpoint is NOT an identity here. Querying in the vocabulary the set was
-    // built from is the mistake the constructor exists to make impossible, so it is
-    // pinned: this must not accidentally start working.
-    CHECK(cluster.Classify("10.0.0.1:7000") == Membership::Outsider);
-}
-
-TEST_CASE("An IPv6 endpoint keeps its address rather than its last colon group", "[distributed][membership]")
-{
-    // `rfind(':')` on `[::1]:7000` splits at the wrong colon and yields a host of
-    // `[::1]` or worse -- the exact defect `Core/HostPort` exists to hold in one
-    // place. Reaching for it here rather than splitting locally is what keeps this
-    // from being a second author of that rule.
-    ClusterMembership const cluster { MembershipParticipant::ClusterMembers, { "[::1]:7000", "[fe80::1]:7000" } };
-
-    CHECK(cluster.Classify("::1") == Membership::Member);
-    CHECK(cluster.Classify("fe80::1") == Membership::Member);
-    CHECK(cluster.Classify("fe80::2") == Membership::Outsider);
-}
-
-TEST_CASE("An endpoint with no port is kept whole", "[distributed][membership]")
-{
-    // A member the set cannot represent must not silently stop being one. Dropping it
-    // would be the same silent-refusal failure the host/endpoint collapse exists to
-    // prevent, arriving by a different route.
-    ClusterMembership const cluster { MembershipParticipant::ClusterMembers, { "10.0.0.1" } };
-
-    CHECK(cluster.Size() == 1);
-    CHECK(cluster.Classify("10.0.0.1") == Membership::Member);
-}
-
-TEST_CASE("Both IPv6 spellings of a member survive publication", "[distributed][membership]")
-{
-    // The two shapes a hand-rolled `SplitHostPort` + fallback got wrong in opposite
-    // directions, each producing a stored "host" no kernel ever reports as a peer
-    // address -- so a listed member silently stopped being one while `Size()` still
-    // counted it.
-    SECTION("an unbracketed literal is not cut at its last colon")
+    // The rule that makes an unconfigured node useful and still closed to the network: a process
+    // on this host already has this host's CPU. Every spelling a kernel reports for a local peer --
+    // the whole 127/8, IPv6 loopback and the IPv4-mapped form a dual-stack listener reports.
+    Fold const fold { {} };
+    for (auto const* host: { "127.0.0.1", "::1", "::ffff:127.0.0.1", "127.0.0.2" })
     {
-        // Split at the last colon this is `2001:db8:`, a plausible-looking wrong
-        // answer rather than a failure.
-        ClusterMembership const cluster { MembershipParticipant::ClusterMembers, { "2001:db8::1" } };
-
-        CHECK(cluster.Size() == 1);
-        CHECK(cluster.Classify("2001:db8::1") == Membership::Member);
-        CHECK(cluster.Classify("2001:db8::2") == Membership::Outsider);
+        INFO(host);
+        auto const decision = Distributed::ExplainConnection(fold.admitted, ConnectionFacts { .host = host });
+        CHECK(decision.verdict == Distributed::Membership::Member);
+        CHECK(decision.decidedBy.Has(Distributed::MembershipParticipant::Loopback));
     }
 
-    SECTION("a bracketed literal with no port loses its brackets")
+    // Not local, and the near-misses are the point: a prefix test on "1" or on "::ffff:" alone would
+    // admit the network. `localhost` is whatever a resolver says, and no kernel reports it as a peer.
+    // An empty host is a peer this machine cannot name, which must not be handed its CPU.
+    for (auto const* host: { "128.0.0.1", "::ffff:10.0.0.1", "10.127.0.1", "localhost", "" })
     {
-        ClusterMembership const cluster { MembershipParticipant::ClusterMembers, { "[2001:db8::1]" } };
-
-        CHECK(cluster.Classify("2001:db8::1") == Membership::Member);
-    }
-
-    SECTION("and the ordinary bracketed endpoint still works")
-    {
-        ClusterMembership const cluster { MembershipParticipant::ClusterMembers, { "[2001:db8::1]:7000" } };
-
-        CHECK(cluster.Classify("2001:db8::1") == Membership::Member);
+        INFO(host);
+        auto const decision = Distributed::ExplainConnection(fold.admitted, ConnectionFacts { .host = host });
+        CHECK(decision.verdict == Distributed::Membership::Outsider);
+        CHECK(decision.decidedBy.Empty());
     }
 }
 
-TEST_CASE("A dual-stack listener's mapped spelling still names a listed member", "[distributed][membership]")
+TEST_CASE("A proof and a ticket each admit a live key, and the fold names which", "[distributed][membership][admission]")
 {
-    // The failure `IsLoopbackHost` was already taught to avoid, arriving at the list
-    // instead of at the loopback branch: a node bound to `::` is dual-stack, so an
-    // IPv4 peer reaches `Classify` as `::ffff:10.0.0.1`. Compared raw against the
-    // list, EVERY member is refused while this machine's own clients are still
-    // admitted -- a fleet that looks configured, serves its own box, and distributes
-    // nothing.
-    ClusterMembership const cluster { MembershipParticipant::ClusterMembers, { "10.0.0.1:7000" } };
+    Fold const fold { { "pc-07" } };
+    auto const byTicket = Distributed::ExplainConnection(
+        fold.admitted, ConnectionFacts { .host = "10.0.0.7", .authenticatedMachine = IdentityOf("pc-07") });
+    CHECK(byTicket.verdict == Distributed::Membership::Member);
+    CHECK(byTicket.decidedBy.Has(Distributed::MembershipParticipant::MachineTicket));
+    CHECK_FALSE(byTicket.decidedBy.Has(Distributed::MembershipParticipant::ProvenIdentity));
 
-    CHECK(cluster.Classify("::ffff:10.0.0.1") == Membership::Member);
-    CHECK(cluster.Classify("10.0.0.1") == Membership::Member);
+    auto const byProof =
+        Distributed::ExplainConnection(fold.admitted, ConnectionFacts { .host = "10.0.0.7", .proven = IdentityOf("pc-07") });
+    CHECK(byProof.verdict == Distributed::Membership::Member);
+    CHECK(byProof.decidedBy.Has(Distributed::MembershipParticipant::ProvenIdentity));
+    CHECK_FALSE(byProof.decidedBy.Has(Distributed::MembershipParticipant::MachineTicket));
 
-    // Folded, never widened: the mapped form of a stranger is still a stranger, and
-    // the prefix rule survives the fold.
-    CHECK(cluster.Classify("::ffff:10.0.0.2") == Membership::Outsider);
-    CHECK(cluster.Classify("::ffff:10.0.0.10") == Membership::Outsider);
+    // Both routes are right at once, so both are named -- the tie arm of the fold.
+    auto const both = Distributed::ExplainConnection(
+        fold.admitted,
+        ConnectionFacts { .host = "10.0.0.7", .proven = IdentityOf("pc-07"), .authenticatedMachine = IdentityOf("pc-07") });
+    CHECK(both.verdict == Distributed::Membership::Member);
+    CHECK(both.decidedBy.Count() == 2);
 
-    // The other side of the fold, for a set published in the mapped form. Bracketed,
-    // because that is the only spelling a mapped address with a port can have: bare,
-    // `::ffff:10.0.0.1:7000` is indistinguishable from an IPv6 literal and is
-    // deliberately kept whole rather than cut at a guessed colon.
-    ClusterMembership const mapped { MembershipParticipant::ClusterMembers, { "[::ffff:10.0.0.1]:7000" } };
-    CHECK(mapped.Classify("10.0.0.1") == Membership::Member);
+    // A key the roster does not hold for that id admits nothing, by either evidence.
+    auto stranger = IdentityOf("pc-07");
+    stranger.key = Testing::TestKeyPair("somebody-else").PublicKey();
+    CHECK(Distributed::ExplainConnection(fold.admitted,
+                                         ConnectionFacts { .host = "10.0.0.7", .authenticatedMachine = stranger })
+              .verdict
+          == Distributed::Membership::Outsider);
 }
 
-TEST_CASE("An empty member entry does not admit a peer this machine cannot name", "[distributed][membership]")
+TEST_CASE("A revoked key is refused from every address, loopback and --fleet-open included",
+          "[distributed][membership][admission][forget]")
 {
-    // Two unanswerable questions are not a match. Under a raw string compare they
-    // were: an endpoint that published as nothing stored an empty host, and the empty
-    // host is exactly what `core::net::formatPeerAddress` answers for a peer whose `getpeername`
-    // failed -- so the one caller that must never be admitted matched.
-    ClusterMembership const cluster { MembershipParticipant::ClusterMembers, { "", "10.0.0.1:7000" } };
-
-    CHECK(cluster.Classify("") == Membership::Outsider);
-    CHECK(cluster.Classify("10.0.0.1") == Membership::Member);
+    // A forgotten machine's tickets are refused, as its proofs are: `KeyTombstone` outranks this
+    // machine's own loopback and the open policy.
+    Fold const fold { {}, { "gone" } };
+    Distributed::OpenMembership const open;
+    Distributed::AnyOfMembership const openly { { &fold.loopback, &open, &fold.keys } };
+    for (auto const* host: { "10.0.0.7", "127.0.0.1" })
+        for (auto const* oracle: { static_cast<Distributed::IMembershipOracle const*>(&fold.admitted),
+                                   static_cast<Distributed::IMembershipOracle const*>(&openly) })
+            for (auto const& facts: { ConnectionFacts { .host = host, .authenticatedMachine = IdentityOf("gone") },
+                                      ConnectionFacts { .host = host, .proven = IdentityOf("gone") } })
+            {
+                INFO(host << (facts.proven.has_value() ? " by proof" : " by ticket"));
+                auto const decision = Distributed::ExplainConnection(*oracle, facts);
+                CHECK(decision.verdict == Distributed::Membership::Forgotten);
+                CHECK(decision.decidedBy.Has(Distributed::MembershipParticipant::KeyTombstone));
+            }
 }
 
-TEST_CASE("Membership can be republished while the scheduler runs", "[distributed][membership]")
+TEST_CASE("A revoked key's verdict says how the key was shown, and only a proof may be told",
+          "[distributed][membership][admission][forget]")
 {
-    // The carve-out to configuration-at-construction, and the reason for it:
-    // membership is precisely what changes while this object lives. Rebuilding the
-    // oracle per join would mean handing a new one to a running server.
-    ClusterMembership cluster { MembershipParticipant::ClusterMembers, { "10.0.0.1:7000" } };
-    REQUIRE(cluster.Classify("10.0.0.1") == Membership::Member);
+    // What a gate may SAY to a forgotten machine rides with the verdict: a proof shows possession, a
+    // ticket shows bytes anybody may have captured. Each way a connection shows a revoked key, and
+    // the fold of two of them, over loopback and the open policy as well.
+    Fold const fold { {}, { "gone" } };
+    Distributed::OpenMembership const open;
+    Distributed::AnyOfMembership const openly { { &fold.loopback, &open, &fold.keys } };
+    struct Row
+    {
+        char const* what;
+        ConnectionFacts facts;
+        bool byProof;
+        bool byTicket;
+    };
+    auto const rows = std::to_array<Row>({
+        { .what = "a proof",
+          .facts = { .host = "10.0.0.7", .proven = IdentityOf("gone") },
+          .byProof = true,
+          .byTicket = false },
+        { .what = "a ticket AUTH accepted before the forget",
+          .facts = { .host = "10.0.0.7", .authenticatedMachine = IdentityOf("gone") },
+          .byProof = false,
+          .byTicket = true },
+        { .what = "a ticket AUTH refused as revoked",
+          .facts = { .host = "10.0.0.7", .revokedMachine = RevokedKeyEvidence { IdentityOf("gone") } },
+          .byProof = false,
+          .byTicket = true },
+        { .what = "a proof and a ticket on one connection",
+          .facts = { .host = "10.0.0.7",
+                     .proven = IdentityOf("gone"),
+                     .revokedMachine = RevokedKeyEvidence { IdentityOf("gone") } },
+          .byProof = true,
+          .byTicket = true },
+    });
+    for (auto const* oracle: { static_cast<Distributed::IMembershipOracle const*>(&fold.admitted),
+                               static_cast<Distributed::IMembershipOracle const*>(&openly) })
+        for (auto const& row: rows)
+        {
+            INFO(row.what);
+            auto const decision = Distributed::ExplainConnection(*oracle, row.facts);
+            REQUIRE(decision.verdict == Distributed::Membership::Forgotten);
+            CHECK(decision.revokedBy.Has(Distributed::KeyEvidence::SessionProof) == row.byProof);
+            CHECK(decision.revokedBy.Has(Distributed::KeyEvidence::MachineTicket) == row.byTicket);
+            CHECK(Distributed::RevocationIsProven(decision) == row.byProof);
+        }
 
-    cluster.Publish({ "10.0.0.2:7000" });
+    // A verdict that is not `Forgotten` is never "proven", whatever evidence it carries, and a
+    // `Forgotten` that names no evidence says nothing: both directions fail toward silence.
+    auto admitted = Distributed::DecidedBy(Distributed::Membership::Member, Distributed::MembershipParticipant::OpenPolicy);
+    admitted.revokedBy.Add(Distributed::KeyEvidence::SessionProof);
+    CHECK_FALSE(Distributed::RevocationIsProven(admitted));
+    CHECK_FALSE(Distributed::RevocationIsProven(
+        Distributed::DecidedBy(Distributed::Membership::Forgotten, Distributed::MembershipParticipant::KeyTombstone)));
+}
 
-    // A peer that left is refused from the next request, not from the next restart.
-    CHECK(cluster.Classify("10.0.0.1") == Membership::Outsider);
-    CHECK(cluster.Classify("10.0.0.2") == Membership::Member);
-    CHECK(cluster.Size() == 1);
+TEST_CASE("A ticket admits a caller and never stands in for a proof", "[distributed][membership][admission]")
+{
+    Fold const fold { { "pc-07" } };
+    auto const caller = Distributed::CallerContextOf(
+        fold.admitted, ConnectionFacts { .host = "10.0.0.7", .authenticatedMachine = IdentityOf("pc-07") });
+    CHECK(caller.membership == Distributed::Membership::Member);
+    CHECK(caller.peerId == "10.0.0.7");
+    // So `Register` over a ticket is refused `NodeIdentityRequired`.
+    CHECK_FALSE(caller.provenNodeId.has_value());
+
+    auto const proven =
+        Distributed::CallerContextOf(fold.admitted, ConnectionFacts { .host = "10.0.0.7", .proven = IdentityOf("pc-07") });
+    CHECK(proven.provenNodeId == std::optional<std::string> { "pc-07" });
+
+    // The shape where the ATTRIBUTION is the only guard: a connection that proved a key the roster
+    // does not hold AND presented a ticket for one it does. The ticket admits it -- and must not
+    // lend its standing to the proof, or the unknown id becomes `provenNodeId` and passes
+    // `ProvenNodeOnly`. The case above cannot show this: with no proof on the connection there is
+    // no id to engage, however a ticket were attributed.
+    auto const mixed = ConnectionFacts { .host = "10.0.0.7",
+                                         .proven = IdentityOf("stranger"),
+                                         .authenticatedMachine = IdentityOf("pc-07") };
+    auto const decision = Distributed::ExplainConnection(fold.admitted, mixed);
+    CHECK(decision.verdict == Distributed::Membership::Member);
+    CHECK(decision.decidedBy.Has(Distributed::MembershipParticipant::MachineTicket));
+    CHECK_FALSE(decision.decidedBy.Has(Distributed::MembershipParticipant::ProvenIdentity));
+    CHECK_FALSE(Distributed::CallerContextOf(fold.admitted, mixed).provenNodeId.has_value());
+}
+
+TEST_CASE("Only a proof or a ticket rests on a machine's key", "[distributed][membership][admission]")
+{
+    Fold const fold { { "pc-07" } };
+    Distributed::OpenMembership const open;
+    Distributed::AnyOfMembership const openly { { &fold.loopback, &open, &fold.keys } };
+    auto const rests = [](Distributed::IMembershipOracle const& oracle, ConnectionFacts const& facts) {
+        return Distributed::RestsOnMachineKey(Distributed::ExplainConnection(oracle, facts));
+    };
+    CHECK(rests(fold.admitted, ConnectionFacts { .host = "10.0.0.7", .authenticatedMachine = IdentityOf("pc-07") }));
+    CHECK(rests(fold.admitted, ConnectionFacts { .host = "10.0.0.7", .proven = IdentityOf("pc-07") }));
+    CHECK_FALSE(rests(fold.admitted, ConnectionFacts { .host = "127.0.0.1" }));
+    CHECK_FALSE(rests(openly, ConnectionFacts { .host = "10.0.0.7" }));
+}
+
+TEST_CASE("The reserved participant can be named by no decision", "[distributed][membership]")
+{
+    auto set = Distributed::MembershipParticipantSet {};
+    set.Add(Distributed::MembershipParticipant::Reserved);
+    CHECK(set.Empty());
+    // A participant that is `Reserved` has no opinion: an admission nobody claims would be the
+    // confident wrong signal from the other side, so it fails closed rather than admitting.
+    auto const unclaimed =
+        Distributed::DecidedBy(Distributed::Membership::Member, Distributed::MembershipParticipant::Reserved);
+    CHECK(unclaimed.verdict == Distributed::Membership::Outsider);
+    CHECK(unclaimed.decidedBy.Empty());
+    CHECK(static_cast<std::uint8_t>(Distributed::MembershipParticipant::Reserved) == 0);
+    CHECK(Distributed::MembershipWireRoutes[0].route == Distributed::MembershipParticipant::Reserved);
+    CHECK(Distributed::MembershipWireRoutes[0].bit == 0);
+
+    // The control: a live participant is recorded, so the empty set above is about `Reserved`.
+    CHECK_FALSE(set.Add(Distributed::MembershipParticipant::Loopback).Empty());
+    CHECK(Distributed::DecidedBy(Distributed::Membership::Member, Distributed::MembershipParticipant::Loopback).verdict
+          == Distributed::Membership::Member);
+}
+
+TEST_CASE("A connection proving a key the record no longer holds is no proven node, wherever it is admitted from",
+          "[distributed][membership][admission]")
+{
+    // The re-key shape. A connection proved m1's key; the cluster then re-admitted m1 under a NEW
+    // key, which replaces the whole record without revoking the old key. The connection is still
+    // admitted where an address admits it -- this machine, or a node that is open -- but the key it
+    // proved is nobody's now, so it must not stand as m1 for the verbs a machine joins the fleet
+    // with. With no ticket anywhere, only the attribution keeps `provenNodeId` disengaged.
+    Fold fold { { "m1" } };
+    Distributed::OpenMembership const open;
+    Distributed::AnyOfMembership const openly { { &fold.loopback, &open, &fold.keys } };
+    auto const onThisMachine = ConnectionFacts { .host = "127.0.0.1", .proven = IdentityOf("m1") };
+    auto const remote = ConnectionFacts { .host = "10.0.0.7", .proven = IdentityOf("m1") };
+
+    // Before the re-key the proof stands, which is what makes the answer below about the re-key.
+    REQUIRE(Distributed::CallerContextOf(fold.admitted, onThisMachine).provenNodeId == std::optional<std::string> { "m1" });
+
+    std::map<std::string, Ed25519PublicKey, std::less<>> rekeyed;
+    rekeyed.emplace("m1", Testing::TestKeyPair("m1-rekeyed").PublicKey());
+    fold.keys.Publish(std::move(rekeyed), {});
+
+    for (auto const& [oracle, facts, route]:
+         { std::tuple { static_cast<Distributed::IMembershipOracle const*>(&fold.admitted),
+                        onThisMachine,
+                        Distributed::MembershipParticipant::Loopback },
+           std::tuple { static_cast<Distributed::IMembershipOracle const*>(&openly),
+                        remote,
+                        Distributed::MembershipParticipant::OpenPolicy } })
+    {
+        INFO(facts.host);
+        auto const decision = Distributed::ExplainConnection(*oracle, facts);
+        CHECK(decision.verdict == Distributed::Membership::Member);
+        CHECK(decision.decidedBy.Has(route));
+        CHECK_FALSE(decision.decidedBy.Has(Distributed::MembershipParticipant::ProvenIdentity));
+        CHECK_FALSE(Distributed::CallerContextOf(*oracle, facts).provenNodeId.has_value());
+    }
+}
+
+TEST_CASE("A membership fake refuses a label no production route could carry", "[distributed][membership]")
+{
+    // Loopback admits this machine and nobody else, so a fake that labels a remote host
+    // `Loopback` models an admission production cannot produce -- a fake more permissive than the
+    // real thing, whose cases pass while describing a route that does not exist.
+    CHECK_THROWS_AS(
+        (Testing::ListedMembership { { "127.0.0.1", "10.0.0.7" }, Distributed::MembershipParticipant::Loopback }),
+        std::invalid_argument);
+    CHECK_THROWS_AS(
+        (Testing::FixedMembership { Distributed::Membership::Member, Distributed::MembershipParticipant::Loopback }),
+        std::invalid_argument);
+    CHECK_THROWS_AS((Testing::ListedMembership { { "10.0.0.7" }, Distributed::MembershipParticipant::Reserved }),
+                    std::invalid_argument);
+
+    // The controls: this machine's spellings under `Loopback`, a remote host under the one route
+    // that admits one by address, and loopback's honest opinion of a remote host -- none.
+    CHECK_NOTHROW((Testing::ListedMembership { { "127.0.0.1", "::1" }, Distributed::MembershipParticipant::Loopback }));
+    CHECK_NOTHROW((Testing::ListedMembership { { "10.0.0.7" }, Distributed::MembershipParticipant::OpenPolicy }));
+    CHECK_NOTHROW(
+        (Testing::FixedMembership { Distributed::Membership::Outsider, Distributed::MembershipParticipant::Loopback }));
+}
+
+TEST_CASE("A key revoked while a ticketed connection is open refuses its next verb", "[distributed][membership][admission]")
+{
+    Fold fold { { "pc-07" } };
+    auto const facts = ConnectionFacts { .host = "10.0.0.7", .authenticatedMachine = IdentityOf("pc-07") };
+    REQUIRE(Distributed::ExplainConnection(fold.admitted, facts).verdict == Distributed::Membership::Member);
+    std::map<std::string, Ed25519PublicKey, std::less<>> none;
+    fold.keys.Publish(std::move(none), { Testing::TestKeyPair("pc-07").PublicKey() });
+    CHECK(Distributed::ExplainConnection(fold.admitted, facts).verdict == Distributed::Membership::Forgotten);
 }
 
 TEST_CASE("An open deployment admits everyone, and says so by name", "[distributed][membership]")
 {
-    // The right answer for one machine, or a fleet whose reachability is its
-    // boundary -- but never a default. "No policy" and "a policy that admits
-    // everybody" have to be the same explicit decision, which is why this is a
-    // named type somebody constructs rather than an unset field.
-    OpenMembership const open;
+    // The right answer for one machine, or a fleet whose reachability is its boundary -- but never
+    // a default. "No policy" and "a policy that admits everybody" have to be the same explicit
+    // decision, which is why this is a named type somebody constructs rather than an unset field.
+    Distributed::OpenMembership const open;
 
-    CHECK(open.Classify("10.0.0.9:7100") == Membership::Member);
-    CHECK(open.Classify("") == Membership::Member);
-}
-
-TEST_CASE("Admission is a union, so one route publishing does not revoke another", "[distributed][membership]")
-{
-    // Issue #251. Two lists answering two different questions -- who may spend this
-    // node's CPU (clients included: a developer's laptop, a CI runner, machines that
-    // never join consensus and never should) and who is in the cluster (peers only)
-    // -- were one list, so the first replicated membership commit discarded
-    // everything an operator had listed. And agreeing something is routine.
-    ClusterMembership listed { MembershipParticipant::FleetMemberList, { "10.0.0.1:7000" } };
-    ClusterMembership agreed { MembershipParticipant::ClusterMembers };
-    AnyOfMembership const admitted { { &listed, &agreed } };
-
-    CHECK(admitted.Classify("10.0.0.1") == Membership::Member);
-    CHECK(admitted.Classify("10.0.0.2") == Membership::Outsider);
-
-    agreed.Publish({ "10.0.0.2:7000" });
-
-    // Each route is still replaced wholesale by whoever owns it, and neither
-    // publisher speaks for the other.
-    CHECK(admitted.Classify("10.0.0.1") == Membership::Member);
-    CHECK(admitted.Classify("10.0.0.2") == Membership::Member);
-
-    // Adding a route must not add an admission.
-    CHECK(admitted.Classify("10.0.0.9") == Membership::Outsider);
-
-    // The same rule at its limit: a route that publishes an empty set -- which is
-    // what a clustered node sees before the first entry naming anybody commits --
-    // takes nothing away from the others. That is the admission-layer spelling of a
-    // rule consensus already applies: absence from `ClusterState` is not removal.
-    agreed.Publish({});
-    CHECK(admitted.Classify("10.0.0.1") == Membership::Member);
-    CHECK(admitted.Classify("10.0.0.2") == Membership::Outsider);
+    CHECK(open.Classify("10.0.0.9:7100") == Distributed::Membership::Member);
+    CHECK(open.Classify("") == Distributed::Membership::Member);
+    CHECK(open.Explain("10.0.0.9").decidedBy.Has(Distributed::MembershipParticipant::OpenPolicy));
 }
 
 TEST_CASE("A composite with no participants refuses everybody", "[distributed][membership]")
 {
-    // The direction this default has to fail in, and the same one every other default
-    // in this file takes: a node whose routes have not been wired must not become an
-    // open scheduler. `OpenMembership` is how "admit everybody" is said out loud.
-    AnyOfMembership const admitted { {} };
+    // The direction this default has to fail in: a node whose routes have not been wired must not
+    // become an open scheduler. `OpenMembership` is how "admit everybody" is said out loud.
+    Distributed::AnyOfMembership const admitted { {} };
 
-    CHECK(admitted.Classify("10.0.0.1") == Membership::Outsider);
+    CHECK(admitted.Classify("10.0.0.1") == Distributed::Membership::Outsider);
 
-    // Not even loopback, because a composite has no policy of its own -- the
-    // this-machine rule belongs to the participants that have one, and inventing it
-    // here would make an unwired composite quietly useful instead of visibly wrong.
-    CHECK(admitted.Classify("127.0.0.1") == Membership::Outsider);
-}
-
-TEST_CASE("A forget outranks a listing, whichever participant said it", "[distributed][membership][forget]")
-{
-    // #1309. The composite folds on `PrecedenceOf` rather than admitting on any_of: the host
-    // an operator has just forgotten in the cluster is exactly the one still named by
-    // `--fleet-member` on a node nobody has reconfigured, so a forget has to WIN. What this
-    // case distinguishes is the fold from the old `any_of(... == Member)`, which answered
-    // `Member` here and flattened the forget to `Outsider` when it stood alone.
-    FixedMembership const forgets { Membership::Forgotten, MembershipParticipant::ClientTombstone };
-    ClusterMembership listed { MembershipParticipant::FleetMemberList, { "10.0.0.1:7000" } };
-
-    SECTION("the forget is asked first")
-    {
-        AnyOfMembership const admitted { { &forgets, &listed } };
-        CHECK(admitted.Classify("10.0.0.1") == Membership::Forgotten);
-    }
-
-    SECTION("the listing is asked first")
-    {
-        AnyOfMembership const admitted { { &listed, &forgets } };
-        CHECK(admitted.Classify("10.0.0.1") == Membership::Forgotten);
-    }
-
-    SECTION("a forget alone reaches the surface as itself, not as an outsider")
-    {
-        AnyOfMembership const admitted { { &forgets } };
-        CHECK(admitted.Classify("10.0.0.9") == Membership::Forgotten);
-    }
-
-    SECTION("and nothing else is disturbed: a listed host with no forget is still a member")
-    {
-        // Any route will do: this fake's whole job is to have NO opinion, and `DecidedBy`
-        // discards the participant given alongside `Outsider`, so the set comes back empty
-        // whatever is named. Asserted below rather than assumed.
-        FixedMembership const nobody { Membership::Outsider, MembershipParticipant::ClusterMembers };
-        REQUIRE(nobody.Explain("10.0.0.9").decidedBy.Empty());
-        AnyOfMembership const admitted { { &nobody, &listed } };
-        CHECK(admitted.Classify("10.0.0.1") == Membership::Member);
-        CHECK(admitted.Classify("10.0.0.2") == Membership::Outsider);
-    }
-}
-
-TEST_CASE("An admission names every route that admitted, not the first one", "[distributed][membership][explain]")
-{
-    // #1471's first acceptance clause. The operator question behind it is not "is this host
-    // served" -- which the verdict already answered -- but "what do I have to change to stop it
-    // being served", and when two routes admit, the answer is BOTH of them.
-    //
-    // This case is why `decidedBy` is a set. The first version of this change folded with a
-    // strict `>` and kept the first winner, so a host on both lists reported `FleetMemberList`
-    // alone; an operator following that removes it from `--fleet-member` and finds it still
-    // served by the cluster, which is the scenario the ticket opens with. The fix had reproduced
-    // the defect.
-    ClusterMembership const listed { MembershipParticipant::FleetMemberList, { "10.0.0.1:7000", "10.0.0.3:7000" } };
-    ClusterMembership const agreed { MembershipParticipant::ClusterMembers, { "10.0.0.2:7000", "10.0.0.3:7000" } };
-
-    SECTION("a host only `--fleet-member` names reports that list")
-    {
-        // A CONTROL for the both-routes section: without a case per route, a fold that
-        // attributed every admission to one fixed route would pass it.
-        AnyOfMembership const admitted { { &listed, &agreed } };
-        auto const decision = admitted.Explain("10.0.0.1");
-
-        CHECK(decision.verdict == Membership::Member);
-        CHECK(decision.decidedBy.Count() == 1);
-        CHECK(decision.decidedBy.Has(MembershipParticipant::FleetMemberList));
-        CHECK_FALSE(decision.decidedBy.Has(MembershipParticipant::ClusterMembers));
-    }
-
-    SECTION("a host only the cluster agreed reports the committed set")
-    {
-        // The other half of the control, and the direction the ticket's scenario is about: the
-        // host is NOT in `--fleet-member`, so an operator editing that list changes nothing.
-        AnyOfMembership const admitted { { &listed, &agreed } };
-        auto const decision = admitted.Explain("10.0.0.2");
-
-        CHECK(decision.verdict == Membership::Member);
-        CHECK(decision.decidedBy.Count() == 1);
-        CHECK(decision.decidedBy.Has(MembershipParticipant::ClusterMembers));
-        CHECK_FALSE(decision.decidedBy.Has(MembershipParticipant::FleetMemberList));
-    }
-
-    SECTION("a host BOTH routes admit reports both, because both are true")
-    {
-        // The section that fails under the single-winner fold.
-        AnyOfMembership const admitted { { &listed, &agreed } };
-        auto const decision = admitted.Explain("10.0.0.3");
-
-        CHECK(decision.verdict == Membership::Member);
-        CHECK(decision.decidedBy.Count() == 2);
-        CHECK(decision.decidedBy.Has(MembershipParticipant::FleetMemberList));
-        CHECK(decision.decidedBy.Has(MembershipParticipant::ClusterMembers));
-    }
-
-    SECTION("and the answer does not depend on the order the routes are folded in")
-    {
-        // Order dependence WAS the defect's signature, so this asserts EQUALITY of the two
-        // answers rather than that each contains both routes: an implementation that unions in
-        // one order and replaces in the other satisfies "contains both" in one direction only,
-        // and a case asking each direction separately would pass on whichever it happened to
-        // check first.
-        AnyOfMembership const listedFirst { { &listed, &agreed } };
-        AnyOfMembership const agreedFirst { { &agreed, &listed } };
-
-        CHECK(listedFirst.Explain("10.0.0.3") == agreedFirst.Explain("10.0.0.3"));
-        CHECK(listedFirst.Explain("10.0.0.3").decidedBy.Count() == 2);
-    }
-
-    SECTION("a host no route names is refused by ABSENCE, attributed to nobody")
-    {
-        // `Outsider` with an EMPTY set, which is a different fact from any route having refused
-        // it: both lists were asked and neither mentioned the host. The assertion that stops
-        // `DecidedBy` being loosened into naming the author of a silence.
-        AnyOfMembership const admitted { { &listed, &agreed } };
-        auto const decision = admitted.Explain("10.9.9.9");
-
-        CHECK(decision.verdict == Membership::Outsider);
-        CHECK(decision.decidedBy.Empty());
-        CHECK(decision.decidedBy.Count() == 0);
-    }
-
-    SECTION("a forget REPLACES the listing rather than joining it")
-    {
-        // The REPLACE arm, and the guard on the tie arm: a tombstone outranks every admission
-        // route, so the set names the tombstone ALONE even though `--fleet-member` is still
-        // admitting the host. Asserting the listing is ABSENT is the whole point -- a tie arm
-        // widened into an unconditional union would tell an operator that `--fleet-member`
-        // refused a host it was in fact still serving.
-        ForgottenMembership const forgotten { { "10.0.0.3" } };
-        AnyOfMembership const admitted { { &listed, &agreed, &forgotten } };
-        auto const decision = admitted.Explain("10.0.0.3");
-
-        CHECK(decision.verdict == Membership::Forgotten);
-        CHECK(decision.decidedBy.Count() == 1);
-        CHECK(decision.decidedBy.Has(MembershipParticipant::ClientTombstone));
-        CHECK_FALSE(decision.decidedBy.Has(MembershipParticipant::FleetMemberList));
-        CHECK_FALSE(decision.decidedBy.Has(MembershipParticipant::ClusterMembers));
-    }
+    // Not even loopback, because a composite has no policy of its own -- the this-machine rule
+    // belongs to `LoopbackMembership`, and inventing it here would make an unwired composite
+    // quietly useful instead of visibly wrong.
+    CHECK(admitted.Classify("127.0.0.1") == Distributed::Membership::Outsider);
+    CHECK(Distributed::ExplainConnection(admitted, ConnectionFacts { .host = "10.0.0.7", .proven = IdentityOf("pc-07") })
+              .verdict
+          == Distributed::Membership::Outsider);
 }
 
 TEST_CASE("A scheduler refuses a non-member through the oracle", "[distributed][membership][scheduler]")
 {
-    // The two halves joined: the oracle answers who, `SchedulerService` decides
-    // what. Asserted together because each is correct in isolation and the wiring
-    // between them is what a caller actually depends on.
-    ClusterMembership const cluster { MembershipParticipant::ClusterMembers, { "10.0.0.1:7000" } };
+    // The two halves joined: the oracle answers who, `SchedulerService` decides what. Asserted
+    // together because each is correct in isolation and the wiring between them is what a caller
+    // actually depends on.
+    Fold const fold { { "pc-07" } };
     core::platform::ManualClock clock;
-    FastCache::AtomicMetricsSink metrics;
-    FastCache::NullLogger schedulerLogger;
+    AtomicMetricsSink metrics;
+    NullLogger schedulerLogger;
     core::platform::ManualWallClock wallClock;
-    auto const signer = FastCache::Testing::TestLeaseSigner();
-    SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
-    service.SetRole(SchedulerRole::Leader, {}, StandaloneSchedulerTerm);
+    auto const signer = Testing::TestLeaseSigner();
+    Distributed::SchedulerService service { clock, wallClock, metrics, schedulerLogger, signer, {} };
+    service.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
 
-    auto const ask = [&](std::string_view peer) {
-        return service.Lease(
-            CallerContext { .membership = cluster.Classify(peer), .peerId = std::string { peer } },
-            FastCache::CompileCacheWire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
+    auto const ask = [&](ConnectionFacts facts) {
+        return service.Lease(Distributed::CallerContextOf(fold.admitted, std::move(facts)),
+                             CompileCacheWire::LeaseRequest { .fingerprint = "gcc-14", .key = "k", .acceptedCodecs = {} });
     };
 
-    // A member reaches the fleet and is refused only for want of a worker, which is
-    // the fleet's own answer rather than the policy's.
-    CHECK(ask("10.0.0.1").error == FastCache::CompileCacheWire::ErrorCode::NoWorker);
+    // A machine with a live key reaches the fleet and is refused only for want of a worker, which
+    // is the fleet's own answer rather than the policy's.
+    CHECK(ask(ConnectionFacts { .host = "10.0.0.7", .authenticatedMachine = IdentityOf("pc-07") }).error
+          == CompileCacheWire::ErrorCode::NoWorker);
 
-    // A stranger never gets that far.
-    CHECK(ask("10.0.0.9").error == FastCache::CompileCacheWire::ErrorCode::NotAMember);
+    // A non-loopback caller that established nothing never gets that far.
+    CHECK(ask(ConnectionFacts { .host = "10.0.0.9" }).error == CompileCacheWire::ErrorCode::NotAMember);
 }
 
-TEST_CASE("This machine is a member of its own fleet, whatever the list says", "[distributed][membership]")
+TEST_CASE("A key roster forgets a revoked key and has no opinion about an address", "[distributed][membership][forget]")
 {
-    // The rule that makes an unconfigured node useful and still closed to the
-    // network. Anti-leeching exists to stop OTHER machines spending capacity they do
-    // not contribute; a process on this host already has this host's CPU, and the
-    // `fastcache-cc` a developer runs against their own node is the whole reason the
-    // node is there.
-    //
-    // Without it, a node whose operator had listed only their peers would refuse
-    // their own builds — a fleet that looks configured and serves nobody locally,
-    // and which nothing would report.
-    ClusterMembership const remoteOnly { MembershipParticipant::ClusterMembers, { "10.0.0.1:7000", "10.0.0.2:7000" } };
+    // The one participant that answers `Forgotten`, and it must admit nobody by ADDRESS: it is
+    // composed into every node's participants, so an opinion escaping from `Explain` would widen or
+    // narrow admission by where a caller dials from.
+    auto keyOf = [](std::uint8_t fill) {
+        auto key = Ed25519PublicKey {};
+        key.fill(static_cast<std::byte>(fill));
+        return key;
+    };
+    Distributed::KeyRosterMembership keys;
+    keys.Publish({ { "n1", keyOf(0x11) }, { "n2", keyOf(0x22) } }, { keyOf(0x22), keyOf(0x33) });
 
-    CHECK(remoteOnly.Classify("127.0.0.1") == Membership::Member);
-    CHECK(remoteOnly.Classify("::1") == Membership::Member);
-    CHECK(remoteOnly.Classify("10.0.0.1") == Membership::Member);
-    CHECK(remoteOnly.Classify("10.9.9.9") == Membership::Outsider);
+    // A revoked key is the removed machine, asked FIRST: `n2`'s key is revoked though a record
+    // still names it, and a revoked key is refused whatever id it now claims, by either evidence.
+    for (auto const evidence: { Distributed::KeyEvidence::SessionProof, Distributed::KeyEvidence::MachineTicket })
+    {
+        auto const stale = keys.ExplainKey(ProvenIdentity { .id = "n2", .key = keyOf(0x22) }, evidence);
+        CHECK(stale.verdict == Distributed::Membership::Forgotten);
+        CHECK(stale.decidedBy.Has(Distributed::MembershipParticipant::KeyTombstone));
+        CHECK(keys.ExplainKey(ProvenIdentity { .id = "n9", .key = keyOf(0x33) }, evidence).verdict
+              == Distributed::Membership::Forgotten);
+    }
 
-    // And an empty list is still closed to everybody but this machine, which is what
-    // makes "no configuration" a safe state rather than an open one.
-    ClusterMembership const unconfigured { MembershipParticipant::ClusterMembers, {} };
-    CHECK(unconfigured.Classify("127.0.0.1") == Membership::Member);
-    CHECK(unconfigured.Classify("10.0.0.1") == Membership::Outsider);
-}
+    // The control: the live key of its own id is a member, attributed by HOW it was shown -- and a
+    // key the roster does not hold for that id is no opinion at all, silence rather than a refusal.
+    auto const proved =
+        keys.ExplainKey(ProvenIdentity { .id = "n1", .key = keyOf(0x11) }, Distributed::KeyEvidence::SessionProof);
+    CHECK(proved.verdict == Distributed::Membership::Member);
+    CHECK(proved.decidedBy.Has(Distributed::MembershipParticipant::ProvenIdentity));
+    auto const ticketed =
+        keys.ExplainKey(ProvenIdentity { .id = "n1", .key = keyOf(0x11) }, Distributed::KeyEvidence::MachineTicket);
+    CHECK(ticketed.verdict == Distributed::Membership::Member);
+    CHECK(ticketed.decidedBy.Has(Distributed::MembershipParticipant::MachineTicket));
+    CHECK(keys.ExplainKey(ProvenIdentity { .id = "n1", .key = keyOf(0x44) }, Distributed::KeyEvidence::SessionProof)
+              .decidedBy.Empty());
 
-TEST_CASE("Every spelling a kernel reports for a local peer is local", "[distributed][membership]")
-{
-    // The whole 127/8, IPv6 loopback, and the IPv4-mapped form a dual-stack listener
-    // reports for an IPv4 client. Missing that last one is the subtle failure: a node
-    // bound to `::` would classify every local client as a stranger and refuse its
-    // own machine, on some hosts and not others.
-    ClusterMembership const membership { MembershipParticipant::ClusterMembers, {} };
-
-    CHECK(membership.Classify("127.0.0.1") == Membership::Member);
-    CHECK(membership.Classify("127.0.0.53") == Membership::Member);
-    CHECK(membership.Classify("::ffff:127.0.0.1") == Membership::Member);
-
-    // Not local, and the near-misses are the point: a prefix test on "127." alone
-    // would be right, but one on "1" or on "::ffff:" alone would admit the network.
-    CHECK(membership.Classify("128.0.0.1") == Membership::Outsider);
-    CHECK(membership.Classify("::ffff:10.0.0.1") == Membership::Outsider);
-    CHECK(membership.Classify("10.127.0.1") == Membership::Outsider);
-
-    // `localhost` is deliberately NOT local here: it is whatever a resolver says it
-    // is, and a resolver is not something a security decision may depend on. No
-    // kernel reports it as a peer address either, so nothing legitimate is lost.
-    CHECK(membership.Classify("localhost") == Membership::Outsider);
-}
-
-TEST_CASE("A peer this machine cannot name is refused", "[distributed][membership]")
-{
-    // The direction an unidentifiable caller has to fail in. An empty host is what
-    // `core::net::formatPeerAddress` answers for a peer whose family it does not know or whose
-    // `getpeername` failed, and handing this machine's CPU to something it cannot
-    // name is the one outcome that must not be possible.
-    ClusterMembership const membership { MembershipParticipant::ClusterMembers, { "10.0.0.1:7000" } };
-
-    CHECK(membership.Classify("") == Membership::Outsider);
-}
-
-TEST_CASE("A forgotten set answers about forgotten hosts and nothing else", "[distributed][membership][forget]")
-{
-    // The real oracle rather than the fake above, which could say `Forgotten` about
-    // anybody and therefore proved only the fold. What only this can show is that the
-    // set answers the RIGHT hosts -- and, twice as important, that it admits nobody: it
-    // is composed into every node's participants, so a `Member` escaping from here would
-    // widen admission on a node whose operator listed nothing at all.
-    ForgottenMembership const forgotten { { "10.0.0.7", "ci-runner-3.example" } };
-
-    CHECK(forgotten.Classify("10.0.0.7") == Membership::Forgotten);
-    CHECK(forgotten.Classify("ci-runner-3.example") == Membership::Forgotten);
-
-    // A host it has nothing to say about is `Outsider`, which is `PrecedenceOf` 0 and
-    // therefore silence in the fold -- not an opinion that this host is a stranger.
-    CHECK(forgotten.Classify("10.0.0.8") == Membership::Outsider);
-    CHECK(forgotten.Classify("") == Membership::Outsider);
-
-    // Whole-host, the same rule the member sets keep: `10.0.0.7` must not forget
-    // `10.0.0.70`, and the dual-stack spelling of a forgotten host is the same machine.
-    CHECK(forgotten.Classify("10.0.0.70") == Membership::Outsider);
-    CHECK(forgotten.Classify("::ffff:10.0.0.7") == Membership::Forgotten);
-}
-
-TEST_CASE("This machine is never forgotten, whatever the set holds", "[distributed][membership][forget]")
-{
-    // The guard `ForgottenVerdicts` exists for, asserted against a set that should be
-    // impossible: `Cluster::Validate` refuses a loopback host to `ForgetClient`, so no
-    // such entry can be committed today. That is a reason this is never REACHED, not a
-    // reason to leave it out -- the consequence is that a node stops serving the local
-    // builds that are the entire reason it is installed, on every surface at once, with
-    // admission having succeeded for years and nothing to report the change.
-    //
-    // It also distinguishes this class from a `ClusterMembership` with its verdict
-    // swapped, which is the cheap-looking implementation: that one answers `Member` for
-    // loopback, and remapping its match verdict would have remapped the loopback arm too.
-    ForgottenMembership const forgotten { { "127.0.0.1", "::1", "10.0.0.7" } };
-
-    CHECK(forgotten.Classify("127.0.0.1") == Membership::Outsider);
-    CHECK(forgotten.Classify("127.0.0.53") == Membership::Outsider);
-    CHECK(forgotten.Classify("::1") == Membership::Outsider);
-
-    // The control, and it is load-bearing: without it a class that answered `Outsider`
-    // for every caller would pass the three checks above.
-    CHECK(forgotten.Classify("10.0.0.7") == Membership::Forgotten);
-}
-
-TEST_CASE("A forget is published wholesale, and a re-admit is its removal", "[distributed][membership][forget]")
-{
-    ForgottenMembership forgotten { { "10.0.0.7" } };
-    REQUIRE(forgotten.Classify("10.0.0.7") == Membership::Forgotten);
-
-    // What a re-admit looks like from here: the tombstone leaves the replicated state,
-    // and the next publish carries a set without it. There is no "un-forget" call,
-    // because the cluster's committed set is the whole truth about this question.
-    forgotten.Publish({});
-    CHECK(forgotten.Classify("10.0.0.7") == Membership::Outsider);
-    CHECK(forgotten.Size() == 0);
+    // No address is anything to it.
+    CHECK(keys.Explain("10.0.0.2").decidedBy.Empty());
+    CHECK(keys.Explain("10.0.0.2").verdict == Distributed::Membership::Outsider);
 }

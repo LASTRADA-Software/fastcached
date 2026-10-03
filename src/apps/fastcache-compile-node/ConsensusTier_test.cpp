@@ -54,11 +54,24 @@
 
 using namespace FastCache;
 
-/// `NodeMembership` reports an unreadable `fleet-open` row here; no case asserts on it.
 namespace
 {
+/// `NodeMembership` reports an unreadable `fleet-open` row here; no case asserts on it.
 FastCache::NullLogger membershipLog;
+
+/// A loopback port nothing listens on at the moment of asking: bound, read and released, the way
+/// the cases here state a member's endpoint. One helper rather than a lambda per case.
+/// @return The port.
+[[nodiscard]] std::uint16_t FreeLoopbackPort()
+{
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->boundPort();
+    probe.reset();
+    return port;
 }
+} // namespace
 using namespace FastCache::Node;
 using FastCache::Testing::Unwrap;
 
@@ -249,6 +262,10 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         CHECK(*tier == nullptr);
     }
 
+    // The identity key is resolved first, and its own refusal is the next case's: these two hold one,
+    // so what refuses them is the self record they are about.
+    std::optional<Ed25519KeyPair> const identity { Testing::TestKeyPair("n1") };
+
     SECTION("--listen-raft with no --node-id gets past the gate")
     {
         auto cfg = Testing::FirstStart(NodeConfig {});
@@ -261,7 +278,7 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         auto const tier = StartConsensusOrExplain(cfg,
                                                   noScheduler,
                                                   "127.0.0.1:6674",
-                                                  std::nullopt,
+                                                  identity,
                                                   membership,
                                                   *Unwrap(roster),
                                                   core::platform::defaultSystemWallClock(),
@@ -284,7 +301,7 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         auto const tier = StartConsensusOrExplain(cfg,
                                                   noScheduler,
                                                   "127.0.0.1:6674",
-                                                  std::nullopt,
+                                                  identity,
                                                   membership,
                                                   *Unwrap(roster),
                                                   core::platform::defaultSystemWallClock(),
@@ -586,14 +603,14 @@ TEST_CASE("The peers that dial in are read from the record and from the configur
                              .key = "tablet",
                              .value = {},
                              .schedulerEndpoint = {},
-                             .publicKey = std::nullopt,
+                             .publicKey = Testing::TestKeyPair("tablet").PublicKey(),
                              .role = std::nullopt });
     Apply(state,
           Cluster::Command { .kind = Cluster::CommandKind::AddMember,
                              .key = "n1",
                              .value = "10.0.0.1:6680",
                              .schedulerEndpoint = {},
-                             .publicKey = std::nullopt,
+                             .publicKey = Testing::TestKeyPair("n1").PublicKey(),
                              .role = std::nullopt });
     auto const configuration = Consensus::Configuration { .voters = { "n1", "n2" }, .learners = { "laptop" } };
 
@@ -808,18 +825,27 @@ TEST_CASE("A lone voter endorses the roster it applied, under its own key, and r
 
 namespace
 {
-/// A command with no endpoint, key or role: a client admission or a forget.
-/// @param kind What it does.
-/// @param host The host it names.
+/// A worker principal admitted under its own test key: a roster fact that is not a member.
+/// @param id The principal's id.
 /// @return The command.
-[[nodiscard]] Cluster::Command HostCommand(Cluster::CommandKind kind, std::string host)
+[[nodiscard]] Cluster::Command PrincipalCommand(std::string id)
 {
-    return Cluster::Command { .kind = kind,
-                              .key = std::move(host),
+    auto const key = Testing::TestKeyPair(id).PublicKey();
+    return Cluster::Command { .kind = Cluster::CommandKind::AdmitPrincipal,
+                              .key = std::move(id),
                               .value = {},
                               .schedulerEndpoint = {},
-                              .publicKey = std::nullopt,
-                              .role = std::nullopt };
+                              .publicKey = key,
+                              .role = Cluster::PrincipalRole::Worker };
+}
+
+/// Whether @p state records a principal under @p id.
+/// @param state The state.
+/// @param id The id.
+/// @return True when a principal carries it.
+[[nodiscard]] bool HasPrincipal(Cluster::ClusterState const& state, std::string_view id)
+{
+    return std::ranges::contains(state.principals, id, &Cluster::ClusterPrincipal::id);
 }
 
 /// Write a node's own consensus state into @p directory, as a node that ran would have left it.
@@ -840,7 +866,7 @@ void PlantConsensusState(std::filesystem::path const& directory,
     auto const term = Consensus::Term { .value = 1 };
     REQUIRE(store->SaveState(Consensus::PersistentState { .currentTerm = term, .votedFor = std::nullopt }).has_value());
 
-    auto const covered = Cluster::Encode(HostCommand(Cluster::CommandKind::AdmitClient, "10.0.0.1"));
+    auto const covered = Cluster::Encode(PrincipalCommand("w0"));
     auto entries = std::vector<Consensus::LogEntry> {};
     for ([[maybe_unused]] auto const index: std::views::iota(1, 4))
         entries.push_back(Consensus::LogEntry { .term = term, .kind = Consensus::EntryKind::Command, .payload = covered });
@@ -868,7 +894,7 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
     // a real state directory. A node that upgraded across a change of the cluster state's
     // or the command's encoding restarts over its OWN snapshot and log, written by the
     // build before. Recovery used to hand the snapshot to a machine that could not decode
-    // it and ran on with an EMPTY state -- no members, no settings, no forget tombstones --
+    // it and ran on with an EMPTY state -- no members, no settings, no revoked keys --
     // and skipped the commands it could not read: removal failing open, loudly but open.
     // It now refuses to start, by name, before anything is applied.
     NullLogger logger;
@@ -898,12 +924,12 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
     cfg.clusterDir = scratch / "state";
     auto const directory = NodeStateDirectory(cfg);
 
-    // A tombstone in the snapshot and an admission above it: what a node that ran on an
+    // A principal in the snapshot and an admission above it: what a node that ran on an
     // unread snapshot loses, and what one that skipped an unread command loses.
     auto current = Cluster::ClusterState {};
-    Cluster::Apply(current, HostCommand(Cluster::CommandKind::ForgetClient, "10.0.0.7"));
+    Cluster::Apply(current, PrincipalCommand("w1"));
     auto const currentSnapshot = Cluster::Encode(current);
-    auto const currentCommand = Cluster::Encode(HostCommand(Cluster::CommandKind::AdmitClient, "10.0.0.9"));
+    auto const currentCommand = Cluster::Encode(PrincipalCommand("w2"));
 
     // Anything published at all is something applied: the observer is how the member set
     // reaches the fleet's oracle.
@@ -929,13 +955,13 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         auto const& tier = *started;
 
         // Restored when the driver was built, before either loop ran.
-        CHECK(tier->ClusterState().HasForgotten("10.0.0.7"));
+        CHECK(HasPrincipal(tier->ClusterState(), "w1"));
         CHECK(published->load() > 0);
 
         // And the entry above it, once the node leads again and commits it.
         CHECK(Testing::WaitUntil(
             "the retained admission to commit",
-            [&tier] { return tier->ClusterState().AdmitsClient("10.0.0.9"); },
+            [&tier] { return HasPrincipal(tier->ClusterState(), "w2"); },
             [&tier] { return std::format("commit index {}", tier->Status().commitIndex.value); }));
     }
 
@@ -949,7 +975,7 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         CHECK(refusal.contains(directory.string()));
         CHECK(refusal.contains("the snapshot as of log entry 3"));
         CHECK(refusal.contains(std::format("cluster state encoding version {}", Testing::PreviousClusterStateVersion)));
-        CHECK(refusal.contains("reads 7"));
+        CHECK(refusal.contains("reads 8"));
         CHECK(refusal.contains("it is intact, and there is no conversion"));
         CHECK(refusal.contains(Consensus::UnreadableStateRemedy));
         CHECK(published->load() == 0);
@@ -968,6 +994,29 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         CHECK(refusal.contains("log entry 4"));
         CHECK(refusal.contains(std::format("cluster command encoding version {}", Testing::PreviousClusterCommandVersion)));
         CHECK(refusal.contains("reads 4"));
+        CHECK(refusal.contains(Consensus::UnreadableStateRemedy));
+        CHECK(published->load() == 0);
+    }
+
+    SECTION("a retained command carrying a retired verb refuses the start, naming the retirement")
+    {
+        // Byte 3 was a client verb an earlier build committed: this build's command version
+        // and layout, and a verb it retired. Applied as nothing it would leave this node
+        // holding a state its log says otherwise about, so it refuses the start by name.
+        auto const retired = Cluster::Encode(Cluster::Command { .kind = Cluster::CommandKind::RetiredForgetClient,
+                                                                .key = "10.0.0.7",
+                                                                .value = {},
+                                                                .schedulerEndpoint = {},
+                                                                .publicKey = std::nullopt,
+                                                                .role = std::nullopt });
+        PlantConsensusState(directory, currentSnapshot, retired);
+        auto const started = start();
+        REQUIRE_FALSE(started.has_value());
+        auto const& refusal = started.error();
+        CAPTURE(refusal);
+        CHECK(refusal.contains(directory.string()));
+        CHECK(refusal.contains("log entry 4"));
+        CHECK(refusal.contains("verb 4 is retired"));
         CHECK(refusal.contains(Consensus::UnreadableStateRemedy));
         CHECK(published->load() == 0);
     }
@@ -1178,18 +1227,10 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
     AtomicMetricsSink metrics;
     NodeConditions conditions;
 
-    auto const freePort = [] {
-        auto probe = BlockingListener::Bind("127.0.0.1", 0);
-        REQUIRE(probe);
-        REQUIRE(probe->IsBound());
-        auto const port = probe->boundPort();
-        probe.reset();
-        return port;
-    };
-    auto const self = freePort();
+    auto const self = FreeLoopbackPort();
     // Nobody answers here. The tier dials its leader and fails, which is ordinary for a
     // follower that has not reached its leader yet; the leader reaches IT, below.
-    auto const leaderPort = freePort();
+    auto const leaderPort = FreeLoopbackPort();
 
     Testing::ScratchDirectory const scratchDirectory { "consensus-unreadable-install" };
     auto const& scratch = scratchDirectory.Path();
@@ -1251,13 +1292,11 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
     SECTION("control: a snapshot this build reads is taken on, and nothing is raised")
     {
         auto current = Cluster::ClusterState {};
-        Cluster::Apply(current, HostCommand(Cluster::CommandKind::ForgetClient, "10.0.0.7"));
+        Cluster::Apply(current, PrincipalCommand("w7"));
         auto const connection = OfferAsLeader(self, offer(Cluster::Encode(current)));
 
         REQUIRE(Testing::WaitUntil(
-            "the offered snapshot to be taken on",
-            [&tier] { return tier->ClusterState().HasForgotten("10.0.0.7"); },
-            commit));
+            "the offered snapshot to be taken on", [&tier] { return HasPrincipal(tier->ClusterState(), "w7"); }, commit));
         CHECK(conditions.StateOf(NodeCondition::UnreadableLeaderSnapshot) == CompileCacheWire::ConditionState::Clear);
         connection->close();
     }
@@ -1280,7 +1319,7 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
         CHECK(row->detail.contains("leader n1"));
         CHECK(row->detail.contains("log entry 3"));
         CHECK(row->detail.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
-        CHECK(row->detail.contains("reads 7"));
+        CHECK(row->detail.contains("reads 8"));
 
         // Nothing taken on: not the previous build's member, not a moved commit index.
         CHECK_FALSE(tier->ClusterState().RaftEndpointOf("n1").has_value());
@@ -1304,15 +1343,6 @@ TEST_CASE("Only a node that founded its cluster bootstraps it; one that joined a
     NullLogger logger;
     AtomicMetricsSink metrics;
 
-    auto const freePort = [] {
-        auto probe = BlockingListener::Bind("127.0.0.1", 0);
-        REQUIRE(probe);
-        REQUIRE(probe->IsBound());
-        auto const port = probe->boundPort();
-        probe.reset();
-        return port;
-    };
-
     auto const start = [&logger, &metrics](NodeConfig const& cfg) {
         return ConsensusTier::Start(
             cfg,
@@ -1328,13 +1358,13 @@ TEST_CASE("Only a node that founded its cluster bootstraps it; one that joined a
 
     auto founder = Testing::FirstStart(NodeConfig {});
     founder.nodeId = "n2";
-    founder.raftListen = std::format("127.0.0.1:{}", freePort());
+    founder.raftListen = std::format("127.0.0.1:{}", FreeLoopbackPort());
     founder.raftSelf = "127.0.0.1";
     founder.clusterDir = Testing::UniqueScratchPath("consensus-bootstrap-founder") / "state";
     REQUIRE(founder.formation.has_value());
 
     auto joiner = founder;
-    joiner.raftListen = std::format("127.0.0.1:{}", freePort());
+    joiner.raftListen = std::format("127.0.0.1:{}", FreeLoopbackPort());
     joiner.clusterDir = Testing::UniqueScratchPath("consensus-bootstrap-joiner") / "state";
     // A voter of a fleet `n1` founded; nobody answers at `n1`'s address, which is ordinary for
     // a node that has not reached its leader yet.
@@ -1344,7 +1374,7 @@ TEST_CASE("Only a node that founded its cluster bootstraps it; one that joined a
         .createdAtUnixSeconds = 0,
         .foundedHere = false,
         .fleetMembers = { Cluster::ClusterMember { .id = "n1",
-                                                   .raftEndpoint = std::format("127.0.0.1:{}", freePort()),
+                                                   .raftEndpoint = std::format("127.0.0.1:{}", FreeLoopbackPort()),
                                                    .schedulerEndpoint = {},
                                                    .schedulerEndpointHistory =
                                                        Cluster::SchedulerEndpointHistory::NeverAnnounced,
@@ -1370,5 +1400,79 @@ TEST_CASE("Only a node that founded its cluster bootstraps it; one that joined a
         CHECK(status.configuration.voters.empty());
         CHECK(status.configuration.learners.empty());
         CHECK(status.role != Consensus::Role::Leader);
+    }
+}
+
+TEST_CASE("A node announces the seat its mode holds: a learner is never announced as a voter",
+          "[node][consensus][formation][learner]")
+{
+    // The record a tier announces about itself is the self member `ConsensusSelfMemberOf` read off
+    // the mode, with its scheduler endpoint and key filled in. A record built afresh with a voter's
+    // seat -- what a bootstrap set of voters once implied -- announced every learner as a voter.
+    //
+    // WHAT DISTINGUISHES: the two starts differ in the mode alone, so a tier that announces a fixed
+    // seat passes one of the two sections and fails the other.
+    NullLogger logger;
+    AtomicMetricsSink metrics;
+
+    auto const joinedAs = [](Cluster::NodeMode mode, std::string_view scratch) {
+        auto cfg = Testing::FirstStart(NodeConfig {});
+        cfg.nodeId = "n2";
+        cfg.raftListen = std::format("127.0.0.1:{}", FreeLoopbackPort());
+        cfg.raftSelf = "127.0.0.1";
+        cfg.clusterDir = Testing::UniqueScratchPath(scratch) / "state";
+        cfg.formation = NodeFormationView {
+            .mode = mode,
+            .clusterId = cfg.clusterId,
+            .createdAtUnixSeconds = 0,
+            .foundedHere = false,
+            .fleetMembers = { Cluster::ClusterMember { .id = "n1",
+                                                       .raftEndpoint = std::format("127.0.0.1:{}", FreeLoopbackPort()),
+                                                       .schedulerEndpoint = {},
+                                                       .schedulerEndpointHistory =
+                                                           Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                                       .seat = Cluster::MemberSeat::Voter,
+                                                       .publicKey = Testing::TestKeyPair("n1").PublicKey() } },
+            .fleetSchedulers = {},
+        };
+        return cfg;
+    };
+
+    auto const start = [&logger, &metrics](NodeConfig const& cfg) {
+        return ConsensusTier::Start(
+            cfg,
+            {},
+            Testing::TestKeyPair("n2"),
+            [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
+            [](Cluster::ClusterState const&) {},
+            core::platform::defaultSystemWallClock(),
+            {},
+            metrics,
+            logger);
+    };
+
+    SECTION("a learner's own record carries a learner's seat")
+    {
+        // Asked of `ConsensusSelfMemberOf`, the record `Start` announces verbatim, rather than of a
+        // started tier: a learner binds no consensus port, and `Start` for a mode whose listener is
+        // closed is lane 2a's Task 19, which has not landed -- today it refuses before it builds a
+        // record. The voter section below is the real tier; the two together pin that the seat
+        // follows the mode, and Task 19 owes the learner section its real-tier form.
+        auto const cfg = joinedAs(Cluster::NodeMode::Learner, "consensus-seat-learner");
+        auto const members = BootstrapMembersOf(cfg);
+        auto const self = ConsensusSelfMemberOf(cfg, members, Testing::TestKeyPair("n2").PublicKey());
+        INFO("self: " << (self.has_value() ? std::string {} : self.error()));
+        REQUIRE(self.has_value());
+        CHECK(self->seat == Cluster::MemberSeat::Learner);
+        CHECK(self->publicKey == Testing::TestKeyPair("n2").PublicKey());
+    }
+
+    SECTION("a voter announces a voter's seat")
+    {
+        auto started = start(joinedAs(Cluster::NodeMode::Voter, "consensus-seat-voter"));
+        INFO("start: " << (started.has_value() ? std::string {} : started.error()));
+        REQUIRE(started.has_value());
+        REQUIRE(*started != nullptr);
+        CHECK((*started)->Self().seat == Cluster::MemberSeat::Voter);
     }
 }

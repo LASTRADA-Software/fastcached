@@ -2,7 +2,6 @@
 #pragma once
 
 #include "NodeConfig.hpp"
-#include "NodeCredential.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Protocol/CompileCacheWire.hpp>
@@ -38,25 +37,22 @@ namespace FastCache::Node
 ///
 /// Split from `RunCordonAdmin` for `PutClusterRequest`'s reason: the dial takes a
 /// `core::net::BlockingConnector` by type, so the exchange is what a scripted socket can drive.
+///
+/// Presents no credential: the node admits a cordon from this machine by the connection, and
+/// checks no password -- `--requirepass` is the secret of the cache behind `--upstream`, and goes
+/// nowhere else.
 /// @param client A connected node; not owned.
-/// @param notice Where "your credential went unchecked" is reported.
 /// @param action Cordon, or lift it.
-/// @param credential What to present, asked at the moment of the exchange.
 /// @param endpoint Where @p client is connected, for the diagnostics.
 /// @return What to print, or what went wrong.
 [[nodiscard]] std::expected<std::string, std::string> PutCordonRequest(core::net::ISocket& client,
-                                                                       Cc::CredentialNotice& notice,
                                                                        CompileCacheWire::CordonAction action,
-                                                                       ICredentialSource const& credential,
                                                                        std::string_view endpoint);
 
 /// Carry out one `--cordon` or `--uncordon` against this machine's own node.
 /// @param cfg Where the node listens.
 /// @param command What the operator asked for; never `CordonCommand::None`.
-/// @param credential What to present.
 /// @return What to print, or what went wrong.
-[[nodiscard]] std::expected<std::string, std::string> RunCordonAdmin(NodeConfig const& cfg,
-                                                                     CordonCommand command,
-                                                                     ICredentialSource const& credential);
+[[nodiscard]] std::expected<std::string, std::string> RunCordonAdmin(NodeConfig const& cfg, CordonCommand command);
 
 } // namespace FastCache::Node

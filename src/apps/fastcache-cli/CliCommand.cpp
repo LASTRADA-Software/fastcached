@@ -267,6 +267,13 @@ namespace
           .description = "read the dashboard credential `fleet` and `live-stats fleet`\n"
                          "present from this file; a leader that names one refuses\n"
                          "the fleet to anybody without it" },
+        { .primary = "--mint-from",
+          .arity = Arity::Value,
+          .operand = "=<host:port>",
+          .apply = AssignEndpoint<&Command::mintFrom>(),
+          .description = "where this machine's node mints the ticket a node on\n"
+                         "another machine is shown; the port counts and the host\n"
+                         "is always loopback (default: the dialled node's port)" },
         { .primary = "--user",
           .arity = Arity::Value,
           .operand = "=<name>",
@@ -545,7 +552,7 @@ void ApplyEnvironment(Command& command, std::optional<std::string> (*lookup)(std
     endpoint("FASTCACHE_ADMIN_ADDR", command.admin);
 
     if (auto const token = value("FASTCACHE_TOKEN"); token.has_value())
-        command.credential.secret = *token;
+        command.credential.secret = SecureString { *token };
     if (auto const user = value("FASTCACHE_USER"); user.has_value())
         command.credential.username = *user;
 }

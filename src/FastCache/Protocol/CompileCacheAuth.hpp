@@ -46,6 +46,10 @@ enum class CredentialOutcome : std::uint8_t
 /// of a server that also names a user. That is the form every in-tree client uses:
 /// `Cc::Credential` is constructed `{ .username = {}, .secret = token }`.
 ///
+/// A **machine ticket** is `NoPolicy` where no password is configured, for the reason
+/// any credential is, and `Rejected` where one is: verifying a ticket needs a roster,
+/// which a password policy does not have.
+///
 /// @param policy The surface's credential, or nullptr when it has none.
 /// @param payload The `AUTH` request payload, already read and bounded by
 ///        `MaxAuthPayload` -- this function does no length checking, because the
@@ -59,6 +63,11 @@ enum class CredentialOutcome : std::uint8_t
 
     if (policy == nullptr || !policy->Enabled())
         return CredentialOutcome::NoPolicy;
+
+    // A password surface holds no roster, so it can verify no machine: a ticket is never a
+    // password here, and comparing its bytes against the secret would be a check of nothing.
+    if (fields->kind == CompileCacheWire::AuthKind::MachineTicket)
+        return CredentialOutcome::Rejected;
 
     auto const username = CompileCacheWire::AsStringView(fields->username);
     auto const secret = CompileCacheWire::AsStringView(fields->secret);

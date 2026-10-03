@@ -112,9 +112,10 @@ inline constexpr std::string_view ConsensusNeedsIdentityKeyRefusal =
 /// mode may start without an address is a rule, and `Start` needs a whole tier to reach it.
 /// @param cfg The resolved configuration, with its identity and formation applied.
 /// @param members The members the formation starts consensus with (`BootstrapMembersOf`).
+/// @param publicKey The identity key this node proves itself with, which a record always holds.
 /// @return The record, or `ConsensusNeedsNodeIdRefusal` / `ConsensusNamesNoDialAddressRefusal`.
 [[nodiscard]] std::expected<Cluster::ClusterMember, std::string> ConsensusSelfMemberOf(
-    NodeConfig const& cfg, std::span<Cluster::ClusterMember const> members);
+    NodeConfig const& cfg, std::span<Cluster::MemberSpec const> members, Ed25519PublicKey const& publicKey);
 
 /// Where a member's consensus port answers, as a log line says it.
 ///
@@ -190,7 +191,7 @@ inline constexpr std::string_view ConsensusNeedsIdentityKeyRefusal =
 ///
 /// `RaftDriver::Create` refused because the application cannot read what the node
 /// recovered -- its own snapshot, or a command its own log holds -- and running on the
-/// rest would mean running without the members, the settings and the forget tombstones
+/// rest would mean running without the members, the settings and the revoked keys
 /// that state carried. What an operator needs is WHERE (the directory), WHAT (which
 /// part, the version found and the version this build reads, all of it in the
 /// refusal's context) and what to DO, which is the store's own remedy: the three files
@@ -519,7 +520,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     ConsensusTier(Cluster::ClusterMember self,
                   Consensus::FileRaftStorage storage,
                   Ed25519KeyPair identityKey,
-                  std::span<Cluster::ClusterMember const> knownMembers,
+                  std::span<Cluster::MemberSpec const> knownMembers,
                   std::string boundEndpoint,
                   RoleObserver onRole,
                   MembersObserver onMembers,
@@ -548,8 +549,8 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// @param bindPort The peer port.
     /// @return Nothing on success, or the fatal reason.
     [[nodiscard]] std::expected<void, std::string> Launch(NodeConfig const& cfg,
-                                                          std::vector<Cluster::ClusterMember> const& dialable,
-                                                          std::vector<Cluster::ClusterMember> const& bootstrap,
+                                                          std::vector<Cluster::MemberSpec> const& dialable,
+                                                          std::vector<Cluster::MemberSpec> const& bootstrap,
                                                           std::string_view bindAddress,
                                                           std::uint16_t bindPort);
 
@@ -620,14 +621,13 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     ///        between, so a leader would dial one set and propose from another.
     void LearnMembers(Cluster::ClusterState const& state, std::span<Cluster::DesiredMember const> desired);
 
-    /// Say, once per member, that a desire was refused because the cluster forgot its
-    /// host or its id.
+    /// Say, once per member, that a desire was refused because the cluster forgot its id
+    /// and revoked its key.
     ///
     /// The refusal itself is `Cluster::MembershipProposals`'s (#1528, #1555); this is only
     /// what makes it visible, since a refused desire and one the state already matches
-    /// both propose nothing. Which forget is named, because a host tombstone refuses
-    /// ANOTHER id at that host too, and an operator reading the line has to know which
-    /// machine's forget is being honoured. Reconciler thread only.
+    /// both propose nothing. The revoked key is named, because it is what the machine is
+    /// forgotten by, wherever it now dials from. Reconciler thread only.
     /// @param state The state the plan was made against.
     /// @param refused The desires this pass's plan refused.
     void ReportForgottenDesires(Cluster::ClusterState const& state, std::span<Cluster::DesiredMember const> refused);

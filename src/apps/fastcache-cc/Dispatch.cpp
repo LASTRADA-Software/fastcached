@@ -53,7 +53,8 @@ namespace
                                 .stdoutText = {},
                                 .stderrText = {},
                                 .detail = std::move(detail),
-                                .workerEndpoint = {} };
+                                .workerEndpoint = {},
+                                .declinedAt = {} };
     }
 
     /// Build a declined `DispatchResult`, classified by what the peer answered.
@@ -71,15 +72,20 @@ namespace
     /// the likeliest cause would be exactly the confident wrong signal this change
     /// exists to remove.
     ///
+    /// The exchange that answered is named with it, for the same reason: a caller explaining the
+    /// decline by what that exchange presented must not have to guess which one it was.
+    ///
     /// @param outcome What the peer answered.
+    /// @param site The exchange that answered it.
     /// @param detail The verbose sentence; variable text is welcome here, because it
     ///        reaches the `Note` and never the tally.
     /// @return The declined result, with its cause already decided.
-    [[nodiscard]] DispatchResult DeclinedBy(CacheOutcome const& outcome, std::string detail)
+    [[nodiscard]] DispatchResult DeclinedBy(CacheOutcome const& outcome, ExchangeSite site, std::string detail)
     {
         auto result = Refused(DispatchStatus::Declined, std::move(detail));
         result.decline =
             outcome.kind == CacheOutcomeKind::Rejected ? DeclineCauseFor(outcome.code) : DeclineCause::Unrecognised;
+        result.declinedAt = std::move(site);
         return result;
     }
 
@@ -197,8 +203,10 @@ namespace
             // fingerprint it does not have, an argument it will not accept. Distinct
             // from the compiler running and rejecting the code, which arrives as a
             // successful exchange carrying a non-zero exit code.
-            return DeclinedBy(compileOutcome,
-                              std::format("{} refused the job: {}", job.endpoint, DescribeOutcome(compileOutcome)));
+            return DeclinedBy(
+                compileOutcome,
+                ExchangeSite { .endpoint = std::string { job.endpoint }, .opcode = std::to_underlying(Wire::Op::Compile) },
+                std::format("{} refused the job: {}", job.endpoint, DescribeOutcome(compileOutcome)));
 
         auto const result = Wire::DecodeCompileResult(compileOutcome.value);
         if (!result.has_value())
@@ -250,7 +258,8 @@ namespace
                                 .stdoutText = std::string { Wire::AsStringView(result->stdoutText) },
                                 .stderrText = std::string { Wire::AsStringView(result->stderrText) },
                                 .detail = {},
-                                .workerEndpoint = std::string { job.endpoint } };
+                                .workerEndpoint = std::string { job.endpoint },
+                                .declinedAt = {} };
     }
 
     /// Tell the scheduler this lease is done with, however the job ended.
@@ -423,7 +432,9 @@ DispatchResult Dispatch(IEndpointExchange& exchange,
         // NoWorker, NoCapacity, AlreadyInFlight, DispatchNotPermitted -- every one
         // of them ordinary, and every one answered by compiling locally. The
         // scheduler's own words travel so the caller can say which it was.
-        return DeclinedBy(leaseOutcome, DescribeOutcome(leaseOutcome));
+        return DeclinedBy(leaseOutcome,
+                          ExchangeSite { .endpoint = lease.scheduler, .opcode = std::to_underlying(Wire::Op::Lease) },
+                          DescribeOutcome(leaseOutcome));
 
     auto const grant = Wire::DecodeLeaseGrant(leaseOutcome.value);
     if (!grant.has_value())

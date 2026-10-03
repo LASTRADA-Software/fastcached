@@ -22,16 +22,14 @@
 
 // **The removal direction is the test** (#405).
 //
-// `--fleet-member` and `--fleet-open` are the settings a fleet actually edits, and
-// their two directions are not symmetric. A member ADDED to the file and not yet
-// admitted fails CLOSED: the machine is refused until somebody restarts the node,
-// which is annoying, self-healing and visible from the machine being refused. A member
-// REMOVED from the file and still admitted fails OPEN: a machine the operator has just
-// revoked keeps being served, and nothing reports it, because admission succeeding is
-// the ordinary case.
+// `--fleet-open` is the admission setting a reload can move, and its two directions
+// are not symmetric. Turned ON and not yet in force it fails CLOSED: a caller is
+// refused until somebody restarts the node, which is annoying, self-healing and
+// visible from the machine being refused. Turned OFF and still in force it fails
+// OPEN: every caller the roster does not admit keeps being served, and nothing reports
+// it, because admission succeeding is the ordinary case.
 //
-// So the addition case is here only to stop a change that satisfies the easy half from
-// passing, and every other case is about narrowing.
+// So the cases are about narrowing, and about the one widening that is refused.
 
 using namespace FastCache;
 
@@ -48,15 +46,14 @@ namespace
 
 /// A node registering with a scheduler on its own machine.
 ///
-/// Loopback deliberately: a REMOTE scheduler plus a membership policy is what the
-/// three `--advertise` reachability rows are about, so a fixture that named one would
-/// have every reload below refused for a reason none of them is testing.
+/// Loopback deliberately: a REMOTE scheduler plus an admission route -- which a worker's
+/// state directory always is -- is what the `--advertise` reachability rows are about,
+/// so a fixture that named one would have every reload below refused for a reason none
+/// of them is testing.
 constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
 
-/// A peer that is not this machine. `ClusterMembership` answers `Member` for the whole
-/// of `127.0.0.0/8` before it reads the list, so a loopback caller could never show
-/// that a list decides anything.
-constexpr std::string_view Revoked = "10.0.0.7";
+/// A peer that is not this machine. `LoopbackMembership` answers `Member` for the whole
+/// of `127.0.0.0/8`, so a loopback caller could never show that a policy decides anything.
 constexpr std::string_view Stranger = "10.0.0.99";
 
 /// Write @p text, verbatim, to a configuration file this case owns.
@@ -106,16 +103,14 @@ constexpr std::string_view StateDirectory = "node-state";
 }
 
 /// The configuration a node in these cases is running with.
-/// @param members What `--fleet-member` named at startup.
 /// @param open Whether `--fleet-open` was given.
 /// @return The live configuration.
-[[nodiscard]] NodeConfig RunningNode(std::vector<std::string> members = {}, bool open = false)
+[[nodiscard]] NodeConfig RunningNode(bool open = false)
 {
     NodeConfig cfg;
     cfg.schedulers = { std::string { SelfScheduler } };
     cfg.clusterDir = StateDirectory;
     cfg.raftListen.clear(); // as `WriteConfig`'s file says
-    cfg.fleetMembers = std::move(members);
     cfg.fleetOpen = open;
     return cfg;
 }
@@ -191,81 +186,17 @@ TEST_CASE("A reload candidate is shaped by the formation, the names and the iden
     CHECK(reloaded.has_value());
 }
 
-TEST_CASE("A member removed from the file is refused after the reload", "[node][membership][reload][revocation]")
-{
-    // **The acceptance clause, and the direction nothing would otherwise report.**
-    //
-    // Asserted on the CLASSIFICATION rather than on the reload's outcome or on the
-    // snapshot's field. A reload that is accepted and publishes a configuration the
-    // running oracle never hears about is exactly the defect: `reloader.Current()`
-    // would agree with the file perfectly while the compile port went on serving the
-    // revoked machine.
-    Testing::ScratchDirectory const scratch { "node-reload-revoke" };
-    auto const path = WriteConfig(scratch.Path(), "fleet_member: 10.0.0.8\n");
-
-    auto const initial = RunningNode({ std::string { Revoked }, "10.0.0.8" });
-    NodeMembership membership { initial, membershipLog };
-    // Bound ONCE, as a surface does at startup.
-    auto const& oracle = membership.Oracle();
-    NullLogger logger;
-
-    REQUIRE(Admits(oracle, Revoked));
-
-    NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
-    NodeConditions conditions;
-    ApplyReloadRequest(&reloader, membership, conditions, logger);
-
-    CHECK_FALSE(Admits(oracle, Revoked));
-    // The control, and it is not decoration: an `Adopt` that published an EMPTY list
-    // would satisfy the assertion above while revoking the whole fleet, which is a
-    // different defect with the same green.
-    CHECK(Admits(oracle, "10.0.0.8"));
-}
-
-TEST_CASE("A member added to the file is admitted after the reload", "[node][membership][reload]")
-{
-    // The easy half, asserted separately and on purpose: a change that only ever
-    // EXTENDS the list -- which is what an implementation reaching for
-    // `ClusterMembership`'s additive publisher by mistake would produce -- passes this
-    // and fails the case above. Neither case alone says the list was replaced.
-    //
-    // It starts from a node that ALREADY admits a remote peer, and that is not
-    // incidental: a rosterless node going from admitting nobody to admitting somebody is
-    // refused by the guard two cases down, so a fixture that widened from nothing
-    // would fail here for a reason this case is not about. Adding a SECOND host to a
-    // policy that already reaches the network changes nothing about what this node can
-    // verify.
-    Testing::ScratchDirectory const scratch { "node-reload-admit" };
-    auto const path = WriteConfig(scratch.Path(), std::format("fleet_member:\n  - 10.0.0.8\n  - {}\n", Revoked));
-
-    auto const initial = RunningNode({ "10.0.0.8" });
-    NodeMembership membership { initial, membershipLog };
-    // Bound ONCE, as a surface does at startup.
-    auto const& oracle = membership.Oracle();
-    NullLogger logger;
-
-    REQUIRE_FALSE(Admits(oracle, Revoked));
-    REQUIRE(Admits(oracle, "10.0.0.8"));
-
-    NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
-    NodeConditions conditions;
-    ApplyReloadRequest(&reloader, membership, conditions, logger);
-
-    CHECK(Admits(oracle, Revoked));
-    CHECK(Admits(oracle, "10.0.0.8"));
-}
-
 TEST_CASE("Dropping fleet_open closes the node again", "[node][membership][reload][revocation]")
 {
-    // The narrowing direction of the OTHER flag, and it needs no list at all: an open
-    // node admits every caller there is, so turning it off revokes everybody nobody
-    // listed. `fleet_open` is a boolean whose key spells the FLAG, so this works
+    // The narrowing direction: an open node admits every caller there is, so turning it
+    // off refuses everybody the roster does not admit. `fleet_open` is a boolean whose
+    // key spells the FLAG, so this works
     // because the candidate is built FRESH -- a key that is gone from the file is a
     // flag that is not passed, rather than a value that persists.
     Testing::ScratchDirectory const scratch { "node-reload-close" };
     auto const path = WriteConfig(scratch.Path(), "fleet_open: false\n");
 
-    auto const initial = RunningNode({}, /*open=*/true);
+    auto const initial = RunningNode(/*open=*/true);
     NodeMembership membership { initial, membershipLog };
     // Bound ONCE, as a surface does at startup.
     auto const& oracle = membership.Oracle();
@@ -296,7 +227,7 @@ TEST_CASE("A reload may not widen admission on a node that cannot check a lease"
     // declined" and "nothing took effect" are two claims and a reload is all-or-nothing
     // only if both hold.
     Testing::ScratchDirectory const scratch { "node-reload-keyless-widen" };
-    auto const path = WriteConfig(scratch.Path(), std::format("fleet_member: {}\n", Revoked));
+    auto const path = WriteConfig(scratch.Path(), "fleet_open: true\n");
 
     auto const initial = RunningNode();
     REQUIRE(initial.voterKeys.empty()); // no roster root (#178)
@@ -311,14 +242,14 @@ TEST_CASE("A reload may not widen admission on a node that cannot check a lease"
     NodeConditions conditions;
     ApplyReloadRequest(&reloader, membership, conditions, logger);
 
-    CHECK_FALSE(Admits(oracle, Revoked));
+    CHECK_FALSE(Admits(oracle, Stranger));
     // **WHICH refusal, not that one happened.** The startup table's lease row and this
     // guard both name `--voter-key` (#178), so matching that string alone passes
     // for either -- and on a loopback-bound node the startup row does not fire, which is
     // exactly the gap this rule exists to cover. `may not widen` is this rule's own
     // words; the case below asserts the other side of the same distinction.
     CHECK(sink.str().contains("may not widen"));
-    CHECK(reloader.Current()->fleetMembers.empty());
+    CHECK_FALSE(reloader.Current()->fleetOpen);
 }
 
 TEST_CASE("A node running no worker may widen admission without a key", "[node][membership][reload][revocation]")
@@ -330,7 +261,7 @@ TEST_CASE("A node running no worker may widen admission without a key", "[node][
     //
     // No `scheduler:` line, because a node running no worker registers nowhere.
     Testing::ScratchDirectory const scratch { "node-reload-no-worker-widen" };
-    auto const path = WriteFile(scratch.Path(), std::format("slots: 0\nfleet_member: {}\n", Revoked));
+    auto const path = WriteFile(scratch.Path(), "slots: 0\nfleet_open: true\n");
 
     NodeConfig initial;
     initial.slots = 0;
@@ -340,8 +271,8 @@ TEST_CASE("A node running no worker may widen admission without a key", "[node][
     auto const candidate = Reparse(path);
     REQUIRE(candidate.has_value());
     // The premise: the widening shape the case above refuses on a worker.
-    REQUIRE(AdmitsRemotePeers(*candidate));
-    REQUIRE_FALSE(AdmitsRemotePeers(initial));
+    REQUIRE(AdmitsRemotePeers(*candidate, RosterPresence::Absent));
+    REQUIRE_FALSE(AdmitsRemotePeers(initial, RosterPresence::Absent));
 
     auto const outcome = ValidateNodeReloadable(initial, *candidate);
     INFO((outcome.has_value() ? std::string {} : outcome.error().context));
@@ -364,7 +295,7 @@ TEST_CASE("A widening refusal names every setting that may not change", "[node][
     // and passed under both orderings, because `StartupPolicyRejection` refuses that one
     // before either check runs. It was the neuter that said so, not the reading.
     Testing::ScratchDirectory const scratch { "node-reload-widen-diagnosis" };
-    auto const path = WriteConfig(scratch.Path(), std::format("slots: 7\nfleet_member: {}\n", Revoked));
+    auto const path = WriteConfig(scratch.Path(), "slots: 7\nfleet_open: true\n");
 
     auto const initial = RunningNode();
     auto const candidate = Reparse(path);
@@ -374,8 +305,8 @@ TEST_CASE("A widening refusal names every setting that may not change", "[node][
     // than passing quietly: this save BOTH widens -- which needs the previous
     // configuration to admit nobody remote, or the widening rule cannot fire at all and
     // the case proves nothing -- and moves an unreloadable row.
-    REQUIRE_FALSE(AdmitsRemotePeers(initial));
-    REQUIRE(AdmitsRemotePeers(*candidate));
+    REQUIRE_FALSE(AdmitsRemotePeers(initial, RosterPresence::Absent));
+    REQUIRE(AdmitsRemotePeers(*candidate, RosterPresence::Absent));
     REQUIRE(candidate->slots != initial.slots);
 
     auto const outcome = ValidateNodeReloadable(initial, *candidate);
@@ -393,100 +324,93 @@ TEST_CASE("Narrowing is allowed on a keyless node, which is the direction that c
     Testing::ScratchDirectory const scratch { "node-reload-keyless-narrow" };
     auto const path = WriteConfig(scratch.Path(), "");
 
-    auto const initial = RunningNode({ std::string { Revoked } });
+    auto const initial = RunningNode(/*open=*/true);
     NodeMembership membership { initial, membershipLog };
     // Bound ONCE, as a surface does at startup.
     auto const& oracle = membership.Oracle();
     NullLogger logger;
 
-    REQUIRE(Admits(oracle, Revoked));
+    REQUIRE(Admits(oracle, Stranger));
 
     NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
     NodeConditions conditions;
     ApplyReloadRequest(&reloader, membership, conditions, logger);
 
-    CHECK_FALSE(Admits(oracle, Revoked));
+    CHECK_FALSE(Admits(oracle, Stranger));
 }
 
 TEST_CASE("A revocation is announced, and a reload that touched nothing is silent", "[node][membership][reload][revocation]")
 {
-    // The observable half. An operator who ADDS a member finds out it worked the
-    // moment that machine's build is distributed; one who REVOKES has no such signal,
-    // because admission succeeding is the ordinary case. So the revoked hosts are
-    // named individually -- what a reader is checking is the list they meant to
-    // shorten.
-    auto const before = RunningNode({ std::string { Revoked }, "10.0.0.8" });
-
-    SECTION("a dropped host is named")
-    {
-        auto const after = RunningNode({ "10.0.0.8" });
-        auto const said = AdmissionAnnouncement(before, after);
-        REQUIRE(said.has_value());
-        auto const line = Testing::Unwrap(said);
-        CHECK(line.contains(Revoked));
-        // And the one still listed is NOT named as dropped, or the line an operator
-        // reads to confirm a revocation reports two and means one.
-        CHECK_FALSE(line.contains("no longer admitted: 10.0.0.7, 10.0.0.8"));
-    }
-
+    // The observable half. Turning `--fleet-open` ON announces itself the moment a
+    // stranger's build is served; turning it OFF has no such signal, because admission
+    // succeeding is the ordinary case -- and it refuses every caller the roster does not
+    // admit, a set no list can enumerate. So both directions are said, in words.
     SECTION("closing an open node says what that did")
     {
-        auto const openBefore = RunningNode({}, /*open=*/true);
-        auto const said = AdmissionAnnouncement(openBefore, RunningNode());
+        auto const said = AdmissionAnnouncement(RunningNode(/*open=*/true), RunningNode());
         REQUIRE(said.has_value());
-        // No list can enumerate "everybody who was not on a list", so this case says
-        // what happened instead of naming nobody and reading as a no-op.
         CHECK(Testing::Unwrap(said).contains("--fleet-open is off"));
+        CHECK(Testing::Unwrap(said).contains("every caller the roster does not admit is now refused"));
     }
 
-    SECTION("a reload that changed neither flag says nothing")
+    SECTION("opening a node says so too")
+    {
+        auto const said = AdmissionAnnouncement(RunningNode(), RunningNode(/*open=*/true));
+        REQUIRE(said.has_value());
+        CHECK(Testing::Unwrap(said).contains("--fleet-open is on"));
+        // And the two directions are told apart, or an operator confirming a narrowing
+        // reads a widening's line.
+        CHECK_FALSE(Testing::Unwrap(said).contains("--fleet-open is off"));
+    }
+
+    SECTION("a reload that changed nothing about admission says nothing")
     {
         // A reload is a routine event: a `log_level` change must not narrate an
         // admission policy nobody edited, or the line that MATTERS is the one that
         // gets filtered out.
+        auto const before = RunningNode(/*open=*/true);
         auto moved = before;
         moved.logLevel = LogLevel::Debug;
         CHECK_FALSE(AdmissionAnnouncement(before, moved).has_value());
-    }
-
-    SECTION("reordering the list is not a revocation")
-    {
-        auto const reordered = RunningNode({ "10.0.0.8", std::string { Revoked } });
-        auto const said = AdmissionAnnouncement(before, reordered);
-        // Either answer is legitimate -- a reorder is a change to the value and saying
-        // so is not wrong -- but neither may claim a host was revoked.
-        if (said.has_value())
-            CHECK_FALSE(Testing::Unwrap(said).contains("no longer admitted"));
     }
 }
 
 TEST_CASE("A reload never revokes what the cluster agreed", "[node][membership][reload]")
 {
-    // #251 arriving through the door this ticket opens. `--fleet-member` and the
-    // cluster's agreed set are two questions with two publishers, and a reload holds
-    // the whole truth about exactly one of them. An `Adopt` that wrote the composite
-    // -- or that published into `_cluster` -- would discard every host consensus
-    // admitted, which is the defect that made the two lists separate in the first
-    // place, reached from the other side.
+    // #251 arriving through the door a reload opens. `--fleet-open` and the cluster's
+    // agreed keys are two questions with two publishers, and a reload holds the whole
+    // truth about exactly one of them. An `Adopt` that rebuilt the composite -- or that
+    // republished the key roster -- would discard every machine consensus admitted.
     Testing::ScratchDirectory const scratch { "node-reload-keeps-cluster" };
     auto const path = WriteConfig(scratch.Path(), "");
 
-    auto const initial = RunningNode({ std::string { Revoked } });
+    auto const initial = RunningNode(/*open=*/true);
     NodeMembership membership { initial, membershipLog };
     // Bound ONCE, as a surface does at startup.
     auto const& oracle = membership.Oracle();
     NullLogger logger;
 
-    membership.Publish({ "10.0.0.50:6676" });
-    REQUIRE(Admits(oracle, "10.0.0.50"));
+    // A member the cluster admitted by its key, proving it from its own address.
+    auto const key = Testing::TestKeyPair("m50").PublicKey();
+    auto state = Cluster::ClusterState {};
+    Cluster::Apply(state,
+                   Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                                      .key = "m50",
+                                      .value = "10.0.0.50:6676",
+                                      .schedulerEndpoint = {},
+                                      .publicKey = key,
+                                      .role = std::nullopt });
+    membership.PublishCluster(state);
+    auto const member = ConnectionFacts { .host = "10.0.0.50", .proven = ProvenIdentity { .id = "m50", .key = key } };
+    REQUIRE(Distributed::ExplainConnection(oracle, member).verdict == Distributed::Membership::Member);
 
     NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
     NodeConditions conditions;
     ApplyReloadRequest(&reloader, membership, conditions, logger);
 
-    // The operator's list emptied, and the cluster's survived it.
-    CHECK_FALSE(Admits(oracle, Revoked));
-    CHECK(Admits(oracle, "10.0.0.50"));
+    // The node closed, and the cluster's member survived it.
+    CHECK_FALSE(Admits(oracle, Stranger));
+    CHECK(Distributed::ExplainConnection(oracle, member).verdict == Distributed::Membership::Member);
 }
 
 TEST_CASE("A node that binds its own network-facing port is closed by the reload guard too",
@@ -507,15 +431,14 @@ TEST_CASE("A node that binds its own network-facing port is closed by the reload
     // widening is refused, and refused by the guard's own words. A change that let it through
     // would open an unauthenticated compile port with every refusal counter reading zero.
     //
-    // `--advertise` is named because otherwise the reachability rows answer first -- a
-    // membership policy plus a wildcard advertise is what they are about, and the case
+    // `--advertise` is named because otherwise the reachability rows answer first -- an
+    // admission route plus a wildcard advertise is what they are about, and the case
     // would then pass for a reason that has nothing to do with keys.
     Testing::ScratchDirectory const scratch { "node-reload-self-bound" };
     auto const path = WriteConfig(scratch.Path(),
-                                  std::format("listen_node: 0.0.0.0:6674\n"
-                                              "advertise: worker-01.internal:6674\n"
-                                              "fleet_member: {}\n",
-                                              Revoked));
+                                  "listen_node: 0.0.0.0:6674\n"
+                                  "advertise: worker-01.internal:6674\n"
+                                  "fleet_open: true\n");
 
     auto initial = RunningNode();
     initial.nodeListen = "0.0.0.0:6674";
@@ -526,8 +449,8 @@ TEST_CASE("A node that binds its own network-facing port is closed by the reload
     REQUIRE(candidate.has_value());
     // The premise: this really is the widening shape, on a port that really does face
     // the network. Without both, the case would pass having exercised nothing.
-    REQUIRE(AdmitsRemotePeers(*candidate));
-    REQUIRE_FALSE(AdmitsRemotePeers(initial));
+    REQUIRE(AdmitsRemotePeers(*candidate, RosterPresence::Absent));
+    REQUIRE_FALSE(AdmitsRemotePeers(initial, RosterPresence::Absent));
     REQUIRE(candidate->nodeListen == "0.0.0.0:6674");
     // And the startup table lets the candidate through, which is what leaves the guard as the
     // only thing standing: it names a state directory, which might hold a roster.
@@ -583,4 +506,35 @@ TEST_CASE("A reload that gives --advertise clears unqualified-host-name, and one
         REQUIRE(reloader.Current()->advertise == "10.0.0.5:6674");
         CHECK(conditions.StateOf(NodeCondition::UnqualifiedHostName) == Wire::ConditionState::Clear);
     }
+}
+
+TEST_CASE("A reload whose file still lists fleet_member is refused by name, and nothing is applied",
+          "[node][membership][reload][admission]")
+{
+    // The retired key reaching the path a running node reads, rather than the start: a file an
+    // operator edited back to its old shape and saved. A key naming no row is refused, so the
+    // list is never silently ignored -- and the refusal is the whole-file kind, so the
+    // `fleet_open: true` beside it does not slip through either.
+    Testing::ScratchDirectory const scratch { "node-reload-fleet-member" };
+    auto const path = WriteConfig(scratch.Path(), "fleet_open: true\nfleet_member: 10.0.0.7\n");
+
+    auto const initial = RunningNode();
+    NodeMembership membership { initial, membershipLog };
+    // Bound ONCE, as a surface does at startup.
+    auto const& oracle = membership.Oracle();
+
+    NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
+    auto const reloaded = reloader.Reload();
+    REQUIRE_FALSE(reloaded.has_value());
+    CHECK(reloaded.error().code == ConfigErrorCode::UnknownKey);
+    CHECK(reloaded.error().field == "fleet_member");
+
+    // Nothing applied: the snapshot is the one the node started with, and a reload request
+    // through the production seam leaves the oracle closed.
+    CHECK_FALSE(reloader.Current()->fleetOpen);
+    NullLogger logger;
+    NodeConditions conditions;
+    ApplyReloadRequest(&reloader, membership, conditions, logger);
+    CHECK_FALSE(Admits(oracle, Stranger));
+    CHECK_FALSE(Admits(oracle, "10.0.0.7"));
 }

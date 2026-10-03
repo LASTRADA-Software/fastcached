@@ -26,7 +26,7 @@ std::optional<EndpointChange> AdvertisedEndpointChange(std::string_view inForce,
                                                        std::shared_ptr<NodeConfig const> const& live)
 {
     // No configuration file means no second moment at which anything could change,
-    // which is `ConfiguredCredential`'s null-reloader arm one layer up. Asked here
+    // which is `ConfiguredCredential`'s null-reloader arm too. Asked here
     // rather than at the call site so the rule is in the tested function rather than in
     // the heartbeat loop no test reaches.
     if (live == nullptr)
@@ -141,7 +141,7 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
     // failure is not retried.
     for (auto& retiring: round.withdrawals)
     {
-        if (auto const retired = retiring.Withdraw(client, round.credential.Current()); !retired.has_value())
+        if (auto const retired = retiring.Withdraw(client); !retired.has_value())
             // Logged and not acted on. Every refusal here -- an `UnknownOpcode` from a
             // scheduler too old to know the verb, a `NotLeader`, an unreachable host --
             // leaves the pre-existing expiry closing the window exactly as before, so
@@ -162,7 +162,7 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
     {
         if (!registrar.WorkerId().empty())
         {
-            auto const beat = registrar.Heartbeat(client, inFlight, load, round.credential.Current());
+            auto const beat = registrar.Heartbeat(client, inFlight, load);
             if (beat.has_value())
             {
                 ++accepted;
@@ -178,7 +178,7 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
         // operator knew about a node that had silently dropped out of the fleet -- a
         // fingerprint the scheduler will not accept, a cluster this node is not a
         // member of, a leader that has moved.
-        if (auto const registered = registrar.Register(client, round.credential.Current()); registered.has_value())
+        if (auto const registered = registrar.Register(client); registered.has_value())
         {
             // The fleet the scheduler named, adopted here rather than configured. Until
             // this runs the worker is unpinned and refuses every grant, which is the
@@ -198,7 +198,7 @@ AnnounceOutcome AnnounceOnce(HeartbeatRound const& round, core::net::ISocket& cl
             // Not counted as a beat: `DescribeAnnounceRound` reads beats and registrations
             // as a partition of the registrars, and this one already registered.
             if (load.cordoned)
-                (void) registrar.Heartbeat(client, inFlight, load, round.credential.Current());
+                (void) registrar.Heartbeat(client, inFlight, load);
         }
         else
         {
@@ -243,12 +243,7 @@ std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEnd
     };
 
     WorkerAnnouncement announcement { round };
-    return DialAndAnnounce(
-        link,
-        dialer,
-        round.logger,
-        announcement,
-        AnnounceProof { .prover = round.prover, .credential = &round.credential, .notice = &round.notice });
+    return DialAndAnnounce(link, dialer, round.logger, announcement, AnnounceProof { .prover = round.prover });
 }
 
 namespace
@@ -308,7 +303,7 @@ std::size_t DialAndAnnounce(
         {
             auto sealed = std::make_unique<SealedFrameSocket>(
                 std::move(client), SealedFrameEnd::Caller, CompileCacheWire::MaxSealedReplyPayload);
-            auto const attempt = proof.prover->Prove(*sealed, *proof.notice, proof.credential->Current());
+            auto const attempt = proof.prover->Prove(*sealed);
             if (attempt.result != NodeProofResult::Proved)
             {
                 auto const unproved = link.Target();

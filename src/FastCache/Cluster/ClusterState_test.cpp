@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <tests/PreviousClusterState.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -29,13 +30,18 @@ using FastCache::Testing::Unwrap;
 
 namespace
 {
-/// A command, spelled once so the cases below vary only what they are about.
+/// A command that states no key, spelled once so the cases below vary only what they are about.
+///
+/// For a member admission this is the KEYLESS one, which `ValidateAgainst` refuses and `Apply`
+/// drops unless a key is already recorded for the id -- so a case admitting a member from
+/// absence spells `Cmd`, which states the member's own key, and only a case ABOUT keylessness
+/// spells this.
 /// @param kind What it does.
 /// @param key The member id or setting name.
 /// @param value The consensus endpoint or setting value.
 /// @param scheduler Where clients reach this member while it leads.
 /// @return The command.
-[[nodiscard]] Command Cmd(CommandKind kind, std::string key, std::string value = {}, std::string scheduler = {})
+[[nodiscard]] Command Keyless(CommandKind kind, std::string key, std::string value = {}, std::string scheduler = {})
 {
     return Command { .kind = kind,
                      .key = std::move(key),
@@ -43,6 +49,22 @@ namespace
                      .schedulerEndpoint = std::move(scheduler),
                      .publicKey = std::nullopt,
                      .role = std::nullopt };
+}
+
+/// A command, spelled once so the cases below vary only what they are about: `Keyless`, except
+/// that a member admission states the member's own identity key, as every admission from absence
+/// must.
+/// @param kind What it does.
+/// @param key The member id or setting name.
+/// @param value The consensus endpoint or setting value.
+/// @param scheduler Where clients reach this member while it leads.
+/// @return The command.
+[[nodiscard]] Command Cmd(CommandKind kind, std::string key, std::string value = {}, std::string scheduler = {})
+{
+    auto command = Keyless(kind, std::move(key), std::move(value), std::move(scheduler));
+    if (SeatAdmittedBy(kind).has_value())
+        command.publicKey = Testing::TestKeyPair(command.key).PublicKey();
+    return command;
 }
 
 /// A public key whose every byte is @p fill -- not a curve point, which the roster never
@@ -54,6 +76,19 @@ namespace
 {
     auto key = Ed25519PublicKey {};
     key.fill(static_cast<std::byte>(fill));
+    return key;
+}
+
+/// A small-order point that is NOT the all-zero key: the identity, y = 1.
+///
+/// The all-zero key is small-order too, but this project reads it first as a key nobody named --
+/// what a command built without one carries -- and refuses it as "no identity key" before the curve
+/// is asked. So a case about the SMALL-ORDER refusal names a point only that refusal can answer.
+/// @return The key.
+[[nodiscard]] Ed25519PublicKey SmallOrderIdentityPoint()
+{
+    auto key = Ed25519PublicKey {};
+    key.front() = std::byte { 0x01 };
     return key;
 }
 
@@ -137,13 +172,10 @@ TEST_CASE("Promoting a learner that has no endpoint is refused by name", "[clust
     CHECK(refusal.context.contains("endpoint"));
 }
 
-TEST_CASE("Forgetting a learner recorded with no endpoint revokes its key and tombstones no host",
-          "[cluster][state][learner][formation]")
+TEST_CASE("Forgetting a learner recorded with no endpoint revokes its key", "[cluster][state][learner][formation]")
 {
-    // A learner that dials in names no host, so its forget has none to tombstone: an empty entry
-    // matches nothing (`SameHost`), and since two empty hosts are not the same machine either,
-    // every such forget would add another -- a `forgotten-clients` count of blanks. The revoked
-    // key is what makes it FORGOTTEN (#1555), and here it is the only fact left.
+    // A learner that dials in names no host, and a forget records none for any member: the revoked
+    // key is what makes a machine FORGOTTEN (#1555), wherever it dials from.
     auto state = ClusterState {};
     Apply(state, Keyed(CommandKind::AddLearner, "laptop", KeyOf(7)));
     Apply(state, Keyed(CommandKind::AddLearner, "tablet", KeyOf(8)));
@@ -151,14 +183,14 @@ TEST_CASE("Forgetting a learner recorded with no endpoint revokes its key and to
     Apply(state, Cmd(CommandKind::Forget, "tablet"));
 
     CHECK(state.members.empty());
-    CHECK(state.forgotten.empty());
     CHECK(state.IsRevoked(KeyOf(7)));
     CHECK(state.IsRevoked(KeyOf(8)));
 
-    // The control: a member that HAD a host still leaves its tombstone.
+    // The control: a member that HAD a host is forgotten the same way, by its key alone.
     Apply(state, Keyed(CommandKind::AddMember, "desk", KeyOf(9), "10.0.0.9:6675"));
     Apply(state, Cmd(CommandKind::Forget, "desk"));
-    CHECK(state.forgotten == std::vector<std::string> { "10.0.0.9" });
+    CHECK(state.members.empty());
+    CHECK(state.IsRevoked(KeyOf(9)));
 }
 
 TEST_CASE("A member the cluster records has to be one it can name", "[cluster][state]")
@@ -426,25 +458,25 @@ TEST_CASE("A truncated snapshot is refused rather than half-read", "[cluster][st
 
 TEST_CASE("A state another build encoded is refused by its version while a command keeps its own", "[cluster][state][wire]")
 {
-    // #1449 added each member's seat, so the state's version moved again -- and the byte
-    // is pinned as well as the refusal, because a symbol both ends spell can only test the
+    // Removing the client and forgotten-host groups moved the state's version again -- and the
+    // byte is pinned as well as the refusal, because a symbol both ends spell can only test the
     // NAME of a wire constant. The version is the first field's only byte, after that
     // field's u32 length prefix.
     ClusterState state;
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     auto bytes = Encode(state);
     REQUIRE(bytes.size() > 4);
-    CHECK(bytes[4] == std::byte { 7 });
+    CHECK(bytes[4] == std::byte { 8 });
 
     // A version the next build might write. Refused BY NAME, both versions stated, and
     // never as `MalformedFrame`: those bytes are intact, and *damaged* is what gets a
     // healthy snapshot deleted. The previous build's LAYOUT is the case below this one.
-    bytes[4] = std::byte { 8 };
+    bytes[4] = std::byte { 9 };
     auto const newerState = DecodeState(bytes);
     REQUIRE_FALSE(newerState.has_value());
     CHECK(newerState.error().code == ConsensusErrorCode::UnsupportedVersion);
-    CHECK(newerState.error().context.contains("version 8"));
-    CHECK(newerState.error().context.contains("reads 7"));
+    CHECK(newerState.error().context.contains("version 9"));
+    CHECK(newerState.error().context.contains("reads 8"));
 
     // #178 moved the COMMAND layout as well -- two fields, a key and a role -- and #1555 moved
     // the version again with the layout untouched, because it changed what a verb MEANS: a
@@ -474,6 +506,11 @@ TEST_CASE("A state the previous build wrote is refused as another build's, never
     // At the decoder, and through `ClusterStateMachine::RestoreSnapshot` in its own file. A
     // node RESTARTING on a snapshot of its own at this version takes a different path, and
     // that path is #1542's -- this case says nothing about it.
+    //
+    // The previous layout is v7's: eight header fields, the client and forgotten-host counts
+    // among them, where this build writes six. Pinned as a literal, so a builder left writing
+    // an older layout still is caught rather than passing under this case's name.
+    REQUIRE(Testing::PreviousClusterStateVersion == 7);
     auto const previous = Testing::EncodePreviousClusterState();
     auto const refused = DecodeState(previous);
     REQUIRE_FALSE(refused.has_value());
@@ -484,7 +521,7 @@ TEST_CASE("A state the previous build wrote is refused as another build's, never
     CHECK(refused.error().context.contains(std::format("version {}", Testing::PreviousClusterStateVersion)));
     // The current version as a literal: it is private to the codec, and pinned by the
     // version case above.
-    CHECK(refused.error().context.contains("reads 7"));
+    CHECK(refused.error().context.contains("reads 8"));
 }
 
 TEST_CASE("A command the previous build wrote is refused by its version before its arity is judged",
@@ -557,9 +594,10 @@ TEST_CASE("A member's scheduler endpoint says whether it was never announced or 
     CHECK(stateOf("led") == SchedulerEndpointState::Announced);
 
     // A forget is a positive act, so an id admitted from absence has announced nothing
-    // -- whatever an earlier member of that name once did.
+    // -- whatever an earlier member of that name once did. Admitted again under a NEW key,
+    // since the forget revoked the old one.
     Apply(state, Cmd(CommandKind::Forget, "led"));
-    Apply(state, Cmd(CommandKind::AddMember, "led", "10.0.0.9:6675"));
+    Apply(state, Keyed(CommandKind::AddMember, "led", KeyOf(0x5E), "10.0.0.9:6675"));
     CHECK(stateOf("led") == SchedulerEndpointState::NeverAnnounced);
 
     // And the three spellings are three, so no renderer reading the table can print
@@ -600,37 +638,40 @@ TEST_CASE("A snapshot whose scheduler endpoint history cannot be true is refused
                                                                     .schedulerEndpoint = "10.0.0.1:7000",
                                                                     .schedulerEndpointHistory =
                                                                         SchedulerEndpointHistory::NeverAnnounced,
-                                                                    .publicKey = std::nullopt } },
+                                                                    .publicKey = KeyOf(0x01) } },
                                        .settings = {},
-                                       .clients = {},
-                                       .forgotten = {},
                                        .principals = {},
                                        .revokedKeys = {} };
     auto const refused = DecodeState(Encode(contradictory));
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().code == ConsensusErrorCode::MalformedFrame);
 
-    // A history byte naming no history. With one member and no settings the byte is
-    // the encoding's last.
+    // A history byte naming no history. With one member and no settings the byte sits before
+    // the seat's field and the key field: two four-byte lengths, the seat and the key.
     ClusterState quiet;
     Apply(quiet, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
     auto bytes = Encode(quiet);
     REQUIRE(DecodeState(bytes).has_value());
-    bytes.back() = static_cast<std::byte>(EnumeratorCount<SchedulerEndpointHistory>);
+    bytes[bytes.size() - 1 - sizeof(std::uint32_t) - Ed25519PublicKeyBytes - 1 - sizeof(std::uint32_t)] =
+        static_cast<std::byte>(EnumeratorCount<SchedulerEndpointHistory>);
     auto const unknown = DecodeState(bytes);
     REQUIRE_FALSE(unknown.has_value());
     CHECK(unknown.error().code == ConsensusErrorCode::MalformedFrame);
 }
 
-TEST_CASE("Endpoints come back in the order a membership oracle wants", "[cluster][state]")
+TEST_CASE("Members come back in id order, whatever order they were admitted in", "[cluster][state]")
 {
-    // `Distributed::ClusterMembership` takes endpoints and keys on hosts, so this is
-    // the shape the two layers meet in.
+    // What a roster is projected in and digested over (`Cluster::ProjectRoster`, "sorted exactly as
+    // `ClusterState` sorts"): two nodes that applied the same entries must hold the same bytes, or
+    // one voter's endorsement would not certify the roster another voter holds. Admitted out of
+    // order, so an append that forgot to sort cannot pass.
     ClusterState state;
     Apply(state, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"));
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
 
-    CHECK(state.Endpoints() == std::vector<std::string> { "10.0.0.1:6675", "10.0.0.2:6675" });
+    REQUIRE(state.members.size() == 2);
+    CHECK(state.members[0].id == "n1");
+    CHECK(state.members[1].id == "n2");
 }
 
 TEST_CASE("A member carries the port a client speaks to, not only the one peers do", "[cluster][state]")
@@ -653,10 +694,6 @@ TEST_CASE("A member carries the port a client speaks to, not only the one peers 
     CHECK(Unwrap(state.RaftEndpointOf("n2")) == "10.0.0.2:6675");
     CHECK_FALSE(state.SchedulerEndpointOf("n2").has_value());
     CHECK_FALSE(state.SchedulerEndpointOf("nobody").has_value());
-
-    // `Endpoints()` stays the consensus ones: it feeds the fleet's membership oracle,
-    // which keys on the HOST, and only this endpoint is guaranteed to be there.
-    CHECK(state.Endpoints() == std::vector<std::string> { "10.0.0.1:6675", "10.0.0.2:6675" });
 }
 
 TEST_CASE("Re-admitting a member replaces its whole record", "[cluster][state]")
@@ -866,85 +903,33 @@ TEST_CASE("A lease lifetime the cluster may not agree on is refused, and one it 
     }
 }
 
-TEST_CASE("Forgetting a client records that it was forgotten, and admitting it again clears that",
-          "[cluster][state][forget]")
+TEST_CASE("A forget revokes the machine's key and records no host", "[cluster][state][wire][forget]")
 {
-    // #1309. A local `--fleet-member` list may still name a host the cluster has
-    // forgotten, and a node can only refuse it if the forget left something behind:
-    // absence from `clients` is also the state of every host a list names and the cluster
-    // never admitted, so an erase alone decides nothing.
-    ClusterState state;
-    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.7"));
-    CHECK(state.AdmitsClient("10.0.0.7"));
-    CHECK_FALSE(state.HasForgotten("10.0.0.7"));
-
-    Apply(state, Cmd(CommandKind::ForgetClient, "10.0.0.7"));
-    CHECK_FALSE(state.AdmitsClient("10.0.0.7"));
-    CHECK(state.HasForgotten("10.0.0.7"));
-    CHECK(state.forgotten == std::vector<std::string> { "10.0.0.7" });
-
-    // The control: a host nobody forgot is not forgotten, including one the cluster never
-    // admitted -- which is every host a local list names.
-    CHECK_FALSE(state.HasForgotten("10.0.0.8"));
-
-    // A re-admit is the route back, and it clears the tombstone rather than leaving a
-    // host both admitted and forgotten for a reader to pick between.
-    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.7"));
-    CHECK(state.AdmitsClient("10.0.0.7"));
-    CHECK_FALSE(state.HasForgotten("10.0.0.7"));
-    CHECK(state.forgotten.empty());
-
-    // By host: a port is not something a caller is matched on, and the dual-stack spelling
-    // of the same machine is the same entry rather than a second one.
-    Apply(state, Cmd(CommandKind::ForgetClient, "10.0.0.7:6674"));
-    CHECK(state.HasForgotten("::ffff:10.0.0.7"));
-    Apply(state, Cmd(CommandKind::ForgetClient, "::ffff:10.0.0.7"));
-    CHECK(state.forgotten.size() == 1);
-}
-
-TEST_CASE("Forgetting a member records its host as forgotten, and admitting that host again clears it",
-          "[cluster][state][forget]")
-{
-    // The decommission this ticket is for: a member is forgotten, and every node whose
-    // own list still names its machine must be able to refuse it. The command carries an
-    // id only, so the host comes from the record being removed.
-    ClusterState state;
-    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
-    Apply(state, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6675"));
-
-    Apply(state, Cmd(CommandKind::Forget, "n1"));
-    CHECK(state.HasForgotten("10.0.0.1"));
-    CHECK_FALSE(state.HasForgotten("10.0.0.2"));
-
-    // Forgetting an id that is not a member leaves nothing: there is no host to derive,
-    // and a tombstone for a guess would refuse a machine nobody forgot.
-    Apply(state, Cmd(CommandKind::Forget, "nobody"));
-    CHECK(state.forgotten.size() == 1);
-
-    // Re-admitting a member at that host clears it; so would `AdmitClient`, the route a
-    // demoted member takes back as a plain worker.
-    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
-    CHECK_FALSE(state.HasForgotten("10.0.0.1"));
-
+    // A machine is forgotten by its key, and an address is not an identity: what the forget
+    // leaves is the revocation, and nothing about where the machine dialled from.
+    auto state = ClusterState {};
+    Apply(state, Keyed(CommandKind::AddMember, "n2", KeyOf(0x42), "10.0.0.2:6680"));
     Apply(state, Cmd(CommandKind::Forget, "n2"));
-    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.2"));
-    CHECK_FALSE(state.HasForgotten("10.0.0.2"));
+    CHECK(state.members.empty());
+    CHECK(state.IsRevoked(KeyOf(0x42)));
+    REQUIRE(state.revokedKeys.size() == 1);
+    CHECK(state.revokedKeys[0] == RevokedKey { .id = "n2", .publicKey = KeyOf(0x42) });
 
-    // Never loopback: a caller on a node's own machine is admitted whatever a list says,
-    // so a tombstone for it could narrow nothing -- and every member of a one-machine
-    // cluster answers on loopback.
-    Apply(state, Cmd(CommandKind::AddMember, "local", "127.0.0.1:6675"));
-    Apply(state, Cmd(CommandKind::Forget, "local"));
-    CHECK_FALSE(state.HasForgotten("127.0.0.1"));
+    // The state has nowhere to put a host any more: what the forget leaves is the key, and it
+    // survives the state's own encoding exactly.
+    auto const decoded = DecodeState(Encode(state));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded) == state);
+    CHECK(Encode(state) == Encode(Unwrap(decoded)));
 }
 
-TEST_CASE("Each cluster verb keeps the byte a log entry already carries", "[cluster][state][wire][forget]")
+TEST_CASE("The retired client verbs keep their bytes and are refused by name", "[cluster][state][wire][retired]")
 {
     // The BYTE, not the symbol: every caller in this tree spells the enumerator, so a
     // consistent renumbering stays green here while every log a fleet has already written
-    // decodes as a different verb. And the two client verbs sit above the byte every
-    // build before them treats as unknown, which is what makes such a build SKIP them
-    // rather than apply one as something else.
+    // decodes as a different verb. The two retired verbs keep 3 and 4, reserved and never
+    // reused, so an old entry carrying one is refused as retired rather than read as a verb
+    // that took its byte.
     auto const byteOf = [](CommandKind kind) {
         auto const bytes = Encode(Cmd(kind, "10.0.0.7"));
         // The verb sits in the second byte of the first field, after that field's u32
@@ -955,55 +940,178 @@ TEST_CASE("Each cluster verb keeps the byte a log entry already carries", "[clus
     CHECK(byteOf(CommandKind::AddMember) == 0U);
     CHECK(byteOf(CommandKind::Forget) == 1U);
     CHECK(byteOf(CommandKind::SetSetting) == 2U);
-    CHECK(byteOf(CommandKind::AdmitClient) == 3U);
-    CHECK(byteOf(CommandKind::ForgetClient) == 4U);
+    CHECK(byteOf(CommandKind::RetiredAdmitClient) == 3U);
+    CHECK(byteOf(CommandKind::RetiredForgetClient) == 4U);
     CHECK(byteOf(CommandKind::AddLearner) == 5U);
     CHECK(byteOf(CommandKind::AdmitPrincipal) == 6U);
     // And nothing above it: the next verb is 7, and until then a 7 is a verb this build does
     // not know, skipped by name rather than applied as something else.
     CHECK(static_cast<unsigned>(CommandKind::Last) == 7U);
+
+    // Refused by name at BOTH doors a command has. Its bytes, where every committed entry is
+    // read -- as the verb it is, retired, never as one this build lacks and never as damage --
+    // and a command somebody built, at `Validate`, whatever it carries: a host, as the old
+    // entries did, or an otherwise well-formed member's fields. `ValidateAgainst` refuses it
+    // the same way.
+    for (auto const kind: { CommandKind::RetiredAdmitClient, CommandKind::RetiredForgetClient })
+    {
+        INFO("verb " << static_cast<unsigned>(kind));
+        auto const decoded = DecodeCommand(Encode(Cmd(kind, "10.0.0.9")));
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == ConsensusErrorCode::UnknownMessageType);
+        CHECK(decoded.error().context.contains(std::format("verb {} is retired", static_cast<unsigned>(kind))));
+
+        auto const refused = Validate(Cmd(kind, "10.0.0.9"));
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::InvalidConfiguration);
+        CHECK(refused.error().context.contains("retired"));
+        CHECK(Refused(Cmd(kind, "n1", "10.0.0.1:6675", "10.0.0.1:7000")).contains("retired"));
+        CHECK(Refused(Cmd(kind, {})).contains("retired"));
+        CHECK(RefusedAgainst(ClusterState {}, Cmd(kind, "10.0.0.9")).context.contains("retired"));
+    }
 }
 
-TEST_CASE("A client command names a machine that is not this one, and nothing else", "[cluster][state][forget]")
+TEST_CASE("A member is never admitted without a key, because only a key can forget it", "[cluster][state][forget]")
 {
-    CHECK(Validate(Cmd(CommandKind::AdmitClient, "10.0.0.7")).has_value());
-    CHECK(Validate(Cmd(CommandKind::ForgetClient, "ci-runner-3.example:6674")).has_value());
+    auto const state = ClusterState {};
+    for (auto const kind: { CommandKind::AddLearner, CommandKind::AddMember })
+    {
+        INFO("verb " << static_cast<unsigned>(kind));
+        auto const refused = RefusedAgainst(state, Keyless(kind, "pc-9", "10.0.0.9:6675"));
+        CHECK(refused.code == ConsensusErrorCode::InvalidConfiguration);
+        CHECK(refused.context.contains("no identity key"));
+        CHECK(refused.context.contains("--cluster-admit=pc-9@<key>"));
+        CHECK(ValidateAgainst(state, Keyed(kind, "pc-9", KeyOf(0x99), "10.0.0.9:6675")).has_value());
+    }
 
-    CHECK(Refused(Cmd(CommandKind::AdmitClient, ":6674")).contains("must name a host"));
-    CHECK(Refused(Cmd(CommandKind::ForgetClient, "127.0.0.1")).contains("loopback"));
-    CHECK(Refused(Cmd(CommandKind::AdmitClient, "::1")).contains("loopback"));
-    CHECK(Refused(Cmd(CommandKind::ForgetClient, "10.0.0.7", "extra")).contains("nothing else"));
-    CHECK(Refused(Cmd(CommandKind::AdmitClient, "10.0.0.7", {}, "10.0.0.7:7000")).contains("nothing else"));
-
-    // Recorded, so it has to be text: the host is printed by every renderer of the state.
-    CHECK(Refused(Cmd(CommandKind::AdmitClient, "10.0.0.\x80")).contains("a client host"));
+    // A re-admission that names no key keeps the RECORDED one, which is a key: a machine that
+    // moves keeps its identity, so this is no keyless admission.
+    auto keyed = ClusterState {};
+    Apply(keyed, Keyed(CommandKind::AddMember, "pc-9", KeyOf(0x99), "10.0.0.9:6675"));
+    CHECK(ValidateAgainst(keyed, Keyless(CommandKind::AddLearner, "pc-9", "10.0.0.10:6675")).has_value());
 }
 
-TEST_CASE("Clients and forgotten hosts survive a snapshot apart from each other", "[cluster][state][wire][forget]")
+TEST_CASE("A keyless admission is dropped at commit when nothing records a key, and never outlives a forget",
+          "[cluster][state][forget]")
 {
-    // Both groups are lists of hosts, so a count read wrongly would silently turn an
-    // admitted client into a forgotten one -- a machine refused everywhere after a
-    // follower restores a snapshot.
-    ClusterState state;
-    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
-    Apply(state, Cmd(CommandKind::SetSetting, "fleet-open", "0"));
-    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.5"));
-    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.6"));
-    Apply(state, Cmd(CommandKind::ForgetClient, "10.0.0.9"));
+    // "`ValidateAgainst` is the courtesy, `Apply` the guarantee": the same predicate, at commit.
+    // Two proposals judged against one state can both be appended before either commits, and
+    // the order below is reachable from a leader of this build -- a keyed member's move, or a
+    // re-admission that names no key, is judged against the recorded key and passes; a forget
+    // of that id commits FIRST. Applied as it stood, the re-admission would re-create the
+    // record with no key: an address route, a forgotten leader kept in the quorum, and a
+    // forget of it refused as one that revokes nothing -- removal failing open.
+    auto state = ClusterState {};
+    Apply(state, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6680"));
+    auto const readmit = Keyless(CommandKind::AddMember, "n2", "10.0.0.20:6680");
+    REQUIRE(ValidateAgainst(state, readmit).has_value());
 
-    auto const restored = DecodeState(Encode(state));
-    REQUIRE(restored.has_value());
-    CHECK(*restored == state);
-    CHECK(restored->clients == std::vector<std::string> { "10.0.0.5", "10.0.0.6" });
-    CHECK(restored->forgotten == std::vector<std::string> { "10.0.0.9" });
+    Apply(state, Cmd(CommandKind::Forget, "n2"));
+    Apply(state, readmit);
 
-    // A count that claims more hosts than the bytes carry is damage, said as damage.
-    auto bytes = Encode(state);
-    auto shortened = bytes;
-    shortened.resize(shortened.size() - 1);
-    auto const truncated = DecodeState(shortened);
-    REQUIRE_FALSE(truncated.has_value());
-    CHECK(truncated.error().code == ConsensusErrorCode::MalformedFrame);
+    // No record, no key, no route.
+    CHECK(state.members.empty());
+    CHECK_FALSE(state.RaftEndpointOf("n2").has_value());
+    CHECK(state.IsRevoked(Testing::TestKeyPair("n2").PublicKey()));
+    CHECK_FALSE(state.HolderOf(Testing::TestKeyPair("n2").PublicKey()).has_value());
+
+    // The control: the same keyless command against the keyed record it was judged by is a
+    // move, and keeps the key -- so what dropped it above is the missing key, nothing else.
+    auto kept = ClusterState {};
+    Apply(kept, Cmd(CommandKind::AddMember, "n2", "10.0.0.2:6680"));
+    Apply(kept, readmit);
+    REQUIRE(kept.members.size() == 1);
+    CHECK(kept.members[0].raftEndpoint == "10.0.0.20:6680");
+    CHECK(kept.members[0].publicKey == Testing::TestKeyPair("n2").PublicKey());
+}
+
+TEST_CASE("An admission stating the all-zero key is refused, and Apply records nothing", "[cluster][state][identity]")
+{
+    // The key type value-initializes to all zero, so the type rules out an ABSENT member key and
+    // not one nobody named: a command built without naming a key carries the all-zero one.
+    // `KeyToRecord` reads it as no key -- refused as the courtesy, dropped as the guarantee.
+    auto const zero = Ed25519PublicKey {};
+    REQUIRE(IsZeroEd25519PublicKey(zero));
+    REQUIRE_FALSE(IsZeroEd25519PublicKey(KeyOf(0x99)));
+
+    for (auto const kind: { CommandKind::AddLearner, CommandKind::AddMember })
+    {
+        INFO("verb " << static_cast<unsigned>(kind));
+        auto state = ClusterState {};
+        auto const command = Keyed(kind, "pc-9", zero, "10.0.0.9:6675");
+        auto const refused = RefusedAgainst(state, command);
+        CHECK(refused.code == ConsensusErrorCode::InvalidConfiguration);
+        CHECK(refused.context.contains("no identity key"));
+        Apply(state, command);
+        CHECK(state.members.empty());
+    }
+
+    // Nor does it fall back to the key a record holds, as a move stating NO key would: a stated
+    // all-zero key is a command that forgot its key, and the record stays exactly as it was.
+    auto recorded = ClusterState {};
+    Apply(recorded, Keyed(CommandKind::AddMember, "pc-9", KeyOf(0x99), "10.0.0.9:6675"));
+    auto const before = recorded;
+    auto const moved = Keyed(CommandKind::AddLearner, "pc-9", zero, "10.0.0.10:6675");
+    CHECK(RefusedAgainst(recorded, moved).context.contains("no identity key"));
+    Apply(recorded, moved);
+    CHECK(recorded == before);
+
+    // The control: the same move naming a real key, or none, is accepted.
+    CHECK(ValidateAgainst(recorded, Keyed(CommandKind::AddLearner, "pc-9", KeyOf(0x99), "10.0.0.10:6675")).has_value());
+    CHECK(ValidateAgainst(recorded, Keyless(CommandKind::AddLearner, "pc-9", "10.0.0.10:6675")).has_value());
+}
+
+TEST_CASE("A principal is never admitted, recorded or decoded under the all-zero key", "[cluster][state][identity]")
+{
+    // The member rule, for the third admitting verb: `KeyToRecord` answers for a principal too,
+    // so the courtesy refuses and the guarantee drops the one key a command that never named a
+    // key carries -- and a snapshot holding it is refused by name.
+    auto const zero = Ed25519PublicKey {};
+    auto state = ClusterState {};
+    auto const command = Keyed(CommandKind::AdmitPrincipal, "w9", zero);
+    auto const refused = RefusedAgainst(state, command);
+    CHECK(refused.code == ConsensusErrorCode::InvalidConfiguration);
+    CHECK(refused.context.contains("w9 would be admitted with no identity key"));
+    CHECK(refused.context.contains("--cluster-admit-worker=w9@<key>"));
+    Apply(state, command);
+    CHECK(state.principals.empty());
+
+    // Nor over a principal already recorded: its key stays exactly as it was.
+    auto recorded = ClusterState {};
+    Apply(recorded, Keyed(CommandKind::AdmitPrincipal, "w9", KeyOf(0x9A)));
+    REQUIRE(recorded.principals.size() == 1);
+    auto const before = recorded;
+    CHECK(RefusedAgainst(recorded, command).context.contains("no identity key"));
+    Apply(recorded, command);
+    CHECK(recorded == before);
+
+    // The control: a real key is admitted.
+    CHECK(ValidateAgainst(ClusterState {}, Keyed(CommandKind::AdmitPrincipal, "w9", KeyOf(0x9A))).has_value());
+
+    // Decoded: with no members, settings or revoked keys, the principal's key is the second of
+    // its last two fields, before the role.
+    auto const encoded = Encode(recorded);
+    auto fields = Unwrap(WireFields::SplitAll(encoded));
+    REQUIRE(fields.size() >= 2);
+    REQUIRE(fields[fields.size() - 2].size() == Ed25519PublicKeyBytes);
+    REQUIRE(DecodeState(WireFields::Encode(WireFields::FieldList { fields })).has_value());
+    for (auto const keyField: { std::span<std::byte const> {}, std::span<std::byte const> { zero } })
+    {
+        INFO("key field of " << keyField.size() << " bytes");
+        fields[fields.size() - 2] = keyField;
+        auto const decoded = DecodeState(WireFields::Encode(WireFields::FieldList { fields }));
+        REQUIRE_FALSE(decoded.has_value());
+        CHECK(decoded.error().code == ConsensusErrorCode::MalformedFrame);
+        CHECK(decoded.error().context.contains("a principal is recorded with no identity key"));
+    }
+
+    // And a key of any other width is damage, not a keyless principal.
+    auto const realKey = KeyOf(0x9A);
+    fields[fields.size() - 2] = std::span<std::byte const> { realKey }.first(Ed25519PublicKeyBytes - 1);
+    auto const damaged = DecodeState(WireFields::Encode(WireFields::FieldList { fields }));
+    REQUIRE_FALSE(damaged.has_value());
+    CHECK(damaged.error().code == ConsensusErrorCode::MalformedFrame);
+    CHECK(damaged.error().context.contains("a principal carries a key of the wrong width"));
 }
 
 // --------------------------------------------------------------------------
@@ -1044,7 +1152,6 @@ TEST_CASE("Every seat names the verb that records it and the set it means", "[cl
     CHECK(SeatAdmittedBy(CommandKind::AddMember) == std::optional { MemberSeat::Voter });
     CHECK(SeatAdmittedBy(CommandKind::AddLearner) == std::optional { MemberSeat::Learner });
     CHECK_FALSE(SeatAdmittedBy(CommandKind::Forget).has_value());
-    CHECK_FALSE(SeatAdmittedBy(CommandKind::AdmitClient).has_value());
 
     CHECK(MemberSeatName(MemberSeat::Voter) == "voter");
     CHECK(MemberSeatName(MemberSeat::Learner) == "learner");
@@ -1081,9 +1188,9 @@ TEST_CASE("A member's seat survives a snapshot, and one this build cannot name i
     // The seat BYTE is pinned, not only the symbol: it is persisted, so a renumbering
     // that stayed consistent across this build would read every snapshot a fleet
     // already wrote as the other set. The last member's seat sits just before its key
-    // field, which is empty -- a four-byte zero length -- and is the state's last field,
-    // since there are no settings, clients, forgotten hosts, principals or revoked keys.
-    auto const seatAt = bytes.size() - 1 - sizeof(std::uint32_t);
+    // field -- a four-byte length and the 32-byte key -- which is the state's last field,
+    // since there are no settings, principals or revoked keys.
+    auto const seatAt = bytes.size() - 1 - sizeof(std::uint32_t) - Ed25519PublicKeyBytes;
     CHECK(bytes[seatAt] == std::byte { 1 });
     CHECK(static_cast<unsigned>(MemberSeat::Voter) == 0U);
     CHECK(static_cast<unsigned>(MemberSeat::Learner) == 1U);
@@ -1100,12 +1207,11 @@ TEST_CASE("A member's seat survives a snapshot, and one this build cannot name i
 
 // --- Identity keys, principals and revocations (#178) --------------------------------
 
-TEST_CASE("A member's key, the principals and the revoked keys survive a snapshot, absent staying absent",
-          "[cluster][state][wire][identity]")
+TEST_CASE("A member's key, the principals and the revoked keys survive a snapshot", "[cluster][state][wire][identity]")
 {
     ClusterState state;
     Apply(state, Keyed(CommandKind::AddMember, "n1", KeyOf(0x11), "10.0.0.1:6675"));
-    Apply(state, Cmd(CommandKind::AddLearner, "n2", "10.0.0.2:6675"));
+    Apply(state, Keyed(CommandKind::AddLearner, "n2", KeyOf(0x12), "10.0.0.2:6675"));
     Apply(state, Keyed(CommandKind::AdmitPrincipal, "w0", KeyOf(0x33)));
     Apply(state, Keyed(CommandKind::AdmitPrincipal, "w1", KeyOf(0x22)));
     Apply(state, Cmd(CommandKind::Forget, "w0"));
@@ -1116,12 +1222,44 @@ TEST_CASE("A member's key, the principals and the revoked keys survive a snapsho
     REQUIRE(restored.has_value());
     CHECK(*restored == state);
     REQUIRE(restored->members.size() == 2);
-    CHECK(restored->members[0].publicKey == std::optional { KeyOf(0x11) });
-    // Absent is not a key of zeroes: a member that stated none comes back having stated none.
-    CHECK_FALSE(restored->members[1].publicKey.has_value());
+    CHECK(restored->members[0].publicKey == KeyOf(0x11));
+    CHECK(restored->members[1].publicKey == KeyOf(0x12));
+    CHECK(restored->members[1].seat == MemberSeat::Learner);
     CHECK(restored->principals[0]
           == ClusterPrincipal { .id = "w1", .publicKey = KeyOf(0x22), .role = PrincipalRole::Worker });
     CHECK(restored->revokedKeys[0] == RevokedKey { .id = "w0", .publicKey = KeyOf(0x33) });
+}
+
+TEST_CASE("A snapshot holding a member with no identity key, or the all-zero one, is refused by name",
+          "[cluster][state][wire][identity]")
+{
+    // A member holds a key by TYPE, so no `ClusterState` can hold one without -- and the bytes
+    // still can, since the field is a length-prefixed run like every other. A state holding
+    // one is not one this build wrote, and read as it stands it would carry a member no forget
+    // could revoke -- an address route that outlives every removal. It is refused as
+    // malformed, by name. Built from the bytes: n2's key is the state's last field, since
+    // there are no settings, principals or revoked keys.
+    ClusterState state;
+    Apply(state, Keyed(CommandKind::AddMember, "n1", KeyOf(0x11), "10.0.0.1:6675"));
+    Apply(state, Keyed(CommandKind::AddMember, "n2", KeyOf(0x12), "10.0.0.2:6675"));
+    auto const keyed = Encode(state);
+    auto fields = Unwrap(WireFields::SplitAll(keyed));
+    REQUIRE(fields.back().size() == Ed25519PublicKeyBytes);
+
+    // WHAT DISTINGUISHES: the fields re-encoded as they stand decode, so the emptied key field
+    // is the whole cause of the refusal below.
+    REQUIRE(DecodeState(WireFields::Encode(WireFields::FieldList { fields })).has_value());
+
+    auto const zero = Ed25519PublicKey {};
+    for (auto const keyField: { std::span<std::byte const> {}, std::span<std::byte const> { zero } })
+    {
+        INFO("key field of " << keyField.size() << " bytes");
+        fields.back() = keyField;
+        auto const refused = DecodeState(WireFields::Encode(WireFields::FieldList { fields }));
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConsensusErrorCode::MalformedFrame);
+        CHECK(refused.error().context.contains("a member is recorded with no identity key"));
+    }
 }
 
 TEST_CASE("A command carries its key and role, and a role this build cannot name is refused by name",
@@ -1208,27 +1346,24 @@ TEST_CASE("Forgetting an id removes it from whichever list records it and revoke
     Apply(state, Keyed(CommandKind::AddMember, "n1", KeyOf(0x72), "10.0.0.1:6675"));
     Apply(state, Keyed(CommandKind::AddMember, "n2", KeyOf(0x74), "10.0.0.2:6675"));
 
-    // A principal: its record goes and its key is revoked, labelled with whose it was. No host
-    // is tombstoned, because a principal has none.
+    // A principal: its record goes and its key is revoked, labelled with whose it was.
     Apply(state, Cmd(CommandKind::Forget, "w1"));
     CHECK(state.principals.empty());
     REQUIRE(state.revokedKeys.size() == 1);
     CHECK(state.revokedKeys[0] == RevokedKey { .id = "w1", .publicKey = KeyOf(0x71) });
-    CHECK(state.forgotten.empty());
 
-    // A member: its record goes, its host is tombstoned as before (#1309), and the key it
-    // held is revoked in the same entry -- not cleared from a record that stays, which the
-    // configuration would go on counting, and a counted member keeps its key for itself.
+    // A member: its record goes, and the key it held is revoked in the same entry -- not
+    // cleared from a record that stays, which the configuration would go on counting, and a
+    // counted member keeps its key for itself.
     Apply(state, Cmd(CommandKind::Forget, "n1"));
     CHECK(std::ranges::none_of(state.members, [](ClusterMember const& m) { return m.id == "n1"; }));
-    CHECK(state.HasForgotten("10.0.0.1"));
     CHECK(state.IsRevoked(KeyOf(0x72)));
     REQUIRE(state.revokedKeys.size() == 2);
     CHECK(std::ranges::contains(state.revokedKeys, RevokedKey { .id = "n1", .publicKey = KeyOf(0x72) }));
 
     // Nothing else moved: n2 is still recorded under its own key, which is not revoked.
     REQUIRE(state.members.size() == 1);
-    CHECK(state.members[0].publicKey == std::optional { KeyOf(0x74) });
+    CHECK(state.members[0].publicKey == KeyOf(0x74));
     CHECK_FALSE(state.IsRevoked(KeyOf(0x74)));
 
     // Idempotent, and an id recorded nowhere is forgotten as nothing at all.
@@ -1238,14 +1373,15 @@ TEST_CASE("Forgetting an id removes it from whichever list records it and revoke
     CHECK(state == before);
 }
 
-TEST_CASE("A forget revokes the key the proposer holds for an id the state records without one, and never another's",
+TEST_CASE("A forget revokes the key the proposer holds for an id beside the record's, and never another's",
           "[cluster][state][identity][forget]")
 {
-    // #1555: a bootstrap member named WITH its key is recorded without one, or not
-    // at all, so the record alone cannot say which key to revoke. The proposing leader states
-    // the key it holds live (`PrepareForget`), and that is revoked beside the record's.
+    // #1555: a bootstrap member named WITH its key may be recorded nowhere, or under another
+    // key -- re-admitted since the roster named it -- so the record alone cannot say every key
+    // to revoke. The proposing leader states the key it holds live (`PrepareForget`), and that
+    // is revoked beside the record's.
     ClusterState state;
-    Apply(state, Cmd(CommandKind::AddMember, "n3", "10.0.0.3:6675"));
+    Apply(state, Keyed(CommandKind::AddMember, "n3", KeyOf(0x7A), "10.0.0.3:6675"));
     Apply(state, Keyed(CommandKind::AddMember, "n4", KeyOf(0x78), "10.0.0.4:6675"));
 
     auto typedKey = Cmd(CommandKind::Forget, "n3");
@@ -1253,7 +1389,8 @@ TEST_CASE("A forget revokes the key the proposer holds for an id the state recor
     REQUIRE(ValidateAgainst(state, typedKey).has_value());
     Apply(state, typedKey);
     CHECK(state.IsRevoked(KeyOf(0x77)));
-    CHECK(state.HasForgotten("10.0.0.3"));
+    CHECK(state.IsRevoked(KeyOf(0x7A)));
+    CHECK(std::ranges::none_of(state.members, [](ClusterMember const& m) { return m.id == "n3"; }));
 
     // Recorded nowhere at all -- typed on the command line and never desired -- and still the
     // key is revoked, which is what reaches every node that types it.
@@ -1287,15 +1424,6 @@ TEST_CASE("A forget revokes the key its record holds when it COMMITS, not the on
     Apply(state, forget);
     CHECK(state.IsRevoked(KeyOf(0x76)));
     CHECK(state.members.empty());
-
-    // And a member recorded WITHOUT a key has nothing to revoke: the forget removes it and
-    // tombstones its host, exactly as `RemoveMember` did before keys existed.
-    ClusterState keyless;
-    Apply(keyless, Cmd(CommandKind::AddMember, "n3", "10.0.0.3:6675"));
-    Apply(keyless, Cmd(CommandKind::Forget, "n3"));
-    CHECK(keyless.members.empty());
-    CHECK(keyless.revokedKeys.empty());
-    CHECK(keyless.HasForgotten("10.0.0.3"));
 }
 
 TEST_CASE("One key proves one identity, and an id is a member or a principal, never both", "[cluster][state][identity]")
@@ -1340,13 +1468,13 @@ TEST_CASE("A re-admit that names no key keeps the one recorded, and one that nam
     // what the member announced.
     ClusterState state;
     Apply(state, Keyed(CommandKind::AddMember, "n1", KeyOf(0x91), "10.0.0.1:6675"));
-    Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.5:6675"));
+    Apply(state, Keyless(CommandKind::AddMember, "n1", "10.0.0.5:6675"));
     REQUIRE(state.members.size() == 1);
     CHECK(state.members[0].raftEndpoint == "10.0.0.5:6675");
-    CHECK(state.members[0].publicKey == std::optional { KeyOf(0x91) });
+    CHECK(state.members[0].publicKey == KeyOf(0x91));
 
     Apply(state, Keyed(CommandKind::AddMember, "n1", KeyOf(0x92), "10.0.0.5:6675"));
-    CHECK(state.members[0].publicKey == std::optional { KeyOf(0x92) });
+    CHECK(state.members[0].publicKey == KeyOf(0x92));
 }
 
 TEST_CASE("Which verbs carry a key and a role is the verb's, and a stray one is refused", "[cluster][state][identity]")
@@ -1415,7 +1543,7 @@ TEST_CASE("A snapshot that breaks a rule of the roster is refused rather than ha
     // the same key REVOKED is a state `Apply` can make, since revoking such a key grants nothing.
     ClusterState smallOrderPrincipal;
     smallOrderPrincipal.principals.push_back(
-        ClusterPrincipal { .id = "w1", .publicKey = Ed25519PublicKey {}, .role = PrincipalRole::Worker });
+        ClusterPrincipal { .id = "w1", .publicKey = SmallOrderIdentityPoint(), .role = PrincipalRole::Worker });
     CHECK(refusalOf(smallOrderPrincipal).contains("small-order or non-canonical point"));
 
     ClusterState nonCanonicalMember = liveRevoked;
@@ -1424,7 +1552,7 @@ TEST_CASE("A snapshot that breaks a rule of the roster is refused rather than ha
     CHECK(refusalOf(nonCanonicalMember).contains("small-order or non-canonical point"));
 
     ClusterState revokedSmallOrder;
-    revokedSmallOrder.revokedKeys.push_back(RevokedKey { .id = "w1", .publicKey = Ed25519PublicKey {} });
+    revokedSmallOrder.revokedKeys.push_back(RevokedKey { .id = "w1", .publicKey = SmallOrderIdentityPoint() });
     CHECK(DecodeState(Encode(revokedSmallOrder)).has_value());
 }
 
@@ -1433,13 +1561,14 @@ TEST_CASE("A key that is a small-order or non-canonical point is never admitted,
 {
     // The courtesy and the guarantee, as for a revoked key: `ValidateAgainst` refuses it by the
     // fault's name where an operator reads the answer, and `Apply` drops the command that was
-    // judged elsewhere and committed anyway. The all-zero key is the point under which the
-    // all-zero signature verifies every message; KeyOf(0xFF) is y = 2^255 - 1, at or above p.
+    // judged elsewhere and committed anyway. The identity is a point under which a small-order
+    // signature verifies every message (the all-zero key is one too, refused earlier as no key at
+    // all); KeyOf(0xFF) is y = 2^255 - 1, at or above p.
     ClusterState state;
     Apply(state, Keyed(CommandKind::AdmitPrincipal, "w0", KeyOf(0xC1)));
     auto const before = state;
 
-    for (auto const& [key, fault]: { std::pair { Ed25519PublicKey {}, PublicKeyFault::SmallOrder },
+    for (auto const& [key, fault]: { std::pair { SmallOrderIdentityPoint(), PublicKeyFault::SmallOrder },
                                      std::pair { KeyOf(0xFF), PublicKeyFault::NonCanonical } })
     {
         for (auto const& command: { Keyed(CommandKind::AdmitPrincipal, "w1", key),
@@ -1501,7 +1630,7 @@ TEST_CASE("The roster version moves with who may vouch for whom, and with nothin
 {
     // #178. `rosterVersion` is what a voter endorses beside the roster's digest and what a worker
     // orders rosters by, so it must move exactly when the ROSTER does -- a member, a seat, a key,
-    // a principal, a revocation -- and never for a setting, a forgotten client or a scheduler
+    // a principal, a revocation -- and never for a setting, a retired verb or a scheduler
     // endpoint an election moves. WHAT DISTINGUISHES: each non-roster change is asserted NOT to
     // move it, so a version bumped on every applied command fails half of this.
     ClusterState state;
@@ -1510,11 +1639,12 @@ TEST_CASE("The roster version moves with who may vouch for whom, and with nothin
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675"));
     CHECK(state.rosterVersion == 1);
 
-    // Not the roster: a setting, a client admission and forget, and the scheduler endpoint the
+    // Not the roster: a setting, the two retired verbs -- which `Apply` takes as nothing, since
+    // it is total and `Validate` refuses them before the append -- and the scheduler endpoint the
     // member announces when it leads.
     Apply(state, Cmd(CommandKind::SetSetting, "lease-lifetime", "20min"));
-    Apply(state, Cmd(CommandKind::AdmitClient, "10.0.0.9"));
-    Apply(state, Cmd(CommandKind::ForgetClient, "10.0.0.9"));
+    Apply(state, Cmd(CommandKind::RetiredAdmitClient, "10.0.0.9"));
+    Apply(state, Cmd(CommandKind::RetiredForgetClient, "10.0.0.9"));
     Apply(state, Cmd(CommandKind::AddMember, "n1", "10.0.0.1:6675", "10.0.0.1:7000"));
     CHECK(state.rosterVersion == 1);
 
@@ -1522,7 +1652,8 @@ TEST_CASE("The roster version moves with who may vouch for whom, and with nothin
     // the record and revokes its key in ONE entry (#1555), so each moves the version once.
     Apply(state, Keyed(CommandKind::AddMember, "n2", KeyOf(0x22), "10.0.0.2:6675"));
     CHECK(state.rosterVersion == 2);
-    Apply(state, Cmd(CommandKind::AddLearner, "n2", "10.0.0.2:6675"));
+    // Keyless, so the step is a seat change and nothing else: n2 keeps the key it holds.
+    Apply(state, Keyless(CommandKind::AddLearner, "n2", "10.0.0.2:6675"));
     CHECK(state.rosterVersion == 3);
     Apply(state, Keyed(CommandKind::AdmitPrincipal, "w1", KeyOf(0x31)));
     CHECK(state.rosterVersion == 4);

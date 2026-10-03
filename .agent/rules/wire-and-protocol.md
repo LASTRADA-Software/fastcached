@@ -682,6 +682,28 @@ Every rule below has already been a bug.
   the weak one and it was the only one that could fail; the instinct that a literal is
   a code smell is usually right and was exactly wrong here.
 
+  **Its mirror: a RETIRED value keeps its number, and the number is never given to
+  anything else.** A peer built before the retirement still maps the byte to its old
+  name, so a new meaning under it is reported by that peer as the old one -- the single
+  worst way for a value to be wrong. Each retired set is a table beside its live one,
+  checked against it at compile time (`NoRetiredErrorCodeIsReused` and its siblings),
+  never a comment:
+
+  <!-- table-total: none -->
+  | Space | Retired | Was | Table |
+  |---|---|---|---|
+  | `ErrorCode` | `0x06`, `0x24` | canonicalization-failed (#59, #69); enrollment-already-collected (#178) | `RetiredErrorCodes` |
+  | `Op` | `0x16`, `0x17` | `CLUSTER-ADMIT-CLIENT`, `CLUSTER-FORGET-CLIENT` (#1309) | `RetiredOpcodes` |
+  | `EnrollmentDecision` | `0x03` | `Collected`, the key hand-over #178 retired with the secret | `RetiredEnrollmentDecisions` |
+  | `WireMembershipRoute` | `0x01`, `0x02`, `0x04` | the address routes: a listed host, the cluster's member hosts, a forgotten host | `RetiredWireMembershipRoutes` |
+  | `Cluster::CommandKind` | `3`, `4` | `AdmitClient`, `ForgetClient`, refused by name when replayed (`RetiredVerbRefusal`) | the `Retired*` enumerators |
+  | `MembershipParticipant` | `0` | reserved rather than retired: a zero route bit is no route | `MembershipParticipant::Reserved` |
+
+  A retired OPCODE is an unknown one to every surface -- `FindOp` answers nullptr and it is
+  refused `UnknownOpcode` -- while a retired `CommandKind` in a node's OWN log refuses the
+  start by name (#1542's `CanRead`), because a log is a record this node must be able to
+  replay and a frame is not.
+
   **And the test for it is a behavioural one, not "the code changed".** Asserting the
   enumerator passes the moment somebody edits a constant. What regresses the defect is
   a credentialled client reaching a surface that does not implement `AUTH` and *still

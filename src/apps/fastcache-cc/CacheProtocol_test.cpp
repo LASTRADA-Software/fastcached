@@ -481,7 +481,7 @@ namespace
 /// A credential with a secret, i.e. one that will actually be presented.
 [[nodiscard]] Credential Token(std::string_view secret, std::string_view username = {})
 {
-    return Credential { .username = std::string { username }, .secret = std::string { secret } };
+    return Credential { .kind = Wire::AuthKind::Password, .username = std::string { username }, .secret = secret };
 }
 
 } // namespace
@@ -523,7 +523,8 @@ TEST_CASE("A credential is pipelined ahead of the command, with no round trip be
     auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", Token("s3cret")));
     CHECK(outcome.kind == CacheOutcomeKind::Miss);
 
-    auto expected = Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = "s3cret" });
+    auto expected =
+        Wire::EncodeAuth(Wire::AuthRequest { .kind = Wire::AuthKind::Password, .username = "", .secret = "s3cret" });
     auto const fetch = Wire::EncodeFetch("k");
     expected.insert(expected.end(), fetch.begin(), fetch.end());
     CHECK(client.Sent() == expected);
@@ -531,6 +532,26 @@ TEST_CASE("A credential is pipelined ahead of the command, with no round trip be
     // deliberately not asserted here: two back-to-back writes are just as
     // pipelined as one, and requiring a single write would mean copying the
     // command frame for nothing.
+    CHECK(client.Trace() == "SSR");
+}
+
+TEST_CASE("A machine ticket is pipelined ahead of the command, and its kind travels")
+{
+    // The same one-write-sequence property, for the credential the launcher presents to every
+    // other machine -- and the KIND byte, without which a node reads the ticket's bytes as a
+    // password and refuses it.
+    Testing::ScriptedSocket client { Replies(
+        { Wire::EncodeReply(Wire::Status::Ok, {}), Wire::EncodeReply(Wire::Status::Miss, {}) }) };
+
+    auto const ticket = Credential { .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = "t" };
+    auto const outcome = core::async::syncRun(CacheFetch(&client, &Unwatched(), "k", ticket));
+    CHECK(outcome.kind == CacheOutcomeKind::Miss);
+
+    auto expected =
+        Wire::EncodeAuth(Wire::AuthRequest { .kind = Wire::AuthKind::MachineTicket, .username = {}, .secret = "t" });
+    auto const fetch = Wire::EncodeFetch("k");
+    expected.insert(expected.end(), fetch.begin(), fetch.end());
+    CHECK(client.Sent() == expected);
     CHECK(client.Trace() == "SSR");
 }
 
@@ -584,7 +605,8 @@ TEST_CASE("CacheStore presents the credential the same way CacheFetch does")
     auto const outcome = core::async::syncRun(CacheStore(&client, &Unwatched(), request, Token("s3cret", "bob")));
     CHECK(outcome.IsHit());
 
-    auto expected = Wire::EncodeAuth(Wire::AuthRequest { .username = "bob", .secret = "s3cret" });
+    auto expected =
+        Wire::EncodeAuth(Wire::AuthRequest { .kind = Wire::AuthKind::Password, .username = "bob", .secret = "s3cret" });
     auto const store = Wire::EncodeStore(request);
     expected.insert(expected.end(), store.begin(), store.end());
     CHECK(client.Sent() == expected);

@@ -79,6 +79,10 @@ struct Command
     Credential credential {}; ///< From `--token-file` and `--user`.
     DialTimeouts timeouts {}; ///< From `--connect-timeout` and `--timeout`.
 
+    /// From `--mint-from`: where this machine's node mints the tickets a node verb presents.
+    /// Unset means the port of the node dialled, on loopback.
+    Endpoint mintFrom {};
+
     std::string tokenFile {}; ///< From `--token-file`; read by `main`, not here.
 
     /// From `--dashboard-token-file`; read by `main`, not here.
@@ -91,6 +95,16 @@ struct Command
     std::string dashboardToken {}; ///< What `dashboardTokenFile` held; presented by `fleet` and a fleet subscription.
     std::string diagnostic {};     ///< Why parsing failed; set iff `action == UsageError`.
 };
+
+/// What a `0xFC` connection of @p command presents to each endpoint it dials.
+/// @param command The parsed command; must outlive the result, which borrows its token.
+/// @return The token for `--addr` alone, and `--mint-from`.
+[[nodiscard]] inline NodeCredentials NodeCredentialsOf(Command const& command)
+{
+    return NodeCredentials { .password = &command.credential,
+                             .passwordFor = EndpointText(command.cache),
+                             .mintFrom = command.mintFrom };
+}
 
 /// The accepted options, in the order `--help` documents them.
 ///

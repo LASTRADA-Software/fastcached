@@ -301,7 +301,7 @@ enum class FleetSection : std::uint8_t
     Workers,    ///< One row per `(toolchain, endpoint)` registry entry.
     Leases,     ///< The oldest outstanding leases, bounded as the page bounds them.
     Members,    ///< What the cluster has agreed, when this node runs one.
-    Forgotten,  ///< The client hosts the cluster has agreed to stop admitting.
+    Revoked,    ///< The keys the cluster will never admit again, and whose they were.
     Conditions, ///< What each machine says is wrong with it (#1364).
     Tiers,      ///< Per-tier cache figures, for the tiers some member runs.
     Series,     ///< The fleet's history over a range: one row per bucket, one column per series.
@@ -387,12 +387,12 @@ inline constexpr EnumTable<FleetSection, FleetSectionRow> FleetSectionTable {
                       .summary = "what the cluster has agreed; absent when this node runs none",
                       .tabular = true,
                       .inWhole = true },
-    FleetSectionRow { .section = FleetSection::Forgotten,
-                      .key = "forgotten",
-                      .one = "forgotten client",
-                      .many = "forgotten clients",
-                      .summary = "client hosts the cluster has agreed to stop admitting; absent when this node "
-                                 "runs no cluster",
+    FleetSectionRow { .section = FleetSection::Revoked,
+                      .key = "revoked",
+                      .one = "revoked key",
+                      .many = "revoked keys",
+                      .summary = "keys the cluster will never admit again, and whose they were; absent when this "
+                                 "node runs no cluster",
                       .tabular = true,
                       .inWhole = true },
     FleetSectionRow { .section = FleetSection::Conditions,

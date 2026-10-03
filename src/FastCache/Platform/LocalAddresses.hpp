@@ -98,8 +98,7 @@ class ILocalityOracle
 
     /// @param host The peer's **host**, as `core::net::ISocket::PeerAddress()` reports it --
     ///        never an endpoint, and never with a port. A peer dials from an
-    ///        ephemeral source port, which is the same reason
-    ///        `Distributed::ClusterMembership` keys on hosts.
+    ///        ephemeral source port, which is why nothing here compares a port.
     /// @return True when that address belongs to the machine this process runs on.
     [[nodiscard]] virtual bool IsThisMachine(std::string_view host) const = 0;
 };
@@ -145,8 +144,8 @@ class ILocalityOracle
 /// million refusals still costs this machine one probe per interval.
 ///
 /// Thread-safe. The lock is taken only past the loopback branch, so the common path
-/// never contends -- which is what makes a plain mutex right here rather than the
-/// shared one `ClusterMembership` needs.
+/// never contends -- which is what makes a plain mutex right here rather than a shared
+/// one.
 ///
 /// ## The refresh runs INLINE, on whatever thread asked
 ///

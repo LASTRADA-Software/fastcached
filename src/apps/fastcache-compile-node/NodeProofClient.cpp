@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../fastcache-cc/CacheProtocol.hpp"
+#include "../fastcache-cc/WorkerProtocol.hpp"
 #include "NodeProofClient.hpp"
 
 #include <FastCache/Core/Nonce.hpp>
@@ -9,9 +10,6 @@
 #include <algorithm>
 #include <format>
 #include <utility>
-
-#include <core/async/SyncRun.hpp>
-#include <core/async/Task.hpp>
 
 namespace FastCache::Node
 {
@@ -55,9 +53,7 @@ namespace
     }
 } // namespace
 
-NodeProofAttempt NodeProofClient::Prove(SealedFrameSocket& peer,
-                                        Cc::CredentialNotice& notice,
-                                        Cc::Credential const& credential) const
+NodeProofAttempt NodeProofClient::Prove(SealedFrameSocket& peer) const
 {
     auto const nonce = DrawNonce(_random);
     auto ephemeral = Distributed::DrawNodeEphemeral(_random);
@@ -72,8 +68,7 @@ NodeProofAttempt NodeProofClient::Prove(SealedFrameSocket& peer,
     std::ranges::copy(*nonce, request.nonce.begin());
     std::ranges::copy(ephemeral->publicKey, request.ephemeral.begin());
 
-    auto const challenged =
-        core::async::syncRun(Cc::ExchangeFramed(&peer, &notice, Wire::EncodeNodeChallenge(request), credential));
+    auto const challenged = Cc::ExchangeWithScheduler(peer, Wire::EncodeNodeChallenge(request));
     if (!challenged.IsHit())
         return Unproved(challenged);
 
@@ -107,8 +102,8 @@ NodeProofAttempt NodeProofClient::Prove(SealedFrameSocket& peer,
     // before the proof leaves; the sending one only once the answer has verified, since the proof
     // itself travels in the clear.
     peer.SealReceiving(std::move(keys->serverToCaller));
-    auto const proved = core::async::syncRun(Cc::ExchangeFramed(
-        &peer, &notice, Wire::EncodeProveNode(Distributed::MintNodeProof(_key, _nodeId, request, *reply)), credential));
+    auto const proved =
+        Cc::ExchangeWithScheduler(peer, Wire::EncodeProveNode(Distributed::MintNodeProof(_key, _nodeId, request, *reply)));
     if (!proved.IsHit())
         return Unproved(proved);
 

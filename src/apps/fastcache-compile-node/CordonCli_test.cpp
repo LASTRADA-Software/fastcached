@@ -68,11 +68,8 @@ TEST_CASE("A cordon dials this node's own listener, on loopback when it is bound
 TEST_CASE("A cordon sends the cordon verb carrying the action, and reports what is still running", "[node][cordon]")
 {
     auto node = NodeAnswering(Wire::CordonFields { .state = Wire::WireCordonState::Draining, .inFlight = 3 });
-    auto notice = Cc::CredentialNotice::Silent();
-    NodeConfig const cfg;
-    ConfiguredCredential const credential { cfg, nullptr };
 
-    auto const report = PutCordonRequest(node, notice, Wire::CordonAction::Cordon, credential, "127.0.0.1:6674");
+    auto const report = PutCordonRequest(node, Wire::CordonAction::Cordon, "127.0.0.1:6674");
 
     // The bytes, not only the rendering: a verb that sent LIFT would be answered by a
     // scripted node exactly the same way.
@@ -98,11 +95,8 @@ TEST_CASE("A cordon the node refuses is reported with the node's reason", "[node
 {
     Testing::ScriptedSocket node { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember,
                                                           "a machine is cordoned from itself") };
-    auto notice = Cc::CredentialNotice::Silent();
-    NodeConfig const cfg;
-    ConfiguredCredential const credential { cfg, nullptr };
 
-    auto const report = PutCordonRequest(node, notice, Wire::CordonAction::Lift, credential, "10.1.2.3:6674");
+    auto const report = PutCordonRequest(node, Wire::CordonAction::Lift, "10.1.2.3:6674");
 
     REQUIRE_FALSE(report.has_value());
     CHECK(report.error().contains("cordoned from itself"));
@@ -112,11 +106,8 @@ TEST_CASE("A cordon answered with a body this build cannot read is refused, not 
 {
     std::vector<std::byte> const noBody;
     Testing::ScriptedSocket node { Wire::EncodeReply(Wire::Status::Ok, noBody) };
-    auto notice = Cc::CredentialNotice::Silent();
-    NodeConfig const cfg;
-    ConfiguredCredential const credential { cfg, nullptr };
 
-    auto const report = PutCordonRequest(node, notice, Wire::CordonAction::Cordon, credential, "127.0.0.1:6674");
+    auto const report = PutCordonRequest(node, Wire::CordonAction::Cordon, "127.0.0.1:6674");
 
     REQUIRE_FALSE(report.has_value());
     CHECK(report.error().contains("cannot read"));

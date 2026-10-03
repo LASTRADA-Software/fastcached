@@ -4093,8 +4093,8 @@ _library_helper_names() {
 }
 
 # Definitions of those names in one script, at ANY indentation. A fixture's
-# helpers are not all at column zero -- `dist-compile-e2e.sh` defines two inside
-# its `--case membership` block -- so anchoring at column zero would read a
+# helpers are not all at column zero -- `check-banner-probe-identity.sh` defines
+# two inside its `--self-test` block -- so anchoring at column zero would read a
 # nested copy as absent, which is the direction that fails silently.
 #
 # WHOLE-FILE FIRST, because this test is in the DEFAULT set and runs on every

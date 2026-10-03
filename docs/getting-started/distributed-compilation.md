@@ -200,9 +200,6 @@ The scheduler is a **compile node**, not the cache. Pick one machine and start i
 fastcache-compile-node \
     --listen-node=0.0.0.0:6675 \
     --raft-self=scheduler.internal \
-    --fleet-member=worker-01.internal \
-    --fleet-member=worker-02.internal \
-    --fleet-member=dev-01.internal \
     --scheduler=127.0.0.1:6675 \
     --advertise=scheduler.internal:6675
 ```
@@ -256,7 +253,7 @@ and history still read 0 slots.
 
 ```sh
 fastcache-compile-node --slots=0 \
-    --listen-node=0.0.0.0:6674 --fleet-member=10.0.0.21 ...
+    --listen-node=0.0.0.0:6674 ...
 ```
 
 Such a machine shows among the cluster's **members** when it runs consensus, and
@@ -270,23 +267,24 @@ cluster, every other one joins it and is admitted by its identity key. See
 
 #### Who may use the fleet
 
-`--fleet-member` lists the hosts this node answers at all, and it is matched by
-**host**: a peer dials from an ephemeral source port, so an endpoint is not
-something a connection can be compared against. It is **not** only the worker
-list — every scheduler verb is gated, `LEASE` included, so a client machine that
-is not on it is refused a lease and compiles locally. List the machines that
-*ask* as well as the machines that *answer*.
+A node admits a machine by its **key**, never by its address. A worker proves the
+identity key in its `--cluster-dir`; a machine that only *asks* — a laptop, a CI runner —
+presents a **machine ticket** its own node mints for each exchange, signed with that
+node's key. Either way the machine's key is admitted to the cluster once, and from then on
+every node admits it from whatever address it dials — which is what makes a machine on a
+VPN or DHCP usable at all. It is **not** only the worker list: every scheduler verb is
+gated, `LEASE` included, so a machine whose key the cluster does not hold is refused a
+lease and compiles locally. Admit the machines that *ask* as well as the machines that
+*answer*: see [a machine that only
+asks](../tools/fastcache-compile-node.md#a-machine-that-only-asks-tickets).
 
-`--fleet-open` admits everybody, for one machine or a network that is already
-your boundary. Give one of them — or admit each client machine with
-`--cluster-admit-client`, which the cluster replicates: a scheduler with none of the
-three refuses every caller but its own machine, which is the right default and not a
-working configuration. The startup rules cannot see the third route, so they no
-longer refuse a scheduler naming neither flag; its `/metrics` shows the refusals
-instead.
+`--fleet-open` admits every caller, for one machine or a network that is already your
+boundary. A node with neither a roster nor `--fleet-open` refuses every caller but its own
+machine, which is the right default and not a working configuration; its `/metrics` shows
+the refusals.
 
 Membership gates **two** of a node's surfaces — its scheduler and its compile port
-— and this machine is always a member of its own fleet whatever the list says.
+— and this machine is always a member of its own fleet, with nothing to present.
 What membership pays for on a node is CPU time, and those two are where it is
 spent.
 
@@ -298,10 +296,11 @@ another machine to read it. Nor does it gate the shared `fastcached`, where a
 non-member reads and writes objects exactly as before — that one is infrastructure
 somebody operates, and it is what a cache several machines share looks like.
 
-Because it gates the compile port, **every node needs one of the two flags, not
-only the scheduler.** A worker without one admits its own machine and refuses the
+Because it gates the compile port, **every worker needs a roster or `--fleet-open`, not
+only the scheduler.** A worker with neither admits its own machine and refuses the
 network, which is the right default for a developer's laptop and cannot receive a
-dispatched compile.
+dispatched compile. `--voter-key`, which a worker needs anyway to check a lease, gives it
+the roster.
 
 ### The workers
 
@@ -367,38 +366,24 @@ worker carries that value for as long as it is installed, so decide it before th
 rollout: [Name the scheduler by something that outlives one machine](../tools/fastcache-compile-node.md#name-the-scheduler-by-something-that-outlives-one-machine)
 says why, and how several `--scheduler` values fall back to one another.
 
-That is the whole of it — but **a membership flag is not optional**, and it is
-the line people leave off. (`--fleet-open` is the one a build network that is
-already your boundary wants; `--fleet-member` is the narrower alternative,
-below.) Membership gates this node's *compile verbs*, so a worker with neither
-admits its own machine and nothing else: the scheduler leases it out,
-the client dials it, and the compile is refused `not-a-member` and run locally
-instead. The scheduler's counters stay flat and correct while that happens,
-because the lease *was* granted
-([#235](https://github.com/LASTRADA-Software/fastcached/issues/235); before it
-was fixed, neither flag could be given to a worker at all). The worker says which
-it is in its own startup line:
+That is the whole of it — but **who the worker admits is not optional**, and it is
+the part people leave off. Membership gates this node's *compile verbs*, so a worker
+that admits its own machine and nothing else is leased out, dialled, and the compile
+is refused `not-a-member` and run locally instead. The scheduler's counters stay flat
+and correct while that happens, because the lease *was* granted
+([#235](https://github.com/LASTRADA-Software/fastcached/issues/235)). The worker says
+what it admits in its own startup line:
 
 ```
-[INFO] compile node ready on 0.0.0.0:6674, advertising worker-01.internal:6674, 16 slot(s) as a … node, identifying 2 toolchain(s), every caller admitted
-[INFO] compile node ready on 0.0.0.0:6674, … , this machine only -- give --fleet-member or --fleet-open to admit peers
+[INFO] compile node ready on 0.0.0.0:6674, advertising worker-01.internal:6674, 16 slot(s) as a … node, identifying 2 toolchain(s), admits this machine, and machines the roster admits by key or ticket, and every other caller (--fleet-open)
 ```
 
-Use `--fleet-open` where the build network is already your boundary. Where it is
-not, swap it for a repeated `--fleet-member=dev-01.internal` naming the machines
-whose clients may dispatch here, and everyone else stays refused. The list is
-matched by **host**: a client dials from an ephemeral source port, so there is no
-port for an endpoint to be compared against.
-
-!!! note "On a node running consensus, the cluster's members are admitted as well"
-
-    The agreed member set **adds** to `--fleet-member` rather than replacing it —
-    see [membership at
-    runtime](../tools/fastcache-compile-node.md#membership-at-runtime). A cluster
-    member is a peer; a client machine is not and never will be, so
-    `--fleet-member` stays the way to admit a laptop or a CI runner on a clustered
-    fleet just as on a node running no consensus. `--fleet-open` remains the answer where the
-    build network is already your boundary.
+`--fleet-open` is for a build network that is already your boundary. Where it is not,
+drop it: the worker's roster — `--voter-key` gives it one — admits exactly the machines
+the cluster admitted, by the key each proves or the ticket each presents, and everyone
+else stays refused, whatever address they dial from. A client machine is admitted by its
+key too, as a learner: see [a machine that only
+asks](../tools/fastcache-compile-node.md#a-machine-that-only-asks-tickets).
 
 The worker then surveys the machine at startup and serves every compiler it
 finds, naming each one and the layout it came from:
@@ -534,27 +519,23 @@ against a worker that has stopped, for the reason in the next box.
     the job; `fastcache_worker_jobs_abandoned_client_gone_total` counts the delivery
     that was skipped.
 
-!!! note "`FASTCACHE_TOKEN` against a node is accepted and ignored"
+!!! note "`FASTCACHE_TOKEN` is the cache's password, and a node never receives it"
 
-    A node's scheduler, compile and cache ports serve no `AUTH` verb, so there is
-    nothing for a credential to authenticate against. All three refuse it
-    `unknown-opcode`, which the launcher steps over before carrying on
-    unauthenticated, so leases, compiles and registrations all work normally.
+    `FASTCACHE_TOKEN` is presented to the cache at `FASTCACHE_ADDR` and to nothing
+    else. Every exchange with another machine — the scheduler, a worker, a remote
+    cache — presents a **machine ticket** instead, minted for that exchange by this
+    machine's own node, so a password is never sent where it was not configured.
 
-    The launcher says `credential ignored` for its **cache** exchanges. It does not
-    say it for a lease, a compile, a release or a worker's registration: those paths
-    carry the same fact back and drop it, so an operator who set a token there is
-    told nothing at all.
+    A node checks no password. A password `AUTH` that does reach one — an older
+    launcher, a hand-written client — is answered `Ok` and establishes nothing, so
+    the request behind it is served or refused exactly as if nothing had been
+    presented.
 
-    Two of the three used to answer `dispatch-not-permitted` instead, which the
+    A node's scheduler once answered a credential `dispatch-not-permitted`, which the
     launcher treats as fatal and returns in place of the answer to the request it
     actually sent — so every `LEASE` was declined and every compile happened
     locally, behind a green build
     ([#340](https://github.com/LASTRADA-Software/fastcached/issues/340)).
-
-    What a credential would *mean* here is still open
-    ([#198](https://github.com/LASTRADA-Software/fastcached/issues/198)); see
-    [Security](#security) for what does protect a fleet today.
 
 ---
 
@@ -630,7 +611,7 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_scratch_unavailable_total` | The scratch disk is full or unwritable. |
 | `fastcache_worker_jobs_refused_spawn_failed_total` | The toolchain is configured but cannot be executed. |
 | `fastcache_worker_jobs_refused_compiler_unclassified_total` | The toolchain runs, and this build cannot tell which driver it is, so no command line can be built for it. The remedy is the `--toolchain` on that node, not a path. The node also says this once at survey time, so check its startup log before this counter. |
-| `fastcache_worker_jobs_refused_not_a_member_total` | A caller this worker does not admit tried to compile on it. **Check your own fleet first**: if this worker has no `--fleet-member` / `--fleet-open`, it admits its own machine and nothing else, and this counter is your clients being turned away one hop after a lease was granted. Once it names a policy, a rise here is somebody with no claim on the machine — check who can reach `--listen-node`. |
+| `fastcache_worker_jobs_refused_not_a_member_total` | A caller this worker does not admit tried to compile on it. **Check your own fleet first**: if this worker holds no roster and is not `--fleet-open`, it admits its own machine and nothing else, and this counter is your clients being turned away one hop after a lease was granted; a client whose machine the cluster has not admitted lands here too, and `fastcache-cli explain-admission <machine>` says so. Once the policy is right, a rise here is somebody with no claim on the machine — check who can reach `--listen-node`. |
 | `fastcache_worker_jobs_refused_envelope_declared_too_large_total` | A request declared its payload expands past this worker's ceiling. Nothing honest does that by accident: a probe of the port, or a client with a larger ceiling than the worker. |
 | `fastcache_worker_jobs_refused_envelope_unsupported_codec_total` | A client compressed with a codec this worker was not built with. A packaging difference between two honest machines; each one cost a local compile. |
 | `fastcache_worker_jobs_refused_envelope_malformed_total` | A payload envelope that did not parse: a version skew, or something on the port that is not this protocol. |
@@ -791,7 +772,7 @@ hostname, endpoint, software version, capacity and cache, plus charts of the las
 
 ```sh
 fastcache-compile-node ... \
-    --listen-node=6675 --fleet-member=10.0.0.2 \
+    --listen-node=6675 \
     --admin-listen=6677 \
     --dashboard --dashboard-token-file=/etc/fastcached/dashboard.token
 ```
@@ -925,16 +906,16 @@ for a worker nor slip a verb into a connection the worker's proof admitted. A ma
 cluster forgets with `--cluster-forget` is refused on its key, from any address. See
 [A node proves which machine it is](../tools/fastcache-compile-node.md#a-node-proves-which-machine-it-is-and-every-frame-after-it-is-sealed).
 
-A node is closed by default. Its compile port and its scheduler admit **this machine
-and `--fleet-member` peers only** (or every caller, once you say `--fleet-open`);
-once a cluster exists the agreed member set is **added** to that list rather than
-replacing it, and both surfaces follow the union — so a host stops being admitted
-only when the operator stops listing it. That matters most for the compile port,
+A node is closed by default. Its compile port and its scheduler admit **this machine,
+and machines whose key the cluster admitted** — by a proof, or by a machine ticket — or
+every caller, once you say `--fleet-open`. A machine stops being admitted everywhere at
+once when the cluster forgets it, since its key is what every node asks about on every
+request. That matters most for the compile port,
 which binds `0.0.0.0` because peers have to dial it — anybody who could route to it
 would otherwise have your machine run their compiler on source they chose.
 
-Its **own cache tier admits this machine and nothing else**, whatever those lists
-say and whatever it is bound to
+Its **own cache tier admits this machine and nothing else**, whatever the roster
+says and whatever it is bound to
 ([#287](https://github.com/LASTRADA-Software/fastcached/issues/287)). A peer that
 may spend this machine's CPU is not thereby entitled to read everything it has ever
 compiled, and the tier is exactly that. A cache several machines share is a
@@ -959,8 +940,8 @@ roster they hold lapses.
 
     Every worker names a scheduler, so every worker **will not start** without
     `--cluster-dir`: it has no identity to prove, and every verb it would join the fleet
-    with would be refused. And a worker another machine could dial — anything with
-    `--fleet-member` or `--fleet-open` on a bind that is not loopback — **will not start**
+    with would be refused. And a worker another machine could dial — one that
+    admits other machines, on a bind that is not loopback — **will not start**
     with no way to check a lease: it runs consensus, keeps a roster in its `--cluster-dir`,
     or names the voters with `--voter-key`. Both refusals are deliberate and both are
     startup ones, not per-request fallbacks: a worker that quietly skipped the check
@@ -978,10 +959,11 @@ roster they hold lapses.
 
 --8<-- "node-credential-gap.md"
 
-Beyond the lease and consensus — whose every connection proves each member's own identity
+Beyond the lease, consensus — whose every connection proves each member's own identity
 key, see [Raft peer authentication](../operations/cluster-communication.md#raft-peer-authentication)
-— the fleet's own traffic is unauthenticated, so treat its boundary as **network
-reachability plus membership** and size the network accordingly.
+— and the machine ticket a client presents, the fleet's own traffic is not encrypted, so
+treat its boundary as **network reachability plus membership** and size the network
+accordingly.
 
 So: keep a scheduling node's port off any network you would not run a compiler for,
 and put mTLS in front of every port for anything beyond a trusted build network.
@@ -989,9 +971,11 @@ The two remaining credentials in this system are real and unaffected —
 `--dashboard-token-file` guards the fleet page and the live-stats fleet stream, and `fastcached`'s own
 `--requirepass` guards the shared cache.
 
-Also worth knowing: the node's inter-node gate matches on the peer's **source
-address** alone ([#180](https://github.com/LASTRADA-Software/fastcached/issues/180)),
-so a build LAN where addresses can be spoofed is not a boundary this can hold.
+Also worth knowing: no **source address** admits anybody but a node's own machine
+([#180](https://github.com/LASTRADA-Software/fastcached/issues/180)) — a machine is
+admitted by its key — so a spoofed address buys a stranger nothing. A captured ticket buys
+one replay at no other node and no later moment, since each names one endpoint, lives a
+minute and is spent once.
 
 ## Limits worth knowing before you adopt it
 
@@ -1028,11 +1012,11 @@ so a build LAN where addresses can be spoofed is not a boundary this can hold.
   preprocessed text it sends and would otherwise silently override yours. Run with
   `FASTCACHE_VERBOSE=1` to see which of these applied.
 
-- **A node's `--requirepass` cannot reach another node** (see
-  [Security](#security)). Until
-  [#198](https://github.com/LASTRADA-Software/fastcached/issues/198) closes, the
-  fleet's own traffic is unauthenticated and setting a token on it is worse than
-  leaving it unset.
+- **A node's `--requirepass` is for its `--upstream` alone.** It is the secret of the
+  shared `fastcached`, presented there and nowhere else. The fleet's own traffic is
+  authenticated by machine keys instead (see [Security](#security)): a node proves its
+  identity key on every connection to its scheduler, and any other machine presents a
+  ticket its own node minted. So there is no fleet password to set.
 
 ## Reference
 

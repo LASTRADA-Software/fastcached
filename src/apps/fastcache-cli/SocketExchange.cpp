@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "SocketExchange.hpp"
 
+#include <FastCache/Core/HostPort.hpp>
+#include <FastCache/Core/SecureBytes.hpp>
+#include <FastCache/Protocol/TicketChoice.hpp>
+
 #include <array>
 #include <charconv>
 #include <format>
@@ -83,12 +87,16 @@ namespace
     /// one that closes mid-reply is a broken connection -- and a second copy of that
     /// distinction is a second thing to get wrong.
     ///
+    /// The chunk is appended straight from the read buffer, with no intermediate string, and the
+    /// read buffer is wiped once it has been: a `0xFC` reply can be a minted ticket.
+    ///
     /// @param socket The connected socket.
     /// @param pending The buffer to append to; its emptiness is what the EOF arms read.
     /// @param words What the read is of, as its failure says it.
     /// @return Nothing on success, or why the read did not happen.
+    template <typename Buffer>
     [[nodiscard]] std::expected<void, ExchangeError> FillMore(core::net::ISocket* socket,
-                                                              std::string& pending,
+                                                              Buffer& pending,
                                                               ReadWords const& words)
     {
         std::array<std::byte, ReadChunkBytes> chunk {};
@@ -100,7 +108,9 @@ namespace
             return std::unexpected(
                 ExchangeError { .kind = ExchangeFailure::Transport,
                                 .detail = std::string { pending.empty() ? words.closedBetween : words.closedWithin } });
-        pending += AsChars(std::span<std::byte const> { chunk.data(), *got });
+        auto const* const first = reinterpret_cast<char const*>(chunk.data());
+        pending.insert(pending.end(), first, first + *got);
+        SecureZero(chunk.data(), *got);
         return {};
     }
 
@@ -111,15 +121,75 @@ namespace
     [[nodiscard]] std::expected<std::unique_ptr<core::net::ISocket>, ExchangeError> Dial(Endpoint const& endpoint,
                                                                                          DialTimeouts timeouts)
     {
-        auto socket =
-            core::async::syncRun(core::net::connectTcp(endpoint.host, endpoint.port, timeouts.connect, timeouts.io));
-        if (!socket.has_value())
-            return std::unexpected(ExchangeError {
-                .kind = ExchangeFailure::Unreachable,
-                .detail = std::format("cannot reach {}:{} ({})", endpoint.host, endpoint.port, socket.error().context) });
-        return std::move(*socket);
+        return DialTcp(endpoint, timeouts);
+    }
+
+    /// Why a mint produced no ticket, and what the line adds to the fixed reason.
+    struct MintRefusal
+    {
+        Cc::MintFailure failure; ///< Which way it failed.
+        std::string detail;      ///< The source, and the node's own words.
+    };
+
+    /// Mint a ticket naming @p audience from this machine's node.
+    /// @param audience The endpoint the ticket is for, as `EndpointText` spells it.
+    /// @param mintFrom `--mint-from`, or unset for @p audience's port.
+    /// @param timeouts How long.
+    /// @param dial How the node is reached.
+    /// @return The ticket, held where it is wiped on release, or why there is none.
+    [[nodiscard]] std::expected<SecureString, MintRefusal> MintTicket(std::string_view audience,
+                                                                      Endpoint const& mintFrom,
+                                                                      DialTimeouts timeouts,
+                                                                      SocketDial const& dial)
+    {
+        // `TicketSourceFor` is the launcher's rule and not a copy of it: a loopback literal at the
+        // port, never a name a resolver could send anywhere.
+        auto const source = Cc::TicketSourceFor(mintFrom.Configured() ? EndpointText(mintFrom) : std::string { audience });
+        auto const parsed = source.has_value() ? ParseDialEndpoint(*source) : std::nullopt;
+        if (!parsed.has_value())
+            return std::unexpected(
+                MintRefusal { .failure = Cc::MintFailure::NoSource, .detail = std::format("{} names no port", audience) });
+        auto const at = Endpoint { .host = parsed->first, .port = parsed->second };
+
+        // Presenting nothing: the mint is admitted as this machine, by the connection, and a loopback
+        // audience is one `ChooseCredential` answers with nothing -- so this cannot recurse.
+        auto minter = NodeExchange::Open(at, timeouts, NodeCredentials {}, dial);
+        if (!minter.has_value())
+            return std::unexpected(MintRefusal { .failure = Cc::MintFailure::Unreachable,
+                                                 .detail = std::format("at {}: {}", *source, minter.error().detail) });
+        auto reply = (*minter)->Send(CompileCacheWire::EncodeMintTicketRequest(audience));
+        if (!reply.has_value())
+            return std::unexpected(MintRefusal { .failure = Cc::MintFailure::Unreachable,
+                                                 .detail = std::format("at {}: {}", *source, reply.error().detail) });
+        if (reply->status != CompileCacheWire::Status::Ok)
+            return std::unexpected(MintRefusal { .failure = Cc::MintFailure::Refused,
+                                                 .detail = ExplainRefusal("mint-ticket", *source, *reply) });
+        if (reply->payload.empty())
+            return std::unexpected(
+                MintRefusal { .failure = Cc::MintFailure::NoTicket, .detail = std::format("at {}", *source) });
+
+        // Named for the credential-container scan's `machineTicket` row, and its type spelled out:
+        // the scan reads the type written before the name, so `auto` would hide it.
+        SecureString machineTicket { CompileCacheWire::AsStringView(reply->payload) };
+        // Where the ticket has been on its way here, and what became of each: the read chunk is
+        // wiped by `FillMore` once appended; the connection's `_pending` zeroes the consumed frame
+        // and frees through a wiping allocator; and the reply's payload, which `DecodeNodeReply`
+        // copied it into, is wiped here before it is freed. So the one copy left is the one wiped
+        // on release. What this process cannot reach is the kernel's socket buffer.
+        SecureZero(reply->payload.data(), reply->payload.size());
+        return machineTicket;
     }
 } // namespace
+
+std::expected<std::unique_ptr<core::net::ISocket>, ExchangeError> DialTcp(Endpoint const& endpoint, DialTimeouts timeouts)
+{
+    auto socket = core::async::syncRun(core::net::connectTcp(endpoint.host, endpoint.port, timeouts.connect, timeouts.io));
+    if (!socket.has_value())
+        return std::unexpected(ExchangeError {
+            .kind = ExchangeFailure::Unreachable,
+            .detail = std::format("cannot reach {}:{} ({})", endpoint.host, endpoint.port, socket.error().context) });
+    return std::move(*socket);
+}
 
 SocketExchange::SocketExchange(std::unique_ptr<core::net::ISocket> socket, ParseLimits limits) noexcept:
     _socket { std::move(socket) },
@@ -155,7 +225,8 @@ std::expected<std::unique_ptr<SocketExchange>, ExchangeError> SocketExchange::Op
     auto argv = std::vector<std::string> { "AUTH" };
     if (!credential.username.empty())
         argv.push_back(credential.username);
-    argv.push_back(credential.secret);
+    // The one plain copy the RESP wire needs: `AUTH` is encoded from strings (#1578).
+    argv.emplace_back(credential.secret.View());
 
     auto const reply = exchange->Call(argv);
     if (!reply.has_value())
@@ -282,19 +353,64 @@ NodeExchange::~NodeExchange()
 
 std::expected<std::unique_ptr<NodeExchange>, ExchangeError> NodeExchange::Open(Endpoint const& endpoint,
                                                                                DialTimeouts timeouts,
-                                                                               Credential const& credential)
+                                                                               NodeCredentials const& credentials)
 {
-    auto socket = Dial(endpoint, timeouts);
+    return Open(endpoint, timeouts, credentials, &Dial);
+}
+
+std::expected<std::unique_ptr<NodeExchange>, ExchangeError> NodeExchange::Open(Endpoint const& endpoint,
+                                                                               DialTimeouts timeouts,
+                                                                               NodeCredentials const& credentials,
+                                                                               SocketDial const& dial)
+{
+    auto socket = dial(endpoint, timeouts);
     if (!socket.has_value())
         return std::unexpected(socket.error());
 
     std::unique_ptr<NodeExchange> exchange { new NodeExchange { std::move(*socket),
                                                                 std::format("{}:{}", endpoint.host, endpoint.port) } };
-    if (!credential.Configured())
-        return exchange;
 
-    auto const reply =
-        exchange->Send(CompileCacheWire::EncodeAuth({ .username = credential.username, .secret = credential.secret }));
+    // The launcher's decision, asked of the endpoint as `EndpointText` spells it -- the same spelling
+    // `passwordFor` was taken in, so an IPv6 `--addr` still matches itself.
+    auto const audience = EndpointText(endpoint);
+    auto const passwordFor = credentials.password != nullptr && credentials.password->Configured()
+                                 ? std::string_view { credentials.passwordFor }
+                                 : std::string_view {};
+    switch (Cc::ChooseCredential(audience, passwordFor))
+    {
+        case Cc::CredentialChoice::None:
+        case Cc::CredentialChoice::Last:
+            return exchange;
+        case Cc::CredentialChoice::Password:
+            return Authenticated(std::move(exchange),
+                                 { .kind = CompileCacheWire::AuthKind::Password,
+                                   .username = credentials.password->username,
+                                   .secret = credentials.password->secret.View() });
+        case Cc::CredentialChoice::Ticket:
+            break;
+    }
+
+    std::expected<SecureString, MintRefusal> const machineTicket =
+        MintTicket(audience, credentials.mintFrom, timeouts, dial);
+    if (!machineTicket.has_value())
+    {
+        exchange->_missingTicket = machineTicket.error().failure;
+        exchange->_advisories.push_back(std::format("{} ({}); continuing without a credential, so {} answers as it does "
+                                                    "to a machine it does not know",
+                                                    Cc::ReasonFor(machineTicket.error().failure),
+                                                    machineTicket.error().detail,
+                                                    audience));
+        return exchange;
+    }
+    return Authenticated(
+        std::move(exchange),
+        { .kind = CompileCacheWire::AuthKind::MachineTicket, .username = {}, .secret = machineTicket->View() });
+}
+
+std::expected<std::unique_ptr<NodeExchange>, ExchangeError> NodeExchange::Authenticated(
+    std::unique_ptr<NodeExchange> exchange, CompileCacheWire::AuthRequest const& request)
+{
+    auto const reply = exchange->Send(CompileCacheWire::EncodeAuth(request));
     if (!reply.has_value())
         return std::unexpected(reply.error());
 
@@ -392,7 +508,10 @@ std::expected<NodeReply, ExchangeError> NodeExchange::ReadOne(Reading reading)
             if (_pending.size() >= whole)
             {
                 auto reply = DecodeNodeReply(bytes.subspan(0, whole));
-                _pending.erase(0, whole);
+                // Zeroed BEFORE the rest moves down over it, so no copy of a consumed frame -- a
+                // minted ticket's among them -- survives in the storage past the new end.
+                SecureZero(_pending.data(), whole);
+                _pending.erase(_pending.begin(), _pending.begin() + static_cast<std::ptrdiff_t>(whole));
                 return reply;
             }
         }
@@ -406,18 +525,14 @@ std::expected<NodeReply, ExchangeError> NodeExchange::ReadOne(Reading reading)
 std::expected<HttpResponse, ExchangeError> HttpGet(Endpoint const& endpoint,
                                                    std::string_view path,
                                                    DialTimeouts timeouts,
-                                                   std::optional<std::string> const& bearer,
                                                    std::size_t maxBodyBytes)
 {
     auto socket = Dial(endpoint, timeouts);
     if (!socket.has_value())
         return std::unexpected(socket.error());
 
-    auto request = std::format(
-        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nAccept: */*\r\nConnection: close\r\n", path, endpoint.host, endpoint.port);
-    if (bearer.has_value())
-        request += std::format("Authorization: Bearer {}\r\n", *bearer);
-    request += "\r\n";
+    auto const request = std::format(
+        "GET {} HTTP/1.1\r\nHost: {}:{}\r\nAccept: */*\r\nConnection: close\r\n\r\n", path, endpoint.host, endpoint.port);
 
     if (!core::async::syncRun(core::net::sendAll(socket->get(), AsBytes(request))))
         return std::unexpected(ExchangeError { .kind = ExchangeFailure::Transport,

@@ -2,12 +2,15 @@
 #pragma once
 
 #include <chrono>
+#include <expected>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 
+#include <CacheProtocol.hpp>
 #include <core/net/IConnector.hpp>
 #include <core/net/ISocket.hpp>
 
@@ -104,6 +107,51 @@ struct ReachedEndpoint
 [[nodiscard]] std::optional<ReachedEndpoint> DialFirstReachable(IEndpointDialer& dialer,
                                                                 std::span<std::string const> endpoints,
                                                                 core::net::DialOptions options);
+
+/// How many `NotLeader` redirects one operator verb follows.
+///
+/// Bounded because two nodes each holding a stale `_knownLeader` can name each other forever --
+/// the same reason the worker's heartbeat bounds its own following. Three is a cluster in the
+/// middle of an election, which settles.
+inline constexpr int MaxLeaderRedirects = 3;
+
+/// What `AskTheLeader` came back with.
+struct LeaderAnswer
+{
+    Cc::CacheOutcome outcome; ///< The last answer: anything but a redirect that was followed.
+    std::string endpoint;     ///< Who gave it.
+};
+
+/// One exchange over a connected socket, told which endpoint it reached -- the audience a
+/// credential is asked for.
+using LeaderAsk = std::function<Cc::CacheOutcome(core::net::ISocket& socket, std::string_view endpoint)>;
+
+/// Put one operator request to whoever leads, following `NotLeader` to the endpoint it names.
+///
+/// **`NotLeader` is an INSTRUCTION, not an answer about the fleet**, so a client follows it --
+/// bounded (`MaxLeaderRedirects`), and judged by PARSING the message (`Cc::RedirectTarget`), never
+/// by its emptiness. The one loop for every operator verb: `RunClusterAdmin` answered the operator
+/// "ask --scheduler=X instead" while `RunEnrollAdmin` followed, which is two rules for one code.
+///
+/// **Safe for a MUTATING verb, and for one reason**: a redirect is followed only after a
+/// `NotLeader`, which is a REFUSAL -- nothing was applied where it landed, so asking the leader it
+/// names cannot apply `--cluster-admit` or `--enroll-approve` twice. Every other answer ends the
+/// loop, and so does a connection that fails mid-exchange: that request may have been applied.
+///
+/// The first ask walks @p schedulers and takes whichever CONNECTS (`DialFirstReachable`, a
+/// fallback only where nothing was sent); a redirect names one endpoint and is followed there,
+/// never back into the list (#1310). Out of hops, the last `NotLeader` is returned as the answer.
+/// @param dialer How each endpoint is reached.
+/// @param schedulers Where to ask first, in order.
+/// @param options Ceiling on each dial.
+/// @param subject What the far end is called in a sentence: "the scheduler", "the cluster".
+/// @param ask One exchange; called once per endpoint asked.
+/// @return The answer and who gave it, or the sentence saying why there is none.
+[[nodiscard]] std::expected<LeaderAnswer, std::string> AskTheLeader(IEndpointDialer& dialer,
+                                                                    std::span<std::string const> schedulers,
+                                                                    core::net::DialOptions options,
+                                                                    std::string_view subject,
+                                                                    LeaderAsk const& ask);
 
 /// Render a list of endpoints for a sentence an operator reads.
 /// @param endpoints The endpoints, in the order they were tried.

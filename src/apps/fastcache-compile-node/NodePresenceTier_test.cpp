@@ -109,10 +109,8 @@ struct PresenceFixture
     NullLogger logger;
     SilentLoadSampler loadSampler;
     Testing::PlacedWallClock wall;
-    Cc::CredentialNotice notice { Cc::CredentialNotice::Silent() };
     Wire::CapacityFields capacity {};
     FleetSampler sampler { std::nullopt, metrics, NodeFacts(), wall, HistoryPaths {}, logger };
-    ConfiguredCredential credential { cfg, nullptr };
     NodeConditions conditions;
 
     PresenceFixture()
@@ -135,8 +133,6 @@ struct PresenceFixture
                                .cacheTier = nullptr,
                                .metrics = metrics,
                                .sampler = sampler,
-                               .credential = credential,
-                               .notice = notice,
                                .capacity = capacity,
                                .endpoint = ThisMachine,
                                .logger = logger,
@@ -241,10 +237,8 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
     NullLogger logger;
     SilentLoadSampler loadSampler;
     Testing::PlacedWallClock wall;
-    Cc::CredentialNotice notice { Cc::CredentialNotice::Silent() };
     Wire::CapacityFields const capacity {};
     FleetSampler sampler { std::nullopt, metrics, NodeFacts(), wall, HistoryPaths {}, logger };
-    ConfiguredCredential credential { cfg, nullptr };
     NodeConditions const conditions;
 
     REQUIRE(sampler.NextHistoryBatch(8).empty());
@@ -255,8 +249,6 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
                                                               .cacheTier = nullptr,
                                                               .metrics = metrics,
                                                               .sampler = sampler,
-                                                              .credential = credential,
-                                                              .notice = notice,
                                                               .capacity = capacity,
                                                               .endpoint = ThisMachine,
                                                               .logger = logger,

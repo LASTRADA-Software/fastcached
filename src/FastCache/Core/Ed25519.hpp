@@ -5,6 +5,7 @@
 #include <FastCache/Core/Errors/CryptoError.hpp>
 #include <FastCache/Core/SecureBytes.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +52,20 @@ inline constexpr std::size_t Ed25519SignatureBytes = 64;
 
 /// An Ed25519 public key. Not a secret, so a fixed-size value type.
 using Ed25519PublicKey = std::array<std::byte, Ed25519PublicKeyBytes>;
+
+/// Whether @p key is the all-zero key: what an `Ed25519PublicKey` field holds when a
+/// construction never named one, since the type value-initializes.
+///
+/// A place that must hold a REAL key asks this rather than trusting the type, because the
+/// type cannot tell a key nobody gave from one somebody did. No key pair this project makes
+/// has it -- a public key is derived from a hashed seed -- so reading it as "no key" costs
+/// nothing honest.
+/// @param key The key.
+/// @return True when every byte is zero.
+[[nodiscard]] constexpr bool IsZeroEd25519PublicKey(Ed25519PublicKey const& key) noexcept
+{
+    return std::ranges::all_of(key, [](std::byte const value) { return value == std::byte { 0 }; });
+}
 
 /// An Ed25519 signature. Not a secret, so a fixed-size value type.
 using Ed25519Signature = std::array<std::byte, Ed25519SignatureBytes>;

@@ -175,9 +175,9 @@ struct CertifyingVoters
     /// revoked -- or every anchor.
     std::vector<TrustedEndorser> endorsers;
 
-    /// How many votes there are: every VOTER, keyless ones included -- a voter that stated no
-    /// key still counts toward the majority it can never help reach, as it counts toward a
-    /// Raft quorum. For anchors, the anchors.
+    /// How many votes there are: every VOTER, a revoked one included -- a voter that cannot
+    /// endorse still counts toward the majority, as it counts toward a Raft quorum. For
+    /// anchors, the anchors.
     std::size_t voters {};
 };
 

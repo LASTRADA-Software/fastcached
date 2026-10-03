@@ -25,6 +25,7 @@
 #include "LiveStatsResponder.hpp"
 #include "LiveStatsSources.hpp"
 #include "NodeAnnounce.hpp"
+#include "NodeAudience.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
@@ -34,6 +35,7 @@
 #include "NodeIoLoop.hpp"
 #include "NodeKey.hpp"
 #include "NodeLogging.hpp"
+#include "NodeMachineStanding.hpp"
 #include "NodeMembership.hpp"
 #include "NodePresenceTier.hpp"
 #include "NodeProofResponder.hpp"
@@ -43,9 +45,11 @@
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
 #include "NodeToolchains.hpp"
+#include "OperatorCredentials.hpp"
 #include "SchedulerLink.hpp"
 #include "SchedulerTier.hpp"
 #include "ScratchClaim.hpp"
+#include "SessionResponder.hpp"
 #include "WorkerLease.hpp"
 #include "WorkerTier.hpp"
 
@@ -613,10 +617,7 @@ using Node::NodeReloader;
     // Not `const`: consensus republishes the member set into it while the node runs,
     // which is the whole point of membership being a replicated log entry rather than
     // a command-line list.
-    //
-    // It reports a `--fleet-member` entry the cluster has forgotten only where there IS a cluster:
-    // `RunsConsensus`, the one predicate every consensus-dependent site asks.
-    Node::NodeMembership membership { cfg, logger, AddressWhen(Node::RunsConsensus(cfg), conditions) };
+    Node::NodeMembership membership { cfg, logger };
 
     // **The roster every lease grant is verified against** (#178), built before anything that
     // reads it: the worker's validator borrows it, consensus feeds it every applied state and
@@ -719,10 +720,9 @@ using Node::NodeReloader;
     auto const hostAddresses = MakeSystemHostAddresses();
     CachedLocalityOracle const locality { *hostAddresses, cacheClock };
 
-    // ONE source, and every site that presents this worker's credential borrows it.
-    // Declared here because the first of those sites is the cache tier immediately
-    // below and the last is the heartbeat round far further down, and a local declared
-    // between them would be an object two consumers reach and one of them outlives.
+    // ONE source, and the one site that presents this worker's credential borrows it: the
+    // cache tier's `--upstream` client, immediately below. Nothing that talks to a scheduler
+    // does -- a scheduler checks no password, and this machine's proof is its credential there.
     //
     // It reads the RELOADER rather than `cfg`, which is the whole of #404: `cfg` is
     // the configuration this worker STARTED with, and a rotated `--requirepass` lives
@@ -798,7 +798,6 @@ using Node::NodeReloader;
                                                         .io = nodeIo,
                                                         .host = *host,
                                                         .cacheTier = cacheTier.get(),
-                                                        .credential = credential,
                                                         .prover = AddressOrNull(prover),
                                                         .leaseRoster = nodeRoster->Lease(),
                                                         .metrics = metrics,
@@ -919,22 +918,12 @@ using Node::NodeReloader;
                                    .capacity = workerTier != nullptr ? &workerTier->Capacity() : nullptr,
                                    .scheduler = ServiceOrNull(schedulerTier.get()),
                                    .enrollment = AddressWhen(servesEnrollment, enrollmentWindow),
-                                   // `RunsConsensus`, not `servesEnrollment`: the committed
-                                   // tombstone set exists wherever this node participates in
-                                   // the cluster's state, which is a broader condition than
-                                   // serving an enrollment window (that also wants a scheduler
-                                   // tier). Asked of the ONE predicate rather than spelled as a
-                                   // conjunction here, which is the rule this file already
-                                   // carries for `servesEnrollment` two lines up.
-                                   //
-                                   // `NodeMembership` exists on every node; the committed SET
-                                   // only exists where consensus runs, so this pointer is what
-                                   // draws the distinction and a keyless node reports the field
-                                   // ABSENT rather than `0` (#1471).
-                                   .membership = AddressWhen(Node::RunsConsensus(cfg), membership),
-                                   // The same predicate, for the same reason: a standing is a
-                                   // claim about a configuration only a consensus node holds, so
-                                   // a node running none reports the field ABSENT (#1449).
+                                   // `RunsConsensus`, not `servesEnrollment`: a standing is a
+                                   // claim about a configuration only a consensus node holds, which
+                                   // is a broader condition than serving an enrollment window (that
+                                   // also wants a scheduler tier), so a node running none reports
+                                   // the field ABSENT (#1449). Asked of the ONE predicate rather
+                                   // than spelled as a conjunction here.
                                    .consensus = AddressWhen(Node::RunsConsensus(cfg), consensusStanding),
                                    // Every node has conditions, so this is never null here: a node
                                    // with nothing raised reports every row `clear` or
@@ -957,7 +946,10 @@ using Node::NodeReloader;
     // this surface: see `LiveStatsSourceSlot`. Declared before every responder reading it, so it is
     // destroyed after them.
     LiveStatsSourceSlot liveSources;
-    Node::NodeStatusResponder nodeStatusResponder { nodeStatus, liveSources, membership.Oracle(), metrics };
+    // What `explain-admission <machine>` answers from: the roster grants are verified against, and
+    // the enrollment window where this node serves one.
+    Node::NodeMachineStanding const machineStanding { *nodeRoster, AddressWhen(servesEnrollment, enrollmentWindow) };
+    Node::NodeStatusResponder nodeStatusResponder { nodeStatus, liveSources, membership.Oracle(), machineStanding, metrics };
 
     // The dashboard credential, read ONCE for the surfaces that guard the fleet with it: `/fleet`
     // over HTTP, and over `0xFC` the fleet subject of a live-stats subscription and `fleet-text`.
@@ -979,6 +971,28 @@ using Node::NodeReloader;
     // the fleet subject of a subscription.
     Node::FleetTextResponder fleetTextResponder { liveSources, membership.Oracle(), dashboardCredential, metrics };
 
+    // The `Session` family's owner, on every built node: the node checks no password, and what an
+    // `AUTH` can establish -- which machine a ticket speaks for -- does not depend on which
+    // components this node runs.
+    //
+    // A ticket is spendable here when it names one of this node's own endpoints: the advertised
+    // one (read per ticket, since `--advertise` reloads), this machine's host name, or any address
+    // of this machine on the `Node` surface's ports. Who signed it is asked of the SAME roster a
+    // lease is checked against, so a revoked or forgotten machine's tickets stop at once.
+    Node::NodeAudience const ticketAudience {
+        announced, QueryHostFacts().hostName, Node::NodeAudience::PortsOf(cfg), locality
+    };
+    Distributed::SpentTickets spentTickets;
+    Distributed::TicketVerifier const ticketVerifier { nodeRoster->Lease(), ticketAudience, spentTickets };
+    core::platform::SystemWallClock const ticketWallClock;
+    Node::SessionResponder sessionResponder {
+        ticketVerifier,
+        Node::SessionKeys { .identityKey = identityKey.has_value() ? &*identityKey : nullptr, .machineId = cfg.nodeId },
+        proofRandom,
+        ticketWallClock,
+        metrics
+    };
+
     // The enrollment surface, built only where there is a cluster to be admitted to.
     //
     // An `optional` rather than a null pointer with a branch at the call site, because
@@ -989,37 +1003,20 @@ using Node::NodeReloader;
     // the two sites spelled different expressions.
     //
     // `membership.Oracle()` bound once, by reference, exactly as every other surface
-    // binds it. The credential is the SCHEDULER's -- `AUTH` routes there -- so this
-    // surface holds the same policy object rather than a second one, or a node with a
-    // token file would gate nine verbs and leave the tenth open.
+    // binds it.
     std::optional<Node::EnrollmentResponder> enrollmentResponder;
     if (servesEnrollment)
-        enrollmentResponder.emplace(enrollmentWindow,
-                                    schedulerTier->ServiceForSurfaces(),
-                                    membership.Oracle(),
-                                    metrics,
-                                    logger,
-                                    schedulerTier->Policy());
+        enrollmentResponder.emplace(
+            enrollmentWindow, schedulerTier->ServiceForSurfaces(), membership.Oracle(), metrics, logger);
 
     // The identity prover (#178), built wherever this node runs CONSENSUS: a proof is judged
     // against the cluster's applied roster -- members, enrolled principals and revoked keys --
     // which only a consensus member holds, and it is asked of `membership`, whose `ExplainKey` is
     // the one door to that answer for the proof and for every later verb alike. A consensus node
     // holds an identity key, as every node does.
-    //
-    // The credential is the SCHEDULER's, for the reason the enrollment surface holds the same
-    // object: `AUTH` is a `Session` verb and routes there, so a node with a token file must gate
-    // these two verbs with it as well -- and `schedulerTier` may legitimately be null on a
-    // consensus member that schedules nothing, which is what the conditional below reads.
     std::optional<Node::NodeProofResponder> nodeProofResponder;
     if (Node::RunsConsensus(cfg) && identityKey.has_value())
-        nodeProofResponder.emplace(cfg.nodeId,
-                                   *identityKey,
-                                   membership,
-                                   proofRandom,
-                                   metrics,
-                                   logger,
-                                   schedulerTier != nullptr ? schedulerTier->Policy() : nullptr);
+        nodeProofResponder.emplace(cfg.nodeId, *identityKey, membership, proofRandom, metrics, logger);
 
     // Which fleet this node is in, answered to anybody who asks: every node holds an identity key,
     // and one that runs no consensus answers `NoCluster` itself rather than leaving the family
@@ -1043,7 +1040,8 @@ using Node::NodeReloader;
                                                                        liveStatsResponder,
                                                                        fleetTextResponder,
                                                                        AddressOrNull(nodeProofResponder),
-                                                                       AddressOrNull(fleetSummaryResponder)),
+                                                                       AddressOrNull(fleetSummaryResponder),
+                                                                       sessionResponder),
                                         activated,
                                         metrics,
                                         logger,
@@ -1326,7 +1324,6 @@ using Node::NodeReloader;
                                                                               .cacheTier = cacheTier.get(),
                                                                               .metrics = metrics,
                                                                               .sampler = sampler,
-                                                                              .credential = credential,
                                                                               .logger = logger,
                                                                               .conditions = conditions,
                                                                               .roster = nodeRoster.get(),
@@ -1652,18 +1649,23 @@ struct EarlyVerbRow
     return 0;
 }
 
+/// Say one line of an operator verb's credential handling on stderr.
+/// @param text The line.
+void SayOperatorCredential(std::string_view text)
+{
+    std::cerr << "fastcache-compile-node: " << text << '\n';
+}
+
 /// Put a cluster question to a running cluster and report the answer (`--cluster-*`).
 ///
-/// No reloader exists at this point and none ever will on this path: a cluster verb
-/// answers and the process returns. The seam is threaded through anyway, so the day one
-/// of these is asked from a running worker it reads the live secret rather than the one
-/// this process was started with.
+/// Each endpoint the verb dials is shown a ticket minted by this machine's own node
+/// (`OperatorCredentials`), so the verb works from any machine the cluster holds the key of.
 /// @param context The configuration.
 /// @return What the verb answered, rendered by `ReportOneShotVerb`.
 [[nodiscard]] int RunClusterVerb(EarlyVerbContext const& context)
 {
-    Node::ConfiguredCredential const credential { context.cfg, nullptr };
-    return ReportOneShotVerb(RunClusterAdmin(context.cfg, context.cfg.cluster, credential));
+    Node::OperatorCredentials operatorCredentials { context.cfg, Node::DefaultOneShotDialer(), &SayOperatorCredential };
+    return ReportOneShotVerb(RunClusterAdmin(context.cfg, context.cfg.cluster, operatorCredentials.Credentials()));
 }
 
 /// Cordon this machine's own worker, or lift its cordon (`--cordon`, `--uncordon`).
@@ -1671,8 +1673,7 @@ struct EarlyVerbRow
 /// @return What the verb answered, rendered by `ReportOneShotVerb`.
 [[nodiscard]] int RunCordonVerb(EarlyVerbContext const& context)
 {
-    Node::ConfiguredCredential const credential { context.cfg, nullptr };
-    return ReportOneShotVerb(Node::RunCordonAdmin(context.cfg, context.cfg.cordon, credential));
+    return ReportOneShotVerb(Node::RunCordonAdmin(context.cfg, context.cfg.cordon));
 }
 
 /// Decide who may join, on behalf of an operator (`--enroll-*`).
@@ -1680,8 +1681,8 @@ struct EarlyVerbRow
 /// @return What the verb answered, rendered by `ReportOneShotVerb`.
 [[nodiscard]] int RunEnrollVerb(EarlyVerbContext const& context)
 {
-    Node::ConfiguredCredential const credential { context.cfg, nullptr };
-    return ReportOneShotVerb(Node::RunEnrollAdmin(context.cfg, context.cfg.enroll, credential));
+    Node::OperatorCredentials operatorCredentials { context.cfg, Node::DefaultOneShotDialer(), &SayOperatorCredential };
+    return ReportOneShotVerb(Node::RunEnrollAdmin(context.cfg, context.cfg.enroll, operatorCredentials.Credentials()));
 }
 
 /// Ask another cluster to let this machine in (`--enroll-from`).
@@ -1691,9 +1692,7 @@ struct EarlyVerbRow
 {
     SystemSecureRandom enrollRandom;
     Node::FileTrustNodeKeyGuard keyGuard;
-    Node::ConfiguredCredential const credential { context.cfg, nullptr };
-    return ReportOneShotVerb(Node::RunEnrollClient(context.cfg, credential, enrollRandom, keyGuard),
-                             "fastcache-compile-node: ");
+    return ReportOneShotVerb(Node::RunEnrollClient(context.cfg, enrollRandom, keyGuard), "fastcache-compile-node: ");
 }
 
 /// The verbs that answer an operator and exit, in the order they are asked.

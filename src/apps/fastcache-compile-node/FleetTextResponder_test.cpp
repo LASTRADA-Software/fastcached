@@ -115,8 +115,7 @@ struct Rig
 {
     AtomicMetricsSink metrics;
     ScriptedFleet sources;
-    ListedMembership membership { { std::string { Reader }, "127.0.0.1" },
-                                  Distributed::MembershipParticipant::FleetMemberList };
+    ListedMembership membership { { std::string { Reader }, "127.0.0.1" }, Distributed::MembershipParticipant::OpenPolicy };
     FleetTextResponder responder { sources, membership, AdminCredential {}, metrics };
 
     /// Ask @p on, from @p peer.
@@ -293,27 +292,6 @@ TEST_CASE("A malformed fleet read and a frame-ceiling probe are counted and an u
         CHECK(rig.metrics.Read(IMetricsSink::Counter::FleetTextRequestsRefusedEndpointBusy) == 1);
         CHECK(rig.metrics.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedEndpointBusy) == 0);
     }
-}
-
-TEST_CASE("The fleet-text surface requires no credential of its own so a plain worker can answer", "[node][fleettext]")
-{
-    Rig rig;
-    auto const opRaw = static_cast<std::uint8_t>(Wire::Op::FleetText);
-    CHECK_FALSE(rig.responder.AuthRequired(opRaw));
-    CHECK(Wire::DecidePrePayload({ .opRaw = opRaw,
-                                   .declaredLength = 0,
-                                   .sessionCap = Wire::MaxControlPayload,
-                                   .authRequired = rig.responder.AuthRequired(opRaw),
-                                   .credentialAccepted = false })
-          == Wire::PrePayloadDecision::Serve);
-
-    // The control: the verb is not pre-auth, so a surface that DOES hold a policy makes it wait.
-    CHECK(Wire::DecidePrePayload({ .opRaw = opRaw,
-                                   .declaredLength = 0,
-                                   .sessionCap = Wire::MaxControlPayload,
-                                   .authRequired = true,
-                                   .credentialAccepted = false })
-          == Wire::PrePayloadDecision::Unauthenticated);
 }
 
 TEST_CASE("A fleet read through the slot is the attached sources' and a detached slot has no fleet", "[node][fleettext]")

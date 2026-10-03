@@ -366,6 +366,19 @@ class WorkerProtocol
 ///         is not a decodable COMPILE, which the protocol refuses on its own terms.
 [[nodiscard]] std::size_t DeclaredRequestFootprint(std::span<std::byte const> frame) noexcept;
 
+/// One exchange with a scheduler, presenting NO credential.
+///
+/// **A node's credential with a scheduler is its proof, never a password.** `--requirepass` is the
+/// secret of the cache behind `--upstream`. A scheduler checks no password -- it answers a password
+/// AUTH `Ok` and establishes nothing -- so a node presenting one anyway handed that secret, in the
+/// clear and pipelined ahead of any seal, to every scheduler it dialled and to every endpoint a
+/// `NotLeader` named. Every verb a node sends a scheduler therefore goes through here, and this
+/// takes no credential: presenting one again is a new parameter, never a forgotten argument.
+/// @param scheduler Connected transport; not owned.
+/// @param frame A complete framed request.
+/// @return The outcome.
+[[nodiscard]] CacheOutcome ExchangeWithScheduler(core::net::ISocket& scheduler, std::vector<std::byte> frame);
+
 /// Register this worker with a scheduler, and keep it registered.
 ///
 /// Separate from `WorkerProtocol` because it is the one part of a worker that
@@ -413,8 +426,7 @@ class WorkerRegistrar
     ///        object comes back in. Two spellings here is how a node comes to advertise
     ///        something it does not answer in.
     /// @param capacity What this machine is, for the scheduler to size it by.
-    WorkerRegistrar(CredentialNotice& notice,
-                    std::string fingerprint,
+    WorkerRegistrar(std::string fingerprint,
                     std::string endpoint,
                     std::uint32_t slots,
                     CompileCacheWire::CodecList acceptedCodecs,
@@ -428,14 +440,13 @@ class WorkerRegistrar
     /// leader that has moved, a toolchain fingerprint that is not text. A worker
     /// that discarded them would disappear from the fleet with nothing anywhere
     /// saying why -- the node's own log can only report that it did not register.
+    /// Presents no credential (`ExchangeWithScheduler`).
     /// @param scheduler Connected transport; not owned.
-    /// @param credential Credential to present.
     /// @return Nothing when the scheduler accepted, and the assigned id is kept
     ///         internally; otherwise the refusal, carrying both the phrase to log
     ///         and -- when this was a `NotLeader` naming somewhere else -- the
     ///         endpoint to announce to instead.
-    [[nodiscard]] std::expected<void, AnnounceRefusal> Register(core::net::ISocket& scheduler,
-                                                                Credential const& credential = {});
+    [[nodiscard]] std::expected<void, AnnounceRefusal> Register(core::net::ISocket& scheduler);
 
     /// Report liveness and current load.
     ///
@@ -452,14 +463,12 @@ class WorkerRegistrar
     /// @param scheduler Connected transport; not owned.
     /// @param inFlight Jobs running right now.
     /// @param load What else this machine has to say about itself right now.
-    /// @param credential Credential to present.
     /// @return Nothing when accepted; otherwise the refusal. An empty `WorkerId()`
     ///         afterwards is the "register again" signal; a set `leader` is the
     ///         "announce somewhere else" one, and the two are independent.
     [[nodiscard]] std::expected<void, AnnounceRefusal> Heartbeat(core::net::ISocket& scheduler,
                                                                  std::uint32_t inFlight,
-                                                                 CompileCacheWire::LoadFields const& load = {},
-                                                                 Credential const& credential = {});
+                                                                 CompileCacheWire::LoadFields const& load = {});
 
     /// Retire this registration, because the node no longer serves its toolchain.
     ///
@@ -480,12 +489,10 @@ class WorkerRegistrar
     /// this registrar is being discarded by its owner either way, and clearing would
     /// only lose the diagnostic.
     /// @param scheduler Connected transport; not owned.
-    /// @param credential Credential to present.
     /// @return Nothing when the scheduler accepted -- which includes it answering
     ///         `Ok` for an id it does not know, since that is the same end state --
     ///         otherwise the refusal, to be logged rather than acted on.
-    [[nodiscard]] std::expected<void, AnnounceRefusal> Withdraw(core::net::ISocket& scheduler,
-                                                                Credential const& credential = {});
+    [[nodiscard]] std::expected<void, AnnounceRefusal> Withdraw(core::net::ISocket& scheduler);
 
     /// The id the scheduler assigned, empty until a successful `Register`.
     [[nodiscard]] std::string const& WorkerId() const noexcept
@@ -547,12 +554,6 @@ class WorkerRegistrar
     }
 
   private:
-    /// Where "your credential went unchecked" is said, once per process.
-    ///
-    /// A reference held at construction rather than a parameter on every verb: the
-    /// registrar announces and heartbeats over the same connection with the same
-    /// credential, so this is a property of the registrar, not of a call.
-    CredentialNotice& _notice;
     std::string _fingerprint;
     std::string _endpoint;
     std::uint32_t _slots;
@@ -571,26 +572,21 @@ class WorkerRegistrar
 /// registrar at all, and it is the reason this exists
 /// ([#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440)).
 ///
-/// It lives beside the registrar so that how a node talks to a scheduler stays ONE place: the
-/// framed exchange, the credential and the notice are all the registrar's, and this borrows
-/// them rather than growing a second answer.
+/// It lives beside the registrar so that how a node talks to a scheduler stays ONE place:
+/// `ExchangeWithScheduler`, which presents no credential, rather than a second answer.
 /// @param scheduler The dialled connection.
-/// @param notice Where a credential the scheduler did not want is reported, once.
 /// @param endpoint Where this machine answers; the key its row is filed under.
 /// @param capacity What the machine is, including its version and cache budget.
 /// @param load What it is doing, and the history buckets it is handing over.
 /// @param endorsement This machine's encoded endorsement of the roster it applied, when it is a
 ///        voter; empty otherwise (#178).
-/// @param credential What to present.
 /// @return The reply's payload on acceptance -- an encoded certified roster, or empty when the
 ///         scheduler has none to hand out -- or why it was refused and where the leader is.
 [[nodiscard]] std::expected<std::vector<std::byte>, AnnounceRefusal> AnnounceNodePresence(
     core::net::ISocket& scheduler,
-    CredentialNotice& notice,
     std::string_view endpoint,
     CompileCacheWire::CapacityFields const& capacity,
     CompileCacheWire::LoadFields const& load = {},
-    std::span<std::byte const> endorsement = {},
-    Credential const& credential = {});
+    std::span<std::byte const> endorsement = {});
 
 } // namespace FastCache::Cc

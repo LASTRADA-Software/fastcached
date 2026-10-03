@@ -29,20 +29,11 @@ namespace
     /// A table rather than three `case` labels so the membership test below is
     /// derived from it: a verb that reaches this class without a row is refused
     /// rather than served, which is the direction a mistake has to fail in.
-    constexpr std::array SchedulerOps { Wire::Op::Register,
-                                        Wire::Op::NodeAnnounce,
-                                        Wire::Op::Heartbeat,
-                                        Wire::Op::Withdraw,
-                                        Wire::Op::Lease,
-                                        Wire::Op::Release,
-                                        Wire::Op::ClusterStatus,
-                                        Wire::Op::ClusterSet,
-                                        Wire::Op::ClusterForget,
-                                        Wire::Op::ClusterAdmit,
-                                        Wire::Op::ClusterAdmitLearner,
-                                        Wire::Op::ClusterAdmitWorker,
-                                        Wire::Op::ClusterAdmitClient,
-                                        Wire::Op::ClusterForgetClient };
+    constexpr std::array SchedulerOps {
+        Wire::Op::Register,      Wire::Op::NodeAnnounce, Wire::Op::Heartbeat,           Wire::Op::Withdraw,
+        Wire::Op::Lease,         Wire::Op::Release,      Wire::Op::ClusterStatus,       Wire::Op::ClusterSet,
+        Wire::Op::ClusterForget, Wire::Op::ClusterAdmit, Wire::Op::ClusterAdmitLearner, Wire::Op::ClusterAdmitWorker
+    };
 
     /// Whether this scheduler serves @p op at all.
     /// @param op The verb, already resolved against `OpTable`.
@@ -57,9 +48,10 @@ namespace
     ///
     /// **Empty since #289**, and the removal is the point. The row that was here said
     /// `Auth` was `UnimplementedVerb` -- "this endpoint schedules and checks no
-    /// credential" -- which was true and is not any more: the scheduler surface
-    /// terminates `AUTH` in `FrameServer`'s loop, because what that verb changes is
-    /// per-connection state and this class is deliberately stateless.
+    /// credential" -- which was true and is not any more: the node's endpoint terminates
+    /// `AUTH` in `FrameServer`'s loop and asks the session component, because what that
+    /// verb changes is per-connection state and this class is deliberately stateless. So
+    /// the verb is served ELSEWHERE, which is `DispatchNotPermitted`, never unknown.
     ///
     /// Leaving the row would have been the exact failure the rulebook records twice
     /// (#283, #340): `UnimplementedVerb` tells `Cc::CacheProtocol::Exchange` to step
@@ -479,20 +471,6 @@ SchedulerReply SchedulerProtocol::Route(Wire::Op op, std::span<std::byte const> 
             if (!memberId.has_value())
                 return SchedulerReply::Malformed();
             return _service.ClusterForget(caller, Wire::AsStringView(*memberId));
-        }
-
-        case Wire::Op::ClusterAdmitClient: {
-            auto const host = Wire::DecodeClusterClientVerbPayload<Wire::Op::ClusterAdmitClient>(payload);
-            if (!host.has_value())
-                return SchedulerReply::Malformed();
-            return _service.ClusterAdmitClient(caller, Wire::AsStringView(*host));
-        }
-
-        case Wire::Op::ClusterForgetClient: {
-            auto const host = Wire::DecodeClusterClientVerbPayload<Wire::Op::ClusterForgetClient>(payload);
-            if (!host.has_value())
-                return SchedulerReply::Malformed();
-            return _service.ClusterForgetClient(caller, Wire::AsStringView(*host));
         }
 
         case Wire::Op::ClusterAdmit: {

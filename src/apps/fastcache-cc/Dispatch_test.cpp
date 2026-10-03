@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CompileCorrelation.hpp"
 #include "Dispatch.hpp"
+#include "TicketCredentials.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -14,11 +16,13 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <core/async/SyncRun.hpp>
 #include <core/net/KeepAlive.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/TicketFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -1122,6 +1126,191 @@ TEST_CASE("A lease refused with NotLeader is retried against the leader it names
     auto const toDemoted = FramesTo(fleet, Scheduler);
     REQUIRE(toDemoted.size() == 1);
     CHECK(OpOf(toDemoted[0]) == Wire::Op::Lease);
+}
+
+namespace
+{
+
+using Testing::MintsForItsAudience;
+
+/// Answers each exchange with the next of `answers`, whoever it is dialled at.
+///
+/// Scripted per EXCHANGE rather than per endpoint, which `ScriptedFleet` cannot do: on one merged
+/// surface the lease, the compile and the release reach one address and are answered differently.
+/// The subject here is which exchange a refusal is filed under, not the framing.
+class AnswersInTurn final: public IEndpointExchange
+{
+  public:
+    CacheOutcome Exchange(std::string_view hostPort,
+                          std::vector<std::byte> /*frame*/,
+                          Credential const& credential,
+                          ExchangeBudget /*budget*/) override
+    {
+        dialled.emplace_back(hostPort);
+        presented.push_back(credential.Configured());
+        REQUIRE(dialled.size() <= answers.size());
+        return answers[dialled.size() - 1];
+    }
+
+    std::vector<CacheOutcome> answers; ///< One per exchange, in order.
+    std::vector<std::string> dialled;  ///< Where each exchange went.
+    std::vector<bool> presented;       ///< Whether each exchange presented a credential.
+};
+
+/// @param value What the exchange served.
+/// @return A hit serving @p value.
+[[nodiscard]] CacheOutcome ServedWith(std::vector<std::byte> value = {})
+{
+    auto outcome = CacheOutcome {};
+    outcome.kind = CacheOutcomeKind::Hit;
+    outcome.value = std::move(value);
+    return outcome;
+}
+
+/// @param code Why the exchange was refused.
+/// @return A refusal with @p code.
+[[nodiscard]] CacheOutcome RefusedWith(Wire::ErrorCode code)
+{
+    auto outcome = CacheOutcome {};
+    outcome.kind = CacheOutcomeKind::Rejected;
+    outcome.code = code;
+    return outcome;
+}
+
+/// @param reply A command's reply.
+/// @return The replies a connection presenting a credential reads: AUTH's `Ok`, then @p reply.
+[[nodiscard]] std::vector<std::byte> BehindAuth(std::vector<std::byte> const& reply)
+{
+    auto replies = Wire::EncodeReply(Wire::Status::Ok, {});
+    replies.insert(replies.end(), reply.begin(), reply.end());
+    return replies;
+}
+
+} // namespace
+
+TEST_CASE("Every exchange of a redirected dispatch presents a ticket naming the endpoint it dialled",
+          "[dispatch][redirect][ticket]")
+{
+    // The decorator asks per DIAL, so a redirect, the worker a grant names and the release at the
+    // scheduler that issued the lease each get a ticket for exactly where the frame went. By
+    // construction today; pinned against a refactor that follows a redirect below the decorator or
+    // hands `Dispatch` the raw exchange -- and against a dial hint rewriting the address under it.
+    constexpr std::string_view Leader = "leader:6675";
+    std::array<std::string, 1> const args { "-c" };
+
+    ScriptedFleet fleet;
+    fleet.Serve(std::string { Scheduler }, BehindAuth(Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, Leader)));
+    fleet.Serve(std::string { Leader }, BehindAuth(GrantReply()));
+    fleet.Serve(std::string { Worker }, BehindAuth(CompileReply(Request(args), "OBJECTBYTES")));
+
+    MintsForItsAudience node;
+    TicketCredentials tickets {
+        node, std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, ExchangeBudget {}, {}
+    };
+    CredentialedExchange credentialed { fleet, tickets };
+
+    auto const result = Dispatch(credentialed, Request(args));
+    REQUIRE(result.status == DispatchStatus::Compiled);
+
+    // The demoted scheduler, the leader it named, the worker that leader granted, and the release
+    // at the leader -- and a ticket minted for each, in the same order.
+    auto const expected = std::vector<std::string> {
+        std::string { Scheduler }, std::string { Leader }, std::string { Worker }, std::string { Leader }
+    };
+    CHECK(fleet.Dialled() == expected);
+    CHECK(node.audiences == expected);
+
+    // What each endpoint was SHOWN: every AUTH it received carries a ticket naming it.
+    for (auto const endpoint: { Scheduler, Leader, Worker })
+    {
+        INFO(endpoint);
+        auto auths = std::size_t { 0 };
+        for (auto const frame: FramesTo(fleet, endpoint))
+        {
+            if (OpOf(frame) != std::optional { Wire::Op::Auth })
+                continue;
+            ++auths;
+            auto const auth = Wire::DecodeAuthPayload(frame.subspan(Wire::RequestHeaderSize));
+            REQUIRE(auth.has_value());
+            CHECK(Unwrap(auth).kind == Wire::AuthKind::MachineTicket);
+            CHECK(Wire::AsStringView(Unwrap(auth).secret) == Testing::TicketFor(endpoint));
+        }
+        CHECK(std::cmp_equal(auths, std::ranges::count(expected, std::string { endpoint })));
+    }
+}
+
+TEST_CASE("A compile refused despite a valid ticket is not explained by the release's failed mint",
+          "[dispatch][ticket][stats]")
+{
+    // A refused compile is always followed by the RELEASE, through the same decorator. When the
+    // compile presented a VALID ticket and was refused anyway, and the release's mint then failed,
+    // the decline is the compile's -- its own words -- and never "no machine ticket". Run with the
+    // worker at an address of its own, and on one merged surface where the scheduler is the worker,
+    // so the endpoint alone cannot tell the compile from the release.
+    struct Row
+    {
+        char const* what;
+        std::string_view worker;
+    };
+    for (auto const& row: std::to_array<Row>(
+             { { .what = "a worker of its own", .worker = Worker }, { .what = "one merged surface", .worker = Scheduler } }))
+    {
+        INFO(row.what);
+        std::array<std::string, 1> const args { "-c" };
+        auto const grant = Wire::EncodeLeaseGrant(
+            Wire::LeaseGrant { .endpoint = row.worker, .leaseToken = "l1", .workerCodecs = {}, .lifetime = {} });
+
+        AnswersInTurn fleet;
+        fleet.answers = { ServedWith(grant),
+                          RefusedWith(Wire::ErrorCode::NotAMember),
+                          RefusedWith(Wire::ErrorCode::NotAMember) };
+
+        // The lease's and the compile's mints succeed; the release's does not.
+        MintsForItsAudience node;
+        node.unreachableAfter = 2;
+        TicketCredentials tickets { node, std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, ExchangeBudget {},
+                                    {} };
+        CredentialedExchange credentialed { fleet, tickets };
+
+        auto const result = Dispatch(credentialed, Request(args));
+        REQUIRE(result.status == DispatchStatus::Declined);
+        REQUIRE(result.decline == DeclineCause::NotPermitted);
+        // Lease, compile, release -- the compile WITH a ticket, the release without one.
+        REQUIRE(fleet.dialled
+                == std::vector<std::string> {
+                    std::string { Scheduler }, std::string { row.worker }, std::string { Scheduler } });
+        CHECK(fleet.presented == std::vector<bool> { true, true, false });
+        CHECK(result.declinedAt
+              == std::optional { ExchangeSite { .endpoint = std::string { row.worker },
+                                                .opcode = std::to_underlying(Wire::Op::Compile) } });
+
+        auto const recorded = RecordedReason(result, credentialed.Refusals());
+        CHECK(recorded.reason == RecordingFor(result.status, result.decline).reason);
+        CHECK(recorded.reason != ReasonFor(MintFailure::Unreachable));
+    }
+}
+
+TEST_CASE("A compile refused because its own mint failed is explained by that mint", "[dispatch][ticket][stats]")
+{
+    // The control for the case above: the same dispatch, with the COMPILE's mint failing and the
+    // release served, is the refusal a missing ticket explains.
+    std::array<std::string, 1> const args { "-c" };
+    auto const grant = Wire::EncodeLeaseGrant(
+        Wire::LeaseGrant { .endpoint = Worker, .leaseToken = "l1", .workerCodecs = {}, .lifetime = {} });
+    AnswersInTurn fleet;
+    fleet.answers = { ServedWith(grant), RefusedWith(Wire::ErrorCode::NotAMember), ServedWith() };
+
+    MintsForItsAudience node;
+    node.unreachableAfter = 1;
+    TicketCredentials tickets {
+        node, std::string { "127.0.0.1:6674" }, Credential {}, std::string {}, ExchangeBudget {}, {}
+    };
+    CredentialedExchange credentialed { fleet, tickets };
+
+    auto const result = Dispatch(credentialed, Request(args));
+    REQUIRE(result.status == DispatchStatus::Declined);
+    CHECK(fleet.presented == std::vector<bool> { true, false, false });
+    CHECK(RecordedReason(result, credentialed.Refusals()).reason == ReasonFor(MintFailure::Unreachable));
 }
 
 TEST_CASE("A NotLeader naming no address is a refusal, not somewhere to dial", "[dispatch][redirect]")

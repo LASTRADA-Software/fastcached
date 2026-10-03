@@ -124,13 +124,19 @@ struct Machine
                                     .publicKey = machine.PublicKey() };
 }
 
+/// @p machine as a command line types it, with its key.
+[[nodiscard]] Cluster::MemberSpec TypedAs(Machine const& machine)
+{
+    return Cluster::MemberSpec { .id = machine.id, .raftEndpoint = "in-memory:1", .publicKey = machine.PublicKey() };
+}
+
 /// One node's view of the cluster: its roster over its own key, and its identity over that --
 /// what `ConsensusTier` holds.
 struct NodeView
 {
     /// @param self The machine this view is.
     /// @param members Every member, as each node's command line names them.
-    NodeView(Machine const& self, std::vector<Cluster::ClusterMember> const& members):
+    NodeView(Machine const& self, std::vector<Cluster::MemberSpec> const& members):
         roster { self.key, members },
         identity { self.id, roster }
     {
@@ -272,12 +278,12 @@ TEST_CASE("After --cluster-forget=n3, n3's session closes and its redial is refu
 
     // Every node's command line names every member with its key, and the cluster's state
     // records the same -- the formed cluster this case starts from.
-    auto const members = std::vector { MemberOf(n1), MemberOf(n2), MemberOf(n3) };
+    auto const typed = std::vector { TypedAs(n1), TypedAs(n2), TypedAs(n3) };
     Cluster::ClusterState state;
-    state.members = members;
-    NodeView v1 { n1, members };
-    NodeView v2 { n2, members };
-    NodeView v3 { n3, members };
+    state.members = { MemberOf(n1), MemberOf(n2), MemberOf(n3) };
+    NodeView v1 { n1, typed };
+    NodeView v2 { n2, typed };
+    NodeView v3 { n3, typed };
     for (auto* const view: { &v1, &v2, &v3 })
         view->roster.Adopt(state);
 

@@ -25,6 +25,7 @@
 #include <core/async/SyncRun.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/ForeignGenerationValue.hpp>
+#include <tests/MembershipFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -344,7 +345,7 @@ TEST_CASE("The node's cache answers this machine and refuses every other one", "
     }
 }
 
-TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or not",
+TEST_CASE("(#287) a ticketed machine is refused this machine's cache tier, member or not",
           "[node][cache][membership][cache-locality]")
 {
     // THE HOLE THIS CLOSED. `CacheResponder` used to gate on `Membership::Member`,
@@ -353,12 +354,12 @@ TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or n
     // ("its own machine and its cluster"), which is why #287 is a deliberate
     // tightening rather than a bug fix, and why it shipped as a breaking change.
     //
-    // The peer here is ADMITTED by the member list, and that is the whole point of
-    // the fixture: a case whose caller was refused for some OTHER reason would pass
-    // under the bug and prove nothing about locality.
+    // The peer here is ADMITTED -- by a verified ticket for a key the roster holds -- and that is
+    // the whole point of the fixture: a case whose caller was refused for some OTHER reason would
+    // pass under the bug and prove nothing about locality.
     Fixture fixture;
-    Distributed::ClusterMembership const membership { Distributed::MembershipParticipant::FleetMemberList,
-                                                      { "10.0.0.1:7000" } };
+    Testing::RosterFold const membership { { "pc-01" } };
+    auto const peer = ConnectionFacts { .host = "10.0.0.1", .authenticatedMachine = Testing::IdentityOf("pc-01") };
     Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
     CachedLocalityOracle const locality { machine, fixture.clock };
     CacheResponder responder { fixture.proxy, locality, fixture.metrics };
@@ -366,15 +367,14 @@ TEST_CASE("(#287) a fleet peer is refused this machine's cache tier, member or n
     // Stated first, so a later change to the membership vocabulary cannot turn this
     // case green by quietly reclassifying the peer: it IS a member, and it is
     // refused anyway.
-    REQUIRE(membership.Classify("10.0.0.1") == Distributed::Membership::Member);
+    REQUIRE(Distributed::ExplainConnection(membership.admitted, peer).verdict == Distributed::Membership::Member);
 
     // And it is not this machine, by either of the two properties that could make
     // it one.
     REQUIRE_FALSE(IsLoopbackHost("10.0.0.1"));
     REQUIRE_FALSE(locality.IsThisMachine("10.0.0.1"));
 
-    auto const refused =
-        core::async::syncRun(responder.Answer(Wire::EncodeFetch("some-key"), PeerIdentity { .host = "10.0.0.1" })).bytes;
+    auto const refused = core::async::syncRun(responder.Answer(Wire::EncodeFetch("some-key"), peer)).bytes;
     auto const header = Wire::DecodeReplyHeader(refused);
     REQUIRE(header.has_value());
     CHECK(Unwrap(header).status == Wire::Status::Error);
@@ -642,21 +642,19 @@ TEST_CASE("(#491) the cache surface's uncounted arms are unreachable, swept rath
         CHECK(served >= 2);
     }
 
-    SECTION("no opcode reaches the cache's Unauthenticated arm, because it requires no credential")
+    SECTION("no opcode reaches the cache's Unauthenticated arm, because the node checks no password")
     {
-        // `AuthRequired()` is false here by decision (#287, #290): a credential every
-        // local build can read is not a credential. `DecidePrePayload` yields
-        // `Unauthenticated` only for a surface that requires one, so this arm is
+        // The endpoint asks `DecidePrePayload` with `authRequired` false for every verb, and it
+        // yields `Unauthenticated` only for a surface that requires a credential -- so this arm is
         // closed by that answer rather than by the routing above.
         for (auto const value: std::views::iota(0, 256))
         {
             auto const opRaw = static_cast<std::uint8_t>(value);
             INFO("opcode " << value);
-            CHECK_FALSE(cache.AuthRequired(opRaw));
             CHECK(Wire::DecidePrePayload({ .opRaw = opRaw,
                                            .declaredLength = 0,
                                            .sessionCap = cache.MaxRequestBytes(),
-                                           .authRequired = cache.AuthRequired(opRaw),
+                                           .authRequired = false,
                                            .credentialAccepted = false })
                   != Wire::PrePayloadDecision::Unauthenticated);
         }
@@ -665,9 +663,9 @@ TEST_CASE("(#491) the cache surface's uncounted arms are unreachable, swept rath
     SECTION("AUTH is the Session family, so no credential outcome is ever decided against the cache")
     {
         // The two `EndpointRefusal` credential arms are answered by whichever surface
-        // owns `Op::Auth`. With no scheduler configured that is NOBODY -- and the
-        // point of asserting the null is that a router which fell back to the cache
-        // would answer `&cache` here and reopen both arms in silence.
+        // owns `Op::Auth` -- the session component, which this composition does not name,
+        // so that is NOBODY here. The point of asserting the null is that a router which
+        // fell back to the cache would answer `&cache` and reopen both arms in silence.
         auto const auth = static_cast<std::uint8_t>(Wire::Op::Auth);
         CHECK(Wire::FamilyOf(auth) == Wire::VerbFamily::Session);
         CHECK(merged.OwnerOf(auth) == nullptr);

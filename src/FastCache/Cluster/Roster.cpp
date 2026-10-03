@@ -24,7 +24,7 @@ namespace
     /// Fields in an encoded roster: the layout version, then the three groups.
     constexpr std::size_t RosterFields = 4;
 
-    /// Fields one member occupies: id, consensus endpoint, seat, key (empty when none).
+    /// Fields one member occupies: id, consensus endpoint, seat, key.
     constexpr std::size_t MemberFields = 4;
 
     /// Fields one principal occupies: id, key, role.
@@ -108,12 +108,10 @@ std::vector<std::byte> EncodeRoster(Roster const& roster)
 {
     auto const members = EncodeGroup(roster.members, [](RosterMember const& member) {
         auto const seat = std::array { static_cast<std::byte>(member.seat) };
-        auto const key =
-            member.publicKey.has_value() ? std::span<std::byte const> { *member.publicKey } : std::span<std::byte const> {};
         return WireFields::Encode({ WireFields::AsBytes(member.id),
                                     WireFields::AsBytes(member.raftEndpoint),
                                     std::span<std::byte const> { seat },
-                                    key });
+                                    std::span<std::byte const> { member.publicKey } });
     });
     auto const principals = EncodeGroup(roster.principals, [](ClusterPrincipal const& principal) {
         auto const role = std::array { static_cast<std::byte>(principal.role) };
@@ -145,32 +143,35 @@ std::expected<Roster, ConsensusError> DecodeRoster(std::span<std::byte const> by
     if (fields->size() != RosterFields)
         return std::unexpected(MalformedWireFrame("a roster is not its version and three groups"));
 
-    auto members =
-        DecodeGroup<RosterMember>((*fields)[1], MemberFields, [](auto const& entry) -> std::optional<RosterMember> {
+    // The refusals named apart from the rest, as `DecodeState` names them: a member or a
+    // principal with no key, or the all-zero one, is one the state cannot record, so no roster
+    // projected out of one carries it -- and a kept roster that does says so in its own words
+    // rather than as damage anywhere. Each flag describes the entry its decoder refused, since
+    // `DecodeGroup` stops at the first.
+    auto keylessMember = false;
+    auto keylessPrincipal = false;
+    auto members = DecodeGroup<RosterMember>(
+        (*fields)[1], MemberFields, [&keylessMember](auto const& entry) -> std::optional<RosterMember> {
             auto const seat = entry[2].size() == 1
                                   ? Consensus::DecodeWireEnum<MemberSeat>(static_cast<std::uint8_t>(entry[2][0]))
                                   : std::nullopt;
-            if (!seat.has_value())
+            auto const key = RequiredKey(entry[3]);
+            keylessMember = entry[3].empty() || (key.has_value() && IsZeroEd25519PublicKey(*key));
+            if (!seat.has_value() || !key.has_value() || keylessMember)
                 return std::nullopt;
-            auto key = std::optional<Ed25519PublicKey> {};
-            if (!entry[3].empty())
-            {
-                key = RequiredKey(entry[3]);
-                if (!key.has_value())
-                    return std::nullopt;
-            }
             return RosterMember { .id = std::string { WireFields::AsStringView(entry[0]) },
                                   .raftEndpoint = std::string { WireFields::AsStringView(entry[1]) },
                                   .seat = *seat,
-                                  .publicKey = key };
+                                  .publicKey = *key };
         });
     auto principals = DecodeGroup<ClusterPrincipal>(
-        (*fields)[2], PrincipalFields, [](auto const& entry) -> std::optional<ClusterPrincipal> {
+        (*fields)[2], PrincipalFields, [&keylessPrincipal](auto const& entry) -> std::optional<ClusterPrincipal> {
             auto const key = RequiredKey(entry[1]);
             auto const role = entry[2].size() == 1
                                   ? Consensus::DecodeWireEnum<PrincipalRole>(static_cast<std::uint8_t>(entry[2][0]))
                                   : std::nullopt;
-            if (!key.has_value() || !role.has_value())
+            keylessPrincipal = entry[1].empty() || (key.has_value() && IsZeroEd25519PublicKey(*key));
+            if (!key.has_value() || !role.has_value() || keylessPrincipal)
                 return std::nullopt;
             return ClusterPrincipal { .id = std::string { WireFields::AsStringView(entry[0]) },
                                       .publicKey = *key,
@@ -182,6 +183,10 @@ std::expected<Roster, ConsensusError> DecodeRoster(std::span<std::byte const> by
             return std::nullopt;
         return RevokedKey { .id = std::string { WireFields::AsStringView(entry[0]) }, .publicKey = *key };
     });
+    if (!members.has_value() && keylessMember)
+        return std::unexpected(MalformedWireFrame("a roster member holds no identity key"));
+    if (!principals.has_value() && keylessPrincipal)
+        return std::unexpected(MalformedWireFrame("a roster principal holds no identity key"));
     if (!members.has_value() || !principals.has_value() || !revoked.has_value())
         return std::unexpected(MalformedWireFrame("a roster entry is malformed"));
 
@@ -196,9 +201,7 @@ std::expected<Roster, ConsensusError> DecodeRoster(std::span<std::byte const> by
     };
     for (auto const& member: *members)
     {
-        if (!member.publicKey.has_value())
-            continue;
-        if (auto why = unusable(member.id, *member.publicKey); why.has_value())
+        if (auto why = unusable(member.id, member.publicKey); why.has_value())
             return std::unexpected(MalformedWireFrame(*std::move(why)));
     }
     for (auto const& principal: *principals)

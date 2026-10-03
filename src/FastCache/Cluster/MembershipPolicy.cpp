@@ -63,7 +63,7 @@ namespace
     /// This node's own removal, once the operator has forgotten it (#1539).
     ///
     /// FORGOTTEN is `IsSelfForgotten`'s reading, the one a node applying the state asks too
-    /// (`SelfForgotten.hpp`): its record gone AND its host tombstoned or its key revoked.
+    /// (`SelfForgotten.hpp`): its record gone AND its key revoked.
     /// @param state The replicated state.
     /// @param active The configuration consensus holds.
     /// @param self This node's own record, as it announces it.
@@ -73,7 +73,7 @@ namespace
                                                                      Consensus::Configuration const& active,
                                                                      ClusterMember const& self)
     {
-        if (!IsSelfForgotten(state, self.id, HostOfEndpoint(self.raftEndpoint)))
+        if (!IsSelfForgotten(state, self.id))
             return std::nullopt;
 
         for (auto const& row: MemberSeatTable)
@@ -156,22 +156,23 @@ MembershipPlan MembershipProposals(ClusterState const& state,
         // The key by the same rule once more (#178): no opinion is whatever is recorded. The
         // command carries the opinion itself rather than the resolved value, because
         // `AddMember` reads an absent key as *keep*, which is this rule stated once more at
-        // the layer that applies it.
-        auto const publicKey = member.publicKey.or_else([&] { return known ? it->publicKey : std::nullopt; });
-
+        // the layer that applies it. Every recorded member holds a key, so a known id always
+        // resolves to one.
         if (known && it->raftEndpoint == member.raftEndpoint && it->schedulerEndpoint == scheduler && it->seat == seat
-            && it->publicKey == publicKey)
+            && member.publicKey.value_or(it->publicKey) == it->publicKey)
             continue;
 
-        // A forget outranks an observation (#1528). Asked with the host `Apply` would
-        // lift the tombstone for and through the same comparison, so what is refused
-        // here is exactly a proposal that would have undone the forget -- and only
-        // once something would be proposed, since a record that already matches lifts
-        // nothing and is no refusal. And by the id whose key the forget revoked
-        // (#1555), which reaches a member that shares its machine over loopback and
-        // left no tombstone -- an id recorded nowhere, since one admitted again under a
-        // new key is a member whatever its old key's entry says.
-        if (state.HasForgotten(HostOfEndpoint(member.raftEndpoint)) || (!known && IsForgottenById(state, member.id)))
+        // A forget outranks an observation (#1528): by the id whose key the forget revoked
+        // (#1555), wherever the machine now dials from -- an address is not an identity, so
+        // no host decides it. Asked only once something would be proposed, since a record
+        // that already matches changes nothing and is no refusal.
+        //
+        // The one way back is an operator's re-admission under a NEW key, committed directly
+        // (`--cluster-admit`) and never through this function. So a desire for a forgotten
+        // id passes only when that has happened -- the id is recorded again -- AND what it
+        // would record is a key the forget did not revoke: a desire still carrying the old
+        // key is the forgotten machine, whatever the record now says.
+        if (IsForgottenById(state, member.id) && (!known || state.IsRevoked(member.publicKey.value_or(it->publicKey))))
         {
             plan.forgotten.push_back(member);
             continue;
@@ -185,6 +186,20 @@ MembershipPlan MembershipProposals(ClusterState const& state,
                                            .role = std::nullopt });
     }
     return plan;
+}
+
+std::vector<DesiredMember> WithLiveKeys(ClusterState const& state,
+                                        std::span<DesiredMember const> desired,
+                                        Consensus::IRaftPeerKeys const& keys)
+{
+    auto filled = std::vector<DesiredMember> { desired.begin(), desired.end() };
+    for (auto& member: filled)
+    {
+        if (member.publicKey.has_value() || std::ranges::contains(state.members, member.id, &ClusterMember::id))
+            continue;
+        member.publicKey = keys.KeysOf(member.id).live;
+    }
+    return filled;
 }
 
 bool Replication::CaughtUp(Consensus::NodeId const& id) const
@@ -381,7 +396,8 @@ QuorumPlan NextQuorumChange(ClusterState const& state,
                         .catchingUp = CatchingUp(state, active, self.id, replication) };
 }
 
-std::expected<Command, ConsensusError> PrepareForget(Consensus::Configuration const& active,
+std::expected<Command, ConsensusError> PrepareForget(ClusterState const& state,
+                                                     Consensus::Configuration const& active,
                                                      Consensus::NodeId const& id,
                                                      std::optional<Ed25519PublicKey> const& liveKey)
 {
@@ -393,6 +409,20 @@ std::expected<Command, ConsensusError> PrepareForget(Consensus::Configuration co
             .code = ConsensusErrorCode::InvalidConfiguration,
             .context = std::format("cannot forget {}: it is the cluster's only voter, and a configuration with no "
                                    "voter can commit nothing -- admit or promote another voter first",
+                                   id),
+            .knownLeader = std::nullopt } };
+
+    // A forget that would revoke NOTHING is no forget: a machine is forgotten by its key, so
+    // one with no key recorded and none held live here would lose its record and nothing
+    // else -- and the next observation of it would admit it again. A member and a principal
+    // always hold a key; an id recorded as neither has only the key this node holds live.
+    auto const recorded = std::ranges::contains(state.members, id, &ClusterMember::id)
+                          || std::ranges::contains(state.principals, id, &ClusterPrincipal::id);
+    if (!recorded && !liveKey.has_value())
+        return std::unexpected { ConsensusError {
+            .code = ConsensusErrorCode::InvalidConfiguration,
+            .context = std::format("cannot forget {}: nothing records a key for it, so a forget would revoke nothing and "
+                                   "the next observation would admit it again",
                                    id),
             .knownLeader = std::nullopt } };
 

@@ -63,20 +63,13 @@ class FleetSummaryResponder final: public IFrameResponder
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                    std::uint8_t opRaw) const override;
 
-    /// @copydoc IFrameResponder::AuthRequired
-    ///
-    /// **No**: the verb is `OpenBeforeAuth`, and a joiner holds no credential of this fleet's.
-    [[nodiscard]] bool AuthRequired(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return false;
-    }
-
     /// @copydoc IFrameResponder::CheckCredential
     ///
-    /// No policy: this surface requires none, and says so rather than inheriting an answer.
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    /// `NoPolicy`: AUTH is the Session family's; this surface is never routed one. The verb is
+    /// `OpenBeforeAuth` besides, since a joiner holds no credential of this fleet's.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
     {
-        return FastCache::CheckCredential(nullptr, payload);
+        return NotTheSessionSurface();
     }
 
     /// @copydoc IFrameResponder::RefusalReply

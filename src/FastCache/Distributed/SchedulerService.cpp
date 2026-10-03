@@ -66,6 +66,11 @@ namespace
         // a node nobody admitted or one whose proof is being refused, and both are worth a series.
         RefusalDescriptor { .code = Wire::ErrorCode::NodeIdentityRequired,
                             .counter = IMetricsSink::Counter::SchedulerRequestsRefusedNodeIdentityRequired },
+        // An operator's control verb from a caller `--fleet-open` alone admitted. Counted: the
+        // caller is ADMITTED and asked to change the fleet anyway, which on an open node is
+        // somebody trying the decision half of the policy -- the refusal carrying the argument.
+        RefusalDescriptor { .code = Wire::ErrorCode::IdentifiedCallerRequired,
+                            .counter = IMetricsSink::Counter::SchedulerRequestsRefusedIdentifiedCallerRequired },
     };
 
     /// The refusals this service makes that deliberately move nothing.
@@ -629,62 +634,6 @@ SchedulerReply SchedulerService::ClusterForget(CallerContext const& caller, std:
                                     .role = std::nullopt });
 }
 
-SchedulerReply SchedulerService::ClusterAdmitClient(CallerContext const& caller, std::string_view host)
-{
-    return OfferClientVerb(caller, Cluster::CommandKind::AdmitClient, host);
-}
-
-SchedulerReply SchedulerService::ClusterForgetClient(CallerContext const& caller, std::string_view host)
-{
-    return OfferClientVerb(caller, Cluster::CommandKind::ForgetClient, host);
-}
-
-SchedulerReply SchedulerService::OfferClientVerb(CallerContext const& caller,
-                                                 Cluster::CommandKind kind,
-                                                 std::string_view host)
-{
-    if (auto refusal = Gate(caller); refusal.has_value())
-        return std::move(*refusal);
-    if (_admin == nullptr)
-        return Refuse(Wire::ErrorCode::NoCluster);
-
-    auto reply = Offer(Cluster::Command { .kind = kind,
-                                          .key = std::string { host },
-                                          .value = {},
-                                          .schedulerEndpoint = {},
-                                          .publicKey = std::nullopt,
-                                          .role = std::nullopt });
-
-    // Said on the FORGET and deliberately not on the admit, and the asymmetry is the
-    // whole reason this line exists. A member whose build predates these verbs skips
-    // the committed entry by name (`ClusterStateMachine::Apply`) and holds the state as
-    // if it had never been proposed. For an admit that fails CLOSED -- the client is
-    // simply not admitted there, and the upgrade heals it. For a forget it fails OPEN:
-    // that member goes on serving a host the fleet has agreed to stop serving, and
-    // admission succeeding is the ordinary case, so nothing else reports it.
-    //
-    // It names NO members, and that is a limit rather than an omission. `WorkerInfo`
-    // carries a version string, and deciding from one which builds implement a verb is a
-    // model of this fleet more permissive than the fleet -- it would produce confident
-    // wrong agreement, which is worse than the vague right answer. What the leader can
-    // say is the consequence and WHERE the evidence lands: the member that skipped the
-    // entry logs it itself, naming the index and the verb byte. So an operator is sent to
-    // the members' own logs rather than to a claim this side cannot support.
-    //
-    // Once per offer rather than once per process: each forget is a separate decision
-    // about a separate host, and a operator who forgets three machines needs to be told
-    // three times. `_warnedLeaseLifetime` above is the opposite case -- one fact about
-    // the cluster's configuration, where a repeat says nothing new.
-    if (kind == Cluster::CommandKind::ForgetClient && reply.status == Wire::Status::Ok)
-        _logger.Logf(LogLevel::Warn,
-                     "forgetting client host {}: any member running a build without this verb SKIPS the entry and "
-                     "goes on serving that host -- such a member says so in its own log, naming the entry it did not "
-                     "apply; upgrade it, or drop the host from its --fleet-member list",
-                     host);
-
-    return reply;
-}
-
 SchedulerReply SchedulerService::ClusterAdmit(CallerContext const& caller,
                                               std::string_view memberId,
                                               std::string_view raftEndpoint,
@@ -847,14 +796,17 @@ SchedulerReply SchedulerService::ClusterAdmitWorker(CallerContext const& caller,
 
 std::optional<SchedulerReply> SchedulerService::RefuseUnlessIdentified(CallerContext const& caller, Wire::Op op) const
 {
+    // Asked of a caller the surface ADMITS: one it does not is membership's refusal, which the door
+    // answers first and `Gate` answers again after the payload. Answering it here instead would give
+    // `Answer` a different refusal from the door's for one stranger, where the two must be the same
+    // bytes.
     auto const* const descriptor = Wire::FindOp(static_cast<std::uint8_t>(op));
-    if (descriptor == nullptr || descriptor->identity != Wire::IdentityRequirement::ProvenNodeOnly
-        || caller.provenNodeId.has_value())
+    if (descriptor == nullptr || caller.membership != Membership::Member)
         return std::nullopt;
-    return Refuse(Wire::ErrorCode::NodeIdentityRequired,
-                  std::format("{} is sent only by a machine that proved its identity on this connection; prove it "
-                              "first, and have it admitted with --enroll-from or --cluster-admit-worker",
-                              descriptor->name));
+    auto const& row = RequirementRowOf(descriptor->identity);
+    if (row.satisfiedBy(caller))
+        return std::nullopt;
+    return Refuse(row.refusal, std::format("{} {}", descriptor->name, row.remedy));
 }
 
 std::optional<Cluster::ClusterState> SchedulerService::AdministeredState() const
@@ -1063,8 +1015,8 @@ SchedulerService::EndorsementOutcome SchedulerService::AcceptEndorsement(Cluster
     // not verify is looked at.
     auto const state = _admin->ClusterState();
     auto const voter = std::ranges::find(state.members, endorsement.endorser, &Cluster::ClusterMember::id);
-    if (voter == state.members.end() || voter->seat != Cluster::MemberSeat::Voter || !voter->publicKey.has_value()
-        || !Cluster::VerifyEndorsement(endorsement, *voter->publicKey))
+    if (voter == state.members.end() || voter->seat != Cluster::MemberSeat::Voter
+        || !Cluster::VerifyEndorsement(endorsement, voter->publicKey))
     {
         _metrics.Increment(IMetricsSink::Counter::SchedulerRosterEndorsementsRefused);
         return EndorsementOutcome::Refused;

@@ -673,7 +673,8 @@ TEST_CASE("a node this client cannot stream with ends the session Protocol even 
     }
 }
 
-TEST_CASE("a node that does not count this machine a member names the flag that admits it", "[cli][live][source][refusal]")
+TEST_CASE("a node that does not count this machine a member names the enrollment that admits it",
+          "[cli][live][source][refusal]")
 {
     // WHAT DISTINGUISHES: `NotAMember` is about the caller like `Unauthenticated`, so it ends a session that has
     // read nothing -- but its remedy is on the NODE, and a note naming a credential flag would send the operator
@@ -688,7 +689,11 @@ TEST_CASE("a node that does not count this machine a member names the flag that 
 
     auto const refused = NextDue(rig, source);
     CHECK(FailedWith(refused, Outcome::Refused));
-    CHECK(NoteOf(refused).contains("--fleet-member"));
+    // The enrollment that admits this machine by its key, both halves: the request made here and the
+    // approval made there.
+    CHECK(NoteOf(refused).contains("--enroll-from"));
+    CHECK(NoteOf(refused).contains("--enroll-approve"));
+    CHECK_FALSE(NoteOf(refused).contains("--fleet-member"));
     CHECK_FALSE(NoteOf(refused).contains("token-file"));
     CHECK(KindOf(NextDue(rig, source)) == DashboardEventKind::Tick);
     CHECK(FinishedItself(NextDue(rig, source)));

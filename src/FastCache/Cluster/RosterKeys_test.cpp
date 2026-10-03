@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <tests/RaftPeerKeyFakes.hpp>
+#include <tests/Unwrap.hpp>
 
 using namespace FastCache;
 using namespace FastCache::Cluster;
@@ -23,7 +24,13 @@ namespace
 {
 
 /// A member as a command line names it, with the key typed for it -- or none.
-[[nodiscard]] ClusterMember Typed(std::string const& id, std::optional<Ed25519PublicKey> key)
+[[nodiscard]] MemberSpec Typed(std::string const& id, std::optional<Ed25519PublicKey> key)
+{
+    return MemberSpec { .id = id, .raftEndpoint = "10.0.0.1:6680", .publicKey = key };
+}
+
+/// A member as the state records it, under @p key.
+[[nodiscard]] ClusterMember Recorded(std::string const& id, Ed25519PublicKey const& key)
 {
     return ClusterMember { .id = id,
                            .raftEndpoint = "10.0.0.1:6680",
@@ -33,6 +40,18 @@ namespace
                            .publicKey = key };
 }
 
+/// The members a command line typed, each recorded under the key it typed.
+[[nodiscard]] std::vector<ClusterMember> RecordedAsTyped(std::vector<MemberSpec> const& typed)
+{
+    auto recorded = std::vector<ClusterMember> {};
+    for (auto const& member: typed)
+    {
+        REQUIRE(member.publicKey.has_value());
+        recorded.push_back(Recorded(member.id, Testing::Unwrap(member.publicKey)));
+    }
+    return recorded;
+}
+
 /// The key a test gives @p machine.
 [[nodiscard]] Ed25519PublicKey KeyOf(std::string const& machine)
 {
@@ -40,7 +59,7 @@ namespace
 }
 
 /// n1's roster, over a command line naming n1, n2 with its key, and n3 with none.
-[[nodiscard]] std::vector<ClusterMember> Bootstrap()
+[[nodiscard]] std::vector<MemberSpec> Bootstrap()
 {
     return { Typed("n1", KeyOf("n1")), Typed("n2", KeyOf("n2")), Typed("n3", std::nullopt) };
 }
@@ -68,18 +87,11 @@ TEST_CASE("The replicated state wins wherever it states a key", "[cluster][roste
     // n2 re-admitted under a new key a year after its command line was written, and n3's key
     // arriving from the cluster where the command line had none.
     ClusterState state;
-    state.members = { Typed("n2", KeyOf("n2-reinstalled")), Typed("n3", KeyOf("n3")) };
+    state.members = { Recorded("n2", KeyOf("n2-reinstalled")), Recorded("n3", KeyOf("n3")) };
     roster.Adopt(state);
 
     CHECK(roster.KeysOf("n2").live == KeyOf("n2-reinstalled"));
     CHECK(roster.KeysOf("n3").live == KeyOf("n3"));
-
-    // A member the state records with NO key falls back to the typed one: admitted before it
-    // stated one, which is not a statement that it has none.
-    ClusterState unstated;
-    unstated.members = { Typed("n2", std::nullopt) };
-    roster.Adopt(unstated);
-    CHECK(roster.KeysOf("n2").live == KeyOf("n2"));
 }
 
 TEST_CASE("A typed key the cluster revoked is revoked, whatever the command line says", "[cluster][roster]")
@@ -90,7 +102,7 @@ TEST_CASE("A typed key the cluster revoked is revoked, whatever the command line
     RosterKeys roster { TestKeyPair("n1"), bootstrap };
 
     ClusterState state;
-    state.members = { Typed("n2", KeyOf("n2")) };
+    state.members = { Recorded("n2", KeyOf("n2")) };
     Apply(state,
           Command { .kind = CommandKind::Forget,
                     .key = "n2",
@@ -122,7 +134,7 @@ TEST_CASE("A forgotten machine is reported as itself whatever id it claims", "[c
     Consensus::RaftPeerIdentity const identity { "n1", roster };
 
     ClusterState state;
-    state.members = bootstrap;
+    state.members = RecordedAsTyped(bootstrap);
     Apply(state,
           Command { .kind = CommandKind::Forget,
                     .key = "n3",
@@ -175,7 +187,7 @@ TEST_CASE("A forgotten member keeps its own key here until the configuration dro
     Consensus::RaftPeerIdentity const identity { "n1", roster };
 
     ClusterState state;
-    state.members = bootstrap;
+    state.members = RecordedAsTyped(bootstrap);
     Apply(state,
           Command { .kind = CommandKind::Forget,
                     .key = "n3",
@@ -246,7 +258,7 @@ TEST_CASE("An applied forget withdraws the key from every session it proved, tho
     Consensus::RaftPeerIdentity const identity { "n1", roster };
 
     ClusterState state;
-    state.members = bootstrap;
+    state.members = RecordedAsTyped(bootstrap);
     roster.Adopt(state);
     REQUIRE(identity.StillProves("n3", KeyOf("n3")));
 

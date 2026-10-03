@@ -21,10 +21,9 @@ namespace
 
     /// A `NodeChallenge` or `ProveNode` payload that would not decode into its fixed-width fields.
     ///
-    /// Counted apart from the rejection below for `SchedulerCredentialsMalformed`'s reason: a peer
-    /// that cannot form the frame is a version or client-library mismatch, and one forming it
-    /// correctly and failing to verify is the security question. Summed, the second hides inside
-    /// the first whenever an old client is in the fleet.
+    /// Counted apart from the rejection below: a peer that cannot form the frame is a version or client-library mismatch,
+    /// and one forming it correctly and failing to verify is the security question. Summed, the second hides inside the
+    /// first whenever an old client is in the fleet.
     constexpr Cc::SurfaceRefusal RefusedMalformed { .code = Wire::ErrorCode::MalformedFrame,
                                                     .counter = IMetricsSink::Counter::NodeProofsMalformed };
 
@@ -49,7 +48,7 @@ namespace
     ///
     /// Refused, and the connection is MARKED rather than closed: every later verb on it is refused
     /// as the forgotten machine's, from any address. Closing it would let the machine simply redial
-    /// and be judged by its address, which `--fleet-member` may still admit.
+    /// and be judged by its address, which `--fleet-open` still admits.
     constexpr Cc::SurfaceRefusal RefusedRevokedKey { .code = Wire::ErrorCode::NodeKeyRevoked,
                                                      .counter = IMetricsSink::Counter::NodeProofsRefusedRevokedKey };
 
@@ -94,11 +93,6 @@ namespace
         "a size or opcode refusal says the peer is confused about the framing rather than about which machine it is; "
         "summed into the node-proof series it would bury the refusals that mean an identity is wrong somewhere";
 
-    /// Why a credential refusal here belongs to the scheduler.
-    constexpr std::string_view CredentialIsTheSchedulersRationale =
-        "the credential is the scheduler's -- AUTH is a Session verb and MergedResponder routes it there -- so the "
-        "peer that presented it is counted against the component that checked it, once";
-
     /// One row per `EndpointRefusal`: what this surface does about it.
     struct NodeProofEndpointRefusal
     {
@@ -119,10 +113,10 @@ namespace
                        "summed into a series read as a wrong key somewhere it is what makes that series unreadable" },
         { .refusal = EndpointRefusal::CredentialMalformed,
           .answer = std::nullopt,
-          .rationale = CredentialIsTheSchedulersRationale },
+          .rationale = CredentialIsTheSessionsRationale },
         { .refusal = EndpointRefusal::CredentialRejected,
           .answer = std::nullopt,
-          .rationale = CredentialIsTheSchedulersRationale },
+          .rationale = CredentialIsTheSessionsRationale },
         { .refusal = EndpointRefusal::AnswerDeadline,
           .answer = std::nullopt,
           .rationale = AnswerDeadlineIsTheEndpointsRationale },
@@ -265,7 +259,10 @@ NodeProofVerdict NodeProofResponder::Verify(NodeHandshake const& handshake, std:
     };
 
     // The signature under the key the caller presented, and the roster only after: a caller who
-    // cannot sign learns nothing about which ids and keys this cluster holds.
+    // cannot sign learns nothing about which ids and keys this cluster holds. AUTH's ticket keeps
+    // the same promise the other way round -- a ticket is checked under the ROSTER's key for the id
+    // it claims, so its roster-dependent refusals share one message (`TicketRefusalSays`) -- and
+    // what either path tells a caller is about a signature it holds, never about an id it only names.
     if (!Distributed::VerifyNodeProof(handshake.request, handshake.reply, *proof))
         return sealed(Cc::Refuse(_metrics,
                                  RefusedRejected,
@@ -277,7 +274,7 @@ NodeProofVerdict NodeProofResponder::Verify(NodeHandshake const& handshake, std:
 
     // The one door to what the cluster holds: the admission oracle's key question, so the answer a
     // proof gets here and the answer every later verb on the connection gets are one fold.
-    auto const standing = _roster.ExplainKey(identity);
+    auto const standing = _roster.ExplainKey(identity, Distributed::KeyEvidence::SessionProof);
     if (standing.decidedBy.Has(Distributed::MembershipParticipant::KeyTombstone))
         return sealed(Cc::Refuse(_metrics,
                                  RefusedRevokedKey,

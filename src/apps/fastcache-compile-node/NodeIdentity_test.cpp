@@ -355,6 +355,10 @@ TEST_CASE("A consensus node that names itself neither way is refused", "[node][i
     // address is awaited, not missing.
     auto neither = Testing::FirstStart(NodeConfig {});
     neither.schedulers = { "127.0.0.1:6674" };
+    // Where CLIENTS dial it is stated, so the only address left unnamed is the one this rule is
+    // about: a consensus node admits other machines by key, and with no host name resolved an
+    // unnamed advertise would be the wildcard, which its own row refuses first.
+    neither.advertise = "10.0.0.7:6674";
     neither.raftListen = "6680";
     ApplyHostNames(neither, NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = {} });
     auto const refusal = StartupPolicyRejection(neither);
@@ -385,6 +389,10 @@ TEST_CASE("The startup row refuses exactly the consensus nodes whose dial addres
 
     auto worker = Testing::FirstStart(NodeConfig {});
     worker.schedulers = { "127.0.0.1:6674" };
+    // Stated for `A consensus node that names itself neither way`'s reason: the client address is
+    // not what this row asks about, and a consensus shape leaving it to a withheld name is refused
+    // by the wildcard row first.
+    worker.advertise = "10.0.0.7:6674";
     worker.raftListen.clear();
     auto consensus = worker;
     consensus.raftListen = "6680";
@@ -526,6 +534,10 @@ TEST_CASE("A service registration bakes in the resolved identity", "[node][ident
     cfg.advertiseExplicit = true;
     cfg.raftListenExplicit = true;
     cfg.raftSelfExplicit = true;
+    // A bind the advertised address answers on: a consensus node admits machines by key, so a
+    // routable advertise over a loopback bind is refused at every boot the registration replays.
+    cfg.nodeListen = "0.0.0.0:6674";
+    cfg.nodeListenExplicit = true;
 
     auto const identity = Resolved(NodeStateDirectory(cfg), cfg.nodeId, random);
     ApplyNodeIdentity(cfg, identity);

@@ -6,7 +6,6 @@
 #include "NodeConfig.hpp"
 #include "Responders.hpp"
 
-#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseSigner.hpp>
@@ -172,18 +171,6 @@ class SchedulerTier
         return _service;
     }
 
-    /// The credential this node's surfaces require, or null when none is configured.
-    ///
-    /// Handed out so a second surface requires the SAME one. `AUTH` is a `Session` verb
-    /// and the merged listener routes it here, so a surface holding a policy of its own
-    /// would gate against a credential nothing on this node ever accepts -- which is a
-    /// port that looks guarded and refuses everybody.
-    /// @return The policy, shared; null means membership is the only gate.
-    [[nodiscard]] std::shared_ptr<AuthPolicy const> Policy() const noexcept
-    {
-        return _policy;
-    }
-
   private:
     SchedulerTier(Distributed::IMembershipOracle const& membership,
                   core::platform::IClock& clock,
@@ -192,8 +179,7 @@ class SchedulerTier
                   ILogger& logger,
                   std::string signerId,
                   Ed25519KeyPair identityKey,
-                  std::string_view clusterId,
-                  std::shared_ptr<AuthPolicy const> policy);
+                  std::string_view clusterId);
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it.
@@ -204,10 +190,6 @@ class SchedulerTier
 
     Distributed::SchedulerService _service;
     Distributed::SchedulerProtocol _protocol;
-
-    /// The credential every surface on this node requires, or null. Declared before
-    /// `_responder`, which is handed the same object.
-    std::shared_ptr<AuthPolicy const> _policy;
 
     SchedulerResponder _responder;
 

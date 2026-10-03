@@ -109,6 +109,10 @@ constexpr std::array WriterFiles {
     SurfaceWriterFile { .surface = MetricsSurface::NodeEnrollment,
                         .path = "src/apps/fastcache-compile-node/EnrollmentWindow.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
+                        .path = "src/FastCache/Distributed/TicketVerifier.cpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
+                        .path = "src/FastCache/Distributed/TicketVerifier.hpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
                         .path = "src/apps/fastcache-compile-node/FleetTextResponder.cpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
                         .path = "src/apps/fastcache-compile-node/FrameEndpoint.cpp" },
@@ -122,6 +126,8 @@ constexpr std::array WriterFiles {
                         .path = "src/apps/fastcache-compile-node/Responders.hpp" },
     SurfaceWriterFile { .surface = MetricsSurface::NodeFormation,
                         .path = "src/apps/fastcache-compile-node/FormationController.cpp" },
+    SurfaceWriterFile { .surface = MetricsSurface::NodeFrameEndpoint,
+                        .path = "src/apps/fastcache-compile-node/SessionResponder.cpp" },
 };
 
 /// A production file that names a counter and writes none.
@@ -553,8 +559,8 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // tracked its own subject would silently re-attribute a real measurement to conditions it
     // was never taken under. Drift is a red build, which is what the previous "106 of 144" --
     // a sentence with nothing watching it -- did not get.
-    CHECK(incremented.size() == 56);
-    CHECK(refusalRow.size() == 127);
+    CHECK(incremented.size() == 58);
+    CHECK(refusalRow.size() == 135);
     CHECK(outcomeRow.size() == 10);
     CHECK(returned.size() == 4);
 
@@ -565,9 +571,9 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     // No catalogue row is written by none of the four. The check for that is the whole
     // catalogue, not a count: a row nobody writes is a row whose surface was guessed.
     CHECK(anyWriter.size() == spellings.size());
-    CHECK(spellings.size() - incremented.size() == 137);
+    CHECK(spellings.size() - incremented.size() == 145);
 
-    // 127 rows have a refusal row; 126 of them have no increment site. Two figures one apart
+    // 135 rows have a refusal row; 134 of them have no increment site. Two figures one apart
     // measuring different things is how a census gets quoted wrong -- the first draft of the
     // comment beside `CounterSoleWriterTable` said 101 for both -- so the REACH of a
     // SurfaceRefusal-only reading is asserted separately from the row count.
@@ -575,9 +581,9 @@ TEST_CASE("counter-attribution: the mechanism figures quoted beside the table st
     for (auto const& name: refusalRow)
         if (!incremented.contains(name))
             reachedByRefusalRowsAlone.insert(name);
-    CHECK(reachedByRefusalRowsAlone.size() == 126);
+    CHECK(reachedByRefusalRowsAlone.size() == 134);
 
-    // And four rows are written two ways, which is why the column sums to 197 over 193 rows.
+    // And four rows are written two ways, which is why the column sums to 207 over 203 rows.
     CHECK(incremented.size() + refusalRow.size() + outcomeRow.size() + returned.size() == spellings.size() + 4);
 }
 

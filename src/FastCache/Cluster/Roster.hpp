@@ -25,10 +25,10 @@ namespace FastCache::Cluster
 /// and a field that moves on every election would move its digest with it.
 struct RosterMember
 {
-    Consensus::NodeId id;                      ///< Its identity.
-    std::string raftEndpoint;                  ///< Where its consensus port answers.
-    MemberSeat seat { MemberSeat::Voter };     ///< Whether it votes.
-    std::optional<Ed25519PublicKey> publicKey; ///< The key it proves itself with, when one is recorded.
+    Consensus::NodeId id;                  ///< Its identity.
+    std::string raftEndpoint;              ///< Where its consensus port answers.
+    MemberSeat seat { MemberSeat::Voter }; ///< Whether it votes.
+    Ed25519PublicKey publicKey {};         ///< The key it proves itself with -- required, as the state's is.
 
     [[nodiscard]] friend bool operator==(RosterMember const&, RosterMember const&) = default;
 };
@@ -70,7 +70,8 @@ inline constexpr std::uint8_t RosterFormatVersion = 1;
 ///
 /// Refuses another layout version by NAME (`UnsupportedVersion`), and anything else that is not
 /// a roster as `MalformedFrame`: a wrong width, a seat or role this build does not know, a
-/// principal or revoked entry with no key.
+/// revoked entry with no key -- and a member or principal with no key, or the all-zero one,
+/// each refused by name.
 /// @param bytes The encoding.
 /// @return The roster, or why the bytes are not one.
 [[nodiscard]] std::expected<Roster, ConsensusError> DecodeRoster(std::span<std::byte const> bytes);

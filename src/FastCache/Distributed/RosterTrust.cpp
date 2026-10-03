@@ -159,8 +159,8 @@ LeaseSignerKeys RosterTrust::KeysOf(std::string_view signer) const
     for (auto const& revoked: _held->roster.revoked)
         keys.revoked.push_back(revoked.publicKey);
     for (auto const& member: _held->roster.members)
-        if (member.id == signer && member.seat == Cluster::MemberSeat::Voter && member.publicKey.has_value()
-            && !std::ranges::contains(keys.revoked, *member.publicKey))
+        if (member.id == signer && member.seat == Cluster::MemberSeat::Voter
+            && !std::ranges::contains(keys.revoked, member.publicKey))
             keys.live = member.publicKey;
     return keys;
 }
@@ -178,6 +178,21 @@ RosterReading RosterTrust::Read(std::chrono::system_clock::time_point now) const
                            .certifiedUntil = _held->certifiedUntil };
 }
 
+LeaseSignerKeys RosterTrust::MachineKeysOf(std::string_view machine) const
+{
+    std::shared_lock const lock { _lock };
+    if (!_held.has_value())
+        return {};
+
+    auto keys = LeaseSignerKeys {};
+    for (auto const& revoked: _held->roster.revoked)
+        keys.revoked.push_back(revoked.publicKey);
+    for (auto const& member: _held->roster.members)
+        if (member.id == machine && !std::ranges::contains(keys.revoked, member.publicKey))
+            keys.live = member.publicKey;
+    return keys;
+}
+
 std::optional<RosterSummary> RosterTrust::Summary() const
 {
     std::shared_lock const lock { _lock };
@@ -186,22 +201,43 @@ std::optional<RosterSummary> RosterTrust::Summary() const
     return Summarise(_held->roster, _held->certificate.version, _held->certifiedUntil);
 }
 
+std::optional<Cluster::Roster> RosterTrust::Held() const
+{
+    std::shared_lock const lock { _lock };
+    if (!_held.has_value())
+        return std::nullopt;
+    return _held->roster;
+}
+
 void StateLeaseRoster::Adopt(Cluster::ClusterState const& state)
 {
     std::map<std::string, Ed25519PublicKey, std::less<>> voters;
+    std::map<std::string, Ed25519PublicKey, std::less<>> machines;
     for (auto const& member: state.members)
-        if (member.seat == Cluster::MemberSeat::Voter && member.publicKey.has_value())
-            voters.emplace(member.id, *member.publicKey);
+    {
+        machines.emplace(member.id, member.publicKey);
+        if (member.seat == Cluster::MemberSeat::Voter)
+            voters.emplace(member.id, member.publicKey);
+    }
     std::vector<Ed25519PublicKey> revoked;
     revoked.reserve(state.revokedKeys.size());
     for (auto const& entry: state.revokedKeys)
         revoked.push_back(entry.publicKey);
-    auto summary = Summarise(Cluster::ProjectRoster(state), state.rosterVersion, std::nullopt);
+    auto roster = Cluster::ProjectRoster(state);
+    auto summary = Summarise(roster, state.rosterVersion, std::nullopt);
 
     std::unique_lock const lock { _lock };
     _voters = std::move(voters);
+    _machines = std::move(machines);
     _revoked = std::move(revoked);
     _summary = summary;
+    _roster = std::move(roster);
+}
+
+Cluster::Roster StateLeaseRoster::Held() const
+{
+    std::shared_lock const lock { _lock };
+    return _roster;
 }
 
 LeaseSignerKeys StateLeaseRoster::KeysOf(std::string_view signer) const
@@ -217,6 +253,15 @@ RosterReading StateLeaseRoster::Read(std::chrono::system_clock::time_point now) 
 {
     (void) now;
     return RosterReading { .standing = RosterStanding::Current, .certifiedUntil = std::nullopt };
+}
+
+LeaseSignerKeys StateLeaseRoster::MachineKeysOf(std::string_view machine) const
+{
+    std::shared_lock const lock { _lock };
+    auto keys = LeaseSignerKeys { .live = std::nullopt, .revoked = _revoked };
+    if (auto const found = _machines.find(machine); found != _machines.end())
+        keys.live = found->second;
+    return keys;
 }
 
 RosterSummary StateLeaseRoster::Summary() const

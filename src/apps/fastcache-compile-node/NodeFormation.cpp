@@ -124,22 +124,28 @@ std::vector<std::string> SchedulersOf(NodeConfig const& cfg)
     return { FormatHostPort(ThisMachineLoopbackHost, node.front().port) };
 }
 
-std::vector<Cluster::ClusterMember> BootstrapMembersOf(NodeConfig const& cfg)
+std::vector<Cluster::MemberSpec> BootstrapMembersOf(NodeConfig const& cfg)
 {
     if (!cfg.formation.has_value())
         return {};
     if (!cfg.formation->foundedHere)
-        return cfg.formation->fleetMembers;
+    {
+        // The approved roster's members, as the typed members consensus starts from: each holds
+        // the key the roster records for it, which the peer sessions verify it against.
+        std::vector<Cluster::MemberSpec> members;
+        members.reserve(cfg.formation->fleetMembers.size());
+        for (auto const& member: cfg.formation->fleetMembers)
+            members.push_back(Cluster::MemberSpec {
+                .id = member.id, .raftEndpoint = member.raftEndpoint, .publicKey = member.publicKey });
+        return members;
+    }
 
     // This node alone: the cluster it minted, whether it is still solitary or has founded a fleet
-    // that others joined -- they are in its log, not in its bootstrap.
+    // that others joined -- they are in its log, not in its bootstrap. Its key is the one it
+    // proves itself with, when the start has resolved it.
     auto const dial = ConsensusDialAddressOf(cfg);
-    return { Cluster::ClusterMember { .id = cfg.nodeId,
-                                      .raftEndpoint = dial.value_or(std::string {}),
-                                      .schedulerEndpoint = {},
-                                      .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
-                                      .seat = Cluster::MemberSeat::Voter,
-                                      .publicKey = cfg.identityPublicKey } };
+    return { Cluster::MemberSpec {
+        .id = cfg.nodeId, .raftEndpoint = dial.value_or(std::string {}), .publicKey = cfg.identityPublicKey } };
 }
 
 std::optional<std::string> RaftClosedByFormation(NodeConfig const& cfg)

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ClusterAdminCli.hpp"
+#include "EndpointDialerTestUtils.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeCredential.hpp"
+#include "NodePresenceTier.hpp"
+#include "NodeProofClient.hpp"
 #include "RemoteUpstream.hpp"
 
 #include <FastCache/Config/YamlReader.hpp>
@@ -34,10 +37,12 @@
 #include <core/net/IAsyncAddressResolver.hpp>
 #include <core/net/IConnector.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/NodeProofFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
+#include <tests/Unwrap.hpp>
 
-// **All three sites in one file, and that arrangement IS the test** (#404).
+// **Every site in one file, and that arrangement IS the test** (#404).
 //
 // `--requirepass` on this worker is presented and never required, and it was captured
 // by value at three construction sites: the cache tier's upstream client, the cluster
@@ -46,11 +51,13 @@
 // symptom is an authentication failure nobody can reproduce, on a machine nobody is
 // watching.
 //
-// The property is therefore "ONE rotation, THREE sites", and a suite that spreads it
-// across three files beside three implementations is a suite in which the third site
-// is the one nobody adds. Each case below rotates the same shape of source and reads
-// the bytes that went OUT, because a site holding a stale copy still returns a correct
-// object, still logs nothing, and still moves no counter.
+// Since then the heartbeat round presents NOTHING, and the case for it here says so: the
+// secret is the `--upstream` cache's, a scheduler checks no password, and presenting it
+// there handed it to every scheduler this node dialled. So the sites are two that rotate
+// and three rounds that must stay bare, and a suite spreading them across files is one in
+// which the next site is the one nobody adds. Each case reads the bytes that went OUT,
+// because a site holding a stale copy -- or presenting where it should not -- still
+// returns a correct object, still logs nothing, and still moves no counter.
 //
 // What is deliberately NOT asserted anywhere here is `ICredentialSource::Current()`
 // alone. A source that rotates while every site ignores it is precisely the bug, and a
@@ -339,6 +346,30 @@ TEST_CASE("Site 1, the other verb: a STORE presents the rotated secret too", "[n
           == authOnly);
 }
 
+namespace
+{
+
+/// A per-endpoint credential that answers from @p source at every ask, for the site whose seam is
+/// `Cc::ICredentialFor`.
+class AskedAtTheExchange final: public Cc::ICredentialFor
+{
+  public:
+    explicit AskedAtTheExchange(ICredentialSource const& source) noexcept:
+        _source { source }
+    {
+    }
+
+    [[nodiscard]] Cc::PresentedCredential Present(std::string_view /*audience*/) override
+    {
+        return Cc::PresentedCredential { .credential = _source.Current() };
+    }
+
+  private:
+    ICredentialSource const& _source;
+};
+
+} // namespace
+
 TEST_CASE("Site 2: a cluster verb presents the secret in force NOW", "[node][credential][rotation]")
 {
     // This verb cannot observe a rotation in production -- it runs once and the
@@ -346,90 +377,155 @@ TEST_CASE("Site 2: a cluster verb presents the secret in force NOW", "[node][cre
     // property that outlives that fact: the site reads the source at the exchange,
     // so it cannot become the stale one when somebody calls it from a running worker.
     RotatingCredential credential { FirstSecret };
+    AskedAtTheExchange credentials { credential };
     auto notice = Cc::CredentialNotice::Silent();
     ClusterRequest const request { .action = ClusterAction::Status, .key = {}, .value = {}, .publicKey = std::nullopt };
 
     Testing::ScriptedSocket first { AcceptedThen(Wire::EncodeReply(Wire::Status::Ok, {})) };
-    (void) PutClusterRequest(first, notice, request, credential, "scheduler.example:6676");
+    (void) PutClusterRequest(first, notice, request, credentials, "scheduler.example:6676");
     CHECK(first.Sent() == AuthThen(FirstSecret, EncodeClusterRequest(request)));
 
     credential.Rotate(SecondSecret);
     Testing::ScriptedSocket second { AcceptedThen(Wire::EncodeReply(Wire::Status::Ok, {})) };
-    (void) PutClusterRequest(second, notice, request, credential, "scheduler.example:6676");
+    (void) PutClusterRequest(second, notice, request, credentials, "scheduler.example:6676");
 
     CHECK(second.Sent() == AuthThen(SecondSecret, EncodeClusterRequest(request)));
     CHECK(second.Sent() != first.Sent());
 }
 
-TEST_CASE("Site 3: a registration presents the secret in force NOW", "[node][credential][rotation]")
+namespace
 {
-    // The site that could not be shown at all before #404, because it lived in
-    // `main.cpp` -- the one translation unit no test reaches. `HeartbeatRound` held a
-    // `Cc::Credential const&` bound to a local `WorkerBody` built once, so this was
-    // the site a rotation was GUARANTEED to miss while the other two moved.
+
+/// Every framed request in @p sent, in order, by its declared length.
+/// @param sent What a scripted socket was written.
+/// @return One op byte per whole frame.
+[[nodiscard]] std::vector<std::uint8_t> OpsIn(std::span<std::byte const> sent)
+{
+    std::vector<std::uint8_t> ops;
+    while (sent.size() >= Wire::RequestHeaderSize)
+    {
+        auto const header = Wire::DecodeRequestHeader(sent);
+        if (!header.has_value())
+            break;
+        auto const whole = Wire::RequestHeaderSize + std::size_t { header->payloadLength };
+        if (sent.size() < whole)
+            break;
+        ops.push_back(header->opRaw);
+        sent = sent.subspan(whole);
+    }
+    return ops;
+}
+
+/// Whether @p secret appears anywhere in @p sent, framed or not.
+/// @param sent What a scripted socket was written.
+/// @param secret The password.
+/// @return True when its bytes are there.
+[[nodiscard]] bool Carries(std::span<std::byte const> sent, std::string_view secret)
+{
+    return !std::ranges::search(sent, Wire::AsBytes(secret)).empty();
+}
+
+/// Assert @p sent is exactly one @p verb frame: no `AUTH` before it and the secret nowhere.
+///
+/// The verb is the positive control. A parse that found no frame at all would satisfy "no
+/// `AUTH`" and "no secret" alike, so the case names what the round DID send.
+/// @param sent What the scheduler was written.
+/// @param verb The one request the round sends.
+void CheckBare(std::span<std::byte const> sent, Wire::Op verb)
+{
+    auto const ops = OpsIn(sent);
+    INFO("ops sent: " << ops.size());
+    CHECK(std::ranges::find(ops, static_cast<std::uint8_t>(Wire::Op::Auth)) == ops.end());
+    CHECK_FALSE(Carries(sent, FirstSecret));
+    CHECK(ops == std::vector<std::uint8_t> { static_cast<std::uint8_t>(verb) });
+}
+
+/// Every server has the one standing; never consulted where the scheduler serves no proof.
+class AnyServer final: public IServerTrust
+{
+  public:
+    [[nodiscard]] ServerStanding StandingOf(std::string_view /*serverId*/,
+                                            Ed25519PublicKey const& /*serverKey*/) const override
+    {
+        return ServerStanding::Voter;
+    }
+};
+
+} // namespace
+
+TEST_CASE("No round a node sends a scheduler presents the password whatever is configured", "[node][credential][scheduler]")
+{
+    // `--requirepass` is the secret of the cache behind `--upstream`. A scheduler checks no
+    // password -- it answers a password AUTH `Ok` and establishes nothing -- so these rounds,
+    // which #404 made present the CURRENT secret, were handing it in the clear, pipelined
+    // ahead of any seal, to every `--scheduler` and to every endpoint a `NotLeader` named. The
+    // node proof is this machine's credential with a scheduler.
     //
-    // Asserted on the REGISTER frame's leading AUTH rather than on the whole exchange:
-    // the registration's own payload carries this machine's capacity and a version
-    // string, which are not what this case is about and would make it fail on an
-    // unrelated wire change.
+    // The secret is configured in every section and the round is the production one, so a
+    // round that read `cfg.requirePass` again -- or an exchange that presented anything --
+    // shows up in the bytes.
     NodeConfig cfg;
     cfg.schedulers = { "scheduler.example:6676" };
+    cfg.requirePass = FirstSecret;
 
-    RotatingCredential credential { FirstSecret };
     AtomicMetricsSink metrics;
     NullLogger logger;
     SilentLoadSampler loadSampler;
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
     Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
-
-    Cc::CredentialNotice notice = Cc::CredentialNotice::Silent();
     std::vector<Cc::WorkerRegistrar> registrars;
-    registrars.emplace_back(notice, "gcc-14", "10.0.0.2:6677", 1U, Wire::CodecList {}, Wire::CapacityFields {});
-
-    // Empty here: this case is about which credential a round PRESENTS, and a
-    // withdrawal presents the same one through the same seam. Covered on its own in
-    // `NodeAnnounce_test.cpp` rather than folded in as a second subject.
+    registrars.emplace_back("gcc-14", "10.0.0.2:6677", 1U, Wire::CodecList {}, Wire::CapacityFields {});
     std::vector<Cc::WorkerRegistrar> withdrawals;
 
-    HeartbeatRound const round { .cfg = cfg,
-                                 .registrars = registrars,
-                                 .withdrawals = withdrawals,
-                                 .capacity = capacity,
-                                 .loadSampler = loadSampler,
-                                 .cacheTier = nullptr,
-                                 .metrics = metrics,
-                                 .credential = credential,
-                                 .notice = notice,
-                                 // Nothing proves: every case in this file is about the announce
-                                 // round itself, against a scripted fleet that serves no handshake
-                                 // (#178). The proof is `FrameEndpoint_test`'s, over a real socket.
-                                 .prover = nullptr,
-                                 .lease = lease,
-                                 .logger = logger };
+    auto const key = Testing::TestKeyPair("worker-a");
+    AnyServer const trust;
+    Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+    NodeProofClient const prover { "worker-a", key, trust, random };
 
-    auto const authFor = [](std::string_view secret) {
-        return Wire::EncodeAuth(Wire::AuthRequest { .username = "", .secret = std::string { secret } });
-    };
-    auto const leadingAuth = [](Testing::ScriptedSocket const& socket, std::size_t length) {
-        auto const& sent = socket.Sent();
-        if (sent.size() < length)
-            return std::vector<std::byte> {};
-        return std::vector<std::byte> { sent.begin(), sent.begin() + static_cast<std::ptrdiff_t>(length) };
+    auto const roundProvedBy = [&](NodeProofClient const* proving) {
+        return HeartbeatRound { .cfg = cfg,
+                                .registrars = registrars,
+                                .withdrawals = withdrawals,
+                                .capacity = capacity,
+                                .loadSampler = loadSampler,
+                                .cacheTier = nullptr,
+                                .metrics = metrics,
+                                .prover = proving,
+                                .lease = lease,
+                                .logger = logger };
     };
 
-    Testing::ScriptedSocket first { AcceptedThen(Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today")) };
-    (void) AnnounceOnce(round, first, cfg.schedulers.front());
-    CHECK(leadingAuth(first, authFor(FirstSecret).size()) == authFor(FirstSecret));
+    SECTION("a registration")
+    {
+        Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today") };
+        (void) AnnounceOnce(roundProvedBy(nullptr), scheduler, cfg.schedulers.front());
+        CheckBare(scheduler.Sent(), Wire::Op::Register);
+    }
 
-    credential.Rotate(SecondSecret);
-    Testing::ScriptedSocket second { AcceptedThen(Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today")) };
-    (void) AnnounceOnce(round, second, cfg.schedulers.front());
+    SECTION("the proof that opens every round")
+    {
+        // A node running no consensus serves no proof: the round stops at the challenge, which
+        // is the first thing any connection to a scheduler carries.
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NoCluster, "no consensus here") } };
+        auto link = Testing::Unwrap(SchedulerLink::For(cfg.schedulers));
+        CHECK(AnnounceRound(roundProvedBy(&prover), link, dialer) == 0);
+        CheckBare(dialer.SentOn(0), Wire::Op::NodeChallenge);
+    }
 
-    CHECK(leadingAuth(second, authFor(SecondSecret).size()) == authFor(SecondSecret));
-    // The round is `const` and was built once, before the rotation. That is the whole
-    // point: a `Cc::Credential` member here could not have moved, and this assertion
-    // is what says the member is a seam rather than a value.
-    CHECK(leadingAuth(second, authFor(FirstSecret).size()) != authFor(FirstSecret));
+    SECTION("a presence announcement")
+    {
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today") } };
+        auto link = Testing::Unwrap(SchedulerLink::For(cfg.schedulers));
+        Wire::CapacityFields const machine {};
+        Wire::LoadFields const load {};
+        CHECK_FALSE(AnnouncePresence(
+            PresenceMessage {
+                .endpoint = "10.0.0.2:6677", .capacity = machine, .load = load, .logger = logger, .prover = nullptr },
+            nullptr,
+            link,
+            dialer));
+        CheckBare(dialer.SentOn(0), Wire::Op::NodeAnnounce);
+    }
 }
 
 TEST_CASE("The production source answers from the LIVE snapshot, not the startup one", "[node][credential][rotation]")
@@ -447,12 +543,15 @@ TEST_CASE("The production source answers from the LIVE snapshot, not the startup
     // A state directory in both, because a node naming a scheduler must keep an identity (#178)
     // and `cluster_dir` is not reloadable: a file and a live configuration disagreeing about it
     // would make this reload refuse for a reason that has nothing to do with the credential.
+    //
+    // The scheduler is on this machine: that state directory is a key route, and a worker admitting
+    // other machines while registering loopback with a scheduler elsewhere is refused -- which is a
+    // reload refusal about the advertise, not the credential.
     auto const path = WriteConfig(
-        scratch.Path(),
-        std::format("scheduler: scheduler.example:6676\ncluster_dir: node-state\nrequirepass: {}\n", SecondSecret));
+        scratch.Path(), std::format("scheduler: 127.0.0.1:6676\ncluster_dir: node-state\nrequirepass: {}\n", SecondSecret));
 
     NodeConfig initial;
-    initial.schedulers = { "scheduler.example:6676" };
+    initial.schedulers = { "127.0.0.1:6676" };
     initial.clusterDir = "node-state";
     initial.requirePass = std::string { FirstSecret };
 

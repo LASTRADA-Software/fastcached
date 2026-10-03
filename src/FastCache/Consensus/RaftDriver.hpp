@@ -186,7 +186,7 @@ class RaftDriver
     /// comes back with its applied index AT the snapshot's boundary, so nothing the
     /// snapshot covers will ever be applied again: the snapshot's state reaches the
     /// application here or never, and a node that ran without it would lose every
-    /// fact it held -- for a membership state the forget tombstones too, so removal
+    /// fact it held -- for a membership state the revoked keys too, so removal
     /// fails OPEN. Folded into building rather than left to the caller, because the
     /// defect was precisely a caller that did not know to do it.
     ///

@@ -82,7 +82,8 @@ TEST_CASE("Any caller is answered a signed fleet summary", "[node][formation][su
     FleetSummaryResponder responder { self, identity };
 
     CHECK_FALSE(responder.RefusePeer(Stranger(), static_cast<std::uint8_t>(Wire::Op::FleetSummary)).has_value());
-    CHECK_FALSE(responder.AuthRequired(static_cast<std::uint8_t>(Wire::Op::FleetSummary)));
+    // Answered before authentication: the verb's own `OpTable` row, which the endpoint reads.
+    CHECK(Wire::IsPreAuthAllowed(static_cast<std::uint8_t>(Wire::Op::FleetSummary)));
 
     auto fresh = Testing::IssuedNonceOf(std::byte { 9 });
     auto const nonce = fresh.wire;

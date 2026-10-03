@@ -355,6 +355,16 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
+    // Moved when a machine became forgotten by its key alone: `node_requests_refused_host_forgotten`
+    // left the catalogue with the host tombstones it counted, which changes which cells every
+    // live-stats reading carries. Clients and nodes upgrade together, as below.
+    //
+    // Moved by the machine ticket before that: eleven counters joined the catalogue -- a ticket a node
+    // accepted (`node_tickets_accepted`) and one row per way a node refuses one (`malformed`,
+    // `not_utf8`, `no_roster`, `unknown_machine`, `forged`, `revoked`, `wrong_audience`,
+    // `expired`, `replayed`, `spent_set_full`) -- which changes which cells every live-stats
+    // reading carries. Clients and nodes upgrade together, as below.
+    //
     // Moved when a pending node began refusing an admission its proven fleet did not vouch for: one
     // counter joined the catalogue (`formation_admissions_refused`). Clients and nodes upgrade
     // together, as below.
@@ -489,7 +499,22 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     //
     // Moved by #1484 before that: the counter cells carry a second bitmap saying WHICH absence
     // each absent cell is, so `StatsReadingWire::Grammar` went to `-4`.
-    CHECK(StatsReadingLayout == 0xb6513d2c510314eaULL);
+    //
+    // Moved when the node's password gate went: seven counters no writer could move any more left
+    // the catalogue (the scheduler's three credential rows, the compile surface's three, and the
+    // enrollment surface's unauthenticated row). Clients and nodes upgrade together, as above.
+    //
+    // Moved when a node began minting machine tickets: five counters joined the catalogue
+    // (`node_tickets_minted` and the four `node_ticket_mints_refused_*` rows). Clients and nodes
+    // upgrade together, as above.
+    //
+    // Moved when lane 2b's admission counters were appended after lane 2a's formation rows, in
+    // integration order (ruling 8). Read off the built test, never computed by hand.
+    //
+    // Moved again when an operator's control verbs began refusing a caller only `--fleet-open`
+    // admitted: two counters joined the catalogue, one per surface that refuses one. Clients and
+    // nodes upgrade together, as above.
+    CHECK(StatsReadingLayout == 0x89d694b65e393ae7ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

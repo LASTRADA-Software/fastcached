@@ -1148,8 +1148,8 @@ and it is recorded here because the question will be asked again.
     so nothing the snapshot covers is ever applied again -- and `RestoreSnapshot` was
     called only on `output.restoreSnapshot`, which only `OnInstallSnapshot` sets. So a
     node that compacted (every 512 entries) and restarted ran without every cluster
-    fact its snapshot held: members, settings, and the forget tombstones, which made
-    REMOVAL fail OPEN -- a forgotten host admitted again after a restart, reported by
+    fact its snapshot held: members, settings, and the revoked keys, which made
+    REMOVAL fail OPEN -- a forgotten machine admitted again after a restart, reported by
     nothing. It recovered only if a leader later sent it an `InstallSnapshot`, which a
     follower whose log is current never gets. `RaftDriver::Create` -- a factory over
     a private constructor, the one way a driver is built -- now restores a node's
@@ -1163,7 +1163,7 @@ and it is recorded here because the question will be asked again.
     restore above met a change of the cluster state's encoding (#178's `StateVersion`
     5 -> 6, `CommandVersion` 2 -> 3): a node restarting over its OWN snapshot from the
     build before reached `RestoreSnapshot`, which logged *cannot decode ... keeping
-    current state* -- and the node then RAN with an empty `ClusterState`, tombstones
+    current state* -- and the node then RAN with an empty `ClusterState`, revocations
     included, while `Apply` skipped every retained command it could not decode.
     Removal failed open on the upgrade path, loudly but open. So `Create` is FALLIBLE:
     it asks `CanRead` -- const, no effects -- of every command the log holds above the
@@ -1608,34 +1608,23 @@ and it is recorded here because the question will be asked again.
     the reconciler is handed is an OBSERVATION -- a peer proved the key, this node knows
     its own record -- and `--cluster-forget` leaves the machine running with the key, so
     discovery proves it again at its next beacon. `ConsensusTier::Desire` never prunes,
-    `MembershipProposals` proposed every desired id the state lacked, and `AddMember`
-    lifts the tombstone for the host it admits at: the leader re-recorded the forgotten
-    member on the very next pass, tombstone gone, and the quorum flapped -- removed on
-    one pass, re-added on the next. Inferred from reading, then REPRODUCED at the policy
-    before the fix. So `MembershipProposals` refuses a desire at a forgotten host --
-    by NAME, into `MembershipPlan::forgotten`, which the tier logs once per member,
+    and `MembershipProposals` proposed every desired id the state lacked: the leader
+    re-recorded the forgotten member on the very next pass and the quorum flapped --
+    removed on one pass, re-added on the next. Inferred from reading, then REPRODUCED at
+    the policy before the fix. So `MembershipProposals` refuses a desire for a forgotten
+    id -- by NAME, into `MembershipPlan::forgotten`, which the tier logs once per member,
     because a refused desire and one the state already matches both propose nothing.
     **Refused at the decision, not by pruning the desire**: discovery hands it back at
-    the next proof for as long as the machine holds the key. The predicate is `Apply`'s
-    own (`HasForgotten` over `HostOfEndpoint`, through `SameHost`), asked only of a desire
-    that would propose something, and it covers this node's OWN record. Lifting a
-    tombstone is the operator's: `--cluster-admit` commits `AddMember` directly. The
-    tombstone is a HOST, so a loopback cluster -- which records none -- is not covered,
-    and #178's per-node keys are what replace it with an identity.
+    the next proof for as long as the machine holds the key. The predicate is
+    `ForgottenById` -- a key `revokedKeys` holds under that id, the one forget fact that
+    outlives the record it removed -- asked only of a desire that would propose something,
+    and it covers this node's OWN record. It is asked by the id and the key, never by an
+    address: a machine is forgotten wherever it now dials from, which is what answers on
+    a rig sharing one machine over loopback and what survives a machine moving to a new
+    address.
 
-    **A HOST is one of the predicate's two arms, and after #1555 it is the weaker
-    one.** `--cluster-forget` revokes the record's key in the same entry (*A forget
-    revokes*, below), so the second arm is *an id recorded nowhere whose key
-    `revokedKeys` holds under it* -- which is the arm that answers on a rig sharing one
-    machine, where every member is loopback and no tombstone is ever written, and the
-    arm that survives a machine moving to a new address. Both are asked, because
-    neither covers the other: a tombstoned host may hold a member admitted afresh under
-    a key nobody revoked, and a revoked key may belong to a machine no tombstone ever
-    named. Asked with the same `MembershipPlan::forgotten` answer, at the same
-    decision.
-
-    **So only a NEW key brings a forgotten machine back.** `--cluster-admit` lifts the
-    tombstone, but `KeyRevoked` is PERMANENT (*A revoked key is never admitted again*,
+    **So only a NEW key brings a forgotten machine back.** `--cluster-admit` records the
+    id again, but `KeyRevoked` is PERMANENT (*A revoked key is never admitted again*,
     below), so re-admitting the same machine under the key it still holds is refused by
     name -- an operator re-keys it with `--print-identity` after wiping `node-key`, or
     it stays out. That is the intended cost rather than an awkwardness: a forget is the
@@ -1648,10 +1637,8 @@ and it is recorded here because the question will be asked again.
     it. Now a leader that is FORGOTTEN proposes its own removal, LAST -- after every
     change it can still make as the leader -- and steps down once it commits (`RaftNode`,
     §4.2.2; #1449's demoted leader is the same rule). **Forgotten is the record gone
-    AND a fact only `Forget` writes beside it** -- the host tombstoned, or (#1555) the
-    key revoked under the id, which is what reaches a rig sharing one machine over
-    loopback: record absence alone is every fresh leader's first pass, and a tombstone
-    alone may be a client forget naming a member's machine. Neutered to absence alone, five cases go red,
+    AND a key revoked under the id**, never the record alone (#1555): record absence
+    alone is every fresh leader's first pass. Neutered to absence alone, five cases go red,
     including the pre-existing *this node never proposes its own removal*. **Its own
     bootstrap entry does not protect it, and nobody else's is touched**: a node names
     itself because it cannot start otherwise, so that one entry asserts nothing. A
@@ -2025,11 +2012,11 @@ right, because the wire now trusts it.
   the configuration goes on counting, so on the consensus wire the revocation never takes
   effect (next bullet but two). That second one is what the retired `RevokeKey` verb produced
   for a member, which is why it went rather than gaining an operator verb.
-  - **The key is DERIVED at `Apply`**, from the record being removed, as the host tombstone is
-    (#1309), so a key replaced between the proposal and the commit is the one revoked.
+  - **The key is DERIVED at `Apply`**, from the record being removed, so a key replaced between
+    the proposal and the commit is the one revoked.
   - **Beside it, the key the proposing LEADER holds live for the id** (`PrepareForget`, from
     `RosterKeys::KeysOf`). The state cannot derive it: a member a `--raft-peer` line typed with
-    its key is recorded without one or not at all, and its key lives on command lines. Revoked,
+    its key is recorded nowhere, or under another key, and that key lives on command lines. Revoked,
     it outranks every one of them (`RosterKeys` drops a typed key the state revoked). Never
     another id's -- `ValidateAgainst` refuses it by name and `Apply` skips it, or a forget of one
     machine would revoke one nobody named.
@@ -2064,6 +2051,17 @@ right, because the wire now trusts it.
   unlike the scheduler endpoint, a machine that moves keeps its identity -- and discovery,
   which has no opinion about a peer's key, can therefore never clear one. A node asserts its
   OWN key on its self record, as it asserts its own scheduler endpoint.
+- **A recorded member holds a key BY TYPE** (`ClusterMember::publicKey`, `RosterMember::publicKey`,
+  neither an `optional`): a machine is admitted and forgotten by its key, so a member without one
+  is a record no forget could revoke. The type rules out ABSENT and not the all-zero key an
+  omitted initializer yields, so what holds is narrower and exact: **a member or principal
+  `Apply` recorded or a decoder read never holds an absent or all-zero key**
+  (`IsZeroEd25519PublicKey`). `KeyToRecord` decides it for all three admitting verbs:
+  `ValidateAgainst` refuses when it returns nothing, and `Apply` records exactly the key it
+  returns. `DecodeState` and `DecodeRoster` each refuse such a member or principal by name.
+  What an operator TYPES may still state no key, so a token is a `MemberSpec` --
+  `--cluster-admit`'s, and the bootstrap set consensus starts from (`BootstrapMembersOf`) --
+  and never a member.
 - **One key, one identity; one id, one list.** A key held by another id is refused, and an id
   is a member or a principal, never both. `DecodeState` refuses a snapshot breaking either rule
   or holding a revoked key live -- the combinations `Apply` never produces.

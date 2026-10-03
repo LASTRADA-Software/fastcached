@@ -160,14 +160,18 @@ LiveFrame ReadLiveFrame(CompileCacheWire::LiveSubject subject, NodeReply const& 
         std::format("a reply with status {:#04x}, which no live-stats stream sends", static_cast<unsigned>(reply.status)));
 }
 
-NodeSubscription::NodeSubscription(DialTimeouts timeouts, Credential credential):
-    NodeSubscription { timeouts, std::move(credential), &NodeExchange::Open }
+NodeSubscription::NodeSubscription(DialTimeouts timeouts, NodeCredentials credentials):
+    NodeSubscription { timeouts,
+                       std::move(credentials),
+                       [](Endpoint const& endpoint, DialTimeouts dialTimeouts, NodeCredentials const& shown) {
+                           return NodeExchange::Open(endpoint, dialTimeouts, shown);
+                       } }
 {
 }
 
-NodeSubscription::NodeSubscription(DialTimeouts timeouts, Credential credential, StreamDial dial):
+NodeSubscription::NodeSubscription(DialTimeouts timeouts, NodeCredentials credentials, StreamDial dial):
     _timeouts { timeouts },
-    _credential { std::move(credential) },
+    _credentials { std::move(credentials) },
     _dial { std::move(dial) }
 {
 }
@@ -187,7 +191,7 @@ std::expected<void, ExchangeError> NodeSubscription::Open(Endpoint const& where,
                 ExchangeError { .kind = ExchangeFailure::Transport, .detail = "the session left its stream" });
     }
 
-    auto opened = _dial(where, _timeouts, _credential);
+    auto opened = _dial(where, _timeouts, _credentials);
     if (!opened.has_value())
         return std::unexpected(std::move(opened).error());
     if (auto posted = (*opened)->Post(CompileCacheWire::EncodeSubscribeRequest(request)); !posted.has_value())

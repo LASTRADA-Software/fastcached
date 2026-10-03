@@ -9,12 +9,6 @@
 #include <string>
 #include <string_view>
 
-namespace FastCache::Cc
-{
-struct Credential;
-class CredentialNotice;
-} // namespace FastCache::Cc
-
 namespace FastCache::Node
 {
 
@@ -121,13 +115,12 @@ class NodeProofClient
     /// On `Proved` the socket is sealed both ways and every later exchange over it is too. On any
     /// other outcome nothing verb-worthy may follow on this connection: a receiving seal may be
     /// engaged already, and a server that refused the proof refuses every joining verb anyway.
+    ///
+    /// Presents no password: the proof IS this machine's credential with a scheduler
+    /// (`Cc::ExchangeWithScheduler`).
     /// @param peer A fresh connection to a scheduler, wrapped so it can be sealed.
-    /// @param notice Where an unwanted credential is reported.
-    /// @param credential What the connection presents where the server asks for one.
     /// @return What was learned.
-    [[nodiscard]] NodeProofAttempt Prove(SealedFrameSocket& peer,
-                                         Cc::CredentialNotice& notice,
-                                         Cc::Credential const& credential) const;
+    [[nodiscard]] NodeProofAttempt Prove(SealedFrameSocket& peer) const;
 
     /// @return The id this machine proves.
     [[nodiscard]] std::string_view NodeId() const noexcept

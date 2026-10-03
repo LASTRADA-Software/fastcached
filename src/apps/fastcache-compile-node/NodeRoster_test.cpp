@@ -134,6 +134,9 @@ TEST_CASE("A consensus member verifies grants against the state it applies, whic
     CHECK_FALSE(Testing::Unwrap(summary).certifiedUntil.has_value());
     CHECK_FALSE(node.ExpiresInSeconds().has_value());
     CHECK_FALSE(node.Wanting());
+
+    // And the roster `explain-admission <machine>` answers from is the state's own projection.
+    CHECK(node.HeldRoster() == std::optional { Cluster::ProjectRoster(state) });
 }
 
 TEST_CASE("A consensus member places a server only once its applied state names a voter's key", "[node][roster][proof]")
@@ -202,6 +205,7 @@ TEST_CASE("A worker no other machine can reach holds no roster and checks no gra
     auto& node = *Testing::Unwrap(roster);
     CHECK(node.Lease() == nullptr);
     CHECK_FALSE(node.Summary().has_value());
+    CHECK_FALSE(node.HeldRoster().has_value());
     CHECK_FALSE(node.Wanting());
 }
 
@@ -224,9 +228,11 @@ TEST_CASE("A worker adopts the roster its anchors certify, keeps it, and starts 
         // Nothing yet: every grant would be refused, so the presence loop asks sooner.
         CHECK(node.Wanting());
         CHECK(node.Lease()->Read(Noon).standing == Distributed::RosterStanding::Absent);
+        CHECK_FALSE(node.HeldRoster().has_value());
 
         node.Offered(Cluster::EncodeCertifiedRoster(Certified(ThreeVoters(), 3, { "n1", "n2" })));
         CHECK_FALSE(node.Wanting());
+        CHECK(node.HeldRoster() == std::optional { ThreeVoters() });
         CHECK(node.Lease()->KeysOf("n2").live == TestKeyPair("n2").PublicKey());
         CHECK(node.ExpiresInSeconds() == std::optional<std::uint64_t> { 3600 });
         auto const summary = node.Summary();
@@ -337,7 +343,7 @@ TEST_CASE("Whether a worker must hold a roster is its mode's row, under every mo
 
         auto const joined = expected->joined;
         CHECK((row.members == Cluster::FleetReach::Beyond) == joined);
-        CHECK(AdmitsRemotePeers(cfg) == joined);
+        CHECK(AdmitsRemotePeers(cfg, RosterPresence::Absent) == joined);
         auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
         if (RunsConsensus(cfg))
         {
@@ -356,6 +362,34 @@ TEST_CASE("Whether a worker must hold a roster is its mode's row, under every mo
             CHECK(Testing::Unwrap(roster)->Lease() == nullptr);
         }
     }
+}
+
+TEST_CASE("A network-facing worker whose directory holds no roster starts, admitting nobody remote",
+          "[node][roster][admission]")
+{
+    // The same directory with nothing in it, and the only difference from the case above is
+    // `--fleet-open`. Having read the directory, `Build` KNOWS there is no roster, so the key
+    // routes admit nobody and the compile port, though it faces the network, reaches no other
+    // machine: the unchecked validator is safe. Asked as if the roster were unknown, the state
+    // directory would count as a key route and refuse a worker nobody remote can use.
+    auto const scratch = Testing::ScratchDirectory { "node-roster-none-closed" };
+    auto cfg = NetworkFacingWorker();
+    cfg.fleetOpen = false;
+    cfg.clusterDir = scratch.Path();
+    REQUIRE(cfg.voterKeys.empty());
+    core::platform::ManualWallClock const clock { Noon };
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+
+    auto const started = NodeRoster::Build(cfg, clock, metrics, logger);
+    REQUIRE(started.has_value());
+    CHECK(Testing::Unwrap(started)->Lease() == nullptr);
+
+    // And `--fleet-open` is what makes the same worker one other machines reach.
+    cfg.fleetOpen = true;
+    auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == RosterlessWorkerRefusal);
 }
 
 TEST_CASE("A node carries the endorsement it last signed, and counts a roster it cannot read", "[node][roster]")

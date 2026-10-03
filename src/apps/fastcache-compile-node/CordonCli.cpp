@@ -8,7 +8,6 @@
 #include <array>
 #include <chrono>
 #include <format>
-#include <iostream>
 
 #include <core/Ranges.hpp>
 #include <core/async/SyncRun.hpp>
@@ -82,15 +81,14 @@ std::string RenderCordonReply(Wire::CordonFields const& fields)
 }
 
 std::expected<std::string, std::string> PutCordonRequest(core::net::ISocket& client,
-                                                         Cc::CredentialNotice& notice,
                                                          Wire::CordonAction action,
-                                                         ICredentialSource const& credential,
                                                          std::string_view endpoint)
 {
-    // Through the launcher's own exchange, for `PutClusterRequest`'s reason: the credential
-    // pipelining is subtle enough that a second copy would differ.
-    auto const outcome =
-        core::async::syncRun(Cc::ExchangeFramed(&client, &notice, Wire::EncodeCordonRequest(action), credential.Current()));
+    // Through the launcher's own exchange, for `PutClusterRequest`'s reason: a second copy of the
+    // framing would differ. Silent and never consulted: a notice reports a credential the peer
+    // ignored, and this exchange presents none.
+    auto notice = Cc::CredentialNotice::Silent();
+    auto const outcome = core::async::syncRun(Cc::ExchangeFramed(&client, &notice, Wire::EncodeCordonRequest(action)));
 
     if (outcome.kind == Cc::CacheOutcomeKind::Transport)
         return std::unexpected { std::format("the node at {} did not answer", endpoint) };
@@ -103,9 +101,7 @@ std::expected<std::string, std::string> PutCordonRequest(core::net::ISocket& cli
     return RenderCordonReply(*fields);
 }
 
-std::expected<std::string, std::string> RunCordonAdmin(NodeConfig const& cfg,
-                                                       CordonCommand command,
-                                                       ICredentialSource const& credential)
+std::expected<std::string, std::string> RunCordonAdmin(NodeConfig const& cfg, CordonCommand command)
 {
     auto const bound = SoleEndpointOf(NodeSurface::Node, cfg);
     if (!bound.has_value())
@@ -121,10 +117,8 @@ std::expected<std::string, std::string> RunCordonAdmin(NodeConfig const& cfg,
         return std::unexpected { std::format(
             "cannot reach this machine's node at {}; a cordon is asked of the node running here", endpoint) };
 
-    auto notice =
-        Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
     auto const action = command == CordonCommand::Cordon ? Wire::CordonAction::Cordon : Wire::CordonAction::Lift;
-    return PutCordonRequest(*client, notice, action, credential, endpoint);
+    return PutCordonRequest(*client, action, endpoint);
 }
 
 } // namespace FastCache::Node

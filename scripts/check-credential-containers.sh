@@ -84,6 +84,8 @@ keyFileBytes|the contents of a node-key file, which carry that seed (NodeKey, #1
 _secret|the shared secret a credential holder keeps -- AuthPolicy, AdminCredential, and the credential-source fakes that stand in for them (Auth/AuthPolicy, Server/AdminCredential, #1125)
 requirePass|the client-authentication secret of the daemon, which ConfigReloader multiplies by every retained snapshot (Config/Config, #1125)
 cookieKey|the key every discovery challenge cookie is MACed under, drawn per epoch: whoever holds it can mint a challenge this node will believe it issued (Cluster/ChallengeCookies)
+machineTicket|a minted machine ticket: a bearer credential, signed by the identity key of this machine, until it expires (Distributed/MachineTicket)
+secret|the text credential a client presents: Cc::Credential::secret in the launcher and the node, and Credential::secret in fastcache-cli (#1125, #1578)
 '
 # The rows are the per-node identity's (#178): the table's claim is "these names hold key
 # material", and a node's signing key and a session's derived keys are exactly that. Each name is
@@ -106,20 +108,19 @@ cookieKey|the key every discovery challenge cookie is MACed under, drawn per epo
 # `_secret` does not reach `_secretKey` and `requirePass` does not reach
 # `requirePassExplicit` -- which is a provenance BIT and holds no secret.
 #
-# THREE names were considered for #1125 and are deliberately NOT rows, each for a different
+# `secret` is a row since both of its holders are `SecureString`: `Cc::Credential::secret`
+# (`apps/fastcache-cc/CacheProtocol.hpp`) since the launcher began presenting machine tickets,
+# and `fastcache-cli`'s own `Credential::secret` since its node verbs began presenting them too.
+# What the row cannot reach is the one plain copy a wire needs spelled out, made where it is sent
+# and named for something else: the RESP `AUTH` vector `SocketExchange.cpp` encodes. That residue
+# is #1578. (The admin surface is sent no credential at all, so no bearer copy exists.) **That vector is NAMED `argv` and is not a process
+# argument list** -- `fastcache-cli` spawns no process at all, and it is written here because
+# the name produced exactly that misreading once.
+#
+# TWO names were considered for #1125 and are deliberately NOT rows, each for a different
 # reason, because an omission that looks like an oversight gets 'fixed' into a refusal
 # nobody can satisfy:
 #
-#   `secret`  -- reaches `Cc::Credential::secret` in `apps/fastcache-cc/CacheProtocol.hpp`.
-#                NOT a dependency wall: that header already includes `Net/ISocket.hpp` and
-#                `Core/SecureBytes.cpp` is already a `_fc_cc_core` row. The reason is that
-#                retyping it RELOCATES the plain copy rather than removing it -- to
-#                `Wire::AuthRequest`, to an `optional<std::string>` in `CredentialOrNone`,
-#                and to the RESP `AUTH` vector `SocketExchange.cpp` encodes. All three are
-#                heap residue, so that is #1125's OWN subject continued and not a larger
-#                one; it is filed as #1578. **That vector is NAMED `argv` and is not a
-#                process argument list** -- `fastcache-cli` spawns no process at all, and
-#                it is written here because the name produced exactly that misreading once.
 #   `dashboardToken`
 #             -- a real wall, and the reason differs: `Protocol/CompileCacheWire.hpp` is
 #                header-only because the launcher does not LINK `FastCache`, and
@@ -128,9 +129,18 @@ cookieKey|the key every discovery challenge cookie is MACed under, drawn per epo
 #                lease's public identifier all spell it, and none is key material. This is
 #                the `key` argument again.
 #
-# Where those secrets LAND is therefore still plain storage, and that is a stated boundary
-# rather than a gap this table forgot -- `fastcache-cli`'s `main.cpp` writes the conversion
-# out longhand at the two sites where it happens.
+# Where those secrets LAND is therefore still plain storage in places, and that is a stated
+# boundary rather than a gap this table forgot -- `fastcache-cli`'s `main.cpp` says where.
+#
+# A MINTED TICKET leaves `SecureString` exactly once, and on purpose: MINT-TICKET's `Ok`
+# reply IS the ticket, so `EncodeReply` copies it into the plain reply vector the endpoint
+# writes and then frees without a wipe. The wire carries the ticket anyway, and a reply
+# buffer is no declaration a name can reach -- a stated boundary, not a missed holder.
+#
+# And a holder spelled `auto` is INVISIBLE here, in the open direction: the type is read
+# from the spelling immediately before the name, so `auto const machineTicket = ...` reads
+# as clean whatever it holds. That is why the minter spells `SecureString const
+# machineTicket` out (`SessionResponder.cpp`); the scan cannot demand it.
 
 # Types that OWN bytes. A borrowing view (`std::span`, `BytesView`, `std::string_view`)
 # is deliberately absent: it owns no storage, so there is nothing for it to zero, and
@@ -370,8 +380,10 @@ SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
 SecureString _secret;
+SecureString secret;
 SecureString requirePass;
 SecureByteBuffer cookieKey;
+SecureString machineTicket;
 std::array<std::byte, 32> publicKey;
 
 EOF
@@ -408,8 +420,10 @@ SecureByteBuffer pseudoRandomKey;
 SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureString _secret;
+SecureString secret;
 SecureString requirePass;
 SecureByteBuffer cookieKey;
+SecureString machineTicket;
 EOF
     verdict=$(bash "$0" --root "$tmp/blind" 2>&1)
     if grep -q "identifier 'keyFileBytes' matches nothing" <<< "$verdict"; then
@@ -455,8 +469,10 @@ SecureByteBuffer outputKeyMaterial;
 SecureByteBuffer identitySeed;
 SecureByteBuffer keyFileBytes;
 SecureString _secret;
+SecureString secret;
 SecureString requirePass;
 SecureByteBuffer cookieKey;
+SecureString machineTicket;
 inline std::string SealWith(std::span<std::byte const> sharedSecret, int claims);
 bool Authenticate(std::span<std::byte const> sharedSecret, std::string_view token);
 EOF
@@ -530,6 +546,21 @@ EOF
         printf 'ok   case 10: a credential named in a block comment is not a declaration\n'
     else
         printf 'FAIL case 10: block-comment mention reported as a violation. Got: %s\n' "$verdict"; return 1
+    fi
+    cases=$((cases + 1))
+
+    # Case 11: the machine-ticket row, asked in the direction case 9 names -- a row the real tree
+    # matches is not a row whose VIOLATION is reported. A minted ticket is a bearer credential until
+    # it expires, and `std::string machineTicket` is the declaration most likely to be written next
+    # by a caller carrying one into AUTH.
+    mkdir -p "$tmp/ticket"
+    cp "$tmp/clean/a.hpp" "$tmp/ticket/a.hpp"
+    printf 'std::string machineTicket {};\n' >> "$tmp/ticket/a.hpp"
+    verdict=$(bash "$0" --root "$tmp/ticket" 2>&1)
+    if grep -q 'machineTicket declared as std::string' <<< "$verdict"; then
+        printf 'ok   case 11: a machine ticket in a plain std::string is reported\n'
+    else
+        printf 'FAIL case 11: machine-ticket violation not reported. Got: %s\n' "$verdict"; return 1
     fi
     cases=$((cases + 1))
 

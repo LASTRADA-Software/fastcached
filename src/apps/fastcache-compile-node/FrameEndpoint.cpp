@@ -739,45 +739,54 @@ namespace
     /// Answer an `AUTH` frame and record what it established on this connection.
     ///
     /// Separated from `ServeConnection` because it needs none of the loop: one
-    /// payload, one flag, one reply. That keeps the loop under the
+    /// payload, one field, one reply. That keeps the loop under the
     /// cognitive-complexity ceiling and puts the credential rules where they can be
     /// read without the framing around them.
     ///
-    /// @param responder The surface whose credential this is.
+    /// @param responder The surface that checks the credential -- on the merged listener, the
+    ///        session component.
     /// @param payload The AUTH request body, already bounded by `MaxAuthPayload`.
-    /// @param opRaw The AUTH opcode as received, so the refusal reaches the surface
-    ///        that owns the credential rather than being encoded here.
-    /// @param credentialAccepted This connection's flag; set only on `Accepted`.
+    /// @param opRaw The AUTH opcode as received, so a refusal the surface did not encode
+    ///        itself still reaches it rather than being encoded here.
+    /// @param identity This connection's facts; its `authenticatedMachine` is ASSIGNED, and its
+    ///        `revokedMachine` is set by a ticket refused for a revoked key and never cleared.
     /// @return The reply frame to write.
     [[nodiscard]] std::vector<std::byte> AnswerAuth(IFrameResponder const& responder,
                                                     std::span<std::byte const> payload,
                                                     std::uint8_t opRaw,
-                                                    bool& credentialAccepted)
+                                                    PeerIdentity& identity)
     {
-        auto const outcome = responder.CheckCredential(payload);
+        auto verdict = responder.CheckCredential(payload);
 
-        // `NoPolicy` answers Ok and sets NOTHING. A surface with no credential must
-        // not break a token-configured client, and must not mark it authenticated
-        // either -- nothing was verified, and a later reconfiguration would otherwise
-        // inherit the blessing.
-        if (outcome == CredentialOutcome::Accepted)
-            credentialAccepted = true;
+        // ASSIGNED, never merged: a refused AUTH clears whatever an earlier one established,
+        // so a connection cannot keep a machine it can no longer vouch for by presenting
+        // something worse afterwards. Only `Accepted` carries a machine; `NoPolicy` answers Ok
+        // and establishes nothing, because nothing was verified.
+        identity.authenticatedMachine =
+            verdict.outcome == CredentialOutcome::Accepted ? std::move(verdict.machine) : std::nullopt;
+
+        // MERGED, never assigned, and the one fact here that is: a ticket refused for a REVOKED
+        // key shows the connection is the forgotten machine's, and a revocation is permanent -- so
+        // no later AUTH may clear it, and the verbs pipelined behind this one are refused as that
+        // machine's rather than judged by an address `--fleet-open` would admit.
+        if (verdict.revokedMachine.has_value())
+            identity.revokedMachine = std::move(verdict.revokedMachine);
 
         // Total over the enumerators, so a fifth outcome cannot be answered by
         // falling through to Ok -- the one wrong answer here, because it would tell a
         // client its credential was accepted.
         //
-        // Both refusals are ANSWERED BY THE SURFACE, which owns the credential and so
-        // owns the counter. Encoded here they moved nothing at all, and the second one
-        // is the expensive silence: a peer presenting a WRONG token is exactly what
-        // `SchedulerRequestsRefusedUnauthenticated` exists to make visible, that
-        // counter fires only on the pre-payload gate, and so credential guessing was
-        // invisible to the one series an operator would go looking at (#447).
-        switch (outcome)
+        // A refusal is ANSWERED BY THE SURFACE, which owns the counter: the reply it already
+        // encoded and counted when it has one, and otherwise the endpoint row it routes.
+        switch (verdict.outcome)
         {
             case CredentialOutcome::Malformed:
+                if (!verdict.refusalReply.empty())
+                    return std::move(verdict.refusalReply);
                 return responder.EndpointRefusalReply(EndpointRefusal::CredentialMalformed, opRaw, {});
             case CredentialOutcome::Rejected:
+                if (!verdict.refusalReply.empty())
+                    return std::move(verdict.refusalReply);
                 return responder.EndpointRefusalReply(EndpointRefusal::CredentialRejected, opRaw, "authentication failed");
             case CredentialOutcome::NoPolicy:
             case CredentialOutcome::Accepted:
@@ -1799,13 +1808,11 @@ namespace
     ///        admission policy had before #1428 -- and a proof is the second thing it now has.
     /// @param decoded The request header, as it decoded.
     /// @param cap The surface-wide request ceiling, read once by the caller.
-    /// @param credentialAccepted Whether an AUTH frame on THIS connection was verified.
     /// @return The refusal, or nullopt when the request is to be served.
     [[nodiscard]] std::optional<HeaderRefusal> DecideHeaderRefusal(FrameServer::State* state,
                                                                    PeerIdentity const& peer,
                                                                    Wire::RequestHeader const& decoded,
-                                                                   std::size_t cap,
-                                                                   bool credentialAccepted)
+                                                                   std::size_t cap)
     {
         // Refused with a reply naming BOTH numbers, because "too large" without the
         // ceiling tells an operator nothing about a 64 KiB limit. The bytes are never
@@ -1832,17 +1839,14 @@ namespace
         if (auto refusal = state->responder.RefusePeer(peer, decoded.opRaw); refusal.has_value())
             return HeaderRefusal { .reply = *std::move(refusal), .resynchronize = Resynchronize::StepOver };
 
-        // The credential, decided from the header and this connection's state (#289). A
-        // SECOND question at the same point rather than a wider first one: `RefusePeer`
-        // answers on the peer and the verb and returns an encoded refusal; this one
-        // answers on the verb alone and feeds the decision alongside the declared length
-        // and per-connection state, so folding them together would make neither
-        // predicate's name describe it.
+        // The per-verb ceiling and the opcode, through the same `DecidePrePayload` the daemon
+        // asks. No credential is required of any verb: the node checks no password, and
+        // admission is `RefusePeer`'s, asked above.
         auto const decision = Wire::DecidePrePayload({ .opRaw = decoded.opRaw,
                                                        .declaredLength = decoded.payloadLength,
                                                        .sessionCap = cap,
-                                                       .authRequired = state->responder.AuthRequired(decoded.opRaw),
-                                                       .credentialAccepted = credentialAccepted });
+                                                       .authRequired = false,
+                                                       .credentialAccepted = false });
         if (decision != Wire::PrePayloadDecision::Serve)
             // Encoded and counted by the surface, not here: the endpoint owns WHEN the
             // question is asked, the responder owns the answer.
@@ -2145,13 +2149,17 @@ namespace
             auto const peer = socket->peerAddress();
 
             // Who this connection IS, as an admission policy sees it: the address above, plus
-            // whatever it goes on to PROVE. Per CONNECTION, exactly as `credentialAccepted`
-            // below is and for the same reason -- the responder is shared by every connection on
-            // this surface, so an id proved here must not admit anybody else (#1428).
+            // whatever it goes on to PROVE or present. Per CONNECTION, because the responder is
+            // shared by every connection on this surface, so an id proved here must not admit
+            // anybody else (#1428).
             //
-            // `proven` starts DISENGAGED, which is what *nothing was proved* means everywhere that
-            // reads it, and is only ever engaged by a `ProveNode` this loop verified (#178).
-            PeerIdentity identity { .host = peer, .proven = std::nullopt };
+            // `proven` and `authenticatedMachine` start DISENGAGED, which is what *nothing was
+            // established* means everywhere that reads them: `proven` is only ever engaged by a
+            // `ProveNode` this loop verified (#178), and `authenticatedMachine` only by an `AUTH`
+            // whose verdict was `Accepted`.
+            PeerIdentity identity {
+                .host = peer, .proven = std::nullopt, .authenticatedMachine = std::nullopt, .revokedMachine = std::nullopt
+            };
 
             // The handshake outstanding on this connection, or none. Opened by the surface's
             // prover on request and SPENT by the next proof whatever its outcome, which is why
@@ -2165,13 +2173,6 @@ namespace
             // internally, so a per-request reader would discard bytes already pulled
             // off the socket -- which is exactly the pipelined second frame.
             ByteReader reader { *socket, /*maxLineBytes*/ 1, cap };
-
-            // Per CONNECTION, exactly as the daemon keeps it: the responder is shared
-            // by every connection on this surface, so a credential accepted here must
-            // not bless anyone else. It starts false and is only ever set by an AUTH
-            // frame this loop verified -- never seeded from the policy, which would
-            // authenticate a connection on the strength of a check that never ran.
-            bool credentialAccepted = false;
 
             while (!state->shuttingDown.load(std::memory_order_acquire))
             {
@@ -2196,6 +2197,14 @@ namespace
                     break; // A foreign magic: no declared length, so nowhere to
                            // resynchronize to. Closing is the only thing left.
 
+                // An `AUTH` replaces what the connection established the moment its header is
+                // read, WHATEVER happens next: a header refusal below steps over it and never
+                // reaches `AnswerAuth`, and a machine left standing there would go on being served
+                // to a client that has just been told its `AUTH` was refused. `AnswerAuth` then
+                // assigns what a served one established.
+                if (decoded->opRaw == static_cast<std::uint8_t>(Wire::Op::Auth))
+                    identity.authenticatedMachine.reset();
+
                 // **Four header refusals, one question, one write.** The decision is
                 // `DecideHeaderRefusal`, which writes nothing -- that is what makes
                 // lifting it out of this loop legal (#675). What stays here is the byte
@@ -2209,8 +2218,7 @@ namespace
                 // closes it, i.e. never usefully. Writing first costs nothing and the
                 // resynchronization is just as good: a peer that sends what it declared
                 // is still stepped over exactly.
-                if (auto const refusal = DecideHeaderRefusal(state, identity, *decoded, cap, credentialAccepted);
-                    refusal.has_value())
+                if (auto const refusal = DecideHeaderRefusal(state, identity, *decoded, cap); refusal.has_value())
                 {
                     if (!co_await WriteAll(EndpointWriter::Loop, socket.get(), refusal->reply))
                         break;
@@ -2256,12 +2264,12 @@ namespace
                 //
                 // Lifted out of this loop rather than written inline: the loop sits at
                 // its cognitive-complexity ceiling, and an arm needing one payload and
-                // one flag is exactly the part that reads fine without the framing.
+                // one field is exactly the part that reads fine without the framing.
                 if (decoded->opRaw == static_cast<std::uint8_t>(Wire::Op::Auth))
                 {
                     if (!co_await WriteAll(EndpointWriter::Loop,
                                            socket.get(),
-                                           AnswerAuth(state->responder, *payload, decoded->opRaw, credentialAccepted)))
+                                           AnswerAuth(state->responder, *payload, decoded->opRaw, identity)))
                         break;
                     continue;
                 }

@@ -1,31 +1,48 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProxy.hpp"
 #include "LocalCache.hpp"
+#include "NodeAnnounce.hpp"
+#include "NodeAudience.hpp"
+#include "NodeConfig.hpp"
+#include "NodeFrameSurface.hpp"
+#include "NodeIoLoop.hpp"
+#include "Responders.hpp"
+#include "SessionResponder.hpp"
 
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/SchedulerProtocol.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/LocalAddresses.hpp>
+#include <FastCache/Platform/LocalAddressesTestUtils.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <initializer_list>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <CacheProtocol.hpp>
 #include <core/async/SyncRun.hpp>
 #include <core/async/Task.hpp>
+#include <core/net/BlockingConnector.hpp>
 #include <core/net/ISocket.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScriptedSocket.hpp>
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -43,34 +60,7 @@ namespace Wire = CompileCacheWire;
 // infrastructure both borrow, exactly as they both borrow `Unwrap.hpp`, and it
 // includes nothing from either app.
 
-/// What a scheduler that does not implement AUTH answers one with.
-///
-/// **Hand-written since #289, and the reversal needs its reasoning kept.** This was
-/// produced by the production `SchedulerProtocol` on the argument that a literal
-/// would pass while the server sent something else. That argument was right for as
-/// long as this server was the one that sent it -- and #289 ended that: the scheduler
-/// surface now terminates `AUTH` in `FrameServer`'s loop, so `SchedulerProtocol`
-/// never sees the verb in production and answers `DispatchNotPermitted` when asked
-/// directly, which `SchedulerAnswersAuthNotPermitted` below pins separately.
-///
-/// So the fixture had to become a literal or the case had to go, and the case is
-/// worth keeping: what it regresses is a property of the **client**, not of this
-/// server. `Cc::CacheProtocol::Exchange` must step over `UnimplementedVerb` and
-/// proceed, and it must keep doing so for every scheduler that predates #289 --
-/// which is every launcher and every node an operator has not upgraded yet.
-///
-/// Written as the byte and not only the symbol, per the rulebook: a wire constant has
-/// two facts, and a spelling both ends share can only test the first.
-/// @return The refusal frame a pre-#289 scheduler sends.
-[[nodiscard]] std::vector<std::byte> SchedulerAuthRefusal()
-{
-    static_assert(static_cast<std::uint8_t>(Wire::UnimplementedVerb) == 0x02,
-                  "a deployed launcher tolerates 0x02 and cannot be recompiled from here");
-    return Wire::EncodeErrorReply(Wire::UnimplementedVerb, "this endpoint schedules and checks no credential");
-}
-
-/// The other half: what THIS scheduler answers, asked at the layer that no longer
-/// serves the verb.
+/// What THIS scheduler answers, asked at the layer that does not serve the verb.
 ///
 /// `DispatchNotPermitted` rather than `UnimplementedVerb`, and the distinction is the
 /// one the rulebook records twice (#283, #340). *Unimplemented* is not *served
@@ -98,41 +88,77 @@ namespace Wire = CompileCacheWire;
 
 } // namespace
 
-TEST_CASE("A credentialled client reaches a scheduler that has no AUTH and still gets its answer", "[node][auth-contract]")
+TEST_CASE("A credentialled client reaches a node and still gets its answer", "[node][auth-contract]")
 {
-    // **The acceptance of #340, and deliberately not "the refusal code changed".**
-    // That assertion passes the moment a constant is edited; this one fails unless
-    // the two binaries actually agree, because the bytes come out of the real
-    // `SchedulerProtocol` and go into the real `Cc::CacheProtocol`.
+    // **The acceptance of #340, over the node as it is built**: a real listener, the real session
+    // component answering `AUTH`, the real cache responder answering the command pipelined behind
+    // it, and the real `Cc::CacheProtocol` on the other end of a real socket. The two binaries link
+    // nothing in common -- `fastcache-cc` compiles `CompileCacheWire.hpp` in and links none of
+    // `FastCache` -- so this is the one place both are present.
     //
-    // The two link nothing in common -- `fastcache-cc` compiles `CompileCacheWire.hpp`
-    // in and links none of `FastCache` -- so the enumerator each names is the only
-    // thing holding them together, and this is the only place both are present.
-    //
-    // What it regresses: with `FASTCACHE_TOKEN` set, a scheduler answering AUTH with
-    // `DispatchNotPermitted` had that refusal returned in place of the answer to the
-    // request the client actually sent. Every LEASE was declined, every compile
-    // happened locally, and the build went green while the fleet distributed nothing.
+    // The node checks no password, so the session component answers `AUTH` `NoPolicy`: `Ok`,
+    // establishing nothing. The contract this file pins is the launcher's: a token-configured
+    // client steps over whatever a node answers its credential with and is served the command it
+    // actually sent -- never refused it, which is the green build distributing nothing.
+    InMemoryLruStorage local { 64 * 1024 };
+    Node::NoUpstream upstream;
+    core::platform::ManualClock clock;
+    AtomicMetricsSink metrics;
+    Node::LocalCache cache { local, upstream, clock, metrics };
+    Node::CacheProxy proxy { cache, metrics };
+    Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
+    CachedLocalityOracle const locality { machine, clock };
+    Node::CacheResponder cacheResponder { proxy, locality, metrics };
+    // The session component as `main` builds it, over a roster nobody is in: this case presents a
+    // password, which the node holds none of, so what a ticket would establish is not its subject.
+    Node::AnnouncedEndpoint const announced { "" };
+    Node::NodeAudience const audience { announced, {}, {}, locality };
+    Distributed::SpentTickets spent;
+    Distributed::TicketVerifier const verifier { nullptr, audience, spent };
+    Testing::ScriptedSecureRandom random;
+    core::platform::ManualWallClock const wallClock;
+    Node::SessionResponder session { verifier, Node::SessionKeys {}, random, wallClock, metrics };
+
+    // Stored through the proxy, so the FETCH below has something to hit.
     auto const stored = std::vector<std::byte> { std::byte { 0x42 } };
-    Testing::ScriptedSocket socket { Testing::Replies(
-        { SchedulerAuthRefusal(), Wire::EncodeReply(Wire::Status::Ok, stored) }) };
+    auto const store = core::async::syncRun(proxy.Answer(Wire::EncodeStore(
+        Wire::StoreRequest { .key = "k", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = stored })));
+    REQUIRE(Wire::DecodeReplyHeader(store).has_value());
+
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->boundPort();
+    probe.reset();
+    Node::NodeConfig cfg;
+    cfg.nodeListen = std::format("127.0.0.1:{}", port);
+    cfg.slots = 0;
+
+    Node::NodeIoLoop io;
+    NullLogger logger;
+    auto surface = Node::StartNodeSurfaceOrExplain(
+        io, cfg, Node::SurfaceComponents { .cache = &cacheResponder, .session = &session }, std::nullopt, metrics, logger);
+    REQUIRE(surface.has_value());
+    REQUIRE(*surface != nullptr);
+    io.Start();
+
+    core::net::BlockingConnector connector;
+    auto socket = core::async::syncRun(
+        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    REQUIRE(socket.has_value());
 
     std::vector<std::string> said;
     Cc::CredentialNotice notice { [&said](std::string_view text) { said.emplace_back(text); } };
-
-    auto const outcome =
-        core::async::syncRun(Cc::CacheFetch(&socket, &notice, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
+    auto const outcome = core::async::syncRun(
+        Cc::CacheFetch(socket->get(), &notice, "k", Cc::Credential { .username = {}, .secret = "s3cret" }));
 
     // The command behind the credential is served. This is the half that was broken.
     REQUIRE(outcome.IsHit());
     CHECK(outcome.value == stored);
-
-    // And the operator is still told their token went unchecked. A surface that
-    // silently does less than it was configured to is the failure this codebase keeps
-    // a list about -- restoring the answer must not also swallow that.
-    CHECK(outcome.credentialIgnored);
-    // Said once, through the notice the exchange carries -- the property #363 adds.
-    CHECK(said.size() == 1);
+    // `Ok` is what a node with no password answers, so nothing was ignored and nothing is said:
+    // the notice is for a credential a server refused to check, which this one did not.
+    CHECK_FALSE(outcome.credentialIgnored);
+    CHECK(said.empty());
 }
 
 TEST_CASE("This scheduler refuses AUTH at the wrong layer without claiming it is unknown", "[node][auth-contract]")

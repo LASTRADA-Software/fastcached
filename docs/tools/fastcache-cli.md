@@ -38,6 +38,7 @@ complaint about a flag you are no longer going to use.
 | Admin surface | `--admin-addr=<host:port>`, `$FASTCACHE_ADMIN_ADDR` — **usually unnecessary**, see below |
 | Credential | `--token-file=<path>` (preferred) or `$FASTCACHE_TOKEN` |
 | Dashboard credential | `--dashboard-token-file=<path>`, presented by `fleet` and `live-stats fleet` only; no environment variable |
+| Machine ticket source | `--mint-from=<host:port>`: where this machine's node mints the ticket a node on another machine is shown; the port counts, the host is always loopback, default the dialled node's port |
 
 The same `$FASTCACHE_ADDR` that `fastcache-cc` reads, so a machine configured for
 the launcher is already configured for this. A variable that is *set but empty*
@@ -145,7 +146,7 @@ the help renders `Verbs()` grouped by `WireSpec::heading`, and
 
 ### The fleet verb
 
-Every fleet table — machines, workers, outstanding leases, members, forgotten clients,
+Every fleet table — machines, workers, outstanding leases, members, revoked keys,
 conditions, cache tiers — used
 to be reachable from a browser and from nowhere else. `/fleet.json` is the only other
 door and it needs a JSON parser the operator supplies; `jq` is not on a Windows build
@@ -227,14 +228,12 @@ spelled twice, in two binaries, free to drift. Unescaping would also put a real 
 into a cell that `--format=csv` carries through raw and that the human format prints
 into its own aligned columns.
 
-`forgotten` is the replicated tombstones — the client hosts `--cluster-forget-client`
-removed, which stay refused however many admission routes name them. `node` already
-reports how MANY a node is enforcing (`forgotten-clients`); this is WHICH, and the
-difference matters once more than one forget has been issued: two nodes reporting
-different counts says only that they disagree, while two lists say which host has not
-propagated. An empty set renders as an empty table and says so in words, and a node
-running no cluster reports the section absent rather than empty — `null` in the JSON,
-because no replicated state at all is not a cluster that has forgotten nobody.
+`revoked` is the replicated revocations — each key a `--cluster-forget` revoked, with the
+id it was revoked under. A machine is forgotten by its key, so this is what a forget leaves
+behind, and a revoked key is never admitted again under any id: compare it against the key a
+machine's `node` reports. An empty set renders as an empty table and says so in words, and a
+node running no cluster reports the section absent rather than empty — `null` in the JSON,
+because no replicated state at all is not a cluster that has revoked nothing.
 
 ### The cluster verbs
 
@@ -323,7 +322,7 @@ The same verbs are also spelled `fastcache-compile-node --cluster-status`,
 `--cluster-set`, `--cluster-forget`, `--cluster-admit` and `--cluster-admit-learner`. Prefer these: that path
 needs `--scheduler`, which is also a **startup** flag, so putting it in a unit file
 to run one admin command points that node at one scheduler forever — a registration
-replays its command line. A `--fleet-member` client has no node binary at all.
+replays its command line.
 
 A modifier that means nothing for a verb is **refused**, not ignored:
 `set k v --raw` is a usage error rather than a store that silently prints
@@ -445,9 +444,8 @@ condition it raised, by its stable id, with **`latched`** or **`live`** beside i
 - **`latched`** — decided once, for the life of the process: an unmappable scratch root, a counter table this build cannot carry. Only a restart on a
   different build or configuration clears it, so waiting for it to clear is waiting for
   nothing.
-- **`live`** — it can clear while the process runs: an open enrollment window, a
-  `--fleet-member` entry the cluster has forgotten. Watching it clear is watching the
-  fix land.
+- **`live`** — it can clear while the process runs: an open enrollment window, a leader's
+  snapshot this build cannot read. Watching it clear is watching the fix land.
 
 A node with nothing raised **says** `none raised`, which is a reading. A node too old to
 carry conditions reports the field **absent**, which is not the same answer: it has not
@@ -500,43 +498,65 @@ they exist for. Loopback is always a member. A remote caller is refused by name:
 fastcache-cli: 10.0.0.7:6674 refused `node`: not-a-member (this node reports its identity and counters to fleet members only)
 ```
 
-The remedy is on the node — `--fleet-member` — not here.
+The remedy is at the cluster, not here: admit this machine's key — see [a machine that
+only asks](fastcache-compile-node.md#a-machine-that-only-asks-tickets) — and `fastcache-cli`
+presents a machine ticket its own node mints (`--mint-from`) to every node on another
+machine.
 
-Which is the next question: *`--fleet-member` names it and it is still refused, so what
-decided?* `explain-admission <host>` asks a node to fold that decision and report it:
+Which is the next question: *what decided?* `explain-admission` asks a node to fold that
+decision and report it -- about a machine, named by its id or by its identity key:
 
 ```console
-$ fastcache-cli explain-admission 10.0.0.42
-host        10.0.0.42
+$ fastcache-cli explain-admission pc-07
+subject     pc-07
+standing    learner
 verdict     admitted
-decided-by  --fleet-member, the cluster's member set
+decided-by  proven-key, ticket
+```
+
+or, with no operand, about the connection asking:
+
+```console
+$ fastcache-cli explain-admission --addr=worker-07.internal:6677
+subject     10.0.0.7
+standing    -
+verdict     refused
+decided-by  -
 ```
 
 **Every route that decided, not only the winning one**
 ([#1471](https://github.com/LASTRADA-Software/fastcached/issues/1471)). Admission is a fold
-over several participants and more than one can be right at once, so an operator who drops
-a host from `--fleet-member` and finds it still served is told the cluster admits it too —
-where naming only the winner would send them to edit a file that changes nothing.
+over several participants and more than one can be right at once -- a machine's key admits it
+as a proven node and as a ticket holder, and `--fleet-open` admits it again -- so naming only
+the winner would send an operator to change a setting that changes nothing.
+
+`standing` is where the machine stands in the roster this node holds: `voter`, `learner`,
+`pending` (not recorded, but waiting in this node's enrollment window), `revoked`, or
+`unknown`. It is **absent** for the question about this connection, which has no place in any
+roster. A node that holds no roster refuses the machine question by name rather than calling
+every machine unknown.
 
 `verdict` is `admitted`, `refused` or `forgotten`, and the third is not a stronger second:
-a `--cluster-forget-client` tombstone outranks every admission route, so a forgotten host
-stays refused however many lists name it. That is the case where the obvious remedy is the
+a key a `--cluster-forget` revoked outranks every admission route, so a forgotten machine
+stays refused whatever admits its address. That is the case where the obvious remedy is the
 wrong one, and it comes with the sentence saying so.
 
 `decided-by` is **absent** when nothing decided. A plain refusal is a refusal by absence —
-no route had an opinion — and naming an author for that silence would report a list as the
-reason a host was refused when the list never mentioned it. A route this client is too old
-to name is **counted** rather than dropped, for the mirror reason: under-reporting during
-an upgrade would say fewer things decided this than did.
+no route had an opinion — and naming an author for that silence would report a route as the
+reason a machine was refused when that route never mentioned it. A route this client is too
+old to name is **printed as its number** (`0x100`) rather than dropped, for the mirror reason:
+under-reporting during an upgrade would say fewer things decided this than did, and the
+number is what lets the operator ask a client of the node's own version which route it is.
 
 The answer is **that node's own fold**, which is the point rather than a limitation. Two
-nodes disagreeing about one host is the finding — a `--fleet-member` list edited on 39
-machines and missed on the fortieth is invisible from any single one of them — so ask the
-machine that is behaving oddly, and ask a second when the answers differ.
+nodes disagreeing about one machine is the finding, and it is invisible from any single one
+of them — so ask the machine that is behaving oddly, and ask a second when the answers differ.
 
-It is gated like `node` and `node-metrics`, on fleet membership — so a host refused by
-every route cannot ask this verb why, and the operator asks from a machine that is
-admitted, or from the node itself.
+The question about **this connection** is answered to anybody, a caller the node refuses
+included: that is the one caller who most needs to know why, and it is told only what its own
+connection established -- which `refused` every other verb already tells it. The question about
+a **machine** reads the roster and so describes a third party; it is gated like `node` and
+`node-metrics`, on fleet membership.
 
 The verdict does not reach the **exit code**: `refused` is a successful answer to the
 question asked. Mapping it to a failure would break a script that was only asking, and
@@ -714,7 +734,8 @@ field of its own output:
 | `info` | RESP `INFO` on the data port | 7 fields |
 
 `/metrics` needs no credential — it is served above the dashboard's
-authentication gate — but it does need the daemon started with its metrics
+authentication gate — and the client sends none: `--token-file`'s secret never
+goes to the admin port, which is plain HTTP. It does need the daemon started with its metrics
 listener, and it is on a different port. Against a node that port is **discovered**
 over `0xFC`; `--admin-addr` is only needed when the discovered answer is wrong for
 your topology.
@@ -775,7 +796,7 @@ $ fastcache-cli live-stats node --format=tsv --samples=30 > node.tsv
 |---|---|---|
 | `cache` | a `fastcached`, or a `fastcache-compile-node` for its own cache tier | the hit rate, and operations, connections, evictions and expiries per second, each with its trend; connections, items and bytes in use against their limits, per storage tier |
 | `node` | a `fastcache-compile-node` | compiles and refusals per minute, the mean compile and its trend; the slots in use against the slots available and the limit that bounds them; the cache tier's fill; the host's CPU and free memory; the node's identity, the conditions it has raised (each marked `latched` or `live`, `none raised` when there are none, the absent marker from a node too old to say), toolchains, registrars and the leader; on a consensus node, `dialled at` — the address its peers dial, the string `--cluster-admit`'s receipt asks you to compare |
-| `fleet` | the node that leads the fleet | the headline figures as tiles; one table per section (machines, workers, leases, members, forgotten, conditions, tiers); each machine's CPU over time |
+| `fleet` | the node that leads the fleet | the headline figures as tiles; one table per section (machines, workers, leases, members, revoked, conditions, tiers); each machine's CPU over time |
 
 The subject may be left out, and then it is what `--addr` is: a `fastcached` is
 watched as `cache`, and a compile node as `node`. **`fleet` is never inferred.** The
@@ -804,7 +825,7 @@ A terminal smaller than a panel's minimum gets one line, `needs <columns>x<rows>
 | `q`, `Q`, `Esc`, `Ctrl-C` | quit, restoring the terminal |
 | `Tab`, `→` / `←` | the fleet's next / previous section |
 | `1` … `9` | the fleet's sections by position |
-| `m` `w` `l` `c` `f` `!` `t` | the fleet's sections by name: machines, workers, leases, members (`c`, for cluster: `m` is taken), forgotten clients, conditions (`!`: `c` is taken) and tiers |
+| `m` `w` `l` `c` `r` `!` `t` | the fleet's sections by name: machines, workers, leases, members (`c`, for cluster: `m` is taken), revoked keys, conditions (`!`: `c` is taken) and tiers |
 | `PgDn` / `PgUp`, `Home` | scroll the fleet's table a page, or back to its top |
 | `/` | filter the fleet's table: type, `Enter` keeps the filter, `Esc` clears it, `Backspace` edits it |
 
@@ -895,8 +916,9 @@ Who may subscribe follows the verbs' own rules:
 
 - **`cache` and `node`** are served to **fleet members**, exactly as `node` and
   `node-metrics` are. Loopback is always a member, and a remote client is refused
-  `not-a-member` until the node names it with `--fleet-member`. Membership is asked
-  again at every tick, so a member removed by a reload stops receiving samples. On a
+  `not-a-member` until the cluster admits its machine's key. Membership is asked
+  again at every tick, so a machine the cluster forgets stops receiving samples at the
+  next one. On a
   daemon with `--requirepass`, a session that never authenticated loses its stream
   when the password takes effect.
 - **`fleet`** needs the dashboard's credential when the node was started with
@@ -917,11 +939,11 @@ What ends a session and what is only a gap:
 | no leader is known yet, the server is at its subscriber limit, or the stream is lost, goes silent or is ended by the server | a gap in the samples with its reason in a remark, then a new subscription at `--addr` one interval later |
 | the server's wire version, or its set of verbs, is not this build's | the session ends, exit **5**, naming the upgrade, even after samples were read: retrying cannot succeed |
 | a frame this build cannot read | the session ends, exit **5** |
-| any other refusal, such as not a member or a wrong or missing credential | before any sample was read, the session ends, exit **4**, naming `--token-file` (cache or node), `--dashboard-token-file` (fleet) or the node's `--fleet-member`; after one, a gap and a retry |
+| any other refusal, such as not a member or a wrong or missing credential | before any sample was read, the session ends, exit **4**, naming `--token-file` (cache), `--dashboard-token-file` (fleet) or, for a node, the admission of this machine's key; after one, a gap and a retry |
 
 A refusal about the caller ends a session only while nothing has been read: once a
-sample was, a refusal is a moment in the view's history, such as a member being
-removed and restored by a reload, and the view keeps going. A session that read at
+sample was, a refusal is a moment in the view's history, such as a leader changing while
+the stream is being moved to it, and the view keeps going. A session that read at
 least one sample exits **0** when it ends by `q`, `Ctrl-C` or `--samples`; one
 that never did exits with the outcome of its first failure. `--dashboard-token-file`
 is sent on a `fleet` subscription only.
@@ -930,7 +952,10 @@ is sent on a `fleet` subscription only.
 
 `--requirepass` on the daemon gates the RESP surface. Present the credential with
 `--token-file` or `$FASTCACHE_TOKEN`; `--user` supplies the two-argument `AUTH`
-form, which is rarely needed.
+form, which is rarely needed. It goes to the endpoint it was configured for and to
+nothing else: a compile node checks no password (the one it may hold is what it presents
+to its own `--upstream`), and one on another machine is shown a machine ticket this
+machine's node mints instead (`--mint-from`).
 
 A credential configured against a daemon that has **no** password is a remark,
 not a failure — the command still runs. That is deliberate: refusing would give a
@@ -965,7 +990,7 @@ Use the RESP verbs on the same `--addr` where they cover the need — `get`, `se
 |---|---|
 | `FASTCACHE_ADDR` | the cache's data port, as `host:port` |
 | `FASTCACHE_ADMIN_ADDR` | the admin surface, as `host:port` |
-| `FASTCACHE_TOKEN` | the credential to present |
+| `FASTCACHE_TOKEN` | the cache's password, presented to `FASTCACHE_ADDR` only |
 | `FASTCACHE_USER` | username for the two-argument `AUTH` form |
 | `NO_COLOR` | set to anything non-empty to suppress colour. It governs the **default**, so an explicit `--color=always` still colours |
 

@@ -178,9 +178,9 @@ namespace
         /// counter of its own rather than shipping one that could not be read.
         ///
         /// Unreachable through the listener besides: `AUTH` is the `Session` family,
-        /// routed to the scheduler or answered unserved. Either clause alone settles
-        /// it; both are recorded because the first survives a routing change and the
-        /// second does not.
+        /// routed to the session component on every built node. Either clause alone
+        /// settles it; both are recorded because the first survives a routing change and
+        /// the second does not.
         ///
         /// A bare rationale and **not** a `Cc::UncountedRefusal`, unlike every other
         /// row here: the code this arm answers with comes from the matched

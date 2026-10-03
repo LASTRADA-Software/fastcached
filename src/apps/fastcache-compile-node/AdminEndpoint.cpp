@@ -144,9 +144,10 @@ std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::filesyst
 
 std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path)
 {
-    // The reading is shared with `--scheduler-token-file` (#289); what differs is
-    // only what the secret becomes. Written once, so the trailing-newline rule and
-    // the empty-file refusal cannot hold for one credential and not the other.
+    // The reading is `ReadSecretFile`'s, shared with every secret this node reads by
+    // path; what differs is only what the secret becomes. Written once, so the
+    // trailing-newline rule and the empty-file refusal cannot hold for one credential
+    // and not another.
     return ReadSecretFile(path).transform(
         [](FastCache::SecureString secret) { return AdminCredential { std::move(secret) }; });
 }

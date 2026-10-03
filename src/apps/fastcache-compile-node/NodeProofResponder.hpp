@@ -3,7 +3,6 @@
 
 #include "FrameEndpoint.hpp"
 
-#include <FastCache/Auth/AuthPolicy.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -14,7 +13,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -39,10 +37,10 @@ namespace FastCache::Node
 ///
 /// ## Why a component of its own
 ///
-/// `VerbFamily::NodeProof` carries that argument in full. The short of it: the credential the
-/// scheduler owns is `--scheduler-token-file`, an operator's token, and an identity is a different
-/// fact every machine in the fleet has -- so folding these verbs into the `Session` family would
-/// make identity a property of the component that owns the operator's token.
+/// `VerbFamily::NodeProof` carries that argument in full. The short of it: a proof is the caller's
+/// OWN signature over this connection, while the `Session` family's `AUTH` carries a ticket -- a
+/// statement another machine made about the caller -- so folding these verbs into it would let one
+/// stand in for the other.
 ///
 /// ## What it does NOT decide
 ///
@@ -78,22 +76,18 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
     /// @param metrics Where every outcome of the exchange is recorded; must outlive this.
     /// @param logger Where a draw this node cannot make is reported; must outlive this. That one
     ///        condition is this machine's to fix and no counter can carry WHY.
-    /// @param policy The credential this surface requires, or nullptr for none. Shared rather
-    ///        than referenced because "there is no credential" has to be representable.
     NodeProofResponder(std::string nodeId,
                        Ed25519KeyPair const& identity,
                        Distributed::IMembershipOracle const& roster,
                        ISecureRandom& random,
                        IMetricsSink& metrics,
-                       ILogger& logger,
-                       std::shared_ptr<AuthPolicy const> policy = nullptr) noexcept:
+                       ILogger& logger) noexcept:
         _nodeId { std::move(nodeId) },
         _identity { identity },
         _roster { roster },
         _random { random },
         _metrics { metrics },
-        _logger { logger },
-        _policy { std::move(policy) }
+        _logger { logger }
     {
     }
 
@@ -115,32 +109,16 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
     /// What stands in place of the list is the signature and the roster: a caller that cannot
     /// sign this connection's handshake under a key the cluster holds live learns nothing and is
     /// admitted to nothing, and its connection goes on being judged by its address exactly as
-    /// before. The credential
-    /// gate is untouched as well -- both verbs are `RequiresAuth` (`VerbFamily::NodeProof` says
-    /// why), so a fleet with `--scheduler-token-file` set still requires the token here.
+    /// before.
     [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
                                                                    std::uint8_t opRaw) const override;
 
-    /// @copydoc IFrameResponder::AuthRequired
-    ///
-    /// The surface-wide answer, and the opcode is deliberately ignored: which verb is reachable
-    /// before a credential is `OpTable::preAuth`'s column and `DecidePrePayload` reads it, so
-    /// answering per verb here would be a second spelling of the pre-auth set -- one a reviewer
-    /// cannot see from the table, and one that can disagree with it.
-    [[nodiscard]] bool AuthRequired(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return _policy != nullptr && _policy->Enabled();
-    }
-
     /// @copydoc IFrameResponder::CheckCredential
     ///
-    /// Delegates to this surface's own policy, which is the scheduler's object. Unreachable
-    /// through `MergedResponder` -- `AUTH` is a `Session` verb and routes to the scheduler -- and
-    /// answered properly rather than stubbed, because a surface that inherits an answer inherits
-    /// an open door by saying nothing.
-    [[nodiscard]] CredentialOutcome CheckCredential(std::span<std::byte const> payload) const override
+    /// `NoPolicy`: AUTH is the Session family's; this surface is never routed one.
+    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
     {
-        return FastCache::CheckCredential(_policy.get(), payload);
+        return NotTheSessionSurface();
     }
 
     /// @copydoc IFrameResponder::RefusalReply
@@ -257,8 +235,6 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
     /// cannot draw a handshake. A counter would tell an operator that proofs are failing and not
     /// that the failure is on THIS machine, which is the whole of the diagnosis.
     ILogger& _logger;
-
-    std::shared_ptr<AuthPolicy const> _policy;
 };
 
 } // namespace FastCache::Node

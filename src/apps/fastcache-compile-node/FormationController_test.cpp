@@ -132,19 +132,21 @@ constexpr std::chrono::seconds MachineStartsAt { 1'700'000'000 };
 /// @param id Its id.
 /// @param raftEndpoint Where its Raft port answers.
 /// @param seat Its seat.
-/// @param publicKey The key recorded for it, when one is.
+/// @param publicKey The key recorded for it; the id's own test key when none is named, since a
+///        recorded member always holds one.
 /// @return The member.
 [[nodiscard]] ClusterMember Member(std::string id,
                                    std::string raftEndpoint,
                                    MemberSeat seat,
                                    std::optional<Ed25519PublicKey> publicKey = std::nullopt)
 {
+    auto const key = publicKey.value_or(Testing::TestKeyPair(id).PublicKey());
     return ClusterMember { .id = std::move(id),
                            .raftEndpoint = std::move(raftEndpoint),
                            .schedulerEndpoint = {},
                            .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
                            .seat = seat,
-                           .publicKey = publicKey };
+                           .publicKey = key };
 }
 
 /// Whether any line @p logger captured contains @p text.
@@ -550,18 +552,15 @@ TEST_CASE("A learner opens a scheduler only once the state it applied seats it a
     laptop.controller.OnClusterState(seatedAsLearner, "c-office", "n-office", "office:6674");
     CHECK(laptop.controller.Mode() == NodeMode::Learner);
 
-    auto seatedWithoutKey = ClusterState {};
-    seatedWithoutKey.members = { office, Member("n-laptop", "laptop:6680", MemberSeat::Voter) };
-    laptop.controller.OnClusterState(seatedWithoutKey, "c-office", "n-office", "office:6674");
-    CHECK(laptop.controller.Mode() == NodeMode::Learner);
-    CHECK(Logged(laptop.logger, "without this machine's key"));
-
+    // A seat recorded under another key -- the only keyless-looking case left, since a recorded
+    // member always holds a key.
     auto seatedUnderAnotherKey = ClusterState {};
     seatedUnderAnotherKey.members = {
         office, Member("n-laptop", "laptop:6680", MemberSeat::Voter, Testing::TestKeyPair("n-impostor").PublicKey())
     };
     laptop.controller.OnClusterState(seatedUnderAnotherKey, "c-office", "n-office", "office:6674");
     CHECK(laptop.controller.Mode() == NodeMode::Learner);
+    CHECK(Logged(laptop.logger, "without this machine's key"));
     CHECK(laptop.store.Saves().empty());
     CHECK(laptop.reform.Requests() == 0);
 

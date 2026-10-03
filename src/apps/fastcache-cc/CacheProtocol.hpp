@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <chrono>
@@ -263,10 +264,16 @@ class CredentialNotice
 /// then sends exactly the bytes it always did. That is what keeps a launcher that
 /// has never heard of authentication byte-compatible on the wire with one that
 /// has: the AUTH frame exists only when there is something to put in it.
+///
+/// Two kinds, and the KIND travels: a password for a `fastcached --requirepass` cache, and a
+/// machine ticket minted by this machine's node (`TicketCredentials`). The secret is a
+/// `SecureString` either way; where it lands on its way out -- `Wire::AuthRequest`'s views and the
+/// encoded AUTH frame -- is the stated boundary `check-credential-containers.sh` names.
 struct Credential
 {
-    std::string username; ///< Empty selects the default user (the `requirepass` form).
-    std::string secret;   ///< Empty means no credential is configured.
+    CompileCacheWire::AuthKind kind { CompileCacheWire::AuthKind::Password }; ///< Which credential `secret` is.
+    std::string username; ///< Password kind only; empty selects the default user (the `requirepass` form).
+    SecureString secret;  ///< The password, or the machine ticket's bytes; empty means none is configured.
 
     /// @return True when a credential should be presented.
     [[nodiscard]] bool Configured() const noexcept

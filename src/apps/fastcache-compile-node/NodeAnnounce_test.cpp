@@ -57,17 +57,15 @@ inline constexpr std::string_view MovedNode = "nat.example:7700";
 ///
 /// The id is what a withdrawal NAMES, so whether it is set is the whole of the
 /// second clause under test rather than incidental setup.
-/// @param notice Where an unchecked credential would be reported.
 /// @param fingerprint The toolchain it announces.
 /// @param endpoint The address it announces, defaulted because only the endpoint cases
 ///        vary it -- and it is the other half of the key the adoption rule reads.
 /// @return The registrar, never registered.
-[[nodiscard]] Cc::WorkerRegistrar Registrar(Cc::CredentialNotice& notice,
-                                            std::string fingerprint,
-                                            std::string_view endpoint = ThisNode)
+[[nodiscard]] Cc::WorkerRegistrar Registrar(std::string fingerprint, std::string_view endpoint = ThisNode)
 {
-    return Cc::WorkerRegistrar { notice, std::move(fingerprint), std::string { endpoint },
-                                 1U,     Wire::CodecList {},     Wire::CapacityFields {} };
+    return Cc::WorkerRegistrar {
+        std::move(fingerprint), std::string { endpoint }, 1U, Wire::CodecList {}, Wire::CapacityFields {}
+    };
 }
 
 /// The fingerprints of a registrar list, in order, so a case can assert WHICH
@@ -114,15 +112,14 @@ TEST_CASE("Adopting a served set retires only the registrations that left it", "
     // The registrars a re-survey drops carry the scheduler-issued `WorkerId` a
     // withdrawal names, and rebuilding the list destroys them. They are moved aside
     // instead.
-    auto notice = Cc::CredentialNotice::Silent();
 
     std::vector<Cc::WorkerRegistrar> current;
-    current.push_back(Registrar(notice, "gcc-13"));
-    current.push_back(Registrar(notice, "clang-20"));
+    current.push_back(Registrar("gcc-13"));
+    current.push_back(Registrar("clang-20"));
 
     std::vector<Cc::WorkerRegistrar> rebuilt;
-    rebuilt.push_back(Registrar(notice, "gcc-14"));
-    rebuilt.push_back(Registrar(notice, "clang-20"));
+    rebuilt.push_back(Registrar("gcc-14"));
+    rebuilt.push_back(Registrar("clang-20"));
 
     std::vector<Cc::WorkerRegistrar> withdrawals;
     AdoptRegistrars(std::move(rebuilt), current, withdrawals);
@@ -145,11 +142,10 @@ TEST_CASE("Adopting a served set retires a registration the scheduler accepted",
     // a function that retires NOTHING -- which is the version this whole change exists
     // to replace. A registrar only carries the `WorkerId` a withdrawal names once a
     // scheduler has accepted it, so the case has to register one for real.
-    auto notice = Cc::CredentialNotice::Silent();
 
     std::vector<Cc::WorkerRegistrar> current;
-    current.push_back(Registrar(notice, "gcc-13"));
-    current.push_back(Registrar(notice, "clang-20"));
+    current.push_back(Registrar("gcc-13"));
+    current.push_back(Registrar("clang-20"));
 
     Testing::ScriptedSocket scheduler { Testing::Replies({
         RegisterOk("w-gcc"),
@@ -160,7 +156,7 @@ TEST_CASE("Adopting a served set retires a registration the scheduler accepted",
     REQUIRE(current[0].WorkerId() == "w-gcc");
 
     std::vector<Cc::WorkerRegistrar> rebuilt;
-    rebuilt.push_back(Registrar(notice, "clang-20"));
+    rebuilt.push_back(Registrar("clang-20"));
 
     std::vector<Cc::WorkerRegistrar> withdrawals;
     AdoptRegistrars(std::move(rebuilt), current, withdrawals);
@@ -181,13 +177,12 @@ TEST_CASE("Adopting a served set leaves the toolchains it still carries alone", 
     // several toolchains re-surveys routinely, and retiring a registration it still
     // serves would take that machine out of the fleet for a fingerprint it can
     // honour -- silently, since the entry simply stops being heartbeated.
-    auto notice = Cc::CredentialNotice::Silent();
 
     std::vector<Cc::WorkerRegistrar> current;
-    current.push_back(Registrar(notice, "clang-20"));
+    current.push_back(Registrar("clang-20"));
 
     std::vector<Cc::WorkerRegistrar> rebuilt;
-    rebuilt.push_back(Registrar(notice, "clang-20"));
+    rebuilt.push_back(Registrar("clang-20"));
 
     std::vector<Cc::WorkerRegistrar> withdrawals;
     AdoptRegistrars(std::move(rebuilt), current, withdrawals);
@@ -201,10 +196,9 @@ TEST_CASE("Adopting an empty served set retires nothing that was never registere
     // A machine that loses every toolchain keeps running and keeps saying nothing,
     // rather than exiting -- the compiler may come back with the next package. What
     // it must not do is invent withdrawals for entries no scheduler ever accepted.
-    auto notice = Cc::CredentialNotice::Silent();
 
     std::vector<Cc::WorkerRegistrar> current;
-    current.push_back(Registrar(notice, "gcc-13"));
+    current.push_back(Registrar("gcc-13"));
 
     std::vector<Cc::WorkerRegistrar> withdrawals;
     AdoptRegistrars({}, current, withdrawals);
@@ -226,11 +220,10 @@ TEST_CASE("A node that moves the address it advertises retires every registratio
     // Two toolchains, because a node serving several is the production shape and the
     // rule is per ENTRY: a version that retired the first and kept the rest would leave
     // the machine half-registered at an address it has left.
-    auto notice = Cc::CredentialNotice::Silent();
 
     std::vector<Cc::WorkerRegistrar> current;
-    current.push_back(Registrar(notice, "gcc-13"));
-    current.push_back(Registrar(notice, "clang-20"));
+    current.push_back(Registrar("gcc-13"));
+    current.push_back(Registrar("clang-20"));
 
     Testing::ScriptedSocket scheduler { Testing::Replies({
         RegisterOk("w-gcc"),
@@ -242,8 +235,8 @@ TEST_CASE("A node that moves the address it advertises retires every registratio
     // The same fingerprints -- nothing about what this machine SERVES has changed, which
     // is exactly why the fingerprint alone could not answer this.
     std::vector<Cc::WorkerRegistrar> rebuilt;
-    rebuilt.push_back(Registrar(notice, "gcc-13", MovedNode));
-    rebuilt.push_back(Registrar(notice, "clang-20", MovedNode));
+    rebuilt.push_back(Registrar("gcc-13", MovedNode));
+    rebuilt.push_back(Registrar("clang-20", MovedNode));
 
     std::vector<Cc::WorkerRegistrar> withdrawals;
     AdoptRegistrars(std::move(rebuilt), current, withdrawals);
@@ -274,16 +267,15 @@ TEST_CASE("A node re-adopting the same set at the same address retires nothing",
     //
     // Without it, keying the rule on the pair reads as proven by a case that would also
     // pass if the pair comparison were replaced by `false`.
-    auto notice = Cc::CredentialNotice::Silent();
 
     std::vector<Cc::WorkerRegistrar> current;
-    current.push_back(Registrar(notice, "gcc-13"));
+    current.push_back(Registrar("gcc-13"));
 
     Testing::ScriptedSocket scheduler { Testing::Replies({ RegisterOk("w-gcc") }) };
     REQUIRE(current[0].Register(scheduler).has_value());
 
     std::vector<Cc::WorkerRegistrar> rebuilt;
-    rebuilt.push_back(Registrar(notice, "gcc-13"));
+    rebuilt.push_back(Registrar("gcc-13"));
 
     std::vector<Cc::WorkerRegistrar> withdrawals;
     AdoptRegistrars(std::move(rebuilt), current, withdrawals);
@@ -391,16 +383,14 @@ struct AnnounceFixture
     // The process singleton wall clock, for the reason `NodeCredential_test` gives beside
     // the same construction: the sampler keeps the ADDRESS and reads it from its own thread.
     CompileCapacity capacity { /*slots=*/1, /*byteBudget=*/1024ULL, std::chrono::seconds { 1 }, logger };
-    ConfiguredCredential credential { cfg, nullptr };
     Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
-    Cc::CredentialNotice notice = Cc::CredentialNotice::Silent();
     std::vector<Cc::WorkerRegistrar> registrars;
     std::vector<Cc::WorkerRegistrar> withdrawals;
 
     AnnounceFixture()
     {
         cfg.schedulers = { "scheduler.example:6676" };
-        registrars.push_back(Registrar(notice, "gcc-14"));
+        registrars.push_back(Registrar("gcc-14"));
     }
 
     /// The round production builds, over this fixture's collaborators.
@@ -414,8 +404,6 @@ struct AnnounceFixture
                                 .loadSampler = loadSampler,
                                 .cacheTier = nullptr,
                                 .metrics = metrics,
-                                .credential = credential,
-                                .notice = notice,
                                 // Nothing proves: every case in this file is about the announce
                                 // round itself, against a scripted fleet that serves no handshake
                                 // (#178). The proof is `FrameEndpoint_test`'s, over a real socket.

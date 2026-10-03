@@ -1733,7 +1733,7 @@ namespace
 /// A registrar with the fields every case below shares.
 [[nodiscard]] WorkerRegistrar MakeRegistrar()
 {
-    return WorkerRegistrar { Unwatched(), "gcc-14", "10.0.0.2:6677", 4, Wire::CodecList {}, Wire::CapacityFields {} };
+    return WorkerRegistrar { "gcc-14", "10.0.0.2:6677", 4, Wire::CodecList {}, Wire::CapacityFields {} };
 }
 
 /// A successful REGISTER reply, in the shape wire version 4 gives it.
