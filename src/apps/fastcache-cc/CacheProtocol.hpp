@@ -489,26 +489,38 @@ struct ExchangeBudget
 /// `Unauthenticated`), because that is the answer the caller acts on; the AUTH
 /// reply is consumed first so the two never desynchronise.
 ///
+/// **One client for both upstream kinds**: @p verbs picks which pair frames the request, so a
+/// daemon or a node's private tier is asked FETCH and the fleet's shared cache SHARED-FETCH by the
+/// same code. The default is the daemon's pair, which is what every caller sent before the
+/// parameter existed.
+///
 /// @param client Connected transport; not owned.
 /// @param key The key to look up.
 /// @param credential Credential to present; default-constructed sends none.
+/// @param verbs The verb pair the upstream answers; its fetch verb frames the request.
 /// @return The outcome; `value` holds the stored bytes on a hit.
-[[nodiscard]] core::async::Task<CacheOutcome> CacheFetch(core::net::ISocket* client,
-                                                         CredentialNotice* notice,
-                                                         std::string_view key,
-                                                         Credential credential = {});
+[[nodiscard]] core::async::Task<CacheOutcome> CacheFetch(
+    core::net::ISocket* client,
+    CredentialNotice* notice,
+    std::string_view key,
+    Credential credential = {},
+    CompileCacheWire::CacheVerbs verbs = CompileCacheWire::DaemonCacheVerbs);
 
 /// STORE one entry over an already-connected client.
 ///
-/// Pipelines AUTH the same way `CacheFetch` does, for the same reason.
+/// Pipelines AUTH the same way `CacheFetch` does, for the same reason, and takes the verb pair
+/// for its reason too.
 /// @param client Connected transport; not owned.
 /// @param request The fields to send.
 /// @param credential Credential to present; default-constructed sends none.
+/// @param verbs The verb pair the upstream answers; its store verb frames the request.
 /// @return The outcome; `kind == Hit` means the daemon acknowledged the write.
-[[nodiscard]] core::async::Task<CacheOutcome> CacheStore(core::net::ISocket* client,
-                                                         CredentialNotice* notice,
-                                                         CompileCacheWire::StoreRequest request,
-                                                         Credential credential = {});
+[[nodiscard]] core::async::Task<CacheOutcome> CacheStore(
+    core::net::ISocket* client,
+    CredentialNotice* notice,
+    CompileCacheWire::StoreRequest request,
+    Credential credential = {},
+    CompileCacheWire::CacheVerbs verbs = CompileCacheWire::DaemonCacheVerbs);
 
 /// Default ceiling on a value the launcher will offer to the daemon.
 ///

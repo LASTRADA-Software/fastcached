@@ -215,11 +215,12 @@ fault.
   while the two happened to be equal. `AttributedCounterCount()` is the derivation that stays
   right.
 
-  **And a scan for `Increment(Counter::X)` attributes barely a quarter of them.** FOUR mechanisms
+  **And a scan for `Increment(Counter::X)` attributes barely a quarter of them.** FIVE mechanisms
   write a counter here -- a `SurfaceRefusal` row spent by `Refuse(row)`, a `LeaseToken` outcome
-  row, a classifier returning the row for its caller to spend, and a direct `Increment` -- so
-  reading only the `SurfaceRefusal` tables, which is the obvious reading of *written through
-  `Refuse(row)`*, leaves a handful looking unwritten.
+  row, a classifier returning the row for its caller to spend, a `CacheTierProfile` member spent
+  by the cache tier built with that profile, and a direct `Increment` -- so reading only the
+  `SurfaceRefusal` tables, which is the obvious reading of *written through `Refuse(row)`*, leaves
+  a good many looking unwritten.
 
   **The figures live in `ctest -R counter-attribution` and are deliberately not copied here.**
   The sentence this replaces said "106 of 144" for a tree that had moved to 148, and then 149;

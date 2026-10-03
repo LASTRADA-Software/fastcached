@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 namespace FastCache::Node
@@ -27,11 +28,15 @@ namespace
     /// Compile values carry no memcached flags word; the framing is the wire's.
     constexpr std::uint32_t NoFlags = 0;
 
-    /// One outcome of offering an object upstream, and the counter it moves.
+    /// One outcome of offering an object upstream, and which of the tier's counters it moves.
+    ///
+    /// A member of `CacheTierProfile` rather than a counter, because the two tiers count the same
+    /// outcome on different series -- and the shared tier on none, its profile leaving both
+    /// members absent.
     struct UpstreamStoreRow
     {
-        UpstreamStore outcome {};                        ///< The outcome this row describes.
-        std::optional<IMetricsSink::Counter> counter {}; ///< What it increments, if anything.
+        UpstreamStore outcome {};                                            ///< The outcome this row describes.
+        std::optional<IMetricsSink::Counter> CacheTierProfile::* counter {}; ///< Null where nothing is counted.
     };
 
     /// Which counter each outcome moves -- a table, so a fourth outcome is a row.
@@ -43,23 +48,75 @@ namespace
     /// single-machine install report a saturated failure rate, which is the
     /// reliable way to make an operator stop reading that counter at all.
     constexpr auto UpstreamStoreCounters = EnumTable<UpstreamStore, UpstreamStoreRow> {
-        UpstreamStoreRow { .outcome = UpstreamStore::Stored, .counter = IMetricsSink::Counter::NodeCacheUpstreamStores },
-        UpstreamStoreRow { .outcome = UpstreamStore::Declined,
-                           .counter = IMetricsSink::Counter::NodeCacheUpstreamStoreFailures },
-        UpstreamStoreRow { .outcome = UpstreamStore::NotConfigured, .counter = std::nullopt },
+        UpstreamStoreRow { .outcome = UpstreamStore::Stored, .counter = &CacheTierProfile::upstreamStores },
+        UpstreamStoreRow { .outcome = UpstreamStore::Declined, .counter = &CacheTierProfile::upstreamStoreFailures },
+        UpstreamStoreRow { .outcome = UpstreamStore::NotConfigured, .counter = nullptr },
     };
     static_assert(RowsInEnumeratorOrder(UpstreamStoreCounters, &UpstreamStoreRow::outcome));
+
+    /// Move @p counter when the tier's profile names one.
+    ///
+    /// An absent member is a tier on which the event cannot happen -- the shared tier has no
+    /// upstream to answer a fetch or take a store -- so skipping it is the profile's statement,
+    /// not a counter this call forgot.
+    /// @param metrics Where the tier counts.
+    /// @param counter The profile's member for this event.
+    void CountIfProfiled(IMetricsSink& metrics, std::optional<IMetricsSink::Counter> const& counter)
+    {
+        if (counter.has_value())
+            metrics.Increment(*counter);
+    }
+
+    /// @p profile, once it states every column; a programmer error otherwise.
+    ///
+    /// Asked in the member initializer, so no constructor can keep a profile without it -- and a
+    /// profile nobody asserted is refused where the tier is composed, rather than reaching
+    /// `Increment(Counter::Last)` the first time the forgotten event happens.
+    /// @param profile The tier's profile.
+    /// @return A copy of @p profile, which is what the tier keeps anyway -- by value rather than a
+    ///         reference to the parameter, which a temporary argument would leave dangling.
+    [[nodiscard]] CacheTierProfile Stated(CacheTierProfile const& profile)
+    {
+        if (!StatesEveryMember(profile))
+            throw std::invalid_argument { "a cache tier profile must state every column that has no absent "
+                                          "reading: its verb pair, its drop verb and every counter" };
+        return profile;
+    }
 } // namespace
 
 LocalCache::LocalCache(IStorage& local,
                        ICacheUpstream& upstream,
                        core::platform::IClock& clock,
-                       IMetricsSink& metrics) noexcept:
+                       IMetricsSink& metrics,
+                       CacheTierProfile const& profile):
     _local { local },
     _upstream { upstream },
     _clock { clock },
-    _metrics { metrics }
+    _metrics { metrics },
+    _counters { Stated(profile) }
 {
+    // A programmer error, so an exception: the pairing is fixed where the tier is composed, and a
+    // tier reading through while counting none of it is the silence a profile exists to prevent.
+    if (UpstreamCountingOf(profile) != UpstreamCounting::Every)
+        throw std::invalid_argument {
+            "a cache tier that reads through to an upstream must count every upstream outcome; one whose profile "
+            "counts none reads through to nothing (NoUpstream)"
+        };
+}
+
+LocalCache::LocalCache(IStorage& local,
+                       NoUpstream& upstream,
+                       core::platform::IClock& clock,
+                       IMetricsSink& metrics,
+                       CacheTierProfile const& profile):
+    _local { local },
+    _upstream { upstream },
+    _clock { clock },
+    _metrics { metrics },
+    _counters { Stated(profile) }
+{
+    if (UpstreamCountingOf(profile) == UpstreamCounting::Partial)
+        throw std::invalid_argument { "a cache tier profile counts every upstream outcome or none" };
 }
 
 core::async::Task<std::optional<std::vector<std::byte>>> LocalCache::Fetch(std::string_view key)
@@ -72,12 +129,12 @@ core::async::Task<std::optional<std::vector<std::byte>>> LocalCache::Fetch(std::
         // object by construction and there is nothing the shared cache could tell us
         // that we do not already know. Revalidating would have moved the round trip
         // rather than removed it.
-        _metrics.Increment(IMetricsSink::Counter::NodeCacheHits);
+        _metrics.Increment(_counters.hits);
         auto const bytes = hit->entry.ValueBytes();
         co_return std::vector<std::byte> { bytes.begin(), bytes.end() };
     }
 
-    _metrics.Increment(IMetricsSink::Counter::NodeCacheMisses);
+    _metrics.Increment(_counters.misses);
 
     auto fetched = co_await _upstream.Fetch(key);
     if (!fetched.has_value())
@@ -86,7 +143,7 @@ core::async::Task<std::optional<std::vector<std::byte>>> LocalCache::Fetch(std::
         // question, and the upstream implementation counts it.
         co_return std::nullopt;
 
-    _metrics.Increment(IMetricsSink::Counter::NodeCacheUpstreamHits);
+    CountIfProfiled(_metrics, _counters.upstreamHits);
 
     // Populate, so the NEXT build of this object is local. Without this the tier is
     // a proxy rather than a cache and the second build is as slow as the first.
@@ -95,7 +152,7 @@ core::async::Task<std::optional<std::vector<std::byte>>> LocalCache::Fetch(std::
     // caller is owed it. Losing the local copy costs one future round trip, which is
     // strictly better than failing a build that could have succeeded.
     if (auto const stored = _local.Set(key, *fetched, NoFlags, NoExpiry); !stored.has_value())
-        _metrics.Increment(IMetricsSink::Counter::NodeCacheFillFailures);
+        CountIfProfiled(_metrics, _counters.fillFailures);
 
     co_return fetched;
 }
@@ -107,7 +164,7 @@ core::async::Task<bool> LocalCache::Store(std::string_view key, std::span<std::b
     auto const stored = _local.Set(key, std::vector<std::byte> { value.begin(), value.end() }, NoFlags, NoExpiry);
     if (!stored.has_value())
     {
-        _metrics.Increment(IMetricsSink::Counter::NodeCacheStoreFailures);
+        _metrics.Increment(_counters.storeFailures);
         co_return false;
     }
 
@@ -119,9 +176,12 @@ core::async::Task<bool> LocalCache::Store(std::string_view key, std::span<std::b
     // Counted through the table, which is what keeps "there is no upstream" from
     // being counted as "the upstream refused": the row for that outcome names no
     // counter at all.
+    //
+    // And through the profile: a row names which of the tier's members it moves, and a tier with
+    // no upstream leaves that member absent.
     auto const& row = UpstreamStoreCounters.at(static_cast<std::size_t>(co_await _upstream.Store(key, value)));
-    if (row.counter.has_value())
-        _metrics.Increment(*row.counter);
+    if (row.counter != nullptr)
+        CountIfProfiled(_metrics, _counters.*row.counter);
 
     co_return true;
 }

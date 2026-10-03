@@ -8,9 +8,13 @@
 #include "NodeMembership.hpp"
 #include "NodeStatusText.hpp"
 #include "SchedulerTier.hpp"
+#include "SharedCacheResponder.hpp"
+#include "SharedCacheSession.hpp"
+#include "SharedCacheUpstream.hpp"
 #include "WorkerTierTestFixture.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Distributed/FleetView.hpp>
@@ -31,10 +35,12 @@
 #include <string_view>
 #include <vector>
 
+#include <core/net/BlockingConnector.hpp>
 #include <core/net/BlockingSocket.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
+#include <tests/ReactorHomeFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SkewedMetricsSink.hpp>
 #include <tests/Unwrap.hpp>
@@ -351,6 +357,27 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     FixedFleetSummary const answered { AnsweredFleetSummary(clusteredNode) };
     auto const discovery = StartDiscoveryOrExplain(clusteredNode, *consensus, answered, conditions, metrics, logger);
     REQUIRE(discovery.has_value());
+
+    // The consensus scope's shared cache, built the way `main` builds it on a consensus node: it
+    // answers `shared-cache-unavailable` from the start, before any state has named this machine.
+    core::platform::ManualClock sharedCacheClock;
+    SharedCacheService sharedCache { clusteredNode, membership.Oracle(), sharedCacheClock,   metrics,
+                                     logger,        &conditions,         ReconcileOn::Caller };
+
+    // And its reading side, the upstream a node the setting does not name reads through: it answers
+    // `shared-cache-unproven` from its construction, since nothing has failed to reach one yet.
+    auto const readerKey = FastCache::Testing::TestKeyPair("n1");
+    SystemSecureRandom readerRandom;
+    NamedMachineTrust const readerTrust { "n1", readerKey.PublicKey() };
+    NodeProofClient const reader { "n1", readerKey, readerTrust, readerRandom };
+    core::net::BlockingConnector readerConnector;
+    SharedCacheDirectory sharedDirectory { "n1", {} };
+    SharedCacheDialer sharedDialer { reader, readerConnector, nullptr, metrics, SharedCacheDialPolicy {} };
+    core::platform::ManualClock sharedSessionClock;
+    Testing::UnturnedLoopHome sharedSessionHome;
+    SharedSessionPool sharedSessions { sharedDialer, sharedSessionClock, sharedSessionHome };
+    SharedCacheUpstream const sharedUpstream { sharedDirectory, sharedSessions,          nullptr, metrics, &conditions,
+                                               logger,          SharedCacheDialPolicy {} };
 
     // The admin surface.
     auto admin = Testing::FirstStart(NodeConfig {});

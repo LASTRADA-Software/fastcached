@@ -1253,6 +1253,30 @@ namespace
                                             : AbsentCell() });
         }
 
+        // **What this node reads through to, or serves, as the fleet's shared cache**: where the
+        // answer comes from, which machine at which endpoint, and how the last attempt went. Cells
+        // rather than one sentence, for the toolchain cells' reason: a JSON or CSV consumer compares
+        // the state word, it does not parse it back out of prose. A node with no shared cache says
+        // `none` -- only a node too old to carry the record leaves `shared-cache` ABSENT, and then
+        // says nothing else about it; a machine, endpoint or detail the node did not name is an
+        // absent cell, never a blank.
+        if (fields.runtime.sharedCache.has_value())
+        {
+            auto const& shared = *fields.runtime.sharedCache;
+            auto const textOrAbsent = [](std::string const& text) {
+                return text.empty() ? AbsentCell() : TextCell(text);
+            };
+            record.push_back(
+                { .name = "shared-cache", .value = TextCell(std::string { NameOfSharedCacheSource(shared.source) }) });
+            record.push_back({ .name = "shared-cache-machine", .value = textOrAbsent(shared.machineId) });
+            record.push_back({ .name = "shared-cache-endpoint", .value = textOrAbsent(shared.endpoint) });
+            record.push_back(
+                { .name = "shared-cache-state", .value = TextCell(std::string { NameOfSharedCacheState(shared.state) }) });
+            record.push_back({ .name = "shared-cache-detail", .value = textOrAbsent(shared.detail) });
+        }
+        else
+            record.push_back({ .name = "shared-cache", .value = AbsentCell() });
+
         // One field per surface the node actually opened. A surface it does not run gets
         // no field at all rather than a zero port -- the same rule the node applies when
         // encoding, held on both sides so neither can quietly invent a number.

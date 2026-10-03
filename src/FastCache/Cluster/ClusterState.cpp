@@ -380,6 +380,14 @@ std::optional<std::string> ClusterState::HolderOf(Ed25519PublicKey const& key) c
     return std::nullopt;
 }
 
+std::optional<Ed25519PublicKey> LiveKeyOf(ClusterState const& state, std::string_view id)
+{
+    auto const member = std::ranges::find(state.members, id, &ClusterMember::id);
+    if (member == state.members.end())
+        return std::nullopt;
+    return member->publicKey;
+}
+
 std::vector<std::byte> Encode(Command const& command)
 {
     auto const header = std::array { static_cast<std::byte>(CommandVersion), static_cast<std::byte>(command.kind) };
@@ -921,6 +929,29 @@ std::optional<std::string> RefuseLeaseLifetime(std::string_view value)
     return std::move(parsed).error();
 }
 
+std::optional<std::string> RefuseSharedCache(std::string_view value)
+{
+    if (value.empty())
+        return std::nullopt;
+    // An address typed where an id belongs: the one mistake this row is shaped against, named
+    // with the flag that DOES take an address.
+    if (ParseDialEndpoint(value).has_value())
+        return std::format("{}: '{}' is an address, and this setting names a machine by its id (see --cluster-status); "
+                           "an address belongs in --upstream on the node that reads through",
+                           SharedCacheSetting,
+                           value);
+    // Whitespace and control bytes, which no id carries and every table renders ambiguously.
+    // Bytes above ASCII pass: an id is opaque to consensus, and the UTF-8 gate has already
+    // run on every setting's value.
+    auto const noIdCarries = [](char c) {
+        auto const byte = static_cast<unsigned char>(c);
+        return byte <= 0x20 || byte == 0x7F;
+    };
+    if (std::ranges::any_of(value, noIdCarries))
+        return std::format("{}: '{}' is not a machine id", SharedCacheSetting, value);
+    return std::nullopt;
+}
+
 namespace
 {
     /// What `AddMember` and `AddLearner` record; all three become a `ClusterMember`.
@@ -1242,8 +1273,26 @@ std::expected<void, ConsensusError> ValidateAgainst(ClusterState const& state, C
                                     command.key)));
             return {};
 
-        case CommandKind::SetSetting:
-            return {};
+        case CommandKind::SetSetting: {
+            // The one setting whose value names a machine: it must name one that can PROVE itself,
+            // or every node would refuse to use what the operator just configured. A courtesy --
+            // a forget committing later leaves the setting in place, and every node then finds no
+            // live key for it and uses no shared cache, which fails closed.
+            if (command.key != SharedCacheSetting || command.value.empty())
+                return {};
+            if (LiveKeyOf(state, command.value).has_value())
+                return {};
+            // `InvalidConfiguration` even for a forgotten id, never `KeyRevoked`: that code is
+            // permanent, and the ID may be admitted again under a fresh key, after which this
+            // same command is accepted. The revocation is still worth naming.
+            auto const revoked = std::ranges::contains(state.revokedKeys, command.value, &RevokedKey::id);
+            return std::unexpected(InvalidConfiguration(
+                std::format("{} names {}, and this cluster holds no live key for it{}: a shared cache is trusted only "
+                            "by the key it proves, so name a current member",
+                            SharedCacheSetting,
+                            command.value,
+                            revoked ? " (its key was revoked when it was forgotten)" : "")));
+        }
 
         // `Validate` refused them above; named rather than swept up by a `default`, for the
         // reason `Apply` names it.

@@ -24,9 +24,11 @@
 #include "NodeProofResponder.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeSurfaces.hpp"
+#include "PrivateTierProfile.hpp"
 #include "Responders.hpp"
 #include "SchedulerTier.hpp"
 #include "SessionResponder.hpp"
+#include "SharedCacheResponder.hpp"
 #include "WorkerTierTestFixture.hpp"
 
 #include <FastCache/Cache/CacheEngine.hpp>
@@ -85,6 +87,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -96,6 +99,7 @@
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SecureRandomFakes.hpp>
+#include <tests/SurfaceOwnerFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -115,251 +119,8 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 
-/// A responder that records what it was asked and answers by name.
-///
-/// Named rather than counted: what a router has to get right is WHICH component was
-/// reached, and two counters that both read 1 cannot say that a frame went to the
-/// right one. The reply carries the name, so a case reads the answer rather than
-/// inferring it.
-class NamedResponder final: public IFrameResponder
-{
-  public:
-    explicit NamedResponder(std::string name):
-        _name { std::move(name) }
-    {
-    }
-
-    [[nodiscard]] core::async::Task<FrameReply> Answer(std::span<std::byte const> /*frame*/, PeerIdentity /*peer*/) override
-    {
-        _answered.push_back(_name);
-        co_return Wire::EncodeErrorReply(Wire::ErrorCode::MalformedValue, _name);
-    }
-
-    [[nodiscard]] std::optional<std::vector<std::byte>> RefusePeer(PeerIdentity const& peer,
-                                                                   std::uint8_t opRaw) const override
-    {
-        _admitted.push_back(opRaw);
-        _peers.push_back(peer);
-        if (_gate.membership == nullptr)
-            return std::nullopt;
-        return RefuseUnlessMember(*_gate.membership,
-                                  *_gate.metrics,
-                                  peer,
-                                  { .code = Wire::ErrorCode::NotAMember, .counter = _gate.strangerCounter },
-                                  _name);
-    }
-
-    /// The next scripted verdict, or `NoPolicy` once the script is spent.
-    [[nodiscard]] CredentialVerdict CheckCredential(std::span<std::byte const> /*payload*/) const override
-    {
-        if (_verdicts.empty())
-            return CredentialVerdict { .outcome = CredentialOutcome::NoPolicy };
-        auto verdict = std::move(_verdicts.front());
-        _verdicts.pop_front();
-        return verdict;
-    }
-
-    [[nodiscard]] std::vector<std::byte> RefusalReply(Wire::PrePayloadDecision decision,
-                                                      std::uint8_t /*opRaw*/,
-                                                      std::string_view /*detail*/) const override
-    {
-        _refusals.push_back(_name);
-        return Wire::EncodeErrorReply(Wire::ErrorCodeFor(decision), _name);
-    }
-
-    /// @copydoc IFrameResponder::EndpointRefusalReply
-    ///
-    /// Records the same name, so the routing cases below assert the attribution of an
-    /// endpoint-decided refusal exactly as they do a pre-payload one.
-    [[nodiscard]] std::vector<std::byte> EndpointRefusalReply(EndpointRefusal /*refusal*/,
-                                                              std::uint8_t /*opRaw*/,
-                                                              std::string_view /*detail*/) const override
-    {
-        _refusals.push_back(_name);
-        return Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy, _name);
-    }
-
-    [[nodiscard]] std::size_t MaxRequestBytes() const noexcept override
-    {
-        return _maxRequest;
-    }
-
-    [[nodiscard]] std::chrono::milliseconds RequestTimeout(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return _requestTimeout;
-    }
-
-    /// How long this fake claims its answers may take.
-    /// @param window The window to report.
-    void PlaceRequestTimeout(std::chrono::milliseconds window) noexcept
-    {
-        _requestTimeout = window;
-    }
-
-    [[nodiscard]] std::size_t MaxOpenConnections() const noexcept override
-    {
-        return _maxOpen;
-    }
-
-    [[nodiscard]] std::size_t MaxInFlightBytes() const noexcept override
-    {
-        return _maxInFlight;
-    }
-
-    /// @copydoc IFrameResponder::HoldsOwnByteBudget
-    ///
-    /// Settable per fake, because what `MergedResponder` must do with this is ROUTE
-    /// it: the three ceilings above fold with `Largest`, and folding this one either
-    /// way is a defect (#448).
-    [[nodiscard]] bool HoldsOwnByteBudget(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return _ownBudget;
-    }
-
-    /// @copydoc IFrameResponder::PeerWatchCounter
-    ///
-    /// Settable per fake, because what `MergedResponder` must do with this is ROUTE
-    /// it -- the same reason `HoldsOwnByteBudget` above is settable.
-    [[nodiscard]] std::optional<IMetricsSink::Counter> PeerWatchCounter(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return _watchPeer;
-    }
-
-    /// Name the counter this fake's abandoned deliveries belong to, or none.
-    /// @param counter What `PeerWatchCounter` should answer.
-    void SetPeerWatchCounter(std::optional<IMetricsSink::Counter> counter) noexcept
-    {
-        _watchPeer = counter;
-    }
-
-    /// @copydoc IFrameResponder::ProgressInterval
-    ///
-    /// Settable per fake, for the reason `PeerWatchCounter` above is: what
-    /// `MergedResponder` must do with this is ROUTE it, and a routing test needs the
-    /// fakes to answer differently from each other.
-    [[nodiscard]] std::optional<std::chrono::milliseconds> ProgressInterval(std::uint8_t /*opRaw*/) const noexcept override
-    {
-        return _progress;
-    }
-
-    /// @copydoc IFrameResponder::StreamFor
-    [[nodiscard]] IFrameStream* StreamFor(std::uint8_t /*opRaw*/) noexcept override
-    {
-        return _stream;
-    }
-    /// @copydoc IFrameResponder::NodeProver
-    ///
-    /// **None.** This fake stands in for a surface, not for the node prover; a case that
-    /// needs one builds a `NodeProofResponder`.
-    [[nodiscard]] INodeProver* NodeProver() noexcept override
-    {
-        return nullptr;
-    }
-
-    /// Say which stream this fake answers with, or that it answers none.
-    /// @param stream What `StreamFor` should answer.
-    void SetStream(IFrameStream* stream) noexcept
-    {
-        _stream = stream;
-    }
-
-    /// Say how often this fake pulses, or that it does not.
-    /// @param interval What `ProgressInterval` should answer.
-    void SetProgressInterval(std::optional<std::chrono::milliseconds> interval) noexcept
-    {
-        _progress = interval;
-    }
-
-    /// Claim, or stop claiming, that this fake accounts for its own request bytes.
-    /// @param own What `HoldsOwnByteBudget` should answer.
-    void ClaimOwnByteBudget(bool own) noexcept
-    {
-        _ownBudget = own;
-    }
-
-    /// Admit callers as every production surface does, through `RefuseUnlessMember` over @p membership,
-    /// rather than admitting everybody.
-    /// @param membership The node's oracle; must outlive this.
-    /// @param metrics Where a refusal is counted; must outlive this.
-    /// @param strangerCounter The row a caller nothing admits is counted on.
-    void GateBy(Distributed::IMembershipOracle const& membership,
-                IMetricsSink& metrics,
-                IMetricsSink::Counter strangerCounter) noexcept
-    {
-        _gate = Gate { .membership = &membership, .metrics = &metrics, .strangerCounter = strangerCounter };
-    }
-
-    /// Script the verdicts `CheckCredential` answers, one per `AUTH`, in order.
-    /// @param verdicts What the next checks establish.
-    void AnswerAuthWith(std::vector<CredentialVerdict> verdicts)
-    {
-        for (auto& verdict: verdicts)
-            _verdicts.push_back(std::move(verdict));
-    }
-
-    /// Place the three session ceilings this fake reports.
-    /// @param request Largest request it will buffer.
-    /// @param open Largest number of connections.
-    /// @param inFlight Largest number of bytes in flight.
-    void PlaceCeilings(std::size_t request, std::size_t open, std::size_t inFlight) noexcept
-    {
-        _maxRequest = request;
-        _maxOpen = open;
-        _maxInFlight = inFlight;
-    }
-
-    /// @return The name recorded once per refusal this fake encoded.
-    [[nodiscard]] std::vector<std::string> const& Refusals() const noexcept
-    {
-        return _refusals;
-    }
-
-    /// @return The verbs this fake was asked to admit, in order.
-    [[nodiscard]] std::vector<std::uint8_t> const& Admitted() const noexcept
-    {
-        return _admitted;
-    }
-
-    /// @return What each connection had established when this fake was asked to admit it, in order.
-    [[nodiscard]] std::vector<PeerIdentity> const& Peers() const noexcept
-    {
-        return _peers;
-    }
-
-    /// @return The name recorded once per frame this fake answered.
-    [[nodiscard]] std::vector<std::string> const& Answered() const noexcept
-    {
-        return _answered;
-    }
-
-  private:
-    /// The membership gate `GateBy` placed; none admits everybody.
-    struct Gate
-    {
-        Distributed::IMembershipOracle const* membership { nullptr };
-        IMetricsSink* metrics { nullptr };
-        IMetricsSink::Counter strangerCounter { IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember };
-    };
-
-    std::string _name;
-    Gate _gate {};
-    std::size_t _maxRequest { 1024 };
-    std::size_t _maxOpen { 8 };
-    std::size_t _maxInFlight { 4096 };
-    bool _ownBudget { false };
-    std::optional<IMetricsSink::Counter> _watchPeer {};
-    std::optional<std::chrono::milliseconds> _progress {};
-    IFrameStream* _stream { nullptr };
-    std::chrono::milliseconds _requestTimeout { FrameServer::HeaderTimeout };
-    // Mutable because the three predicates recording into them are `const`: a
-    // predicate that counted how often it was asked would otherwise have to look like
-    // a mutator, which is the thing `RefusePeer`'s own signature refuses to do.
-    mutable std::vector<std::string> _refusals;
-    mutable std::vector<std::uint8_t> _admitted;
-    mutable std::vector<PeerIdentity> _peers;
-    mutable std::vector<std::string> _answered;
-    mutable std::deque<CredentialVerdict> _verdicts;
-};
+using SurfaceFakes::EveryNodeOwners;
+using SurfaceFakes::NamedResponder;
 
 /// The message an error reply carries, or nothing when the frame is not one.
 ///
@@ -576,7 +337,7 @@ TEST_CASE("(#290) one peer on one listener has a FETCH refused and a COMPILE adm
     NoUpstream upstream;
     core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
-    LocalCache cache { local, upstream, clock, metrics };
+    LocalCache cache { local, upstream, clock, metrics, PrivateTierProfile };
     CacheProxy proxy { cache, metrics };
 
     // This machine answers on 10.0.0.7, so 10.0.0.1 is somebody else. Injected because
@@ -748,9 +509,21 @@ TEST_CASE("An unowned verb is refused before its payload is read", "[node][merge
     // about a verb it cannot place has only the one honest answer, and giving it here
     // is what keeps a peer from being told its frame was too large for a verb that was
     // never going to be answered at all.
+    auto const deadline =
+        schedulerOnly.EndpointRefusalReply(EndpointRefusal::AnswerDeadline, static_cast<std::uint8_t>(Wire::Op::Fetch), {});
+    CHECK(ErrorOf(deadline) == Wire::UnimplementedVerb);
+    CHECK(scheduler.Refusals().empty());
+
+    // Except the in-flight budget, the one endpoint refusal decided from a header nobody
+    // verified: a SEALED frame over budget is refused before its tag is read, so its verb is
+    // a byte that may name anything. The refusal is certain and the verb is not, so it is
+    // answered by the owner whose budget ran out and counted on that owner's row -- the
+    // unserved answer moved no counter at all. Busy is also the kinder wrong answer: it sends
+    // a peer to retry, where it meets the unserved answer once the verb can be believed.
     auto const budget =
         schedulerOnly.EndpointRefusalReply(EndpointRefusal::InFlightBudget, static_cast<std::uint8_t>(Wire::Op::Fetch), {});
-    CHECK(ErrorOf(budget) == Wire::UnimplementedVerb);
+    CHECK(ErrorOf(budget) == Wire::ErrorCode::EndpointBusy);
+    CHECK(scheduler.Refusals() == std::vector<std::string> { "scheduler" });
 }
 
 TEST_CASE("A refusal is counted against the component that owned the verb", "[node][merged-responder]")
@@ -822,6 +595,14 @@ TEST_CASE("The session ceilings are the largest of the components present", "[no
     CHECK(schedulerOnly.MaxRequestBytes() == SchedulerRequest);
     CHECK(schedulerOnly.MaxOpenConnections() == SchedulerOpen);
     CHECK(schedulerOnly.MaxInFlightBytes() == SchedulerInFlight);
+
+    // And the budget that folds to has an OWNER: the component whose ceiling it is answers an
+    // in-flight refusal for a verb nobody here owns -- the cache, not the scheduler listed
+    // after it and not whichever comes first.
+    std::ignore =
+        both.EndpointRefusalReply(EndpointRefusal::InFlightBudget, static_cast<std::uint8_t>(Wire::Op::Compile), {});
+    CHECK(cache.Refusals() == std::vector<std::string> { "cache" });
+    CHECK(scheduler.Refusals().empty());
 }
 
 TEST_CASE("A surface serving only the node families folds their ceilings rather than zero", "[node][merged-responder]")
@@ -916,8 +697,9 @@ TEST_CASE("A node whose only component is its worker opens the 0xFC port", "[nod
     REQUIRE_FALSE(ServesScheduler(cfg));
     REQUIRE_FALSE(cfg.nodeListen.empty());
 
-    auto surface =
-        StartNodeSurfaceOrExplain(io, cfg, SurfaceComponents { .compile = &compile }, std::nullopt, metrics, logger);
+    EveryNodeOwners owners;
+    auto surface = StartNodeSurfaceOrExplain(
+        io, cfg, owners.Around(SurfaceComponents { .compile = &compile }), std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface != nullptr);
 
@@ -952,8 +734,14 @@ TEST_CASE("A node running only consensus opens the 0xFC port it is watched throu
     REQUIRE(named.size() == 1);
     CHECK(named.front().port == port);
 
-    auto surface = StartNodeSurfaceOrExplain(
-        io, cfg, SurfaceComponents { .node = &node, .live = &live, .fleet = &fleet }, std::nullopt, metrics, logger);
+    EveryNodeOwners owners;
+    auto surface =
+        StartNodeSurfaceOrExplain(io,
+                                  cfg,
+                                  owners.Around(SurfaceComponents { .node = &node, .live = &live, .fleet = &fleet }),
+                                  std::nullopt,
+                                  metrics,
+                                  logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
     CHECK_FALSE(Logged(logger, "serving no 0xFC port"));
@@ -1008,8 +796,10 @@ TEST_CASE("An AUTH establishes a machine for the connection, and a refused one c
     cfg.cacheMemoryBytes = 0;
     cfg.cacheDir.clear();
 
+    // Every other every-node owner a stand-in, as `main` always has them (`MissingEveryNodeOwner`).
+    EveryNodeOwners owners;
     auto surface = StartNodeSurfaceOrExplain(
-        io, cfg, SurfaceComponents { .node = &node, .session = &session }, std::nullopt, metrics, logger);
+        io, cfg, owners.Around(SurfaceComponents { .node = &node, .session = &session }), std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
     io.Start();
@@ -1107,8 +897,10 @@ TEST_CASE("A forgotten machine's tickets are refused, and the connection present
     cfg.slots = 0;
     cfg.cacheMemoryBytes = 0;
     cfg.cacheDir.clear();
+    // Every other every-node owner a stand-in, as `main` always has them (`MissingEveryNodeOwner`).
+    EveryNodeOwners owners;
     auto surface = StartNodeSurfaceOrExplain(
-        io, cfg, SurfaceComponents { .node = &node, .session = &session }, std::nullopt, metrics, logger);
+        io, cfg, owners.Around(SurfaceComponents { .node = &node, .session = &session }), std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
     io.Start();
@@ -1206,8 +998,10 @@ TEST_CASE("On an open fleet, a forgotten machine's revoked ticket refuses the ve
 
     NamedResponder node { "node" };
     node.GateBy(membership.Oracle(), metrics, IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember);
+    // Every other every-node owner a stand-in, as `main` always has them (`MissingEveryNodeOwner`).
+    EveryNodeOwners owners;
     auto surface = StartNodeSurfaceOrExplain(
-        io, cfg, SurfaceComponents { .node = &node, .session = &session }, std::nullopt, metrics, logger);
+        io, cfg, owners.Around(SurfaceComponents { .node = &node, .session = &session }), std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
     io.Start();
@@ -1357,8 +1151,10 @@ TEST_CASE("A captured ticket of a forgotten machine is answered as a stranger's 
     cfg.slots = 0;
     cfg.cacheMemoryBytes = 0;
     cfg.cacheDir.clear();
+    // Every other every-node owner a stand-in, as `main` always has them (`MissingEveryNodeOwner`).
+    EveryNodeOwners owners;
     auto surface = StartNodeSurfaceOrExplain(
-        io, cfg, SurfaceComponents { .node = &node, .session = &session }, std::nullopt, metrics, logger);
+        io, cfg, owners.Around(SurfaceComponents { .node = &node, .session = &session }), std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
     io.Start();
@@ -1442,7 +1238,10 @@ TEST_CASE("An explain-admission above its own ceiling is refused before any comp
     cfg.slots = 0;
     cfg.cacheMemoryBytes = 0;
     cfg.cacheDir.clear();
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, SurfaceComponents { .node = &node }, std::nullopt, metrics, logger);
+    // Every other every-node owner a stand-in, as `main` always has them (`MissingEveryNodeOwner`).
+    EveryNodeOwners owners;
+    auto surface = StartNodeSurfaceOrExplain(
+        io, cfg, owners.Around(SurfaceComponents { .node = &node }), std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
     io.Start();
@@ -1494,8 +1293,14 @@ TEST_CASE("A node running only consensus still answers its status with every liv
     cfg.cacheMemoryBytes = 0;
     cfg.cacheDir.clear();
 
-    auto surface = StartNodeSurfaceOrExplain(
-        io, cfg, SurfaceComponents { .node = &node, .live = &live, .fleet = &fleet }, std::nullopt, metrics, logger);
+    EveryNodeOwners owners;
+    auto surface =
+        StartNodeSurfaceOrExplain(io,
+                                  cfg,
+                                  owners.Around(SurfaceComponents { .node = &node, .live = &live, .fleet = &fleet }),
+                                  std::nullopt,
+                                  metrics,
+                                  logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
     io.Start();
@@ -1551,7 +1356,8 @@ struct EveryNodeResponders
         node { status, sources, membership, standing, metrics },
         live { sources, membership, AdminCredential {}, io.Reactor(), metrics },
         fleet { sources, membership, AdminCredential {}, metrics },
-        session { verifier, SessionKeys {}, random, wallClock, metrics }
+        session { verifier, SessionKeys {}, random, wallClock, metrics },
+        sharedCache { cfg, membership, clock, metrics, logger, nullptr, ReconcileOn::Caller }
     {
     }
 
@@ -1573,6 +1379,10 @@ struct EveryNodeResponders
     Testing::ScriptedSecureRandom random;
     core::platform::ManualWallClock wallClock;
     SessionResponder session;
+    // The fleet's shared cache every node builds, dormant: nothing names this machine, so nothing
+    // opens, and a routing case needs no more of it.
+    NullLogger logger;
+    SharedCacheService sharedCache;
 };
 } // namespace
 
@@ -1593,8 +1403,17 @@ TEST_CASE("The surface main composes routes each family to the component it was 
     FleetSummaryResponder formation { answered, identity };
     EveryNodeResponders every { cfg, io, metrics };
 
-    auto const components = ComposeSurfaceComponents(
-        nullptr, nullptr, nullptr, every.node, nullptr, every.live, every.fleet, nullptr, &formation, every.session);
+    auto const components = ComposeSurfaceComponents(nullptr,
+                                                     nullptr,
+                                                     nullptr,
+                                                     every.node,
+                                                     nullptr,
+                                                     every.live,
+                                                     every.fleet,
+                                                     nullptr,
+                                                     &formation,
+                                                     every.session,
+                                                     every.sharedCache);
 
     struct Expected
     {
@@ -1612,6 +1431,7 @@ TEST_CASE("The surface main composes routes each family to the component it was 
         Expected { .family = Wire::VerbFamily::Fleet, .owner = &every.fleet },
         Expected { .family = Wire::VerbFamily::NodeProof, .owner = nullptr },
         Expected { .family = Wire::VerbFamily::Formation, .owner = &formation },
+        Expected { .family = Wire::VerbFamily::SharedCache, .owner = &every.sharedCache.Responder() },
     };
     for (auto const& row: expected)
     {
@@ -1635,8 +1455,20 @@ TEST_CASE("With every component present, the surface main composes routes each f
 
     auto const nodeCfg = BaseConfig().first;
     ConfiguredCredential const upstreamCredential { nodeCfg, nullptr };
-    auto cache =
-        StartCacheTierOrExplain(fix.io, nodeCfg, upstreamCredential, fix.locality, fix.clock, fix.metrics, fix.logger);
+    // Reading through to nothing: no --upstream, a fleet setting naming no machine, and no
+    // identity to prove with -- this case is about which component owns each family.
+    SharedCacheDirectory const directory { "n1", {} };
+    UpstreamParts const parts { .upstream = nodeCfg.upstream,
+                                .credential = upstreamCredential,
+                                .directory = directory,
+                                .prover = nullptr,
+                                .io = fix.io,
+                                .clock = fix.clock,
+                                .metrics = fix.metrics,
+                                .conditions = nullptr,
+                                .logger = fix.logger,
+                                .host = nullptr };
+    auto cache = StartCacheTierOrExplain(nodeCfg, parts, fix.locality, fix.clock, fix.metrics, fix.logger);
     REQUIRE(cache.has_value());
     REQUIRE(*cache != nullptr);
 
@@ -1668,7 +1500,8 @@ TEST_CASE("With every component present, the surface main composes routes each f
                                                      every.fleet,
                                                      &nodeProof,
                                                      &formation,
-                                                     every.session);
+                                                     every.session,
+                                                     every.sharedCache);
 
     struct Expected
     {
@@ -1687,6 +1520,7 @@ TEST_CASE("With every component present, the surface main composes routes each f
         Expected { .family = Wire::VerbFamily::Fleet, .owner = &every.fleet },
         Expected { .family = Wire::VerbFamily::NodeProof, .owner = &nodeProof },
         Expected { .family = Wire::VerbFamily::Formation, .owner = &formation },
+        Expected { .family = Wire::VerbFamily::SharedCache, .owner = &every.sharedCache.Responder() },
     };
     for (auto const& row: expected)
     {
@@ -1720,14 +1554,22 @@ TEST_CASE("A node's port answers FLEET-SUMMARY over the probe's own nonce and on
     FleetSummaryResponder formation { answered, identity };
     // Beside the families every node builds, composed by the function `main` composes with.
     EveryNodeResponders every { cfg, io, metrics };
-    auto surface = StartNodeSurfaceOrExplain(
-        io,
-        cfg,
-        ComposeSurfaceComponents(
-            nullptr, nullptr, nullptr, every.node, nullptr, every.live, every.fleet, nullptr, &formation, every.session),
-        std::nullopt,
-        metrics,
-        logger);
+    auto surface = StartNodeSurfaceOrExplain(io,
+                                             cfg,
+                                             ComposeSurfaceComponents(nullptr,
+                                                                      nullptr,
+                                                                      nullptr,
+                                                                      every.node,
+                                                                      nullptr,
+                                                                      every.live,
+                                                                      every.fleet,
+                                                                      nullptr,
+                                                                      &formation,
+                                                                      every.session,
+                                                                      every.sharedCache),
+                                             std::nullopt,
+                                             metrics,
+                                             logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
     io.Start();
@@ -1773,7 +1615,9 @@ TEST_CASE("An emptied --listen-node closes the port and says so", "[node][node-s
     NodeConfig cfg;
     cfg.nodeListen.clear();
 
-    auto surface = StartNodeSurfaceOrExplain(io, cfg, SurfaceComponents { .cache = &cache }, std::nullopt, metrics, logger);
+    EveryNodeOwners owners;
+    auto surface = StartNodeSurfaceOrExplain(
+        io, cfg, owners.Around(SurfaceComponents { .cache = &cache }), std::nullopt, metrics, logger);
     REQUIRE(surface.has_value());
     CHECK(*surface == nullptr);
     CHECK(Logged(logger, "--listen-node is empty"));
@@ -1863,8 +1707,9 @@ TEST_CASE("A socket-activated node serves the descriptor it was handed", "[node]
     // of this case, so the two must differ.
     cfg.advertise = "worker-01.internal:1";
 
+    EveryNodeOwners owners;
     auto surface = StartNodeSurfaceOrExplain(
-        io, cfg, SurfaceComponents { .cache = &cache }, std::optional { handed.Release() }, metrics, logger);
+        io, cfg, owners.Around(SurfaceComponents { .cache = &cache }), std::optional { handed.Release() }, metrics, logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
 
@@ -1919,8 +1764,9 @@ TEST_CASE("A socket-activated descriptor that cannot be served is fatal", "[node
     // Not a descriptor. `Adopt` answers this without touching it, which is also why
     // there is nothing here to close: ownership passes on every path, including the
     // ones that fail.
-    auto refused =
-        StartNodeSurfaceOrExplain(io, cfg, SurfaceComponents { .cache = &cache }, std::optional { -1 }, metrics, logger);
+    EveryNodeOwners owners;
+    auto refused = StartNodeSurfaceOrExplain(
+        io, cfg, owners.Around(SurfaceComponents { .cache = &cache }), std::optional { -1 }, metrics, logger);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().contains("socket-activated"));
     CHECK(refused.error().contains(UnservableDescriptorCause));
@@ -1983,10 +1829,11 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
         REQUIRE(holder);
         REQUIRE(holder->IsBound());
 
+        EveryNodeOwners owners;
         auto refused = StartNodeSurfaceOrExplain(
             io,
             cfg,
-            SurfaceComponents { .cache = &cache, .scheduler = shape.servesScheduler ? &scheduler : nullptr },
+            owners.Around(SurfaceComponents { .cache = &cache, .scheduler = shape.servesScheduler ? &scheduler : nullptr }),
             std::nullopt,
             metrics,
             logger);
@@ -2007,4 +1854,42 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
         // rather than passing as "it refused for some reason".
         CHECK_FALSE(Logged(logger, "continuing without a 0xFC port"));
     }
+}
+
+TEST_CASE("A listener missing a component every built node serves is refused by that component's name",
+          "[node][node-surface][shared-cache]")
+{
+    // `SurfaceComponents` says these owners are never null on a built node, and this is what makes
+    // that true: `main` is in no test target, and a node that dropped one would answer its whole
+    // family `UnimplementedVerb` -- *this node is too old* -- with nothing red anywhere. One owner
+    // at a time, each refused by its own name; the control, every owner present, starts.
+    auto const [cfg, port] = BaseConfig();
+    std::size_t asked = 0;
+    for (auto const& row: FamilyRoutes)
+    {
+        if (row.presence != FamilyPresence::OnEveryBuiltNode)
+            continue;
+        ++asked;
+        INFO("left out: " << row.component);
+        NodeIoLoop io;
+        CapturingLogger logger;
+        AtomicMetricsSink metrics;
+        EveryNodeOwners owners;
+        auto components = owners.Around(SurfaceComponents {});
+        components.*row.owner = nullptr;
+        auto const refused = StartNodeSurfaceOrExplain(io, cfg, components, std::nullopt, metrics, logger);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().contains(std::format("without its {} component", row.component)));
+    }
+    // Session, node, live stats, the fleet document, formation and the fleet's shared cache.
+    CHECK(asked == 6);
+
+    NodeIoLoop io;
+    CapturingLogger logger;
+    AtomicMetricsSink metrics;
+    EveryNodeOwners owners;
+    auto const started =
+        StartNodeSurfaceOrExplain(io, cfg, owners.Around(SurfaceComponents {}), std::nullopt, metrics, logger);
+    REQUIRE(started.has_value());
+    CHECK(*started != nullptr);
 }

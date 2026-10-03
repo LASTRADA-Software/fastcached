@@ -1359,6 +1359,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
     std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
     NodeRoster& roster,
+    SharedCacheListeners sharedCache,
     core::platform::WallClockRef wallClock,
     IMetricsSink& metrics,
     ILogger& logger,
@@ -1385,7 +1386,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
             if (schedulerTier != nullptr)
                 schedulerTier->SetRole(role, leaderEndpoint, term);
         },
-        [&membership, &roster](Cluster::ClusterState const& state) {
+        [&membership, &roster, sharedCache](Cluster::ClusterState const& state) {
             // The member set no longer joins admission; its KEYS do. A machine the cluster
             // agreed to admit is served by every surface at once by the key it proves or
             // presents, never by the address it dials from. `--fleet-open` is this node's own
@@ -1401,6 +1402,12 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExpla
             // And the roster every grant this node's worker checks is verified against (#178):
             // the committed voters and revocations, the moment they are committed.
             roster.Applied(state);
+
+            // And the fleet's shared cache: where it is, and whether this machine is it -- recorded
+            // and handed to the host's own thread, never opened here: opening a store may walk it,
+            // and this is the apply callback a voter's heartbeats wait behind. Then the private
+            // tier's upstream, which re-judges what it reports from what the directory now says.
+            sharedCache.Applied(state);
         },
         wallClock,
         [&schedulerTier, &roster](Cluster::RosterEndorsement const& endorsement) {

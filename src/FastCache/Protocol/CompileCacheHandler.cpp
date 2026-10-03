@@ -193,6 +193,19 @@ namespace
                             .code = Wire::ErrorCode::DispatchNotPermitted,
                             .why = "this endpoint is a cache, not a compile node, and serves no fleet; read it from "
                                    "the fleet's scheduler, a fastcache-compile-node" },
+        // `NotSharedCache` and never `UnknownOpcode`: the fleet's shared cache is a
+        // compile node the replicated setting names, and a client told the verb is unknown would
+        // conclude this daemon is too OLD. Not `DispatchNotPermitted` either -- the code a node that
+        // is not the named machine answers is this one, so a client has one refusal to read as a
+        // miss whichever wrong machine it reached.
+        Wire::RefusedVerb { .op = Wire::Op::SharedFetch,
+                            .code = Wire::ErrorCode::NotSharedCache,
+                            .why = "this endpoint is a fastcached daemon; the fleet's shared cache is the "
+                                   "fastcache-compile-node its shared-cache setting names" },
+        Wire::RefusedVerb { .op = Wire::Op::SharedStore,
+                            .code = Wire::ErrorCode::NotSharedCache,
+                            .why = "this endpoint is a fastcached daemon; the fleet's shared cache is the "
+                                   "fastcache-compile-node its shared-cache setting names" },
     };
 
     /// Whether every compile-family verb has a row here saying `Wire::NoCompileWorker`'s fact.
@@ -1280,6 +1293,10 @@ core::async::Task<void> CompileCacheHandler::Run(core::net::ISocket* socket,
             // `RefusalFor` is the one place the code and the sentence are decided.
             case Wire::Op::NodeChallenge:
             case Wire::Op::ProveNode:
+            // The fleet's shared cache, answered by the compile node the replicated
+            // setting names. This daemon is never that machine; same arm, same reason.
+            case Wire::Op::SharedFetch:
+            case Wire::Op::SharedStore:
                 next = co_await HandleDistributed(socket, descriptor->code);
                 break;
 

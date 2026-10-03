@@ -360,6 +360,34 @@ Consequences that are each load-bearing:
     permanent 0% hit rate before. `NodeCacheRequestsRefusedNotLocal` carries the
     operator's half: the tightening removed access somebody had, and a peer whose hit
     rate fell needs one number that says why.
+- **The fleet's shared cache is a different VERB PAIR on the same listener, never `FETCH`
+  widened.** `SharedFetch`/`SharedStore` are `VerbFamily::SharedCache`, a `FamilyRoutes`
+  row on the merged `0xFC` listener every built node already opens, so naming a machine at
+  runtime opens no port.
+  - **Admission is the node's one fold** (`Distributed::ExplainConnection`), then a
+    narrower bar, `RestsOnMachineKey`. The caller needs a key its connection PROVED or a
+    ticket it presented, never loopback alone and never `--fleet-open` alone: an open
+    fleet must not make the fleet's objects anyone's. A revoked key is refused through the
+    fold from any address.
+  - **Every node answers the family.** A node the setting does not name answers an
+    admitted caller `NotSharedCache` through its own counted row, never
+    `UnimplementedVerb` and never `NotAMember`, which would be a confident wrong signal.
+  - **Which leg a node's private tier reads through to is one `UpstreamKindTable` row.**
+    `--upstream` is the override and speaks the daemon's verbs. The setting is the fleet
+    leg. On the named machine itself the tier is read IN PROCESS, never over its own
+    socket.
+  - **The locality rule above is untouched.** `Fetch` and `Store` never reach the shared
+    responder, and these verbs never reach `CacheResponder`.
+- **A kept shared-cache session is a cached answer, bounded below the server's sweep.**
+  `SharedSessionIdleLimit` is DERIVED from `FrameServer::HeaderTimeout` and
+  `static_assert`ed below it, so this end hangs up an idle session before the server
+  closes it under the next request.
+  - A REUSED session that fails at the transport is re-proved ONCE, in the same operation.
+  - A FRESH session's failure is the answer, and so is an exchange-deadline expiry: that
+    is a slow live machine, never a dead session.
+  - A session is dropped whenever its target's (id, key, endpoint) changes, and whenever
+    the server stops admitting its key (`NotAMember`, the one row of `SessionEndingRefusals`).
+    Every other refusal, `NotSharedCache` included, answers the request and keeps the session.
 - **Anti-leeching refuses the fleet, never the cache.** A non-member reads and
   writes objects exactly as before — the cache is a separate service this class
   cannot reach — and is refused only the fleet's CPU time, which is the thing
@@ -3321,9 +3349,12 @@ ephemeral X25519 exchange (HKDF over both nonces, both ephemeral keys and both i
 frame both ways carries a `Core/SessionSeal` tag over an implicit position, its header and its
 payload (`Protocol/SealedFrameSocket`). A bad tag, a replayed frame, the other direction's key
 or an oversized frame closes the connection UNANSWERED and is counted
-(`NodeSealedFramesRefused`). The acceptance case is that relay, injecting a `Register` with a
-forged tag after an honest proof, and its neuter is a seal that accepts any tag -- under which
-the relay's worker is registered and the honest control stays green.
+(`NodeSealedFramesRefused`). A frame the in-flight budget has no room for is the one sealed
+refusal that is ANSWERED -- `EndpointBusy`, sealed, counted on the busy row of the verb's owner,
+or of the budget's owner when nothing owns the verb -- and then closed, never resynchronized;
+why is `wire-and-protocol.md` § Framing. The acceptance case is that relay, injecting a
+`Register` with a forged tag after an honest proof, and its neuter is a seal that accepts any
+tag -- under which the relay's worker is registered and the honest control stays green.
 
 **The socket is wrapped from the start and ENGAGED later**, rather than swapped at the proof: the
 loop's reader, the sweeper's registration, the peer watch and the progress pulse all hold the

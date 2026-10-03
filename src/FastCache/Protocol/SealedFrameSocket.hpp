@@ -41,12 +41,48 @@ enum class SealFault : std::uint8_t
     BadTag,    ///< A frame's tag did not verify: injected, altered, replayed, reordered or dropped.
     Oversized, ///< A frame declared more payload than this end will hold before it can check a tag.
     Unframed,  ///< A header that is not this protocol's: nothing after it can be located.
-    Last,      ///< Not a fault, and has no row: the length of a table keyed by one.
+    /// A frame this end would have to hold, unverified, beyond what its owner's in-flight budget
+    /// has room for. **Not KNOWN to be a forgery**, which is not the same as known not to be one:
+    /// the header is refused before its tag is read, so an injector that declares a large length
+    /// turns what would have been a `BadTag` into this, and the verb whose surface answers and
+    /// counts it (`RefusedVerb`) is a byte nobody verified. Observability, not safety: the
+    /// connection ends either way and nothing of the frame is accepted.
+    OverBudget,
+    Last, ///< Not a fault, and has no row: the length of a table keyed by one.
 };
 
 /// @param fault A fault.
 /// @return What an operator reads about it.
 [[nodiscard]] std::string_view DescribeSealFault(SealFault fault) noexcept;
+
+/// Where a sealed end charges the bytes it holds before it can check a frame's tag.
+///
+/// **The tag follows the payload**, so a sealed frame is held WHOLE before anything about it --
+/// its verb, its admission, the surface's own byte budget -- can be asked. Charged nowhere, that is
+/// `maxPayload` per connection outside every budget: the per-request cap made per-connection, the
+/// defect the in-flight budget exists to close. So the end charges its owner's budget for a frame
+/// the moment its header says how large it is, and refuses one the budget has no room for, before
+/// a byte of its payload is kept.
+class ISealedFrameBudget
+{
+  public:
+    virtual ~ISealedFrameBudget() = default;
+
+    ISealedFrameBudget() = default;
+    ISealedFrameBudget(ISealedFrameBudget const&) = delete;
+    ISealedFrameBudget& operator=(ISealedFrameBudget const&) = delete;
+    ISealedFrameBudget(ISealedFrameBudget&&) = delete;
+    ISealedFrameBudget& operator=(ISealedFrameBudget&&) = delete;
+
+    /// Charge @p bytes, or refuse without charging anything.
+    /// @param bytes A whole frame's size.
+    /// @return Whether it was charged.
+    [[nodiscard]] virtual bool TryHold(std::size_t bytes) noexcept = 0;
+
+    /// Give back @p bytes a successful `TryHold` charged.
+    /// @param bytes Exactly what was charged.
+    virtual void Release(std::size_t bytes) noexcept = 0;
+};
 
 /// An `core::net::ISocket` that seals every `0xFC` frame it writes and checks every one it reads, once a
 /// connection has proved its identity (#178).
@@ -90,13 +126,21 @@ class SealedFrameSocket final: public core::net::ISocket
     /// @param raw The connection; owned.
     /// @param end Which end this is, which decides the header shape read and written.
     /// @param maxPayload The largest payload a sealed frame read here may declare.
-    SealedFrameSocket(std::unique_ptr<core::net::ISocket> raw, SealedFrameEnd end, std::size_t maxPayload);
+    /// @param budget Where the bytes of a frame held before its tag can be checked are charged, or
+    ///        nullptr for an end with no budget to charge -- a caller reading a reply it asked for.
+    ///        Must outlive this. REQUIRED rather than defaulted, so a server end cannot be built
+    ///        uncharged by omission.
+    SealedFrameSocket(std::unique_ptr<core::net::ISocket> raw,
+                      SealedFrameEnd end,
+                      std::size_t maxPayload,
+                      ISealedFrameBudget* budget);
 
     SealedFrameSocket(SealedFrameSocket const&) = delete;
     SealedFrameSocket(SealedFrameSocket&&) = delete;
     SealedFrameSocket& operator=(SealedFrameSocket const&) = delete;
     SealedFrameSocket& operator=(SealedFrameSocket&&) = delete;
-    ~SealedFrameSocket() override = default;
+    /// Gives back whatever a frame still not whole was holding.
+    ~SealedFrameSocket() override;
 
     /// Check every frame read from now on under @p key. Call with no read in flight.
     /// @param key The key the PEER seals under.
@@ -111,6 +155,17 @@ class SealedFrameSocket final: public core::net::ISocket
 
     /// @return Why reading stopped, or nothing while it has not.
     [[nodiscard]] std::optional<SealFault> Fault() const noexcept;
+
+    /// The verb a frame refused `SealFault::OverBudget` named, as its unverified header said.
+    ///
+    /// Unverified, so it chooses which surface ANSWERS the refusal and counts it, and nothing else:
+    /// the answer goes out sealed, to whoever holds the session key, and the connection then ends.
+    /// @return The verb, or nothing when reading has not stopped over budget.
+    [[nodiscard]] std::optional<std::uint8_t> RefusedVerb() const noexcept;
+
+    /// The bytes a frame refused `SealFault::OverBudget` would have held.
+    /// @return The frame's size, header and tag included; 0 when reading has not stopped over budget.
+    [[nodiscard]] std::size_t RefusedBytes() const noexcept;
 
     [[nodiscard]] core::net::IoAwaitable read(std::span<std::byte> buffer) override;
     [[nodiscard]] core::net::IoAwaitable write(std::span<std::byte const> buffer) override;
@@ -167,9 +222,16 @@ class SealedFrameSocket final: public core::net::ISocket
     /// @return The awaitable.
     [[nodiscard]] core::net::IoAwaitable StartWrite(std::size_t reported);
 
+    /// Give back what the frame still being gathered holds, if anything.
+    void ReleaseHeld() noexcept;
+
     std::unique_ptr<core::net::ISocket> _raw;
     SealedFrameEnd _end;
     std::size_t _maxPayload;
+    ISealedFrameBudget* _budget;
+    std::size_t _held { 0 };                  ///< What the frame at the front of `_pending` has charged.
+    std::size_t _refusedBytes { 0 };          ///< What an over-budget frame would have held.
+    std::optional<std::uint8_t> _refusedVerb; ///< What an over-budget frame's header named.
 
     std::optional<FrameOpener> _opener;
     std::optional<FrameSealer> _sealer;

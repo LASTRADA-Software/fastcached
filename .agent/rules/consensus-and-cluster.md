@@ -816,6 +816,38 @@ and it is recorded here because the question will be asked again.
   row that lets the answer say why and name `--upstream`; a `static_assert` refuses a key
   that is in both tables, so the refusal cannot be shadowed by a row arriving later.
 
+  **A replicated address is safe only under TWO conditions, and each one alone fails.**
+  Nothing the node sends there may be replayable, AND the peer must prove, before anything is
+  sent, an identity the roster holds in the role the leg is for. `upstream` fails the first:
+  a password in a `CacheFetch` is the same bytes at whichever endpoint captured it. The first
+  alone still hands every node's objects to whoever a committed entry names. The second alone
+  presents a replayable secret to a machine that is a member today and forgotten tomorrow. So
+  a node's `--requirepass` goes to ONE place, the `fastcached` its own `--upstream` names. No
+  scheduler-facing round presents it, so no replicated, redirected or announced scheduler
+  endpoint can collect it.
+
+  **`shared-cache` complies with this rule rather than escaping it.** It names an ID, never an
+  address. `RefuseSharedCache` refuses an address by its shape, and `ValidateAgainst` refuses
+  an id the cluster holds no live key for.
+  - The address a node dials is the `0xFC` endpoint that MEMBER records about itself in the
+    replicated state (`ClusterMember::schedulerEndpoint`), proposed by that machine and
+    nobody else.
+  - Nothing is sent until the peer proves the key the roster records for that id.
+    `NamedMachineTrust` checks BOTH halves: the id alone is a claim anybody can type, and the
+    key alone accepts another fleet machine answering at a stale address.
+  - The role proven is *recorded MEMBER, under this id*. `LiveKeyOf` reads `members` only, so
+    a principal cannot be named, and there is no cache role of its own to prove.
+  - Every frame after the proof is sealed under the session key, so nothing captured on that
+    leg replays.
+  - Nothing a node holds as a secret is presented there. `SharedCacheUpstream` holds no
+    `ICredentialSource`, which is structural rather than a setting.
+  - The leg speaks its own verb pair, `SharedFetch`/`SharedStore`, which `fastcached` refuses
+    by name (`NotSharedCache`, never an unknown opcode).
+  - `upstream` stays in `RefusedSettingTable`, and its refusal names `shared-cache` as the
+    replicated alternative.
+  - Pinned by `No credential reaches the shared cache` and `A node sends nothing to a machine
+    that proves another key`.
+
 - **Absent is not empty, and a membership proposal is where that pays.**
   `Cluster::DesiredMember` carries `std::optional<std::string> schedulerEndpoint`
   while `ClusterMember` carries a plain string, and the difference is load-bearing in

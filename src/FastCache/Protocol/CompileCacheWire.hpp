@@ -781,6 +781,14 @@ enum class Op : std::uint8_t
     /// no family that holds a gated verb could take it without changing what that family's gate
     /// answers.
     FleetSummary = 0x1F,
+
+    /// Read a compile result from the FLEET's shared cache. `Fetch`'s payload and replies;
+    /// a different verb because a different policy: FETCH reads this machine's private tier and
+    /// answers this machine alone (#287), this answers any caller the admission fold admits, and only
+    /// on the machine the `shared-cache` setting names. Everywhere else it is `NotSharedCache`.
+    SharedFetch = 0x20,
+    /// Store a compile result in the fleet's shared cache: `Store`'s payload, `SharedFetch`'s policy.
+    SharedStore = 0x21,
 };
 
 /// Reply status, the first byte of every reply.
@@ -1290,6 +1298,14 @@ enum class ErrorCode : std::uint8_t
     /// (`IdentityRequirement::IdentifiedCaller`). Its own code rather than `NotAMember`, because
     /// the caller IS admitted and the remedy is to identify itself, not to be admitted.
     IdentifiedCallerRequired = 0x2E,
+
+    /// This machine is not the fleet's shared cache right now: the `shared-cache` setting names
+    /// another machine or none, or names this one and its tier could not be opened.
+    ///
+    /// Its own code rather than `UnimplementedVerb` -- every node implements the family -- and
+    /// rather than `NotAMember`, which would tell a proven member it is not one. A client treats
+    /// it as a miss.
+    NotSharedCache = 0x2F,
 };
 
 /// Bit for `status` within an `OpDescriptor::legalStatuses` mask.
@@ -1621,6 +1637,11 @@ enum class VerbFamily : std::uint8_t
     /// anybody knows what it serves; while no component owns it, the merged listener refuses it as
     /// it refuses every family nobody answers (`FamilyRoutes`).
     Formation,
+
+    /// The fleet's shared cache: its own family so `MergedResponder` routes it to the
+    /// component every node builds -- dormant unless the applied state names this machine -- and never
+    /// to the private tier, whose verbs are `Cache`.
+    SharedCache,
 
     /// The count, not a family: what sizes a table with one row per family
     /// (`Core/EnumTable.hpp`), so appending a family fails the build of every such table
@@ -2277,6 +2298,28 @@ inline constexpr std::array OpTable {
                    .maxReply = ReplyBoundedTo(MaxReportReply),
                    .family = VerbFamily::Scheduler,
                    .identity = IdentityRequirement::IdentifiedCaller },
+    // The fleet cache verbs: their twins' shapes -- the same objects -- and their own family,
+    // which is where their policy lives. `AddressAdmits` because admission is the fold's answer
+    // (a proven key, a ticket, loopback), never a column of this table.
+    OpDescriptor { .code = Op::SharedStore,
+                   .name = "shared-store",
+                   .fieldCount = 5, // key, prefetchGroup, srcRoot, buildTree, value
+                   .legalStatuses = static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = SessionCapGoverns,
+                   .maxReply = ReplyBoundedTo(MaxReportReply),
+                   .family = VerbFamily::SharedCache,
+                   .identity = IdentityRequirement::AddressAdmits },
+    OpDescriptor { .code = Op::SharedFetch,
+                   .name = "shared-fetch",
+                   .fieldCount = 1, // key
+                   .legalStatuses =
+                       static_cast<std::uint8_t>(StatusBit(Status::Ok) | StatusBit(Status::Miss) | StatusBit(Status::Error)),
+                   .preAuth = RequiresAuth,
+                   .maxPayload = SessionCapGoverns,
+                   .maxReply = ReplyCarriesArtefact,
+                   .family = VerbFamily::SharedCache,
+                   .identity = IdentityRequirement::AddressAdmits },
     OpDescriptor { .code = Op::MintTicket,
                    .name = "mint-ticket",
                    .fieldCount = 1, // audience
@@ -2729,6 +2772,10 @@ inline constexpr std::array ErrorTable {
                       .defaultMessage = "an operator's control verb needs a caller this node can identify -- from this "
                                         "machine, or by a proven node key or a machine ticket; --fleet-open admits "
                                         "nobody to it" },
+    ErrorDescriptor { .code = ErrorCode::NotSharedCache,
+                      .name = "not-shared-cache",
+                      .defaultMessage = "this machine is not the fleet's shared cache; the shared-cache setting names "
+                                        "another machine, or none" },
 };
 
 /// Wire bytes that once meant something and must never mean anything again.
@@ -3182,6 +3229,96 @@ namespace Detail
 
 } // namespace Detail
 
+namespace Detail
+{
+    /// Whether two verbs take the same request and may answer the same statuses.
+    ///
+    /// What makes a fleet cache verb its private twin's twin: the same objects, so the same
+    /// payload and the same replies, and only the POLICY -- the family -- differs.
+    /// @param a One verb.
+    /// @param b The other.
+    /// @return True when both are in `OpTable` and agree on arity, statuses and ceiling.
+    [[nodiscard]] constexpr bool SameRequestShape(Op a, Op b) noexcept
+    {
+        auto const* const left = FindOp(static_cast<std::uint8_t>(a));
+        auto const* const right = FindOp(static_cast<std::uint8_t>(b));
+        return left != nullptr && right != nullptr && left->fieldCount == right->fieldCount
+               && left->legalStatuses == right->legalStatuses && left->maxPayload.Bytes() == right->maxPayload.Bytes();
+    }
+} // namespace Detail
+
+/// The fetch and store verbs one cache upstream speaks, as data.
+///
+/// A pair rather than a flag, so the client that speaks to a `fastcached` and the one that speaks to
+/// the fleet's shared cache are the same code over a different ROW -- the node picks the row from a
+/// table keyed on its upstream kind, and nothing branches on which kind it is.
+///
+/// **A pair naming a verb of another shape is unrepresentable, not refused.** The constructor is
+/// `consteval` and walks `OpTable` through `FindOp`, so a pair whose fetch is not FETCH's shape or
+/// whose store is not STORE's -- or a shared verb whose row drifts from its twin's -- fails the
+/// BUILD at the pair's declaration. That is what lets `EncodeFetchAs` and `EncodeStoreAs` take a
+/// pair and frame it without a check: every `CacheVerbs` that exists at run time was proved at
+/// compile time, and a request framed under the wrong verb would be refused as malformed, which a
+/// client reads as a dead cache.
+struct CacheVerbs
+{
+    Op fetch; ///< The read verb: FETCH's request and replies.
+    Op store; ///< The write verb: STORE's request and replies.
+
+    /// @param fetchVerb A verb of FETCH's shape.
+    /// @param storeVerb A verb of STORE's shape.
+    consteval CacheVerbs(Op fetchVerb, Op storeVerb):
+        fetch { fetchVerb },
+        store { storeVerb }
+    {
+        // Reaching the throw makes the evaluation not a constant expression, which a `consteval`
+        // call must be: the diagnostic is a compile error at the offending pair, never a run-time
+        // exception.
+        if (!Detail::SameRequestShape(fetchVerb, Op::Fetch) || !Detail::SameRequestShape(storeVerb, Op::Store))
+            throw std::invalid_argument("a cache verb pair names a fetch of FETCH's shape and a store of STORE's");
+    }
+
+    [[nodiscard]] friend constexpr bool operator==(CacheVerbs, CacheVerbs) noexcept = default;
+};
+
+/// What a `fastcached` -- and a node's private tier -- answers.
+inline constexpr CacheVerbs DaemonCacheVerbs { Op::Fetch, Op::Store };
+
+/// What the fleet's shared cache answers.
+inline constexpr CacheVerbs FleetSharedCacheVerbs { Op::SharedFetch, Op::SharedStore };
+
+/// Frame a STORE request under the store verb of @p verbs.
+/// @param verbs The pair the upstream speaks; its store verb frames the request.
+/// @param request The fields to send.
+/// @param version Version to advertise; overridable so tests can offer a version
+///                the peer does not support.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeStoreAs(CacheVerbs verbs,
+                                                          StoreRequest const& request,
+                                                          WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version,
+                                 verbs.store,
+                                 { AsBytes(request.key),
+                                   AsBytes(request.prefetchGroup),
+                                   AsBytes(request.srcRoot),
+                                   AsBytes(request.buildTree),
+                                   request.value });
+}
+
+/// Frame a FETCH request under the fetch verb of @p verbs.
+/// @param verbs The pair the upstream speaks; its fetch verb frames the request.
+/// @param key The key to look up.
+/// @param version Version to advertise; overridable so tests can offer a version
+///                the peer does not support.
+/// @return The framed request.
+[[nodiscard]] inline std::vector<std::byte> EncodeFetchAs(CacheVerbs verbs,
+                                                          std::string_view key,
+                                                          WireVersion version = CurrentVersion)
+{
+    return Detail::EncodeRequest(version, verbs.fetch, { AsBytes(key) });
+}
+
 /// Frame a STORE request.
 /// @param request The fields to send.
 /// @param version Version to advertise; overridable so tests can offer a version
@@ -3189,13 +3326,7 @@ namespace Detail
 /// @return The framed request.
 [[nodiscard]] inline std::vector<std::byte> EncodeStore(StoreRequest const& request, WireVersion version = CurrentVersion)
 {
-    return Detail::EncodeRequest(version,
-                                 Op::Store,
-                                 { AsBytes(request.key),
-                                   AsBytes(request.prefetchGroup),
-                                   AsBytes(request.srcRoot),
-                                   AsBytes(request.buildTree),
-                                   request.value });
+    return EncodeStoreAs(DaemonCacheVerbs, request, version);
 }
 
 /// Frame a FETCH request.
@@ -3205,7 +3336,7 @@ namespace Detail
 /// @return The framed request.
 [[nodiscard]] inline std::vector<std::byte> EncodeFetch(std::string_view key, WireVersion version = CurrentVersion)
 {
-    return Detail::EncodeRequest(version, Op::Fetch, { AsBytes(key) });
+    return EncodeFetchAs(DaemonCacheVerbs, key, version);
 }
 
 /// Frame a CACHE-DROP request.
@@ -5745,6 +5876,51 @@ struct NodeRosterFields
     [[nodiscard]] friend bool operator==(NodeRosterFields const&, NodeRosterFields const&) = default;
 };
 
+/// Where a node's idea of the fleet's shared cache came from.
+///
+/// Explicit values from `0x01` because these bytes are transmitted: a zero byte names nothing,
+/// and a byte a newer sender uses is SKIPPED -- the record stays absent -- which is the
+/// enrollment and cordon fields' rule.
+enum class WireSharedCacheSource : std::uint8_t
+{
+    None = 0x01,        ///< No shared cache: the setting names no machine and nothing overrides it.
+    Setting = 0x02,     ///< The replicated `shared-cache` setting names a machine.
+    Override = 0x03,    ///< This node's `--upstream` wins over the setting.
+    ThisMachine = 0x04, ///< The setting names this node, which serves it and reads it in process.
+};
+
+/// How a node's last dealing with the fleet's shared cache went.
+///
+/// Explicit values from `0x01`, for `WireSharedCacheSource`'s reason.
+enum class WireSharedCacheState : std::uint8_t
+{
+    NotTried = 0x01,    ///< Named, and no operation has needed it yet.
+    Proven = 0x02,      ///< The last attempt proved the key the roster holds for that machine.
+    Unresolved = 0x03,  ///< The state names no dialable machine with a live key.
+    WrongKey = 0x04,    ///< The peer proved another key than the roster's.
+    Unreachable = 0x05, ///< The dial or the handshake failed.
+    Serving = 0x06,     ///< This node serves the shared tier.
+    Unavailable = 0x07, ///< This node is named and cannot serve.
+    /// The named machine proved its key and refused THIS node's proof: its roster does not hold
+    /// this node's key, or holds it revoked. The right machine answered; it is not a network.
+    ProofRefused = 0x08,
+};
+
+/// What `--node-status` says about the fleet's shared cache from where this node stands.
+///
+/// Its own nested record inside `NodeRuntimeFields`, for `NodeRosterFields`' reason: one fact an
+/// operator reads as one -- which machine, reached where, and how the last attempt went.
+struct SharedCacheStatusFields
+{
+    WireSharedCacheSource source { WireSharedCacheSource::None };  ///< Where the answer came from.
+    std::string machineId;                                         ///< Empty for `None` and `Override`.
+    std::string endpoint;                                          ///< What is dialled, or served; empty when unresolved.
+    WireSharedCacheState state { WireSharedCacheState::NotTried }; ///< How the last attempt went.
+    std::string detail;                                            ///< One sentence; empty when there is nothing to add.
+
+    [[nodiscard]] friend bool operator==(SharedCacheStatusFields const&, SharedCacheStatusFields const&) = default;
+};
+
 /// What a node's live components report about themselves, as opposed to what its
 /// configuration asked for.
 ///
@@ -5934,6 +6110,10 @@ struct NodeRuntimeFields
     /// words the node chose, so no reader restates the list. Engaged exactly beside
     /// `stateDirectory`.
     std::optional<std::string> stateDirectoryReason {};
+
+    /// What this node reads through to, or serves, as the fleet's shared cache; disengaged
+    /// on a sender too old to say. See `SharedCacheStatusFields`.
+    std::optional<SharedCacheStatusFields> sharedCache {};
 };
 
 /// What an operator reads `NodeRuntimeFields::consensusEndpoint` under, as prose: the
@@ -6065,6 +6245,94 @@ inline constexpr std::size_t NodeRosterFieldCount = 5;
     return true;
 }
 
+namespace Detail
+{
+    /// Whether this build names a shared-cache source byte.
+    ///
+    /// A total `switch` with no `default:`, so an enumerator added without a case fails the
+    /// build under `-Werror=switch` -- the argument `CachePrePayloadPolicy` makes for a wire enum
+    /// that carries no `Last` to size a table by.
+    /// @param source The byte, cast.
+    /// @return True when it is one of the enumerators.
+    [[nodiscard]] constexpr bool NamesSharedCacheSource(WireSharedCacheSource source) noexcept
+    {
+        switch (source)
+        {
+            case WireSharedCacheSource::None:
+            case WireSharedCacheSource::Setting:
+            case WireSharedCacheSource::Override:
+            case WireSharedCacheSource::ThisMachine:
+                return true;
+        }
+        return false;
+    }
+
+    /// Whether this build names a shared-cache state byte. See `NamesSharedCacheSource`.
+    /// @param state The byte, cast.
+    /// @return True when it is one of the enumerators.
+    [[nodiscard]] constexpr bool NamesSharedCacheState(WireSharedCacheState state) noexcept
+    {
+        switch (state)
+        {
+            case WireSharedCacheState::NotTried:
+            case WireSharedCacheState::Proven:
+            case WireSharedCacheState::Unresolved:
+            case WireSharedCacheState::WrongKey:
+            case WireSharedCacheState::Unreachable:
+            case WireSharedCacheState::Serving:
+            case WireSharedCacheState::Unavailable:
+            case WireSharedCacheState::ProofRefused:
+                return true;
+        }
+        return false;
+    }
+} // namespace Detail
+
+/// Fields a `SharedCacheStatusFields` record carries: source, machine, endpoint, state, detail.
+/// A reader accepts more, and ignores the surplus.
+inline constexpr std::size_t SharedCacheStatusFieldCount = 5;
+
+/// Encode a shared-cache status as one nested record.
+/// @param status The status.
+/// @return Its bytes; never empty, so an engaged record never reads back as absent.
+[[nodiscard]] inline std::vector<std::byte> EncodeSharedCacheStatus(SharedCacheStatusFields const& status)
+{
+    auto const source = std::array { static_cast<std::byte>(status.source) };
+    auto const state = std::array { static_cast<std::byte>(status.state) };
+    return WireFields::Encode({ std::span<std::byte const> { source },
+                                AsBytes(status.machineId),
+                                AsBytes(status.endpoint),
+                                std::span<std::byte const> { state },
+                                AsBytes(status.detail) });
+}
+
+/// Read a shared-cache status.
+/// @param field The nested record's bytes; empty is ABSENT.
+/// @param out Set only when the field carried a record this build can name.
+/// @return False when the field was present and not a record this build reads.
+[[nodiscard]] inline bool ReadSharedCacheStatus(std::span<std::byte const> field,
+                                                std::optional<SharedCacheStatusFields>& out)
+{
+    if (field.empty())
+        return true;
+    auto const parts = WireFields::SplitAll(field);
+    if (!parts.has_value() || parts->size() < SharedCacheStatusFieldCount || (*parts)[0].size() != 1
+        || (*parts)[3].size() != 1)
+        return false;
+    auto const source = static_cast<WireSharedCacheSource>((*parts)[0][0]);
+    auto const state = static_cast<WireSharedCacheState>((*parts)[3][0]);
+    // A byte this build does not name is SKIPPED -- the record stays absent -- never read as a
+    // neighbour: the enrollment field's rule, for the same reason.
+    if (!Detail::NamesSharedCacheSource(source) || !Detail::NamesSharedCacheState(state))
+        return true;
+    out = SharedCacheStatusFields { .source = source,
+                                    .machineId = std::string { AsStringView((*parts)[1]) },
+                                    .endpoint = std::string { AsStringView((*parts)[2]) },
+                                    .state = state,
+                                    .detail = std::string { AsStringView((*parts)[4]) } };
+    return true;
+}
+
 /// Frame a runtime record as one nested field list.
 ///
 /// Absent facts travel as ZERO-LENGTH fields rather than as zero values, exactly as
@@ -6110,6 +6378,9 @@ inline constexpr std::size_t NodeRosterFieldCount = 5;
         runtime.stateDirectory.has_value() ? AsBytes(*runtime.stateDirectory) : std::span<std::byte const> {};
     auto const stateDirectoryReason =
         runtime.stateDirectoryReason.has_value() ? AsBytes(*runtime.stateDirectoryReason) : std::span<std::byte const> {};
+    // Absent as zero length; an engaged record is never empty -- see `EncodeSharedCacheStatus`.
+    auto const sharedCache =
+        runtime.sharedCache.has_value() ? EncodeSharedCacheStatus(*runtime.sharedCache) : std::vector<std::byte> {};
 
     // Positional, so the ORDER here is the wire contract for this record. Append only:
     // an insertion shifts every later field and every peer decodes one fact as the next.
@@ -6133,7 +6404,8 @@ inline constexpr std::size_t NodeRosterFieldCount = 5;
                                 roster,
                                 autoApproveLeft,
                                 stateDirectory,
-                                stateDirectoryReason });
+                                stateDirectoryReason,
+                                sharedCache });
 }
 
 /// Read a runtime record back.
@@ -6325,6 +6597,12 @@ inline constexpr std::size_t NodeRosterFieldCount = 5;
         out.stateDirectory = std::string { AsStringView(directory) };
         out.stateDirectoryReason = std::string { AsStringView(reason) };
     }
+
+    // Field 21, appended behind the state directory. Empty is ABSENT, and so is a record from a
+    // build before it; a source or state byte this build does not name leaves it absent rather
+    // than refusing the whole reply.
+    if (!ReadSharedCacheStatus(at(21), out.sharedCache))
+        return std::nullopt;
 
     return out;
 }

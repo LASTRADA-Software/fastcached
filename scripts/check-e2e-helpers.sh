@@ -646,6 +646,53 @@ run_case() {
         echo "port_answers is false for an unbound port"
         ;;
 
+    # --- a stop that must END CLEANLY ------------------------------------------
+    #
+    # `stop_and_require_clean_exit`, both directions and both of its refusals. Each
+    # staged child answers TERM the way a node can: by exiting 0 from a handler, by
+    # dying of the default disposition (143), by crashing on the way out (134 is
+    # `abort`), or by exiting 0 after printing the shared-cache host's refusal. The
+    # child says when its trap is INSTALLED, and the case waits for that, so a TERM
+    # can never land before the handler exists and read as 143. And each child drops
+    # the case's own traps first: a forked subshell inherits them, and one exiting
+    # from its handler would otherwise run this case's cleanup -- deleting the very
+    # log the helper is about to read.
+    clean-stop-handled | clean-stop-unhandled | clean-stop-unhandled-opted-in | clean-stop-bad-opt-in | clean-stop-crashed | clean-stop-refusal-line)
+        log="${scratch}/child.log"
+        childArmed="${scratch}/armed"
+        : > "$log"
+        case "$name" in
+            clean-stop-handled)
+                ( trap - EXIT INT HUP; trap 'kill "$s" 2>/dev/null; exit 0' TERM
+                  : > "$childArmed"; sleep 30 & s=$!; wait "$s" ) >/dev/null 2>&1 3>&- &
+                ;;
+            clean-stop-unhandled | clean-stop-unhandled-opted-in | clean-stop-bad-opt-in)
+                ( trap - EXIT TERM INT HUP; : > "$childArmed"; exec sleep 30 ) >/dev/null 2>&1 3>&- &
+                ;;
+            clean-stop-crashed)
+                ( trap - EXIT INT HUP; trap 'kill "$s" 2>/dev/null; exit 134' TERM
+                  : > "$childArmed"; sleep 30 & s=$!; wait "$s" ) >/dev/null 2>&1 3>&- &
+                ;;
+            clean-stop-refusal-line)
+                ( trap - EXIT INT HUP
+                  trap 'kill "$s" 2>/dev/null; echo "the shared-cache host is being destroyed while 1 reader(s) still borrow it" >> "$log"; exit 0' TERM
+                  : > "$childArmed"; sleep 30 & s=$!; wait "$s" ) >/dev/null 2>&1 3>&- &
+                ;;
+        esac
+        child=$!
+        armedYet() { [ -e "$childArmed" ]; }
+        wait_until armedYet "the staged child to install its TERM handling" "$child" "-" 5
+        # The opt-in is passed only where the case is named for it: every other row,
+        # the unhandled TERM included, is judged by the DEFAULT contract.
+        optIn=()
+        case "$name" in
+            clean-stop-unhandled-opted-in) optIn=(term-ends-it) ;;
+            clean-stop-bad-opt-in) optIn=(term-is-fine) ;;
+        esac
+        stop_and_require_clean_exit "$child" "the staged child" 5 "$log" ${optIn[@]+"${optIn[@]}"}
+        echo "stop_and_require_clean_exit accepted status ${E2eStopStatus}"
+        ;;
+
     # --- the wait loop -------------------------------------------------------
     #
     # Driven through `wait_until` rather than through `wait_for_port`,
@@ -2981,6 +3028,15 @@ cases=(
     "ports|0|40 distinct ports, all in range, all recorded"
     "ports-ledger|0|the ledger confined five draws to the ports it had not issued"
     "port-answers-closed|0|port_answers is false for an unbound port"
+    # Both accepting rows first: a helper refusing everything would satisfy every
+    # refusing row while failing each clean stop. 143 is refused by DEFAULT -- a TERM
+    # that killed a process skipped its teardown -- and accepted only when opted into.
+    "clean-stop-handled|0|stop_and_require_clean_exit accepted status 0|!BUG:"
+    "clean-stop-unhandled-opted-in|0|stop_and_require_clean_exit accepted status 143|!BUG:"
+    "clean-stop-unhandled|1|exited with status 143: the TERM killed it before its handler ran|!accepted status|!BUG:"
+    "clean-stop-bad-opt-in|1|unknown fifth argument 'term-is-fine'|!accepted status|!BUG:"
+    "clean-stop-crashed|1|exited with status 134 when asked to stop|!accepted status|!BUG:"
+    "clean-stop-refusal-line|1|refused to destroy its shared-cache host|exit status 0|!accepted status|!BUG:"
     "wait-success|0|the wait returned when the predicate became true|polls) for the staged marker"
     "wait-death-is-prompt|1|the process DIED|exit=3|of a 10s budget|!BUG:|!waited 9s|!waited 10s"
     "wait-timeout-silent|1|logged NOTHING for the whole 2s|!BUG:"

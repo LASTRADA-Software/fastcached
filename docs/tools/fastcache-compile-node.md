@@ -12,6 +12,7 @@ about one of them:
 | [A cache tier of its own](#a-cache-of-its-own) | `--cache-memory`, `--cache-dir` | on, 25% of RAM in memory, uncompressed |
 | [Fleet scheduler](#a-cluster-and-who-leads-it) | the node's **mode**, and consensus | **on** — a first start is a cluster of one, and serves it |
 | [Consensus member](#a-cluster-and-who-leads-it) | `--listen-raft`, and the mode | **on** (`6680`) — an empty `--listen-raft=` runs none |
+| [The fleet's shared cache](#the-fleets-shared-cache) | `--cluster-set=shared-cache=<id>`, once, for the whole cluster | **off** — no machine is named |
 | [Peer discovery](#finding-peers-instead-of-typing-them) | `--discovery` | **off** — **UDP**, unlike every other surface |
 | [Metrics, and the fleet dashboard](#watching-one) | `--admin-listen`, `--dashboard` | **off** |
 
@@ -839,7 +840,10 @@ local cache tier (memory 36G zstd, disk 36G zstd at /var/cache/fastcache-node, u
 ### `--upstream` may be empty
 
 That is the honest configuration for one developer's machine, not a broken one: the
-tier caches locally and never tries to reach a fleet.
+tier caches locally and never tries to reach a fleet. On a node that runs consensus, an
+empty `--upstream` is also what lets the fleet's
+[`shared-cache` setting](#the-fleets-shared-cache) decide where the tier reads through
+to.
 
 ### Reading it
 
@@ -1493,6 +1497,7 @@ live in the `fastcached` this state merely names.
 | --- | --- |
 | `fleet-open` | `1` to admit every caller to the fleet, `0` for members only |
 | `lease-lifetime` | how long a compile lease lives end to end, as a duration (`20min`) |
+| `shared-cache` | the id of the member every node reads through to as the fleet's shared cache, empty for none — see [the fleet's shared cache](#the-fleets-shared-cache) |
 
 A key the build does not know is **refused when it is proposed**, not stored. The
 alternative is a typo replicated to every node, snapshotted, carried across
@@ -1509,6 +1514,16 @@ setting*, which reads as a typo or as a node too old
 ([#1123](https://github.com/LASTRADA-Software/fastcached/issues/1123)). Nothing read
 the setting, so there is nothing to move: `--upstream` on the node that reads through
 is what has always decided this.
+
+`shared-cache` is the replicated way to say the same thing, and it is safe where
+`upstream` was not:
+
+- it names a member by **id**;
+- a node sends nothing until that machine proves the key the roster holds for it;
+- the leg carries no credential at all.
+
+So one committed entry can move where the fleet's objects go, but never where anybody's
+secret goes. The refusal of `upstream` names it.
 
 ### Membership at runtime
 
@@ -2237,6 +2252,146 @@ directions at the moment it is asked (a moved node's old address never answers, 
 cloned one's answers only while both happen to be running). Copy the directory when
 you mean to move a node, not to make a second one.
 
+## The fleet's shared cache
+
+A cluster can name one of its members as the fleet's shared cache. Every other node that
+runs consensus then reads through to that machine after a local miss, and offers it what it
+stores. The machine is named by its **id**, once, in the replicated configuration. No
+`fastcached` is needed for this, and no address is typed on any other machine.
+
+### Setting it once
+
+```sh
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-set=shared-cache=n2
+fastcache-compile-node --scheduler=10.0.0.1:6675 --cluster-set=shared-cache=
+```
+
+The first command names `n2`, and the second, with an empty value, unsets the setting.
+
+The value must be a member's id and is never an address. It is refused when it is
+proposed if:
+
+- it is shaped like an address;
+- it names no member the cluster holds a live key for. A forgotten id is refused too, and
+  the refusal says that its key was revoked.
+
+A machine admitted only by its key, such as a roaming worker, is not a member and cannot be
+named. `--cluster-status` shows the setting beside the others.
+
+### What every node does
+
+Every node that runs consensus, whether a voter or a learner, does the following:
+
+- **It resolves the id at every change the cluster applies.** The result is the key the
+  roster records for that member and the `0xFC` endpoint the member announced about itself.
+  Moving the machine, forgetting it or naming another one reaches every node that way, with
+  nothing to edit and nothing to restart.
+- **It proves the key before it sends anything.** A machine that answers at the announced
+  address but proves another key has been sent a challenge and nothing else. The node
+  counts it, raises `shared-cache-unproven`, and compiles locally.
+- **It keeps one proven session open.** An idle session is hung up before the named
+  machine would close it. A kept session found dead is proved again once, in the same
+  operation. A failure on a fresh session is the answer: the build compiles locally.
+- **It speaks the fleet cache verbs, `shared-fetch` and `shared-store`.** These are not
+  the `FETCH` and `STORE` a launcher sends. A `fastcached` refuses them by name.
+- **It presents no credential.** The proven session identifies both ends, so this node's
+  `--requirepass` never goes there. A node presents that secret to one machine only: the
+  `fastcached` its own `--upstream` names.
+
+An unreachable or refusing shared cache is a miss and never an error. A node that runs no
+consensus holds no cluster state, so the setting does not reach it. Its cache tier reads
+through to its `--upstream`, or to nothing.
+
+### Overriding it on one machine
+
+`--upstream=<host>:<port>` on a node wins over the setting. That node reads through to the
+`fastcached` it names, speaks that daemon's `FETCH` and `STORE`, and presents its
+`--requirepass` there. The override is fixed for the process. The startup line reports it
+as `<host>:<port> (override, fastcached verbs)`. `--node-status` reports it as `override`,
+and its detail names the machine the setting names, if any.
+
+### The named machine
+
+When the fleet's `shared-cache` setting names this machine, its store lives at
+`<state-dir>/shared-cache/objects.cow` — a directory of its own inside the node's state
+directory (`--cluster-dir`, or the default the start resolves), never `--cache-dir`: the private tier's store is already claimed exclusively by
+this process, and the two tiers answer to different verbs and different callers.
+
+`--shared-cache-disk` caps it, defaulting to `64g`; `0` grows it as needed, the same
+rule `--cache-disk` follows for the private tier.
+
+The store is opened when the cluster applies a state naming this machine — on a thread
+of the node's own, never on the apply path — and closed within 30 seconds of the setting
+naming another machine and the last answer reading it finishing. Naming the machine again while the
+store is still open reuses it. If it will not open, the node raises
+`shared-cache-unavailable` (below) and answers `not-shared-cache` until it does.
+
+This machine's own builds read the tier **in process**, never through its own socket.
+
+Every node answers the fleet cache verbs on its `0xFC` port, which is `--listen-node`. No
+port is added for them. The endpoint other nodes dial is the one this machine announces:
+its consensus host with the port `--listen-node` bound. So `--listen-node` must face the
+network on the named machine, as it already must on a scheduler.
+
+A node serves the fleet cache verbs only while it is the named machine. Any other node
+answers `not-shared-cache`. A caller is served only when its connection proved a key the
+fleet holds or presented a ticket the node verifies. This machine's own address and
+`--fleet-open` admit nobody here, and a revoked key is refused from any address.
+
+### When it does not work
+
+Start with `--node-status` on the node whose builds are missing. Its `shared-cache` line
+says where the shared cache comes from: `none`, `setting`, `override` or `this-machine`.
+`shared-cache-state` says how the last attempt went: `not-tried`, `proven`, `unresolved`,
+`wrong-key`, `unreachable`, `proof-refused`, or `serving` or `unavailable` on the named
+machine. `shared-cache-detail` says why. The fields are listed on
+[the CLI page](fastcache-cli.md).
+
+Two conditions name the cases an operator must act on:
+
+- **`shared-cache-unproven`**, on a node reading through. The node is not reaching the
+  shared cache, for one of these reasons:
+  - a machine at the announced address proved another key;
+  - the named machine refused this node's key;
+  - the named machine did not answer;
+  - the setting names a machine this cluster cannot reach by key.
+- **`shared-cache-unavailable`**, on the named machine. Its tier will not open.
+
+Both appear in the [conditions table](#conditions) with their remedies.
+
+Five counters on the node that reads through tell the story over time:
+
+- `proofs_refused_wrong_key` is an impostor or a reassigned address.
+- `proofs_failed` is the network.
+- `unresolved` is the setting.
+- `stale_hints` is a remembered address that went away.
+- `sessions_opened` says whether the kept session holds: about one per burst of misses is
+  healthy, one per miss is not.
+
+### Reading the shared cache's counters
+
+Fifteen counters, on whichever end of the fleet cache verbs this node is: ten on
+the machine the `shared-cache` setting names, which serves them; five on every
+other node, reading through to it.
+
+| Series | Says |
+|---|---|
+| `fastcache_node_shared_cache_hits_total` | Objects the fleet's shared tier on this machine answered. |
+| `fastcache_node_shared_cache_misses_total` | Objects the shared tier on this machine did not hold. |
+| `fastcache_node_shared_cache_store_failures_total` | Objects the shared tier could not keep. A sustained rate is this machine's disk. |
+| `fastcache_node_shared_cache_requests_refused_not_a_member_total` | A caller that proved no key and presented no ticket the fleet admits. |
+| `fastcache_node_shared_cache_requests_refused_not_serving_total` | Answered `not-shared-cache`: the setting names another machine, or this one and its tier is unavailable. |
+| `fastcache_node_shared_cache_requests_refused_payload_too_large_total` | A request declaring more than one object's ceiling. |
+| `fastcache_node_shared_cache_requests_refused_endpoint_busy_total` | Refused because the surface's in-flight byte budget was spent. |
+| `fastcache_node_shared_cache_requests_refused_unsupported_version_total` | A request from a build of another wire version. |
+| `fastcache_node_shared_cache_requests_refused_malformed_payload_total` | A request whose payload would not decode. |
+| `fastcache_node_shared_cache_requests_refused_foreign_generation_total` | A store of a value generation this build does not implement. |
+| `fastcache_node_shared_cache_proofs_refused_wrong_key_total` | The machine answering at the shared cache's announced address proved a key that is not the named machine's; nothing was sent. |
+| `fastcache_node_shared_cache_proofs_failed_total` | The shared cache could not be reached, or did not complete the handshake; the build compiled locally. |
+| `fastcache_node_shared_cache_unresolved_total` | Operations skipped because the `shared-cache` setting names no machine this node can reach by key; `--node-status` says which reason. |
+| `fastcache_node_shared_cache_stale_hints_total` | The address this node's last proven session to the shared cache connected to failed, and the announced name was dialled instead. |
+| `fastcache_node_shared_cache_sessions_opened_total` | Proven sessions this node opened to the shared cache. One per burst of misses is healthy; one per miss means the kept session is being lost. |
+
 ## Running it as a service
 
 ### Linux
@@ -2580,17 +2735,18 @@ closes it.
 ### Rotating `requirepass`
 
 On this worker the token is **presented and never required** — it is what this node
-shows the shared `fastcached` named by `--upstream`, and nothing authenticates
-*against* it here. It goes to no other endpoint: a scheduler admits this machine by
-its node proof and checks no password, so a registration, a heartbeat and a presence
-announcement present none. That asymmetry is what makes it rotatable one machine at a
-time: an inbound credential could not be, because every client would have to move
-with it.
+shows the `fastcached` its `--upstream` names, and nothing else. No scheduler, and not
+the fleet's shared cache, is ever shown it: a scheduler admits this machine by its node
+proof and checks no password, and the shared cache is reached over a proof and carries
+no credential at all, so a registration, a heartbeat, a presence announcement and a
+shared-cache exchange present none. Nothing authenticates *against* it here. That
+asymmetry is what makes it rotatable one machine at a time: an inbound credential could
+not be, because every client would have to move with it.
 
-Edit `requirepass:` and reload, and the **next** exchange with the shared cache
-presents the new secret. Nothing in flight is retried, and there is no handshake to
-renegotiate — a cache fetch and a store each open a connection and present whatever
-is in force at that moment.
+Edit `requirepass:` and reload, and the **next** exchange with the upstream presents
+the new secret. Nothing in flight is retried, and there is no handshake to
+renegotiate: each cache fetch and each store presents whatever is in force at that
+moment.
 
 Rotate the peers first, or at the same time. A worker presenting the new secret to a
 `fastcached` that has not moved is **refused, visibly**, and its compiles fall back to
@@ -2892,6 +3048,8 @@ Every row says two things before anything else:
 | `unqualified-host-name` | live | warning | peers are told to dial this node at a host name with no domain, which a peer whose DNS search list does not complete it cannot reach | set `--advertise` (a reload applies it) and `--raft-self` (a restart applies it) to a name every peer resolves, or to an address; or give the machine a DNS domain and restart |
 | `host-name-reaches-only-this-machine` | live | warning | this machine's name reaches only itself (`localhost`, a name under `.localhost`, or a loopback address), so nothing offers it to a peer: consensus and discovery stand down, and the worker is announced to no scheduler elsewhere; the detail says what stood down | set `--raft-self` (a restart applies it) and, to be announced to a scheduler, `--advertise` (a reload applies it) to an address or name other machines resolve; or give the machine a real host name and restart |
 | `foreign-fleet-visible` | live | warning | this node's fleet is established and discovery proves another established fleet on the segment that neither yields to, so they will not merge; the detail names both cluster ids | decide which fleet each machine belongs to and `--cluster-forget` it from the other; it clears a few minutes after the other fleet stops being heard |
+| `shared-cache-unavailable` | live | alert | the fleet's `shared-cache` setting names this machine and its shared tier will not open, so every other node's builds miss and compile locally; the detail says why | fix what the detail names — usually another process holding `<state-dir>/shared-cache`, or a full disk — and it opens at the next change the cluster applies or within 30 seconds; or name another machine with `--cluster-set shared-cache=<id>` |
+| `shared-cache-unproven` | live | warning | the fleet's `shared-cache` setting names another machine and this node's builds are not reaching it, so they compile locally; the detail says why — a machine at the announced address that proved another key (nothing was sent to it), the named machine refusing this node's key, one that did not answer, or a setting naming a machine this cluster cannot reach by key | check `--cluster-status` and the named machine's own `--node-status`; it clears by itself at the next operation that proves the named machine's key, and at the apply that stops the setting naming another machine or names a different one (not tried until an operation tries it); a setting naming a machine this cluster cannot reach by key raises it at the apply, before any build asks, and it clears at the apply that resolves it (not tried until an operation tries it); an operation still running when an apply moved the setting says nothing about the machine it had dialled |
 
 The remedy each row carries is longer than this column, and it is the node's text: an older
 client or leader prints a newer node's row exactly as that node wrote it, rather than looking

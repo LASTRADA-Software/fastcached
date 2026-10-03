@@ -310,6 +310,11 @@
 # no disk tier for a budget to bound.
 #cache_disk:
 
+# cap the shared tier this node serves when the fleet's shared-cache setting
+# names it (default 64g; 0 grows as needed). Kept under
+# <cluster-dir>/shared-cache.
+#shared_cache_disk:
+
 # back the local cache tier with disk at this path. Memory-only otherwise: a
 # disk tier is a resource an operator should have to name. ONE node per
 # path, enforced: the store is claimed exclusively, so a second node sharing

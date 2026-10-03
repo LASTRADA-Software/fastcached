@@ -4,6 +4,7 @@
 #include <FastCache/Core/EnumTable.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace FastCache
@@ -84,11 +85,25 @@ struct StorageTierTraits
     bool budgetIsResidentMemory;
 
     std::string_view name; ///< Spelling used as a metric label and in diagnostics.
+
+    /// The budget a SHARED tier of this kind gets by default, or `nullopt`
+    /// when the shared tier has no such half.
+    ///
+    /// A present zero is unbounded, `--cache-memory`'s rule: the column answers "what
+    /// size" for a tier that has one, and `nullopt` answers "there is no such tier"
+    /// rather than reusing zero for both, which would make an operator's explicit
+    /// "no limit" indistinguishable from a kind that was never a candidate.
+    std::optional<std::uint64_t> sharedTierDefaultBytes;
 };
 
 /// Every tier, in enumerator order.
 inline constexpr EnumTable<StorageTier, StorageTierTraits> StorageTierTable { {
-    { .tier = StorageTier::Memory, .budgetIsResidentMemory = true, .name = "memory" },
+    // The shared host's working set is disk-sized, and a memory half would spend RAM
+    // on a machine whose job is disk -- so a memory tier is never a shared one.
+    { .tier = StorageTier::Memory,
+      .budgetIsResidentMemory = true,
+      .name = "memory",
+      .sharedTierDefaultBytes = std::nullopt },
     // Its budget is bytes on a filesystem, so it is not RAM and does not belong in
     // a memory sum. That is NOT the same claim as "a disk tier costs no memory":
     // `CowTreeStorage` keeps an in-memory index of every live key, which grows with
@@ -96,7 +111,10 @@ inline constexpr EnumTable<StorageTier, StorageTierTraits> StorageTierTable { {
     // accounts for that overhead today (#175) -- what must not happen is papering
     // over it by adding a disk figure to a memory total, which would be wrong by
     // the ratio between them rather than by the index's size.
-    { .tier = StorageTier::Disk, .budgetIsResidentMemory = false, .name = "disk" },
+    { .tier = StorageTier::Disk,
+      .budgetIsResidentMemory = false,
+      .name = "disk",
+      .sharedTierDefaultBytes = 64ULL * 1024 * 1024 * 1024 },
 } };
 
 // A tier added to the enum without a row is a build failure rather than a series

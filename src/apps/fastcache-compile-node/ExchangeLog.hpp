@@ -131,6 +131,16 @@ inline constexpr std::array ExchangeLogTable {
     VerbLogRow { .code = CompileCacheWire::Op::ClusterAdmitWorker,
                  .level = LogLevel::Info,
                  .rationale = "admits a machine's identity key as a worker; same audit argument as cluster-admit" },
+    // The fleet cache verbs at their private twins' level, for their twins' reason: the
+    // shared cache is asked once or more per translation unit by every machine in the fleet.
+    VerbLogRow { .code = CompileCacheWire::Op::SharedStore,
+                 .level = LogLevel::Debug,
+                 .rationale = "store's rate across the whole fleet, on the one machine that serves it; at Info a "
+                              "single office build buries that machine's journal" },
+    VerbLogRow { .code = CompileCacheWire::Op::SharedFetch,
+                 .level = LogLevel::Debug,
+                 .rationale = "fetch's rate across the whole fleet -- every machine's every TU -- on the one machine "
+                              "that serves it; the highest-rate verb that node answers" },
     VerbLogRow { .code = CompileCacheWire::Op::MintTicket,
                  .level = LogLevel::Debug,
                  .rationale = "one per launcher exchange; an Info line each would bury the log" },

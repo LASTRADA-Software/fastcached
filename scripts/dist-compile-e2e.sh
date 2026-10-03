@@ -265,7 +265,8 @@ readonly SKIP=77
 [[ -n "$fastcached" && -x "$fastcached" ]] || { echo "fastcached not found: '$fastcached'; skipping"; exit "$SKIP"; }
 [[ -n "$node"       && -x "$node"       ]] || { echo "fastcache-compile-node not found: '$node'; skipping"; exit "$SKIP"; }
 
-# Every node below except the cache-tier case turns its own cache port OFF.
+# Every node below except the cache-tier cases (9 and 11) and case 8's worker, whose
+# stop asserts the teardown of a private tier, turns its own cache OFF.
 # `--listen-node` defaults to 0.0.0.0:6674 -- 6674 being where `fastcache-cc` looks --
 # which is right for the one node per machine a real deployment runs and wrong
 # here, where several share a host and would race for it. Said explicitly rather
@@ -1225,12 +1226,24 @@ echo "== case 8: a worker exits on SIGTERM"
 # Pinning removes the overlap rather than papering over it: nothing leases
 # `graceful-stop-only`, so a corpse under that name is inert. Loosening case 12 to
 # accept a local fallback would have deleted the #236 assertion it exists for.
+#
+# And it holds a private cache tier and names no `--upstream`, which is the DEFAULT
+# shape of a node -- the one shape whose stop can crash AFTER it looks graceful. Such a
+# node reads through to the fleet's shared cache, and when that is this machine's own
+# tier it reads it in process, borrowing the host `main` declares first so it is
+# destroyed last. Reverse the two and `~SharedCacheHost` aborts at every stop, after
+# "compile node stopped" is already logged; only the exit STATUS says so, which is why
+# this stop is `stop_and_require_clean_exit`.
 stop_port="$(free_port)"
 start_node "stop-worker" 127.0.0.1 "$stop_port" \
-    "$no_local_cache" \
+    --cache-memory=16m \
     --scheduler="127.0.0.1:${dispatch_port}" \
     --toolchain="graceful-stop-only=${compiler}" --slots=1 --log-level=info
 stop_worker_pid="$started_pid"
+# The shape is asserted, not assumed: a node that built no fleet upstream holds no
+# borrow, and its clean exit would prove nothing about the order.
+grep -q "upstream shared-cache (the fleet setting; resolved at every apply)" "${workdir}/stop-worker.log" \
+    || { cat "${workdir}/stop-worker.log" >&2; fail "the worker under test did not build the fleet's shared-cache upstream, so its stop cannot show the teardown order"; }
 
 # A TERM is sent only once `start_node` has seen `compile node ready`, and that is
 # not incidental: this is the case whose failure measured the bind-to-ready window,
@@ -1238,7 +1251,7 @@ stop_worker_pid="$started_pid"
 # assertions below report "did not report a graceful stop" about a worker that was
 # never asked to. The wait is in `start_node` because the hole is not this case's;
 # the argument is there in full.
-stop_and_require_exit "$stop_worker_pid" "the worker under test" "$stop_bound_seconds"
+stop_and_require_clean_exit "$stop_worker_pid" "the worker under test" "$stop_bound_seconds" "${workdir}/stop-worker.log"
 
 # Exiting is necessary but not sufficient: a worker that died of the signal also
 # "exits". These lines are what distinguish a graceful stop from a death, and

@@ -344,17 +344,19 @@ std::string DescribeOutcome(CacheOutcome const& outcome)
 core::async::Task<CacheOutcome> CacheFetch(core::net::ISocket* client,
                                            CredentialNotice* notice,
                                            std::string_view key,
-                                           Credential credential)
+                                           Credential credential,
+                                           Wire::CacheVerbs verbs)
 {
-    co_return co_await Exchange(client, notice, Wire::EncodeFetch(key), std::move(credential), nullptr);
+    co_return co_await Exchange(client, notice, Wire::EncodeFetchAs(verbs, key), std::move(credential), nullptr);
 }
 
 core::async::Task<CacheOutcome> CacheStore(core::net::ISocket* client,
                                            CredentialNotice* notice,
                                            Wire::StoreRequest request,
-                                           Credential credential)
+                                           Credential credential,
+                                           Wire::CacheVerbs verbs)
 {
-    co_return co_await Exchange(client, notice, Wire::EncodeStore(request), std::move(credential), nullptr);
+    co_return co_await Exchange(client, notice, Wire::EncodeStoreAs(verbs, request), std::move(credential), nullptr);
 }
 
 } // namespace FastCache::Cc

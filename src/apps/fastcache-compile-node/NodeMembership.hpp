@@ -5,6 +5,7 @@
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/NodeMode.hpp>
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
@@ -12,13 +13,38 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace FastCache::Node
 {
+
+/// Publish which identity keys @p state holds live and which it revoked, into @p keys.
+///
+/// Members of either seat and enrolled principals are live under their ids; a revoked key is
+/// revoked whatever id it was revoked under. In one swap, so a reader never sees a key admitted by
+/// one roster and revoked by the next as neither. The ONE derivation from state to key admission:
+/// `NodeMembership::PublishCluster` calls it, and so does a test fleet whose machines must admit
+/// exactly what production would, never a copy of this loop.
+/// @param keys The roster the surfaces consult.
+/// @param state The cluster state as of the latest commit.
+inline void PublishClusterKeys(Distributed::KeyRosterMembership& keys, Cluster::ClusterState const& state)
+{
+    std::map<std::string, Ed25519PublicKey, std::less<>> live;
+    for (auto const& member: state.members)
+        live.emplace(member.id, member.publicKey);
+    for (auto const& principal: state.principals)
+        live.emplace(principal.id, principal.publicKey);
+    std::vector<Ed25519PublicKey> revoked;
+    revoked.reserve(state.revokedKeys.size());
+    for (auto const& entry: state.revokedKeys)
+        revoked.push_back(entry.publicKey);
+    keys.Publish(std::move(live), std::move(revoked));
+}
 
 /// This node's one answer to "who is this caller to us".
 ///
@@ -207,20 +233,8 @@ class NodeMembership final: public Distributed::IMembershipOracle
         _agreedOpen.store(AgreedOpenness(state), std::memory_order_relaxed);
         SettleOpenness();
 
-        // Which identity keys are live and which are revoked (#178), in one swap so a reader never
-        // sees a key admitted by one roster and revoked by the next as neither. Members of either
-        // seat and enrolled principals are live under their ids; a revoked key is revoked whatever
-        // id it was revoked under.
-        std::map<std::string, Ed25519PublicKey, std::less<>> live;
-        for (auto const& member: state.members)
-            live.emplace(member.id, member.publicKey);
-        for (auto const& principal: state.principals)
-            live.emplace(principal.id, principal.publicKey);
-        std::vector<Ed25519PublicKey> revoked;
-        revoked.reserve(state.revokedKeys.size());
-        for (auto const& entry: state.revokedKeys)
-            revoked.push_back(entry.publicKey);
-        _keys.Publish(std::move(live), std::move(revoked));
+        // Which identity keys are live and which are revoked (#178).
+        PublishClusterKeys(_keys, state);
     }
 
     /// The oracle every surface on this node consults.

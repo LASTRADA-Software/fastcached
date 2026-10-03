@@ -24,6 +24,7 @@ class NodeProofResponder;
 class NodeStatusResponder;
 class SchedulerTier;
 class SessionResponder;
+class SharedCacheService;
 class WorkerTier;
 struct NodeConfig;
 
@@ -170,6 +171,7 @@ class NodeFrameSurface
 /// @param nodeProof The identity prover, or nullptr when this node runs no consensus.
 /// @param formation The fleet-summary responder, or nullptr when this node holds no identity key.
 /// @param session The `Session` family's owner; every node has one.
+/// @param sharedCache The fleet's shared cache; every node builds one, dormant unless named.
 /// @return The components, each family's owner where `MergedResponder` reads it.
 [[nodiscard]] SurfaceComponents ComposeSurfaceComponents(CacheTier* cache,
                                                          SchedulerTier* scheduler,
@@ -180,6 +182,7 @@ class NodeFrameSurface
                                                          FleetTextResponder& fleet,
                                                          NodeProofResponder* nodeProof,
                                                          FleetSummaryResponder* formation,
-                                                         SessionResponder& session) noexcept;
+                                                         SessionResponder& session,
+                                                         SharedCacheService& sharedCache) noexcept;
 
 } // namespace FastCache::Node

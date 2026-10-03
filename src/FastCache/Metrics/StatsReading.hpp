@@ -454,6 +454,11 @@ enum class MetricsSurface : std::uint8_t
     /// until then no process moves these.
     NodeFormation,
 
+    /// The fleet cache verbs on the node's merged listener: `SharedCacheResponder`,
+    /// `SharedCacheHost` and `LocalCache` under `SharedTierProfile`. Built on every node,
+    /// dormant or serving.
+    NodeSharedCache,
+
     /// Enumerator count. Not a surface.
     Last
 };
@@ -470,6 +475,7 @@ inline constexpr std::array EverySurface {
     MetricsSurface::LiveStats,         MetricsSurface::ConsensusPeerWire, MetricsSurface::CompileScheduler,
     MetricsSurface::CompileWorker,     MetricsSurface::NodeEnrollment,    MetricsSurface::NodeCacheTier,
     MetricsSurface::NodeFrameEndpoint, MetricsSurface::NodeDiscovery,     MetricsSurface::NodeFormation,
+    MetricsSurface::NodeSharedCache,
 };
 
 static_assert(EverySurface.size() == static_cast<std::size_t>(MetricsSurface::Last),
@@ -510,23 +516,29 @@ struct CounterSoleWriter
 /// a row silently absent from the attribution and indistinguishable from one nobody had
 /// considered, cannot recur by omission ([#1501](https://github.com/LASTRADA-Software/fastcached/issues/1501)).
 ///
-/// **How the 203 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 58
-/// of them and would have rendered the other 145 absent -- the same defect as the bug, three
-/// times larger. The rows are written by four mechanisms, and reading only `SurfaceRefusal`
-/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 134 of the 145 and
-/// leaves eleven looking unwritten:
+/// **How the 218 rows are attributed**, since a scan for `Increment(Counter::X)` finds only 56
+/// of them and would have rendered the other 162 absent -- the same defect as the bug, three
+/// times larger. The rows are written by five mechanisms, and reading only `SurfaceRefusal`
+/// tables (the obvious reading of *written through `Refuse(row)`*) reaches 135 of the 162 and
+/// leaves 27 looking unwritten:
 ///
 /// | mechanism | rows |
 /// |---|---|
-/// | a `SurfaceRefusal` row, spent by `Refuse(row)` | 135 |
+/// | a `.counter` table row: a `SurfaceRefusal` spent by `Refuse(row)`, or an outcome table spent by its reader | 136 |
 /// | a `LeaseToken.hpp` outcome row's `workerCounter` | 10 |
 /// | returned by a classifier for its caller to spend | 4 |
-/// | `Increment(Counter::X)` directly | 58 |
+/// | a `CacheTierProfile` member, spent by the tier built with it | 16 |
+/// | `Increment(Counter::X)` directly | 56 |
 ///
-/// The column sums past 203 because four rows are written two ways -- and the 134 above is not
-/// the 135 here: 135 rows HAVE a refusal row, and 134 of those have no increment site, which is
+/// The column sums past 218 because four rows are written two ways -- and the 135 above is not
+/// the 136 here: 136 rows HAVE a refusal row, and 135 of those have no increment site, which is
 /// what a `SurfaceRefusal`-only reading would reach. Two figures one apart, measuring different
 /// things, is exactly how a census comes to be quoted wrong, so both are asserted.
+///
+/// **Every row has a writer.** The fleet's shared cache catalogued fifteen counters ahead of the
+/// tasks that write them, each named meanwhile by `DeclaredAheadOfItsWriterTable` in
+/// `CounterAttribution_test.cpp`; that table is empty now, and its own check refuses a row the
+/// moment its counter gets a real writer -- so an exclusion cannot outlive the reason for it.
 ///
 /// **The figures are pinned rather than pointed at**, which the rulebook asks for a
 /// measurement's conditions: they describe this tree at one instant and must not silently
@@ -921,6 +933,35 @@ inline constexpr std::array CounterSoleWriterTable {
                         .surface = MetricsSurface::CompileScheduler },
     CounterSoleWriter { .counter = IMetricsSink::Counter::EnrollmentControlRefusedIdentifiedCallerRequired,
                         .surface = MetricsSurface::NodeEnrollment },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheHits, .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheMisses,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheStoreFailures,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedNotAMember,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedNotServing,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedPayloadTooLarge,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedEndpointBusy,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedUnsupportedVersion,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedMalformedPayload,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheRequestsRefusedForeignGeneration,
+                        .surface = MetricsSurface::NodeSharedCache },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheProofsRefusedWrongKey,
+                        .surface = MetricsSurface::NodeCacheTier },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheProofsFailed,
+                        .surface = MetricsSurface::NodeCacheTier },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheUnresolved,
+                        .surface = MetricsSurface::NodeCacheTier },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheStaleHints,
+                        .surface = MetricsSurface::NodeCacheTier },
+    CounterSoleWriter { .counter = IMetricsSink::Counter::NodeSharedCacheSessionsOpened,
+                        .surface = MetricsSurface::NodeCacheTier },
 };
 
 /// Whether every catalogue row has at least one surface attributed to it.
@@ -931,7 +972,7 @@ inline constexpr std::array CounterSoleWriterTable {
 /// says it does. A measurement of that moment, so it does not move with the catalogue.
 ///
 /// A `consteval` fold rather than a size comparison, because `CounterSoleWriterTable.size()`
-/// counts (counter, surface) PAIRS: it is 180 for 179 counters today, and a row duplicated
+/// counts (counter, surface) PAIRS: it is 219 for 218 counters today, and a row duplicated
 /// while another went missing would leave any arithmetic on the size perfectly consistent.
 ///
 /// @return True when no enumerator is missing from the table.

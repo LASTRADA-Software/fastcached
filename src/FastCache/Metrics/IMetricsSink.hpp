@@ -619,6 +619,30 @@ class IMetricsSink
         NodeCacheUpstreamStores,
         NodeCacheUpstreamStoreFailures,
 
+        /// The fleet cache verbs on this node's merged listener, served while the `shared-cache`
+        /// setting names this machine; every refusal is its own row because each sends
+        /// an operator somewhere different.
+        NodeSharedCacheHits,
+        NodeSharedCacheMisses,
+        NodeSharedCacheStoreFailures,
+        NodeSharedCacheRequestsRefusedNotAMember,
+        NodeSharedCacheRequestsRefusedNotServing,
+        NodeSharedCacheRequestsRefusedPayloadTooLarge,
+        NodeSharedCacheRequestsRefusedEndpointBusy,
+        NodeSharedCacheRequestsRefusedUnsupportedVersion,
+        NodeSharedCacheRequestsRefusedMalformedPayload,
+        NodeSharedCacheRequestsRefusedForeignGeneration,
+
+        /// This node reading through to the named machine: a peer that proved ANOTHER key is
+        /// counted apart from one that proved nothing, because the first is an impostor or a
+        /// re-addressed host and the second is a network; and every handshake is counted, because
+        /// a kept-open session is supposed to make them rare.
+        NodeSharedCacheProofsRefusedWrongKey,
+        NodeSharedCacheProofsFailed,
+        NodeSharedCacheUnresolved,
+        NodeSharedCacheStaleHints,
+        NodeSharedCacheSessionsOpened,
+
         /// Cache requests refused because the caller is not on this machine (#287).
         ///
         /// The node's tier is this machine's entire build output, so it is served to

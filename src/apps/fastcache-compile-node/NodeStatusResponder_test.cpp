@@ -270,6 +270,8 @@ struct DirectSources
     NodeConditions const* conditions { nullptr };
     /// The enrollment list; null is a node that serves none.
     EnrollmentWindow const* enrollment { nullptr };
+    /// What the node says about the fleet's shared cache; null is a build that carries none.
+    ISharedCacheStatusSource const* sharedCache { nullptr };
 };
 
 /// A `ConfiguredNodeStatus` beside the configuration it holds a reference to.
@@ -308,7 +310,8 @@ struct Fixture
                                       .scheduler = direct.scheduler,
                                       .enrollment = direct.enrollment,
                                       .consensus = direct.consensus,
-                                      .conditions = direct.conditions } }
+                                      .conditions = direct.conditions,
+                                      .sharedCache = direct.sharedCache } }
     {
     }
 
@@ -1460,4 +1463,52 @@ TEST_CASE("A leader with an armed window reports auto-approve and the seconds le
     auto const armed = node.status.Describe().runtime;
     CHECK(armed.enrollment == std::optional { Wire::WireEnrollmentState::AutoApprove });
     CHECK(armed.enrollmentAutoApproveSecondsLeft == std::optional<std::uint64_t> { 600 });
+}
+
+namespace
+{
+
+/// A shared-cache status that reports one fixed record.
+class FixedSharedStatus final: public ISharedCacheStatusSource
+{
+  public:
+    [[nodiscard]] Wire::SharedCacheStatusFields Report() const override
+    {
+        return fields;
+    }
+
+    [[nodiscard]] Wire::SharedCacheStatusFields ReportFor(SharedCacheTarget const& /*target*/) const override
+    {
+        return fields;
+    }
+
+    Wire::SharedCacheStatusFields fields; ///< What `Report()` answers.
+};
+
+} // namespace
+
+TEST_CASE("A node reports the shared cache its status source describes, and nothing when none is wired",
+          "[node][status][shared-cache]")
+{
+    core::platform::ManualClock clock;
+    FixedSharedStatus shared;
+    shared.fields = Wire::SharedCacheStatusFields { .source = Wire::WireSharedCacheSource::Setting,
+                                                    .machineId = "cache-c",
+                                                    .endpoint = "10.0.0.3:6674",
+                                                    .state = Wire::WireSharedCacheState::Unreachable,
+                                                    .detail = "connection refused" };
+    Fixture const wired { {}, clock, { .cacheTier = true }, std::nullopt, DirectSources { .sharedCache = &shared } };
+    CHECK(wired.status.Describe().runtime.sharedCache == std::optional { shared.fields });
+
+    // Asked per request: a report that moved shows on the next answer, and survives the wire.
+    shared.fields.state = Wire::WireSharedCacheState::Proven;
+    auto const fields = wired.status.Describe();
+    CHECK(Unwrap(fields.runtime.sharedCache).state == Wire::WireSharedCacheState::Proven);
+    auto const decoded = Wire::DecodeNodeStatus(Wire::EncodeNodeStatus(fields));
+    REQUIRE(decoded.has_value());
+    CHECK(Unwrap(decoded).runtime.sharedCache == fields.runtime.sharedCache);
+
+    // Nothing wired is ABSENT -- a sender too old to say -- never a `none` it did not state.
+    Fixture const bare { {}, clock, { .cacheTier = true } };
+    CHECK_FALSE(bare.status.Describe().runtime.sharedCache.has_value());
 }

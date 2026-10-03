@@ -15,8 +15,9 @@
 #                   allow without a count would accept.
 #
 # And the opposite direction, which is how a guard gets deleted rather than fixed:
-# `prose` (a comment spelling the cast) and `plural` (a cast of `counters.size()`, a
-# different name) must both be accepted.
+# `prose` (a comment spelling the cast), `plural` (a cast of `counters.size()`, a
+# different name) and `adjacent` (a cast whose TABLE row names a counter after the cast
+# closes) must all be accepted.
 #
 # Runs as `cmake -P`. See `check-script-check-signals.cmake` for why such a check
 # reports failure through its OUTPUT rather than an exit code.
@@ -210,6 +211,35 @@ if(NOT objected)
 else()
     fastcached_expect_phrase("nosources" "${output}" "no source file"
         "it refused, but not as a walk that found no source")
+endif()
+
+# 11. A name AFTER the cast's closing parenthesis is not its operand. The overstating shape
+#     this check shipped with: an outcome indexes a table whose ROW names a counter.
+math(EXPR cases "${cases} + 1")
+fastcached_make_tree("adjacent" "${converterBody}" "apps/fastcache-compile-node/SharedCacheSession.cpp"
+    "    if (auto const& counter = NamedDialCounters[static_cast<std::size_t>(named.session.outcome)].counter\; counter.has_value())" tree)
+fastcached_run_check("${tree}" objected output)
+if(objected)
+    list(APPEND failures "adjacent: a cast of an outcome followed by a .counter member was refused -- the operand ran past the cast's closing parenthesis, and the check overstates what is wrong")
+endif()
+
+# 12. Balanced, not merely closed at the first `)`: a counter AFTER a nested call's closing
+#     parenthesis is still the operand, and an operand ended at the first `)` would miss it.
+math(EXPR cases "${cases} + 1")
+fastcached_make_tree("nested" "${converterBody}" "FastCache/Metrics/StatsReading.cpp"
+    "reading.counters[static_cast<std::size_t>(Base(reading) + row.counter)] = 1\;" tree)
+fastcached_run_check("${tree}" objected output)
+if(NOT objected)
+    list(APPEND failures "nested: a counter cast through a nested call was accepted -- the operand ended at the first closing parenthesis rather than its own")
+endif()
+
+# 13. Every cast on the line is asked, not only the first.
+math(EXPR cases "${cases} + 1")
+fastcached_make_tree("second" "${converterBody}" "FastCache/Metrics/StatsReading.cpp"
+    "auto const pair = static_cast<int>(outcome) + static_cast<int>(row.counter)\;" tree)
+fastcached_run_check("${tree}" objected output)
+if(NOT objected)
+    list(APPEND failures "second: a counter cast after an unrelated cast on the same line was accepted -- only the first cast was asked")
 endif()
 
 # ---------------------------------------------------------------------------

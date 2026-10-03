@@ -31,6 +31,26 @@ Every rule below has already been a bug.
   is deliberately **no handshake**, because the launcher opens a fresh connection
   per *operation* and a HELLO would cost 2–4 round trips per translation unit on
   the exact path this list already records regressions on.
+- **On a SEALED connection, a refusal decided from a header whose tag has not been
+  read is a sealed reply and then a CLOSE, never a resynchronization** -- the one
+  exception to the rule above, and it is not a relaxation of it. That rule's premise
+  is that a declared length leaves both ends agreeing where the next frame starts.
+  On a sealed stream the tag FOLLOWS the payload, so a header refused before its
+  frame is gathered (`SealFault::OverBudget`: the in-flight budget has no room for
+  it) carries a length nobody verified. Stepping over that many bytes would let
+  whoever wrote the header -- an on-path writer holding no session key -- choose
+  the next frame boundary and so the sequence position every later tag is checked
+  at, which is exactly what the seal exists to deny ("a proof is worth nothing
+  unless every frame after it is SEALED"). So `AnswerSealedOverBudget`
+  (`FrameEndpoint.cpp`) writes the verb owner's `EndpointRefusalReply(InFlightBudget)`
+  -- the budget owner's when nothing owns the verb, since the verb is as unverified as
+  the length -- sealed, and the connection ends: an honest peer still reads *busy* as an unsealed
+  one does, for the price of one re-proof. Its case is *"A sealed frame the in-flight
+  budget has no room for is answered busy and never held"*. **Do not "fix" this
+  close into a resync to match the rule above**: that turns a refusal into a
+  frame-boundary oracle for an attacker. Every other seal fault (a bad tag, a
+  replay, an oversized or unframed header) closes UNANSWERED, because there the
+  frame is not known to be the peer's at all.
 - **A reply is one frame per request, and `Status::Progress` is the first of two exceptions --
   bounded to exactly one verb, carrying nothing, and paid for with a version step.** The
   second is `Status::Push`, below, bounded the same way.
@@ -615,6 +635,9 @@ Every rule below has already been a bug.
     is that the symptom names the wrong subject.
   - **A `RelocatedVerbs` row**, saying which code and which sentence. `DispatchNotPermitted`
     for a verb another binary serves; `NoCluster` only for one asking about replicated state.
+    A refusal DERIVED from data that already names the verb is that row's equivalent, not a
+    special case: `CacheProxy` refuses a verb another cache tier's `CacheTierProfile` serves as
+    `DispatchNotPermitted`, computed from the profiles, because a row per verb would restate them.
     Admission is a property of the PROCESS being asked, so a client told `NoCluster` goes
     looking for consensus it does not need. The generic walk only asserts the refusal is not
     `UnknownOpcode`, so the case that asserts WHICH refusal is a second one.

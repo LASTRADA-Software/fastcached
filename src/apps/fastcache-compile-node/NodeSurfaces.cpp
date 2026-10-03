@@ -668,6 +668,11 @@ ServedSurfaces NodeServedSurfacesFor(NodeConfig const& cfg)
         // counters read absent rather than as a node that never yielded. The wiring makes this the
         // condition it constructs the controller under.
         Row { .surface = MetricsSurface::NodeFormation, .served = false },
+        // Always: the fleet cache verbs sit on the same merged listener as `NodeFrameEndpoint`
+        // above, so every node that starts builds the component that answers them -- serving,
+        // when the `shared-cache` setting names this machine, or refusing `not-shared-cache`
+        // otherwise. A dormant node still moves the refusal counters, so it can move these too.
+        Row { .surface = MetricsSurface::NodeSharedCache, .served = true },
     };
     static_assert(rows.size() == EnumeratorCount<MetricsSurface>,
                   "every MetricsSurface needs a row here: a surface omitted is answered 'not "

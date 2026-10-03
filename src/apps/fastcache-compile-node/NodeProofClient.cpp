@@ -8,8 +8,14 @@
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <algorithm>
+#include <cstddef>
+#include <expected>
 #include <format>
 #include <utility>
+#include <vector>
+
+#include <core/async/SyncRun.hpp>
+#include <core/async/Task.hpp>
 
 namespace FastCache::Node
 {
@@ -29,86 +35,154 @@ namespace
 
     /// The attempt a refused exchange amounts to.
     /// @param outcome What the exchange answered.
+    /// @param standing What the trust said about the server, when it was asked before the exchange.
     /// @return `NotOffered` for a peer that serves no proof, `Refused` otherwise, with its words.
-    [[nodiscard]] NodeProofAttempt Unproved(Cc::CacheOutcome const& outcome)
+    [[nodiscard]] NodeProofAttempt Unproved(Cc::CacheOutcome const& outcome,
+                                            std::optional<ServerStanding> standing = std::nullopt)
     {
         auto const offered = !(outcome.kind == Cc::CacheOutcomeKind::Rejected && SaysNoProofHere(outcome.code));
         return NodeProofAttempt { .result = offered ? NodeProofResult::Refused : NodeProofResult::NotOffered,
-                                  .reason = Cc::DescribeOutcome(outcome) };
+                                  .reason = Cc::DescribeOutcome(outcome),
+                                  .standing = standing };
     }
 
-    /// What this machine says about a server it will not prove itself to.
-    /// @param standing Why.
-    /// @param serverId Who the server said it is.
-    /// @return The sentence.
-    [[nodiscard]] std::string DescribeUntrusted(ServerStanding standing, std::string_view serverId)
+    /// Who is proving, borrowed from the client for one handshake.
+    ///
+    /// Pointers rather than references, as for every coroutine parameter here: this travels into
+    /// `Challenge` by value, and a reference member would be the borrow the reference-parameter rule
+    /// refuses, passed in by another route.
+    struct Prover
     {
-        if (standing == ServerStanding::Revoked)
-            return std::format("{} signed with a key this cluster REVOKED: it is a machine the cluster forgot, and this "
-                               "node proves nothing to it. Drop it from --scheduler",
-                               serverId);
-        return std::format("{} signed with a key that is no voter's in the roster this node holds, so this node proves "
-                           "nothing to it: a --scheduler that names a machine which is not, or no longer, a voter",
-                           serverId);
+        std::string_view nodeId;   ///< The id it proves.
+        Ed25519KeyPair const* key; ///< Its identity key pair; not owned.
+        ISecureRandom* random;     ///< Where the handshake's nonce and ephemeral key come from; not owned.
+    };
+
+    /// What the challenge settled that the proof exchange needs, and nothing else.
+    struct ProofStep
+    {
+        std::vector<std::byte> frame;      ///< The proof, framed.
+        Distributed::NodeSessionKeys keys; ///< What seals the connection in each direction.
+        ServerStanding standing;           ///< What the trust said about the server.
+    };
+
+    /// Open the handshake, read the server's signed challenge, and decide whether to answer it.
+    ///
+    /// Its own coroutine so that the opening -- the nonce, the ephemeral secret, the request and the
+    /// server's reply -- ends here, and only the proof, the keys and the standing cross the proof
+    /// exchange that follows.
+    /// @param prover Who is proving; what it borrows must outlive the coroutine.
+    /// @param peer The connection; not owned.
+    /// @param notice Where an unwanted credential is reported; not owned. The handshake presents none.
+    /// @param trust Whom the prover may prove itself to; not owned.
+    /// @return The step, or the attempt the handshake ended as.
+    [[nodiscard]] core::async::Task<std::expected<ProofStep, NodeProofAttempt>> Challenge(Prover prover,
+                                                                                          SealedFrameSocket* peer,
+                                                                                          Cc::CredentialNotice* notice,
+                                                                                          IServerTrust const* trust)
+    {
+        // `nonce` and `ephemeral`, and `request` built from them, are held across the challenge's
+        // `co_await`, and the first two are call results: the shape MSVC 19.44 for ARM64 miscompiled
+        // in #1545, keeping such a result on the resume function's stack. The rulebook's remedy is to
+        // compute the value after the await, and it cannot apply here: the nonce and the ephemeral
+        // key are what the challenge SENDS, and the reply is checked and the session key agreed
+        // against them afterwards, so neither can be drawn later or drawn again. The pin is the
+        // `[proof]` cases on the `windows-11-arm` `cl-release` leg, which runs `ctest`: a draw read
+        // back from a later activation's stack fails the signature check or the seal there. That leg
+        // is NON-BINDING -- a failure on it stops no merge -- so the pin is a signal someone must read,
+        // not a gate.
+        auto const nonce = DrawNonce(*prover.random);
+        auto ephemeral = Distributed::DrawNodeEphemeral(*prover.random);
+        if (!nonce.has_value() || !ephemeral.has_value())
+            co_return std::unexpected { NodeProofAttempt {
+                .result = NodeProofResult::Refused,
+                .reason = std::format("this node cannot draw a handshake from its random source: {}",
+                                      (nonce.has_value() ? ephemeral.error() : nonce.error()).ToString()),
+                .standing = std::nullopt,
+            } };
+
+        auto request = Wire::NodeChallengeRequest {};
+        std::ranges::copy(*nonce, request.nonce.begin());
+        std::ranges::copy(ephemeral->publicKey, request.ephemeral.begin());
+
+        auto const challenged = co_await Cc::ExchangeFramed(peer, notice, Wire::EncodeNodeChallenge(request));
+        if (!challenged.IsHit())
+            co_return std::unexpected { Unproved(challenged) };
+
+        // Exact widths are the decoder's rule: a field silently truncated would have both ends sign
+        // different inputs, and the refusal would read as a forgery for a version mismatch.
+        auto const reply = Wire::DecodeNodeChallengeReply(challenged.value);
+        if (!reply.has_value())
+            co_return std::unexpected { NodeProofAttempt {
+                .result = NodeProofResult::Refused,
+                .reason = "the server answered a challenge this build cannot read",
+                .standing = std::nullopt,
+            } };
+
+        // The server's signature under the key it named FIRST, and whether that key is one to trust
+        // second -- so a server that cannot sign is told apart from one this node will not talk to.
+        if (!Distributed::VerifyNodeChallengeReply(request, *reply))
+            co_return std::unexpected { NodeProofAttempt {
+                .result = NodeProofResult::Untrusted,
+                .reason = std::format("{}'s signature does not verify under the key it named", reply->serverId),
+                .standing = std::nullopt,
+            } };
+
+        auto serverKey = Ed25519PublicKey {};
+        std::ranges::copy(reply->serverKey, serverKey.begin());
+        auto const standing = trust->StandingOf(reply->serverId, serverKey);
+        auto const expected = trust->Expected();
+        if (auto const& row = ServerStandingTable[static_cast<std::size_t>(standing)]; !row.provesTo)
+            co_return std::unexpected { NodeProofAttempt {
+                .result = NodeProofResult::Untrusted,
+                .reason = std::vformat(row.refusal, std::make_format_args(reply->serverId, expected)),
+                .standing = standing,
+            } };
+
+        auto keys =
+            Distributed::DeriveNodeSessionKeys(ephemeral->secret, request, *reply, prover.nodeId, /*callerSide=*/true);
+        if (!keys.has_value())
+            co_return std::unexpected { NodeProofAttempt {
+                .result = NodeProofResult::Untrusted,
+                .reason = std::format("{}'s ephemeral key agrees no session key", reply->serverId),
+                .standing = standing,
+            } };
+
+        co_return ProofStep {
+            .frame = Wire::EncodeProveNode(Distributed::MintNodeProof(*prover.key, prover.nodeId, request, *reply)),
+            .keys = *std::move(keys),
+            .standing = standing,
+        };
     }
 } // namespace
 
-NodeProofAttempt NodeProofClient::Prove(SealedFrameSocket& peer) const
+core::async::Task<NodeProofAttempt> NodeProofClient::ProveAsync(SealedFrameSocket* peer, IServerTrust const* trust) const
 {
-    auto const nonce = DrawNonce(_random);
-    auto ephemeral = Distributed::DrawNodeEphemeral(_random);
-    if (!nonce.has_value() || !ephemeral.has_value())
-        return NodeProofAttempt {
-            .result = NodeProofResult::Refused,
-            .reason = std::format("this node cannot draw a handshake from its random source: {}",
-                                  (nonce.has_value() ? ephemeral.error() : nonce.error()).ToString()),
-        };
-
-    auto request = Wire::NodeChallengeRequest {};
-    std::ranges::copy(*nonce, request.nonce.begin());
-    std::ranges::copy(ephemeral->publicKey, request.ephemeral.begin());
-
-    auto const challenged = Cc::ExchangeWithScheduler(peer, Wire::EncodeNodeChallenge(request));
-    if (!challenged.IsHit())
-        return Unproved(challenged);
-
-    // Exact widths are the decoder's rule: a field silently truncated would have both ends sign
-    // different inputs, and the refusal would read as a forgery for a version mismatch.
-    auto const reply = Wire::DecodeNodeChallengeReply(challenged.value);
-    if (!reply.has_value())
-        return NodeProofAttempt { .result = NodeProofResult::Refused,
-                                  .reason = "the server answered a challenge this build cannot read" };
-
-    // The server's signature under the key it named FIRST, and whether that key is one to trust
-    // second -- so a server that cannot sign is told apart from one this node will not talk to.
-    if (!Distributed::VerifyNodeChallengeReply(request, *reply))
-        return NodeProofAttempt { .result = NodeProofResult::Untrusted,
-                                  .reason = std::format("{}'s signature does not verify under the key it named",
-                                                        reply->serverId) };
-
-    auto serverKey = Ed25519PublicKey {};
-    std::ranges::copy(reply->serverKey, serverKey.begin());
-    if (auto const standing = _trust.StandingOf(reply->serverId, serverKey);
-        standing == ServerStanding::NotVoter || standing == ServerStanding::Revoked)
-        return NodeProofAttempt { .result = NodeProofResult::Untrusted,
-                                  .reason = DescribeUntrusted(standing, reply->serverId) };
-
-    auto keys = Distributed::DeriveNodeSessionKeys(ephemeral->secret, request, *reply, _nodeId, /*callerSide=*/true);
-    if (!keys.has_value())
-        return NodeProofAttempt { .result = NodeProofResult::Untrusted,
-                                  .reason = std::format("{}'s ephemeral key agrees no session key", reply->serverId) };
+    // Silent and never consulted: a notice reports a credential the peer ignored, and a proof
+    // presents none -- the proof IS this machine's credential (`Cc::ExchangeWithScheduler`'s rule).
+    // Held in this frame, so it outlives every suspension below.
+    auto notice = Cc::CredentialNotice::Silent();
+    auto step = co_await Challenge(Prover { .nodeId = _nodeId, .key = &_key, .random = &_random }, peer, &notice, trust);
+    if (!step.has_value())
+        co_return std::move(step).error();
 
     // The server answers the proof SEALED, whatever it decides, so the receiving seal is engaged
     // before the proof leaves; the sending one only once the answer has verified, since the proof
     // itself travels in the clear.
-    peer.SealReceiving(std::move(keys->serverToCaller));
-    auto const proved =
-        Cc::ExchangeWithScheduler(peer, Wire::EncodeProveNode(Distributed::MintNodeProof(_key, _nodeId, request, *reply)));
+    peer->SealReceiving(std::move(step->keys.serverToCaller));
+    auto const proved = co_await Cc::ExchangeFramed(peer, &notice, std::move(step->frame));
     if (!proved.IsHit())
-        return Unproved(proved);
+        co_return Unproved(proved, step->standing);
 
-    peer.SealSending(std::move(keys->callerToServer));
-    return NodeProofAttempt { .result = NodeProofResult::Proved, .reason = {} };
+    peer->SealSending(std::move(step->keys.callerToServer));
+    co_return NodeProofAttempt { .result = NodeProofResult::Proved, .reason = {}, .standing = step->standing };
+}
+
+NodeProofAttempt NodeProofClient::Prove(SealedFrameSocket& peer) const
+{
+    // The presence round runs on a thread that may block, over a blocking socket: `syncRun` is sound
+    // there and nowhere else. The shared-cache leg runs on the reactor and awaits `ProveAsync`.
+    return core::async::syncRun(ProveAsync(&peer, &_trust));
 }
 
 } // namespace FastCache::Node

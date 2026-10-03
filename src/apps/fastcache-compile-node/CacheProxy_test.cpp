@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProxy.hpp"
+#include "PrivateTierProfile.hpp"
 #include "Responders.hpp"
+#include "SharedTierProfile.hpp"
 
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/CompileCache/CompileValue.hpp>
@@ -20,6 +22,7 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <core/async/SyncRun.hpp>
@@ -49,16 +52,39 @@ namespace
     return out;
 }
 
+/// The words a refusal carries.
+///
+/// Two refusals on this surface share `DispatchNotPermitted` -- a twin tier's verb and another
+/// port's verb -- so a case asserting WHICH refusal it got reads the sentence as well as the code.
+/// @param reply The reply bytes.
+/// @return The refusal's message.
+[[nodiscard]] std::string RefusalWordsOf(std::span<std::byte const> reply)
+{
+    auto const decoded = Wire::DecodeErrorPayload(PayloadOf(reply));
+    REQUIRE(decoded.has_value());
+    return std::string { Unwrap(decoded).second };
+}
+
 /// A node cache with nothing behind it, which is the single-machine shape.
+///
+/// The private tier unless a case names another: `Fixture fix;` builds what every node has, and
+/// `Fixture fix { .profile = SharedTierProfile };` the fleet's shared tier over the same code.
 struct Fixture
 {
     // Field order is the analyzer's rather than the reading order; see
-    // `LocalCache_test` for why a test fixture's padding is worth caring about.
+    // `LocalCache_test` for why a test fixture's padding is worth caring about. `profile` sits
+    // after `local` for that reason, which a designated initializer is free to name.
+    //
+    // Every member without a constructor argument is braced, because naming `profile` is
+    // aggregate initialization: each member it does not name is copy-list-initialized from its
+    // default member initializer, or from `{}` when it has none -- which `ManualClock`'s explicit
+    // default constructor refuses, and which the missing-field warning reports for the rest.
     InMemoryLruStorage local { 64 * 1024 };
-    NoUpstream upstream;
-    core::platform::ManualClock clock;
-    AtomicMetricsSink metrics;
-    LocalCache cache { local, upstream, clock, metrics };
+    CacheTierProfile const& profile { PrivateTierProfile };
+    NoUpstream upstream {};
+    core::platform::ManualClock clock {};
+    AtomicMetricsSink metrics {};
+    LocalCache cache { local, upstream, clock, metrics, profile };
     CacheProxy proxy { cache, metrics };
 };
 
@@ -718,4 +744,146 @@ TEST_CASE("(#1276) a drop from another machine is refused before it removes anyt
         StatusOf(core::async::syncRun(responder.Answer(Wire::EncodeCacheDrop("victim"), PeerIdentity { .host = "10.0.0.7" }))
                      .bytes)
         == Wire::Status::Miss);
+}
+
+TEST_CASE("A tier answers its own verb pair and refuses its twin's", "[node][cache][shared-cache]")
+{
+    Fixture fix { .profile = SharedTierProfile };
+    CompileValue value;
+    value.objectBlob = Bytes("OBJECT");
+    auto const request = Wire::StoreRequest {
+        .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = EncodeCompileValue(value)
+    };
+    CHECK(StatusOf(core::async::syncRun(fix.proxy.Answer(Wire::EncodeStoreAs(Wire::FleetSharedCacheVerbs, request))))
+          == Wire::Status::Ok);
+    CHECK(StatusOf(core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetchAs(Wire::FleetSharedCacheVerbs, "k"))))
+          == Wire::Status::Ok);
+    // The private verbs reaching the shared tier are refused, never served: the router never sends
+    // them here, and a tier that answered them would be a second door to the fleet's objects. The
+    // code says *served elsewhere*, and the words say WHERE -- the other tier, not another port.
+    for (auto const& frame: { Wire::EncodeFetch("k"), Wire::EncodeCacheDrop("k") })
+    {
+        auto const reply = core::async::syncRun(fix.proxy.Answer(frame));
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::DispatchNotPermitted);
+        CHECK(RefusalWordsOf(reply).contains("other cache tier"));
+    }
+}
+
+TEST_CASE("The shared tier canonicalizes a stored value against the producer's roots", "[node][cache][shared-cache]")
+{
+    // The reason the shared tier reuses this class: the fleet's cache is where one machine's
+    // object is replayed by another, so a region still naming the PRODUCER's checkout would hand
+    // every consumer dependencies on files it will never edit (#319). Driven through the fleet
+    // verbs with non-empty roots, both of them, so a shared path that skipped the rewrite -- or
+    // rewrote only the source root -- is seen here rather than in somebody's build graph.
+    Fixture fix { .profile = SharedTierProfile };
+
+    CompileValue value;
+    value.objectBlob = Bytes("OBJECT");
+    value.textRegions.push_back({ .grammar = PathCanon::Grammar::ShowIncludes,
+                                  .bytes = "Note: including file: /producer/src/dep.hpp\n"
+                                           "Note: including file: /producer/build/gen/cfg.hpp\n" });
+
+    auto const stored = core::async::syncRun(
+        fix.proxy.Answer(Wire::EncodeStoreAs(Wire::FleetSharedCacheVerbs,
+                                             Wire::StoreRequest { .key = "k-shared-canon",
+                                                                  .prefetchGroup = {},
+                                                                  .srcRoot = "/producer/src",
+                                                                  .buildTree = "/producer/build",
+                                                                  .value = EncodeCompileValue(value) })));
+    REQUIRE(StatusOf(stored) == Wire::Status::Ok);
+
+    auto const fetched =
+        core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetchAs(Wire::FleetSharedCacheVerbs, "k-shared-canon")));
+    REQUIRE(StatusOf(fetched) == Wire::Status::Ok);
+    auto const decoded = DecodeCompileValue(PayloadOf(fetched));
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->textRegions.size() == 1);
+
+    CHECK(decoded->textRegions.front().bytes
+          == "Note: including file: <SRCROOT>/dep.hpp\n"
+             "Note: including file: <BUILDTREE>/gen/cfg.hpp\n");
+    CHECK_FALSE(decoded->textRegions.front().bytes.contains("/producer/"));
+    CHECK(decoded->objectBlob == Bytes("OBJECT"));
+}
+
+TEST_CASE("A tier's refusals move its own series and never its twin's", "[node][cache][shared-cache][metrics]")
+{
+    // The refusal rows are functions of the tier, so the shared tier's version skew, bad body and
+    // foreign generation rise on the `NodeSharedCache*` series. Asserted over the whole counter
+    // vector, for `AllCounters`'s reason: a check on the one row passes with the neighbouring
+    // private-tier row moving beside it.
+    auto const store = [](std::vector<std::byte> value) {
+        return Wire::EncodeStoreAs(
+            Wire::FleetSharedCacheVerbs,
+            Wire::StoreRequest {
+                .key = "k", .prefetchGroup = {}, .srcRoot = "/src", .buildTree = "/build", .value = std::move(value) });
+    };
+
+    SECTION("a version this build cannot decode")
+    {
+        Fixture fix { .profile = SharedTierProfile };
+        auto const before = AllCounters(fix.metrics);
+        auto const reply = core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetchAs(
+            Wire::FleetSharedCacheVerbs, "k", static_cast<Wire::WireVersion>(Wire::CurrentVersion + 1))));
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::UnsupportedVersion);
+        CHECK(Moved(before, AllCounters(fix.metrics))
+              == Only(IMetricsSink::Counter::NodeSharedCacheRequestsRefusedUnsupportedVersion));
+    }
+
+    SECTION("a body that will not decode")
+    {
+        // The declared length matches the bytes sent, so this is a malformed BODY rather than a
+        // truncated frame, which answers the same code and moves nothing.
+        Fixture fix { .profile = SharedTierProfile };
+        std::vector<std::byte> frame(Wire::RequestHeaderSize + 2);
+        WireFrame::PutHeader(
+            frame, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(Wire::FleetSharedCacheVerbs.fetch), 2);
+        frame[Wire::RequestHeaderSize] = std::byte { 0xFF };
+        frame[Wire::RequestHeaderSize + 1] = std::byte { 0xFF };
+
+        auto const before = AllCounters(fix.metrics);
+        CHECK(ErrorOf(core::async::syncRun(fix.proxy.Answer(frame))) == Wire::ErrorCode::MalformedFrame);
+        CHECK(Moved(before, AllCounters(fix.metrics))
+              == Only(IMetricsSink::Counter::NodeSharedCacheRequestsRefusedMalformedPayload));
+    }
+
+    SECTION("a stored value of another generation")
+    {
+        Fixture fix { .profile = SharedTierProfile };
+        auto const before = AllCounters(fix.metrics);
+        auto const reply = core::async::syncRun(fix.proxy.Answer(store(Testing::ForeignGenerationValue())));
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::ForeignValueGeneration);
+        CHECK(Moved(before, AllCounters(fix.metrics))
+              == Only(IMetricsSink::Counter::NodeSharedCacheRequestsRefusedForeignGeneration));
+    }
+
+    SECTION("and the twin's verbs move nothing, like every other arm a peer cannot reach")
+    {
+        Fixture fix { .profile = SharedTierProfile };
+        auto const before = AllCounters(fix.metrics);
+        CHECK(ErrorOf(core::async::syncRun(fix.proxy.Answer(Wire::EncodeStore(Wire::StoreRequest {
+                  .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = Bytes("OBJECT") }))))
+              == Wire::ErrorCode::DispatchNotPermitted);
+        CHECK(Moved(before, AllCounters(fix.metrics)).empty());
+    }
+}
+
+TEST_CASE("The private tier refuses the shared tier's verbs as its twin's", "[node][cache][shared-cache]")
+{
+    // The other direction of the pair: the private tier answers exactly FETCH, STORE and
+    // CACHE-DROP, and a fleet verb reaching it is refused as served elsewhere, naming the other
+    // tier -- never `UnimplementedVerb`, which a client reads as a build too old to know the verb.
+    Fixture fix;
+    auto const request =
+        Wire::StoreRequest { .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = Bytes("OBJECT") };
+    for (auto const& frame: { Wire::EncodeStoreAs(Wire::FleetSharedCacheVerbs, request),
+                              Wire::EncodeFetchAs(Wire::FleetSharedCacheVerbs, "k") })
+    {
+        auto const reply = core::async::syncRun(fix.proxy.Answer(frame));
+        CHECK(ErrorOf(reply) == Wire::ErrorCode::DispatchNotPermitted);
+        CHECK(RefusalWordsOf(reply).contains("other cache tier"));
+    }
+    // Nothing was stored through the refused verb.
+    CHECK(StatusOf(core::async::syncRun(fix.proxy.Answer(Wire::EncodeFetch("k")))) == Wire::Status::Miss);
 }

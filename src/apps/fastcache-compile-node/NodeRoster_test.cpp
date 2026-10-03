@@ -156,6 +156,8 @@ TEST_CASE("A consensus member places a server only once its applied state names 
     auto& node = *Testing::Unwrap(roster);
 
     CHECK(node.StandingOf("n1", TestKeyPair("n1").PublicKey()) == ServerStanding::Unchecked);
+    // What a refusal says this node expected: a scheduler is any voter, never one id.
+    CHECK(node.Expected() == "a voter");
 
     Cluster::ClusterState state;
     state.members = { Cluster::ClusterMember { .id = "n1",

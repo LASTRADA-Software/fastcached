@@ -12,6 +12,7 @@
 #include "NodeSurfaces.hpp"
 #include "SchedulerTier.hpp"
 #include "SessionResponder.hpp"
+#include "SharedCacheResponder.hpp"
 #include "WorkerTier.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
@@ -32,7 +33,8 @@ SurfaceComponents ComposeSurfaceComponents(CacheTier* cache,
                                            FleetTextResponder& fleet,
                                            NodeProofResponder* nodeProof,
                                            FleetSummaryResponder* formation,
-                                           SessionResponder& session) noexcept
+                                           SessionResponder& session,
+                                           SharedCacheService& sharedCache) noexcept
 {
     // Designated, so the NAME travels with each pointer: two of these are one family's owner
     // placed in another's slot otherwise, and a transposed pair routes every cache verb to the
@@ -50,7 +52,8 @@ SurfaceComponents ComposeSurfaceComponents(CacheTier* cache,
                                // the node-proof family `NoCluster`.
                                .nodeProof = nodeProof,
                                .formation = formation,
-                               .session = &session };
+                               .session = &session,
+                               .sharedCache = &sharedCache.Responder() };
 }
 
 std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
@@ -116,6 +119,15 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
         logger.Logf(LogLevel::Info, "no component answers any verb family; serving no 0xFC port");
         return std::unique_ptr<NodeFrameSurface> {};
     }
+    // Refused BY NAME rather than served: a family every built node answers, left unrouted, is
+    // answered `UnimplementedVerb` -- *this node is too old* -- to every client that asks, with
+    // nothing to say the node was assembled wrong. The operator families and the fleet's shared
+    // cache are such families, and this is the one place `main`'s routing of them is asked.
+    if (auto const* const missing = MissingEveryNodeOwner(components); missing != nullptr)
+        return std::unexpected { std::format(
+            "the 0xFC listener was assembled without its {} component, which every built node serves; this is a "
+            "defect in how this build wires its surfaces, not in its configuration",
+            missing->component) };
     // Asked BEFORE the row, because under activation the row answers about a flag
     // that configured nothing. An operator who enables the `.socket` unit and leaves
     // `--listen-node` empty has not asked for a closed port -- the unit is the port --

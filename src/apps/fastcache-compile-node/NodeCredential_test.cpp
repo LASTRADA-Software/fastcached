@@ -449,6 +449,12 @@ class AnyServer final: public IServerTrust
     {
         return ServerStanding::Voter;
     }
+
+    /// @copydoc IServerTrust::Expected
+    [[nodiscard]] std::string_view Expected() const override
+    {
+        return "a voter";
+    }
 };
 
 } // namespace

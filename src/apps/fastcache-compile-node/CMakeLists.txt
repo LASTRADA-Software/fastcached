@@ -92,6 +92,14 @@ add_executable(fastcache-compile-node
     LiveStatsSources.cpp
     FleetReadGate.cpp
     FleetTextResponder.cpp
+    SharedCacheTier.cpp
+    SharedCacheHost.cpp
+    SharedCacheResponder.cpp
+    SharedCacheDirectory.cpp
+    SharedCacheStatus.cpp
+    SharedCacheSession.cpp
+    SharedCacheUpstream.cpp
+    InProcessSharedUpstream.cpp
     ${_fc_node_shared}
 )
 target_include_directories(fastcache-compile-node PRIVATE
@@ -232,6 +240,21 @@ if(FASTCACHED_BUILD_TESTS)
         FleetReadGate_test.cpp
         MembershipGate_test.cpp
         FleetTextResponder_test.cpp
+        SharedCacheTier.cpp
+        SharedCacheHost.cpp
+        SharedCacheHost_test.cpp
+        SharedCacheResponder.cpp
+        SharedCacheResponder_test.cpp
+        SharedCacheDirectory.cpp
+        SharedCacheDirectory_test.cpp
+        SharedCacheStatus.cpp
+        SharedCacheStatus_test.cpp
+        SharedCacheSession.cpp
+        SharedCacheUpstream.cpp
+        SharedCacheUpstream_test.cpp
+        FleetSharedCache_test.cpp
+        InProcessSharedUpstream.cpp
+        InProcessSharedUpstream_test.cpp
         DocumentedCommandLines_test.cpp
         ${_fc_node_shared}
         # The CLI's reading of a `NodeMetrics` body and of a `/metrics` one, compiled in for the

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -28,6 +29,7 @@
 #include <span>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -266,6 +268,51 @@ struct TrackedConnection
     std::chrono::milliseconds window { 0 };
 };
 
+/// Charges what a sealing layer holds before it can check a tag to the surface's in-flight budget.
+///
+/// **The same budget, not a second one**: a sealed frame is held WHOLE before its header reaches
+/// the endpoint, so without this a proven peer could park `MaxRequestBytes()` per connection
+/// outside the budget -- which since every node serves the fleet's shared cache is 256 MiB on every
+/// node. A compare-and-swap rather than the endpoint's load-then-add, because a refusal here has
+/// no reply to race with: it must not let two frames both see room that only one of them has.
+class SealedFrameCharge final: public ISealedFrameBudget
+{
+  public:
+    /// @param inFlight The surface's in-flight byte count; must outlive this.
+    /// @param responder The surface, whose `MaxInFlightBytes()` is the ceiling; must outlive this.
+    SealedFrameCharge(std::atomic<std::size_t>& inFlight, IFrameResponder const& responder) noexcept:
+        _inFlight { inFlight },
+        _responder { responder }
+    {
+    }
+
+    /// @copydoc ISealedFrameBudget::TryHold
+    [[nodiscard]] bool TryHold(std::size_t bytes) noexcept override
+    {
+        auto const budget = _responder.MaxInFlightBytes();
+        auto held = _inFlight.load(std::memory_order_acquire);
+        // A `while` retrying a lost compare-and-swap, which no `for` head can state.
+        while (true)
+        {
+            // Zero is *no ceiling*, as the endpoint reads it.
+            if (budget != 0 && held + bytes > budget)
+                return false;
+            if (_inFlight.compare_exchange_weak(held, held + bytes, std::memory_order_acq_rel, std::memory_order_acquire))
+                return true;
+        }
+    }
+
+    /// @copydoc ISealedFrameBudget::Release
+    void Release(std::size_t bytes) noexcept override
+    {
+        _inFlight.fetch_sub(bytes, std::memory_order_acq_rel);
+    }
+
+  private:
+    std::atomic<std::size_t>& _inFlight;
+    IFrameResponder const& _responder;
+};
+
 struct FrameServer::State
 {
     NodeIoLoop& io;
@@ -311,6 +358,10 @@ struct FrameServer::State
 
     std::atomic<std::size_t> openConnections { 0 };
     std::atomic<std::size_t> inFlightBytes { 0 };
+
+    /// Where every connection's sealing layer charges a frame it holds before checking its tag:
+    /// `inFlightBytes`, against the surface's own ceiling. Declared after both it reads.
+    SealedFrameCharge sealedCharge { inFlightBytes, responder };
 
     /// How many of this server's own loops -- the accept loop and the sweeper --
     /// are still running.
@@ -918,8 +969,8 @@ namespace
         if (state.responder.NodeProver() == nullptr)
             return ConnectionSocket { .socket = std::shared_ptr<core::net::ISocket> { std::move(owned) },
                                       .sealing = nullptr };
-        auto sealed =
-            std::make_shared<SealedFrameSocket>(std::move(owned), SealedFrameEnd::Server, state.responder.MaxRequestBytes());
+        auto sealed = std::make_shared<SealedFrameSocket>(
+            std::move(owned), SealedFrameEnd::Server, state.responder.MaxRequestBytes(), &state.sealedCharge);
         auto* const sealing = sealed.get();
         return ConnectionSocket { .socket = std::move(sealed), .sealing = sealing };
     }
@@ -936,11 +987,45 @@ namespace
         if (sealing == nullptr)
             return;
         auto const fault = sealing->Fault();
-        if (!fault.has_value())
+        // Over budget is not KNOWN to be a broken seal -- its tag was never read -- and a surface
+        // already answered and counted it (`AnswerSealedOverBudget`), so counting it here as well
+        // would count one refusal twice.
+        if (!fault.has_value() || *fault == SealFault::OverBudget)
             return;
         state.metrics.Increment(IMetricsSink::Counter::NodeSealedFramesRefused);
         state.logger.Logf(
             LogLevel::Warn, "{}: closed a proven connection from {}: {}", state.what, peer, DescribeSealFault(*fault));
+    }
+
+    /// Tell a proven peer its sealed frame found no room in the in-flight budget, and let the
+    /// surface that owns the verb count it.
+    ///
+    /// **A reply and then a close**, where an unsealed frame over budget gets a reply and a
+    /// resynchronization: the frame was refused BEFORE it was held, so its tag was never checked,
+    /// and a sealed stream cannot be stepped over without checking one -- the next frame's position
+    /// in the sequence is the tag's. The verb is the unverified header's and chooses only which
+    /// surface answers; the answer goes out sealed, so only the key's holder can read it.
+    /// @param state The server state. A pointer, as every coroutine here takes it: a reference
+    ///        parameter to a coroutine is one the frame outlives the caller's knowledge of.
+    /// @param socket The connection.
+    /// @param sealing Its sealing layer, or null.
+    core::async::Task<void> AnswerSealedOverBudget(FrameServer::State* state,
+                                                   core::net::ISocket* socket,
+                                                   SealedFrameSocket const* sealing)
+    {
+        if (sealing == nullptr || sealing->Fault() != SealFault::OverBudget)
+            co_return;
+        auto const verb = sealing->RefusedVerb().value_or(std::uint8_t { 0xFF });
+        auto const reply = state->responder.EndpointRefusalReply(
+            EndpointRefusal::InFlightBudget,
+            verb,
+            std::format("{} has {} of {} bytes in flight, and a sealed frame of {} bytes is held whole before its seal "
+                        "can be checked",
+                        state->what,
+                        state->inFlightBytes.load(std::memory_order_acquire),
+                        state->responder.MaxInFlightBytes(),
+                        sealing->RefusedBytes()));
+        std::ignore = co_await WriteAll(EndpointWriter::Loop, socket, reply);
     }
 
     /// Encode the refusal a connection owes its peer after a sweep deferred to it.
@@ -2504,6 +2589,9 @@ namespace
         // Deregistered before the socket is destroyed, or the sweeper would hold a
         // pointer into a freed object.
         state->Untrack(socket.get());
+        // Answered before the close, and sealed like every frame after a proof: the peer is told
+        // what an unsealed one would be -- the surface is busy -- by the surface that owns the verb.
+        co_await AnswerSealedOverBudget(state, socket.get(), sealing);
         NoteSealFault(*state, sealing, socket->peerAddress());
         socket->close();
         co_return;
@@ -2818,6 +2906,11 @@ FrameEndpoint::~FrameEndpoint()
 std::size_t FrameEndpoint::InFlightBytes() const noexcept
 {
     return _server->InFlightBytes();
+}
+
+std::size_t FrameEndpoint::OpenConnections() const noexcept
+{
+    return _server->OpenConnections();
 }
 
 std::unique_ptr<FrameEndpoint> FrameEndpoint::StartWithListener(NodeIoLoop& io,

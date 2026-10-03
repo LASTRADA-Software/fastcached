@@ -437,6 +437,18 @@ Beside them, what that worker is offering and whether anyone knows about it:
   checks no grant reports none of them rather than a roster of nobody, and a consensus
   member reports `roster-certified-until` as absent: its roster is the state it applies
   and never lapses.
+- **`shared-cache`, `shared-cache-machine`, `shared-cache-endpoint`,
+  `shared-cache-state`, `shared-cache-detail`** — what this node reads through to, or
+  serves, as the fleet's shared cache. `shared-cache` says where that comes from:
+  `none`, `setting` (the fleet's `shared-cache` setting names another machine),
+  `override` (this node's `--upstream` wins, and the detail names the machine the
+  setting names, if any) or `this-machine` (the setting names this node, which serves
+  the tier at the endpoint it advertises). `shared-cache-state` is how the last attempt
+  went — `not-tried`, `proven`, `unresolved`, `wrong-key`, `unreachable`,
+  `proof-refused` — or, on the named machine, `serving` or `unavailable`, with the reason
+  in the detail. A node with no shared cache says `none`; only a node too old to report
+  it leaves `shared-cache` absent. A machine, endpoint or detail the node did not name
+  is absent rather than blank.
 
 **`conditions`** is what this node has detected that an operator must act on — each
 condition it raised, by its stable id, with **`latched`** or **`live`** beside it:

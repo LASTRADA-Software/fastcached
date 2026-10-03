@@ -50,6 +50,7 @@
 #include "SchedulerTier.hpp"
 #include "ScratchClaim.hpp"
 #include "SessionResponder.hpp"
+#include "SharedCacheResponder.hpp"
 #include "WorkerLease.hpp"
 #include "WorkerTier.hpp"
 
@@ -731,7 +732,52 @@ using Node::NodeReloader;
     // fallback -- it has no second moment for anything to arrive at.
     Node::ConfiguredCredential const credential { cfg, reloader };
 
-    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(nodeIo, cfg, credential, locality, cacheClock, metrics, logger);
+    // Where a node handshake's nonce and ephemeral key come from, on both ends: the operating
+    // system's generator (#1527). Its own instance rather than a share of `identityRandom`, which
+    // is a different lifetime -- an identity is minted once at startup and handshakes are drawn
+    // for as long as the process serves.
+    SystemSecureRandom proofRandom;
+
+    // **How this machine proves WHICH machine it is** (#178): its id, the identity key it holds,
+    // whom it may prove itself to as a scheduler's client -- the roster its grants are checked
+    // against -- and the generator above. Built wherever this node HOLDS an identity, not only
+    // where it names a scheduler: the fleet's shared cache is proved to with it too, from every
+    // node that has one. The presence tier still decides for itself whether it announces. Declared
+    // ABOVE the cache, worker and presence tiers, which borrow it.
+    std::optional<Node::NodeProofClient> prover;
+    if (identityKey.has_value())
+        prover.emplace(cfg.nodeId, *identityKey, *nodeRoster, proofRandom);
+
+    // The fleet's shared cache, built on EVERY node: dormant until the applied cluster state names
+    // this machine, when its host opens the tier on a thread of its own. Declared BEFORE the cache
+    // tier -- whose upstream reads its directory and borrows its host -- and before the surface
+    // that routes to it and the consensus tier that feeds it, so it is destroyed after all three.
+    // The first of those is enforced as well as ordered: an in-process upstream that outlived the
+    // host would end the process by name (`SharedCacheHost::Borrow`). Its condition is this node's
+    // to answer only where cluster state reaches it.
+    Node::SharedCacheService sharedCache { cfg,
+                                           membership.Oracle(),
+                                           cacheClock,
+                                           metrics,
+                                           logger,
+                                           AddressWhen(Node::RunsConsensus(cfg), conditions),
+                                           Node::ReconcileOn::OwnThread };
+
+    // What the private tier reads through to is chosen from these, by a table keyed on the kind:
+    // `--upstream` if typed, else the fleet's setting for a node with an identity, else nothing.
+    // Every one of them is declared above the tier and outlives it.
+    Node::UpstreamParts const upstreamParts { .upstream = cfg.upstream,
+                                              .credential = credential,
+                                              .directory = sharedCache.Directory(),
+                                              .prover = AddressOrNull(prover),
+                                              .io = nodeIo,
+                                              .clock = cacheClock,
+                                              .metrics = metrics,
+                                              .conditions = AddressWhen(Node::RunsConsensus(cfg), conditions),
+                                              .logger = logger,
+                                              .host = &sharedCache.Host() };
+
+    auto cacheTierOrRefusal = Node::StartCacheTierOrExplain(cfg, upstreamParts, locality, cacheClock, metrics, logger);
     if (!cacheTierOrRefusal.has_value())
     {
         // No flag prefix here, unlike its neighbours: this tier can fail over two
@@ -765,21 +811,6 @@ using Node::NodeReloader;
     auto const host = MakeSystemHostFacts();
     auto const capacity =
         Node::NodeCapacityOf(cfg, *host, Node::CacheCapacityOf(cacheTier.get()), Node::IndexReserveBytesOf(cacheTier.get()));
-
-    // Where a node handshake's nonce and ephemeral key come from, on both ends: the operating
-    // system's generator (#1527). Its own instance rather than a share of `identityRandom`, which
-    // is a different lifetime -- an identity is minted once at startup and handshakes are drawn
-    // for as long as the process serves.
-    SystemSecureRandom proofRandom;
-
-    // **How this machine proves WHICH machine it is to a scheduler** (#178): its id, the identity
-    // key it holds, whom it may prove itself to -- the roster its grants are checked against --
-    // and the generator above. Built wherever this node names a scheduler; `SchedulerNeedsIdentity`
-    // refuses a node that does so without an identity, so a serving node that announces always
-    // has one. Declared ABOVE the worker and presence tiers, which borrow it.
-    std::optional<Node::NodeProofClient> prover;
-    if (identityKey.has_value() && !cfg.schedulers.empty())
-        prover.emplace(cfg.nodeId, *identityKey, *nodeRoster, proofRandom);
 
     // The worker: survey, scratch root, lease check, slot cap, compile responder and
     // heartbeat, as one object (#1387). Built BELOW the cache tier, because the slots it
@@ -889,6 +920,16 @@ using Node::NodeReloader;
         statusClock, AddressWhen(servesEnrollment, conditions), &metrics, rosterWallClock
     };
 
+    // What `--node-status` says about the fleet's shared cache: the directory for where it is, the
+    // cache tier's fleet half for how reaching another machine went, the host for whether this one
+    // serves it, and the announced endpoint for where it does. Every one of them is declared above
+    // and outlives it; a node with no tier, or none reading through to the fleet, passes a null
+    // fleet half and still reports what it can.
+    Node::NodeSharedCacheStatus const sharedCacheStatus { sharedCache.Directory(),
+                                                          cacheTier != nullptr ? cacheTier->SharedCacheStatus() : nullptr,
+                                                          &sharedCache.Host(),
+                                                          announced };
+
     Node::ConfiguredNodeStatus const nodeStatus {
         cfg,
         statusClock,
@@ -931,7 +972,10 @@ using Node::NodeReloader;
                                    .conditions = &conditions,
                                    // Every node has one; one that holds no roster reports the
                                    // field ABSENT through it (#178).
-                                   .roster = nodeRoster.get() },
+                                   .roster = nodeRoster.get(),
+                                   // Every node has one, so a node with no shared cache says
+                                   // `none` rather than nothing.
+                                   .sharedCache = &sharedCacheStatus },
     };
 
     // The operator verbs. Declared BEFORE the surface that routes to it and therefore
@@ -1041,7 +1085,8 @@ using Node::NodeReloader;
                                                                        fleetTextResponder,
                                                                        AddressOrNull(nodeProofResponder),
                                                                        AddressOrNull(fleetSummaryResponder),
-                                                                       sessionResponder),
+                                                                       sessionResponder,
+                                                                       sharedCache),
                                         activated,
                                         metrics,
                                         logger,
@@ -1103,17 +1148,20 @@ using Node::NodeReloader;
     // Started AFTER the scheduler tier, because its observers push into it, and
     // declared after too, so it is destroyed first and cannot call into a tier that
     // has gone.
-    auto consensusOrRefusal =
-        Node::StartConsensusOrExplain(cfg,
-                                      schedulerTier,
-                                      nodeSurface != nullptr ? nodeSurface->BoundEndpoint() : std::string {},
-                                      identityKey,
-                                      membership,
-                                      *nodeRoster,
-                                      rosterWallClock,
-                                      metrics,
-                                      logger,
-                                      &conditions);
+    auto consensusOrRefusal = Node::StartConsensusOrExplain(
+        cfg,
+        schedulerTier,
+        nodeSurface != nullptr ? nodeSurface->BoundEndpoint() : std::string {},
+        identityKey,
+        membership,
+        *nodeRoster,
+        Node::SharedCacheListeners { .directory = sharedCache.Directory(),
+                                     .host = sharedCache.Host(),
+                                     .upstream = cacheTier != nullptr ? &cacheTier->Upstream() : nullptr },
+        rosterWallClock,
+        metrics,
+        logger,
+        &conditions);
     if (!consensusOrRefusal.has_value())
     {
         // No flag prefix here, for the reason the cache tier's line below has none:

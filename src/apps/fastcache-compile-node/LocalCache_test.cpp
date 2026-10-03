@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LocalCache.hpp"
+#include "PrivateTierProfile.hpp"
+#include "SharedTierProfile.hpp"
 
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
@@ -10,7 +12,9 @@
 #include <format>
 #include <map>
 #include <ranges>
+#include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <core/async/SyncRun.hpp>
@@ -82,7 +86,7 @@ struct Fixture
     core::platform::ManualClock clock;
     ScriptedUpstream upstream;
     AtomicMetricsSink metrics;
-    LocalCache cache { local, upstream, clock, metrics };
+    LocalCache cache { local, upstream, clock, metrics, PrivateTierProfile };
 
     [[nodiscard]] std::uint64_t Count(IMetricsSink::Counter counter) const
     {
@@ -195,7 +199,7 @@ TEST_CASE("A node with no shared cache still caches locally", "[node][cache]")
     AtomicMetricsSink metrics;
     InMemoryLruStorage local { 64 * 1024 };
     NoUpstream none;
-    LocalCache cache { local, none, clock, metrics };
+    LocalCache cache { local, none, clock, metrics, PrivateTierProfile };
 
     CHECK(core::async::syncRun(cache.Store("k6", Bytes("object-six"))));
     auto const hit = core::async::syncRun(cache.Fetch("k6"));
@@ -220,7 +224,7 @@ TEST_CASE("A node with no shared cache reports no upstream stores and no failure
     AtomicMetricsSink metrics;
     InMemoryLruStorage local { 64 * 1024 };
     NoUpstream none;
-    LocalCache cache { local, none, clock, metrics };
+    LocalCache cache { local, none, clock, metrics, PrivateTierProfile };
 
     for (auto const index: std::views::iota(0, 5))
         CHECK(core::async::syncRun(cache.Store(std::format("k{}", index), Bytes("object"))));
@@ -296,4 +300,120 @@ TEST_CASE("A drop reaches this tier only, so a shared cache holding the key refi
     REQUIRE(refilled.has_value());
     CHECK(Unwrap(refilled) == Bytes("object-ten"));
     CHECK(fix.upstream.fetches == 2);
+}
+
+TEST_CASE("A tier counts on its own descriptor and moves nobody else's counters", "[node][cache][shared-cache]")
+{
+    // The fleet's shared tier reuses this class, so a stored value is canonicalized on the one
+    // path every server of this wire shares -- and it must still move only its own series. An
+    // operator reading the private tier's hit rate is reading this machine's builds; a shared
+    // tier counting there would fold every other machine's builds into it.
+    InMemoryLruStorage local { 1024 * 1024 };
+    NoUpstream upstream;
+    core::platform::ManualClock clock;
+    AtomicMetricsSink metrics;
+    LocalCache shared { local, upstream, clock, metrics, SharedTierProfile };
+
+    std::ignore = core::async::syncRun(shared.Fetch("absent"));
+    auto const value = std::vector<std::byte> { std::byte { 1 } };
+    REQUIRE(core::async::syncRun(shared.Store("k", value)));
+    REQUIRE(core::async::syncRun(shared.Fetch("k")).has_value());
+
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeSharedCacheMisses) == 1);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeSharedCacheHits) == 1);
+    // The private tier's series are untouched: an operator reading them sees this machine's builds only.
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeCacheMisses) == 0);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeCacheHits) == 0);
+    CHECK(metrics.Read(IMetricsSink::Counter::NodeCacheUpstreamStoreFailures) == 0);
+}
+
+TEST_CASE("A tier that counts no upstream outcome reads through to nothing", "[node][cache][shared-cache]")
+{
+    // The shared tier's profile names no upstream counter, because the shared tier IS the top of
+    // the fleet's cache. Paired with an upstream that reads and stores, every read-through and every
+    // offered store would happen with nothing an operator reads moving -- so the pairing is refused
+    // where the tier is composed, not discovered in a graph that stays flat.
+    InMemoryLruStorage local { 1024 * 1024 };
+    ScriptedUpstream upstream;
+    NoUpstream nothing;
+    core::platform::ManualClock clock;
+    AtomicMetricsSink metrics;
+
+    CHECK(UpstreamCountingOf(SharedTierProfile) == UpstreamCounting::None);
+    CHECK(UpstreamCountingOf(PrivateTierProfile) == UpstreamCounting::Every);
+
+    CHECK_THROWS_AS((LocalCache { local, upstream, clock, metrics, SharedTierProfile }), std::invalid_argument);
+    CHECK_NOTHROW((LocalCache { local, nothing, clock, metrics, SharedTierProfile }));
+    // An upstream reached through the interface is one that may read through, whatever it is.
+    CHECK_THROWS_AS((LocalCache { local, static_cast<ICacheUpstream&>(nothing), clock, metrics, SharedTierProfile }),
+                    std::invalid_argument);
+    // The private tier counts every outcome, so either pairing is sound.
+    CHECK_NOTHROW((LocalCache { local, upstream, clock, metrics, PrivateTierProfile }));
+    CHECK_NOTHROW((LocalCache { local, nothing, clock, metrics, PrivateTierProfile }));
+
+    // A profile counting some outcomes of an upstream and not others is refused either way.
+    auto partial = PrivateTierProfile;
+    partial.fillFailures = std::nullopt;
+    CHECK(UpstreamCountingOf(partial) == UpstreamCounting::Partial);
+    CHECK_THROWS_AS((LocalCache { local, upstream, clock, metrics, partial }), std::invalid_argument);
+    CHECK_THROWS_AS((LocalCache { local, nothing, clock, metrics, partial }), std::invalid_argument);
+}
+
+TEST_CASE("A cache tier profile that leaves a column unstated is refused at compile time", "[node][cache][shared-cache]")
+{
+    // The columns default to their UNSTATED values -- an unstated verb pair, `DropVerb::Unstated`,
+    // `Counter::Last` -- so a row that forgot one compiles and the missing-field warning cannot say
+    // so. `StatesEveryMember` is what does, and each profile header asserts it. Asserted here in
+    // the refusing direction too, one column at a time, so the guard is watched refusing.
+    STATIC_REQUIRE(StatesEveryMember(PrivateTierProfile));
+    STATIC_REQUIRE(StatesEveryMember(SharedTierProfile));
+
+    constexpr auto forgotVerbs = [] {
+        auto row = PrivateTierProfile;
+        row.verbs = TierVerbs {};
+        return row;
+    }();
+    constexpr auto forgotDrop = [] {
+        auto row = PrivateTierProfile;
+        row.drop = DropVerb::Unstated;
+        return row;
+    }();
+    constexpr auto forgotHits = [] {
+        auto row = SharedTierProfile;
+        row.hits = IMetricsSink::Counter::Last;
+        return row;
+    }();
+    constexpr auto forgotRefusal = [] {
+        auto row = SharedTierProfile;
+        row.refusedForeignGeneration = IMetricsSink::Counter::Last;
+        return row;
+    }();
+    STATIC_REQUIRE_FALSE(StatesEveryMember(forgotVerbs));
+    STATIC_REQUIRE_FALSE(StatesEveryMember(forgotDrop));
+    STATIC_REQUIRE_FALSE(StatesEveryMember(forgotHits));
+    STATIC_REQUIRE_FALSE(StatesEveryMember(forgotRefusal));
+}
+
+TEST_CASE("A tier built from a profile that leaves a column unstated is refused, whoever forgot the assert",
+          "[node][cache][shared-cache]")
+{
+    // The `static_assert` beside a profile is a guard called ALONGSIDE; a third profile whose author
+    // forgot it would reach `Increment(Counter::Last)` at run time. So the construction itself asks,
+    // with either upstream, and the stated profiles are the control.
+    InMemoryLruStorage local { 1024 * 1024 };
+    ScriptedUpstream upstream;
+    NoUpstream nothing;
+    core::platform::ManualClock clock;
+    AtomicMetricsSink metrics;
+
+    auto forgotStores = PrivateTierProfile;
+    forgotStores.storeFailures = IMetricsSink::Counter::Last;
+    auto forgotDrop = SharedTierProfile;
+    forgotDrop.drop = DropVerb::Unstated;
+
+    CHECK_THROWS_AS((LocalCache { local, upstream, clock, metrics, forgotStores }), std::invalid_argument);
+    CHECK_THROWS_AS((LocalCache { local, nothing, clock, metrics, forgotStores }), std::invalid_argument);
+    CHECK_THROWS_AS((LocalCache { local, nothing, clock, metrics, forgotDrop }), std::invalid_argument);
+    CHECK_NOTHROW((LocalCache { local, upstream, clock, metrics, PrivateTierProfile }));
+    CHECK_NOTHROW((LocalCache { local, nothing, clock, metrics, SharedTierProfile }));
 }

@@ -1830,11 +1830,17 @@ _e2e_counter_wait() {
 # loop cannot be woken the handler sets a flag nobody comes back to read. A test
 # that hangs reports less than a test that fails.
 #
+# The exit STATUS is left in `E2eStopStatus` and judged by nobody here: most callers
+# stop a process to be rid of it. `stop_and_require_clean_exit` below is the one that
+# asks. `wait` can only answer for a child of THIS shell; for anything else it answers
+# 127, which is recorded like any other status.
+#
 # @param 1 pid
 # @param 2 what it is, for the message
 # @param 3 seconds to allow
 stop_and_require_exit() {
     local pid="$1" what="$2" seconds="$3"
+    E2eStopStatus=""
     kill "$pid" >/dev/null 2>&1 || true
     # Bounded by a DURATION for the reason `wait_until` is: this bound is an
     # assertion about how promptly a process stops, so a loop that silently ran
@@ -1854,7 +1860,8 @@ stop_and_require_exit() {
     while ! _e2e_deadline_passed "$dmark"; do
         kill -0 "$pid" 2>/dev/null || {
             _e2e_deadline_disarm "$dpid" "$dmark"
-            wait "$pid" 2>/dev/null || true
+            E2eStopStatus=0
+            wait "$pid" 2>/dev/null || E2eStopStatus=$?
             return 0
         }
         sleep "$_e2e_poll_pause"
@@ -1864,6 +1871,52 @@ stop_and_require_exit() {
     kill -9 "$pid" >/dev/null 2>&1 || true
     wait "$pid" 2>/dev/null || true
     fail "${what} was still running ${elapsed}s (measured) after being asked to stop, against a ${seconds}s bound"
+}
+
+# Stop a process as `stop_and_require_exit` does, and require it to have ENDED CLEANLY:
+# status 0, which is a process that handled the TERM and ran its teardown to the end.
+# Anything else is a stop that did not, which exiting at all does not show.
+#
+# **143 is refused by default.** It is the TERM killing the process outright, so its
+# handler and every destructor after it never ran -- and for a process that handles
+# TERM, that teardown is the very thing this stop exists to watch. A process that does
+# NOT handle TERM names that with `term-ends-it` as the fifth argument, and only then
+# is 143 its clean stop. A `fastcache-compile-node` handles TERM; it is never one.
+#
+# The shape it guards: `fastcache-compile-node`'s `~SharedCacheHost` ABORTS when a
+# reader still borrows the host, which is `main` destroying its locals in the wrong
+# ORDER -- deterministic, on every stop of every node holding a private tier and an
+# identity, and after the last line `main` logs ("compile node stopped"), so no grep
+# for that line can see it. Its own words are looked for as well, so the failure names
+# its cause rather than only a status.
+#
+# @param 1 pid; a child of this shell, or its status cannot be read
+# @param 2 what it is, for the message
+# @param 3 seconds to allow
+# @param 4 its log, which receives its stderr
+# @param 5 `term-ends-it` for a process that does not handle TERM, else absent
+stop_and_require_clean_exit() {
+    local pid="$1" what="$2" seconds="$3" log="$4" unhandledTerm="${5:-}"
+    case "$unhandledTerm" in
+        "" | term-ends-it) ;;
+        *) fail "stop_and_require_clean_exit: unknown fifth argument '${unhandledTerm}'; the only one is term-ends-it, for a process that does not handle TERM" ;;
+    esac
+    stop_and_require_exit "$pid" "$what" "$seconds"
+    if grep -q "shared-cache host is being destroyed" "$log"; then
+        cat "$log" >&2
+        fail "${what} refused to destroy its shared-cache host under a live reader (exit status ${E2eStopStatus}): main destroyed its locals in the wrong order"
+    fi
+    if [ "$E2eStopStatus" = 0 ]; then
+        return 0
+    fi
+    if [ "$E2eStopStatus" = 143 ] && [ "$unhandledTerm" = term-ends-it ]; then
+        return 0
+    fi
+    cat "$log" >&2
+    if [ "$E2eStopStatus" = 143 ]; then
+        fail "${what} exited with status 143: the TERM killed it before its handler ran, so none of its teardown did. Pass term-ends-it only for a process that does not handle TERM; one that does must exit 0"
+    fi
+    fail "${what} exited with status ${E2eStopStatus} when asked to stop; a clean stop is 0"
 }
 
 # ---------------------------------------------------------------------------

@@ -464,6 +464,13 @@ the frame's header and its payload. A frame whose tag does not verify, one that 
 one sent under the other direction's key, or one longer than a frame may be closes the
 connection, unanswered.
 
+A sealed frame is held whole until its tag can be checked, and that holding is charged to the
+node's in-flight byte budget. A frame the budget has no room for is refused as soon as its
+header arrives: the peer is answered `endpoint-busy`, sealed, and the connection then closes.
+It closes rather than skipping the frame because the frame's length is not verified until its
+tag is, and skipping a length nobody verified would let whoever wrote it choose where the next
+frame starts. A caller that reads `endpoint-busy` here proves again on a fresh connection.
+
 **The seal is what makes the proof worth having.** Without it, a machine on the path could
 relay a genuine worker's handshake to the scheduler, watch it succeed, and then write a
 REGISTER of its own into the connection the worker's proof admitted — naming an endpoint of

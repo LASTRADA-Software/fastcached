@@ -413,6 +413,26 @@ inline constexpr std::string_view LeaseLifetimeSetting = "lease-lifetime";
 /// The reliable question is who passes this constant to `SettingOf`.
 inline constexpr std::string_view FleetOpenSetting = "fleet-open";
 
+/// The key naming the machine every node reads through to as the fleet's shared cache.
+///
+/// **An ID, never an address**, and that is what lets it be replicated where `upstream` could not
+/// be: a node dials the `0xFC` endpoint the cluster records for that member
+/// (`ClusterMember::schedulerEndpoint`) and sends nothing until the peer proves the key the roster
+/// holds for this id -- and it presents no credential on that leg, because the proven session
+/// identifies both ends. So one committed entry cannot send any node's secret anywhere. Empty is
+/// how it is unset.
+inline constexpr std::string_view SharedCacheSetting = "shared-cache";
+
+/// Refuse a `shared-cache` value this cluster may not agree on: anything that is not empty and not
+/// shaped like an id -- an address above all, since the setting exists to name a machine by id.
+///
+/// The value's SHAPE only, so it can be a `SettingSpec::refuse` column. Whether the id names a
+/// machine the cluster holds a live key for is a question about the state, and
+/// `ValidateAgainst` asks it.
+/// @param value What the operator typed.
+/// @return Why it may not be set, or nullopt when it may.
+[[nodiscard]] std::optional<std::string> RefuseSharedCache(std::string_view value);
+
 /// Read a `lease-lifetime` value, or say why it is not one.
 ///
 /// **The one predicate both the validator and every reader ask**, rather than one
@@ -444,7 +464,7 @@ inline constexpr std::string_view FleetOpenSetting = "fleet-open";
 /// can differ per machine because the machines differ. `--slots` is the counter-
 /// example worth naming: it describes one host and replicating it would impose one
 /// machine's size on all of them.
-inline constexpr std::array<SettingSpec, 2> SettingTable {
+inline constexpr std::array<SettingSpec, 3> SettingTable {
     SettingSpec { .name = FleetOpenSetting,
                   .summary = R"('1' to admit every caller to the fleet, '0' for members only)",
                   .readBy = "NodeMembership::AgreedOpenness" },
@@ -453,6 +473,13 @@ inline constexpr std::array<SettingSpec, 2> SettingTable {
                              "for a slot, compile, and the object coming back -- not how long a compiler may run",
                   .refuse = &RefuseLeaseLifetime,
                   .readBy = "SchedulerService::AgreedLeaseLifetime" },
+    SettingSpec { .name = SharedCacheSetting,
+                  .summary = "the id of the machine every node reads through to and stores to as the fleet's shared "
+                             "cache; empty for none. An ID, never an address: each node dials what that machine "
+                             "announced and sends nothing until that machine proves the key this cluster holds "
+                             "for the id",
+                  .refuse = &RefuseSharedCache,
+                  .readBy = "SharedCacheDirectory::Applied" },
 };
 
 static_assert(RowsCarryAConsumer(SettingTable),
@@ -515,10 +542,16 @@ struct RefusedSettingSpec
 ///
 /// Nothing read the row, so removing it takes no behaviour with it: the per-node
 /// `--upstream` flag has always been what decides this, and the refusal names it.
+///
+/// `shared-cache` complies with this rule rather than escaping it: it names an ID, the peer
+/// must prove that ID's roster key before anything is sent, and nothing a node holds as a
+/// secret is presented on that leg.
 inline constexpr std::array<RefusedSettingSpec, 1> RefusedSettingTable { {
     RefusedSettingSpec { .name = "upstream",
-                         .reason = "it decides where a node presents its --requirepass credential, so it is "
-                                   "per-machine configuration -- set --upstream on the node that reads through" },
+                         .reason = "it would decide where a node presents its --requirepass credential, so it is "
+                                   "per-machine configuration -- set --upstream on the node that reads through, or "
+                                   "name a machine with shared-cache=<id>, which every node reaches only once that "
+                                   "machine proves its own roster key, and to which no credential is presented" },
 } };
 
 /// Whether `name` is a key this cluster refuses to replicate.
@@ -628,6 +661,17 @@ struct ClusterState
     /// @return The holder's id, or nullopt when no member and no principal holds it.
     [[nodiscard]] std::optional<std::string> HolderOf(Ed25519PublicKey const& key) const;
 };
+
+/// The key `id` holds LIVE as a member.
+///
+/// Members only: every fleet machine is admitted as a member, voter or learner, so a machine
+/// recorded any other way is not one a node could be asked to trust by id. A revoked key is never
+/// a live one here, since a forget removes the record together with the key it held. Matched
+/// whole, never by prefix.
+/// @param state The state.
+/// @param id The machine.
+/// @return Its recorded key, or nullopt when it is not a member.
+[[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(ClusterState const& state, std::string_view id);
 
 /// What a command does to the state.
 ///

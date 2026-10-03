@@ -317,9 +317,10 @@ TEST_CASE("Every replicated setting says what reads it", "[cluster][state]")
     // checking it, so the two live rows are spelled out here: the guard cannot tell a
     // true `Class::Function` from a plausible one, and this is where a rename that
     // left the column behind shows up.
-    REQUIRE(SettingTable.size() == 2);
+    REQUIRE(SettingTable.size() == 3);
     CHECK(FindSetting(FleetOpenSetting)->readBy == "NodeMembership::AgreedOpenness");
     CHECK(FindSetting(LeaseLifetimeSetting)->readBy == "SchedulerService::AgreedLeaseLifetime");
+    CHECK(FindSetting(SharedCacheSetting)->readBy == "SharedCacheDirectory::Applied");
 }
 
 TEST_CASE("A key this cluster refuses to replicate is refused BY NAME", "[cluster][state]")
@@ -346,6 +347,59 @@ TEST_CASE("A key this cluster refuses to replicate is refused BY NAME", "[cluste
     CHECK(FindSetting("upstream") == nullptr);
     CHECK(FindRefusedSetting("upstream") != nullptr);
     CHECK(FindRefusedSetting("lease-lifetime") == nullptr);
+}
+
+TEST_CASE("The shared-cache setting names a machine by id and never by address", "[cluster][state][shared-cache]")
+{
+    CHECK(Validate(Cmd(CommandKind::SetSetting, "shared-cache", "cache-c")).has_value());
+    // Empty is how it is unset.
+    CHECK(Validate(Cmd(CommandKind::SetSetting, "shared-cache", "")).has_value());
+    // An address is refused BY NAME, and the refusal names the flag that takes one.
+    auto const address = Refused(Cmd(CommandKind::SetSetting, "shared-cache", "cache-c.office.example:6674"));
+    CHECK(address.contains("id"));
+    CHECK(address.contains("--upstream"));
+    CHECK(Refused(Cmd(CommandKind::SetSetting, "shared-cache", "[fd00::3]:6674")).contains("--upstream"));
+    CHECK(Refused(Cmd(CommandKind::SetSetting, "shared-cache", "cache c")).contains("id"));
+    CHECK(Refused(Cmd(CommandKind::SetSetting, "shared-cache", "cache-c\t")).contains("id"));
+    // An id is opaque, as consensus treats it: an encoding, not an alphabet.
+    CHECK(Validate(Cmd(CommandKind::SetSetting, "shared-cache", "arbeiter-\xC3\xA9")).has_value());
+}
+
+TEST_CASE("The shared-cache setting must name a machine whose key this cluster holds live", "[cluster][state][shared-cache]")
+{
+    ClusterState state;
+    Apply(state, Keyed(CommandKind::AddLearner, "cache-c", KeyOf(0x11), "10.0.0.3:6680"));
+
+    CHECK(ValidateAgainst(state, Cmd(CommandKind::SetSetting, "shared-cache", "cache-c")).has_value());
+    CHECK(ValidateAgainst(state, Cmd(CommandKind::SetSetting, "shared-cache", "")).has_value());
+    CHECK(Unwrap(LiveKeyOf(state, "cache-c")) == KeyOf(0x11));
+
+    // A machine the cluster does not hold could prove nothing: a setting every node would refuse to use.
+    CHECK(RefusedAgainst(state, Cmd(CommandKind::SetSetting, "shared-cache", "nobody")).context.contains("key"));
+    CHECK(RefusedAgainst(state, Cmd(CommandKind::SetSetting, "shared-cache", "nobody")).context.contains("nobody"));
+    // Ids are matched whole, never by prefix.
+    CHECK_FALSE(ValidateAgainst(state, Cmd(CommandKind::SetSetting, "shared-cache", "cache")).has_value());
+
+    // A forgotten machine's record went with its key. Refused as a command naming no live
+    // key, NOT as `KeyRevoked`: that code is permanent, and the id itself may be admitted
+    // again under a fresh key, after which the same command is accepted.
+    Apply(state, Cmd(CommandKind::Forget, "cache-c"));
+    auto const forgotten = RefusedAgainst(state, Cmd(CommandKind::SetSetting, "shared-cache", "cache-c"));
+    CHECK(forgotten.code == ConsensusErrorCode::InvalidConfiguration);
+    CHECK(forgotten.context.contains("revoked"));
+    Apply(state, Keyed(CommandKind::AddLearner, "cache-c", KeyOf(0x22), "10.0.0.3:6680"));
+    CHECK(ValidateAgainst(state, Cmd(CommandKind::SetSetting, "shared-cache", "cache-c")).has_value());
+}
+
+TEST_CASE("Upstream stays a refused setting and the refusal names shared-cache", "[cluster][state][shared-cache]")
+{
+    // The losing reading is recorded in the table's own comment; what an operator reads is here.
+    auto const why = Refused(Cmd(CommandKind::SetSetting, "upstream", "cache-c:6674"));
+    CHECK(why.contains("--upstream"));
+    CHECK(why.contains("shared-cache"));
+    // And it says who proves: the NAMED machine proves its key to each node, never the reverse.
+    CHECK(why.contains("that machine proves its own roster key"));
+    CHECK(why.contains("no credential is presented"));
 }
 
 TEST_CASE("Applying is total, and admitting a known member moves it", "[cluster][state]")

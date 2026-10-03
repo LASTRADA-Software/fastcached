@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheTier.hpp"
+#include "InProcessSharedUpstream.hpp"
 #include "NodeIoLoop.hpp"
+#include "NodeProofClient.hpp"
 #include "NodeSurfaces.hpp"
+#include "PrivateTierProfile.hpp"
 #include "RemoteUpstream.hpp"
+#include "SharedCacheHost.hpp"
+#include "SharedCacheSession.hpp"
+#include "SharedCacheUpstream.hpp"
 
 #include <FastCache/Cache/CowTreeStorage.hpp>
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
@@ -16,10 +22,16 @@
 #include <cstddef>
 #include <filesystem>
 #include <format>
+#include <memory>
+#include <optional>
+#include <span>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
+
+#include <core/async/Task.hpp>
 
 namespace FastCache::Node
 {
@@ -78,58 +90,6 @@ namespace
     /// every page in the file.
     constexpr std::size_t DiskMaxValueBytes = 256ULL * 1024ULL * 1024ULL;
 
-    /// Open the on-disk half of the tier under `--cache-dir`.
-    ///
-    /// ONE process per directory, and the store now enforces it rather than
-    /// asking to be trusted: `CowTreeStorage::Open` claims the file for the life
-    /// of the process, so a second node pointed at one `--cache-dir` is refused
-    /// with `StorageErrorCode::InUse`. That refusal is spelled out here because
-    /// `--cache-dir` is the flag most likely to be copied between two nodes on
-    /// one machine, and a node that will not start is worth one clear sentence.
-    /// @param cfg    The parsed configuration; `cacheDir` must not be empty.
-    /// @param logger Where an unenforceable claim is reported.
-    /// @return The store, or why it could not be opened.
-    [[nodiscard]] std::expected<std::unique_ptr<IStorage>, std::string> OpenDiskTier(NodeConfig const& cfg, ILogger& logger)
-    {
-        auto error = std::error_code {};
-        std::filesystem::create_directories(cfg.cacheDir, error);
-        if (error)
-            return std::unexpected { std::format("cannot create {}: {}", cfg.cacheDir.string(), error.message()) };
-
-        CowTreeStorage::Options options;
-        options.path = cfg.cacheDir / DiskStoreFileName;
-        options.maxBytes = static_cast<std::size_t>(cfg.cacheDiskBytes);
-        options.maxValueBytes = DiskMaxValueBytes;
-        // The EFFECTIVE codec, never the configured one. A build without
-        // `FASTCACHED_ENABLE_COMPRESSION` cannot use the default `zstd` -- and a
-        // default is the one route past `ParseCompressionCodec`, which refuses a
-        // codec an operator NAMES -- so the store would fall back to plaintext
-        // while `options.compression` went on saying otherwise to everything that
-        // reads it back, the startup line included.
-        options.compression = Compression::EffectiveCodec(cfg.compression);
-        options.compressionLevel = cfg.compressionLevel;
-        options.compressionMinBytes = cfg.compressionMinBytes;
-        auto opened = CowTreeStorage::Open(options);
-        if (!opened.has_value())
-        {
-            if (opened.error().code == StorageErrorCode::InUse)
-                return std::unexpected { std::format(
-                    "cannot open {}: another process already has this cache open. A --cache-dir belongs to one "
-                    "node; give this one a path of its own.",
-                    options.path.string()) };
-            return std::unexpected { std::format("cannot open {}: {}", options.path.string(), opened.error().ToString()) };
-        }
-
-        // Said out loud rather than assumed. A guard that silently does nothing
-        // reads exactly like one that works, and this is the one place an
-        // operator could still end up with two nodes on one store.
-        if ((*opened)->StoreLockState() == CowTree::FilePageStore::LockState::Unavailable)
-            logger.Logf(LogLevel::Warn,
-                        "{} is on a filesystem that cannot lock; nothing stops a second node opening it",
-                        options.path.string());
-        return std::move(*opened);
-    }
-
     /// Assemble the storage the operator asked for.
     ///
     /// The on-disk half does its reads and writes on the reactor thread the node's
@@ -157,7 +117,17 @@ namespace
         std::unique_ptr<IStorage> storage;
         if (!cfg.cacheDir.empty())
         {
-            auto disk = OpenDiskTier(cfg, logger);
+            auto disk = OpenDiskStore(
+                DiskStoreSpec {
+                    .path = cfg.cacheDir / DiskStoreFileName,
+                    .maxBytes = cfg.cacheDiskBytes,
+                    .codec = Compression::EffectiveCodec(cfg.compression),
+                    .level = cfg.compressionLevel,
+                    .minBytes = cfg.compressionMinBytes,
+                    .inUse = "another process already has this cache open. A --cache-dir belongs to one node; give this "
+                             "one a path of its own.",
+                },
+                logger);
             if (!disk.has_value())
                 return std::unexpected { std::move(disk.error()) };
             storage = std::move(*disk);
@@ -171,23 +141,245 @@ namespace
                                          : std::make_unique<LayeredStorage>(std::move(memory), std::move(storage));
         }
 
-        // A persistence failure (full disk / I/O error / corruption / read-only)
-        // is otherwise invisible at the default log level: it never reaches the
-        // trace-only TracingStorage, so a store silently does not happen. The
-        // daemon has wrapped its backend in this since the counter existed; the
-        // node did not, so it exported `fastcached_write_errors_total` and could
-        // never move it, and a node whose disk tier was failing every write
-        // looked identical to a healthy one on every surface an operator watches
-        // (#574).
-        //
-        // Wrapped INSIDE the sharding wrapper, so it observes the true result the
-        // composed backend returns -- the disk error LayeredStorage propagates --
-        // and so it is covered by the lock that wrapper exists to provide.
-        std::vector<std::unique_ptr<IStorage>> shards;
-        shards.push_back(std::make_unique<WriteErrorReportingStorage>(std::move(storage), logger));
-        return std::make_unique<ShardedStorage>(std::move(shards));
+        return ShareStorage(std::move(storage), logger);
     }
+    /// The fleet's shared cache at another machine: a dialer, a session pool and the upstream over
+    /// them, owned as one object in their reference order.
+    ///
+    /// **The dialer's connector and the pool's home are the SAME loop, by construction**: both are
+    /// read off the one `NodeIoLoop` in the parts, and nothing else in the parts names a loop.
+    class ProvenSharedCacheUpstream final: public ICacheUpstream
+    {
+      public:
+        /// @param parts `prover` must not be null; every part must outlive this.
+        explicit ProvenSharedCacheUpstream(UpstreamParts const& parts):
+            _dialer { *parts.prover, parts.io.Connector(), &parts.io.Reactor(), parts.metrics, SharedCacheDialPolicy {} },
+            _pool { _dialer, parts.clock, parts.io },
+            _upstream { parts.directory,  _pool,        &parts.io.Reactor(),     parts.metrics,
+                        parts.conditions, parts.logger, SharedCacheDialPolicy {} }
+        {
+        }
+
+        [[nodiscard]] core::async::Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) override
+        {
+            return _upstream.Fetch(key);
+        }
+
+        [[nodiscard]] core::async::Task<UpstreamStore> Store(std::string_view key, std::span<std::byte const> value) override
+        {
+            return _upstream.Store(key, value);
+        }
+
+        [[nodiscard]] bool Configured() const noexcept override
+        {
+            return _upstream.Configured();
+        }
+
+        void StateApplied() override
+        {
+            _upstream.StateApplied();
+        }
+
+        [[nodiscard]] ISharedCacheStatusSource const* SharedCacheStatus() const noexcept override
+        {
+            return _upstream.SharedCacheStatus();
+        }
+
+      private:
+        // Declaration order IS construction order: the pool borrows the dialer, the upstream the pool.
+        SharedCacheDialer _dialer;
+        SharedSessionPool _pool;
+        SharedCacheUpstream _upstream;
+    };
+
+    /// The fleet's `shared-cache` setting, whichever machine it names: this machine's own tier in
+    /// process while the directory says `ThisMachine`, the proven session otherwise -- asked per
+    /// operation, so a setting that moves between the two needs no rebuild and neither half knows
+    /// the other exists.
+    ///
+    /// **One window, accepted:** the directory and the host are told the same apply, but the host
+    /// opens its store on a thread of its own. Between the two, the directory already says
+    /// `ThisMachine` while the host publishes no tier yet, so an operation meets the in-process half
+    /// with nothing behind it and answers as a node with no shared cache: `NotConfigured`, counted as
+    /// nothing. It heals itself once the store is open, costs at most a miss per operation in the
+    /// window, and no failure counter can move for it -- which is right, since nothing failed.
+    class SwitchingSharedUpstream final: public ICacheUpstream
+    {
+      public:
+        /// @param proven The half for another machine.
+        /// @param inProcess The half for this one.
+        /// @param directory Says which, per operation; must outlive this.
+        SwitchingSharedUpstream(std::unique_ptr<ICacheUpstream> proven,
+                                std::unique_ptr<ICacheUpstream> inProcess,
+                                ISharedCacheTargetSource const& directory) noexcept:
+            _proven { std::move(proven) },
+            _inProcess { std::move(inProcess) },
+            _directory { directory }
+        {
+        }
+
+        [[nodiscard]] core::async::Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view key) override
+        {
+            return Now().Fetch(key);
+        }
+
+        [[nodiscard]] core::async::Task<UpstreamStore> Store(std::string_view key, std::span<std::byte const> value) override
+        {
+            return Now().Store(key, value);
+        }
+
+        [[nodiscard]] bool Configured() const noexcept override
+        {
+            return Now().Configured();
+        }
+
+        void StateApplied() override
+        {
+            // Both halves: each re-judges from the same directory, and the one not chosen now clears
+            // what it reported, since nothing asks it to read through any more.
+            _proven->StateApplied();
+            _inProcess->StateApplied();
+        }
+
+        [[nodiscard]] ISharedCacheStatusSource const* SharedCacheStatus() const noexcept override
+        {
+            // The proven half's, whichever half answers now: `--node-status` reports this machine's
+            // own tier from its host, and the verdict about another machine lives only here.
+            return _proven->SharedCacheStatus();
+        }
+
+      private:
+        /// @return The half the directory's current source names.
+        [[nodiscard]] ICacheUpstream& Now() const
+        {
+            return _directory.Current().source == CompileCacheWire::WireSharedCacheSource::ThisMachine ? *_inProcess
+                                                                                                       : *_proven;
+        }
+
+        std::unique_ptr<ICacheUpstream> _proven;
+        std::unique_ptr<ICacheUpstream> _inProcess;
+        ISharedCacheTargetSource const& _directory;
+    };
 } // namespace
+
+std::expected<std::unique_ptr<IStorage>, std::string> OpenDiskStore(DiskStoreSpec const& spec, ILogger& logger)
+{
+    auto error = std::error_code {};
+    std::filesystem::create_directories(spec.path.parent_path(), error);
+    if (error)
+        return std::unexpected { std::format("cannot create {}: {}", spec.path.parent_path().string(), error.message()) };
+
+    CowTreeStorage::Options options;
+    options.path = spec.path;
+    options.maxBytes = static_cast<std::size_t>(spec.maxBytes);
+    options.maxValueBytes = DiskMaxValueBytes;
+    // The EFFECTIVE codec, never the configured one. A build without
+    // `FASTCACHED_ENABLE_COMPRESSION` cannot use the default `zstd` -- and a
+    // default is the one route past `ParseCompressionCodec`, which refuses a
+    // codec an operator NAMES -- so the store would fall back to plaintext
+    // while `options.compression` went on saying otherwise to everything that
+    // reads it back, the startup line included. The caller resolves it.
+    options.compression = spec.codec;
+    options.compressionLevel = spec.level;
+    options.compressionMinBytes = spec.minBytes;
+    auto opened = CowTreeStorage::Open(options);
+    if (!opened.has_value())
+    {
+        if (opened.error().code == StorageErrorCode::InUse)
+            return std::unexpected { std::format("cannot open {}: {}", options.path.string(), spec.inUse) };
+        return std::unexpected { std::format("cannot open {}: {}", options.path.string(), opened.error().ToString()) };
+    }
+
+    // Said out loud rather than assumed. A guard that silently does nothing
+    // reads exactly like one that works, and this is the one place an
+    // operator could still end up with two nodes on one store.
+    if ((*opened)->StoreLockState() == CowTree::FilePageStore::LockState::Unavailable)
+        logger.Logf(LogLevel::Warn,
+                    "{} is on a filesystem that cannot lock; nothing stops a second node opening it",
+                    options.path.string());
+    return std::move(*opened);
+}
+
+std::unique_ptr<IStorage> ShareStorage(std::unique_ptr<IStorage> storage, ILogger& logger)
+{
+    // A persistence failure (full disk / I/O error / corruption / read-only)
+    // is otherwise invisible at the default log level: it never reaches the
+    // trace-only TracingStorage, so a store silently does not happen. The
+    // daemon has wrapped its backend in this since the counter existed; the
+    // node did not, so it exported `fastcached_write_errors_total` and could
+    // never move it, and a node whose disk tier was failing every write
+    // looked identical to a healthy one on every surface an operator watches
+    // (#574).
+    //
+    // Wrapped INSIDE the sharding wrapper, so it observes the true result the
+    // composed backend returns -- the disk error LayeredStorage propagates --
+    // and so it is covered by the lock that wrapper exists to provide.
+    std::vector<std::unique_ptr<IStorage>> shards;
+    shards.push_back(std::make_unique<WriteErrorReportingStorage>(std::move(storage), logger));
+    return std::make_unique<ShardedStorage>(std::move(shards));
+}
+
+std::unique_ptr<ICacheUpstream> BuildNoUpstream(UpstreamParts const& /*parts*/)
+{
+    return std::make_unique<NoUpstream>();
+}
+
+std::unique_ptr<ICacheUpstream> BuildRemoteUpstream(UpstreamParts const& parts)
+{
+    // The loop's own connector, so this dial SUSPENDS rather than blocking. It is the point of the
+    // whole exercise: this call happens inside a cache answer, and answering used to be serialized
+    // -- so one upstream that took five seconds held every local `fastcache-cc` behind it.
+    //
+    // The reactor is passed too, because with a reactor socket `SO_RCVTIMEO` is inert: the
+    // per-operation ceiling is a `core::net::DeadlineTimer` that closes the socket, which bounds
+    // the whole exchange rather than one call.
+    return std::make_unique<RemoteUpstream>(
+        std::string { parts.upstream },
+        parts.credential,
+        // The node is a CLIENT of the shared cache, and had the same silence the launcher did: a
+        // token set here against a daemon that does not know AUTH was ignored, and nothing said so.
+        [&logger = parts.logger](std::string_view text) { logger.Logf(LogLevel::Warn, "upstream cache: {}", text); },
+        parts.io.Connector(),
+        &parts.io.Reactor(),
+        parts.io.Resolver(),
+        parts.clock,
+        UpstreamConnectTimeout,
+        UpstreamIoTimeout,
+        UpstreamAddressRefreshInterval);
+}
+
+std::unique_ptr<ICacheUpstream> BuildSharedCacheUpstream(UpstreamParts const& parts)
+{
+    auto proven = std::make_unique<ProvenSharedCacheUpstream>(parts);
+    if (parts.host == nullptr)
+        // No shared tier here to read in process: another machine's, or nothing.
+        return proven;
+    return std::make_unique<SwitchingSharedUpstream>(
+        std::move(proven),
+        UpstreamKindTable[static_cast<std::size_t>(UpstreamKind::InProcessShared)].build(parts),
+        parts.directory);
+}
+
+std::unique_ptr<ICacheUpstream> BuildInProcessSharedUpstream(UpstreamParts const& parts)
+{
+    if (parts.host == nullptr)
+        return std::make_unique<NoUpstream>();
+    return std::make_unique<InProcessSharedUpstream>(*parts.host);
+}
+
+UpstreamKind UpstreamKindOf(UpstreamParts const& parts) noexcept
+{
+    if (!parts.upstream.empty())
+        return UpstreamKind::Daemon;
+    if (parts.prover != nullptr)
+        return UpstreamKind::FleetSharedCache;
+    return UpstreamKind::None;
+}
+
+std::unique_ptr<ICacheUpstream> MakeCacheUpstream(UpstreamParts const& parts)
+{
+    return UpstreamKindTable[static_cast<std::size_t>(UpstreamKindOf(parts))].build(parts);
+}
 
 CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
                      std::unique_ptr<ICacheUpstream> upstream,
@@ -196,53 +388,25 @@ CacheTier::CacheTier(std::unique_ptr<IStorage> storage,
                      IMetricsSink& metrics):
     _storage { std::move(storage) },
     _upstream { std::move(upstream) },
-    _cache { *_storage, *_upstream, clock, metrics },
+    _cache { *_storage, *_upstream, clock, metrics, PrivateTierProfile },
     _proxy { _cache, metrics },
     _responder { _proxy, locality, metrics }
 {
 }
 
-std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLoop& io,
-                                                                        NodeConfig const& cfg,
+std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeConfig const& cfg,
                                                                         std::unique_ptr<IStorage> storage,
-                                                                        ICredentialSource const& credential,
+                                                                        UpstreamParts const& upstream,
                                                                         ILocalityOracle const& locality,
                                                                         core::platform::IClock& clock,
                                                                         IMetricsSink& metrics,
                                                                         ILogger& logger)
 {
-    // An absent upstream is a named type rather than a null pointer: one developer's
-    // machine has no shared cache, and that configuration should not cost every call
-    // site a branch.
-    std::unique_ptr<ICacheUpstream> upstream;
-    if (cfg.upstream.empty())
-        upstream = std::make_unique<NoUpstream>();
-    else
-        // The loop's own connector, so this dial SUSPENDS rather than blocking. It
-        // is the point of the whole exercise: this call happens inside a cache
-        // answer, and answering used to be serialized -- so one upstream that took
-        // five seconds held every local `fastcache-cc` behind it.
-        //
-        // The reactor is passed too, because with a reactor socket `SO_RCVTIMEO`
-        // is inert: the per-operation ceiling is a `core::net::DeadlineTimer` that closes the
-        // socket, which bounds the whole exchange rather than one call.
-        upstream = std::make_unique<RemoteUpstream>(
-            cfg.upstream,
-            credential,
-            // The node is a CLIENT of the shared cache, and had the same
-            // silence the launcher did: a token set here against a daemon
-            // that does not know AUTH was ignored, and nothing said so.
-            [&logger](std::string_view text) { logger.Logf(LogLevel::Warn, "upstream cache: {}", text); },
-            io.Connector(),
-            &io.Reactor(),
-            io.Resolver(),
-            clock,
-            UpstreamConnectTimeout,
-            UpstreamIoTimeout,
-            UpstreamAddressRefreshInterval);
-
+    // The kind is decided ONCE and both the upstream and the line below read it, so the startup
+    // line cannot name a choice other than the one that was built.
+    auto const& kind = UpstreamKindTable[static_cast<std::size_t>(UpstreamKindOf(upstream))];
     auto tier =
-        std::unique_ptr<CacheTier> { new CacheTier { std::move(storage), std::move(upstream), locality, clock, metrics } };
+        std::unique_ptr<CacheTier> { new CacheTier { std::move(storage), kind.build(upstream), locality, clock, metrics } };
 
     // No address in this line since #290: the cache verbs are answered on the node's
     // one 0xFC listener, and that listener names itself when it binds. A tier that
@@ -304,13 +468,14 @@ std::expected<std::unique_ptr<CacheTier>, std::string> CacheTier::Start(NodeIoLo
                                                           : FormatByteSize(static_cast<std::size_t>(cfg.cacheDiskBytes)),
                                   Compression::NameOf(diskCodec),
                                   cfg.cacheDir.string()),
-                cfg.upstream.empty() ? std::string { "none" } : cfg.upstream);
+                kind.namesEndpoint ? std::format("{} {}", upstream.upstream, kind.described)
+                                   : std::string { kind.described });
     return tier;
 }
 
 InMemoryLruStorage::CompressionOptions MemoryCompressionOf(NodeConfig const& cfg)
 {
-    // Resolved here rather than reported raw, for the reason `OpenDiskTier` gives
+    // Resolved here rather than reported raw, for the reason `OpenDiskStore` gives
     // about its own half: this is the one place a memory tier's codec is decided, so
     // it is also the one place that can make what is REPORTED and what is STORED the
     // same fact.
@@ -390,9 +555,8 @@ Distributed::NodeCacheLoad CacheLoadOf(CacheTier const* tier, IMetricsSink const
     return out;
 }
 
-std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(NodeIoLoop& io,
-                                                                               NodeConfig const& cfg,
-                                                                               ICredentialSource const& credential,
+std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(NodeConfig const& cfg,
+                                                                               UpstreamParts const& upstream,
                                                                                ILocalityOracle const& locality,
                                                                                core::platform::IClock& clock,
                                                                                IMetricsSink& metrics,
@@ -450,7 +614,7 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(N
     // The bind, and the judgement about a failed one, moved to
     // `StartNodeSurfaceOrExplain` with the surfaces (#290): a listener that carries
     // two components cannot have its failure judged by one of them.
-    return CacheTier::Start(io, cfg, std::move(*storage), credential, locality, clock, metrics, logger);
+    return CacheTier::Start(cfg, std::move(*storage), upstream, locality, clock, metrics, logger);
 }
 
 std::expected<std::string, std::string> MigrateDiskTier(NodeConfig const& cfg)

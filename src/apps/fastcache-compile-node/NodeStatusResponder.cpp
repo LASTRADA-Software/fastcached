@@ -586,6 +586,11 @@ CompileCacheWire::NodeStatusFields ConfiguredNodeStatus::Describe() const
             }),
         };
 
+    // What this node reads through to, or serves, as the fleet's shared cache -- asked per request,
+    // like everything above, so an apply that moves the setting shows on the next answer.
+    if (_sources.sharedCache != nullptr)
+        fields.runtime.sharedCache = _sources.sharedCache->Report();
+
     for (auto const& mapping: mappings)
     {
         // **A surface the configuration does not resolve is ABSENT, never a zero port.**

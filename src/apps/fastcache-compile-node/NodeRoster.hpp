@@ -109,6 +109,11 @@ class NodeRoster final: public IPresenceRoster, public IServerTrust
     /// nothing and says so, and the seal is what still protects the connection.
     [[nodiscard]] ServerStanding StandingOf(std::string_view serverId, Ed25519PublicKey const& serverKey) const override;
 
+    /// @copydoc IServerTrust::Expected
+    ///
+    /// A scheduler is any voter, so the expectation is the kind of machine, never an id.
+    [[nodiscard]] std::string_view Expected() const override;
+
     /// Adopt what the cluster now says. A consensus member's roster only; a no-op otherwise.
     /// @param state The replicated state.
     void Applied(Cluster::ClusterState const& state);

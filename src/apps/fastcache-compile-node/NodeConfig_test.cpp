@@ -338,6 +338,27 @@ TEST_CASE("NodeConfig: --cordon is a mode, and never reaches a service registrat
     CHECK(std::ranges::any_of(spec.arguments, [](std::string const& arg) { return FlagMatches(arg, "--cache-dir"); }));
 }
 
+TEST_CASE("The shared-cache size flag parses and defaults from its table", "[node][config][shared-cache]")
+{
+    auto const defaults = Unwrap(ParseNodeArgv({}));
+    CHECK(defaults.sharedCacheDiskBytes == Unwrap(TraitsFor(StorageTier::Disk).sharedTierDefaultBytes));
+    CHECK_FALSE(defaults.sharedCacheDiskBytesExplicit);
+
+    auto const set = Unwrap(ParseNodeArgv({ "--shared-cache-disk=100g" }));
+    CHECK(set.sharedCacheDiskBytes == 100ULL * 1024 * 1024 * 1024);
+    CHECK(set.sharedCacheDiskBytesExplicit);
+
+    NodeConfig cfg;
+    cfg.clusterDir = "D:/cd";
+    CHECK(SharedCacheStorePath(cfg) == std::filesystem::path { "D:/cd/shared-cache/objects.cow" });
+
+    // A node that names no --cluster-dir keeps its shared tier in the state directory the start
+    // resolved -- never at a path relative to wherever the process was started.
+    NodeConfig defaulted;
+    defaulted.stateDirectory = NodeStateDirectoryChoice { .path = "D:/state", .origin = StateDirectoryOrigin::PerUser };
+    CHECK(SharedCacheStorePath(defaulted) == std::filesystem::path { "D:/state/shared-cache/objects.cow" });
+}
+
 TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", "[node][service]")
 {
     // The daemon's equivalent case exists because its table once stopped after

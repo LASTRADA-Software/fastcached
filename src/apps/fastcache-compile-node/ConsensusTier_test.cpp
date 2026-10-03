@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
+#include "LocalCache.hpp"
 #include "NodeFormation.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeMembership.hpp"
 #include "NodeRoster.hpp"
 #include "SchedulerTier.hpp"
+#include "SharedCacheDirectory.hpp"
+#include "SharedCacheHost.hpp"
+#include "SharedCacheTier.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/Roster.hpp>
@@ -28,6 +32,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -50,6 +55,7 @@
 #include <tests/PreviousClusterState.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/SharedTierFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -71,6 +77,52 @@ FastCache::NullLogger membershipLog;
     probe.reset();
     return port;
 }
+
+/// An upstream that records, at every apply it is told of, what the directory it reads said then --
+/// so a case can tell "told after the directory" from "told at all".
+class RecordingUpstream final: public Node::ICacheUpstream
+{
+  public:
+    /// @param directory What the production upstream would read; must outlive this.
+    explicit RecordingUpstream(Node::ISharedCacheTargetSource const& directory) noexcept:
+        _directory { directory }
+    {
+    }
+
+    [[nodiscard]] core::async::Task<std::optional<std::vector<std::byte>>> Fetch(std::string_view /*key*/) override
+    {
+        co_return std::nullopt;
+    }
+
+    [[nodiscard]] core::async::Task<Node::UpstreamStore> Store(std::string_view /*key*/,
+                                                               std::span<std::byte const> /*value*/) override
+    {
+        co_return Node::UpstreamStore::NotConfigured;
+    }
+
+    [[nodiscard]] bool Configured() const noexcept override
+    {
+        return false;
+    }
+
+    void StateApplied() override
+    {
+        std::scoped_lock const lock { _mutex };
+        _seen.push_back(_directory.Current().source);
+    }
+
+    /// @return The directory's source at each apply, in order. Any thread.
+    [[nodiscard]] std::vector<CompileCacheWire::WireSharedCacheSource> Seen() const
+    {
+        std::scoped_lock const lock { _mutex };
+        return _seen;
+    }
+
+  private:
+    Node::ISharedCacheTargetSource const& _directory;
+    mutable std::mutex _mutex;
+    std::vector<CompileCacheWire::WireSharedCacheSource> _seen;
+};
 } // namespace
 using namespace FastCache::Node;
 using FastCache::Testing::Unwrap;
@@ -240,6 +292,10 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
     auto const roster =
         NodeRoster::Build(Testing::FirstStart(NodeConfig {}), core::platform::defaultSystemWallClock(), metrics, logger);
     REQUIRE(roster.has_value());
+    // Never asked to open: these cases' clusters name no shared cache.
+    Testing::MemoryOpener opener;
+    SharedCacheHost sharedCache { "n1", opener, nullptr, logger, ReconcileOn::Caller };
+    SharedCacheDirectory directory { "n1", {} };
 
     SECTION("--node-id with no --listen-raft builds no tier")
     {
@@ -249,15 +305,17 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         cfg.raftSelf = "10.0.0.1";
         NodeMembership membership { cfg, membershipLog };
 
-        auto const tier = StartConsensusOrExplain(cfg,
-                                                  noScheduler,
-                                                  "127.0.0.1:6674",
-                                                  std::nullopt,
-                                                  membership,
-                                                  *Unwrap(roster),
-                                                  core::platform::defaultSystemWallClock(),
-                                                  metrics,
-                                                  logger);
+        auto const tier = StartConsensusOrExplain(
+            cfg,
+            noScheduler,
+            "127.0.0.1:6674",
+            std::nullopt,
+            membership,
+            *Unwrap(roster),
+            SharedCacheListeners { .directory = directory, .host = sharedCache, .upstream = nullptr },
+            core::platform::defaultSystemWallClock(),
+            metrics,
+            logger);
         REQUIRE(tier.has_value());
         CHECK(*tier == nullptr);
     }
@@ -275,15 +333,17 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         // Refused, and refused by NAME: a null tier here would mean the gate is still
         // reading the id, and any other refusal would mean it got somewhere this test
         // does not intend to reach.
-        auto const tier = StartConsensusOrExplain(cfg,
-                                                  noScheduler,
-                                                  "127.0.0.1:6674",
-                                                  identity,
-                                                  membership,
-                                                  *Unwrap(roster),
-                                                  core::platform::defaultSystemWallClock(),
-                                                  metrics,
-                                                  logger);
+        auto const tier = StartConsensusOrExplain(
+            cfg,
+            noScheduler,
+            "127.0.0.1:6674",
+            identity,
+            membership,
+            *Unwrap(roster),
+            SharedCacheListeners { .directory = directory, .host = sharedCache, .upstream = nullptr },
+            core::platform::defaultSystemWallClock(),
+            metrics,
+            logger);
         REQUIRE_FALSE(tier.has_value());
         CHECK(tier.error() == ConsensusNeedsNodeIdRefusal);
     }
@@ -298,15 +358,17 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
         cfg.nodeId = "n1";
         NodeMembership membership { cfg, membershipLog };
 
-        auto const tier = StartConsensusOrExplain(cfg,
-                                                  noScheduler,
-                                                  "127.0.0.1:6674",
-                                                  identity,
-                                                  membership,
-                                                  *Unwrap(roster),
-                                                  core::platform::defaultSystemWallClock(),
-                                                  metrics,
-                                                  logger);
+        auto const tier = StartConsensusOrExplain(
+            cfg,
+            noScheduler,
+            "127.0.0.1:6674",
+            identity,
+            membership,
+            *Unwrap(roster),
+            SharedCacheListeners { .directory = directory, .host = sharedCache, .upstream = nullptr },
+            core::platform::defaultSystemWallClock(),
+            metrics,
+            logger);
         REQUIRE_FALSE(tier.has_value());
         CHECK(tier.error() == ConsensusNamesNoDialAddressRefusal);
     }
@@ -334,16 +396,22 @@ TEST_CASE("A consensus tier refuses to start without an identity key", "[node][c
     auto const roster =
         NodeRoster::Build(Testing::FirstStart(NodeConfig {}), core::platform::defaultSystemWallClock(), metrics, logger);
     REQUIRE(roster.has_value());
+    // Never asked to open: these cases' clusters name no shared cache.
+    Testing::MemoryOpener opener;
+    SharedCacheHost sharedCache { "n1", opener, nullptr, logger, ReconcileOn::Caller };
+    SharedCacheDirectory directory { "n1", {} };
 
-    auto const tier = StartConsensusOrExplain(cfg,
-                                              noScheduler,
-                                              "127.0.0.1:6674",
-                                              std::nullopt,
-                                              membership,
-                                              *Unwrap(roster),
-                                              core::platform::defaultSystemWallClock(),
-                                              metrics,
-                                              logger);
+    auto const tier =
+        StartConsensusOrExplain(cfg,
+                                noScheduler,
+                                "127.0.0.1:6674",
+                                std::nullopt,
+                                membership,
+                                *Unwrap(roster),
+                                SharedCacheListeners { .directory = directory, .host = sharedCache, .upstream = nullptr },
+                                core::platform::defaultSystemWallClock(),
+                                metrics,
+                                logger);
     REQUIRE_FALSE(tier.has_value());
     CHECK(tier.error() == ConsensusNeedsIdentityKeyRefusal);
 }
@@ -520,6 +588,96 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
         [&tier] { return std::format("commit index {}", tier->Status().commitIndex.value); }));
     CHECK(tier->Status().commitIndex.value == before.value + 1);
     CHECK(records(tier->ClusterState(), self));
+}
+
+TEST_CASE("Every state a consensus tier applies reaches the shared-cache directory, host and upstream, in order",
+          "[node][consensus][shared-cache]")
+{
+    // The apply half of the shared cache's production wiring. `StartConsensusOrExplain` is what
+    // `main` calls, and its observer is the only thing that tells the three what the cluster agreed:
+    // a host nobody told would leave the machine the fleet named answering not-shared-cache forever;
+    // a directory nobody told would send every other node's reads nowhere; and an upstream told
+    // BEFORE the directory would re-judge the previous state. So a real one-voter tier, over a real
+    // listener and state directory, is asked to name itself.
+    NullLogger logger;
+    AtomicMetricsSink metrics;
+    std::unique_ptr<SchedulerTier> const noScheduler;
+
+    auto probe = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(probe);
+    REQUIRE(probe->IsBound());
+    auto const port = probe->boundPort();
+    probe.reset();
+
+    Testing::ScratchDirectory const scratch { "consensus-shared-cache-apply" };
+    auto cfg = Testing::FirstStart(NodeConfig {});
+    cfg.nodeId = "n1";
+    cfg.raftListen = std::format("127.0.0.1:{}", port);
+    cfg.raftSelf = "127.0.0.1";
+    cfg.clusterDir = scratch.Path() / "state";
+
+    NodeMembership membership { cfg, membershipLog };
+    auto const roster =
+        NodeRoster::Build(Testing::FirstStart(NodeConfig {}), core::platform::defaultSystemWallClock(), metrics, logger);
+    REQUIRE(roster.has_value());
+    Testing::MemoryOpener opener;
+    SharedCacheHost sharedCache { "n1", opener, nullptr, logger, ReconcileOn::Caller };
+    SharedCacheDirectory directory { "n1", {} };
+    RecordingUpstream upstream { directory };
+
+    auto started =
+        StartConsensusOrExplain(cfg,
+                                noScheduler,
+                                {},
+                                Testing::TestKeyPair("n1"),
+                                membership,
+                                *Unwrap(roster),
+                                SharedCacheListeners { .directory = directory, .host = sharedCache, .upstream = &upstream },
+                                core::platform::defaultSystemWallClock(),
+                                metrics,
+                                logger);
+    REQUIRE(started.has_value());
+    auto const& tier = *started;
+    REQUIRE(tier != nullptr);
+
+    // The setting is validated against a live key, so the tier must first have recorded itself.
+    REQUIRE(Testing::WaitUntil(
+        "the one-voter tier to lead and record itself",
+        [&tier] {
+            auto const state = tier->ClusterState();
+            return tier->Status().role == Consensus::Role::Leader
+                   && std::ranges::find(state.members, Consensus::NodeId { "n1" }, &Cluster::ClusterMember::id)
+                          != state.members.end();
+        },
+        [&tier] { return std::format("commit index {}", tier->Status().commitIndex.value); }));
+    // Nothing named yet: the host has opened nothing.
+    sharedCache.Reconcile();
+    CHECK(sharedCache.Current() == nullptr);
+
+    REQUIRE(tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::SetSetting,
+                                                      .key = std::string { Cluster::SharedCacheSetting },
+                                                      .value = "n1",
+                                                      .schedulerEndpoint = {},
+                                                      .publicKey = std::nullopt,
+                                                      .role = std::nullopt })
+                .has_value());
+    // Reconciled on this thread, as `ReconcileOn::Caller` means: what is waited for is the APPLY
+    // reaching the host, and the host acts only when asked.
+    CHECK(Testing::WaitUntil(
+        "the applied setting to reach the host",
+        [&sharedCache] {
+            sharedCache.Reconcile();
+            return sharedCache.Current() != nullptr;
+        },
+        [&sharedCache] { return std::format("named {}", sharedCache.Status().named); }));
+    CHECK(opener.opens == 1);
+
+    // The directory saw it too, and the upstream was told AFTER the directory: the last source it
+    // read at an apply is the one the setting named.
+    CHECK(directory.Current().source == CompileCacheWire::WireSharedCacheSource::ThisMachine);
+    auto const seen = upstream.Seen();
+    REQUIRE_FALSE(seen.empty());
+    CHECK(seen.back() == CompileCacheWire::WireSharedCacheSource::ThisMachine);
 }
 
 TEST_CASE("A leader counts its sends to a learner with no endpoint as a learner with no session",
@@ -1475,4 +1633,27 @@ TEST_CASE("A node announces the seat its mode holds: a learner is never announce
         REQUIRE(*started != nullptr);
         CHECK((*started)->Self().seat == Cluster::MemberSeat::Voter);
     }
+}
+
+TEST_CASE("A shared-cache apply tells the directory before the upstream re-judges from it",
+          "[node][consensus][shared-cache]")
+{
+    // The order the consensus tier's apply callback relies on, asked of the record that holds it: an
+    // upstream told first would re-judge the state BEFORE the one just applied.
+    NullLogger logger;
+    Testing::MemoryOpener opener;
+    SharedCacheHost host { "n1", opener, nullptr, logger, ReconcileOn::Caller };
+    SharedCacheDirectory directory { "n1", {} };
+    RecordingUpstream upstream { directory };
+    SharedCacheListeners const listeners { .directory = directory, .host = host, .upstream = &upstream };
+
+    listeners.Applied(Testing::NamingSharedCache("n1"));
+    CHECK(upstream.Seen() == std::vector { CompileCacheWire::WireSharedCacheSource::ThisMachine });
+    host.Reconcile();
+    CHECK(host.Current() != nullptr); // and the host was told the same state
+
+    // A node with no private tier has no upstream to tell, and the other two are still told.
+    SharedCacheListeners const noTier { .directory = directory, .host = host, .upstream = nullptr };
+    noTier.Applied(Cluster::ClusterState {});
+    CHECK(directory.Current().source == CompileCacheWire::WireSharedCacheSource::None);
 }

@@ -531,6 +531,11 @@ inline constexpr std::array DeclineCauseTable {
     // control verb, so a compile cannot reach it; were one to, no retry clears it, which is
     // `NotPermitted`'s answer.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::IdentifiedCallerRequired, .cause = DeclineCause::NotPermitted },
+    // The fleet's shared cache, which no compile reaches: the launcher speaks FETCH and
+    // STORE to its own machine and never the shared verbs, so meeting this means it reached a
+    // surface it did not think it was talking to -- the enrollment rows' reasoning. A row so it
+    // does not arrive `Unrecognised`, which reads as a peer from the future.
+    DeclineCauseRow { .code = CompileCacheWire::ErrorCode::NotSharedCache, .cause = DeclineCause::NotPermitted },
 };
 
 /// Whether every refusal this build's wire header knows carries a classification.

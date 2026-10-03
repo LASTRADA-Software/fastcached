@@ -2648,6 +2648,93 @@ TEST_CASE("`node` reports which set consensus counts it in", "[cli][node][verbs]
 namespace
 {
 
+/// A `node` answer from a node that says @p shared about the fleet's shared cache.
+/// @param shared The record, or nothing for a node too old to carry one.
+/// @return The answer.
+[[nodiscard]] Answer NodeSaying(std::optional<CacheWire::SharedCacheStatusFields> shared)
+{
+    ScriptedNodeExchange node { { StatusReply({ .version = "1.2.3",
+                                                .nodeId = "node-a",
+                                                .uptimeSeconds = 5,
+                                                .surfaces = {},
+                                                .components = CacheWire::NodeComponentBit::CacheTier,
+                                                .runtime = { .sharedCache = std::move(shared) } }) } };
+    return RunNodeVerb("node", node);
+}
+
+} // namespace
+
+TEST_CASE("`node` reports the fleet's shared cache as cells", "[cli][node][verbs][shared-cache]")
+{
+    // Cells, so a JSON or CSV consumer compares the state word rather than parsing a sentence.
+    auto const answer =
+        NodeSaying(CacheWire::SharedCacheStatusFields { .source = CacheWire::WireSharedCacheSource::Setting,
+                                                        .machineId = "cache-c",
+                                                        .endpoint = "10.0.0.3:6674",
+                                                        .state = CacheWire::WireSharedCacheState::Unreachable,
+                                                        .detail = "connection refused" });
+    REQUIRE(answer.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(answer, "shared-cache").lexical == "setting");
+    CHECK(RequiredCell(answer, "shared-cache-machine").lexical == "cache-c");
+    CHECK(RequiredCell(answer, "shared-cache-endpoint").lexical == "10.0.0.3:6674");
+    CHECK(RequiredCell(answer, "shared-cache-state").lexical == "unreachable");
+    CHECK(RequiredCell(answer, "shared-cache-detail").lexical == "connection refused");
+}
+
+TEST_CASE("`node` says none for a node with no shared cache, and nothing only for one too old to say",
+          "[cli][node][verbs][shared-cache]")
+{
+    // A node with none says `none`, and what it did not name is ABSENT at the cell, never blank.
+    auto const none = NodeSaying(CacheWire::SharedCacheStatusFields {});
+    REQUIRE(none.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(none, "shared-cache").lexical == "none");
+    CHECK(RequiredCell(none, "shared-cache-state").lexical == "not-tried");
+    CHECK(RequiredCell(none, "shared-cache-machine").kind == CellKind::Absent);
+    CHECK(RequiredCell(none, "shared-cache-endpoint").kind == CellKind::Absent);
+    CHECK(RequiredCell(none, "shared-cache-detail").kind == CellKind::Absent);
+
+    // A node that sent no record: the field is there and absent, and nothing else is claimed.
+    auto const silent = NodeSaying(std::nullopt);
+    REQUIRE(silent.outcome == Outcome::Affirmative);
+    CHECK(RequiredCell(silent, "shared-cache").kind == CellKind::Absent);
+    CHECK(CellOf(silent, "shared-cache-state") == nullptr);
+    CHECK(CellOf(silent, "shared-cache-machine") == nullptr);
+}
+
+TEST_CASE("`node` names every shared-cache source and state in one token", "[cli][node][verbs][shared-cache]")
+{
+    // Every enumerator, so a spelling that named one of them wrongly -- or two alike -- is red.
+    for (auto const& [source, word]:
+         { std::pair { CacheWire::WireSharedCacheSource::None, std::string_view { "none" } },
+           std::pair { CacheWire::WireSharedCacheSource::Setting, std::string_view { "setting" } },
+           std::pair { CacheWire::WireSharedCacheSource::Override, std::string_view { "override" } },
+           std::pair { CacheWire::WireSharedCacheSource::ThisMachine, std::string_view { "this-machine" } } })
+    {
+        INFO("source: " << word);
+        auto shared = CacheWire::SharedCacheStatusFields {};
+        shared.source = source;
+        CHECK(RequiredCell(NodeSaying(shared), "shared-cache").lexical == word);
+    }
+    for (auto const& [state, word]:
+         { std::pair { CacheWire::WireSharedCacheState::NotTried, std::string_view { "not-tried" } },
+           std::pair { CacheWire::WireSharedCacheState::Proven, std::string_view { "proven" } },
+           std::pair { CacheWire::WireSharedCacheState::Unresolved, std::string_view { "unresolved" } },
+           std::pair { CacheWire::WireSharedCacheState::WrongKey, std::string_view { "wrong-key" } },
+           std::pair { CacheWire::WireSharedCacheState::Unreachable, std::string_view { "unreachable" } },
+           std::pair { CacheWire::WireSharedCacheState::Serving, std::string_view { "serving" } },
+           std::pair { CacheWire::WireSharedCacheState::Unavailable, std::string_view { "unavailable" } },
+           std::pair { CacheWire::WireSharedCacheState::ProofRefused, std::string_view { "proof-refused" } } })
+    {
+        INFO("state: " << word);
+        auto shared = CacheWire::SharedCacheStatusFields {};
+        shared.state = state;
+        CHECK(RequiredCell(NodeSaying(shared), "shared-cache-state").lexical == word);
+    }
+}
+
+namespace
+{
+
 /// One condition row as a node sends it: words, never an enumerator.
 /// @param id The row's id.
 /// @param persistence Its persistence word.

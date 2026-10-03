@@ -16,8 +16,12 @@
 #include "NodeProofClient.hpp"
 #include "NodeProofResponder.hpp"
 #include "NodeStatusResponder.hpp"
+#include "PrivateTierProfile.hpp"
 #include "Responders.hpp"
 #include "SessionResponder.hpp"
+#include "SharedCacheHost.hpp"
+#include "SharedCacheResponder.hpp"
+#include "SharedCacheTier.hpp"
 
 #include <FastCache/Cache/InMemoryLruStorage.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
@@ -40,6 +44,7 @@
 #include <FastCache/Transport/NativeListen.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <array>
@@ -3842,13 +3847,16 @@ struct ProvingFleet
         Testing::PublishKeyRoster(keys, { std::string { ProvingMachine } }, { std::string { RetiredMachine } });
     }
 
+    /// The id this node signs as, and whose test key it signs under.
+    static constexpr std::string_view ServerName = "scheduler";
+
     Fleet fleet;
     Distributed::KeyRosterMembership keys;
     Distributed::AnyOfMembership oracle { { &fleet.membership, &keys } };
     SchedulerResponder scheduler { fleet.protocol, oracle, fleet.metrics };
-    Ed25519KeyPair const identity = Testing::TestKeyPair("scheduler");
+    Ed25519KeyPair const identity = Testing::TestKeyPair(std::string { ServerName });
     Testing::ScriptedSecureRandom random { Testing::ServerHandshakeScript() };
-    NodeProofResponder prover { "scheduler", identity, oracle, random, fleet.metrics, fleet.logger };
+    NodeProofResponder prover { std::string { ServerName }, identity, oracle, random, fleet.metrics, fleet.logger };
     MergedResponder merged { SurfaceComponents { .scheduler = &scheduler, .nodeProof = &prover } };
 
     /// Start an endpoint on a free port, serving this node's surface.
@@ -3867,6 +3875,18 @@ struct ProvingFleet
     [[nodiscard]] std::uint64_t Read(IMetricsSink::Counter counter) const noexcept
     {
         return fleet.metrics.Read(counter);
+    }
+
+    /// @return The id this node's responder signs its challenges as.
+    [[nodiscard]] std::string ServerId() const
+    {
+        return std::string { ServerName };
+    }
+
+    /// @return The identity key this node's responder signs its challenges under.
+    [[nodiscard]] Ed25519PublicKey ServerKey() const
+    {
+        return identity.PublicKey();
     }
 };
 
@@ -4042,6 +4062,12 @@ class FixedServerTrust final: public IServerTrust
         return _standing;
     }
 
+    /// @copydoc IServerTrust::Expected
+    [[nodiscard]] std::string_view Expected() const override
+    {
+        return "a voter";
+    }
+
   private:
     ServerStanding _standing;
 };
@@ -4055,7 +4081,8 @@ class FixedServerTrust final: public IServerTrust
     auto socket =
         core::async::syncRun(connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = 5s }));
     REQUIRE(socket.has_value());
-    return std::make_unique<SealedFrameSocket>(*std::move(socket), SealedFrameEnd::Caller, Wire::MaxSealedReplyPayload);
+    return std::make_unique<SealedFrameSocket>(
+        *std::move(socket), SealedFrameEnd::Caller, Wire::MaxSealedReplyPayload, nullptr);
 }
 
 } // namespace
@@ -4113,6 +4140,121 @@ TEST_CASE("A relayed handshake followed by an injected verb is refused by the se
 
     CHECK(WaitFor([&rig] { return rig.Read(IMetricsSink::Counter::NodeSealedFramesRefused) == 1; }));
     CHECK(rig.fleet.service.Workers().LiveWorkers().empty());
+}
+
+namespace
+{
+
+/// A shared tier nobody names: the component answers, dormant, and is here for its CEILINGS --
+/// every node folds 256 MiB of them into its listener, which is what a sealed frame could be.
+class NeverNamedOpener final: public ISharedTierOpener
+{
+  public:
+    [[nodiscard]] std::expected<std::shared_ptr<SharedCacheTier>, std::string> Open() override
+    {
+        return std::unexpected { std::string { "this case names no shared cache" } };
+    }
+};
+
+/// `ProvingFleet` as every node now is: the fleet's shared cache on the listener too, so the
+/// surface takes a frame of an object's size -- and a server script for two handshakes.
+struct SharedCacheProvingFleet
+{
+    SharedCacheProvingFleet()
+    {
+        Testing::PublishKeyRoster(keys, { std::string { ProvingMachine } });
+    }
+
+    Fleet fleet;
+    Distributed::KeyRosterMembership keys;
+    Distributed::AnyOfMembership oracle { { &fleet.membership, &keys } };
+    SchedulerResponder scheduler { fleet.protocol, oracle, fleet.metrics };
+    Ed25519KeyPair const identity = Testing::TestKeyPair(std::string { ProvingFleet::ServerName });
+    Testing::ScriptedSecureRandom random { Testing::ScriptedSecureRandom::Ascending(4 * NonceBytes, 0x00) };
+    NodeProofResponder prover {
+        std::string { ProvingFleet::ServerName }, identity, oracle, random, fleet.metrics, fleet.logger
+    };
+    NeverNamedOpener opener;
+    SharedCacheHost host { "cache-c", opener, nullptr, fleet.logger, ReconcileOn::Caller };
+    SharedCacheResponder shared { host, oracle, fleet.metrics };
+    MergedResponder merged { SurfaceComponents { .scheduler = &scheduler, .nodeProof = &prover, .sharedCache = &shared } };
+
+    [[nodiscard]] std::pair<std::unique_ptr<FrameEndpoint>, std::uint16_t> Serve()
+    {
+        auto const port = FreePort();
+        auto endpoint = FrameEndpoint::Start(
+            fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), merged, fleet.metrics, fleet.logger);
+        REQUIRE(endpoint.has_value());
+        fleet.Serve();
+        return { *std::move(endpoint), port };
+    }
+};
+
+/// A request header alone, naming @p op and declaring @p payload bytes it never sends.
+/// @param op The verb it names.
+/// @param payload The declared length.
+/// @return The header.
+[[nodiscard]] std::vector<std::byte> HeaderDeclaring(Wire::Op op, std::uint32_t payload)
+{
+    auto header = std::vector<std::byte>(Wire::RequestHeaderSize);
+    WireFrame::PutHeader(
+        std::span<std::byte> { header }, Wire::Magic, Wire::CurrentVersion, static_cast<std::uint8_t>(op), payload);
+    return header;
+}
+
+} // namespace
+
+TEST_CASE("A sealed frame the in-flight budget has no room for is answered busy and never held",
+          "[node][frame][proof][seal][budget]")
+{
+    // A sealed frame is held whole before its seal can be checked, so before the surface's own
+    // byte budget can be asked -- and since every node folds the shared cache's 256 MiB into its
+    // listener, that is 256 MiB a proven peer could park per connection. So the holding is charged
+    // to the same budget: one proven connection gathering a large frame holds its size, and a
+    // second whose frame would pass the budget is refused BEFORE a byte of it is kept -- answered
+    // busy by the component that owns the verb, never counted as a broken seal.
+    //
+    // The late frame's verb is a byte nobody verified, so it may name a verb nothing on this node
+    // owns -- a STORE, with no local cache in this rig. That one is answered busy too, by the owner
+    // whose budget ran out, and counted on ITS row: answered unserved, it moved no counter at all.
+    //
+    // Neutered -- the sealing layer charging nothing -- the first hold never shows in the budget
+    // and the second frame is gathered rather than refused. Neutered to answer an unowned verb
+    // unserved, only the STORE run goes red.
+    auto const lateVerb = GENERATE(Wire::Op::SharedStore, Wire::Op::Store);
+    CAPTURE(static_cast<int>(lateVerb));
+    SharedCacheProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+    auto const budget = rig.merged.MaxInFlightBytes();
+    REQUIRE(budget == 256ULL * 1024ULL * 1024ULL);
+
+    constexpr std::uint32_t Large = 200U * 1024U * 1024U;
+    HandshakeCaller holder { port, ProvingMachine, 0x80 };
+    REQUIRE(holder.Challenge());
+    REQUIRE(Testing::StatusOf(holder.Prove()) == Wire::Status::Ok);
+    REQUIRE(holder.Connection().SendOnly(HeaderDeclaring(Wire::Op::SharedStore, Large)));
+    constexpr auto held = Wire::RequestHeaderSize + Large + SessionTagBytes;
+    REQUIRE(WaitFor([&endpoint] { return endpoint->InFlightBytes() == held; }));
+
+    constexpr std::uint32_t Second = 100U * 1024U * 1024U;
+    HandshakeCaller late { port, ProvingMachine, 0xC0 };
+    REQUIRE(late.Challenge());
+    REQUIRE(Testing::StatusOf(late.Prove()) == Wire::Status::Ok);
+    REQUIRE(late.Connection().SendOnly(HeaderDeclaring(lateVerb, Second)));
+    auto const refused = late.ReadSealedReply();
+    REQUIRE_FALSE(refused.empty());
+    CHECK(late.LastTagVerified());
+    CHECK(Testing::ErrorOf(refused) == Wire::ErrorCode::EndpointBusy);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeSharedCacheRequestsRefusedEndpointBusy) == 1);
+    CHECK(rig.fleet.metrics.Read(IMetricsSink::Counter::NodeSealedFramesRefused) == 0);
+    // Nothing of the refused frame was charged: the budget holds the first frame alone.
+    CHECK(endpoint->InFlightBytes() == held);
+    // And the connection ends: a sealed stream cannot be stepped over a frame whose seal was never read.
+    CHECK(late.Connection().ReadReply().empty());
+
+    // The holder goes away mid-frame, and what it held is given back.
+    holder.Connection().CloseNow();
+    CHECK(WaitFor([&endpoint] { return endpoint->InFlightBytes() == 0; }));
 }
 
 TEST_CASE("A sealed frame replayed on its own connection is refused by the seal", "[node][frame][proof][seal]")
@@ -4312,6 +4454,8 @@ TEST_CASE("A worker proves nothing to a server its roster does not hold as a vot
         auto const attempt = client.Prove(*sealed);
         CHECK(attempt.result == NodeProofResult::Untrusted);
         CHECK_FALSE(sealed->Sealed());
+        CHECK(attempt.reason.contains(rig.ServerId()));
+        CHECK(attempt.reason.contains("expected a voter"));
         if (standing == ServerStanding::Revoked)
             CHECK(attempt.reason.contains("REVOKED"));
     }
@@ -4435,7 +4579,7 @@ struct TicketedNode
     /// far past what `optin.performance.Padding` allows.
     std::unique_ptr<InMemoryLruStorage> local = std::make_unique<InMemoryLruStorage>(64 * 1024);
     NoUpstream upstream;
-    LocalCache cache { *local, upstream, fleet.clock, fleet.metrics };
+    LocalCache cache { *local, upstream, fleet.clock, fleet.metrics, PrivateTierProfile };
     CacheProxy proxy { cache, fleet.metrics };
     CacheResponder cacheTier { proxy, locality, fleet.metrics };
 
@@ -4850,4 +4994,95 @@ TEST_CASE("A key revoked while its ticketed connection is open refuses the next 
     CHECK(ErrorOf(client.Send(Wire::EncodeNodeStatusRequest())) == Wire::ErrorCode::NotAMember);
     CHECK(node.Read(IMetricsSink::Counter::NodeRequestsRefusedKeyRevoked) == 1);
     CHECK(node.Read(IMetricsSink::Counter::NodeStatusRequestsRefusedNotAMember) == 0);
+}
+
+TEST_CASE("Every server standing states whether a machine proves itself to it", "[node][proof][client][shared-cache]")
+{
+    static_assert(RowsInEnumeratorOrder(ServerStandingTable, &ServerStandingRow::standing));
+    // Exactly the three acceptances; every refusal carries a sentence naming both sides.
+    for (auto const& row: ServerStandingTable)
+    {
+        CHECK(row.provesTo == row.refusal.empty());
+        CHECK((row.provesTo || (row.refusal.contains("{0}") && row.refusal.contains("{1}"))));
+    }
+    CHECK(std::ranges::count_if(ServerStandingTable, &ServerStandingRow::provesTo) == 3);
+    CHECK(ServerStandingTable[static_cast<std::size_t>(ServerStanding::Named)].provesTo);
+    CHECK_FALSE(ServerStandingTable[static_cast<std::size_t>(ServerStanding::NotNamed)].provesTo);
+    CHECK_FALSE(ServerStandingTable[static_cast<std::size_t>(ServerStanding::NamedUnderOtherKey)].provesTo);
+    // The two shared-cache refusals are different diagnoses, so they are different sentences.
+    CHECK(ServerStandingTable[static_cast<std::size_t>(ServerStanding::NotNamed)].refusal
+          != ServerStandingTable[static_cast<std::size_t>(ServerStanding::NamedUnderOtherKey)].refusal);
+}
+
+TEST_CASE("A named-machine trust accepts that machine's key and nothing else", "[node][proof][client][shared-cache]")
+{
+    auto const key = Testing::TestKeyPair("cache-c").PublicKey();
+    NamedMachineTrust const trust { "cache-c", key };
+    CHECK(trust.Expected() == "cache-c");
+    CHECK(trust.StandingOf("cache-c", key) == ServerStanding::Named);
+    // Another machine of the same fleet, with ITS live key: still not the shared cache.
+    CHECK(trust.StandingOf("pc-9", Testing::TestKeyPair("pc-9").PublicKey()) == ServerStanding::NotNamed);
+    // The right name under another key: an impostor, or a re-keyed host the roster has not caught up
+    // with -- a different answer, because the remedy is not the address.
+    CHECK(trust.StandingOf("cache-c", Testing::TestKeyPair("pc-9").PublicKey()) == ServerStanding::NamedUnderOtherKey);
+    // Never "Unchecked": a named trust always has something to check against.
+}
+
+TEST_CASE("A node proves itself to the named machine and to no other", "[node][frame][proof][client][shared-cache]")
+{
+    // The real endpoint of the fixture signs as `ProvingFleet`'s server id under its own key.
+    ProvingFleet rig;
+    auto const [endpoint, port] = rig.Serve();
+    auto const clientKey = Testing::TestKeyPair(std::string { ProvingMachine });
+
+    // Named correctly: proved, and sealed both ways, over the coroutine.
+    {
+        auto sealed = DialSealed(port);
+        Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+        FixedServerTrust const voter { ServerStanding::Voter }; // the client's own trust; unused by ProveAsync here
+        NodeProofClient const client { std::string { ProvingMachine }, clientKey, voter, random };
+        NamedMachineTrust const named { rig.ServerId(), rig.ServerKey() };
+        auto const attempt = core::async::syncRun(client.ProveAsync(sealed.get(), &named));
+        INFO(attempt.reason);
+        CHECK(attempt.result == NodeProofResult::Proved);
+        CHECK(attempt.standing == std::optional { ServerStanding::Named });
+        CHECK(sealed->Sealed());
+    }
+    auto const acceptedBefore = rig.Read(IMetricsSink::Counter::NodeProofsAccepted);
+
+    // Named as somebody else, or as this server's id under another key -- an impostor that typed
+    // the right name: untrusted, and NO proof reaches the server. Each refusal names who answered
+    // AND whom this node expected, and says which of the two mistakes it is.
+    struct Refusal
+    {
+        std::string namedId;        ///< Whom the trust expects.
+        ServerStanding standing;    ///< What the trust answers.
+        std::string_view diagnosis; ///< The words only this refusal's sentence carries.
+    };
+    auto const anotherKey = Testing::TestKeyPair("cache-c").PublicKey();
+    for (auto const& refusal:
+         { Refusal {
+               .namedId = "cache-c", .standing = ServerStanding::NotNamed, .diagnosis = "now reaches another machine" },
+           Refusal { .namedId = rig.ServerId(),
+                     .standing = ServerStanding::NamedUnderOtherKey,
+                     .diagnosis = "--cluster-admit=scheduler=<endpoint>@<key>" } })
+    {
+        INFO("named " << refusal.namedId);
+        auto sealed = DialSealed(port);
+        Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+        FixedServerTrust const voter { ServerStanding::Voter }; // the client's own trust; unused by ProveAsync here
+        NodeProofClient const client { std::string { ProvingMachine }, clientKey, voter, random };
+        NamedMachineTrust const other { refusal.namedId, anotherKey };
+        auto const attempt = core::async::syncRun(client.ProveAsync(sealed.get(), &other));
+        INFO(attempt.reason);
+        CHECK(attempt.result == NodeProofResult::Untrusted);
+        CHECK(attempt.standing == std::optional { refusal.standing });
+        // WHICH refusal: the server that answered, the machine this node expected, and the diagnosis.
+        CHECK(attempt.reason.contains(rig.ServerId()));
+        CHECK(attempt.reason.contains(refusal.namedId));
+        CHECK(attempt.reason.contains(refusal.diagnosis));
+        CHECK_FALSE(sealed->Sealed());
+    }
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsAccepted) == acceptedBefore);
+    CHECK(rig.Read(IMetricsSink::Counter::NodeProofsRejected) == 0);
 }

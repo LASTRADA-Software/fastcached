@@ -951,3 +951,10 @@ TEST_CASE("Discovery on a node running no consensus is not served, and the works
     // The control: the same address beside consensus is served.
     CHECK_FALSE(RowFor(NodeSurface::Discovery).Resolve(Testing::FirstStart(NodeConfig {})).empty());
 }
+
+TEST_CASE("Every node is attributed the shared-cache counters", "[node][surfaces][metrics][shared-cache]")
+{
+    // Every node builds the shared-cache component on its merged listener, dormant or serving, so
+    // every node can move these -- a dormant one counts its not-serving refusals.
+    CHECK(std::ranges::contains(NodeServedSurfacesFor(NodeConfig {}).Span(), MetricsSurface::NodeSharedCache));
+}

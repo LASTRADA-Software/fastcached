@@ -35,6 +35,9 @@ namespace
         { .fault = SealFault::Oversized,
           .why = "a sealed frame declared more payload than this end holds before it can check a seal" },
         { .fault = SealFault::Unframed, .why = "a sealed connection carried bytes that are not a frame of this protocol" },
+        { .fault = SealFault::OverBudget,
+          .why = "a sealed frame declared more than this end's in-flight byte budget has room to hold before it can "
+                 "check the seal" },
     } };
 
     static_assert(RowsInEnumeratorOrder(SealFaults, &SealFaultRow::fault),
@@ -71,11 +74,38 @@ std::string_view DescribeSealFault(SealFault fault) noexcept
     return SealFaults[static_cast<std::size_t>(fault)].why;
 }
 
-SealedFrameSocket::SealedFrameSocket(std::unique_ptr<core::net::ISocket> raw, SealedFrameEnd end, std::size_t maxPayload):
+SealedFrameSocket::SealedFrameSocket(std::unique_ptr<core::net::ISocket> raw,
+                                     SealedFrameEnd end,
+                                     std::size_t maxPayload,
+                                     ISealedFrameBudget* budget):
     _raw { std::move(raw) },
     _end { end },
-    _maxPayload { maxPayload }
+    _maxPayload { maxPayload },
+    _budget { budget }
 {
+}
+
+SealedFrameSocket::~SealedFrameSocket()
+{
+    ReleaseHeld();
+}
+
+void SealedFrameSocket::ReleaseHeld() noexcept
+{
+    if (_held == 0 || _budget == nullptr)
+        return;
+    _budget->Release(_held);
+    _held = 0;
+}
+
+std::optional<std::uint8_t> SealedFrameSocket::RefusedVerb() const noexcept
+{
+    return _refusedVerb;
+}
+
+std::size_t SealedFrameSocket::RefusedBytes() const noexcept
+{
+    return _refusedBytes;
 }
 
 void SealedFrameSocket::SealReceiving(SessionKey key)
@@ -157,7 +187,26 @@ std::optional<SealFault> SealedFrameSocket::ReleaseWholeFrames()
         }
         auto const frameBytes = headerBytes + *declared;
         if (rest.size() < frameBytes + SessionTagBytes)
+        {
+            // Not whole: what this end is about to hold, unverified, until it is. Charged ONCE per
+            // frame, from its header, before another byte of it is kept -- and refused, charging
+            // nothing, when the owner's budget has no room.
+            if (_held == 0 && _budget != nullptr)
+            {
+                if (!_budget->TryHold(frameBytes + SessionTagBytes))
+                {
+                    fault = SealFault::OverBudget;
+                    _refusedBytes = frameBytes + SessionTagBytes;
+                    if (isRequest)
+                        _refusedVerb = Wire::DecodeRequestHeader(rest.first(headerBytes))
+                                           .transform([](Wire::RequestHeader const& h) { return h.opRaw; })
+                                           .value_or(std::uint8_t { 0xFF });
+                    break;
+                }
+                _held = frameBytes + SessionTagBytes;
+            }
             break;
+        }
 
         auto tag = SessionTag {};
         std::ranges::copy(rest.subspan(frameBytes, SessionTagBytes), tag.begin());
@@ -168,7 +217,13 @@ std::optional<SealFault> SealedFrameSocket::ReleaseWholeFrames()
         }
         _released.insert(_released.end(), rest.begin(), rest.begin() + static_cast<std::ptrdiff_t>(frameBytes));
         consumed += frameBytes + SessionTagBytes;
+        // Whole and verified: from here the frame is the reader's, and the reader's own budget --
+        // the endpoint's, charged from the same header -- is what accounts for it.
+        ReleaseHeld();
     }
+    // A fault ends the stream, so nothing is gathered for it any more.
+    if (fault.has_value())
+        ReleaseHeld();
 
     _pending.erase(_pending.begin(), _pending.begin() + static_cast<std::ptrdiff_t>(consumed));
     return fault;

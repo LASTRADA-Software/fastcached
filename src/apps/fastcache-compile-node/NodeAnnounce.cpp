@@ -302,7 +302,11 @@ std::size_t DialAndAnnounce(
         if (proof.prover != nullptr)
         {
             auto sealed = std::make_unique<SealedFrameSocket>(
-                std::move(client), SealedFrameEnd::Caller, CompileCacheWire::MaxSealedReplyPayload);
+                // No budget: a caller holds the replies to what it asked, one at a time.
+                std::move(client),
+                SealedFrameEnd::Caller,
+                CompileCacheWire::MaxSealedReplyPayload,
+                nullptr);
             auto const attempt = proof.prover->Prove(*sealed);
             if (attempt.result != NodeProofResult::Proved)
             {

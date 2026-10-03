@@ -8,6 +8,7 @@
 #include "NodeConditions.hpp"
 #include "NodeMachineStanding.hpp"
 #include "NodeRoster.hpp"
+#include "SharedCacheStatus.hpp"
 
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
@@ -523,6 +524,13 @@ struct NodeRuntimeSources
     /// wired. A node that holds no roster reports the field ABSENT through it, which is a
     /// different answer from a roster of nobody.
     NodeRoster const* roster { nullptr };
+
+    /// What this node says about the fleet's shared cache; null only where nothing was wired,
+    /// which reports the field ABSENT -- the reading a node too old to carry it gives.
+    ///
+    /// Every node has one, so on a running node this is never null: a node with no shared cache
+    /// says `none` through it rather than nothing (`SharedCacheStatusOf`).
+    ISharedCacheStatusSource const* sharedCache { nullptr };
 };
 
 /// The production `INodeStatusSource`: config for the surfaces, a clock for the uptime.

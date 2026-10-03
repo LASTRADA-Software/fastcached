@@ -46,6 +46,8 @@ enum class NodeCondition : std::uint8_t
     HostNameReachesOnlyThisMachine, ///< This machine's name reaches only itself, so nothing offers it.
     EnrollmentRequestsWaiting,      ///< Machines have asked to join and nobody has decided about them.
     ForeignFleetVisible,            ///< Another established fleet proves itself on this segment; neither will merge.
+    SharedCacheUnavailable,         ///< The fleet names this machine its shared cache, and its shared tier will not open.
+    SharedCacheUnproven,            ///< The fleet names another machine its shared cache, and this node is not reaching it.
     Last,                           ///< Not a condition.
 };
 
@@ -212,6 +214,25 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
                 "apart and caching twice. If both fleets are meant to stay, nothing is wrong and this clears on its "
                 "own a few minutes after the other fleet stops being heard; put them on separate segments to stop "
                 "hearing it." },
+    { .condition = NodeCondition::SharedCacheUnavailable,
+      .id = "shared-cache-unavailable",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Alert,
+      .scope = ConditionScope::Consensus,
+      .remedy = "The fleet's shared-cache setting names this machine and its shared tier will not open; every other "
+                "node's builds miss meanwhile and compile locally. Fix what the detail names -- usually another process "
+                "holding <state-dir>/shared-cache, or a full disk -- and it opens at the next change the cluster "
+                "applies or within 30 seconds; or name another machine with --cluster-set shared-cache=<id>." },
+    { .condition = NodeCondition::SharedCacheUnproven,
+      .id = "shared-cache-unproven",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Consensus,
+      .remedy = "This node's builds are not reaching the fleet's shared cache and compile locally instead. The detail "
+                "names why: a machine at the announced address that proved another key (an address reassigned, or an "
+                "impostor -- nothing was sent to it), the named machine refusing this node's key (its roster does not "
+                "hold it, or holds it revoked), one that did not answer, or a setting naming a machine this cluster "
+                "cannot reach by key. Check --cluster-status and the named machine's own --node-status." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");

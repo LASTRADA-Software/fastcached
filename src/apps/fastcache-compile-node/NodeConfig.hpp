@@ -4,6 +4,7 @@
 #include "NodeDefaults.hpp"
 #include "NodeFormation.hpp"
 
+#include <FastCache/Cache/StorageTier.hpp>
 #include <FastCache/Cli/Options.hpp>
 #include <FastCache/Cli/UsageDoc.hpp>
 #include <FastCache/Cluster/ClusterState.hpp>
@@ -149,6 +150,28 @@ struct EnrollCommand
 /// @param text What the operator wrote.
 /// @return The pair, or nullopt when it is not one.
 [[nodiscard]] std::optional<std::pair<std::string, std::string>> ParseSettingAssignment(std::string_view text);
+
+// The Disk row is REQUIRED to carry a shared-cache default: `DefaultSharedCacheDiskBytes`
+// below has no other answer to give, and 0 is not a safe stand-in -- it is
+// `--cache-memory`'s spelling of UNBOUNDED, so a fallback to it would let the shared
+// tier grow until the disk is full rather than fail. Asserted here, at compile time,
+// against the table itself, so the function's runtime check can never actually be
+// false: the check stays (clang-tidy's `bugprone-unchecked-optional-access` cannot see
+// a static_assert two declarations away), but what it guards is unreachable.
+static_assert(TraitsFor(StorageTier::Disk).sharedTierDefaultBytes.has_value(),
+              "the Disk tier must carry a shared-cache default byte budget");
+
+/// `StorageTierTable`'s default byte budget for the shared tier this node may serve:
+/// `TraitsFor(StorageTier::Disk).sharedTierDefaultBytes`, unwrapped.
+///
+/// A CHECKED read rather than a bare dereference, which is what keeps this clean under
+/// `bugprone-unchecked-optional-access` -- the analyser has no way to know the
+/// static_assert above already rules the empty case out. It is ruled out there and not
+/// answered here with a fallback value, because 0 reads as UNBOUNDED for this budget:
+/// the only correct answer to "the Disk row has no default" is a build that never
+/// produces this binary, not a large number silently standing in for a small one.
+/// @return The Disk tier's shared-cache default in bytes.
+[[nodiscard]] std::uint64_t DefaultSharedCacheDiskBytes() noexcept;
 
 struct NodeConfig
 {
@@ -331,6 +354,18 @@ struct NodeConfig
     /// to keep what it has -- but a node runs on somebody's workstation, so this
     /// is the flag that exists because that default is not always the right one.
     std::uint64_t cacheDiskBytes { 0 };
+
+    /// Bytes the SHARED tier this node serves may hold, when the fleet's
+    /// `shared-cache` setting names this machine.
+    ///
+    /// Defaults from `StorageTierTable`'s own column rather than a literal here, so
+    /// the one place that answers "how large by default" stays the table. A present
+    /// zero means "grow as needed", `--cache-memory`'s rule and not `cacheDiskBytes`'s
+    /// -- the private tier defaults to unbounded because a cache asked to survive
+    /// restarts is usually asked to keep what it has, while the shared tier defaults
+    /// to a cap because it answers other machines' builds, on a filesystem an
+    /// operator did not necessarily size for the whole fleet.
+    std::uint64_t sharedCacheDiskBytes { DefaultSharedCacheDiskBytes() };
 
     /// Codec effort for the on-disk tier, and for the in-memory one.
     ///
@@ -664,6 +699,7 @@ struct NodeConfig
     bool toolchainDiscoveryExplicit { false };
     bool adminListenExplicit { false };
     bool cacheDiskBytesExplicit { false };
+    bool sharedCacheDiskBytesExplicit { false };
     bool raftListenExplicit { false };
     bool raftSelfExplicit { false };
     bool discoveryAddressExplicit { false };
@@ -1620,6 +1656,21 @@ inline constexpr OptionComponent<NodeConfig> WorkerComponent {
 /// @param cfg The parsed configuration.
 /// @return True when a cache tier will be built unless starting it fails.
 [[nodiscard]] bool ConfiguresCacheTier(NodeConfig const& cfg) noexcept;
+
+/// Where the shared tier's store lives: `<state directory>/shared-cache/objects.cow`.
+///
+/// A directory of its own inside the node's state directory (`NodeStateDirectory`: the
+/// `--cluster-dir` typed, else the default resolved at startup), never `--cache-dir`: the
+/// private tier's store is claimed exclusively by this process already, and the two tiers
+/// answer to different verbs and different callers. `DiskStoreFileName` is the file's
+/// name in both, so a test measuring either store spells it once.
+///
+/// **Never `cfg.clusterDir` alone**: that is only the TYPED directory, so a zero-config
+/// node -- which names none -- would open its shared tier at a path relative to the
+/// working directory.
+/// @param cfg The configuration; its state directory must be resolved.
+/// @return The store file.
+[[nodiscard]] std::filesystem::path SharedCacheStorePath(NodeConfig const& cfg);
 
 /// The member endpoint `--raft-self` -- or, when it is not given, this machine's resolved
 /// fully qualified name -- and `--listen-raft` name between them.

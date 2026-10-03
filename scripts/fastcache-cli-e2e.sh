@@ -598,6 +598,11 @@ else
     expect_status 0 "the node answers node-status"
     expect_stdout "components" "the node reports which components it runs"
     expect_stdout_line "^admin-port +$nodeAdminPort\$" "the reported admin port is the one it bound"
+    # **A node with no shared cache says `none`, end to end** -- which a unit test cannot show,
+    # because what hands the status to the reply is `main`, and `main` is in no test target. An
+    # unwired source reports the field ABSENT, which renders as something other than `none`.
+    expect_stdout_line "^shared-cache +none\$" "a node with no shared cache says none rather than nothing"
+    expect_stdout_line "^shared-cache-state +not-tried\$" "and has tried nothing"
 
     # Every node holds an identity now, and says where it keeps it and why there: one
     # machine can hold two (the service's and a hand-started node's), and the reason is

@@ -101,6 +101,11 @@ ServerStanding NodeRoster::StandingOf(std::string_view serverId, Ed25519PublicKe
     return ServerStanding::NotVoter;
 }
 
+std::string_view NodeRoster::Expected() const
+{
+    return "a voter";
+}
+
 void NodeRoster::Applied(Cluster::ClusterState const& state)
 {
     if (_state != nullptr)

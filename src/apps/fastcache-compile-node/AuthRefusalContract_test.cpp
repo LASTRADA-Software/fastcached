@@ -6,6 +6,7 @@
 #include "NodeConfig.hpp"
 #include "NodeFrameSurface.hpp"
 #include "NodeIoLoop.hpp"
+#include "PrivateTierProfile.hpp"
 #include "Responders.hpp"
 #include "SessionResponder.hpp"
 
@@ -43,6 +44,7 @@
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScriptedSocket.hpp>
 #include <tests/SecureRandomFakes.hpp>
+#include <tests/SurfaceOwnerFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -104,7 +106,7 @@ TEST_CASE("A credentialled client reaches a node and still gets its answer", "[n
     Node::NoUpstream upstream;
     core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
-    Node::LocalCache cache { local, upstream, clock, metrics };
+    Node::LocalCache cache { local, upstream, clock, metrics, Node::PrivateTierProfile };
     Node::CacheProxy proxy { cache, metrics };
     Testing::ScriptedHostAddresses const machine { { "10.0.0.7" } };
     CachedLocalityOracle const locality { machine, clock };
@@ -136,8 +138,15 @@ TEST_CASE("A credentialled client reaches a node and still gets its answer", "[n
 
     Node::NodeIoLoop io;
     NullLogger logger;
+    // Every other owner a built node has, as stand-ins: this case is about the cache verb and AUTH.
+    Node::SurfaceFakes::EveryNodeOwners owners;
     auto surface = Node::StartNodeSurfaceOrExplain(
-        io, cfg, Node::SurfaceComponents { .cache = &cacheResponder, .session = &session }, std::nullopt, metrics, logger);
+        io,
+        cfg,
+        owners.Around(Node::SurfaceComponents { .cache = &cacheResponder, .session = &session }),
+        std::nullopt,
+        metrics,
+        logger);
     REQUIRE(surface.has_value());
     REQUIRE(*surface != nullptr);
     io.Start();
@@ -206,7 +215,7 @@ TEST_CASE("A credentialled client reaches a cache tier that has no AUTH and stil
     Node::NoUpstream upstream;
     core::platform::ManualClock clock;
     AtomicMetricsSink metrics;
-    Node::LocalCache cache { local, upstream, clock, metrics };
+    Node::LocalCache cache { local, upstream, clock, metrics, Node::PrivateTierProfile };
     Node::CacheProxy proxy { cache, metrics };
 
     auto const refusal =

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "CacheProxy.hpp"
+#include "PrivateTierProfile.hpp"
+#include "SharedTierProfile.hpp"
 
 #include <FastCache/CompileCache/CompileValue.hpp>
 #include <FastCache/Protocol/SurfaceRefusal.hpp>
@@ -45,10 +47,14 @@ namespace
         /// second command", steps over it and compiles locally, so the build stays
         /// correct and merely stops being fast. That is the failure shape this tree
         /// has already paid for twice.
-        constexpr Cc::SurfaceRefusal UnsupportedVersion {
-            .code = Wire::ErrorCode::UnsupportedVersion,
-            .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedUnsupportedVersion,
-        };
+        ///
+        /// A function of the tier rather than a constant: each tier counts it on its own series.
+        /// @param tier The tier answering.
+        /// @return The row, naming that tier's counter.
+        [[nodiscard]] constexpr Cc::SurfaceRefusal UnsupportedVersion(CacheTierProfile const& tier) noexcept
+        {
+            return { .code = Wire::ErrorCode::UnsupportedVersion, .counter = tier.refusedUnsupportedVersion };
+        }
 
         /// A `FETCH` or `STORE` body that would not decode.
         ///
@@ -62,10 +68,14 @@ namespace
         /// Its OWN counter rather than any other `malformed-frame` row. The code is
         /// shared with a truncated compile frame, an undecodable compile payload and
         /// two `AUTH` payloads; the row is the refusal and not the code.
-        constexpr Cc::SurfaceRefusal MalformedPayload {
-            .code = Wire::ErrorCode::MalformedFrame,
-            .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedMalformedPayload,
-        };
+        ///
+        /// A function of the tier, for `UnsupportedVersion`'s reason.
+        /// @param tier The tier answering.
+        /// @return The row, naming that tier's counter.
+        [[nodiscard]] constexpr Cc::SurfaceRefusal MalformedPayload(CacheTierProfile const& tier) noexcept
+        {
+            return { .code = Wire::ErrorCode::MalformedFrame, .counter = tier.refusedMalformedPayload };
+        }
 
         /// A `STORE` whose value names a canonicalization generation this build does
         /// not implement.
@@ -103,10 +113,14 @@ namespace
         /// damaged while the fleet was merely mid-rollout — and since #229 a node IS
         /// the shared cache, so this is the surface a launcher actually talks to and
         /// therefore where that wrong reading was reached.
-        constexpr Cc::SurfaceRefusal ForeignGeneration {
-            .code = Wire::ErrorCode::ForeignValueGeneration,
-            .counter = IMetricsSink::Counter::NodeCacheRequestsRefusedForeignGeneration,
-        };
+        ///
+        /// A function of the tier, for `UnsupportedVersion`'s reason.
+        /// @param tier The tier answering.
+        /// @return The row, naming that tier's counter.
+        [[nodiscard]] constexpr Cc::SurfaceRefusal ForeignGeneration(CacheTierProfile const& tier) noexcept
+        {
+            return { .code = Wire::ErrorCode::ForeignValueGeneration, .counter = tier.refusedForeignGeneration };
+        }
 
         /// A frame whose payload is not the length its header declared.
         ///
@@ -139,8 +153,8 @@ namespace
 
         /// A local write that failed.
         ///
-        /// **Uncounted here, and counted one layer down**: `LocalCache::Store` moves
-        /// `NodeCacheStoreFailures` at the write itself. A row here would count one
+        /// **Uncounted here, and counted one layer down**: `LocalCache::Store` moves the
+        /// tier's `storeFailures` at the write itself. A row here would count one
         /// failed write twice, and the lower one is the better placed of the two -- it
         /// sees every caller, where this arm sees only the callers that arrived over
         /// the wire.
@@ -150,8 +164,8 @@ namespace
         /// storage and not framing.
         constexpr Cc::UncountedRefusal StorageWriteFailed {
             .code = Wire::ErrorCode::StorageWriteFailed,
-            .rationale = "LocalCache::Store already counts this as NodeCacheStoreFailures at the write, where every "
-                         "caller is visible and not only the ones that arrived over the wire",
+            .rationale = "LocalCache::Store already counts this as the tier's storeFailures at the write, where "
+                         "every caller is visible and not only the ones that arrived over the wire",
         };
 
         /// A removal the tier could not persist.
@@ -203,7 +217,69 @@ namespace
             .rationale = "MergedResponder routes by verb family, so a frame reaching this tier names a cache verb; "
                          "this arm answers a direct call and nothing a peer can send",
         };
+
+        /// A verb the node's OTHER cache tier answers: `FETCH` at the shared tier, `SHARED-FETCH`
+        /// at the private one.
+        ///
+        /// `DispatchNotPermitted`, because the verb IS implemented -- by the other tier on this
+        /// same node -- and that code is how this wire says *served elsewhere*.
+        /// `UnimplementedVerb` is reserved for a verb nothing implements, which a client reads as
+        /// *this build is too old*. The sentence names the other tier, so the refusal is told
+        /// apart from `WrongSurface`'s, which shares the code and names the other PORTS.
+        ///
+        /// A refusal DERIVED from `TierProfiles` rather than a `RefusedVerbs` row: the verbs it
+        /// covers are exactly the ones some other tier's profile names, so a table of them would
+        /// be a second copy of the profiles that could drift from them.
+        ///
+        /// **Uncounted**, for `WrongSurface`'s reason: `MergedResponder` sends each cache family to
+        /// the tier that serves it, so a frame reaches a tier naming its twin's verb only through a
+        /// direct `Answer`, never from a peer.
+        constexpr Cc::UncountedRefusal TwinTierVerb {
+            .code = Wire::ErrorCode::DispatchNotPermitted,
+            .rationale = "MergedResponder routes each cache family to the tier whose profile names it, so a tier "
+                         "sees its twin's verbs only through a direct Answer, never from a peer",
+        };
     } // namespace TierRefusal
+
+    /// What one verb is to one tier. PRIVATE: never transmitted and never persisted.
+    enum class TierVerb : std::uint8_t
+    {
+        Fetch,     ///< The profile's fetch verb.
+        Store,     ///< The profile's store verb.
+        Drop,      ///< `CacheDrop`, on a profile that serves it.
+        NotServed, ///< Anything else.
+    };
+
+    /// Which of the tier's arms @p op reaches.
+    ///
+    /// The profile's columns read as the arms of `Answer`'s switch, in one place, so the switch
+    /// and the `static_assert` below ask the same question.
+    /// @param tier The tier answering.
+    /// @param op The verb, already resolved against `OpTable`.
+    /// @return The arm, or `NotServed`.
+    [[nodiscard]] constexpr TierVerb ServedAs(CacheTierProfile const& tier, Wire::Op op) noexcept
+    {
+        if (op == tier.verbs.fetch)
+            return TierVerb::Fetch;
+        if (op == tier.verbs.store)
+            return TierVerb::Store;
+        if (op == Wire::Op::CacheDrop && tier.drop == DropVerb::Serves)
+            return TierVerb::Drop;
+        return TierVerb::NotServed;
+    }
+
+    /// Every tier a node builds, so a verb one of them serves is refused by the others as theirs
+    /// to answer, never as a scheduler or compile verb.
+    constexpr std::array TierProfiles { PrivateTierProfile, SharedTierProfile };
+
+    /// Whether some tier's profile names @p op.
+    /// @param op The verb.
+    /// @return True when a tier answers it.
+    [[nodiscard]] constexpr bool ServedByATier(Wire::Op op) noexcept
+    {
+        return std::ranges::any_of(TierProfiles,
+                                   [op](CacheTierProfile const& tier) { return ServedAs(tier, op) != TierVerb::NotServed; });
+    }
 
     /// This surface's rows. The shape, the lookup and why they exist are on
     /// `Wire::RefusedVerb`; what belongs here is only which verbs and what they say.
@@ -216,16 +292,11 @@ namespace
                             .why = "this endpoint is the node's cache and checks no credential" },
     };
 
-    // The table is consulted from the `default:` arm only, so a row naming FETCH or
-    // STORE would sit there looking like a decision and change nothing. Refused at
-    // compile time rather than left to be noticed.
-    static_assert(std::ranges::none_of(
-                      RefusedVerbs,
-                      [](Wire::Op op) {
-                          return op == Wire::Op::Fetch || op == Wire::Op::Store || op == Wire::Op::CacheDrop;
-                      },
-                      &Wire::RefusedVerb::op),
-                  "a refusal row for a verb this tier serves is dead: the lookup never reaches it");
+    // The table is consulted from the `NotServed` arm only, so a row naming a verb a tier
+    // serves would sit there looking like a decision and change nothing on that tier.
+    // Refused at compile time, over every tier's profile, rather than left to be noticed.
+    static_assert(std::ranges::none_of(RefusedVerbs, ServedByATier, &Wire::RefusedVerb::op),
+                  "a refusal row for a verb a tier serves is dead: the lookup never reaches it");
 } // namespace
 
 core::async::Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte const> frame)
@@ -238,7 +309,7 @@ core::async::Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte
 
     if (!Wire::IsSupported(header->version))
         co_return Cc::Refuse(_metrics,
-                             TierRefusal::UnsupportedVersion,
+                             TierRefusal::UnsupportedVersion(_cache.Profile()),
                              std::format("supported versions {}..{}",
                                          static_cast<unsigned>(Wire::MinSupportedVersion),
                                          static_cast<unsigned>(Wire::CurrentVersion)));
@@ -251,12 +322,12 @@ core::async::Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte
     if (payload.size() != header->payloadLength)
         co_return Cc::RefuseWithoutCounter(TierRefusal::Truncated);
 
-    switch (descriptor->code)
+    switch (ServedAs(_cache.Profile(), descriptor->code))
     {
-        case Wire::Op::Fetch: {
+        case TierVerb::Fetch: {
             auto const key = Wire::DecodeFetchPayload(payload);
             if (!key.has_value())
-                co_return Cc::Refuse(_metrics, TierRefusal::MalformedPayload);
+                co_return Cc::Refuse(_metrics, TierRefusal::MalformedPayload(_cache.Profile()));
 
             auto const found = co_await _cache.Fetch(Wire::AsStringView(*key));
             if (!found.has_value())
@@ -267,10 +338,10 @@ core::async::Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte
                 co_return Wire::EncodeReply(Wire::Status::Miss, {});
             co_return Wire::EncodeReply(Wire::Status::Ok, *found);
         }
-        case Wire::Op::Store: {
+        case TierVerb::Store: {
             auto const fields = Wire::DecodeStorePayload(payload);
             if (!fields.has_value())
-                co_return Cc::Refuse(_metrics, TierRefusal::MalformedPayload);
+                co_return Cc::Refuse(_metrics, TierRefusal::MalformedPayload(_cache.Profile()));
 
             // Canonicalized against the roots the client sent, through the one
             // recipe both servers on this wire share.
@@ -315,21 +386,22 @@ core::async::Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte
                     toStore = fields->value;
                     break;
                 case CanonicalizationOutcome::ForeignGeneration:
-                    co_return Cc::Refuse(
-                        _metrics, TierRefusal::ForeignGeneration, ForeignGenerationMessage(canonical.generation));
+                    co_return Cc::Refuse(_metrics,
+                                         TierRefusal::ForeignGeneration(_cache.Profile()),
+                                         ForeignGenerationMessage(canonical.generation));
             }
 
             if (!co_await _cache.Store(Wire::AsStringView(fields->key), toStore))
                 co_return Cc::RefuseWithoutCounter(TierRefusal::StorageWriteFailed);
             co_return Wire::EncodeReply(Wire::Status::Ok, {});
         }
-        case Wire::Op::CacheDrop: {
+        case TierVerb::Drop: {
             // The locality gate has already run: `CacheResponder::RefusePeer` answers for
             // every verb that reaches this tier, before the payload was read, so a caller
             // on another machine never gets here and the key it named is untouched.
             auto const key = Wire::DecodeCacheDropPayload(payload);
             if (!key.has_value())
-                co_return Cc::Refuse(_metrics, TierRefusal::MalformedPayload);
+                co_return Cc::Refuse(_metrics, TierRefusal::MalformedPayload(_cache.Profile()));
 
             switch (_cache.Drop(Wire::AsStringView(*key)))
             {
@@ -344,22 +416,28 @@ core::async::Task<std::vector<std::byte>> CacheProxy::Answer(std::span<std::byte
             }
             co_return Cc::RefuseWithoutCounter(TierRefusal::StorageRemoveFailed);
         }
-        default:
-            if (auto const* const row = Wire::FindRefusal(RefusedVerbs, descriptor->code); row != nullptr)
-                // `row->why` is the sentence the CLIENT is sent; `rationale` on the row
-                // above is why nothing rises and is never transmitted. The two meet in
-                // this one expression, which is exactly where the names have to differ.
-                co_return Cc::RefuseWithoutCounter({ .code = row->code, .rationale = TierRefusal::RefusedVerbRationale },
-                                                   row->why);
-
-            // A scheduler or worker verb at the cache port. Answered rather than
-            // dropped, so a client that reached the wrong one of this node's ports
-            // learns which instead of seeing something indistinguishable from a dead
-            // host.
-            co_return Cc::RefuseWithoutCounter(TierRefusal::WrongSurface,
-                                               "this endpoint is the node's cache; scheduling and compiles are served "
-                                               "on their own ports");
+        case TierVerb::NotServed:
+            break;
     }
+
+    if (auto const* const row = Wire::FindRefusal(RefusedVerbs, descriptor->code); row != nullptr)
+        // `row->why` is the sentence the CLIENT is sent; `rationale` on the row
+        // above is why nothing rises and is never transmitted. The two meet in
+        // this one expression, which is exactly where the names have to differ.
+        co_return Cc::RefuseWithoutCounter({ .code = row->code, .rationale = TierRefusal::RefusedVerbRationale }, row->why);
+
+    if (ServedByATier(descriptor->code))
+        co_return Cc::RefuseWithoutCounter(
+            TierRefusal::TwinTierVerb,
+            "this cache tier answers its own verb pair; the node's other cache tier serves this one");
+
+    // A scheduler or worker verb at the cache port. Answered rather than
+    // dropped, so a client that reached the wrong one of this node's ports
+    // learns which instead of seeing something indistinguishable from a dead
+    // host.
+    co_return Cc::RefuseWithoutCounter(TierRefusal::WrongSurface,
+                                       "this endpoint is the node's cache; scheduling and compiles are served "
+                                       "on their own ports");
 }
 
 } // namespace FastCache::Node

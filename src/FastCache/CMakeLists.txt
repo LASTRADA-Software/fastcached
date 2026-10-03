@@ -57,6 +57,7 @@ target_sources(FastCache
         Cluster/ClusterState.cpp
         Cluster/ClusterStateMachine.cpp
         Cluster/ChallengeCookies.cpp
+        Cluster/SharedCacheTarget.cpp
         Cluster/DiscoveryService.cpp
         Cluster/FleetEndpoints.cpp
         Cluster/FormationRecord.cpp

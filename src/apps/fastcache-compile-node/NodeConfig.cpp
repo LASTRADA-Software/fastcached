@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "CacheTier.hpp"
 #include "EnrollAutoApprove.hpp"
 #include "NodeConfig.hpp"
+#include "NodeIdentity.hpp"
 #include "NodeKey.hpp"
 #include "NodeMembership.hpp"
 #include "NodeSurfaces.hpp"
@@ -1407,6 +1409,18 @@ std::span<OptionSpec<NodeConfig> const> NodeOptions() noexcept
             .same = FieldEq<&NodeConfig::cacheDiskBytes>(),
         },
         {
+            .primary = "--shared-cache-disk",
+            .arity = Arity::Value,
+            .operand = "=<bytes>",
+            .apply = AssignFrom<&NodeConfig::sharedCacheDiskBytes, ParseCacheDiskBytes>(),
+            .explicitBit = &NodeConfig::sharedCacheDiskBytesExplicit,
+            .description = "cap the shared tier this node serves when the fleet's\n"
+                           "shared-cache setting names it (default 64g; 0 grows\n"
+                           "as needed). Kept under <state-dir>/shared-cache.",
+            .yamlKey = "shared_cache_disk",
+            .same = FieldEq<&NodeConfig::sharedCacheDiskBytes>(),
+        },
+        {
             .primary = "--cache-dir",
             .arity = Arity::Value,
             .operand = "=<path>",
@@ -2385,6 +2399,7 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     emitPathIfSet("tls-key", cfg.tlsKeyFile.string());
     emitIfExplicit("cache-memory", cfg.cacheMemoryBytes, cfg.cacheMemoryExplicit);
     emitIfExplicit("cache-disk", cfg.cacheDiskBytes, cfg.cacheDiskBytesExplicit);
+    emitIfExplicit("shared-cache-disk", cfg.sharedCacheDiskBytes, cfg.sharedCacheDiskBytesExplicit);
     // Codecs by NAME: `emitIfExplicit` formats its value, and a `CompressionCodec`
     // is a byte-wide enum, so the registration would otherwise bake in `2` -- which
     // the next start's own parser refuses.
@@ -2593,6 +2608,21 @@ bool ConfiguresCacheTier(NodeConfig const& cfg) noexcept
     // than spelling them, so the table and the tier cannot disagree about whether a tier
     // was asked for.
     return !RowFor(NodeSurface::Node).Resolve(cfg).empty() && (cfg.cacheMemoryBytes != 0 || !cfg.cacheDir.empty());
+}
+
+std::filesystem::path SharedCacheStorePath(NodeConfig const& cfg)
+{
+    return NodeStateDirectory(cfg) / "shared-cache" / DiskStoreFileName;
+}
+
+std::uint64_t DefaultSharedCacheDiskBytes() noexcept
+{
+    // The `: 0` arm is unreachable -- the static_assert beside this function's
+    // declaration in NodeConfig.hpp rules the Disk row out ever lacking a default --
+    // and is written anyway because that is what keeps this read CHECKED rather than a
+    // bare dereference clang-tidy's bugprone-unchecked-optional-access cannot see past.
+    auto const& bytes = TraitsFor(StorageTier::Disk).sharedTierDefaultBytes;
+    return bytes ? *bytes : 0;
 }
 
 std::optional<std::uint32_t> WorkerSlotsOf(NodeConfig const& cfg, Distributed::NodeCapacity const& capacity) noexcept

@@ -355,9 +355,15 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // client built before the change will refuse this node. Update the constant in the same
     // change, and say in its message that clients and nodes upgrade together.
     INFO(std::format("StatsReadingLayout is 0x{:016x}", StatsReadingLayout));
-    // Moved when a machine became forgotten by its key alone: `node_requests_refused_host_forgotten`
-    // left the catalogue with the host tombstones it counted, which changes which cells every
-    // live-stats reading carries. Clients and nodes upgrade together, as below.
+    // Moved by the fleet's shared cache: fifteen counters joined the catalogue -- the
+    // shared tier's hits, misses, store failures and seven refusals, and the client's wrong-key,
+    // failed-proof, unresolved, stale-hint and sessions-opened tallies. Clients and nodes upgrade
+    // together, as below.
+    //
+    // Moved when a machine became forgotten by its key alone before that:
+    // `node_requests_refused_host_forgotten` left the catalogue with the host tombstones it
+    // counted, which changes which cells every live-stats reading carries. Clients and nodes
+    // upgrade together, as below.
     //
     // Moved by the machine ticket before that: eleven counters joined the catalogue -- a ticket a node
     // accepted (`node_tickets_accepted`) and one row per way a node refuses one (`malformed`,
@@ -514,7 +520,10 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     // Moved again when an operator's control verbs began refusing a caller only `--fleet-open`
     // admitted: two counters joined the catalogue, one per surface that refuses one. Clients and
     // nodes upgrade together, as above.
-    CHECK(StatsReadingLayout == 0x89d694b65e393ae7ULL);
+    //
+    // Moved when lane 2c's fifteen shared-cache counters joined the catalogue, after lane 2b's in
+    // integration order (ruling 8). Read off the built test, never computed by hand.
+    CHECK(StatsReadingLayout == 0xed690b6da9395300ULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

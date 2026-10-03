@@ -3093,17 +3093,23 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
     sent.enrollmentAutoApproveSecondsLeft = 600;
     sent.stateDirectory = "/var/lib/fastcache-node";
     sent.stateDirectoryReason = "machine-wide: this process runs privileged";
+    sent.sharedCache = SharedCacheStatusFields { .source = WireSharedCacheSource::Setting,
+                                                 .machineId = "cache-c",
+                                                 .endpoint = "10.0.0.9:6674",
+                                                 .state = WireSharedCacheState::Proven,
+                                                 .detail = {} };
     // Kept in a local: `SplitAll` hands back spans INTO it.
     auto const emitted = EncodeNodeRuntime(sent);
     auto const parts = WireFields::SplitAll(emitted);
     REQUIRE(parts.has_value());
-    // Twenty-one: thirteen that predate #1328, the endpoint it added, #1449's consensus standing,
+    // Twenty-two: thirteen that predate #1328, the endpoint it added, #1449's consensus standing,
     // #1364's condition list, #178's identity key, the roster #178 certifies, the auto-approve
-    // seconds left, and the state directory with the reason it is that one. Pinned, since every
-    // cut below is counted from it and a record that grew or shrank would move what "older"
-    // means -- which is how this case caught each append, and the retirement of #1471's
-    // applied-tombstone count, rather than letting any of them shift the cuts silently.
-    REQUIRE(Unwrap(parts).size() == 21);
+    // seconds left, the state directory with the reason it is that one, and the shared-cache
+    // record. Pinned, since every cut below is counted from it and a record that grew
+    // or shrank would move what "older" means -- which is how this case caught each append, and
+    // the retirement of #1471's applied-tombstone count, rather than letting any of them shift
+    // the cuts silently.
+    REQUIRE(Unwrap(parts).size() == 22);
 
     SECTION("a record cut after field 13: the endpoint is absent, and the cordon still read")
     {
@@ -3205,7 +3211,18 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         }
     }
 
-    SECTION("the whole record, twenty-one fields: every fact engaged")
+    SECTION("twenty-one fields, as a build after the state directory and before the shared-cache record emits: it is absent")
+    {
+        // Absent, never a record of zeroes: a node too old to say is not one whose shared cache
+        // is `None`.
+        auto const older = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).begin() + 21 };
+        auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { older }));
+        REQUIRE(back.has_value());
+        CHECK_FALSE(Unwrap(back).sharedCache.has_value());
+        CHECK(Unwrap(back).stateDirectory == sent.stateDirectory);
+    }
+
+    SECTION("the whole record, twenty-two fields: every fact engaged")
     {
         auto const current = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { current }));
@@ -3219,9 +3236,10 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(runtime.enrollmentAutoApproveSecondsLeft == std::optional<std::uint64_t> { 600 });
         CHECK(runtime.stateDirectory == sent.stateDirectory);
         CHECK(runtime.stateDirectoryReason == sent.stateDirectoryReason);
+        CHECK(runtime.sharedCache == sent.sharedCache);
     }
 
-    SECTION("twenty-two fields, one past the record: the surplus is skipped")
+    SECTION("twenty-three fields, one past the record: the surplus is skipped")
     {
         auto ahead = std::vector<std::span<std::byte const>> { Unwrap(parts).begin(), Unwrap(parts).end() };
         auto const extra = AsBytes(std::string_view { "a fact from the future" });
@@ -3236,6 +3254,7 @@ TEST_CASE("The consensus address rides the runtime record's variable arity, in b
         CHECK(runtime.roster == sent.roster);
         CHECK(runtime.stateDirectory == sent.stateDirectory);
         CHECK(runtime.stateDirectoryReason == sent.stateDirectoryReason);
+        CHECK(runtime.sharedCache == sent.sharedCache);
     }
 }
 
@@ -3265,7 +3284,7 @@ TEST_CASE("An identity key travels as its 32 bytes, absent as nothing, and any o
     {
         auto emitted = EncodeNodeRuntime(NodeRuntimeFields {});
         auto parts = Unwrap(WireFields::SplitAll(emitted));
-        REQUIRE(parts.size() == 21);
+        REQUIRE(parts.size() == 22);
         auto const wrong = std::vector<std::byte>(width, std::byte { 0x11 });
         parts[16] = wrong;
         CHECK_FALSE(DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts })).has_value());
@@ -3300,11 +3319,12 @@ TEST_CASE("A consensus standing travels as its pinned byte, and one this build c
     sent.consensusEndpoint = "10.0.0.4:6680";
     auto emitted = EncodeNodeRuntime(sent);
     auto parts = Unwrap(WireFields::SplitAll(emitted));
-    // Twenty-one: #1364 and #178 appended the condition list, the identity key and the roster
-    // behind the standing, and the auto-approve seconds and the state directory with its reason
-    // behind those, while the applied-tombstone count ahead of it was retired -- so the standing
-    // is the fifteenth field, and the byte replaced below is the one under test.
-    REQUIRE(parts.size() == 21);
+    // Twenty-two: #1364 and #178 appended the condition list, the identity key and the roster
+    // behind the standing, and the auto-approve seconds, the state directory with its reason and
+    // the shared-cache record behind those, while the applied-tombstone count ahead of it was
+    // retired -- so the standing is the fifteenth field, and the byte replaced below is the one
+    // under test.
+    REQUIRE(parts.size() == 22);
     auto const unknown = std::array { std::byte { 0x7F } };
     parts[14] = unknown;
     auto const back = DecodeNodeRuntime(WireFields::Encode(WireFields::FieldList { parts }));
@@ -3855,6 +3875,8 @@ TEST_CASE("The node handshake's widths, verbs and refusals are pinned as bytes",
     CHECK(static_cast<std::uint8_t>(Op::NodeChallenge) == 0x18);
     CHECK(static_cast<std::uint8_t>(Op::ProveNode) == 0x19);
     CHECK(static_cast<std::uint8_t>(Op::ClusterAdmitWorker) == 0x1D);
+    CHECK(static_cast<std::uint8_t>(Op::SharedFetch) == 0x20);
+    CHECK(static_cast<std::uint8_t>(Op::SharedStore) == 0x21);
     CHECK(OpFieldCount(Op::NodeChallenge) == 2);
     CHECK(OpFieldCount(Op::ProveNode) == 3);
     CHECK(OpFieldCount(Op::ClusterAdmitWorker) == 2);
@@ -3869,7 +3891,8 @@ TEST_CASE("The node handshake's widths, verbs and refusals are pinned as bytes",
          { Pinned { .code = ErrorCode::NodeKeyUnknown, .byte = 0x29, .name = "node-key-unknown" },
            Pinned { .code = ErrorCode::NodeKeyRevoked, .byte = 0x2A, .name = "node-key-revoked" },
            Pinned { .code = ErrorCode::NodeIdentityRequired, .byte = 0x2B, .name = "node-identity-required" },
-           Pinned { .code = ErrorCode::EnrollmentHostFull, .byte = 0x2C, .name = "enrollment-host-full" } })
+           Pinned { .code = ErrorCode::EnrollmentHostFull, .byte = 0x2C, .name = "enrollment-host-full" },
+           Pinned { .code = ErrorCode::NotSharedCache, .byte = 0x2F, .name = "not-shared-cache" } })
     {
         CHECK(static_cast<std::uint8_t>(pinned.code) == pinned.byte);
         auto const* const row = Describe(pinned.code);
@@ -4009,4 +4032,139 @@ TEST_CASE("A mint request carries exactly one audience, and anything else is ref
     // An empty audience is a well-formed field count but names nobody a ticket could be
     // scoped to, so it is refused here rather than left for whatever mints the ticket.
     CHECK_FALSE(DecodeMintTicketPayload(WireFields::Encode({ AsBytes(std::string_view {}) })).has_value());
+}
+
+TEST_CASE("The fleet cache verbs keep their bytes and their family", "[wire][optable][shared-cache]")
+{
+    // The raw enumerator, deliberately: a symbol both ends spell tests only the name.
+    CHECK(static_cast<std::uint8_t>(Op::SharedFetch) == 0x20);
+    CHECK(static_cast<std::uint8_t>(Op::SharedStore) == 0x21);
+    REQUIRE(FindOp(0x20) != nullptr);
+    REQUIRE(FindOp(0x21) != nullptr);
+    CHECK(FindOp(0x20)->family == VerbFamily::SharedCache);
+    CHECK(FindOp(0x21)->family == VerbFamily::SharedCache);
+    CHECK(FindOp(0x20)->name == "shared-fetch");
+    CHECK(FindOp(0x21)->name == "shared-store");
+    // The private tier's verbs did not move family: FETCH/STORE stay this machine's alone.
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Fetch)) == VerbFamily::Cache);
+    CHECK(FamilyOf(static_cast<std::uint8_t>(Op::Store)) == VerbFamily::Cache);
+}
+
+TEST_CASE("A fleet cache verb has exactly its private twin's shape", "[wire][optable][shared-cache]")
+{
+    // Same objects, same payloads, same replies: only the policy differs, and the policy is the verb.
+    for (auto const& [shared, twin]: { std::pair { Op::SharedFetch, Op::Fetch }, std::pair { Op::SharedStore, Op::Store } })
+    {
+        auto const* const a = FindOp(static_cast<std::uint8_t>(shared));
+        auto const* const b = FindOp(static_cast<std::uint8_t>(twin));
+        REQUIRE(a != nullptr);
+        REQUIRE(b != nullptr);
+        INFO("verb " << a->name);
+        CHECK(a->fieldCount == b->fieldCount);
+        CHECK(a->legalStatuses == b->legalStatuses);
+        CHECK(a->maxPayload.Bytes() == b->maxPayload.Bytes());
+        CHECK(a->preAuth.Allowed() == b->preAuth.Allowed());
+        CHECK(a->identity == b->identity);
+    }
+}
+
+TEST_CASE("A verb pair encodes the verb it names and nothing else", "[wire][shared-cache]")
+{
+    auto const fleetFetch = EncodeFetchAs(FleetSharedCacheVerbs, "k");
+    CHECK(Unwrap(DecodeRequestHeader(fleetFetch)).opRaw == 0x20);
+    auto const key = DecodeFetchPayload(std::span<std::byte const> { fleetFetch }.subspan(RequestHeaderSize));
+    REQUIRE(key.has_value());
+    CHECK(AsStringView(Unwrap(key)) == "k");
+    // The daemon pair is byte-for-byte what EncodeFetch always sent.
+    CHECK(EncodeFetchAs(DaemonCacheVerbs, "k") == EncodeFetch("k"));
+    CHECK(DaemonCacheVerbs != FleetSharedCacheVerbs);
+
+    auto const request = StoreRequest { .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = {} };
+    CHECK(Unwrap(DecodeRequestHeader(EncodeStoreAs(FleetSharedCacheVerbs, request))).opRaw == 0x21);
+    CHECK(EncodeStoreAs(DaemonCacheVerbs, request) == EncodeStore(request));
+}
+
+TEST_CASE("The not-shared-cache refusal keeps its byte and its name", "[wire][errors][shared-cache]")
+{
+    CHECK(static_cast<std::uint8_t>(ErrorCode::NotSharedCache) == 0x2F);
+    auto const* const row = Describe(ErrorCode::NotSharedCache);
+    REQUIRE(row != nullptr);
+    CHECK(row->name == "not-shared-cache");
+    CHECK_FALSE(std::ranges::contains(RetiredErrorCodes, std::uint8_t { 0x2D }));
+    // Not `NotAMember`, which would tell a proven member it is not one.
+    CHECK(ErrorCode::NotSharedCache != ErrorCode::NotAMember);
+}
+
+TEST_CASE("A node status carries its shared-cache record and round-trips it", "[wire][node-status][shared-cache]")
+{
+    auto fields = NodeStatusFields {
+        .version = "1.2.3", .nodeId = "pc-7", .uptimeSeconds = 0, .surfaces = {}, .components = 0, .runtime = {}
+    };
+    fields.runtime.sharedCache = SharedCacheStatusFields { .source = WireSharedCacheSource::Setting,
+                                                           .machineId = "cache-c",
+                                                           .endpoint = "cache-c.office.example:6674",
+                                                           .state = WireSharedCacheState::WrongKey,
+                                                           .detail = "the peer proved another key" };
+    auto const decoded = DecodeNodeStatus(EncodeNodeStatus(fields));
+    REQUIRE(decoded.has_value());
+    REQUIRE(Unwrap(decoded).runtime.sharedCache.has_value());
+    CHECK(Unwrap(Unwrap(decoded).runtime.sharedCache) == Unwrap(fields.runtime.sharedCache));
+
+    // Absent is not a record of zeroes.
+    auto const none = DecodeNodeStatus(EncodeNodeStatus(NodeStatusFields {
+        .version = "1.2.3", .nodeId = {}, .uptimeSeconds = 0, .surfaces = {}, .components = 0, .runtime = {} }));
+    REQUIRE(none.has_value());
+    CHECK_FALSE(Unwrap(none).runtime.sharedCache.has_value());
+}
+
+TEST_CASE("The shared-cache status enums keep their bytes", "[wire][node-status][shared-cache]")
+{
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheSource::None) == 0x01);
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheSource::Setting) == 0x02);
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheSource::Override) == 0x03);
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheSource::ThisMachine) == 0x04);
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheState::NotTried) == 0x01);
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheState::Proven) == 0x02);
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheState::Unresolved) == 0x03);
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheState::WrongKey) == 0x04);
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheState::Unreachable) == 0x05);
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheState::Serving) == 0x06);
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheState::Unavailable) == 0x07);
+    CHECK(static_cast<std::uint8_t>(WireSharedCacheState::ProofRefused) == 0x08);
+}
+
+TEST_CASE("A shared-cache record with a state byte this build does not name is skipped", "[wire][node-status][shared-cache]")
+{
+    auto const record = EncodeSharedCacheStatus(SharedCacheStatusFields { .source = WireSharedCacheSource::Setting,
+                                                                          .machineId = "cache-c",
+                                                                          .endpoint = "c:6674",
+                                                                          .state = WireSharedCacheState::Proven,
+                                                                          .detail = {} });
+    // The control: the record as sent reads back engaged, so the skip below is the BYTE's doing.
+    auto control = std::optional<SharedCacheStatusFields> {};
+    CHECK(ReadSharedCacheStatus(record, control));
+    CHECK(control.has_value());
+
+    auto parts = Unwrap(WireFields::SplitAll(record));
+    REQUIRE(parts.size() == SharedCacheStatusFieldCount);
+    for (auto const [index, unnamed]: { std::pair { std::size_t { 0 }, std::byte { 0x7F } },
+                                        std::pair { std::size_t { 3 }, std::byte { 0x7F } },
+                                        std::pair { std::size_t { 3 }, std::byte { 0x00 } } })
+    {
+        INFO("field " << index << " byte " << static_cast<int>(unnamed));
+        auto rewrittenParts = parts;
+        auto const replacement = std::array { unnamed };
+        rewrittenParts[index] = replacement;
+        auto const rewritten = WireFields::Encode(WireFields::FieldList { rewrittenParts });
+        auto out = std::optional<SharedCacheStatusFields> {};
+        CHECK(ReadSharedCacheStatus(rewritten, out));
+        CHECK_FALSE(out.has_value());
+    }
+
+    // A state two bytes wide is a shape this build does not know: refused, never read as its first byte.
+    auto const wide = std::array { std::byte { 0x02 }, std::byte { 0x02 } };
+    parts[3] = wide;
+    auto out = std::optional<SharedCacheStatusFields> {};
+    CHECK_FALSE(ReadSharedCacheStatus(WireFields::Encode(WireFields::FieldList { parts }), out));
+    CHECK_FALSE(out.has_value());
 }

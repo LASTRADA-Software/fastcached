@@ -1334,6 +1334,10 @@ class FrameEndpoint
     /// observe (#448).
     [[nodiscard]] std::size_t InFlightBytes() const noexcept;
 
+    /// @return How many connections are being served right now. For tests: forwarded for the same
+    ///         reason as `InFlightBytes`, so a case can see a peer LEAVE rather than infer it.
+    [[nodiscard]] std::size_t OpenConnections() const noexcept;
+
   private:
     FrameEndpoint(NodeIoLoop& io,
                   std::unique_ptr<core::net::IListener> listener,

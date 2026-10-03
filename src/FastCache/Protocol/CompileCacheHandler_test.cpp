@@ -862,6 +862,30 @@ TEST_CASE("The daemon refuses a ticket mint by name and sends it to a compile no
     CHECK(error.message.contains("fastcache-compile-node"));
 }
 
+TEST_CASE("The daemon refuses the fleet cache verbs by name and names the machine that serves them",
+          "[compile-cache][handler][shared-cache]")
+{
+    // The new-verb checklist's daemon half: a missing switch arm DROPS the frame (and on MSVC does not
+    // fail the build), and a missing RelocatedVerbs row answers the generic refusal naming nobody.
+    // `NotSharedCache`, never `UnknownOpcode`: a client told the verb is unknown concludes this build is
+    // too old, when it asked a fastcached for what only the named compile node serves.
+    auto const store = Wire::StoreRequest { .key = "k", .prefetchGroup = {}, .srcRoot = {}, .buildTree = {}, .value = {} };
+    for (auto const& frame:
+         { Wire::EncodeFetchAs(Wire::FleetSharedCacheVerbs, "k"), Wire::EncodeStoreAs(Wire::FleetSharedCacheVerbs, store) })
+    {
+        // A fixture per verb: an exchange half-closes the client, so one fixture answers one batch.
+        CcFixture fix;
+        auto const reply = SoleReply(Exchange(fix, frame));
+        REQUIRE(reply.present);
+        auto const error = ErrorOf(reply);
+        REQUIRE(error.present);
+        CHECK(error.code == Wire::ErrorCode::NotSharedCache);
+        // The ROW's words, for the fleet case's reason: `NotSharedCache`'s own default message says
+        // "shared-cache" too, so only the destination proves the RelocatedVerbs row answered.
+        CHECK(error.message.contains("fastcache-compile-node"));
+    }
+}
+
 TEST_CASE("A dropped frame is logged", "[compile-cache][handler][version]")
 {
     // Every other handler reports a frame drop through the session logger; this

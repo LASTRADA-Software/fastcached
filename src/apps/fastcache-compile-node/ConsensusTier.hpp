@@ -2,11 +2,14 @@
 #pragma once
 
 #include "ConsensusStanding.hpp"
+#include "LocalCache.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
 #include "NodeRoster.hpp"
 #include "SchedulerTier.hpp"
+#include "SharedCacheDirectory.hpp"
+#include "SharedCacheHost.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 #include <FastCache/Cluster/ClusterStateMachine.hpp>
@@ -904,6 +907,26 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
 /// @return A reader of that tier's status, or an empty function when there is none.
 [[nodiscard]] std::function<ConsensusStatus()> ConsensusScrapeSource(ConsensusTier const* tier);
 
+/// What the consensus tier tells about the fleet's shared cache, at every applied state, in this
+/// order: where the shared cache is, whether this machine serves it, and then the private tier's
+/// upstream, which re-judges what it reports from the directory it was just told.
+///
+/// One record, so the three cannot be transposed at the call site; the order they are told in lives
+/// in `ApplySharedCacheState`, which a harness with no host calls too.
+struct SharedCacheListeners
+{
+    SharedCacheDirectory& directory; ///< Where the shared cache is.
+    SharedCacheHost& host;           ///< Whether this machine serves it.
+    ICacheUpstream* upstream;        ///< The private tier's upstream; null on a node that keeps no objects.
+
+    /// Tell each of them @p state, in order.
+    /// @param state The state the cluster just applied.
+    void Applied(Cluster::ClusterState const& state) const
+    {
+        ApplySharedCacheState(state, directory, &host, upstream);
+    }
+};
+
 /// Start consensus when the operator configured a cluster, wiring it to the node.
 ///
 /// A function rather than four lines in `WorkerBody`, for the reason
@@ -930,6 +953,9 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
 /// @param membership Told the replicated member set; must outlive the tier.
 /// @param roster Told every applied state and every endorsement this node signs (#178); must
 ///        outlive the tier.
+/// @param sharedCache Told every applied state: the directory and the host by reference, since every
+///        node builds both and a consensus node that told them nothing would neither find nor serve
+///        the tier the cluster named; the upstream where there is one. Each must outlive the tier.
 /// @param wallClock What an endorsement's lapse is read from; must outlive the tier.
 /// @param metrics Where a refused peer connection is counted; must outlive the tier.
 /// @param logger Where progress and refusals are reported.
@@ -941,6 +967,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     std::optional<Ed25519KeyPair> const& identityKey,
     NodeMembership& membership,
     NodeRoster& roster,
+    SharedCacheListeners sharedCache,
     core::platform::WallClockRef wallClock,
     IMetricsSink& metrics,
     ILogger& logger,
