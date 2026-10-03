@@ -740,7 +740,7 @@ TEST_CASE("A cluster command asks the next --scheduler when the first cannot be 
 
         auto const rendered = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
 
-        INFO("result: " << rendered.value_or(rendered.error_or("")));
+        INFO("result: " << (rendered.has_value() ? *rendered : rendered.error().reason));
         REQUIRE(rendered.has_value());
         CHECK(rendered->contains("10.0.0.1:6675"));
         CHECK(dialer.Dialed() == std::vector<std::string> { "sched-a.internal:6675", "sched-b.internal:6675" });
@@ -774,7 +774,7 @@ TEST_CASE("A cluster command asks the next --scheduler when the first cannot be 
         auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
 
         REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().contains("sched-a.internal:6675, sched-b.internal:6675"));
+        CHECK(refused.error().reason.contains("sched-a.internal:6675, sched-b.internal:6675"));
     }
 }
 
@@ -953,7 +953,7 @@ TEST_CASE("A cluster command presents a ticket minted for the scheduler it reach
 
     auto const rendered = RunClusterAdmin(cfg, Ask(ClusterAction::Status), tickets, dialer);
 
-    INFO("result: " << rendered.value_or(rendered.error_or("")));
+    INFO("result: " << (rendered.has_value() ? *rendered : rendered.error().reason));
     REQUIRE(rendered.has_value());
     REQUIRE(dialer.Dialed() == std::vector<std::string> { "sched-a.internal:6675", "sched-b.internal:6675" });
     CHECK(node.audiences == std::vector<std::string> { "sched-b.internal:6675" });
@@ -982,7 +982,7 @@ TEST_CASE("A cluster command refused for want of a ticket says why there was non
     auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), tickets, dialer);
 
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error() == Cc::ReasonFor(Cc::MintFailure::Unreachable));
+    CHECK(refused.error().reason == Cc::ReasonFor(Cc::MintFailure::Unreachable));
 }
 
 namespace
@@ -1044,7 +1044,7 @@ TEST_CASE("A cluster command to a remote leader presents a ticket minted for tha
 
     auto const rendered = RunClusterAdmin(cfg, Ask(ClusterAction::Status), tickets, dialer);
 
-    INFO("result: " << rendered.value_or(rendered.error_or("")));
+    INFO("result: " << (rendered.has_value() ? *rendered : rendered.error().reason));
     REQUIRE(rendered.has_value());
     auto const asked = std::vector<std::string> { "sched-a:6675", "sched-b:6675" };
     REQUIRE(dialer.Dialed() == asked);
@@ -1090,7 +1090,7 @@ TEST_CASE("A cluster command follows NotLeader a bounded number of times, and no
         auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), nothing, dialer);
 
         REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().contains(std::format("gave up after {} leader redirect(s)", MaxLeaderRedirects)));
+        CHECK(refused.error().reason.contains(std::format("gave up after {} leader redirect(s)", MaxLeaderRedirects)));
         CHECK(std::cmp_equal(dialer.Dialed().size(), MaxLeaderRedirects + 1));
     }
 
@@ -1101,7 +1101,116 @@ TEST_CASE("A cluster command follows NotLeader a bounded number of times, and no
         auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), nothing, dialer);
 
         REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().contains("no leader right now"));
+        CHECK(refused.error().reason.contains("no leader right now"));
         CHECK(dialer.Dialed() == std::vector<std::string> { "sched-a:6675" });
+    }
+}
+
+TEST_CASE("A cluster command that reached nobody is transient, and one the scheduler refused is a decision",
+          "[node][clusteradmin][exit]")
+{
+    // A script retries a 1 and acts on a 2 (`AnswerSource`): an answer that never arrived says
+    // nothing about the request, and a refusal that arrived is the cluster's decision.
+    NodeConfig cfg;
+    cfg.schedulers = { "sched-a.internal:6675" };
+    Testing::PresentsNothing credential;
+
+    SECTION("no scheduler could be reached")
+    {
+        Testing::ScriptedDialer dialer { { {} } };
+        auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().ending == CommandEnding::Failed);
+    }
+
+    SECTION("the scheduler replied with a refusal")
+    {
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not one of ours") } };
+        auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().ending == CommandEnding::Declined);
+    }
+
+    SECTION("nothing to ask: refused here, before any dial")
+    {
+        NodeConfig none;
+        Testing::ScriptedDialer dialer { {} };
+        auto const refused = RunClusterAdmin(none, Ask(ClusterAction::Status), credential, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().ending == CommandEnding::Declined);
+        CHECK(dialer.Dialed().empty());
+    }
+
+    // A refusal the WIRE calls retriable decided nothing about the request: the same command
+    // asked again is likely served, so it is 1 however it arrived (`ErrorDescriptor::retry`).
+    SECTION("the cluster is still committing another change: transient")
+    {
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::ClusterChangeInFlight,
+                                                                  "one at a time") } };
+        auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        INFO(refused.error().reason);
+        CHECK(refused.error().ending == CommandEnding::Failed);
+    }
+
+    SECTION("the scheduler is serving all it will at once: transient")
+    {
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy) } };
+        auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        INFO(refused.error().reason);
+        CHECK(refused.error().ending == CommandEnding::Failed);
+    }
+
+    // `NotLeader` naming nobody is an election, which settles by itself; naming somebody is an
+    // instruction this verb FOLLOWS (`AskTheLeader`), and a chain of them that never settles
+    // decided nothing either.
+    SECTION("the cluster has no leader right now: transient")
+    {
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader) } };
+        auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        INFO(refused.error().reason);
+        CHECK(refused.error().reason.contains("no leader right now"));
+        CHECK(refused.error().ending == CommandEnding::Failed);
+    }
+
+    // A reply header carries a status and a length and NO version: the SERVER's range decides, and
+    // it answers a request outside it with `UnsupportedVersion` (`SchedulerProtocol::Answer`) -- a
+    // refusal that arrived, which the same two builds give again. Only bytes that cannot be framed
+    // as a reply at all are a transport that delivered nothing.
+    SECTION("a scheduler on another wire version: a decision, not a transport fault")
+    {
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::UnsupportedVersion,
+                                                                  "supported versions 15..15") } };
+        auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        INFO(refused.error().reason);
+        CHECK(refused.error().reason.contains("unsupported-version"));
+        CHECK(refused.error().ending == CommandEnding::Declined);
+    }
+
+    SECTION("bytes that cannot be framed as a reply: transient")
+    {
+        // A status byte no build of this wire has sent: a header that does not decode.
+        REQUIRE_FALSE(Wire::IsKnownStatus(0x7F));
+        Testing::ScriptedDialer dialer { { std::vector<std::byte> {
+            std::byte { 0x7F }, std::byte { 0 }, std::byte { 0 }, std::byte { 0 }, std::byte { 0 } } } };
+        auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        INFO(refused.error().reason);
+        CHECK(refused.error().ending == CommandEnding::Failed);
+    }
+
+    SECTION("a redirect chain that did not settle: transient")
+    {
+        auto const ping = Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "10.0.0.9:7000");
+        auto const pong = Wire::EncodeErrorReply(Wire::ErrorCode::NotLeader, "sched-a.internal:6675");
+        Testing::ScriptedDialer dialer { { ping, pong, ping, pong } };
+        auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        INFO(refused.error().reason);
+        CHECK(refused.error().reason.contains("gave up after"));
+        CHECK(refused.error().ending == CommandEnding::Failed);
     }
 }

@@ -486,7 +486,7 @@ TEST_CASE("A seed address that is not an address to dial is refused before any s
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
     auto const refused = RunEnrollClient(cfg, random, keyGuard);
     REQUIRE(!refused.has_value());
-    CHECK(refused.error().contains("--enroll-from"));
+    CHECK(refused.error().reason.contains("--enroll-from"));
 
     // **The half that distinguishes.** Every refusal on this path produces an error
     // string, so matching one proves nothing about WHEN it fired. What separates a
@@ -727,7 +727,7 @@ TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[
 
     // Named on the failure path: every refusal on this route produces an error string,
     // so a case that fails without printing WHICH one cannot be diagnosed from its output.
-    INFO("refusal: " << outcome.error());
+    INFO("refusal: " << outcome.error().reason);
     INFO("dialled: " << dialer.Dialed().size() << " endpoint(s)");
 
     // **The assertion that DISTINGUISHES.** Both readings end in an error, so
@@ -735,8 +735,8 @@ TEST_CASE("A node that answered on its own behalf breaks the redirect chain", "[
     // sixth reply and ends on the operator's refusal; without it the count
     // accumulates and the FIFTH reply trips the bound instead. Remove `redirects = 0`
     // from the `Waiting`/`Closed` arm and all three of these flip together.
-    CHECK(outcome.error().contains("refused this machine"));
-    CHECK_FALSE(outcome.error().contains("gave up after"));
+    CHECK(outcome.error().reason.contains("refused this machine"));
+    CHECK_FALSE(outcome.error().reason.contains("gave up after"));
     // REQUIRE, and last of the three so the two above still report: the reads below take
     // `front()` and `back()`, and on a run that dialled nothing a CHECK here let them read an
     // empty vector -- the process died mid-report and took every later case's verdict with it.
@@ -781,13 +781,17 @@ TEST_CASE("A consecutive redirect chain is still bounded", "[enrollment][client]
 
     // Named on the failure path: every refusal on this route produces an error string,
     // so a case that fails without printing WHICH one cannot be diagnosed from its output.
-    INFO("refusal: " << outcome.error());
+    INFO("refusal: " << outcome.error().reason);
     INFO("dialled: " << dialer.Dialed().size() << " endpoint(s)");
-    CHECK(outcome.error().contains("gave up after"));
+    CHECK(outcome.error().reason.contains("gave up after"));
 
     // Four dials rather than all four replies consumed: the fourth REPLY is never
     // read, because the bound is checked before the redirect is followed.
     CHECK(dialer.Dialed().size() == 4);
+
+    // A chain that did not settle decided nothing about this machine: transient, since the
+    // same command succeeds once leadership does.
+    CHECK(outcome.error().ending == CommandEnding::Failed);
 }
 
 namespace
@@ -862,7 +866,7 @@ TEST_CASE("A joiner asks under the key it minted and believes a roster that reco
     auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
     auto const admitted = RunEnrollClient(joiner.cfg, random, keyGuard, wait, dialer);
 
-    INFO("result: " << admitted.value_or(admitted.error_or("")));
+    INFO("result: " << (admitted.has_value() ? *admitted : admitted.error().reason));
     REQUIRE(admitted.has_value());
     CHECK(admitted->contains(Cluster::RenderRosterFingerprint(Cluster::DigestOfRoster(roster))));
 
@@ -901,7 +905,7 @@ TEST_CASE("A joiner handed a roster naming it under another key is not admitted"
     auto const refused = RunEnrollClient(joiner.cfg, random, keyGuard, wait, dialer);
 
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("does not record"));
+    CHECK(refused.error().reason.contains("does not record"));
 }
 
 namespace
@@ -938,7 +942,7 @@ TEST_CASE("An enrollment command asks the next --scheduler when the first cannot
 
     auto const listed = RunEnrollAdmin(cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, nothing, dialer);
 
-    INFO("result: " << listed.value_or(listed.error_or("")));
+    INFO("result: " << (listed.has_value() ? *listed : listed.error().reason));
     REQUIRE(listed.has_value());
     CHECK(listed->contains("manual"));
     CHECK(dialer.Dialed() == std::vector<std::string> { std::string { FirstScheduler }, std::string { SecondScheduler } });
@@ -963,8 +967,8 @@ TEST_CASE("An enrollment command that reached a scheduler is never sent to anoth
                        dialer);
 
     REQUIRE_FALSE(approved.has_value());
-    INFO("refusal: " << approved.error());
-    CHECK(approved.error().contains(FirstScheduler));
+    INFO("refusal: " << approved.error().reason);
+    CHECK(approved.error().reason.contains(FirstScheduler));
     CHECK(dialer.Dialed() == std::vector<std::string> { std::string { FirstScheduler } });
 }
 
@@ -977,7 +981,7 @@ TEST_CASE("An enrollment command that reaches no --scheduler names every one it 
     auto const listed = RunEnrollAdmin(cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, nothing, dialer);
 
     REQUIRE_FALSE(listed.has_value());
-    CHECK(listed.error().contains(std::format("{}, {}", FirstScheduler, SecondScheduler)));
+    CHECK(listed.error().reason.contains(std::format("{}, {}", FirstScheduler, SecondScheduler)));
 }
 
 TEST_CASE("A NotLeader sends an enrollment command to the leader it names, not down the --scheduler list",
@@ -1123,7 +1127,7 @@ TEST_CASE("An enrollment command presents a ticket for each endpoint it asks, th
 
     auto const listed = RunEnrollAdmin(cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, tickets, dialer);
 
-    INFO("result: " << listed.value_or(listed.error_or("")));
+    INFO("result: " << (listed.has_value() ? *listed : listed.error().reason));
     REQUIRE(listed.has_value());
     auto const asked = std::vector<std::string> { std::string { FirstScheduler }, "10.0.0.9:7000" };
     REQUIRE(dialer.Dialed() == asked);
@@ -1157,5 +1161,127 @@ TEST_CASE("An enrollment command refused for want of a ticket says why there was
     auto const refused = RunEnrollAdmin(cfg, EnrollCommand { .action = EnrollAction::List, .subject = {} }, tickets, dialer);
 
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error() == Cc::ReasonFor(Cc::MintFailure::Unreachable));
+    CHECK(refused.error().reason == Cc::ReasonFor(Cc::MintFailure::Unreachable));
+}
+
+TEST_CASE("An enrollment command that reached nobody is transient, and one the cluster refused is a decision",
+          "[enrollment][client][exit]")
+{
+    auto const cfg = TwoSchedulers();
+    auto const list = EnrollCommand { .action = EnrollAction::List, .subject = {} };
+    Testing::PresentsNothing nothing;
+
+    SECTION("no scheduler could be reached")
+    {
+        Testing::ScriptedDialer dialer { { {}, {} } };
+        auto const refused = RunEnrollAdmin(cfg, list, nothing, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().ending == CommandEnding::Failed);
+    }
+
+    SECTION("the scheduler replied with a refusal")
+    {
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not one of ours") } };
+        auto const refused = RunEnrollAdmin(cfg, list, nothing, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().ending == CommandEnding::Declined);
+    }
+
+    // Two nodes each holding a stale `_knownLeader` name each other until leadership settles,
+    // which it does by itself: giving up on the chain is transient, not the cluster's decision.
+    SECTION("a redirect chain that did not settle: transient")
+    {
+        Testing::ScriptedDialer dialer { {
+            RedirectTo("10.0.0.2:7000"),
+            RedirectTo("10.0.0.1:7000"),
+            RedirectTo("10.0.0.2:7000"),
+            RedirectTo("10.0.0.1:7000"),
+        } };
+        auto const refused = RunEnrollAdmin(cfg, list, nothing, dialer);
+        REQUIRE_FALSE(refused.has_value());
+        INFO(refused.error().reason);
+        CHECK(refused.error().reason.contains("gave up after"));
+        CHECK(refused.error().ending == CommandEnding::Failed);
+    }
+}
+
+TEST_CASE("A joiner the seed never answered is transient, and one the seed refused is a decision",
+          "[enrollment][client][exit]")
+{
+    // `Fatal` is one reading for two sources -- an exchange that broke and a reply that refused --
+    // so the ending is read off the exchange's own outcome, and both halves are asserted.
+    Testing::ScratchDirectory scratch { "enroll-endings" };
+    auto const joiner = MintJoiner(scratch.Path());
+    Testing::SteppedDrainWait wait;
+    SystemSecureRandom random;
+    auto keyGuard = Testing::ScriptedNodeKeyGuard::OwnerOnly();
+    auto const ask = [&](Testing::ScriptedDialer& dialer) {
+        return RunEnrollClient(joiner.cfg, random, keyGuard, wait, dialer);
+    };
+
+    SECTION("the seed could not be reached")
+    {
+        Testing::ScriptedDialer dialer { { {} } };
+        auto const refused = ask(dialer);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().ending == CommandEnding::Failed);
+    }
+
+    SECTION("the seed broke off the exchange: fatal, and still transient")
+    {
+        Testing::ScriptedDialer dialer { { std::vector<std::byte> { std::byte { 0xFC } } } };
+        auto const refused = ask(dialer);
+        REQUIRE_FALSE(refused.has_value());
+        INFO(refused.error().reason);
+        CHECK(refused.error().ending == CommandEnding::Failed);
+    }
+
+    SECTION("the seed refused this machine")
+    {
+        Testing::ScriptedDialer dialer { { Rejected() } };
+        auto const refused = ask(dialer);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().ending == CommandEnding::Declined);
+    }
+
+    SECTION("the seed replied that it is no place to join: fatal, and a decision")
+    {
+        Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NoCluster, "no cluster here") } };
+        auto const refused = ask(dialer);
+        REQUIRE_FALSE(refused.has_value());
+        INFO(refused.error().reason);
+        CHECK(refused.error().ending == CommandEnding::Declined);
+    }
+
+    // Giving up on the approval bound after a seed that only ever said *not yet*: nothing was
+    // decided, and running it again once an operator approves succeeds, so it is transient. The
+    // bound is reached on the injected clock -- one poll at the start and one per interval until
+    // it -- and the dial count asserts that it WAS the bound that ended it, not the script.
+    auto const pollsToTheBound = static_cast<std::size_t>(EnrollTotalBound / EnrollPollInterval) + 1;
+    auto const undecided = [&](std::vector<std::byte> const& reply) {
+        Testing::ScriptedDialer dialer { std::vector<std::vector<std::byte>>(pollsToTheBound, reply) };
+        auto const startedAt = wait.Now();
+        auto const gaveUp = ask(dialer);
+        CHECK(dialer.Dialed().size() == pollsToTheBound);
+        CHECK(wait.Now() - startedAt >= EnrollTotalBound);
+        return gaveUp;
+    };
+
+    SECTION("the seed kept the request waiting for a person until the bound: transient")
+    {
+        auto const gaveUp = undecided(Recorded());
+        REQUIRE_FALSE(gaveUp.has_value());
+        INFO(gaveUp.error().reason);
+        CHECK(gaveUp.error().reason.contains("waiting to be approved"));
+        CHECK(gaveUp.error().ending == CommandEnding::Failed);
+    }
+
+    SECTION("the seed's list stayed full until the bound: transient")
+    {
+        auto const gaveUp = undecided(Wire::EncodeErrorReply(Wire::ErrorCode::EnrollmentFull, "full"));
+        REQUIRE_FALSE(gaveUp.has_value());
+        INFO(gaveUp.error().reason);
+        CHECK(gaveUp.error().reason.contains("waiting to be approved"));
+        CHECK(gaveUp.error().ending == CommandEnding::Failed);
+    }
 }

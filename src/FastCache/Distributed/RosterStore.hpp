@@ -53,6 +53,26 @@ class FileRosterStore final: public IRosterStore
     std::filesystem::path _path;
 };
 
+/// Which half of reading a kept roster failed.
+///
+/// The two halves are different kinds of answer: a READ that failed says nothing about the roster
+/// and may succeed at the next start (a permission restored, a mount back), while a roster that
+/// was read and cannot be used is a verdict on its bytes that the next start reaches again.
+///
+/// Private: never transmitted or persisted.
+enum class RosterLoadStep : std::uint8_t
+{
+    Read,   ///< The file is there and could not be read.
+    Decode, ///< The file was read, and is not a roster this build can use.
+};
+
+/// Why a kept roster cannot be used, and which half said so.
+struct RosterLoadError
+{
+    RosterLoadStep step { RosterLoadStep::Read }; ///< Which half failed.
+    std::string reason;                           ///< What an operator is told, naming the file.
+};
+
 /// Read the roster kept at @p path.
 ///
 /// Three answers, because two of them must not be confused: NO FILE is a machine that has not
@@ -61,8 +81,9 @@ class FileRosterStore final: public IRosterStore
 /// and that is a refusal -- replacing it with the anchors would hand a say back to whichever of
 /// them the cluster revoked since.
 /// @param path The file.
-/// @return The kept roster, nothing when there is no file, or why the file cannot be used.
-[[nodiscard]] std::expected<std::optional<Cluster::PersistedRoster>, std::string> LoadPersistedRoster(
+/// @return The kept roster, nothing when there is no file, or why the file cannot be used and
+///         which half of reading it said so.
+[[nodiscard]] std::expected<std::optional<Cluster::PersistedRoster>, RosterLoadError> LoadPersistedRoster(
     std::filesystem::path const& path);
 
 } // namespace FastCache::Distributed

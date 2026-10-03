@@ -216,9 +216,9 @@ class NodePresence
     /// nothing can cancel is a thread a `SIGTERM` has to sit through. One helper rather than
     /// the lock dance at each of the two exits, which is where the two come to differ.
     ///
-    /// `RosterWantingInterval` rather than `NodeAnnounceInterval` while this node holds no
-    /// roster it could verify a grant against (#178): until one arrives it refuses every
-    /// compile, and twenty seconds of that after every start is a worker nobody can use.
+    /// The interval is `NextAnnounceWait`'s, shared with the worker's heartbeat: shorter while
+    /// this node holds no roster it could verify a grant against (#178), or while its own cluster
+    /// has not recorded it yet.
     /// @param stop Requested when the node is shutting down.
     /// @return True when the loop should end.
     [[nodiscard]] bool WaitOutInterval(std::stop_token const& stop);

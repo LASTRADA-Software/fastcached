@@ -41,6 +41,7 @@
 #include <tests/LeaseRosterFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedHostFacts.hpp>
+#include <tests/UnreadablePath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -595,7 +596,10 @@ TEST_CASE("A credential file that cannot be used is refused rather than ignored"
 
     auto const missing = Node::ReadDashboardToken(scratch.Path() / "absent");
     REQUIRE_FALSE(missing.has_value());
-    CHECK(missing.error().contains("absent"));
+    CHECK(missing.error().reason.contains("absent"));
+    // An open that failed is the I/O arm, whatever its errno: nothing was read, and the next start
+    // may open it -- a provisioner that had not written it yet, a mount back.
+    CHECK(missing.error().cause == Node::NodeRefusalCause::CredentialIo);
 
     auto const emptyPath = scratch.Path() / "empty";
     {
@@ -604,7 +608,17 @@ TEST_CASE("A credential file that cannot be used is refused rather than ignored"
     }
     auto const empty = Node::ReadDashboardToken(emptyPath);
     REQUIRE_FALSE(empty.has_value());
-    CHECK(empty.error().contains("empty"));
+    CHECK(empty.error().reason.contains("empty"));
+    // A verdict on bytes that WERE read: the next start reads the same nothing.
+    CHECK(empty.error().cause == Node::NodeRefusalCause::CredentialFile);
+
+    Testing::UnreadablePath const held { scratch.Path() / "unreadable", "secret" };
+    if (held.Held())
+    {
+        auto const unreadable = Node::ReadDashboardToken(scratch.Path() / "unreadable");
+        REQUIRE_FALSE(unreadable.has_value());
+        CHECK(unreadable.error().cause == Node::NodeRefusalCause::CredentialIo);
+    }
 }
 
 TEST_CASE("The fleet routes answer on their own paths and gate on the credential", "[node][admin][dashboard]")
@@ -777,7 +791,8 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
         auto const surface = Node::StartAdminSurfaceOrExplain(
             cfg, scrapeHost, metrics, WorkerShapedSnapshot(), std::nullopt, nullptr, AdminCredential {}, logger, conditions);
         REQUIRE_FALSE(surface.has_value());
-        CHECK(surface.error().contains("--admin-listen"));
+        CHECK(surface.error().reason.contains("--admin-listen"));
+        CHECK(surface.error().cause == Node::NodeRefusalCause::Listener);
 
         // The VALUE is no longer echoed here, and that is the relocation rather than
         // a loss: since #288 the surface table owns the grammar, so a spelling that
@@ -805,7 +820,11 @@ TEST_CASE("An admin surface reports which flag refused it", "[node][admin][dashb
 
         auto const credential = Node::LoadDashboardCredentialOrExplain(cfg);
         REQUIRE_FALSE(credential.has_value());
-        CHECK(credential.error().contains("--dashboard-token-file"));
+        CHECK(credential.error().reason.contains("--dashboard-token-file"));
+        // Refused to start -- never read as "no credential" -- and a FAILURE a supervisor
+        // restarts, since an open that failed may succeed at the next start.
+        CHECK(credential.error().cause == Node::NodeRefusalCause::CredentialIo);
+        CHECK(Node::ExitCodeFor(credential.error().cause) == ExitCodeOf(ProcessExit::Failed));
 
         // And the control: naming no file is no credential, not a refusal.
         auto const none = Node::LoadDashboardCredentialOrExplain(NodeConfig {});

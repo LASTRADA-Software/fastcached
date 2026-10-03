@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <tests/ScratchPath.hpp>
+#include <tests/Unwrap.hpp>
 
 namespace
 {
@@ -499,4 +500,64 @@ TEST_CASE("FormatBindSummary: empty list renders <none>", "[config][bind][summar
     // FormatBindSummary itself stays total.
     std::vector<FastCache::BindConfig> binds {};
     REQUIRE(FastCache::FormatBindSummary(binds) == "<none>");
+}
+
+TEST_CASE("The daemon's startup rules refuse what its body used to refuse only once running",
+          "[config][bind][validate][startup]")
+{
+    // Each of these was asked inside the daemon body, which `--install-service` never reaches and
+    // which a service entered only after telling the SCM it was running. They depend on the
+    // configuration and the build and nothing else, so `main` asks them before either.
+    FastCache::Config config;
+
+    SECTION("the control: the default configuration starts")
+    {
+        CHECK_FALSE(FastCache::DaemonStartupRejection(config).has_value());
+    }
+
+    SECTION("two listeners on one endpoint, named by the endpoint")
+    {
+        config.binds = { FastCache::BindConfig { .address = "0.0.0.0", .port = 6379, .tls = false },
+                         FastCache::BindConfig { .address = "0.0.0.0", .port = 6379, .tls = true } };
+        auto const refusal = FastCache::DaemonStartupRejection(config);
+        REQUIRE(refusal.has_value());
+        CHECK(FastCache::Testing::Unwrap(refusal).contains("duplicate listener endpoint 0.0.0.0:6379"));
+    }
+
+    SECTION("TLS on one listener with no material, or on a build that cannot serve it")
+    {
+        config.binds = { FastCache::BindConfig { .address = "127.0.0.1", .port = 6380, .tls = true } };
+#if defined(FC_TLS_ENABLED)
+        auto const why = FastCache::DaemonTlsMaterialRefusal;
+#else
+        auto const why = FastCache::DaemonTlsUnavailableRefusal;
+#endif
+        CHECK(FastCache::DaemonStartupRejection(config) == std::optional<std::string> { std::string { why } });
+    }
+
+    SECTION("TLS with both halves of its material starts exactly where the build can serve it")
+    {
+        config.tlsEnabled = true;
+        config.tlsCertPath = "server.crt";
+        config.tlsKeyPath = "server.key";
+#if defined(FC_TLS_ENABLED)
+        CHECK_FALSE(FastCache::DaemonStartupRejection(config).has_value());
+#else
+        CHECK(FastCache::DaemonStartupRejection(config)
+              == std::optional<std::string> { std::string { FastCache::DaemonTlsUnavailableRefusal } });
+#endif
+    }
+}
+
+TEST_CASE("The daemon serves its listener list when one was named, else its single endpoint", "[config][bind][startup]")
+{
+    FastCache::Config config;
+    config.bindAddress = "10.0.0.5";
+    config.port = 7000;
+    config.tlsEnabled = true;
+    CHECK(FastCache::EffectiveBinds(config)
+          == std::vector { FastCache::BindConfig { .address = "10.0.0.5", .port = 7000, .tls = true } });
+
+    config.binds = { FastCache::BindConfig { .address = "::", .port = 6379, .tls = false } };
+    CHECK(FastCache::EffectiveBinds(config) == config.binds);
 }

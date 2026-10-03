@@ -192,6 +192,8 @@ if(FASTCACHED_BUILD_TESTS)
         NodePresenceTier.cpp
         NodeRoster.cpp
         NodeRoster_test.cpp
+        NodeRefusal_test.cpp
+        OneShotAnswer_test.cpp
         NodeConditions.cpp
         NodeConditions_test.cpp
         NodeConfig.cpp
@@ -225,6 +227,7 @@ if(FASTCACHED_BUILD_TESTS)
         NodeFirewall_test.cpp
         NodeSurfaces.cpp
         NodeSurfaces_test.cpp
+        StartupRefusalCensus_test.cpp
         NodeMembership_test.cpp
         WorkerLease_test.cpp
         NodeToolchains.cpp

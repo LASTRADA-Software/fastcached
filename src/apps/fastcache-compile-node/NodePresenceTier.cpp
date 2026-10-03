@@ -239,9 +239,8 @@ void NodePresence::Loop(std::stop_token const& stop)
 
 bool NodePresence::WaitOutInterval(std::stop_token const& stop)
 {
-    auto const interval = _roster != nullptr && _roster->Wanting()
-                              ? std::chrono::duration_cast<std::chrono::milliseconds>(RosterWantingInterval)
-                              : std::chrono::duration_cast<std::chrono::milliseconds>(NodeAnnounceInterval);
+    auto const interval = std::chrono::duration_cast<std::chrono::milliseconds>(
+        NextAnnounceWait(_prover, _roster != nullptr && _roster->Wanting()));
     return _presenceWake.WaitOut(stop, interval) == PresenceWakeReason::Stopped;
 }
 

@@ -225,6 +225,21 @@ class NodeProofResponder final: public IFrameResponder, public INodeProver
     [[nodiscard]] NodeProofVerdict Verify(NodeHandshake const& handshake, std::span<std::byte const> payload) override;
 
   private:
+    /// Why a proof that verified is refused as unknown, with the remedy that fits WHO proved it.
+    ///
+    /// **A remedy that sends its reader somewhere the refusal persists is worse than none**, and
+    /// "admit it" does exactly that for the two callers that carry THIS node's own id: this node
+    /// itself, proving to its own scheduler before its own consensus has recorded it -- nothing to
+    /// admit, the record is on its way -- and another machine holding a copy of this node's state
+    /// directory, which admitting would not separate from this one. Only a stranger's own id is
+    /// told how a machine gets admitted. And this node's own id and key, recorded under ANOTHER
+    /// key, is a `node-key` replaced while its id survived, which waiting does not fix: answered
+    /// with the words this node's prover gives itself (`ReplacedNodeKeyDiagnosis`). Never for a
+    /// stranger's id, where the same shape may be another machine claiming a member's id.
+    /// @param proven The identity the proof verified under.
+    /// @return The refusal's words.
+    [[nodiscard]] std::string UnknownKeyReason(ProvenIdentity const& proven) const;
+
     std::string _nodeId;
     Ed25519KeyPair const& _identity;
     Distributed::IMembershipOracle const& _roster;

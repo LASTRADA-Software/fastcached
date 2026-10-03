@@ -349,7 +349,7 @@ ConsensusTier::ConsensusTier(Cluster::ClusterMember self,
                                                 .publicKey = _self.publicKey });
 }
 
-std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
+std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> ConsensusTier::Start(
     NodeConfig const& cfg,
     std::string_view schedulerBound,
     std::optional<Ed25519KeyPair> const& identityKey,
@@ -374,15 +374,17 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // Every node has a state directory (`NodeStateDirectory`) and the start resolves
     // the key there before this tier exists, so this is the answer to a caller that did not.
     if (!identityKey.has_value())
-        return std::unexpected { std::string { ConsensusNeedsIdentityKeyRefusal } };
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, std::string { ConsensusNeedsIdentityKeyRefusal }) };
 
     // This node's own record (`ConsensusSelfMemberOf`). A node whose id names no member it can be
     // reached at could never win a vote and could never be voted for: it would stand for election
     // forever against a cluster that has never heard of it, which from the outside is a node that
     // simply never becomes ready.
     auto self = ConsensusSelfMemberOf(cfg, members, identityKey->PublicKey());
+    // Both of its refusals are startup-table rows (`ConsensusNeedsNodeIdRefusal`,
+    // `ConsensusNamesNoDialAddressRefusal`), asked before any tier: this is their belt.
     if (!self.has_value())
-        return std::unexpected { std::move(self).error() };
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, std::move(self).error()) };
 
     // Only a node that FOUNDED its cluster bootstraps it. One that joined another's starts with
     // an empty bootstrap set and waits to be admitted -- the only shape a cluster can admit,
@@ -411,7 +413,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     // opener reaches for.
     auto const resolved = SoleEndpointOf(NodeSurface::Raft, cfg);
     if (!resolved.has_value())
-        return std::unexpected { resolved.error() };
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, resolved.error()) };
     auto const& endpoint = *resolved;
 
     // The listener is bound in `Launch` rather than here, because it binds against
@@ -427,10 +429,11 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     auto const stateDirectory = NodeStateDirectory(cfg);
     auto storage = Consensus::FileRaftStorage::Open(stateDirectory);
     if (!storage.has_value())
-        return std::unexpected { std::format("cannot open {}: {}{}",
-                                             stateDirectory.string(),
-                                             storage.error().context,
-                                             StateFileUnreadableHint(stateDirectory)) };
+        return std::unexpected { Refusal(NodeRefusalCause::ConsensusStore,
+                                         std::format("cannot open {}: {}{}",
+                                                     stateDirectory.string(),
+                                                     storage.error().context,
+                                                     StateFileUnreadableHint(stateDirectory))) };
 
     // The record this node announces about itself, and the only place both of its
     // addresses are known at once: the consensus one is what an operator typed and
@@ -461,7 +464,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
 
     if (auto started = tier->Launch(cfg, members, bootstrap, endpoint.host, endpoint.port, std::move(boundListener));
         !started.has_value())
-        return std::unexpected { started.error() };
+        return std::unexpected { std::move(started).error() };
 
     logger.Logf(LogLevel::Info,
                 "consensus on {} as {} ({}, state in {})",
@@ -473,7 +476,7 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     return tier;
 }
 
-std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
+std::expected<void, NodeRefusal> ConsensusTier::Launch(NodeConfig const& cfg,
                                                        std::vector<Cluster::MemberSpec> const& dialable,
                                                        std::vector<Cluster::MemberSpec> const& bootstrap,
                                                        std::string_view bindAddress,
@@ -488,8 +491,9 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
     if (boundListener != nullptr)
     {
         if (!boundListener->IsBound())
-            return std::unexpected { std::format("the listener handed to consensus is not bound: {}",
-                                                 boundListener->BindError()) };
+            return std::unexpected { Refusal(
+                NodeRefusalCause::HandedOverListeners,
+                std::format("the listener handed to consensus is not bound: {}", boundListener->BindError())) };
         // The host is compared as the KERNEL reports it, against the configured host's canonical
         // literal. A configured NAME would need a lookup this path does not make, so it is refused
         // rather than matched by spelling; an empty host is the wildcard, which either family's
@@ -498,22 +502,25 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
         auto const heldPort = boundListener->boundPort();
         auto const configuredHost = CanonicalAddressLiteral(bindAddress);
         if (!bindAddress.empty() && !configuredHost.has_value())
-            return std::unexpected { std::format(
-                "the listener handed to consensus cannot be matched to {}: the configuration names its host by name, "
-                "and a handed listener is matched against an address literal only",
-                FormatHostPort(bindAddress, bindPort)) };
+            return std::unexpected { Refusal(
+                NodeRefusalCause::HandedOverListeners,
+                std::format("the listener handed to consensus cannot be matched to {}: the configuration names its "
+                            "host by name, and a handed listener is matched against an address literal only",
+                            FormatHostPort(bindAddress, bindPort))) };
         auto const hostMatches =
             bindAddress.empty() ? (heldHost == "0.0.0.0" || heldHost == "::") : heldHost == *configuredHost;
         if (!hostMatches || heldPort != bindPort)
-            return std::unexpected { std::format(
-                "the listener handed to consensus is bound to {}, and the configuration names {}",
-                FormatHostPort(heldHost, heldPort),
-                FormatHostPort(bindAddress, bindPort)) };
+            return std::unexpected { Refusal(NodeRefusalCause::HandedOverListeners,
+                                             std::format("the listener handed to consensus is bound to {}, and the "
+                                                         "configuration names {}",
+                                                         FormatHostPort(heldHost, heldPort),
+                                                         FormatHostPort(bindAddress, bindPort))) };
         auto adopted = AdoptBoundListener(_reactor, boundListener->Release());
         if (!adopted.has_value())
-            return std::unexpected { std::format("cannot serve the listener handed to consensus on {}: {}",
-                                                 FormatHostPort(bindAddress, bindPort),
-                                                 adopted.error()) };
+            return std::unexpected { Refusal(NodeRefusalCause::Listener,
+                                             std::format("cannot serve the listener handed to consensus on {}: {}",
+                                                         FormatHostPort(bindAddress, bindPort),
+                                                         adopted.error())) };
         _listener = std::move(*adopted);
     }
     else
@@ -533,7 +540,7 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
                 std::format("cannot bind {}: {}", FormatHostPort(bindAddress, bindPort), listened.error().toString()),
                 _logger);
             if (!judged.has_value())
-                return std::unexpected { std::move(judged).error() };
+                return std::unexpected { Refusal(NodeRefusalCause::Listener, std::move(judged).error()) };
 
             // Refused rather than tolerated (#352). This is the earliest point in `Launch`,
             // so returning success here hands `Start` a tier whose `_transport`, `_driver`,
@@ -541,8 +548,10 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
             // against a listener that never bound, and the first `Propose` would dereference
             // a null `_driver`. Carrying a tolerated verdict here is not a branch, it is the
             // rest of this function.
-            return std::unexpected { BindToleranceUnsupported(
-                RowFor(NodeSurface::Raft), "the tier's driver, transport and peer server are built below this point") };
+            return std::unexpected { Refusal(NodeRefusalCause::Listener,
+                                             BindToleranceUnsupported(RowFor(NodeSurface::Raft),
+                                                                      "the tier's driver, transport and peer server are "
+                                                                      "built below this point")) };
         }
         _listener = std::move(*listened);
     }
@@ -564,7 +573,9 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
         // one place.
         auto where = PeerEndpointFor(member.id, member.raftEndpoint);
         if (!where.has_value())
-            return std::unexpected { std::format("{} is not a dialable endpoint for {}", member.raftEndpoint, member.id) };
+            return std::unexpected { Refusal(
+                NodeRefusalCause::EarlierRule,
+                std::format("{} is not a dialable endpoint for {}", member.raftEndpoint, member.id)) };
 
         // This node itself is deliberately included. `RaftPeerTransport` refuses a
         // message addressed to `self` rather than looping it through a socket, so
@@ -592,7 +603,8 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
 
     auto recovered = _storage.Load();
     if (!recovered.has_value())
-        return std::unexpected { std::format("cannot recover consensus state: {}", recovered.error().context) };
+        return std::unexpected { Refusal(NodeRefusalCause::ConsensusStore,
+                                         std::format("cannot recover consensus state: {}", recovered.error().context)) };
 
     // `Create` rather than the constructor, which is private precisely so the
     // configuration validation cannot be bypassed by omission -- so there is no
@@ -603,7 +615,7 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
                                     std::chrono::steady_clock::now(),
                                     *std::move(recovered));
     if (!node.has_value())
-        return std::unexpected { node.error().context };
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, node.error().context) };
 
     // Read from the node rather than left at its default, because a node recovered
     // from storage comes back at whatever term it had reached. Only the term can
@@ -634,7 +646,8 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
                                       _application,
                                       Consensus::CompactionPolicy { .appliedEntriesBeforeCompaction = CompactAfterEntries });
     if (!driver.has_value())
-        return std::unexpected { UnreadableConsensusStateRefusal(NodeStateDirectory(cfg), driver.error()) };
+        return std::unexpected { Refusal(NodeRefusalCause::ConsensusState,
+                                         UnreadableConsensusStateRefusal(NodeStateDirectory(cfg), driver.error())) };
     _driver = *std::move(driver);
 
     // Pushed, not polled. A poll interval is a window in which this node has stopped
@@ -1394,7 +1407,7 @@ void ConsensusTier::Republish()
         _onRole(scheduled, leaderEndpoint, _lastTerm.value);
 }
 
-std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExplain(
+std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExplain(
     NodeConfig const& cfg,
     std::unique_ptr<SchedulerTier> const& schedulerTier,
     std::string_view schedulerBound,

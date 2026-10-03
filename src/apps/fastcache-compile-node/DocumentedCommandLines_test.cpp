@@ -782,7 +782,8 @@ TEST_CASE("The MSI's node registration installs with and without an advertised e
         Testing::RecordingFirewall firewall;
         NoKeptFormation const fresh;
         auto const installed = InstallWithServiceFirewall(
-            [] { return ServiceControlResult { .outcome = ServiceControlOutcome::Done, .message = "installed" }; },
+            [] { return ServiceControlResult { .outcome = ServiceControlOutcome::Created, .message = "installed" }; },
+            [] { return ServiceControlResult { .outcome = ServiceControlOutcome::Failed, .message = "not asked" }; },
             cfg,
             // Absolute on every host: a rule whose program is not is refused before the firewall is asked.
             std::filesystem::current_path() / "fastcache-compile-node",

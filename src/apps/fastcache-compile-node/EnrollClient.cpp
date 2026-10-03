@@ -3,6 +3,7 @@
 #include "EnrollmentWindow.hpp"
 #include "NodeIdentity.hpp"
 #include "NodeKey.hpp"
+#include "NodeRefusal.hpp"
 #include "NodeStateFiles.hpp"
 #include "NodeSurfaces.hpp"
 
@@ -431,13 +432,14 @@ std::string KeepEnrolledRoster(std::span<std::byte const> roster,
                        Distributed::RosterFileName);
 }
 
-std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
-                                                       EnrollCommand const& request,
-                                                       Cc::ICredentialFor& credentials,
-                                                       IEndpointDialer& dialer)
+std::expected<std::string, UnfinishedCommand> RunEnrollAdmin(NodeConfig const& cfg,
+                                                             EnrollCommand const& request,
+                                                             Cc::ICredentialFor& credentials,
+                                                             IEndpointDialer& dialer)
 {
     if (cfg.schedulers.empty())
-        return std::unexpected { std::string { "--scheduler names where to ask; an enrollment command needs one" } };
+        return std::unexpected { Unanswered(AnswerSource::Local,
+                                            "--scheduler names where to ask; an enrollment command needs one") };
 
     auto notice =
         Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
@@ -455,21 +457,19 @@ std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
                                      auto const presented = credentials.Present(endpoint);
                                      missing = presented.missing;
                                      return core::async::syncRun(Cc::ExchangeFramed(
-                                         &socket,
-                                         &notice,
-                                         EnrollControlFrame(request),
-                                         presented.credential));
+                                         &socket, &notice, EnrollControlFrame(request), presented.credential));
                                  });
     if (!answered.has_value())
         return std::unexpected { std::move(answered).error() };
 
     auto const& outcome = answered->outcome;
     if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
-        return std::unexpected { Cc::RecordedReason(outcome, missing) };
+        return std::unexpected { Unanswered(outcome, Cc::RecordedReason(outcome, missing)) };
 
     auto const report = Wire::DecodeEnrollmentReport(outcome.value);
     if (!report.has_value())
-        return std::unexpected { std::format("{} answered with a body this client cannot read", answered->endpoint) };
+        return std::unexpected { Unanswered(
+            outcome, std::format("{} answered with a body this client cannot read", answered->endpoint)) };
     return RenderEnrollmentReport(*report, answered->endpoint);
 }
 
@@ -520,12 +520,12 @@ std::expected<std::pair<std::string, std::string>, std::string> EnrollClaim(Node
     return std::pair { cfg.nodeId, *std::move(dial) };
 }
 
-std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
-                                                        ISecureRandom& random,
-                                                        INodeKeyFileGuard& keyGuard,
-                                                        IDrainWait& wait,
-                                                        IEndpointDialer& dialer,
-                                                        core::platform::IWallClock const& wallClock)
+std::expected<std::string, UnfinishedCommand> RunEnrollClient(NodeConfig const& cfg,
+                                                              ISecureRandom& random,
+                                                              INodeKeyFileGuard& keyGuard,
+                                                              IDrainWait& wait,
+                                                              IEndpointDialer& dialer,
+                                                              core::platform::IWallClock const& wallClock)
 {
     // **This mode's own preconditions are refused HERE and not as `StartupPolicyRejection`
     // rows, and that is a decision rather than a missed table row.** That table judges a
@@ -554,10 +554,12 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
     // come to different conclusions about the same string; a bare port names no machine,
     // which is the whole of why `HostOfEndpoint` is not the predicate here.
     if (!cfg.enrollFrom.empty() && !ParseDialEndpoint(cfg.enrollFrom).has_value())
-        return std::unexpected { std::format(
-            "--enroll-from={} is not an address to dial: it names a seed as <host>:<port>, and a bare port names no "
-            "machine. Nothing has been changed on this machine",
-            cfg.enrollFrom) };
+        return std::unexpected { Unanswered(
+            AnswerSource::Local,
+            std::format(
+                "--enroll-from={} is not an address to dial: it names a seed as <host>:<port>, and a bare port names no "
+                "machine. Nothing has been changed on this machine",
+                cfg.enrollFrom)) };
 
     // **The one-way mistake, caught before anything is asked of anybody (#1299).**
     //
@@ -575,21 +577,25 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
     // again: a consensus store another account planted must be refused for that, never read
     // as this node's history.
     if (auto walked = JudgeStateDirectory(NodeStateDirectory(cfg), keyGuard); !walked.has_value())
-        return std::unexpected { std::move(walked).error().message };
+        return std::unexpected { UnfinishedCommand { .ending = EndingOf(walked.error().fault),
+                                                     .reason = std::move(walked).error().message } };
     auto const history = ReadConsensusHistory(NodeStateDirectory(cfg));
     if (!history.has_value())
-        return std::unexpected { std::move(history).error() };
+        return std::unexpected { UnfinishedCommand { .ending = EndingOf(NodeRefusalCause::ConsensusStore),
+                                                     .reason = std::move(history).error() } };
     if (*history == ConsensusHistory::Recorded)
-        return std::unexpected { std::format(
-            "{} already holds consensus state: this node has run a cluster before. Either it is its OWN -- every "
-            "node that runs consensus founds a cluster of one at its first start -- and a node that led one cannot "
-            "be admitted to anybody else's as it stands, since it would refuse every leader but its own; or it is "
-            "one it was already admitted to, in which case it does not need enrolling. Both are fixed the same way "
-            "and only if you mean it: stop this node, delete {}, and run this again. A wiped "
-            "state directory gets a NEW identity, which is what admission needs -- clearing only the log would "
-            "leave this node's old identity in place holding a vote record for the cluster it led.",
-            NodeStateDirectory(cfg).string(),
-            NodeStateDirectory(cfg).string()) };
+        return std::unexpected { Unanswered(
+            AnswerSource::Local,
+            std::format(
+                "{} already holds consensus state: this node has run a cluster before. Either it is its OWN -- every "
+                "node that runs consensus founds a cluster of one at its first start -- and a node that led one cannot "
+                "be admitted to anybody else's as it stands, since it would refuse every leader but its own; or it is "
+                "one it was already admitted to, in which case it does not need enrolling. Both are fixed the same way "
+                "and only if you mean it: stop this node, delete {}, and run this again. A wiped "
+                "state directory gets a NEW identity, which is what admission needs -- clearing only the log would "
+                "leave this node's old identity in place holding a vote record for the cluster it led.",
+                NodeStateDirectory(cfg).string(),
+                NodeStateDirectory(cfg).string())) };
 
     // The KEY first, as a start resolves it: it is what the seed records and what every later
     // proof is checked against, so a machine that asked under one key and started with another
@@ -597,7 +603,8 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
     // state directory the id is minted into next, its owner's alone.
     auto key = ResolveNodeKeyFor(cfg, random, keyGuard);
     if (!key.has_value())
-        return std::unexpected { std::move(key).error().message };
+        return std::unexpected { UnfinishedCommand { .ending = EndingOf(key.error().fault),
+                                                     .reason = std::move(key).error().message } };
 
     // The identity is MINTED here, into `--cluster-dir`, before anything is asked of
     // anybody -- because it is what the seed is asked to admit. A joiner that asked
@@ -605,7 +612,8 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
     // counts and cannot reach.
     auto identity = ResolveNodeIdentity(NodeStateDirectory(cfg), cfg.nodeId, random);
     if (!identity.has_value())
-        return std::unexpected { std::move(identity).error() };
+        return std::unexpected { UnfinishedCommand { .ending = EndingOf(identity.error().fault),
+                                                     .reason = std::move(identity).error().message } };
 
     auto resolved = cfg;
     ApplyNodeIdentity(resolved, *identity);
@@ -650,9 +658,11 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
         // `DialEndpointBlocking` still sees the concrete type it requires.
         auto client = dialer.Dial(seed, core::net::DialOptions { .connectTimeout = EnrollDialTimeout });
         if (client == nullptr)
-            return std::unexpected { std::format("cannot reach the seed at {}", seed) };
+            return std::unexpected { Unanswered(AnswerSource::Transport, std::format("cannot reach the seed at {}", seed)) };
 
-        auto reading = ReadEnrollReply(core::async::syncRun(
+        // Kept, not read once and dropped: a `Fatal` reading is both a transport that broke and a
+        // reply that refused, and only the outcome says which (`SourceOf`).
+        auto const outcome = core::async::syncRun(
             Cc::ExchangeFramed(client.get(),
                                &notice,
                                // No credential: `ENROLL` is answered before authentication, and no roster holds this
@@ -660,12 +670,15 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                                Wire::EncodeEnroll(Wire::EnrollRequest { .nodeId = self.nodeId,
                                                                         .nodeEndpoint = self.nodeEndpoint,
                                                                         .role = self.role,
-                                                                        .publicKey = self.publicKey }))));
+                                                                        .publicKey = self.publicKey })));
+        auto reading = ReadEnrollReply(outcome);
 
         switch (reading.progress)
         {
             case EnrollProgress::Admitted: {
-                auto admitted = DescribeAdmission(self, reading.roster, NodeStateDirectory(cfg));
+                auto admitted =
+                    DescribeAdmission(self, reading.roster, NodeStateDirectory(cfg))
+                        .transform_error([&outcome](std::string reason) { return Unanswered(outcome, std::move(reason)); });
                 // A worker keeps the leader's certified roster as its trust root; a member applies the
                 // replicated state and needs none.
                 if (!admitted.has_value() || self.role != Wire::EnrollRole::Worker)
@@ -674,13 +687,18 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                 return *admitted + KeepEnrolledRoster(reading.roster, reading.certificate, wallClock.now(), store);
             }
             case EnrollProgress::Refused:
-                return std::unexpected { std::format("{} refused this machine ({})", seed, reading.detail) };
+                return std::unexpected { Unanswered(outcome,
+                                                    std::format("{} refused this machine ({})", seed, reading.detail)) };
             case EnrollProgress::Fatal:
-                return std::unexpected { std::format("{} could not enrol this machine: {}", seed, reading.detail) };
+                return std::unexpected { Unanswered(
+                    outcome, std::format("{} could not enrol this machine: {}", seed, reading.detail)) };
             case EnrollProgress::Redirect:
+                // A chain that did not settle decided nothing about this machine (`Pending`).
                 if (redirects >= MaxEnrollRedirects)
-                    return std::unexpected { std::format(
-                        "gave up after {} leader redirect(s); the last named {}", MaxEnrollRedirects, reading.detail) };
+                    return std::unexpected { Unanswered(AnswerSource::Pending,
+                                                        std::format("gave up after {} leader redirect(s); the last named {}",
+                                                                    MaxEnrollRedirects,
+                                                                    reading.detail)) };
                 ++redirects;
                 std::cerr << std::format(
                     "fastcache-compile-node: {} does not lead the cluster; asking {} instead\n", seed, reading.detail);
@@ -721,13 +739,16 @@ std::expected<std::string, std::string> RunEnrollClient(NodeConfig const& cfg,
                                      EnrollPollInterval.count() / 1000);
         }
 
+        // The last answer was the seed's own -- waiting, or closed -- and neither decides anything,
+        // so giving up on it is transient: the same command succeeds once an operator approves.
         if (wait.Now() - startedAt >= EnrollTotalBound)
-            return std::unexpected { std::format(
-                "gave up after {} minute(s) waiting to be approved by {}. Nothing has been changed on this "
-                "machine, and this node's request stays on that seed's list until its window closes, so "
-                "running this again after an operator approves it is enough",
-                std::chrono::duration_cast<std::chrono::minutes>(EnrollTotalBound).count(),
-                seed) };
+            return std::unexpected { Unanswered(
+                AnswerSource::Pending,
+                std::format("gave up after {} minute(s) waiting to be approved by {}. Nothing has been changed on this "
+                            "machine, and this node's request stays on that seed's list until its window closes, so "
+                            "running this again after an operator approves it is enough",
+                            std::chrono::duration_cast<std::chrono::minutes>(EnrollTotalBound).count(),
+                            seed)) };
 
         wait.Sleep(EnrollPollInterval);
     }

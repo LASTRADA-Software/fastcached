@@ -90,7 +90,7 @@ FastCachedTable="${FASTCACHED_FIXTURE_STARTS_TABLE:-${FastCachedRoot}/scripts/ch
 OneShotVerbs="print-surfaces help version cluster-status cluster-set cluster-admit cluster-admit-learner"
 OneShotVerbs="${OneShotVerbs} cluster-admit-worker cluster-admit-client cluster-forget cluster-forget-client"
 OneShotVerbs="${OneShotVerbs} install-service uninstall-service enroll-list enroll-approve enroll-reject"
-OneShotVerbs="${OneShotVerbs} migrate-cache seed-config"
+OneShotVerbs="${OneShotVerbs} migrate-cache seed-config cordon uncordon"
 # The verbs that write this node's identity, and so need `--cluster-dir` and nothing else.
 MintingVerbs="print-identity enroll-from"
 # How many lines one statement may span, backwards to its opener or forwards to its end.

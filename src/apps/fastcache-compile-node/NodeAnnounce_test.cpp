@@ -17,9 +17,12 @@
 #include "EndpointDialerTestUtils.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodePresenceTier.hpp"
+#include "NodeRoster.hpp"
 #include "SchedulerReachability.hpp"
 
+#include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/HostLoad.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
@@ -47,9 +50,13 @@
 #include <utility>
 #include <vector>
 
+#include <core/Ranges.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/NodeProofFakes.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -1271,4 +1278,178 @@ TEST_CASE("A suspend with nothing registered dials nobody", "[node][announce][ho
     Testing::ScriptedDialer dialer { {} };
     CHECK(WithdrawOnce(fix.Round(), link, dialer) == 0);
     CHECK(dialer.Dialed().empty());
+}
+
+namespace
+{
+
+/// The id of the node these cases announce as.
+constexpr std::string_view SelfNode = "self-01";
+
+/// A server trust that checks nothing: what these cases decide happens before any server is met.
+class UncheckedServerTrust final: public IServerTrust
+{
+  public:
+    /// @copydoc IServerTrust::StandingOf
+    [[nodiscard]] ServerStanding StandingOf(std::string_view /*serverId*/,
+                                            Ed25519PublicKey const& /*serverKey*/) const override
+    {
+        return ServerStanding::Unchecked;
+    }
+
+    /// @copydoc IServerTrust::Expected
+    [[nodiscard]] std::string_view Expected() const override
+    {
+        return "any server";
+    }
+};
+
+/// A consensus node's proving half: its key, and the roster its own consensus publishes into.
+struct OwnRecordFixture
+{
+    Ed25519KeyPair const key = Testing::TestKeyPair(std::string { SelfNode });
+    UncheckedServerTrust trust;
+    Distributed::KeyRosterMembership ownCluster;
+    NodeConditions conditions;
+    Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+    NodeProofClient client { std::string { SelfNode }, key, trust, &ownCluster, &conditions, random };
+    CapturingLogger logger;
+
+    /// @return How many records were captured at @p level and contain @p text.
+    [[nodiscard]] std::size_t Said(LogLevel level, std::string_view text) const
+    {
+        return static_cast<std::size_t>(std::ranges::count_if(logger.Snapshot(), [level, text](auto const& record) {
+            return record.level == level && record.message.contains(text);
+        }));
+    }
+};
+
+/// An announcement no case here may reach.
+class UnreachableAnnouncement final: public IAnnouncement
+{
+  public:
+    /// @copydoc IAnnouncement::Attempt
+    [[nodiscard]] AnnounceOutcome Attempt(core::net::ISocket& /*client*/, std::string_view /*endpoint*/) override
+    {
+        FAIL("a held round reached its announcement");
+        return {};
+    }
+};
+
+} // namespace
+
+TEST_CASE("A node its own cluster has not recorded dials nothing and says so once then louder then when it clears",
+          "[node][announce][self-record][conditions]")
+{
+    // Held rounds are the ordinary moment before an election at the start of every consensus node
+    // that names --scheduler, so they are said ONCE at Info rather than per round -- and louder once
+    // at Warn when they outlast what an election explains, and once more when the record lands.
+    OwnRecordFixture fix;
+    auto link = LinkOver({ "10.0.0.1:6674" });
+    Testing::ScriptedDialer dialer { {} };
+    UnreachableAnnouncement announcement;
+    core::platform::ManualClock reachabilityClock;
+    SchedulerReachability reachability { reachabilityClock };
+    auto const proof = AnnounceProof { .prover = &fix.client };
+
+    CHECK(fix.client.OwnRecordNow() == OwnRecord::Awaited);
+    // Evaluated from construction, so `Settle` never finds the row undecided on a consensus node.
+    CHECK(fix.conditions.StateOf(NodeCondition::OwnRecordAwaited) == Wire::ConditionState::Clear);
+    for (auto const ask: std::views::iota(std::size_t { 0 }, OwnRecordPatience + 2))
+    {
+        INFO("ask " << ask);
+        CHECK(DialAndAnnounce(link, reachability, dialer, fix.logger, announcement, proof) == 0);
+        // Raised with the Warn, not before: the ordinary hold before an election is no condition.
+        auto const raised = ask + 1 >= OwnRecordPatience;
+        CHECK((fix.conditions.StateOf(NodeCondition::OwnRecordAwaited) == Wire::ConditionState::Raised) == raised);
+    }
+    CHECK(dialer.Dialed().empty());
+    CHECK(fix.Said(LogLevel::Info, "not announcing to the fleet yet") == 1);
+    CHECK(fix.Said(LogLevel::Warn, "still not announcing to the fleet") == 1);
+    CHECK(fix.Said(LogLevel::Warn, "--cluster-admit-worker") == 0);
+    CHECK(fix.logger.Snapshot().size() == 2);
+
+    Testing::PublishKeyRoster(fix.ownCluster, { std::string { SelfNode } });
+    CHECK(fix.client.OwnRecordNow() == OwnRecord::Recorded);
+    CHECK_FALSE(fix.client.HoldUntilRecorded(fix.logger));
+    CHECK_FALSE(fix.client.HoldUntilRecorded(fix.logger));
+    CHECK(fix.Said(LogLevel::Info, "has recorded it; announcing") == 1);
+    CHECK(fix.conditions.StateOf(NodeCondition::OwnRecordAwaited) == Wire::ConditionState::Clear);
+}
+
+TEST_CASE("A node whose own cluster records its id under another key is held and told why at once",
+          "[node][announce][self-record][conditions]")
+{
+    // The id this machine minted survived and its node-key did not: its cluster records the id
+    // under the OLD key, so every scheduler refuses the new one -- and "not recorded yet" would send
+    // an operator waiting for a record that already exists. Said at Warn on the FIRST held ask,
+    // raised at once, and never repeated.
+    OwnRecordFixture fix;
+    auto const oldKey = Testing::TestKeyPair("self-01-before-its-key-was-replaced").PublicKey();
+    fix.ownCluster.Publish({ { std::string { SelfNode }, oldKey } }, {});
+    CHECK(fix.client.OwnRecordNow() == OwnRecord::OtherKey);
+
+    CHECK(fix.client.HoldUntilRecorded(fix.logger));
+    CHECK(fix.client.HoldUntilRecorded(fix.logger));
+    CHECK(fix.Said(LogLevel::Warn, "under another identity key") == 1);
+    CHECK(fix.Said(LogLevel::Warn, "--cluster-forget=self-01") == 1);
+    CHECK(fix.Said(LogLevel::Info, "not announcing to the fleet yet") == 0);
+    CHECK(fix.conditions.StateOf(NodeCondition::OwnRecordAwaited) == Wire::ConditionState::Raised);
+    auto const rows = fix.conditions.Snapshot();
+    auto const* const row = core::findIfOrNull(rows, [](auto const& fields) { return fields.id == "own-record-awaited"; });
+    REQUIRE(row != nullptr);
+    CHECK(row->detail.contains("node-key was replaced"));
+
+    // The control: the key this machine holds, recorded, releases the round and clears the row.
+    Testing::PublishKeyRoster(fix.ownCluster, { std::string { SelfNode } });
+    CHECK(fix.client.OwnRecordNow() == OwnRecord::Recorded);
+    CHECK_FALSE(fix.client.HoldUntilRecorded(fix.logger));
+    CHECK(fix.conditions.StateOf(NodeCondition::OwnRecordAwaited) == Wire::ConditionState::Clear);
+}
+
+TEST_CASE("Only a consensus node whose own cluster has no opinion of its key is held", "[node][announce][self-record]")
+{
+    SECTION("a node that runs no consensus is never held: its admission is an operator's, and the scheduler says so")
+    {
+        auto const key = Testing::TestKeyPair(std::string { SelfNode });
+        UncheckedServerTrust const trust;
+        Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
+        NodeProofClient const client { std::string { SelfNode }, key, trust, nullptr, nullptr, random };
+        CapturingLogger logger;
+        CHECK(client.OwnRecordNow() == OwnRecord::NotAsked);
+        CHECK_FALSE(client.HoldUntilRecorded(logger));
+        CHECK(logger.Snapshot().empty());
+        CHECK(NextAnnounceWait(&client, false) == NodeAnnounceInterval);
+    }
+
+    SECTION("a REVOKED key is an opinion: the scheduler refuses it by name, so the round is not held back")
+    {
+        OwnRecordFixture fix;
+        Testing::PublishKeyRoster(fix.ownCluster, {}, { std::string { SelfNode } });
+        CHECK(fix.client.OwnRecordNow() == OwnRecord::Recorded);
+        CHECK_FALSE(fix.client.HoldUntilRecorded(fix.logger));
+    }
+
+    SECTION("another machine's record is not this one's")
+    {
+        OwnRecordFixture fix;
+        Testing::PublishKeyRoster(fix.ownCluster, { "other-02" });
+        CHECK(fix.client.OwnRecordNow() == OwnRecord::Awaited);
+    }
+}
+
+TEST_CASE("Both announcing loops wait the short interval while this node's own record is awaited",
+          "[node][announce][self-record]")
+{
+    OwnRecordFixture fix;
+    auto const shortWait = std::chrono::duration_cast<std::chrono::seconds>(RosterWantingInterval);
+    REQUIRE(shortWait < NodeAnnounceInterval);
+
+    CHECK(NextAnnounceWait(&fix.client, false) == shortWait);
+    CHECK(NextAnnounceWait(nullptr, false) == NodeAnnounceInterval);
+    CHECK(NextAnnounceWait(nullptr, true) == shortWait);
+
+    Testing::PublishKeyRoster(fix.ownCluster, { std::string { SelfNode } });
+    CHECK(NextAnnounceWait(&fix.client, false) == NodeAnnounceInterval);
+    CHECK(NextAnnounceWait(&fix.client, true) == shortWait);
 }

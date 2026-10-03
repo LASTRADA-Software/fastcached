@@ -27,6 +27,7 @@
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/UnreadablePath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -179,8 +180,8 @@ TEST_CASE("A consensus member places a server only once its applied state names 
 
 TEST_CASE("A consensus member names a revoked server as revoked before it knows any voter's key", "[node][roster][proof]")
 {
-    // The control on the rule above: what a member has NOT learned yet excuses a stranger, never a
-    // machine the state it applied says was forgotten.
+    // What a member has NOT learned yet -- any voter's key -- never excuses a machine the state it
+    // applied says was forgotten.
     auto cfg = Worker();
     cfg.raftListen = "127.0.0.1:6680";
     core::platform::ManualWallClock const clock { Noon };
@@ -269,7 +270,26 @@ TEST_CASE("A kept roster this machine cannot use refuses the start, never falls 
         scratch.Write(Distributed::RosterFileName, "not a roster");
         auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
         REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().contains(Distributed::RosterFileName));
+        CHECK(refused.error().reason.contains(Distributed::RosterFileName));
+        // An unusable kept roster is still there at the next start: `Refused`, never restarted.
+        CHECK(refused.error().cause == NodeRefusalCause::KeptRoster);
+        CHECK(ExitCodeFor(refused.error().cause) == ExitCodeOf(ProcessExit::Refused));
+    }
+
+    SECTION("a kept roster that is there and cannot be read")
+    {
+        // The I/O arm, and not a verdict: nothing was read, so nothing was judged, and the next
+        // start may read it -- a permission restored, a mount back. So it is a FAILURE a
+        // supervisor restarts, where the arm above is a refusal it never does. Measured before
+        // this: a mode-000 roster exited 78, and systemd never tried it again.
+        Testing::UnreadablePath const held { scratch / Distributed::RosterFileName, "not read" };
+        if (!held.Held())
+            SKIP("this process reads the file anyway (root), so the read arm cannot be reached here");
+        auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().reason.contains("cannot be read"));
+        CHECK(refused.error().cause == NodeRefusalCause::KeptRosterIo);
+        CHECK(ExitCodeFor(refused.error().cause) == ExitCodeOf(ProcessExit::Failed));
     }
 }
 
@@ -287,7 +307,8 @@ TEST_CASE("A worker other machines can reach refuses to start holding no roster 
 
     auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error() == RosterlessWorkerRefusal);
+    CHECK(refused.error().reason == RosterlessWorkerRefusal);
+    CHECK(refused.error().cause == NodeRefusalCause::KeptRoster);
 
     // The control: an anchor is enough to start -- the worker then refuses grants until a
     // roster arrives, which is a state it can leave.
@@ -314,7 +335,7 @@ TEST_CASE("A worker started with no configuration reads the roster its enrollmen
     // The control first: the same configuration with nothing kept is the refusal.
     auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error() == RosterlessWorkerRefusal);
+    CHECK(refused.error().reason == RosterlessWorkerRefusal);
 
     // Kept where an enrollment keeps it.
     REQUIRE(Distributed::FileRosterStore { NodeStateDirectory(cfg) / Distributed::RosterFileName }
@@ -391,7 +412,7 @@ TEST_CASE("Whether a worker must hold a roster is its mode's row, under every mo
         else if (joined)
         {
             REQUIRE_FALSE(roster.has_value());
-            CHECK(roster.error() == RosterlessWorkerRefusal);
+            CHECK(roster.error().reason == RosterlessWorkerRefusal);
         }
         else
         {
@@ -426,7 +447,7 @@ TEST_CASE("A network-facing worker whose directory holds no roster starts, admit
     cfg.fleetOpen = true;
     auto const refused = NodeRoster::Build(cfg, clock, metrics, logger);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error() == RosterlessWorkerRefusal);
+    CHECK(refused.error().reason == RosterlessWorkerRefusal);
 }
 
 TEST_CASE("A node carries the endorsement it last signed, and counts a roster it cannot read", "[node][roster]")

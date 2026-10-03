@@ -75,23 +75,36 @@ namespace
     /// already obey it. Not consolidated here: this file has no business owning a
     /// shared file-reading seam, and reaching into `FastCache::Cc` for one would put a
     /// cross-app include in the node's identity code to save nine lines.
+    ///
+    /// **Absent is asked of the filesystem, not inferred from a failed open.** An open that
+    /// failed for any other reason -- a permission, a mount, a directory where the file should
+    /// be -- used to answer "nothing", and the caller then MINTED over an identity the cluster
+    /// had admitted, replacing the file the moment it could write one.
     /// @param path The file.
-    /// @return Its contents, or nothing when it does not exist or cannot be read.
-    [[nodiscard]] std::optional<std::string> ReadIdentityFile(std::filesystem::path const& path)
+    /// @return Its contents, nothing when it does not exist, or why it is there and cannot be read.
+    [[nodiscard]] std::expected<std::optional<std::string>, std::string> ReadIdentityFile(std::filesystem::path const& path)
     {
+        auto presence = std::error_code {};
+        auto const present = std::filesystem::exists(path, presence);
+        if (presence)
+            return std::unexpected { std::format("cannot tell whether {} is there: {}", path.string(), presence.message()) };
+        if (!present)
+            return std::optional<std::string> {};
+
+        auto const unreadable = std::format("{} is there, and cannot be read", path.string());
         auto stream = std::ifstream { path, std::ios::binary | std::ios::ate };
         if (!stream.is_open())
-            return std::nullopt;
+            return std::unexpected { unreadable };
 
         auto const size = stream.tellg();
         if (size < 0)
-            return std::nullopt;
+            return std::unexpected { unreadable };
         stream.seekg(0, std::ios::beg);
 
         std::string text(static_cast<std::size_t>(size), '\0');
         if (!text.empty() && !stream.read(text.data(), size))
-            return std::nullopt;
-        return text;
+            return std::unexpected { unreadable };
+        return std::optional { std::move(text) };
     }
 
     /// Write @p id into @p path, so that a crash cannot leave half of one.
@@ -231,18 +244,20 @@ std::expected<std::string, SecureRandomError> MintNodeId(ISecureRandom& random)
 
 std::optional<std::string> RecordedNodeId(std::filesystem::path const& stateDirectory)
 {
+    // An identity file that is absent, unreadable, empty or not text records no id this report can
+    // name; the start says which, by name, when it resolves the identity (`ResolveNodeIdentity`).
     auto const recorded = ReadIdentityFile(stateDirectory / NodeIdentityFileName);
-    if (!recorded.has_value())
+    if (!recorded.has_value() || !recorded->has_value())
         return std::nullopt;
-    auto const trimmed = Trimmed(*recorded);
+    auto const trimmed = Trimmed(**recorded);
     if (trimmed.empty() || !IsValidUtf8(trimmed))
         return std::nullopt;
     return std::string { trimmed };
 }
 
-std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::path const& stateDirectory,
-                                                             std::string_view configured,
-                                                             ISecureRandom& random)
+std::expected<NodeIdentity, NodeIdentityRefusal> ResolveNodeIdentity(std::filesystem::path const& stateDirectory,
+                                                                     std::string_view configured,
+                                                                     ISecureRandom& random)
 {
     auto const path = stateDirectory / NodeIdentityFileName;
 
@@ -254,13 +269,15 @@ std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::pa
     // A file that is THERE and cannot be opened is refused, never read as absent: minting over it
     // would replace an id the cluster may already have admitted, and the rename would succeed
     // wherever the directory lets this account delete it -- silently. Only an ABSENT id mints.
-    auto const recorded = ReadIdentityFile(path);
-    auto present = std::error_code {};
-    if (!recorded.has_value() && std::filesystem::exists(path, present))
-        return std::unexpected { std::format("{} holds this node's identity and cannot be read; it is never minted "
-                                             "over, since the cluster may have admitted the id it holds{}",
-                                             path.string(),
-                                             StateFileUnreadableHint(path)) };
+    auto const read = ReadIdentityFile(path);
+    if (!read.has_value())
+        return std::unexpected { NodeIdentityRefusal {
+            .fault = NodeIdentityFault::Unreadable,
+            .message = std::format("{}. It is refused rather than minted over: it may hold an identity the "
+                                   "cluster has admitted{}",
+                                   read.error(),
+                                   StateFileUnreadableHint(path)) } };
+    auto const& recorded = *read;
     if (recorded.has_value())
     {
         auto const trimmed = Trimmed(*recorded);
@@ -270,15 +287,19 @@ std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::pa
         // cluster may already have admitted -- silently, on a machine whose only
         // symptom is that a member it used to be is now a member it is not.
         if (trimmed.empty())
-            return std::unexpected { std::format("{} is empty: it should hold this node's identity, and an empty one "
-                                                 "cannot be told from an identity this node has lost. Delete it to "
-                                                 "mint a new identity, which the cluster must then admit",
-                                                 path.string()) };
+            return std::unexpected { NodeIdentityRefusal {
+                .fault = NodeIdentityFault::Empty,
+                .message = std::format("{} is empty: it should hold this node's identity, and an empty one cannot be "
+                                       "told from an identity this node has lost. Delete it to mint a new identity, "
+                                       "which the cluster must then admit",
+                                       path.string()) } };
         if (!IsValidUtf8(trimmed))
-            return std::unexpected { std::format("{} does not hold text: this node's identity travels in Raft "
-                                                 "messages, in discovery beacons and onto a dashboard, and every one "
-                                                 "of those reads it back out as text",
-                                                 path.string()) };
+            return std::unexpected { NodeIdentityRefusal {
+                .fault = NodeIdentityFault::NotText,
+                .message = std::format("{} does not hold text: this node's identity travels in Raft messages, in "
+                                       "discovery beacons and onto a dashboard, and every one of those reads it "
+                                       "back out as text",
+                                       path.string()) } };
 
         if (configured.empty() || configured == trimmed)
             return NodeIdentity { .id = std::string { trimmed },
@@ -292,20 +313,25 @@ std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::pa
     auto const minted =
         configured.empty() ? MintNodeId(random) : std::expected<std::string, SecureRandomError> { configured };
     if (!minted.has_value())
-        return std::unexpected { std::format("cannot mint an identity into {}: {}. Nothing was written, and no weaker "
-                                             "source is used in its place, because two machines drawing the same id "
-                                             "are two members the cluster cannot tell apart",
-                                             path.string(),
-                                             minted.error().ToString()) };
+        return std::unexpected { NodeIdentityRefusal {
+            .fault = NodeIdentityFault::DrawFailed,
+            .message = std::format("cannot mint an identity into {}: {}. Nothing was written, and no weaker source "
+                                   "is used in its place, because two machines drawing the same id are two members "
+                                   "the cluster cannot tell apart",
+                                   path.string(),
+                                   minted.error().ToString()) } };
 
     // Created its owner's alone, as the identity key's directory is: an install mints the id
     // here before any key exists, and a directory that took `%ProgramData%`'s list would be one
     // every local account can plant files in -- which the key's start then refuses.
     if (auto const created = CreateOwnerOnlyDirectory(stateDirectory); !created.has_value())
-        return std::unexpected { std::format("cannot create {}: {}", stateDirectory.string(), created.error().message()) };
+        return std::unexpected { NodeIdentityRefusal {
+            .fault = NodeIdentityFault::CreateFailed,
+            .message = std::format("cannot create {}: {}", stateDirectory.string(), created.error().message()) } };
 
     if (auto const written = WriteIdentityFile(path, *minted); !written.has_value())
-        return std::unexpected { written.error() };
+        return std::unexpected { NodeIdentityRefusal { .fault = NodeIdentityFault::WriteFailed,
+                                                       .message = written.error() } };
 
     return NodeIdentity { .id = *minted,
                           .origin = configured.empty() ? NodeIdentityOrigin::Minted : NodeIdentityOrigin::Configured,

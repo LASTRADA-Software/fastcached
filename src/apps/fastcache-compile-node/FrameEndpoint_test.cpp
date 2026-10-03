@@ -12,7 +12,9 @@
 #include "LiveStatsResponder.hpp"
 #include "LocalCache.hpp"
 #include "MachineStandingTestUtils.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodeConfig.hpp"
+#include "NodeCredential.hpp"
 #include "NodeIoLoop.hpp"
 #include "NodeMembership.hpp"
 #include "NodeProofClient.hpp"
@@ -4457,7 +4459,7 @@ TEST_CASE("A worker proves itself through the client a node runs, and then speak
     FixedServerTrust const trust { ServerStanding::Voter };
     Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
     auto const key = Testing::TestKeyPair(std::string { ProvingMachine });
-    NodeProofClient const client { std::string { ProvingMachine }, key, trust, random };
+    NodeProofClient const client { std::string { ProvingMachine }, key, trust, nullptr, nullptr, random };
 
     auto const attempt = client.Prove(*sealed);
     INFO(attempt.reason);
@@ -4483,7 +4485,7 @@ TEST_CASE("A worker proves nothing to a server its roster does not hold as a vot
         auto sealed = DialSealed(port);
         FixedServerTrust const trust { standing };
         Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
-        NodeProofClient const client { std::string { ProvingMachine }, key, trust, random };
+        NodeProofClient const client { std::string { ProvingMachine }, key, trust, nullptr, nullptr, random };
         auto const attempt = client.Prove(*sealed);
         CHECK(attempt.result == NodeProofResult::Untrusted);
         CHECK_FALSE(sealed->Sealed());
@@ -4503,7 +4505,7 @@ TEST_CASE("A worker proves nothing to a server its roster does not hold as a vot
     auto sealed = DialSealed(port);
     FixedServerTrust const unchecked { ServerStanding::Unchecked };
     Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
-    NodeProofClient const client { std::string { ProvingMachine }, key, unchecked, random };
+    NodeProofClient const client { std::string { ProvingMachine }, key, unchecked, nullptr, nullptr, random };
     CHECK(client.Prove(*sealed).result == NodeProofResult::Proved);
 }
 
@@ -4524,7 +4526,7 @@ TEST_CASE("A worker told the node serves no proof reads it as no scheduler, not 
     FixedServerTrust const trust { ServerStanding::Voter };
     Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
     auto const key = Testing::TestKeyPair(std::string { ProvingMachine });
-    NodeProofClient const client { std::string { ProvingMachine }, key, trust, random };
+    NodeProofClient const client { std::string { ProvingMachine }, key, trust, nullptr, nullptr, random };
     CHECK(client.Prove(*sealed).result == NodeProofResult::NotOffered);
 }
 
@@ -5073,7 +5075,7 @@ TEST_CASE("A node proves itself to the named machine and to no other", "[node][f
         auto sealed = DialSealed(port);
         Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
         FixedServerTrust const voter { ServerStanding::Voter }; // the client's own trust; unused by ProveAsync here
-        NodeProofClient const client { std::string { ProvingMachine }, clientKey, voter, random };
+        NodeProofClient const client { std::string { ProvingMachine }, clientKey, voter, nullptr, nullptr, random };
         NamedMachineTrust const named { rig.ServerId(), rig.ServerKey() };
         auto const attempt = core::async::syncRun(client.ProveAsync(sealed.get(), &named));
         INFO(attempt.reason);
@@ -5104,7 +5106,7 @@ TEST_CASE("A node proves itself to the named machine and to no other", "[node][f
         auto sealed = DialSealed(port);
         Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
         FixedServerTrust const voter { ServerStanding::Voter }; // the client's own trust; unused by ProveAsync here
-        NodeProofClient const client { std::string { ProvingMachine }, clientKey, voter, random };
+        NodeProofClient const client { std::string { ProvingMachine }, clientKey, voter, nullptr, nullptr, random };
         NamedMachineTrust const other { refusal.namedId, anotherKey };
         auto const attempt = core::async::syncRun(client.ProveAsync(sealed.get(), &other));
         INFO(attempt.reason);
@@ -5138,7 +5140,7 @@ struct ProvingClient
     FixedServerTrust trust;                                                              ///< Whom it proves itself to.
     Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };           ///< Its ephemeral draws.
     Ed25519KeyPair const key = Testing::TestKeyPair(std::string { ProvingMachine });     ///< Its identity.
-    NodeProofClient const client { std::string { ProvingMachine }, key, trust, random }; ///< What a round proves with.
+    NodeProofClient const client { std::string { ProvingMachine }, key, trust, nullptr, nullptr, random }; ///< What a round proves with.
 };
 
 /// @param port A loopback port.
@@ -5269,4 +5271,136 @@ TEST_CASE("A suspend's withdrawal proves this machine too, and a refused identit
         // would be the proof row's sentence, spending that scheduler's Warn.
         CHECK(LinesCarrying(fix.logger, "will not prove itself") == 0);
     }
+}
+
+namespace
+{
+
+/// The id of a node that schedules for itself: the one machine in these cases that is both ends.
+constexpr std::string_view SelfSchedulingMachine = "self-01";
+
+/// A node whose own worker announces to its own scheduler, before and after its own consensus
+/// records it.
+///
+/// **One identity at both ends, and one roster behind both**, which is how `main` wires a node that
+/// names itself in `--scheduler`: the responder proves as the node's id under the node's key, the
+/// client proves as the same id under the same key, and both ask the one admission oracle -- whose
+/// key roster is what the node's consensus publishes from its applied state, and holds nothing until
+/// that consensus has recorded this node.
+struct SelfSchedulingNode
+{
+    Fleet fleet;
+    Distributed::KeyRosterMembership keys;
+    Distributed::AnyOfMembership oracle { { &fleet.membership, &keys } };
+    SchedulerResponder scheduler { fleet.protocol, oracle, fleet.metrics };
+    Ed25519KeyPair const identity = Testing::TestKeyPair(std::string { SelfSchedulingMachine });
+    Testing::ScriptedSecureRandom serverRandom { Testing::ServerHandshakeScript() };
+    NodeProofResponder responder {
+        std::string { SelfSchedulingMachine }, identity, oracle, serverRandom, fleet.metrics, fleet.logger
+    };
+    MergedResponder merged { SurfaceComponents { .scheduler = &scheduler, .nodeProof = &responder } };
+    NodeConditions conditions; ///< Where the node's prover answers `own-record-awaited`.
+
+    /// Start the node's one listener.
+    /// @return The endpoint and its port.
+    [[nodiscard]] std::pair<std::unique_ptr<FrameEndpoint>, std::uint16_t> Serve()
+    {
+        auto const port = FreePort();
+        auto endpoint = FrameEndpoint::Start(
+            fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), merged, fleet.metrics, fleet.logger);
+        REQUIRE(endpoint.has_value());
+        fleet.Serve();
+        return { *std::move(endpoint), port };
+    }
+
+    /// What this node's consensus does a moment after it elects itself: record this node, key and
+    /// all, and publish that into the roster every surface asks.
+    void RecordSelf()
+    {
+        Testing::PublishKeyRoster(keys, { std::string { SelfSchedulingMachine } });
+    }
+
+    /// @return What @p counter reads.
+    [[nodiscard]] std::uint64_t Read(IMetricsSink::Counter counter) const noexcept
+    {
+        return fleet.metrics.Read(counter);
+    }
+};
+
+/// An announcement that says nothing and counts how often it was reached: what these cases ask is
+/// WHETHER a round got as far as speaking, not what it said.
+class CountingAnnouncement final: public IAnnouncement
+{
+  public:
+    /// @copydoc IAnnouncement::Attempt
+    [[nodiscard]] AnnounceOutcome Attempt(core::net::ISocket& /*client*/, std::string_view /*endpoint*/) override
+    {
+        ++attempts;
+        return AnnounceOutcome { .accepted = 1, .leader = std::nullopt };
+    }
+
+    std::size_t attempts = 0; ///< How many rounds reached the announcement.
+};
+
+/// @return Whether any record @p logger captured contains @p text.
+[[nodiscard]] bool Logged(CapturingLogger const& logger, std::string_view text)
+{
+    return std::ranges::any_of(logger.Snapshot(), [text](auto const& record) { return record.message.contains(text); });
+}
+
+/// @return How many records @p logger captured at @p level.
+[[nodiscard]] std::size_t LoggedAt(CapturingLogger const& logger, LogLevel level)
+{
+    return static_cast<std::size_t>(std::ranges::count(logger.Snapshot(), level, &CapturingLogger::Record::level));
+}
+
+} // namespace
+
+TEST_CASE("A node that schedules for itself does not announce before its own consensus records it",
+          "[node][frame][proof][client][self-record]")
+{
+    // The order every such node logged at start: its worker (and its presence loop) proved itself to
+    // its OWN scheduler before its own consensus had elected and recorded it, was refused
+    // `node-key-unknown`, and warned "admit it with --enroll-from or --cluster-admit-worker" -- a
+    // remedy telling an operator to admit this machine to its own cluster, one second before the
+    // node recorded itself. Driven through `DialAndAnnounce`, the one seam both loops dial through,
+    // against the node's real endpoint and responder.
+    SelfSchedulingNode node;
+    auto const [endpoint, port] = node.Serve();
+
+    auto const configured = SchedulerLink::For({ std::format("127.0.0.1:{}", port) });
+    REQUIRE(configured.has_value());
+    auto link = Unwrap(configured);
+    BlockingEndpointDialer dialer { 5s };
+    CapturingLogger logger;
+    Testing::ScriptedSecureRandom callerRandom { Testing::CallerHandshakeScript() };
+    auto const trust = FixedServerTrust { ServerStanding::Unchecked };
+    auto const client =
+        NodeProofClient { std::string { SelfSchedulingMachine }, node.identity, trust, &node.oracle, &node.conditions, callerRandom };
+    auto const proof = AnnounceProof { .prover = &client };
+    core::platform::ManualClock reachabilityClock;
+    SchedulerReachability reachability { reachabilityClock };
+
+    // Before the record: nothing dialled, nothing refused, and nothing an operator is told to do.
+    CountingAnnouncement early;
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, early, proof) == 0);
+    CHECK(early.attempts == 0);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 0);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsAccepted) == 0);
+    CHECK_FALSE(Logged(logger, "did not accept this machine's identity"));
+    CHECK_FALSE(Logged(logger, "--cluster-admit-worker"));
+    CHECK(LoggedAt(logger, LogLevel::Warn) == 0);
+    CHECK(Logged(logger, "has not recorded this node yet"));
+
+    // The record lands, and the next round proves and speaks -- the half without which a gate that
+    // never opened would pass everything above.
+    node.RecordSelf();
+    CountingAnnouncement late;
+    CHECK(DialAndAnnounce(link, reachability, dialer, logger, late, proof) == 1);
+    CHECK(late.attempts == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsAccepted) == 1);
+    CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 0);
+    CHECK(LoggedAt(logger, LogLevel::Warn) == 0);
+    // An ordinary hold, one ask long, raises nothing an operator must act on.
+    CHECK(node.conditions.StateOf(NodeCondition::OwnRecordAwaited) == Wire::ConditionState::Clear);
 }

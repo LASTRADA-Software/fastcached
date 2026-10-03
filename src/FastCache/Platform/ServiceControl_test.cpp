@@ -7,6 +7,7 @@
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Platform/Firewall.hpp>
 #include <FastCache/Platform/HostMemory.hpp>
+#include <FastCache/Platform/ProcessExit.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -16,18 +17,25 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <ranges>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 #include <core/Ranges.hpp>
 #include <tests/FirewallFakes.hpp>
+#include <tests/ScriptedServiceCalls.hpp>
+#include <tests/SteppedDrainWait.hpp>
 #include <tests/Unwrap.hpp>
 
 using FastCache::Testing::Unwrap;
@@ -181,6 +189,29 @@ TEST_CASE("ServiceControl: a relative storage path is absolutized", "[platform][
     REQUIRE(!cmd.contains("--storage=relative/cache.cow"));
 }
 
+TEST_CASE("ServiceControl: a registration refused by name declines, having changed nothing", "[platform][service][exit]")
+{
+    // A name the registration would not use is refused before the service manager is even opened,
+    // so the operation DECLINES (2) rather than failing (1): nothing was changed. Safe
+    // to call on every host for that reason -- the rejection returns first, where a name it
+    // accepted would register a real service. Off Windows and macOS the stub declines the same
+    // way, for its own reason, and the case holds it to the ending alone.
+    FastCache::Config cfg {};
+    cfg.serviceName = "a/b";
+    auto const spec = SpecFor(std::filesystem::path { "fastcached" }, cfg);
+    REQUIRE(FastCache::ServiceNameRejection(spec).has_value());
+
+    auto const installed = FastCache::InstallService(spec);
+    auto const removed = FastCache::UninstallService(spec);
+    CHECK(installed.outcome == FastCache::ServiceControlOutcome::Declined);
+    CHECK(removed.outcome == FastCache::ServiceControlOutcome::Declined);
+    CHECK(installed.Ending() == FastCache::CommandEnding::Declined);
+    CHECK(removed.ExitCode() == FastCache::CommandExitCode(FastCache::CommandEnding::Declined));
+#if defined(_WIN32) || defined(__APPLE__)
+    CHECK(removed.message == *FastCache::ServiceNameRejection(spec));
+#endif
+}
+
 TEST_CASE("ServiceControl: install/uninstall are unsupported without a supervisor", "[platform][service]")
 {
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -188,8 +219,10 @@ TEST_CASE("ServiceControl: install/uninstall are unsupported without a superviso
     auto const spec = SpecFor(std::filesystem::path { "fastcached" }, cfg);
     auto const installed = FastCache::InstallService(spec);
     auto const removed = FastCache::UninstallService(spec);
-    REQUIRE(installed.outcome == FastCache::ServiceControlOutcome::Failed);
-    REQUIRE(removed.outcome == FastCache::ServiceControlOutcome::Failed);
+    // Declined: with no supervisor to act on, nothing was changed.
+    REQUIRE(installed.outcome == FastCache::ServiceControlOutcome::Declined);
+    REQUIRE(removed.outcome == FastCache::ServiceControlOutcome::Declined);
+    REQUIRE(installed.Ending() == FastCache::CommandEnding::Declined);
 #else
     // Deliberately not called here: on Windows and macOS these really do
     // register a service, which a unit test must not do to the host. The
@@ -212,6 +245,18 @@ using FastCache::ServiceScope;
 
 namespace
 {
+/// @p path's whole text, through the stream buffer for `PosixDaemonHost_test`'s measured reason.
+/// @param path A file the case has already found.
+/// @return Its bytes.
+[[nodiscard]] std::string ReadWholeFile(std::filesystem::path const& path)
+{
+    std::ifstream in { path, std::ios::binary };
+    REQUIRE(in);
+    std::ostringstream contents;
+    contents << in.rdbuf();
+    return std::move(contents).str();
+}
+
 /// The plist a default config produces in @p scope, for the assertions below.
 [[nodiscard]] std::string PlistFor(FastCache::Config const& cfg, ServiceScope scope)
 {
@@ -628,20 +673,65 @@ TEST_CASE("ServiceControl: the plist path follows the scope", "[platform][servic
     REQUIRE(!system.string().contains("/Users/jo"));
 }
 
-TEST_CASE("ServiceControl: KeepAlive differs by scope", "[platform][service][launchd]")
+TEST_CASE("A refused start is not restarted by launchd in either scope", "[platform][service][launchd][recovery]")
 {
+    // launchd has no retry count, so every KeepAlive shape that restarts a clean non-zero exit
+    // restarts a refused start forever, once per ThrottleInterval. The system daemon's `<true/>`
+    // did exactly that. Both scopes now render the one bounded shape: restart on a crash only.
     FastCache::Config const cfg {};
+    constexpr std::string_view CrashOnly = "    <key>KeepAlive</key>\n    <dict>\n"
+                                           "        <key>Crashed</key>\n        <true/>\n"
+                                           "    </dict>\n";
+    for (auto const scope: { ServiceScope::User, ServiceScope::System })
+    {
+        INFO("scope " << FastCache::ServiceScopeName(scope));
+        auto const plist = PlistFor(cfg, scope);
+        CHECK(plist.contains(CrashOnly));
+        CHECK_FALSE(plist.contains("<key>KeepAlive</key>\n    <true/>"));
+        CHECK_FALSE(plist.contains("<key>SuccessfulExit</key>"));
+        // And a crash loop is still throttled rather than immediate.
+        CHECK(plist.contains("    <key>ThrottleInterval</key>\n    <integer>30</integer>\n"));
+    }
+}
 
-    // A user agent that loses the race for the port exits cleanly, which
-    // KeepAlive=<true/> would treat as "restart" — a permanent crash loop.
-    auto const user = PlistFor(cfg, ServiceScope::User);
-    REQUIRE(user.contains("<key>KeepAlive</key>"));
-    REQUIRE(user.contains("<key>Crashed</key>"));
+TEST_CASE("Every shipped systemd unit restarts a failure and never a refusal", "[platform][service][systemd][recovery]")
+{
+    // A refusal leaves the process as its own code (`ProcessExit::Refused`), so systemd can be told
+    // not to restart it and every other failure keeps `Restart=on-failure`. Read off the files the
+    // packages install -- every `*.service` under packaging/linux, so a new unit is held to it.
+    //
+    // The codes a unit exempts are DERIVED from the table: every row a START can end with that a
+    // supervisor does not restart, except the clean exit `on-failure` already leaves alone. A one-shot
+    // command's usage exit is no start's, and no unit runs one.
+    std::string exempted;
+    for (auto const& row: FastCache::ProcessExitRows)
+        if (row.endsAStart && !row.restarted && row.code != 0)
+            exempted += std::format("{}{}", exempted.empty() ? "" : " ", row.code);
+    REQUIRE_FALSE(exempted.empty());
+    auto const prevent = std::format("\nRestartPreventExitStatus={}\n", exempted);
 
-    // The system daemon owns the port outright, so restart-always is right.
-    auto const system = PlistFor(cfg, ServiceScope::System);
-    REQUIRE(system.contains("<key>KeepAlive</key>"));
-    REQUIRE(!system.contains("<key>Crashed</key>"));
+    auto const directory = std::filesystem::path { FASTCACHED_SOURCE_DIR } / "packaging" / "linux";
+    REQUIRE(std::filesystem::is_directory(directory));
+    auto units = std::size_t { 0 };
+    for (auto const& entry: std::filesystem::directory_iterator { directory })
+    {
+        if (entry.path().extension() != ".service")
+            continue;
+        ++units;
+        INFO(entry.path().filename().string());
+        auto const text = ReadWholeFile(entry.path());
+        auto const serviceSection = text.find("[Service]\n");
+        REQUIRE(serviceSection != std::string::npos);
+        // Both keys belong to [Service]; systemd ignores them, with only a warning, elsewhere.
+        auto const service = std::string_view { text }.substr(serviceSection);
+        CHECK(service.contains(prevent));
+        CHECK(service.contains("\nRestart=on-failure\n"));
+        // No start limit of the unit's own: one counted an operator's restarts with the refusals,
+        // and the fourth `systemctl restart` in ten minutes left the service stopped (measured).
+        CHECK_FALSE(text.contains("StartLimitBurst="));
+        CHECK_FALSE(text.contains("StartLimitIntervalSec="));
+    }
+    CHECK(units == 3);
 }
 
 TEST_CASE("ServiceControl: only the system job runs as the service account", "[platform][service][launchd]")
@@ -1911,15 +2001,18 @@ TEST_CASE("ServiceControl: a manual system job is not kept alive unconditionally
           "[platform][service][launchd][service-start]")
 {
     // launchd starts a `KeepAlive = true` job as soon as it is loaded, whatever `RunAtLoad`
-    // says: "keep it running" is a demand to run it. A system-scope manual job that kept the
-    // scope's unconditional KeepAlive would be started by `bootstrap` at install and at every
-    // boot -- the auto-start the operator declined, reported as manual. It falls back to the
+    // says: "keep it running" is a demand to run it. A system-scope manual job kept alive
+    // unconditionally would be started by `bootstrap` at install and at every boot -- the
+    // auto-start the operator declined, reported as manual. No job is, in either mode: the
+    // unconditional form also restarts a refused start forever, so every job takes the
     // restart-on-crash form, which keeps a job the operator started from staying down.
     constexpr std::string_view Unconditional = "<key>KeepAlive</key>\n    <true/>";
     constexpr std::string_view OnCrash = "<key>KeepAlive</key>\n    <dict>\n        <key>Crashed</key>\n        <true/>";
 
     auto spec = SpecFor(std::filesystem::path { "/opt/fastcached/bin/fastcached" }, FastCache::CliResult {});
-    CHECK(BuildLaunchdPlist(spec, ServiceScope::System, "/tmp/logs").contains(Unconditional));
+    auto const automatic = BuildLaunchdPlist(spec, ServiceScope::System, "/tmp/logs");
+    CHECK_FALSE(automatic.contains(Unconditional));
+    CHECK(automatic.contains(OnCrash));
 
     spec.startMode = FastCache::ServiceStart::Manual;
     auto const manual = BuildLaunchdPlist(spec, ServiceScope::System, "/tmp/logs");
@@ -2413,13 +2506,13 @@ TEST_CASE("ServiceControl: an uninstall whose firewall removal is refused still 
     FastCache::Testing::RecordingFirewall firewall;
     firewall.rules = { ours.front(), theirs };
 
-    auto const deleted =
-        FastCache::WithRemovalFirewall(FastCache::ServiceControlResult { .outcome = FastCache::ServiceControlOutcome::Done,
-                                                                         .message = "uninstalled service 'Probe'" },
-                                       &firewall,
-                                       "Probe");
+    auto const deleted = FastCache::WithRemovalFirewall(
+        FastCache::ServiceControlResult { .outcome = FastCache::ServiceControlOutcome::Removed,
+                                          .message = "uninstalled service 'Probe'" },
+        &firewall,
+        "Probe");
     INFO(deleted.message);
-    CHECK(deleted.outcome == FastCache::ServiceControlOutcome::Done);
+    CHECK(deleted.outcome == FastCache::ServiceControlOutcome::Removed);
     CHECK(deleted.ExitCode() == 0);
     CHECK(deleted.message.starts_with("uninstalled service 'Probe'"));
     CHECK(deleted.message.contains("have the same name ignoring case"));
@@ -2437,7 +2530,7 @@ TEST_CASE("ServiceControl: an uninstall whose firewall removal is refused still 
         "Probe");
     INFO(missing.message);
     CHECK(missing.outcome == FastCache::ServiceControlOutcome::NotInstalled);
-    CHECK(missing.ExitCode() == 1);
+    CHECK(missing.ExitCode() == FastCache::CommandExitCode(FastCache::CommandEnding::Declined));
     CHECK(missing.message.starts_with("no service named 'Probe' is installed"));
     CHECK(missing.message.contains("firewall: removed 1 rule(s)"));
     CHECK(firewall.rules.empty());
@@ -2448,25 +2541,28 @@ TEST_CASE("ServiceControl: an uninstall whose deletion was refused leaves the fi
 {
     // A non-elevated uninstall: OpenService(DELETE) is refused, so the service is still installed
     // and running. Removing its rules -- or telling the operator how to -- would close its ports.
+    // Both ways a removal can leave the service in place: DECLINED (access denied, a decision) and
+    // FAILED (a call that failed on its own); neither is a service that is gone.
     auto const ours = FastCache::DaemonFirewallRules(OpenDaemon("Probe"), FirewallProgram, {});
     REQUIRE(ours.size() == 1);
-    FastCache::Testing::RecordingFirewall firewall;
-    firewall.rules = ours;
+    for (auto const outcome: { FastCache::ServiceControlOutcome::Declined, FastCache::ServiceControlOutcome::Failed })
+    {
+        FastCache::Testing::RecordingFirewall firewall;
+        firewall.rules = ours;
 
-    auto const refused =
-        FastCache::WithRemovalFirewall(FastCache::ServiceControlResult { .outcome = FastCache::ServiceControlOutcome::Failed,
-                                                                         .message = "access denied opening the service" },
-                                       &firewall,
-                                       "Probe");
-    INFO(refused.message);
-    CHECK(refused.outcome == FastCache::ServiceControlOutcome::Failed);
-    CHECK(refused.ExitCode() == 1);
-    CHECK(firewall.rules == ours);
-    CHECK(refused.message.starts_with("access denied opening the service"));
-    CHECK(
-        refused.message.contains("any rules of this service are left in place, since the service may still be registered"));
-    CHECK_FALSE(refused.message.contains("Remove-NetFirewallRule"));
-    CHECK_FALSE(refused.message.contains("firewall: removed"));
+        auto const refused = FastCache::WithRemovalFirewall(
+            FastCache::ServiceControlResult { .outcome = outcome, .message = "access denied opening the service" },
+            &firewall,
+            "Probe");
+        INFO(refused.message);
+        CHECK(refused.outcome == outcome);
+        CHECK(firewall.rules == ours);
+        CHECK(refused.message.starts_with("access denied opening the service"));
+        CHECK(refused.message.contains(
+            "any rules of this service are left in place, since the service may still be registered"));
+        CHECK_FALSE(refused.message.contains("Remove-NetFirewallRule"));
+        CHECK_FALSE(refused.message.contains("firewall: removed"));
+    }
 
     // Where no firewall is managed there is nothing to say at all.
     auto const unmanaged =
@@ -2494,25 +2590,25 @@ TEST_CASE("ServiceControl: only an install that registered touches the firewall,
     CHECK(firewall.adds == 0);
 
     auto const registered = FastCache::WithRegistrationFirewall(
-        FastCache::ServiceControlResult { .outcome = FastCache::ServiceControlOutcome::Done,
+        FastCache::ServiceControlResult { .outcome = FastCache::ServiceControlOutcome::Created,
                                           .message = "installed service 'Probe'" },
         &firewall,
         "Probe",
         rules);
-    CHECK(registered.outcome == FastCache::ServiceControlOutcome::Done);
+    CHECK(registered.outcome == FastCache::ServiceControlOutcome::Created);
     CHECK(registered.message
           == "installed service 'Probe'\nfirewall: allowed inbound Probe cache tcp/6674 (every network profile)");
     CHECK(firewall.InGroup("fastcached: Probe") == rules);
 
     firewall.refuseRemove = "access denied reading the firewall";
     auto const unopened = FastCache::WithRegistrationFirewall(
-        FastCache::ServiceControlResult { .outcome = FastCache::ServiceControlOutcome::Done,
+        FastCache::ServiceControlResult { .outcome = FastCache::ServiceControlOutcome::Created,
                                           .message = "installed service 'Probe'" },
         &firewall,
         "Probe",
         rules);
     INFO(unopened.message);
-    CHECK(unopened.outcome == FastCache::ServiceControlOutcome::Done);
+    CHECK(unopened.outcome == FastCache::ServiceControlOutcome::Created);
     CHECK(
         unopened.message.contains("warning: the firewall rules were not all created (access denied reading the firewall)"));
 }
@@ -2545,7 +2641,7 @@ TEST_CASE("ServiceControl: a bracketed loopback bind opens nothing, and one boun
 
     FastCache::Testing::RecordingFirewall firewall;
     auto const installed = FastCache::WithRegistrationFirewall(
-        FastCache::ServiceControlResult { .outcome = FastCache::ServiceControlOutcome::Done,
+        FastCache::ServiceControlResult { .outcome = FastCache::ServiceControlOutcome::Created,
                                           .message = "installed service 'Probe'" },
         &firewall,
         "Probe",
@@ -2555,4 +2651,451 @@ TEST_CASE("ServiceControl: a bracketed loopback bind opens nothing, and one boun
     CHECK(installed.message.contains("note: Probe metrics tcp/9464 is opened for a surface bound to 'localhost': a name is "
                                      "whatever the resolver answers"));
     CHECK(installed.message.contains("bind 127.0.0.1 or ::1 to need no rule"));
+}
+
+TEST_CASE("A Windows registration restarts a failed service three times and then leaves it stopped",
+          "[platform][service][recovery]")
+{
+    // The list `sc qfailure` shows, as the install registers it. It used to end in a restart, which
+    // the SCM repeats for every failure past the end -- so a start refused by its own configuration
+    // was restarted every thirty seconds, forever, writing the same refusal into the event log.
+    // A refusal (`ProcessExit::Refused`) is retried here too, three times, because the SCM cannot be
+    // told otherwise without hiding its code from `sc query` -- `ServiceRestartAttempts` says why.
+    CHECK(FastCache::ScmRecoveryActions()
+          == std::vector {
+              FastCache::ScmRecoveryAction { .type = FastCache::ScActionRestart, .delayMs = 1'000 },
+              FastCache::ScmRecoveryAction { .type = FastCache::ScActionRestart, .delayMs = 1'000 },
+              FastCache::ScmRecoveryAction { .type = FastCache::ScActionRestart, .delayMs = 30'000 },
+              FastCache::ScmRecoveryAction { .type = FastCache::ScActionNone, .delayMs = 0 },
+          });
+    CHECK(FastCache::ServiceRecoveryResetPeriod == std::chrono::minutes { 10 });
+}
+
+// ----------------------------------------------------------------------------
+// The registration seam: every ending a registration can reach, on every host.
+
+namespace
+{
+/// A registration of the daemon with no setting named, whose name every rule accepts.
+/// @param exePath The executable it launches.
+/// @return The spec.
+[[nodiscard]] FastCache::ServiceSpec RegistrableSpec(std::filesystem::path const& exePath)
+{
+    auto const spec = SpecFor(exePath, FastCache::CliResult {});
+    REQUIRE_FALSE(FastCache::ServiceNameRejection(spec).has_value());
+    return spec;
+}
+
+/// One way an SCM call can answer, and how the registration must end on it.
+struct ScmVerdict
+{
+    std::string_view why;                 ///< The answer, in words.
+    FastCache::Testing::ScmScript script; ///< What the service manager answers.
+    FastCache::CommandEnding ending;      ///< How the registration ends.
+    std::string_view says;                ///< What it tells the operator.
+};
+
+/// One way launchd or the system around it can answer, and how the registration must end on it.
+struct LaunchdVerdict
+{
+    std::string_view why;                     ///< The answer, in words.
+    FastCache::ServiceScope scope;            ///< Which domain.
+    bool knowsItsExecutable;                  ///< False: the spec names no executable.
+    FastCache::Testing::LaunchdScript script; ///< What launchd answers.
+    FastCache::CommandEnding ending;          ///< How the registration ends.
+    std::string_view says;                    ///< What it tells the operator.
+};
+} // namespace
+
+TEST_CASE("An SCM registration declines on a decision and fails on a call that failed on its own",
+          "[platform][service][scm][exit]")
+{
+    // A decision -- access denied, a service that exists or does not -- is 2 and a retry meets it
+    // again; a call that failed on its own, or a path the environment could not answer, is 1.
+    // Each code is one no DECISION reads: `ERROR_SHUTDOWN_IN_PROGRESS`, `ERROR_INVALID_SERVICE_ACCOUNT`,
+    // `ERROR_INVALID_HANDLE`, `ERROR_SERVICE_MARKED_FOR_DELETE`.
+    using FastCache::CommandEnding;
+    using FastCache::Testing::ScmScript;
+    auto const installs = std::vector<ScmVerdict> {
+        { .why = "the executable's own path is unknown",
+          .script = ScmScript { .executable = {} },
+          .ending = CommandEnding::Failed,
+          .says = "could not determine the fastcached executable path" },
+        { .why = "the manager refuses this account",
+          .script = ScmScript { .openManagerError = FastCache::ScmErrorAccessDenied },
+          .ending = CommandEnding::Declined,
+          .says = "access denied opening the service manager" },
+        { .why = "the manager would not open",
+          .script = ScmScript { .openManagerError = 1115 },
+          .ending = CommandEnding::Failed,
+          .says = "OpenSCManager failed (error 1115)" },
+        { .why = "the service already exists, and its registration is re-applied",
+          .script = ScmScript { .createError = FastCache::ScmErrorServiceExists },
+          .ending = CommandEnding::Completed,
+          .says = "updated the registration of service 'FastCached'" },
+        { .why = "the service already exists, and re-applying is refused to this account",
+          .script =
+              ScmScript { .createError = FastCache::ScmErrorServiceExists, .reapplyError = FastCache::ScmErrorAccessDenied },
+          .ending = CommandEnding::Declined,
+          .says = "access denied registering the service" },
+        { .why = "creating a service is refused to this account",
+          .script = ScmScript { .createError = FastCache::ScmErrorAccessDenied },
+          .ending = CommandEnding::Declined,
+          .says = "access denied registering the service" },
+        { .why = "the service could not be created",
+          .script = ScmScript { .createError = 1057 },
+          .ending = CommandEnding::Failed,
+          .says = "registering service 'FastCached' failed (error 1057)" },
+        { .why = "every call succeeded",
+          .script = ScmScript {},
+          .ending = CommandEnding::Completed,
+          .says = "installed service 'FastCached' (auto-start)" },
+        { .why = "the restart policy was refused, and the registration stands",
+          .script = ScmScript { .recoveryError = FastCache::ScmErrorAccessDenied },
+          .ending = CommandEnding::Completed,
+          .says = "the restart policy could not be set (error 5)" },
+        { .why = "the service SID type was refused, and the registration stands",
+          .script = ScmScript { .sidTypeError = FastCache::ScmErrorAccessDenied },
+          .ending = CommandEnding::Completed,
+          .says = "the service SID type could not be set (error 5)" },
+    };
+    for (auto const& verdict: installs)
+    {
+        INFO(verdict.why);
+        FastCache::Testing::ScriptedScmCalls calls { verdict.script };
+        auto const result = FastCache::ScmInstall(RegistrableSpec("C:/fastcached/fastcached.exe"), calls);
+        INFO(result.message);
+        CHECK(result.Ending() == verdict.ending);
+        CHECK(result.message.contains(verdict.says));
+        // Every path out closes what it opened, and never a handle twice.
+        CHECK(calls.OpenHandles() == 0);
+        CHECK(std::ranges::count(calls.Calls(), std::string { "Close(unknown handle)" }) == 0);
+    }
+
+    auto const removals = std::vector<ScmVerdict> {
+        { .why = "the manager refuses this account",
+          .script = ScmScript { .openManagerError = FastCache::ScmErrorAccessDenied },
+          .ending = CommandEnding::Declined,
+          .says = "access denied opening the service manager" },
+        { .why = "the manager would not open",
+          .script = ScmScript { .openManagerError = 1115 },
+          .ending = CommandEnding::Failed,
+          .says = "OpenSCManager failed (error 1115)" },
+        { .why = "no such service is installed",
+          .script = ScmScript { .openError = FastCache::ScmErrorServiceDoesNotExist },
+          .ending = CommandEnding::Declined,
+          .says = "no service named 'FastCached' is installed" },
+        { .why = "opening the service is refused to this account",
+          .script = ScmScript { .openError = FastCache::ScmErrorAccessDenied },
+          .ending = CommandEnding::Declined,
+          .says = "access denied opening the service" },
+        { .why = "the service would not open",
+          .script = ScmScript { .openError = 6 },
+          .ending = CommandEnding::Failed,
+          .says = "OpenService failed (error 6)" },
+        { .why = "the service was stopped and its delete failed",
+          .script = ScmScript { .deleteError = 1072 },
+          .ending = CommandEnding::Failed,
+          .says = "DeleteService failed (error 1072)" },
+        { .why = "every call succeeded",
+          .script = ScmScript {},
+          .ending = CommandEnding::Completed,
+          .says = "uninstalled service 'FastCached'" },
+    };
+    for (auto const& verdict: removals)
+    {
+        INFO(verdict.why);
+        FastCache::Testing::ScriptedScmCalls calls { verdict.script };
+        auto const result = FastCache::ScmUninstall(RegistrableSpec("C:/fastcached/fastcached.exe"), calls);
+        INFO(result.message);
+        CHECK(result.Ending() == verdict.ending);
+        CHECK(result.message.contains(verdict.says));
+        CHECK(calls.OpenHandles() == 0);
+        CHECK(std::ranges::count(calls.Calls(), std::string { "Close(unknown handle)" }) == 0);
+    }
+}
+
+TEST_CASE("An SCM removal forgets the event source only once the service is gone", "[platform][service][scm]")
+{
+    // A service still installed without its provider logs records nobody can read, and nothing
+    // short of a reinstall puts it back: a failed delete must leave the event source alone.
+    using FastCache::Testing::ScmScript;
+    FastCache::Testing::ScriptedScmCalls removed { ScmScript {} };
+    REQUIRE(FastCache::ScmUninstall(RegistrableSpec("C:/fastcached/fastcached.exe"), removed).Ending()
+            == FastCache::CommandEnding::Completed);
+    CHECK(removed.Calls()
+          == std::vector<std::string> {
+              "OpenManager(Connect)", "Open", "Stop", "StillRunning", "Delete", "Close", "Close", "RemoveEventSource" });
+
+    FastCache::Testing::ScriptedScmCalls stuck { ScmScript { .deleteError = 1072 } };
+    REQUIRE(FastCache::ScmUninstall(RegistrableSpec("C:/fastcached/fastcached.exe"), stuck).Ending()
+            == FastCache::CommandEnding::Failed);
+    CHECK(std::ranges::count(stuck.Calls(), std::string { "RemoveEventSource" }) == 0);
+}
+
+TEST_CASE("An SCM registration opens the manager with the least each operation needs", "[platform][service][scm]")
+{
+    // An install creates a service -- or opens the existing one to re-apply it -- and an uninstall
+    // only opens one, so neither asks for more: a mask wider than the operation is access a
+    // registration holds and never uses. The values are the SDK's, asserted against `<windows.h>`
+    // in the Windows build.
+    CHECK(FastCache::ScmManagerAccessMask(FastCache::ScmManagerAccess::Create) == 0x0003);
+    CHECK(FastCache::ScmManagerAccessMask(FastCache::ScmManagerAccess::Connect) == 0x0001);
+
+    FastCache::Testing::ScriptedScmCalls installing { FastCache::Testing::ScmScript {} };
+    REQUIRE(FastCache::ScmInstall(RegistrableSpec("C:/fastcached/fastcached.exe"), installing).Ending()
+            == FastCache::CommandEnding::Completed);
+    CHECK(std::ranges::count(installing.Calls(), std::string { "OpenManager(Create)" }) == 1);
+    FastCache::Testing::ScriptedScmCalls removing { FastCache::Testing::ScmScript {} };
+    REQUIRE(FastCache::ScmUninstall(RegistrableSpec("C:/fastcached/fastcached.exe"), removing).Ending()
+            == FastCache::CommandEnding::Completed);
+    CHECK(std::ranges::count(removing.Calls(), std::string { "OpenManager(Connect)" }) == 1);
+}
+
+TEST_CASE("An SCM registration asks for the service it was given, under the logon it names", "[platform][service][scm]")
+{
+    FastCache::Testing::ScriptedScmCalls calls { FastCache::Testing::ScmScript {} };
+    auto const spec = RegistrableSpec("C:/fastcached/fastcached.exe");
+    REQUIRE(FastCache::ScmInstall(spec, calls).Ending() == FastCache::CommandEnding::Completed);
+    auto const& requested = Unwrap(calls.Requested());
+    CHECK(requested.name == spec.serviceName);
+    CHECK(requested.commandLine == FastCache::BuildServiceCommandLine(spec));
+    CHECK(requested.logonName == FastCache::WindowsLogonName(spec));
+    CHECK(requested.startType == FastCache::ServiceStartRowOf(spec.startMode).scmStartType);
+}
+
+TEST_CASE("A registration says whether it created the service or re-applied one that was there",
+          "[platform][service][scm][launchd]")
+{
+    // What a refusal after the registration may undo: a registration this install CREATED is
+    // removed again, one it RE-APPLIED is an upgrade's and stays (`InstallWithServiceFirewall`).
+    using FastCache::ServiceControlOutcome;
+    using FastCache::Testing::LaunchdScript;
+    using FastCache::Testing::ScmScript;
+    auto const spec = RegistrableSpec("C:/fastcached/fastcached.exe");
+
+    FastCache::Testing::ScriptedScmCalls fresh { ScmScript {} };
+    CHECK(FastCache::ScmInstall(spec, fresh).outcome == ServiceControlOutcome::Created);
+    FastCache::Testing::ScriptedScmCalls existing { ScmScript { .createError = FastCache::ScmErrorServiceExists } };
+    CHECK(FastCache::ScmInstall(spec, existing).outcome == ServiceControlOutcome::Reapplied);
+
+    auto const job = RegistrableSpec("/opt/fastcached/bin/fastcached");
+    FastCache::Testing::ScriptedLaunchdCalls newJob { LaunchdScript {} };
+    CHECK(FastCache::LaunchdInstall(job, FastCache::ServiceScope::User, newJob).outcome == ServiceControlOutcome::Created);
+    FastCache::Testing::ScriptedLaunchdCalls oldJob { LaunchdScript { .jobFileExists = true } };
+    CHECK(FastCache::LaunchdInstall(job, FastCache::ServiceScope::User, oldJob).outcome == ServiceControlOutcome::Reapplied);
+
+    // Every outcome's row, written out: an install's two leave a registration and no removal does.
+    for (auto const outcome: FastCache::Enumerators<ServiceControlOutcome>())
+    {
+        INFO(static_cast<int>(outcome));
+        auto const installs = outcome == ServiceControlOutcome::Created || outcome == ServiceControlOutcome::Reapplied;
+        auto const gone = outcome == ServiceControlOutcome::Removed || outcome == ServiceControlOutcome::NotInstalled;
+        CHECK(FastCache::Registered(outcome) == installs);
+        CHECK(FastCache::NoneRemains(outcome) == gone);
+    }
+}
+
+TEST_CASE("An SCM install a private path refuses deletes the registration it created, and keeps one it re-applied",
+          "[platform][service][scm]")
+{
+    // The handover's refusal, reached through the registration rather than beside it: the MSI
+    // starts the service whatever the install answered, so a registration THIS install created
+    // must not outlive the refusal -- and one it merely re-applied was there before it.
+    using FastCache::Testing::ScmScript;
+    auto spec = RegistrableSpec("C:/fastcached/fastcached.exe");
+    spec.ownedPaths.push_back(FastCache::OwnedPath {
+        .path = "C:/ProgramData/fastcached/state", .privacy = FastCache::PathPrivacy::Private, .credentialFiles = {} });
+
+    FastCache::Testing::ScriptedScmCalls created { ScmScript { .secludeDenial = "the list would not apply" } };
+    auto const refused = FastCache::ScmInstall(spec, created);
+    INFO(refused.message);
+    CHECK(refused.outcome == FastCache::ServiceControlOutcome::Failed);
+    CHECK(refused.message.contains("was removed again"));
+    CHECK(std::ranges::count(created.Calls(), std::string { "Delete" }) == 1);
+    CHECK(created.OpenHandles() == 0);
+
+    FastCache::Testing::ScriptedScmCalls reapplied { ScmScript { .createError = FastCache::ScmErrorServiceExists,
+                                                                 .secludeDenial = "the list would not apply" } };
+    auto const kept = FastCache::ScmInstall(spec, reapplied);
+    INFO(kept.message);
+    CHECK(kept.outcome == FastCache::ServiceControlOutcome::Failed);
+    CHECK(kept.message.contains("re-applied registration is left in place"));
+    CHECK(std::ranges::count(reapplied.Calls(), std::string { "Delete" }) == 0);
+    CHECK(reapplied.OpenHandles() == 0);
+
+    FastCache::Testing::ScriptedScmCalls stuck { ScmScript { .deleteError = 1072,
+                                                             .secludeDenial = "the list would not apply" } };
+    CHECK(FastCache::ScmInstall(spec, stuck).message.contains("could NOT be removed"));
+    CHECK(stuck.OpenHandles() == 0);
+}
+
+TEST_CASE("An SCM removal waits for the service to stop, bounded, and says when it deleted one still running",
+          "[platform][service][scm]")
+{
+    using FastCache::Testing::ScmScript;
+    FastCache::Testing::SteppedDrainWait stoppedWait;
+    FastCache::Testing::ScriptedScmCalls stopping { ScmScript { .runningPolls = 3 } };
+    auto const removed = FastCache::ScmUninstall(RegistrableSpec("C:/fastcached/fastcached.exe"), stopping, stoppedWait);
+    INFO(removed.message);
+    CHECK(removed.outcome == FastCache::ServiceControlOutcome::Removed);
+    CHECK(std::ranges::count(stopping.Calls(), std::string { "StillRunning" }) == 4);
+    CHECK_FALSE(removed.message.contains("had not stopped"));
+
+    // The control: a service that never reports STOPPED is deleted at the bound, and SAID to be.
+    FastCache::Testing::SteppedDrainWait ceilingWait;
+    FastCache::Testing::ScriptedScmCalls running { ScmScript { .runningPolls = 1'000'000 } };
+    auto const marked = FastCache::ScmUninstall(RegistrableSpec("C:/fastcached/fastcached.exe"), running, ceilingWait);
+    INFO(marked.message);
+    CHECK(marked.outcome == FastCache::ServiceControlOutcome::Removed);
+    CHECK(marked.message.contains(std::format("it had not stopped after {} s", FastCache::UninstallStopCeiling.count())));
+    CHECK(ceilingWait.Elapsed() >= FastCache::UninstallStopCeiling);
+}
+
+TEST_CASE("A launchd registration declines on a decision and fails on a call that failed on its own",
+          "[platform][service][launchd][exit]")
+{
+    using FastCache::CommandEnding;
+    using FastCache::ServiceScope;
+    using FastCache::Testing::LaunchdScript;
+    auto const installs = std::vector<LaunchdVerdict> {
+        { .why = "the spec names no executable",
+          .scope = ServiceScope::User,
+          .knowsItsExecutable = false,
+          .script = LaunchdScript {},
+          .ending = CommandEnding::Failed,
+          .says = "could not determine the executable path to register" },
+        { .why = "a system job by an account that is not root",
+          .scope = ServiceScope::System,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript {},
+          .ending = CommandEnding::Declined,
+          .says = "requires root" },
+        { .why = "a user agent by root",
+          .scope = ServiceScope::User,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript { .root = true },
+          .ending = CommandEnding::Declined,
+          .says = "must not run as root" },
+        { .why = "the invoking user's home is unknown",
+          .scope = ServiceScope::User,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript { .home = {} },
+          .ending = CommandEnding::Failed,
+          .says = "could not determine the invoking user's home directory" },
+        { .why = "the service account does not exist",
+          .scope = ServiceScope::System,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript { .root = true, .accountExists = false },
+          .ending = CommandEnding::Declined,
+          .says = "service account does not exist" },
+        { .why = "the job's directory could not be created",
+          .scope = ServiceScope::User,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript { .createError = std::make_error_code(std::errc::io_error) },
+          .ending = CommandEnding::Failed,
+          .says = "could not create" },
+        { .why = "the job file could not be written",
+          .scope = ServiceScope::User,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript { .writes = false },
+          .ending = CommandEnding::Failed,
+          .says = "could not write" },
+        { .why = "a private path could not be closed to other accounts, before anything was registered",
+          .scope = ServiceScope::System,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript { .root = true, .handOverRefusal = "the mode would not apply" },
+          .ending = CommandEnding::Failed,
+          .says = "nothing was registered" },
+        { .why = "the written job would not load",
+          .scope = ServiceScope::User,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript { .bootstrapStatus = 5 },
+          .ending = CommandEnding::Failed,
+          .says = "`launchctl bootstrap gui/501` failed" },
+        { .why = "every call succeeded",
+          .scope = ServiceScope::User,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript {},
+          .ending = CommandEnding::Completed,
+          .says = "installed and started launchd job" },
+    };
+    for (auto const& verdict: installs)
+    {
+        INFO(verdict.why);
+        auto spec = RegistrableSpec("/opt/fastcached/bin/fastcached");
+        if (!verdict.knowsItsExecutable)
+            spec.exePath.clear();
+        FastCache::Testing::ScriptedLaunchdCalls calls { verdict.script };
+        auto const result = FastCache::LaunchdInstall(spec, verdict.scope, calls);
+        INFO(result.message);
+        CHECK(result.Ending() == verdict.ending);
+        CHECK(result.message.contains(verdict.says));
+    }
+
+    auto const removals = std::vector<LaunchdVerdict> {
+        { .why = "a system job by an account that is not root",
+          .scope = ServiceScope::System,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript {},
+          .ending = CommandEnding::Declined,
+          .says = "requires root" },
+        { .why = "the invoking user's home is unknown",
+          .scope = ServiceScope::User,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript { .home = {} },
+          .ending = CommandEnding::Failed,
+          .says = "could not determine the invoking user's home directory" },
+        { .why = "no job file is installed",
+          .scope = ServiceScope::User,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript { .removal = false },
+          .ending = CommandEnding::Declined,
+          .says = "no launchd job installed at" },
+        { .why = "the job file could not be removed",
+          .scope = ServiceScope::User,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript { .removal = std::unexpected { std::make_error_code(std::errc::io_error) } },
+          .ending = CommandEnding::Failed,
+          .says = "could not remove" },
+        { .why = "every call succeeded",
+          .scope = ServiceScope::User,
+          .knowsItsExecutable = true,
+          .script = LaunchdScript {},
+          .ending = CommandEnding::Completed,
+          .says = "removed launchd job" },
+    };
+    for (auto const& verdict: removals)
+    {
+        INFO(verdict.why);
+        FastCache::Testing::ScriptedLaunchdCalls calls { verdict.script };
+        auto const result =
+            FastCache::LaunchdUninstall(RegistrableSpec("/opt/fastcached/bin/fastcached"), verdict.scope, calls);
+        INFO(result.message);
+        CHECK(result.Ending() == verdict.ending);
+        CHECK(result.message.contains(verdict.says));
+    }
+}
+
+TEST_CASE("A launchd registration boots a previous job out of every domain before it loads the new one",
+          "[platform][service][launchd]")
+{
+    // The domain a job landed in was decided when it was installed, so the teardown asks every
+    // candidate, and loads into the first domain launchd knows -- here `gui/501`.
+    FastCache::Testing::ScriptedLaunchdCalls calls { FastCache::Testing::LaunchdScript {} };
+    auto const spec = RegistrableSpec("/opt/fastcached/bin/fastcached");
+    REQUIRE(FastCache::LaunchdInstall(spec, FastCache::ServiceScope::User, calls).Ending()
+            == FastCache::CommandEnding::Completed);
+    auto const label = FastCache::LaunchdLabel(spec);
+    auto const& made = calls.Calls();
+    auto const at = [&made](std::string const& call) {
+        INFO(call);
+        auto const index = std::ranges::distance(made.begin(), std::ranges::find(made, call));
+        REQUIRE(index < std::ssize(made));
+        return index;
+    };
+    auto const plist = FastCache::LaunchdPlistPath(spec, FastCache::ServiceScope::User, "/Users/operator");
+    CHECK(at("launchctl bootout gui/501/" + label) < at("launchctl bootstrap gui/501 " + plist.string()));
+    CHECK(at("launchctl bootout user/501/" + label) < at("launchctl bootstrap gui/501 " + plist.string()));
+    CHECK(at("launchctl bootstrap gui/501 " + plist.string()) < at("launchctl kickstart -k gui/501/" + label));
 }

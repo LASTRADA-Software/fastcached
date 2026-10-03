@@ -175,6 +175,27 @@ class CowTreeStorage final: public IStorage
         bool resumed { false };
     };
 
+    /// Why a conversion stopped, and whether it had begun rewriting the store when it did.
+    ///
+    /// An operator's exit code turns on `Transient()` (`CommandEnding`). A conversion that stopped
+    /// part-way has left the store part-way, which `Open` refuses by name until a re-run finishes
+    /// it; one whose store file could not be found or opened may find it at the next run. Every
+    /// other refusal before rewriting is a DECISION about what it found -- a layout it cannot read,
+    /// a conversion another build started, a store another process holds -- and running it again
+    /// unchanged gets the same answer.
+    struct MigrationFailure
+    {
+        StorageError error;       ///< Why it stopped.
+        bool rewriting { false }; ///< Whether it had begun rewriting records: past the read-only validation pass.
+
+        /// Whether a re-run may get past what stopped it.
+        /// @return True when it stopped part-way, or on an I/O error before it began.
+        [[nodiscard]] bool Transient() const noexcept
+        {
+            return rewriting || error.code == StorageErrorCode::IoError;
+        }
+    };
+
     /// Open or create the storage. Replays existing entries into the
     /// in-memory LRU mirror.
     ///
@@ -211,18 +232,18 @@ class CowTreeStorage final: public IStorage
     /// @param options Storage options; `path` and `pageSize` are used.
     ///                Durability is chosen here rather than taken from the
     ///                caller — see the implementation.
-    /// @return What was converted; `UnsupportedFormatVersion` when the store is
-    ///         NEWER than this build can read, since there is no converting
-    ///         forwards from a layout nothing here knows; `IoError` when the
-    ///         path names no store at all.
-    [[nodiscard]] static std::expected<MigrationReport, StorageError> Migrate(Options const& options);
+    /// @return What was converted; otherwise why not, and whether it had begun rewriting:
+    ///         `UnsupportedFormatVersion` when the store is NEWER than this build can read,
+    ///         since there is no converting forwards from a layout nothing here knows;
+    ///         `IoError` when the path names no store at all.
+    [[nodiscard]] static std::expected<MigrationReport, MigrationFailure> Migrate(Options const& options);
 
     /// `Migrate` over an injected page store, so the conversion can be driven
     /// against a synthesised store of a known vintage rather than only against
     /// a file somebody still has.
     /// @param store Borrowed page store; must outlive the call.
     /// @return As `Migrate`.
-    [[nodiscard]] static std::expected<MigrationReport, StorageError> MigrateStore(CowTree::IPageStore& store);
+    [[nodiscard]] static std::expected<MigrationReport, MigrationFailure> MigrateStore(CowTree::IPageStore& store);
 
     /// Test seam: open over an injected page store (e.g. an InMemoryPageStore
     /// with fault injection) instead of a FilePageStore on disk. Used by the
@@ -351,6 +372,14 @@ class CowTreeStorage final: public IStorage
     [[nodiscard]] std::optional<CowTree::FilePageStore::LockState> StoreLockState() const noexcept;
 
   private:
+    /// `MigrateStore`'s conversion, which says where it stopped.
+    /// @param store Borrowed page store; must outlive the call.
+    /// @param rewriting Set true at the one point the conversion leaves its read-only passes and
+    ///        begins rewriting records; read by the caller only when this fails.
+    /// @return As `MigrateStore`, with the error alone.
+    [[nodiscard]] static std::expected<MigrationReport, StorageError> ConvertStore(CowTree::IPageStore& store,
+                                                                                   bool& rewriting);
+
     explicit CowTreeStorage(Options options) noexcept;
 
     /// Build the tree over `_store`, replay, and set stats. Shared by the
@@ -727,8 +756,13 @@ class CowTreeStorage final: public IStorage
     /// second place that erased a node would be a second place that could
     /// leave the cursor dangling -- and the one to forget the fix-up would be
     /// whichever is written next.
+    ///
+    /// **`it` may be stored INSIDE `_index`**: `EraseFromLru` hands over the map's own
+    /// value. So the index entry is erased LAST, through a map iterator found first, and
+    /// nothing reads `it` after that -- the erase that drops the map node is the one that
+    /// ends the reference.
     /// @param it Mirror node to drop. Must be dereferenceable.
-    void EraseNode(Iterator it);
+    void EraseNode(Iterator const& it);
 
     LruList _lru;
 
@@ -801,7 +835,8 @@ class CowTreeStorage final: public IStorage
 /// @param path    The store the conversion acted on.
 /// @param outcome What `CowTreeStorage::Migrate` returned for it.
 /// @return The line, without a trailing newline and without a program prefix.
-[[nodiscard]] std::string DescribeMigration(std::filesystem::path const& path,
-                                            std::expected<CowTreeStorage::MigrationReport, StorageError> const& outcome);
+[[nodiscard]] std::string DescribeMigration(
+    std::filesystem::path const& path,
+    std::expected<CowTreeStorage::MigrationReport, CowTreeStorage::MigrationFailure> const& outcome);
 
 } // namespace FastCache

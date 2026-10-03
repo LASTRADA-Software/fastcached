@@ -51,6 +51,7 @@ enum class NodeCondition : std::uint8_t
     SchedulerUnreachable,           ///< A --scheduler endpoint does not answer a dial.
     UnservedToolchain,              ///< Clients asked the leader for a toolchain no live worker serves.
     MixedNodeVersions,              ///< The leader sees one wire served by more than one build.
+    OwnRecordAwaited,               ///< Its own cluster has not recorded this node's key, so it announces to nobody.
     Last,                           ///< Not a condition.
 };
 
@@ -268,6 +269,16 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
                 "does not carry. The detail and the fleet page's version column name each build and its machines. It "
                 "clears once the last odd machine runs the fleet's build or has been gone for ninety seconds; see "
                 "docs/operations/upgrading-a-fleet.md." },
+    { .condition = NodeCondition::OwnRecordAwaited,
+      .id = "own-record-awaited",
+      .persistence = CompileCacheWire::ConditionPersistence::Live,
+      .severity = CompileCacheWire::ConditionSeverity::Warning,
+      .scope = ConditionScope::Consensus,
+      .remedy = "This node announces itself to no scheduler until its own cluster records its key. If that cluster "
+                "cannot elect, bring back a majority of its voters. If this machine joined a running cluster, admit "
+                "it: --enroll-from=<seed> here, or --cluster-admit=<id>=<host>:<port>@<key> on a member, with what "
+                "--print-identity prints. If the detail says its id is recorded under another key, restore that "
+                "node-key, or --cluster-forget=<id> and admit this key." },
 } };
 static_assert(RowsInEnumeratorOrder(NodeConditionTable, &NodeConditionRow::condition),
               "NodeConditionTable must hold one row per NodeCondition, in enumerator order");

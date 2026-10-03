@@ -197,7 +197,8 @@ src/FastCache/
                 contributes rows to, so the fleet page can be served without
                 Server/ ever learning about Distributed/) and AdminCredential
                 (the Basic/Bearer scheme table, over ConstantTimeEquals)
-  Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / WindowsServiceHost),
+  Platform/     IDaemonHost (ForegroundHost / PosixDaemonHost / ServiceHost over
+                IServiceControlManager, the SCM on Windows),
                 ISignalSource, DaemonControls (process-wide stop/reload flags),
                 CpuAffinity, HostMemory, HostInfo (what a machine IS: OS, version,
                 architecture, disk space -- the facts a scheduler weighs),

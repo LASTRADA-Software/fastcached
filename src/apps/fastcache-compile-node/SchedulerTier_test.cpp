@@ -189,7 +189,8 @@ TEST_CASE("A scheduler holding no identity key is refused, never run unsigned", 
     auto const refused = SchedulerTier::Start(
         cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, std::nullopt, fix.conditions, NoWatch);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error() == SchedulerNeedsIdentityKeyRefusal);
+    CHECK(refused.error().reason == SchedulerNeedsIdentityKeyRefusal);
+    CHECK(refused.error().cause == NodeRefusalCause::EarlierRule);
 
     CHECK(SchedulerTier::Start(cfg,
                                membership.Oracle(),

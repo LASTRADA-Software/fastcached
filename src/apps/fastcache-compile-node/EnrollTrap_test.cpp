@@ -114,24 +114,24 @@ TEST_CASE("A node whose state directory has run consensus is refused at enrol ti
     // unrelated faults -- no state directory, an unreachable seed, no consensus
     // identity. What only THIS refusal says is the remedy and the reason the cheaper
     // remedy is wrong.
-    CHECK(refused.error().contains("already holds consensus state"));
-    CHECK(refused.error().contains(scratch.Path().string()));
-    CHECK(refused.error().contains("delete"));
+    CHECK(refused.error().reason.contains("already holds consensus state"));
+    CHECK(refused.error().reason.contains(scratch.Path().string()));
+    CHECK(refused.error().reason.contains("delete"));
 
     // It names BOTH causes rather than asserting one. This directory holding a term and
     // a vote is a fact; *it bootstrapped a cluster of itself* is one of two readings of
     // it, and the other -- a node already in a cluster being pointed at another -- is
     // equally consistent with the same bytes. A confident wrong signal is worse than a
     // vague right one, and here they share a remedy so naming both costs nothing.
-    CHECK(refused.error().contains("founds a cluster of one at its first start"));
-    CHECK(refused.error().contains("already admitted to"));
+    CHECK(refused.error().reason.contains("founds a cluster of one at its first start"));
+    CHECK(refused.error().reason.contains("already admitted to"));
     // And it names no step this build lacks: every flag it prints parses.
-    CHECK(Testing::FlagsNoNodeRowAccepts(refused.error()).empty());
+    CHECK(Testing::FlagsNoNodeRowAccepts(refused.error().reason).empty());
 
     // And it says why clearing only the log is NOT the fix: that leaves this node's
     // minted identity in place, holding a vote record for the cluster it led. A wiped
     // state directory must get a new identity, which is what admission needs.
-    CHECK(refused.error().contains("identity"));
+    CHECK(refused.error().reason.contains("identity"));
 
     // Nothing was written. The refusal must not leave a half-enrolled machine behind,
     // and the identity key -- minted only after this check -- is the observable half of

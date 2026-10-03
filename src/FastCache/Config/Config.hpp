@@ -151,8 +151,7 @@ enum class ServiceStart : std::uint8_t
 {
     Auto, ///< Starts with the machine: SCM auto-start, launchd `RunAtLoad`.
     /// Registered, and started only when somebody asks: SCM demand-start, no `RunAtLoad`.
-    /// On macOS a system-scope job is then not restarted after a clean non-zero exit,
-    /// since launchd's restart-on-any-exit also starts the job at load (see its row).
+    /// On macOS it is restarted on a crash alone, as an auto-start job is (see its row).
     Manual,
     Last
 };

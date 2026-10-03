@@ -314,42 +314,49 @@ ClusterExchange PutClusterRequest(core::net::ISocket& client,
                              .missing = presented.missing };
 }
 
-std::expected<std::string, std::string> InterpretClusterAnswer(ClusterAction action,
-                                                               ClusterExchange const& answer,
-                                                               std::string_view scheduler)
+std::expected<std::string, UnfinishedCommand> InterpretClusterAnswer(ClusterAction action,
+                                                                     ClusterExchange const& answer,
+                                                                     std::string_view scheduler)
 {
     auto const& outcome = answer.outcome;
     if (outcome.kind == Cc::CacheOutcomeKind::Transport)
-        return std::unexpected { std::format("the scheduler at {} did not answer", scheduler) };
+        return std::unexpected { Unanswered(outcome, std::format("the scheduler at {} did not answer", scheduler)) };
 
     if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
     {
-        // A redirect is here only when the bound ran out: every one before it was followed
-        // (`AskTheLeader`). WHETHER it carries an address is `Cc::RedirectTarget`'s question,
+        // A redirect reaches here only from a caller that did not follow it: `AskTheLeader`
+        // answers a chain that did not settle itself. `Pending` either way -- it decided nothing
+        // about the request. WHETHER it carries an address is `Cc::RedirectTarget`'s question,
         // shared with the launcher (#237).
         if (auto const leader = Cc::RedirectTarget(outcome); leader.has_value())
-            return std::unexpected { std::format("gave up after {} leader redirect(s); the last, from {}, named {}",
-                                                 MaxLeaderRedirects,
-                                                 scheduler,
-                                                 *leader) };
+            return std::unexpected { Unanswered(AnswerSource::Pending,
+                                                std::format("gave up after {} leader redirect(s); the last, from {}, "
+                                                            "named {}",
+                                                            MaxLeaderRedirects,
+                                                            scheduler,
+                                                            *leader)) };
         if (outcome.code == Wire::ErrorCode::NotLeader)
             // An election in progress, which is a different fact from "somebody else
             // leads" and has no address to offer.
-            return std::unexpected { std::string { "the cluster has no leader right now; try again shortly" } };
+            return std::unexpected { Unanswered(outcome, "the cluster has no leader right now; try again shortly") };
         // A refusal THIS exchange's missing ticket explains is said as WHY no ticket was presented.
-        return std::unexpected { Cc::RecordedReason(outcome, answer.missing) };
+        return std::unexpected { Unanswered(outcome, Cc::RecordedReason(outcome, answer.missing)) };
     }
 
-    return InterpretClusterReply(action, outcome.value);
+    // A reply that arrived: whatever the interpretation refuses, the peer decided it.
+    return InterpretClusterReply(action, outcome.value).transform_error([&outcome](std::string reason) {
+        return Unanswered(outcome, std::move(reason));
+    });
 }
 
-std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg,
-                                                        ClusterRequest const& request,
-                                                        Cc::ICredentialFor& credentials,
-                                                        IEndpointDialer& dialer)
+std::expected<std::string, UnfinishedCommand> RunClusterAdmin(NodeConfig const& cfg,
+                                                              ClusterRequest const& request,
+                                                              Cc::ICredentialFor& credentials,
+                                                              IEndpointDialer& dialer)
 {
     if (cfg.schedulers.empty())
-        return std::unexpected { std::string { "--scheduler names where to ask; a cluster command needs one" } };
+        return std::unexpected { Unanswered(AnswerSource::Local,
+                                            "--scheduler names where to ask; a cluster command needs one") };
 
     // Owned here rather than threaded in: this is a one-shot CLI verb, so "once per
     // process" and "once per invocation" are the same thing, and the admin surface

@@ -11,6 +11,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -259,6 +261,84 @@ TEST_CASE("A key file that is not one, is another build's, or disagrees with its
     CHECK(refusalFor(overlong) == NodeKeyFault::Damaged);
 }
 
+TEST_CASE("A key fault ends a one-shot command by its stage: an I/O arm transient, a verdict a decision",
+          "[node][identity][key][exit]")
+{
+    // The OTHER reader of the same faults: `--print-identity` is read by an operator, and a retry may
+    // get past an I/O arm (1) while a verdict on the bytes read is a decision (2). Written out here,
+    // as the start's verdicts are, so a fault whose ending changes fails by name.
+    struct FaultEnding
+    {
+        NodeKeyFault fault;
+        CommandEnding ending;
+    };
+    constexpr auto verdicts = std::to_array<FaultEnding>({
+        { .fault = NodeKeyFault::Unreadable, .ending = CommandEnding::Failed },
+        { .fault = NodeKeyFault::Truncated, .ending = CommandEnding::Declined },
+        { .fault = NodeKeyFault::NotAKeyFile, .ending = CommandEnding::Declined },
+        { .fault = NodeKeyFault::ForeignFormat, .ending = CommandEnding::Declined },
+        { .fault = NodeKeyFault::Damaged, .ending = CommandEnding::Declined },
+        { .fault = NodeKeyFault::Exposed, .ending = CommandEnding::Declined },
+        { .fault = NodeKeyFault::ForeignOwner, .ending = CommandEnding::Declined },
+        { .fault = NodeKeyFault::OpenDirectory, .ending = CommandEnding::Declined },
+        { .fault = NodeKeyFault::LinkEntry, .ending = CommandEnding::Declined },
+        { .fault = NodeKeyFault::DrawFailed, .ending = CommandEnding::Failed },
+        { .fault = NodeKeyFault::WriteFailed, .ending = CommandEnding::Failed },
+        { .fault = NodeKeyFault::Unprotectable, .ending = CommandEnding::Failed },
+        { .fault = NodeKeyFault::UnknownEntry, .ending = CommandEnding::Declined },
+        { .fault = NodeKeyFault::OthersMayWrite, .ending = CommandEnding::Declined },
+        { .fault = NodeKeyFault::NotARegularFile, .ending = CommandEnding::Declined },
+        { .fault = NodeKeyFault::WritersUndetermined, .ending = CommandEnding::Failed },
+    });
+    for (auto const fault: Enumerators<NodeKeyFault>())
+        CHECK(std::ranges::count(verdicts, fault, &FaultEnding::fault) == 1);
+    for (auto const& verdict: verdicts)
+    {
+        INFO(static_cast<int>(verdict.fault));
+        CHECK(EndingOf(verdict.fault) == verdict.ending);
+    }
+}
+
+TEST_CASE("A key fault ends a start as a refusal only when it is a verdict on bytes that were read",
+          "[node][identity][key][exit]")
+{
+    // Written out here rather than read back from `NodeKeyFaultStages`, so a fault whose stage is
+    // changed -- or one added without a decision -- fails by name. An I/O arm is a FAILURE, whatever
+    // its errno: the next start may open, write or draw.
+    struct FaultVerdict
+    {
+        NodeKeyFault fault;
+        StartStage stage;
+    };
+    constexpr auto verdicts = std::to_array<FaultVerdict>({
+        { .fault = NodeKeyFault::Unreadable, .stage = StartStage::IdentityKeyIo },
+        { .fault = NodeKeyFault::Truncated, .stage = StartStage::IdentityKey },
+        { .fault = NodeKeyFault::NotAKeyFile, .stage = StartStage::IdentityKey },
+        { .fault = NodeKeyFault::ForeignFormat, .stage = StartStage::IdentityKey },
+        { .fault = NodeKeyFault::Damaged, .stage = StartStage::IdentityKey },
+        { .fault = NodeKeyFault::Exposed, .stage = StartStage::IdentityKey },
+        { .fault = NodeKeyFault::ForeignOwner, .stage = StartStage::IdentityKey },
+        { .fault = NodeKeyFault::OpenDirectory, .stage = StartStage::IdentityKey },
+        { .fault = NodeKeyFault::LinkEntry, .stage = StartStage::IdentityKey },
+        { .fault = NodeKeyFault::DrawFailed, .stage = StartStage::IdentityKeyIo },
+        { .fault = NodeKeyFault::WriteFailed, .stage = StartStage::IdentityKeyIo },
+        { .fault = NodeKeyFault::Unprotectable, .stage = StartStage::IdentityKeyIo },
+        { .fault = NodeKeyFault::UnknownEntry, .stage = StartStage::IdentityKey },
+        { .fault = NodeKeyFault::OthersMayWrite, .stage = StartStage::IdentityKey },
+        { .fault = NodeKeyFault::NotARegularFile, .stage = StartStage::IdentityKey },
+        { .fault = NodeKeyFault::WritersUndetermined, .stage = StartStage::IdentityKeyIo },
+    });
+    for (auto const fault: Enumerators<NodeKeyFault>())
+        CHECK(std::ranges::count(verdicts, fault, &FaultVerdict::fault) == 1);
+    for (auto const& verdict: verdicts)
+    {
+        INFO(static_cast<int>(verdict.fault));
+        CHECK(StageOf(verdict.fault) == verdict.stage);
+    }
+    CHECK(ExitOf(StartStage::IdentityKey) == ProcessExit::Refused);
+    CHECK(ExitOf(StartStage::IdentityKeyIo) == ProcessExit::Failed);
+}
+
 TEST_CASE("A key file that cannot be opened is refused, not treated as absent", "[node][identity][key]")
 {
     // ABSENT is what the open says and nothing else; an open that fails any other way, read
@@ -272,6 +352,8 @@ TEST_CASE("A key file that cannot be opened is refused, not treated as absent", 
     ScriptedSecureRandom random { ScriptedSecureRandom::Ascending(Ed25519SeedBytes) };
     auto const refusal = Refused(scratch.Path(), random, guard);
     CHECK(refusal.fault == NodeKeyFault::NotARegularFile);
+    // A verdict on what the filesystem says is there, which the next start reads the same way.
+    CHECK(StageOf(refusal.fault) == StartStage::IdentityKey);
     CHECK(random.FillCount() == 0);
     CHECK(std::filesystem::is_directory(scratch.Path() / NodeKeyFileName));
 }

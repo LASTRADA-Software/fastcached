@@ -7,6 +7,7 @@
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
+#include "NodeRefusal.hpp"
 #include "Responders.hpp"
 #include "SharedCacheDirectory.hpp"
 
@@ -19,6 +20,7 @@
 #include <FastCache/Distributed/NodePolicy.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Platform/LocalAddresses.hpp>
+#include <FastCache/Platform/ProcessExit.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstddef>
@@ -428,7 +430,7 @@ struct DiskStoreSpec
 /// @param metrics Where hits, misses and upstream outcomes are counted.
 /// @param logger Where what the tier holds, or why there is none, is announced.
 /// @return The tier, a null tier meaning "carry on without one", or the fatal reason.
-[[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(NodeConfig const& cfg,
+[[nodiscard]] std::expected<std::unique_ptr<CacheTier>, NodeRefusal> StartCacheTierOrExplain(NodeConfig const& cfg,
                                                                                              UpstreamParts const& upstream,
                                                                                              ILocalityOracle const& locality,
                                                                                              core::platform::IClock& clock,
@@ -444,7 +446,8 @@ struct DiskStoreSpec
 /// for itself would be a second place to change it, and would convert nothing
 /// on the day the first one moved.
 /// @param cfg The parsed configuration; `cacheDir` must not be empty.
-/// @return A line to print on success, or the reason it could not be done.
-[[nodiscard]] std::expected<std::string, std::string> MigrateDiskTier(NodeConfig const& cfg);
+/// @return A line to print on success; otherwise the reason, and whether a re-run may get past
+///         it (`CommandEnding`).
+[[nodiscard]] std::expected<std::string, UnfinishedCommand> MigrateDiskTier(NodeConfig const& cfg);
 
 } // namespace FastCache::Node

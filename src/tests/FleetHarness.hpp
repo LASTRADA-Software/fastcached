@@ -828,7 +828,7 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
                 cfg.voterKeys.push_back(TestKeyPair(voter).PublicKey());
             auto built = FastCache::Node::NodeRoster::Build(cfg, fleet._wallClock, fleet._metrics, fleet._logger);
             if (!built.has_value())
-                throw std::runtime_error { "FleetHarness: a worker's roster could not be built: " + built.error() };
+                throw std::runtime_error { "FleetHarness: a worker's roster could not be built: " + built.error().reason };
             return *std::move(built);
         }
 

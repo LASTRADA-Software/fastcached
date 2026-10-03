@@ -39,6 +39,59 @@ flag:
 Leave `log_timestamps` off — journald timestamps every line already, and off
 is the default on Linux.
 
+A start the daemon **refuses** — a flag it does not know, a configuration file
+it read that does not load, a combination of settings a rule forbids, and for
+`fastcache-compile-node` also a credential file it read and found empty, or a
+kept roster in its state directory it read and cannot use — exits **78**
+(`EX_CONFIG`; `systemctl status` shows `status=78/CONFIG`) and is **not**
+restarted: the unit says `RestartPreventExitStatus=78`, because the next start
+would refuse the same configuration the same way. A start that finds a defect in
+the binary's own build — a component it was built without — exits 78 as well,
+for the same reason: no configuration causes it, and every start meets it. The unit stays `failed` with
+the reason in the journal until you fix it and start it. Every other failure —
+a port still held by a process that was exiting, a store another process holds,
+and **any named file that could not be read**, whatever the reason: a
+configuration file, a credential, a key or a kept roster that is not there, or
+that the service account may not read, or that lives on a share or a mount
+that is not back yet — exits 1 and is restarted after a second
+(`Restart=on-failure`), within systemd's default start limit of five starts in
+ten seconds. A file that could not be read says nothing about its contents, and
+the next start may read it; if it cannot — a path that is simply wrong — the
+limit stops the retries.
+
+Measured on systemd 259:
+
+| What happened | What systemd did |
+|---|---|
+| a refusal, at once or after three seconds | ran it once; `failed`, status 78 |
+| a failure, at once | five runs, then `failed` by the start limit |
+| a failure after three seconds | restarted every time: nine restarts in forty seconds, still going |
+| `systemctl restart` by hand, eight times three seconds apart | every one honoured |
+| `systemctl restart` by hand, eight times 0.2 seconds apart | the fifth refused, "start of the service was attempted too often", and the unit left **stopped** |
+
+The last row is the default start limit, which counts your starts as well as
+systemd's: five starts inside ten seconds are honoured, and a sixth — the fifth
+`systemctl restart` right after a start — is refused and leaves the service
+down until `systemctl reset-failed fastcached && systemctl start fastcached`.
+
+Only a start answers 1 or 78. A command that answers and exits —
+`--install-service`, `--uninstall-service`, `--migrate-storage` and
+`--seed-config` on either binary, and `fastcache-compile-node`'s
+`--print-surfaces`, `--print-identity`, `--migrate-cache`, cluster,
+enrollment and cordon commands — is not supervised, and answers what a
+script calling it should do next:
+
+| Exit | Meaning | When |
+|---|---|---|
+| 0 | done | it did what it was asked |
+| **2** | **a decision — do not retry** | a command line that did not parse (wherever the command was typed on it), a configuration file that did not parse or names a setting that does not exist, an install the startup rules refuse, a service name the registration will not use, access denied, a service that already exists or is not installed, a store in a format it cannot convert or that another process holds, a refusal the scheduler or seed **replied** with — except the ones listed under 1 |
+| 1 | **transient — a retry may help** | a scheduler, seed or node that **could not be reached** or broke off the exchange, a reply that decided nothing: another cluster change still committing, an endpoint or fleet at its capacity, a fleet with no worker registered for the toolchain yet (one that is still starting), a cluster with no leader right now, leaders that went on redirecting to each other, a machine that gave up waiting to be approved (run it again once an operator approves it), a file that is not there or could not be read or written (a named configuration file included, as at a start), a service-manager call that failed on its own, a conversion that stopped part-way (run it again to finish it) |
+
+`fastcached --healthcheck` is read by a container runtime, and Docker documents
+0 and 1 and reserves 2, so it answers 0 for healthy and **1 for everything
+else** — unhealthy, a refused command line, or a configuration file that did
+not load.
+
 ### Reloading
 
 `systemctl reload fastcached` sends `SIGHUP`, which re-reads the config file in
@@ -150,17 +203,31 @@ agent under `/var/root` that your own login never starts and your own
 | Runs as | the invoking user | `_fastcached` |
 | Starts at | login | boot |
 | Privileges | none | root to install |
-| `KeepAlive` | on crash only | always |
+| `KeepAlive` | on crash only | on crash only |
 
 The generated plist deliberately does **not** pass `--daemon`. launchd, like
 systemd, supervises the process it started; a job that double-forks is
 reaped immediately as `exited` and the service silently never runs.
 
 The two scopes are alternatives — both bind the same address, and there is
-no unix-socket endpoint to separate them. A per-user agent uses
-`KeepAlive={Crashed:true}` rather than `true` for that reason: an agent that
-loses the race for the port exits cleanly, and restart-always would turn
-that into a permanent ten-second crash loop instead of one log line.
+no unix-socket endpoint to separate them.
+
+Both use `KeepAlive={Crashed:true}`: a process that crashed is restarted, no
+more often than every thirty seconds (`ThrottleInterval`), and one that
+**exited** — whatever its code — stays stopped. launchd cannot tell a refusal
+(exit 78) from any other exit: `launchd.plist(5)`'s `KeepAlive` conditions ask
+whether an exit was successful or a crash, never which code it had, and nothing
+in it stops after N. So every shape that restarts a clean non-zero exit restarts
+a refused start forever, once per `ThrottleInterval`, writing the same refusal
+each time; the system daemon's `KeepAlive=true` did exactly that. Crash-only is
+the least bad choice, and it costs two things the other supervisors do not:
+
+- a **failure** is not retried either — a port still held by a process that was
+  exiting, or a per-user agent that lost the race for the port to another
+  user's, is one line in the log and a stopped job, where systemd and the
+  Windows service manager would start it again;
+- a process that **crashes** at every start is restarted forever, every thirty
+  seconds.
 
 Status, restart, logs:
 
@@ -224,6 +291,50 @@ fastcached.exe --uninstall-service
 
 Pass `--config=C:\path\to\fastcached.yaml` only to point the service at a file
 *other* than the default location.
+
+### When a start is refused
+
+A configuration the service refuses at startup — a flag it does not know, a file
+that does not parse, a flag combination a startup rule rejects — is reported to
+the SCM as a **stop with
+a service-specific code**, and the reason is written to the Application event log
+under the service's name:
+
+```
+> sc.exe query FastCached
+        STATE              : 1  STOPPED
+        WIN32_EXIT_CODE    : 1066  (0x42a)
+        SERVICE_EXIT_CODE  : 78  (0x4e)
+```
+
+`1066` is `ERROR_SERVICE_SPECIFIC_ERROR`: the reason is the process's own exit
+code, `78` for a start either binary refused on its configuration (or on a defect in
+its own build) and `1` for
+one that failed for a reason the next start may not meet. It is **not** error 1053, *did not respond to the start or
+control request in a timely fashion* — that is what a refusal used to produce,
+because the process exited before connecting to the SCM.
+
+`--install-service` is held to the same rules as a start, so a line every start
+would refuse is refused while you are watching rather than registered.
+`--uninstall-service` and `--healthcheck` are not: removing a service must not be
+blocked by the mistake it was reached to undo, and a probe of a daemon that is
+serving must not call it unhealthy over a rule that decides only whether one may
+start.
+
+The restart policy the registration sets is **finite**: after a failure the SCM
+restarts the service after one second, again after one second, once more after
+thirty seconds, and then leaves it stopped (`sc qfailure` lists the four
+actions). Ten minutes without a failure starts the count over. It counts
+failures rather than starts, so the SCM never refuses a start you make yourself.
+
+A refused start is restarted here too, unlike under systemd, because the SCM
+cannot be told apart from a failure without losing what `sc query` shows: it runs
+its recovery actions for every stop whose `WIN32_EXIT_CODE` is not zero, and the
+only refusal that would escape them is one reported as zero — with the `1066` and
+the `78` above gone. So a configuration that stays wrong is refused four times,
+each writing its reason to the event log, and then the service stays stopped
+until you fix it and start it. systemd does not restart a refusal at all, and
+launchd restarts a crash only (see [launchd](#launchd)).
 
 ### What it runs as
 

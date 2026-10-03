@@ -5,6 +5,7 @@
 #include "ForeignFleetWatch.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeRefusal.hpp"
 #include "NodeSurfaces.hpp"
 
 #include <FastCache/Cluster/DiscoveryService.hpp>
@@ -166,7 +167,7 @@ class DiscoveryTier
     /// @param metrics Where proofs under keys the roster does not accept are counted.
     /// @param logger Where beacons, joins and rejections are reported.
     /// @return The running tier, or the fatal reason.
-    [[nodiscard]] static std::expected<std::unique_ptr<DiscoveryTier>, std::string> Start(
+    [[nodiscard]] static std::expected<std::unique_ptr<DiscoveryTier>, NodeRefusal> Start(
         NodeConfig const& cfg,
         Cluster::IFleetSummarySource const& self,
         Consensus::IRaftPeerKeys const& keys,
@@ -310,7 +311,7 @@ class DiscoveryTier
 /// @param metrics Where discovery's refusals are counted.
 /// @param logger Where progress and refusals are reported.
 /// @return The tier, a null tier meaning "not configured", or the fatal reason.
-[[nodiscard]] std::expected<std::unique_ptr<DiscoveryTier>, std::string> StartDiscoveryOrExplain(
+[[nodiscard]] std::expected<std::unique_ptr<DiscoveryTier>, NodeRefusal> StartDiscoveryOrExplain(
     NodeConfig const& cfg,
     std::unique_ptr<ConsensusTier> const& consensus,
     Cluster::IFleetSummarySource const& self,

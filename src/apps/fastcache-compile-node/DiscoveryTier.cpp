@@ -131,7 +131,7 @@ std::unique_ptr<DiscoveryTier> DiscoveryTier::Over(Parts parts)
     return std::unique_ptr<DiscoveryTier> { new DiscoveryTier { std::move(parts) } };
 }
 
-std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(NodeConfig const& cfg,
+std::expected<std::unique_ptr<DiscoveryTier>, NodeRefusal> DiscoveryTier::Start(NodeConfig const& cfg,
                                                                                 Cluster::IFleetSummarySource const& self,
                                                                                 Consensus::IRaftPeerKeys const& keys,
                                                                                 NodeConditions& conditions,
@@ -145,7 +145,8 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     // this node will send to, which must name a host and may not be a bare port.
     auto const announce = ParseDialEndpoint(cfg.discoveryAddress);
     if (!announce.has_value())
-        return std::unexpected { std::format("--discovery={} is not <address>:<port>", cfg.discoveryAddress) };
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule,
+                                         std::format("--discovery={} is not <address>:<port>", cfg.discoveryAddress)) };
 
     // Two sockets, and which does what is the whole of issue #126.
     //
@@ -174,15 +175,19 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
     // wildcard whatever it says, and the resolver is where that is enforced.
     auto const endpoints = RowFor(NodeSurface::Discovery).Resolve(cfg);
     if (endpoints.empty())
-        return std::unexpected { std::format("--discovery={} is not <address>:<port>", cfg.discoveryAddress) };
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule,
+                                         std::format("--discovery={} is not <address>:<port>", cfg.discoveryAddress)) };
 
     // Beacon first, reply second, always: the row resolves the reply socket whether or not
     // a port is pinned, and says which by its port kind. Anything else is this binary's defect.
     if (endpoints.size() != 2)
-        return std::unexpected { std::format(
-            "the discovery surface resolved {} endpoint(s) where it always resolves a beacon and a reply socket; "
-            "this is a defect in this binary rather than in the configuration",
-            endpoints.size()) };
+        // A defect in this build's own table, which the next start resolves the same way: refused,
+        // as every build defect is, since a supervisor's restart would only meet it again.
+        return std::unexpected { Refusal(
+            NodeRefusalCause::BuildDefect,
+            std::format("the discovery surface resolved {} endpoint(s) where it always resolves a beacon and a reply "
+                        "socket; this is a defect in this binary rather than in the configuration",
+                        endpoints.size())) };
     auto const& beaconSocket = endpoints.front();
     auto const& replySocket = endpoints.back();
     auto const& bindHost = beaconSocket.host;
@@ -195,15 +200,17 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
                                        DiscoveryBindFailure(beaconSocket, replySocket, opened.error().toString()),
                                        logger);
         if (!judged.has_value())
-            return std::unexpected { std::move(judged).error() };
+            return std::unexpected { Refusal(NodeRefusalCause::Listener, std::move(judged).error()) };
 
         // Refused rather than tolerated (#352). `main.cpp` does handle a null discovery
         // tier -- it is how "no --discovery" is spelled -- so this is the one opener
         // whose caller would survive it. It still refuses, because the two mean opposite
         // things: one is an operator who asked for nothing, the other an operator who
         // asked and silently did not get it, and only the row's reason distinguishes them.
-        return std::unexpected { BindToleranceUnsupported(RowFor(NodeSurface::Discovery),
-                                                          "a null tier already means \"--discovery was not asked for\"") };
+        return std::unexpected { Refusal(
+            NodeRefusalCause::Listener,
+            BindToleranceUnsupported(RowFor(NodeSurface::Discovery),
+                                     "a null tier already means \"--discovery was not asked for\"")) };
     }
 
     auto socket = std::move(*opened);
@@ -219,7 +226,7 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> DiscoveryTier::Start(
 
     auto destinations = BeaconDestinationsFor(cfg, beaconSocket.port, *production->interfaces, production->clock, logger);
     if (!destinations.has_value())
-        return std::unexpected { std::move(destinations).error() };
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, std::move(destinations).error()) };
     auto config = Cluster::DiscoveryConfig { .beaconDestinations = *std::move(destinations),
                                              .beaconInterval = Cluster::DiscoveryConfig {}.beaconInterval,
                                              .challengeLifetime = Cluster::DiscoveryConfig {}.challengeLifetime };
@@ -448,7 +455,7 @@ std::string DiscoveryBindFailure(SurfaceEndpoint const& beacon, SurfaceEndpoint 
                        why);
 }
 
-std::expected<std::unique_ptr<DiscoveryTier>, std::string> StartDiscoveryOrExplain(
+std::expected<std::unique_ptr<DiscoveryTier>, NodeRefusal> StartDiscoveryOrExplain(
     NodeConfig const& cfg,
     std::unique_ptr<ConsensusTier> const& consensus,
     Cluster::IFleetSummarySource const& self,
@@ -472,13 +479,13 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> StartDiscoveryOrExpla
     // the ordinary worker -- `--listen-raft=` turns consensus off and discovery with it -- so
     // nothing starts. A TYPED one is refused rather than ignored: `StartupPolicyRejection`
     // already turns it away before this runs, so this is the belt to that braces, and a null
-    // consensus tier here would mean discovering peers for a cluster this node is not in.
+    // consensus tier here would mean discovering peers for a cluster this node is not in. In the
+    // table's words.
     if (consensus == nullptr)
     {
         if (!cfg.discoveryAddressExplicit)
             return std::unique_ptr<DiscoveryTier> {};
-        return std::unexpected { std::string {
-            "--discovery needs --listen-raft: there is no cluster to admit anybody to" } };
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, std::string { DiscoveryNeedsConsensusRefusal }) };
     }
 
     // **Never announced: an endpoint every peer resolves to itself** (`AnnouncesOnlyThisMachine`).
@@ -494,7 +501,8 @@ std::expected<std::unique_ptr<DiscoveryTier>, std::string> StartDiscoveryOrExpla
     if (Cluster::AnnouncesOnlyThisMachine(announced))
     {
         if (cfg.discoveryAddressExplicit)
-            return std::unexpected { std::string { DiscoveryAnnouncesOnlyThisMachineRefusal } };
+            return std::unexpected { Refusal(NodeRefusalCause::EarlierRule,
+                                             std::string { DiscoveryAnnouncesOnlyThisMachineRefusal }) };
         logger.Logf(LogLevel::Info,
                     "discovery stands down: this node's consensus address {} reaches only the machine that dials "
                     "it, so a beacon would send every peer to itself",

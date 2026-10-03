@@ -4371,6 +4371,66 @@ set_tests_properties("compile-cache-caveat" PROPERTIES
     TIMEOUT 600
 )
 
+# ---------------------------------------------------------------------------
+# compile-cache-dispatch: configure's `[cache] dispatch:` line is true of the build.
+#
+# fastcache-cc dispatched a miss only when the environment of whatever ran the BUILD named
+# FASTCACHE_SCHEDULER, so a developer who set it in one shell and built from another compiled
+# everything locally while configure said only that fastcache-cc was the launcher -- measured:
+# 341 misses, `NOT_CONFIGURED` on each. The module now decides at configure, bakes it into the
+# launcher and says so; this asserts the decision over every source combination, and then
+# configures the fixture with a stand-in launcher it builds and compares the printed line with
+# the `FASTCACHE_SCHEDULER=` every generated LAUNCHER line carries. Both states, both sources,
+# reconfigures with and without a -D from shells with and without the variable, and ninja's own
+# regeneration -- where a first version of the fix turned dispatch off, and a retarget turned an
+# explicit -DFASTCACHE_SCHEDULER= back on. FASTCACHE_ADDR is held by the same rule and pinned
+# the same way.
+#
+# Runs on Windows as well -- the stand-in is compiled, not a script -- and reports a toolchain
+# that cannot build it with `SKIP: `, as compile-cache-caveat does -- unless a decision failed,
+# which is FAILED on every host, because the decisions need no toolchain. "hygiene" for that
+# check's reason: no daemon, no socket.
+add_test(
+    NAME "compile-cache-dispatch"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/compile-cache-dispatch"
+        "-DFASTCACHED_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+        "-DFASTCACHED_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DFASTCACHED_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-dispatch.cmake"
+)
+set_tests_properties("compile-cache-dispatch" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    SKIP_REGULAR_EXPRESSION "SKIP: "
+    TIMEOUT 600
+)
+
+# How ctest SCORES the check above when its wiring cannot run. ctest lets SKIP_REGULAR_EXPRESSION
+# outrank FAIL_REGULAR_EXPRESSION, so a decision failure printed beside the skip marker scored
+# `***Skipped` -- measured. This runs the real check with a planted decision failure and no
+# usable compiler, under the two patterns the registration above carries -- read back from this
+# build tree through `ctest --show-only=json-v1`, never restated -- through a nested ctest, and
+# requires FAILED at both exits before the wiring and SKIPPED for the clean controls. No skip
+# pattern of its own: a verdict pin that could be scored skipped would repeat the defect.
+add_test(
+    NAME "compile-cache-dispatch-verdict"
+    COMMAND ${CMAKE_COMMAND}
+        "-DFASTCACHED_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
+        "-DFASTCACHED_SCRATCH_DIR=${CMAKE_CURRENT_BINARY_DIR}/compile-cache-dispatch-verdict"
+        "-DFASTCACHED_CTEST_COMMAND=${CMAKE_CTEST_COMMAND}"
+        "-DFASTCACHED_BUILD_DIR=${CMAKE_BINARY_DIR}"
+        "-DFASTCACHED_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
+        "-DFASTCACHED_GENERATOR=${CMAKE_GENERATOR}"
+        -P "${CMAKE_SOURCE_DIR}/scripts/check-compile-cache-dispatch-verdict.cmake"
+)
+set_tests_properties("compile-cache-dispatch-verdict" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "${FASTCACHED_SCRIPT_CHECK_FAILED}"
+    LABELS "hygiene"
+    TIMEOUT 900
+)
+
 # The other half: that it can actually install one. Serves a synthetic release
 # over file:// through FASTCACHE_AUTO_INSTALL_DOWNLOAD_BASE — the same seam an
 # organisation uses to install from an internal mirror — so the happy path is
@@ -4524,6 +4584,36 @@ else()
     set_tests_properties("node-config-file-e2e" PROPERTIES
         LABELS "hygiene"
         TIMEOUT 120
+    )
+endif()
+
+# ---------------------------------------------------------------------------
+# exit-codes-e2e: what each daemon EXITS with, through the real binaries.
+#
+# Who reads an exit decides it -- a supervisor a start's 1 or 78, an operator a
+# one-shot command's 2, a container runtime a probe's 0 or 1 -- and the tables that
+# say so are unit-tested. The ROUTING in each `main` is not, since neither is in a
+# test target: a site handing the refusal a start's outcome for an install's command
+# line stayed green under every Catch2 case. Names both executables, so it lives here.
+#
+# NOT labelled "smoke": every case is a refusal that exits before anything is opened,
+# bound or registered.
+if(NOT TARGET fastcached OR NOT TARGET fastcache-compile-node)
+    message(STATUS "exit-codes-e2e: fastcached or the compile node not built -- skipping")
+elseif(WIN32)
+    # REGISTERED and skipped, never omitted (#1355), for `e2e-helpers-selftest`'s reason: the
+    # bounded runner every case goes through is the shared POSIX library.
+    fastcached_register_skipped_test("exit-codes-e2e"
+        "every case is bounded by scripts/lib/e2e-common.sh's run_bounded, and that library is POSIX; the tables it drives are unit-tested on every platform")
+else()
+    add_test(
+        NAME "exit-codes-e2e"
+        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/exit-codes-e2e.sh"
+            "$<TARGET_FILE:fastcached>" "$<TARGET_FILE:fastcache-compile-node>"
+    )
+    set_tests_properties("exit-codes-e2e" PROPERTIES
+        LABELS "hygiene"
+        TIMEOUT 300
     )
 endif()
 

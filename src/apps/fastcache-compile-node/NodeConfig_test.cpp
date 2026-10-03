@@ -113,6 +113,21 @@ constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
     return cfg;
 }
 
+/// What a configuration that is otherwise complete and names TLS material is answered with on
+/// THIS build: nothing where the build serves TLS, and the build's own refusal where it does not.
+///
+/// A configuration naming TLS is a working one only on a build that can terminate it, so a case
+/// asserting that such a line starts asserts it through this -- and runs in both directions across
+/// the builds CI makes, rather than failing on the one without TLS.
+/// @return The verdict the startup table owes.
+[[nodiscard]] std::optional<std::string> TlsVerdictOfThisBuild()
+{
+    if constexpr (BuildServesTls)
+        return std::nullopt;
+    else
+        return std::string { TlsUnavailableRefusal };
+}
+
 [[nodiscard]] NodeConfig Installable()
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
@@ -1040,7 +1055,7 @@ TEST_CASE("NodeConfig: a registration that can work is still accepted", "[node][
     full.adminListen = "0.0.0.0:6680";
     full.tlsCertFile = "/etc/fastcache/server.pem";
     full.tlsKeyFile = "/etc/fastcache/server.key";
-    CHECK_FALSE(NodeInstallRejection(full).has_value());
+    CHECK(NodeInstallRejection(full) == TlsVerdictOfThisBuild());
 }
 
 TEST_CASE("NodeConfig: a registration that could not work is refused", "[node][service]")
@@ -2938,11 +2953,11 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
         REQUIRE(keyRefusal.has_value());
         CHECK(Unwrap(keyRefusal).contains("--tls-cert"));
 
-        // Both together is the configuration that works.
+        // Both together is the configuration that works -- on a build that serves TLS.
         auto both = servingNode();
         both.tlsCertFile = "admin.crt";
         both.tlsKeyFile = "admin.key";
-        CHECK_FALSE(StartupPolicyRejection(both).has_value());
+        CHECK(StartupPolicyRejection(both) == TlsVerdictOfThisBuild());
     }
 
     SECTION("a generated certificate and a named one contradict each other")
@@ -2987,7 +3002,7 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
         // obtain first.
         auto cfg = servingNode();
         cfg.tlsSelfSigned = true;
-        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+        CHECK(StartupPolicyRejection(cfg) == TlsVerdictOfThisBuild());
     }
 
     SECTION("a fleet map on a public port with no credential")
@@ -4856,6 +4871,9 @@ TEST_CASE("A reload re-asks the filesystem about the worker's key files", "[node
     // through the same `MakeNodeReloader` recipe `main` wires: the two things that
     // must be true are that the subscription is attached at all and that what it asks
     // reaches the filesystem, and a fake reloader would establish neither.
+    if constexpr (!BuildServesTls)
+        SKIP("the key file under test is the admin surface's TLS key, which a build without TLS refuses "
+             "to be configured with (TlsUnavailableRefusal), so no reload here could be applied");
     Testing::ScratchDirectory const scratch { "node-secret-reload" };
 
     // `key` is what the case is about; the configuration file itself stays 0600 and
@@ -6646,4 +6664,33 @@ TEST_CASE("NodeConfig: --service-start reaches the spec and never the registered
     CHECK(MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, *defaulted, Testing::InstallerPathProbe())
               .startMode
           == ServiceStart::Auto);
+}
+
+TEST_CASE("TLS material on a build that cannot serve it is refused by the startup table", "[node-config][tls]")
+{
+    // It was refused only by the admin tier's `#else`, which neither `--print-surfaces` nor
+    // `--install-service` reaches: the worksheet accepted the line and a registration baked in a
+    // command line that refused at every boot. A property of the BUILD and the configuration and
+    // nothing else, so it is a row, asked everywhere the table is.
+    auto cfg = Installable();
+    cfg.adminListen = "127.0.0.1:6677";
+
+    SECTION("a generated certificate")
+    {
+        cfg.tlsSelfSigned = true;
+        CHECK(StartupPolicyRejection(cfg) == TlsVerdictOfThisBuild());
+        CHECK(NodeInstallRejection(cfg) == StartupPolicyRejection(cfg));
+    }
+
+    SECTION("a named certificate")
+    {
+        cfg.tlsCertFile = "admin.crt";
+        cfg.tlsKeyFile = "admin.key";
+        CHECK(StartupPolicyRejection(cfg) == TlsVerdictOfThisBuild());
+    }
+
+    SECTION("the control: no TLS material is never refused for the build")
+    {
+        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
 }

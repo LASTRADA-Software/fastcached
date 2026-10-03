@@ -3,6 +3,7 @@
 
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeRefusal.hpp"
 #include "NodeRoster.hpp"
 #include "NodeSurfaces.hpp"
 
@@ -141,17 +142,6 @@ struct NodeScrapeSources
 [[nodiscard]] AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sources,
                                                                          std::chrono::steady_clock::time_point startedAt);
 
-/// Read the dashboard credential out of the file an operator named.
-///
-/// Fallible and reported rather than warned about, for the reason the endpoint's
-/// own failure is: a credential file that could not be read must not silently
-/// become "no credential", which is the one failure mode that turns a guarded
-/// fleet map into an open one.
-///
-/// The trailing newline every editor adds is trimmed, so a secret typed into a
-/// file works without the operator having to know that.
-/// @param path Where the secret is.
-/// @return The credential, or why it could not be used.
 /// Read a secret an operator put in a file.
 ///
 /// Trailing newlines are trimmed because every editor adds one and an operator
@@ -161,11 +151,26 @@ struct NodeScrapeSources
 /// different secret. An empty file is refused: a credential nobody can fail to match
 /// is worse than none, because the surface still looks guarded.
 ///
+/// A file that was read and holds nothing is `CredentialFile` -- the next start reads it the same
+/// -- while one that could not be opened, or whose read failed part way, is `CredentialIo`: the
+/// next start may open it (a permission restored, a mount back, a file its provisioner had not
+/// written yet), whatever the errno.
+///
 /// @param path The file to read.
 /// @return The secret, or why it could not be used.
-[[nodiscard]] std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::filesystem::path const& path);
+[[nodiscard]] std::expected<FastCache::SecureString, NodeRefusal> ReadSecretFile(std::filesystem::path const& path);
 
-[[nodiscard]] std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path);
+/// Read the dashboard credential out of the file an operator named.
+///
+/// Fallible and reported rather than warned about, for the reason the endpoint's
+/// own failure is: a credential file that could not be read must not silently
+/// become "no credential", which is the one failure mode that turns a guarded
+/// fleet map into an open one.
+///
+/// Read as `ReadSecretFile` reads any secret, trailing newline and refusal causes included.
+/// @param path Where the secret is.
+/// @return The credential, or why it could not be used.
+[[nodiscard]] std::expected<AdminCredential, NodeRefusal> ReadDashboardToken(std::filesystem::path const& path);
 
 /// The routes that serve the fleet dashboard.
 ///
@@ -683,7 +688,7 @@ struct AdminSurface
 /// @param conditions Where whether this surface serves a GENERATED certificate is answered, with
 ///        its fingerprint (#1364) -- once it serves, since a surface that did not start has nothing
 ///        to report. A node asking for no surface answers nothing here; the row's scope does.
-[[nodiscard]] std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(
+[[nodiscard]] std::expected<AdminSurface, NodeRefusal> StartAdminSurfaceOrExplain(
     NodeConfig const& cfg,
     IHostFactsSource const& host,
     IMetricsSink& metrics,
@@ -703,6 +708,6 @@ struct AdminSurface
 /// @param cfg The parsed configuration.
 /// @return The credential -- a default one when no file is named -- or why the file could not be
 ///         used. An unreadable file is refused, never read as "no credential".
-[[nodiscard]] std::expected<AdminCredential, std::string> LoadDashboardCredentialOrExplain(NodeConfig const& cfg);
+[[nodiscard]] std::expected<AdminCredential, NodeRefusal> LoadDashboardCredentialOrExplain(NodeConfig const& cfg);
 
 } // namespace FastCache::Node

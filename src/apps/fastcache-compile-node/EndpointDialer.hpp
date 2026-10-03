@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "OneShotAnswer.hpp"
+
 #include <chrono>
 #include <expected>
 #include <functional>
@@ -140,18 +142,21 @@ using LeaderAsk = std::function<Cc::CacheOutcome(core::net::ISocket& socket, std
 ///
 /// The first ask walks @p schedulers and takes whichever CONNECTS (`DialFirstReachable`, a
 /// fallback only where nothing was sent); a redirect names one endpoint and is followed there,
-/// never back into the list (#1310). Out of hops, the last `NotLeader` is returned as the answer.
+/// never back into the list (#1310). Out of hops, the chain that did not settle is the answer --
+/// `Pending`, since it decided nothing about the request.
 /// @param dialer How each endpoint is reached.
 /// @param schedulers Where to ask first, in order.
 /// @param options Ceiling on each dial.
 /// @param subject What the far end is called in a sentence: "the scheduler", "the cluster".
 /// @param ask One exchange; called once per endpoint asked.
-/// @return The answer and who gave it, or the sentence saying why there is none.
-[[nodiscard]] std::expected<LeaderAnswer, std::string> AskTheLeader(IEndpointDialer& dialer,
-                                                                    std::span<std::string const> schedulers,
-                                                                    core::net::DialOptions options,
-                                                                    std::string_view subject,
-                                                                    LeaderAsk const& ask);
+/// @return The answer and who gave it, or the sentence saying why there is none -- classified
+///         where it is known, by where it came from (`AnswerSource`): an endpoint nobody reached or
+///         an exchange that broke is `Transport`.
+[[nodiscard]] std::expected<LeaderAnswer, UnfinishedCommand> AskTheLeader(IEndpointDialer& dialer,
+                                                                          std::span<std::string const> schedulers,
+                                                                          core::net::DialOptions options,
+                                                                          std::string_view subject,
+                                                                          LeaderAsk const& ask);
 
 /// Render a list of endpoints for a sentence an operator reads.
 /// @param endpoints The endpoints, in the order they were tried.

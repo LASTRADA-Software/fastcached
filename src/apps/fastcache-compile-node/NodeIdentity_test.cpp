@@ -25,6 +25,7 @@
 #include <tests/NodeFormationFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/SecureRandomFakes.hpp>
+#include <tests/UnreadablePath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -229,7 +230,9 @@ TEST_CASE("A recorded identity that cannot be read is refused, never replaced", 
         std::ofstream { path, std::ios::binary | std::ios::trunc } << "\n";
         auto const refused = ResolveNodeIdentity(scratch.Path(), {}, random);
         REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().contains("is empty"));
+        CHECK(refused.error().message.contains("is empty"));
+        CHECK(refused.error().fault == NodeIdentityFault::Empty);
+        CHECK(StageOf(refused.error().fault) == StartStage::NodeIdentity);
     }
 
     SECTION("a record that is not text")
@@ -237,7 +240,24 @@ TEST_CASE("A recorded identity that cannot be read is refused, never replaced", 
         std::ofstream { path, std::ios::binary | std::ios::trunc } << "n1\x80\x80\n";
         auto const refused = ResolveNodeIdentity(scratch.Path(), {}, random);
         REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().contains("does not hold text"));
+        CHECK(refused.error().message.contains("does not hold text"));
+        CHECK(refused.error().fault == NodeIdentityFault::NotText);
+    }
+
+    SECTION("a record that is there and cannot be read")
+    {
+        // Neither absent nor a verdict: nothing was read. It used to answer "absent", and the
+        // resolver then MINTED -- replacing, the moment it could write, an identity the cluster
+        // may have admitted. Refused instead, as the I/O failure it is, and left as it was.
+        Testing::UnreadablePath const held { path, "n1\n" };
+        if (!held.Held())
+            SKIP("this process reads the file anyway (root), so the read arm cannot be reached here");
+        auto const refused = ResolveNodeIdentity(scratch.Path(), {}, random);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().fault == NodeIdentityFault::Unreadable);
+        CHECK(StageOf(refused.error().fault) == StartStage::NodeIdentityIo);
+        CHECK(held.Held());
+        CHECK_FALSE(std::filesystem::exists(std::filesystem::path { path }.concat(".new")));
     }
 
     // The control, and it is not decoration: without it "refuses a damaged record" and
@@ -247,6 +267,61 @@ TEST_CASE("A recorded identity that cannot be read is refused, never replaced", 
         std::ofstream { path, std::ios::binary | std::ios::trunc } << "  n1\r\n";
         CHECK(Resolved(scratch.Path(), {}, random).id == "n1");
     }
+}
+
+TEST_CASE("An identity fault ends a one-shot command by its stage: an I/O arm transient, a verdict a decision",
+          "[node][identity][exit]")
+{
+    // The OTHER reader of the same faults: `--print-identity` and `--install-service` are read by an
+    // operator, and a retry may get past an I/O arm (1) while a verdict on the bytes read is a
+    // decision (2).
+    struct FaultEnding
+    {
+        NodeIdentityFault fault;
+        CommandEnding ending;
+    };
+    constexpr auto verdicts = std::to_array<FaultEnding>({
+        { .fault = NodeIdentityFault::Unreadable, .ending = CommandEnding::Failed },
+        { .fault = NodeIdentityFault::Empty, .ending = CommandEnding::Declined },
+        { .fault = NodeIdentityFault::NotText, .ending = CommandEnding::Declined },
+        { .fault = NodeIdentityFault::DrawFailed, .ending = CommandEnding::Failed },
+        { .fault = NodeIdentityFault::CreateFailed, .ending = CommandEnding::Failed },
+        { .fault = NodeIdentityFault::WriteFailed, .ending = CommandEnding::Failed },
+    });
+    for (auto const fault: Enumerators<NodeIdentityFault>())
+        CHECK(std::ranges::count(verdicts, fault, &FaultEnding::fault) == 1);
+    for (auto const& verdict: verdicts)
+    {
+        INFO(static_cast<int>(verdict.fault));
+        CHECK(EndingOf(verdict.fault) == verdict.ending);
+    }
+}
+
+TEST_CASE("An identity fault ends a start as a refusal only when it is a verdict on bytes that were read",
+          "[node][identity][exit]")
+{
+    struct FaultVerdict
+    {
+        NodeIdentityFault fault;
+        StartStage stage;
+    };
+    constexpr auto verdicts = std::to_array<FaultVerdict>({
+        { .fault = NodeIdentityFault::Unreadable, .stage = StartStage::NodeIdentityIo },
+        { .fault = NodeIdentityFault::Empty, .stage = StartStage::NodeIdentity },
+        { .fault = NodeIdentityFault::NotText, .stage = StartStage::NodeIdentity },
+        { .fault = NodeIdentityFault::DrawFailed, .stage = StartStage::NodeIdentityIo },
+        { .fault = NodeIdentityFault::CreateFailed, .stage = StartStage::NodeIdentityIo },
+        { .fault = NodeIdentityFault::WriteFailed, .stage = StartStage::NodeIdentityIo },
+    });
+    for (auto const fault: Enumerators<NodeIdentityFault>())
+        CHECK(std::ranges::count(verdicts, fault, &FaultVerdict::fault) == 1);
+    for (auto const& verdict: verdicts)
+    {
+        INFO(static_cast<int>(verdict.fault));
+        CHECK(StageOf(verdict.fault) == verdict.stage);
+    }
+    CHECK(ExitOf(StartStage::NodeIdentity) == ProcessExit::Refused);
+    CHECK(ExitOf(StartStage::NodeIdentityIo) == ProcessExit::Failed);
 }
 
 TEST_CASE("A minted identity is 128 bits of the source it was given", "[node][identity]")
@@ -281,8 +356,11 @@ TEST_CASE("An identity the generator cannot draw is refused by name, and nothing
 
     auto const refused = ResolveNodeIdentity(state, {}, denied);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("cannot mint an identity"));
-    CHECK(refused.error().contains(ScriptedSecureRandom::DeniedFailure().primitive));
+    CHECK(refused.error().message.contains("cannot mint an identity"));
+    CHECK(refused.error().message.contains(ScriptedSecureRandom::DeniedFailure().primitive));
+    // A draw that failed is an I/O arm: the next start may draw.
+    CHECK(refused.error().fault == NodeIdentityFault::DrawFailed);
+    CHECK(StageOf(refused.error().fault) == StartStage::NodeIdentityIo);
     CHECK_FALSE(std::filesystem::exists(state));
     CHECK(denied.FillCount() == 2);
 

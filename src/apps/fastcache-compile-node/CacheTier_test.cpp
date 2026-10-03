@@ -124,7 +124,7 @@ struct Fixture
     /// the upstream is `--upstream`'s or none -- the cases here are about the TIER.
     SharedCacheDirectory directory { "pc-7", {} };
 
-    [[nodiscard]] std::expected<std::unique_ptr<CacheTier>, std::string> Start(NodeConfig const& cfg)
+    [[nodiscard]] std::expected<std::unique_ptr<CacheTier>, NodeRefusal> Start(NodeConfig const& cfg)
     {
         UpstreamParts const parts { .upstream = cfg.upstream,
                                     .credential = credential,
@@ -170,7 +170,7 @@ struct UpstreamFixture
     Ed25519KeyPair key = Testing::TestKeyPair("pc-7");
     RefusingTrust trust;
     SystemSecureRandom random;
-    NodeProofClient prover { "pc-7", key, trust, random };
+    NodeProofClient prover { "pc-7", key, trust, nullptr, nullptr, random };
     Testing::MemoryOpener opener;
     SharedCacheHost host { "pc-7", opener, nullptr, logger, ReconcileOn::Caller };
 
@@ -521,8 +521,11 @@ TEST_CASE("A cache directory that cannot be opened is fatal when it was named", 
     // And it names the flag that failed. Both failures this function can report
     // leave through one string, so a directory it could not create used to reach
     // the operator as "--listen-node ..." and send them to check a port.
-    CHECK(started.error().contains("--cache-dir"));
-    CHECK_FALSE(started.error().contains("--listen-node"));
+    CHECK(started.error().reason.contains("--cache-dir"));
+    CHECK_FALSE(started.error().reason.contains("--listen-node"));
+    // A directory that could not be created may be creatable at the next start -- a volume not yet
+    // mounted -- so the cache tier's refusals are restarted.
+    CHECK(started.error().cause == NodeRefusalCause::CacheStore);
 }
 
 // The provenance rule -- a NAMED address is a promise and a broken promise is fatal,

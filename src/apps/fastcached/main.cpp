@@ -37,6 +37,7 @@
 #include <FastCache/Platform/Environment.hpp>
 #include <FastCache/Platform/Firewall.hpp>
 #include <FastCache/Platform/IDaemonHost.hpp>
+#include <FastCache/Platform/ProcessExit.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Platform/WindowsEventLogger.hpp>
@@ -47,6 +48,7 @@
 #include <FastCache/Protocol/RedisTransaction.hpp>
 #include <FastCache/Protocol/StreamWaiterRegistry.hpp>
 #include <FastCache/Server/AdminHttpServer.hpp>
+#include <FastCache/Server/DaemonStartupGate.hpp>
 #include <FastCache/Server/ReactorServerLoop.hpp>
 #include <FastCache/Transport/NativeListen.hpp>
 
@@ -107,11 +109,53 @@ constexpr std::string_view ProgramVersion = FastCache::VersionString;
     return *parsed;
 }
 
+/// Refuse a start: say why on stderr, and -- under the Windows service @p config names -- in the
+/// event log and to the SCM as a stop with @p stage's exit code as the service-specific code.
+///
+/// **Unless the command line asked for something no supervisor reads** -- `ExitReaderOf`, a column
+/// of `CliOutcomeTable`. A one-shot command answers the ending a command stopped at @p stage has --
+/// 1 for an I/O arm, 2 for a verdict -- and a `--healthcheck` answers 1, the only failure its reader
+/// knows; either reports to the terminal only, never to a service host.
+///
+/// Takes the whole command-line parse, never an outcome beside it, so no site can hand it one the
+/// command line did not name: the outcome and the service host are read off one result. After a
+/// parse that FAILED, that result is `RecognisedCli`'s, so a verb typed after the bad token counts.
+/// `--daemon` and `--service-name` cannot come from a file, so the command line alone says whether
+/// this is a service.
+///
+/// Every refusal below returned from `main` before the host was entered, so under the SCM it
+/// exited before connecting: error 1053, *did not respond in a timely fashion*, with the reason on
+/// a stderr no service holds and in no log at all. `IDaemonHost::Refuse` is what connects to say
+/// so; off Windows, or without `--daemon`, there is no service host and the exit code is the report.
+/// @param commandLine What the command line named: its outcome, and its `--daemon` and `--service-name`.
+/// @param stage The step that refused, whose row says which code a supervisor reads.
+/// @param reason Why this process will not start.
+/// @return What the outcome's reader is answered: a start's @p stage code, or another reader's ending.
+[[nodiscard]] int RefuseUnderService(FastCache::CliResult const& commandLine,
+                                     FastCache::StartStage stage,
+                                     std::string_view reason)
+{
+    std::println(std::cerr, "fastcached: {}", reason);
+    if (auto const reader = FastCache::ExitReaderOf(commandLine.outcome); reader != FastCache::ExitReader::Supervisor)
+        return FastCache::RefusalExitCode(reader, stage);
+    auto const& config = commandLine.config;
+    auto const code = FastCache::ExitCodeFor(stage);
+    auto const host = config.daemon ? FastCache::MakeWindowsServiceHost(
+                                    config.serviceName, FastCache::ServiceHostOptions { .stop = FastCache::StopPendingPlanFor(std::nullopt) }) : nullptr;
+    if (host == nullptr)
+        return code;
+    auto const eventLogger = FastCache::MakeWindowsEventLogger(config.serviceName, config.logLevel);
+    if (eventLogger == nullptr)
+        return host->Refuse(code);
+    return FastCache::RefuseStart(*host, *eventLogger, reason, code);
+}
+
 /// Install `templatePath` at the machine-wide config location, unless a config
 /// is already there. The `--seed-config` action: how a packaging format with no
 /// conffile mechanism ships a default config that survives its own upgrades.
 /// @param templatePath The shipped template to copy.
-/// @return Process exit code.
+/// @return Process exit code: the ending the seeding came to (`EndingOf`), declined for a
+///         template it could not use and failed for a file it began writing.
 [[nodiscard]] int SeedDefaultConfig(std::string const& templatePath)
 {
     FastCache::SystemConfigPathProbe const probe;
@@ -122,14 +166,14 @@ constexpr std::string_view ProgramVersion = FastCache::VersionString;
     if (!seeded.has_value())
     {
         std::println(std::cerr, "fastcached: {}", seeded.error().ToString());
-        return EXIT_FAILURE;
+        return FastCache::CommandExitCode(FastCache::EndingOf(seeded.error().code));
     }
 
     // The sentence lives beside `SeedConfigFile`, not here: the WORKER seeds too
     // (#397), and two copies of a three-row table is two chances to describe the
     // repaired-permissions outcome as though nothing happened.
     std::println("fastcached: {}", FastCache::SeedOutcomeSentence(*seeded, *destination));
-    return EXIT_SUCCESS;
+    return FastCache::CommandExitCode(FastCache::CommandEnding::Completed);
 }
 
 extern "C" void HandleStopSignal(int /*signum*/)
@@ -550,8 +594,9 @@ struct StorageBackendBundle
 /// conversion has to cover every file the daemon could open on ANY future start,
 /// and the set on disk is exactly that.
 /// @param storagePath The configured `--storage` path.
-/// @return The store files, or why there are none to convert.
-[[nodiscard]] std::expected<std::vector<std::filesystem::path>, std::string> ExistingStorePaths(
+/// @return The store files, or why there are none to convert: transient for a path that is not
+///         there or a directory that could not be listed, a decision for one that holds no store.
+[[nodiscard]] std::expected<std::vector<std::filesystem::path>, FastCache::UnfinishedCommand> ExistingStorePaths(
     std::string const& storagePath)
 {
     std::filesystem::path const configured { storagePath };
@@ -560,8 +605,10 @@ struct StorageBackendBundle
     if (std::filesystem::is_regular_file(configured, ec))
         return std::vector<std::filesystem::path> { configured };
     if (!std::filesystem::is_directory(configured, ec))
-        return std::unexpected(
-            std::format("no store at '{}': it is neither a store file nor a directory of shards", configured.string()));
+        return std::unexpected(FastCache::UnfinishedCommand {
+            .ending = FastCache::CommandEnding::Failed,
+            .reason = std::format("no store at '{}': it is neither a store file nor a directory of shards",
+                                  configured.string()) });
 
     // Incremented explicitly with an error_code. A range-for over
     // `directory_iterator` advances through the THROWING `operator++`, so an
@@ -577,9 +624,13 @@ struct StorageBackendBundle
             shards.push_back(entry->path());
     }
     if (ec)
-        return std::unexpected(std::format("cannot list '{}': {}", configured.string(), ec.message()));
+        return std::unexpected(FastCache::UnfinishedCommand {
+            .ending = FastCache::CommandEnding::Failed,
+            .reason = std::format("cannot list '{}': {}", configured.string(), ec.message()) });
     if (shards.empty())
-        return std::unexpected(std::format("no shard-NN.cow files under '{}'", configured.string()));
+        return std::unexpected(
+            FastCache::UnfinishedCommand { .ending = FastCache::CommandEnding::Declined,
+                                           .reason = std::format("no shard-NN.cow files under '{}'", configured.string()) });
 
     // Sorted so the report reads in shard order rather than in whatever order
     // the filesystem hands them back.
@@ -598,6 +649,10 @@ struct StorageBackendBundle
 /// shard needs to know which one, and a summary line saying "4 stores, 0
 /// converted" hides the case where three were converted and the fourth was
 /// refused.
+/// The exit is the WORST ending any shard came to: a shard that stopped part-way, or whose file
+/// could not be opened, makes the run `Failed`, since a re-run may finish it; a shard refused on
+/// a decision -- a layout it cannot read, a store another process holds -- makes it `Declined`,
+/// and so does a configuration with nothing to convert.
 /// @param effective The merged configuration.
 /// @return Process exit code.
 [[nodiscard]] int MigrateConfiguredStorage(FastCache::Config const& effective)
@@ -607,7 +662,7 @@ struct StorageBackendBundle
         std::println(std::cerr,
                      "fastcached: --migrate-storage needs --storage: there is no on-disk store to convert "
                      "in a memory-only configuration");
-        return EXIT_FAILURE;
+        return FastCache::CommandExitCode(FastCache::CommandEnding::Declined);
     }
 
     // What is ON DISK, not what the shard formula predicts. With no explicit
@@ -621,11 +676,12 @@ struct StorageBackendBundle
     auto const paths = ExistingStorePaths(effective.storagePath);
     if (!paths.has_value())
     {
-        std::println(std::cerr, "fastcached: {}", paths.error());
-        return EXIT_FAILURE;
+        std::println(std::cerr, "fastcached: {}", paths.error().reason);
+        return FastCache::CommandExitCode(paths.error().ending);
     }
 
-    auto failures = 0;
+    // Ordered by severity, so the run's ending is the largest a shard came to.
+    auto ending = FastCache::CommandEnding::Completed;
     for (auto const& path: *paths)
     {
         FastCache::CowTreeStorage::Options opts;
@@ -637,12 +693,12 @@ struct StorageBackendBundle
         if (!report.has_value())
         {
             std::println(std::cerr, "fastcached: {}", line);
-            ++failures;
+            ending = std::max(ending, FastCache::UnfinishedEnding(report.error().Transient()));
             continue;
         }
         std::println("fastcached: {}", line);
     }
-    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return FastCache::CommandExitCode(ending);
 }
 
 /// Daemon body: holds the actual server lifecycle. Runs under whatever
@@ -783,7 +839,7 @@ int DaemonBody(FastCache::Config const& effective,
                     "fastcached: invalid --notify-keyspace-events '{}': {}",
                     effective.notifyKeyspaceEvents,
                     eventsMask.error().context);
-        return EXIT_FAILURE;
+        return FastCache::ExitCodeFor(FastCache::StartStage::KeyspaceEvents);
     }
     FastCache::KeyspaceNotifier keyspaceNotifier { &pubsub, *eventsMask };
 
@@ -805,7 +861,7 @@ int DaemonBody(FastCache::Config const& effective,
     if (!bundle.has_value())
     {
         logger.Logf(FastCache::LogLevel::Fatal, "{}", bundle.error());
-        return EXIT_FAILURE;
+        return FastCache::ExitCodeFor(FastCache::StartStage::Storage);
     }
     auto backend = std::move(bundle->backend);
 
@@ -906,21 +962,19 @@ int DaemonBody(FastCache::Config const& effective,
 #if defined(FC_TLS_ENABLED)
         if (effective.tlsCertPath.empty() || effective.tlsKeyPath.empty())
         {
-            logger.Log(FastCache::LogLevel::Fatal, "fastcached: --tls requires both --tls-cert and --tls-key");
-            return EXIT_FAILURE;
+            logger.Logf(FastCache::LogLevel::Fatal, "fastcached: {}", FastCache::DaemonTlsMaterialRefusal);
+            return FastCache::ExitCodeFor(FastCache::StartStage::TlsMaterial);
         }
         auto created = core::net::makeTlsServerContextFromFiles(effective.tlsCertPath, effective.tlsKeyPath);
         if (!created.has_value())
         {
             logger.Logf(FastCache::LogLevel::Fatal, "fastcached: TLS init failed: {}", created.error());
-            return EXIT_FAILURE;
+            return FastCache::ExitCodeFor(FastCache::StartStage::TlsLoad);
         }
         tlsContext = std::move(*created);
 #else
-        logger.Log(FastCache::LogLevel::Fatal,
-                   "fastcached: --tls requested but this build has no TLS support "
-                   "(rebuild with -DFASTCACHED_ENABLE_TLS=ON)");
-        return EXIT_FAILURE;
+        logger.Logf(FastCache::LogLevel::Fatal, "fastcached: {}", FastCache::DaemonTlsUnavailableRefusal);
+        return FastCache::ExitCodeFor(FastCache::StartStage::TlsUnavailable);
 #endif
     }
 
@@ -1037,26 +1091,10 @@ int DaemonBody(FastCache::Config const& effective,
     // common single-port case working without an explicit --listen, and
     // lets advanced operators bring up multiple binds (e.g. plaintext on a
     // private interface + TLS on the public one) with repeated --listen /
-    // --listen-tls flags.
-    if (!effective.binds.empty())
-    {
-        serverOpts.binds = effective.binds;
-    }
-    else
-    {
-        serverOpts.binds.push_back(
-            FastCache::BindConfig { .address = effective.bindAddress, .port = effective.port, .tls = effective.tlsEnabled });
-    }
-    // (ValidateBindFlagShape ran in main() before the daemon host was
-    // invoked, so the mixed-shape rejection has already happened.)
-    // Reject duplicate {address, port} endpoints before we hit the kernel:
-    // SO_REUSEPORT would let both bind succeed and silently split traffic
-    // 50/50 between mismatched protocols (plaintext vs TLS).
-    if (auto const v = FastCache::ValidateBinds(serverOpts.binds); !v.has_value())
-    {
-        logger.Logf(FastCache::LogLevel::Fatal, "fastcached: {}", v.error().context);
-        return EXIT_FAILURE;
-    }
+    // --listen-tls flags. `EffectiveBinds` is that rule, and `DaemonStartupRejection` judged these
+    // very endpoints in `main()` -- duplicates included, which SO_REUSEPORT would otherwise let both
+    // bind and split traffic between -- before the daemon host was invoked.
+    serverOpts.binds = FastCache::EffectiveBinds(effective);
     serverOpts.listenBacklog = effective.listenBacklog;
     // The active expiry cycle. The two defaults are asserted equal rather than trusted:
     // `Config` cannot include `Cache/`, so the number is written in both places,
@@ -1249,24 +1287,30 @@ int main(int argc, char const* const* argv)
     CORE_THREAD_NAME("fastcached-main");
     std::span<char const* const> const args { argv + 1, argc > 0 ? static_cast<std::size_t>(argc - 1) : 0 };
 
-    auto const parsed = FastCache::ParseCli(args);
-    if (!parsed.has_value())
+    // A command line refused still says what it named, from the WHOLE of it (`RecognisedCli`):
+    // whether it is a service's -- under the SCM the registered line carries `--daemon`, and a
+    // refusal that never told the host exits before the SCM hears anything, error 1053 -- and
+    // which verb it asked for, wherever the operator typed it relative to the bad token.
+    FastCache::CliResult cli;
+    if (auto const flow = FastCache::ParseCliInto(args, cli); !flow.has_value())
     {
-        std::println(std::cerr, "fastcached: {}", parsed.error().ToString());
+        auto const refused =
+            RefuseUnderService(FastCache::RecognisedCli(args), FastCache::StartStage::CommandLine, flow.error().ToString());
         std::println(std::cerr, "{}", FastCache::CliUsage());
-        return EXIT_FAILURE;
+        return refused;
     }
+    auto const* const parsed = &cli;
 
     switch (parsed->outcome)
     {
         case FastCache::CliOutcome::ShowVersion:
             std::println("fastcached {}", ProgramVersion);
-            return EXIT_SUCCESS;
+            return FastCache::CommandExitCode(FastCache::CommandEnding::Completed);
         case FastCache::CliOutcome::ShowHelp:
             std::print("{}",
                        FastCache::CliUsage(FastCache::StdoutSupportsColor() ? FastCache::UsageColor::Colored
                                                                             : FastCache::UsageColor::Plain));
-            return EXIT_SUCCESS;
+            return FastCache::CommandExitCode(FastCache::CommandEnding::Completed);
         case FastCache::CliOutcome::SeedConfig:
             return SeedDefaultConfig(parsed->seedConfigTemplate);
         case FastCache::CliOutcome::Run:
@@ -1277,6 +1321,9 @@ int main(int argc, char const* const* argv)
             // These all need the effective config assembled below; they branch
             // apart afterwards.
             break;
+        case FastCache::CliOutcome::Last:
+            // The table's count, which no option row selects.
+            return RefuseUnderService(*parsed, FastCache::StartStage::NoOutcome, "the command line selected no outcome");
     }
 
     // The config file to read: the one the operator named, or else whichever
@@ -1333,10 +1380,9 @@ int main(int argc, char const* const* argv)
         // report success either way.
         if (!parsed->config.configPath.empty() || parsed->outcome == FastCache::CliOutcome::Run
             || parsed->outcome == FastCache::CliOutcome::MigrateStorage)
-        {
-            std::println(std::cerr, "fastcached: {}", assembled.error().ToString());
-            return EXIT_FAILURE;
-        }
+            // The command line's `--daemon`, since no merged configuration exists to ask.
+            return RefuseUnderService(
+                *parsed, FastCache::ConfigurationFileStage(assembled.error().code), assembled.error().ToString());
 
         // Ignored, and the PATH ignored with it: re-assembling against no file at
         // all is what leaves `configPath` empty, so nothing later re-reads a file
@@ -1358,38 +1404,21 @@ int main(int argc, char const* const* argv)
     if (parsed->outcome == FastCache::CliOutcome::MigrateStorage)
         return MigrateConfiguredStorage(effective);
 
-    // Reject shapes that would silently drop user-typed values: combining the
-    // legacy single-bind triplet (`--bind / --port / --tls` OR `bind: / port: /
-    // tls:`) with `--listen / --listen-tls` (or `listen: / listen_tls:`) makes the
-    // legacy values vanish — DaemonBody picks `binds` and discards the singletons.
-    // Asked of the assembly, which knows what was named in EITHER source. Validate
-    // BEFORE handing off to the daemon host (which may fork) so the error reaches
-    // the operator.
-    if (auto const shape = FastCache::ValidateBindFlagShape(*assembled); !shape.has_value())
-    {
-        std::println(std::cerr, "fastcached: {}", shape.error().context);
-        return EXIT_FAILURE;
-    }
-
-    // Validate notify-keyspace-events BEFORE handing off to the daemon
-    // host (which may fork) so a typo reaches the operator's terminal,
-    // not a syslog the child has already detached from. DaemonBody
-    // re-parses the same value — parsing is pure and the error here was
-    // caught well before any state was constructed.
-    if (auto const eventsMask = FastCache::ParseKeyspaceEvents(effective.notifyKeyspaceEvents); !eventsMask.has_value())
-    {
-        std::println(std::cerr,
-                     "fastcached: invalid --notify-keyspace-events '{}': {}",
-                     effective.notifyKeyspaceEvents,
-                     eventsMask.error().context);
-        return EXIT_FAILURE;
-    }
+    // The rules a SERVING daemon is held to -- the bind-flag shape, the keyspace-event grammar and
+    // every rule decided by the configuration and the build alone -- asked of a start and an install
+    // only, BEFORE handing off to the daemon host (which may fork) so the refusal reaches the
+    // operator, and before an install bakes the command line in. `ServingRulesRejection` says
+    // which outcomes and in what order; it is in the library, where a test holds it to that.
+    if (auto const rejection = FastCache::ServingRulesRejection(parsed->outcome, *assembled))
+        return RefuseUnderService(*parsed, FastCache::StartStage::StartupRules, *rejection);
 
     // Health check: probe the running daemon's /healthz on loopback and exit
     // 0/1. Loopback regardless of the configured metrics bind address, since the
     // probe runs inside the same host/container as the daemon.
     if (parsed->outcome == FastCache::CliOutcome::HealthCheck)
-        return core::net::httpHealthProbe("127.0.0.1", effective.metricsPort, "/healthz") ? EXIT_SUCCESS : EXIT_FAILURE;
+        return FastCache::CommandExitCode(core::net::httpHealthProbe("127.0.0.1", effective.metricsPort, "/healthz")
+                                              ? FastCache::CommandEnding::Completed
+                                              : FastCache::CommandEnding::Failed);
 
     // Service-control requests act on the service manager and exit; they never
     // run the daemon body.
@@ -1459,7 +1488,7 @@ int main(int argc, char const* const* argv)
                                 : FastCache::WithRemovalFirewall(FastCache::UninstallService(spec, parsed->serviceScope),
                                                                  firewall.get(),
                                                                  spec.serviceName);
-        if (result.ExitCode() == 0)
+        if (result.Ending() == FastCache::CommandEnding::Completed)
             std::println("fastcached: {}", result.message);
         else
             std::println(std::cerr, "fastcached: {}", result.message);

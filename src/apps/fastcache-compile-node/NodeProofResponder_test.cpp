@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "MembershipGate.hpp"
+#include "NodeProofClient.hpp"
 #include "NodeProofResponder.hpp"
 #include "Responders.hpp"
 
@@ -414,11 +415,87 @@ TEST_CASE("A key the cluster does not hold is refused as unknown, never as a for
         auto const verdict = node.prover.Verify(challenged.issued.handshake, ProofOver(challenged, OtherNode, AdmittedNode));
         CHECK(ErrorOf(verdict.reply) == Wire::ErrorCode::NodeKeyUnknown);
         CHECK_FALSE(verdict.identity.has_value());
+        // Another machine claiming a member's id looks, from here, like that member's key replaced:
+        // so a stranger's id is never answered "forget it", which would remove the real member.
+        auto const decoded = Wire::DecodeErrorPayload(Testing::PayloadOf(verdict.reply));
+        REQUIRE(decoded.has_value());
+        CHECK_FALSE(std::string { Unwrap(decoded).second }.contains("--cluster-forget"));
     }
 
     CHECK(node.metrics.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 1);
     CHECK(node.metrics.Read(IMetricsSink::Counter::NodeProofsRejected) == 0);
     CHECK(node.metrics.Read(IMetricsSink::Counter::NodeProofsRefusedRevokedKey) == 0);
+}
+
+TEST_CASE("An unknown key under THIS node's own id is never answered with a remedy to admit it",
+          "[node][proof][self-record]")
+{
+    // The refusal a node that schedules for itself used to send ITSELF at every start, before its
+    // own consensus had recorded it: "admit it with --enroll-from or --cluster-admit-worker". No
+    // operator can admit a machine to its own cluster, and nothing needed doing -- the record lands
+    // a moment later. Still refused, and counted as unknown: the answer is right, the remedy was not.
+    ProvingNode node;
+
+    /// The remedy for a machine an operator really can admit, which neither self case may carry.
+    constexpr std::string_view AdmitRemedy = "--cluster-admit-worker";
+
+    /// The refusal's own words, out of its sealed reply.
+    auto const reasonOf = [](NodeProofVerdict const& verdict) {
+        auto const decoded = Wire::DecodeErrorPayload(Testing::PayloadOf(verdict.reply));
+        REQUIRE(decoded.has_value());
+        return std::string { Unwrap(decoded).second };
+    };
+
+    SECTION("its own key: the node itself, a moment before its cluster records it")
+    {
+        auto const challenged = Challenge(node);
+        auto const verdict =
+            node.prover.Verify(challenged.issued.handshake, ProofOver(challenged, "scheduler", "scheduler"));
+        CHECK(ErrorOf(verdict.reply) == Wire::ErrorCode::NodeKeyUnknown);
+        CHECK_FALSE(verdict.identity.has_value());
+        auto const reason = reasonOf(verdict);
+        INFO(reason);
+        CHECK_FALSE(reason.contains(AdmitRemedy));
+        CHECK(reason.contains("this node's own identity"));
+    }
+
+    SECTION("another key under its id: a second machine holding a copy of its state directory")
+    {
+        auto const challenged = Challenge(node);
+        auto const verdict =
+            node.prover.Verify(challenged.issued.handshake, ProofOver(challenged, UnknownNode, "scheduler"));
+        CHECK(ErrorOf(verdict.reply) == Wire::ErrorCode::NodeKeyUnknown);
+        auto const reason = reasonOf(verdict);
+        INFO(reason);
+        CHECK_FALSE(reason.contains(AdmitRemedy));
+        CHECK(reason.contains("--cluster-dir"));
+    }
+
+    SECTION("its own key, while its cluster records its id under another: its node-key was replaced")
+    {
+        // The id survived and the key did not, so waiting will not record it: said the way this
+        // node's own prover says it (`ReplacedNodeKeyDiagnosis`).
+        node.keys.Publish({ { "scheduler", TestKeyPair("scheduler-before-its-key-was-replaced").PublicKey() } }, {});
+        auto const challenged = Challenge(node);
+        auto const verdict =
+            node.prover.Verify(challenged.issued.handshake, ProofOver(challenged, "scheduler", "scheduler"));
+        CHECK(ErrorOf(verdict.reply) == Wire::ErrorCode::NodeKeyUnknown);
+        auto const reason = reasonOf(verdict);
+        INFO(reason);
+        CHECK(reason == ReplacedNodeKeyDiagnosis("scheduler"));
+        CHECK_FALSE(reason.contains("not recorded yet"));
+    }
+
+    SECTION("the control: a stranger's own id is still told how it gets admitted")
+    {
+        auto const challenged = Challenge(node);
+        auto const verdict =
+            node.prover.Verify(challenged.issued.handshake, ProofOver(challenged, UnknownNode, UnknownNode));
+        CHECK(ErrorOf(verdict.reply) == Wire::ErrorCode::NodeKeyUnknown);
+        CHECK(reasonOf(verdict).contains(AdmitRemedy));
+    }
+
+    CHECK(node.metrics.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 1);
 }
 
 TEST_CASE("A revoked key is refused by name, and the connection keeps the identity it proved", "[node][proof][revoke]")

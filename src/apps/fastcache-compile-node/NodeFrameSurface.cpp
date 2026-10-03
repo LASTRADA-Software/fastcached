@@ -92,7 +92,7 @@ std::expected<void, std::string> NodeFrameSurface::Bind(NodeIoLoop& io,
     return {};
 }
 
-std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOrExplain(NodeIoLoop& io,
+std::expected<std::unique_ptr<NodeFrameSurface>, NodeRefusal> StartNodeSurfaceOrExplain(NodeIoLoop& io,
                                                                                         NodeConfig const& cfg,
                                                                                         SurfaceComponents const& components,
                                                                                         std::optional<int> inherited,
@@ -124,10 +124,11 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     // nothing to say the node was assembled wrong. The operator families and the fleet's shared
     // cache are such families, and this is the one place `main`'s routing of them is asked.
     if (auto const* const missing = MissingEveryNodeOwner(components); missing != nullptr)
-        return std::unexpected { std::format(
-            "the 0xFC listener was assembled without its {} component, which every built node serves; this is a "
-            "defect in how this build wires its surfaces, not in its configuration",
-            missing->component) };
+        return std::unexpected { Refusal(
+            NodeRefusalCause::BuildDefect,
+            std::format("the 0xFC listener was assembled without its {} component, which every built node serves; "
+                        "this is a defect in how this build wires its surfaces, not in its configuration",
+                        missing->component)) };
     // Asked BEFORE the row, because under activation the row answers about a flag
     // that configured nothing. An operator who enables the `.socket` unit and leaves
     // `--listen-node` empty has not asked for a closed port -- the unit is the port --
@@ -185,7 +186,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
                     bound.error()),
         logger);
     if (!judged.has_value())
-        return std::unexpected { std::move(judged).error() };
+        return std::unexpected { Refusal(NodeRefusalCause::Listener, std::move(judged).error()) };
 
     // The row called it tolerable and this opener cannot carry that, so it says so
     // rather than fabricating one (#352). A null here is `StartNodeSurfaceOrExplain`'s
@@ -193,10 +194,11 @@ std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOr
     // that way and goes on to advertise the CONFIGURED endpoint, so returning one
     // after a failed bind would announce an address nothing answers. That is the node
     // row's own reason arriving through the door meant for a different fact.
-    return std::unexpected { BindToleranceUnsupported(RowFor(NodeSurface::Node),
-                                                      "a null surface here already means \"no component needs the "
-                                                      "port\", and the node would advertise its configured endpoint "
-                                                      "regardless") };
+    return std::unexpected { Refusal(NodeRefusalCause::Listener,
+                                     BindToleranceUnsupported(RowFor(NodeSurface::Node),
+                                                              "a null surface here already means \"no component needs the "
+                                                              "port\", and the node would advertise its configured endpoint "
+                                                              "regardless")) };
 }
 
 } // namespace FastCache::Node

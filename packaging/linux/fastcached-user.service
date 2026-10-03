@@ -56,6 +56,18 @@ TimeoutStopSec=30
 
 Restart=on-failure
 RestartSec=1
+# A start refused on its configuration, or on a defect in its own build, exits 78
+# (EX_CONFIG, `ProcessExit::Refused` in src/FastCache/Platform/ProcessExit.hpp), and the
+# next start would refuse it again, so
+# it is not restarted: the unit stays failed, with the reason in the journal. Every other
+# failure -- a port still held by a process that was exiting, a store another process
+# holds, a named file that is absent or could not be read -- is restarted, within
+# systemd's default start limit of five starts in ten seconds. Measured on systemd 259: a refusal ran once and stayed failed, whether it
+# arrived at once or after three seconds; a failure after three seconds was restarted
+# nine times in forty seconds and went on; eight restarts by hand three seconds apart
+# were all honoured, and five starts inside ten seconds are honoured too -- it is a
+# SIXTH, the fifth restart typed right after a start, that the default limit refuses.
+RestartPreventExitStatus=78
 
 # Creates %S/fastcached (~/.local/state/fastcached) for storage_path.
 StateDirectory=fastcached

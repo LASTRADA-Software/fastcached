@@ -4159,6 +4159,25 @@ turned off and MSVC debug info is forced to `/Z7`
 (a modmap flag makes the launcher's preprocess step fail, and a PCH or shared
 PDB is a second artefact no hit can reproduce).
 
+- **An environment value SEEDS a build tree and never steers one** (`_fc_hold_setting`).
+  `FASTCACHE_ADDR` and `FASTCACHE_SCHEDULER` are taken from the environment only by the
+  configure that creates their cache entry; a later configure whose environment differs
+  REPORTS it, naming the `-D` that would apply it, and applies nothing. Both used to
+  retarget on an environment CHANGE unless the entry had been "changed by hand", judged by
+  comparing it with the value last applied — which cannot see a `-D` that typed the value
+  already held, `OptionSpec::explicitBit`'s blind spot in CMake, where nothing says a `-D`
+  was on this command line. Measured: `-DFASTCACHE_SCHEDULER=`, typed to say OFF from a
+  shell holding the variable, turned dispatch ON. And dispatch is baked into the launcher
+  in BOTH states and said beside it (`_fc_dispatch_state`), because the launcher used to
+  read it from whatever shell ran the build and 341 misses compiled locally in silence.
+  `ctest -R compile-cache-dispatch` compares the printed line with every `LAUNCHER =` line,
+  across reconfigures with and without a `-D` and across ninja's own regeneration. **Its
+  decisions are a verdict on every host, so a decision failure ends the check FAILED and never
+  beside its `SKIP: ` marker**: ctest lets `SKIP_REGULAR_EXPRESSION` outrank
+  `FAIL_REGULAR_EXPRESSION` (measured, `***Skipped` and `100% tests passed`), and only the
+  wiring needs a toolchain. `ctest -R compile-cache-dispatch-verdict` asks a nested ctest how
+  a planted failure is scored under the registration's own two patterns.
+
 - **Under MSVC and clang-cl the `sccache` fallback can silently produce a wrong
   build, and the configure warns about it now rather than leaving it to be
   discovered.** sccache replays a cache hit's `/showIncludes` stream verbatim —

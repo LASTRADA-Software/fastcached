@@ -3177,6 +3177,7 @@ Every row says two things before anything else:
 | `scheduler-unreachable` | live | warning | a `--scheduler` endpoint (or a leader it named) has not answered a dial; the detail names each, and one nobody has dialled for ten minutes is dropped from it | check the VPN or network between this machine and the schedulers named; the node keeps serving this machine meanwhile and rejoins by itself |
 | `unserved-toolchain` | live | warning | clients asked the leader for a toolchain no live worker serves, so those compiles ran on the clients' own machines; the detail names each by driver and version as the client reported it (`cl 19.44.35207`), with how many leases were refused. Decided by the leader; any other scheduler answers `not-evaluated`, and so does a leader that has led for less than fifteen minutes, since nothing another leader saw carries over | put that compiler version on a worker, or move the clients to one the fleet serves; clears once a worker serves it, or after fifteen minutes with nobody asking |
 | `mixed-node-versions` | live | warning | the leader sees more than one build serving one wire — nothing refuses that, so nothing else says so; the detail names each build and the machines on it. Decided by the leader; any other scheduler answers `not-evaluated`, and so does a leader that has led for less than ninety seconds, before every machine has announced to it | upgrade every node to one build ([Upgrading a fleet](../operations/upgrading-a-fleet.md)); clears once the odd machine is upgraded or has been gone ninety seconds |
+| `own-record-awaited` | live | warning | a consensus node that names `--scheduler` announces to nobody until its own cluster records its key, and it has waited longer than an election explains — or its cluster records its id under **another** key, its `node-key` replaced while the id survived, which is raised at once | bring back a majority of the cluster's voters, or admit a joining machine (`--enroll-from`, or `--cluster-admit` with what `--print-identity` prints); for a replaced key, restore that `node-key` or `--cluster-forget=<id>` and admit the new one |
 
 The remedy each row carries is longer than this column, and it is the node's text: an older
 client or leader prints a newer node's row exactly as that node wrote it, rather than looking
@@ -4306,6 +4307,17 @@ not answer:
 ```
 WARN  scheduler.internal:6675 did not accept this machine's identity: node-key-unknown: this cluster holds no such key for w-7 ...
 ```
+
+A node that runs consensus is admitted by its OWN cluster's record of its key, and a member
+the cluster was started with is recorded only once the cluster has elected a leader -- a
+moment after its worker and presence loops start. So such a node does not dial any
+`--scheduler` until that record exists: it says so once at `INFO` ("not announcing to the
+fleet yet"), asks again every two seconds, says so again at `WARN` if the record has not
+arrived after 15 asks (a cluster that cannot elect, or a joining machine nobody admitted),
+and says when it has. A node that schedules for itself is therefore never refused by its
+own scheduler at start, and its own id never meets the *admit it* remedy: a proof under
+this node's own id is answered as this node's own identity, or -- under another key -- as
+a second machine running with a copy of its `--cluster-dir`.
 
 A node running no consensus answers both verbs `no-cluster` rather than *unimplemented
 verb* — which a caller would read as *this node's build is too old* and act on by upgrading

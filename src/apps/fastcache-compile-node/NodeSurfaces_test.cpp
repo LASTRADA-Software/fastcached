@@ -440,11 +440,16 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
     SECTION("a configuration that would start is printed and NOT refused")
     {
         // The control, and the ticket names it explicitly: without it, a flag that
-        // always fails satisfies the section above.
-        auto const cfg = WithoutTheContradiction(WorkerServingTlsTwoWays());
+        // always fails satisfies the section above. On a build without TLS the generated
+        // certificate is refused as well (`TlsUnavailableRefusal`), so there the control asks
+        // for no TLS at all.
+        auto cfg = WithoutTheContradiction(WorkerServingTlsTwoWays());
+        if constexpr (!BuildServesTls)
+            cfg.tlsSelfSigned = false;
 
         auto const report = ReportSurfaces(cfg);
         CHECK(report.text.contains("0.0.0.0:6674")); // the RESOLVED endpoint, which is what the flag exists to print
+        INFO(report.refusal.value_or("<none>"));
         CHECK_FALSE(report.refusal.has_value());
     }
 
@@ -460,6 +465,82 @@ TEST_CASE("The surface worksheet carries a verdict and prints either way", "[nod
         // appears in no surface row -- which is what makes this comparison exact rather than
         // approximate.
         CHECK(ReportSurfaces(broken).text == ReportSurfaces(fixed).text);
+    }
+}
+
+TEST_CASE("The worksheet and the install and the start refuse a cross-flag rule in one sentence",
+          "[node][surfaces][verdict]")
+{
+    // A report from a real installation said `--print-surfaces` accepted -- printed the map and
+    // exited 0 for -- a line the service then refused at every start. It does not reproduce: the
+    // worksheet's verdict IS the startup table's, and the binary exits 2 on such a line. What
+    // reported 0 was the deploy script's `| Select-Object -First 4`, which stops the pipeline
+    // before PowerShell records the native command's exit code, so `$LASTEXITCODE` still held the
+    // previous command's 0.
+    //
+    // Kept as the pin that the three judgements of one command line cannot drift apart: parsed
+    // exactly as a registration spells it, through the parser `main` uses. The reported line named
+    // `--serve-scheduler`, which is gone -- the formation record decides -- so the pin rides a
+    // cross-flag rule that is still a row: a TYPED `--discovery` on a node that runs no consensus.
+    auto const line = [](char const* raftListen) {
+        return std::vector<char const*> {
+            "--listen-node=127.0.0.1:6674",
+            "--scheduler=127.0.0.1:6674",
+            raftListen,
+            "--discovery=255.255.255.255:6681",
+            "--advertise=127.0.0.1:6674",
+            "--admin-listen=0.0.0.0:6677",
+            "--dashboard",
+            R"(--dashboard-token-file=D:\.token)",
+            "--cache-disk=68719476736",
+            R"(--cache-dir=C:\ProgramData\fastcache-node\cache)",
+        };
+    };
+
+    auto const judge = [](std::vector<char const*> const& argv) {
+        NodeConfig cfg;
+        auto const flow = ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, cfg);
+        INFO((flow.has_value() ? std::string {} : flow.error().ToString()));
+        REQUIRE(flow.has_value());
+        // As `main` shapes it after the parse: the mode a first start mints, which is what decides
+        // whether consensus runs at all.
+        Testing::ShapeAsFirstStart(cfg);
+        struct Verdicts
+        {
+            std::optional<std::string> worksheet; ///< What `--print-surfaces` exits on.
+            std::optional<std::string> install;   ///< What `--install-service` exits on.
+            std::optional<std::string> start;     ///< What a start exits on.
+        };
+        return Verdicts { .worksheet = ReportSurfaces(cfg).refusal,
+                          .install = NodeInstallRejection(cfg),
+                          .start = StartupPolicyRejection(cfg) };
+    };
+
+    SECTION("the line with consensus turned off: all three refuse, in the start's own words")
+    {
+        auto const verdicts = judge(line("--listen-raft="));
+        REQUIRE(verdicts.start.has_value());
+        CHECK(Unwrap(verdicts.start) == DiscoveryNeedsConsensusRefusal);
+        CHECK(verdicts.worksheet == verdicts.start);
+        CHECK(verdicts.install == verdicts.start);
+    }
+
+    SECTION("the line with its cluster of one: all three accept")
+    {
+        // The control: without it a worksheet that refused everything would satisfy the section
+        // above. The refusal's remedy taken literally -- a consensus port, with an address peers
+        // can dial, since a typed `--discovery` beaconing one that reaches only this machine is
+        // refused too -- plus the `--cluster-dir` an INSTALL alone demands of a consensus node
+        // (`NodeServiceRejection`), since a service's working directory is not the installing shell's.
+        auto corrected = line("--listen-raft=0.0.0.0:6680");
+        corrected.push_back("--raft-self=10.0.0.5");
+        corrected.push_back(R"(--cluster-dir=C:\ProgramData\fastcache-node\cluster)");
+        auto const verdicts = judge(corrected);
+        INFO(verdicts.start.value_or("<none>"));
+        INFO(verdicts.install.value_or("<none>"));
+        CHECK_FALSE(verdicts.start.has_value());
+        CHECK_FALSE(verdicts.worksheet.has_value());
+        CHECK_FALSE(verdicts.install.has_value());
     }
 }
 

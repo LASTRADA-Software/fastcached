@@ -438,7 +438,7 @@ class SharedCacheFleet
         /// The trust `NodeProofClient`'s synchronous `Prove` would use. The upstream never calls it -- it
         /// passes a `NamedMachineTrust` per operation to `ProveAsync` -- so this refuses everybody.
         RefusingTrust presenceTrust;
-        Node::NodeProofClient prover { id, key, presenceTrust, random };
+        Node::NodeProofClient prover { id, key, presenceTrust, nullptr, nullptr, random };
         RecordingConnector connector;
         AtomicMetricsSink metrics;
         NullLogger logger;

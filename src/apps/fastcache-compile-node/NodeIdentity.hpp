@@ -7,6 +7,7 @@
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 #include <FastCache/Core/StateFiles.hpp>
+#include <FastCache/Platform/ProcessExit.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <cstdint>
@@ -155,6 +156,67 @@ enum class IdentityNeed : std::uint8_t
 /// @return What this invocation is entitled to do about an identity.
 [[nodiscard]] IdentityNeed NodeIdentityNeed(NodeConfig const& cfg) noexcept;
 
+/// What went wrong resolving a node's identity.
+///
+/// Private: never transmitted or persisted.
+enum class NodeIdentityFault : std::uint8_t
+{
+    Unreadable,   ///< The identity file is there, and could not be read.
+    Empty,        ///< It was read, and holds nothing.
+    NotText,      ///< It was read, and does not hold text.
+    DrawFailed,   ///< The operating system's generator refused the bits a new identity needs.
+    CreateFailed, ///< The state directory could not be created.
+    WriteFailed,  ///< The identity could not be recorded.
+    Last,         ///< Not a fault, and has no row: the length of a table keyed by one.
+};
+
+/// A refusal, and the sentence an operator reads.
+struct NodeIdentityRefusal
+{
+    NodeIdentityFault fault { NodeIdentityFault::Unreadable }; ///< What went wrong, for a caller that decides on it.
+    std::string message;                                       ///< What an operator is told, naming the file.
+};
+
+/// One identity fault, and the step of a start it gives up at.
+struct NodeIdentityFaultStage
+{
+    NodeIdentityFault fault { NodeIdentityFault::Unreadable }; ///< The fault.
+    StartStage stage { StartStage::NodeIdentityIo };           ///< Which decides how a start AND a command end.
+};
+
+/// Every identity fault, by `StartStageRows`' rule: a verdict on the bytes of an identity file that
+/// was READ is `NodeIdentity` (refused, 78); a read, a directory, a write or a draw that failed is
+/// `NodeIdentityIo` (a failure, restarted), whatever its errno.
+///
+/// A ONE-SHOT command that mints -- `--print-identity`, `--install-service` -- ends by the same stage
+/// (`EndingOf`): an I/O arm is transient (1), a verdict a decision (2).
+inline constexpr auto NodeIdentityFaultStages = EnumTable<NodeIdentityFault, NodeIdentityFaultStage> { {
+    { .fault = NodeIdentityFault::Unreadable, .stage = StartStage::NodeIdentityIo },
+    { .fault = NodeIdentityFault::Empty, .stage = StartStage::NodeIdentity },
+    { .fault = NodeIdentityFault::NotText, .stage = StartStage::NodeIdentity },
+    { .fault = NodeIdentityFault::DrawFailed, .stage = StartStage::NodeIdentityIo },
+    { .fault = NodeIdentityFault::CreateFailed, .stage = StartStage::NodeIdentityIo },
+    { .fault = NodeIdentityFault::WriteFailed, .stage = StartStage::NodeIdentityIo },
+} };
+static_assert(RowsInEnumeratorOrder(NodeIdentityFaultStages, [](NodeIdentityFaultStage const& row) { return row.fault; }),
+              "every NodeIdentityFault needs a stage, at its own index");
+
+/// The step of a start @p fault gives up at.
+/// @param fault What went wrong with the identity.
+/// @return `NodeIdentity` for a verdict on bytes read, `NodeIdentityIo` for an I/O arm.
+[[nodiscard]] constexpr StartStage StageOf(NodeIdentityFault fault) noexcept
+{
+    return NodeIdentityFaultStages[static_cast<std::size_t>(fault)].stage;
+}
+
+/// How a one-shot command that stopped on @p fault ended.
+/// @param fault What went wrong with the identity.
+/// @return `Failed` for an I/O arm, `Declined` for a verdict on the bytes read.
+[[nodiscard]] constexpr CommandEnding EndingOf(NodeIdentityFault fault) noexcept
+{
+    return EndingOf(StageOf(fault));
+}
+
 /// Read this node's recorded identity, minting one if the directory holds none.
 ///
 /// **Minted FRESH, never derived from the machine**, and that is a decision against
@@ -173,8 +235,9 @@ enum class IdentityNeed : std::uint8_t
 ///
 /// A recorded value that is empty or is not text is a REFUSAL, never a re-mint: an
 /// identity this cluster has already admitted must not be replaced because a file
-/// was hard to read. Whoever meets that message can delete the file deliberately and
-/// take the consequences knowingly.
+/// was hard to read. Nor is a file that is there and cannot be read taken for an
+/// absent one: that is refused as well, as the I/O failure it is. Whoever meets that message can delete the file
+/// deliberately and take the consequences knowingly.
 ///
 /// And so is a mint whose bits cannot be drawn (#1527): nothing is written, and the
 /// caller refuses to start rather than running under an identity drawn from anywhere
@@ -183,9 +246,8 @@ enum class IdentityNeed : std::uint8_t
 /// @param configured What `--node-id` said, or empty.
 /// @param random Where a minted identity's bits come from.
 /// @return The identity and how it was arrived at, or why it could not be.
-[[nodiscard]] std::expected<NodeIdentity, std::string> ResolveNodeIdentity(std::filesystem::path const& stateDirectory,
-                                                                           std::string_view configured,
-                                                                           ISecureRandom& random);
+[[nodiscard]] std::expected<NodeIdentity, NodeIdentityRefusal> ResolveNodeIdentity(
+    std::filesystem::path const& stateDirectory, std::string_view configured, ISecureRandom& random);
 
 /// The id recorded in @p stateDirectory, read and never minted.
 ///

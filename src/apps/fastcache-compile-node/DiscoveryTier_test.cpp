@@ -533,7 +533,7 @@ TEST_CASE("Discovery on a consensus port bound to loopback stands down when defa
     NodeConditions typedConditions;
     auto const refused = StartDiscoveryOrExplain(typed, consensus, answered, typedConditions, metrics, logger);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error() == DiscoveryAnnouncesOnlyThisMachineRefusal);
+    CHECK(refused.error().reason == DiscoveryAnnouncesOnlyThisMachineRefusal);
 
     // And the startup table refuses the typed one first, where an install is judged too; the
     // defaulted one it accepts, since standing down is the answer for it.
@@ -587,7 +587,7 @@ TEST_CASE("Discovery defaulted on a node running no consensus starts nothing, an
     typed.discoveryAddressExplicit = true;
     auto const refused = StartDiscoveryOrExplain(typed, none, answered, conditions, metrics, logger);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().starts_with("--discovery needs --listen-raft"));
+    CHECK(refused.error().reason.starts_with("--discovery needs --listen-raft"));
 }
 
 TEST_CASE("A named --discovery is beaconed exactly, and an unnamed one on every link's directed broadcast",
@@ -961,4 +961,29 @@ TEST_CASE("A beacon refused everywhere is said at most once an interval, with ho
     CHECK(refused.Refused() == 5);
     CHECK(node.Warnings() == 2);
     CHECK(node.Warnings("(4 refused since the last such line") == 1);
+}
+
+TEST_CASE("The discovery tier refuses a node without consensus in the startup table's words", "[node][discovery]")
+{
+    // The belt and the braces said different things: the table named `--listen-raft`, the tier
+    // `--node-id` -- a flag that has not turned consensus on since #1022, which an operator reading
+    // the tier's sentence would add to no effect.
+    // TYPED, on a node that turned consensus off: a defaulted `--discovery` there starts nothing.
+    NodeConfig cfg;
+    cfg.raftListen.clear();
+    cfg.discoveryAddress = "255.255.255.255:6681";
+    cfg.discoveryAddressExplicit = true;
+    AtomicMetricsSink metrics;
+    NullLogger logger;
+    std::unique_ptr<ConsensusTier> const none;
+    NodeConditions conditions;
+    FixedFleetSummary const answered { AnsweredFleetSummary(cfg) };
+
+    auto const started = StartDiscoveryOrExplain(cfg, none, answered, conditions, metrics, logger);
+    REQUIRE_FALSE(started.has_value());
+    CHECK(started.error().reason == DiscoveryNeedsConsensusRefusal);
+    CHECK(started.error().cause == NodeRefusalCause::EarlierRule);
+    auto const table = StartupPolicyRejection(cfg);
+    REQUIRE(table.has_value());
+    CHECK(Unwrap(table) == started.error().reason);
 }

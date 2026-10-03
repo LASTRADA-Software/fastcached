@@ -80,9 +80,9 @@ std::string RenderCordonReply(Wire::CordonFields const& fields)
     return std::format("worker {}\n", sentence);
 }
 
-std::expected<std::string, std::string> PutCordonRequest(core::net::ISocket& client,
-                                                         Wire::CordonAction action,
-                                                         std::string_view endpoint)
+std::expected<std::string, UnfinishedCommand> PutCordonRequest(core::net::ISocket& client,
+                                                               Wire::CordonAction action,
+                                                               std::string_view endpoint)
 {
     // Through the launcher's own exchange, for `PutClusterRequest`'s reason: a second copy of the
     // framing would differ. Silent and never consulted: a notice reports a credential the peer
@@ -91,21 +91,22 @@ std::expected<std::string, std::string> PutCordonRequest(core::net::ISocket& cli
     auto const outcome = core::async::syncRun(Cc::ExchangeFramed(&client, &notice, Wire::EncodeCordonRequest(action)));
 
     if (outcome.kind == Cc::CacheOutcomeKind::Transport)
-        return std::unexpected { std::format("the node at {} did not answer", endpoint) };
+        return std::unexpected { Unanswered(outcome, std::format("the node at {} did not answer", endpoint)) };
     if (outcome.kind == Cc::CacheOutcomeKind::Rejected)
-        return std::unexpected { Cc::DescribeOutcome(outcome) };
+        return std::unexpected { Unanswered(outcome, Cc::DescribeOutcome(outcome)) };
 
     auto const fields = Wire::DecodeCordonFields(outcome.value);
     if (!fields.has_value())
-        return std::unexpected { std::format("{} answered with a body this client cannot read", endpoint) };
+        return std::unexpected { Unanswered(outcome,
+                                            std::format("{} answered with a body this client cannot read", endpoint)) };
     return RenderCordonReply(*fields);
 }
 
-std::expected<std::string, std::string> RunCordonAdmin(NodeConfig const& cfg, CordonCommand command)
+std::expected<std::string, UnfinishedCommand> RunCordonAdmin(NodeConfig const& cfg, CordonCommand command)
 {
     auto const bound = SoleEndpointOf(NodeSurface::Node, cfg);
     if (!bound.has_value())
-        return std::unexpected { bound.error() };
+        return std::unexpected { Unanswered(AnswerSource::Local, bound.error()) };
     auto const endpoint = SelfDialEndpoint(*bound);
 
     // A one-shot CLI on the process main thread: no reactor exists here, so this
@@ -114,8 +115,9 @@ std::expected<std::string, std::string> RunCordonAdmin(NodeConfig const& cfg, Co
                                              core::net::BlockingConnectorOptions { .ioTimeout = DialTimeout } };
     auto client = Cc::DialEndpointBlocking(connector, endpoint, core::net::DialOptions { .connectTimeout = DialTimeout });
     if (client == nullptr)
-        return std::unexpected { std::format(
-            "cannot reach this machine's node at {}; a cordon is asked of the node running here", endpoint) };
+        return std::unexpected { Unanswered(
+            AnswerSource::Transport,
+            std::format("cannot reach this machine's node at {}; a cordon is asked of the node running here", endpoint)) };
 
     auto const action = command == CordonCommand::Cordon ? Wire::CordonAction::Cordon : Wire::CordonAction::Lift;
     return PutCordonRequest(*client, action, endpoint);

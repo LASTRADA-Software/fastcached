@@ -9,6 +9,7 @@
 #include <FastCache/Core/SecureBytes.hpp>
 #include <FastCache/Core/StateFiles.hpp>
 #include <FastCache/Platform/FileTrust.hpp>
+#include <FastCache/Platform/ProcessExit.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -92,6 +93,61 @@ struct NodeKeyRefusal
     NodeKeyFault fault { NodeKeyFault::Unreadable }; ///< What went wrong, for a caller that decides on it.
     std::string message;                             ///< What an operator is told, naming the file.
 };
+
+/// One key fault, and the step of a start it gives up at.
+struct NodeKeyFaultStage
+{
+    NodeKeyFault fault { NodeKeyFault::Unreadable }; ///< The fault.
+    StartStage stage { StartStage::IdentityKeyIo };  ///< Which decides how a start AND a command end.
+};
+
+/// Every key fault, by `StartStageRows`' rule: a verdict on the bytes of a key file that was
+/// READ is `IdentityKey` (refused, 78); an open, a read, a write or a draw that failed is
+/// `IdentityKeyIo` (a failure, restarted), whatever its errno.
+///
+/// A verdict on who may reach the file or its state directory -- an access list, an owner, a link,
+/// an entry no row names -- was read from the filesystem and is judged the same way at the next
+/// start, so it is `IdentityKey` too. An access list that could not be SET on a new file, or a
+/// question about writers the filesystem would not answer, is an arm that failed: `IdentityKeyIo`.
+///
+/// A ONE-SHOT command that mints -- `--print-identity` -- ends by the same stage (`EndingOf`): an I/O
+/// arm is transient (1), a verdict a decision (2).
+inline constexpr auto NodeKeyFaultStages = EnumTable<NodeKeyFault, NodeKeyFaultStage> { {
+    { .fault = NodeKeyFault::Unreadable, .stage = StartStage::IdentityKeyIo },
+    { .fault = NodeKeyFault::Truncated, .stage = StartStage::IdentityKey },
+    { .fault = NodeKeyFault::NotAKeyFile, .stage = StartStage::IdentityKey },
+    { .fault = NodeKeyFault::ForeignFormat, .stage = StartStage::IdentityKey },
+    { .fault = NodeKeyFault::Damaged, .stage = StartStage::IdentityKey },
+    { .fault = NodeKeyFault::Exposed, .stage = StartStage::IdentityKey },
+    { .fault = NodeKeyFault::ForeignOwner, .stage = StartStage::IdentityKey },
+    { .fault = NodeKeyFault::OpenDirectory, .stage = StartStage::IdentityKey },
+    { .fault = NodeKeyFault::LinkEntry, .stage = StartStage::IdentityKey },
+    { .fault = NodeKeyFault::DrawFailed, .stage = StartStage::IdentityKeyIo },
+    { .fault = NodeKeyFault::WriteFailed, .stage = StartStage::IdentityKeyIo },
+    { .fault = NodeKeyFault::Unprotectable, .stage = StartStage::IdentityKeyIo },
+    { .fault = NodeKeyFault::UnknownEntry, .stage = StartStage::IdentityKey },
+    { .fault = NodeKeyFault::OthersMayWrite, .stage = StartStage::IdentityKey },
+    { .fault = NodeKeyFault::NotARegularFile, .stage = StartStage::IdentityKey },
+    { .fault = NodeKeyFault::WritersUndetermined, .stage = StartStage::IdentityKeyIo },
+} };
+static_assert(RowsInEnumeratorOrder(NodeKeyFaultStages, [](NodeKeyFaultStage const& row) { return row.fault; }),
+              "every NodeKeyFault needs a stage, at its own index");
+
+/// The step of a start @p fault gives up at.
+/// @param fault What went wrong with the key.
+/// @return `IdentityKey` for a verdict on bytes read, `IdentityKeyIo` for an I/O arm.
+[[nodiscard]] constexpr StartStage StageOf(NodeKeyFault fault) noexcept
+{
+    return NodeKeyFaultStages[static_cast<std::size_t>(fault)].stage;
+}
+
+/// How a one-shot command that stopped on @p fault ended.
+/// @param fault What went wrong with the key.
+/// @return `Failed` for an I/O arm, `Declined` for a verdict on the bytes read.
+[[nodiscard]] constexpr CommandEnding EndingOf(NodeKeyFault fault) noexcept
+{
+    return EndingOf(StageOf(fault));
+}
 
 /// A node's identity key, and how it was arrived at.
 struct NodeKey

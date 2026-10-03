@@ -2,6 +2,7 @@
 #pragma once
 
 #include "FrameEndpoint.hpp"
+#include "NodeRefusal.hpp"
 #include "Responders.hpp"
 
 #include <FastCache/Core/Logger.hpp>
@@ -143,7 +144,7 @@ class NodeFrameSurface
 /// @param metrics Where the endpoint's own at-capacity refusal is counted.
 /// @param logger Where the bound address, or the tolerated failure, is announced.
 /// @return The surface, a null surface meaning "carry on without one", or the reason.
-[[nodiscard]] std::expected<std::unique_ptr<NodeFrameSurface>, std::string> StartNodeSurfaceOrExplain(
+[[nodiscard]] std::expected<std::unique_ptr<NodeFrameSurface>, NodeRefusal> StartNodeSurfaceOrExplain(
     NodeIoLoop& io,
     NodeConfig const& cfg,
     SurfaceComponents const& components,

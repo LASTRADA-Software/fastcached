@@ -978,8 +978,8 @@ enum class ErrorCode : std::uint8_t
     /// replicating. Under the wrong code an operator is sent to correct a record
     /// that is already correct, once per reconcile interval.
     ///
-    /// Retriable, and the ONE code here that is: everything else in this range is
-    /// a refusal the caller stops asking about.
+    /// Retriable, and the ONE code in this range that is (`ErrorDescriptor::retry`):
+    /// everything else here is a refusal the caller stops asking about.
     ClusterChangeInFlight = 0x1F,
 
     /// The change asked for is already in force, so nothing was recorded.
@@ -2641,91 +2641,218 @@ static_assert(JoiningVerbsNeedAnIdentity(),
 static_assert(ControlVerbsNeedAnIdentifiedCaller(),
               "exactly the cluster control verbs and EnrollControl require an identified caller -- see IdentityRequirement");
 
-/// One row of the error table: the code, its stable name, and the message sent
-/// when the caller has nothing more specific to say.
+/// Whether asking again, UNCHANGED, may be answered differently -- with nobody acting on the
+/// request in between.
+///
+/// **What a script reading a one-shot verb's exit acts on**: a refusal that may clear by itself
+/// is 1, retry, and one that will be given again is 2, do not. The code is a structured fact the
+/// PEER states, not words, so its permanence is stated here, once, per code -- where the code's
+/// own documentation already argues it -- rather than guessed by each reader.
+///
+/// **A type rather than a `bool`, for `PreAuth`'s reason**: the default constructor is deleted,
+/// so an `ErrorTable` row that does not state its answer does not compile, and a new code cannot
+/// inherit a permanence nobody decided. Every row also says WHY (`retryWhy`), and
+/// `EveryRetryIsReasoned` refuses an empty one.
+///
+/// **PRIVATE: in-process only.** Neither end transmits it; each reads it off its own table.
+class Retry
+{
+  public:
+    /// Deleted on purpose: a row must state its answer. See the class comment.
+    Retry() = delete;
+
+    /// @param mayHelp True when the same request asked again may be answered differently.
+    constexpr explicit Retry(bool mayHelp) noexcept:
+        _mayHelp { mayHelp }
+    {
+    }
+
+    /// @return True when the same request asked again may be answered differently.
+    [[nodiscard]] constexpr bool MayHelp() const noexcept
+    {
+        return _mayHelp;
+    }
+
+  private:
+    bool _mayHelp;
+};
+
+/// The refusal may clear by itself: the same request, asked again, may be served.
+inline constexpr Retry RetryMayHelp { true };
+
+/// The refusal will be given again until somebody changes something.
+inline constexpr Retry RetryWillNotHelp { false };
+
+/// One row of the error table: the code, its stable name, the message sent when the
+/// caller has nothing more specific to say, and whether asking again may help.
 struct ErrorDescriptor
 {
     ErrorCode code;                  ///< The wire byte.
     std::string_view name;           ///< Stable lower-case name, for logs and tests.
     std::string_view defaultMessage; ///< Human-readable text sent when no detail is supplied.
+    Retry retry;                     ///< Whether the same request asked again may be answered differently.
+    std::string_view retryWhy;       ///< Why, for this code.
 };
 
 /// Every error code this build emits. Size deduced, for the reason `OpTable`'s is.
 inline constexpr std::array ErrorTable {
-    ErrorDescriptor {
-        .code = ErrorCode::UnsupportedVersion, .name = "unsupported-version", .defaultMessage = "unsupported wire version" },
-    ErrorDescriptor { .code = ErrorCode::UnknownOpcode, .name = "unknown-opcode", .defaultMessage = "unknown opcode" },
-    ErrorDescriptor { .code = ErrorCode::MalformedFrame, .name = "malformed-frame", .defaultMessage = "malformed frame" },
-    ErrorDescriptor {
-        .code = ErrorCode::PayloadTooLarge, .name = "payload-too-large", .defaultMessage = "payload too large" },
-    ErrorDescriptor {
-        .code = ErrorCode::MalformedValue, .name = "malformed-value", .defaultMessage = "malformed compile-value frame" },
-    ErrorDescriptor {
-        .code = ErrorCode::StorageWriteFailed, .name = "storage-write-failed", .defaultMessage = "storage write failed" },
-    ErrorDescriptor {
-        .code = ErrorCode::Unauthenticated, .name = "unauthenticated", .defaultMessage = "authentication required" },
-    ErrorDescriptor {
-        .code = ErrorCode::NoWorker, .name = "no-worker", .defaultMessage = "no worker matches this toolchain" },
-    ErrorDescriptor {
-        .code = ErrorCode::NoCapacity, .name = "no-capacity", .defaultMessage = "every matching worker is busy" },
+    ErrorDescriptor { .code = ErrorCode::UnsupportedVersion,
+                      .name = "unsupported-version",
+                      .defaultMessage = "unsupported wire version",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the two builds' wire ranges do not meet until one of them is upgraded" },
+    ErrorDescriptor { .code = ErrorCode::UnknownOpcode,
+                      .name = "unknown-opcode",
+                      .defaultMessage = "unknown opcode",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "this peer's build does not know the verb, and will not learn it while asked" },
+    ErrorDescriptor { .code = ErrorCode::MalformedFrame,
+                      .name = "malformed-frame",
+                      .defaultMessage = "malformed frame",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the same bytes are malformed the same way every time" },
+    ErrorDescriptor { .code = ErrorCode::PayloadTooLarge,
+                      .name = "payload-too-large",
+                      .defaultMessage = "payload too large",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the same payload exceeds the same cap every time" },
+    ErrorDescriptor { .code = ErrorCode::MalformedValue,
+                      .name = "malformed-value",
+                      .defaultMessage = "malformed compile-value frame",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the same value fails to decode the same way every time" },
+    ErrorDescriptor { .code = ErrorCode::StorageWriteFailed,
+                      .name = "storage-write-failed",
+                      .defaultMessage = "storage write failed",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "the peer's own storage failed, an I/O arm at the other end that a retry may get past" },
+    ErrorDescriptor { .code = ErrorCode::Unauthenticated,
+                      .name = "unauthenticated",
+                      .defaultMessage = "authentication required",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the same credential is refused the same way until an operator changes one" },
+    ErrorDescriptor { .code = ErrorCode::NoWorker,
+                      .name = "no-worker",
+                      .defaultMessage = "no worker matches this toolchain",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "a booting fleet has none yet: a node registers nothing until its survey is real, "
+                                  "and a restarted scheduler's registry starts empty" },
+    ErrorDescriptor { .code = ErrorCode::NoCapacity,
+                      .name = "no-capacity",
+                      .defaultMessage = "every matching worker is busy",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "every matching worker is busy with this fleet's own work, which finishes" },
     ErrorDescriptor { .code = ErrorCode::AlreadyInFlight,
                       .name = "already-in-flight",
-                      .defaultMessage = "another client is already compiling this key" },
+                      .defaultMessage = "another client is already compiling this key",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "another client's compile of this key finishes, and the key is then cached or free" },
     ErrorDescriptor { .code = ErrorCode::DispatchNotPermitted,
                       .name = "dispatch-not-permitted",
-                      .defaultMessage = "this endpoint does not serve distributed execution" },
-    ErrorDescriptor {
-        .code = ErrorCode::UnknownLease, .name = "unknown-lease", .defaultMessage = "unknown or expired lease" },
+                      .defaultMessage = "this endpoint does not serve distributed execution",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "this listener's roles do not change while it runs" },
+    ErrorDescriptor { .code = ErrorCode::UnknownLease,
+                      .name = "unknown-lease",
+                      .defaultMessage = "unknown or expired lease",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "a token this scheduler does not hold stays unknown; a retry needs a new lease" },
     ErrorDescriptor { .code = ErrorCode::FingerprintMismatch,
                       .name = "fingerprint-mismatch",
-                      .defaultMessage = "this worker's toolchain is not the one the lease named" },
-    ErrorDescriptor {
-        .code = ErrorCode::UnsupportedCodec, .name = "unsupported-codec", .defaultMessage = "no codec in common" },
+                      .defaultMessage = "this worker's toolchain is not the one the lease named",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "this worker serves another toolchain, and goes on serving it" },
+    ErrorDescriptor { .code = ErrorCode::UnsupportedCodec,
+                      .name = "unsupported-codec",
+                      .defaultMessage = "no codec in common",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the two ends' codec lists do not meet until one of them changes" },
     ErrorDescriptor { .code = ErrorCode::WorkerScratchUnavailable,
                       .name = "worker-scratch-unavailable",
-                      .defaultMessage = "the worker could not prepare a scratch directory" },
+                      .defaultMessage = "the worker could not prepare a scratch directory",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "a full or unwritable scratch disk waits for an operator" },
     ErrorDescriptor { .code = ErrorCode::WorkerSpawnFailed,
                       .name = "worker-spawn-failed",
-                      .defaultMessage = "the worker could not start the compiler" },
+                      .defaultMessage = "the worker could not start the compiler",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the compiler the worker names cannot be run until its configuration changes" },
     ErrorDescriptor { .code = ErrorCode::WorkerCompilerUnclassified,
                       .name = "worker-compiler-unclassified",
-                      .defaultMessage = "the worker cannot classify its own configured compiler" },
-    ErrorDescriptor {
-        .code = ErrorCode::NotLeader, .name = "not-leader", .defaultMessage = "this node does not lead the cluster" },
-    ErrorDescriptor {
-        .code = ErrorCode::NotAMember, .name = "not-a-member", .defaultMessage = "not a member of this cluster" },
+                      .defaultMessage = "the worker cannot classify its own configured compiler",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "this build does not recognise the worker's compiler, and will not while asked" },
+    ErrorDescriptor { .code = ErrorCode::NotLeader,
+                      .name = "not-leader",
+                      .defaultMessage = "this node does not lead the cluster",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "it names where to ask instead, and the same ask here gets the same name; one naming "
+                                  "NOBODY is an election, which the reader of the message decides" },
+    ErrorDescriptor { .code = ErrorCode::NotAMember,
+                      .name = "not-a-member",
+                      .defaultMessage = "not a member of this cluster",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "membership is an operator's decision" },
     ErrorDescriptor { .code = ErrorCode::Withdrawn,
                       .name = "withdrawn",
-                      .defaultMessage = "every matching worker has withdrawn its capacity" },
-    ErrorDescriptor { .code = ErrorCode::NoCluster, .name = "no-cluster", .defaultMessage = "this node runs no cluster" },
+                      .defaultMessage = "every matching worker has withdrawn its capacity",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "the matching workers' machines are busy with something else, which ends" },
+    ErrorDescriptor { .code = ErrorCode::NoCluster,
+                      .name = "no-cluster",
+                      .defaultMessage = "this node runs no cluster",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "this node runs no cluster, and the remedy is another address" },
     ErrorDescriptor { .code = ErrorCode::InvalidClusterChange,
                       .name = "invalid-cluster-change",
-                      .defaultMessage = "the cluster cannot accept that change" },
+                      .defaultMessage = "the cluster cannot accept that change",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the cluster could never accept the change as asked" },
     ErrorDescriptor { .code = ErrorCode::ClusterChangeInFlight,
                       .name = "cluster-change-in-flight",
-                      .defaultMessage = "another cluster change is still committing; ask again shortly" },
+                      .defaultMessage = "another cluster change is still committing; ask again shortly",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "the change already accepted finishes committing, and this one is then admitted" },
     ErrorDescriptor { .code = ErrorCode::ClusterChangeNotNeeded,
                       .name = "cluster-change-not-needed",
-                      .defaultMessage = "the cluster is already in that state" },
+                      .defaultMessage = "the cluster is already in that state",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the cluster is already in that state, and stays in it" },
     ErrorDescriptor { .code = ErrorCode::EndpointBusy,
                       .name = "endpoint-busy",
-                      .defaultMessage = "this endpoint is serving all it will serve at once" },
+                      .defaultMessage = "this endpoint is serving all it will serve at once",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "this endpoint's own bound frees as the requests it holds finish" },
     ErrorDescriptor { .code = ErrorCode::MalformedRegistration,
                       .name = "malformed-registration",
-                      .defaultMessage = "a worker must name itself in UTF-8" },
+                      .defaultMessage = "a worker must name itself in UTF-8",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the same bytes are not text the same way every time" },
     ErrorDescriptor { .code = ErrorCode::LeaseUnauthorized,
                       .name = "lease-unauthorized",
-                      .defaultMessage = "this lease was not issued by this cluster" },
+                      .defaultMessage = "this lease was not issued by this cluster",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "a token no voter this worker trusts issued stays unauthorized" },
     ErrorDescriptor { .code = ErrorCode::LeaseEndpointMismatch,
                       .name = "lease-endpoint-mismatch",
-                      .defaultMessage = "this lease was issued for another worker" },
-    ErrorDescriptor { .code = ErrorCode::LeaseExpired, .name = "lease-expired", .defaultMessage = "this lease has expired" },
+                      .defaultMessage = "this lease was issued for another worker",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the lease names another worker, and always will" },
+    ErrorDescriptor { .code = ErrorCode::LeaseExpired,
+                      .name = "lease-expired",
+                      .defaultMessage = "this lease has expired",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "an expired lease stays expired; a retry needs a new one" },
     ErrorDescriptor { .code = ErrorCode::WorkerToolchainSurveyInFlight,
                       .name = "worker-toolchain-survey-in-flight",
-                      .defaultMessage = "this worker is still identifying its toolchains" },
+                      .defaultMessage = "this worker is still identifying its toolchains",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "the survey completes or the node exits: transient by construction" },
     ErrorDescriptor { .code = ErrorCode::RequestDeadlineExceeded,
                       .name = "request-deadline-exceeded",
-                      .defaultMessage = "this request outran the window this surface allows" },
+                      .defaultMessage = "this request outran the window this surface allows",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the same work outruns the same window; the remedy is the timeout" },
     // The default names no generation, because the generations are what an operator
     // acts on and neither of them is known here. Both surfaces send
     // `ForeignGenerationMessage`, which states them; this sentence is what a caller
@@ -2733,50 +2860,117 @@ inline constexpr std::array ErrorTable {
     ErrorDescriptor { .code = ErrorCode::ForeignValueGeneration,
                       .name = "foreign-value-generation",
                       .defaultMessage = "stored value names a canonicalization generation this build does not "
-                                        "implement" },
+                                        "implement",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the two generations do not meet until the rollout finishes" },
     ErrorDescriptor { .code = ErrorCode::EnrollmentFull,
                       .name = "enrollment-full",
-                      .defaultMessage = "the enrollment list is full; nothing was recorded" },
+                      .defaultMessage = "the enrollment list is full; nothing was recorded",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "nothing about this machine was decided, and the list drains as an operator decides" },
     ErrorDescriptor { .code = ErrorCode::UnknownFleetSelector,
                       .name = "unknown-fleet-selector",
-                      .defaultMessage = "this build serves no fleet section or range by that name" },
+                      .defaultMessage = "this build serves no fleet section or range by that name",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "this build serves no selector by that name, and will not while asked" },
     ErrorDescriptor { .code = ErrorCode::NodeProofUnchallenged,
                       .name = "node-proof-unchallenged",
-                      .defaultMessage = "no challenge is outstanding on this connection; ask for one first" },
+                      .defaultMessage = "no challenge is outstanding on this connection; ask for one first",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the exchange was got wrong, and the same exchange is wrong again" },
     ErrorDescriptor { .code = ErrorCode::NodeProofRejected,
                       .name = "node-proof-rejected",
-                      .defaultMessage = "the node proof's signature does not verify under the key it presented" },
+                      .defaultMessage = "the node proof's signature does not verify under the key it presented",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the signature does not verify, and the same signature never will" },
     ErrorDescriptor { .code = ErrorCode::RosterExpired,
                       .name = "roster-expired",
                       .defaultMessage = "this worker holds no roster its voters currently certify, so it can verify no "
-                                        "grant" },
+                                        "grant",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "the worker's roster is re-certified once its voters are reachable again" },
     ErrorDescriptor { .code = ErrorCode::NodeKeyUnknown,
                       .name = "node-key-unknown",
-                      .defaultMessage = "this cluster holds no such identity key for that node; it has not been admitted" },
+                      .defaultMessage = "this cluster holds no such identity key for that node; it has not been admitted",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "admitting a key is an operator's decision" },
     ErrorDescriptor { .code = ErrorCode::NodeKeyRevoked,
                       .name = "node-key-revoked",
-                      .defaultMessage = "this cluster has revoked that identity key; the machine was forgotten" },
+                      .defaultMessage = "this cluster has revoked that identity key; the machine was forgotten",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "a revoked key is never admitted again" },
     ErrorDescriptor { .code = ErrorCode::NodeIdentityRequired,
                       .name = "node-identity-required",
-                      .defaultMessage = "only a node that has proved its identity on this connection may send that verb" },
+                      .defaultMessage = "only a node that has proved its identity on this connection may send that verb",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the connection must prove an identity first, and the same connection has not" },
     ErrorDescriptor { .code = ErrorCode::EnrollmentHostFull,
                       .name = "enrollment-host-full",
                       .defaultMessage = "this host already has as many enrollment requests waiting as one host may; "
-                                        "nothing was recorded" },
+                                        "nothing was recorded",
+                      .retry = RetryMayHelp,
+                      .retryWhy = "nothing about this machine was decided, and the host's rows drain as an operator decides" },
     ErrorDescriptor { .code = ErrorCode::TicketRefused,
                       .name = "ticket-refused",
                       .defaultMessage = "this node did not accept the machine ticket presented; the reason is named in "
-                                        "the message" },
+                                        "the message",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the node judged what the ticket names, and judges the same machine the same way until its standing changes" },
     ErrorDescriptor { .code = ErrorCode::IdentifiedCallerRequired,
                       .name = "identified-caller-required",
                       .defaultMessage = "an operator's control verb needs a caller this node can identify -- from this "
                                         "machine, or by a proven node key or a machine ticket; --fleet-open admits "
-                                        "nobody to it" },
+                                        "nobody to it",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "who the caller is does not change by asking again" },
     ErrorDescriptor { .code = ErrorCode::NotSharedCache,
                       .name = "not-shared-cache",
                       .defaultMessage = "this machine is not the fleet's shared cache; the shared-cache setting names "
-                                        "another machine, or none" },
+                                        "another machine, or none",
+                      .retry = RetryWillNotHelp,
+                      .retryWhy = "the shared-cache setting is the cluster's, and names another machine until an operator changes it" },
 };
+
+/// Whether every row says why asking again may or may not help.
+/// @return True when no `ErrorTable` row leaves `retryWhy` empty.
+[[nodiscard]] consteval bool EveryRetryIsReasoned() noexcept
+{
+    return std::ranges::none_of(ErrorTable, [](ErrorDescriptor const& row) { return row.retryWhy.empty(); });
+}
+
+static_assert(EveryRetryIsReasoned(), "every error code says why asking again may or may not help");
+
+/// The codes a one-shot verb meeting them should retry, written out once more so a row that
+/// changes its answer fails the BUILD by name rather than turning a script's retry into a stop:
+/// the direction that costs is a transient refusal read as a decision, which gives up on a
+/// healthy cluster mid-election or mid-change.
+inline constexpr std::array RetriableErrorCodes {
+    ErrorCode::StorageWriteFailed,
+    ErrorCode::NoWorker,
+    ErrorCode::NoCapacity,
+    ErrorCode::AlreadyInFlight,
+    ErrorCode::Withdrawn,
+    ErrorCode::ClusterChangeInFlight,
+    ErrorCode::EndpointBusy,
+    ErrorCode::WorkerToolchainSurveyInFlight,
+    ErrorCode::EnrollmentFull,
+    ErrorCode::EnrollmentHostFull,
+    ErrorCode::RosterExpired,
+};
+
+/// Whether the table's retriable rows are exactly `RetriableErrorCodes`.
+/// @return True when the two agree in both directions.
+[[nodiscard]] consteval bool RetriableCodesArePinned() noexcept
+{
+    return std::ranges::all_of(ErrorTable,
+                               [](ErrorDescriptor const& row) {
+                                   return row.retry.MayHelp() == std::ranges::contains(RetriableErrorCodes, row.code);
+                               })
+           && std::ranges::count_if(ErrorTable, [](ErrorDescriptor const& row) { return row.retry.MayHelp(); })
+                  == std::ssize(RetriableErrorCodes);
+}
+
+static_assert(RetriableCodesArePinned(), "ErrorTable's retriable rows and RetriableErrorCodes must name the same codes");
 
 /// Wire bytes that once meant something and must never mean anything again.
 ///
@@ -2953,6 +3147,16 @@ static_assert(FieldCountsAgree(), "a verb carries fields, or is listed as carryi
         if (row.code == code)
             return &row;
     return nullptr;
+}
+
+/// Whether the same request, asked again, may be answered differently than by @p code.
+/// @param code The refusal.
+/// @return The row's answer; false for a code this build does not know, which is a refusal it
+///         cannot read and reads as one it will be given again.
+[[nodiscard]] constexpr bool IsRetriable(ErrorCode code) noexcept
+{
+    auto const* const row = Describe(code);
+    return row != nullptr && row->retry.MayHelp();
 }
 
 /// Request field count for a known opcode, from the table.

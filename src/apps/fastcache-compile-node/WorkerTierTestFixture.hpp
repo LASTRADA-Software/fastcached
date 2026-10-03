@@ -160,7 +160,7 @@ struct WorkerTierFixture
     }
 
     /// Start a tier for `cfg` on a machine of sixteen cores.
-    [[nodiscard]] std::expected<std::unique_ptr<WorkerTier>, std::string> Start()
+    [[nodiscard]] std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> Start()
     {
         auto const makeMachine = [this] {
             ++machineBuilds;

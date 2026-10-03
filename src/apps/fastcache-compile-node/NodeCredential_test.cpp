@@ -513,7 +513,7 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
     auto const key = Testing::TestKeyPair("worker-a");
     AnyServer const trust;
     Testing::ScriptedSecureRandom random { Testing::CallerHandshakeScript() };
-    NodeProofClient const prover { "worker-a", key, trust, random };
+    NodeProofClient const prover { "worker-a", key, trust, nullptr, nullptr, random };
 
     auto const roundProvedBy = [&](NodeProofClient const* proving) {
         return HeartbeatRound { .cfg = cfg,

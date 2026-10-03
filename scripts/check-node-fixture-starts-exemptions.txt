@@ -14,4 +14,6 @@
 
 helper	scripts/dist-compile-e2e.sh	admit_worker	--print-identity over the state directory start_node hands it, which each call spells
 helper	scripts/node-scratch-isolation-e2e.ps1	Start-NodeIn	its body runs the argv each call spells as an @( ... ) block
+exempt	scripts/exit-codes-e2e.sh	"$NODE" --no-such-flag	refused while its command line is parsed, before any state directory is named or any port is opened
+exempt	scripts/node-config-file-e2e.sh	"$NODE" --no-such-flag	refused while its command line is parsed, before any state directory is named or any port is opened
 census	scripts/check-cli-node-flags.sh	"$exe" --help, through a function parameter	it reads the node's --help and nothing else: a one-shot verb, which binds nothing and writes no state

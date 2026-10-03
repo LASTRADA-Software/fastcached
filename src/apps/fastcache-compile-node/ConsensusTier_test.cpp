@@ -344,7 +344,8 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
             metrics,
             logger);
         REQUIRE_FALSE(tier.has_value());
-        CHECK(tier.error() == ConsensusNeedsNodeIdRefusal);
+        CHECK(tier.error().reason == ConsensusNeedsNodeIdRefusal);
+        CHECK(tier.error().cause == NodeRefusalCause::EarlierRule);
     }
 
     SECTION("an id and no address its peers dial is refused for the address")
@@ -369,7 +370,8 @@ TEST_CASE("A consensus tier is built exactly when RunsConsensus says so", "[node
             metrics,
             logger);
         REQUIRE_FALSE(tier.has_value());
-        CHECK(tier.error() == ConsensusNamesNoDialAddressRefusal);
+        CHECK(tier.error().reason == ConsensusNamesNoDialAddressRefusal);
+        CHECK(tier.error().cause == NodeRefusalCause::EarlierRule);
     }
 }
 
@@ -412,7 +414,8 @@ TEST_CASE("A consensus tier refuses to start without an identity key", "[node][c
                                 metrics,
                                 logger);
     REQUIRE_FALSE(tier.has_value());
-    CHECK(tier.error() == ConsensusNeedsIdentityKeyRefusal);
+    CHECK(tier.error().reason == ConsensusNeedsIdentityKeyRefusal);
+    CHECK(tier.error().cause == NodeRefusalCause::EarlierRule);
 }
 
 TEST_CASE("A listener handed to consensus is served only on the configured address, and closed when refused",
@@ -470,8 +473,8 @@ TEST_CASE("A listener handed to consensus is served only on the configured addre
     {
         auto const started = start(std::move(held));
         REQUIRE_FALSE(started.has_value());
-        CHECK(started.error().contains(std::format("bound to 127.0.0.1:{}", heldPort)));
-        CHECK(started.error().contains(std::format("names 127.0.0.1:{}", namedPort)));
+        CHECK(started.error().reason.contains(std::format("bound to 127.0.0.1:{}", heldPort)));
+        CHECK(started.error().reason.contains(std::format("names 127.0.0.1:{}", namedPort)));
         // Closed: the port it held can be claimed again, which a still-open listener forbids.
         auto const rebound = BlockingListener::Bind("127.0.0.1", heldPort);
         REQUIRE(rebound);
@@ -486,7 +489,7 @@ TEST_CASE("A listener handed to consensus is served only on the configured addre
         REQUIRE_FALSE(unbound->IsBound());
         auto const started = start(std::move(unbound));
         REQUIRE_FALSE(started.has_value());
-        CHECK(started.error().contains("the listener handed to consensus is not bound"));
+        CHECK(started.error().reason.contains("the listener handed to consensus is not bound"));
     }
 
     SECTION("the right port on another host is refused, naming both addresses")
@@ -496,8 +499,8 @@ TEST_CASE("A listener handed to consensus is served only on the configured addre
         cfg.raftListen = std::format("0.0.0.0:{}", heldPort);
         auto const started = start(std::move(held));
         REQUIRE_FALSE(started.has_value());
-        CHECK(started.error().contains(std::format("bound to 127.0.0.1:{}", heldPort)));
-        CHECK(started.error().contains(std::format("names 0.0.0.0:{}", heldPort)));
+        CHECK(started.error().reason.contains(std::format("bound to 127.0.0.1:{}", heldPort)));
+        CHECK(started.error().reason.contains(std::format("names 0.0.0.0:{}", heldPort)));
     }
 
     SECTION("a configured host NAME is refused rather than matched by its spelling")
@@ -505,7 +508,7 @@ TEST_CASE("A listener handed to consensus is served only on the configured addre
         cfg.raftListen = std::format("localhost:{}", heldPort);
         auto const started = start(std::move(held));
         REQUIRE_FALSE(started.has_value());
-        CHECK(started.error().contains("names its host by name"));
+        CHECK(started.error().reason.contains("names its host by name"));
     }
 }
 
@@ -1221,7 +1224,9 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         PlantConsensusState(directory, Testing::EncodePreviousClusterState(), currentCommand);
         auto const started = start();
         REQUIRE_FALSE(started.has_value());
-        auto const& refusal = started.error();
+        // A state this build cannot read is still unreadable to it at the next start.
+        CHECK(started.error().cause == NodeRefusalCause::ConsensusState);
+        auto const& refusal = started.error().reason;
         CAPTURE(refusal);
         CHECK(refusal.contains(directory.string()));
         CHECK(refusal.contains("the snapshot as of log entry 3"));
@@ -1239,7 +1244,8 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         PlantConsensusState(directory, currentSnapshot, Testing::EncodePreviousClusterCommand());
         auto const started = start();
         REQUIRE_FALSE(started.has_value());
-        auto const& refusal = started.error();
+        CHECK(started.error().cause == NodeRefusalCause::ConsensusState);
+        auto const& refusal = started.error().reason;
         CAPTURE(refusal);
         CHECK(refusal.contains(directory.string()));
         CHECK(refusal.contains("log entry 4"));
@@ -1264,11 +1270,11 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
         auto const started = start();
         REQUIRE_FALSE(started.has_value());
         auto const& refusal = started.error();
-        CAPTURE(refusal);
-        CHECK(refusal.contains(directory.string()));
-        CHECK(refusal.contains("log entry 4"));
-        CHECK(refusal.contains("verb 4 is retired"));
-        CHECK(refusal.contains(Consensus::UnreadableStateRemedy));
+        CAPTURE(refusal.reason);
+        CHECK(refusal.reason.contains(directory.string()));
+        CHECK(refusal.reason.contains("log entry 4"));
+        CHECK(refusal.reason.contains("verb 4 is retired"));
+        CHECK(refusal.reason.contains(Consensus::UnreadableStateRemedy));
         CHECK(published->load() == 0);
     }
 }
@@ -1724,7 +1730,7 @@ TEST_CASE("A node announces the seat its mode holds: a learner is never announce
     SECTION("a voter announces a voter's seat")
     {
         auto started = start(joinedAs(Cluster::NodeMode::Voter, "consensus-seat-voter"));
-        INFO("start: " << (started.has_value() ? std::string {} : started.error()));
+        INFO("start: " << (started.has_value() ? std::string {} : started.error().reason));
         REQUIRE(started.has_value());
         REQUIRE(*started != nullptr);
         CHECK((*started)->Self().seat == Cluster::MemberSeat::Voter);

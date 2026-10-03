@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <format>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -45,12 +46,22 @@ namespace
             // wrong -- a typo in `--config` -- and `ParseError` sends an operator
             // to look for a syntax mistake in a file that is not there.
             //
-            // The code is what monitoring and every caller switch on, and
-            // `FileNotFound` is documented for exactly this. yaml-cpp cannot tell
-            // absent from unreadable, so the sentence says both rather than
-            // asserting the one it did not check.
-            return std::unexpected(
-                MakeError(ConfigErrorCode::FileNotFound, path, {}, "no such file, or this account may not read it"));
+            // The code is what monitoring and every caller switch on. yaml-cpp cannot tell
+            // absent from unreadable, so this asks the filesystem which it was: a file that is
+            // not there is `FileNotFound`, and one that is there -- or whose presence cannot
+            // even be asked -- is `FileUnreadable`. They are different answers to an
+            // operator -- a path to correct, or a permission -- though both are I/O arms a
+            // supervisor retries (`ConfigurationFileStage`): at boot either may be a mount
+            // not back yet.
+            auto presence = std::error_code {};
+            if (!std::filesystem::exists(path, presence) && !presence)
+                return std::unexpected(MakeError(ConfigErrorCode::FileNotFound, path, {}, "no such file"));
+            return std::unexpected(MakeError(ConfigErrorCode::FileUnreadable,
+                                             path,
+                                             {},
+                                             presence
+                                                 ? std::format("cannot tell whether it is there: {}", presence.message())
+                                                 : std::string { "it is there, and this account may not read it" }));
         }
         catch (YAML::ParserException const& e)
         {

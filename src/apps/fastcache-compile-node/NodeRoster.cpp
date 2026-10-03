@@ -14,7 +14,7 @@
 namespace FastCache::Node
 {
 
-std::expected<std::unique_ptr<NodeRoster>, std::string> NodeRoster::Build(NodeConfig const& cfg,
+std::expected<std::unique_ptr<NodeRoster>, NodeRefusal> NodeRoster::Build(NodeConfig const& cfg,
                                                                           core::platform::WallClockRef wallClock,
                                                                           IMetricsSink& metrics,
                                                                           ILogger& logger)
@@ -36,7 +36,16 @@ std::expected<std::unique_ptr<NodeRoster>, std::string> NodeRoster::Build(NodeCo
         auto const path = chosen->path / Distributed::RosterFileName;
         auto loaded = Distributed::LoadPersistedRoster(path);
         if (!loaded.has_value())
-            return std::unexpected { std::format("{}{}", loaded.error(), StateFileUnreadableHint(path)) };
+        {
+            // By the ARM: a read that failed may succeed at the next start, and a roster that was
+            // read and cannot be used is a verdict the next start reaches again. Only the read arm
+            // is told how to hand the file to the service's account: the other was read.
+            if (loaded.error().step == Distributed::RosterLoadStep::Read)
+                return std::unexpected { Refusal(
+                    NodeRefusalCause::KeptRosterIo,
+                    std::format("{}{}", loaded.error().reason, StateFileUnreadableHint(path))) };
+            return std::unexpected { Refusal(NodeRefusalCause::KeptRoster, std::move(loaded).error().reason) };
+        }
         kept = *std::move(loaded);
         store = std::make_unique<Distributed::FileRosterStore>(path);
     }
@@ -48,7 +57,7 @@ std::expected<std::unique_ptr<NodeRoster>, std::string> NodeRoster::Build(NodeCo
         // same rule answered for a node whose directory turned out to hold nothing. `Absent`
         // is what this branch has just found out, at the one place that read the directory.
         if (RunsWorker(cfg) && CompileVerbsReachOtherMachines(cfg, RosterPresence::Absent))
-            return std::unexpected { std::string { RosterlessWorkerRefusal } };
+            return std::unexpected { Refusal(NodeRefusalCause::KeptRoster, std::string { RosterlessWorkerRefusal }) };
         return std::unique_ptr<NodeRoster> { new NodeRoster { wallClock, nullptr, nullptr, nullptr, metrics, logger } };
     }
 
@@ -95,10 +104,11 @@ ServerStanding NodeRoster::StandingOf(std::string_view serverId, Ed25519PublicKe
         return ServerStanding::Revoked;
     if (keys.live == serverKey)
         return ServerStanding::Voter;
-    // A consensus member whose applied state names no voter's key yet has nothing to place a server
-    // against -- itself included, when it schedules for itself. Calling that server a stranger made
-    // every such node refuse to prove itself to its OWN scheduler until a heartbeat round after the
-    // commit that recorded its key, warning at every start. The revocation above is still asked.
+    // A consensus member whose applied state names no voter yet has nothing to place a server
+    // against, so it answers `Unchecked` rather than calling every server a stranger; the
+    // revocation above is still asked. That is the one state left here: a voter record always
+    // carries its key, since `ClusterMember::publicKey` is required by type, so a keyless voter --
+    // the other state this branch once answered -- cannot be built.
     if (_state != nullptr && !_state->HoldsVoterKeys())
         return ServerStanding::Unchecked;
     return ServerStanding::NotVoter;

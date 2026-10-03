@@ -580,7 +580,7 @@ Distributed::NodeCacheLoad CacheLoadOf(CacheTier const* tier, IMetricsSink const
     return out;
 }
 
-std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(NodeConfig const& cfg,
+std::expected<std::unique_ptr<CacheTier>, NodeRefusal> StartCacheTierOrExplain(NodeConfig const& cfg,
                                                                                UpstreamParts const& upstream,
                                                                                ILocalityOracle const& locality,
                                                                                core::platform::IClock& clock,
@@ -632,21 +632,27 @@ std::expected<std::unique_ptr<CacheTier>, std::string> StartCacheTierOrExplain(N
     // type, so without this a bad `--cache-dir` reached the operator as
     // "--listen-node cannot create /var/lib/...: permission denied" -- which
     // sends them to check a port.
+    //
+    // `CacheStore` for all of it: creating the directory, a store another process holds and a store
+    // of another format are one text by the time it arrives here, and the first two may not refuse
+    // the next start.
     auto storage = BuildStorage(cfg, logger);
     if (!storage.has_value())
-        return std::unexpected { std::format("--cache-dir {}", storage.error()) };
+        return std::unexpected { Refusal(NodeRefusalCause::CacheStore, std::format("--cache-dir {}", storage.error())) };
 
     // The bind, and the judgement about a failed one, moved to
     // `StartNodeSurfaceOrExplain` with the surfaces (#290): a listener that carries
     // two components cannot have its failure judged by one of them.
-    return CacheTier::Start(cfg, std::move(*storage), upstream, locality, clock, metrics, logger);
+    return CacheTier::Start(cfg, std::move(*storage), upstream, locality, clock, metrics, logger)
+        .transform_error([](std::string reason) { return Refusal(NodeRefusalCause::CacheStore, std::move(reason)); });
 }
 
-std::expected<std::string, std::string> MigrateDiskTier(NodeConfig const& cfg)
+std::expected<std::string, UnfinishedCommand> MigrateDiskTier(NodeConfig const& cfg)
 {
     if (cfg.cacheDir.empty())
-        return std::unexpected { std::string {
-            "--migrate-cache needs --cache-dir: a memory-only node has no on-disk store to convert" } };
+        return std::unexpected { UnfinishedCommand {
+            .ending = CommandEnding::Declined,
+            .reason = "--migrate-cache needs --cache-dir: a memory-only node has no on-disk store to convert" } };
 
     auto const path = cfg.cacheDir / DiskStoreFileName;
     CowTreeStorage::Options options;
@@ -656,7 +662,8 @@ std::expected<std::string, std::string> MigrateDiskTier(NodeConfig const& cfg)
     auto const report = CowTreeStorage::Migrate(options);
     auto line = DescribeMigration(path, report);
     if (!report.has_value())
-        return std::unexpected { std::move(line) };
+        return std::unexpected { UnfinishedCommand { .ending = UnfinishedEnding(report.error().Transient()),
+                                                     .reason = std::move(line) } };
     return line;
 }
 

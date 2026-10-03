@@ -82,5 +82,7 @@ TEST_CASE("A kept roster that cannot be used refuses, never reads as none kept",
 
     auto const loaded = LoadPersistedRoster(path);
     REQUIRE_FALSE(loaded.has_value());
-    CHECK(loaded.error().contains(path.string()));
+    CHECK(loaded.error().reason.contains(path.string()));
+    // Read, and not a roster: a verdict on its bytes, which is a different answer from a read that failed.
+    CHECK(loaded.error().step == RosterLoadStep::Decode);
 }

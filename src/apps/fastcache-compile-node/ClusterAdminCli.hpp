@@ -3,6 +3,7 @@
 
 #include "EndpointDialer.hpp"
 #include "NodeConfig.hpp"
+#include "OneShotAnswer.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
 
@@ -76,10 +77,10 @@ struct ClusterExchange
 /// @param action What was asked.
 /// @param answer The last exchange: never a redirect `RunClusterAdmin` followed.
 /// @param scheduler Who gave it.
-/// @return What to print, or what went wrong.
-[[nodiscard]] std::expected<std::string, std::string> InterpretClusterAnswer(ClusterAction action,
-                                                                             ClusterExchange const& answer,
-                                                                             std::string_view scheduler);
+/// @return What to print, or what went wrong and where the answer came from (`AnswerSource`).
+[[nodiscard]] std::expected<std::string, UnfinishedCommand> InterpretClusterAnswer(ClusterAction action,
+                                                                                   ClusterExchange const& answer,
+                                                                                   std::string_view scheduler);
 
 /// Carry out one cluster-administration request against `cfg.schedulers`.
 ///
@@ -97,10 +98,11 @@ struct ClusterExchange
 /// @param request What to ask.
 /// @param credentials What each endpoint is shown: `OperatorCredentials` in production.
 /// @param dialer How each endpoint is reached; production never varies it.
-/// @return What to print, or what went wrong.
-[[nodiscard]] std::expected<std::string, std::string> RunClusterAdmin(NodeConfig const& cfg,
-                                                                      ClusterRequest const& request,
-                                                                      Cc::ICredentialFor& credentials,
-                                                                      IEndpointDialer& dialer = DefaultOneShotDialer());
+/// @return What to print, or what went wrong and where the answer came from (`AnswerSource`).
+[[nodiscard]] std::expected<std::string, UnfinishedCommand> RunClusterAdmin(
+    NodeConfig const& cfg,
+    ClusterRequest const& request,
+    Cc::ICredentialFor& credentials,
+    IEndpointDialer& dialer = DefaultOneShotDialer());
 
 } // namespace FastCache::Node

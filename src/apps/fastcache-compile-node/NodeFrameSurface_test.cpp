@@ -1778,8 +1778,9 @@ TEST_CASE("A socket-activated descriptor that cannot be served is fatal", "[node
     auto refused = StartNodeSurfaceOrExplain(
         io, cfg, owners.Around(SurfaceComponents { .cache = &cache }), std::optional { -1 }, metrics, logger);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("socket-activated"));
-    CHECK(refused.error().contains(UnservableDescriptorCause));
+    CHECK(refused.error().reason.contains("socket-activated"));
+    CHECK(refused.error().reason.contains(UnservableDescriptorCause));
+    CHECK(refused.error().cause == NodeRefusalCause::Listener);
 }
 
 TEST_CASE("A node port that cannot be bound is fatal however it was configured", "[node][node-surface]")
@@ -1850,15 +1851,17 @@ TEST_CASE("A node port that cannot be bound is fatal however it was configured",
         REQUIRE_FALSE(refused.has_value());
 
         // The flag, so an operator knows what to edit.
-        CHECK(refused.error().contains("--listen-node"));
+        CHECK(refused.error().reason.contains("--listen-node"));
+        // A port held by another process may be free at the next start.
+        CHECK(refused.error().cause == NodeRefusalCause::Listener);
 
         // And the REMEDY, not merely the diagnosis. "cannot bind" is a wall; what an
         // operator needs is what is almost certainly holding the port and that this
         // node does not need it. Asserted because a message is the entire user
         // interface of a startup refusal, and a diagnosis-only one passes every test
         // that checks the refusal happened.
-        CHECK(refused.error().contains("fastcached"));
-        CHECK(refused.error().contains("stop it, or give"));
+        CHECK(refused.error().reason.contains("fastcached"));
+        CHECK(refused.error().reason.contains("stop it, or give"));
 
         // The tolerated outcome is gone, and named so a reinstated warning fails here
         // rather than passing as "it refused for some reason".
@@ -1889,7 +1892,9 @@ TEST_CASE("A listener missing a component every built node serves is refused by 
         components.*row.owner = nullptr;
         auto const refused = StartNodeSurfaceOrExplain(io, cfg, components, std::nullopt, metrics, logger);
         REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().contains(std::format("without its {} component", row.component)));
+        // The CAUSE, which decides the exit: a build defect is refused (78), never restarted.
+        CHECK(refused.error().cause == NodeRefusalCause::BuildDefect);
+        CHECK(refused.error().reason.contains(std::format("without its {} component", row.component)));
     }
     // Session, node, live stats, the fleet document, formation and the fleet's shared cache.
     CHECK(asked == 6);

@@ -99,7 +99,19 @@ TEST_CASE("A worker with no scheduler to register with is refused rather than st
 
     auto const refused = fixture.Start();
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("no --scheduler"));
+    CHECK(refused.error().reason.contains("no --scheduler"));
+    CHECK(refused.error().cause == NodeRefusalCause::EarlierRule);
+}
+
+TEST_CASE("A worker that gave up while serving ends as a failure, so a compiler installed since is found",
+          "[node][worker-tier][exit]")
+{
+    // A survey that found nothing finds the compiler installed since, so the supervisor restarts it.
+    // (A fleet other than the one `--cluster-id` named was the refusal here; that flag is gone, and
+    // the formation record is the one author of which fleet this node is in.)
+    CHECK_FALSE(WorkerEnding(false).has_value());
+    CHECK(WorkerEnding(true) == NodeRefusalCause::ToolchainSurvey);
+    CHECK(ExitOf(NodeRefusalCause::ToolchainSurvey) == ProcessExit::Failed);
 }
 
 TEST_CASE("A worker answers whether its scratch root can be written into a mapping rule", "[node][worker-tier][conditions]")

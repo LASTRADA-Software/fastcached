@@ -4,6 +4,7 @@
 #include "EndpointDialer.hpp"
 #include "NodeConfig.hpp"
 #include "NodeKey.hpp"
+#include "OneShotAnswer.hpp"
 
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Ed25519.hpp>
@@ -278,11 +279,11 @@ struct JoinerIdentity
 /// @param credentials What each endpoint is shown, asked where it is presented.
 /// @param dialer How each endpoint is reached. Defaulted for `RunEnrollClient`'s
 ///        reason: production never varies it, and a test always does.
-/// @return What to print on success, or what to print on failure.
-[[nodiscard]] std::expected<std::string, std::string> RunEnrollAdmin(NodeConfig const& cfg,
-                                                                     EnrollCommand const& request,
-                                                                     Cc::ICredentialFor& credentials,
-                                                                     IEndpointDialer& dialer = DefaultOneShotDialer());
+/// @return What to print on success, or what to print on failure and where the answer came from.
+[[nodiscard]] std::expected<std::string, UnfinishedCommand> RunEnrollAdmin(NodeConfig const& cfg,
+                                                                           EnrollCommand const& request,
+                                                                           Cc::ICredentialFor& credentials,
+                                                                           IEndpointDialer& dialer = DefaultOneShotDialer());
 
 /// Run `--enroll-from` to completion.
 ///
@@ -301,8 +302,8 @@ struct JoinerIdentity
 /// @param dialer How each poll reaches the seed. Defaulted for the reason
 ///        `DefaultDrainWait` is: production never varies it, and a test always does.
 /// @param wallClock What an admitted worker certifies the leader's roster at.
-/// @return What to print on success, or what to print on failure.
-[[nodiscard]] std::expected<std::string, std::string> RunEnrollClient(
+/// @return What to print on success, or what to print on failure and where the answer came from.
+[[nodiscard]] std::expected<std::string, UnfinishedCommand> RunEnrollClient(
     NodeConfig const& cfg,
     ISecureRandom& random,
     INodeKeyFileGuard& keyGuard,

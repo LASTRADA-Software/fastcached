@@ -198,7 +198,7 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
     // different and wrong one (#613), and there is no longer a node for whom it is right.
 }
 
-std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
+std::expected<std::unique_ptr<SchedulerTier>, NodeRefusal> SchedulerTier::Start(
     NodeConfig const& cfg,
     Distributed::IMembershipOracle const& membership,
     core::platform::IClock& clock,
@@ -214,7 +214,7 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
     // holds one, so this is the answer to a caller that did not -- never a fallback to
     // unsigned grants, which no longer exist.
     if (!identityKey.has_value())
-        return std::unexpected { std::string { SchedulerNeedsIdentityKeyRefusal } };
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, std::string { SchedulerNeedsIdentityKeyRefusal }) };
 
     auto tier = std::unique_ptr<SchedulerTier> { new SchedulerTier { membership,
                                                                      clock,

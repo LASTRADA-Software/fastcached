@@ -86,11 +86,11 @@ AdminHttpServer::SnapshotProvider MakeNodeSnapshotProvider(NodeScrapeSources sou
     };
 }
 
-std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::filesystem::path const& path)
+std::expected<FastCache::SecureString, NodeRefusal> ReadSecretFile(std::filesystem::path const& path)
 {
     std::ifstream file { path, std::ios::binary };
     if (!file)
-        return std::unexpected { std::format("cannot read '{}'", path.string()) };
+        return std::unexpected { Refusal(NodeRefusalCause::CredentialIo, std::format("cannot read '{}'", path.string())) };
 
     // **Read into SECURE character storage rather than through `std::ostringstream`.**
     // That is what this used to do, and `buffer.str()` is an ordinary `std::string` while
@@ -126,7 +126,8 @@ std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::filesyst
     // The `std::ostringstream` form this replaced had the same hole, so it is a carried
     // gap rather than a regression, and the loop is where it became cheap to close.
     if (file.bad())
-        return std::unexpected { std::format("could not read all of '{}'", path.string()) };
+        return std::unexpected { Refusal(NodeRefusalCause::CredentialIo,
+                                         std::format("could not read all of '{}'", path.string())) };
 
     // Trailing whitespace is trimmed because every editor adds a newline, and an
     // operator should not have to know that a secret which looks right is one byte
@@ -137,14 +138,15 @@ std::expected<FastCache::SecureString, std::string> ReadSecretFile(std::filesyst
         secret.pop_back();
 
     if (secret.empty())
-        return std::unexpected { std::format("'{}' is empty; a credential file nobody can fail to match is "
-                                             "worse than none, because the surface looks guarded",
-                                             path.string()) };
+        return std::unexpected { Refusal(NodeRefusalCause::CredentialFile,
+                                         std::format("'{}' is empty; a credential file nobody can fail to match "
+                                                     "is worse than none, because the surface looks guarded",
+                                                     path.string())) };
 
     return FastCache::SecureString { std::string_view { secret.data(), secret.size() } };
 }
 
-std::expected<AdminCredential, std::string> ReadDashboardToken(std::filesystem::path const& path)
+std::expected<AdminCredential, NodeRefusal> ReadDashboardToken(std::filesystem::path const& path)
 {
     // The reading is `ReadSecretFile`'s, shared with every secret this node reads by
     // path; what differs is only what the secret becomes. Written once, so the
@@ -1015,7 +1017,7 @@ void FleetSampler::Persist()
     }
 }
 
-std::expected<AdminCredential, std::string> LoadDashboardCredentialOrExplain(NodeConfig const& cfg)
+std::expected<AdminCredential, NodeRefusal> LoadDashboardCredentialOrExplain(NodeConfig const& cfg)
 {
     // A file that cannot be read must not become "no credential": that is the single failure
     // that turns a guarded fleet map into an open one.
@@ -1023,11 +1025,12 @@ std::expected<AdminCredential, std::string> LoadDashboardCredentialOrExplain(Nod
         return AdminCredential {};
     auto read = ReadDashboardToken(cfg.dashboardTokenFile);
     if (!read.has_value())
-        return std::unexpected { std::format("--dashboard-token-file {}", read.error()) };
+        return std::unexpected { Refusal(read.error().cause,
+                                         std::format("--dashboard-token-file {}", read.error().reason)) };
     return std::move(*read);
 }
 
-std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig const& cfg,
+std::expected<AdminSurface, NodeRefusal> StartAdminSurfaceOrExplain(NodeConfig const& cfg,
                                                                     [[maybe_unused]] IHostFactsSource const& host,
                                                                     IMetricsSink& metrics,
                                                                     AdminHttpServer::SnapshotProvider snapshot,
@@ -1059,16 +1062,15 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
                                  .commonName = "fastcache-node", .subjectNames = SelfSignedSubjectNames(cfg, host) })
                            : core::net::makeTlsServerContextFromFiles(cfg.tlsCertFile, cfg.tlsKeyFile);
         if (!created.has_value())
-            return std::unexpected { std::format(
-                "{}: {}", cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert/--tls-key", created.error()) };
+            return std::unexpected { Refusal(
+                NodeRefusalCause::TlsMaterial,
+                std::format("{}: {}", cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert/--tls-key", created.error())) };
         surface.tls = std::move(*created);
 #else
-        // Refused rather than warned about, and the daemon answers the same way: a
-        // node that started in the clear after being told to serve TLS is one an
-        // operator believes is encrypted.
-        return std::unexpected { std::format("{} requested but this build has no TLS support "
-                                             "(rebuild with -DFASTCACHED_ENABLE_TLS=ON)",
-                                             cfg.tlsSelfSigned ? "--tls-self-signed" : "--tls-cert") };
+        // The startup table refuses this first (`BuildServesTls`), so `--print-surfaces` and
+        // `--install-service` do too; this is the belt for a configuration no argv produced,
+        // in the table's words.
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, std::string { TlsUnavailableRefusal }) };
 #endif
     }
 
@@ -1095,7 +1097,9 @@ std::expected<AdminSurface, std::string> StartAdminSurfaceOrExplain(NodeConfig c
                                         nullptr);
 #endif
     if (!started.has_value())
-        return std::unexpected { std::format("--admin-listen {}", started.error()) };
+        // `Listener` for the whole of `AdminEndpoint::Start`: it binds, and it also judges the
+        // address -- which the startup table has refused first -- so a refusal from it is mixed.
+        return std::unexpected { Refusal(NodeRefusalCause::Listener, std::format("--admin-listen {}", started.error())) };
 
     surface.endpoint = std::move(*started);
 

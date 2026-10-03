@@ -564,6 +564,19 @@ struct AnnounceProof
                                           IAnnouncement& announcement,
                                           AnnounceProof const& proof);
 
+/// How long an announcing loop waits before its next round.
+///
+/// One answer for both loops, for `DialAndAnnounce`'s reason: the worker's heartbeat and the
+/// presence loop wait on different primitives, and the rule deciding HOW LONG must not be two.
+/// `RosterWantingInterval` while this node holds no roster it could verify a grant against, or
+/// while its own cluster has not recorded it yet -- each of which leaves the machine unusable to
+/// the fleet until it clears, and a whole `NodeAnnounceInterval` of that after every start is a node
+/// nobody can use -- and `NodeAnnounceInterval` otherwise.
+/// @param prover Who this machine is; null where nothing proves.
+/// @param rosterWanting Whether this node wants a roster it does not hold.
+/// @return The wait.
+[[nodiscard]] std::chrono::seconds NextAnnounceWait(NodeProofClient const* prover, bool rosterWanting);
+
 [[nodiscard]] std::size_t AnnounceRound(HeartbeatRound const& round, SchedulerLink& link, IEndpointDialer& dialer);
 
 /// The connect bound of the one dial a suspend makes; inside `SuspendWithdrawBudget`.

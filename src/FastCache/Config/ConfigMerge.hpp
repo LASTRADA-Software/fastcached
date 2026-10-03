@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -140,6 +141,33 @@ class EffectiveConfig
 /// @return Empty on success; ConfigError naming the duplicated endpoint
 ///         otherwise.
 [[nodiscard]] std::expected<void, ConfigError> ValidateBinds(std::span<BindConfig const> binds);
+
+/// The endpoints a daemon with @p config serves: the `--listen` / `--listen-tls` list when any
+/// was named, else the single `--bind` / `--port` / `--tls` endpoint.
+///
+/// One derivation, asked by the startup rules and by the daemon body alike, so the endpoints a
+/// start is judged by are the endpoints it binds.
+/// @param config The effective configuration.
+/// @return The endpoints, in the order they are bound.
+[[nodiscard]] std::vector<BindConfig> EffectiveBinds(Config const& config);
+
+/// Why TLS is refused on a build that has no TLS support.
+inline constexpr std::string_view DaemonTlsUnavailableRefusal =
+    "--tls requested but this build has no TLS support (rebuild with -DFASTCACHED_ENABLE_TLS=ON)";
+
+/// Why TLS is refused without both halves of its material.
+inline constexpr std::string_view DaemonTlsMaterialRefusal = "--tls requires both --tls-cert and --tls-key";
+
+/// Why the daemon must not start with @p config -- decided from the configuration and the BUILD
+/// alone, so `main` asks it before the service host and before an install, and an operator hears it
+/// from `--install-service` rather than from a service that refuses at every boot.
+///
+/// **A table, and the rows moved here out of the daemon body**, where each was asked only once the
+/// host had been entered: an install baked the command line in without consulting any of them, and
+/// under the SCM the refusal was reported only after the service had already said it was running.
+/// @param config The effective configuration.
+/// @return Why it must not start -- the refusal's own words, without the program name -- or nothing.
+[[nodiscard]] std::optional<std::string> DaemonStartupRejection(Config const& config);
 
 /// Reject a configuration naming both ways to declare endpoints, which would
 /// silently drop what the operator wrote. There are two: the legacy single-bind

@@ -6,6 +6,8 @@
 #include "NodeConditions.hpp"
 #include "NodeDefaults.hpp"
 #include "NodeMembership.hpp"
+#include "NodeProofClient.hpp"
+#include "NodeRoster.hpp"
 #include "NodeStatusText.hpp"
 #include "SchedulerReachability.hpp"
 #include "SchedulerTier.hpp"
@@ -43,6 +45,7 @@
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ReactorHomeFakes.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/SecureRandomFakes.hpp>
 #include <tests/SkewedMetricsSink.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -309,6 +312,19 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     auto clustered = Testing::FirstStart(NodeConfig {});
     NodeMembership membership { clustered, membershipLog };
 
+    // And the consensus scope's prover, built as `main` builds it on a consensus node that names a
+    // scheduler -- over that node's roster and its own membership -- which answers
+    // `own-record-awaited`.
+    NodeConfig proving;
+    proving.schedulers = { "127.0.0.1:6674" };
+    proving.raftListen = "127.0.0.1:6680";
+    core::platform::ManualWallClock rosterClock;
+    auto const roster = NodeRoster::Build(proving, rosterClock, metrics, logger);
+    REQUIRE(roster.has_value());
+    auto const proverKey = FastCache::Testing::TestKeyPair("n1");
+    FastCache::Testing::ScriptedSecureRandom proofRandom;
+    NodeProofClient const prover { "n1", proverKey, *Unwrap(roster), &membership, &conditions, proofRandom };
+
     // The scheduler scope: a scheduler, signing with its identity key (#178), started the way `main`
     // starts it -- with the registry -- because it answers its fleet-wide rows as it starts.
     auto scheduling = Testing::FirstStart(NodeConfig {});
@@ -381,7 +397,7 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     auto const readerKey = FastCache::Testing::TestKeyPair("n1");
     SystemSecureRandom readerRandom;
     NamedMachineTrust const readerTrust { "n1", readerKey.PublicKey() };
-    NodeProofClient const reader { "n1", readerKey, readerTrust, readerRandom };
+    NodeProofClient const reader { "n1", readerKey, readerTrust, nullptr, nullptr, readerRandom };
     core::net::BlockingConnector readerConnector;
     SharedCacheDirectory sharedDirectory { "n1", {} };
     SharedCacheDialer sharedDialer { reader, readerConnector, nullptr, metrics, SharedCacheDialPolicy {} };

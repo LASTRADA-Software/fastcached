@@ -154,6 +154,121 @@ namespace
     }
 } // namespace
 
+std::string ReplacedNodeKeyDiagnosis(std::string_view id)
+{
+    return std::format("this cluster records {} under another identity key: that machine's node-key was replaced while "
+                       "the id it minted survived. Restore the node-key it was recorded with, or --cluster-forget={} on "
+                       "a member and admit the new key (--enroll-from=<seed> there, or "
+                       "--cluster-admit={}=<host>:<port>@<key> on a member, with what --print-identity prints)",
+                       id,
+                       id,
+                       id);
+}
+
+NodeProofClient::NodeProofClient(std::string nodeId,
+                                 Ed25519KeyPair const& key,
+                                 IServerTrust const& trust,
+                                 Distributed::IMembershipOracle const* ownCluster,
+                                 NodeConditions* conditions,
+                                 ISecureRandom& random):
+    _nodeId { std::move(nodeId) },
+    _key { key },
+    _trust { trust },
+    _ownCluster { ownCluster },
+    _conditions { conditions },
+    _random { random }
+{
+    // Evaluated from the start: a consensus node's row is this client's, and one left undecided is
+    // a wiring defect `NodeConditions::Settle` names. Nothing has been held yet.
+    if (_ownCluster != nullptr && _conditions != nullptr)
+        _conditions->Clear(NodeCondition::OwnRecordAwaited);
+}
+
+OwnRecord NodeProofClient::OwnRecordNow() const
+{
+    if (_ownCluster == nullptr)
+        return OwnRecord::NotAsked;
+    // As the node-proof surface asks it (`NodeProofResponder`): the key, proven by a session proof.
+    auto const standing = _ownCluster->ExplainKey(ProvenIdentity { .id = _nodeId, .key = _key.PublicKey() },
+                                                  Distributed::KeyEvidence::SessionProof);
+    if (Distributed::RestsOnProvenIdentity(standing)
+        || standing.decidedBy.Has(Distributed::MembershipParticipant::KeyTombstone))
+        return OwnRecord::Recorded;
+    // No opinion of this key, and yet the id may be recorded -- under a key this machine no longer
+    // holds. That is not a wait, and saying "not recorded yet" about it is a confident wrong signal.
+    if (auto const recorded = _ownCluster->LiveKeyOf(_nodeId); recorded.has_value() && *recorded != _key.PublicKey())
+        return OwnRecord::OtherKey;
+    return OwnRecord::Awaited;
+}
+
+bool NodeProofClient::HoldUntilRecorded(ILogger& logger) const
+{
+    auto const record = OwnRecordNow();
+    std::scoped_lock const lock { _holdMutex };
+    if (record == OwnRecord::NotAsked || record == OwnRecord::Recorded)
+    {
+        if (_heldAsks > 0)
+        {
+            logger.Log(LogLevel::Info, "this node's own cluster has recorded it; announcing to the fleet");
+            if (_conditions != nullptr)
+                _conditions->Clear(NodeCondition::OwnRecordAwaited);
+        }
+        _heldAsks = 0;
+        _heldFor = record;
+        return false;
+    }
+
+    // A hold for a different reason is a new hold, said afresh; leaving a replaced key behind ends
+    // what the raised row said about it.
+    if (record != _heldFor)
+    {
+        if (_heldFor == OwnRecord::OtherKey && _conditions != nullptr)
+            _conditions->Clear(NodeCondition::OwnRecordAwaited);
+        _heldAsks = 0;
+        _heldFor = record;
+    }
+    ++_heldAsks;
+    NarrateHold(record, logger);
+    return true;
+}
+
+void NodeProofClient::NarrateHold(OwnRecord record, ILogger& logger) const
+{
+    if (record == OwnRecord::OtherKey)
+    {
+        if (_heldAsks != 1)
+            return;
+        auto const diagnosis = ReplacedNodeKeyDiagnosis(_nodeId);
+        logger.Logf(LogLevel::Warn, "not announcing to the fleet: {}", diagnosis);
+        if (_conditions != nullptr)
+            _conditions->Raise(NodeCondition::OwnRecordAwaited, diagnosis);
+        return;
+    }
+
+    if (_heldAsks == 1)
+        logger.Logf(LogLevel::Info,
+                    "not announcing to the fleet yet: this node's own cluster has not recorded this node yet, so every "
+                    "scheduler of that cluster would refuse {} as unknown. A member the cluster was started with is "
+                    "recorded once the cluster has elected a leader, a moment after start; a machine joining a "
+                    "cluster that already runs is recorded once it is admitted. Announcing as soon as it is recorded",
+                    _nodeId);
+    else if (_heldAsks == OwnRecordPatience)
+    {
+        logger.Logf(LogLevel::Warn,
+                    "still not announcing to the fleet: after {} asks this node's own cluster has not recorded {}. "
+                    "Either that cluster cannot elect a leader -- a majority of its voters must answer -- or this "
+                    "machine joined a cluster that never admitted it: --enroll-from=<seed> on this machine, or "
+                    "--cluster-admit=<id>=<host>:<port>@<key> on a member, with the id and key this machine's "
+                    "--print-identity prints",
+                    OwnRecordPatience,
+                    _nodeId);
+        if (_conditions != nullptr)
+            _conditions->Raise(
+                NodeCondition::OwnRecordAwaited,
+                std::format("after {} asks this node's own cluster has not recorded {}", OwnRecordPatience, _nodeId));
+    }
+}
+
 core::async::Task<NodeProofAttempt> NodeProofClient::ProveAsync(SealedFrameSocket* peer, IServerTrust const* trust) const
 {
     // Both exchanges present NO credential, by the seam's signature rather than by an argument left

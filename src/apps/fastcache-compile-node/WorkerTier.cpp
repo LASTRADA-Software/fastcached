@@ -214,7 +214,7 @@ WorkerMachine MakeSystemWorkerMachine()
                            .scratchBase = ScratchBaseDirectory() };
 }
 
-std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(WorkerTierParts const& parts,
+std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> WorkerTier::Start(WorkerTierParts const& parts,
                                                                           WorkerMachineFactory const& makeMachine)
 {
     // Through `WorkerSlotsOf`, never `OfferableSlots` directly -- its header says which
@@ -228,9 +228,10 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
     // without one: the tier's constructor takes it by value.
     auto link = SchedulerLink::For(parts.cfg.schedulers);
     if (!link.has_value())
-        return std::unexpected { std::string {
+        return std::unexpected { Refusal(
+            NodeRefusalCause::EarlierRule,
             "a worker was started with no --scheduler, which the startup table exists to refuse: it would never "
-            "register, never be leased and never be sent a job. Name the scheduler's --listen-node endpoint" } };
+            "register, never be leased and never be sent a job. Name the scheduler's --listen-node endpoint") };
 
     // Only now, with a worker decided: see `MakeSystemWorkerMachine`.
     auto machine = makeMachine();
@@ -249,12 +250,12 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
     auto discovered = DiscoverToolchainEntries(parts.cfg, discovery, *machine.runner, parts.logger);
     if (!discovered.has_value())
         // The entry was named above, at Error, by the survey that could not read it.
-        return std::unexpected { std::string { "a malformed --toolchain was named" } };
+        return std::unexpected { Refusal(NodeRefusalCause::EarlierRule, "a malformed --toolchain was named") };
 
     auto claim = ClaimScratchRoot(
         !discovered->entries.empty(), *machine.claimant, machine.scratchBase, parts.logger, parts.conditions);
     if (!claim.has_value())
-        return std::unexpected { std::move(claim).error() };
+        return std::unexpected { Refusal(NodeRefusalCause::ScratchRoot, std::move(claim).error()) };
 
     // What this worker keeps between lease checks: the grants it has already run (#614),
     // the scheduler term the last authentic grant named (#421), and where a term going
@@ -281,7 +282,7 @@ std::expected<std::unique_ptr<WorkerTier>, std::string> WorkerTier::Start(Worker
                                               parts.metrics,
                                               parts.logger);
     if (!validator.has_value())
-        return std::unexpected { std::move(validator).error() };
+        return std::unexpected { Refusal(NodeRefusalCause::LeaseValidation, std::move(validator).error()) };
 
     return std::unique_ptr<WorkerTier> { new WorkerTier(parts,
                                                         std::move(machine),
@@ -567,12 +568,14 @@ void WorkerTier::Heartbeat(std::stop_token const& stop,
 
         // A cordon, or its lifting, reaches the scheduler at once rather than a whole
         // interval later (#1303), and so does a resume or a network change; a stop ends the
-        // wait immediately.
+        // wait immediately. Sooner while this node's own cluster has not recorded it, so the
+        // registrations follow the record by seconds rather than by a whole interval
+        // (`NextAnnounceWait`).
         if (AwaitNextRound(stop,
                            _capacity,
                            _hostInbox,
                            announcedCordon,
-                           NodeAnnounceInterval,
+                           NextAnnounceWait(_prover, false),
                            [this, &round, &statusClock] { WithdrawForSuspend(round, statusClock); })
             == HeartbeatWake::Stopped)
             break;

@@ -142,14 +142,9 @@ endfunction()
 # operator who typed the default. CMake can tell the two apart with
 # `DEFINED ENV{...}`; nothing but this predicate was in the way.
 #
-# **The resolved address is the whole answer, and the change-detection record
-# stores IT rather than a second encoding of the environment.** The record exists
-# so a reconfigure notices the environment moving; what it has to notice is the
-# address moving, and unset and set-empty already resolve to different addresses
-# -- `127.0.0.1:6674` against the empty opt-out. A separate presence-carrying
-# token would additionally separate *absent* from *explicitly set to the default*,
-# which differ in no way this module acts on: the retarget would fire, recompute
-# the same address, and print a line saying it had changed nothing.
+# **The resolved address is the whole answer**: it is what the environment SEEDS
+# into a build tree with no entry (`_fc_hold_setting`), and what a held entry is
+# compared with when a later environment presents one.
 #
 # Pure: it reads no environment and touches no cache, so
 # `check-fastcache-addr-opt-out.cmake` can drive the case a developer cannot
@@ -169,6 +164,131 @@ function(_fc_resolve_addr present value outWanted)
         # --listen-cache defaults to the same address for exactly this reason.
         set(${outWanted} "127.0.0.1:6674" PARENT_SCOPE)
     endif()
+endfunction()
+
+# Hold a setting the configure environment SEEDS, and say whether the environment now presents a
+# value it did not apply.
+#
+# **The environment seeds a build tree with no entry and never moves one it has.** Both settings
+# this holds once let a CHANGE in the environment retarget the entry on a reconfigure, unless the
+# entry had been changed by hand since -- and "changed by hand" was read as "differs from what
+# this module last applied", which cannot see a `-D` that typed the value already held. Measured:
+# a tree configured off from an agent's shell, reconfigured from a terminal holding the variable
+# with `-DFASTCACHE_SCHEDULER=` to say OFF explicitly, came up ON. That is the blind spot
+# `OptionSpec::explicitBit` exists for, and CMake offers nothing that says a `-D` was on this
+# command line. So nothing is inferred: a `-D`, empty included, always outranks an ambient
+# variable, and a difference is REPORTED, naming the `-D` that would apply it, never acted on.
+# Only a `-D`, `-U <name>` (which lets the next configure seed again) or `--fresh` moves it.
+#
+# Pure: it reads no environment and touches no cache, so `check-compile-cache-dispatch.cmake`
+# drives every combination.
+#
+# @param cached        TRUE when the setting has a cache entry.
+# @param cacheValue    Its value; meaningful only when @p cached.
+# @param envPresent    TRUE when the configure environment PRESENTS a value for it.
+# @param envValue      That value, or what a tree with no entry is seeded with when there is none.
+# @param outValue      The value to hold.
+# @param outSeeded     TRUE when this configure took the value from @p envValue.
+# @param outUnapplied  TRUE when the environment presents a value other than the held one.
+function(_fc_hold_setting cached cacheValue envPresent envValue outValue outSeeded outUnapplied)
+    set(${outUnapplied} FALSE PARENT_SCOPE)
+    if(NOT cached)
+        set(${outValue} "${envValue}" PARENT_SCOPE)
+        set(${outSeeded} TRUE PARENT_SCOPE)
+        return()
+    endif()
+    set(${outValue} "${cacheValue}" PARENT_SCOPE)
+    set(${outSeeded} FALSE PARENT_SCOPE)
+    if(envPresent AND NOT "${envValue}" STREQUAL "${cacheValue}")
+        set(${outUnapplied} TRUE PARENT_SCOPE)
+    endif()
+endfunction()
+
+# The line reporting an environment value a held setting did NOT apply.
+#
+# @param name      The setting.
+# @param held      What the build tree holds.
+# @param envValue  What the environment presents.
+# @param outLine   The status line.
+function(_fc_unapplied_note name held envValue outLine)
+    set(heldText "'${held}'")
+    if("${held}" STREQUAL "")
+        set(heldText "it empty")
+    endif()
+    set(envText "'${envValue}'")
+    if("${envValue}" STREQUAL "")
+        set(envText "set but empty")
+    endif()
+    set(${outLine}
+        "[cache] ${name} is ${envText} in the environment and NOT applied: this build tree holds ${heldText}, and the environment only seeds a tree with no ${name} entry -- -D${name}=${envValue} applies it"
+        PARENT_SCOPE)
+endfunction()
+
+# What configure SAYS about dispatch and what it BAKES, from the scheduler it holds.
+#
+# **Decided HERE and baked into the launcher, never left to the build's environment.** The
+# launcher reads `FASTCACHE_SCHEDULER` at run time, and this module used to pass it nothing --
+# so dispatch was whatever the environment of whichever process ran `ninja` happened to hold.
+# Measured on a workstation: agents set it in one shell and built from the next, every compile
+# recorded `NOT_CONFIGURED`, and 341 misses compiled locally while the fleet's `dispatched`
+# stood still -- with configure having said only that fastcache-cc was the launcher. A setting
+# that must be present at build time and silently is not is the silent no-op this project
+# refuses elsewhere, so configure decides, SAYS what it decided, and the generated LAUNCHER line
+# carries exactly that.
+#
+# **And the decision is HELD in the cache (`_fc_hold_setting`), not re-read from the environment
+# at every configure.** A configure is not always one somebody ran: ninja re-runs CMake by itself
+# whenever a CMakeLists.txt changes, from whatever shell started the build. Measured on the same
+# machine, a first version that re-read the environment turned dispatch OFF at exactly such a
+# re-run -- the build shell had no FASTCACHE_SCHEDULER -- and printed so into a build log nobody
+# reads, which is the original failure one step later. Set-but-empty and unset are the same
+# answer in the environment, unlike FASTCACHE_ADDR (#372), because the launcher reads them the
+# same way (`EnvOr`): neither dispatches, so neither is a value the environment PRESENTS.
+#
+# One function for the line and the entry, because the line is the module's claim and the entry
+# is the artefact (the generated LAUNCHER): two derivations could disagree, and a configure that
+# printed `dispatch: off` over a launcher that dispatches -- or the reverse -- is the #187 shape.
+# The line says where the value came from, and that it is CONFIGURATION: nothing here asks the
+# scheduler anything, and "fastcache-cc is the launcher" was once read as "the fleet is building".
+#
+# **The entry is baked in BOTH states.** An endpoint when dispatch is on; `FASTCACHE_SCHEDULER=`
+# when it is off, which the launcher reads as unset -- so a value in the build's own environment
+# cannot turn on a dispatch configure said was off, any more than it can retarget one it said was
+# on. That is what keeps the printed line true of the build.
+#
+# @param endpoint    What `_fc_hold_setting` holds: where misses go, empty for off.
+# @param seeded      TRUE when this configure seeded it from the environment.
+# @param unapplied   TRUE when the environment presents a scheduler the tree does not hold.
+# @param envValue    That scheduler; meaningful only when @p unapplied.
+# @param outLine     The status line.
+# @param outEnvEntry The `NAME=VALUE` the launcher runs with.
+function(_fc_dispatch_state endpoint seeded unapplied envValue outLine outEnvEntry)
+    set(${outEnvEntry} "FASTCACHE_SCHEDULER=${endpoint}" PARENT_SCOPE)
+    set(turnOn "<host:port>")
+    set(unappliedClause "")
+    if(unapplied)
+        set(turnOn "${envValue}")
+        set(unappliedClause "; the ${envValue} in the environment is NOT applied -- -DFASTCACHE_SCHEDULER=${envValue} retargets it")
+    endif()
+    if(NOT "${endpoint}" STREQUAL "")
+        set(source "held in this build tree's cache, where a -DFASTCACHE_SCHEDULER or the configure that created the tree put it")
+        if(seeded)
+            set(source "seeded from the configure environment and held in this build tree's cache")
+        endif()
+        set(${outLine}
+            "[cache] dispatch: ${endpoint} (configured, ${source}; baked into the launcher, so the build's own environment does not change it; not probed -- each compile records DISPATCHED or DECLINED in invocations.log; -DFASTCACHE_SCHEDULER= turns it off${unappliedClause})"
+            PARENT_SCOPE)
+        return()
+    endif()
+    set(source "FASTCACHE_SCHEDULER is empty in this build tree's cache")
+    if(seeded)
+        set(source "no FASTCACHE_SCHEDULER in the configure environment, and this build tree now holds that")
+    elseif(unapplied)
+        set(source "FASTCACHE_SCHEDULER is empty in this build tree's cache, which outranks the ${envValue} in the environment")
+    endif()
+    set(${outLine}
+        "[cache] dispatch: off (${source}; every miss compiles on this machine -- -DFASTCACHE_SCHEDULER=${turnOn} turns it on)"
+        PARENT_SCOPE)
 endfunction()
 
 # What does a launcher's REJECTION deserve to be said about it, and what replaced it?
@@ -333,46 +453,57 @@ if(DEFINED ENV{FASTCACHE_ADDR})
 endif()
 _fc_resolve_addr("${_fc_addr_env_present}" "$ENV{FASTCACHE_ADDR}" _fc_addr_wanted)
 
-# Ordinary cache semantics would freeze the address at whatever the first
-# configure saw, so exporting FASTCACHE_ADDR to reach a remote daemon would do
-# nothing until the build tree was wiped. Track the environment across
-# configures instead and let a *change* to it retarget the cache entry — while
-# leaving a -D from this very run alone, which is the one instruction more
-# deliberate than the environment. The two are told apart by whether the cache
-# still holds what this module last put there, which is also why the retarget
-# needs a previous configure to compare against: on a first configure there is
-# no bookkeeping yet, both tests hold vacuously, and a -DFASTCACHE_ADDR= meant
-# to opt out would be overwritten by an address merely left in the environment.
-if(NOT DEFINED CACHE{FASTCACHE_ADDR})
-    set(FASTCACHE_ADDR "${_fc_addr_wanted}" CACHE STRING
-        "host:port of the fastcached compile-cache daemon, 127.0.0.1:6674 by default (empty disables the fastcache-cc launcher)")
-elseif(DEFINED CACHE{_FASTCACHE_ADDR_APPLIED}
-       AND NOT _fc_addr_wanted STREQUAL "${_FASTCACHE_ADDR_ENV_SEEN}"
-       AND FASTCACHE_ADDR STREQUAL "${_FASTCACHE_ADDR_APPLIED}")
-    message(STATUS "[cache] FASTCACHE_ADDR changed in the environment; retargeting to ${_fc_addr_wanted}")
-    set(FASTCACHE_ADDR "${_fc_addr_wanted}" CACHE STRING
-        "host:port of the fastcached compile-cache daemon, 127.0.0.1:6674 by default (empty disables the fastcache-cc launcher)"
-        FORCE)
+# Held, not re-read: the environment seeds a tree with no entry, and after that only a -D moves
+# the address -- see `_fc_hold_setting` for the reconfigure that silently undid a -D. A later
+# environment presenting another address is reported here rather than beside the launcher line,
+# because the address decides whether fastcache-cc is tried at all: a tree holding the empty
+# opt-out never reaches the row that would print anything else.
+set(_fc_addr_cached FALSE)
+if(DEFINED CACHE{FASTCACHE_ADDR})
+    set(_fc_addr_cached TRUE)
 endif()
-# The RESOLVED address, not the raw environment value: unset and set-to-empty
-# resolve differently (the default against the empty opt-out), which is exactly the
-# distinction the record has to keep, and storing the resolution keeps one encoding
-# of it rather than two. An existing build tree holds a pre-#372 record in the old
-# format, so its first reconfigure reads as a change and recomputes -- which lands
-# on the same address unless the environment now genuinely says otherwise, and is
-# how a tree that was silently ignoring an opt-out starts honouring it.
-set(_FASTCACHE_ADDR_ENV_SEEN "${_fc_addr_wanted}" CACHE INTERNAL
-    "the address FASTCACHE_ADDR last resolved to, to notice a change on reconfigure")
-set(_FASTCACHE_ADDR_APPLIED "${FASTCACHE_ADDR}" CACHE INTERNAL
-    "the address this module last applied, to tell its own value from one set externally")
+_fc_hold_setting("${_fc_addr_cached}" "${FASTCACHE_ADDR}" "${_fc_addr_env_present}" "${_fc_addr_wanted}"
+                 _fc_addr _fc_addr_seeded _fc_addr_unapplied)
+set(FASTCACHE_ADDR "${_fc_addr}" CACHE STRING
+    "host:port of the fastcached compile-cache daemon, 127.0.0.1:6674 by default (empty disables the fastcache-cc launcher)"
+    FORCE)
+if(_fc_addr_unapplied)
+    _fc_unapplied_note(FASTCACHE_ADDR "${_fc_addr}" "${_fc_addr_wanted}" _fc_addr_note)
+    message(STATUS "${_fc_addr_note}")
+endif()
 
-# How fastcache-cc is configured, in one place: the probe below must test the
-# very environment the build will use, or it would vouch for a configuration
-# nothing else runs.
+# How the CACHE exchange is configured, in one place: the probe below must test the very cache
+# environment the build will use, or it would vouch for a configuration nothing else runs.
+# Dispatch is the one setting the probe deliberately does NOT share; the next block says why.
 set(_fc_fastcache_env
     "FASTCACHE_ADDR=${FASTCACHE_ADDR}"
     "FASTCACHE_SOURCE_DIR=${CMAKE_SOURCE_DIR}"
     "FASTCACHE_BINARY_DIR=${CMAKE_BINARY_DIR}")
+
+# Where a miss is dispatched, decided once: see `_fc_dispatch_state` for why configure decides it
+# and the build's environment does not. Joined to the LAUNCHER's environment only, never the
+# probe's -- the probe asks whether the CACHE answers, and a dispatch it could make to a scheduler
+# that is slow or gone would bound that answer by a compile node's latency and drop fastcache-cc
+# for a reason that has nothing to do with the cache. The probe pins dispatch off instead, so the
+# configure environment cannot reach it either. Whether the environment presents a scheduler the
+# tree does not hold is said on the dispatch line itself, which is printed only when fastcache-cc
+# is the launcher -- the one launcher a scheduler means anything to.
+set(_fc_scheduler_cached FALSE)
+if(DEFINED CACHE{FASTCACHE_SCHEDULER})
+    set(_fc_scheduler_cached TRUE)
+endif()
+set(_fc_scheduler_env_present FALSE)
+if(NOT "$ENV{FASTCACHE_SCHEDULER}" STREQUAL "")
+    set(_fc_scheduler_env_present TRUE)
+endif()
+_fc_hold_setting("${_fc_scheduler_cached}" "${FASTCACHE_SCHEDULER}"
+                 "${_fc_scheduler_env_present}" "$ENV{FASTCACHE_SCHEDULER}"
+                 _fc_scheduler _fc_scheduler_seeded _fc_scheduler_unapplied)
+set(FASTCACHE_SCHEDULER "${_fc_scheduler}" CACHE STRING
+    "host:port of the compile-fleet scheduler fastcache-cc dispatches misses to, baked into the launcher (empty: every miss compiles locally)"
+    FORCE)
+_fc_dispatch_state("${_fc_scheduler}" "${_fc_scheduler_seeded}" "${_fc_scheduler_unapplied}"
+                   "$ENV{FASTCACHE_SCHEDULER}" _fc_dispatch_line _fc_dispatch_env)
 
 # Optional auto-install of fastcache-cc from this project's GitHub Releases.
 #
@@ -1323,6 +1454,7 @@ function(_fc_probe_fastcache_cc outVar reasonVar)
     execute_process(
         COMMAND "${CMAKE_COMMAND}" -E env
                 ${_fc_fastcache_env}
+                "FASTCACHE_SCHEDULER="
                 "FASTCACHE_VERBOSE=1"
                 "FASTCACHE_NO_STATS=1"
                 "FASTCACHE_TIMEOUT=2s"
@@ -1398,7 +1530,7 @@ set(_fc_cache_fastcache_cc_requires "${FASTCACHE_ADDR}")
 # No note: an empty FASTCACHE_ADDR is the documented way to opt out of this row
 # (#372), so a machine that took it does not need telling what it just asked for.
 set(_fc_cache_fastcache_cc_requires_note "")
-set(_fc_cache_fastcache_cc_env ${_fc_fastcache_env})
+set(_fc_cache_fastcache_cc_env ${_fc_fastcache_env} "${_fc_dispatch_env}")
 set(_fc_cache_fastcache_cc_check _fc_probe_fastcache_cc)
 # A WIRE VERSION mismatch, and only that. "not installed", "no answer" and "the
 # probe was uncacheable" predict nothing about the replacement, and warning on
@@ -1583,6 +1715,12 @@ if(_fc_cache_chosen)
 
     _fc_cache_describe("${_fc_cache_chosen}" _fc_cache_desc)
     message(STATUS "[cache] Enabling ${_fc_cache_desc} (${_fc_cache_program}) for C/C++ compilation")
+    # Whether a miss leaves this machine, said beside the launcher that decides it: "fastcache-cc
+    # is the launcher" read as "the fleet is building", and it was not. Only for the row that can
+    # dispatch at all, and in the words `_fc_dispatch_state` derived from the value it baked.
+    if(_fc_cache_chosen STREQUAL "fastcache_cc")
+        message(STATUS "${_fc_dispatch_line}")
+    endif()
 
     # A launcher that can silently produce a WRONG build says so, at the moment a
     # build is opted into it. A warning rather than a status line because the

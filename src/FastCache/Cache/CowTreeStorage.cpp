@@ -628,8 +628,13 @@ std::expected<void, StorageError> CowTreeStorage::EnsureFormatVersion()
     return {};
 }
 
-std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Migrate(Options const& options)
+std::expected<CowTreeStorage::MigrationReport, CowTreeStorage::MigrationFailure> CowTreeStorage::Migrate(
+    Options const& options)
 {
+    // Every refusal before `MigrateStore` is one before anything was rewritten.
+    auto const refused = [](StorageError error) {
+        return std::unexpected(MigrationFailure { .error = std::move(error), .rewriting = false });
+    };
     // `FilePageStore::Open` creates what it cannot find, which is right for a
     // daemon starting up and wrong here: it would turn a mistyped path into a
     // brand-new empty store, report "nothing to convert" over it, and leave the
@@ -637,8 +642,7 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
     // at every start with no hint that they converted something else.
     auto error = std::error_code {};
     if (!std::filesystem::exists(options.path, error) || error)
-        return std::unexpected(
-            MakeError(StorageErrorCode::IoError, std::format("no storage file at '{}'", options.path.string())));
+        return refused(MakeError(StorageErrorCode::IoError, std::format("no storage file at '{}'", options.path.string())));
 
     CowTree::FilePageStore::Options pageOpts;
     pageOpts.path = options.path;
@@ -654,8 +658,8 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
 
     auto store = CowTree::FilePageStore::Open(pageOpts);
     if (!store.has_value())
-        return std::unexpected(TranslateError(
-            store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error().cause))));
+        return refused(TranslateError(store.error(),
+                                      std::format("cannot open the store: {}", CowTree::ToStringView(store.error().cause))));
 
     // Opening had to assume a page size in order to know where the second meta
     // slot even is, and the file gets to overrule that. When it does, the slot
@@ -670,13 +674,23 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
         store->reset();
         store = CowTree::FilePageStore::Open(pageOpts);
         if (!store.has_value())
-            return std::unexpected(TranslateError(
+            return refused(TranslateError(
                 store.error(), std::format("cannot open the store: {}", CowTree::ToStringView(store.error().cause))));
     }
     return MigrateStore(**store);
 }
 
-std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::MigrateStore(CowTree::IPageStore& store)
+std::expected<CowTreeStorage::MigrationReport, CowTreeStorage::MigrationFailure> CowTreeStorage::MigrateStore(
+    CowTree::IPageStore& store)
+{
+    auto rewriting = false;
+    return ConvertStore(store, rewriting).transform_error([&rewriting](StorageError error) {
+        return MigrationFailure { .error = std::move(error), .rewriting = rewriting };
+    });
+}
+
+std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::ConvertStore(CowTree::IPageStore& store,
+                                                                                          bool& rewriting)
 {
     CowTree::CowTree tree { store };
     if (auto const r = tree.Open(); !r.has_value())
@@ -762,6 +776,10 @@ std::expected<CowTreeStorage::MigrationReport, StorageError> CowTreeStorage::Mig
         if (invalid.has_value())
             return std::unexpected(*invalid);
     }
+
+    // Everything above read; everything below rewrites. A failure from here on has left the store
+    // part-way, which is what an operator's exit code has to say.
+    rewriting = true;
 
     // Converted in slices rather than in one transaction; see
     // `MigrationChunkRecords` for why a single transaction is not an option.
@@ -1529,8 +1547,16 @@ void CowTreeStorage::EraseFromLru(std::string_view key)
     EraseNode(it->second);
 }
 
-void CowTreeStorage::EraseNode(Iterator it)
+void CowTreeStorage::EraseNode(Iterator const& it)
 {
+    // **`it` may live inside the index entry this erases** -- `EraseFromLru` passes
+    // `_index`'s own value -- so the order below is load-bearing. The entry is found
+    // FIRST, while the key it is looked up by is still there; the list node goes while
+    // that entry, and so `it`, still lives; and the entry goes LAST, by iterator, after
+    // which `it` is never read. Erasing the entry by key first -- the order this had --
+    // drops the map node that holds `it`, and the list erase after it reads freed memory.
+    auto const entry = _index.find(it->key);
+
     // Advanced rather than reset, for the reason spelled out on the in-memory
     // tier: restarting the sweep whenever eviction runs would leave the pass
     // permanently unfinished on a cache that is under pressure.
@@ -1543,8 +1569,9 @@ void CowTreeStorage::EraseNode(Iterator it)
     // and for the same reason.
     _indexBytes -= IndexBytesFor(it->key.size());
 
-    _index.erase(it->key);
     _lru.erase(it);
+    if (entry != _index.end())
+        _index.erase(entry);
 }
 
 void CowTreeStorage::ReclaimDeadRecord(std::string_view key, CacheEntry const& entry, core::platform::SteadyTimePoint now)
@@ -2297,14 +2324,21 @@ std::optional<CowTree::FilePageStore::LockState> CowTreeStorage::StoreLockState(
     return _storeLockState;
 }
 
-std::string DescribeMigration(std::filesystem::path const& path,
-                              std::expected<CowTreeStorage::MigrationReport, StorageError> const& outcome)
+std::string DescribeMigration(
+    std::filesystem::path const& path,
+    std::expected<CowTreeStorage::MigrationReport, CowTreeStorage::MigrationFailure> const& outcome)
 {
     if (!outcome.has_value())
         // The code as well as the context: several failure paths carry only the
         // label of the step that failed, and "CowTree::Open" on its own tells an
-        // operator nothing about which kind of problem to go looking for.
-        return std::format("{}: {}: {}", path.string(), ToStringView(outcome.error().code), outcome.error().context);
+        // operator nothing about which kind of problem to go looking for. And
+        // whether it had begun: a part-way store is refused until a re-run finishes it.
+        return std::format("{}: {}: {}{}",
+                           path.string(),
+                           ToStringView(outcome.error().error.code),
+                           outcome.error().error.context,
+                           outcome.error().rewriting ? " (stopped part-way; run the conversion again to finish it)"
+                                                     : " (nothing was changed)");
 
     if (outcome->fromVersion == outcome->toVersion)
         return std::format(

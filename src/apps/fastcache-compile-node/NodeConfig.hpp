@@ -1543,6 +1543,33 @@ inline constexpr std::string_view ConsensusNamesNoDialAddressRefusal =
 static_assert(ConsensusNamesNoDialAddressRefusal.contains(ConsensusDialRemedy),
               "the startup refusal names the way to state the dial address, in the worksheet's words");
 
+/// Why a node that runs no consensus may not name `--discovery`.
+///
+/// One sentence for the startup table and for the discovery tier's belt, which spelled it
+/// separately and named `--node-id` as the switch long after #1022 made it `--listen-raft` --
+/// the flag an operator would then go and add without effect.
+inline constexpr std::string_view DiscoveryNeedsConsensusRefusal =
+    "--discovery needs --listen-raft: discovery finds peers for a CLUSTER, and without a consensus port this node "
+    "is not in one. It would broadcast, be answered, prove its identity and have nowhere to put the answer.";
+
+/// Whether this build can terminate TLS: a property of the BUILD, which the startup table asks
+/// beside the configuration so a line naming TLS material on a build without it is refused where
+/// an operator is watching -- `--print-surfaces`, `--install-service` -- and not only at boot.
+#if defined(FC_TLS_ENABLED)
+inline constexpr bool BuildServesTls = true;
+#else
+inline constexpr bool BuildServesTls = false;
+#endif
+
+/// Why TLS material is refused on a build that cannot serve it.
+///
+/// Refused rather than warned about, and the daemon answers the same way: a node that started in
+/// the clear after being told to serve TLS is one an operator believes is encrypted.
+inline constexpr std::string_view TlsUnavailableRefusal =
+    "--tls-self-signed or --tls-cert was given, and this build has no TLS support (rebuild with "
+    "-DFASTCACHED_ENABLE_TLS=ON): the admin surface would be served in the clear while an operator believed it "
+    "was encrypted.";
+
 /// Why a worker that could verify no lease is refused, when other machines can reach it (#178).
 ///
 /// Answered by the startup check of the state directory (`NodeRoster::Build`), the one moment the

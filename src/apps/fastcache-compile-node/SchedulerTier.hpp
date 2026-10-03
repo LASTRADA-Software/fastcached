@@ -4,6 +4,7 @@
 #include "FrameEndpoint.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeRefusal.hpp"
 #include "Responders.hpp"
 
 #include <FastCache/Core/Ed25519.hpp>
@@ -112,7 +113,7 @@ class SchedulerTier
     /// @param conditionInterval How often the watch re-asks them: `SchedulerConditionInterval` in
     ///        production, a long interval in a case that drives every evaluation itself.
     /// @return The tier, or why it could not be built.
-    [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, std::string> Start(
+    [[nodiscard]] static std::expected<std::unique_ptr<SchedulerTier>, NodeRefusal> Start(
         NodeConfig const& cfg,
         Distributed::IMembershipOracle const& membership,
         core::platform::IClock& clock,

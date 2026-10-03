@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include "NodeConditions.hpp"
+
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
+#include <FastCache/Core/Logger.hpp>
+#include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Protocol/SealedFrameSocket.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -196,6 +202,47 @@ enum class NodeProofResult : std::uint8_t
     Refused,
 };
 
+/// Whether this machine's OWN cluster has recorded it yet, as the roster it applies says.
+///
+/// **PRIVATE: persisted and transmitted nowhere.** Three answers, because "no cluster of its own"
+/// and "recorded" both mean *announce*, for opposite reasons, and only one of them can ever turn
+/// into the third.
+enum class OwnRecord : std::uint8_t
+{
+    /// This node runs no consensus, so no cluster of its own records it and nothing is awaited: an
+    /// operator admits it (`--enroll-from`, `--cluster-admit-worker`), and until then the
+    /// scheduler's refusal is what says so.
+    NotAsked,
+    /// Its own cluster holds an opinion about its key -- live, or revoked. Revoked announces too:
+    /// that refusal is the scheduler's to say, by name, and holding the round back would hide it.
+    Recorded,
+    /// Its own cluster holds no opinion about its key yet, so every scheduler of that cluster would
+    /// refuse it as unknown.
+    Awaited,
+    /// Its own cluster records this node's ID under ANOTHER key: its `node-key` was replaced while
+    /// the id it minted survived. Held as `Awaited` is -- every scheduler would refuse it -- but said
+    /// at once, because no amount of waiting ends it.
+    OtherKey,
+};
+
+/// What this machine, and a scheduler refusing it, say about an id recorded under another key.
+///
+/// One sentence for both ends (`NodeProofClient::HoldUntilRecorded`, `NodeProofResponder`): the
+/// client is the machine an operator can fix, the refusal is what a scheduler's log shows, and two
+/// wordings of one remedy drift into two remedies.
+/// @param id The id the cluster records under another key.
+/// @return The diagnosis and its remedy.
+[[nodiscard]] std::string ReplacedNodeKeyDiagnosis(std::string_view id);
+
+/// How many consecutive held asks pass before a hold is said again, at `Warn`.
+///
+/// A node its cluster was started with is recorded a moment after start -- one election and one
+/// commit -- so the first hold is ordinary and said at `Info`. One still held after this many asks
+/// is the other cause: a machine joining a cluster that never admitted it, or a cluster that cannot
+/// elect. Counted in ASKS, from every loop that announces -- the worker's heartbeat and the presence
+/// loop share one client -- so at `RosterWantingInterval` it is well under a minute.
+inline constexpr std::size_t OwnRecordPatience = 15;
+
 /// What the attempt learned, and what to say about it.
 struct NodeProofAttempt
 {
@@ -220,15 +267,50 @@ class NodeProofClient
     /// @param nodeId The id this machine minted into its `--cluster-dir`, as the cluster admitted it.
     /// @param key Its identity key pair; must outlive this.
     /// @param trust Whom it may prove itself to; must outlive this.
+    /// @param ownCluster The admission oracle this node's OWN consensus publishes into -- the one its
+    ///        own node-proof surface judges proofs by -- or null on a node that runs no consensus.
+    ///        Required and undefaulted: a consensus node passing null is the defect
+    ///        `HoldUntilRecorded` closes. Must outlive this.
+    /// @param conditions Where a hold that outlasts `OwnRecordPatience`, or an id recorded under
+    ///        another key, is raised as `own-record-awaited`; null where nothing reports it. Answered
+    ///        `Clear` here when @p ownCluster is given, since nothing has been held yet. Required and
+    ///        undefaulted, for @p ownCluster's reason. Must outlive this.
     /// @param random Where each handshake's nonce and ephemeral key come from; must outlive this.
-    NodeProofClient(std::string nodeId, Ed25519KeyPair const& key, IServerTrust const& trust, ISecureRandom& random) noexcept
-        :
-        _nodeId { std::move(nodeId) },
-        _key { key },
-        _trust { trust },
-        _random { random }
-    {
-    }
+    NodeProofClient(std::string nodeId,
+                    Ed25519KeyPair const& key,
+                    IServerTrust const& trust,
+                    Distributed::IMembershipOracle const* ownCluster,
+                    NodeConditions* conditions,
+                    ISecureRandom& random);
+
+    /// Whether this machine's own cluster has recorded it yet.
+    ///
+    /// Asked of the SAME oracle this node's own node-proof surface asks, with the identity this
+    /// client proves, so "would my own scheduler admit me" and "does my own cluster hold me" are one
+    /// question. Read per call: a record arriving between two rounds is seen by the second.
+    /// @return See `OwnRecord`.
+    [[nodiscard]] OwnRecord OwnRecordNow() const;
+
+    /// Whether a round must hold back rather than dial, because this node's own cluster has not
+    /// recorded it yet -- and say so, once per hold.
+    ///
+    /// **Why hold rather than dial.** A node that runs consensus is admitted by its own cluster's
+    /// record of its key, and a member its cluster was started with is recorded only once that
+    /// cluster has elected and committed -- a moment after the worker and presence loops start.
+    /// Dialling before that proved this machine to a scheduler that could only refuse it
+    /// `node-key-unknown`, with a remedy telling an operator to ADMIT this machine to its own
+    /// cluster: a confident wrong signal at every such start, and a counted refusal of a non-event.
+    ///
+    /// **What it says.** `Info` on the first held ask, naming both causes -- the ordinary moment
+    /// before an election, and a joining machine nobody admitted -- because this end cannot tell
+    /// which it is; `Warn` once the hold has lasted `OwnRecordPatience` asks, when the ordinary cause
+    /// no longer explains it, raising `own-record-awaited`; and `Info` when the record arrives, which
+    /// clears it. An id recorded under ANOTHER key (`OwnRecord::OtherKey`) is said at `Warn` and
+    /// raised at once, with `ReplacedNodeKeyDiagnosis`: waiting will not end that one. Never once
+    /// per round.
+    /// @param logger Where a hold, a long hold and its end are said.
+    /// @return True when the round must not dial.
+    [[nodiscard]] bool HoldUntilRecorded(ILogger& logger) const;
 
     /// Prove this machine's identity over @p peer, and seal it: the handshake itself.
     ///
@@ -263,10 +345,26 @@ class NodeProofClient
     }
 
   private:
+    /// Say and raise what @p record means for a round that holds. Caller holds `_holdMutex`.
+    /// @param record `Awaited` or `OtherKey`.
+    /// @param logger Where it is said.
+    void NarrateHold(OwnRecord record, ILogger& logger) const;
+
     std::string _nodeId;
     Ed25519KeyPair const& _key;
     IServerTrust const& _trust;
+    Distributed::IMembershipOracle const* _ownCluster;
+    NodeConditions* _conditions;
     ISecureRandom& _random;
+
+    /// Guards `_heldAsks` and `_heldFor`. Mutable because a hold is narrated from `const` callers:
+    /// both announcing loops share this client read-only.
+    mutable std::mutex _holdMutex;
+    /// Consecutive asks answered "hold" for `_heldFor`, across every loop sharing this client; zero
+    /// when not held.
+    mutable std::size_t _heldAsks { 0 };
+    /// What the current hold is for; `NotAsked` when nothing is held.
+    mutable OwnRecord _heldFor { OwnRecord::NotAsked };
 };
 
 } // namespace FastCache::Node

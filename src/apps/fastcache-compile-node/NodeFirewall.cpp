@@ -124,6 +124,7 @@ std::expected<NodeConfig, std::string> ShapedForService(NodeConfig const& cfg, I
 }
 
 ServiceControlResult InstallWithServiceFirewall(std::function<ServiceControlResult()> const& registerService,
+                                                std::function<ServiceControlResult()> const& removeService,
                                                 NodeConfig const& cfg,
                                                 std::filesystem::path const& program,
                                                 std::string_view serviceName,
@@ -131,23 +132,39 @@ ServiceControlResult InstallWithServiceFirewall(std::function<ServiceControlResu
                                                 IFirewall* firewall)
 {
     auto registered = registerService();
-    if (registered.outcome != ServiceControlOutcome::Done)
+    if (!Registered(registered.outcome))
         return registered;
-    auto const refused = [&registered](std::string_view why) {
+
+    // A registration THIS install created is removed again, so the SCM starts no service the
+    // install refused -- the MSI starts the node straight after it, whatever it answered. On
+    // launchd that is not quite so: `LaunchdInstall` kickstarts a Created auto-start job BEFORE
+    // this judgement, so the job runs briefly until it is booted out here, and that run refuses
+    // to start for the same reason the install was refused. One it only RE-APPLIED is an
+    // upgrade's and stays, refusing to start for the same reason. The refusal is the verdict's
+    // ending (@p outcome) unless the removal itself did not go through, which leaves a
+    // registration nobody asked for: that is a failure, and says how to remove it.
+    auto const refused = [&](ServiceControlOutcome outcome, std::string_view why) {
+        auto registration = RefusedRegistration::Kept;
+        if (registered.outcome == ServiceControlOutcome::Created)
+            registration =
+                NoneRemains(removeService().outcome) ? RefusedRegistration::Removed : RefusedRegistration::NotRemoved;
+        // A rule's sentence may end in its own full stop; the one added here is the only one.
+        auto const sentence = why.ends_with('.') ? why.substr(0, why.size() - 1) : why;
+        auto const refusal = std::format("refusing the install: {}. No firewall rule was opened, since the service's "
+                                         "surfaces follow that configuration",
+                                         sentence);
         return ServiceControlResult {
-            .outcome = ServiceControlOutcome::Failed,
-            .message = std::format("{}\nrefusing the install: {}. No firewall rule was opened, since the service's "
-                                   "surfaces follow that configuration; the service stays registered and refuses to "
-                                   "start for the same reason. Fix it, then run --install-service again",
-                                   registered.message,
-                                   why),
+            .outcome = registration == RefusedRegistration::NotRemoved ? ServiceControlOutcome::Failed : outcome,
+            .message = std::format("{}\n{}", registered.message, RefusedInstallMessage(refusal, serviceName, registration)),
         };
     };
+    // A record that could not be read may be read at the next attempt; a configuration the rules
+    // refuse is refused again, a decision.
     auto const shaped = ShapedForService(cfg, formation);
     if (!shaped.has_value())
-        return refused(shaped.error());
+        return refused(ServiceControlOutcome::Failed, shaped.error());
     if (auto const rejection = NodeInstallRejection(*shaped))
-        return refused(*rejection);
+        return refused(ServiceControlOutcome::Declined, *rejection);
     return WithRegistrationFirewall(std::move(registered), firewall, serviceName, NodeFirewallRules(*shaped, program));
 }
 
@@ -156,12 +173,18 @@ ServiceControlResult InstallNodeService(NodeConfig const& merged,
                                         IConfigPathProbe const& probe,
                                         std::filesystem::path const& program,
                                         std::function<ServiceControlResult(ServiceSpec const&)> const& install,
+                                        std::function<ServiceControlResult(ServiceSpec const&)> const& uninstall,
                                         IFirewall* firewall)
 {
     auto const spec = MakeNodeServiceSpec(program, registration, probe);
     StateDirectoryFormationReader const formation { RegisteredStateDirectory(registration, probe) };
-    return InstallWithServiceFirewall(
-        [&install, &spec] { return install(spec); }, merged, spec.exePath, spec.serviceName, formation, firewall);
+    return InstallWithServiceFirewall([&install, &spec] { return install(spec); },
+                                      [&uninstall, &spec] { return uninstall(spec); },
+                                      merged,
+                                      spec.exePath,
+                                      spec.serviceName,
+                                      formation,
+                                      firewall);
 }
 
 } // namespace FastCache::Node

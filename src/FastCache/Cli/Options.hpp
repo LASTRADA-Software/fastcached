@@ -774,6 +774,38 @@ template <typename Result>
     return ParseFlow::Continue;
 }
 
+/// Apply every option of a whole argument vector that the table can apply, stepping over each
+/// token it cannot.
+///
+/// For a command line that did NOT parse, where what it still NAMED decides something: which
+/// verb an operator typed decides what the refusal exits with, and `ParseOptionsInto` stops at
+/// the first bad token, so a verb typed after one went unseen -- `--no-such-flag --install-service`
+/// answered a start's code. The rows are the one spelling of every flag, so asking them again is
+/// how the verb is found anywhere in the vector without a second list of spellings. Never a
+/// substitute for the real parse: what this assembles is evidence about a command line that was
+/// refused, not a configuration to run with.
+/// @param table The rows to match against.
+/// @param args The arguments, with the program name already removed.
+/// @param result The result to populate with whatever did apply.
+template <typename Result>
+void ApplyRecognisedOptions(std::span<OptionSpec<Result> const> table, std::span<char const* const> args, Result& result)
+{
+    // The same walk as `ParseOptionsInto`, and a `while` for its reason. On a token that does not
+    // apply, the walk resumes just past THAT token -- whatever value `ApplyOneOption` consumed for
+    // it is read again as a token of its own, and refused or applied on its own merits.
+    auto i = std::size_t { 0 };
+    while (i < args.size())
+    {
+        auto const token = i;
+        auto const flow = ApplyOneOption(table, args, i, result);
+        if (flow.has_value() && *flow == ParseFlow::Stop)
+            return;
+        if (!flow.has_value())
+            i = token;
+        ++i;
+    }
+}
+
 /// Parse a whole argument vector against an option table.
 /// @param table The rows to match against.
 /// @param args The arguments, with the program name already removed.

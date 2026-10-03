@@ -184,7 +184,7 @@ TEST_CASE("A node's uninstall removes the any-port discovery reply rule with the
 
     Testing::RecordingFirewall firewall;
     auto const installed =
-        WithRegistrationFirewall(ServiceControlResult { .outcome = ServiceControlOutcome::Done, .message = "installed" },
+        WithRegistrationFirewall(ServiceControlResult { .outcome = ServiceControlOutcome::Created, .message = "installed" },
                                  &firewall,
                                  cfg.serviceName,
                                  NodeFirewallRules(cfg, Program));
@@ -193,8 +193,10 @@ TEST_CASE("A node's uninstall removes the any-port discovery reply rule with the
     REQUIRE(opened.has_value());
     CHECK(std::ranges::count(Testing::Unwrap(opened), std::string { "FastCacheCompileNode discovery-reply udp/any" }) == 1);
 
-    auto const removed = WithRemovalFirewall(
-        ServiceControlResult { .outcome = ServiceControlOutcome::Done, .message = "removed" }, &firewall, cfg.serviceName);
+    auto const removed =
+        WithRemovalFirewall(ServiceControlResult { .outcome = ServiceControlOutcome::Removed, .message = "removed" },
+                            &firewall,
+                            cfg.serviceName);
     CHECK(removed.ExitCode() == 0);
     CHECK(firewall.rules.empty());
 }
@@ -350,8 +352,9 @@ TEST_CASE("An install whose formation record was held opens what the service wil
     auto const result = InstallWithServiceFirewall(
         [&formation] {
             formation.secured = true;
-            return ServiceControlResult { .outcome = ServiceControlOutcome::Done, .message = "installed" };
+            return ServiceControlResult { .outcome = ServiceControlOutcome::Created, .message = "installed" };
         },
+        [] { return ServiceControlResult { .outcome = ServiceControlOutcome::Failed, .message = "not asked" }; },
         unshaped,
         Program,
         unshaped.serviceName,
@@ -380,11 +383,16 @@ TEST_CASE("An install whose formation record cannot be read after securing is re
     formation.unreadable = "the formation record in this node's state directory cannot be read (truncated)";
     Testing::RecordingFirewall firewall;
     auto registrations = 0;
+    auto removals = 0;
 
     auto const result = InstallWithServiceFirewall(
         [&registrations] {
             ++registrations;
-            return ServiceControlResult { .outcome = ServiceControlOutcome::Done, .message = "installed" };
+            return ServiceControlResult { .outcome = ServiceControlOutcome::Created, .message = "installed" };
+        },
+        [&removals] {
+            ++removals;
+            return ServiceControlResult { .outcome = ServiceControlOutcome::Removed, .message = "removed" };
         },
         Installed(),
         Program,
@@ -392,12 +400,127 @@ TEST_CASE("An install whose formation record cannot be read after securing is re
         formation,
         &firewall);
 
+    INFO(result.message);
     CHECK(registrations == 1);
+    // A record that could not be read may be read at the next attempt: transient.
     CHECK(result.ExitCode() == 1);
     CHECK(result.message.contains("refusing the install"));
     CHECK(result.message.contains("cannot be read (truncated)"));
-    CHECK(result.message.contains("refuses to start"));
+    // The registration this install created does not outlive the refusal.
+    CHECK(removals == 1);
+    CHECK(result.message.contains("was removed again"));
     CHECK(firewall.rules.empty());
+}
+
+TEST_CASE("An install refused after its registration removes the registration it created, and keeps one it re-applied",
+          "[node][firewall][install]")
+{
+    // The MSI starts the node straight after the install, whatever the install answered, so a
+    // registration THIS install created must not outlive the refusal. One it only re-applied is an
+    // upgrade's: removing it would take away a service the operator had, so it stays, refusing to
+    // start for the same reason, and the message says which happened.
+    ScriptedFormationReader formation;
+    formation.unreadable = "the formation record in this node's state directory cannot be read (truncated)";
+
+    struct Removal
+    {
+        ServiceControlOutcome registeredAs;   ///< What the registration reported.
+        ServiceControlOutcome removalAnswers; ///< What the removal reports, when it is asked.
+        int removals;                         ///< How many times the removal must be asked.
+        ServiceControlOutcome refusalLeaves;  ///< What the refused install reports.
+        std::string_view says;                ///< What it tells the operator.
+    };
+    auto const cases = std::to_array<Removal>({
+        { .registeredAs = ServiceControlOutcome::Created,
+          .removalAnswers = ServiceControlOutcome::Removed,
+          .removals = 1,
+          .refusalLeaves = ServiceControlOutcome::Failed,
+          .says = "this install had created was removed again" },
+        { .registeredAs = ServiceControlOutcome::Created,
+          .removalAnswers = ServiceControlOutcome::NotInstalled,
+          .removals = 1,
+          .refusalLeaves = ServiceControlOutcome::Failed,
+          .says = "this install had created was removed again" },
+        { .registeredAs = ServiceControlOutcome::Created,
+          .removalAnswers = ServiceControlOutcome::Failed,
+          .removals = 1,
+          .refusalLeaves = ServiceControlOutcome::Failed,
+          .says = "could NOT be removed" },
+        { .registeredAs = ServiceControlOutcome::Reapplied,
+          .removalAnswers = ServiceControlOutcome::Removed,
+          .removals = 0,
+          .refusalLeaves = ServiceControlOutcome::Failed,
+          .says = "re-applied registration is left in place" },
+    });
+    for (auto const& removal: cases)
+    {
+        Testing::RecordingFirewall firewall;
+        auto removals = 0;
+        auto const result = InstallWithServiceFirewall(
+            [&removal] { return ServiceControlResult { .outcome = removal.registeredAs, .message = "installed" }; },
+            [&removal, &removals] {
+                ++removals;
+                return ServiceControlResult { .outcome = removal.removalAnswers, .message = "removal" };
+            },
+            Installed(),
+            Program,
+            "FastCacheCompileNode",
+            formation,
+            &firewall);
+        INFO(result.message);
+        CHECK(removals == removal.removals);
+        CHECK(result.outcome == removal.refusalLeaves);
+        CHECK(result.message.contains(removal.says));
+        CHECK(firewall.rules.empty());
+    }
+
+    // WHAT DISTINGUISHES: above, the verdict is itself a failure, so a removal that failed cannot
+    // be told apart from one that went through. A configuration the rules refuse is a DECISION, and
+    // keeps that ending -- unless the removal failed, which leaves a registration nobody asked for.
+    // A worker naming no --scheduler: an install refuses it, since the service would exit at every boot.
+    NodeConfig const refusedByRules;
+    ScriptedFormationReader readable;
+    auto const decided = std::to_array<Removal>({
+        { .registeredAs = ServiceControlOutcome::Created,
+          .removalAnswers = ServiceControlOutcome::Removed,
+          .removals = 1,
+          .refusalLeaves = ServiceControlOutcome::Declined,
+          .says = "this install had created was removed again" },
+        { .registeredAs = ServiceControlOutcome::Created,
+          .removalAnswers = ServiceControlOutcome::Failed,
+          .removals = 1,
+          .refusalLeaves = ServiceControlOutcome::Failed,
+          .says = "could NOT be removed" },
+        { .registeredAs = ServiceControlOutcome::Reapplied,
+          .removalAnswers = ServiceControlOutcome::Removed,
+          .removals = 0,
+          .refusalLeaves = ServiceControlOutcome::Declined,
+          .says = "re-applied registration is left in place" },
+    });
+    for (auto const& removal: decided)
+    {
+        Testing::RecordingFirewall firewall;
+        auto removals = 0;
+        auto const result = InstallWithServiceFirewall(
+            [&removal] { return ServiceControlResult { .outcome = removal.registeredAs, .message = "installed" }; },
+            [&removal, &removals] {
+                ++removals;
+                return ServiceControlResult { .outcome = removal.removalAnswers, .message = "removal" };
+            },
+            refusedByRules,
+            Program,
+            "FastCacheCompileNode",
+            readable,
+            &firewall);
+        INFO(result.message);
+        CHECK(removals == removal.removals);
+        CHECK(result.outcome == removal.refusalLeaves);
+        CHECK(result.message.contains(removal.says));
+        CHECK(result.message.contains("--scheduler is required to install a service"));
+        // One full stop between the rule's sentence and what the install adds, never two.
+        CHECK_FALSE(result.message.contains(".."));
+        CHECK(firewall.rules.empty());
+    }
 }
 
 TEST_CASE("A failed registration reads no formation and opens nothing", "[node][firewall][install]")
@@ -407,6 +530,7 @@ TEST_CASE("A failed registration reads no formation and opens nothing", "[node][
 
     auto const result = InstallWithServiceFirewall(
         [] { return ServiceControlResult { .outcome = ServiceControlOutcome::Failed, .message = "access denied" }; },
+        [] { return ServiceControlResult { .outcome = ServiceControlOutcome::Failed, .message = "not asked" }; },
         Installed(),
         Program,
         "FastCacheCompileNode",
@@ -446,15 +570,18 @@ TEST_CASE("An install whose formation record was held is judged on the configura
     auto const result = InstallWithServiceFirewall(
         [&formation] {
             formation.secured = true;
-            return ServiceControlResult { .outcome = ServiceControlOutcome::Done, .message = "installed" };
+            return ServiceControlResult { .outcome = ServiceControlOutcome::Created, .message = "installed" };
         },
+        [] { return ServiceControlResult { .outcome = ServiceControlOutcome::Removed, .message = "removed" }; },
         unshaped,
         Program,
         unshaped.serviceName,
         formation,
         &firewall);
 
-    CHECK(result.ExitCode() == 1);
+    INFO(result.message);
+    // A configuration the rules refuse is refused again: a decision.
+    CHECK(result.ExitCode() == 2);
     CHECK(result.message.contains("refusing the install"));
     CHECK(result.message.contains(LoopbackAdvertise));
     CHECK(firewall.rules.empty());
@@ -499,7 +626,10 @@ TEST_CASE("An install reads the formation record in exactly the directory its re
             Program,
             [&registered](ServiceSpec const& spec) {
                 registered.push_back(spec);
-                return ServiceControlResult { .outcome = ServiceControlOutcome::Done, .message = "installed" };
+                return ServiceControlResult { .outcome = ServiceControlOutcome::Created, .message = "installed" };
+            },
+            [](ServiceSpec const& /*spec*/) {
+                return ServiceControlResult { .outcome = ServiceControlOutcome::Removed, .message = "removed" };
             },
             &firewall);
     };

@@ -3,6 +3,7 @@
 
 #include "NodeConfig.hpp"
 #include "NodeProofClient.hpp"
+#include "NodeRefusal.hpp"
 #include "SchedulerReachability.hpp"
 
 #include <FastCache/Cluster/ClusterState.hpp>
@@ -102,8 +103,9 @@ class NodeRoster final: public IPresenceRoster, public IServerTrust
     /// @param wallClock What "now" is when an offered roster is judged. Borrowed.
     /// @param metrics Where a refused roster is counted. Borrowed.
     /// @param logger Where an adoption and a refusal are said. Borrowed.
-    /// @return The roster, or why the node must not start.
-    [[nodiscard]] static std::expected<std::unique_ptr<NodeRoster>, std::string> Build(
+    /// @return The roster, or why the node must not start -- always `KeptRoster`: what the state
+    ///         directory holds, or does not, is what the next start finds there too.
+    [[nodiscard]] static std::expected<std::unique_ptr<NodeRoster>, NodeRefusal> Build(
         NodeConfig const& cfg, core::platform::WallClockRef wallClock, IMetricsSink& metrics, ILogger& logger);
 
     /// @return What a grant is verified against, or null when this node verifies none.

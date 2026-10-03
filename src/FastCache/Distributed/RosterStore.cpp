@@ -26,11 +26,14 @@ std::expected<void, std::string> FileRosterStore::Save(Cluster::PersistedRoster 
     return {};
 }
 
-std::expected<std::optional<Cluster::PersistedRoster>, std::string> LoadPersistedRoster(std::filesystem::path const& path)
+std::expected<std::optional<Cluster::PersistedRoster>, RosterLoadError> LoadPersistedRoster(
+    std::filesystem::path const& path)
 {
     auto const bytes = Consensus::ReadFileIfPresent(path);
     if (!bytes.has_value())
-        return std::unexpected { std::format("the roster this machine kept cannot be read: {}", bytes.error().context) };
+        return std::unexpected { RosterLoadError {
+            .step = RosterLoadStep::Read,
+            .reason = std::format("the roster this machine kept cannot be read: {}", bytes.error().context) } };
     if (!bytes->has_value())
         return std::optional<Cluster::PersistedRoster> {};
 
@@ -43,11 +46,12 @@ std::expected<std::optional<Cluster::PersistedRoster>, std::string> LoadPersiste
             return kept;
         });
     if (!persisted.has_value())
-        return std::unexpected { std::format(
-            "{} holds the roster this machine adopted, and it is not one this build can use ({}); move it aside only "
-            "if this machine should trust its --voter-key anchors again",
-            path.string(),
-            persisted.error().context) };
+        return std::unexpected { RosterLoadError {
+            .step = RosterLoadStep::Decode,
+            .reason = std::format("{} holds the roster this machine adopted, and it is not one this build can use "
+                                  "({}); move it aside only if this machine should trust its --voter-key anchors again",
+                                  path.string(),
+                                  persisted.error().context) } };
     return std::optional { *std::move(persisted) };
 }
 

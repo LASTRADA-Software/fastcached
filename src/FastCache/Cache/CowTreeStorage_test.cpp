@@ -2347,8 +2347,12 @@ TEST_CASE("A conversion another build started is never picked up", "[cowstorage]
     auto const pagesBefore = store.PageCount();
     auto const report = FastCache::CowTreeStorage::MigrateStore(store);
     REQUIRE_FALSE(report.has_value());
-    REQUIRE(report.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
-    REQUIRE(report.error().context.contains("finish it with the build that started it"));
+    REQUIRE(report.error().error.code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+    REQUIRE(report.error().error.context.contains("finish it with the build that started it"));
+    // A decision, not a failure: the conversion had not begun rewriting, and a re-run gets the same
+    // answer, so its operator's exit says do not retry.
+    CHECK_FALSE(report.error().rewriting);
+    CHECK_FALSE(report.error().Transient());
     // Refused without writing: the check happens before the first slice opens a
     // transaction.
     REQUIRE(store.PageCount() == pagesBefore);
@@ -2465,6 +2469,72 @@ TEST_CASE("A conversion killed part-way finishes correctly on a re-run", "[cowst
             REQUIRE(std::cmp_equal(got->entry.flags, i));
         }
     }
+}
+
+TEST_CASE("A conversion that stops part-way says it had begun rewriting", "[cowstorage][format][migrate][exit]")
+{
+    // The other half of the refusals above: a write that fails once the conversion has left its
+    // read-only passes has left the store part-way, and that is what an operator's exit code turns
+    // on -- `Failed`, where a refusal before rewriting is `Declined`. Driven through the page store's
+    // fault injection, as the part-way case above is, so the stop is one the real path produces.
+    //
+    // The FIRST write fails, so the stop is certain rather than depending on how many writes the
+    // conversion happens to need -- and every write is past the read-only passes, which is the
+    // boundary asserted.
+    constexpr int Total = 200;
+    CowTree::InMemoryPageStore store { 4096 };
+    {
+        FastCache::CowTreeStorage::Options opts;
+        opts.compression = FastCache::CompressionCodec::Identity;
+        auto storage = FastCache::CowTreeStorage::OpenBorrowing(opts, store);
+        REQUIRE(storage.has_value());
+        for (auto const i: std::views::iota(0, Total))
+            REQUIRE((*storage)
+                        ->Set(std::format("key-{:05d}", i),
+                              MakeBytes(std::format("value-{}", i)),
+                              static_cast<std::uint32_t>(i),
+                              core::platform::SteadyTimePoint::max())
+                        .has_value());
+    }
+    DowngradeStoreToV3(store);
+
+    // The store counts its writes from construction, and populating it made plenty: counted afresh,
+    // so the ONE the plan names is the conversion's own first.
+    store.ResetCounters();
+    CowTree::InMemoryPageStore::FaultPlan plan;
+    plan.failNthWrite = 1;
+    store.SetFaultPlan(plan);
+    auto const report = FastCache::CowTreeStorage::MigrateStore(store);
+    REQUIRE_FALSE(report.has_value());
+    CHECK(report.error().rewriting);
+    CHECK(report.error().Transient());
+}
+
+TEST_CASE("A conversion that cannot find its store is transient, and one held by another process is a decision",
+          "[cowstorage][format][migrate][exit]")
+{
+    // Both refused before rewriting anything, and a script reads them differently: a path that is not
+    // there -- a mount not back yet -- may be there on a re-run, while a store another process holds
+    // is a decision to act on, not to retry into (the lock is exclusive for the holder's lifetime).
+    TempFile missingFile; // named and never created: `TempFile` removes its path, and nothing opens it
+    FastCache::CowTreeStorage::Options absent;
+    absent.path = missingFile.path;
+    auto const missing = FastCache::CowTreeStorage::Migrate(absent);
+    REQUIRE_FALSE(missing.has_value());
+    CHECK(missing.error().error.code == FastCache::StorageErrorCode::IoError);
+    CHECK_FALSE(missing.error().rewriting);
+    CHECK(missing.error().Transient());
+
+    TempFile heldFile;
+    FastCache::CowTreeStorage::Options held;
+    held.path = heldFile.path;
+    auto holder = FastCache::CowTreeStorage::Open(held);
+    REQUIRE(holder.has_value());
+    auto const busy = FastCache::CowTreeStorage::Migrate(held);
+    REQUIRE_FALSE(busy.has_value());
+    CHECK(busy.error().error.code == FastCache::StorageErrorCode::InUse);
+    CHECK_FALSE(busy.error().rewriting);
+    CHECK_FALSE(busy.error().Transient());
 }
 
 TEST_CASE("Converting a store costs a slice of headroom, not a multiple of the store", "[cowstorage][format][migrate]")
@@ -2633,8 +2703,10 @@ TEST_CASE("A store older than any reader is refused, not rewritten in place", "[
     auto const before = store.PageCount();
     auto const report = FastCache::CowTreeStorage::MigrateStore(store);
     REQUIRE_FALSE(report.has_value());
-    REQUIRE(report.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
-    REQUIRE(report.error().context.contains("NOT been modified"));
+    REQUIRE(report.error().error.code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+    REQUIRE(report.error().error.context.contains("NOT been modified"));
+    CHECK_FALSE(report.error().rewriting);
+    CHECK_FALSE(report.error().Transient());
 
     // Refused before writing anything: the validation pass runs to completion
     // before the first slice opens a transaction.
@@ -2687,8 +2759,10 @@ TEST_CASE("A store newer than this build cannot be converted forwards", "[cowsto
 
     auto const report = FastCache::CowTreeStorage::MigrateStore(store);
     REQUIRE_FALSE(report.has_value());
-    REQUIRE(report.error().code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
-    REQUIRE(report.error().context.contains("upgrade"));
+    REQUIRE(report.error().error.code == FastCache::StorageErrorCode::UnsupportedFormatVersion);
+    REQUIRE(report.error().error.context.contains("upgrade"));
+    CHECK_FALSE(report.error().rewriting);
+    CHECK_FALSE(report.error().Transient());
 }
 
 TEST_CASE("A converted store keeps working as a cache", "[cowstorage][format][migrate]")

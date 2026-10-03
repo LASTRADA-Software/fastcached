@@ -1060,9 +1060,22 @@ std::string CliUsage(UsageColor color)
     return RenderUsage({ .sections = sections }, color, substitutions);
 }
 
+std::expected<void, ConfigError> ParseCliInto(std::span<char const* const> args, CliResult& result)
+{
+    return ParseOptionsInto(CliOptions(), args, result).transform([](ParseFlow) {});
+}
+
+CliResult RecognisedCli(std::span<char const* const> args)
+{
+    CliResult result {};
+    ApplyRecognisedOptions(CliOptions(), args, result);
+    return result;
+}
+
 std::expected<CliResult, ConfigError> ParseCli(std::span<char const* const> args)
 {
-    return ParseOptions(CliOptions(), args);
+    CliResult result {};
+    return ParseCliInto(args, result).transform([&result] { return std::move(result); });
 }
 
 } // namespace FastCache

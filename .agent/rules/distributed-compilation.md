@@ -1776,8 +1776,9 @@ Consequences that are each load-bearing:
     separately, or a `main` that lost one reads exactly like a `main` that has both.
   - **The resolved path travels UNGUARDED by "was the file applied", and the reason is
     that the guard could never decide anything.** A resolved path that will not load
-    already exits `ExitUsage` above, except under `--uninstall-service`, which returns
-    at the service block — so a run reaching the check either applied its file or never
+    already ends the run above (`RefuseUnderService`), except under
+    `--uninstall-service`, which returns at the service block — so a run reaching the
+    check either applied its file or never
     had one. In the unreachable case the gate answers false either way: `cfg` IS the
     command-line parse there, so argv named the token or no secret is in force. **It is
     NOT a reload fix**, and the REASON for that changed under #404 while the conclusion
@@ -3557,6 +3558,24 @@ exchange wrong -- five refusal diagnoses beside it, and not one of them is folde
 connection is UNREACHABLE.** Anything but `Proved` means every verb that round came to send would
 be refused, so `DialAndAnnounce` moves on to the next `--scheduler` rather than sending them --
 which is also what keeps a revoked ex-scheduler from being told anything.
+
+**A consensus node presents no proof before its OWN cluster records its key.** A member the
+cluster was started with is recorded once the cluster has elected, and the worker and presence
+loops start before that -- so a node scheduling for itself proved its identity to itself and was
+refused `node-key-unknown` with a remedy to ADMIT it, at every such start. `DialAndAnnounce`
+holds the round while the node's own admission oracle -- the one its node-proof surface asks --
+has no opinion of its key (`NodeProofClient::HoldUntilRecorded`): said once at Info, and at Warn
+past `OwnRecordPatience`, where it also raises `own-record-awaited` so an operator arriving later
+can ask for it. A REVOKED key is never held, since that refusal is the scheduler's to say. An id
+the cluster records under ANOTHER key is not a wait at all but a `node-key` replaced while the id
+survived (`OwnRecord::OtherKey`, told apart through `IMembershipOracle::LiveKeyOf`): said and
+raised at once, with one remedy for both ends, `ReplacedNodeKeyDiagnosis`. The client-side
+`Unchecked` carve-out in `NodeRoster::StandingOf` survives only for voter records that carry no key,
+and is to be deleted once the member key is required by type. And the responder never
+answers its own id with "admit it" (`UnknownKeyReason`): its own key is this node awaiting its
+record, or its replaced key; another key under its id is a copy of its `--cluster-dir`. It never
+tells a STRANGER'S id to forget itself either: from the scheduler's side a replaced key and
+another machine claiming a member's id look the same, and "forget it" would remove the member.
 
 **What it does not cover, stated rather than left to be found.** The cache tier is unaffected and
 that is the fix rather than an omission: locality is a property of the VERB, and a machine that

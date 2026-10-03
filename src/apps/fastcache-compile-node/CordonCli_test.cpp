@@ -99,7 +99,7 @@ TEST_CASE("A cordon the node refuses is reported with the node's reason", "[node
     auto const report = PutCordonRequest(node, Wire::CordonAction::Lift, "10.1.2.3:6674");
 
     REQUIRE_FALSE(report.has_value());
-    CHECK(report.error().contains("cordoned from itself"));
+    CHECK(report.error().reason.contains("cordoned from itself"));
 }
 
 TEST_CASE("A cordon answered with a body this build cannot read is refused, not rendered", "[node][cordon]")
@@ -110,5 +110,35 @@ TEST_CASE("A cordon answered with a body this build cannot read is refused, not 
     auto const report = PutCordonRequest(node, Wire::CordonAction::Cordon, "127.0.0.1:6674");
 
     REQUIRE_FALSE(report.has_value());
-    CHECK(report.error().contains("cannot read"));
+    CHECK(report.error().reason.contains("cannot read"));
+}
+
+TEST_CASE("A cordon the node never answered is transient, and one it refused is a decision", "[node][cordon][exit]")
+{
+    // The node is always this machine's own, so an unreachable one is the process test's
+    // (`exit-codes-e2e`): the dial there is concrete. Here the exchange itself -- a node that
+    // closed before replying, against one that replied with a refusal.
+    SECTION("the node closed before it replied")
+    {
+        Testing::ScriptedSocket node { std::vector<std::byte> {} };
+        auto const report = PutCordonRequest(node, Wire::CordonAction::Cordon, "127.0.0.1:6674");
+        REQUIRE_FALSE(report.has_value());
+        CHECK(report.error().ending == CommandEnding::Failed);
+    }
+
+    SECTION("the node replied with a refusal")
+    {
+        Testing::ScriptedSocket node { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not one of ours") };
+        auto const report = PutCordonRequest(node, Wire::CordonAction::Cordon, "127.0.0.1:6674");
+        REQUIRE_FALSE(report.has_value());
+        CHECK(report.error().ending == CommandEnding::Declined);
+    }
+
+    SECTION("the node was serving all it will at once: transient")
+    {
+        Testing::ScriptedSocket node { Wire::EncodeErrorReply(Wire::ErrorCode::EndpointBusy) };
+        auto const report = PutCordonRequest(node, Wire::CordonAction::Cordon, "127.0.0.1:6674");
+        REQUIRE_FALSE(report.has_value());
+        CHECK(report.error().ending == CommandEnding::Failed);
+    }
 }

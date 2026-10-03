@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeAnnounce.hpp"
 #include "NodeProofClient.hpp"
+#include "NodeRoster.hpp"
 #include "SchedulerLink.hpp"
 #include "SchedulerReachability.hpp"
 #include "WorkerLease.hpp"
@@ -374,6 +375,12 @@ std::size_t DialAndAnnounce(SchedulerLink& link,
                             IAnnouncement& announcement,
                             AnnounceProof const& proof)
 {
+    // Not dialled at all while this node's own cluster has not recorded it: every scheduler of that
+    // cluster could only refuse the proof as unknown. HERE, the one place both loops dial through,
+    // so neither can reach its own scheduler early; `HoldUntilRecorded` says why, once per hold.
+    if (proof.prover != nullptr && proof.prover->HoldUntilRecorded(logger))
+        return 0;
+
     for (link.BeginRound();;)
     {
         auto client = dialer.Dial(link.Target(), core::net::DialOptions { .connectTimeout = HeartbeatConnectTimeout });
@@ -486,6 +493,13 @@ std::size_t WithdrawOnce(HeartbeatRound const& round, SchedulerLink const& link,
         return 0;
     }
     return WithdrawQueued(round, **proved, target);
+}
+
+std::chrono::seconds NextAnnounceWait(NodeProofClient const* prover, bool rosterWanting)
+{
+    auto const recordAwaited = prover != nullptr && prover->OwnRecordNow() == OwnRecord::Awaited;
+    return rosterWanting || recordAwaited ? std::chrono::duration_cast<std::chrono::seconds>(RosterWantingInterval)
+                                          : NodeAnnounceInterval;
 }
 
 } // namespace FastCache::Node

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <FastCache/Config/YamlReader.hpp>
+#include <FastCache/Platform/ProcessExit.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -9,6 +10,7 @@
 #include <string_view>
 
 #include <tests/ScratchPath.hpp>
+#include <tests/UnreadablePath.hpp>
 
 namespace
 {
@@ -154,6 +156,26 @@ TEST_CASE("YamlReader: a file that is not there is FileNotFound, not ParseError"
     auto const settings = FastCache::ReadYamlSettings(missing);
     REQUIRE_FALSE(settings.has_value());
     CHECK(settings.error().code == FastCache::ConfigErrorCode::FileNotFound);
+    // Absent is an I/O arm, not a verdict: a boot-time start can race the share or the mount the
+    // file lives on, so the supervisor retries it within its start limit.
+    CHECK(FastCache::ConfigurationFileStage(settings.error().code) == FastCache::StartStage::ConfigurationFileIo);
+}
+
+TEST_CASE("YamlReader: a file that is there and cannot be read is FileUnreadable, not FileNotFound", "[config][yaml]")
+{
+    // Two different answers to an OPERATOR -- a path to correct, or a permission -- though one to a
+    // supervisor, which retries both. yaml-cpp reports both as one "bad file", so the reader asks
+    // the filesystem which it was.
+    static FastCache::Testing::ScratchDirectory const scratch { "fastcached-yaml-unreadable" };
+    auto const path = scratch.Path() / "unreadable.yaml";
+    FastCache::Testing::UnreadablePath const held { path, "port: 11211\n" };
+    if (!held.Held())
+        SKIP("this process reads the file anyway (root), so the read arm cannot be reached here");
+
+    auto const settings = FastCache::ReadYamlSettings(path);
+    REQUIRE_FALSE(settings.has_value());
+    CHECK(settings.error().code == FastCache::ConfigErrorCode::FileUnreadable);
+    CHECK(FastCache::ConfigurationFileStage(settings.error().code) == FastCache::StartStage::ConfigurationFileIo);
 }
 
 TEST_CASE("YamlReader: a malformed document reports the line it gave up on", "[config][yaml]")

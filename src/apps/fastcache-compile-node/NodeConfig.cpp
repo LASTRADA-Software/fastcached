@@ -4037,9 +4037,7 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
               [](NodeConfig const& c) {
                   return c.discoveryAddressExplicit && !c.discoveryAddress.empty() && !RunsConsensus(c);
               },
-          .message = "--discovery needs --listen-raft: discovery finds peers for a CLUSTER, and without a "
-                     "consensus port this node is not in one. It would broadcast, be answered, prove its identity "
-                     "and have nowhere to put the answer." },
+          .message = DiscoveryNeedsConsensusRefusal },
         { .refuses = [](NodeConfig const& c) { return RunsConsensus(c) && !c.voterKeys.empty(); },
           .message = VoterKeyOnConsensusNodeRefusal },
         { .refuses = [](NodeConfig const& c) { return c.discoveryReplyPort != 0 && c.discoveryAddress.empty(); },
@@ -4096,6 +4094,11 @@ std::optional<std::string> StartupPolicyRejection(NodeConfig const& cfg)
           .message = "--tls-cert and --tls-key are both or neither: a certificate with no key cannot terminate "
                      "TLS, and this node would otherwise start and serve the admin surface in the clear while "
                      "an operator believed it was encrypted." },
+        // A fact about the BUILD and the configuration together, and nothing else -- so a row, not the
+        // admin tier's `#else` where it lived alone: there `--print-surfaces` accepted the line and
+        // `--install-service` baked it into a registration that refused at every boot.
+        { .refuses = [](NodeConfig const& c) { return !BuildServesTls && (c.tlsSelfSigned || !c.tlsCertFile.empty()); },
+          .message = TlsUnavailableRefusal },
         // The rule that keeps a fleet map off an open port. Loopback needs no
         // credential -- reaching it already means being on the machine -- but a
         // bind an operator deliberately exposed does, and HTTPS alone does not

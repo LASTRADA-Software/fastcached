@@ -128,12 +128,16 @@ class StateDirectoryFormationReader final: public IKeptFormationReader
 ///
 /// A registration that failed reads and opens nothing. A record that still cannot be read, or a
 /// shaped configuration the install's rules refuse, REFUSES the install by name while the operator
-/// is watching: no rule is opened, the exit code is a failure, and the message says the start will
-/// refuse for the same reason. The registration itself is left as it is, because one this install
-/// only RE-APPLIED is an upgrade's, which a refusal must not delete; the service it names refuses
-/// to start. (`main` judges a configuration it could shape BEFORE registering, so a fresh install
-/// is refused with nothing registered; only a held record defers the judgement to here.)
+/// is watching: no rule is opened, and the message says what became of the registration. One this
+/// install CREATED is removed again (@p removeService), because the MSI starts the node straight
+/// after the install whatever it answered; one it only RE-APPLIED is an upgrade's, which a refusal
+/// must not delete, and the service it names refuses to start for the same reason. The ending is
+/// the verdict's -- a record that could not be read fails (1), a configuration the rules refuse is
+/// declined (2) -- unless the removal did not go through, which fails. (`main` judges a
+/// configuration it could shape BEFORE registering, so a fresh install is refused with nothing
+/// registered; only a held record defers the judgement to here.)
 /// @param registerService Makes the registration (`InstallService`).
+/// @param removeService Removes it again (`UninstallService`), asked only for one it created.
 /// @param cfg The merged configuration the install was given.
 /// @param program The executable the rules admit.
 /// @param serviceName The service registered.
@@ -141,6 +145,7 @@ class StateDirectoryFormationReader final: public IKeptFormationReader
 /// @param firewall The machine's firewall, or null where none is managed.
 /// @return The registration's result with the firewall folded in, or the refusal.
 [[nodiscard]] ServiceControlResult InstallWithServiceFirewall(std::function<ServiceControlResult()> const& registerService,
+                                                              std::function<ServiceControlResult()> const& removeService,
                                                               NodeConfig const& cfg,
                                                               std::filesystem::path const& program,
                                                               std::string_view serviceName,
@@ -162,13 +167,16 @@ class StateDirectoryFormationReader final: public IKeptFormationReader
 /// @param probe Answers where the machine-wide state directory lives.
 /// @param program The executable registered and admitted.
 /// @param install Registers a spec (`InstallService` at the configured scope).
+/// @param uninstall Removes it again (`UninstallService` at the configured scope).
 /// @param firewall The machine's firewall, or null where none is managed.
 /// @return As `InstallWithServiceFirewall`.
-[[nodiscard]] ServiceControlResult InstallNodeService(NodeConfig const& merged,
-                                                      NodeConfig const& registration,
-                                                      IConfigPathProbe const& probe,
-                                                      std::filesystem::path const& program,
-                                                      std::function<ServiceControlResult(ServiceSpec const&)> const& install,
-                                                      IFirewall* firewall);
+[[nodiscard]] ServiceControlResult InstallNodeService(
+    NodeConfig const& merged,
+    NodeConfig const& registration,
+    IConfigPathProbe const& probe,
+    std::filesystem::path const& program,
+    std::function<ServiceControlResult(ServiceSpec const&)> const& install,
+    std::function<ServiceControlResult(ServiceSpec const&)> const& uninstall,
+    IFirewall* firewall);
 
 } // namespace FastCache::Node

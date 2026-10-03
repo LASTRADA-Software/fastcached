@@ -438,9 +438,9 @@ TEST_CASE("Enrollment refuses a consensus store another account wrote for that, 
 
     auto const refused = RunEnrollClient(cfg, random, guard);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("consensus term and vote"));
-    CHECK(refused.error().contains("scripted-owner"));
-    CHECK_FALSE(refused.error().contains("already holds consensus state"));
+    CHECK(refused.error().reason.contains("consensus term and vote"));
+    CHECK(refused.error().reason.contains("scripted-owner"));
+    CHECK_FALSE(refused.error().reason.contains("already holds consensus state"));
     CHECK(random.FillCount() == 0);
 }
 
@@ -791,8 +791,8 @@ TEST_CASE("A node id that is there and cannot be read is refused, never minted o
     std::filesystem::permissions(path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
 #endif
     REQUIRE_FALSE(resolved.has_value());
-    CHECK(resolved.error().contains(path.string()));
-    CHECK(resolved.error().contains("never minted over"));
+    CHECK(resolved.error().message.contains(path.string()));
+    CHECK(resolved.error().message.contains("refused rather than minted over"));
     CHECK(random.FillCount() == 0);
     CHECK(TextOf(path) == "n-admitted\n");
 }

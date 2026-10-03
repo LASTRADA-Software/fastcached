@@ -8,6 +8,7 @@
 #include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeRefusal.hpp"
 #include "NodeReload.hpp"
 #include "NodeStatusResponder.hpp"
 #include "NodeToolchains.hpp"
@@ -84,6 +85,19 @@ struct WorkerMachine
 /// @param logger Where the Warn goes.
 /// @return The label to send; empty when it is withheld.
 [[nodiscard]] std::string RegisteredToolchainLabel(ServedToolchain const& toolchain, ILogger& logger);
+
+/// How a worker that served and then gave up ends, when it did.
+///
+/// A survey that found nothing to compile with is `ToolchainSurvey`, a FAILURE: a compiler
+/// installed since is found by the next one.
+/// @param surveyFoundNothing Whether the survey found nothing to serve.
+/// @return The cause, or nullopt when the worker stopped cleanly.
+[[nodiscard]] constexpr std::optional<NodeRefusalCause> WorkerEnding(bool surveyFoundNothing) noexcept
+{
+    if (surveyFoundNothing)
+        return NodeRefusalCause::ToolchainSurvey;
+    return std::nullopt;
+}
 
 /// This machine's own worker seams: the real process runner, toolchain host, discovery
 /// and scratch claimant, claiming under `ScratchBaseDirectory()`.
@@ -225,7 +239,7 @@ class WorkerTier
     /// @param parts What the node lends the tier.
     /// @param makeMachine Builds the machine's seams; not called when no worker runs.
     /// @return The tier; null when `RunsWorker` is false; or why the node must not start.
-    [[nodiscard]] static std::expected<std::unique_ptr<WorkerTier>, std::string> Start(
+    [[nodiscard]] static std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> Start(
         WorkerTierParts const& parts, WorkerMachineFactory const& makeMachine);
 
     ~WorkerTier() = default;
@@ -320,12 +334,12 @@ class WorkerTier
     /// Stop admitting compiles, and wait for the ones admitted to finish.
     void StopAndDrain();
 
-    /// Whether the worker ended in a way a supervisor must read as a failure: a survey
-    /// that found nothing to serve.
-    /// @return True when the process should exit non-zero.
-    [[nodiscard]] bool EndedInRefusal() const noexcept
+    /// How the worker ended, when a supervisor must not read it as a clean stop
+    /// (`WorkerEnding`).
+    /// @return The cause the process ends with, or nullopt for a clean stop.
+    [[nodiscard]] std::optional<NodeRefusalCause> Ending() const noexcept
     {
-        return _surveyFoundNothing;
+        return WorkerEnding(_surveyFoundNothing);
     }
 
   private:

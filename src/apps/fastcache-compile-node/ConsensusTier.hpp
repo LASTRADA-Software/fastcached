@@ -6,6 +6,7 @@
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeMembership.hpp"
+#include "NodeRefusal.hpp"
 #include "NodeRoster.hpp"
 #include "SchedulerTier.hpp"
 #include "SharedCacheDirectory.hpp"
@@ -417,7 +418,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     ///        anything else on the host to take in between. Owned from here on, on every path --
     ///        a start refused before the listener is served closes it.
     /// @return The running tier, or the fatal reason.
-    [[nodiscard]] static std::expected<std::unique_ptr<ConsensusTier>, std::string> Start(
+    [[nodiscard]] static std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> Start(
         NodeConfig const& cfg,
         std::string_view schedulerBound,
         std::optional<Ed25519KeyPair> const& identityKey,
@@ -560,7 +561,7 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// @param bindPort The peer port.
     /// @param boundListener The peer port already bound, or null to bind it; see `Start`.
     /// @return Nothing on success, or the fatal reason.
-    [[nodiscard]] std::expected<void, std::string> Launch(NodeConfig const& cfg,
+    [[nodiscard]] std::expected<void, NodeRefusal> Launch(NodeConfig const& cfg,
                                                           std::vector<Cluster::MemberSpec> const& dialable,
                                                           std::vector<Cluster::MemberSpec> const& bootstrap,
                                                           std::string_view bindAddress,
@@ -970,7 +971,7 @@ struct SharedCacheListeners
 /// @param metrics Where a refused peer connection is counted; must outlive the tier.
 /// @param logger Where progress and refusals are reported.
 /// @return The tier, a null tier meaning "no cluster configured", or the fatal reason.
-[[nodiscard]] std::expected<std::unique_ptr<ConsensusTier>, std::string> StartConsensusOrExplain(
+[[nodiscard]] std::expected<std::unique_ptr<ConsensusTier>, NodeRefusal> StartConsensusOrExplain(
     NodeConfig const& cfg,
     std::unique_ptr<SchedulerTier> const& schedulerTier,
     std::string_view schedulerBound,

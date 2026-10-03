@@ -23,7 +23,7 @@ readable and silently ignored. Every rule below has already been one of them.
   on macOS or Windows. Four things about the seam's shape are load-bearing:
   - **`daemonFlag` is a field rather than an argument**, because the two supervisors
     disagree and one spec has to answer both: the Windows SCM needs it (it is the
-    hook that hands control to `WindowsServiceHost`) and launchd needs its absence,
+    hook that hands control to the Windows `ServiceHost`) and launchd needs its absence,
     since like systemd it supervises the process it started and reaps a job that
     forks as "exited".
   - **`serviceAccount` and `ownedPaths` replaced a constant and a reach into
@@ -202,6 +202,13 @@ readable and silently ignored. Every rule below has already been one of them.
   answer depends on anything but the parsed configuration, and if it does not, the
   table is where it goes.
 
+  **A property of the BUILD is not I/O either.** TLS material on a build without TLS was
+  refused only by the admin tier's `#else`, so `--print-surfaces` accepted the line and
+  an install baked it in; it is a row (`BuildServesTls`, `TlsUnavailableRefusal`) now. The
+  daemon has the same shape and its own table, `DaemonStartupRejection` -- duplicate
+  listeners and both TLS rules, which its body asked only once the host had been entered
+  -- asked in `main` before the install branch.
+
   Where it goes depends on what the answer needs to say. A **grammar** goes in the
   option table -- `--raft-peer` holds `Cluster::ClusterMember`, parsed by the row
   that accepts it, which refuses a bad token on every path and *names the token*.
@@ -337,6 +344,151 @@ readable and silently ignored. Every rule below has already been one of them.
   that could be wrong for years with nothing to show it. The default hosts are named
   (`SchedulerListenDefaultHost` and its siblings) for the rules that *do* turn on
   them -- `--dashboard`'s loopback test is the one that does.
+- **A refusal in `main` still owes the SCM its answer.** The SCM waits for
+  the service it started to CONNECT; a process that refuses and returns from `main`
+  first is reported as error 1053, *did not respond in a timely fashion*, however
+  clearly it named the refusal in the event log -- and `fastcached`'s refusals there
+  went to stderr, which a service does not have. So every refusal between choosing the
+  host and entering it goes through `RefuseStart(host, logger, reason, code)`, which the
+  foreground and POSIX hosts answer with the code and the service host answers by
+  connecting and reporting a stop with the code as `dwServiceSpecificExitCode`
+  (`Platform/ServiceStatusPlan.hpp` is the order, as a table), never RUNNING first. The
+  Windows host is therefore CHOSEN before the configuration is judged, and a refusal
+  from before any configuration exists -- a command line that does not parse, a file
+  that does not load -- is reported under the service the command line names.
+  `ServiceStatusPlan_test`'s source walk refuses a bare refusal `return` in that
+  stretch of either `main`, which opens at the PARSE: an unknown flag is a refusal too.
+  The host is `ServiceHost`, platform-neutral over `IServiceControlManager`'s three
+  calls, so what it reports is asserted against `Testing::ScriptedServiceControlManager`
+  -- which records every SCM rule a caller breaks, nothing after `STOPPED` among them,
+  because a fake more permissive than the SCM passes a host that is not. **Reporting
+  `STOPPED` is the LAST thing the host does**: the dispatcher returns once the SCM records
+  it and `main` frees the host, so nothing of the host's is held or released after the
+  call -- the `Close()` rule's shape. The fake runs the service main INLINE, which is its
+  blind spot, so `AfterStopped` stands a case in that window. **And the control handler
+  reaches the host only through a gate**: the SCM keeps its registration for the life of the
+  PROCESS and calls it on its own thread, so the registration holds `ServiceControlGate`,
+  never `this`; the host closes it before any member goes, a delivery runs wholly under its
+  lock, and the Win32 slot holding it is never destroyed.
+
+  Only a start and an install are judged by the serving rules (`ServingRulesRejection`, over
+  `JudgedByServingRules`): an uninstall refused over the typo it was reached to undo is
+  recovery blocked.
+
+- **A refused start exits with a code of its OWN, and a supervisor that can read it never
+  restarts it** -- `ProcessExit::Refused`, 78 (`EX_CONFIG`), in `Platform/ProcessExit.hpp`.
+  A defect in the build's own wiring (`NodeRefusalCause::BuildDefect`) borrows it: no
+  configuration reaches one, and every start meets it.
+  A retry cannot change a refusal and can change a failure, so the code is decided **by the
+  ARM that gave up, never by the step**: only a VERDICT -- on the command line, or on bytes
+  that were actually READ (garbage, a foreign layout, an empty file, a contradiction) -- is
+  `Refused`. **Every I/O arm is `Failed`** (`EXIT_FAILURE`, restarted), whatever its errno
+  and without interpreting it: an open, a read, a directory created, a file written, a random
+  draw; the supervisor's own start limit bounds the retries. So a step that both reads and
+  judges has a row per arm (`IdentityKey` / `IdentityKeyIo`, `NodeIdentity` /
+  `NodeIdentityIo`, `ConfigurationFile` / `ConfigurationFileIo`), chosen from the fault that
+  refused (`StageOf`, `ConfigurationFileStage`) -- never one row for a site whose arms differ.
+  **ABSENCE is an I/O arm too, with no carve-out**: a named configuration file, credential or
+  roster that is not there is `Failed`, because a start at boot can race the share or the mount
+  it lives on, and a path that is simply wrong still stops once the start limit is spent. An
+  earlier ruling refused an absent configuration file; it was revised. Measured before this
+  rule: a mode-000 kept roster exited 78 and systemd never tried it again. `ProcessExit_test`
+  holds each row to a written verdict and both `main`s to the table.
+  - **WHO READS an exit decides it, and a one-shot command is not a start.** A START is read by
+    a supervisor: 1 or 78 by the arm, as above. A ONE-SHOT command -- `--print-surfaces`,
+    `--print-identity`, `--install-service`, `--uninstall-service`, `--migrate-storage`,
+    `--migrate-cache`, `--seed-config`, `--cluster-*`, `--enroll-*`, `--enroll-from`, `--cordon`
+    -- is read by an operator or a script, and ends as a `CommandEnding` by what that reader
+    should do next: **2 (`Declined`) is a DECISION -- the same command gets the same
+    answer, so do not retry; 1 (`Failed`) is TRANSIENT -- a retry may get past it.** A decision:
+    a verdict on the arguments or on bytes read, a refusal a peer REPLIED with (`NotLeader` naming
+    a leader the verb does not follow, `UnknownLease`, `NotAMember`, a body this build cannot read,
+    `NoCluster`, `UnsupportedVersion`),
+    a store another process holds, a precondition only the operator changes (elevation, an
+    account that does not exist, a name the registration refuses). Transient: an I/O arm (an
+    open, a read, a write, a directory, a draw, a file that is not there), a transport that
+    delivered no reply (a dial, a broken or timed-out exchange, a seal), a system call that
+    failed on its own, a change stopped part-way that a re-run finishes. It is the start's own
+    rule asked of a command: a step that has a stage or a cause ends by it (`EndingOf(StartStage)`,
+    `EndingOf(NodeRefusalCause)`, the key and identity faults' stages, `ConfigurationFileStage`),
+    the refusals decided BEFORE a one-shot runs included (`ExitReaderRows`' `Operator` row). A
+    `--healthcheck` is read
+    by a container runtime, which knows 0 and 1 only (Docker reserves 2), so its every refusal
+    and failure is 1.
+    - **The ending is DATA, never a literal at the site**: a verb's result carries it --
+      `ServiceControlResult::ending`, `CowTreeStorage::MigrationFailure::Transient()` (part-way, or
+      an I/O error before it began), `UnfinishedCommand` -- and `CommandExitCode` is the one mapping
+      to a code. It is named apart from a start's `ExitCodeFor` because they answer different
+      readers, and `ServiceStatusPlan_test`'s scan reads that name as a start's refusal. **No
+      site in either `main` spells a code** -- no literal, no `EXIT_*`, no local constant standing
+      for one: a local decision states its ending (`CommandEnding::Declined`) and the mapping turns
+      it into a code, and `ProcessExit_test` pins both mains to that. The node's pre-verb refusal
+      asks `RefusalExitCode(ExitReader::Operator, stage)`, the row the daemon reads, so one row
+      governs both binaries. A command
+      over several parts ends as the WORST of them -- the enumerators are in order of severity and
+      `std::max` reads it.
+    - **A registration decides its ending over a SEAM, compiled on every host**: every SCM and
+      launchd call goes through `IScmCalls` / `ILaunchdCalls` (one per supervisor -- they share no
+      primitive), the registration itself is `ScmInstall`/`ScmUninstall`/`LaunchdInstall`/
+      `LaunchdUninstall` over it, and the real calls live behind `#if` in one implementation per
+      platform. An SCM error travels as its raw code, compared against `ScmError*` constants the
+      Windows build `static_assert`s against the SDK, so WHICH code declines is tested on Linux as
+      well; `src/tests/ScriptedServiceCalls.hpp` scripts both. The interface names no Win32 API
+      (`Create`, not `CreateService`): `<windows.h>` defines those as macros, and a member one TU
+      renames and another does not is two vtables.
+    - **A network verb ends by WHERE ITS ANSWER CAME FROM, never by its words**
+      (`Node/OneShotAnswer.hpp`): `AnswerSource` -- `Local` (refused here before any dial),
+      `Transport`, `Reply`, `Pending` -- is a table, and the exchange's own outcome is classified
+      ONCE (`SourceOf`: `Transport` is transport, every outcome that arrived is a reply unless it
+      decided nothing). A runner
+      returns `std::expected<std::string, UnfinishedCommand>` and `ReportOneShotVerb` maps it. The
+      enrollment `Fatal` reading is BOTH sources, so the joiner keeps the outcome and classifies it
+      rather than the reading. **A reply that decided NOTHING is not a decision**, and is `Pending`,
+      transient (1): a refusal whose code the WIRE calls retriable (`ErrorDescriptor::retry`, a
+      type with a deleted default so no row omits it, a `retryWhy` per code, and the set pinned by
+      `RetriableCodesArePinned`) -- a code is a structured fact the peer states, not its words; a
+      `NotLeader` naming nobody, which is an election; a redirect chain that did not settle; and a
+      joiner that gives up at the approval bound after `Waiting` or `Closed`. Only a joiner the
+      seed REFUSED is 2. **A peer on another wire version is a decision, not a transport fault**:
+      a reply header carries no version, so the SERVER's range decides and answers
+      `UnsupportedVersion`, a refusal that arrived; only bytes that cannot be framed at all are
+      `Transport`.
+    - **Who reads an outcome is a COLUMN**: `CliOutcomeTable`'s `reader` (`ExitReader`:
+      `Supervisor`, `Operator`, `Prober`) for the daemon, `EarlyVerbs` for the node, and a
+      pre-verb refusal answers `RefusalExitCode(reader, stage)`. `RefuseUnderService` takes the
+      daemon's whole `CliResult`, never an outcome beside it, so no site can hand it one the
+      command line did not name. After a parse that FAILED, the verb is read from the WHOLE
+      argv (`ApplyRecognisedOptions`, through the option rows themselves -- the one spelling of
+      every flag), so `--no-such-flag --install-service` is an install's refusal, in both binaries.
+    - `Usage` is ONE `ProcessExit` row with `endsAStart` false: no `StartStage` answers it and the
+      systemd units' derived `RestartPreventExitStatus` does not exempt it.
+    - `exit-codes-e2e` drives the routing through both real binaries (neither `main` is in a test
+      target): each one-shot decline at 2, a start's 1 and 78 behind a bait the start refuses
+      after its file, a probe's 1, both argv orders, and every network verb against a port nobody
+      answers (1) and refused locally (2); a refusal a PEER replied is asserted at each runner's
+      seam. `node-config-file-e2e` covers the node's files.
+  - **The node's serving body by the same rule, per REFUSAL rather than per step**: a tier's
+    refusals are of several kinds, so each `*OrExplain` refusal carries a `NodeRefusalCause`
+    (`NodeRefusal.hpp`) and `main` ends with that cause's exit. The census names the cause
+    every refusal site spells, one site per arm; `NodeRefusal_test` holds each cause to its
+    exit. A kept roster or a credential file that was read and cannot be used is `Refused`;
+    one that could not be read (`KeptRosterIo`, `CredentialIo`), a port, a store, TLS
+    material, a scratch root and the toolchain survey are `Failed`. **An identity file that is
+    there and cannot be read is not an absent one**: it used to be read as absent and MINTED
+    over.
+  - **systemd**: every shipped unit says `RestartPreventExitStatus=78` and keeps
+    `Restart=on-failure` under the DEFAULT start limit. A unit start limit of its own is gone:
+    it counted an operator's restarts with the refusals, and the fourth `systemctl restart` in
+    ten minutes left the service STOPPED. Measured on systemd 259: a refusal runs once and stays
+    failed; a failure is restarted; restarts at a human pace are all honoured, and only five
+    starts inside ten seconds meet the default limit.
+  - **Windows**: the SCM runs its recovery actions for every stop whose Win32 code is not zero,
+    so a refusal it did not restart would have to report zero -- hiding 1066 and 78 from
+    `sc query`. It is bounded instead (`ServiceRestartAttempts`): three restarts in ten minutes,
+    and `ServiceRecoverySteps` ends in no action, since the SCM repeats the LAST step forever.
+  - **launchd** can tell an exit only from a crash, so `{Crashed:true}` restarts neither exit and
+    a crash at every start forever; `BuildLaunchdPlist` states both costs.
+
 - **The supervisor's launch arguments must not pass `--daemon`.** The POSIX
   daemonize path double-forks and sends stdout/stderr to `/dev/null`, which
   silences journald; its pidfile is also written after both parents exit, racing
@@ -954,7 +1106,11 @@ readable and silently ignored. Every rule below has already been one of them.
   found on the day somebody ran the installer.
 - **A missing file is `FileNotFound`, not `ParseError`.** `YAML::BadFile` derives
   from `YAML::Exception`, so catching only the general case sent an operator who
-  mistyped `--config` hunting for a syntax mistake in a file that is not there.
+  mistyped `--config` hunting for a syntax mistake in a file that is not there. And
+  a file that IS there and cannot be read is `FileUnreadable`, asked of the filesystem
+  since yaml-cpp cannot tell the two apart. They are two answers to an OPERATOR (a path, a
+  permission) and ONE to a supervisor: both are I/O arms, exit 1, restarted
+  (`ConfigurationIoCodes`).
 - **The shipped reference configuration is checked against the table.** Nothing else
   connects them: the flag parses, the file parses, and a build in which they describe
   different products passes everything. A setting with no commented block is one

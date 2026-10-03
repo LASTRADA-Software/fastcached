@@ -116,16 +116,83 @@ cmake -S . -B build -G Ninja \
 The fastcached build does this for itself: `cmake/portable/CompileCache.cmake` picks
 `fastcache-cc` up automatically whenever the binary is on `PATH` and a daemon
 answers at `127.0.0.1:6674` — at any other daemon, local or remote, when
-`FASTCACHE_ADDR` is exported, at `-DFASTCACHE_ADDR=host:port` ahead of even that,
-nowhere if it is set empty — and injects `FASTCACHE_SOURCE_DIR` /
+`FASTCACHE_ADDR` is exported when the build tree is created, at
+`-DFASTCACHE_ADDR=host:port` ahead of even that, nowhere if it is set empty — and injects `FASTCACHE_SOURCE_DIR` /
 `FASTCACHE_BINARY_DIR` from the source and binary directories, so those two need
 not be exported.
 
-Exporting `FASTCACHE_ADDR` retargets an existing build tree on its next
-configure, rather than being frozen at whatever the first configure saw, which is
-what ordinary cache semantics would do to it. A `-DFASTCACHE_ADDR=` passed on the
-current run still wins over the environment — including the empty value that opts
-out — since it is the more deliberate of the two.
+**The configure environment seeds a build tree; it does not steer one.**
+`FASTCACHE_ADDR` and `FASTCACHE_SCHEDULER` (below) are taken from the environment
+by the configure that creates the tree's cache entry, and from then on they are
+held in the build tree's cache. Only these move a held value:
+
+- `-DFASTCACHE_ADDR=<host:port>` / `-DFASTCACHE_SCHEDULER=<host:port>`, and the
+  empty `-DFASTCACHE_ADDR=` / `-DFASTCACHE_SCHEDULER=`, which turn the cache and
+  dispatch **off** respectively. A `-D` always outranks the environment, including
+  one that repeats the value the tree already holds;
+- `cmake -U FASTCACHE_ADDR` / `-U FASTCACHE_SCHEDULER`, which removes the entry,
+  so the configure it is part of seeds it again from its own environment;
+- `cmake --fresh`, which seeds everything again.
+
+A configure whose environment presents a different value does **not** apply it.
+It says so, naming the `-D` that would:
+
+```
+-- [cache] FASTCACHE_ADDR is '10.0.0.5:6674' in the environment and NOT applied: this build tree holds '127.0.0.1:6674', and the environment only seeds a tree with no FASTCACHE_ADDR entry -- -DFASTCACHE_ADDR=10.0.0.5:6674 applies it
+```
+
+This used to be the other way round: a *change* in the environment retargeted
+the entry unless it had been "changed by hand", and "by hand" was judged by
+comparing the entry with the value last applied. That comparison cannot see a
+`-D` that typed the value already held -- measured: a tree configured with
+dispatch off from one shell, reconfigured from a terminal holding
+`FASTCACHE_SCHEDULER` with `-DFASTCACHE_SCHEDULER=` to say off explicitly, came up
+**on**. A held value and a reported difference have no such blind spot.
+
+**Dispatch is decided at configure, and configure says which way.** Beside the
+line naming the launcher, it prints one of:
+
+```
+-- [cache] dispatch: 10.0.0.9:6674 (configured, seeded from the configure environment and held in this build tree's cache; baked into the launcher, so the build's own environment does not change it; not probed -- each compile records DISPATCHED or DECLINED in invocations.log; -DFASTCACHE_SCHEDULER= turns it off)
+-- [cache] dispatch: off (no FASTCACHE_SCHEDULER in the configure environment, and this build tree now holds that; every miss compiles on this machine -- -DFASTCACHE_SCHEDULER=<host:port> turns it on)
+-- [cache] dispatch: off (FASTCACHE_SCHEDULER is empty in this build tree's cache, which outranks the 10.0.0.9:6674 in the environment; every miss compiles on this machine -- -DFASTCACHE_SCHEDULER=10.0.0.9:6674 turns it on)
+```
+
+Both open with `[cache] dispatch: ` and then the endpoint or `off`, so one search
+finds the line whichever way configure decided. A value held from an earlier
+configure reads `held in this build tree's cache,
+where a -DFASTCACHE_SCHEDULER or the configure that created the tree put it`,
+and an environment presenting another scheduler adds `the <host:port> in the
+environment is NOT applied -- -DFASTCACHE_SCHEDULER=<host:port> retargets it`.
+The line is **configuration, not reachability**: nothing at configure asks the
+scheduler anything, and each compile records whether it was `DISPATCHED` or
+`DECLINED` in `invocations.log`.
+
+The generated launcher carries exactly what the line says:
+`FASTCACHE_SCHEDULER=<host:port>` when dispatch is on, and `FASTCACHE_SCHEDULER=`
+(which the launcher reads as unset) when it is off. Set-but-empty and unset are
+the same thing in the environment here, unlike `FASTCACHE_ADDR`, because the
+launcher reads them the same way: neither dispatches.
+
+**So a `FASTCACHE_SCHEDULER` in the build's own environment no longer changes
+anything**, in either direction. That is on purpose. The launcher used to read it
+only from the environment of whatever ran the build, so a value set in one shell
+and a build started from another compiled every miss locally -- measured on a
+workstation, 341 misses with `NOT_CONFIGURED` on each, noticed only because a
+fleet dashboard read 0 compiling -- while configure had said nothing about
+dispatch at all. And it is held rather than re-read because the first version of
+this re-read the environment at every configure, and ninja's own re-run from a
+build shell without the variable turned dispatch off in a log nobody reads
+(measured the same day). The configure probe never dispatches, whatever the
+setting: it asks whether the cache answers, and a slow or vanished scheduler must
+not make that question time out. Changing the value changes every compile command,
+so the next build recompiles everything -- served from the cache, since the key does
+not include the scheduler. `ctest -R compile-cache-dispatch` pins the printed line
+against the generated launcher, in both states, across reconfigures with and
+without a `-D`, and across ninja's own regeneration; it holds `FASTCACHE_ADDR` to
+the same rule. This applies only where the module chooses the launcher; a build
+that sets `CMAKE_CXX_COMPILER_LAUNCHER=fastcache-cc` itself still reads the
+environment at build time.
 
 "Answers" is checked, not assumed: configure compiles one tiny translation unit
 through the launcher with `FASTCACHE_VERBOSE=1` and accepts only a reported
@@ -232,7 +299,7 @@ This page is the prose version; if the two ever disagree, `--help` is right.
 | `FASTCACHE_DISPATCH_TIMEOUT` | Deadline for one whole **`COMPILE`** exchange with a worker. `0s` removes the bound. Far larger than `FASTCACHE_TIMEOUT` because it bounds a different shape of conversation: a worker writes nothing until the compiler has finished, so the client waits out the entire remote compile in one read. Ten minutes because that is the scheduler's own lease timeout — waiting longer means waiting on a lease it has already reclaimed. See [Distributed compilation](../getting-started/distributed-compilation.md). | `10min` |
 | `FASTCACHE_DISPATCH_IDLE` | Deadline on **silence** during a `COMPILE` exchange. `0s` removes the bound. A worker writes a five-byte progress frame every few seconds while it is compiling, so this bounds how long it may say *nothing* rather than how long the compile may take — which is what lets it be seconds while `FASTCACHE_DISPATCH_TIMEOUT` stays minutes. It is the only thing that sees a worker whose machine answers every keepalive probe while the process makes no progress. On expiry the launcher compiles locally and hands the lease back, and its fall-back line (with `FASTCACHE_VERBOSE`) reads *stopped reporting progress* rather than *ran out of budget*. See [Distributed compilation](../getting-started/distributed-compilation.md). | `30s` |
 | `FASTCACHE_MAX_STORE_BYTES` | Largest compiled result the launcher will offer to the daemon; `0` means no limit. A bigger result is simply left uncached. Matches the daemon's `--storage-max-value` default by construction rather than by negotiation — there is no handshake, so raise **both** or the other keeps refusing. | `268435456` (256 MiB) |
-| `FASTCACHE_SCHEDULER` | `host:port` of a fleet scheduler — the `--listen-node` port of some `fastcache-compile-node` that serves it. On a miss the launcher asks it for a worker and sends that worker the preprocessed translation unit. Every refusal falls back to a local compile, with one exception: `not-leader` is an instruction rather than an answer about the fleet, so the launcher retries against the endpoint the refusal names (up to two hops, then it compiles locally). This value therefore only has to be **a** member of the cluster, not the current leader — no launcher needs re-pointing after an election. The workers do the same with their own `--scheduler`: a node follows `not-leader` when it registers and heartbeats, and remembers where the leader answered, so an election re-points the whole fleet rather than just the clients. Both halves are needed — a launcher that followed the redirect while the workers did not would reach a leader whose registry they had all expired out of, and every lease would answer `no-worker`. A cache that is unreachable or refuses counts as a miss for this purpose — it does not disable dispatch. See [Distributed compilation](../getting-started/distributed-compilation.md). | unset — **every miss compiles locally** |
+| `FASTCACHE_SCHEDULER` | `host:port` of a fleet scheduler — the `--listen-node` port of some `fastcache-compile-node` that serves it. On a miss the launcher asks it for a worker and sends that worker the preprocessed translation unit. Every refusal falls back to a local compile, with one exception: `not-leader` is an instruction rather than an answer about the fleet, so the launcher retries against the endpoint the refusal names (up to two hops, then it compiles locally). This value therefore only has to be **a** member of the cluster, not the current leader — no launcher needs re-pointing after an election. The workers do the same with their own `--scheduler`: a node follows `not-leader` when it registers and heartbeats, and remembers where the leader answered, so an election re-points the whole fleet rather than just the clients. Both halves are needed — a launcher that followed the redirect while the workers did not would reach a leader whose registry they had all expired out of, and every lease would answer `no-worker`. A cache that is unreachable or refuses counts as a miss for this purpose — it does not disable dispatch. See [Distributed compilation](../getting-started/distributed-compilation.md). A build configured through `cmake/portable/CompileCache.cmake` has this decided at **configure** and baked into its launcher, so the build's own environment does not change it (see Usage). | unset — **every miss compiles locally** |
 | `FASTCACHE_TOKEN` | The password for a cache at `FASTCACHE_ADDR` started with `--requirepass`, presented **to that cache alone**. Costs no round trip — it is pipelined ahead of the real command, not awaited. Safe against a cache that requires none: such a cache accepts it and ignores it. A compile node needs none: every exchange with another machine — the scheduler, a worker, a remote cache — presents a **machine ticket** this machine's node mints for that exchange alone, over loopback at `FASTCACHE_ADDR`'s port, and a token sent there would admit nobody. | unset — **no password sent** |
 | `FASTCACHE_USER` | Username to accompany `FASTCACHE_TOKEN`. Unset (the usual case) authenticates against the secret alone, which is what `--requirepass` configures. Ignored without a token — a username on its own is a misconfiguration, not a request to authenticate, and sending an empty secret would be refused by every server that wants one. | unset |
 | `FASTCACHE_VERIFY` | Verify one hit in every N by compiling the translation unit again and comparing the objects — see [Verifying that a hit is the right object](#verifying-that-a-hit-is-the-right-object). Costs a whole compile per verified hit, so it is for CI, a nightly, or reproducing a report. `1` checks every hit. Which hits are sampled is decided by hashing the key rather than by chance, so the rate holds over a build and a translation unit that verified verifies again. A value that is not a whole number reads as **off** rather than as an error: this is a diagnostic set by hand, and refusing to compile over a typo in it would break the build it was brought in to investigate. | unset (off) |
@@ -281,7 +348,13 @@ it folded a set-but-empty `FASTCACHE_ADDR` into the default -- so on a POSIX she
 where the spelling above *does* travel, `export FASTCACHE_ADDR=` reached the launcher
 as an opt-out and reached the build integration as "say nothing", and the build went
 on being fronted. The two readings of one variable now agree: absent means the
-default, present-and-empty means no caching, in both. Note this is why the paragraph
+default, present-and-empty means no caching, in both -- **on the configure that
+creates the build tree's `FASTCACHE_ADDR` entry**. After that the tree holds its
+address and the environment only seeds a tree with no entry, so a later
+`export FASTCACHE_ADDR=` is reported as not applied and the launcher keeps the held
+address; opt a tree that already holds one out with `-DFASTCACHE_ADDR=`. The
+launcher itself reads the variable at every compile only where the module did not
+choose it. Note this is why the paragraph
 above still sends a PowerShell user to `-D`: that platform's problem is that the
 variable never reaches the child at all, which no predicate on the receiving side can
 repair.

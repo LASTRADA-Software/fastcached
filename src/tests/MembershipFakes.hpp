@@ -10,6 +10,7 @@
 #include <format>
 #include <functional>
 #include <map>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -98,6 +99,12 @@ class ListedMembership final: public Distributed::IMembershipOracle
         return {};
     }
 
+    /// No key, for `ExplainKey`'s reason.
+    [[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(std::string_view /*id*/) const override
+    {
+        return std::nullopt;
+    }
+
     /// Stop admitting @p peer.
     ///
     /// Part of the union rather than of one caller: `LiveStatsResponder_test` needs a member to
@@ -160,6 +167,12 @@ class FixedMembership final: public Distributed::IMembershipOracle
                                                              Distributed::KeyEvidence /*evidence*/) const override
     {
         return {};
+    }
+
+    /// No key, for `ExplainKey`'s reason.
+    [[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(std::string_view /*id*/) const override
+    {
+        return std::nullopt;
     }
 
   private:

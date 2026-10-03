@@ -81,6 +81,17 @@ class IMembershipOracle
     /// @return `Member` naming the evidence's route when the key is live for that id, `Forgotten`
     ///         naming `KeyTombstone` when it is revoked, and `Outsider` -- no opinion -- otherwise.
     [[nodiscard]] virtual MembershipDecision ExplainKey(ProvenIdentity const& identity, KeyEvidence evidence) const = 0;
+
+    /// The key the cluster holds LIVE under @p id, whichever key is asking.
+    ///
+    /// `ExplainKey` answers no opinion both for an id nobody recorded and for an id recorded under
+    /// ANOTHER key -- a machine whose `node-key` was replaced while the id it minted survived -- and
+    /// the two have different remedies: waiting or admitting for the first, restoring the old key
+    /// or forgetting the id for the second. This is what tells them apart. Pure virtual for
+    /// `ExplainKey`'s reason: a participant that inherited silence would hide the second case.
+    /// @param id The id to look up.
+    /// @return The live key recorded under @p id, or nothing when this participant records none.
+    [[nodiscard]] virtual std::optional<Ed25519PublicKey> LiveKeyOf(std::string_view id) const = 0;
 };
 
 /// Fold one participant's answer into a running decision, on `PrecedenceOf`.
@@ -156,6 +167,11 @@ class OpenMembership final: public IMembershipOracle
     {
         return {};
     }
+    /// No key: an open policy records none.
+    [[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(std::string_view /*id*/) const override
+    {
+        return std::nullopt;
+    }
 };
 
 /// This machine is a member of its own node's fleet, and nothing else is -- by address.
@@ -184,6 +200,12 @@ class LoopbackMembership final: public IMembershipOracle
     [[nodiscard]] MembershipDecision ExplainKey(ProvenIdentity const& /*identity*/, KeyEvidence /*evidence*/) const override
     {
         return {};
+    }
+
+    /// No key: an address records none.
+    [[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(std::string_view /*id*/) const override
+    {
+        return std::nullopt;
     }
 };
 
@@ -235,6 +257,17 @@ class AnyOfMembership final: public IMembershipOracle
         for (auto const* participant: _participants)
             FoldMembership(decision, participant->ExplainKey(identity, evidence));
         return decision;
+    }
+
+    /// @param id The id to look up.
+    /// @return The first participant's live key for @p id; one roster records keys, so there is
+    ///         no second answer to reconcile.
+    [[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(std::string_view id) const override
+    {
+        for (auto const* participant: _participants)
+            if (auto key = participant->LiveKeyOf(id); key.has_value())
+                return key;
+        return std::nullopt;
     }
 
   private:
@@ -422,6 +455,16 @@ class KeyRosterMembership final: public IMembershipOracle
         if (auto const live = _live.find(identity.id); live != _live.end() && live->second == identity.key)
             return DecidedBy(Membership::Member, KeyEvidenceRoutes[static_cast<std::size_t>(evidence)].participant);
         return {};
+    }
+
+    /// @param id The id to look up.
+    /// @return Its live key, or nothing when no member or principal is recorded under it.
+    [[nodiscard]] std::optional<Ed25519PublicKey> LiveKeyOf(std::string_view id) const override
+    {
+        std::shared_lock const guard { _mutex };
+        if (auto const live = _live.find(id); live != _live.end())
+            return live->second;
+        return std::nullopt;
     }
 
   private:

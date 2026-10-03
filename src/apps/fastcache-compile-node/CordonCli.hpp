@@ -3,6 +3,7 @@
 
 #include "NodeConfig.hpp"
 #include "NodeSurfaces.hpp"
+#include "OneShotAnswer.hpp"
 
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -44,15 +45,15 @@ namespace FastCache::Node
 /// @param client A connected node; not owned.
 /// @param action Cordon, or lift it.
 /// @param endpoint Where @p client is connected, for the diagnostics.
-/// @return What to print, or what went wrong.
-[[nodiscard]] std::expected<std::string, std::string> PutCordonRequest(core::net::ISocket& client,
-                                                                       CompileCacheWire::CordonAction action,
-                                                                       std::string_view endpoint);
+/// @return What to print, or what went wrong and where the answer came from (`AnswerSource`).
+[[nodiscard]] std::expected<std::string, UnfinishedCommand> PutCordonRequest(core::net::ISocket& client,
+                                                                             CompileCacheWire::CordonAction action,
+                                                                             std::string_view endpoint);
 
 /// Carry out one `--cordon` or `--uncordon` against this machine's own node.
 /// @param cfg Where the node listens.
 /// @param command What the operator asked for; never `CordonCommand::None`.
-/// @return What to print, or what went wrong.
-[[nodiscard]] std::expected<std::string, std::string> RunCordonAdmin(NodeConfig const& cfg, CordonCommand command);
+/// @return What to print, or what went wrong and where the answer came from (`AnswerSource`).
+[[nodiscard]] std::expected<std::string, UnfinishedCommand> RunCordonAdmin(NodeConfig const& cfg, CordonCommand command);
 
 } // namespace FastCache::Node

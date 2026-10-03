@@ -105,6 +105,7 @@ target_sources(FastCache
         Platform/PosixDaemonHost.cpp
         Platform/Registry.cpp
         Platform/ServiceControl.cpp
+        Platform/ServiceHost.cpp
         Platform/SrvResolver.cpp
         Platform/StopPending.cpp
         Platform/StopSignal.cpp
@@ -128,6 +129,7 @@ target_sources(FastCache
         Protocol/StreamWaiterRegistry.cpp
         Server/AdminHttpServer.cpp
         Server/Connection.cpp
+        Server/DaemonStartupGate.cpp
         Server/ReactorServerLoop.cpp
         Server/ReadinessAnnouncer.cpp
         Server/Server.cpp

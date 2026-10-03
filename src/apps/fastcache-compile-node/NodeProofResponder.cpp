@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeProofClient.hpp"
 #include "NodeProofResponder.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
@@ -232,6 +233,29 @@ std::expected<NodeChallengeIssued, std::vector<std::byte>> NodeProofResponder::C
     };
 }
 
+std::string NodeProofResponder::UnknownKeyReason(ProvenIdentity const& proven) const
+{
+    auto const ownId = proven.id == _nodeId;
+    if (ownId && proven.key != _identity.PublicKey())
+        return std::format("{} is this node's own id, proved under a key that is not this node's: another machine is "
+                           "running with a copy of this node's --cluster-dir. Give that machine a state directory of "
+                           "its own, so it mints its own id and key",
+                           proven.id);
+    if (!ownId)
+        return std::format("this cluster holds no such key for {}: admit it with --enroll-from or --cluster-admit-worker",
+                           proven.id);
+    // This node's own id and key, recorded under ANOTHER key: its node-key was replaced while its
+    // id survived, which waiting will not fix -- the diagnosis this node's prover gives itself. Only
+    // for its OWN id: a stranger's proof of a recorded member's id may as well be another machine
+    // claiming that id, and "forget it" is then the one remedy that must not be offered.
+    if (auto const recorded = _roster.LiveKeyOf(proven.id); recorded.has_value() && *recorded != proven.key)
+        return ReplacedNodeKeyDiagnosis(proven.id);
+    return std::format("{} is this node's own identity, which its own cluster has not recorded yet: a member the "
+                       "cluster was started with is recorded once the cluster has elected a leader, so nothing "
+                       "needs admitting",
+                       proven.id);
+}
+
 NodeProofVerdict NodeProofResponder::Verify(NodeHandshake const& handshake, std::span<std::byte const> payload)
 {
     auto const proof = Wire::DecodeProveNodePayload(payload);
@@ -282,12 +306,7 @@ NodeProofVerdict NodeProofResponder::Verify(NodeHandshake const& handshake, std:
                                  "as the forgotten machine's"),
                       std::move(identity));
     if (!Distributed::RestsOnProvenIdentity(standing))
-        return sealed(Cc::Refuse(_metrics,
-                                 RefusedUnknownKey,
-                                 std::format("this cluster holds no such key for {}: admit it with --enroll-from or "
-                                             "--cluster-admit-worker",
-                                             identity.id)),
-                      std::nullopt);
+        return sealed(Cc::Refuse(_metrics, RefusedUnknownKey, UnknownKeyReason(identity)), std::nullopt);
 
     _metrics.Increment(IMetricsSink::Counter::NodeProofsAccepted);
     return sealed(Wire::EncodeReply(Wire::Status::Ok, {}), std::move(identity));
