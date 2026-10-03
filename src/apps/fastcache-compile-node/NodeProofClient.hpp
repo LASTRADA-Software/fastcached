@@ -39,7 +39,7 @@ namespace FastCache::Node
 ///
 /// The server signs first. A machine that holds a roster -- a consensus member, or a worker that
 /// has adopted a certified one -- refuses to prove itself to a server whose key is not a live
-/// voter's: a revoked ex-scheduler still named in its `--scheduler` gets nothing, not even a proof
+/// voter's: a revoked ex-scheduler still named among its scheduler endpoints gets nothing, not even a proof
 /// it could relay. A machine with no roster yet takes the server's word for its key, and the seal
 /// is what still stops a relay from injecting verbs on the connection the proof admitted.
 ///
@@ -92,12 +92,14 @@ inline constexpr EnumTable<ServerStanding, ServerStandingRow> ServerStandingTabl
     { .standing = ServerStanding::NotVoter,
       .provesTo = false,
       .refusal = "{0} answered where this node expected {1}, and signed with a key that is no voter's in the roster "
-                 "this node holds, so this node proves nothing to it: a --scheduler that names a machine which is "
-                 "not, or no longer, a voter" },
+                 "this node holds, so this node proves nothing to it: the endpoint this node registers at names a "
+                 "machine which is not, or no longer, a voter of its fleet" },
     { .standing = ServerStanding::Revoked,
       .provesTo = false,
       .refusal = "{0} answered where this node expected {1}, and signed with a key this cluster REVOKED: it is a "
-                 "machine the cluster forgot, and this node proves nothing to it. Drop it from --scheduler" },
+                 "machine the cluster forgot, and this node proves nothing to it. This node registers where its "
+                 "formation record says; if that still names the forgotten machine, the fleet's remembered "
+                 "endpoints are stale" },
     { .standing = ServerStanding::Named, .provesTo = true, .refusal = {} },
     { .standing = ServerStanding::NotNamed,
       .provesTo = false,
@@ -108,8 +110,7 @@ inline constexpr EnumTable<ServerStanding, ServerStandingRow> ServerStandingTabl
       .provesTo = false,
       .refusal = "{0} answered at the endpoint {1} advertised, as {1}, but signed with a key that is not the one the "
                  "roster records for {1}, and this node sends it nothing: an impostor, or {1} was re-keyed and its new "
-                 "key is not recorded yet -- record it with --cluster-admit={1}=<endpoint>@<key>, or "
-                 "--cluster-admit-worker={1}@<key> for a worker" },
+                 "key is not recorded yet -- record it with --cluster-admit={1}=<endpoint>@<key>" },
 } };
 static_assert(RowsInEnumeratorOrder(ServerStandingTable, &ServerStandingRow::standing),
               "ServerStandingTable must hold one row per ServerStanding, in enumerator order");
@@ -210,7 +211,7 @@ enum class NodeProofResult : std::uint8_t
 enum class OwnRecord : std::uint8_t
 {
     /// This node runs no consensus, so no cluster of its own records it and nothing is awaited: an
-    /// operator admits it (`--enroll-from`, `--cluster-admit-worker`), and until then the
+    /// operator admits it (it asks to enroll, and `--enroll-approve` admits it), and until then the
     /// scheduler's refusal is what says so.
     NotAsked,
     /// Its own cluster holds an opinion about its key -- live, or revoked. Revoked announces too:

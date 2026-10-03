@@ -1246,7 +1246,7 @@ enum class ErrorCode : std::uint8_t
 
     /// A node proof verified under a key this cluster does not hold for the id it named (#178).
     ///
-    /// A machine never admitted -- a worker nobody enrolled or `--cluster-admit-worker`ed -- or
+    /// A machine never admitted -- one nobody enrolled -- or
     /// one presenting a key other than the one admitted under its id. **Not `NodeProofRejected`**,
     /// because the remedy is the operator's rather than the caller's: the signature is sound and
     /// the machine is who it says it is, so what is missing is an admission, and a refusal naming
@@ -5236,7 +5236,8 @@ inline constexpr std::size_t MaxAnnouncedJoinMemos = 8;
 /// The longest join-memo list `EncodeJoinMemos` writes, its own prefix excluded: every memo a nested
 /// cluster id at `MaxIdBytes`, which `DecodeJoinMemos` refuses past, and a key.
 inline constexpr std::size_t MaxJoinMemoListBytes =
-    MaxAnnouncedJoinMemos * Detail::FramedField(Detail::FramedField(MaxIdBytes) + Detail::FramedField(IdentityPublicKeyBytes));
+    MaxAnnouncedJoinMemos
+    * Detail::FramedField(Detail::FramedField(MaxIdBytes) + Detail::FramedField(IdentityPublicKeyBytes));
 
 /// The longest roster endorsement a node attaches: `Cluster::EncodeEndorsement`'s six fields --
 /// cluster id, roster version, the roster's SHA-256 (32 bytes), not-after, endorser id, signature.
@@ -5270,8 +5271,7 @@ inline constexpr std::size_t MaxNodeAnnounceOtherBytes =
 /// reads, held to `MaxConditionRemedyBytes` -- and the row count is whatever that leaves room for:
 /// `MaxNodeConditions` is asserted to be the most full rows this share holds. A further row needs a
 /// smaller history share, fewer other bytes, or shorter ceilings; nothing here can simply grow.
-inline constexpr std::size_t ConditionPayloadShare =
-    MaxControlPayload - HistoryPayloadShare - MaxNodeAnnounceOtherBytes;
+inline constexpr std::size_t ConditionPayloadShare = MaxControlPayload - HistoryPayloadShare - MaxNodeAnnounceOtherBytes;
 
 static_assert(MaxNodeConditionListBytes <= ConditionPayloadShare,
               "a node's conditions must fit the share of the payload they are given");

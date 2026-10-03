@@ -50,6 +50,9 @@ library="${source_dir}/scripts/lib/e2e-common.sh"
 # shellcheck source=lib/third-party-roots.sh
 . "${source_dir}/scripts/lib/third-party-roots.sh" \
     || { echo "FAIL: cannot read scripts/lib/third-party-roots.sh" >&2; exit 1; }
+# shellcheck source=lib/git-scrub.sh
+. "${source_dir}/scripts/lib/git-scrub.sh" \
+    || { echo "FAIL: cannot read scripts/lib/git-scrub.sh" >&2; exit 1; }
 
 # How many immediate commands `fast_path_ms` puts through `run_bounded`.
 #
@@ -788,6 +791,34 @@ run_case() {
         mkdir -p "${scratch}/bin"
         printf '#!/bin/sh\nif [ -n "${E2E_STATE_TREES+x}" ]; then exit 2; fi\nPATH="${PATH#*:}" exec awk "$@"\n' > "${scratch}/bin/awk"
         chmod +x "${scratch}/bin/awk"
+        failed="$(PATH="${scratch}/bin:${PATH}" _e2e_launcher_state_caller_damage)"
+        case "$failed" in
+            *"could not be read past its start"*) echo "a failed count is reported, not clean" ;;
+            "") echo "BUG: a failed count read as a clean log" ;;
+            *) echo "BUG: a failed count read as: [${failed}]" ;;
+        esac
+        ;;
+
+    # The same count, failed one stage EARLIER: the `tail` that feeds awk. Under `set +o
+    # pipefail` the pipeline's status is awk's alone, and an awk handed nothing prints zero
+    # records -- a clean log -- so the count asks both stages' statuses (`PIPESTATUS`). The stub
+    # fails on the `-c +N` form the count uses; it cannot key on `E2E_STATE_TREES` as the awk
+    # stub does, since only awk's environment carries it.
+    launcher-damage-unread-tail)
+        caller="${scratch}/caller.log"
+        e2e_launcher_log_line MISS "${scratch}/run/a.cpp" > "$caller"
+        _e2e_workdir="${scratch}/run"
+        _e2e_launcher_state_trees=""
+        _e2e_launcher_state_caller="${caller}|absent||"
+        control="$(_e2e_launcher_state_caller_damage)"
+        case "$control" in
+            *"1 of this run's compiles were recorded"*) echo "the control found this run's record" ;;
+            *) echo "BUG: the control did not find this run's record: [${control}]" ;;
+        esac
+        # The real `tail` is reached by dropping the stub's own PATH entry, as the awk stub does.
+        mkdir -p "${scratch}/bin"
+        printf '#!/bin/sh\nif [ "${1-}" = "-c" ]; then exit 1; fi\nPATH="${PATH#*:}" exec tail "$@"\n' > "${scratch}/bin/tail"
+        chmod +x "${scratch}/bin/tail"
         failed="$(PATH="${scratch}/bin:${PATH}" _e2e_launcher_state_caller_damage)"
         case "$failed" in
             *"could not be read past its start"*) echo "a failed count is reported, not clean" ;;
@@ -3179,6 +3210,7 @@ cases=(
     "port-answers-closed|0|port_answers is false for an unbound port"
     "launcher-log-field|0|outcomes: MISS HIT |sources: /tree/v.cpp /tree/old.cpp |a foreign version: status 3, []|an unknown column: status 2|a short line: status 4, []|an odd column name: status 2|!BUG:"
     "launcher-damage-unread|0|the control found this run's record|a failed count is reported, not clean|!BUG:"
+    "launcher-damage-unread-tail|0|the control found this run's record|a failed count is reported, not clean|!BUG:"
     # Both accepting rows first: a helper refusing everything would satisfy every
     # refusing row while failing each clean stop. 143 is refused by DEFAULT -- a TERM
     # that killed a process skipped its teardown -- and accepted only when opted into.
@@ -5182,8 +5214,8 @@ if git -C "$source_dir" rev-parse --git-dir >/dev/null 2>&1; then
     : > "${stray_canary}/tree/vendor/upstream/upstream.sh"
     : > "${stray_canary}/tree/tools/stray.sh"
     stray_canary_found=""
-    if git -C "${stray_canary}/tree" init -q >/dev/null 2>&1 \
-        && git -C "${stray_canary}/tree" add -A >/dev/null 2>&1; then
+    if scratch_git -C "${stray_canary}/tree" init -q >/dev/null 2>&1 \
+        && scratch_git -C "${stray_canary}/tree" add -A >/dev/null 2>&1; then
         stray_canary_found="$(_shell_walk_strays "${stray_canary}/tree" 2>"${stray_canary}/declined")"
     fi
     stray_canary_declined="$(cat "${stray_canary}/declined" 2>/dev/null || true)"

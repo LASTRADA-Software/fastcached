@@ -175,7 +175,6 @@ if(FASTCACHED_BUILD_TESTS)
         NodeProofClient.cpp
     NodeProofResponder.cpp
         NodeProofResponder_test.cpp
-        EnrollTrap_test.cpp
         ExchangeLog_test.cpp
         HostEventInbox.cpp
         HostEventInbox_test.cpp
@@ -218,7 +217,6 @@ if(FASTCACHED_BUILD_TESTS)
         NodeFrameSurface_test.cpp
         AuthRefusalContract_test.cpp
         FleetMachinePresence_test.cpp
-        FleetRoster_test.cpp
         FleetTickets_test.cpp
         FleetLeaseRouting_test.cpp
         FleetExclusion_test.cpp

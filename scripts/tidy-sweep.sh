@@ -392,6 +392,9 @@ NotOurPattern=""
 # shellcheck source=lib/third-party-roots.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/third-party-roots.sh" \
     || { echo "TIDY SWEEP FATAL: cannot read scripts/lib/third-party-roots.sh" >&2; exit 2; }
+# shellcheck source=lib/git-scrub.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/git-scrub.sh" \
+    || { echo "TIDY SWEEP FATAL: cannot read scripts/lib/git-scrub.sh" >&2; exit 2; }
 
 # Read the third-party roots of the repository at @p 1 into `NotOurRoots` and `NotOurPattern`.
 # @param 1 The repository root.
@@ -1779,8 +1782,8 @@ C:/Temp/src\\FastCache/${hdrInc}:4:1: error: variable is non-const [cppcoreguide
     printf 'int a;\n' > "$tp/src/a.cpp"
     printf 'int b;\n' > "$tp/vendor/upstream/b.cpp"
     printf '# roots\nvendor\n' > "$tp/scripts/lib/third-party-roots.txt"
-    if env -u GIT_DIR -u GIT_WORK_TREE git -C "$tp" init -q >/dev/null 2>&1 \
-        && env -u GIT_DIR -u GIT_WORK_TREE git -C "$tp" add -A >/dev/null 2>&1; then
+    if scratch_git -C "$tp" init -q >/dev/null 2>&1 \
+        && scratch_git -C "$tp" add -A >/dev/null 2>&1; then
         Expect "a planted third-party source is declined, and the first-party one kept" \
                "src/a.cpp"$'\t'"vendor/upstream/b.cpp" \
                "$(cd "$tp" && LoadNotOurRoots "$tp" && printf '%s\t%s' "$(FirstPartyFiles '*.cpp')" "$(DeclinedThirdPartyFiles '*.cpp')")"

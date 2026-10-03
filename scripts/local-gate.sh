@@ -439,6 +439,9 @@ gate_known_defects_unusable_status=77
 # shellcheck source=lib/proc-stat.sh
 . "${repo_root}/scripts/lib/proc-stat.sh" \
     || { echo "${gate_failed_marker} cannot read scripts/lib/proc-stat.sh, so the gate lock's holder cannot be walked" >&2; exit 1; }
+# shellcheck source=lib/git-scrub.sh
+. "${repo_root}/scripts/lib/git-scrub.sh" \
+    || { echo "${gate_failed_marker} cannot read scripts/lib/git-scrub.sh, so the gate's own scratch repositories could not be made safely" >&2; exit 1; }
 
 # ctest's own totals line, which three readers here hinge on: it is what
 # `skip_report` requires before it will conclude anything from a missing block,
@@ -3329,8 +3332,8 @@ src/apps/fastcached/Main.hpp"
     : > "$_hf_tree/vendor/endo/CMakeLists.txt"
     : > "$_hf_tree/thirdparty/lib/CMakeLists.txt"
     _hf_roots vendor thirdparty
-    if git -C "$_hf_tree" init -q . 2>/dev/null \
-        && git -C "$_hf_tree" add -A 2>/dev/null; then
+    if scratch_git -C "$_hf_tree" init -q . 2>/dev/null \
+        && scratch_git -C "$_hf_tree" add -A 2>/dev/null; then
         _hf_config "$_hf_clean"
         expect "a vendored header is excluded from coverage, and the first-party one still counts" \
             "1/1" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
@@ -3376,7 +3379,7 @@ src/apps/fastcached/Main.hpp"
         _hf_config "$_hf_clean"
         cp "$_hf_tree/CMakeLists.txt" "$_hf_tree/CMakeLists.txt.kept"
         printf '# no packages\n' > "$_hf_tree/CMakeLists.txt"
-        git -C "$_hf_tree" add CMakeLists.txt 2>/dev/null
+        scratch_git -C "$_hf_tree" add CMakeLists.txt 2>/dev/null
         expect "a tree declaring no package is refused, never read as having no dependencies" \
             "no-dependencies" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
         # PLANTED: a call with no NAME beside a named one. Dropped, it would leave the named
@@ -3392,7 +3395,7 @@ src/apps/fastcached/Main.hpp"
         expect "a CPMAddPackage NAME spelled through a variable is refused, never read as its prefix" \
             "no-dependencies" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
         mv "$_hf_tree/CMakeLists.txt.kept" "$_hf_tree/CMakeLists.txt"
-        git -C "$_hf_tree" add CMakeLists.txt 2>/dev/null
+        scratch_git -C "$_hf_tree" add CMakeLists.txt 2>/dev/null
 
         # PLANTED: a roots file naming no root. Refused as its own word, never read
         # as "nothing is third-party" -- which would score this tree 1/3.
@@ -3406,7 +3409,7 @@ src/apps/fastcached/Main.hpp"
 
         # PLANTED: a root's directory git knows nothing about -- the FIRST root, with
         # the second still tracked, so a check asking only one root cannot pass it.
-        git -C "$_hf_tree" rm -r -q --cached vendor 2>/dev/null
+        scratch_git -C "$_hf_tree" rm -r -q --cached vendor 2>/dev/null
         expect "a third-party root tracking nothing is refused by name" \
             "third-party-untracked vendor" "$(header_filter_coverage "$_hf_tree/.clang-tidy" "$_hf_tree" 2>/dev/null)"
     else

@@ -25,9 +25,7 @@ namespace
 /// @param key Its recorded key, which every member carries.
 /// @param seat Its seat.
 /// @return The member record.
-[[nodiscard]] ClusterMember Member(std::string const& id,
-                                   Ed25519PublicKey key,
-                                   MemberSeat seat = MemberSeat::Voter)
+[[nodiscard]] ClusterMember Member(std::string const& id, Ed25519PublicKey key, MemberSeat seat = MemberSeat::Voter)
 {
     return ClusterMember { .id = id,
                            .raftEndpoint = seat == MemberSeat::Voter ? id + ":6680" : std::string {},

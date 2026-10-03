@@ -200,7 +200,6 @@ The scheduler is a **compile node**, not the cache. Pick one machine and start i
 fastcache-compile-node \
     --listen-node=0.0.0.0:6675 \
     --raft-self=scheduler.internal \
-    --scheduler=127.0.0.1:6675 \
     --advertise=scheduler.internal:6675
 ```
 
@@ -213,10 +212,13 @@ start mints a cluster of one into its state directory, which it leads, and whose
 serves the scheduler. Consensus is on by default (`--listen-raft` defaults to `6680`),
 and `--raft-self` states the host another member would dial it at (`127.0.0.1` when
 none ever will; this machine's name when it is not given). A node whose consensus is
-turned off with an empty `--listen-raft=` serves no scheduler. Its identity
+turned off with an empty `--listen-raft=` serves no scheduler and joins no fleet, so it
+may run only a cache tier (`--slots=0`): one running a worker is refused at startup,
+since its worker would have nowhere to register. Its identity
 is minted into its state directory on first start, and the same command line with
-`--print-identity` added prints it without serving — the `public-key` line is what
-every worker's `--voter-key` names.
+`--print-identity` added prints it without serving. Its own worker registers with the
+scheduler it serves, on this machine: no flag names where, since a node's formation
+record says that.
 
 There is **no shared secret to provision**: the pre-shared `--cluster-key-file` a fleet
 used to copy to every member is gone
@@ -244,9 +246,7 @@ To keep a machine out of the work — a small always-on box, a VM whose cores be
 to something else — give it **`--slots=0`**. It then runs no worker at all: it
 surveys no compilers, claims no scratch directory, registers nothing and is never
 sent a compile, so a setting only a worker reads — `--toolchain` or `--node-class`,
-say — refuses to start it, by name. `--scheduler` it may keep: on such a node it
-registers nothing and only tells the `--cluster-*` and `--enroll-*` commands where
-to ask. What it can still run is the scheduler, consensus and a cache tier; a node
+say — refuses to start it, by name. What it can still run is the scheduler, consensus and a cache tier; a node
 running none of those is refused too. Until
 [#1440](https://github.com/LASTRADA-Software/fastcached/issues/1440) its `/metrics`
 and history still read 0 slots.
@@ -262,7 +262,7 @@ its own history is not handed to a leader either ([#1440](https://github.com/LAS
 
 Once several nodes schedule, exactly one of them may at a time, which is what the
 same consensus decides once it has more than one member: one machine founds the
-cluster, every other one joins it and is admitted by its identity key. See
+cluster, every other one joins it as a learner and is admitted by its identity key. See
 [a cluster, and who leads it](../tools/fastcache-compile-node.md#a-cluster-and-who-leads-it).
 
 #### Who may use the fleet
@@ -299,8 +299,9 @@ somebody operates, and it is what a cache several machines share looks like.
 Because it gates the compile port, **every worker needs a roster or `--fleet-open`, not
 only the scheduler.** A worker with neither admits its own machine and refuses the
 network, which is the right default for a developer's laptop and cannot receive a
-dispatched compile. `--voter-key`, which a worker needs anyway to check a lease, gives it
-the roster.
+dispatched compile. A worker in a fleet has the roster already: it runs consensus, as
+every serving node does, and the state it applies is the roster it checks leases and
+admission against.
 
 ### The workers
 
@@ -308,52 +309,43 @@ On each machine that should take work:
 
 ```sh
 fastcache-compile-node \
-    --scheduler=build-cache.internal:6675 \
+    --fleet-seed=scheduler.internal:6675 \
     --listen-node=0.0.0.0:6674 \
     --advertise=worker-01.internal:6674 \
     --fleet-open \
-    --voter-key=<scheduler-public-key> \
     --cluster-dir=/var/lib/fastcache-node
 ```
 
-**`--cluster-dir` is where a worker keeps WHO IT IS**
-([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). On its first start
-it mints an identity key there, and from then on it proves that key on every connection
-to its scheduler; the scheduler refuses every verb a machine joins the fleet with --
-registering, announcing, heartbeating -- on a connection that proved nothing, so a worker
-started without `--cluster-dir` is refused at startup instead. The cluster admits the key
-once, and either way works:
+**A worker joins the scheduler's fleet as a LEARNER, and that is the only way a machine
+joins.** Its first start founds a cluster of one in `--cluster-dir`, minting its identity
+key there; it then finds the scheduler's fleet -- by the LAN beacon, or at `--fleet-seed`
+where no beacon reaches -- and asks to be admitted under that key. An operator on the
+scheduler compares the key and approves it:
 
 ```sh
-# on the worker: ask a member to enrol it, then approve it there with --enroll-approve
-fastcache-compile-node --cluster-dir=/var/lib/fastcache-node --enroll-from=scheduler.internal:6675
+# on the scheduler: what is waiting, each row with the key to compare and the line to approve it
+fastcache-compile-node --enroll-list
+fastcache-compile-node --enroll-approve=<id>@<key>
 
-# or print the worker's identity, and admit it from anywhere
-fastcache-compile-node --cluster-dir=/var/lib/fastcache-node --print-identity
-fastcache-compile-node --scheduler=scheduler.internal:6675 --cluster-admit-worker=<id>@<key>
+# or, while a known batch of machines is being added, admit whoever asks for a while
+fastcache-compile-node --enroll-auto-approve=30min
 ```
+
+The approved machine becomes a learner of the fleet: it applies the fleet's replicated
+state, counts towards no quorum, and its worker registers with the fleet's scheduler,
+which its formation record names. No flag says where the scheduler is: `--scheduler` names
+only where a one-shot verb like the ones above is sent (this machine's own node when unset,
+which follows the fleet to its leader), and a node that serves is refused it.
+
+**A learner checks every lease against the state it applies.** Every lease is signed by
+the scheduler that issued it, with that machine's own identity key, and the worker checks
+the signature against the voters its fleet's replicated state records -- so there is no
+key to type, and a voter the fleet revokes stops verifying the moment the learner applies
+the revocation. A worker another machine can reach **will not start** with no way to check
+a lease; one reachable only from its own machine needs none.
 
 An address still admits a *client* -- a developer's `fastcache-cc` asking for a lease
 needs no identity -- but never a machine joining the fleet.
-
-**`--voter-key` is how a worker knows whose leases to honour**
-([#178](https://github.com/LASTRADA-Software/fastcached/issues/178)). Every lease is
-signed by the scheduler that issued it, with that machine's own identity key, and the
-worker checks the signature against a *roster*: the cluster's voters and their keys,
-endorsed by a strict majority of those voters, re-endorsed every 15 minutes and good
-for an hour at a time. `--voter-key` names the voters it trusts before it holds one —
-paste each voter's `public-key` line from `--print-identity`, one flag per voter. The
-first roster a majority of them endorses is adopted from the scheduler's reply, and
-from then on only the roster held certifies its successor, so a key typed here never
-outvotes the cluster's own revocation. The roster is kept in `--cluster-dir` across
-restarts, and a worker enrolled with `--enroll-from` is handed one at admission -- it then
-needs no `--voter-key` at all. A worker another machine can reach **will not start** with
-no way to check a lease; one reachable only from its own machine needs none.
-
-A worker cut off from the leader goes on honouring grants for as long as its roster
-stays certified, and then refuses every one `roster-expired`: that is the bound on how
-long a scheduler the cluster has since removed can go on leasing it out.
-`fastcache_node_roster_expires_in_seconds` says how long is left.
 
 **`--listen-node` is not optional on a worker that serves a fleet.** It defaults to
 **loopback**, which is right for the single-machine install and unreachable for
@@ -361,10 +353,9 @@ everybody else — so a worker that leaves it alone advertises an address no cli
 dial. The node refuses to start rather than registering one, but the flag is the fix
 and it is easy to leave off.
 
-**`--scheduler` names a DNS name or a VIP, never a scheduler's literal address.** Every
-worker carries that value for as long as it is installed, so decide it before the
-rollout: [Name the scheduler by something that outlives one machine](../tools/fastcache-compile-node.md#name-the-scheduler-by-something-that-outlives-one-machine)
-says why, and how several `--scheduler` values fall back to one another.
+**`--fleet-seed` names a DNS name or a VIP, never a scheduler's literal address,** where
+it is needed at all: every worker carries that value for as long as it is installed, so
+decide it before the rollout.
 
 That is the whole of it — but **who the worker admits is not optional**, and it is
 the part people leave off. Membership gates this node's *compile verbs*, so a worker
@@ -379,7 +370,7 @@ what it admits in its own startup line:
 ```
 
 `--fleet-open` is for a build network that is already your boundary. Where it is not,
-drop it: the worker's roster — `--voter-key` gives it one — admits exactly the machines
+drop it: the worker's roster — the fleet's state, which it applies — admits exactly the machines
 the cluster admitted, by the key each proves or the ticket each presents, and everyone
 else stays refused, whatever address they dial from. A client machine is admitted by its
 key too, as a learner: see [a machine that only
@@ -627,7 +618,7 @@ what that machine is doing:
 | `fastcache_worker_jobs_refused_lease_replayed_total` | An **authentic**, unexpired lease that this worker had **already run**. A lease authorizes exactly one compile — one grant per lease, presented once, with no retry — so nothing honest produces this and it should read zero forever. Any rise is somebody presenting a captured grant a second time. Do not sum it with `..._wrong_cluster_total` either: they share a wire code and nothing else, and they send you to opposite places. |
 | `fastcache_worker_jobs_refused_lease_endpoint_mismatch_total` | An **authentic** lease named a different worker. Almost never a replay and almost always a worker registered under an address clients do not dial — a NAT, or a hostname where clients resolve an address. |
 | `fastcache_worker_jobs_refused_lease_expired_total` | An **authentic** lease had expired. A rise on one machine and nowhere else is that machine's clock, not the fleet's leases — which is why the check carries skew slack and why this is worth seeing per node. |
-| `fastcache_worker_jobs_refused_lease_no_roster_total` | The worker holds **no roster** to check any lease against yet: none its `--voter-key` voters endorse has arrived. A few at startup are ordinary; a rise that does not stop means no leader it reaches is endorsed by the keys it was given. |
+| `fastcache_worker_jobs_refused_lease_no_roster_total` | The worker holds **no roster** to check any lease against yet. A few at startup are ordinary; a rise that does not stop means no leader it reaches is endorsed by the voters it trusts. |
 | `fastcache_worker_jobs_refused_lease_roster_expired_total` | The worker's roster was not re-certified within its lifetime, so it can no longer tell a live voter from a revoked one. It is cut off from the leader, or reaches only an ex-leader withholding newer rosters — `fastcache_node_roster_expires_in_seconds` reached 0 first. |
 | `fastcache_worker_scratch_roots_reclaimed_total` | This worker took over a scratch root left behind by a node that exited without cleaning up. The work itself is correct — a root is only reclaimed once its previous owner's exclusive claim is free, which the OS releases however that process died. A rise means nodes are **dying rather than stopping**, which is worth knowing and is visible nowhere else. |
 | `fastcache_worker_bytes_received_total` / `..._returned_total` | Link volume, counted at the socket. |
@@ -650,8 +641,8 @@ fixes, and one number covering both tells you neither.
 > and only one of those means your fleet is healthy.
 
 The `..._lease_*` counters move only on a worker that checks leases: a consensus
-member, against the state it applies, or a worker holding a roster its `--voter-key`
-voters certified. A worker that checks nothing says so at startup rather than leaving
+member -- a learner included -- against the state it applies, or a worker holding a roster
+an earlier run kept. A worker that checks nothing says so at startup rather than leaving
 these at zero and looking healthy — and one another machine could dial is refused
 outright ([#282](https://github.com/LASTRADA-Software/fastcached/issues/282),
 [#178](https://github.com/LASTRADA-Software/fastcached/issues/178)).
@@ -945,12 +936,11 @@ roster they hold lapses.
 
 !!! warning "Give every worker a `--cluster-dir`, and a way to check a lease"
 
-    Every worker names a scheduler, so every worker **will not start** without
-    `--cluster-dir`: it has no identity to prove, and every verb it would join the fleet
-    with would be refused. And a worker another machine could dial — one that
-    admits other machines, on a bind that is not loopback — **will not start**
-    with no way to check a lease: it runs consensus, keeps a roster in its `--cluster-dir`,
-    or names the voters with `--voter-key`. Both refusals are deliberate and both are
+    Every worker registers with a scheduler, so every worker keeps its identity in a state
+    directory: `--cluster-dir`, or the platform's default. And a worker another machine
+    could dial — one that admits other machines, on a bind that is not loopback —
+    **will not start** with no way to check a lease: it runs consensus, or keeps a roster
+    in its `--cluster-dir`. Both refusals are deliberate and both are
     startup ones, not per-request fallbacks: a worker that quietly skipped the check
     would serve whoever reached its port while every refusal counter read zero, which
     is a fleet that looks healthy from both ends.

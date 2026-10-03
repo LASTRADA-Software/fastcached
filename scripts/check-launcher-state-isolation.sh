@@ -838,6 +838,7 @@ prez|present|fail|was DELETED during this run
 prez|empty|fail|was DELETED during this run
 prez|absent|pass|
 misdirected|absent|fail|did not have its state redirected
+ampersand|absent|pass|
 "
 # How many lanes run the cases at once: each case is a process that sources the library
 # and spawns a dozen more, so on Git Bash they were most of this check run one by one.
@@ -877,7 +878,10 @@ case "${1-}" in
     *) if [ -z "${FASTCACHE_NO_STATS-}" ]; then
            mkdir -p "${base}/fastcache-cc"
            for last in "$@"; do :; done
-           printf '%s\n' "${log_line/@SOURCE@/$last}" >> "$log"
+           # The replacement QUOTED: bash 5.2's `patsub_replacement` reads an unquoted `&` in it as
+           # the matched pattern, so a source path holding one was recorded as another path. bash
+           # 3.2 has no such option, and the quotes change nothing there.
+           printf '%s\n' "${log_line/@SOURCE@/"$last"}" >> "$log"
        fi ;;
 esac
 FAKE
@@ -898,6 +902,11 @@ FAKE
             misdirected) printf '%s\n' 'e2e_launcher_state_enter launcher' 'grep -v "^export " "$launcher" > "$workdir/shim"' \
                         'cat "$workdir/shim" > "$launcher"' 'FASTCACHE_NO_STATS=1 "$launcher" "$workdir/c.cpp"' \
                         'e2e_launcher_state_assert_used --no-stats' ;;
+            # A source path holding `&`: the stand-in's record must name it exactly, which an
+            # unquoted replacement under bash 5.2's `patsub_replacement` does not.
+            ampersand) printf '%s\n' 'e2e_launcher_state_enter launcher' 'src="$workdir/t&u.cpp"' '"$launcher" "$src"' \
+                        'e2e_launcher_state_assert_used' \
+                        'grep -qF "$src" "$_e2e_launcher_state_log" || fail "the record does not name $src: $(cat "$_e2e_launcher_state_log")"' ;;
         esac
     }
     _launcher_caller_hashes() {

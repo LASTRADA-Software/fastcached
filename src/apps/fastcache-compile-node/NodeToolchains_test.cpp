@@ -278,7 +278,6 @@ void DescribeMsvcLayout(ScriptedToolchainHost& host)
 [[nodiscard]] NodeConfig Startable()
 {
     NodeConfig cfg;
-    cfg.schedulers = { "cache.internal:6675" };
     cfg.advertise = "worker-01.internal:6676";
     return cfg;
 }

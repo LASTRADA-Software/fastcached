@@ -83,6 +83,9 @@ case "${BASH_SOURCE[0]}" in
 esac
 . "${SelfDir}/lib/third-party-roots.sh" \
     || { echo "FAIL reloadable-docs: cannot read scripts/lib/third-party-roots.sh" >&2; exit 1; }
+# shellcheck source=lib/git-scrub.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/git-scrub.sh" \
+    || { echo "FAIL reloadable-docs: cannot read scripts/lib/git-scrub.sh" >&2; exit 1; }
 
 # The markers that DEFINE the artefact set. Spelled once each: they are what the scan
 # searches for, what the refusal names, and what a new artefact would have to adopt.
@@ -889,7 +892,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
     #
     # @param 1 The tree.
     _track() {
-        git -C "$1" add -A >/dev/null 2>&1
+        scratch_git -C "$1" add -A >/dev/null 2>&1
     }
 
     _tree() {
@@ -911,7 +914,7 @@ if [[ "${1:-}" == "--self-test" ]]; then
         # the roots file -- including the ones expecting a refusal for something else.
         printf '# planted\nvendor/upstream\n' > "${at}/scripts/lib/third-party-roots.txt"
 
-        git -C "$at" init -q >/dev/null 2>&1
+        scratch_git -C "$at" init -q >/dev/null 2>&1
         _track "$at"
     }
 

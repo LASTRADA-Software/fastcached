@@ -151,12 +151,12 @@ src/FastCache/
                 FleetChart derives every series from those buckets -- a rate is a
                 delta between adjacent buckets that can both ANSWER for it -- and
                 renders them as standalone SVG.
-                RosterTrust is what a worker that runs no consensus checks a lease
-                against (#178): the certified roster it holds, rooted in its
-                `--voter-key` anchors until the first adoption and in the roster
-                itself after, with RosterStore keeping it in `--cluster-dir` over
-                the durable-file seam the Raft store uses. A consensus member uses
-                StateLeaseRoster instead -- its applied state IS the roster.
+                RosterTrust is what a worker that runs no consensus checked a lease
+                against (#178): a certified roster it held, with RosterStore keeping
+                it in `--cluster-dir`. No start reaches it since a worker with its
+                consensus closed is refused (`WorkerConsensusClosed`), so every
+                worker uses StateLeaseRoster -- its applied state IS the roster --
+                and RosterTrust awaits its deletion with the kept roster.
                 NodeProof is the handshake a machine joining the fleet proves its
                 identity key with on the 0xFC surface (#178): the server signs its
                 challenge first, the caller signs the whole transcript, and both

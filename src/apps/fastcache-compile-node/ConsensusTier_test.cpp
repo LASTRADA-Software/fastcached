@@ -1178,14 +1178,14 @@ TEST_CASE("A lone voter endorses the roster it applied, under its own key, and r
     CHECK(first.notAfter <= now + Cluster::RosterEndorsementLifetime);
 
     // An unchanged roster is NOT re-signed every pass: the next endorsement is due a refresh
-    // from now. A changed one is re-signed at once -- admitting a principal moves the roster.
+    // from now. A changed one is re-signed at once -- admitting a learner moves the roster.
     auto const before = count();
-    REQUIRE(tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::AdmitPrincipal,
+    REQUIRE(tier->ProposeToCluster(Cluster::Command { .kind = Cluster::CommandKind::AddLearner,
                                                       .key = "w1",
                                                       .value = {},
                                                       .schedulerEndpoint = {},
                                                       .publicKey = Testing::TestKeyPair("w1").PublicKey(),
-                                                      .role = Cluster::PrincipalRole::Worker })
+                                                      .role = std::nullopt })
                 .has_value());
     REQUIRE(Testing::WaitUntil(
         "the lone voter to endorse the roster that admits w1",

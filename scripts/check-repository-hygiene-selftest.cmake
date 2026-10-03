@@ -37,6 +37,10 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# `fastcached_scratch_git`: the fixture's own git runs with the inherited `GIT_DIR` and its
+# kin removed, or under an exported `GIT_DIR` its `git init` writes THAT repository.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -148,8 +152,9 @@ set(tree "${FASTCACHED_SCRATCH_DIR}/work-tree")
 file(REMOVE_RECURSE "${tree}")
 file(MAKE_DIRECTORY "${tree}/scripts")
 file(WRITE "${tree}/scripts/ordinary.sh" "#!/usr/bin/env bash\necho hello\n")
-execute_process(COMMAND "${GIT_EXECUTABLE}" init -q "${tree}" OUTPUT_QUIET ERROR_QUIET)
-execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${tree}" add -A OUTPUT_QUIET ERROR_QUIET)
+fastcached_scratch_git("${GIT_EXECUTABLE}" scratchGit)
+execute_process(COMMAND ${scratchGit} init -q "${tree}" OUTPUT_QUIET ERROR_QUIET)
+execute_process(COMMAND ${scratchGit} -C "${tree}" add -A OUTPUT_QUIET ERROR_QUIET)
 RunCheck("work-tree" "${tree}" "-" flat)
 ExpectVerdict("state 1: a checkout is inspected and accepted" "${flat}" "pass" "")
 
@@ -167,7 +172,7 @@ file(WRITE "${tarball}/scripts/ordinary.sh" "#!/usr/bin/env bash\necho hello\n")
 # so the case fails reporting a defect in the CHECK when the fixture is what broke.
 # Refused here instead, naming the cause, because that is a different finding.
 execute_process(
-    COMMAND "${GIT_EXECUTABLE}" -C "${tarball}" rev-parse --is-inside-work-tree
+    COMMAND ${scratchGit} -C "${tarball}" rev-parse --is-inside-work-tree
     OUTPUT_VARIABLE tarballInsideTree ERROR_QUIET RESULT_VARIABLE tarballStatus
     OUTPUT_STRIP_TRAILING_WHITESPACE)
 if(tarballStatus EQUAL 0 AND tarballInsideTree STREQUAL "true")

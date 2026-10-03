@@ -6,11 +6,11 @@
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Core/HostPort.hpp>
 
-#include <core/Ranges.hpp>
-
 #include <algorithm>
 #include <format>
 #include <utility>
+
+#include <core/Ranges.hpp>
 
 namespace FastCache::Node
 {
@@ -105,30 +105,43 @@ bool ModeServesConsensusToPeers(Cluster::NodeMode mode) noexcept
 
 bool ServesEnrollment(NodeConfig const& cfg, bool schedulerRuns) noexcept
 {
-    return RunsConsensus(cfg) && schedulerRuns;
+    // Not while its consensus is confined to this machine: a member admitted there would be told to
+    // dial a loopback address, which reaches itself.
+    return RunsConsensus(cfg) && schedulerRuns && !ConsensusConfinedToThisMachine(cfg);
 }
 
 bool ServesScheduler(NodeConfig const& cfg) noexcept
 {
     // Only while it runs consensus: a scheduler signs every grant with its identity key and hands
     // its workers the cluster's state, so a mode that serves one on a node whose consensus is
-    // closed (an empty `--listen-raft=`, or a name that reaches only this machine) serves none.
+    // closed (an empty `--listen-raft=`) serves none. One whose consensus is confined to this
+    // machine still serves its own, to its own worker.
     return cfg.formation.has_value()
            && Cluster::NodeModeRowFor(cfg.formation->mode).scheduler == Cluster::SchedulerDuty::Serves && RunsConsensus(cfg);
 }
 
-std::vector<std::string> SchedulersOf(NodeConfig const& cfg)
+std::vector<std::string> SchedulersOf(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated)
 {
     if (!cfg.formation.has_value())
         return {};
     if (!ServesScheduler(cfg))
         return cfg.formation->fleetSchedulers;
 
-    // Its own scheduler, on its own node port.
+    // Dialled where it binds. A wildcard bind answers on loopback; a node bound to ONE address
+    // answers there alone, and loopback would reach nothing -- its worker would never register
+    // with the scheduler in its own process. One rule for both sources of the binding.
+    auto const dialledAt = [](std::string_view host, std::uint16_t port) {
+        return FormatHostPort(IsWildcardHost(host) ? ThisMachineLoopbackHost : host, port);
+    };
+
+    // Its own scheduler, on its own node port: the socket a supervisor handed over when it did,
+    // since the configuration then names an address and a port nothing serves.
+    if (activated.has_value())
+        return { dialledAt(activated->host, activated->port) };
     auto const node = RowFor(NodeSurface::Node).Resolve(cfg);
     if (node.empty())
         return {};
-    return { FormatHostPort(ThisMachineLoopbackHost, node.front().port) };
+    return { dialledAt(node.front().host, node.front().port) };
 }
 
 std::vector<Cluster::MemberSpec> BootstrapMembersOf(NodeConfig const& cfg)
@@ -142,8 +155,8 @@ std::vector<Cluster::MemberSpec> BootstrapMembersOf(NodeConfig const& cfg)
         std::vector<Cluster::MemberSpec> members;
         members.reserve(cfg.formation->fleetMembers.size());
         for (auto const& member: cfg.formation->fleetMembers)
-            members.push_back(Cluster::MemberSpec {
-                .id = member.id, .raftEndpoint = member.raftEndpoint, .publicKey = member.publicKey });
+            members.push_back(
+                Cluster::MemberSpec { .id = member.id, .raftEndpoint = member.raftEndpoint, .publicKey = member.publicKey });
         return members;
     }
 

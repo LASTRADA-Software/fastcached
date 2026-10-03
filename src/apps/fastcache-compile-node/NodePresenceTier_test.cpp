@@ -17,6 +17,7 @@
 #include "EndpointDialerTestUtils.hpp"
 #include "HostEventInbox.hpp"
 #include "NodeAnnounce.hpp"
+#include "NodeFormation.hpp"
 #include "NodePresenceTier.hpp"
 #include "NodeRoster.hpp"
 #include "SchedulerReachability.hpp"
@@ -54,6 +55,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/BoundedWait.hpp>
 #include <tests/FleetHistoryFakes.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScriptedHostEvents.hpp>
 #include <tests/Unwrap.hpp>
@@ -157,7 +159,7 @@ struct PresenceFixture
 
     PresenceFixture()
     {
-        cfg.schedulers = { std::string { Scheduler } };
+        cfg = Testing::LearnerRegisteringWith(std::move(cfg), { std::string { Scheduler } });
 
         // Only a CLOSED bucket may travel: an open one is a partial window a leader could
         // never be told to correct.
@@ -203,12 +205,58 @@ struct PresenceFixture
     /// @return Whether the round reported acceptance.
     [[nodiscard]] bool AnnounceThrough(Testing::ScriptedDialer& dialer)
     {
-        auto link = Unwrap(SchedulerLink::For(cfg.schedulers));
+        auto link = Unwrap(SchedulerLink::For(SchedulersOf(cfg, AsConfigured)));
         return AnnounceMachineOnce(Round(), link, dialer);
     }
 };
 
 } // namespace
+
+TEST_CASE("A zero-config node announces, so scheduler-unreachable and own-record-awaited are evaluated",
+          "[node][presence][conditions][formation]")
+{
+    // H-b. A serving node is refused `--scheduler` and registers where its formation record says, so
+    // a row scoped on the typed flag reads "names no scheduler" on EVERY node -- a confident wrong
+    // signal. Asked of what a body actually registers with, a first start announces to the
+    // scheduler it serves, a learner to its fleet, and a node whose consensus is closed to nobody.
+    auto const zeroConfig = Testing::FirstStart(NodeConfig {});
+    REQUIRE(zeroConfig.schedulers.empty());
+    REQUIRE(RunsConsensus(zeroConfig));
+    CHECK(AnnouncesToAScheduler(zeroConfig, AsConfigured));
+    CHECK(AwaitsItsOwnRecord(zeroConfig, AsConfigured));
+
+    auto const learner = Testing::LearnerRegisteringWith(NodeConfig {}, { std::string { Scheduler } });
+    REQUIRE(learner.schedulers.empty());
+    CHECK(AnnouncesToAScheduler(learner, AsConfigured));
+
+    // The control, both rows: consensus closed, so no scheduler served and none remembered.
+    auto closed = NodeConfig {};
+    closed.raftListen.clear();
+    closed = Testing::FirstStart(std::move(closed));
+    REQUIRE_FALSE(RunsConsensus(closed));
+    REQUIRE(SchedulersOf(closed, AsConfigured).empty());
+    CHECK_FALSE(AnnouncesToAScheduler(closed, AsConfigured));
+    CHECK_FALSE(AwaitsItsOwnRecord(closed, AsConfigured));
+}
+
+TEST_CASE("own-record-awaited is a consensus node's: a learner announces and awaits, a worker registering nowhere does not",
+          "[node][presence][conditions][formation]")
+{
+    // The second row's own question: it needs consensus AND an announcement. A learner runs both;
+    // and the scope never reads `--scheduler`, which a one-shot verb may still name -- typed on a
+    // node that serves nothing, it decides nothing here.
+    auto const learner = Testing::LearnerRegisteringWith(NodeConfig {}, { std::string { Scheduler } });
+    REQUIRE(RunsConsensus(learner));
+    CHECK(AwaitsItsOwnRecord(learner, AsConfigured));
+
+    auto aimed = NodeConfig {};
+    aimed.raftListen.clear();
+    aimed = Testing::FirstStart(std::move(aimed));
+    aimed.schedulers = { std::string { Scheduler } };
+    REQUIRE(SchedulersOf(aimed, AsConfigured).empty());
+    CHECK_FALSE(AnnouncesToAScheduler(aimed, AsConfigured));
+    CHECK_FALSE(AwaitsItsOwnRecord(aimed, AsConfigured));
+}
 
 TEST_CASE("A presence round hands the leader every fleet this machine once asked", "[node][presence][formation]")
 {
@@ -305,8 +353,7 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
     // had history to carry would pass both of them, and would leave a freshly started node
     // absent from the Machines table for its first minute -- which is precisely the minute an
     // operator provisioning machine 7 of 40 is looking at it.
-    NodeConfig cfg;
-    cfg.schedulers = { std::string { Scheduler } };
+    auto const cfg = Testing::LearnerRegisteringWith(NodeConfig {}, { std::string { Scheduler } });
     AtomicMetricsSink metrics;
     NullLogger logger;
     SilentLoadSampler loadSampler;
@@ -320,7 +367,7 @@ TEST_CASE("A machine with no closed window announces itself anyway", "[node][pre
     REQUIRE(sampler.NextHistoryBatch(8).empty());
 
     Testing::ScriptedDialer dialer { { Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {}) } };
-    auto link = Unwrap(SchedulerLink::For(cfg.schedulers));
+    auto link = Unwrap(SchedulerLink::For(SchedulersOf(cfg, AsConfigured)));
     auto const accepted = AnnounceMachineOnce(PresenceRound { .loadSampler = loadSampler,
                                                               .cacheTier = nullptr,
                                                               .metrics = metrics,
@@ -522,6 +569,7 @@ class ThreadNotingDialer final: public IEndpointDialer
                                           IPresenceRoster* roster = nullptr)
 {
     return NodePresenceParts { .cfg = fix.cfg,
+                               .activatedNodeEndpoint = AsConfigured,
                                .capacity = capacity,
                                .announced = announced,
                                .cacheTier = nullptr,

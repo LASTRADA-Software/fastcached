@@ -182,6 +182,11 @@ struct OptionComponent
     bool (*runs)(Config const&) noexcept; ///< Whether a configuration runs it.
     std::string_view absentBecause;       ///< The setting that turned it off, said as a clause.
     std::string_view remedy;              ///< How to run it instead, said as a clause.
+
+    /// The whole refusal, in place of the sentence a binary generates from the three fields
+    /// above, or empty for that sentence. For a component whose absence has a better remedy
+    /// than running it: a node that serves is not told to stop serving to use `--scheduler`.
+    std::string_view refusal {};
 };
 
 /// One accepted command-line option.

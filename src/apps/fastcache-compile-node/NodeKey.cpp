@@ -4,6 +4,7 @@
 #include "NodeStateFiles.hpp"
 
 #include <FastCache/Cluster/FormationRecord.hpp>
+#include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Consensus/FileRaftStorage.hpp>
 #include <FastCache/Core/Owner.hpp>
 #include <FastCache/Core/WireFields.hpp>
@@ -19,12 +20,6 @@
 #include <optional>
 #include <system_error>
 #include <utility>
-
-#if defined(_WIN32)
-    #include <io.h>
-#else
-    #include <unistd.h>
-#endif
 
 namespace FastCache::Node
 {
@@ -98,22 +93,6 @@ namespace
     } };
     static_assert(RowsInEnumeratorOrder(KeyDirectoryTable, &KeyDirectoryRow::writers),
                   "one row per DirectoryWriters, in enumerator order");
-
-    /// Flush a stream all the way to the disk, for `FileRaftStorage::FlushToDisk`'s reason:
-    /// `fflush` alone reaches the kernel, which a power loss still discards -- and a key file
-    /// a crash leaves EMPTY is one the next start refuses as truncated.
-    /// @param file The open stream.
-    /// @return True when both stages succeeded.
-    [[nodiscard]] bool FlushToDisk(std::FILE* file) noexcept
-    {
-        if (std::fflush(file) != 0)
-            return false;
-#if defined(_WIN32)
-        return ::_commit(::_fileno(file)) == 0;
-#else
-        return ::fsync(::fileno(file)) == 0;
-#endif
-    }
 
     /// A refusal, built in one place so the fault and the sentence travel together.
     /// @param fault What went wrong.
@@ -264,13 +243,24 @@ namespace
 
         // A partial write leaves a file the next start refuses as truncated, which is the
         // safe direction: a key that may have been seen is never silently replaced. The
-        // sentence says so, because the file is left behind.
-        if (std::fwrite(bytes.data(), 1, bytes.size(), file.get()) != bytes.size() || !FlushToDisk(file.get())
+        // sentence says so, because the file is left behind. Flushed to the disk
+        // (`Consensus::FlushToDisk`): `fflush` alone reaches the kernel, which a power loss
+        // still discards, and a key file a crash leaves EMPTY is one the next start refuses.
+        if (std::fwrite(bytes.data(), 1, bytes.size(), file.get()) != bytes.size() || !Consensus::FlushToDisk(file.get())
             || std::fclose(file.release()) != 0)
             return Refuse(NodeKeyFault::WriteFailed,
                           std::format("cannot write {} in full; the next start will refuse what was written, and "
                                       "removing it mints a new identity",
                                       path.string()));
+        // And the directory, or a power loss can take back the ENTRY of a key whose bytes are on the
+        // disk: the next start finds no key, mints another, and the machine the fleet knew is gone
+        // (`Consensus::SyncDirectoryToDisk`). The key is written, so the next start reads it.
+        if (auto const synced = Consensus::SyncDirectoryToDisk(path.parent_path()); synced)
+            return Refuse(NodeKeyFault::WriteFailed,
+                          std::format("wrote {}, but cannot sync its directory: {}; it is not known to survive a power "
+                                      "loss. The next start reads the key that was written",
+                                      path.string(),
+                                      synced.message()));
         return {};
     }
 } // namespace

@@ -62,8 +62,7 @@ namespace
 [[nodiscard]] NodeConfig Installable()
 {
     NodeConfig cfg;
-    cfg.schedulers = { "cache.internal:6675" };
-    // Where its identity is kept (#178): a node naming a scheduler proves which machine it is.
+    // Where its identity is kept (#178): a node that registers proves which machine it is.
     cfg.clusterDir = "cluster";
     // A bind other machines reach, beside the address they are told to dial: that state
     // directory is a key route, so a routable advertise over a loopback bind is refused.

@@ -36,6 +36,7 @@
 #include <core/platform/Clock.hpp>
 #include <tests/FleetHarness.hpp>
 #include <tests/LocalityFakes.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -391,8 +392,7 @@ TEST_CASE("A heartbeat reports what the audience accepts, so a hint names a new 
     fleet.VerifyTicketsAtWorker(std::string { Laptop }, audience, Sched);
     fleet.VerifyTicketsAtWorker(std::string { NewAddress }, audience, Sched);
 
-    Node::NodeConfig cfg;
-    cfg.schedulers = { std::string { Sched } };
+    auto const cfg = FastCache::Testing::LearnerRegisteringWith(Node::NodeConfig {}, { std::string { Sched } });
     AtomicMetricsSink workerMetrics;
     NullLogger logger;
     SilentLoadSampler loadSampler;
@@ -404,7 +404,7 @@ TEST_CASE("A heartbeat reports what the audience accepts, so a hint names a new 
     std::vector<Cc::WorkerRegistrar> withdrawals;
     std::atomic<bool> addressCapNoticed { false };
     Node::SchedulerReachability reachability { clock };
-    auto link = Testing::Unwrap(Node::SchedulerLink::For(cfg.schedulers));
+    auto link = Testing::Unwrap(Node::SchedulerLink::For(Node::SchedulersOf(cfg, Node::AsConfigured)));
     Node::HeartbeatRound const round { .cfg = cfg,
                                        .registrars = registrars,
                                        .withdrawals = withdrawals,

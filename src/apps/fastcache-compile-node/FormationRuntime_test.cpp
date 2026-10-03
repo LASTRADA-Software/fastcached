@@ -35,6 +35,7 @@
 #include <tests/FormationFakes.hpp>
 #include <tests/HostNamingFakes.hpp>
 #include <tests/ManualClockWait.hpp>
+#include <tests/NodeConditionFakes.hpp>
 #include <tests/NodeFormationControllerFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
@@ -122,10 +123,6 @@ struct RuntimeRig
         cfg.nodeId = nodeId;
         cfg.identityPublicKey = Testing::TestKeyPair(nodeId).PublicKey();
         cfg.hostNames = NodeHostNames { .fqdn = nodeId.substr(2) + ".corp.example", .dnsSuffix = {}, .withheld = {} };
-        // Every move is judged by the startup rules (`StartupShapeJudge`), and today those refuse a
-        // worker that names no scheduler (Task 24 moves registration to `SchedulersOf`): named here as
-        // an operator must name it now, its own node port.
-        cfg.schedulers = { nodeId.substr(2) + ".corp.example:6674" };
         REQUIRE(ApplyFormation(cfg, body.record, {}).has_value());
     }
 
@@ -348,11 +345,16 @@ TEST_CASE("The startup judge reads the configuration in force, so an accepted re
           == std::optional { std::string { "a test rule refuses advertising elsewhere.corp.example:6674" } });
 }
 
-TEST_CASE("The startup judge refuses a loopback-named founder's voter shape, unreachable by a controller on this branch",
+TEST_CASE("A loopback-named founder that gets a joiner is refused the move by its own controller, in the move's own row",
           "[node][formation][runtime][judge]")
 {
-    // The shape I-1's check exists for: a solitary founder whose name reaches only this machine, moved
-    // to a VOTER, whose consensus port peers dial. The judge every move asks refuses it, by name.
+    // I-1's shape, reached through PRODUCTION (NI-2): since T24 a node whose name reaches only this
+    // machine runs SOLITARY with its consensus on loopback, so it HAS a controller -- and the move a
+    // joiner makes (solitary to voter, whose consensus port peers dial) is the shape the startup rules
+    // refuse by name. The runtime's own judge refuses it before the record is written: the node stays
+    // solitary and says which rule in `formation-move-refused`. That row is the EVENT; the STANDING
+    // fact -- this name reaches only this machine -- is `host-name-reaches-only-this-machine`, the
+    // host-name evaluator's to raise, and the controller does not raise it a second time.
     auto cfg = NodeConfig {};
     cfg.nodeId = "n-solo";
     cfg.slots = 0; // no worker: the rule judged is consensus's, and nothing else is asked
@@ -361,27 +363,41 @@ TEST_CASE("The startup judge refuses a loopback-named founder's voter shape, unr
     auto const solitary = Testing::Minted("c-solo", 500);
     REQUIRE(ApplyFormation(cfg, solitary, {}).has_value());
     REQUIRE_FALSE(StartupPolicyRejection(cfg).has_value()); // the start passes it
+    REQUIRE(RunsConsensus(cfg));                            // confined to loopback, and on
 
-    Testing::ScratchDirectory const scratch { "shape-judge" };
-    Cluster::FleetEndpointsFile endpoints { scratch.Path() };
-    LiveNodeConfig const live { cfg, nullptr };
-    StartupShapeJudge const judge { live, endpoints, StartupPolicyRejection };
-    CHECK_FALSE(judge.RefusalOf(solitary).has_value());
-    auto voter = solitary;
-    voter.mode = Cluster::NodeMode::Voter;
-    CHECK(judge.RefusalOf(voter) == std::optional { std::string { ConsensusNameReachesOnlyThisMachineRefusal } });
-
-    // And why no production transition reaches it ON THIS BRANCH ONLY: such a founder's consensus
-    // stands down here, so its body builds no formation at all -- no controller exists to take the move.
-    // Task 24 reverses that premise (a loopback-named node runs SOLITARY on loopback, consensus ON), so
-    // after that merge the founder HAS a controller and this judge is what refuses its move into a
-    // multi-member shape, raising `formation-move-refused`. The assertions below are then false by
-    // design, and this half is replaced at that integration by a case driving that refusal.
-    CHECK_FALSE(RunsConsensus(cfg));
     RuntimeRig rig { "n-solo", solitary };
-    auto const none = MakeFormationRuntime(cfg, rig.body, nullptr, rig.metrics, rig.logger, nullptr);
-    REQUIRE(none.has_value());
-    CHECK(*none == nullptr);
+    NodeConditions conditions;
+    auto made = MakeFormationRuntime(cfg, rig.body, nullptr, rig.metrics, rig.logger, &conditions);
+    REQUIRE(made.has_value());
+    auto const& runtime = *made;
+    REQUIRE(runtime != nullptr);
+    auto const savedBefore = rig.store.Saves().size();
+
+    // Its cluster records a second machine: what makes a founder a voter.
+    auto state = Cluster::ClusterState {};
+    state.members.push_back(
+        Cluster::ClusterMember { .id = "n-solo",
+                                 .raftEndpoint = "127.0.0.1:6680",
+                                 .schedulerEndpoint = {},
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                 .seat = Cluster::MemberSeat::Voter,
+                                 .publicKey = Testing::TestKeyPair("n-solo").PublicKey() });
+    state.members.push_back(
+        Cluster::ClusterMember { .id = "n-joiner",
+                                 .raftEndpoint = {},
+                                 .schedulerEndpoint = {},
+                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::NeverAnnounced,
+                                 .seat = Cluster::MemberSeat::Learner,
+                                 .publicKey = Testing::TestKeyPair("n-joiner").PublicKey() });
+    runtime->Controller().OnClusterState(state, "c-solo", "n-solo", "127.0.0.1:6674");
+
+    CHECK(runtime->Controller().Mode() == Cluster::NodeMode::Solitary);
+    CHECK(rig.store.Saves().size() == savedBefore);
+    REQUIRE(conditions.StateOf(NodeCondition::FormationMoveRefused) == CompileCacheWire::ConditionState::Raised);
+    // WHICH rule: the name's, not any refusal at all.
+    CHECK(Testing::DetailOf(conditions, NodeCondition::FormationMoveRefused).contains("reaches only itself"));
+    // And the standing row is not this one's to raise.
+    CHECK(conditions.StateOf(NodeCondition::HostNameReachesOnlyThisMachine) == CompileCacheWire::ConditionState::Undecided);
 }
 
 TEST_CASE("A formation's beat waits its interval on the injected clock, never the wall's", "[node][formation][runtime]")

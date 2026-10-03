@@ -525,7 +525,9 @@ while IFS="$FieldSep" read -r leg stepUses runsOn cacheKey unresolved; do
         continue
     fi
 
-    resolvedKey="${cacheKey//"$osPattern"/$runnerOs}"
+    # The replacement quoted, as every one is: bash 5.2's `patsub_replacement` reads an unquoted `&`
+    # in it as the matched pattern. A runner OS name holds none, so this was not a live defect.
+    resolvedKey="${cacheKey//"$osPattern"/"$runnerOs"}"
     if [[ "$resolvedKey" == *'${{ runner.'* ]]; then
         Fail "job '$leg' has a cache key this check cannot resolve -- key: $resolvedKey. It names a \`runner.\` field other than \`os\`, so $question cannot be decided in either direction."
         continue

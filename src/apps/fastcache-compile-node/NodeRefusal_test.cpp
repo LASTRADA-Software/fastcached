@@ -128,12 +128,12 @@ TEST_CASE("A node's start gives up as a refusal only when the next start reaches
 TEST_CASE("The node's body gives up with the cause its refusal carries, never one of its own", "[node][startup][exit]")
 {
     // `main` is in no test target, so what holds it to the table is its text: every refusal from a
-    // tier, a surface or the state directory ends with that refusal's own cause -- ten of them --
-    // and the worker's late ending with its own. None ends as `StartStage::Serving` any more, which
-    // was one answer for all of them.
+    // tier, a surface, the state directory or a handed-over socket ends with that refusal's own
+    // cause -- eleven of them -- and the worker's late ending with its own. None ends as
+    // `StartStage::Serving` any more, which was one answer for all of them.
     auto const text = NodeMain();
-    CHECK(Occurrences(text, ".error().cause);") == 10);
-    CHECK(Occurrences(text, "return ExitCodeFor(") == 12);
+    CHECK(Occurrences(text, ".error().cause);") == 11);
+    CHECK(Occurrences(text, "return ExitCodeFor(") == 13);
     CHECK(Occurrences(text, "->Ending()") == 1);
     CHECK(Occurrences(text, "StartStage::Serving") == 0);
     CHECK(Occurrences(text, "EndedInRefusal") == 0);

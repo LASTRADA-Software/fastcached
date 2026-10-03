@@ -57,8 +57,8 @@ enum class StateFileAccess : std::uint8_t
     /// protected list of its own, whatever the directory would hand it.
     OwnerOnly,
     /// Integrity, not secrecy: every account may read it, only its owner writes it. POSIX mode
-    /// 0644 and not 0600, because a verb run as ANOTHER account -- `sudo --print-identity`,
-    /// `--enroll-from`, an install -- writes files the service's account then reads, and a file
+    /// 0644 and not 0600, because a verb run as ANOTHER account -- `sudo --print-identity`, an
+    /// install -- writes files the service's account then reads, and a file
     /// that account cannot read refuses its start. On Windows the directory's list, inherited:
     /// that is how the grant the directory gives the service reaches a file an elevated command
     /// wrote.

@@ -50,16 +50,16 @@ enum class NodeCondition : std::uint8_t
     ForeignFleetVisible,            ///< Another established fleet proves itself on this segment; neither will merge.
     SharedCacheUnavailable,         ///< The fleet names this machine its shared cache, and its shared tier will not open.
     SharedCacheUnproven,            ///< The fleet names another machine its shared cache, and this node is not reaching it.
-    SchedulerUnreachable,           ///< A --scheduler endpoint does not answer a dial.
+    SchedulerUnreachable,           ///< A scheduler this node registers with does not answer a dial.
     UnservedToolchain,              ///< Clients asked the leader for a toolchain no live worker serves.
     MixedNodeVersions,              ///< The leader sees one wire served by more than one build.
     OwnRecordAwaited,               ///< Its own cluster has not recorded this node's key, so it announces to nobody.
     RefusedCompileArguments,        ///< The worker refused compiles over arguments it will not pass to its compiler.
     SurfaceNotAccepting,            ///< A serving surface's accept loop has ended: its port listens and refuses.
     SurfaceAcceptDegraded,          ///< A serving surface's accept loop is backing off on failures nothing classifies.
-    FleetSplitHealing,              ///< This fleet and another are one fleet split in two: healing by itself, or waiting on an operator.
-    FormationMoveRefused,           ///< A move of this node's formation was refused: the startup rules refuse the shape it moves to.
-    Last,                           ///< Not a condition.
+    FleetSplitHealing, ///< This fleet and another are one fleet split in two: healing by itself, or waiting on an operator.
+    FormationMoveRefused, ///< A move of this node's formation was refused: the startup rules refuse the shape it moves to.
+    Last,                 ///< Not a condition.
 };
 
 /// Which of this node's components evaluates a row.
@@ -75,7 +75,7 @@ enum class ConditionScope : std::uint8_t
     AdminSurface, ///< The admin HTTP surface; absent without `--admin-listen`.
     Enrollment,   ///< The enrollment window; served only by a consensus node that also schedules.
     Consensus,    ///< Consensus and the cluster state it replicates; absent without `--listen-raft`.
-    Announce,     ///< The announce loops; absent without --scheduler.
+    Announce,     ///< The announce loops; absent when this node registers with no scheduler (`AnnouncesToAScheduler`).
     Last,         ///< Not a scope.
 };
 
@@ -88,7 +88,7 @@ struct PresentComponents
     bool adminSurface; ///< An admin endpoint is serving.
     bool enrollment;   ///< An enrollment window is reachable.
     bool consensus;    ///< Consensus runs.
-    bool announces;    ///< The announce loops run: this node names a --scheduler.
+    bool announces;    ///< The announce loops run: this node registers somewhere (`AnnouncesToAScheduler`).
 };
 
 /// One scope: which `PresentComponents` member says it runs, and what a row of it answers when it
@@ -123,7 +123,7 @@ inline constexpr EnumTable<ConditionScope, ConditionScopeRow> ConditionScopeTabl
       .notEvaluated = "this node runs no consensus (no --listen-raft), so no cluster state reaches it" },
     { .scope = ConditionScope::Announce,
       .present = &PresentComponents::announces,
-      .notEvaluated = "this node names no --scheduler, so it dials no scheduler that could be unreachable" },
+      .notEvaluated = "this node registers with no scheduler, so it dials none that could be unreachable" },
 } };
 static_assert(RowsInEnumeratorOrder(ConditionScopeTable, &ConditionScopeRow::scope),
               "ConditionScopeTable must hold one row per ConditionScope, in enumerator order");
@@ -207,11 +207,10 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .persistence = CompileCacheWire::ConditionPersistence::Live,
       .severity = CompileCacheWire::ConditionSeverity::Warning,
       .scope = ConditionScope::Process,
-      .remedy = "Set --raft-self (raft_self in the configuration file; a restart applies it) and, to be announced to "
-                "a scheduler, --advertise (advertise; a reload applies it) to an address or a name other machines "
-                "resolve; or give this machine a real host name and restart the node, since the name is read once at "
-                "startup. Until then this node serves this machine alone: every peer resolves its name to itself, so "
-                "it runs no consensus or discovery and is announced to no scheduler." },
+      .remedy = "Fix this machine's DNS so its name resolves for other machines, and restart (the name is read once "
+                "at startup); or set --raft-self (raft_self; a restart applies it) and --advertise (advertise; a "
+                "reload applies it) to an address or name they resolve. Until then this node is a fleet of its own on "
+                "loopback -- its own scheduler and worker, no discovery -- that can neither form nor join a fleet." },
     { .condition = NodeCondition::EnrollmentRequestsWaiting,
       .id = "enrollment-requests-waiting",
       .persistence = CompileCacheWire::ConditionPersistence::Live,
@@ -283,8 +282,9 @@ inline constexpr EnumTable<NodeCondition, NodeConditionRow> NodeConditionTable {
       .scope = ConditionScope::Consensus,
       .remedy = "This node announces itself to no scheduler until its own cluster records its key. If that cluster "
                 "cannot elect, bring back a majority of its voters. If this machine joined a running cluster, admit "
-                "it: --enroll-from=<seed> here, or --cluster-admit=<id>=<host>:<port>@<key> on a member, with what "
-                "--print-identity prints. If the detail says its id is recorded under another key, restore that "
+                "it: it asks to enroll and --enroll-approve admits it, or --cluster-admit=<id>=<host>:<port>@<key> "
+                "on a member, with what --print-identity prints. If the detail says its id is recorded under another key, "
+                "restore that "
                 "node-key, or --cluster-forget=<id> and admit this key." },
     // Live: an operator's reload of the allowlist is the fix landing, and it re-judges the row --
     // each argument the new list admits leaves, and the row clears once none is left.

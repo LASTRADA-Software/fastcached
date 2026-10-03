@@ -105,8 +105,11 @@ inline void PublishClusterKeys(Distributed::KeyRosterMembership& keys, Cluster::
     // The fleet a formed node is in, or is asking into: its mode row's `members` column, which
     // says for a pending node too that other machines are about to be members -- the roster
     // consensus will later publish, peers admitted by the keys they prove, which no runtime query
-    // can see yet.
-    if (cfg.formation.has_value() && Cluster::NodeModeRowFor(cfg.formation->mode).members == Cluster::FleetReach::Beyond)
+    // can see yet. Unless its consensus is confined to this machine (`ConsensusConfinedToThisMachine`):
+    // every way of becoming more than one machine is then shut, a pending node's ask included, so
+    // that roster can never name another machine.
+    if (cfg.formation.has_value() && Cluster::NodeModeRowFor(cfg.formation->mode).members == Cluster::FleetReach::Beyond
+        && !ConsensusConfinedToThisMachine(cfg))
         return true;
 
     // The key routes: a proof or a VERIFIED ticket admits only against a roster -- never an AUTH

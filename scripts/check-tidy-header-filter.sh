@@ -36,6 +36,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 . scripts/lib/header-filter.sh
 # shellcheck source=lib/third-party-roots.sh
 . scripts/lib/third-party-roots.sh
+# shellcheck source=lib/git-scrub.sh
+. scripts/lib/git-scrub.sh
 
 # Judge one filter. Prints one line per failure, or `ok <n>`; returns 1 on any failure.
 # @param 1 The include regex. @param 2 The exclude regex, possibly empty. @param 3 The root.
@@ -159,7 +161,7 @@ src/CowTree/Tree.hpp"
     printf 'CPMAddPackage(\n    NAME Bar\n    VERSION 2.0\n)\n' > "$tree/cmake/Deps.cmake"
     printf 'CPMAddPackage(NAME Vendored)\n' > "$tree/vendor/up/CMakeLists.txt"
     cases=$((cases + 1))
-    if ( cd "$tree" && git init -q . && git add -A ) >/dev/null 2>&1; then
+    if ( cd "$tree" && scratch_git init -q . && scratch_git add -A ) >/dev/null 2>&1; then
         got="$(header_filter_declared_packages "$tree" 2>/dev/null)" && status=0 || status=$?
         got="$(printf '%s\n' "$got" | tr '\n' ' ')"
         if [[ "$status" == 0 && "$got" == "bar foo " ]]; then
@@ -238,10 +240,10 @@ src/CowTree/Tree.hpp"
         cases=$((cases + 1))
         printf 'CPMAddPackage(NAME Assigned VERSION 1.0)\n' > "$tree/x=y.cmake"
         printf 'CPMAddPackage(NAME Foo VERSION 1.0)\n' > "$tree/CMakeLists.txt"
-        ( cd "$tree" && git add -- 'x=y.cmake' ) >/dev/null 2>&1
+        ( cd "$tree" && scratch_git add -- 'x=y.cmake' ) >/dev/null 2>&1
         got="$(header_filter_declared_packages "$tree" 2>&1)" && status=0 || status=$?
         got="$(printf '%s\n' "$got" | tr '\n' ' ')"
-        ( cd "$tree" && git rm -q --cached -- 'x=y.cmake' ) >/dev/null 2>&1
+        ( cd "$tree" && scratch_git rm -q --cached -- 'x=y.cmake' ) >/dev/null 2>&1
         rm -f "$tree/x=y.cmake"
         if [[ "$status" == 0 && "$got" == "assigned bar foo " ]]; then
             echo "   ok   a tracked file named like an awk assignment (x=y.cmake) is read, never skipped"

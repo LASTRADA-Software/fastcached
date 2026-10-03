@@ -814,9 +814,10 @@ TEST_CASE("A signature over the claims without the lease's label is not a lease"
 
     // The control, built the same way with the label: accepted, so the refusal above is the
     // label's and not the helper's.
-    CHECK(AuthenticateLeaseToken(roster,
-                                 envelopeOver(Distributed::Detail::SignedLeaseMessage(packed).Bytes(), Testing::TestKeyPair("scheduler")))
-              .has_value());
+    CHECK(
+        AuthenticateLeaseToken(
+            roster, envelopeOver(Distributed::Detail::SignedLeaseMessage(packed).Bytes(), Testing::TestKeyPair("scheduler")))
+            .has_value());
 }
 
 TEST_CASE("A grant's signature is Ed25519 over the lease label and the claims as packed", "[distributed][lease][token]")

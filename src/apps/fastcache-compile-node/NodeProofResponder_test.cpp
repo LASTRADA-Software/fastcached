@@ -437,7 +437,7 @@ TEST_CASE("An unknown key under THIS node's own id is never answered with a reme
     ProvingNode node;
 
     /// The remedy for a machine an operator really can admit, which neither self case may carry.
-    constexpr std::string_view AdmitRemedy = "--cluster-admit-worker";
+    constexpr std::string_view AdmitRemedy = "--enroll-approve";
 
     /// The refusal's own words, out of its sealed reply.
     auto const reasonOf = [](NodeProofVerdict const& verdict) {

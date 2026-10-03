@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <format>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -25,74 +26,97 @@
     #include <io.h>
     #include <share.h>
 #else
+    #include <fcntl.h>
     #include <unistd.h>
 #endif
 
 namespace FastCache::Consensus
 {
 
-#if defined(_WIN32)
 namespace
 {
-    /// What `SetFileInformationByHandle` answers on a filesystem that has no POSIX-semantics rename: the
-    /// information class or its flags are not understood there, which says nothing about the files.
-    constexpr auto NoPosixRename =
-        std::to_array<DWORD>({ ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION });
-} // namespace
-#endif
+    /// A state file created by `CreateStateFile`, written through its stream.
+    class SystemDurableSink final: public IDurableSink
+    {
+      public:
+        /// @param stream The open temporary, owned from here.
+        explicit SystemDurableSink(SecretFileStream stream) noexcept:
+            _stream { std::move(stream) }
+        {
+        }
 
-bool MeansNoPosixRename(std::error_code refusal) noexcept
+        std::error_code Write(std::span<std::byte const> bytes) override
+        {
+            errno = 0;
+            if (bytes.empty() || std::fwrite(bytes.data(), 1, bytes.size(), _stream.get()) == bytes.size())
+                return {};
+            return Failure();
+        }
+
+        std::error_code Sync() override
+        {
+            errno = 0;
+            return FlushToDisk(_stream.get()) ? std::error_code {} : Failure();
+        }
+
+        std::error_code Close() override
+        {
+            // Released rather than reset: `fclose`'s answer is the close this asks, and the stream's
+            // own deleter would discard it.
+            errno = 0;
+            return std::fclose(_stream.release()) == 0 ? std::error_code {} : Failure();
+        }
+
+      private:
+        /// @return What the C library said, or an I/O error when it set nothing.
+        [[nodiscard]] static std::error_code Failure() noexcept
+        {
+            return std::error_code { errno != 0 ? errno : EIO, std::generic_category() };
+        }
+
+        SecretFileStream _stream;
+    };
+} // namespace
+
+std::expected<std::unique_ptr<IDurableSink>, std::error_code> SystemDurableFiles::Create(std::filesystem::path const& path,
+                                                                                         StateFile which)
 {
-#if defined(_WIN32)
-    return refusal.category() == std::system_category()
-           && std::ranges::contains(NoPosixRename, static_cast<DWORD>(refusal.value()));
-#else
-    // `rename(2)` has the semantics already, so nothing it answers asks for another rename.
-    static_cast<void>(refusal);
-    return false;
-#endif
+    return CreateStateFile(path, which).transform([](SecretFileStream stream) -> std::unique_ptr<IDurableSink> {
+        return std::make_unique<SystemDurableSink>(std::move(stream));
+    });
 }
 
-std::error_code SystemReplacingRename::RenameReplacing(std::filesystem::path const& from,
-                                                       std::filesystem::path const& to) const
+std::error_code SystemDurableFiles::SyncDirectory(std::filesystem::path const& directory)
+{
+    return SyncDirectoryToDisk(directory);
+}
+
+std::error_code SyncDirectoryToDisk(std::filesystem::path const& directory)
 {
 #if defined(_WIN32)
-    auto* const handle = ::CreateFileW(from.wstring().c_str(),
-                                       DELETE | SYNCHRONIZE,
+    // FILE_WRITE_DATA is a directory's add-file right, which a replace into it already needs; read
+    // access alone is refused the flush (measured, see the header).
+    auto* const handle = ::CreateFileW(directory.wstring().c_str(),
+                                       FILE_WRITE_DATA,
                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                        nullptr,
                                        OPEN_EXISTING,
-                                       FILE_ATTRIBUTE_NORMAL,
+                                       FILE_FLAG_BACKUP_SEMANTICS,
                                        nullptr);
     if (handle == INVALID_HANDLE_VALUE)
         return std::error_code { static_cast<int>(::GetLastError()), std::system_category() };
-
-    // `FILE_RENAME_INFO` ends in the name, so it is laid out in storage of the whole size, held as
-    // words so it is aligned for the structure.
-    auto const name = to.wstring();
-    auto const nameBytes = name.size() * sizeof(wchar_t);
-    auto const size = sizeof(FILE_RENAME_INFO) + nameBytes;
-    auto storage = std::vector<std::uint64_t>((size + sizeof(std::uint64_t) - 1) / sizeof(std::uint64_t));
-    // `Flags` shares a union with the older `ReplaceIfExists`, so it is written as bytes at its offset
-    // rather than through the union; the storage starts zeroed, so `RootDirectory` is null.
-    auto const flags = DWORD { FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS };
-    std::memcpy(std::as_writable_bytes(std::span { storage }).subspan(offsetof(FILE_RENAME_INFO, Flags)).data(),
-                &flags,
-                sizeof flags);
-    auto* const info = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-    info->FileNameLength = static_cast<DWORD>(nameBytes);
-    std::memcpy(&info->FileName[0], name.data(), nameBytes);
-
-    auto const renamed = ::SetFileInformationByHandle(handle, FileRenameInfoEx, info, static_cast<DWORD>(size)) != 0;
-    auto const failure = renamed ? DWORD { 0 } : ::GetLastError();
+    auto const flushed = ::FlushFileBuffers(handle) != FALSE
+                             ? std::error_code {}
+                             : std::error_code { static_cast<int>(::GetLastError()), std::system_category() };
     ::CloseHandle(handle);
-    if (renamed)
-        return {};
-    return std::error_code { static_cast<int>(failure), std::system_category() };
+    return flushed;
 #else
-    auto error = std::error_code {};
-    std::filesystem::rename(from, to, error);
-    return error;
+    auto const descriptor = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (descriptor < 0)
+        return std::error_code { errno, std::generic_category() };
+    auto const synced = ::fsync(descriptor) == 0 ? std::error_code {} : std::error_code { errno, std::generic_category() };
+    auto const closed = ::close(descriptor) == 0 ? std::error_code {} : std::error_code { errno, std::generic_category() };
+    return synced ? synced : closed;
 #endif
 }
 
@@ -208,12 +232,21 @@ std::expected<std::optional<std::vector<std::byte>>, ConsensusError> ReadFileIfP
     return std::optional { std::move(into) };
 }
 
-std::expected<ReplacedBy, ConsensusError> ReplaceFileWith(std::filesystem::path const& path,
-                                                          std::span<std::byte const> body,
-                                                          StateFile which,
-                                                          IReplacingRename const& rename)
+std::expected<Platform::ReplacedBy, ConsensusError> ReplaceFileWith(std::filesystem::path const& path,
+                                                                    std::span<std::byte const> body,
+                                                                    StateFile which,
+                                                                    IDurableFiles& files,
+                                                                    Platform::IReplacingRename const& rename)
 {
     auto const temporary = std::filesystem::path { path }.concat(ReplacementSuffix);
+    // Every way out but the rename removes the temporary, AFTER its sink is gone: Windows refuses to
+    // delete a file that is still open.
+    auto const abandon = [&temporary](std::string_view step, std::error_code failure) {
+        auto discard = std::error_code {};
+        std::filesystem::remove(temporary, discard);
+        return std::unexpected { FastCache::StorageFailure(
+            std::format("cannot {} {}: {}", step, temporary.string(), failure.message())) };
+    };
 
     // Created exclusively and unshared, so no handle another account opened on a temporary it
     // could reach keeps writing to the file after the rename -- and with the access its row
@@ -223,61 +256,70 @@ std::expected<ReplacedBy, ConsensusError> ReplaceFileWith(std::filesystem::path 
     // cleared first -- it holds nothing anybody trusts.
     auto stale = std::error_code {};
     std::filesystem::remove(temporary, stale);
-    auto created = CreateStateFile(temporary, which);
+    auto created = files.Create(temporary, which);
     if (!created.has_value())
         return std::unexpected { FastCache::StorageFailure(
             std::format("cannot open {}: {}", temporary.string(), created.error().message())) };
-    auto stream = *std::move(created);
+    auto sink = *std::move(created);
 
-    errno = 0;
-    auto const wrote = body.empty() || std::fwrite(body.data(), 1, body.size(), stream.get()) == body.size();
-    auto const flushed = wrote && FlushToDisk(stream.get());
-    auto const failure = errno;
-    stream.reset();
+    // In order, each only once the one before it held: a close is still asked after a failed write or
+    // sync, to release the file, and its own answer is then not the one reported.
+    auto failure = sink->Write(body);
+    auto step = std::string_view { "write" };
+    if (!failure)
+    {
+        failure = sink->Sync();
+        step = "sync";
+    }
+    auto const closed = sink->Close();
+    sink.reset();
+    if (failure)
+        return abandon(step, failure);
+    if (closed)
+        return abandon("close", closed);
 
-    if (!flushed)
+    auto replaced = Platform::RenameIntoPlace(temporary, path, rename);
+    if (!replaced.has_value())
     {
         auto discard = std::error_code {};
         std::filesystem::remove(temporary, discard);
         return std::unexpected { FastCache::StorageFailure(
-            std::format("cannot write {}: {}", temporary.string(), std::generic_category().message(failure))) };
+            std::format("cannot replace {}: {}", path.string(), replaced.error().message())) };
     }
 
-    auto replaced = ReplacedBy {};
-    auto error = rename.RenameReplacing(temporary, path);
-    if (MeansNoPosixRename(error))
-    {
-        replaced = ReplacedBy { .route = ReplaceRoute::Classic, .posixRefusal = error };
-        error.clear();
-        std::filesystem::rename(temporary, path, error);
-    }
-    if (error)
-    {
-        auto discard = std::error_code {};
-        std::filesystem::remove(temporary, discard);
+    // The rename changed the directory, and only a flush of the directory makes that survive a
+    // power loss. Reported rather than swallowed: the new file is in place, but a caller told it is
+    // durable could act on a write a power cut takes back -- a vote, for one.
+    auto const directory = path.has_parent_path() ? path.parent_path() : std::filesystem::path { "." };
+    if (auto const synced = files.SyncDirectory(directory); synced)
         return std::unexpected { FastCache::StorageFailure(
-            std::format("cannot replace {}: {}", path.string(), error.message())) };
-    }
-    return replaced;
+            std::format("replaced {}, but cannot sync its directory {}: {}; the replace is not known to survive a "
+                        "power loss",
+                        path.string(),
+                        directory.string(),
+                        synced.message())) };
+    return *replaced;
 }
 
 std::expected<void, ConsensusError> ReplaceFileAtomically(std::filesystem::path const& path,
                                                           std::span<std::byte const> body,
                                                           StateFile which)
 {
-    auto const rename = SystemReplacingRename {};
-    return ReplaceFileWith(path, body, which, rename).transform([](ReplacedBy const&) {});
+    auto files = SystemDurableFiles {};
+    auto const rename = Platform::SystemReplacingRename {};
+    return ReplaceFileWith(path, body, which, files, rename).transform([](Platform::ReplacedBy const&) {});
 }
 
-std::expected<ReplacedBy, ConsensusError> ProbeReplaceRoute(std::filesystem::path const& directory,
-                                                            IReplacingRename const& rename)
+std::expected<Platform::ReplacedBy, ConsensusError> ProbeReplaceRoute(std::filesystem::path const& directory,
+                                                                      Platform::IReplacingRename const& rename)
 {
     auto const probe = directory / ReplaceProbeFileName;
+    auto files = SystemDurableFiles {};
     // Twice: the first may CREATE the file, and only a rename over one that exists is the replace
     // every state file there goes through.
-    auto const first = ReplaceFileWith(probe, std::span<std::byte const> {}, StateFile::Formation, rename);
-    auto const second = first.and_then([&](ReplacedBy const&) {
-        return ReplaceFileWith(probe, std::span<std::byte const> {}, StateFile::Formation, rename);
+    auto const first = ReplaceFileWith(probe, std::span<std::byte const> {}, StateFile::Formation, files, rename);
+    auto const second = first.and_then([&](Platform::ReplacedBy const&) {
+        return ReplaceFileWith(probe, std::span<std::byte const> {}, StateFile::Formation, files, rename);
     });
     auto discard = std::error_code {};
     std::filesystem::remove(probe, discard);

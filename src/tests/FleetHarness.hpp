@@ -2,6 +2,7 @@
 #pragma once
 
 #include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/NodeMode.hpp>
 #include <FastCache/Cluster/Roster.hpp>
 #include <FastCache/Cluster/RosterCertificate.hpp>
 #include <FastCache/Core/Ed25519.hpp>
@@ -23,6 +24,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <map>
 #include <memory>
@@ -39,6 +41,7 @@
 #include <WorkerProtocol.hpp>
 #include <apps/fastcache-compile-node/EndpointDialer.hpp>
 #include <apps/fastcache-compile-node/NodeConfig.hpp>
+#include <apps/fastcache-compile-node/NodeFormation.hpp>
 #include <apps/fastcache-compile-node/NodeMembership.hpp>
 #include <apps/fastcache-compile-node/NodePresenceTier.hpp>
 #include <apps/fastcache-compile-node/NodeRoster.hpp>
@@ -141,12 +144,11 @@ namespace FastCache::Testing
 /// Every scheduler signs its grants with its own identity key -- `TestKeyPair` of its
 /// endpoint, which is also its member id -- and holds a cluster state of its own, set by
 /// `SetClusterStateAt`: an ex-leader that has not heard a change is a node holding an older
-/// one. A voter's endorsement reaches a scheduler on NODE-ANNOUNCE (`EndorseAt`). A
-/// `RosterWorker` is a machine with no consensus: a production `FastCache::Node::NodeRoster` rooted in
-/// `--voter-key` anchors, the production lease validator over it, and a presence round that is
-/// production's `FastCache::Node::AnnouncePresence` -- `SchedulerLink`'s redirects and fallbacks, dialled
-/// through this harness (`SetUnreachable`), the certified roster adopted from whichever
-/// scheduler answered.
+/// one. A voter's endorsement reaches a scheduler on NODE-ANNOUNCE (`EndorseAt`). A node's
+/// presence round dials a scheduler through this harness (`Dial`, `SetUnreachable`), so
+/// `SchedulerLink`'s redirects and fallbacks run as production runs them. A `LearnerWorker` is a
+/// machine that runs consensus as a learner: a production `FastCache::Node::NodeRoster` fed the
+/// state it applied, and the production ticket verifier over it.
 class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::IEndpointDialer
 {
   public:
@@ -525,8 +527,8 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
     ///
     /// Every node at once, and its roster version moved, as an applied admission would; each voter
     /// endorses the changed roster at once, as a voter does (`Cluster::RosterEndorsementRefresh`
-    /// is for one that has NOT changed), so a `RosterWorker` adopts it on its next round. A node
-    /// whose membership was published (`PublishMembershipAt`) is republished.
+    /// is for one that has NOT changed). A node whose membership was published
+    /// (`PublishMembershipAt`) is republished.
     /// @param machine The machine's id, which is also the id its tickets name.
     void AdmitMachine(std::string const& machine)
     {
@@ -727,70 +729,37 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         return std::string { CompileCacheWire::AsStringView(grant->leaseToken) };
     }
 
-    /// A machine that runs no consensus and verifies every grant against the roster its
-    /// voters certify (#178). Production parts throughout; see the class comment.
-    class RosterWorker final
+    /// A machine that runs consensus as a LEARNER of this fleet and verifies a machine ticket the way
+    /// its worker's session surface does: a production `FastCache::Node::NodeRoster`, built for a
+    /// learner's configuration, fed what that learner APPLIED -- `NodeRoster::Applied`, which the
+    /// consensus tier's apply callback calls with every committed state -- and the production
+    /// verifier over it for an audience that is exactly this machine.
+    ///
+    /// What it applied is a scheduler's state copied at `Apply`, so a case can hold a learner that
+    /// has not caught up yet; nothing reaches it between two calls.
+    class LearnerWorker final
     {
       public:
-        /// @param fleet The harness it lives in, for the clocks, the sink and the dialer.
-        /// @param endpoint Where it answers compiles, and the key its presence is filed under.
-        /// @param anchors The voters whose keys it is started with (`--voter-key`).
-        /// @param schedulers Its `--scheduler` list, in order.
-        RosterWorker(FleetHarness& fleet,
-                     std::string endpoint,
-                     std::vector<std::string> const& anchors,
-                     std::vector<std::string> schedulers):
+        /// @param fleet The harness it lives in, for the clock, the sink and the states.
+        /// @param endpoint Its member id, and the one endpoint a ticket for it names.
+        /// @param leader The scheduler whose applied state this learner replicates; must have been
+        ///        added, and must be a voter in that state.
+        LearnerWorker(FleetHarness& fleet, std::string endpoint, std::string leader):
             _fleet { fleet },
-            _advertised { std::move(endpoint) },
-            _roster { BuildRoster(fleet, anchors) },
-            _link { Unwrap(FastCache::Node::SchedulerLink::For(std::move(schedulers))) },
-            _reachability { fleet._clock },
-            _lease { Distributed::SchedulerTermRegressionNotice::Silent() },
-            _validator { Cc::SignedLeaseValidator(*_roster->Lease(), _advertised, fleet._wallClock, _lease, fleet._metrics) }
+            _endpoint { std::move(endpoint) },
+            _leader { std::move(leader) },
+            _roster { BuildRoster(fleet, _endpoint, _leader) }
         {
-            // Registered into the harness's fleet, as a completed REGISTER round pins it (#401).
-            _lease.fleet.Pin(std::string { ClusterId });
         }
 
-        /// One presence round: production's announcement, through this harness's dialer.
-        /// @return Whether a scheduler recorded this machine.
-        bool Announce()
+        /// Apply what the leader's state says NOW, as a learner's consensus tier hands its roster
+        /// every committed state.
+        void Apply()
         {
-            auto const capacity = CompileCacheWire::CapacityFields {};
-            auto const load = CompileCacheWire::LoadFields {};
-            auto const endpoint = _advertised.Current();
-            return FastCache::Node::AnnouncePresence(FastCache::Node::PresenceMessage { .endpoint = endpoint,
-                                                                                        .capacity = capacity,
-                                                                                        .load = load,
-                                                                                        .logger = _fleet._logger,
-                                                                                        // Nothing proves over this
-                                                                                        // harness's transport; see
-                                                                                        // `Caller`.
-                                                                                        .prover = nullptr,
-                                                                                        .reachability = _reachability,
-                                                                                        .joinMemos = {} },
-                                                     _roster.get(),
-                                                     _link,
-                                                     _fleet);
+            _roster->Applied(_fleet.NodeAt(_leader).cluster.state);
         }
 
-        /// What this worker's compile port answers @p token with.
-        /// @param token The grant a client presents.
-        /// @param fingerprint The toolchain the client asks for.
-        /// @return The refusal, or nothing when the grant is honoured.
-        [[nodiscard]] std::optional<Distributed::LeaseRefusal> Check(std::string_view token, std::string_view fingerprint)
-        {
-            return _validator(token, fingerprint).refusal;
-        }
-
-        /// @return The roster this worker holds, summarised; nothing before the first.
-        [[nodiscard]] std::optional<Distributed::RosterSummary> Roster() const
-        {
-            return _roster->Summary();
-        }
-
-        /// What this worker's session surface answers a machine ticket with: the production
-        /// verifier over the roster it holds, for an audience that is exactly this worker.
+        /// What this learner's session surface answers a machine ticket with.
         /// @param credential The ticket a launcher presents.
         /// @return The machine it speaks for, or why it is refused.
         [[nodiscard]] std::expected<ProvenIdentity, Distributed::TicketRefusal> CheckTicket(Cc::Credential const& credential)
@@ -801,47 +770,41 @@ class FleetHarness final: public Cc::IEndpointExchange, public FastCache::Node::
         }
 
       private:
-        /// Where this worker answers: fixed, since nothing here moves an address.
-        struct Advertised final: Cc::IAdvertisedEndpointSource
+        /// The production roster for a learner of @p leader's fleet: a node that runs consensus,
+        /// so its roster is the state it applies and nothing it was handed.
+        [[nodiscard]] static std::unique_ptr<FastCache::Node::NodeRoster> BuildRoster(FleetHarness& fleet,
+                                                                                      std::string const& endpoint,
+                                                                                      std::string const& leader)
         {
-            explicit Advertised(std::string at):
-                endpoint { std::move(at) }
-            {
-            }
-
-            [[nodiscard]] std::string Current() const override
-            {
-                return endpoint;
-            }
-
-            std::string endpoint;
-        };
-
-        /// The production roster for a worker trusting @p anchors, with no state directory.
-        [[nodiscard]] static std::unique_ptr<FastCache::Node::NodeRoster> BuildRoster(
-            FleetHarness& fleet, std::vector<std::string> const& anchors)
-        {
-            FastCache::Node::NodeConfig cfg;
-            cfg.clusterId = std::string { ClusterId };
-            // A worker that runs no consensus -- the only kind that holds a roster of its own.
-            cfg.raftListen.clear();
-            for (auto const& voter: anchors)
-                cfg.voterKeys.push_back(TestKeyPair(voter).PublicKey());
+            auto cfg = FastCache::Node::NodeConfig {};
+            cfg.nodeId = endpoint;
+            cfg.formation = FastCache::Node::NodeFormationView {
+                .mode = Cluster::NodeMode::Learner,
+                .clusterId = std::string { ClusterId },
+                .createdAtUnixSeconds = 0,
+                .foundedHere = false,
+                .fleetMembers = { Cluster::ClusterMember { .id = leader,
+                                                           .raftEndpoint = leader,
+                                                           .schedulerEndpoint = leader,
+                                                           .schedulerEndpointHistory =
+                                                               Cluster::SchedulerEndpointHistory::Announced,
+                                                           .seat = Cluster::MemberSeat::Voter,
+                                                           .publicKey = TestKeyPair(leader).PublicKey() } },
+                .fleetSchedulers = { leader },
+            };
+            if (!FastCache::Node::RunsConsensus(cfg))
+                throw std::runtime_error { "FleetHarness: a learner's configuration runs no consensus" };
             auto built = FastCache::Node::NodeRoster::Build(cfg, fleet._wallClock, fleet._metrics, fleet._logger);
             if (!built.has_value())
-                throw std::runtime_error { "FleetHarness: a worker's roster could not be built: " + built.error().reason };
+                throw std::runtime_error { "FleetHarness: a learner's roster could not be built: " + built.error().reason };
             return *std::move(built);
         }
 
         FleetHarness& _fleet;
-        Advertised _advertised;
+        std::string _endpoint;
+        std::string _leader;
         std::unique_ptr<FastCache::Node::NodeRoster> _roster;
-        FastCache::Node::SchedulerLink _link;
-        /// How loudly this worker says a setback at a scheduler, on the harness's clock.
-        FastCache::Node::SchedulerReachability _reachability;
-        Distributed::WorkerLeaseState _lease;
-        Cc::LeaseValidator _validator;
-        ExactAudience _audience { _advertised.Current() };
+        ExactAudience _audience { _endpoint };
         Distributed::SpentTickets _spent;
     };
 

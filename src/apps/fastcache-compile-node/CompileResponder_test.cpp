@@ -2,14 +2,17 @@
 #include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
 #include "FrameEndpoint.hpp"
+#include "NodeAnnounce.hpp"
 #include "NodeConfig.hpp"
 #include "NodeIoLoop.hpp"
 #include "NodeSurfaces.hpp"
 #include "Responders.hpp"
+#include "WorkerLease.hpp"
 
 #include <FastCache/Core/BoundedDrain.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/WireFrame.hpp>
+#include <FastCache/Distributed/LeaseToken.hpp>
 #include <FastCache/Distributed/MembershipOracle.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Metrics/MetricsCatalog.hpp>
@@ -46,6 +49,8 @@
 #include <core/async/ThreadPoolExecutor.hpp>
 #include <core/net/BlockingConnector.hpp>
 #include <core/net/BlockingSocket.hpp>
+#include <core/platform/Clock.hpp>
+#include <tests/LeaseRosterFakes.hpp>
 #include <tests/LocalityFakes.hpp>
 #include <tests/MembershipFakes.hpp>
 #include <tests/ScratchPath.hpp>
@@ -139,13 +144,15 @@ struct Fixture
 
 /// A framed COMPILE naming @p fingerprint.
 /// @param fingerprint The toolchain to claim.
+/// @param leaseToken The grant it presents; a placeholder the unchecked validator accepts by default.
 /// @return The request frame.
-[[nodiscard]] std::vector<std::byte> CompileFrame(std::string_view fingerprint = "gcc-13")
+[[nodiscard]] std::vector<std::byte> CompileFrame(std::string_view fingerprint = "gcc-13",
+                                                  std::string_view leaseToken = "l1")
 {
     constexpr std::string_view Source = "int main(){return 0;}";
     auto const enveloped =
         Wire::EncodeCodecEnvelope(Wire::IdentityCodec, static_cast<std::uint32_t>(Source.size()), Wire::AsBytes(Source));
-    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = "l1",
+    return Wire::EncodeCompile(Wire::CompileRequest { .leaseToken = leaseToken,
                                                       .fingerprint = fingerprint,
                                                       .args = {},
                                                       .source = enveloped,
@@ -399,6 +406,70 @@ TEST_CASE("The merged surface applies the worker's own membership rule", "[node]
         AnswerFrom(responder,
                    reactor,
                    CompileFrame(),
+                   ConnectionFacts { .host = "10.0.0.1", .authenticatedMachine = Testing::IdentityOf("pc-01") });
+    CHECK(StatusOf(member.reply) == Wire::Status::Ok);
+    CHECK(fix.runner.Runs() == 1);
+}
+
+TEST_CASE("A worker refuses a non-member its scheduler granted a lease to under the checked validator",
+          "[node][compile-responder][lease]")
+{
+    // #235, the worker half, with nothing stood in: a grant SIGNED by the scheduler's own identity
+    // key and naming this worker's endpoint, verified by the production factory's checked validator
+    // against a roster that holds that key -- and a caller the scheduler admitted but this worker's
+    // policy does not. The production shape is a leader whose policy admits more than this
+    // worker's -- `--fleet-open` there and not here. The refusal is the worker's own, by WHICH code,
+    // and counted; the grant is not why.
+    Fixture fix;
+    core::async::ThreadPoolExecutor reactor { 1 };
+    core::async::ThreadPoolExecutor jobs { 1 };
+    static constexpr std::string_view fleet = "fleet-a";
+    static constexpr std::string_view thisWorker = "10.0.0.5:6676";
+    core::platform::ManualWallClock wall { std::chrono::system_clock::time_point { std::chrono::seconds { 1704067200 } } };
+
+    Testing::FixedLeaseRoster const roster { { "scheduler" } };
+    AnnouncedEndpoint advertised { std::string { thisWorker } };
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+    LeaseCheckInForce inForce;
+    NodeConfig cfg;
+    cfg.clusterId = std::string { fleet };
+    auto validator = MakeWorkerLeaseValidator(
+        cfg, &roster, advertised, SocketActivation::No, wall, lease, fix.metrics, fix.logger, inForce);
+    REQUIRE(validator.has_value());
+    REQUIRE(inForce.Current() == BuiltLeaseCheck::Signed);
+    lease.fleet.Pin(std::string { fleet });
+    Cc::WorkerProtocol checked {
+        fix.jobs, *std::move(validator), { Wire::IdentityCodec }, fix.metrics, Cc::IgnoreJobRefusals()
+    };
+
+    // What the scheduler granted: real, signed, naming this worker.
+    auto const grant = [&wall](std::string_view serial) {
+        return Distributed::MintLeaseToken(Testing::TestLeaseSigner("scheduler"),
+                                           Distributed::LeaseClaims { .serial = std::string { serial },
+                                                                      .endpoint = std::string { thisWorker },
+                                                                      .fingerprint = "gcc-13",
+                                                                      .key = "obj-abc",
+                                                                      .expiresAt = wall.now() + std::chrono::minutes { 10 },
+                                                                      .clusterId = std::string { fleet },
+                                                                      .epoch = 9,
+                                                                      .signer = {} });
+    };
+
+    CompileCapacity capacity { /*slots=*/2, /*byteBudget=*/1024ULL * 1024ULL, std::chrono::seconds { 5 }, fix.logger };
+    Testing::RosterFold const listed { { "pc-01" } };
+    CompileResponder responder { checked, capacity, listed.admitted, fix.locality, jobs, reactor, fix.metrics, fix.logger };
+
+    auto const stranger = AnswerFrom(responder, reactor, CompileFrame("gcc-13", grant("granted-to-a-stranger")), "10.9.9.9");
+    CHECK(ErrorOf(stranger.reply) == Wire::ErrorCode::NotAMember);
+    CHECK(fix.runner.Runs() == 0);
+    CHECK(fix.metrics.Read(IMetricsSink::Counter::WorkerJobsRefusedNotAMember) == 1);
+
+    // The control: the SAME kind of grant from a member is verified and served, so the stranger was
+    // refused for who it is and not for its lease.
+    auto const member =
+        AnswerFrom(responder,
+                   reactor,
+                   CompileFrame("gcc-13", grant("granted-to-a-member")),
                    ConnectionFacts { .host = "10.0.0.1", .authenticatedMachine = Testing::IdentityOf("pc-01") });
     CHECK(StatusOf(member.reply) == Wire::Status::Ok);
     CHECK(fix.runner.Runs() == 1);

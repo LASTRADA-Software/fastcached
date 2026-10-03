@@ -81,36 +81,16 @@
 # The full reasoning for each setting is in that help output.
 
 
-# the scheduler's --listen-node endpoint. Required of a worker: one nothing
-# knows about serves nobody. A list: each is tried in order, in the same
-# heartbeat, until one answers -- so a fleet survives retiring one machine.
-# On a node running no worker (slots: 0) it registers nothing and only names
-# where the --cluster-* and --enroll-* commands ask.
+# where the one-shot verbs (--cluster-*, --enroll-*) send their request: the
+# first value that connects is asked, and none other once a connection was
+# made. Without it they ask this machine's own node.
 #
-# Prefer a name that outlives any one machine -- a DNS name or a VIP you
-# control -- over a scheduler's literal address. Every worker in the fleet
-# carries this value, and a literal address makes retiring that machine an
-# edit on every one of them. Kept HERE rather than on an --install-service
-# command line, re-pointing is an edit and a restart rather than a
-# re-registration.
-#
-# A node that names a scheduler and runs no consensus still keeps an identity
-# key, which is what the scheduler admits it by -- in its state directory,
-# which needs no cluster_dir: the default below serves.
+# A node that SERVES is refused this key: it finds its scheduler from the fleet
+# it joined, recorded in cluster_dir, so no worker carries a scheduler's
+# address. To join a fleet no LAN beacon reaches, name fleet_seed instead.
 #scheduler:
 #  - <host:port>
 #  - <host:port>
-
-# the identity key of one of the cluster's voters, as its --print-identity
-# prints it; repeatable. A worker that runs no consensus trusts the first
-# roster a strict majority of these endorse, and from then on only the roster
-# it holds -- so a key here never outvotes the cluster's own revocation.
-# Required of a worker other machines can reach and that keeps no roster in
-# its state directory (cluster_dir, or the default one): without it no lease
-# it is handed could be checked.
-#voter_key:
-#  - <public-key>
-#  - <public-key>
 
 # host:port CLIENTS should use to reach this worker. Defaults to this
 # machine's fully qualified name on the listen_node port while listen_node
@@ -191,7 +171,9 @@
 
 # where peers reach this node's consensus port; default 6680. The port is what
 # turns consensus ON, so a node with no settings is a cluster of one, and an
-# empty value runs none. A bare port binds the WILDCARD: peers are on other
+# empty value runs none -- on a cache-only node (slots: 0) alone: a worker with
+# no consensus never joins a fleet, so it would register nowhere and is refused
+# at startup. A bare port binds the WILDCARD: peers are on other
 # machines by definition, so loopback would silently not work.
 #listen_raft: 6680
 
@@ -211,8 +193,8 @@
 # twice in one term after a restart, which is two leaders; a node that lost it
 # is a new identity. Every node keeps one: the identity key kept here is what
 # it proves on every connection to its scheduler and its peers. The cluster
-# admits the key once, through --enroll-from or --cluster-admit-worker, and a
-# worker enrolled that way keeps the roster it was handed here too.
+# admits the key once, when an operator approves the machine's enrollment
+# (--enroll-approve) or names it in --cluster-admit.
 #
 # Unless given: the machine's directory for a privileged process or a service
 # -- %ProgramData%\fastcache-node, /var/lib/fastcache-node or
@@ -295,10 +277,6 @@
 # since the key spells a flag -- and reloading closes the node to every
 # caller the roster does not admit.
 #
-# It cannot be WIDENED by a reload on a worker that runs no consensus and
-# names no voter_key: such a worker may verify no lease signatures, which is
-# safe only while no machine but its own is admitted, so the reload is refused
-# by name and nothing is applied. Narrowing is always allowed.
 #fleet_open: false
 
 # size of this node's own in-memory cache tier; k/m/g = KiB/MiB/GiB or N% of

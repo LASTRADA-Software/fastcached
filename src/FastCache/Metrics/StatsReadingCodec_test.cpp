@@ -557,7 +557,11 @@ TEST_CASE("This build's live-stats layout is the pinned one", "[metrics][livesta
     //
     // Moved when lane 2a's `state_file_replaces_fell_back` joined the catalogue after it, in
     // integration order (ruling 8). Read off the built test, never computed by hand.
-    CHECK(StatsReadingLayout == 0x93dc205cb5431266ULL);
+    //
+    // Moved when step 20 put lane 2a batch 2's counters after integration's own rows (ruling 8),
+    // `formation_admissions_unverified` after `dispatch_node_announcements_field_too_long` and
+    // `state_file_replaces_fell_back` last. Read off the built test, never computed by hand.
+    CHECK(StatsReadingLayout == 0x13f2562893c19abeULL);
 }
 
 TEST_CASE("A truncated or padded reading is refused and never half-read", "[metrics][livestats]")

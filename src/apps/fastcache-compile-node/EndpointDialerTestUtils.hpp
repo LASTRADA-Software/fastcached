@@ -22,7 +22,7 @@ namespace FastCache::Testing
 
 /// Hands back one scripted socket per dial, and records where it was asked to go.
 ///
-/// The seam `RunEnrollClient`, `RunEnrollAdmin`, `RunClusterAdmin` and `AnnounceRound`
+/// The seam `RunEnrollAdmin`, `RunClusterAdmin` and `AnnounceRound`
 /// take, standing in for `BlockingEndpointDialer`. A fresh socket per dial is what
 /// production does -- a poll re-dials, and a redirect or a fallback moves the endpoint
 /// -- so one script per dial is the shape, not a convenience.

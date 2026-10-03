@@ -2,6 +2,7 @@
 #include "AdminEndpoint.hpp"
 #include "CacheTier.hpp"
 #include "NodeAnnounce.hpp"
+#include "NodeFormation.hpp"
 #include "NodeIoLoop.hpp"
 #include "WorkerTier.hpp"
 
@@ -226,13 +227,17 @@ std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> WorkerTier::Start(Worker
         return std::unique_ptr<WorkerTier> {};
 
     // The link the heartbeat announces through, built HERE so a worker cannot exist
-    // without one: the tier's constructor takes it by value.
-    auto link = SchedulerLink::For(parts.cfg.schedulers);
+    // without one: the tier's constructor takes it by value. Aimed where the formation
+    // record says this node registers (`SchedulersOf`), never at `--scheduler`, which
+    // aims one-shot verbs and is refused on a node that serves.
+    auto link = SchedulerLink::For(SchedulersOf(parts.cfg, parts.activatedNodeEndpoint));
     if (!link.has_value())
         return std::unexpected { Refusal(
             NodeRefusalCause::EarlierRule,
-            "a worker was started with no --scheduler, which the startup table exists to refuse: it would never "
-            "register, never be leased and never be sent a job. Name the scheduler's --listen-node endpoint") };
+            "this worker has nowhere to register: its formation record names no scheduler -- a node serves its own "
+            "only while its consensus port is open, and a learner registers with the fleet endpoints it remembers -- "
+            "so it would never be leased and never be sent a job. Open consensus (--listen-raft), or give "
+            "--fleet-seed=<host> to join a fleet") };
 
     // Only now, with a worker decided: see `MakeSystemWorkerMachine`.
     auto machine = makeMachine();
@@ -274,14 +279,16 @@ std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> WorkerTier::Start(Worker
     //
     // It borrows `main`'s one `AnnouncedEndpoint` -- see `WorkerTierParts::announced` for why
     // there is exactly one per process rather than one per component that needs an address.
-    auto validator = MakeWorkerLeaseValidator(parts.cfg,
-                                              parts.leaseRoster,
-                                              parts.announced,
-                                              parts.activation,
-                                              core::platform::defaultSystemWallClock(),
-                                              *leaseState,
-                                              parts.metrics,
-                                              parts.logger);
+    auto validator =
+        MakeWorkerLeaseValidator(parts.cfg,
+                                 parts.leaseRoster,
+                                 parts.announced,
+                                 parts.activatedNodeEndpoint.has_value() ? SocketActivation::Yes : SocketActivation::No,
+                                 core::platform::defaultSystemWallClock(),
+                                 *leaseState,
+                                 parts.metrics,
+                                 parts.logger,
+                                 parts.leaseCheck);
     if (!validator.has_value())
         return std::unexpected { Refusal(NodeRefusalCause::LeaseValidation, std::move(validator).error()) };
 

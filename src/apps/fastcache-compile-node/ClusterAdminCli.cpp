@@ -85,12 +85,6 @@ std::vector<std::byte> EncodeClusterRequest(ClusterRequest const& request)
             return EncodeAdmission<Wire::Op::ClusterAdmit>(request);
         case ClusterAction::AdmitLearner:
             return EncodeAdmission<Wire::Op::ClusterAdmitLearner>(request);
-        case ClusterAction::AdmitWorker: {
-            // Parsed when the flag was read, so a request without a key is not one this can hold.
-            auto const keyText = request.publicKey.transform(FormatEd25519PublicKey).value_or(std::string {});
-            return Wire::EncodeClusterAdmitWorker(
-                Wire::ClusterAdmitWorkerRequest { .workerId = request.key, .publicKey = keyText });
-        }
     }
 
     return {};
@@ -135,16 +129,14 @@ std::string RenderClusterState(Cluster::ClusterState const& state)
     }
 
     // Said out loud when empty, for the members' reason: an operator reading this after a
-    // revocation needs "none" to be an answer rather than a section that failed to render.
+    // revocation needs "none" to be an answer rather than a section that failed to render. No
+    // verb this build sends admits one; a state an older build wrote may still hold some, and
+    // `--cluster-forget` removes each.
     out += std::format("principals ({}):\n", state.principals.size());
     if (state.principals.empty())
         out += "  (none)\n";
     for (auto const& principal: state.principals)
-        out += std::format("  {:<{}} role={} key={}\n",
-                           principal.id,
-                           IdColumn,
-                           Cluster::PrincipalRoleName(principal.role),
-                           FormatEd25519PublicKey(principal.publicKey));
+        out += std::format("  {:<{}} key={}\n", principal.id, IdColumn, FormatEd25519PublicKey(principal.publicKey));
 
     out += std::format("revoked keys ({}):\n", state.revokedKeys.size());
     if (state.revokedKeys.empty())
@@ -262,30 +254,6 @@ std::expected<std::string, std::string> InterpretClusterReply(ClusterAction acti
                                ReceiptLabelColumn,
                                Cluster::MemberSeatName(seat));
         }
-
-        case ClusterAction::AdmitWorker: {
-            // The member receipt's reasoning, one field shorter: a principal has no consensus
-            // endpoint, so the leader echoes the id and the key it RECORDED and nothing else.
-            auto const receipt = Wire::DecodeClusterAdmitReceipt(reply);
-            if (!receipt.has_value())
-                return std::unexpected { std::string {
-                    "the leader took the request and answered with a receipt this build cannot read" } };
-            return std::format("recorded, as received:\n"
-                               "  {:<{}}{}\n"
-                               "  {:<{}}{}\n"
-                               "\n"
-                               "Appended, not committed: a majority has to take it, and this leader cannot\n"
-                               "see that yet. Ask for the cluster state again to see the result.\n"
-                               "\n"
-                               "Compare both lines against what the worker's own --print-identity printed.\n"
-                               "Each is one thing spelled on two machines, and nothing else compares them.\n",
-                               "worker id",
-                               ReceiptLabelColumn,
-                               receipt->memberId,
-                               "identity key",
-                               ReceiptLabelColumn,
-                               receipt->publicKey.value_or(std::string { NoKeyStated }));
-        }
     }
 
     return std::unexpected { std::string { "unknown cluster request" } };
@@ -354,9 +322,8 @@ std::expected<std::string, UnfinishedCommand> RunClusterAdmin(NodeConfig const& 
                                                               Cc::ICredentialFor& credentials,
                                                               IEndpointDialer& dialer)
 {
-    if (cfg.schedulers.empty())
-        return std::unexpected { Unanswered(AnswerSource::Local,
-                                            "--scheduler names where to ask; a cluster command needs one") };
+    // `--scheduler`'s values, or this machine's own node when it names none (`AdminTargetsOf`).
+    auto const targets = AdminTargetsOf(cfg);
 
     // Owned here rather than threaded in: this is a one-shot CLI verb, so "once per
     // process" and "once per invocation" are the same thing, and the admin surface
@@ -371,7 +338,7 @@ std::expected<std::string, UnfinishedCommand> RunClusterAdmin(NodeConfig const& 
     // redirect's leader is shown a ticket naming it.
     std::optional<Cc::MintFailure> missing;
     auto answered = AskTheLeader(dialer,
-                                 cfg.schedulers,
+                                 targets,
                                  core::net::DialOptions { .connectTimeout = DialTimeout },
                                  "the scheduler",
                                  [&](core::net::ISocket& socket, std::string_view endpoint) {

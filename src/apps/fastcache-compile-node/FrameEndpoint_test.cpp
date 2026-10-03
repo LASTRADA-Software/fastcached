@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "AnnounceTestFixture.hpp"
 #include "CacheProxy.hpp"
+#include "ClusterAdminCli.hpp"
 #include "CompileCapacity.hpp"
 #include "CompileResponder.hpp"
 #include "EndpointDialer.hpp"
@@ -96,9 +97,11 @@
 #include <tests/FormationFakes.hpp>
 #include <tests/HalfClose.hpp>
 #include <tests/LeaseRosterFakes.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/RelabelledPeerListener.hpp>
 #include <tests/ScratchPath.hpp>
+#include <tests/TicketFakes.hpp>
 #include <tests/Unwrap.hpp>
 #include <tests/WireReply.hpp>
 
@@ -4701,10 +4704,10 @@ struct TicketedNode
     FleetTextResponder fleetText { readings, membership.Oracle(), AdminCredential {}, fleet.metrics };
     EnrollmentWindow window { fleet.clock };
     /// What this node says about itself, and the key every admission it answers is signed with.
-    Testing::ScriptedSummarySource const self { Wire::FleetSummary { .clusterId = "c-ticketed",
-                                                                     .nodeId = "n-ticketed" } };
+    Testing::ScriptedSummarySource const self { Wire::FleetSummary { .clusterId = "c-ticketed", .nodeId = "n-ticketed" } };
     Ed25519KeyPair const signingKey = Testing::TestKeyPair("n-ticketed");
-    EnrollmentResponder enrollment { window, fleet.service, membership.Oracle(), self, signingKey, fleet.metrics, fleet.logger };
+    EnrollmentResponder enrollment { window,     fleet.service, membership.Oracle(), self,
+                                     signingKey, fleet.metrics, fleet.logger };
 
     MergedResponder merged { SurfaceComponents { .cache = &cacheTier,
                                                  .compile = &compile,
@@ -5252,9 +5255,9 @@ TEST_CASE("A heartbeat round to a real node proves this machine first, and regis
     auto const [endpoint, port] = rig.Serve();
     ProvingClient machine { ServerStanding::Voter };
     AnnounceTesting::AnnounceFixture fix;
-    fix.cfg.schedulers = { LoopbackScheduler(port) };
+    fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { LoopbackScheduler(port) });
     fix.prover = &machine.client;
-    auto link = AnnounceTesting::LinkOver(fix.cfg.schedulers);
+    auto link = AnnounceTesting::LinkOver(SchedulersOf(fix.cfg, AsConfigured));
     BlockingEndpointDialer dialer { HeartbeatIoTimeout };
 
     CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
@@ -5272,9 +5275,9 @@ TEST_CASE("A round whose proof does not seal says so in the proof's own words, a
     SECTION("a server this machine will not prove itself to is that, not unreachable and not a refusal")
     {
         ProvingClient machine { ServerStanding::Revoked };
-        fix.cfg.schedulers = { LoopbackScheduler(port) };
+        fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { LoopbackScheduler(port) });
         fix.prover = &machine.client;
-        auto link = AnnounceTesting::LinkOver(fix.cfg.schedulers);
+        auto link = AnnounceTesting::LinkOver(SchedulersOf(fix.cfg, AsConfigured));
 
         CHECK(AnnounceRound(fix.Round(), link, dialer) == 0);
         CHECK(rig.fleet.service.Workers().LiveWorkers().empty());
@@ -5301,9 +5304,9 @@ TEST_CASE("A round whose proof does not seal says so in the proof's own words, a
         plain.Serve();
 
         ProvingClient machine { ServerStanding::Voter };
-        fix.cfg.schedulers = { LoopbackScheduler(plainPort), LoopbackScheduler(port) };
+        fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { LoopbackScheduler(plainPort), LoopbackScheduler(port) });
         fix.prover = &machine.client;
-        auto link = AnnounceTesting::LinkOver(fix.cfg.schedulers);
+        auto link = AnnounceTesting::LinkOver(SchedulersOf(fix.cfg, AsConfigured));
 
         CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
         CHECK(rig.fleet.service.Workers().LiveWorkers().size() == 1);
@@ -5321,9 +5324,9 @@ TEST_CASE("A suspend's withdrawal proves this machine too, and a refused identit
     auto const [endpoint, port] = rig.Serve();
     ProvingClient machine { ServerStanding::Voter };
     AnnounceTesting::AnnounceFixture fix;
-    fix.cfg.schedulers = { LoopbackScheduler(port) };
+    fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { LoopbackScheduler(port) });
     fix.prover = &machine.client;
-    auto link = AnnounceTesting::LinkOver(fix.cfg.schedulers);
+    auto link = AnnounceTesting::LinkOver(SchedulersOf(fix.cfg, AsConfigured));
     BlockingEndpointDialer dialer { HeartbeatIoTimeout };
     REQUIRE(AnnounceRound(fix.Round(), link, dialer) == 1);
     REQUIRE(rig.fleet.service.Workers().LiveWorkers().size() == 1);
@@ -5470,7 +5473,7 @@ TEST_CASE("A node that schedules for itself does not announce before its own con
     CHECK(node.Read(IMetricsSink::Counter::NodeProofsRefusedUnknownKey) == 0);
     CHECK(node.Read(IMetricsSink::Counter::NodeProofsAccepted) == 0);
     CHECK_FALSE(Logged(logger, "did not accept this machine's identity"));
-    CHECK_FALSE(Logged(logger, "--cluster-admit-worker"));
+    CHECK_FALSE(Logged(logger, "--enroll-approve"));
     CHECK(LoggedAt(logger, LogLevel::Warn) == 0);
     CHECK(Logged(logger, "has not recorded this node yet"));
 
@@ -5633,4 +5636,58 @@ TEST_CASE("A surface shutting down ends its accept loop without calling itself s
     }
     CHECK(fleet.io.AcceptLoops().snapshot().empty());
     CHECK(LinesAt(logger, LogLevel::Error, "accept loop ended") == 0);
+}
+
+TEST_CASE("The cluster-status verb reads a live node's cluster over its node port through the production client",
+          "[node][frame][clusteradmin]")
+{
+    // The one-shot verb's LIVE path, in process: the production client (`RunClusterAdmin`, with the
+    // dialler production uses) over a real loopback socket to the real endpoint, whose scheduler
+    // answers from the cluster state it administers. The e2e fixtures no longer run a cluster verb
+    // against a node, and --scheduler now defaults to this machine's own node for exactly these verbs.
+    struct LiveCluster final: public Distributed::IClusterAdmin
+    {
+        Cluster::ClusterState state;
+
+        [[nodiscard]] Cluster::ClusterState ClusterState() const override
+        {
+            return state;
+        }
+
+        [[nodiscard]] std::expected<void, ConsensusError> ProposeToCluster(Cluster::Command const& /*command*/) override
+        {
+            return {};
+        }
+    };
+    Fleet fleet;
+    LiveCluster cluster;
+    Cluster::Apply(cluster.state,
+                   Cluster::Command { .kind = Cluster::CommandKind::AddMember,
+                                      .key = "n1",
+                                      .value = "10.0.0.1:6680",
+                                      .schedulerEndpoint = "10.0.0.1:6675",
+                                      // A member record carries its key: `Apply` records none without.
+                                      .publicKey = Testing::TestKeyPair("n1").PublicKey(),
+                                      .role = std::nullopt });
+    REQUIRE(cluster.state.members.size() == 1);
+    fleet.service.AdministerWith(cluster);
+    MergedResponder merged { SurfaceComponents { .scheduler = &fleet.responder } };
+    auto const port = FreePort();
+    auto endpoint = FrameEndpoint::Start(
+        fleet.io, NodeSurface::Node, LoopbackFor(NodeSurface::Node, port), merged, fleet.metrics, fleet.logger);
+    REQUIRE(endpoint.has_value());
+    fleet.Serve();
+
+    NodeConfig cfg;
+    cfg.schedulers = { FormatHostPort("127.0.0.1", port) };
+    // Asked per endpoint (`Cc::ICredentialFor`); a loopback operator presents nothing.
+    Testing::PresentsNothing credential;
+    auto const rendered = RunClusterAdmin(
+        cfg,
+        ClusterRequest { .action = ClusterAction::Status, .key = {}, .value = {}, .publicKey = std::nullopt },
+        credential);
+    INFO((rendered.has_value() ? std::string {} : rendered.error().reason));
+    REQUIRE(rendered.has_value());
+    CHECK(Unwrap(rendered).contains("n1"));
+    CHECK(Unwrap(rendered).contains("10.0.0.1:6675"));
 }

@@ -5,7 +5,6 @@
 #include <FastCache/Core/Endian.hpp>
 #include <FastCache/Core/WireFields.hpp>
 #include <FastCache/Distributed/FleetHistory.hpp>
-#include <FastCache/Platform/FileTrust.hpp>
 
 #include <algorithm>
 #include <array>
@@ -279,7 +278,7 @@ namespace
     /// @param envelope What to stamp.
     /// @param file The whole file: header space, then the body.
     /// @param which Which state file it is, and so who may read it.
-    /// @return True when the rename succeeded.
+    /// @return True when the file was replaced.
     [[nodiscard]] bool WriteFramed(std::filesystem::path const& path,
                                    FileEnvelope const& envelope,
                                    std::string& file,
@@ -295,30 +294,9 @@ namespace
         AppendU64(header, Crc32c::Compute(std::span { reinterpret_cast<std::byte const*>(body.data()), body.size() }));
         std::ranges::copy(header, file.begin());
 
-        // Temp then rename: a crash between the two leaves the previous file whole
-        // rather than half of this one.
-        // Created exclusively, after a temporary a crash left is cleared, with the access its row
-        // gives it (`CreateStateFile`), as every state file is.
-        auto const temp = std::filesystem::path { path }.concat(Consensus::ReplacementSuffix);
-        {
-            auto stale = std::error_code {};
-            std::filesystem::remove(temp, stale);
-            auto created = CreateStateFile(temp, which);
-            if (!created.has_value())
-                return false;
-            auto const stream = *std::move(created);
-            if (std::fwrite(file.data(), 1, file.size(), stream.get()) != file.size() || std::fflush(stream.get()) != 0)
-                return false;
-        }
-
-        std::error_code ec;
-        std::filesystem::rename(temp, path, ec);
-        if (ec)
-        {
-            std::filesystem::remove(temp, ec);
-            return false;
-        }
-        return true;
+        // Through the node's one durable writer: a crash leaves the previous file whole rather than
+        // half of this one, and what lands is synced and its close checked, as every state file is.
+        return Consensus::ReplaceFileAtomically(path, std::as_bytes(std::span { file }), which).has_value();
     }
 
     /// What reading a framed file produced.

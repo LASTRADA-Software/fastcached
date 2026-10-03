@@ -516,8 +516,7 @@ again in place. Bytes a caller pipelined behind PROVE-NODE close the connection 
 arrived in the clear, before the seal existed, so nothing can say whose they are.
 
 A worker holds its identity key in `--cluster-dir`, which it mints on first start; the
-cluster admits the key through an enrollment window or `--cluster-admit-worker=<id>@<key>`
-(`0x1d`), and forgets it — refusing it from every address — with `--cluster-forget`. What
+cluster admits the key through an enrollment window, as a learner, and forgets it — refusing it from every address — with `--cluster-forget`. What
 an operator sees of all of this is on the
 [node's page](../tools/fastcache-compile-node.md#a-node-proves-which-machine-it-is-and-every-frame-after-it-is-sealed).
 

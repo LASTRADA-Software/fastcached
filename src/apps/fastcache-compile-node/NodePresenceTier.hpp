@@ -35,10 +35,13 @@ namespace FastCache::Node
 /// What the presence loop borrows from the node. All of it outlives the loop.
 struct NodePresenceParts
 {
-    NodeConfig const& cfg;                          ///< Where the schedulers are.
+    NodeConfig const& cfg; ///< Where the schedulers are.
+    /// Where a supervisor handed the node surface over, or `AsConfigured`: where this node's own
+    /// scheduler answers when its mode serves one (`SchedulersOf`).
+    ActivatedNodeEndpoint activatedNodeEndpoint;
     Distributed::NodeCapacity const& capacity;      ///< What this machine is.
     Cc::IAdvertisedEndpointSource const& announced; ///< Where it answers; the key its row is filed under.
-    CacheTier const* cacheTier;                     ///< Null on a node with no cache.
+    CacheTier const* cacheTier {};                  ///< Null on a node with no cache.
     IMetricsSink const& metrics;                    ///< Where the cache figures are read.
     FleetSampler& sampler;                          ///< This machine's own series, and its history.
     ILogger& logger;                                ///< Where a refusal is named.
@@ -47,10 +50,10 @@ struct NodePresenceParts
     NodeConditions const& conditions;
     /// The roster half of the verb (#178): this node's endorsement out, the certified roster
     /// back. Null on a node that neither endorses nor verifies anything.
-    IPresenceRoster* roster;
+    IPresenceRoster* roster {};
 
     /// How this machine proves itself on each connection (#178); null where nothing proves.
-    NodeProofClient const* prover;
+    NodeProofClient const* prover {};
     /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
     SchedulerReachability& reachability;
     /// How the loop's rounds reach a scheduler. Only the loop's own thread dials through it --
@@ -88,7 +91,7 @@ struct PresenceRound
     NodeProofClient const* prover;                    ///< How this machine proves itself; null where nothing proves.
     /// How loudly a scheduler that does not answer, or refuses, is said; the process's one.
     SchedulerReachability& reachability;
-    Cluster::IAskedJoinsSource const* askedJoins;     ///< The fleets it once asked; null where none are kept.
+    Cluster::IAskedJoinsSource const* askedJoins; ///< The fleets it once asked; null where none are kept.
 };
 
 /// Announce this machine once, and hand over the history it owes.
@@ -169,6 +172,23 @@ class PresenceWake final: public IHostEventSink
     bool _announceNow { false };       ///< A round is owed now. Under `_mutex`.
 };
 
+/// Whether this node's announce loops run: its formation record names somewhere it registers
+/// (`SchedulersOf`, at the port it actually serves). `NodePresence::Start` builds its link from
+/// that same list, and `scheduler-unreachable` is answered exactly where this says a loop runs
+/// (`PresentComponents::announces`) -- never from `--scheduler`, which a serving node is refused
+/// and which would read "names no scheduler" on every node there is.
+/// @param cfg The configuration the body runs.
+/// @param activated Where a supervisor handed the node surface over, or `AsConfigured`.
+/// @return True when there is somewhere to announce to.
+[[nodiscard]] bool AnnouncesToAScheduler(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated);
+
+/// Whether this node's prover can observe `own-record-awaited`: a consensus node that announces.
+/// One that announces to nobody holds nothing back, so the row is not evaluated there.
+/// @param cfg The configuration the body runs.
+/// @param activated Where a supervisor handed the node surface over, or `AsConfigured`.
+/// @return True when a held-back announcement is something this node can be in.
+[[nodiscard]] bool AwaitsItsOwnRecord(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated);
+
 /// The loop that tells a scheduler this MACHINE exists, running on EVERY node.
 ///
 /// **The component `--slots=0` was missing** (#1440). `WorkerTier` is null on such a node, so
@@ -192,9 +212,10 @@ class NodePresence
   public:
     /// Start announcing.
     ///
-    /// **Null when this node has no `--scheduler`**, which is the honest off-switch rather than
-    /// a flag of its own: `SchedulerLink::For` answers nothing for an empty list, and a node
-    /// with nowhere to announce to has no loop to run. A node with `--slots=0` still gets one.
+    /// **Null when this node registers nowhere** -- its formation record's answer, `SchedulersOf`,
+    /// is empty -- which is the honest off-switch rather than a flag of its own:
+    /// `SchedulerLink::For` answers nothing for an empty list, and a node with nowhere to
+    /// announce to has no loop to run. A node with `--slots=0` still gets one.
     /// @param parts What the node lends the loop.
     /// @return The running loop, or null when there is no scheduler to announce to.
     [[nodiscard]] static std::unique_ptr<NodePresence> Start(NodePresenceParts const& parts);

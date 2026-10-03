@@ -244,11 +244,12 @@ struct ResolvedHostNames
 /// @return The condition's detail, or nothing when no bare name is in use.
 [[nodiscard]] std::optional<std::string> UnqualifiedHostNameInUse(NodeConfig const& cfg);
 
-/// What stood down because this machine's name reaches only itself, and the name.
+/// What was confined because this machine's name reaches only itself, and the name.
 ///
 /// A name every machine resolves to ITSELF is withheld rather than offered: nothing is advertised
-/// to a scheduler, and consensus and discovery -- on by default -- stand down, so the node serves
-/// this machine alone. That is a vague right answer where offering the name would be a confident
+/// to a scheduler elsewhere, and consensus -- on by default -- is confined to loopback
+/// (`ConsensusConfinedToThisMachine`), so the node runs as a fleet of its own and serves this
+/// machine alone. That is a vague right answer where offering the name would be a confident
 /// wrong one, and this is what makes it visible rather than silent.
 /// @param cfg The configuration, with its host names applied.
 /// @return The condition's detail, or nothing when no name was withheld or nothing stood down.

@@ -128,7 +128,6 @@ void WriteBytes(std::filesystem::path const& path, std::span<std::byte const> by
 [[nodiscard]] NodeConfig ClusteredNode(std::filesystem::path const& dir)
 {
     NodeConfig cfg;
-    cfg.schedulers = { "127.0.0.1:6674" };
     cfg.raftListen = "6680";
     cfg.raftSelf = "10.0.0.7";
     cfg.clusterDir = dir;

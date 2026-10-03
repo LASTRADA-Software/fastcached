@@ -61,7 +61,9 @@ namespace
         return SelfFacts { .nodeId = cfg.nodeId,
                            .publicKey = identityKey,
                            .nodeEndpoint = AdvertisedEndpoint(cfg),
-                           .raftEndpoint = ConsensusDialAddressOf(cfg).value_or(std::string {}) };
+                           .raftEndpoint = ConsensusDialAddressOf(cfg).value_or(std::string {}),
+                           .reach = ConsensusConfinedToThisMachine(cfg) ? FleetReachability::ThisMachineAlone
+                                                                        : FleetReachability::Open };
     }
 } // namespace
 

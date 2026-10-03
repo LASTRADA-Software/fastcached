@@ -1,21 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeAnnounce.hpp"
+#include "NodeDefaults.hpp"
+#include "NodeFormation.hpp"
+#include "NodeRoster.hpp"
 #include "WorkerLease.hpp"
 
+#include <FastCache/Cluster/ClusterState.hpp>
+#include <FastCache/Cluster/NodeMode.hpp>
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/LeaseSigner.hpp>
 #include <FastCache/Distributed/LeaseToken.hpp>
+#include <FastCache/Distributed/SchedulerService.hpp>
+#include <FastCache/Protocol/CompileCacheWire.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <core/platform/Clock.hpp>
 #include <tests/LeaseRosterFakes.hpp>
+#include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -153,6 +163,8 @@ struct WorkerState
     /// fake would be a second answer to the one question this struct exists to settle --
     /// what the validator borrows, and who keeps it alive.
     AnnouncedEndpoint advertised { ThisWorker };
+
+    LeaseCheckInForce inForce; ///< Where the factory records the lease check it built.
 };
 } // namespace
 
@@ -172,8 +184,15 @@ TEST_CASE("A worker that republishes its advertised address verifies grants nami
     auto const cfg = CheckingConfig();
     WorkerState state;
 
-    auto validator = MakeWorkerLeaseValidator(
-        cfg, &TestRoster(), state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+    auto validator = MakeWorkerLeaseValidator(cfg,
+                                              &TestRoster(),
+                                              state.advertised,
+                                              SocketActivation::No,
+                                              LeaseClock,
+                                              state.lease,
+                                              state.metrics,
+                                              state.logger,
+                                              state.inForce);
     REQUIRE(validator.has_value());
     // Registered, as every case here but the unregistered one assumes (#401).
     state.lease.fleet.Pin(std::string { ThisCluster });
@@ -224,8 +243,15 @@ TEST_CASE("A worker that has verified no grant still refuses a foreign fleet", "
     auto const cfg = CheckingConfig();
     WorkerState state;
 
-    auto validator = MakeWorkerLeaseValidator(
-        cfg, &TestRoster(), state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+    auto validator = MakeWorkerLeaseValidator(cfg,
+                                              &TestRoster(),
+                                              state.advertised,
+                                              SocketActivation::No,
+                                              LeaseClock,
+                                              state.lease,
+                                              state.metrics,
+                                              state.logger,
+                                              state.inForce);
     REQUIRE(validator.has_value());
 
     // What a completed registration round does, and the only way this worker learns a
@@ -279,8 +305,15 @@ TEST_CASE("The production factory wires the spend and the term through", "[node]
     WorkerState state { Distributed::SchedulerTermRegressionNotice {
         [&said](std::string_view line) { said.emplace_back(line); } } };
 
-    auto validator = MakeWorkerLeaseValidator(
-        cfg, &TestRoster(), state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+    auto validator = MakeWorkerLeaseValidator(cfg,
+                                              &TestRoster(),
+                                              state.advertised,
+                                              SocketActivation::No,
+                                              LeaseClock,
+                                              state.lease,
+                                              state.metrics,
+                                              state.logger,
+                                              state.inForce);
     REQUIRE(validator.has_value());
     // Registered, as every case here but the unregistered one assumes (#401).
     state.lease.fleet.Pin(std::string { ThisCluster });
@@ -351,9 +384,18 @@ TEST_CASE("A node with no roster builds a validator that learns and spends nothi
     NodeConfig cfg;
     WorkerState state;
 
-    auto validator = MakeWorkerLeaseValidator(
-        cfg, nullptr, state.advertised, SocketActivation::No, LeaseClock, state.lease, state.metrics, state.logger);
+    auto validator = MakeWorkerLeaseValidator(cfg,
+                                              nullptr,
+                                              state.advertised,
+                                              SocketActivation::No,
+                                              LeaseClock,
+                                              state.lease,
+                                              state.metrics,
+                                              state.logger,
+                                              state.inForce);
     REQUIRE(validator.has_value());
+    // What the reload guard reads: the factory recorded the check it built (review I-2b).
+    CHECK(state.inForce.Current() == BuiltLeaseCheck::Unchecked);
     // Registered, as every case here but the unregistered one assumes (#401).
     state.lease.fleet.Pin(std::string { ThisCluster });
 
@@ -372,10 +414,19 @@ TEST_CASE("A socket-activated worker that admits remote peers and holds no roste
     cfg.fleetOpen = true;
     WorkerState state;
 
-    auto const refused = MakeWorkerLeaseValidator(
-        cfg, nullptr, state.advertised, SocketActivation::Yes, LeaseClock, state.lease, state.metrics, state.logger);
+    auto const refused = MakeWorkerLeaseValidator(cfg,
+                                                  nullptr,
+                                                  state.advertised,
+                                                  SocketActivation::Yes,
+                                                  LeaseClock,
+                                                  state.lease,
+                                                  state.metrics,
+                                                  state.logger,
+                                                  state.inForce);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("--voter-key"));
+    CHECK(refused.error().contains("--listen-raft"));
+    // Refused before anything was built, so nothing is recorded for the reload guard to read.
+    CHECK(state.inForce.Current() == BuiltLeaseCheck::None);
 
     // The control: the same node HOLDING a roster builds its checking validator.
     CHECK(MakeWorkerLeaseValidator(cfg,
@@ -385,8 +436,10 @@ TEST_CASE("A socket-activated worker that admits remote peers and holds no roste
                                    LeaseClock,
                                    state.lease,
                                    state.metrics,
-                                   state.logger)
+                                   state.logger,
+                                   state.inForce)
               .has_value());
+    CHECK(state.inForce.Current() == BuiltLeaseCheck::Signed);
 }
 
 TEST_CASE("A socket-activated worker with no roster is opened only by --fleet-open, and refused then",
@@ -395,16 +448,24 @@ TEST_CASE("A socket-activated worker with no roster is opened only by --fleet-op
     // No roster means no proof and no ticket can admit anybody, so the factory asks
     // `AdmitsRemotePeers` with `Absent`: only `--fleet-open` or a fleet the formation record
     // puts it in widens such a node. Asked with `Unknown` instead, a state directory -- which
-    // every worker naming a scheduler keeps -- would count as a key route and refuse every
+    // every worker keeps -- would count as a key route and refuse every
     // activated worker the directory turned out to hold no roster for, although nobody remote
     // is admitted there.
     NodeConfig cfg;
     cfg.clusterDir = "cluster";
     WorkerState state;
 
-    auto validator = MakeWorkerLeaseValidator(
-        cfg, nullptr, state.advertised, SocketActivation::Yes, LeaseClock, state.lease, state.metrics, state.logger);
+    auto validator = MakeWorkerLeaseValidator(cfg,
+                                              nullptr,
+                                              state.advertised,
+                                              SocketActivation::Yes,
+                                              LeaseClock,
+                                              state.lease,
+                                              state.metrics,
+                                              state.logger,
+                                              state.inForce);
     REQUIRE(validator.has_value());
+    CHECK(state.inForce.Current() == BuiltLeaseCheck::Unchecked);
     // The unchecked validator: nobody remote is admitted, so it refuses nothing and spends
     // nothing.
     state.lease.fleet.Pin(std::string { ThisCluster });
@@ -414,8 +475,161 @@ TEST_CASE("A socket-activated worker with no roster is opened only by --fleet-op
     // And `--fleet-open` admits every caller, so the same node is refused, naming the remedy.
     cfg.fleetOpen = true;
     WorkerState opened;
-    auto const refused = MakeWorkerLeaseValidator(
-        cfg, nullptr, opened.advertised, SocketActivation::Yes, LeaseClock, opened.lease, opened.metrics, opened.logger);
+    auto const refused = MakeWorkerLeaseValidator(cfg,
+                                                  nullptr,
+                                                  opened.advertised,
+                                                  SocketActivation::Yes,
+                                                  LeaseClock,
+                                                  opened.lease,
+                                                  opened.metrics,
+                                                  opened.logger,
+                                                  opened.inForce);
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().contains("--voter-key"));
+    CHECK(refused.error().contains("--listen-raft"));
+}
+
+TEST_CASE("A learner verifies the grant its fleet's leader signed against the state it applied", "[node][lease][formation]")
+{
+    // The cross-machine half of what `dist-compile-e2e` used to check with two processes and a typed
+    // voter key: a machine that joined a fleet is leased out by that fleet's LEADER, so the
+    // grant it is handed was signed on another machine. It holds no key anybody typed -- it
+    // verifies against the cluster state its consensus applied, through the production roster
+    // (`NodeRoster`) and the production factory. A stranger's grant is refused as `Unauthorized`.
+    auto cfg = CheckingConfig();
+    cfg.formation = NodeFormationView { .mode = Cluster::NodeMode::Learner,
+                                        .clusterId = std::string { ThisCluster },
+                                        .createdAtUnixSeconds = 0,
+                                        .foundedHere = false,
+                                        .fleetMembers = {},
+                                        .fleetSchedulers = { "scheduler:6674" } };
+    REQUIRE(RunsConsensus(cfg));
+    REQUIRE_FALSE(ServesScheduler(cfg));
+
+    AtomicMetricsSink rosterMetrics;
+    NullLogger rosterLogger;
+    auto built = NodeRoster::Build(cfg, LeaseClock, rosterMetrics, rosterLogger);
+    REQUIRE(built.has_value());
+    auto& roster = *Testing::Unwrap(built);
+    REQUIRE(roster.Lease() != nullptr);
+
+    // What the learner's consensus applied: the leader, a voter, under its own key.
+    Cluster::ClusterState applied;
+    applied.members = { Cluster::ClusterMember { .id = "scheduler",
+                                                 .raftEndpoint = "scheduler:6680",
+                                                 .schedulerEndpoint = "scheduler:6674",
+                                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
+                                                 .seat = Cluster::MemberSeat::Voter,
+                                                 .publicKey = Testing::TestKeyPair("scheduler").PublicKey() } };
+    roster.Applied(applied);
+
+    WorkerState state;
+    auto validator = MakeWorkerLeaseValidator(cfg,
+                                              roster.Lease(),
+                                              state.advertised,
+                                              SocketActivation::No,
+                                              LeaseClock,
+                                              state.lease,
+                                              state.metrics,
+                                              state.logger,
+                                              state.inForce);
+    REQUIRE(validator.has_value());
+    state.lease.fleet.Pin(std::string { ThisCluster });
+
+    // The leader's grant, naming this worker, verifies.
+    CHECK_FALSE((*validator)(GrantUnder(CurrentTerm, "from-the-leader"), "gcc-13").refusal.has_value());
+
+    // A grant from a machine the applied state holds no voter key for does not.
+    auto const stranger =
+        Distributed::MintLeaseToken(Testing::TestLeaseSigner("stranger"),
+                                    Distributed::LeaseClaims { .serial = "from-a-stranger",
+                                                               .endpoint = std::string { ThisWorker },
+                                                               .fingerprint = "gcc-13",
+                                                               .key = "obj-abc",
+                                                               .expiresAt = LeaseClock.now() + std::chrono::minutes { 10 },
+                                                               .clusterId = std::string { ThisCluster },
+                                                               .epoch = CurrentTerm,
+                                                               .signer = {} });
+    auto const refused = (*validator)(stranger, "gcc-13").refusal;
+    REQUIRE(refused.has_value());
+    CHECK(Testing::Unwrap(refused).reason == Distributed::LeaseRefusalReason::Unauthorized);
+}
+
+TEST_CASE("A node whose name reaches only itself grants its own worker a lease that it checks against the state it applies",
+          "[node][lease][formation][defaults]")
+{
+    // A fleet of its own on loopback (`ConsensusConfinedToThisMachine`): its scheduler -- the
+    // production service, signing with this node's identity -- leases its own worker at the loopback
+    // endpoint the worker advertises, and the worker verifies that grant through the production roster
+    // and factory. Local dispatch works on such a machine; the checking path is the one that runs.
+    core::platform::ManualClock clock;
+    core::platform::ManualWallClock wall { LeaseClock.now() };
+    auto cfg = CheckingConfig();
+    cfg.nodeId = "scheduler";
+    cfg.toolchains = { "/usr/bin/g++" };
+    cfg.formation = NodeFormationView { .mode = Cluster::NodeMode::Solitary,
+                                        .clusterId = std::string { ThisCluster },
+                                        .createdAtUnixSeconds = 0,
+                                        .foundedHere = true,
+                                        .fleetMembers = {},
+                                        .fleetSchedulers = {} };
+    ApplyHostNames(cfg, NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = "localhost" });
+    REQUIRE(ConsensusConfinedToThisMachine(cfg));
+    REQUIRE(ServesScheduler(cfg));
+    REQUIRE(SchedulersOf(cfg, AsConfigured) == std::vector<std::string> { "127.0.0.1:6674" });
+    auto const advertised = AdvertisedEndpoint(cfg);
+    REQUIRE(advertised == "127.0.0.1:6674");
+
+    // Its scheduler: the worker registers where `SchedulersOf` says, from this machine, and leases.
+    AtomicMetricsSink schedulerMetrics;
+    NullLogger schedulerLogger;
+    auto const signer = Testing::TestLeaseSigner("scheduler");
+    Distributed::SchedulerService scheduler { clock, wall, schedulerMetrics, schedulerLogger, signer, ThisCluster };
+    scheduler.SetRole(Distributed::SchedulerRole::Leader, {}, Distributed::StandaloneSchedulerTerm);
+    auto const local = Distributed::CallerContext { .membership = Distributed::Membership::Member, .peerId = "127.0.0.1" };
+    auto const registered = scheduler.Register(
+        local,
+        Distributed::WorkerRegistration { .fingerprint = "gcc-13", .endpoint = advertised, .slots = 1, .codecs = {} });
+    REQUIRE(registered.status == CompileCacheWire::Status::Ok);
+    auto const granted = scheduler.Lease(
+        local, CompileCacheWire::LeaseRequest { .fingerprint = "gcc-13", .key = "obj-abc", .acceptedCodecs = {} });
+    REQUIRE(granted.status == CompileCacheWire::Status::Ok);
+    auto const grant = CompileCacheWire::DecodeLeaseGrant(granted.payload);
+    REQUIRE(grant.has_value());
+    CHECK(CompileCacheWire::AsStringView(Testing::Unwrap(grant).endpoint) == advertised);
+
+    // Its worker: the roster is the state its own consensus applies, this node its one voter.
+    AtomicMetricsSink rosterMetrics;
+    NullLogger rosterLogger;
+    auto built = NodeRoster::Build(cfg, wall, rosterMetrics, rosterLogger);
+    REQUIRE(built.has_value());
+    auto& roster = *Testing::Unwrap(built);
+    REQUIRE(roster.Lease() != nullptr);
+    Cluster::ClusterState applied;
+    applied.members = { Cluster::ClusterMember { .id = "scheduler",
+                                                 .raftEndpoint = ConsensusDialAddressOf(cfg).value_or(std::string {}),
+                                                 .schedulerEndpoint = advertised,
+                                                 .schedulerEndpointHistory = Cluster::SchedulerEndpointHistory::Announced,
+                                                 .seat = Cluster::MemberSeat::Voter,
+                                                 .publicKey = Testing::TestKeyPair("scheduler").PublicKey() } };
+    roster.Applied(applied);
+
+    Distributed::WorkerLeaseState lease { Distributed::SchedulerTermRegressionNotice::Silent() };
+    AtomicMetricsSink workerMetrics;
+    CapturingLogger workerLogger;
+    AnnouncedEndpoint announced { advertised };
+    LeaseCheckInForce inForce;
+    auto validator = MakeWorkerLeaseValidator(
+        cfg, roster.Lease(), announced, SocketActivation::No, wall, lease, workerMetrics, workerLogger, inForce);
+    REQUIRE(validator.has_value());
+    lease.fleet.Pin(std::string { ThisCluster });
+    auto const said = [&workerLogger](std::string_view phrase) {
+        return std::ranges::any_of(workerLogger.Snapshot(), [phrase](CapturingLogger::Record const& record) {
+            return record.message.contains(phrase);
+        });
+    };
+    CHECK(said("verifying lease signatures against the roster this node applies"));
+    CHECK_FALSE(said("compiling WITHOUT verifying"));
+
+    auto const decision = (*validator)(CompileCacheWire::AsStringView(Testing::Unwrap(grant).leaseToken), "gcc-13");
+    CHECK_FALSE(decision.refusal.has_value());
 }

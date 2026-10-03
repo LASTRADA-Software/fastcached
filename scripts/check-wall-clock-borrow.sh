@@ -32,6 +32,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 if [ "${1:-}" = "--self-test" ]; then
     self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    # shellcheck source=lib/git-scrub.sh
+    . "${self%/*}/lib/git-scrub.sh"
     work="$(mktemp -d)"
     trap 'rm -rf "$work"' EXIT
     ran=0
@@ -43,7 +45,7 @@ if [ "${1:-}" = "--self-test" ]; then
     {
         ran=$((ran + 1))
         if [ "$5" = "git" ]; then
-            ( cd "$2" && git init -q . && git add -A && git -c user.email=t@t -c user.name=t commit -qm t ) > /dev/null 2>&1
+            ( cd "$2" && scratch_git init -q . && scratch_git add -A && scratch_git -c user.email=t@t -c user.name=t commit -qm t ) > /dev/null 2>&1
         fi
         out="$(bash "$self" "$2" 2>&1)" && rc=0 || rc=$?
         if [ "$rc" != "$3" ]; then

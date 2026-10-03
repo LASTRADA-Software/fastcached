@@ -48,11 +48,10 @@ namespace FastCache::Node
 
 /// How long a pending node keeps asking a fleet that does not answer before it gives the join up.
 ///
-/// `EnrollTotalBound`'s figure, for its reason: an operator walking to another terminal, not one
-/// going home. Giving up changes nothing anywhere -- the node never stopped serving its own cluster
-/// -- so the bound costs a later ask and never a wrong state.
+/// Ten minutes: an operator walking to another terminal, not one going home. Giving up changes
+/// nothing anywhere -- the node never stopped serving its own cluster, and its row stays on the
+/// leader's list until the window closes -- so the bound costs a later ask and never a wrong state.
 inline constexpr std::chrono::minutes PendingGiveUpAfter { 10 };
-static_assert(PendingGiveUpAfter == EnrollTotalBound, "a pending node gives up where --enroll-from does");
 
 /// How long a node that a person refused leaves that fleet alone before asking it again.
 ///
@@ -119,6 +118,15 @@ class IReformSignal
     virtual void RequestReform() = 0;
 };
 
+/// Whether other machines can be this node's fleet at all.
+///
+/// **Private**: never transmitted or persisted.
+enum class FleetReachability : std::uint8_t
+{
+    Open,             ///< Its consensus address leaves this machine: it may ask a fleet, and be asked.
+    ThisMachineAlone, ///< Its consensus is confined to this machine (`ConsensusConfinedToThisMachine`).
+};
+
 /// Who this node is, as every summary it announces and every `Enroll` it sends says it.
 struct SelfFacts
 {
@@ -126,6 +134,12 @@ struct SelfFacts
     Ed25519PublicKey publicKey {}; ///< Its identity key.
     std::string nodeEndpoint;      ///< Its `0xFC` endpoint, as `AdvertisedEndpoint(cfg)` states it.
     std::string raftEndpoint;      ///< Where its Raft port answers; announced EMPTY while its listener is closed.
+
+    /// Whether it may ask a fleet to take it. A node confined to this machine asks no seed and polls
+    /// no fleet -- a member admitted at a loopback address is one nobody else can reach -- and so
+    /// decides nothing on a beat, a pending one included: it stays its own cluster, serving its own
+    /// scheduler, until a restart with a name other machines resolve resumes the join.
+    FleetReachability reach { FleetReachability::Open };
 };
 
 /// What a formation controller acts through. Every member outlives the controller.

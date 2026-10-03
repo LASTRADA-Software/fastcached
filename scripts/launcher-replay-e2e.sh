@@ -492,10 +492,14 @@ TEST_CASE("launcher-replay canary: this object does not match its source", "[can
 EOF
 
     # Compiled with the build's own command line, minus the launcher, so the only
-    # difference from the real object is the source it came from.
-    canary_cmd="${victim_cmd/${victim_src}/${workdir}/canary.cpp}"
-    canary_cmd="${canary_cmd//${launcher_wrapper} /}"
-    canary_cmd="${canary_cmd//${launcher} /}"
+    # difference from the real object is the source it came from. Every pattern and
+    # replacement QUOTED: an unquoted pattern is a glob, so a path holding `*`, `?` or `[`
+    # matched something other than itself -- or nothing, leaving the launcher in the
+    # command -- and an unquoted replacement holding `&` reads as the match under bash
+    # 5.2's `patsub_replacement`.
+    canary_cmd="${victim_cmd/"${victim_src}"/"${workdir}/canary.cpp"}"
+    canary_cmd="${canary_cmd//"${launcher_wrapper} "/}"
+    canary_cmd="${canary_cmd//"${launcher} "/}"
     # The copy compiles from the workdir, so a quoted include no longer resolves
     # relative to the file that writes it -- `#include "CmdLine.hpp"` next to the
     # original is a fatal error next to the copy. The unit's own directory joins

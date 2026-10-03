@@ -42,7 +42,6 @@ namespace
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.nodeListen = "0.0.0.0:6674";
-    cfg.schedulers = { "scheduler.internal:6675" };
     cfg.advertise = "worker-01.internal:6674";
     cfg.advertiseExplicit = true;
     cfg.toolchains = { "/usr/bin/g++" };
@@ -485,7 +484,6 @@ TEST_CASE("The worksheet and the install and the start refuse a cross-flag rule 
     auto const line = [](char const* raftListen) {
         return std::vector<char const*> {
             "--listen-node=127.0.0.1:6674",
-            "--scheduler=127.0.0.1:6674",
             raftListen,
             "--discovery=255.255.255.255:6681",
             "--advertise=127.0.0.1:6674",

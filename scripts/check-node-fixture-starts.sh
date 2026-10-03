@@ -36,11 +36,14 @@
 #   one-shot   names a verb that answers and exits (`--print-surfaces`, `--cluster-status`,
 #              `--install-service`, ... -- `OneShotVerbs` below): nothing bound, nothing
 #              written. Passes.
-#   mints      names `--print-identity` or `--enroll-from`, which write the identity. Needs
+#   mints      names `--print-identity`, which writes the identity. Needs
 #              `--cluster-dir`.
 #   runs       everything else. Needs `--cluster-dir`, and an EMPTY `--listen-raft=` (no
 #              consensus, and so no discovery) or an EMPTY `--discovery=` (consensus, but no
-#              beacon on the shared port).
+#              beacon on the shared port). A node running a WORKER takes the second: with its
+#              consensus closed it would have no scheduler to register with, and the node
+#              refuses to start (`WorkerWithConsensusClosedRefusal`) -- which this scan does
+#              not judge, because the node itself does, by name, at the first start.
 #
 # ## What it does NOT cover, said plainly, with the direction each fails in
 #
@@ -88,11 +91,11 @@ FastCachedTable="${FASTCACHED_FIXTURE_STARTS_TABLE:-${FastCachedRoot}/scripts/ch
 # The node's verbs that answer and exit, as the option table spells them. A NAME list rather
 # than a pattern over `--cluster-`, because `--cluster-dir` is a setting.
 OneShotVerbs="print-surfaces help version cluster-status cluster-set cluster-admit cluster-admit-learner"
-OneShotVerbs="${OneShotVerbs} cluster-admit-worker cluster-admit-client cluster-forget cluster-forget-client"
+OneShotVerbs="${OneShotVerbs} cluster-admit-client cluster-forget cluster-forget-client"
 OneShotVerbs="${OneShotVerbs} install-service uninstall-service enroll-list enroll-approve enroll-reject"
 OneShotVerbs="${OneShotVerbs} migrate-cache seed-config cordon uncordon"
-# The verbs that write this node's identity, and so need `--cluster-dir` and nothing else.
-MintingVerbs="print-identity enroll-from"
+# The verb that writes this node's identity, and so needs `--cluster-dir` and nothing else.
+MintingVerbs="print-identity"
 # How many lines one statement may span, backwards to its opener or forwards to its end.
 StatementCap=80
 
@@ -101,6 +104,9 @@ if [ "${1:-}" = "--self-test" ]; then
     selfTestCases=0
     selfTestStatus=0
     me="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    # From beside THIS script, not the root the run was handed: that may be a staged tree.
+    # shellcheck source=scripts/lib/git-scrub.sh
+    . "${me%/*}/lib/git-scrub.sh"
     scratch="$(mktemp -d)" || { echo "cannot create a scratch directory" >&2; exit 2; }
     # shellcheck disable=SC2064  # expand $scratch now, not at trap time
     trap "rm -rf '$scratch'" EXIT
@@ -117,9 +123,9 @@ if [ "${1:-}" = "--self-test" ]; then
         printf '%s\n' 'add_test(' '    NAME "fixture"' \
             '    COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/fixture.sh"' \
             '        "$<TARGET_FILE:fastcache-compile-node>")' > "$scratch/tree/src/tests/CMakeLists.txt"
-        git -C "$scratch/tree" init -q 2>/dev/null
+        scratch_git -C "$scratch/tree" init -q 2>/dev/null
     }
-    Track() { git -C "$scratch/tree" add -A -f >/dev/null 2>&1; }
+    Track() { scratch_git -C "$scratch/tree" add -A -f >/dev/null 2>&1; }
 
     # @param 1 what is being staged  @param 2 want-pass|want-fail|want-refuse
     Case() {
@@ -712,7 +718,8 @@ fi
 if [ "${Problems}" -ne 0 ]; then
     echo "check-node-fixture-starts: ${Problems} finding(s) over ${starts} start(s)." >&2
     echo "  A fixture names --cluster-dir (its own state, never the platform's) and turns off the fleet it" >&2
-    echo "  does not test: --listen-raft= for a node running no consensus, --discovery= for one that runs it." >&2
+    echo "  does not test: --discovery= for a node that runs consensus -- every node running a worker does --" >&2
+    echo "  or --listen-raft= for a cache-only one (--slots=0)." >&2
     echo "  See this script's header for what the scan reads, and the exemptions table for helpers." >&2
     exit 1
 fi

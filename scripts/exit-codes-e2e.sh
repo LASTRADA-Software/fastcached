@@ -66,7 +66,7 @@ DAEMON_BAIT_SAYS="unknown flag character 'Z'"
 # The node's: a TYPED --discovery on a node that turned consensus off, which its startup rules
 # refuse, 78. Arrays, so `check-node-fixture-starts` reads the flags each start names: the empty
 # --listen-raft= and the --cluster-dir every fixture start owes.
-NODE_BAIT=(--listen-node=127.0.0.1:6674 --scheduler=127.0.0.1:6674 --listen-raft= --discovery=255.255.255.255:6681)
+NODE_BAIT=(--listen-node=127.0.0.1:6674 --listen-raft= --discovery=255.255.255.255:6681)
 NODE_BAIT_SAYS="--discovery needs --listen-raft"
 NODE_STATE=("--cluster-dir=$WORK/state")
 # A name every registration refuses, the belt on every install and uninstall.
@@ -182,22 +182,16 @@ expect_exit "node: an uninstall that changes nothing declines" 2 "" \
 #
 # A port nothing answers on (`free_port`, from below the ephemeral range): a loopback
 # dial there is refused at once, so each is a transport that delivered no reply --
-# transient, 1, the exit a script retries. Beside each, a refusal made HERE before any
-# dial -- 2, a decision. A refusal the PEER replied needs a live peer, and is asserted at
-# the runners' seams (`ClusterAdminCli_test`, `CordonCli_test`, `EnrollClient_test`).
+# transient, 1, the exit a script retries. No verb here has nowhere to ask any more: one
+# naming no --scheduler asks this machine's own node (`AdminTargetsOf`), so it dials too,
+# and a machine joins through --fleet-seed at run time rather than a one-shot verb. A
+# refusal the PEER replied needs a live peer, and is asserted at the runners' seams
+# (`ClusterAdminCli_test`, `CordonCli_test`, `EnrollClient_test`).
 NOBODY="127.0.0.1:$(free_port)"
 expect_exit "node: a cluster command no scheduler answered is transient" 1 "cannot reach" \
     "$NODE" "$EMPTY" --cluster-status "--scheduler=$NOBODY"
-expect_exit "node: a cluster command with nowhere to ask declines" 2 "--scheduler names where to ask" \
-    "$NODE" "$EMPTY" --cluster-status
 expect_exit "node: an enrollment command no scheduler answered is transient" 1 "cannot reach" \
     "$NODE" "$EMPTY" --enroll-list "--scheduler=$NOBODY"
-expect_exit "node: an enrollment command with nowhere to ask declines" 2 "--scheduler names where to ask" \
-    "$NODE" "$EMPTY" --enroll-list
-expect_exit "node: a machine asking a seed nobody answers is transient" 1 "cannot reach the seed" \
-    "$NODE" "$EMPTY" "--enroll-from=$NOBODY" "--cluster-dir=$WORK/joiner"
-expect_exit "node: a machine asking a seed that is no address declines" 2 "is not an address to dial" \
-    "$NODE" "$EMPTY" "--enroll-from=10.0.0.1" "--cluster-dir=$WORK/joiner"
 expect_exit "node: a cordon this machine's node never answered is transient" 1 "cannot reach this machine's node" \
     "$NODE" "$EMPTY" --cordon "--listen-node=$NOBODY"
 

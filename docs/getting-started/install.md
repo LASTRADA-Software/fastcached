@@ -86,13 +86,15 @@ registers the services that follow from the choice:
 | the node (with or without fastcached) | starts with Windows, started now | manual, stopped |
 | fastcached without the node | — | starts with Windows, started now (pass `FASTCACHED_START_SERVICE=0` to leave it stopped) |
 
-The node is registered only when the install also names its scheduler
-(`FASTCACHE_NODE_SCHEDULER`, described on the
-[fastcache-compile-node page](../tools/fastcache-compile-node.md#macos-and-windows)); without it
-fastcached is still made manual and nothing is started. The address clients reach the node at
+The node needs no property to be registered: it finds its scheduler from the fleet it forms or
+joins (the [fastcache-compile-node page](../tools/fastcache-compile-node.md#macos-and-windows)
+has the details). The address clients reach the node at
 (`FASTCACHE_NODE_ADVERTISE`) is optional: left out, the node advertises this machine's fully
 qualified name. So is `FASTCACHE_FIREWALL_ALLOW=10.0.0.0/8`, which limits the firewall rules both
-registrations create to that remote range; left out, they admit any address. The package also
+registrations create to that remote range; left out, they admit any address. So is
+`FASTCACHE_FLEET_SEED=office-a.vpn.example`, one machine of the fleet for the node to ask when no
+discovery beacon reaches it, as across a VPN; it is registered as the node's `--fleet-seed`, and a
+node that needs more than one names them under `fleet_seed:` in its configuration file. The package also
 pins the node's discovery reply port, `FASTCACHE_DISCOVERY_REPLY_PORT=6682` unless you pass another
 (or pass it empty), so its firewall opens UDP 6682 rather than every local UDP port. A node run by
 hand leaves that port to the kernel, because two nodes on one machine each need one of their own;
@@ -106,9 +108,18 @@ installs.
 
 **Upgrading from 0.3.0 or earlier is the exception.** Those installers delete both services when
 they are removed, and a major upgrade removes the old version first. The new installer registers
-`FastCached` again from the table, but it registers the node only when that upgrade passes
-`FASTCACHE_NODE_SCHEDULER` again (and `FASTCACHE_NODE_ADVERTISE`, if the node had one), so pass
-them on that one upgrade.
+`FastCached` and the node again from the table, the node with no property needed.
+
+Every transaction that keeps a service registers it again, and the optional properties are
+remembered for it: `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_NODE_ADVERTISE` and `FASTCACHE_FLEET_SEED` are written to
+`HKLM\SOFTWARE\fastcached\Installer` and read back by the next repair or upgrade, so one that
+leaves them out registers what was installed. A transaction that states a new value replaces the
+remembered one. An empty value counts as leaving the property out, so a remembered scope is kept;
+to drop it, uninstall (which forgets the values) and install again. An installer older than this
+remembering has nothing to read back, so the first upgrade from one registers what it states: with
+no property the node is still registered and started, advertising this machine's name with its
+firewall rules admitting any address, so pass `FASTCACHE_FIREWALL_ALLOW` (and any other property
+you installed with) on that upgrade to keep it.
 
 ```powershell
 sc.exe query FastCached

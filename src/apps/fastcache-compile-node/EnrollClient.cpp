@@ -1,20 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "EnrollClient.hpp"
 #include "EnrollmentWindow.hpp"
-#include "NodeIdentity.hpp"
-#include "NodeKey.hpp"
-#include "NodeRefusal.hpp"
-#include "NodeStateFiles.hpp"
-#include "NodeSurfaces.hpp"
 
 #include <FastCache/Cluster/Roster.hpp>
-#include <FastCache/Cluster/RosterCertificate.hpp>
-#include <FastCache/Consensus/FileRaftStorage.hpp>
-#include <FastCache/Core/Base64.hpp>
 #include <FastCache/Core/EnumTable.hpp>
 #include <FastCache/Core/HostPort.hpp>
-#include <FastCache/Distributed/LeaseToken.hpp>
-#include <FastCache/Distributed/RosterStore.hpp>
 #include <FastCache/Protocol/LeaderRedirect.hpp>
 
 #include <algorithm>
@@ -193,17 +183,15 @@ EnrollReading ReadEnrollReply(Cc::CacheOutcome const& outcome)
                                                  "address as it records from one host; one being decided makes room",
                                        .roster = {} };
             case Wire::ErrorCode::NoCluster:
-                // **The one an operator actually gets, and it is NOT a version
-                // problem.** The documented flow points `--enroll-from` at any member,
-                // and most members run no consensus -- so this is the commonest
-                // mistake, and it used to arrive as `UnknownOpcode` and be reported as
-                // *the seed is running an older build*, sending somebody to upgrade a
-                // node that was already current. Fatal, because a node that runs no
-                // consensus will not start running it while this loop polls, and the
+                // **Not a version problem.** A seed that runs no consensus is the
+                // commonest mistake, and it used to arrive as `UnknownOpcode` and be
+                // reported as *the seed is running an older build*, sending somebody to
+                // upgrade a node that was already current. Fatal, because a node that runs
+                // no consensus will not start running it while a joiner polls, and the
                 // remedy is a different ADDRESS rather than a different moment.
                 return EnrollReading { .progress = EnrollProgress::Fatal,
                                        .detail = "that node runs no consensus, so it belongs to no cluster and there "
-                                                 "is nothing there to join. Point --enroll-from at a node that runs "
+                                                 "is nothing there to join. Point --fleet-seed at a node that runs "
                                                  "consensus; --node-status names the components a node serves",
                                        .roster = {} };
             case Wire::ErrorCode::UnknownOpcode:
@@ -383,58 +371,13 @@ std::expected<std::string, std::string> DescribeAdmission(JoinerIdentity const& 
 
     // What approval DID, and where this machine wrote it -- and nothing it did not. The seed
     // recorded the key; this machine kept the identity it asked under, and nothing else: a
-    // member keeps no record of the cluster it was admitted to, and a principal's roster is
-    // `KeepEnrolledRoster`'s sentence.
+    // member keeps no record of the cluster it was admitted to.
     out += std::format("The seed recorded this machine's key in its cluster as a {}. On this machine, enrollment wrote "
-                       "the identity it asked under -- its id and its identity key -- into {}",
+                       "the identity it asked under -- its id and its identity key -- into {}, and nothing else: no "
+                       "record of the cluster it was admitted to is kept here.\n",
                        row.name,
                        stateDirectory.string());
-    if (!row.principal.has_value())
-        out += ", and nothing else: no record of the cluster it was admitted to is kept here.\n";
-    else
-        out += ". Start this node with the same state directory; a worker principal joins no consensus.\n";
     return out;
-}
-
-std::string KeepEnrolledRoster(std::span<std::byte const> roster,
-                               std::span<std::byte const> certificate,
-                               std::chrono::system_clock::time_point now,
-                               Distributed::IRosterStore& store)
-{
-    if (certificate.empty())
-        return "The leader holds no certified roster yet, so none was kept: this worker adopts one when it first "
-               "reaches a scheduler, and until then checks grants against --voter-key if it names any.\n";
-
-    auto const compared = Cluster::DecodeRoster(roster);
-    auto const offered = Cluster::DecodeCertifiedRoster(certificate);
-    if (!compared.has_value() || !offered.has_value())
-        return "The leader's certified roster could not be read, so none was kept: this worker adopts one when it "
-               "first reaches a scheduler.\n";
-
-    // The voters of the roster the OPERATOR compared stand in for the anchors a worker would
-    // otherwise be given, so the certificate is judged exactly as any offered roster is.
-    auto const voters = Cluster::VotersOf(*compared);
-    auto adopted = Cluster::CertifyRoster(*offered,
-                                          Cluster::CertificationInput { .clusterId = offered->clusterId,
-                                                                        .voters = voters,
-                                                                        .minimumVersion = 0,
-                                                                        .held = std::nullopt,
-                                                                        .now = now,
-                                                                        .slack = Distributed::LeaseTokenClockSkewSlack });
-    if (!adopted.has_value())
-        return std::format("The leader's certified roster was not kept -- {} -- so this worker adopts one when it first "
-                           "reaches a scheduler.\n",
-                           Cluster::DescribeRosterRefusal(adopted.error()));
-
-    if (auto saved = store.Save(
-            Cluster::PersistedRoster { .certificate = adopted->certificate, .certifiedUntil = adopted->certifiedUntil });
-        !saved.has_value())
-        return std::format("The leader's certified roster could not be kept: {}.\n", saved.error());
-
-    return std::format("Kept the cluster's certified roster, version {}, as {} in the same directory: it is this "
-                       "worker's trust root, so it checks every grant against it and needs no --voter-key.\n",
-                       adopted->certificate.version,
-                       Distributed::RosterFileName);
 }
 
 std::expected<std::string, UnfinishedCommand> RunEnrollAdmin(NodeConfig const& cfg,
@@ -442,20 +385,18 @@ std::expected<std::string, UnfinishedCommand> RunEnrollAdmin(NodeConfig const& c
                                                              Cc::ICredentialFor& credentials,
                                                              IEndpointDialer& dialer)
 {
-    if (cfg.schedulers.empty())
-        return std::unexpected { Unanswered(AnswerSource::Local,
-                                            "--scheduler names where to ask; an enrollment command needs one") };
-
     auto notice =
         Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
 
-    // The first ask walks the configured list and takes whichever CONNECTS; a redirect names one
+    // The first ask walks the configured list -- this machine's own node when `--scheduler` names
+    // none (`AdminTargetsOf`) -- and takes whichever CONNECTS; a redirect names one
     // endpoint and is followed there, never back into the list (#1310) -- `AskTheLeader`, the one
     // loop the cluster verbs share. Each ask presents what @p credentials answers for the endpoint
     // it reached, so a redirect's leader is shown a ticket naming the leader.
     std::optional<Cc::MintFailure> missing;
+    auto const configured = AdminTargetsOf(cfg);
     auto answered = AskTheLeader(dialer,
-                                 cfg.schedulers,
+                                 configured,
                                  core::net::DialOptions { .connectTimeout = EnrollDialTimeout },
                                  "the cluster",
                                  [&](core::net::ISocket& socket, std::string_view endpoint) {
@@ -476,301 +417,6 @@ std::expected<std::string, UnfinishedCommand> RunEnrollAdmin(NodeConfig const& c
         return std::unexpected { Unanswered(
             outcome, std::format("{} answered with a body this client cannot read", answered->endpoint)) };
     return RenderEnrollmentReport(*report, answered->endpoint);
-}
-
-std::expected<ConsensusHistory, std::string> ReadConsensusHistory(std::filesystem::path const& stateDirectory)
-{
-    auto storage = Consensus::FileRaftStorage::Open(stateDirectory);
-    if (!storage.has_value())
-        return std::unexpected { std::format("cannot read {}: {}{}",
-                                             stateDirectory.string(),
-                                             storage.error().context,
-                                             StateFileUnreadableHint(stateDirectory)) };
-
-    auto recovered = storage->Load();
-    if (!recovered.has_value())
-        return std::unexpected { std::format("cannot read the consensus state in {}: {}{}",
-                                             stateDirectory.string(),
-                                             recovered.error().context,
-                                             StateFileUnreadableHint(stateDirectory)) };
-
-    // Every durable trace, not one of them. A node that campaigned wrote a term AND a
-    // self-vote AND a log entry, so any single field would do for the case this exists
-    // to catch -- and asking all four is what makes the ANSWER right for the cases it
-    // does not: a node admitted to somebody else's cluster carries a term it was told
-    // and entries it was sent, and must be refused here too.
-    //
-    // The default-constructed value is documented as *a node that has never run*, which
-    // is exactly the question, so this is that sentence rather than a reading of the
-    // format.
-    auto const& state = *recovered;
-    auto const ran = state.state.currentTerm.value != 0 || state.state.votedFor.has_value() || !state.entries.empty()
-                     || state.snapshot.has_value();
-    return ran ? ConsensusHistory::Recorded : ConsensusHistory::None;
-}
-
-std::expected<std::pair<std::string, std::string>, std::string> EnrollClaim(NodeConfig const& cfg)
-{
-    // `ConsensusDialAddressOf` is the one place this node's consensus endpoint is derived --
-    // the same one consensus runs under (`BootstrapMembersOf`). Deriving it again here would be
-    // a second spelling that can disagree, and the whole point of stating both halves is that a
-    // member the cluster counts must be one it can dial.
-    auto dial = ConsensusDialAddressOf(cfg);
-    if (cfg.nodeId.empty() || !dial.has_value())
-        return std::unexpected { std::string {
-            "this node names no consensus member of its own, so it has nothing to ask to be admitted as. "
-            "--listen-raft says where its consensus port answers and --raft-self says at which address other "
-            "nodes reach it" } };
-
-    return std::pair { cfg.nodeId, *std::move(dial) };
-}
-
-std::expected<std::string, UnfinishedCommand> RunEnrollClient(NodeConfig const& cfg,
-                                                              ISecureRandom& random,
-                                                              INodeKeyFileGuard& keyGuard,
-                                                              IDrainWait& wait,
-                                                              IEndpointDialer& dialer,
-                                                              core::platform::IWallClock const& wallClock)
-{
-    // **This mode's own preconditions are refused HERE and not as `StartupPolicyRejection`
-    // rows, and that is a decision rather than a missed table row.** That table judges a
-    // configuration this node will SERVE with -- it requires a `--scheduler`, and it
-    // requires a toolchain -- and a node that is enrolling serves nothing and has
-    // neither. A row there would refuse exactly the fresh install this mode exists for,
-    // which is its entire population. `RunClusterAdmin` refuses its own empty
-    // `--scheduler` inline for the same reason (`ClusterAdminCli.cpp`), and this is that
-    // shape rather than a new one.
-    //
-    // Both refusals are taken before anything is asked of anybody, so a misconfigured
-    // run costs no round trip and leaves no row on somebody else's list.
-    //
-    // **The seed's SHAPE is refused here too, and that is a reachability fix rather than
-    // a second opinion.** `--enroll-from` has a `StartupPolicyRejection` row -- the same
-    // idiom `--scheduler`, `--advertise` and `--upstream` use -- and on this path that
-    // row cannot fire: `main` dispatches `--enroll-from` and RETURNS before the startup
-    // table is consulted, so the row is reachable only through `--print-surfaces`. Left
-    // to the dial, `--enroll-from=10.0.0.1` with no port was answered *cannot reach the
-    // seed*, which names the wrong problem -- and named it AFTER this function had minted
-    // this node's identity into `--cluster-dir`, so a typo wrote durable state. First of
-    // this mode's preconditions for that reason: it is the cheapest, and it is the only
-    // one that is purely about what the operator typed.
-    //
-    // `ParseDialEndpoint` and not a spelling of its own, so this and the table row cannot
-    // come to different conclusions about the same string; a bare port names no machine,
-    // which is the whole of why `HostOfEndpoint` is not the predicate here.
-    if (!cfg.enrollFrom.empty() && !ParseDialEndpoint(cfg.enrollFrom).has_value())
-        return std::unexpected { Unanswered(
-            AnswerSource::Local,
-            std::format(
-                "--enroll-from={} is not an address to dial: it names a seed as <host>:<port>, and a bare port names no "
-                "machine. Nothing has been changed on this machine",
-                cfg.enrollFrom)) };
-
-    // **The one-way mistake, caught before anything is asked of anybody (#1299).**
-    //
-    // A node that runs consensus founds a cluster of one at its first start, elects itself,
-    // and cannot afterwards be admitted to anybody else's as it stands: it would refuse every
-    // leader but its own. It is silent: the node comes up, leads a cluster of one, and looks
-    // healthy on every surface. So a directory holding that history is refused here, before
-    // anything is asked of anybody.
-    //
-    // Refused BEFORE the identity is resolved, so a refusal writes nothing: a directory
-    // that already holds consensus state also already holds an id, and a fresh one is
-    // left untouched for whoever fixes the configuration and runs this again.
-    //
-    // After asking WHO wrote what the directory holds, which the key resolution below asks
-    // again: a consensus store another account planted must be refused for that, never read
-    // as this node's history.
-    if (auto walked = JudgeStateDirectory(NodeStateDirectory(cfg), keyGuard); !walked.has_value())
-        return std::unexpected { UnfinishedCommand { .ending = EndingOf(walked.error().fault),
-                                                     .reason = std::move(walked).error().message } };
-    auto const history = ReadConsensusHistory(NodeStateDirectory(cfg));
-    if (!history.has_value())
-        return std::unexpected { UnfinishedCommand { .ending = EndingOf(NodeRefusalCause::ConsensusStore),
-                                                     .reason = std::move(history).error() } };
-    if (*history == ConsensusHistory::Recorded)
-        return std::unexpected { Unanswered(
-            AnswerSource::Local,
-            std::format(
-                "{} already holds consensus state: this node has run a cluster before. Either it is its OWN -- every "
-                "node that runs consensus founds a cluster of one at its first start -- and a node that led one cannot "
-                "be admitted to anybody else's as it stands, since it would refuse every leader but its own; or it is "
-                "one it was already admitted to, in which case it does not need enrolling. Both are fixed the same way "
-                "and only if you mean it: stop this node, delete {}, and run this again. A wiped "
-                "state directory gets a NEW identity, which is what admission needs -- clearing only the log would "
-                "leave this node's old identity in place holding a vote record for the cluster it led.",
-                NodeStateDirectory(cfg).string(),
-                NodeStateDirectory(cfg).string())) };
-
-    // The KEY first, as a start resolves it: it is what the seed records and what every later
-    // proof is checked against, so a machine that asked under one key and started with another
-    // would be a stranger to its own cluster -- and resolving it is what judges, and creates, the
-    // state directory the id is minted into next, its owner's alone.
-    auto key = ResolveNodeKeyFor(cfg, random, keyGuard);
-    if (!key.has_value())
-        return std::unexpected { UnfinishedCommand { .ending = EndingOf(key.error().fault),
-                                                     .reason = std::move(key).error().message } };
-
-    // The identity is MINTED here, into `--cluster-dir`, before anything is asked of
-    // anybody -- because it is what the seed is asked to admit. A joiner that asked
-    // under one id and then started under another would be a member the cluster
-    // counts and cannot reach.
-    auto identity = ResolveNodeIdentity(NodeStateDirectory(cfg), cfg.nodeId, random);
-    if (!identity.has_value())
-        return std::unexpected { UnfinishedCommand { .ending = EndingOf(identity.error().fault),
-                                                     .reason = std::move(identity).error().message } };
-
-    auto resolved = cfg;
-    ApplyNodeIdentity(resolved, *identity);
-
-    // Always a worker principal. A machine that runs consensus joins a fleet as a LEARNER through
-    // its formation record, which the node itself drives, not through this one-shot verb; what
-    // `--enroll-from` admits is a worker by its key. It states no endpoint: a principal has none
-    // anybody dials.
-    auto const role = Wire::EnrollRole::Worker;
-    auto self =
-        JoinerIdentity { .nodeId = resolved.nodeId, .nodeEndpoint = {}, .role = role, .publicKey = key->pair.PublicKey() };
-    auto const& nodeId = self.nodeId;
-
-    // The key, whole, BEFORE the first ask: it is what the operator compares against the row
-    // `--enroll-list` shows, and the comparison is the whole strength of an approval now that
-    // no secret is exchanged (#178).
-    std::cerr << std::format("fastcache-compile-node: asking {} to admit {} as a {} under the key\n"
-                             "    {}\n"
-                             "  Compare it with the key --enroll-list shows for {} before approving it.\n",
-                             cfg.enrollFrom,
-                             nodeId,
-                             EnrollRoleRowFor(role).name,
-                             FormatEd25519PublicKey(self.publicKey),
-                             nodeId);
-
-    auto notice =
-        Cc::CredentialNotice { [](std::string_view text) { std::cerr << "fastcache-compile-node: " << text << '\n'; } };
-
-    auto seed = cfg.enrollFrom;
-    auto redirects = 0;
-    auto said = std::string {};
-
-    // The bound is MEASURED against the wait's own clock rather than accumulated from
-    // the sleeps this loop asked for: a requested two seconds costs what the host's
-    // timer granularity says, so counting them states a bound and enforces some
-    // multiple of it.
-    auto const startedAt = wait.Now();
-    while (true)
-    {
-        // Through the seam, so a test can script what comes BACK. The blocking dial
-        // and its `core::net::BlockingConnector` live in `BlockingEndpointDialer`, where
-        // `DialEndpointBlocking` still sees the concrete type it requires.
-        // A nonce per request, as the grammar requires, and a failed draw is a refusal rather than a
-        // request over bytes somebody else could predict. This mode does not judge the answer's
-        // signature by it: it proves no key of the fleet before asking, so there is no key to hold
-        // a signature to, and what an operator compares -- this key before approval, the roster's
-        // fingerprint after it -- is this mode's trust root, as it always was.
-        auto nonce = std::array<std::byte, Wire::NodeChallengeBytes> {};
-        if (auto drawn = random.Fill(nonce); !drawn.has_value())
-            // A draw is an I/O arm, so the command ends `Failed` (`StartStage`'s rule): the next run
-            // may draw, where a decision would refuse it again.
-            return std::unexpected { UnfinishedCommand {
-                .ending = CommandEnding::Failed,
-                .reason = std::format("no nonce could be drawn for the enroll request: {}", drawn.error().ToString()) } };
-
-        auto client = dialer.Dial(seed, core::net::DialOptions { .connectTimeout = EnrollDialTimeout });
-        if (client == nullptr)
-            return std::unexpected { Unanswered(AnswerSource::Transport, std::format("cannot reach the seed at {}", seed)) };
-
-        // Kept, not read once and dropped: a `Fatal` reading is both a transport that broke and a
-        // reply that refused, and only the outcome says which (`SourceOf`).
-        auto const outcome = core::async::syncRun(
-            Cc::ExchangeFramed(client.get(),
-                               &notice,
-                               // No credential: `ENROLL` is answered before authentication, and no roster holds this
-                               // machine's key yet, so no ticket it could present would be admitted.
-                               Wire::EncodeEnroll(Wire::EnrollRequest { .nodeId = self.nodeId,
-                                                                        .nodeEndpoint = self.nodeEndpoint,
-                                                                        .role = self.role,
-                                                                        .publicKey = self.publicKey,
-                                                                        .nonce = nonce })));
-        auto reading = ReadEnrollReply(outcome);
-
-        switch (reading.progress)
-        {
-            case EnrollProgress::Admitted: {
-                auto admitted =
-                    DescribeAdmission(self, reading.roster, NodeStateDirectory(cfg))
-                        .transform_error([&outcome](std::string reason) { return Unanswered(outcome, std::move(reason)); });
-                // A worker keeps the leader's certified roster as its trust root; a member applies the
-                // replicated state and needs none.
-                if (!admitted.has_value() || self.role != Wire::EnrollRole::Worker)
-                    return admitted;
-                Distributed::FileRosterStore store { NodeStateDirectory(cfg) / Distributed::RosterFileName };
-                return *admitted + KeepEnrolledRoster(reading.roster, reading.certificate, wallClock.now(), store);
-            }
-            case EnrollProgress::Refused:
-                return std::unexpected { Unanswered(outcome,
-                                                    std::format("{} refused this machine ({})", seed, reading.detail)) };
-            case EnrollProgress::Fatal:
-                return std::unexpected { Unanswered(
-                    outcome, std::format("{} could not enrol this machine: {}", seed, reading.detail)) };
-            case EnrollProgress::Redirect:
-                // A chain that did not settle decided nothing about this machine (`Pending`).
-                if (redirects >= MaxEnrollRedirects)
-                    return std::unexpected { Unanswered(AnswerSource::Pending,
-                                                        std::format("gave up after {} leader redirect(s); the last named {}",
-                                                                    MaxEnrollRedirects,
-                                                                    reading.detail)) };
-                ++redirects;
-                std::cerr << std::format(
-                    "fastcache-compile-node: {} does not lead the cluster; asking {} instead\n", seed, reading.detail);
-                seed = reading.detail;
-                continue;
-            case EnrollProgress::Waiting:
-            case EnrollProgress::Closed:
-                // **The redirect budget is a CHAIN bound, so reaching a node that
-                // answered resets it.**
-                //
-                // `MaxEnrollRedirects` exists for the loop two nodes with a stale
-                // `_knownLeader` can make by naming each other -- a property of
-                // CONSECUTIVE redirects. Accumulated over the whole run it becomes a
-                // total instead, and this mode waits up to ten minutes for a person:
-                // that is ~300 polls, so three ordinary leadership changes anywhere in
-                // the wait would abort a perfectly good enrolment with "gave up after 3
-                // leader redirect(s)" -- a message naming a loop that never happened,
-                // on a cluster that was about to admit this machine.
-                //
-                // A `Waiting` or `Closed` reading is a node that answered on its own
-                // behalf, which is exactly what breaks a chain, so the count goes back
-                // to zero here and the anti-loop property is untouched: a genuine
-                // mutual-redirect loop produces redirects BACK TO BACK and never
-                // reaches this arm.
-                redirects = 0;
-                break;
-        }
-
-        // Said once per DISTINCT reading rather than once per poll: a joiner waiting
-        // ten minutes for a person produces three hundred polls, and a line each
-        // would bury the one line that changes.
-        if (reading.detail != said)
-        {
-            said = reading.detail;
-            std::cerr << std::format("fastcache-compile-node: {} ({}); asking again every {}s\n",
-                                     reading.detail,
-                                     nodeId,
-                                     EnrollPollInterval.count() / 1000);
-        }
-
-        // The last answer was the seed's own -- waiting, or closed -- and neither decides anything,
-        // so giving up on it is transient: the same command succeeds once an operator approves.
-        if (wait.Now() - startedAt >= EnrollTotalBound)
-            return std::unexpected { Unanswered(
-                AnswerSource::Pending,
-                std::format("gave up after {} minute(s) waiting to be approved by {}. Nothing has been changed on this "
-                            "machine, and this node's request stays on that seed's list until its window closes, so "
-                            "running this again after an operator approves it is enough",
-                            std::chrono::duration_cast<std::chrono::minutes>(EnrollTotalBound).count(),
-                            seed)) };
-
-        wait.Sleep(EnrollPollInterval);
-    }
 }
 
 } // namespace FastCache::Node

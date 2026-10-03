@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# End-to-end test of distributed compilation (POSIX). Starts a fastcached with a
-# dispatch listener, one or more fastcache-compile-node workers, and drives real
-# compiles through fastcache-cc.
+# End-to-end test of distributed compilation (POSIX). Starts a fastcached cache and
+# fastcache-compile-node processes, and drives real compiles through fastcache-cc.
+#
+# EVERY NODE HERE IS SOLITARY. A zero-config node is a fleet of its own: it serves the
+# scheduler, its own worker registers with it, and its scheduler leases that worker --
+# so each node a case starts is ONE process that leases, verifies and compiles, and the
+# client asks it directly. A second node cannot join a first over loopback, which is
+# how these nodes bind, and that is production behaviour rather than a gap: a fleet is
+# never offered at an address only this machine reaches. The properties that need two
+# MACHINES are asserted in process,
+# where an interleaving can be placed rather than hoped for -- each named at the case it
+# came out of, and all of them listed in the report of the change that moved them:
+# a lease landing on another machine and released to its issuer (`FleetLeaseRouting_test`),
+# a learner verifying the grant its fleet's leader signed (`WorkerLease_test`), a worker
+# refusing a caller its scheduler admitted (#235, `CompileResponder_test`), and a
+# registration that proves the machine's key (`NodeProofResponder_test`).
 #
 # The properties asserted here are the ones no unit test can reach, because each
-# needs three real processes and a real compiler:
+# needs real processes and a real compiler:
 #
 #   1. Byte-identical      — an object compiled on a WORKER equals the one this
 #                            machine's compiler produces locally. This is the whole
@@ -339,17 +352,14 @@ command -v "$compiler" >/dev/null 2>&1 || { echo "compiler not found: '$compiler
 
 workdir="$(mktemp -d)"
 
-# No key file (#178 PR 6): every scheduler signs with its own identity key, what makes a
-# worker CHECK the signature is the `--voter-key` `start_node` hands it, and what lets a
-# worker join at all is an identity key of its own that the scheduler's cluster admitted --
-# see there.
+# No key file (#178 PR 6): every node's scheduler signs with the node's own identity key,
+# and its worker CHECKS the signature against the cluster state the node's own consensus
+# applies -- no key is typed anywhere, and nothing has to be admitted by hand.
 #
-# With both, every case below is a real client presenting a real signed grant to a real
-# worker over a real socket, checked against a roster that worker adopted from its
-# scheduler, and the grant's signature covers the endpoint that worker advertised. A
-# worker advertising an address the scheduler did not grant fails every case rather
-# than none, which is the property no in-process test can show: the unit tests mint and
-# verify inside one process.
+# So every case below is a real client presenting a real signed grant to a real worker
+# over a real socket, and the grant's signature covers the endpoint that worker
+# advertised. A worker advertising an address its scheduler did not grant fails every
+# case rather than none.
 cleanup() {
     # Every spawned process, not just the ones a happy path reaps: a `fail`
     # anywhere exits the script, and a daemon or worker left holding a port makes
@@ -520,6 +530,24 @@ started_pid=""
 # failure need not respell the tag.
 started_log=""
 
+# Every grant a worker runs is CHECKED: its own startup line says which lease check it built
+# (`MakeWorkerLeaseValidator`). A worker that fell back to the check verifying nothing would pass
+# every case below -- its compiles still run -- so the line is waited for, and its opposite asserted
+# absent. WAITED for rather than read: the worker tier is built after the scheduler that logs
+# `scheduling for the fleet`, so that marker says nothing about whether this line is out yet.
+#
+# @param 1 the node's pid
+# @param 2 tag, for the message
+# @param 3 the node's log
+assert_checks_leases() {
+    local pid="$1" tag="$2" log="$3"
+    wait_for_log "verifying lease signatures against the roster this node applies" "$pid" "$tag" "$log"
+    if grep -qF "compiling WITHOUT verifying" "$log"; then
+        cat "$log" >&2
+        fail "the ${tag} worker compiles WITHOUT verifying lease signatures"
+    fi
+}
+
 # Start one compile node, and wait for it to be SERVING.
 #
 # THE recipe this fixture inlined at ten sites (#451). What was actually repeated
@@ -540,7 +568,8 @@ started_log=""
 # rather than inherits (#380), and the bind, which is also what is advertised -- a node
 # that advertised something else would be describing an endpoint the lease signature
 # then covers and no client can reach. What makes every dispatch here a SIGNED and
-# CHECKED one (#282) is the `--voter-key` each worker is handed, below.
+# CHECKED one (#282) is that every node runs consensus: its worker checks each grant
+# against the state that consensus applies.
 #
 # Everything else is a flag the caller passes, INCLUDING the cache tier and the log
 # level. Neither gets a default here, because a default plus an override is the
@@ -572,151 +601,42 @@ started_log=""
 #          mapping from one to the other
 # @param 2 host to bind, advertise and probe
 # @param 3 port to bind, advertise and probe
-# @param 4.. every flag that differs between the nodes this fixture starts, and
-#          `scheduler-node` -- this fixture's word, never passed on -- for the node that
-#          serves the fleet's scheduler. No flag says that any more: a node's mode does,
-#          and a first start's serves one while it runs consensus, so the word is what
-#          gives this node the consensus every other node here turns off.
+# @param 4.. every flag that differs between the nodes this fixture starts. Which node
+#          serves a scheduler is no flag's business: every one does, because a first start
+#          is a cluster of one and its mode serves one while it runs consensus.
 start_node() {
     local tag="$1" host="$2" port="$3"
     shift 3
-    local log="${workdir}/${tag}.log" pid="" arg="" identity="" key="" worker="yes" voterKeyFile="" schedulerAt=""
+    local log="${workdir}/${tag}.log" pid="" arg=""
     : > "$log"
     # The stated drain is a WORKER's setting, so a node running none (`--slots=0`,
     # #206) is not handed it: it refuses a worker-only setting by name, and it has no
     # compile to drain.
     local drain=("$stated_drain")
-    # A scheduler is a consensus member even alone (#178): it signs every lease with an
-    # identity key it keeps in a state directory, and runs a cluster of one to hold the
-    # roster its workers check those signatures against. Its consensus port is bound to
-    # loopback, where nothing dials it.
-    local consensus=()
-    # Every other node runs NO consensus, and says so: consensus is on by default, so a node
-    # naming no `--listen-raft` would be a one-voter cluster of itself on the default port --
-    # and the second one this fixture starts would be refused that port.
-    local solo=(--listen-raft=)
-    # What reaches the node: every argument but this fixture's own word.
-    local forwarded=()
     for arg in ${@+"$@"}; do
-        [ "$arg" = "scheduler-node" ] || forwarded+=("$arg")
-        case "$arg" in
-            --slots=0)
-                drain=()
-                worker=""
-                ;;
-            scheduler-node)
-                # And no discovery, which is on beside consensus by default: this fixture
-                # names every peer, and a beacon on the shared port would reach every other
-                # fixture running on this machine.
-                consensus=(--listen-raft="127.0.0.1:$(free_port)" --raft-self=127.0.0.1
-                    --cluster-dir="${workdir}/${tag}.state" --discovery=)
-                solo=()
-                ;;
-            --scheduler=*)
-                voterKeyFile="${workdir}/scheduler-${arg##*:}.key"
-                schedulerAt="${arg#--scheduler=}"
-                ;;
-        esac
+        [ "$arg" = "--slots=0" ] && drain=()
     done
-    # Minted BEFORE the start, by `--print-identity` over the same state directory, and
-    # filed under the port its workers name; the start then reads the same files back
-    # rather than minting a second identity.
-    if [ -n "${consensus[*]+x}" ]; then
-        identity="$("$node" --print-identity "${consensus[@]}" 2>> "$log")" \
-            || { cat "$log" >&2; fail "${tag}: --print-identity could not mint this scheduler's identity"; }
-        key="$(sed -n 's/^public-key //p' <<< "$identity")"
-        [ -n "$key" ] || fail "${tag}: --print-identity printed no public-key line: ${identity}"
-        printf '%s\n' "$key" > "${workdir}/scheduler-${port}.key"
-    fi
-    # And every worker is told its scheduler's key, which is what puts this fixture's
-    # dispatches on the CHECKED path: a worker with no --voter-key that only this machine
-    # can reach verifies no lease at all, so without it every compile below would run
-    # through the unchecked validator and exercise none of the signature, the roster or
-    # its adoption (#282, #178). A worker naming a scheduler this fixture did not start
-    # has no file, and checks nothing.
-    local voter=()
-    if [ -n "$worker" ] && [ -n "$voterKeyFile" ] && [ -f "$voterKeyFile" ]; then
-        voter=(--voter-key="$(cat "$voterKeyFile")")
-    fi
-    # And a node that names a scheduler and runs no consensus proves its OWN identity on every
-    # connection to it (#178 PR 6): the scheduler refuses registering, announcing and
-    # heartbeating from a machine that proved nothing, loopback included. So it keeps a state
-    # directory -- the start refuses one that names a scheduler without -- and, when this
-    # fixture started that scheduler, is admitted there BEFORE it starts, or its first rounds
-    # are refused and it registers a heartbeat interval late.
+    # Every node runs consensus, a cluster of one (#178): its scheduler signs every lease
+    # with the identity key the node keeps in its state directory, and a node running a
+    # worker with its consensus closed would have no scheduler to register with and is
+    # refused at startup. Bound to loopback, where nothing dials it, under `--raft-self`
+    # so it names itself -- and with no discovery, which is on beside consensus by
+    # default and would put a beacon on the port every other fixture on this machine
+    # shares.
     #
-    # And EVERY node keeps its state in this fixture's directory, scheduler or not: a node
-    # naming no `--cluster-dir` keeps its identity in the platform's default, which for this
+    # And EVERY node keeps its state in this fixture's directory: a node naming no
+    # `--cluster-dir` keeps its identity in the platform's default, which for this
     # process is the account's own -- real state this fixture must not touch, and one
     # identity every such node would share.
-    local state=()
-    if [ -z "${consensus[*]+x}" ]; then
-        state=(--cluster-dir="${workdir}/${tag}.state")
-        if [ -n "$schedulerAt" ] && [ -f "$voterKeyFile" ]; then
-            admit_worker "$tag" "$schedulerAt" "$log" "${solo[@]}" "${state[@]}"
-        fi
-    fi
+    local consensus=(--listen-raft="127.0.0.1:$(free_port)" --raft-self=127.0.0.1 --discovery=
+        --cluster-dir="${workdir}/${tag}.state")
     "$node" ${drain[@]+"${drain[@]}"} \
         --listen-node="${host}:${port}" --advertise="${host}:${port}" \
-        ${consensus[@]+"${consensus[@]}"} ${solo[@]+"${solo[@]}"} ${voter[@]+"${voter[@]}"} \
-        ${state[@]+"${state[@]}"} ${forwarded[@]+"${forwarded[@]}"} >> "$log" 2>&1 &
+        "${consensus[@]}" ${@+"$@"} >> "$log" 2>&1 &
     pid=$!
     started_pid="$pid"
     started_log="$log"
     wait_for_node_ready "$host" "$port" "$pid" "$tag" "$log"
-    # A lease reaching a worker before it holds a roster is refused `roster-expired` and
-    # compiled locally, which every case below would report as a dispatch that never
-    # happened -- so a checking worker is not started until it holds one.
-    if [ -n "${voter[*]+x}" ]; then
-        wait_for_log "roster: adopted roster version" "$pid" "$tag" "$log"
-    fi
-}
-
-# Admit a node that runs no consensus to the cluster its scheduler leads, under the identity
-# it will prove there (#178 PR 6), and wait until the admission is APPLIED.
-#
-# What an operator runs, in the order an operator runs it: `--print-identity` mints the
-# node's id and key into its state directory and prints the `--cluster-admit-worker` line,
-# and that line goes to the scheduler. The start then reads the same files back, so the
-# identity it proves is the one admitted.
-#
-# Applied rather than accepted, because the receipt says only that the leader APPENDED the
-# entry: a worker that dialled in before it was applied is refused `node-key-unknown`, and
-# its next round is a heartbeat interval away -- longer than the roster wait in
-# `start_node`. So the wait reads the key back out of `--cluster-status`, which is the
-# leader's applied state. Retried, because a scheduler that has just started may not lead
-# its cluster of one yet, and answers `not-leader` until it does.
-#
-# @param 1 tag: whose log the attempts are appended to, and every message about it
-# @param 2 the scheduler endpoint the node names
-# @param 3 its log
-# @param 4.. its state directory flag
-admit_worker() {
-    local tag="$1" scheduler="$2" log="$3"
-    shift 3
-    local identity=""
-    identity="$("$node" --print-identity "$@" 2>> "$log")" \
-        || { cat "$log" >&2; fail "${tag}: --print-identity could not mint this node's identity"; }
-    admitting_token="$(sed -n 's/^cluster-admit-worker //p' <<< "$identity")"
-    admitting_key="$(sed -n 's/^public-key //p' <<< "$identity")"
-    [ -n "$admitting_token" ] && [ -n "$admitting_key" ] \
-        || fail "${tag}: --print-identity printed no cluster-admit-worker line and key: ${identity}"
-    admitting_scheduler="$scheduler"
-    admitting_log="$log"
-    wait_until admission_recorded "the scheduler at ${scheduler} to admit ${tag}" - "$log" 30
-    wait_until admission_applied "the scheduler at ${scheduler} to apply ${tag}'s admission" - "$log" 30
-}
-
-# One attempt to record the admission `admit_worker` stated. A predicate for `wait_until`.
-admission_recorded() {
-    "$node" --scheduler="$admitting_scheduler" --cluster-admit-worker="$admitting_token" >> "$admitting_log" 2>&1
-}
-
-# Whether the leader's applied state holds the admitted key yet. A predicate for `wait_until`.
-admission_applied() {
-    local status=""
-    status="$("$node" --scheduler="$admitting_scheduler" --cluster-status 2>> "$admitting_log")" || return 1
-    grep -Fq "key=${admitting_key}" <<< "$status"
 }
 
 # Start one `fastcached` daemon, and wait for it to be ACCEPTING.
@@ -931,39 +851,29 @@ daemon_pid="$started_pid"
 
 export FASTCACHE_ADDR="127.0.0.1:${cache_port}"
 
-# --- start the scheduler -----------------------------------------------------
-# A compile node running the fleet's scheduler. --fleet-open because every peer
-# here is loopback -- and because the policy has to be STATED: a node with no
-# member list refuses everybody, which is the right default and not a working
-# configuration, so it is refused at startup rather than discovered later as a
-# fleet that silently distributes nothing.
+# --- start the node ------------------------------------------------------------
+# One compile node. It serves the fleet's scheduler -- a first start is a cluster of
+# one, and its mode serves one -- and its own worker registers with it, so the
+# scheduler that leases this worker is the one in the same process: what every
+# zero-config machine runs. A serving node is refused `--scheduler`, so there is no
+# second process to point at it. `--fleet-open` because the policy has to be STATED:
+# the clients here are this machine and admitted either way, and the flag keeps the
+# node's scheduler answering the shape this fixture always asserted against.
 #
-# It runs no worker, deliberately (`--slots=0`, #206). A scheduler is a worker
-# too unless told otherwise, and a second MATCHING worker would make "which
-# worker ran this job" a race, which the cases below assert against by reading
-# one worker's counters. That a scheduler CAN also take work is the point of the
-# architecture; it is simply not what these cases are measuring. Running none, it
-# registers with nobody, so it names no --scheduler of its own either.
-dispatch_port="$(free_port)"
-
-start_node "scheduler" 127.0.0.1 "$dispatch_port" \
-    "$no_local_cache" \
-    scheduler-node --fleet-open \
-    --slots=0 --log-level=debug
-scheduler_pid="$started_pid"
-
-wait_for_log "scheduling for the fleet" "$scheduler_pid" "scheduler" "${workdir}/scheduler.log"
-
-# --- start a worker ----------------------------------------------------------
-
+# The node is the ONLY worker its scheduler has, so "which worker ran this job" is
+# never a race: the cases below read this one worker's counters.
 worker_port="$(free_port)"
 worker_admin_port="$(free_port)"
 start_node "worker" 127.0.0.1 "$worker_port" \
     "$no_local_cache" \
-    --scheduler="127.0.0.1:${dispatch_port}" \
+    --fleet-open \
     --admin-listen="$worker_admin_port" \
     --toolchain="${compiler}" --slots="$worker_slots" --log-level=debug
 worker_pid="$started_pid"
+dispatch_port="$worker_port"
+
+wait_for_log "scheduling for the fleet" "$worker_pid" "worker" "${workdir}/worker.log"
+assert_checks_leases "$worker_pid" "worker" "${workdir}/worker.log"
 
 # Registration is the worker's own outbound step and completes after it listens,
 # so the port being up is not enough to start dispatching against.
@@ -1121,27 +1031,19 @@ echo "   worker metrics moved: ${completed} job(s), ${millis}ms, ${bytes} bytes 
 
 # --- 3: a worker for a different toolchain is never chosen -------------------
 echo "== case 3: fingerprint isolation"
-# A second cache and a second SCHEDULER, so the mismatched worker is the ONLY
-# one registered with it. Reusing the first scheduler would leave the matching
-# worker available and the case would pass without testing anything.
-#
-# The scheduler node runs no worker (`--slots=0`, #206), for the same reason: a
-# scheduler that also served the real compiler would be a second matching worker,
-# which is exactly what this case must not have.
+# A second cache and a second NODE, so the mismatched worker is the ONLY one its
+# scheduler has: the node's own, serving a toolchain this client does not use.
+# Reusing the first node would leave the matching worker available and the case
+# would pass without testing anything.
 iso_cache_port="$(free_port)"
-iso_dispatch_port="$(free_port)"
 start_daemon "iso-daemon" 127.0.0.1 "$iso_cache_port" --log-level=info
 iso_daemon_pid="$started_pid"
 
-start_node "iso-scheduler" 127.0.0.1 "$iso_dispatch_port" \
-    "$no_local_cache" \
-    scheduler-node --fleet-open \
-    --slots=0 --log-level=debug
-
 iso_worker_port="$(free_port)"
+iso_dispatch_port="$iso_worker_port"
 start_node "iso-worker" 127.0.0.1 "$iso_worker_port" \
     "$no_local_cache" \
-    --scheduler="127.0.0.1:${iso_dispatch_port}" \
+    --fleet-open \
     --toolchain="not-the-compiler-this-client-uses=${compiler}" --slots=2 --log-level=debug
 iso_worker_pid="$started_pid"
 wait_for_registration "$iso_worker_pid" "iso-worker" "${workdir}/iso-worker.log"
@@ -1178,13 +1080,15 @@ write_source "${proj}/four.cpp" "casefour"
     run_launcher "${workdir}/case4.log" -std=c++17 -O1 -c "${proj}/four.cpp" -o "${proj}/build/four.o"
 ) || { cat "${workdir}/case4.log" >&2; fail "the build did not survive every worker being dead"; }
 
-# Either refusal is correct and which one fires is a race with heartbeat expiry:
-# the scheduler may still believe the worker is alive and lease it (the client
-# then finds it unreachable), or may already have expired it (no-worker). Both
-# end at a local compile, which is the property; asserting one of the two would
-# be asserting the timing.
-grep -qE "not dispatched \((rejected \(no-worker\)|worker .* unreachable)" "${workdir}/case4.log" \
-    || { cat "${workdir}/case4.log" >&2; fail "expected a refusal naming the unavailable worker"; }
+# The worker and the scheduler were one process, so the scheduler is gone too and
+# the client is told so by the transport: `scheduler exchange failed`, then a
+# local compile, which is the property. A scheduler that outlives its worker --
+# leasing a dead endpoint until the heartbeat lapses, then answering no-worker --
+# is the two-machine shape, asserted in process: the client's fallback on a worker
+# that does not answer is `fastcache-cc`'s Dispatch cases, and the expiry is
+# `ExpireStale`'s.
+grep -q "not dispatched (scheduler exchange failed)" "${workdir}/case4.log" \
+    || { cat "${workdir}/case4.log" >&2; fail "expected the client to report the unreachable scheduler"; }
 cmp -s "${proj}/build/four-ref.o" "${proj}/build/four.o" \
     || fail "the failover object is wrong"
 echo "   the build succeeded locally with no worker alive"
@@ -1222,22 +1126,16 @@ echo "== case 6: concurrency beyond the fleet's slot count"
 # WorkerRegistry_test against a ManualClock; what needs three processes to observe
 # is that pressure produces neither a hang nor a wrong object.
 cap_cache_port="$(free_port)"
-cap_dispatch_port="$(free_port)"
 start_daemon "cap-daemon" 127.0.0.1 "$cap_cache_port" --log-level=info
 cap_daemon_pid="$started_pid"
 
-# The scheduler node runs no worker, deliberately (`--slots=0`, #206). A scheduler
-# is a worker too unless told otherwise, and a second MATCHING worker would give
-# this fleet two slots when the whole point of the case is that it has one.
-start_node "cap-scheduler" 127.0.0.1 "$cap_dispatch_port" \
-    "$no_local_cache" \
-    scheduler-node --fleet-open \
-    --slots=0 --log-level=debug
-
+# One node, whose own worker is the fleet's only one: one slot, which is the
+# whole point of the case.
 cap_worker_port="$(free_port)"
+cap_dispatch_port="$cap_worker_port"
 start_node "cap-worker" 127.0.0.1 "$cap_worker_port" \
     "$no_local_cache" \
-    --scheduler="127.0.0.1:${cap_dispatch_port}" \
+    --fleet-open \
     --toolchain="${compiler}" --slots=1 --log-level=debug
 cap_worker_pid="$started_pid"
 wait_for_registration "$cap_worker_pid" "cap-worker" "${workdir}/cap-worker.log"
@@ -1380,8 +1278,11 @@ echo "== case 8: a worker exits on SIGTERM"
 # is why this is asserted here and not left to a developer machine.
 #
 # Its fingerprint is PINNED and unique, like every other single-purpose worker here,
-# and that is not cosmetic. This worker registers with the shared scheduler and is
-# then deliberately killed -- but the scheduler only learns a worker is gone when its
+# and that is not cosmetic. It is a node of its own now, registering with its own
+# scheduler, so its corpse is leasable by nobody -- but the reasoning below is why it
+# was pinned when it registered with the shared one, and it is kept for the day a
+# worker here joins a scheduler it does not run. A worker is deliberately
+# killed -- and a scheduler only learns a worker is gone when its
 # heartbeat lapses, which is by design: a polite goodbye would be a second path to
 # "this worker is alive", exercised on exactly the shutdowns that are already
 # harmless and never on the crash that matters (the reasoning is at the end of
@@ -1409,7 +1310,6 @@ echo "== case 8: a worker exits on SIGTERM"
 stop_port="$(free_port)"
 start_node "stop-worker" 127.0.0.1 "$stop_port" \
     --cache-memory=16m \
-    --scheduler="127.0.0.1:${dispatch_port}" \
     --toolchain="graceful-stop-only=${compiler}" --slots=1 --log-level=info
 stop_worker_pid="$started_pid"
 # The shape is asserted, not assumed: a node that built no fleet upstream holds no
@@ -1503,7 +1403,6 @@ echo "== case 10: a worker sizes itself from its node class"
 sizing_port="$(free_port)"
 start_node "sizing" 127.0.0.1 "$sizing_port" \
     "$no_local_cache" \
-    --scheduler="127.0.0.1:${dispatch_port}" \
     --toolchain="self-sizing=${compiler}" \
     --node-class=dedicated --reserve-cores=0 --log-level=debug
 sizing_pid="$started_pid"

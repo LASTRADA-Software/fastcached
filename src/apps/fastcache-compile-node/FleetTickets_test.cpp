@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Machines admitted by ticket, across a fleet: a launcher on another machine leased capacity on
-// its ticket alone, every way a ticket is refused, a worker that runs no consensus verifying one
-// against the roster its voters certified, and a forgotten machine. Driven through
+// its ticket alone, every way a ticket is refused, a learner verifying one against the state it
+// applied, and a forgotten machine. Driven through
 // `FleetHarness`, because each is decided by two machines -- the one that minted the ticket and
 // the one it was presented to -- over the production verifier and the production fold.
 //
@@ -203,50 +203,65 @@ TEST_CASE("Every ticket refusal is named on the wire and counted apart, across t
     }
 }
 
-TEST_CASE("A pure worker verifies a ticket against the roster its voters certified", "[fleet][ticket][roster]")
+TEST_CASE("A learner verifies a ticket against the state it applied", "[fleet][ticket][roster]")
 {
-    // The worker asks its own verifier over the roster its rounds adopted, so this stays GREEN
-    // with `CallerContextOf`'s ticket fold removed -- the asymmetry with the lease case above is
-    // the evidence that the fold, not the verifier, is what admits at a scheduler.
+    // A worker verifying a ticket where it compiles, against the trust root it holds. That root
+    // was a pure worker's certified roster until T24 retired the pure worker; it is now the state a
+    // LEARNER applied. The learner asks its own verifier, so this stays GREEN with
+    // `CallerContextOf`'s ticket fold removed -- the asymmetry with the lease case above is the
+    // evidence that the fold, not the verifier, is what admits at a scheduler.
+    //
+    // RED with `NodeRoster::Applied` neutered (the learner applies nothing, so the laptop is
+    // unknown to it), and with `StateLeaseRoster::Adopt` keeping no revoked key (the forgotten
+    // laptop then reads as unknown rather than revoked).
     Office office;
-    office.ProvePcRounds();
-    FleetHarness::RosterWorker worker { office.fleet, Pc, { OfficeScheduler }, { OfficeScheduler } };
-    REQUIRE(worker.Announce()); // adopts the certified roster, which admits the laptop
+    office.fleet.AdmitMachine(Pc);
+    FleetHarness::LearnerWorker learner { office.fleet, Pc, OfficeScheduler };
+    learner.Apply(); // the committed state, which admits the laptop
 
-    auto const accepted = worker.CheckTicket(office.fleet.TicketFor(Laptop, Pc));
+    auto const accepted = learner.CheckTicket(office.fleet.TicketFor(Laptop, Pc));
     REQUIRE(accepted.has_value());
     CHECK(accepted->id == Laptop);
-    auto const elsewhere = worker.CheckTicket(office.fleet.TicketFor(Laptop, OfficeScheduler, 2));
+    auto const elsewhere = learner.CheckTicket(office.fleet.TicketFor(Laptop, OfficeScheduler, 2));
     REQUIRE_FALSE(elsewhere.has_value());
     CHECK(elsewhere.error() == Distributed::TicketRefusal::WrongAudience);
 
     office.fleet.ForgetMachine(Laptop);
-    REQUIRE(worker.Announce()); // the forget reaches the worker on its next round -- no restart
-    auto const forgotten = worker.CheckTicket(office.fleet.TicketFor(Laptop, Pc, 3));
+    learner.Apply(); // the forget is applied -- no restart
+    auto const forgotten = learner.CheckTicket(office.fleet.TicketFor(Laptop, Pc, 3));
     REQUIRE_FALSE(forgotten.has_value());
     CHECK(forgotten.error() == Distributed::TicketRefusal::Revoked);
 }
 
-TEST_CASE("A worker whose roster lapsed refuses tickets as no-roster, and recovers on its next round",
-          "[fleet][ticket][roster]")
+TEST_CASE("A learner's verdict on a ticket follows the state it applied, never a roster's lapse", "[fleet][ticket][roster]")
 {
-    // RED when the verifier stops asking whether the roster it holds is still certified: the
-    // lapsed worker accepts the ticket.
+    // The pure worker's version of this case asked a roster that LAPSES: asleep past its
+    // certification, the worker refused every ticket as no-roster until a voter endorsed again. A
+    // learner's trust root is the state it applied, which carries no certificate to lapse -- what
+    // it can be is BEHIND, and a machine admitted since it last applied is one it does not know.
+    //
+    // RED with `NodeRoster::Applied` neutered (the second machine stays unknown after the apply),
+    // and with `NodeRoster::Build`'s consensus branch removed (the learner then holds a certified
+    // roster's trust, of which it has none, and refuses every ticket as no-roster).
     Office office;
-    office.ProvePcRounds();
-    FleetHarness::RosterWorker worker { office.fleet, Pc, { OfficeScheduler }, { OfficeScheduler } };
-    REQUIRE(worker.Announce());
-    REQUIRE(worker.CheckTicket(office.fleet.TicketFor(Laptop, Pc)).has_value());
+    office.fleet.AdmitMachine(Pc);
+    FleetHarness::LearnerWorker learner { office.fleet, Pc, OfficeScheduler };
+    learner.Apply();
+    REQUIRE(learner.CheckTicket(office.fleet.TicketFor(Laptop, Pc)).has_value());
 
-    // A PC asleep past its roster's certification and the slack.
+    // A second machine admitted after the learner last applied: behind, not lapsed.
+    std::string const desktop = "desktop";
+    office.fleet.AdmitMachine(desktop);
+    auto const behind = learner.CheckTicket(office.fleet.TicketFor(desktop, Pc));
+    REQUIRE_FALSE(behind.has_value());
+    CHECK(behind.error() == Distributed::TicketRefusal::UnknownMachine);
+    learner.Apply();
+    CHECK(learner.CheckTicket(office.fleet.TicketFor(desktop, Pc, 2)).has_value());
+
+    // Asleep past what a certified roster's endorsement and its slack would have allowed: the
+    // state it applied is still the state it applied.
     office.fleet.Step(Cluster::RosterEndorsementLifetime + std::chrono::hours { 1 });
-    auto const lapsed = worker.CheckTicket(office.fleet.TicketFor(Laptop, Pc, 2));
-    REQUIRE_FALSE(lapsed.has_value());
-    CHECK(lapsed.error() == Distributed::TicketRefusal::NoRoster);
-
-    office.fleet.EndorseAll(); // the voter re-endorses, as its refresh would
-    REQUIRE(worker.Announce());
-    CHECK(worker.CheckTicket(office.fleet.TicketFor(Laptop, Pc, 3)).has_value());
+    CHECK(learner.CheckTicket(office.fleet.TicketFor(Laptop, Pc, 4)).has_value());
 }
 
 TEST_CASE("A forgotten machine's ticket is refused by the scheduler from any address with no restart",

@@ -56,7 +56,11 @@ TEST_CASE("a stop requested during a long wait ends it at once, not after a slic
     else
         waiter.join();
     REQUIRE(status == std::future_status::ready);
-    CHECK(result.get() == WaitEnd::Stopped);
+    // Read once, outside the assertion: `future::get` moves the value out, and Catch2's macro names
+    // its expression twice, so the analyzer on MSVC's library sees a second `get` on a moved-from
+    // future.
+    auto const end = result.get();
+    CHECK(end == WaitEnd::Stopped);
 }
 
 TEST_CASE("a wait nobody stops lasts its interval and says so", "[core][stop]")

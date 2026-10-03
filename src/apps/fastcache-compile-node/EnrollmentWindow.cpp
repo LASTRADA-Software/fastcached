@@ -20,11 +20,8 @@ bool RosterRecordsJoiner(Cluster::Roster const& roster,
                          Ed25519PublicKey const& key,
                          Wire::EnrollRole role)
 {
-    auto const& row = EnrollRoleRowFor(role);
-    if (row.principal.has_value())
-        return std::ranges::any_of(roster.principals, [&](Cluster::ClusterPrincipal const& principal) {
-            return principal.id == nodeId && principal.publicKey == key && principal.role == *row.principal;
-        });
+    if (!ServesEnrollRole(role))
+        return false;
     return std::ranges::any_of(
         roster.members, [&](Cluster::RosterMember const& member) { return member.id == nodeId && member.publicKey == key; });
 }

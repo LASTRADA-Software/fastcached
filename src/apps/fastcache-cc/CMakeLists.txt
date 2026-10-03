@@ -19,6 +19,12 @@
 # get either wrong. It compiles to nothing on POSIX, so it costs that build a
 # translation unit and no dependency.
 #
+# Platform/ReplacingRename.cpp is the one rename a written file is moved over the one it replaces with:
+# POSIX semantics on Windows, so a reader sharing delete does not refuse it, and the classic rename only
+# where a filesystem has none -- said, never decided in silence. The node's durable writer is built on
+# it too, and two copies of it were two places for a fix to land in one and miss the other. Standard
+# library and the Win32 API only.
+#
 # Cli/Duration.cpp is the one duration grammar every time-valued setting is written in (#1402). The launcher's
 # timeout environment variables are such settings, and a second parser here would be a second answer to what `2s`
 # means. A unit table and two functions over <charconv> and <chrono>: no dependency either.
@@ -44,6 +50,7 @@ set(_fc_cc_core
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Environment.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/NarrowText.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Registry.cpp"
+    "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/ReplacingRename.cpp"
     "${CMAKE_SOURCE_DIR}/src/FastCache/Platform/Terminal.cpp")
 
 # The launcher's TCP client -- the blocking pair it dials with, and the event loop and

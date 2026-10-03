@@ -148,7 +148,7 @@ TEST_CASE("the help text sends an operator to fastcache-compile-node for what on
     auto const tail = std::string_view { help }.substr(notes);
     CHECK(tail.contains("fastcache-compile-node"));
     CHECK(tail.contains("--enroll-list"));
-    CHECK(tail.contains("--enroll-from"));
+    CHECK(tail.contains("--fleet-seed"));
     CHECK(tail.contains("--print-surfaces"));
     CHECK(tail.contains("--cluster-status"));
 }

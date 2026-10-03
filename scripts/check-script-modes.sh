@@ -21,6 +21,8 @@ set -euo pipefail
 # script's mode is upstream's decision, and a vendored copy stays byte-for-byte theirs.
 # shellcheck source=lib/third-party-roots.sh
 . "$(dirname "$0")/lib/third-party-roots.sh"
+# shellcheck source=lib/git-scrub.sh
+. "$(dirname "$0")/lib/git-scrub.sh"
 
 selfTest=0
 for arg in ${1+"$@"}; do
@@ -133,11 +135,11 @@ PlantRoots() {
 MakeRepo() {  # $1 = dir, $2 = mode for scripts/a.sh (+x or -x)
     mkdir -p "$1/scripts"
     PlantRoots "$1"
-    git -C "$1" init -q
+    scratch_git -C "$1" init -q
     printf '#!/usr/bin/env bash\ntrue\n' > "$1/scripts/a.sh"
     printf 'true\n' > "$1/scripts/lib.sh"   # sourced library: no shebang, no bit
-    git -C "$1" add -A >/dev/null 2>&1
-    git -C "$1" update-index "--chmod=$2" scripts/a.sh
+    scratch_git -C "$1" add -A >/dev/null 2>&1
+    scratch_git -C "$1" update-index "--chmod=$2" scripts/a.sh
 }
 
 Assert() {  # $1 = label, $2 = dir, $3 = expect pass|fail, $4 = expected mode, $5 = text the output must carry
@@ -164,12 +166,12 @@ MakeRepo "$tmp/bad" "-x"
 Assert "a shebanged script without the bit is refused" "$tmp/bad" fail git
 
 # Two empty lists agree perfectly, so both of these must REFUSE rather than pass.
-mkdir -p "$tmp/empty"; PlantRoots "$tmp/empty"; git -C "$tmp/empty" init -q
+mkdir -p "$tmp/empty"; PlantRoots "$tmp/empty"; scratch_git -C "$tmp/empty" init -q
 Assert "a tree with no .sh at all is refused" "$tmp/empty" fail git
 
-mkdir -p "$tmp/noshebang/scripts"; PlantRoots "$tmp/noshebang"; git -C "$tmp/noshebang" init -q
+mkdir -p "$tmp/noshebang/scripts"; PlantRoots "$tmp/noshebang"; scratch_git -C "$tmp/noshebang" init -q
 printf 'true\n' > "$tmp/noshebang/scripts/lib.sh"
-git -C "$tmp/noshebang" add -A >/dev/null 2>&1
+scratch_git -C "$tmp/noshebang" add -A >/dev/null 2>&1
 Assert "a tree whose only .sh carries no shebang is refused" "$tmp/noshebang" fail git
 
 # And the fallback is REACHED for a non-git tree. Asserted on the enumeration it
@@ -190,8 +192,8 @@ grep -q "enumerated via walk" <<< "$out" \
 MakeRepo "$tmp/vendored" "+x"
 mkdir -p "$tmp/vendored/vendor/upstream"
 printf '#!/usr/bin/env bash\ntrue\n' > "$tmp/vendored/vendor/upstream/tool.sh"
-git -C "$tmp/vendored" add vendor/upstream/tool.sh >/dev/null 2>&1
-git -C "$tmp/vendored" update-index --chmod=-x vendor/upstream/tool.sh
+scratch_git -C "$tmp/vendored" add vendor/upstream/tool.sh >/dev/null 2>&1
+scratch_git -C "$tmp/vendored" update-index --chmod=-x vendor/upstream/tool.sh
 Assert "a third-party script without the bit is declined, and named" "$tmp/vendored" pass git \
     "declined 1 third-party shell script(s) under the roots in scripts/lib/third-party-roots.txt, first vendor/upstream/tool.sh"
 

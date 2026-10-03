@@ -458,6 +458,25 @@ std::optional<std::string> CanonicalAddressLiteral(std::string_view text)
     return std::nullopt;
 }
 
+std::optional<BoundEndpoint> BoundEndpointOfDescriptor([[maybe_unused]] int descriptor)
+{
+#if defined(_WIN32)
+    // A descriptor number names no socket here, for the reason `AdoptInheritedListener` gives.
+    return std::nullopt;
+#else
+    if (descriptor < 0)
+        return std::nullopt;
+    // The address in `BoundAddressOf`'s spelling -- the one `CanonicalAddressLiteral` gives a
+    // configured literal, so the two compare -- and the port as `BoundPortOf` reads it.
+    auto const handle = ToHandle(static_cast<SocketValue>(descriptor));
+    auto bound = BoundEndpoint { .host = BoundAddressOf(handle), .port = BoundPortOf(handle) };
+    // A family with no address or no port (a UNIX socket) names no endpoint a worker could dial.
+    if (bound.host.empty() || bound.port == 0)
+        return std::nullopt;
+    return bound;
+#endif
+}
+
 std::expected<std::unique_ptr<core::net::IListener>, std::string> AdoptInheritedListener(core::net::EventLoop& loop,
                                                                                          int descriptor)
 {

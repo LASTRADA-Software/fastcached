@@ -691,7 +691,7 @@ TEST_CASE("a node that does not count this machine a member names the enrollment
     CHECK(FailedWith(refused, Outcome::Refused));
     // The enrollment that admits this machine by its key, both halves: the request made here and the
     // approval made there.
-    CHECK(NoteOf(refused).contains("--enroll-from"));
+    CHECK(NoteOf(refused).contains("asks to enroll"));
     CHECK(NoteOf(refused).contains("--enroll-approve"));
     CHECK_FALSE(NoteOf(refused).contains("--fleet-member"));
     CHECK_FALSE(NoteOf(refused).contains("token-file"));

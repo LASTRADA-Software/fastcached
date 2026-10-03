@@ -187,8 +187,8 @@ class FormationRuntime
     /// duty of a node runs at. At most one exchange per beat (`FormationController::Tick`).
     static constexpr std::chrono::seconds TickInterval = NodeAnnounceInterval;
 
-    /// The per-call ceiling of a poll or a probe the controller dials: `--enroll-from`'s, since an
-    /// `Enroll` is the same exchange whoever sends it. Each exchange holds its own round-trip bound
+    /// The per-call ceiling of a poll or a probe the controller dials: the operator's enrollment
+    /// verbs', since an `Enroll` is the same exchange whoever sends it. Each exchange holds its own round-trip bound
     /// on top (`DialledFleetProbe::ExchangeDeadline`, `Cc::ExchangeFramed`'s).
     static constexpr std::chrono::milliseconds IoTimeout = EnrollDialTimeout;
 

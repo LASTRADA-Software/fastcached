@@ -1475,7 +1475,6 @@ TEST_CASE("With every component present, the surface main composes routes each f
     REQUIRE(*cache != nullptr);
 
     auto schedulerCfg = Testing::FirstStart(NodeConfig {});
-    schedulerCfg.schedulers = { "127.0.0.1:6675" };
     schedulerCfg.nodeId = "n1";
     schedulerCfg.raftListen = "127.0.0.1:6680";
     core::platform::ManualWallClock wallClock;

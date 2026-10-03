@@ -24,11 +24,9 @@ std::expected<std::unique_ptr<NodeRoster>, NodeRefusal> NodeRoster::Build(NodeCo
         return std::unique_ptr<NodeRoster> { new NodeRoster {
             wallClock, std::make_unique<Distributed::StateLeaseRoster>(), nullptr, nullptr, metrics, logger } };
 
-    // What an earlier run adopted, when this node keeps a state directory. Read BEFORE the
-    // anchors are considered: once a roster has been adopted it is the trust root, and the
-    // anchors are never read again. The directory is the one the node keeps, typed or the
-    // default its start resolved: an enrollment writes the roster there (`EnrollClient`), and a
-    // node started with no configuration that asked only the typed flag never read it back.
+    // What an earlier run adopted, when this node keeps a state directory: the only trust root a
+    // node that runs no consensus can have, since nothing typed on its command line anchors one.
+    // The directory is the one the node keeps, typed or the default its start resolved.
     auto kept = std::optional<Cluster::PersistedRoster> {};
     auto store = std::unique_ptr<Distributed::IRosterStore> {};
     if (auto const chosen = ChosenStateDirectory(cfg); chosen.has_value())
@@ -50,7 +48,7 @@ std::expected<std::unique_ptr<NodeRoster>, NodeRefusal> NodeRoster::Build(NodeCo
         store = std::make_unique<Distributed::FileRosterStore>(path);
     }
 
-    if (!kept.has_value() && cfg.voterKeys.empty())
+    if (!kept.has_value())
     {
         // Nothing to verify a grant against. Legal only where no other machine can present one
         // -- the table refused the rest before any state directory was asked, and this is the
@@ -64,7 +62,7 @@ std::expected<std::unique_ptr<NodeRoster>, NodeRefusal> NodeRoster::Build(NodeCo
     // No cluster is ASSERTED: `--cluster-id` is gone, and the formation record is the one author
     // of this node's cluster.
     auto trust = std::make_unique<Distributed::RosterTrust>(
-        std::nullopt, cfg.voterKeys, std::move(kept), store.get(), metrics, logger);
+        std::nullopt, std::vector<Ed25519PublicKey> {}, std::move(kept), store.get(), metrics, logger);
     return std::unique_ptr<NodeRoster> { new NodeRoster {
         wallClock, nullptr, std::move(store), std::move(trust), metrics, logger } };
 }

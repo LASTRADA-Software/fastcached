@@ -16,6 +16,7 @@
 #include "AnnounceTestFixture.hpp"
 #include "EndpointDialerTestUtils.hpp"
 #include "NodeAnnounce.hpp"
+#include "NodeFormation.hpp"
 #include "NodePresenceTier.hpp"
 #include "NodeRoster.hpp"
 #include "SchedulerReachability.hpp"
@@ -52,6 +53,7 @@
 
 #include <core/Ranges.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/RaftPeerKeyFakes.hpp>
 #include <tests/ScratchPath.hpp>
@@ -461,8 +463,8 @@ TEST_CASE("A heartbeat round whose first scheduler is unreachable registers with
     // list: the first dial FAILS here, and the case asserts which endpoint then took the
     // registration, and that it was the same round rather than the next one.
     AnnounceFixture fix;
-    fix.cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
-    auto link = LinkOver(fix.cfg.schedulers);
+    fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { std::string { FirstScheduler }, std::string { SecondScheduler } });
+    auto link = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
 
     SECTION("the first is unreachable: the second is dialled and registers the worker")
     {
@@ -509,8 +511,8 @@ TEST_CASE("A NotLeader is followed to the endpoint it names, not to the next con
     // consulted for it would dial `SecondScheduler` here and register with a follower
     // that refuses every verb.
     AnnounceFixture fix;
-    fix.cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
-    auto link = LinkOver(fix.cfg.schedulers);
+    fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { std::string { FirstScheduler }, std::string { SecondScheduler } });
+    auto link = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
     Testing::ScriptedDialer dialer { { NotLeaderNaming(NamedLeader), RegisterOk("w-7") } };
 
     CHECK(AnnounceRound(fix.Round(), link, dialer) == 1);
@@ -524,8 +526,8 @@ TEST_CASE("A worker whose remembered leader stops answering falls back through t
     // #1310 acceptance 4, second half: forgetting the leader reaches the configured SET,
     // in the SAME round -- past a first entry that is itself unreachable.
     AnnounceFixture fix;
-    fix.cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
-    auto link = LinkOver(fix.cfg.schedulers);
+    fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { std::string { FirstScheduler }, std::string { SecondScheduler } });
+    auto link = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
     Testing::ScriptedDialer dialer { {
         NotLeaderNaming(NamedLeader),
         RegisterOk("w-7"), // round one: the leader takes the registration and is remembered
@@ -748,7 +750,7 @@ TEST_CASE("An hour of unreachable heartbeat rounds warns once and reminds on the
     // what it says about them is one Warn when the dials start failing, an Info reminder per cadence
     // while they go on failing, and a Warn when the scheduler answers again -- everything else Debug.
     AnnounceFixture fix;
-    auto link = LinkOver(fix.cfg.schedulers);
+    auto link = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
 
     constexpr std::size_t Rounds = 180;
     std::vector<std::vector<std::byte>> script(Rounds); // every dial fails...
@@ -777,8 +779,8 @@ TEST_CASE("Two announce loops sharing one reachability say the transition once",
     // connect differs between them -- and which `main` lends one tracker, so a machine running both
     // says a loss once. What the presence loop itself says is the case below and `NodePresenceTier_test`.
     AnnounceFixture fix;
-    auto firstLink = LinkOver(fix.cfg.schedulers);
-    auto secondLink = LinkOver(fix.cfg.schedulers);
+    auto firstLink = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
+    auto secondLink = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
     Testing::ScriptedDialer dialer { std::vector<std::vector<std::byte>>(6) };
 
     for ([[maybe_unused]] auto const _: std::views::iota(0, 3))
@@ -798,7 +800,7 @@ TEST_CASE("A registration refused round after round is one Warn and not one per 
     // `0 of 1 toolchain(s) registered` summary is Debug on every round, because the refusal it counts
     // is said on its own.
     AnnounceFixture fix;
-    auto link = LinkOver(fix.cfg.schedulers);
+    auto link = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
     auto const refused = Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "");
     Testing::ScriptedDialer dialer { { refused, refused, refused } };
 
@@ -855,8 +857,8 @@ TEST_CASE("A worker's success at a scheduler does not end the presence loop's re
     // a machine that scheduler is still refusing. The worker's dial succeeding does not end it
     // either: a dial is an earlier stage than the announcement that is being refused.
     AnnounceFixture fix;
-    auto workerLink = LinkOver(fix.cfg.schedulers);
-    auto presenceLink = LinkOver(fix.cfg.schedulers);
+    auto workerLink = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
+    auto presenceLink = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
     auto const refused = Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "");
     auto const recorded = Wire::EncodeReply(Wire::Status::Ok, std::vector<std::byte> {});
     Testing::ScriptedDialer dialer { { refused, RegisterOk("w-7"), HeartbeatOk(), refused, recorded } };
@@ -1216,8 +1218,8 @@ void RegisterThenRetireForSuspend(AnnounceFixture& fix)
 TEST_CASE("A suspend withdraws every registration in one short dial, and registers nothing", "[node][announce][host-events]")
 {
     AnnounceFixture fix;
-    fix.cfg.schedulers = { std::string { FirstScheduler }, std::string { SecondScheduler } };
-    auto link = LinkOver(fix.cfg.schedulers);
+    fix.cfg = Testing::LearnerRegisteringWith(fix.cfg, { std::string { FirstScheduler }, std::string { SecondScheduler } });
+    auto link = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
     RegisterThenRetireForSuspend(fix);
 
     SECTION("the endpoint the link names is dialled once, with the suspend's own connect bound")
@@ -1248,7 +1250,7 @@ TEST_CASE("After a suspend, the next ORDINARY round registers again, with no hos
     // The retired registrars carry no id, so the first round after waking REGISTERS rather than
     // heartbeating a dead entry.
     AnnounceFixture fix;
-    auto link = LinkOver(fix.cfg.schedulers);
+    auto link = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
     RegisterThenRetireForSuspend(fix);
     Testing::ScriptedDialer before { { HeartbeatOk() } };
     REQUIRE(WithdrawOnce(fix.Round(), link, before) == 1);
@@ -1269,7 +1271,7 @@ TEST_CASE("A suspend with nothing registered dials nobody", "[node][announce][ho
     // A worker still surveying, or one whose scheduler never accepted it, has nothing to retire;
     // a dial would spend up to a second of the machine's sleep saying nothing.
     AnnounceFixture fix;
-    auto link = LinkOver(fix.cfg.schedulers);
+    auto link = LinkOver(SchedulersOf(fix.cfg, AsConfigured));
     std::vector<Cc::WorkerRegistrar> rebuilt;
     rebuilt.push_back(Registrar("gcc-14"));
     RetireAllRegistrations(std::move(rebuilt), fix.registrars, fix.withdrawals);
@@ -1367,7 +1369,6 @@ TEST_CASE("A node its own cluster has not recorded dials nothing and says so onc
     CHECK(dialer.Dialed().empty());
     CHECK(fix.Said(LogLevel::Info, "not announcing to the fleet yet") == 1);
     CHECK(fix.Said(LogLevel::Warn, "still not announcing to the fleet") == 1);
-    CHECK(fix.Said(LogLevel::Warn, "--cluster-admit-worker") == 0);
     CHECK(fix.logger.Snapshot().size() == 2);
 
     Testing::PublishKeyRoster(fix.ownCluster, { std::string { SelfNode } });

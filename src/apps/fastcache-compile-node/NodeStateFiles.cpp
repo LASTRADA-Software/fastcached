@@ -154,7 +154,7 @@ namespace
         NodeStateFileRow { .file = StateFile::Roster,
                            .holds = "the roster this machine verifies grants against",
                            .trusting = "accept grants signed by keys somebody else chose",
-                           .remedy = "Remove it only if this machine should trust its --voter-key anchors again",
+                           .remedy = "Remove it only if this machine should verify no grant until it runs consensus again",
                            .answer = ForeignStateFileAnswer::RefuseStart },
         NodeStateFileRow { .file = StateFile::NodeHistory,
                            .holds = "this node's own history",
@@ -190,8 +190,15 @@ std::span<NodeStateFileRow const> NodeStateFiles()
 
 std::span<std::string_view const> NodeStateTemporarySuffixes()
 {
-    static constexpr auto suffixes = std::array { Consensus::ReplacementSuffix, NodeIdentityReplacementSuffix };
+    // One: every state file is replaced through the one durable writer (`Consensus::ReplaceFileAtomically`).
+    static constexpr auto suffixes = std::array { Consensus::ReplacementSuffix };
     return suffixes;
+}
+
+std::span<std::string_view const> NodeStateProbeLeftovers()
+{
+    static constexpr auto names = std::array { Consensus::ReplaceProbeFileName, Consensus::ReplaceProbeTemporaryName };
+    return names;
 }
 
 NodeStateFileRow const* NodeStateFileRowOf(std::string_view name)
@@ -270,6 +277,18 @@ std::expected<void, NodeKeyRefusal> RefuseForeignStateFiles(std::filesystem::pat
         // An entry directly in the directory is one of the node's files by its name; deeper, only
         // the archive's fixed layout is anything this build keeps.
         auto const name = entry.path().filename().string();
+        // The replace probe's leftovers, by name and only as regular files: nothing reads them, and
+        // the next probe clears them. Refusing them would turn one crash during a start into a node
+        // that never starts again until somebody deletes a file.
+        auto isFile = std::error_code {};
+        if (walk.depth() == 0 && std::ranges::contains(NodeStateProbeLeftovers(), std::string_view { name })
+            && entry.is_regular_file(isFile))
+        {
+            walk.increment(failure);
+            if (failure)
+                return unlisted(failure);
+            continue;
+        }
         auto const* row =
             walk.depth() == 0 ? NodeStateFileRowOf(name) : NestedEntryRowOf(entry.path().lexically_relative(stateDirectory));
         auto const temporary = walk.depth() == 0 && row != nullptr && name != row->Name();
@@ -310,7 +329,7 @@ std::string StateFileUnreadableHint(std::filesystem::path const& path)
 #if defined(_WIN32)
     auto isDirectory = std::error_code {};
     std::string_view const recurse = std::filesystem::is_directory(path, isDirectory) ? " /T" : "";
-    return std::format(". If an elevated command (--print-identity, --enroll-from, an install) wrote it before the "
+    return std::format(". If an elevated command (--print-identity, an install) wrote it before the "
                        "service's first start, the service's account may not be able to read it; hand it over with: "
                        "icacls \"{}\" /setowner \"NT SERVICE\\<the service's name>\"{}",
                        path.string(),
@@ -318,7 +337,7 @@ std::string StateFileUnreadableHint(std::filesystem::path const& path)
 #else
     auto isDirectory = std::error_code {};
     std::string_view const recurse = std::filesystem::is_directory(path, isDirectory) ? " -R" : "";
-    return std::format(". If a command run as another account (sudo --print-identity, --enroll-from, an install) "
+    return std::format(". If a command run as another account (sudo --print-identity, an install) "
                        "wrote it before the service's first start, the service's account may not be able to read it; "
                        "hand it over with: chown{} <the service's user> '{}'",
                        recurse,
@@ -375,10 +394,10 @@ std::expected<KeptFormation, std::string> ReadStateDirectoryFormation(std::files
     });
 }
 
-std::optional<Consensus::ReplaceRoute> ReportReplaceRoute(std::filesystem::path const& directory,
-                                                          Consensus::IReplacingRename const& rename,
-                                                          ILogger& logger,
-                                                          IMetricsSink& metrics)
+std::optional<Platform::ReplaceRoute> ReportReplaceRoute(std::filesystem::path const& directory,
+                                                         Platform::IReplacingRename const& rename,
+                                                         ILogger& logger,
+                                                         IMetricsSink& metrics)
 {
     auto const probed = Consensus::ProbeReplaceRoute(directory, rename);
     if (!probed.has_value())
@@ -389,7 +408,7 @@ std::optional<Consensus::ReplaceRoute> ReportReplaceRoute(std::filesystem::path 
                     probed.error().context);
         return std::nullopt;
     }
-    if (probed->route == Consensus::ReplaceRoute::Classic)
+    if (probed->route == Platform::ReplaceRoute::Classic)
     {
         metrics.Increment(IMetricsSink::Counter::StateFileReplacesFellBack);
         logger.Logf(LogLevel::Warn,

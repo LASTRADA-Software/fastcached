@@ -91,6 +91,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # Which files are third-party, asked of the tree being scanned (#1370).
 # shellcheck source=lib/third-party-roots.sh
 . scripts/lib/third-party-roots.sh
+# shellcheck source=lib/git-scrub.sh
+. scripts/lib/git-scrub.sh
 
 Workflow=".github/workflows/build.yml"
 
@@ -493,7 +495,7 @@ and again, three hundred lines further down:
         # nothing about what had happened, which is the failure shape this
         # repository's own testing rules refuse.
         if [[ "$useGit" == git ]]; then
-            if ! ( cd "$tree" && git init -q . && git add -A ) >/dev/null 2>&1; then
+            if ! ( cd "$tree" && scratch_git init -q . && scratch_git add -A ) >/dev/null 2>&1; then
                 Report "scan '$name' setup" "git init + git add to succeed" "they failed"
                 return 0
             fi
@@ -529,7 +531,7 @@ and again, three hundred lines further down:
         printf 'vendor/upstream\n' > "$tree/scripts/lib/third-party-roots.txt"
         printf '#   cmake --preset clang-debug -B %s\n' "$DatabaseDir" > "$tree/scripts/tidy-sweep.sh"
         printf '    cmake --preset clang-debug -B %s -DSTALE=YES\n' "$DatabaseDir" > "$tree/docs.md"
-        if [[ "$useGit" == git ]] && ! ( cd "$tree" && git init -q . && git add -A ) >/dev/null 2>&1; then
+        if [[ "$useGit" == git ]] && ! ( cd "$tree" && scratch_git init -q . && scratch_git add -A ) >/dev/null 2>&1; then
             Report "scan '$name' setup" "git init + git add to succeed" "they failed"
             return 0
         fi

@@ -100,6 +100,7 @@
 #include <FastCache/Platform/Terminal.hpp>
 #include <FastCache/Platform/WindowsEventLogger.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <algorithm>
 #include <array>
@@ -563,6 +564,24 @@ using Node::NodeReloader;
     return key.transform([](Ed25519KeyPair const& pair) { return pair.PublicKey(); });
 }
 
+/// Where a supervisor handed this body's node surface over, read off the socket.
+/// @param activated The descriptor, or nothing when this node binds its own.
+/// @return The address and port, `Node::AsConfigured` with no descriptor, or why the socket would not
+///         say -- a refusal about the socket the supervisor handed over (`HandedOverListeners`).
+[[nodiscard]] std::expected<Node::ActivatedNodeEndpoint, Node::NodeRefusal> ActivatedNodeEndpointOf(
+    std::optional<int> activated)
+{
+    if (!activated.has_value())
+        return Node::AsConfigured;
+    auto const bound = BoundEndpointOfDescriptor(*activated);
+    if (!bound.has_value())
+        return std::unexpected { Node::Refusal(
+            Node::NodeRefusalCause::HandedOverListeners,
+            "the socket a supervisor handed over will not say which address and port it listens on, so this "
+            "node cannot tell its own worker where its scheduler answers") };
+    return Node::ActivatedEndpoint { .host = bound->host, .port = bound->port };
+}
+
 /// Everything the node runs, under whichever host runs it.
 /// @param cfg The configuration the node started with.
 /// @param identityKey The machine's identity key, or nothing.
@@ -576,7 +595,8 @@ using Node::NodeReloader;
                              NodeReloader* reloader,
                              IHostEvents& hostEvents,
                              Node::FormationBody const& formation,
-                             std::optional<int> activated)
+                             std::optional<int> activated,
+                             Node::LeaseCheckInForce& leaseCheck)
 {
     // ONE origin for every uptime this process reports. `/healthz` and the `0xFC`
     // `NodeStatus` verb both answer *how long has this been serving*, and two
@@ -588,6 +608,18 @@ using Node::NodeReloader;
 
     // Socket activation was resolved before the first body, and before the toolchains
     // (`RunNodeBodies`): `activated` is this body's own copy of what the supervisor handed over.
+    //
+    // And the ADDRESS and PORT it listens on, read off that socket here, once, before any tier
+    // that registers: under activation `--listen-node` describes nothing, so a node serving its
+    // own scheduler would otherwise register its worker and its presence where it does not serve
+    // (`SchedulersOf`). Read here rather than in the tiers, which take it as a value.
+    auto const activatedNodeEndpointOrError = ActivatedNodeEndpointOf(activated);
+    if (!activatedNodeEndpointOrError.has_value())
+    {
+        logger.Logf(LogLevel::Error, "{}; refusing to start", activatedNodeEndpointOrError.error().reason);
+        return ExitCodeFor(activatedNodeEndpointOrError.error().cause);
+    }
+    auto const& activatedNodeEndpoint = *activatedNodeEndpointOrError;
 
     // The ONE derivation, shared with the startup refusal that judges it. This value
     // goes to the worker tier's lease validator and to its REGISTER, and a lease's MAC is
@@ -650,7 +682,7 @@ using Node::NodeReloader;
     // classic rename, which on Windows a reader holding the file open refuses (`ReportReplaceRoute`).
     if (auto const stateDirectory = Node::ChosenStateDirectory(cfg); stateDirectory.has_value())
     {
-        Consensus::SystemReplacingRename const replacingRename;
+        Platform::SystemReplacingRename const replacingRename;
         static_cast<void>(Node::ReportReplaceRoute(stateDirectory->path, replacingRename, logger, metrics));
     }
 
@@ -671,7 +703,7 @@ using Node::NodeReloader;
     //
     // Refusing here is where `RosterlessWorkerRefusal` is answered, since only the state
     // directory knows whether it holds a roster, and a kept roster this build cannot use -- never
-    // a quiet fall back to the `--voter-key` anchors, which may name a voter revoked since.
+    // a quiet fall back to no roster at all, which would check nothing.
     core::platform::SystemWallClock const rosterWallClock;
     auto rosterOrRefusal = Node::NodeRoster::Build(cfg, rosterWallClock, metrics, logger);
     if (!rosterOrRefusal.has_value())
@@ -823,11 +855,11 @@ using Node::NodeReloader;
     // it a node scheduling for itself proved itself to itself before its own first election and was
     // refused `node-key-unknown` with a remedy to admit it, at every such start.
     //
-    // The prover answers `own-record-awaited` on a consensus node that announces -- one naming a
-    // scheduler. One that names none announces to nobody, so the row has nothing to observe there
-    // and says so, rather than reading `clear` from a prover that is only ever asked to reach the
-    // shared cache.
-    auto const consensusAnnounces = Node::RunsConsensus(cfg) && !cfg.schedulers.empty();
+    // The prover answers `own-record-awaited` on a consensus node that announces -- one whose
+    // formation record names somewhere it registers (`AwaitsItsOwnRecord`). One that registers
+    // nowhere announces to nobody, so the row has nothing to observe there and says so, rather than
+    // reading `clear` from a prover that is only ever asked to reach the shared cache.
+    auto const consensusAnnounces = Node::AwaitsItsOwnRecord(cfg, activatedNodeEndpoint);
     std::optional<Node::NodeProofClient> prover;
     if (identityKey.has_value())
         prover.emplace(cfg.nodeId,
@@ -838,7 +870,7 @@ using Node::NodeReloader;
                        proofRandom);
     if (Node::RunsConsensus(cfg) && !(consensusAnnounces && prover.has_value()))
         conditions.NotEvaluated(Node::NodeCondition::OwnRecordAwaited,
-                                "this node names no --scheduler, so it announces itself to none");
+                                "this node registers with no scheduler, so it announces itself to none");
 
     // The fleet's shared cache, built on EVERY node: dormant until the applied cluster state names
     // this machine, when its host opens the tier on a thread of its own. Declared BEFORE the cache
@@ -912,27 +944,26 @@ using Node::NodeReloader;
     //
     // Its heartbeat dials through `workerDialer`, declared above it so it outlives the tier.
     Node::BlockingEndpointDialer workerDialer { Node::HeartbeatIoTimeout };
-    auto workerOrRefusal =
-        Node::WorkerTier::Start(Node::WorkerTierParts { .cfg = cfg,
-                                                        .reloader = reloader,
-                                                        .capacity = capacity,
-                                                        .announced = announced,
-                                                        .activation = activated.has_value() ? Node::SocketActivation::Yes
-                                                                                            : Node::SocketActivation::No,
-                                                        .membership = membership.Oracle(),
-                                                        .locality = locality,
-                                                        .io = nodeIo,
-                                                        .host = *host,
-                                                        .cacheTier = cacheTier.get(),
-                                                        .prover = AddressOrNull(prover),
-                                                        .leaseRoster = nodeRoster->Lease(),
-                                                        .metrics = metrics,
-                                                        .logger = logger,
-                                                        .conditions = conditions,
-                                                        .hostEvents = hostEvents,
-                                                        .suspendWait = DefaultDrainWait(),
-                                                        .schedulerDialer = workerDialer },
-                                &Node::MakeSystemWorkerMachine);
+    auto workerOrRefusal = Node::WorkerTier::Start(Node::WorkerTierParts { .cfg = cfg,
+                                                                           .reloader = reloader,
+                                                                           .capacity = capacity,
+                                                                           .announced = announced,
+                                                                           .activatedNodeEndpoint = activatedNodeEndpoint,
+                                                                           .membership = membership.Oracle(),
+                                                                           .locality = locality,
+                                                                           .io = nodeIo,
+                                                                           .host = *host,
+                                                                           .cacheTier = cacheTier.get(),
+                                                                           .prover = AddressOrNull(prover),
+                                                                           .leaseRoster = nodeRoster->Lease(),
+                                                                           .leaseCheck = leaseCheck,
+                                                                           .metrics = metrics,
+                                                                           .logger = logger,
+                                                                           .conditions = conditions,
+                                                                           .hostEvents = hostEvents,
+                                                                           .suspendWait = DefaultDrainWait(),
+                                                                           .schedulerDialer = workerDialer },
+                                                   &Node::MakeSystemWorkerMachine);
     if (!workerOrRefusal.has_value())
     {
         logger.Logf(LogLevel::Error, "{}; refusing to start", workerOrRefusal.error().reason);
@@ -1469,9 +1500,10 @@ using Node::NodeReloader;
     // recovery once rather than once per loop. Declared before both handles, so it outlives the
     // threads that report into it.
     core::platform::SteadyClock const reachabilityClock;
-    // The same predicate `NodePresence::Start` asks, so the scope and the loop cannot disagree about
-    // whether this node announces. Only an announcing node answers the row; `Settle` answers the rest.
-    auto const announces = Node::SchedulerLink::For(cfg.schedulers).has_value();
+    // Over the list `NodePresence::Start` builds its link from, so the scope and the loop cannot
+    // disagree about whether this node announces. Only an announcing node answers the row; `Settle`
+    // answers the rest.
+    auto const announces = Node::AnnouncesToAScheduler(cfg, activatedNodeEndpoint);
     Node::SchedulerReachability schedulerReachability { reachabilityClock, announces ? &conditions : nullptr };
 
     // Both surfaces have bound and adopted, so the loop can start accepting. Doing
@@ -1516,20 +1548,22 @@ using Node::NodeReloader;
     //
     // Its rounds dial through `presenceDialer`, declared just above it so it outlives the loop.
     Node::BlockingEndpointDialer presenceDialer { Node::PresenceIoTimeout };
-    auto const presence = Node::NodePresence::Start(Node::NodePresenceParts { .cfg = cfg,
-                                                                              .capacity = capacity,
-                                                                              .announced = announced,
-                                                                              .cacheTier = cacheTier.get(),
-                                                                              .metrics = metrics,
-                                                                              .sampler = sampler,
-                                                                              .logger = logger,
-                                                                              .conditions = conditions,
-                                                                              .roster = nodeRoster.get(),
-                                                                              .prover = AddressOrNull(prover),
-                                                                              .reachability = schedulerReachability,
-                                                                              .dialer = presenceDialer,
-                                                                              .hostEvents = hostEvents,
-                                                                              .askedJoins = Node::AskedJoinsOf(formationRuntime.get()) });
+    auto const presence =
+        Node::NodePresence::Start(Node::NodePresenceParts { .cfg = cfg,
+                                                            .activatedNodeEndpoint = activatedNodeEndpoint,
+                                                            .capacity = capacity,
+                                                            .announced = announced,
+                                                            .cacheTier = cacheTier.get(),
+                                                            .metrics = metrics,
+                                                            .sampler = sampler,
+                                                            .logger = logger,
+                                                            .conditions = conditions,
+                                                            .roster = nodeRoster.get(),
+                                                            .prover = AddressOrNull(prover),
+                                                            .reachability = schedulerReachability,
+                                                            .dialer = presenceDialer,
+                                                            .hostEvents = hostEvents,
+                                                            .askedJoins = Node::AskedJoinsOf(formationRuntime.get()) });
 
     // Installed only once the listener is up and the heartbeat is running, so a
     // stop arriving during startup cannot close a listener that does not exist yet.
@@ -1642,6 +1676,7 @@ struct ServingParts
     Node::IStoreArchiver& archiver;         ///< What finishes a left cluster's store at every reform.
     Node::ReformRequest& reform;            ///< Raised by a move; ends a body and starts the next.
     Node::FormationRuntimeParts runtime;    ///< What every body's formation acts through.
+    Node::LeaseCheckInForce& leaseCheck;    ///< Where every body's worker records the lease check it built.
 };
 
 /// Wait @p wait, returning early once a stop is asked: the pause between two reforms.
@@ -1724,7 +1759,8 @@ void PauseUnlessStopped(std::chrono::milliseconds wait)
                               reloader,
                               hostEvents,
                               Node::FormationBody { .record = record, .durables = durables, .reloader = reloader },
-                              served);
+                              served,
+                              parts.leaseCheck);
         },
         logger);
 }
@@ -1826,9 +1862,9 @@ struct EarlyVerbRow
     }
     auto const publicKey = key->pair.PublicKey();
 
-    // The id travels with the key (#178): a consensus member is admitted under it, and a worker
-    // with a `--cluster-dir` proves it on every connection to a scheduler -- and is admitted under
-    // it by `--cluster-admit-worker=<id>@<key>`, typed from these very lines.
+    // The id travels with the key (#178): a member is admitted under it -- `--enroll-approve`
+    // names both, as these very lines print them -- and proves it on every connection to a
+    // scheduler.
     auto identity = Node::ResolveNodeIdentity(Node::NodeStateDirectory(cfg), cfg.nodeId, random);
     if (!identity.has_value())
     {
@@ -1843,8 +1879,7 @@ struct EarlyVerbRow
         if (auto const dial = ConsensusDialAddressOf(cfg); dial.has_value())
             dialAddress = *dial;
 
-    std::cout << Node::DescribeIdentity(
-        cfg.nodeId, publicKey, dialAddress, RunsConsensus(cfg) ? Node::IdentityRole::Member : Node::IdentityRole::Worker);
+    std::cout << Node::DescribeIdentity(cfg.nodeId, publicKey, dialAddress);
     // And where it is kept: an unelevated run prints a PER-USER identity the service never holds.
     std::cout << Node::DescribeIdentityOrigin(cfg);
     return CommandExitCode(CommandEnding::Completed);
@@ -1891,7 +1926,7 @@ struct EarlyVerbRow
     // Judged on the MERGED configuration, and registered from the command line alone --
     // which is not a contradiction. What the service will run with is the file plus
     // these arguments, so judging the command line alone would refuse the documented
-    // setup, where `--scheduler` and the toolchains come out of the packaged file. What
+    // setup, where the toolchains come out of the packaged file. What
     // is baked in is still only what was typed, plus the `--config` path that supplies
     // the rest.
     //
@@ -2014,16 +2049,6 @@ void SayOperatorCredential(std::string_view text)
     return ReportOneShotVerb(Node::RunEnrollAdmin(context.cfg, context.cfg.enroll, operatorCredentials.Credentials()));
 }
 
-/// Ask another cluster to let this machine in (`--enroll-from`).
-/// @param context The configuration.
-/// @return What the exchange answered, rendered by `ReportOneShotVerb`.
-[[nodiscard]] int RunEnrollFrom(EarlyVerbContext const& context)
-{
-    SystemSecureRandom enrollRandom;
-    Node::FileTrustNodeKeyGuard keyGuard;
-    return ReportOneShotVerb(Node::RunEnrollClient(context.cfg, enrollRandom, keyGuard), "fastcache-compile-node: ");
-}
-
 /// The verbs that answer an operator and exit, in the order they are asked.
 ///
 /// A plain array rather than an `EnumTable`, and the reason is that nothing indexes
@@ -2034,7 +2059,7 @@ void SayOperatorCredential(std::string_view text)
 /// Each row carries the reason it sits where it does. That ordering used to be expressed
 /// by the LAYOUT of seven `if` blocks in `main` -- true, readable only by scrolling, and
 /// with nothing that made reordering them show up as a change to the thing being ordered.
-constexpr std::array<EarlyVerbRow, 9> EarlyVerbs { {
+constexpr std::array<EarlyVerbRow, 8> EarlyVerbs { {
     // **Below the logger and still above the startup table** (#582). Its refusal has to
     // reach the same terminal a start prints to, rendered the same way -- an operator
     // who meets that sentence here and again at boot should be reading one message, not
@@ -2073,16 +2098,17 @@ constexpr std::array<EarlyVerbRow, 9> EarlyVerbs { {
     // Converting the store acts on the files and exits. After the service row for the
     // same reason that one is early -- it costs microseconds to decide -- and before
     // everything below it, because a node whose store is of the wrong vintage cannot
-    // start at all: making the operator satisfy `--scheduler` or a toolchain probe first
+    // start at all: making the operator satisfy a toolchain probe first
     // would be demanding they fix a running configuration before being allowed to fix
     // the store that stops it running.
     { .applies = [](NodeConfig const& cfg) { return cfg.migrateCache; }, .run = &RunMigrateCache },
 
     // A question asked OF a running cluster, rather than a worker starting up. After the
     // service row, because an installation is about this machine and this is about
-    // somebody else's; before the `--scheduler` and `--toolchain` checks, because a
-    // cluster command needs the first and not the second.
-    { .applies = [](NodeConfig const& cfg) { return cfg.cluster.action != ClusterAction::None; }, .run = &RunClusterVerb },
+    // somebody else's; before the startup table, which refuses `--scheduler` on a node
+    // that serves: a cluster command is what that flag aims, and it needs no toolchain.
+    { .applies = [](NodeConfig const& cfg) { return Node::IsOneShotVerb(cfg, Node::OneShotVerb::Cluster); },
+      .run = &RunClusterVerb },
 
     // An operator taking THIS machine out of the fleet or putting it back (#1303). Beside
     // the cluster row because it is the same kind of thing -- a question put to a running
@@ -2094,21 +2120,8 @@ constexpr std::array<EarlyVerbRow, 9> EarlyVerbs { {
     // An operator deciding who may join, rather than a worker starting up. Beside the
     // cluster row because it is the same kind of thing -- a question put to a running
     // cluster by a person at a terminal, answered, and the process exits.
-    { .applies = [](NodeConfig const& cfg) { return cfg.enroll.action != EnrollAction::None; }, .run = &RunEnrollVerb },
-
-    // A machine asking to be LET IN to somebody else's cluster. Beside the cluster row
-    // and after it, because the two are the same kind of thing from opposite ends --
-    // that one is an operator administering a cluster they are already in, this one is a
-    // machine that is not in one yet.
-    //
-    // Before the startup table below, and that is the point rather than an accident:
-    // those rules judge a configuration this node will SERVE with, and this one serves
-    // nothing at all. A node enrolling has no --scheduler and no toolchain, and being
-    // refused for either would refuse exactly the fresh install the mode exists for.
-    // What this mode itself requires -- somewhere to write the key, and a consensus
-    // identity to be admitted AS -- it refuses by name itself, which is the shape
-    // `RunClusterAdmin` already uses for its own `--scheduler`.
-    { .applies = [](NodeConfig const& cfg) { return !cfg.enrollFrom.empty(); }, .run = &RunEnrollFrom },
+    { .applies = [](NodeConfig const& cfg) { return Node::IsOneShotVerb(cfg, Node::OneShotVerb::Enroll); },
+      .run = &RunEnrollVerb },
 } };
 
 bool SelectsOneShotVerb(NodeConfig const& cfg)
@@ -2415,8 +2428,9 @@ int main(int argc, char** argv)
     logger.Logf(LogLevel::Info, "fastcache-compile-node {} starting", VersionString);
 
     // An empty `--scheduler` and "no --toolchain and no discovery" were both refused
-    // HERE, as inline `if`s, and both are now `StartupPolicyRejection` rows -- the
-    // toolchain pair by #403, the scheduler by #386. Neither reads anything but the
+    // HERE, as inline `if`s, and both became `StartupPolicyRejection` rows -- the
+    // toolchain pair by #403, the scheduler by #386, which the formation record then
+    // retired: where a worker registers is no flag any more. Neither reads anything but the
     // parsed configuration, which is what that table is for, and a rule in this tier
     // is one that a RELOAD cannot consult and that no test can reach: this file is in
     // no test target, so the copy that ran at startup was the untested one while the
@@ -2519,15 +2533,11 @@ int main(int argc, char** argv)
     auto adopted = Node::AdoptFormation(
         cfg, *formationStore, archiver, *endpointsFile, identityRandom, core::platform::defaultSystemWallClock());
     if (!adopted.has_value())
-        return RefuseStart(startHost,
-                           logger,
-                           std::format("{}; refusing to start", adopted.error()),
-                           ExitCodeFor(StartStage::Formation));
+        return RefuseStart(
+            startHost, logger, std::format("{}; refusing to start", adopted.error()), ExitCodeFor(StartStage::Formation));
     if (auto applied = Node::ApplyFormation(cliOnly, adopted->record, adopted->remembered); !applied.has_value())
-        return RefuseStart(startHost,
-                           logger,
-                           std::format("{}; refusing to start", applied.error()),
-                           ExitCodeFor(StartStage::Formation));
+        return RefuseStart(
+            startHost, logger, std::format("{}; refusing to start", applied.error()), ExitCodeFor(StartStage::Formation));
     logger.Logf(LogLevel::Info, "{}, cluster {}", Node::DescribeFormationMode(cfg), cfg.clusterId);
 
     // Built only when there IS a file, and holding the SAME argv the startup parse
@@ -2542,6 +2552,12 @@ int main(int argc, char** argv)
     // destroyed first -- the ordering `WatchSecretExposure` requires. And the host is
     // chosen afterwards because the POSIX one redirects stdout to /dev/null inside
     // `Run()`: every startup warning has to be emitted before that.
+    //
+    // **What the running worker's lease check IS**, declared before the reloader that reads it at
+    // every reload and destroyed after it: a reload may not widen admission on a worker that built
+    // the unchecked one (`Node::ReloadCheckWith`). Recorded by the factory that builds the check,
+    // in whichever body runs, so the guard asks what was BUILT rather than a flag shape.
+    Node::LeaseCheckInForce leaseCheck;
     std::optional<NodeReloader> reloader;
     if (!lookup.path.empty())
         reloader.emplace(cfg,
@@ -2558,7 +2574,7 @@ int main(int argc, char** argv)
                                                          .formation = Node::RunningFormationOf(*adopted),
                                                          .identity = identity->value_or(Node::NodeIdentity {}),
                                                      }),
-                         &ValidateNodeReloadable);
+                         Node::ReloadCheckWith(leaseCheck));
 
     // A secret is only as private as the file holding it, and this worker has one per
     // row of `NodeSecretFileTable()` beside its configuration file, where the daemon has
@@ -2711,13 +2727,15 @@ int main(int argc, char** argv)
                                       .endpoints = *endpointsFile,
                                       .archiver = archiver,
                                       .reform = reform,
-                                      .runtime = Node::FormationRuntimeParts {
-                                          .wall = core::platform::defaultSystemWallClock(),
-                                          .random = identityRandom,
-                                          .dialer = formationDialer,
-                                          .srv = *formationSrv,
-                                          .wait = formationWait,
-                                      } };
+                                      .runtime =
+                                          Node::FormationRuntimeParts {
+                                              .wall = core::platform::defaultSystemWallClock(),
+                                              .random = identityRandom,
+                                              .dialer = formationDialer,
+                                              .srv = *formationSrv,
+                                              .wait = formationWait,
+                                          },
+                                      .leaseCheck = leaseCheck };
     return host->Run([&cfg, &identityKey, &logger, reloaderPtr, &hostEvents, &adopted, &parts] {
         return ServeNodeBodies(cfg, *identityKey, logger, reloaderPtr, hostEvents, *adopted, parts);
     });

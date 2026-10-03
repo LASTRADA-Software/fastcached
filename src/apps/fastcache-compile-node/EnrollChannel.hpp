@@ -43,7 +43,7 @@ class IEnrollChannel
 
 /// `IEnrollChannel` over a dialled connection: one connection, one request, one answer.
 ///
-/// `RunEnrollClient`'s loop body for one request, with the loop left to the caller: the dial bounded
+/// One request of a joiner's poll, with the loop left to the caller: the dial bounded
 /// by `EnrollDialTimeout`, the exchange by `Cc::ExchangeFramed`'s own round-trip bound, so one poll
 /// holds the calling thread for at most one exchange.
 ///

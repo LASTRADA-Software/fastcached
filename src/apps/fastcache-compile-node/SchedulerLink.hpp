@@ -65,14 +65,14 @@ constexpr int MaxAnnounceRedirects = 2;
 /// stick.
 ///
 /// A remembered leader that stops answering is forgotten and the configured
-/// `--scheduler` is tried again **in the same round**, rather than a heartbeat
+/// scheduler endpoint is tried again **in the same round**, rather than a heartbeat
 /// interval later: the configured endpoint is the one an operator can actually
 /// fix, and skipping a round to reach it doubles the window in which this machine
 /// is missing from the fleet.
 ///
 /// ## Several configured endpoints (#1310)
 ///
-/// `--scheduler` is a list, and the fallback walks it: a round that cannot get
+/// `SchedulersOf` is a list, and the fallback walks it: a round that cannot get
 /// through at one configured endpoint tries the next, still in the same round, until
 /// each has been tried once. The walk starts at the configured endpoint that last
 /// ACCEPTED a round, so a fleet whose first entry was retired pays that entry's
@@ -101,10 +101,17 @@ class SchedulerLink
     ///
     /// On a configuration the startup table accepts, the answer is present exactly when
     /// `RunsWorker` is true, which `NodeConfig_test` asserts.
-    /// @param configured The `--scheduler` endpoints, in the operator's order. Never
-    ///        forgotten, and what this falls back through.
+    /// @param configured The endpoints to register with, in order -- a node's formation record's
+    ///        answer (`SchedulersOf`). Never forgotten, and what this falls back through.
     /// @return The link, or nothing when @p configured is empty.
     [[nodiscard]] static std::optional<SchedulerLink> For(std::vector<std::string> configured);
+
+    /// @return The endpoints this link was built over, in order: fixed for its lifetime, so
+    ///         safe to read from any thread while a round moves `Target()`.
+    [[nodiscard]] std::vector<std::string> const& Configured() const noexcept
+    {
+        return _configured;
+    }
 
     /// Start a heartbeat round, resetting the per-round redirect budget.
     ///

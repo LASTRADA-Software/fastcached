@@ -45,7 +45,6 @@ constexpr auto Noon = std::chrono::system_clock::time_point { std::chrono::hours
 [[nodiscard]] NodeConfig Worker()
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.schedulers = { "127.0.0.1:6674" };
     cfg.clusterId = "fleet";
     // A worker that runs no consensus -- the only kind that holds a roster of its own.
     cfg.raftListen.clear();
@@ -97,10 +96,16 @@ constexpr auto Noon = std::chrono::system_clock::time_point { std::chrono::hours
     return certified;
 }
 
-/// The anchors a worker trusts before it holds a roster: every voter's key.
-[[nodiscard]] std::vector<Ed25519PublicKey> Anchors()
+/// Keep, in @p cfg's state directory, the roster version 3 that n1 and n2 certified until an hour
+/// past noon: what an earlier run of a worker that ran no consensus adopted. Nothing typed on a
+/// command line roots a roster any more, so a kept one is the only trust root such a worker has.
+/// @param cfg The worker whose state directory receives it.
+void KeepRoster(NodeConfig const& cfg)
 {
-    return { TestKeyPair("n1").PublicKey(), TestKeyPair("n2").PublicKey(), TestKeyPair("n3").PublicKey() };
+    REQUIRE(Distributed::FileRosterStore { NodeStateDirectory(cfg) / Distributed::RosterFileName }
+                .Save(Cluster::PersistedRoster { .certificate = Certified(ThreeVoters(), 3, { "n1", "n2" }),
+                                                 .certifiedUntil = Noon + 1h })
+                .has_value());
 }
 
 } // namespace
@@ -213,53 +218,38 @@ TEST_CASE("A worker no other machine can reach holds no roster and checks no gra
     CHECK_FALSE(node.Wanting());
 }
 
-TEST_CASE("A worker adopts the roster its anchors certify, keeps it, and starts from it again", "[node][roster]")
+TEST_CASE("A worker restarts from the roster it kept, lapse included, and adopts one its voters certify", "[node][roster]")
 {
     auto const scratch = Testing::ScratchDirectory { "node-roster-keep" };
     auto cfg = Worker();
-    cfg.voterKeys = Anchors();
     cfg.clusterDir = scratch.Path();
-    core::platform::ManualWallClock clock { Noon };
+    KeepRoster(cfg);
+    core::platform::ManualWallClock clock { Noon + 30min };
     AtomicMetricsSink metrics;
     NullLogger logger;
 
-    {
-        auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
-        REQUIRE(roster.has_value());
-        auto& node = *Testing::Unwrap(roster);
-        REQUIRE(node.Lease() != nullptr);
-
-        // Nothing yet: every grant would be refused, so the presence loop asks sooner.
-        CHECK(node.Wanting());
-        CHECK(node.Lease()->Read(Noon).standing == Distributed::RosterStanding::Absent);
-        CHECK_FALSE(node.HeldRoster().has_value());
-
-        node.Offered(Cluster::EncodeCertifiedRoster(Certified(ThreeVoters(), 3, { "n1", "n2" })));
-        CHECK_FALSE(node.Wanting());
-        CHECK(node.HeldRoster() == std::optional { ThreeVoters() });
-        CHECK(node.Lease()->KeysOf("n2").live == TestKeyPair("n2").PublicKey());
-        CHECK(node.ExpiresInSeconds() == std::optional<std::uint64_t> { 3600 });
-        auto const summary = node.Summary();
-        REQUIRE(summary.has_value());
-        CHECK(Testing::Unwrap(summary).version == 3);
-        CHECK(Testing::Unwrap(summary).certifiedUntil == std::optional { Noon + 1h });
-    }
-
     // A restart reads what it kept -- lapse included, which a restart must not reset.
-    clock.setNow(Noon + 30min);
     auto const again = NodeRoster::Build(cfg, clock, metrics, logger);
     REQUIRE(again.has_value());
     auto& restarted = *Testing::Unwrap(again);
     REQUIRE(restarted.Lease() != nullptr);
     CHECK(restarted.Lease()->Read(Noon + 30min).standing == Distributed::RosterStanding::Current);
     CHECK(restarted.ExpiresInSeconds() == std::optional<std::uint64_t> { 1800 });
+    CHECK(restarted.HeldRoster() == std::optional { ThreeVoters() });
+
+    // And the roster it holds certifies its successor: a majority of ITS voters endorsing the next
+    // version, for one endorsement lifetime from now, is adopted.
+    restarted.Offered(Cluster::EncodeCertifiedRoster(Certified(ThreeVoters(), 4, { "n1", "n2" }, Noon + 90min)));
+    auto const summary = restarted.Summary();
+    REQUIRE(summary.has_value());
+    CHECK(Testing::Unwrap(summary).version == 4);
+    CHECK(restarted.ExpiresInSeconds() == std::optional<std::uint64_t> { 3600 });
 }
 
-TEST_CASE("A kept roster this machine cannot use refuses the start, never falls back to the anchors", "[node][roster]")
+TEST_CASE("A kept roster this machine cannot use refuses the start, never falls back to none", "[node][roster]")
 {
     auto const scratch = Testing::ScratchDirectory { "node-roster-bad" };
     auto cfg = Worker();
-    cfg.voterKeys = Anchors();
     cfg.clusterDir = scratch.Path();
     core::platform::ManualWallClock const clock { Noon };
     AtomicMetricsSink metrics;
@@ -293,7 +283,7 @@ TEST_CASE("A kept roster this machine cannot use refuses the start, never falls 
     }
 }
 
-TEST_CASE("A worker other machines can reach refuses to start holding no roster and no anchor", "[node][roster]")
+TEST_CASE("A worker other machines can reach refuses to start holding no roster", "[node][roster]")
 {
     // Where `RosterlessWorkerRefusal` is answered, since only the state directory can: the table
     // lets this configuration through because it names a `--cluster-dir`, which might have held
@@ -310,23 +300,23 @@ TEST_CASE("A worker other machines can reach refuses to start holding no roster 
     CHECK(refused.error().reason == RosterlessWorkerRefusal);
     CHECK(refused.error().cause == NodeRefusalCause::KeptRoster);
 
-    // The control: an anchor is enough to start -- the worker then refuses grants until a
-    // roster arrives, which is a state it can leave.
-    cfg.voterKeys = Anchors();
-    CHECK(NodeRoster::Build(cfg, clock, metrics, logger).has_value());
+    // The control: the same worker running consensus starts -- its roster is the state it
+    // applies, which needs nothing kept.
+    auto clustered = cfg;
+    clustered.raftListen = "127.0.0.1:6680";
+    REQUIRE(RunsConsensus(clustered));
+    CHECK(NodeRoster::Build(clustered, clock, metrics, logger).has_value());
 }
 
 TEST_CASE("A worker started with no configuration reads the roster its enrollment kept in the default directory",
           "[node][roster]")
 {
-    // An enrolled worker names no `--voter-key` and no `--cluster-dir`: the roster its enrollment
-    // kept, in the state directory the start resolved (`EnrollClient` saves it there), is its only
-    // trust root. Asked of the typed flag alone, nothing was read, and a worker other machines
-    // can reach was refused as holding no roster at all.
+    // A worker that names no `--cluster-dir`: the roster an earlier run kept, in the state
+    // directory the start resolved, is its only trust root. Asked of the typed flag alone, nothing
+    // was read, and a worker other machines can reach was refused as holding no roster at all.
     auto const scratch = Testing::ScratchDirectory { "node-roster-default-dir" };
     auto cfg = NetworkFacingWorker();
     REQUIRE(cfg.clusterDir.empty());
-    REQUIRE(cfg.voterKeys.empty());
     cfg.stateDirectory = NodeStateDirectoryChoice { .path = scratch.Path(), .origin = StateDirectoryOrigin::PerUser };
     core::platform::ManualWallClock const clock { Noon };
     AtomicMetricsSink metrics;
@@ -337,11 +327,8 @@ TEST_CASE("A worker started with no configuration reads the roster its enrollmen
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().reason == RosterlessWorkerRefusal);
 
-    // Kept where an enrollment keeps it.
-    REQUIRE(Distributed::FileRosterStore { NodeStateDirectory(cfg) / Distributed::RosterFileName }
-                .Save(Cluster::PersistedRoster { .certificate = Certified(ThreeVoters(), 3, { "n1", "n2" }),
-                                                 .certifiedUntil = Noon + 1h })
-                .has_value());
+    // Kept where an earlier run keeps it.
+    KeepRoster(cfg);
     auto const roster = NodeRoster::Build(cfg, clock, metrics, logger);
     REQUIRE(roster.has_value());
     auto& node = *Testing::Unwrap(roster);
@@ -390,7 +377,6 @@ TEST_CASE("Whether a worker must hold a roster is its mode's row, under every mo
                                                       .roster = Cluster::EncodeRoster(ThreeVoters()),
                                                       .createdAtUnixSeconds = 0 };
         auto cfg = NodeConfig {};
-        cfg.schedulers = { "127.0.0.1:6674" };
         cfg.raftListen.clear();
         cfg.nodeListen = "0.0.0.0:6674";
         cfg.clusterDir = scratch.Path();
@@ -434,7 +420,6 @@ TEST_CASE("A network-facing worker whose directory holds no roster starts, admit
     auto cfg = NetworkFacingWorker();
     cfg.fleetOpen = false;
     cfg.clusterDir = scratch.Path();
-    REQUIRE(cfg.voterKeys.empty());
     core::platform::ManualWallClock const clock { Noon };
     AtomicMetricsSink metrics;
     NullLogger logger;
@@ -452,8 +437,10 @@ TEST_CASE("A network-facing worker whose directory holds no roster starts, admit
 
 TEST_CASE("A node carries the endorsement it last signed, and counts a roster it cannot read", "[node][roster]")
 {
+    auto const scratch = Testing::ScratchDirectory { "node-roster-endorse" };
     auto cfg = Worker();
-    cfg.voterKeys = Anchors();
+    cfg.clusterDir = scratch.Path();
+    KeepRoster(cfg);
     core::platform::ManualWallClock const clock { Noon };
     AtomicMetricsSink metrics;
     NullLogger logger;
@@ -475,9 +462,14 @@ TEST_CASE("A node carries the endorsement it last signed, and counts a roster it
     CHECK(node.Endorsement() == Cluster::EncodeEndorsement(endorsement));
 
     auto const garbage = std::vector<std::byte>(7, std::byte { 0x5A });
+    REQUIRE_FALSE(node.Wanting());
     node.Offered(garbage);
     CHECK(metrics.Read(IMetricsSink::Counter::WorkerRostersRefusedUncertified) == 1);
-    CHECK(node.Wanting());
+    // Refused, and the roster it held is still the one it holds.
+    CHECK_FALSE(node.Wanting());
+    auto const held = node.Summary();
+    REQUIRE(held.has_value());
+    CHECK(Testing::Unwrap(held).version == 3);
 
     // An empty reply is a scheduler with no roster to hand out yet: not counted.
     node.Offered({});

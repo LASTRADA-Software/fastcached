@@ -330,12 +330,6 @@ TEST_CASE("A poll under another KEY is another machine: counted, held, and never
     // the approval answers. Without it the two checks above pass under a window that answers
     // `Pending` to everybody.
     CHECK(window.Offer(Claim("joiner-a", "10.0.0.9:7100", TheKey()), "10.0.0.9") == EnrollDecision::Approved);
-
-    // A ROLE is held the same way: a worker's request under a learner's id is another claim.
-    auto worker = Claim("joiner-a", "", TheKey());
-    worker.role = Wire::EnrollRole::Worker;
-    CHECK(window.Offer(worker, "10.0.0.9") == EnrollDecision::Pending);
-    CHECK(Unwrap(window.Find("joiner-a")).role == Wire::EnrollRole::Learner);
 }
 
 TEST_CASE("The roster fingerprint a joiner was handed is recorded on its row", "[enrollment][window]")
@@ -368,43 +362,49 @@ TEST_CASE("The roster fingerprint a joiner was handed is recorded on its row", "
     CHECK(window.Summary().second == 1);
 }
 
-TEST_CASE("A roster records a joiner only under the key and the role it asked for", "[enrollment][window]")
+TEST_CASE("A roster records a joiner only as a member under the key it asked with", "[enrollment][window]")
 {
     // The one question both ends ask -- the leader before it answers `Approved`, the joiner before
     // it believes it -- so it is pinned once, here, in every direction it can be wrong.
     auto roster = Cluster::Roster {};
     roster.members.push_back(Cluster::RosterMember {
         .id = "n1", .raftEndpoint = "10.0.0.1:6680", .seat = Cluster::MemberSeat::Voter, .publicKey = KeyOf(0x01) });
-    roster.principals.push_back(
-        Cluster::ClusterPrincipal { .id = "w1", .publicKey = KeyOf(0x11), .role = Cluster::PrincipalRole::Worker });
 
     CHECK(RosterRecordsJoiner(roster, "n1", KeyOf(0x01), Wire::EnrollRole::Learner));
-    CHECK(RosterRecordsJoiner(roster, "w1", KeyOf(0x11), Wire::EnrollRole::Worker));
 
     // Another key under the same id is not this machine.
     CHECK_FALSE(RosterRecordsJoiner(roster, "n1", KeyOf(0x99), Wire::EnrollRole::Learner));
 
-    // A principal is not a member and a member is not a principal: a worker counted towards
-    // quorum is a vote nobody can collect.
-    CHECK_FALSE(RosterRecordsJoiner(roster, "w1", KeyOf(0x11), Wire::EnrollRole::Learner));
-    CHECK_FALSE(RosterRecordsJoiner(roster, "n1", KeyOf(0x01), Wire::EnrollRole::Worker));
+    // A role no row serves is admitted as nothing, whatever the roster records under its id: the
+    // wire still decodes the retired roles, and none of them is a member.
+    for (auto const role: Wire::KnownEnrollRoles)
+    {
+        INFO("role byte " << static_cast<int>(role));
+        if (!ServesEnrollRole(role))
+            CHECK_FALSE(RosterRecordsJoiner(roster, "n1", KeyOf(0x01), role));
+    }
 }
 
-TEST_CASE("Each enrollment role says whether it states an endpoint and what an approval records", "[enrollment][window]")
+TEST_CASE("The role table has one row and it seats a learner", "[enrollment][window][formation]")
 {
-    // The two roles' difference is what the responder refuses and what the approval commits,
-    // so it is pinned per row rather than inferred from a name.
-    auto const& learner = EnrollRoleRowFor(Wire::EnrollRole::Learner);
+    // A machine joins ONE way, as a learner: what the responder refuses and what an approval
+    // commits are this row, pinned rather than inferred from a name.
+    REQUIRE(EnrollRoleTable.size() == 1);
+    auto const& learner = EnrollRoleTable.front();
+    CHECK(learner.role == Wire::EnrollRole::Learner);
     CHECK(learner.name == "learner");
     CHECK_FALSE(learner.statesEndpoint);
-    CHECK_FALSE(learner.principal.has_value());
     CHECK(learner.seat == Cluster::MemberSeat::Learner);
 
-    auto const& worker = EnrollRoleRowFor(Wire::EnrollRole::Worker);
-    CHECK(worker.name == "worker");
-    CHECK_FALSE(worker.statesEndpoint);
-    CHECK(worker.principal == Cluster::PrincipalRole::Worker);
-    CHECK_FALSE(worker.seat.has_value());
+    // Every other role the wire still decodes is one this build refuses, and the learner is not.
+    auto served = 0;
+    for (auto const role: Wire::KnownEnrollRoles)
+    {
+        INFO("role byte " << static_cast<int>(role));
+        CHECK(ServesEnrollRole(role) == (role == Wire::EnrollRole::Learner));
+        served += ServesEnrollRole(role) ? 1 : 0;
+    }
+    CHECK(served == 1);
 }
 
 TEST_CASE("A second decision about a settled id is refused rather than repeated", "[enrollment][window]")

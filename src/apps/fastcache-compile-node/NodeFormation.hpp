@@ -87,7 +87,9 @@ struct NodeFormationView
 
 /// Whether @p cfg serves the enrollment surface: it runs consensus -- there is a cluster to be
 /// admitted to -- AND a scheduler tier was built, without which the responder has nothing to admit
-/// through. The second half is a runtime fact about what was BUILT, which the caller states.
+/// through. The second half is a runtime fact about what was BUILT, which the caller states. And
+/// not while its consensus is confined to this machine (`ConsensusConfinedToThisMachine`): the
+/// member it admitted would be told to dial an address that reaches only itself.
 ///
 /// One predicate for `main`'s two sites -- the surface and what `NodeStatus` reports, which must not
 /// disagree, or a window no verb can act on is reported open -- and for the formation harness, so the
@@ -96,17 +98,42 @@ struct NodeFormationView
 /// an approval hands over no key.
 /// @param cfg The configuration.
 /// @param schedulerRuns Whether this node's scheduler tier was built.
-/// @return True when both hold.
+/// @return True when all three hold.
 [[nodiscard]] bool ServesEnrollment(NodeConfig const& cfg, bool schedulerRuns) noexcept;
+
+/// Where a supervisor handed this node's `0xFC` surface over (socket activation), read off the
+/// adopted socket. Only the socket can say it: the unit chose the address AND the port, so
+/// `--listen-node` then describes neither.
+struct ActivatedEndpoint
+{
+    std::string host;      ///< The bound address: the wildcard for `ListenStream=<port>`, else the one address.
+    std::uint16_t port {}; ///< The bound port.
+};
+
+/// The handed-over endpoint, or disengaged when the node binds its own.
+using ActivatedNodeEndpoint = std::optional<ActivatedEndpoint>;
+
+/// What a caller that cannot see a handed-over socket passes, and what it means: the
+/// configuration's own answer. A startup rule is such a caller -- it judges the command line
+/// before anything is adopted, and at an install nothing ever is.
+inline constexpr std::nullopt_t AsConfigured = std::nullopt;
 
 /// Where this node's worker registers.
 ///
 /// Its own node port for a mode that serves a scheduler -- it leads its own cluster, or it is a
 /// voter whose scheduler redirects to the leader (`NotLeader`) when it does not -- the fleet's
 /// for a mode that serves none, and none for an unformed configuration.
+///
+/// **Its own node port is the one it SERVES**, dialled at the address it binds -- loopback for a
+/// wildcard bind, the address itself for one bound to a single address. Under socket activation
+/// both halves are the socket the supervisor handed over (@p activated), never `--listen-node`'s:
+/// the packaged unit listens on 6676 while the flag's default is 6674, and a worker registering
+/// there is never sent a job -- or registers with whatever else holds 6674, a `fastcached` among
+/// them -- and a unit bound to one address answers there alone, so loopback would reach nothing.
 /// @param cfg The configuration.
+/// @param activated Where a supervisor handed the node surface over, or `AsConfigured`.
 /// @return The endpoints, in the order they are tried.
-[[nodiscard]] std::vector<std::string> SchedulersOf(NodeConfig const& cfg);
+[[nodiscard]] std::vector<std::string> SchedulersOf(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated);
 
 /// The members consensus starts with.
 ///

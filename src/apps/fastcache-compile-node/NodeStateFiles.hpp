@@ -9,6 +9,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Core/StateFiles.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
+#include <FastCache/Platform/ReplacingRename.hpp>
 
 #include <cstdint>
 #include <expected>
@@ -49,10 +50,10 @@ namespace FastCache::Node
 /// @param logger Where a fallback, or a probe that could not run, is said.
 /// @param metrics Where a fallback is counted.
 /// @return The route, or nothing when the probe could not be written.
-std::optional<Consensus::ReplaceRoute> ReportReplaceRoute(std::filesystem::path const& directory,
-                                                          Consensus::IReplacingRename const& rename,
-                                                          ILogger& logger,
-                                                          IMetricsSink& metrics);
+std::optional<Platform::ReplaceRoute> ReportReplaceRoute(std::filesystem::path const& directory,
+                                                         Platform::IReplacingRename const& rename,
+                                                         ILogger& logger,
+                                                         IMetricsSink& metrics);
 
 /// What a node does with a state file another account owns.
 ///
@@ -99,13 +100,21 @@ struct NodeStateFileRow
 /// @return The row naming it, or the row of the file it is a temporary of; null for neither.
 [[nodiscard]] NodeStateFileRow const* NodeStateFileRowOf(std::string_view name);
 
+/// The files a crash during the startup replace probe (`Consensus::ProbeReplaceRoute`) can leave in
+/// the state directory: the probe and its temporary. Never read, and cleared by the next probe, so
+/// `RefuseForeignStateFiles` passes a regular file of exactly these names whoever wrote it. By NAME
+/// and nothing wider: any other unnamed entry is still refused.
+/// @return The names.
+[[nodiscard]] std::span<std::string_view const> NodeStateProbeLeftovers();
+
 /// Refuse the state directory when another account owns anything in it the node would act on.
 ///
 /// Walks every entry, at any depth, and asks @p guard who owns it. Only `Another` refuses: this
 /// node's own account and an administrative one may have written it, and an owner the platform
 /// would not name is not evidence either way -- the same standing `ResolveNodeKey` gives the key.
 /// A row whose answer is `StartWithout` is asked where it is read instead. An entry no row names,
-/// temporaries aside, is refused WHOEVER owns it (`NodeKeyFault::UnknownEntry`): the node writes
+/// temporaries and the replace probe's leftovers (`NodeStateProbeLeftovers`) aside, is refused
+/// WHOEVER owns it (`NodeKeyFault::UnknownEntry`): the node writes
 /// nothing without a row, so it cannot say what such an entry is. And a file OTHER ACCOUNTS MAY
 /// WRITE is refused as another account's is (`NodeKeyFault::OthersMayWrite`), naming the command
 /// that restricts it: whoever owns it, its contents are whoever-may-write's to choose.
@@ -120,7 +129,7 @@ struct NodeStateFileRow
 
 /// What an operator is told beside a state file, or the consensus store's directory, this node
 /// cannot open: the command that hands it to the service's account, since a command run as
-/// another account (`--print-identity`, `--enroll-from`, an install) before the service's first
+/// another account (`--print-identity`, an install) before the service's first
 /// start writes as that account -- `icacls /setowner` on Windows, where a file with a list of its
 /// own never takes the grant the directory later gives the service, and `chown` on POSIX.
 /// @param path The file, or a directory (then the command recurses).

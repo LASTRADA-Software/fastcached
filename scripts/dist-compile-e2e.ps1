@@ -112,10 +112,13 @@ if (-not $SelfTest) {
     $Fastcached = (Resolve-Path $Fastcached).Path
     $Node       = (Resolve-Path $Node).Path
 
-# Every WORKER started below runs no consensus (`--listen-raft=`) and every scheduler no
-# discovery (`--discovery=`), named since both are on by default: a worker would otherwise be
-# a cluster of itself on the default raft port, and a beacon would reach every other fixture
-# on this machine.
+# Every node started below is SOLITARY: a fleet of its own, serving the scheduler its own
+# worker registers with, so one process leases, verifies and compiles. A second node cannot
+# join a first over loopback, which is how these nodes bind -- a fleet is never offered at an
+# address only this machine reaches -- so what needs two machines is asserted in process;
+# `dist-compile-e2e.sh` names where. Each runs consensus on a loopback port of its own (`$schedRaftPort`, `$isoRaftPort`)
+# and no discovery (`--discovery=`), which is on by default and whose beacon would reach every
+# other fixture on this machine.
 #
 # Every node started below turns its own cache tier OFF. `--listen-node` defaults
 # to 0.0.0.0:6674 -- 6674 being where `fastcache-cc` looks -- which is right for the one node
@@ -332,6 +335,18 @@ function Read-LiveText([string]$path) {
     }
 }
 
+# Every grant this worker runs is CHECKED: the worker's own startup line says which lease check it
+# built (`MakeWorkerLeaseValidator`), and a worker that fell back to the one verifying nothing would
+# pass every case below -- its compiles still run. So the line is WAITED for -- the worker tier is
+# built after the scheduler that logs `scheduling for the fleet` -- and its opposite asserted absent.
+function Assert-ChecksLeases([string]$path, [string]$what) {
+    $text = Wait-ForLine $path ([regex]::Escape("verifying lease signatures against the roster this node applies")) 60 $what
+    if ($text -match [regex]::Escape("compiling WITHOUT verifying")) {
+        Write-Host $text
+        throw "$what compiles WITHOUT verifying lease signatures"
+    }
+}
+
 function Wait-ForLine([string]$path, [string]$pattern, [int]$seconds, [string]$what) {
     foreach ($attempt in 1..($seconds * 5)) {
         $text = Read-LiveText $path
@@ -340,61 +355,6 @@ function Wait-ForLine([string]$path, [string]$pattern, [int]$seconds, [string]$w
     }
     Write-Host (Read-LiveText $path)
     throw "$what never reported /$pattern/"
-}
-
-# The public key a scheduler will sign its leases with, minted into its state directory
-# before it starts (#178): `--print-identity` over the same consensus flags, whose
-# `public-key` line is what a worker's --voter-key takes. The start that follows reads
-# the same files back rather than minting a second identity.
-function Get-SchedulerKey([string]$stateDir, [int]$raftPort) {
-    $identity = & $Node --print-identity "--listen-raft=127.0.0.1:$raftPort" `
-                        "--raft-self=127.0.0.1" "--cluster-dir=$stateDir" "--discovery="
-    if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint a scheduler identity in $stateDir (exit $LASTEXITCODE)" }
-    $line = @($identity) | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
-    if (-not $line) { throw "--print-identity printed no public-key line: $identity" }
-    return $line.Substring('public-key '.Length)
-}
-
-# Admit a worker to the cluster its scheduler leads, under the identity it will prove there
-# (#178 PR 6), and wait until the leader has APPLIED the admission. The shell twin is
-# `dist-compile-e2e.sh`'s `admit_worker`, and the reasoning is the same: a worker that dials
-# in before the entry is applied is refused `node-key-unknown` and registers a heartbeat
-# interval late, and a scheduler that has just started answers `not-leader` until it leads
-# its cluster of one. What an operator runs, in the order an operator runs it: the worker's
-# `--print-identity` mints the identity into its state directory and prints the
-# `--cluster-admit-worker` line, and the start then reads the same files back.
-#
-# Bounded by a Stopwatch, which is monotonic, rather than by counting the sleeps it asked for.
-function Admit-Worker([string]$stateDir, [string]$scheduler, [string]$what) {
-    # A worker runs no consensus -- named, since consensus is on by default -- so the
-    # identity printed is a worker's, with the `--cluster-admit-worker` line.
-    $identity = @(& $Node --print-identity "--cluster-dir=$stateDir" "--listen-raft=")
-    if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint an identity for the $what in $stateDir (exit $LASTEXITCODE)" }
-    $tokenLine = $identity | Where-Object { $_ -like 'cluster-admit-worker *' } | Select-Object -First 1
-    $keyLine = $identity | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
-    if (-not $tokenLine -or -not $keyLine) {
-        throw "--print-identity printed no cluster-admit-worker line and key for the ${what}: $($identity -join ' | ')"
-    }
-    $token = $tokenLine.Substring('cluster-admit-worker '.Length)
-    $key = $keyLine.Substring('public-key '.Length)
-
-    $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    $recorded = $false
-    $last = ""
-    while ($clock.Elapsed.TotalSeconds -lt 30) {
-        if (-not $recorded) {
-            $last = (@(& $Node "--scheduler=$scheduler" "--cluster-admit-worker=$token") -join ' | ')
-            $recorded = ($LASTEXITCODE -eq 0)
-        }
-        if ($recorded) {
-            $status = (@(& $Node "--scheduler=$scheduler" --cluster-status) -join "`n")
-            if ($LASTEXITCODE -eq 0 -and $status.Contains("key=$key")) { return }
-            $last = $status
-        }
-        Start-Sleep -Milliseconds 200
-    }
-    throw ("the scheduler at $scheduler did not admit the $what within " +
-           "$([int]$clock.Elapsed.TotalSeconds) s (recorded: $recorded): $last")
 }
 
 # The readiness markers, as a TABLE (#1213).
@@ -1203,17 +1163,15 @@ try {
         $BasePort = if ($PinnedBasePort -ne 0) { $PinnedBasePort } else { Get-FreePortBlock $PortsNeeded }
         $cachePort    = $BasePort
         $dispatchPort = $BasePort + 1
-        $workerPort   = $BasePort + 2
-        # Each scheduler's consensus port (#178): a scheduler is a cluster of one, bound
-        # to loopback where nothing dials it. +6 and +7 were free since the dedicated
-        # compile port went.
+        # Each node's consensus port (#178): a node is a cluster of one, bound to loopback
+        # where nothing dials it. +6 and +7 were free since the dedicated compile port went;
+        # +2 and +5, which were the separate workers' ports, are drawn and left unused.
         $schedRaftPort = $BasePort + 6
         $isoRaftPort   = $BasePort + 7
 
-        # No key file (#178 PR 6): every scheduler signs with its own identity key, a
-        # worker CHECKS the signature when it is given that key with --voter-key, as each
-        # worker below is, and a worker JOINS only under an identity key of its own that
-        # the scheduler's cluster admitted (`Admit-Worker`). The shell twin does the same.
+        # No key file (#178 PR 6): every node's scheduler signs with the node's own identity
+        # key, and its worker CHECKS the signature against the state the node's own consensus
+        # applies. No key is typed and nothing is admitted by hand. The shell twin does the same.
 
         if (-not (Test-CompilerWorks $cc $scratch)) {
             Write-Host "skip $cc (on PATH but cannot compile here)"
@@ -1233,41 +1191,6 @@ try {
             "--storage-max-value=64M", "--log-level=info") $daemonLog
         $procs += $daemon
         Wait-ForReady Daemon $cachePort $daemon "daemon" $daemonLog
-
-        # A compile node running the fleet's scheduler. --fleet-open because every
-        # peer here is loopback -- and because the policy has to be STATED: a node
-        # with no member list refuses everybody, which is the right default and not a
-        # working configuration, so it is refused at startup.
-        #
-        # It runs no worker, deliberately (`--slots=0`, #206). A scheduler is a worker
-        # too unless told otherwise, and a second MATCHING worker would make "which
-        # worker ran this job" a race that the cases below assert against by reading
-        # one worker's counters. Running none, it registers with nobody, so it names no
-        # --scheduler of its own either.
-        # One port: since #290 stage 3 the compile verbs arrive on --listen-node
-        # beside the cache and scheduler verbs, so this node's worker half answers on
-        # $dispatchPort too and --advertise names that. The dedicated compile port it
-        # used to open, and the $BasePort + 6 it used to take, are both gone -- that
-        # offset is the scheduler's consensus port now.
-        #
-        # And it runs consensus, a cluster of one (#178): a scheduler signs every lease with
-        # an identity key kept in its state directory, and holds the roster its workers
-        # check those signatures against. Each worker is given its key with --voter-key,
-        # which is what puts this fixture's dispatches on the CHECKED path: a loopback
-        # worker told no voter checks no lease at all.
-        $schedLog = Join-Path $scratch "scheduler.log"
-        $schedState = Join-Path $scratch "scheduler.state"
-        $schedKey = Get-SchedulerKey $schedState $schedRaftPort
-        $scheduler = Start-Background $Node @(
-            $NoLocalCache,
-            "--listen-node=127.0.0.1:$dispatchPort", "--fleet-open",
-            "--listen-raft=127.0.0.1:$schedRaftPort", "--raft-self=127.0.0.1",
-            "--cluster-dir=$schedState", "--discovery=",
-            "--advertise=127.0.0.1:$dispatchPort",
-            "--slots=0",
-            "--log-level=debug") $schedLog
-        $procs += $scheduler
-        Wait-ForReady Node $dispatchPort $scheduler "scheduler" $schedLog
 
         # Asked of the launcher rather than derived here. The fingerprint is a
         # digest over the compiler's whole include tree; a fixture that recomputed
@@ -1311,20 +1234,27 @@ try {
         }
         $workerSlots = $hostCores + 1
 
+        # One compile node: it serves the fleet's scheduler -- a first start is a cluster of
+        # one, and its mode serves one -- and its own worker registers with it, so the
+        # scheduler that leases this worker is the one in the same process. A serving node
+        # is refused `--scheduler`, so there is no second process to point at it.
+        # --fleet-open because the policy has to be STATED; the clients here are this
+        # machine and admitted either way. The node is the ONLY worker its scheduler has,
+        # so "which worker ran this job" is never a race. One port: the scheduler and the
+        # compile verbs answer on --listen-node, and --advertise names it.
         $workerLog = Join-Path $scratch "worker.log"
         $workerState = Join-Path $scratch "worker.state"
-        Admit-Worker $workerState "127.0.0.1:$dispatchPort" "worker"
         $worker = Start-Background $Node @(
-            $NoLocalCache, "--voter-key=$schedKey", "--cluster-dir=$workerState", "--listen-raft=",
-            "--scheduler=127.0.0.1:$dispatchPort", "--listen-node=127.0.0.1:$workerPort",
-            "--advertise=127.0.0.1:$workerPort", "--toolchain=$ccPath", "--slots=$workerSlots",
+            $NoLocalCache, "--fleet-open",
+            "--listen-node=127.0.0.1:$dispatchPort", "--advertise=127.0.0.1:$dispatchPort",
+            "--listen-raft=127.0.0.1:$schedRaftPort", "--raft-self=127.0.0.1",
+            "--cluster-dir=$workerState", "--discovery=",
+            "--toolchain=$ccPath", "--slots=$workerSlots",
             "--log-level=debug") $workerLog
         $procs += $worker
-        Wait-ForReady Node $workerPort $worker "worker" $workerLog
-        # A lease reaching a worker before it holds a roster is refused `roster-expired`
-        # and compiled locally, which every case below would report as a dispatch that
-        # never happened -- so nothing is dispatched until it holds one.
-        Wait-ForLine $workerLog "roster: adopted roster version" 60 "worker" | Out-Null
+        Wait-ForReady Node $dispatchPort $worker "worker" $workerLog
+        Wait-ForLine $workerLog "scheduling for the fleet" 60 "worker" | Out-Null
+        Assert-ChecksLeases $workerLog "worker"
         $workerText = Wait-ForLine $workerLog "toolchain\(s\) registered" 120 "worker"
 
         # The worker computed its own fingerprint from a bare --toolchain. If it
@@ -1355,7 +1285,7 @@ try {
         $r = Invoke-Dispatching $cc $root $obj "127.0.0.1:$dispatchPort" $cachePort
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the dispatched compile failed" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
-            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$workerPort" $fingerprint
+            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$dispatchPort" $fingerprint
             Write-Host $r.stderr
             # The WORKER's log too, not just the client's. A refusal reaches the
             # client as one line naming a wire error code, and the reason it
@@ -1488,7 +1418,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $r = Invoke-Dispatching $cc $croot $cobj "127.0.0.1:$dispatchPort" $cachePort "u.c"
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the dispatched C compile failed" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
-            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$workerPort" $fingerprint
+            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$dispatchPort" $fingerprint
             Write-Host $r.stderr
             Write-Host "--- worker log ---"
             Write-Host (Read-LiveText $workerLog)
@@ -1577,12 +1507,11 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         Write-Host "   a header reached through two include chains was one note, with no '..' in any"
 
         # --- 4: a worker for another toolchain is never chosen ---------------
-        # Its own daemon and its own worker, so the mismatched worker is the ONLY
-        # one registered. Reusing the fleet above would leave a matching worker
-        # available and the case would pass without testing anything.
+        # Its own daemon and its own node, so the mismatched worker is the ONLY one its
+        # scheduler has. Reusing the node above would leave a matching worker available
+        # and the case would pass without testing anything.
         $isoCache    = $BasePort + 3
         $isoDispatch = $BasePort + 4
-        $isoWorker   = $BasePort + 5
 
         $isoDaemonLog = Join-Path $scratch "iso-daemon.log"
         $isoDaemon = Start-Background $Fastcached @(
@@ -1591,34 +1520,21 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $procs += $isoDaemon
         Wait-ForReady Daemon $isoCache $isoDaemon "isolation daemon" $isoDaemonLog
 
-        # A second SCHEDULER as well, so the mismatched worker is the only one
-        # registered with it -- and it runs no worker (`--slots=0`, #206), or it would
-        # BE a matching worker and the case would pass without testing anything.
-        $isoSchedLog = Join-Path $scratch "iso-scheduler.log"
-        $isoSchedState = Join-Path $scratch "iso-scheduler.state"
-        $isoSchedKey = Get-SchedulerKey $isoSchedState $isoRaftPort
-        $isoScheduler = Start-Background $Node @(
-            $NoLocalCache,
-            "--listen-node=127.0.0.1:$isoDispatch", "--fleet-open",
-            "--listen-raft=127.0.0.1:$isoRaftPort", "--raft-self=127.0.0.1",
-            "--cluster-dir=$isoSchedState", "--discovery=",
-            "--advertise=127.0.0.1:$isoDispatch",
-            "--slots=0", "--log-level=debug") $isoSchedLog
-        $procs += $isoScheduler
-        Wait-ForReady Node $isoDispatch $isoScheduler "isolation scheduler" $isoSchedLog
-
+        # One node, serving a toolchain this client does not use: its own worker is the
+        # only one its scheduler has.
         $isoWorkerLog = Join-Path $scratch "iso-worker.log"
         $isoWorkerState = Join-Path $scratch "iso-worker.state"
-        Admit-Worker $isoWorkerState "127.0.0.1:$isoDispatch" "isolation worker"
         $isoNode = Start-Background $Node @(
-            $NoLocalCache, "--voter-key=$isoSchedKey", "--cluster-dir=$isoWorkerState", "--listen-raft=",
-            "--scheduler=127.0.0.1:$isoDispatch", "--listen-node=127.0.0.1:$isoWorker",
-            "--advertise=127.0.0.1:$isoWorker",
+            $NoLocalCache, "--fleet-open",
+            "--listen-node=127.0.0.1:$isoDispatch", "--advertise=127.0.0.1:$isoDispatch",
+            "--listen-raft=127.0.0.1:$isoRaftPort", "--raft-self=127.0.0.1",
+            "--cluster-dir=$isoWorkerState", "--discovery=",
             "--toolchain=not-the-compiler-this-client-uses=$ccPath", "--slots=2",
             "--log-level=debug") $isoWorkerLog
         $procs += $isoNode
-        Wait-ForReady Node $isoWorker $isoNode "isolation worker" $isoWorkerLog
-        Wait-ForLine $isoWorkerLog "roster: adopted roster version" 60 "isolation worker" | Out-Null
+        Wait-ForReady Node $isoDispatch $isoNode "isolation worker" $isoWorkerLog
+        Wait-ForLine $isoWorkerLog "scheduling for the fleet" 60 "isolation worker" | Out-Null
+        Assert-ChecksLeases $isoWorkerLog "isolation worker"
         Wait-ForLine $isoWorkerLog "toolchain\(s\) registered" 120 "isolation worker" | Out-Null
 
         $isoRoot = Join-Path $scratch "iso-proj"
@@ -1675,7 +1591,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $r = Invoke-Dispatching $cc $deadRoot $deadObj "127.0.0.1:$dispatchPort" $deadCachePort
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the build did not survive an unreachable cache" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
-            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$workerPort" $fingerprint
+            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$dispatchPort" $fingerprint
             Write-Host $r.stderr
             Write-Host "--- worker log ---"
             Write-Host (Read-LiveText $workerLog)

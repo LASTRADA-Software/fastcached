@@ -39,6 +39,10 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# `fastcached_scratch_git`: the fixture's own git runs with the inherited `GIT_DIR` and its
+# kin removed, or under an exported `GIT_DIR` its `git init` writes THAT repository.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR)
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -382,7 +386,8 @@ function(fastcached_stage_and_run name target from to backlog outOutput outAppli
                 "case `${name}` needs a git repository around its tree and no git was found. Skipping "
                 "it would leave the arrangement ctest actually runs every walk case in untested")
         endif()
-        execute_process(COMMAND "${GIT_EXECUTABLE}" init -q "${nestedIn}" OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE outerStatus)
+        fastcached_scratch_git("${GIT_EXECUTABLE}" scratchGit)
+        execute_process(COMMAND ${scratchGit} init -q "${nestedIn}" OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE outerStatus)
         if(NOT outerStatus EQUAL 0)
             message(FATAL_ERROR "case `${name}` could not create the repository around its tree (init=${outerStatus})")
         endif()
@@ -394,8 +399,9 @@ function(fastcached_stage_and_run name target from to backlog outOutput outAppli
                 "case `${name}` asks for the git enumeration path and no git was found. Skipping it "
                 "would leave the mode CI actually takes untested")
         endif()
-        execute_process(COMMAND "${GIT_EXECUTABLE}" init -q "${tree}" OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE initStatus)
-        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${tree}" add -A OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE addStatus)
+        fastcached_scratch_git("${GIT_EXECUTABLE}" scratchGit)
+        execute_process(COMMAND ${scratchGit} init -q "${tree}" OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE initStatus)
+        execute_process(COMMAND ${scratchGit} -C "${tree}" add -A OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE addStatus)
         if(NOT initStatus EQUAL 0 OR NOT addStatus EQUAL 0)
             message(FATAL_ERROR
                 "case `${name}` could not stage a git index (init=${initStatus} add=${addStatus}), so it "

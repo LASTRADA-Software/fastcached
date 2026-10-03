@@ -340,10 +340,9 @@ TEST_CASE("An install whose formation record was held opens what the service wil
     // other accounts write in it, so `main` HELD the record and left the configuration unshaped --
     // and an unshaped configuration runs no consensus, so rules derived from it open the node port
     // alone. The registration secures the directory; the rules are derived after it.
-    // What the MSI registers: a worker naming its scheduler, everything else defaulted. The install
-    // judges the shaped configuration too, so the case names what an install needs to pass.
+    // What the MSI registers: a worker with everything defaulted, which names no scheduler -- a
+    // node that serves is refused one, and registers where its formation record says.
     NodeConfig unshaped;
-    unshaped.schedulers = { "build-cache.internal:6675" };
     REQUIRE_FALSE(unshaped.formation.has_value());
     ScriptedFormationReader formation;
     formation.heldUntilSecured = "the state directory lets other accounts create entries in it";
@@ -477,8 +476,13 @@ TEST_CASE("An install refused after its registration removes the registration it
     // WHAT DISTINGUISHES: above, the verdict is itself a failure, so a removal that failed cannot
     // be told apart from one that went through. A configuration the rules refuse is a DECISION, and
     // keeps that ending -- unless the removal failed, which leaves a registration nobody asked for.
-    // A worker naming no --scheduler: an install refuses it, since the service would exit at every boot.
-    NodeConfig const refusedByRules;
+    // A worker with its consensus port closed: an install refuses it (`WorkerConsensusClosed`), since
+    // its worker would have nowhere to register at every boot.
+    auto const refusedByRules = [] {
+        NodeConfig cfg;
+        cfg.raftListen.clear();
+        return cfg;
+    }();
     ScriptedFormationReader readable;
     auto const decided = std::to_array<Removal>({
         { .registeredAs = ServiceControlOutcome::Created,
@@ -516,7 +520,7 @@ TEST_CASE("An install refused after its registration removes the registration it
         CHECK(removals == removal.removals);
         CHECK(result.outcome == removal.refusalLeaves);
         CHECK(result.message.contains(removal.says));
-        CHECK(result.message.contains("--scheduler is required to install a service"));
+        CHECK(result.message.contains(WorkerWithConsensusClosedRefusal));
         // One full stop between the rule's sentence and what the install adds, never two.
         CHECK_FALSE(result.message.contains(".."));
         CHECK(firewall.rules.empty());
@@ -552,7 +556,6 @@ TEST_CASE("An install whose formation record was held is judged on the configura
     // the node runs no consensus, admits nobody, and the rule is silent: judged there, the install
     // would succeed and the start refuse.
     NodeConfig unshaped;
-    unshaped.schedulers = { "sched.corp.example:6675" };
     unshaped.nodeListen = "0.0.0.0:6674";
     unshaped.nodeListenExplicit = true;
     unshaped.advertise = "127.0.0.1:6674";
@@ -602,7 +605,6 @@ TEST_CASE("An install reads the formation record in exactly the directory its re
     Testing::ScriptedConfigPathProbe const probe { { { "ProgramData", (scratch / "programdata").string() } },
                                                    Testing::ScriptedConfigPathProbe::Privilege::Privileged };
     NodeConfig registration;
-    registration.schedulers = { "build-cache.internal:6675" };
     REQUIRE(registration.clusterDir.empty());
     auto const secured = RegisteredStateDirectory(registration, probe);
     REQUIRE(secured.has_value());

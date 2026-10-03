@@ -345,6 +345,38 @@ TEST_CASE("CanonicalAddressLiteral spells one address one way, and a name as not
     CHECK_FALSE(FastCache::CanonicalAddressLiteral("").has_value());
 }
 
+TEST_CASE("BoundEndpointOfDescriptor reads the address and port off a descriptor number as a supervisor hands one over",
+          "[net][listener][activation]")
+{
+    CHECK_FALSE(FastCache::BoundEndpointOfDescriptor(-1).has_value());
+#if defined(_WIN32)
+    // No socket activation: a number names no socket, so there is never an endpoint to read.
+    CHECK_FALSE(FastCache::BoundEndpointOfDescriptor(3).has_value());
+#else
+    // One address: the socket names it, not the wildcard.
+    auto held = BindLoopback(0);
+    REQUIRE(held.has_value());
+    auto const port = FastCache::BoundPortOf(held->handle);
+    REQUIRE(port != 0);
+    // The same socket, named the way an activation handoff names it.
+    auto const bound = FastCache::BoundEndpointOfDescriptor(static_cast<int>(held->handle));
+    REQUIRE(bound.has_value());
+    CHECK(FastCache::Testing::Unwrap(bound).host == "127.0.0.1");
+    CHECK(FastCache::Testing::Unwrap(bound).port == port);
+    FastCache::CloseNativeSocket(held->handle);
+
+    // The wildcard: a bare `ListenStream=<port>` binds every interface, and the socket says so.
+    FakeAddressResolver anywhere { std::vector { MakeV4Endpoint("0.0.0.0", 0) } };
+    auto wildcard = FastCache::BindAndListen(anywhere, "0.0.0.0", 0, /*backlog*/ 16);
+    REQUIRE(wildcard.has_value());
+    auto const any = FastCache::BoundEndpointOfDescriptor(static_cast<int>(wildcard->handle));
+    REQUIRE(any.has_value());
+    CHECK(FastCache::Testing::Unwrap(any).host == "0.0.0.0");
+    CHECK(FastCache::Testing::Unwrap(any).port == FastCache::BoundPortOf(wildcard->handle));
+    FastCache::CloseNativeSocket(wildcard->handle);
+#endif
+}
+
 TEST_CASE("An armed listener's accept wakes on its own poll, with nobody connecting", "[net][socket][listener]")
 {
     // #260's portability half. The admin accept loop wakes to re-check a shutdown flag, and the

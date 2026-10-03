@@ -104,6 +104,7 @@ target_sources(FastCache
         Platform/NetworkChangeWatcher.cpp
         Platform/PosixDaemonHost.cpp
         Platform/Registry.cpp
+        Platform/ReplacingRename.cpp
         Platform/ServiceControl.cpp
         Platform/ServiceHost.cpp
         Platform/SrvResolver.cpp

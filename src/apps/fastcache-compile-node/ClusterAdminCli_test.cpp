@@ -756,6 +756,17 @@ TEST_CASE("A cluster command asks the next --scheduler when the first cannot be 
         CHECK(dialer.Dialed() == std::vector<std::string> { "sched-a.internal:6675" });
     }
 
+    SECTION("no --scheduler at all: this machine's own node is asked")
+    {
+        // A fleet member's operator names nowhere: the verb asks this machine's own node, which
+        // answers or redirects to the leader. Asserted by WHICH endpoint was dialled.
+        NodeConfig const unnamed;
+        Testing::ScriptedDialer dialer { { answer } };
+
+        REQUIRE(RunClusterAdmin(unnamed, Ask(ClusterAction::Status), credential, dialer).has_value());
+        CHECK(dialer.Dialed() == std::vector<std::string> { std::string { DefaultAdminTarget } });
+    }
+
     SECTION("a first that connects and then fails is reported, never retried elsewhere")
     {
         // `--cluster-admit` may already have been proposed where it landed.
@@ -890,15 +901,14 @@ TEST_CASE("A status report shows each member's key, the principals and the revok
     auto keyed = Cmd(Cluster::CommandKind::AddMember, "keyed", "10.0.0.1:6680");
     keyed.publicKey = Ed25519PublicKey {};
     keyed.publicKey->fill(std::byte { 0x2B });
-    auto principal = Cmd(Cluster::CommandKind::AdmitPrincipal, "worker-1");
-    principal.publicKey = Ed25519PublicKey {};
-    principal.publicKey->fill(std::byte { 0x2C });
-    principal.role = Cluster::PrincipalRole::Worker;
+    // A principal an earlier build admitted: no verb this build sends records one, and the state
+    // may still carry it, so it is placed in the state directly.
+    auto principal = Cluster::ClusterPrincipal { .id = "worker-1", .publicKey = {} };
+    principal.publicKey.fill(std::byte { 0x2C });
     // Revoked the one way a key is: its holder was forgotten (#1555).
-    auto revoked = Cmd(Cluster::CommandKind::AdmitPrincipal, "gone");
+    auto revoked = Cmd(Cluster::CommandKind::AddLearner, "gone", "");
     revoked.publicKey = Ed25519PublicKey {};
     revoked.publicKey->fill(std::byte { 0x2D });
-    revoked.role = Cluster::PrincipalRole::Worker;
 
     SECTION("an empty roster says so")
     {
@@ -914,7 +924,7 @@ TEST_CASE("A status report shows each member's key, the principals and the revok
     {
         Cluster::ClusterState state;
         Apply(state, keyed);
-        Apply(state, principal);
+        state.principals.push_back(principal);
         Apply(state, revoked);
         Apply(state, Cmd(Cluster::CommandKind::Forget, "gone"));
         auto const rendered = InterpretClusterReply(ClusterAction::Status, Cluster::Encode(state));
@@ -922,7 +932,8 @@ TEST_CASE("A status report shows each member's key, the principals and the revok
         INFO(*rendered);
         CHECK(rendered->contains(std::format("key={}", FormatEd25519PublicKey(*keyed.publicKey))));
         CHECK(rendered->contains("principals (1):"));
-        CHECK(rendered->contains(std::format("role=worker key={}", FormatEd25519PublicKey(*principal.publicKey))));
+        CHECK(rendered->contains("principals (1):\n  worker-1 "));
+        CHECK(rendered->contains(std::format(" key={}\n", FormatEd25519PublicKey(principal.publicKey))));
         CHECK(rendered->contains("revoked keys (1):"));
         CHECK(rendered->contains(std::format("key={}", FormatEd25519PublicKey(*revoked.publicKey))));
     }
@@ -1129,16 +1140,6 @@ TEST_CASE("A cluster command that reached nobody is transient, and one the sched
         auto const refused = RunClusterAdmin(cfg, Ask(ClusterAction::Status), credential, dialer);
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().ending == CommandEnding::Declined);
-    }
-
-    SECTION("nothing to ask: refused here, before any dial")
-    {
-        NodeConfig none;
-        Testing::ScriptedDialer dialer { {} };
-        auto const refused = RunClusterAdmin(none, Ask(ClusterAction::Status), credential, dialer);
-        REQUIRE_FALSE(refused.has_value());
-        CHECK(refused.error().ending == CommandEnding::Declined);
-        CHECK(dialer.Dialed().empty());
     }
 
     // A refusal the WIRE calls retriable decided nothing about the request: the same command

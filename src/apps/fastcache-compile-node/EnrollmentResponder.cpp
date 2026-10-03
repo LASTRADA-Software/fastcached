@@ -230,6 +230,14 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
                           "an enroll request names an id, an endpoint, a role this build knows, a 32-byte "
                           "identity key and a 32-byte nonce");
 
+    // A machine joins ONE way, as a learner. A role the wire still decodes and no row names is
+    // refused here, before anything is recorded, so no later step reads a row for it.
+    if (!ServesEnrollRole(fields->role))
+        return Cc::Refuse(_metrics,
+                          { .code = Wire::ErrorCode::MalformedFrame,
+                            .counter = IMetricsSink::Counter::EnrollmentRequestsRefusedMalformed },
+                          "a machine enrolls as a learner; no other role is admitted");
+
     auto const nodeId = Wire::AsStringView(fields->nodeId);
     auto const nodeEndpoint = Wire::AsStringView(fields->nodeEndpoint);
     auto const& role = EnrollRoleRowFor(fields->role);
@@ -391,10 +399,9 @@ std::vector<std::byte> EnrollmentResponder::AnswerEnroll(std::span<std::byte con
     _window.NoteServed(nodeId, Cluster::DigestOfRoster(roster));
     _metrics.Increment(IMetricsSink::Counter::EnrollmentRostersServed);
 
-    // And the roster a majority of the voters has CERTIFIED, when there is one: an approved worker
-    // keeps it as its trust root and needs no `--voter-key`, once it has checked it against the
-    // roster above, which is the one its operator compares. Empty until the voters have endorsed
-    // one, which the worker then adopts on its first announcement instead.
+    // And the roster a majority of the voters has CERTIFIED, when there is one, because the
+    // approved reply still has the field. No joiner keeps it any more: a learner applies its
+    // fleet's state, which needs no certificate. Empty until the voters have endorsed one.
     auto const certificate =
         _scheduler.CurrentCertifiedRoster()
             .transform([](Cluster::CertifiedRoster const& certified) { return Cluster::EncodeCertifiedRoster(certified); })
@@ -523,8 +530,6 @@ Distributed::SchedulerReply EnrollmentResponder::AdmitRow(Wire::EnrollmentPendin
                                                           Distributed::CallerContext const& caller)
 {
     auto const& role = EnrollRoleRowFor(entry.role);
-    if (role.principal.has_value())
-        return _scheduler.AdmitPrincipal(caller, entry.nodeId, entry.publicKey, *role.principal);
     return _scheduler.ClusterAdmit(
         caller, entry.nodeId, entry.nodeEndpoint, FormatEd25519PublicKey(entry.publicKey), role.seat);
 }
@@ -607,9 +612,9 @@ std::vector<std::byte> EnrollmentResponder::AnswerDecision(
         // the failure is a machine the cluster records that never polled again -- visible,
         // and removable by name.
         //
-        // Through the one `SchedulerService` entry point each role has -- `ClusterAdmit` for a
-        // learner, which `--cluster-admit` reaches, and `AdmitPrincipal` for a worker: one gate,
-        // one validation, one mapping from a consensus refusal onto a wire code.
+        // Through the one `SchedulerService` entry point a learner has -- `ClusterAdmit`, which
+        // `--cluster-admit-learner` reaches: one gate, one validation, one mapping from a
+        // consensus refusal onto a wire code.
         //
         // UNDER THE KEY THE ROW HOLDS (#178), which is the key the operator was shown: the
         // first key this id asked with, never refreshed.
@@ -653,7 +658,7 @@ std::vector<std::byte> EnrollmentResponder::AnswerDecision(
     // which is the path an operator correcting a mis-approval takes. The membership change
     // was committed by the approval, so the reject stops the ROSTER being handed over (which
     // is worth having, and is why this is not refused outright) and leaves the machine in
-    // `ClusterState` -- a member counted towards quorum, or a principal holding its key.
+    // `ClusterState`, holding its key.
     // `--enroll-reject`'s own help text promised the opposite -- *"a machine refused here was
     // never a member and needs no --cluster-forget"* -- which is true only of a row that was
     // still pending; the flag's description now says so, and this is the record for the node
@@ -665,8 +670,8 @@ std::vector<std::byte> EnrollmentResponder::AnswerDecision(
     // it, and widening the wire for one advisory line would be the expensive way to say
     // this.
     //
-    // One remedy for every role, because one verb removes either (#1555): `--cluster-forget`
-    // takes the id out of whichever list records it and revokes the key it was admitted under.
+    // One remedy (#1555): `--cluster-forget` takes the id out of the cluster and revokes the key
+    // it was admitted under.
     if (decided == Wire::EnrollmentDecision::Rejected && entry->decision == Wire::EnrollmentDecision::Approved)
         _logger.Logf(LogLevel::Warn,
                      "enrollment: {} was rejected after it had already been approved, so it will not be handed the "

@@ -140,12 +140,32 @@ worktree_pointer_state() {
     # is this defect and is repairable from here, while a relative one that still
     # fails is something else -- a moved repository, a deleted admin directory --
     # and rewriting it would be guessing.
-    case "$payload" in
-        "")            echo "unreadable-other" ;;
-        # A UNC path (`\\server\share\...`, either separator) is as absolute as a drive
-        # letter; the same two-separator shape `windows_root_of` reads its share from.
-        /*|[A-Za-z]:[/\\]*|[/\\][/\\]?*) echo "absolute-gitdir" ;;
-        *)             echo "relative-broken" ;;
+    if [ -z "$payload" ]; then
+        echo "unreadable-other"
+    elif pointer_is_absolute "$payload"; then
+        echo "absolute-gitdir"
+    else
+        echo "relative-broken"
+    fi
+}
+
+# Whether a pointer's path is absolute, in EITHER dialect a git on this machine
+# writes: POSIX (`/repo/...`) or Windows (`D:/repo/...`). Windows git writes the
+# second even when Git Bash runs it -- measured: a `git worktree add` from Git Bash
+# under `/tmp/...` wrote `gitdir: C:/Users/.../Temp/...`. The classifier above and the
+# self-test's own controls ask this one predicate, so the two cannot disagree about
+# which dialects exist; the control once knew only the POSIX one, and the self-test
+# failed on every Windows host while nothing registered it there.
+#
+# @param 1 the path a pointer names, without its `gitdir: ` prefix
+# @return 0 when absolute, 1 when relative
+pointer_is_absolute() {
+    # A UNC path (`\\server\share\...`, either separator) is as absolute as a drive letter;
+    # the same two-separator shape `windows_root_of` reads its share from. A drive letter
+    # needs its separator: `C:foo` is relative to that drive's current directory.
+    case "$1" in
+        /*|[A-Za-z]:[/\\]*|[/\\][/\\]?*) return 0 ;;
+        *)                               return 1 ;;
     esac
 }
 
@@ -532,7 +552,14 @@ repair_self_test() {
     # A lane was gating with exactly that pair exported while this was written, to work
     # around the very defect this script repairs. The header above has described the
     # hazard in prose since the file was created, and a comment is not a guard.
-    unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+    #
+    # The WHOLE self-test is scrubbed, not only its writes, because the functions it judges
+    # run in this shell and read git too. The list is `scripts/lib/git-scrub-variables.txt`'s;
+    # the three names this used to unset by hand left `GIT_COMMON_DIR` and the rest inherited.
+    # shellcheck source=lib/git-scrub.sh
+    . "$(dirname "${BASH_SOURCE[0]}")/lib/git-scrub.sh" \
+        || { echo "REPAIR SELF-TEST FAILED: cannot read scripts/lib/git-scrub.sh" >&2; return 1; }
+    scrub_git_environment || return 1
 
     _rw_expect() {
         ran=$(( ran + 1 ))
@@ -681,13 +708,13 @@ repair_self_test() {
     mkdir -p "$repo" "${scratch}/trees"
     (
         cd "$repo" || exit 1
-        git init -q .
-        git config user.email t@example.invalid
-        git config user.name t
+        scratch_git init -q .
+        scratch_git config user.email t@example.invalid
+        scratch_git config user.name t
         echo hello > a.txt
-        git add a.txt
-        git commit -q -m first
-        git worktree add -q "$wt" -b lane
+        scratch_git add a.txt
+        scratch_git commit -q -m first
+        scratch_git worktree add -q "$wt" -b lane
     ) >/dev/null 2>&1
 
     if [ ! -e "${wt}/.git" ]; then
@@ -700,7 +727,9 @@ repair_self_test() {
     # A positive control on the FIXTURE: git's own default really is absolute, so
     # the rewrite below is a change rather than a no-op. If git ever started writing
     # relative pointers this whole section would be vacuous and nothing else would
-    # say so.
+    # say so. Absolute in EITHER dialect (`pointer_is_absolute`): Windows git writes
+    # `gitdir: C:/...`, and a control that knew only `gitdir: /...` failed on every
+    # Windows host, which is why this self-test was not registered there.
     # `case` at STATEMENT level, never inside `$( )`. bash 3.2 -- which macOS ships,
     # and which every default-set script must parse under -- counts parentheses
     # naively inside a command substitution, so the `)` that closes a case PATTERN is
@@ -719,29 +748,27 @@ repair_self_test() {
     # on the host.
     local wtPointer adminPointer verdict
     wtPointer="$(cat "${wt}/.git")"
-    # A drive letter is absolute too: Git for Windows writes `gitdir: C:/...`, so a
-    # POSIX-only pattern failed this control on Git Bash while git had done exactly
-    # what the control asserts.
-    case "$wtPointer" in gitdir:\ /*|gitdir:\ [A-Za-z]:[/\\]*) verdict=yes ;; *) verdict=no ;; esac
+    verdict=no
+    case "$wtPointer" in
+        gitdir:\ ?*) pointer_is_absolute "${wtPointer#gitdir: }" && verdict=yes ;;
+    esac
     _rw_expect "git wrote an ABSOLUTE pointer, which is what makes this necessary" \
         "yes" "$verdict"
 
     write_relative_pointers "$wt" "${repo}/.git/worktrees/lane"
 
     wtPointer="$(cat "${wt}/.git")"
+    verdict=no
     case "$wtPointer" in
-        gitdir:\ /*|gitdir:\ [A-Za-z]:[/\\]*) verdict=no ;;
-        gitdir:*)                        verdict=yes ;;
-        *)                               verdict=no ;;
+        gitdir:\ ?*) pointer_is_absolute "${wtPointer#gitdir: }" || verdict=yes ;;
     esac
     _rw_expect "the worktree pointer is relative afterwards" "yes" "$verdict"
 
     adminPointer="$(cat "${repo}/.git/worktrees/lane/gitdir")"
-    case "$adminPointer" in
-        /*|[A-Za-z]:[/\\]*) verdict=no ;;
-        ?*)            verdict=yes ;;
-        *)             verdict=no ;;
-    esac
+    verdict=no
+    if [ -n "$adminPointer" ] && ! pointer_is_absolute "$adminPointer"; then
+        verdict=yes
+    fi
     _rw_expect "and so is the admin pointer" "yes" "$verdict"
     _rw_expect "git still reads the worktree" \
         "yes" "$( ( cd "$wt" && git ls-files 2>/dev/null | grep -c . ) | { read -r n; [ "${n:-0}" -gt 0 ] && echo yes || echo no; } )"

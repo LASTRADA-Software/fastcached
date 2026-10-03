@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ConsensusTier.hpp"
+#include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
 #include "NodeDefaults.hpp"
 #include "NodeFormation.hpp"
@@ -9,6 +10,7 @@
 #include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Cluster/NodeMode.hpp>
 #include <FastCache/Cluster/Roster.hpp>
+#include <FastCache/Core/HostPort.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -125,7 +127,7 @@ TEST_CASE("A configuration no record shaped runs no consensus and opens no raft 
     CHECK_FALSE(ServesScheduler(cfg));
     CHECK_FALSE(ServesEnrollment(cfg, true));
     CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).empty());
-    CHECK(SchedulersOf(cfg).empty());
+    CHECK(SchedulersOf(cfg, AsConfigured).empty());
     CHECK(BootstrapMembersOf(cfg).empty());
 }
 
@@ -150,11 +152,87 @@ TEST_CASE("A pending node keeps serving exactly what it served while solitary", 
     auto const solitary = FormedBy(RecordIn(Cluster::NodeMode::Solitary));
     auto const pending = FormedBy(RecordIn(Cluster::NodeMode::Pending));
     CHECK(ServesScheduler(pending) == ServesScheduler(solitary));
-    CHECK(SchedulersOf(pending) == SchedulersOf(solitary));
-    CHECK(SchedulersOf(pending) == std::vector<std::string> { "127.0.0.1:6674" });
+    CHECK(SchedulersOf(pending, AsConfigured) == SchedulersOf(solitary, AsConfigured));
+    CHECK(SchedulersOf(pending, AsConfigured) == std::vector<std::string> { "127.0.0.1:6674" });
     CHECK(BootstrapMembersOf(pending).size() == 1);
     CHECK(Unwrap(pending.formation).clusterId == Unwrap(solitary.formation).clusterId);
     CHECK(pending.clusterId == "own-c");
+}
+
+TEST_CASE("A node serving its own scheduler registers at the port it serves, a handed-over one included",
+          "[node][formation][mode][activation]")
+{
+    // The packaged unit hands the node surface over on 6676 while `--listen-node` defaults to 6674,
+    // so registering at the configuration's port sent the node's own worker to a port it does not
+    // serve -- or to whatever else holds 6674 -- and it was never sent a job.
+    auto const solitary = FormedBy(RecordIn(Cluster::NodeMode::Solitary));
+    REQUIRE(ServesScheduler(solitary));
+    // A bare `ListenStream=6676` binds every interface, so it is dialled at loopback -- in either
+    // family's spelling of the wildcard.
+    CHECK(SchedulersOf(solitary, ActivatedEndpoint { .host = "0.0.0.0", .port = 6676 })
+          == std::vector<std::string> { "127.0.0.1:6676" });
+    CHECK(SchedulersOf(solitary, ActivatedEndpoint { .host = "::", .port = 6676 })
+          == std::vector<std::string> { "127.0.0.1:6676" });
+    // A unit bound to ONE address (`ListenStream=10.0.0.5:6676`) answers there alone, so that is
+    // where it is dialled; loopback would reach nothing.
+    CHECK(SchedulersOf(solitary, ActivatedEndpoint { .host = "10.0.0.5", .port = 6676 })
+          == std::vector<std::string> { "10.0.0.5:6676" });
+
+    // Bound by the node itself, it is the port the surface binds -- the one `--print-surfaces`
+    // prints, from the same row, so the map and the registration cannot disagree.
+    CHECK(SchedulersOf(solitary, AsConfigured) == std::vector<std::string> { "127.0.0.1:6674" });
+    auto bound = solitary;
+    bound.nodeListen = "127.0.0.1:6690";
+    CHECK(SchedulersOf(bound, AsConfigured) == std::vector<std::string> { "127.0.0.1:6690" });
+    CHECK(RenderSurfaces(bound).contains("127.0.0.1:6690"));
+
+    // Dialled at the address it binds: a node bound to one address answers there alone, so
+    // loopback would reach nothing, and a wildcard bind answers on loopback.
+    bound.nodeListen = "10.0.0.5:6690";
+    CHECK(SchedulersOf(bound, AsConfigured) == std::vector<std::string> { "10.0.0.5:6690" });
+    bound.nodeListen = "0.0.0.0:6690";
+    CHECK(SchedulersOf(bound, AsConfigured) == std::vector<std::string> { "127.0.0.1:6690" });
+
+    // A learner registers with its fleet, whatever socket it was handed.
+    auto const remembered = Cluster::FleetEndpoints {
+        .clusterId = "fleet-c",
+        .voters = { { .id = "office", .raftEndpoint = "office:6680", .nodeEndpoint = "office:6674" } }
+    };
+    auto const learner = FormedBy(RecordIn(Cluster::NodeMode::Learner), remembered);
+    CHECK(SchedulersOf(learner, ActivatedEndpoint { .host = "0.0.0.0", .port = 6676 })
+          == std::vector<std::string> { "office:6674" });
+}
+
+TEST_CASE("A node bound to its LAN address reads its own scheduler as this machine and a fleet's as remote",
+          "[node][formation][mode]")
+{
+    // Its own scheduler is dialled at the one address it binds (`SchedulersOf`), which is not
+    // loopback -- so a test of "names only this machine" alone called it remote. It is this
+    // machine's own address, decided through `SameHost` against what this node binds and states.
+    auto bound = FormedBy(RecordIn(Cluster::NodeMode::Solitary));
+    bound.nodeListen = "10.0.0.5:6690";
+    ApplyHostNames(bound, NodeHostNames { .fqdn = "this-pc.corp.example", .dnsSuffix = "corp.example", .withheld = {} });
+    REQUIRE(SchedulersOf(bound, AsConfigured) == std::vector<std::string> { "10.0.0.5:6690" });
+    CHECK_FALSE(SchedulerIsRemote(bound));
+
+    // A typed --advertise names this machine too: a scheduler there is its own.
+    auto advertised = FormedBy(RecordIn(Cluster::NodeMode::Learner));
+    advertised.advertise = "build-7.corp.example:6674";
+    REQUIRE(advertised.formation.has_value());
+    if (advertised.formation.has_value())
+        advertised.formation->fleetSchedulers = { "build-7.corp.example:6674" };
+    REQUIRE_FALSE(ServesScheduler(advertised));
+    CHECK_FALSE(SchedulerIsRemote(advertised));
+
+    // The control: a learner bound to the same LAN address registers with its fleet's scheduler on
+    // another machine, and that one IS remote.
+    auto learner = FormedBy(RecordIn(Cluster::NodeMode::Learner));
+    learner.nodeListen = "10.0.0.5:6690";
+    REQUIRE(learner.formation.has_value());
+    if (learner.formation.has_value())
+        learner.formation->fleetSchedulers = { "10.0.0.9:6674" };
+    REQUIRE(SchedulersOf(learner, AsConfigured) == std::vector<std::string> { "10.0.0.9:6674" });
+    CHECK(SchedulerIsRemote(learner));
 }
 
 TEST_CASE("A learner starts from the approved roster and registers with the fleet's leader first", "[node][formation][mode]")
@@ -168,7 +246,7 @@ TEST_CASE("A learner starts from the approved roster and registers with the flee
     CHECK_FALSE(Unwrap(cfg.formation).foundedHere);
     // The lease signature's cluster field follows the record.
     CHECK(cfg.clusterId == "fleet-c");
-    CHECK(SchedulersOf(cfg) == std::vector<std::string> { "office:6674" });
+    CHECK(SchedulersOf(cfg, AsConfigured) == std::vector<std::string> { "office:6674" });
     auto const members = BootstrapMembersOf(cfg);
     // Never itself: its own seat is the leader's to replicate.
     CHECK(std::ranges::none_of(members, [&](auto const& m) { return m.id == cfg.nodeId; }));
@@ -183,7 +261,7 @@ TEST_CASE("Remembered endpoints of another fleet are not registered with", "[nod
         Cluster::FleetEndpoints { .clusterId = "old-fleet",
                                   .voters = { { .id = "gone", .raftEndpoint = "gone:6680", .nodeEndpoint = "gone:6674" } } };
     auto const cfg = FormedBy(RecordIn(Cluster::NodeMode::Learner), stale);
-    CHECK(SchedulersOf(cfg).empty());
+    CHECK(SchedulersOf(cfg, AsConfigured).empty());
 }
 
 TEST_CASE("A founder voter bootstraps itself and a promoted voter does not", "[node][formation][mode]")
@@ -226,13 +304,13 @@ TEST_CASE("A record whose roster does not decode refuses rather than forming an 
     CHECK_FALSE(cfg.formation.has_value());
 }
 
-TEST_CASE("A machine whose name reaches only itself stands down or is refused under every mode",
+TEST_CASE("A machine whose name reaches only itself is confined to loopback or refused under every mode",
           "[node][formation][mode][defaults]")
 {
     // Walked over the mode TABLE, so a mode added tomorrow is judged here with no edit. The
     // expectation is read off the same two columns the rule reads: a mode that opens the port
-    // stands consensus down on a name nobody else can dial, a learner dials out and needs no
-    // name, and a mode other machines dial is refused by name rather than standing down.
+    // binds it to loopback on a name nobody else can dial -- a fleet of its own -- a learner dials
+    // out and needs no name, and a mode other machines dial is refused by name.
     //
     // **The EXACT outcome, never "not that refusal"**: every other refusal also satisfies a
     // negative, and one did -- a learner was refused for naming no dial address, on every
@@ -244,8 +322,12 @@ TEST_CASE("A machine whose name reaches only itself stands down or is refused un
         cfg.slots = 0;
         ApplyHostNames(cfg, Withheld());
 
-        CHECK(RunsConsensus(cfg) == !ModeOpensRaftPort(mode.mode));
-        CHECK(RowFor(NodeSurface::Raft).Resolve(cfg).empty());
+        CHECK(RunsConsensus(cfg));
+        CHECK(ConsensusConfinedToThisMachine(cfg) == ModeOpensRaftPort(mode.mode));
+        auto const raft = RowFor(NodeSurface::Raft).Resolve(cfg);
+        CHECK(raft.empty() == !ModeOpensRaftPort(mode.mode));
+        for (auto const& endpoint: raft)
+            CHECK(endpoint.host == ThisMachineLoopbackHost);
         auto const expected = ModeServesConsensusToPeers(mode.mode)
                                   ? std::optional { std::string { ConsensusNameReachesOnlyThisMachineRefusal } }
                                   : std::optional<std::string> {};
@@ -317,7 +399,6 @@ TEST_CASE("A worker on a machine whose name reaches only itself registers at loo
     // scheduler on ANOTHER machine is the case the refusal is for, and it still refuses.
     auto worker = FormedBy(RecordIn(Cluster::NodeMode::Solitary));
     REQUIRE(ServesScheduler(worker));
-    worker.schedulers = SchedulersOf(worker);
     worker.toolchains = { "/usr/bin/g++" };
     ApplyHostNames(worker, Withheld());
 
@@ -330,16 +411,89 @@ TEST_CASE("A worker on a machine whose name reaches only itself registers at loo
         REQUIRE(detail.has_value());
         CHECK(Unwrap(detail).contains("loopback"));
     }
+    // A learner registers with its fleet's scheduler, which its record names.
+    auto const learnerOf = [](NodeConfig cfg, std::vector<std::string> fleet) {
+        cfg.formation->mode = Cluster::NodeMode::Learner;
+        cfg.formation->foundedHere = false;
+        cfg.formation->fleetSchedulers = std::move(fleet);
+        REQUIRE_FALSE(ServesScheduler(cfg));
+        return cfg;
+    };
     SECTION("a scheduler on another machine")
     {
-        worker.schedulers = { "sched.corp.example:6675" };
+        worker = learnerOf(worker, { "sched.corp.example:6675" });
         CHECK(AdvertisedEndpoint(worker).empty());
         CHECK(StartupPolicyRejection(worker) == std::optional { std::string { WorkerNameReachesOnlyThisMachineRefusal } });
     }
     SECTION("any one of several schedulers on another machine")
     {
-        worker.schedulers = { "127.0.0.1:6674", "sched.corp.example:6675" };
+        worker = learnerOf(worker, { "127.0.0.1:6674", "sched.corp.example:6675" });
         CHECK(StartupPolicyRejection(worker) == std::optional { std::string { WorkerNameReachesOnlyThisMachineRefusal } });
+    }
+}
+
+TEST_CASE(
+    "A machine whose name reaches only itself runs a fleet of its own with consensus and scheduler and worker on loopback",
+    "[node][formation][mode][defaults]")
+{
+    // Neither standing down nor refused: a node needs no peer to be a fleet of one, so its consensus
+    // binds loopback, its scheduler signs grants, and its own worker registers there and checks them
+    // against the state it applies. What it cannot do is become more than one machine -- discovery,
+    // enrollment and a FLEET-SUMMARY are all closed -- and the condition says so, with the remedy.
+    //
+    // The PENDING row is the review's path (I-2): a node that asked a fleet to take it, restarting on a
+    // name that reaches only itself. It must not register at the leader it asked holding no roster; it
+    // stays its own cluster, serving its own scheduler, and its worker registers there.
+    auto pending = RecordIn(Cluster::NodeMode::Pending);
+    pending.joining =
+        Cluster::JoinTarget { .summary = CompileCacheWire::FleetSummary { .clusterId = "fleet-c",
+                                                                          .leaderNodeEndpoint = "office.corp.example:6674" },
+                              .provenKey = Testing::TestKeyPair("office").PublicKey(),
+                              .askedAtUnixSeconds = 90 };
+    for (auto const& record: { RecordIn(Cluster::NodeMode::Solitary), pending })
+    {
+        INFO(Cluster::NodeModeRowFor(record.mode).name);
+        auto cfg = FormedBy(record);
+        cfg.toolchains = { "/usr/bin/g++" };
+        ApplyHostNames(cfg, Withheld());
+
+        INFO("refusal: " << StartupPolicyRejection(cfg).value_or("<none>"));
+        CHECK(StartupPolicyRejection(cfg) == std::optional<std::string> {});
+        CHECK(ConsensusConfinedToThisMachine(cfg));
+        CHECK(RunsConsensus(cfg));
+        CHECK(ServesScheduler(cfg));
+        CHECK(SchedulersOf(cfg, AsConfigured) == std::vector<std::string> { "127.0.0.1:6674" });
+        CHECK(AdvertisedEndpoint(cfg) == "127.0.0.1:6674");
+        CHECK_FALSE(SchedulerIsRemote(cfg));
+        auto const dial = ConsensusDialAddressOf(cfg);
+        REQUIRE(dial.has_value());
+        CHECK(HostOfEndpoint(Unwrap(dial)) == ThisMachineLoopbackHost);
+        CHECK(RowFor(NodeSurface::Discovery).Resolve(cfg).empty());
+        CHECK_FALSE(ServesEnrollment(cfg, true));
+
+        auto const detail = NameReachesOnlyThisMachineInUse(cfg);
+        REQUIRE(detail.has_value());
+        CHECK(Unwrap(detail).contains("can neither form nor join a fleet"));
+        NodeConditions conditions;
+        EvaluateHostNameCondition(conditions, cfg);
+        CHECK(conditions.StateOf(NodeCondition::HostNameReachesOnlyThisMachine) == CompileCacheWire::ConditionState::Raised);
+
+        // The control: the same record on a machine whose name peers dial changes nothing it did
+        // before -- consensus at that name, discovery and enrollment open, no condition.
+        auto named = FormedBy(record);
+        named.toolchains = { "/usr/bin/g++" };
+        ApplyHostNames(named, NodeHostNames { .fqdn = "this-pc.corp.example", .dnsSuffix = "corp.example", .withheld = {} });
+        CHECK(StartupPolicyRejection(named) == std::optional<std::string> {});
+        CHECK_FALSE(ConsensusConfinedToThisMachine(named));
+        CHECK(RunsConsensus(named));
+        CHECK(ServesScheduler(named));
+        CHECK(SchedulersOf(named, AsConfigured) == std::vector<std::string> { "127.0.0.1:6674" });
+        auto const namedDial = ConsensusDialAddressOf(named);
+        REQUIRE(namedDial.has_value());
+        CHECK(HostOfEndpoint(Unwrap(namedDial)) == "this-pc.corp.example");
+        CHECK_FALSE(RowFor(NodeSurface::Discovery).Resolve(named).empty());
+        CHECK(ServesEnrollment(named, true));
+        CHECK_FALSE(NameReachesOnlyThisMachineInUse(named).has_value());
     }
 }
 
@@ -349,12 +503,10 @@ TEST_CASE("A learner and a voter whose fleet records a learner pass every startu
     // Raft port -- and a voter whose roster names a learner with no endpoint, judged by the rules a
     // start asks before any tier exists. Their tiers' starts are `ConsensusTier_test`'s.
     //
-    // Each names its scheduler, as every worker must today: the `--scheduler is required` row reads
-    // `cfg.schedulers`, never `SchedulersOf`, which nothing in production calls yet. That a zero-config
-    // worker is refused by it is Task 24's to close, where registration moves to `SchedulersOf`.
+    // Neither names a scheduler: each worker registers where its record says (`SchedulersOf`), and a
+    // node that serves is refused `--scheduler`, which aims one-shot verbs alone.
     auto named = [](NodeConfig cfg) {
         cfg.hostNames = NodeHostNames { .fqdn = "this-pc.corp.example", .dnsSuffix = "corp.example", .withheld = {} };
-        cfg.schedulers = { "office:6674" };
         return cfg;
     };
 

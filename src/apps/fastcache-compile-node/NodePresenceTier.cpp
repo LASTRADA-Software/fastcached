@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "NodeFormation.hpp"
 #include "NodePresenceTier.hpp"
 
 // Its own header FIRST and in a group of its own, for `WorkerLease.cpp`'s reason.
@@ -168,9 +169,8 @@ bool AnnouncePresence(PresenceMessage const& message, IPresenceRoster* roster, S
     // the leader can certify -- which a node that holds none adopts in this same round, from
     // whichever scheduler the round's redirects and fallbacks reached.
     auto const endorsement = roster != nullptr ? roster->Endorsement() : std::vector<std::byte> {};
-    PresenceAnnouncement announcement { message.endpoint,  message.capacity, message.load,
-                                        endorsement,       message.joinMemos, message.logger,
-                                        message.reachability };
+    PresenceAnnouncement announcement { message.endpoint,  message.capacity, message.load,        endorsement,
+                                        message.joinMemos, message.logger,   message.reachability };
     (void) DialAndAnnounce(
         link, message.reachability, dialer, message.logger, announcement, AnnounceProof { .prover = message.prover });
 
@@ -179,9 +179,19 @@ bool AnnouncePresence(PresenceMessage const& message, IPresenceRoster* roster, S
     return announcement.Accepted();
 }
 
+bool AnnouncesToAScheduler(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated)
+{
+    return SchedulerLink::For(SchedulersOf(cfg, activated)).has_value();
+}
+
+bool AwaitsItsOwnRecord(NodeConfig const& cfg, ActivatedNodeEndpoint const& activated)
+{
+    return RunsConsensus(cfg) && AnnouncesToAScheduler(cfg, activated);
+}
+
 std::unique_ptr<NodePresence> NodePresence::Start(NodePresenceParts const& parts)
 {
-    auto link = SchedulerLink::For(parts.cfg.schedulers);
+    auto link = SchedulerLink::For(SchedulersOf(parts.cfg, parts.activatedNodeEndpoint));
     if (!link.has_value())
         return nullptr;
 

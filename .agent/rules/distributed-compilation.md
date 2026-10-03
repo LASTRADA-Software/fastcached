@@ -425,8 +425,7 @@ Consequences that are each load-bearing:
   about a credential an endpoint requires, the other about contribution.
   - **An empty key roster refuses everybody but this machine, and "admit everybody" is
     a named type somebody constructs.** A roster with nothing in it is the state of a
-    node whose consensus has not formed, that names no `--voter-key`, or that is
-    misconfigured — and a scheduler that answered "member" there would silently become
+    node whose consensus has not formed, or that is misconfigured — and a scheduler that answered "member" there would silently become
     an open one, which is invisible from both ends because the fleet keeps working and
     merely serves strangers too. `OpenMembership` is the right answer for one machine or
     a fleet whose reachability is its boundary, but it is never a *default*: "no policy"
@@ -621,10 +620,10 @@ Consequences that are each load-bearing:
       the reload passes under precisely that defect -- so bind the reference BEFORE the
       reload and classify through it after, which is what the fixture does and what
       the production call sites do.
-    - **A reload may not WIDEN admission on a worker that runs no consensus and names no
-      `--voter-key`.** Such a node may have built `Cc::UncheckedLeaseValidator()` at
-      startup, which is safe only while no machine but this one is admitted -- and neither
-      guard for that can see a reload. `StartupPolicyRejection` decides reachability from
+    - **A reload may not WIDEN admission while the running worker verifies no lease**
+      (review I-2b). A worker may have built `Cc::UncheckedLeaseValidator()` at startup,
+      which is safe only while no machine but this one is admitted -- and neither guard for
+      that can see a reload. `StartupPolicyRejection` decides reachability from
       the listen flags, which describe nothing under socket activation, and
       `MakeWorkerLeaseValidator`'s backstop for exactly that has already run. Widening
       would hand it an open unauthenticated compile port with every refusal counter
@@ -634,8 +633,12 @@ Consequences that are each load-bearing:
       peers and the previous configuration did not -- because a keyless worker that
       already admits them passed its own startup rules, is running today, and must
       stay free to NARROW: a guard refusing its reloads would punish the one edit that
-      makes it safer. A `PairRule` row in `ValidateNodeReloadable`, so the second rule
-      about a transition is a row rather than another `if`.
+      makes it safer. Keyed on what the running worker BUILT (`LeaseCheckInForce`, recorded
+      inside `MakeWorkerLeaseValidator` so no worker can build one unrecorded), never on flag
+      shapes: the shapes missed a path, and a configuration carries no such fact. So it is not
+      a row of `ValidateNodeReloadable`, whose rules are about configurations; `ReloadCheckWith`
+      composes it beside that, LAST, so a save that also moves an unreloadable setting is told
+      about the setting first.
     - **It does not contradict *absence from `ClusterState` is not removal*.** That
       rule is about ABSENCE -- a member the state never named, which must not be read
       as a removal -- while a forget is a positive act, and it revokes the key the
@@ -1169,8 +1172,7 @@ Consequences that are each load-bearing:
     is stored or approved.** The verify is the guarantee; the door is where somebody is TOLD, and
     where a key that proves nothing is kept out of a list an operator reads and compares. The
     doors on master: `ParseEd25519PublicKey` (every flag and verb reading a key as TEXT --
-    `--raft-peer`, `--cluster-admit[-learner]`, `--cluster-admit-worker`, `--voter-key`, the
-    cli's `cluster-admit`, the leader's `ClusterAdmit` and `ClusterAdmitWorker`);
+    `--cluster-admit[-learner]`, the cli's `cluster-admit`, and the leader's `ClusterAdmit`);
     `SchedulerService::AdmitPrincipal`, which takes BYTES, since an enrollment approval hands
     over the key its row holds; the enrollment door (`EnrollmentResponder::AnswerEnroll`, the
     malformed row: no build mints such a key); `ValidateAgainst` and `Apply`
@@ -1372,8 +1374,8 @@ Consequences that are each load-bearing:
   `SignedLeaseValidator` takes one and never a key.
   - **A worker adopts v' >= v only if a STRICT MAJORITY of the voters in the roster it HOLDS
     endorse it, unexpired** (`CertifyRoster`: `needed = voters / 2 + 1`, every voter in the
-    denominator). `--voter-key` roots only the FIRST roster, and is never read again once
-    one is held -- as the replicated state wins over the keys `--raft-peer` typed. So a
+    denominator). Its anchors root only the FIRST roster, and are never read again once
+    one is held -- as the replicated state wins over the keys a formation record names. So a
     revoked ex-leader that withholds the roster revoking it and serves one of its own, with
     itself as the only voter, is ONE endorsement of three and is refused. **A majority of
     the voters the worker already trusts, never of the voters the offered roster names**:
@@ -1398,8 +1400,9 @@ Consequences that are each load-bearing:
     `NodeAnnounceInterval`: it is compiling nothing until one arrives.
   - **A roster is kept only with `--cluster-dir`, and a kept one that cannot be used REFUSES
     the start** (`NodeRoster::Build`) -- it may be all that stands between this worker and a
-    voter revoked since. A widening reload asks `--voter-key` and fails CLOSED on a kept
-    roster the configuration cannot see.
+    voter revoked since. No start reaches this worker any more: one with its consensus closed
+    is refused (`WorkerConsensusClosed`), so every worker checks the state it applies, and the
+    kept roster awaits its deletion.
 - **Whether a worker CHECKS a lease is a startup decision, never a per-request
   fallback.** The two are not the same rule written twice. "No key, so skip the
   check" taken per request is silent degradation of exactly the kind this file
@@ -1464,7 +1467,7 @@ Consequences that are each load-bearing:
   them.) Meanwhile the fixtures that *do* dispatch bind loopback, slipped under the
   startup rule, and ran `UncheckedLeaseValidator` for every one of their hundreds of
   compiles. Both halves have to meet in one fixture, which is why `dist-compile-e2e`
-  hands every worker its scheduler's `--voter-key` (the cluster key, until #178): an
+  runs every worker as a member of its scheduler's fleet, checking the grants it applies: an
   in-process test mints and verifies inside one process and cannot show that the
   endpoint a worker ADVERTISED is the endpoint the scheduler signed.
 - **A flag that describes nothing under socket activation cannot answer whether a
@@ -3418,9 +3421,8 @@ towards the give-up exactly as silence does, and a legitimate full list lasting 
 the join up and asks again, which is benign. The signature is judged before the key
 (`Forged` before `Unproven`), and an unsigned, forged or unproven answer is refused by name and
 counted (`FormationAdmissionsUnverified`), apart from a signed admission whose roster is wrong
-(`FormationAdmissionsRefused`). The one-shot `--enroll-from` sends the nonce and does not judge
-the signature: it proves no key before asking, and its trust root is the operator's two
-comparisons above.
+(`FormationAdmissionsRefused`). There is no one-shot join any more: a machine asks through
+`--fleet-seed`, at run time, and every answer it acts on is judged as above.
 
 **And the key an answer is held to is reached from the key the join was DECIDED on, never
 from whichever key answers at an endpoint.** A fresh FLEET-SUMMARY probe proves only that
@@ -3470,8 +3472,8 @@ proof, went at #178 PR 6 once both proved identity keys.
 `UnimplementedVerb`.** This is *unimplemented is not served elsewhere* on a new
 surface: such a node implements the verbs perfectly well and has no cluster to let
 anybody into, so `UnimplementedVerb` — which the client reads as `UnknownOpcode` — told
-a joiner *the seed is running a build older than this one*. The documented flow points
-`--enroll-from` at ANY member and most members run no consensus, so that wrong sentence
+a joiner *the seed is running a build older than this one*. The documented flow then pointed
+a joiner at ANY member and most members ran no consensus, so that wrong sentence
 was the likeliest thing a healthy fleet would ever print, sending somebody to upgrade a
 node that was already current. `CompileCacheHandler`'s `RefusedVerbs` table had drawn
 exactly this distinction for the daemon, with the argument written beside it, and the
@@ -3489,12 +3491,13 @@ hand-over and that is worth having; what changed is that the flag's own descript
 a Warn both name what removes it -- the ROLE's remedy, above. The control that a PENDING
 reject stays SILENT is what keeps that warning worth reading.
 
-**A one-shot verb's shape is refused on the path that uses it.** `--enroll-from` has a
-`StartupPolicyRejection` row and `main` dispatches the flag and RETURNS before that
-table is consulted, so the row was reachable only through `--print-surfaces`. Left to
-the dial, a bare host was reported as *cannot reach the seed* — the wrong problem — and
-reported it after this node had minted its identity into `--cluster-dir`, so a typo
-wrote durable state. `ParseDialEndpoint` at both sites, never a second spelling.
+**A one-shot verb's shape is refused on the path that uses it.** The retired joiner's
+seed flag had a `StartupPolicyRejection` row, and `main` dispatched the flag and RETURNED
+before that table was consulted, so the row was reachable only through `--print-surfaces`.
+Left to the dial, a bare host was reported as *cannot reach the seed* — the wrong problem —
+and reported it after this node had minted its identity into `--cluster-dir`, so a typo
+wrote durable state. `ParseDialEndpoint` at both sites, never a second spelling, for every
+one-shot verb's `--scheduler`.
 
 **The redirect budget is a CHAIN bound, not a total.** `MaxRedirects` exists for the
 loop two nodes with a stale `_knownLeader` make by naming each other; counted across a

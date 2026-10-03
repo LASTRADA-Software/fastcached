@@ -117,7 +117,7 @@ using WorkerMachineFactory = std::function<WorkerMachine()>;
 struct WorkerTierParts
 {
     NodeConfig const& cfg;                     ///< The configuration the node started with.
-    NodeReloader const* reloader;              ///< The live configuration; null with no file.
+    NodeReloader const* reloader {};           ///< The live configuration; null with no file.
     Distributed::NodeCapacity const& capacity; ///< What `NodeCapacityOf` made of this machine.
     /// Where this node tells clients to reach it, right now.
     ///
@@ -133,21 +133,28 @@ struct WorkerTierParts
     /// address is learned by re-surveying, and only a worker re-surveys. The presence loop
     /// reads it and never writes.
     AnnouncedEndpoint& announced;
-    SocketActivation activation;                      ///< Whether a supervisor handed the port over.
+    /// Where a supervisor handed the node surface over; disengaged when the node binds its own. One
+    /// value for both questions it answers -- whether the socket was handed over, which the lease
+    /// check asks, and where this node's own scheduler answers, which the registration asks -- so
+    /// the two cannot disagree.
+    ActivatedNodeEndpoint activatedNodeEndpoint;
     Distributed::IMembershipOracle const& membership; ///< Who may send a compile at all.
     /// Who may cordon this worker, and what each heartbeat reports it answers on: ONE set, the
     /// one the ticket audience checks, so a dial hint never names an address this node refuses.
     ILocalityOracle const& locality;
-    NodeIoLoop& io;               ///< The reactor a compile's reply returns to.
-    IHostFactsSource const& host; ///< The hostname a registration labels.
-    CacheTier const* cacheTier;   ///< Null on a node with no cache.
+    NodeIoLoop& io;                ///< The reactor a compile's reply returns to.
+    IHostFactsSource const& host;  ///< The hostname a registration labels.
+    CacheTier const* cacheTier {}; ///< Null on a node with no cache.
     /// How this machine proves WHICH machine it is to a scheduler (#178), or null where nothing
     /// proves -- a test whose scripted fleet serves no handshake. One instance per process,
     /// shared with the presence loop.
-    NodeProofClient const* prover;
+    NodeProofClient const* prover {};
     /// What a lease grant is verified against (#178), or null when this node verifies none --
     /// legal only where no other machine can reach it. Owned by `main`'s `NodeRoster`.
-    Distributed::ILeaseRoster const* leaseRoster;
+    Distributed::ILeaseRoster const* leaseRoster {};
+    /// Where the lease check this worker builds is recorded, for the reload guard
+    /// (`ReloadCheckWith`). Owned by `main`, across every body, beside the reloader that reads it.
+    LeaseCheckInForce& leaseCheck;
     IMetricsSink& metrics; ///< Where the worker counts.
     ILogger& logger;       ///< Where it reports.
     /// Where the worker's conditions are answered (#1364): whether its scratch root can be
@@ -247,9 +254,9 @@ class WorkerTier
     /// answered on the node's one `0xFC` listener through `Responder()`.
     ///
     /// **A worker always has a scheduler link, and that is enforced here rather than
-    /// assumed.** The startup table refuses a worker with no `--scheduler`; a
-    /// configuration that reached this anyway is a defect in that table, and it is
-    /// refused by name rather than left to start a worker that never registers.
+    /// assumed.** It is aimed where the formation record says this node registers
+    /// (`SchedulersOf`), never at `--scheduler`; a record that names nowhere is refused by
+    /// name rather than left to start a worker that never registers.
     ///
     /// **Nothing of the machine is built for a node running no worker**, the scratch base
     /// included: @p makeMachine is called only once a worker is decided.
@@ -278,6 +285,13 @@ class WorkerTier
     ///        process's one, shared with the presence loop. Must outlive the returned heartbeat.
     /// @return The running heartbeat.
     [[nodiscard]] WorkerHeartbeat Launch(core::platform::IClock const& statusClock, SchedulerReachability& reachability);
+
+    /// @return Where this worker registers, in the order its heartbeat tries them: its
+    ///         formation record's answer, fixed when the tier was built.
+    [[nodiscard]] std::vector<std::string> const& RegistersWith() const noexcept
+    {
+        return _link.Configured();
+    }
 
     /// @return What answers the compile family on this node's `0xFC` listener.
     [[nodiscard]] CompileResponder& Responder() noexcept

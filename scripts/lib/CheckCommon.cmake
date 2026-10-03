@@ -1466,3 +1466,46 @@ function(fastcached_first_party_cxx sourceDir filesOut declinedOut modeOut)
     set(${declinedOut} "${declined}" PARENT_SCOPE)
     set(${modeOut} "${mode}" PARENT_SCOPE)
 endfunction()
+
+# The COMMAND prefix that runs @p gitExecutable with every variable
+# `scripts/lib/git-scrub-variables.txt` names removed from its environment -- how a
+# self-test spells git for a repository it created, the CMake twin of `scratch_git` in
+# `scripts/lib/git-scrub.sh`. That file says why: an inherited `GIT_DIR` turns a fixture's
+# `git init` into a write of whatever repository it names.
+#
+#   fastcached_scratch_git("${GIT_EXECUTABLE}" scratchGit)
+#   execute_process(COMMAND ${scratchGit} init -q "${tree}" ...)
+#
+# `cmake -E env --unset=...` rather than `unset(ENV{...})`, because an environment change in a
+# `cmake -P` script is process-wide: it would reach the check under test as well, and the scrub
+# is for the fixture's own writes. Refuses -- `FATAL_ERROR` -- when the list names nothing or
+# names something that is not a `GIT_*` variable, since there is no unscrubbed fallback.
+#
+# @param gitExecutable The git to run.
+# @param outVar Set to the command prefix, a list.
+function(fastcached_scratch_git gitExecutable outVar)
+    set(listFile "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/git-scrub-variables.txt")
+    if(NOT EXISTS "${listFile}")
+        message(FATAL_ERROR "fastcached_scratch_git: ${listFile} is missing, so git is NOT run unscrubbed")
+    endif()
+    file(STRINGS "${listFile}" lines)
+    set(unsets "")
+    foreach(line IN LISTS lines)
+        string(FIND "${line}" "#" hashAt)
+        if(NOT hashAt EQUAL -1)
+            string(SUBSTRING "${line}" 0 ${hashAt} line)
+        endif()
+        string(STRIP "${line}" line)
+        if(line STREQUAL "")
+            continue()
+        endif()
+        if(NOT line MATCHES "^GIT_[A-Z_]+$")
+            message(FATAL_ERROR "fastcached_scratch_git: ${listFile} names '${line}', which is not a GIT_* variable")
+        endif()
+        list(APPEND unsets "--unset=${line}")
+    endforeach()
+    if(unsets STREQUAL "")
+        message(FATAL_ERROR "fastcached_scratch_git: ${listFile} names no variable, so git is NOT run unscrubbed")
+    endif()
+    set(${outVar} "${CMAKE_COMMAND};-E;env;${unsets};${gitExecutable}" PARENT_SCOPE)
+endfunction()

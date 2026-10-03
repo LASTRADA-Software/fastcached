@@ -8,6 +8,7 @@
 #include "EndpointDialerTestUtils.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeFormation.hpp"
 #include "NodeIoLoop.hpp"
 #include "ScratchClaim.hpp"
 #include "WorkerTier.hpp"
@@ -28,6 +29,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -81,12 +83,21 @@ class NeverSpawnsRunner final: public Cc::IProcessRunner
     }
 };
 
-/// A worker naming one compiler and its own scheduler, so nothing is spawned to start it.
+/// The scheduler a fixture worker registers with: its fleet's, on this machine.
+inline constexpr std::string_view FleetScheduler = "127.0.0.1:6675";
+
+/// A worker naming one compiler, so nothing is spawned to start it, and registering where its
+/// formation record says: a learner of a fleet whose scheduler is `FleetScheduler`.
 [[nodiscard]] inline NodeConfig Worker()
 {
     NodeConfig cfg;
-    cfg.schedulers = { "127.0.0.1:6675" };
     cfg.toolchains = { "/usr/bin/g++" };
+    cfg.formation = NodeFormationView { .mode = Cluster::NodeMode::Learner,
+                                        .clusterId = "fleet-1",
+                                        .createdAtUnixSeconds = 0,
+                                        .foundedHere = false,
+                                        .fleetMembers = {},
+                                        .fleetSchedulers = { std::string { FleetScheduler } } };
     return cfg;
 }
 
@@ -158,6 +169,11 @@ struct WorkerTierFixture
             builtDialer.emplace(heartbeatReplies);
         return *builtDialer;
     }
+    /// Where a supervisor handed the node surface over; `AsConfigured` for a node that binds its
+    /// own, which is every case but the socket-activation ones.
+    ActivatedNodeEndpoint activatedNodeEndpoint = AsConfigured;
+    /// Where the tier records the lease check it built; a case reads it after `Start`.
+    LeaseCheckInForce leaseCheck;
 
     /// Start a tier for `cfg` on a machine of sixteen cores.
     [[nodiscard]] std::expected<std::unique_ptr<WorkerTier>, NodeRefusal> Start()
@@ -178,7 +194,7 @@ struct WorkerTierFixture
                                                    .reloader = nullptr,
                                                    .capacity = capacity,
                                                    .announced = announced,
-                                                   .activation = SocketActivation::No,
+                                                   .activatedNodeEndpoint = activatedNodeEndpoint,
                                                    .membership = membership,
                                                    .locality = locality,
                                                    .io = io,
@@ -190,6 +206,7 @@ struct WorkerTierFixture
                                                    // No roster either, for the same reason: a worker no other
                                                    // machine reaches checks no grant (#178).
                                                    .leaseRoster = nullptr,
+                                                   .leaseCheck = leaseCheck,
                                                    .metrics = metrics,
                                                    .logger = logger,
                                                    .conditions = conditions,

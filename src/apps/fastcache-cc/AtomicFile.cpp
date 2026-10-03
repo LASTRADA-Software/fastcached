@@ -2,6 +2,7 @@
 #include "AtomicFile.hpp"
 
 #include <FastCache/Core/EnumTable.hpp>
+#include <FastCache/Platform/ReplacingRename.hpp>
 
 #if defined(_WIN32)
     #include <windows.h>
@@ -10,16 +11,13 @@
     #include <unistd.h>
 #endif
 
-#include <algorithm>
 #include <array>
 #include <atomic>
-#include <cstring>
 #include <fstream>
 #include <ios>
 #include <string>
 #include <system_error>
 #include <utility>
-#include <vector>
 
 namespace FastCache::Cc
 {
@@ -36,50 +34,6 @@ namespace
         static std::atomic<std::uint64_t> next { 0 };
         return next.fetch_add(1, std::memory_order_relaxed);
     }
-
-#if defined(_WIN32)
-    /// What `SetFileInformationByHandle` answers on a filesystem with no POSIX-semantics rename:
-    /// the information class or its flags are not understood there, which says nothing about the
-    /// files. Measured by lane 2a (`DurableFile.cpp`, M-5).
-    constexpr auto NoPosixRename =
-        std::to_array<DWORD>({ ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED, ERROR_INVALID_FUNCTION });
-
-    /// Rename @p from over @p to with POSIX semantics: the name is replaced even while a reader that
-    /// shares delete holds @p to open, and that reader goes on reading what it opened.
-    /// @param from The file to move. @param to Where it goes.
-    /// @return 0, or the Win32 error that refused it.
-    [[nodiscard]] DWORD PosixRename(std::filesystem::path const& from, std::filesystem::path const& to)
-    {
-        auto* const handle = ::CreateFileW(from.wstring().c_str(),
-                                           DELETE | SYNCHRONIZE,
-                                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                           nullptr,
-                                           OPEN_EXISTING,
-                                           FILE_ATTRIBUTE_NORMAL,
-                                           nullptr);
-        if (handle == INVALID_HANDLE_VALUE)
-            return ::GetLastError();
-        // `FILE_RENAME_INFO` ends in the name, so it is laid out in storage of the whole size, held
-        // as words so it is aligned for the structure.
-        auto const name = to.wstring();
-        auto const nameBytes = name.size() * sizeof(wchar_t);
-        auto const size = sizeof(FILE_RENAME_INFO) + nameBytes;
-        auto storage = std::vector<std::uint64_t>((size + sizeof(std::uint64_t) - 1) / sizeof(std::uint64_t));
-        // `Flags` shares a union with the older `ReplaceIfExists`, so it is written as bytes at its
-        // offset rather than through the union; the storage starts zeroed, so `RootDirectory` is null.
-        auto const flags = DWORD { FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS };
-        std::memcpy(std::as_writable_bytes(std::span { storage }).subspan(offsetof(FILE_RENAME_INFO, Flags)).data(),
-                    &flags,
-                    sizeof flags);
-        auto* const info = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-        info->FileNameLength = static_cast<DWORD>(nameBytes);
-        std::memcpy(&info->FileName[0], name.data(), nameBytes);
-        auto const renamed = ::SetFileInformationByHandle(handle, FileRenameInfoEx, info, static_cast<DWORD>(size)) != 0;
-        auto const failure = renamed ? DWORD { 0 } : ::GetLastError();
-        ::CloseHandle(handle);
-        return failure;
-    }
-#endif
 
     /// No file held, in either representation.
     constexpr std::intptr_t InvalidHandle = -1;
@@ -126,19 +80,12 @@ namespace
 
         bool Replace(std::filesystem::path const& from, std::filesystem::path const& to) override
         {
-#if defined(_WIN32)
-            auto const refused = PosixRename(from, to);
-            if (refused == 0)
-                return true;
-            // Refused by the files -- a reader that does not share delete is the one this
-            // writer expects -- is the answer. Refused because the filesystem has no such
-            // rename, the classic one is asked instead, which any open reader refuses.
-            if (!std::ranges::contains(NoPosixRename, refused))
-                return false;
-#endif
-            std::error_code ec;
-            std::filesystem::rename(from, to, ec);
-            return !ec;
+            // The one rename the node's durable writer moves its files with, compiled in rather than
+            // linked (`Platform/ReplacingRename`). Refused by the files -- a reader that does not
+            // share delete is the one this writer expects -- is the answer; refused because the
+            // filesystem has no such rename, the classic one is asked instead, which any open reader
+            // refuses.
+            return Platform::RenameIntoPlace(from, to, Platform::SystemReplacingRename {}).has_value();
         }
 
         void Remove(std::filesystem::path const& path) noexcept override

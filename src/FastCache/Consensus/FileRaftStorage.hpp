@@ -42,7 +42,8 @@ inline constexpr std::string_view UnreadableStateRemedy =
     "and without them it starts as a different node. A node that JOINED its fleet then waits to be admitted rather "
     "than bootstrapping a cluster of itself: a fleet that still counts it catches it up from the leader, and one that "
     "has forgotten it admits it again with --cluster-admit (or --cluster-admit-learner). It keeps its identity, so it "
-    "needs no --enroll-from. The node that FOUNDED its fleet bootstraps it again, alone, so move its state aside only "
+    "is admitted under the key it already holds. The node that FOUNDED its fleet bootstraps it again, alone, so move its "
+    "state aside only "
     "when every member's was moved aside together; then admit the others again from it and make again every "
     "--cluster-* change made since the fleet formed; see docs/operations/upgrading-a-fleet.md";
 

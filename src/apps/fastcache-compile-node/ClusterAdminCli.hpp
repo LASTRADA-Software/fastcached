@@ -82,7 +82,8 @@ struct ClusterExchange
                                                                                    ClusterExchange const& answer,
                                                                                    std::string_view scheduler);
 
-/// Carry out one cluster-administration request against `cfg.schedulers`.
+/// Carry out one cluster-administration request against `AdminTargetsOf(cfg)`: `--scheduler`'s
+/// values, or this machine's own node when it names none.
 ///
 /// The one impure step: connect, exchange, interpret. Everything it decides lives in
 /// the functions above, which is what lets `main.cpp` -- in no test target -- hold

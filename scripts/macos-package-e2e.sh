@@ -680,10 +680,8 @@ node_plist="/Library/LaunchDaemons/${NODE_LABEL}.plist"
 #
 # DERIVED from `$port` rather than written out, so `--port` still moves every
 # surface this fixture opens together; a literal would collide again the day two
-# of these run with different `--port` values. `--scheduler` and `--advertise`
-# deliberately keep their literals: a scheduler address is DIALLED and an
-# advertised address is TOLD, so neither binds anything here and neither can
-# collide -- but `--advertise` MOVES WITH IT, and that is not cosmetic. Naming
+# of these run with different `--port` values. `--advertise` MOVES WITH IT, and
+# that is not cosmetic. Naming
 # `--listen-node` explicitly turns on a startup rule that an unset one does not
 # have: the node then refuses an `--advertise` naming a different port, because a
 # client told to dial a port nothing listens on gets no compile while the
@@ -700,18 +698,23 @@ node_plist="/Library/LaunchDaemons/${NODE_LABEL}.plist"
 # `--advertise` is authoritative there) which is why the ORIGINAL command was
 # accepted with a 6674 bind and a 6676 advertisement.
 #
-# `--cluster-dir` since #178 PR 6: a worker proves an identity key kept there on
-# every connection to its scheduler, so naming a scheduler without one is refused
-# at install time as it is at startup. A directory of its own under the prefix,
-# because the registration hands the directory it names to the worker's account,
-# so it must be one nothing else uses.
+# No `--scheduler`: a node that serves is refused one, and registers its worker
+# with the fleet its formation record names -- its own, on a first start, which is
+# why consensus is on, on a port derived like the others, with no discovery beacon
+# on the port every node on the segment shares.
+#
+# `--cluster-dir` since #178 PR 6: the node keeps its identity key and its formation
+# record there. A directory of its own under the prefix, because the registration
+# hands the directory it names to the worker's account, so it must be one nothing
+# else uses.
 node_port=$(( port + 3 ))
+raft_port=$(( port + 4 ))
 if ! node_log="$(sudo "${PREFIX}/bin/fastcache-compile-node" --install-service --service-scope=system \
         --listen-node=127.0.0.1:${node_port} \
         --advertise=127.0.0.1:${node_port} \
-        --scheduler=127.0.0.1:6675 \
         --cluster-dir="${PREFIX}/var/fastcache-node" \
-        --listen-raft= \
+        --listen-raft=127.0.0.1:${raft_port} \
+        --discovery= \
         --toolchain=/usr/bin/cc 2>&1)"; then
     # **Ask launchd what it did with the job before giving up on the reading.**
     #

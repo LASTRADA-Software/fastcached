@@ -379,6 +379,61 @@ function Assert-NodeFirewall {
     }
 }
 
+# Does every rule of the node's firewall group admit exactly @p Scope as its remote address? A pure
+# verdict so the self-test can drive it without a real firewall. Windows reports a prefix in mask
+# form (10.0.0.0/8 reads back as 10.0.0.0/255.0.0.0), so both spellings of the scope are accepted.
+# @param Seen Each rule's display name and its remote addresses, as @{ Name; Remote }.
+# @param Scope The one address with a /prefix the install was given.
+# @return $null when every rule admits exactly the scope, else which rules admit what.
+function Get-NodeFirewallScopeVerdict([object[]] $Seen, [string] $Scope) {
+    $address, $prefix = $Scope -split '/'
+    $accepted = @($Scope)
+    if ($prefix) {
+        $bits = ([uint64]4294967295 -shl (32 - [int]$prefix)) -band [uint64]4294967295
+        $mask = (3, 2, 1, 0 | ForEach-Object { ($bits -shr (8 * $_)) -band 0xFF }) -join '.'
+        $accepted += "$address/$mask"
+    }
+    if ($Seen.Count -eq 0) { return "the node's firewall group holds no rule to scope" }
+    $wrong = @($Seen | Where-Object { @($_.Remote).Count -ne 1 -or $accepted -notcontains @($_.Remote)[0] })
+    if ($wrong.Count -eq 0) { return $null }
+    return "rules not scoped to ${Scope}: " + (($wrong | ForEach-Object { "$($_.Name) admits [$(@($_.Remote) -join ', ')]" }) -join '; ')
+}
+
+# The node's firewall rules on the REAL Windows Firewall admit exactly @p Scope. A repair that
+# states no scope must keep the one an earlier transaction stated (the remembered property), so
+# a rule reading Any here is the fail-open this exists to catch. Reads a live firewall, so the
+# self-test reaches only the verdict above; fails CLOSED.
+function Assert-NodeFirewallScope([string] $Scope) {
+    $group = 'fastcached: FastCacheCompileNode'
+    $seen = @(Get-NetFirewallRule -Group $group -ErrorAction SilentlyContinue | ForEach-Object {
+            @{ Name = $_.DisplayName; Remote = @(($_ | Get-NetFirewallAddressFilter).RemoteAddress) }
+        })
+    $seen | ForEach-Object { Write-Host "$($_.Name): $($_.Remote -join ', ')" }
+    if ($verdict = Get-NodeFirewallScopeVerdict $seen $Scope) { throw $verdict }
+}
+
+# Does the node service's command line carry @p Argument as one whole token? A pure verdict so the
+# self-test can drive it without a service. Whole tokens, because a prefix match would pass a
+# registration carrying a longer value, and a quoted program path may hold spaces.
+# @param ImagePath The registration's command line, as the service control manager reports it.
+# @param Argument The token it must carry, e.g. a fleet-seed flag and its normalized value.
+# @return $null when it is there, else the command line it is missing from.
+function Get-NodeRegistrationArgumentVerdict([string] $ImagePath, [string] $Argument) {
+    $tokens = @([regex]::Matches($ImagePath, '"[^"]*"|\S+') | ForEach-Object { $_.Value.Trim('"') })
+    if ($tokens -ccontains $Argument) { return $null }
+    return "the node's registration does not carry $Argument as an argument: $ImagePath"
+}
+
+# The node's REAL registration carries @p Argument. A repair that states no fleet seed must keep the
+# one an earlier transaction stated (the remembered property). Reads a live service, so the
+# self-test reaches only the verdict above; fails CLOSED.
+function Assert-NodeRegistrationArgument([string] $Argument) {
+    $svc = Get-CimInstance Win32_Service -Filter "Name='FastCacheCompileNode'"
+    if (-not $svc) { throw "no FastCacheCompileNode service is registered, so it carries no $Argument" }
+    Write-Host "FastCacheCompileNode: $($svc.PathName)"
+    if ($verdict = Get-NodeRegistrationArgumentVerdict $svc.PathName $Argument) { throw $verdict }
+}
+
 # Is @p OwnerSid the Administrators SID? The state directory's owner must be, so whoever
 # created it first keeps no WRITE_DAC. A pure verdict so the self-test can drive it without a
 # real directory, the way the service verdicts are.
@@ -775,7 +830,33 @@ function Invoke-MsiServiceTableSelfTest {
         if ($verdict = Get-NodeFirewallVerdict ($four + 'e tcp/9') $four) { throw $verdict }
     } 'carries \[e tcp/9\]'
 
-    $expectedCases = 47
+    # The scope verdict Assert-NodeFirewallScope reads: the mask spelling Windows reports passes, a
+    # rule left open to any address is refused by name, and so is a rule with another scope.
+    $scoped = @(@{ Name = 'a tcp/1'; Remote = @('10.0.0.0/255.0.0.0') }, @{ Name = 'b udp/2'; Remote = @('10.0.0.0/8') })
+    if ($null -ne (Get-NodeFirewallScopeVerdict $scoped '10.0.0.0/8')) { throw 'scope verdict: both spellings of the scope must pass' }
+    Pass 'scope: the mask spelling Windows reports and the prefix spelling both pass'
+    ExpectThrow 'scope: a rule open to any address is refused, naming it' {
+        if ($verdict = Get-NodeFirewallScopeVerdict (@($scoped[0]) + @(@{ Name = 'b udp/2'; Remote = @('Any') })) '10.0.0.0/8') { throw $verdict }
+    } 'b udp/2 admits \[Any\]'
+    ExpectThrow 'scope: a rule with another scope is refused' {
+        if ($verdict = Get-NodeFirewallScopeVerdict @(@{ Name = 'a tcp/1'; Remote = @('192.168.0.0/255.255.0.0') }) '10.0.0.0/8') { throw $verdict }
+    } 'not scoped to 10\.0\.0\.0/8'
+
+    # The registration verdict Assert-NodeRegistrationArgument reads: a whole token passes behind a
+    # quoted program path with spaces, and neither its absence nor a longer value passes.
+    $imagePath = '"C:\Program Files\fastcached\bin\fastcache-compile-node.exe" --service --fleet-seed=seed.example.invalid:6674'
+    if ($null -ne (Get-NodeRegistrationArgumentVerdict $imagePath '--fleet-seed=seed.example.invalid:6674')) {
+        throw 'registration verdict: a whole token must pass'
+    }
+    Pass 'registration: the argument as a whole token passes'
+    ExpectThrow 'registration: a command line without it is refused, naming it' {
+        if ($verdict = Get-NodeRegistrationArgumentVerdict '"C:\Program Files\x.exe" --service' '--fleet-seed=a:6674') { throw $verdict }
+    } 'does not carry --fleet-seed=a:6674'
+    ExpectThrow 'registration: a longer value is not the argument' {
+        if ($verdict = Get-NodeRegistrationArgumentVerdict 'x.exe --fleet-seed=a:66740' '--fleet-seed=a:6674') { throw $verdict }
+    } 'does not carry'
+
+    $expectedCases = 53
     if ($script:SelfTestCases -ne $expectedCases) {
         throw "ran $script:SelfTestCases cases, expected ${expectedCases}: a case was added or lost without this count moving"
     }
@@ -786,4 +867,5 @@ Export-ModuleMember -Function Get-ServiceObservation, Get-ServiceVerdict, Assert
     Get-MsiProperty, Get-InstalledProductCodes, Assert-InstalledProduct, Show-MsiLog, Invoke-Msiexec, Assert-MsiLog,
     Get-MsiActionRanPattern, Get-ServiceStabilityVerdict, Get-UpgradeVersionVerdict, Remove-FastCacheMachineState,
     Assert-NodeStatePrivate, Get-DirectoryOwnerVerdict, Get-NodeFirewallVerdict, Assert-NodeFirewall,
-    Invoke-MsiServiceTableSelfTest
+    Get-NodeFirewallScopeVerdict, Assert-NodeFirewallScope, Get-NodeRegistrationArgumentVerdict,
+    Assert-NodeRegistrationArgument, Invoke-MsiServiceTableSelfTest

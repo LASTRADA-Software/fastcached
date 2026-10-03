@@ -260,15 +260,18 @@ struct Machine
     /// @param record The record it starts with.
     /// @param typedSeeds The `--fleet-seed` values it was given, if any.
     /// @param nodeEndpoint The `0xFC` endpoint it advertises; by default one named after its id.
+    /// @param reach Whether other machines can be its fleet at all.
     Machine(std::string const& nodeId,
             FormationRecord record,
             std::vector<std::string> typedSeeds = {},
-            std::optional<std::string> const& nodeEndpoint = std::nullopt):
+            std::optional<std::string> const& nodeEndpoint = std::nullopt,
+            FleetReachability reach = FleetReachability::Open):
         typed { std::move(typedSeeds) },
         self { .nodeId = nodeId,
                .publicKey = Testing::TestKeyPair(nodeId).PublicKey(),
                .nodeEndpoint = nodeEndpoint.value_or(nodeId.substr(2) + ":6674"),
-               .raftEndpoint = nodeId.substr(2) + ":6680" },
+               .raftEndpoint = nodeId.substr(2) + ":6680",
+               .reach = reach },
         controller { FormationParts { .store = store,
                                       .enroll = enroll,
                                       .probe = probe,
@@ -318,14 +321,14 @@ struct Machine
     FormationController controller;
 };
 
-/// A startup rule of the kind Task 24 adds, stated through the judge's own seam: it refuses a shape
+/// A startup rule stated through the judge's own seam: it refuses a shape
 /// by what the node's DERIVED schedulers are -- here, a learner registering with the office's node
 /// port, which only the remembered fleet endpoints put there.
 /// @param cfg A shaped configuration.
 /// @return The refusal, or nothing.
 [[nodiscard]] std::optional<std::string> RefuseRegisteringWithTheOffice(NodeConfig const& cfg)
 {
-    if (std::ranges::contains(SchedulersOf(cfg), std::string { "office:6674" }))
+    if (std::ranges::contains(SchedulersOf(cfg, AsConfigured), std::string { "office:6674" }))
         return std::string { "a test rule refuses registering with office:6674" };
     return std::nullopt;
 }
@@ -574,6 +577,52 @@ TEST_CASE("A node with a typed seed asks it before it decides on a beacon fleet"
     CHECK(laptop.probe.Asked().size() == 1); // a typed seed is asked ONCE before the decision, not every beat
 }
 
+TEST_CASE("A node confined to this machine asks no seed and polls no fleet whether solitary or pending",
+          "[node][formation][controller][defaults]")
+{
+    // Its consensus answers on loopback alone (`ConsensusConfinedToThisMachine`), so a fleet that took
+    // it would be told to dial an address that reaches only itself. Every beat is a no-op: the typed
+    // seed is never asked, a proven fleet never decided on, and a pending join never polled -- the
+    // node stays its own cluster, serving its own scheduler.
+    Machine solitary {
+        "n-laptop", Minted("c-laptop", 500), { "office:6674" }, std::nullopt, FleetReachability::ThisMachineAlone
+    };
+    solitary.probe.Answer("office:6674",
+                          Testing::ProvenSeed(OfficeSummary("c-office", "office:6674"), Cluster::SeedSource::FleetSeedFlag));
+    solitary.controller.OnFleetProven(Proven("c-office", FleetState::Solitary, OfficeCreatedAt, "office:6674"));
+    solitary.controller.Tick();
+    solitary.controller.Tick();
+    CHECK(solitary.probe.Asked().empty());
+    CHECK(solitary.controller.Mode() == NodeMode::Solitary);
+    CHECK(solitary.store.Saves().empty());
+
+    Machine pending { "n-laptop",
+                      Pending("c-laptop", 500, "c-office", "office:6674"),
+                      {},
+                      std::nullopt,
+                      FleetReachability::ThisMachineAlone };
+    pending.enroll.Script({ Admitted(OfficeRosterWith("n-laptop")) });
+    pending.controller.Tick();
+    pending.clock.advance(PendingGiveUpAfter + std::chrono::seconds { 1 });
+    pending.controller.Tick();
+    CHECK(pending.enroll.AskedEndpoints().empty());
+    CHECK(pending.probe.Asked().empty());
+    CHECK(pending.controller.Mode() == NodeMode::Pending); // neither admitted nor abandoned
+    CHECK(pending.store.Saves().empty());
+    CHECK(pending.reform.Requests() == 0);
+
+    // The control: the same two machines, open, ask the seed and take the admission.
+    Machine open { "n-laptop", Minted("c-laptop", 500), { "office:6674" } };
+    open.probe.Answer("office:6674",
+                      Testing::ProvenSeed(OfficeSummary("c-office", "office:6674"), Cluster::SeedSource::FleetSeedFlag));
+    open.controller.Tick();
+    CHECK(open.probe.Asked().size() == 1);
+    Machine admitted { "n-laptop", Pending("c-laptop", 500, "c-office", "office:6674") };
+    admitted.enroll.Script({ Admitted(OfficeRosterWith("n-laptop")) });
+    admitted.controller.Tick();
+    CHECK(admitted.controller.Mode() == NodeMode::Learner);
+}
+
 TEST_CASE("A learner seeing an older established fleet stays and never yields to a foreign fleet",
           "[node][formation][controller]")
 {
@@ -633,6 +682,37 @@ TEST_CASE("A learner shape refused for the schedulers its fleet leaves it is ref
     CHECK(laptop.store.Saves().empty());
     CHECK(laptop.reform.Requests() == 0);
     CHECK(Logged(laptop.logger, "a test rule refuses registering with office:6674"));
+    CHECK(laptop.conditions.StateOf(NodeCondition::FormationMoveRefused) == CompileCacheWire::ConditionState::Raised);
+}
+
+TEST_CASE("A learner shape the PRODUCTION advertise rows refuse for its fleet's schedulers is refused before its "
+          "record is written",
+          "[node][formation][controller][judge]")
+{
+    // M-J on the merged tree: the production table's fourth advertise row reads where the worker
+    // registers (`SchedulersOf`), which for a learner only the remembered fleet endpoints say. A
+    // laptop that TYPED a loopback node port is fine pending -- it registers with its own scheduler,
+    // on this machine -- and would register LOOPBACK with the office's once it moves. Judged on the
+    // endpoints the move leaves behind, the move is refused before its record is written: no
+    // learner record on disk that every restart then refuses.
+    auto const pending = Pending("c-laptop", 500, "c-office", "office:6674");
+    Machine laptop { "n-laptop", pending };
+    auto shaped = LaptopShapedBy(pending);
+    shaped.nodeListen = "127.0.0.1:6674";
+    shaped.nodeListenExplicit = true;
+    shaped.toolchains = { "/usr/bin/g++" };
+    INFO("pending refusal: " << StartupPolicyRejection(shaped).value_or("<none>"));
+    REQUIRE_FALSE(StartupPolicyRejection(shaped).has_value()); // the shape it is in starts
+    LiveNodeConfig const live { shaped, nullptr };
+    StartupShapeJudge const production { live, laptop.endpoints, StartupPolicyRejection };
+    laptop.judge.DelegateTo(production);
+    laptop.enroll.Script({ Admitted(OfficeRosterWith("n-laptop")) });
+    laptop.controller.Tick();
+
+    CHECK(laptop.controller.Mode() == NodeMode::Pending);
+    CHECK(laptop.store.Saves().empty());
+    CHECK(laptop.reform.Requests() == 0);
+    CHECK(Logged(laptop.logger, "would register LOOPBACK"));
     CHECK(laptop.conditions.StateOf(NodeCondition::FormationMoveRefused) == CompileCacheWire::ConditionState::Raised);
 }
 

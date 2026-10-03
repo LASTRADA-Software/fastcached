@@ -209,19 +209,24 @@ namespace
             .resolve = [](SurfaceRow const& row, NodeConfig const& cfg) -> SurfaceEndpoints {
                 if (!cfg.formation.has_value() || !ModeOpensRaftPort(cfg.formation->mode))
                     return {};
-                // Standing down, when the port was never asked for and this machine's name reaches
-                // only itself: a consensus member must name the address its peers dial, and that
-                // name would send every one of them to itself. Asked HERE so `RunsConsensus`,
+                // Confined to LOOPBACK, when the port was never asked for and this machine's name
+                // reaches only itself (`ConsensusConfinedToThisMachine`): a consensus member must
+                // name the address its peers dial, and that name would send every one of them to
+                // itself -- so it binds where only this machine dials, and the node runs as a fleet
+                // of its own, its own scheduler and worker included. Asked HERE so `RunsConsensus`,
                 // `--print-surfaces` and the tier cannot disagree. A TYPED `--listen-raft`, or a
                 // mode other machines dial, is refused by name instead.
-                if (!cfg.raftListenExplicit && ConsensusNameWithheld(cfg))
-                    return {};
-                return ResolveFromSpec(row, cfg);
+                auto endpoints = ResolveFromSpec(row, cfg);
+                if (ConsensusConfinedToThisMachine(cfg))
+                    for (auto& endpoint: endpoints)
+                        endpoint.host = std::string { ThisMachineLoopbackHost };
+                return endpoints;
             },
             .closedBecause = RaftClosedByFormation,
             .note = "the formation record's mode opens the port, and every mode but a learner's does; it is on by "
                     "default, an empty --listen-raft= closes it (a node running no consensus), and a node whose name "
-                    "reaches only itself (localhost) stands it down unless --raft-self names it. The wildcard for a bare "
+                    "reaches only itself (localhost) binds it to loopback, a fleet of its own, unless --raft-self names "
+                    "it. The wildcard for a bare "
                     "port: peers are on other machines by definition, so a loopback default would be one that silently "
                     "cannot work",
         },
@@ -244,7 +249,11 @@ namespace
                 // socket whatever this address says, and since discovery is on by default
                 // that is the ordinary worker. Asked here so `--print-surfaces`,
                 // `--node-status` and the tier cannot disagree about whether it is served.
-                if (!RunsConsensus(cfg))
+                //
+                // And, defaulted, not beside a consensus address that reaches only this machine --
+                // a loopback bind, or a consensus confined to it -- which the tier stands down on
+                // too: a beacon would send every peer to itself. A typed one is refused instead.
+                if (!RunsConsensus(cfg) || (!cfg.discoveryAddressExplicit && ConsensusAddressReachesOnlyThisMachine(cfg)))
                     return {};
 
                 // NOT `ResolveFromSpec`: the host half of `--discovery` is where
@@ -285,7 +294,8 @@ namespace
                     "and peers send their challenges and proofs TO it: a restrictive firewall has to let it in, "
                     "INBOUND, by program, since no port rule can name it. --discovery-reply-port pins one where a "
                     "site must name it. On by default, and beside consensus only: a node with an empty "
-                    "--listen-raft opens neither socket",
+                    "--listen-raft opens neither socket, and one whose consensus address reaches only this machine "
+                    "opens neither unless you typed --discovery, which is refused",
         },
     };
 
@@ -675,9 +685,8 @@ ServedSurfaces NodeServedSurfacesFor(NodeConfig const& cfg)
         bool served;
     };
 
-    // `ServesScheduler`, the one predicate `main` builds the tier under. Enrollment repeats
-    // `ServesEnrollment`'s two clauses -- that helper takes a started tier, which does not exist
-    // when a scrape asks this question.
+    // `ServesScheduler`, the one predicate `main` builds the tier under, and `ServesEnrollment` handed
+    // that answer in place of a started tier, which does not exist when a scrape asks this question.
     auto const servesScheduler = ServesScheduler(cfg);
     std::array const rows {
         // Never: this binary constructs no `Server`/`ReactorServerLoop`, so
@@ -695,10 +704,10 @@ ServedSurfaces NodeServedSurfacesFor(NodeConfig const& cfg)
         Row { .surface = MetricsSurface::CompileScheduler, .served = servesScheduler },
         Row { .surface = MetricsSurface::CompileWorker, .served = RunsWorker(cfg) },
         Row { .surface = MetricsSurface::NodeCacheTier, .served = ConfiguresCacheTier(cfg) },
-        Row { .surface = MetricsSurface::NodeEnrollment, .served = RunsConsensus(cfg) && servesScheduler },
-        // `StartDiscoveryOrExplain`'s two conditions: an announce address, and a consensus tier
-        // to desire peers onto.
-        Row { .surface = MetricsSurface::NodeDiscovery, .served = RunsConsensus(cfg) && !cfg.discoveryAddress.empty() },
+        Row { .surface = MetricsSurface::NodeEnrollment, .served = ServesEnrollment(cfg, servesScheduler) },
+        // The discovery row, which asks `StartDiscoveryOrExplain`'s conditions: an announce address,
+        // a consensus tier to desire peers onto, and a consensus address that leaves this machine.
+        Row { .surface = MetricsSurface::NodeDiscovery, .served = !RowFor(NodeSurface::Discovery).Resolve(cfg).empty() },
         // Never, yet: no `FormationController` is constructed until `main` wires one, so its
         // counters read absent rather than as a node that never yielded. The wiring makes this the
         // condition it constructs the controller under.

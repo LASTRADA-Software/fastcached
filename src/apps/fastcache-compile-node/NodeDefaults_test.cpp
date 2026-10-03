@@ -253,7 +253,6 @@ TEST_CASE("A state directory the start resolved is a key route though nobody typ
     // has to count that directory as one that may hold a roster, exactly as a typed one does.
     auto cfg = Testing::FirstStart(Unwrap(Parse({ "--listen-raft=" })));
     REQUIRE_FALSE(RunsConsensus(cfg));
-    REQUIRE(cfg.voterKeys.empty());
     REQUIRE(cfg.clusterDir.empty());
 
     // The control: nothing resolved, so nothing could hold a roster yet.
@@ -479,9 +478,10 @@ TEST_CASE("A withheld name is offered to no peer, and the node serves this machi
 {
     auto const withheld = NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = "localhost" };
 
-    // A node with its defaults and no worker: consensus and discovery are on by default, and both
-    // stand down -- nothing tells a peer to dial `localhost` -- while the node still starts. The
-    // one address it does offer is loopback, to a scheduler on this machine, which reaches it there.
+    // A node with its defaults and no worker: consensus and discovery are on by default. Consensus
+    // is confined to loopback -- a fleet of its own, so nothing tells a peer to dial `localhost` --
+    // and discovery stands down, while the node still starts. The one address it does offer is
+    // loopback, to a scheduler on this machine, which reaches it there.
     auto local = Testing::FirstStart(NodeConfig {});
     local.slots = 0;
     ApplyHostNames(local, withheld);
@@ -492,16 +492,21 @@ TEST_CASE("A withheld name is offered to no peer, and the node serves this machi
     CHECK(DescribeListeningEndpoint(local, true) == "the socket its supervisor handed it");
     CHECK(DescribeAdvertisedEndpoint(local) == "127.0.0.1:6674");
     CHECK(ConsensusNameWithheld(local));
-    CHECK(RaftSelfEndpoint(local).empty());
-    CHECK_FALSE(RunsConsensus(local));
-    CHECK(RowFor(NodeSurface::Raft).Resolve(local).empty());
+    CHECK(ConsensusConfinedToThisMachine(local));
+    CHECK(RunsConsensus(local));
+    auto const raft = RowFor(NodeSurface::Raft).Resolve(local);
+    REQUIRE(raft.size() == 1);
+    CHECK(raft.front().host == ThisMachineLoopbackHost);
+    CHECK(RaftSelfEndpoint(local) == FormatHostPort(ThisMachineLoopbackHost, raft.front().port));
+    CHECK(ConsensusAddressReachesOnlyThisMachine(local));
     CHECK(RowFor(NodeSurface::Discovery).Resolve(local).empty());
     CHECK_FALSE(StartupPolicyRejection(local).has_value());
     auto const detail = NameReachesOnlyThisMachineInUse(local);
     REQUIRE(detail.has_value());
     CHECK(Unwrap(detail).contains("'localhost'"));
     CHECK(Unwrap(detail).contains("advertised at loopback"));
-    CHECK(Unwrap(detail).contains("consensus and discovery stand down"));
+    CHECK(Unwrap(detail).contains("a fleet of its own on loopback and can neither form nor join a fleet"));
+    CHECK(Unwrap(detail).contains("fix this machine's DNS, or give --raft-self and --advertise"));
 
     // The control: the same node with a name peers can dial runs consensus and advertises it.
     auto named = Testing::FirstStart(NodeConfig {});
@@ -515,8 +520,16 @@ TEST_CASE("A withheld name is offered to no peer, and the node serves this machi
     // never the downstream symptom (`--discovery needs --listen-raft`) of standing down.
     SECTION("a worker")
     {
+        // A learner, registering with its fleet's scheduler on another machine as its formation
+        // record says.
         auto worker = Testing::FirstStart(NodeConfig {});
-        worker.schedulers = { "sched.corp.example:6675" };
+        REQUIRE(worker.formation.has_value());
+        if (worker.formation.has_value())
+        {
+            worker.formation->mode = Cluster::NodeMode::Learner;
+            worker.formation->foundedHere = false;
+            worker.formation->fleetSchedulers = { "sched.corp.example:6675" };
+        }
         worker.toolchains = { "/usr/bin/g++" };
         ApplyHostNames(worker, withheld);
         CHECK(StartupPolicyRejection(worker) == std::optional { std::string { WorkerNameReachesOnlyThisMachineRefusal } });
@@ -766,7 +779,8 @@ TEST_CASE("host-name-reaches-only-this-machine is raised while a withheld name s
     // And the remedy says which half a reload reaches.
     auto const remedy = RowFor(NodeCondition::HostNameReachesOnlyThisMachine).remedy;
     CHECK(remedy.contains("--advertise (advertise; a reload applies it)"));
-    CHECK(remedy.contains("--raft-self (raft_self in the configuration file; a restart applies it)"));
+    CHECK(remedy.contains("--raft-self (raft_self; a restart applies it)"));
+    CHECK(remedy.contains("Fix this machine's DNS"));
 }
 
 TEST_CASE("A service registration owns the machine-wide state directory and hands it to a POSIX daemon",

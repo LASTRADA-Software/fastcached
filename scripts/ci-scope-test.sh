@@ -25,13 +25,16 @@ trap 'rm -rf "${WORK}"' EXIT
 
 # A repository of our own, so the test says nothing about the tree it runs in --
 # and so it still works from an exported tarball or a worktree whose git this
-# host cannot read.
-export GIT_DIR= GIT_WORK_TREE= GIT_INDEX_FILE=
-unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+# host cannot read. The WHOLE process is scrubbed, not only its writes, because
+# the subject -- ci-scope.sh -- reads git here too, and an inherited GIT_DIR would
+# have it classify a diff of some other repository.
+# shellcheck source=lib/git-scrub.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/git-scrub.sh"
+scrub_git_environment
 cd "$WORK"
-git init -q -b master .
-git config user.email ci-scope@example.invalid
-git config user.name "ci-scope test"
+scratch_git init -q -b master .
+scratch_git config user.email ci-scope@example.invalid
+scratch_git config user.name "ci-scope test"
 
 mkdir -p docs/guide .agent/rules src/FastCache/Core scripts cmake packaging .github/workflows
 for f in docs/guide/page.md .agent/rules/thing.md README.md mkdocs.yml CMakeLists.txt \
@@ -39,8 +42,8 @@ for f in docs/guide/page.md .agent/rules/thing.md README.md mkdocs.yml CMakeList
          packaging/CMakeLists.txt .github/workflows/build.yml; do
     echo original > "$f"
 done
-git add -A
-git commit -q -m base
+scratch_git add -A
+scratch_git commit -q -m base
 BASE="$(git rev-parse HEAD)"
 
 failures=0
@@ -48,7 +51,7 @@ Expect() { # $1 = expected value, $2 = label, $3.. = files to touch
     local want="$1" label="$2"; shift 2
     local f
     for f in "$@"; do echo changed > "$f"; done
-    git add -A && git commit -q -m "$label"
+    scratch_git add -A && scratch_git commit -q -m "$label"
     local got
     got="$("$SCOPE" "$BASE" HEAD 2>/dev/null || echo "code=ERROR")"
     if [[ "$got" == "$want" ]]; then
@@ -57,7 +60,7 @@ Expect() { # $1 = expected value, $2 = label, $3.. = files to touch
         printf '  FAIL  %-44s got %s, want %s\n' "$label" "$got" "$want"
         failures=$((failures + 1))
     fi
-    git reset -q --hard "$BASE"
+    scratch_git reset -q --hard "$BASE"
 }
 
 echo "documentation only -- the matrix must be skippable:"
@@ -78,7 +81,7 @@ Expect "code=true"  "docs AND code"        docs/guide/page.md src/FastCache/Core
 
 echo "a path no row describes is code, never documentation:"
 echo new > unheard-of.frobnicate
-git add -A && git commit -q -m unknown
+scratch_git add -A && scratch_git commit -q -m unknown
 got="$("$SCOPE" "$BASE" HEAD 2>/dev/null || echo code=ERROR)"
 if [[ "$got" == "code=true" ]]; then
     printf '  ok    %-44s %s\n' "an unrecognised extension" "$got"
@@ -86,7 +89,7 @@ else
     printf '  FAIL  %-44s got %s, want code=true\n' "an unrecognised extension" "$got"
     failures=$((failures + 1))
 fi
-git reset -q --hard "$BASE"
+scratch_git reset -q --hard "$BASE"
 
 echo "every way of not knowing escalates:"
 for spec in "unresolvable base|0000000000000000000000000000000000000000|HEAD" \

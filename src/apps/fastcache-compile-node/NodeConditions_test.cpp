@@ -325,11 +325,10 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     auto clustered = Testing::FirstStart(NodeConfig {});
     NodeMembership membership { clustered, membershipLog };
 
-    // And the consensus scope's prover, built as `main` builds it on a consensus node that names a
-    // scheduler -- over that node's roster and its own membership -- which answers
+    // And the consensus scope's prover, built as `main` builds it on a consensus node that announces
+    // (`AwaitsItsOwnRecord`) -- over that node's roster and its own membership -- which answers
     // `own-record-awaited`.
     NodeConfig proving;
-    proving.schedulers = { "127.0.0.1:6674" };
     proving.raftListen = "127.0.0.1:6680";
     core::platform::ManualWallClock rosterClock;
     auto const roster = NodeRoster::Build(proving, rosterClock, metrics, logger);
@@ -612,10 +611,10 @@ TEST_CASE("surface-accept-degraded stays raised while any surface is degraded, a
 
 namespace
 {
-    /// How many rounds the two-loop case runs: each is one chance at the race, at its last events.
-    constexpr auto AcceptLoopRaceRounds = 400;
-    /// How many events each loop records per round.
-    constexpr auto AcceptLoopRaceFlips = 25;
+/// How many rounds the two-loop case runs: each is one chance at the race, at its last events.
+constexpr auto AcceptLoopRaceRounds = 400;
+/// How many events each loop records per round.
+constexpr auto AcceptLoopRaceFlips = 25;
 } // namespace
 
 TEST_CASE("Two loops reporting at once leave surface-accept-degraded as the registry finally reads",

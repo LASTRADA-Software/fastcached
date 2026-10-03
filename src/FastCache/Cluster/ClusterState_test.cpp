@@ -1241,7 +1241,7 @@ TEST_CASE("A principal is never admitted, recorded or decoded under the all-zero
     auto const refused = RefusedAgainst(state, command);
     CHECK(refused.code == ConsensusErrorCode::InvalidConfiguration);
     CHECK(refused.context.contains("w9 would be admitted with no identity key"));
-    CHECK(refused.context.contains("--cluster-admit-worker=w9@<key>"));
+    CHECK(refused.context.contains("the request must carry one"));
     Apply(state, command);
     CHECK(state.principals.empty());
 

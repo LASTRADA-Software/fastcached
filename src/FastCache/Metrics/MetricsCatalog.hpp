@@ -1166,9 +1166,9 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseNoRoster,
       .prometheusName = "fastcache_worker_jobs_refused_lease_no_roster_total",
       .help = "Grants refused because this worker holds no roster to verify them against: it has not yet been "
-              "handed one its --voter-key anchors certify, and kept none from an earlier run. A few at startup are "
-              "ordinary; a rise that does not stop means no leader it can reach is endorsed by the keys it was "
-              "given.",
+              "handed one the roster it holds certifies, and kept none from an earlier run. A few at startup are "
+              "ordinary; a rise that does not stop means no leader it can reach is endorsed by the voters it "
+              "trusts.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::WorkerJobsRefusedLeaseRosterExpired,
       .prometheusName = "fastcache_worker_jobs_refused_lease_roster_expired_total",
@@ -1205,7 +1205,7 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
     { .counter = IMetricsSink::Counter::NodeProofsRefusedUnknownKey,
       .prometheusName = "fastcache_node_proofs_refused_unknown_key_total",
       .help = "Node proofs whose signature verified under a key this cluster does not hold for the id named: a "
-              "machine nobody enrolled or admitted with --cluster-admit-worker, or one presenting a key other than "
+              "machine nobody enrolled, or one presenting a key other than "
               "the one admitted under its id. The remedy is an admission, not a key.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeProofsRefusedRevokedKey,
@@ -1294,23 +1294,6 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "the roster does not record it under its own key, or records no member under the key that proved the "
               "fleet. The fleet answered, wrongly -- an approval of another key for this id, most often. Nothing was "
               "archived; the node stays in its own cluster, and gives the join up if it goes on.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::FormationAdmissionsUnverified,
-      .prometheusName = "fastcache_formation_admissions_unverified_total",
-      .help = "Answers to this node's join -- an admission, a refusal or a not-yet -- it refused because nothing "
-              "bound them to the fleet it asked: no signature, one that does not verify over this node's own "
-              "request and the outcome it states, or a genuine one by a key it never proved for that fleet. Such an "
-              "answer counts as no answer: a refusal does not send the node away and a not-yet does not keep it "
-              "waiting. A rise is something answering at the endpoint this node polls that is not that fleet. "
-              "Nothing was archived; the node stays in its own cluster, and gives the join up if it goes on.",
-      .type = MetricType::Counter },
-    { .counter = IMetricsSink::Counter::StateFileReplacesFellBack,
-      .prometheusName = "fastcache_state_file_replaces_fell_back_total",
-      .help = "Serving bodies that found, as they started, that the state files in this node's directory are "
-              "replaced by the classic rename because the POSIX-semantics one was refused -- a filesystem "
-              "without it, or a path form it will not take. Every replace still lands; on Windows a reader "
-              "holding a state file open then makes its replace fail. The warning names the directory and the "
-              "refusal.",
       .type = MetricType::Counter },
     { .counter = IMetricsSink::Counter::NodeTicketsAccepted,
       .prometheusName = "fastcache_node_tickets_accepted_total",
@@ -1438,6 +1421,23 @@ inline constexpr EnumTable<IMetricsSink::Counter, CounterDescriptor> CounterTabl
               "scheduler records. Nothing is recorded for them. An overlong condition field is refused "
               "earlier, when the frame is decoded, and is not counted here. This project's nodes send "
               "none that long, so any rise names a peer that does.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::FormationAdmissionsUnverified,
+      .prometheusName = "fastcache_formation_admissions_unverified_total",
+      .help = "Answers to this node's join -- an admission, a refusal or a not-yet -- it refused because nothing "
+              "bound them to the fleet it asked: no signature, one that does not verify over this node's own "
+              "request and the outcome it states, or a genuine one by a key it never proved for that fleet. Such an "
+              "answer counts as no answer: a refusal does not send the node away and a not-yet does not keep it "
+              "waiting. A rise is something answering at the endpoint this node polls that is not that fleet. "
+              "Nothing was archived; the node stays in its own cluster, and gives the join up if it goes on.",
+      .type = MetricType::Counter },
+    { .counter = IMetricsSink::Counter::StateFileReplacesFellBack,
+      .prometheusName = "fastcache_state_file_replaces_fell_back_total",
+      .help = "Serving bodies that found, as they started, that the state files in this node's directory are "
+              "replaced by the classic rename because the POSIX-semantics one was refused -- a filesystem "
+              "without it, or a path form it will not take. Every replace still lands; on Windows a reader "
+              "holding a state file open then makes its replace fail. The warning names the directory and the "
+              "refusal.",
       .type = MetricType::Counter },
 } };
 

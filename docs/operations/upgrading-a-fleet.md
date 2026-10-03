@@ -150,15 +150,14 @@ changes to what each machine is started with:
 1. **Every scheduler runs consensus, even alone.** Add `--listen-raft` and
    `--raft-self` (and `--cluster-dir`, for a service) to a scheduler that had none; it
    is a cluster of one. One without them is refused at startup, by name.
-2. **Every worker another machine can reach names the voters.** Run
-   `--print-identity` on each voter, with the flags it runs with, and give every such
-   worker one `--voter-key=<public-key>` per voter. Without one it is refused at
-   startup; a worker only its own machine can reach needs none. With `--cluster-dir` it
-   keeps the roster it adopts, and from then on that roster certifies its successor.
-3. **Confirm on the workers.** `fastcache_node_roster_expires_in_seconds` appears on
-   every checking worker once it holds a roster, and
-   `fastcache_worker_jobs_refused_lease_no_roster_total` rising without stopping means
-   a worker never reached a leader its `--voter-key` voters endorse.
+2. **Every worker another machine can reach joins the fleet as a learner.** It applies the
+   fleet's replicated state and checks every grant against it, so there is no key to type:
+   start it with no `--scheduler` (`--fleet-seed=<host>` where no beacon reaches) and
+   approve it on a voter with `--enroll-approve`. A worker only its own machine can reach
+   checks no grant and needs neither.
+3. **Confirm on the workers.** `fastcache_worker_jobs_refused_lease_no_roster_total`
+   rising without stopping means a worker holds nothing to check a grant against: it has
+   not been admitted yet.
 
 ## The consensus state directory
 
@@ -188,8 +187,8 @@ tombstones). Either way the directory is intact; what an operator does is:
 3. If the node **joined** its fleet, start it again: its formation record says so, and it
    waits to be admitted instead of bootstrapping a cluster of itself. A cluster that still
    counts it catches it up from the leader; one that has forgotten it admits it again with
-   `--cluster-admit` (or `--cluster-admit-learner`). It keeps its identity, so it needs no
-   `--enroll-from`.
+   `--cluster-admit` (or `--cluster-admit-learner`). It keeps its identity, so it is admitted
+   under the key it already holds.
 4. The node that **founded** its fleet bootstraps it again, alone, so move its state aside
    only when every member's was moved aside together. Start it first, admit the others
    again from it, and make again every `--cluster-*` change made since the fleet formed.

@@ -100,9 +100,10 @@ endfunction()
 ## @param tree The directory.
 ## @param stage TRUE to `git add -A`; FALSE leaves an index that names nothing.
 function(MakeRepository tree stage)
-    execute_process(COMMAND "${GIT_EXECUTABLE}" init -q "${tree}" OUTPUT_QUIET ERROR_QUIET)
+    fastcached_scratch_git("${GIT_EXECUTABLE}" scratchGit)
+    execute_process(COMMAND ${scratchGit} init -q "${tree}" OUTPUT_QUIET ERROR_QUIET)
     if(stage)
-        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${tree}" add -A
+        execute_process(COMMAND ${scratchGit} -C "${tree}" add -A
                         OUTPUT_QUIET ERROR_QUIET)
     endif()
 endfunction()
@@ -421,10 +422,11 @@ Expect("bytesWalk" "a byte nobody holds equals git's" "${walkNone}" "${gitNone}"
 # A git built without PCRE refuses `-P`; `grep.threads=-1` makes this one refuse `grep` the same
 # way while `ls-files` still answers, so the mode stays git's and only the search fails. The
 # answer must be the one a working search gives -- a failed search is not one that found nothing.
-execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${bytesTree}" config grep.threads -1)
+fastcached_scratch_git("${GIT_EXECUTABLE}" scratchGit)
+execute_process(COMMAND ${scratchGit} -C "${bytesTree}" config grep.threads -1)
 AskBytes(fallbackBel fallbackMode 07)
 AskBytes(fallbackNul fallbackMode 00)
-execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${bytesTree}" config --unset grep.threads)
+execute_process(COMMAND ${scratchGit} -C "${bytesTree}" config --unset grep.threads)
 Expect("bytesGrepFails" "mode" "${fallbackMode}" "git ls-files")
 Expect("bytesGrepFails" "a BEL equals a working search's" "${fallbackBel}" "${gitBel}")
 Expect("bytesGrepFails" "a NUL equals a working search's" "${fallbackNul}" "${gitNul}")
@@ -489,13 +491,13 @@ endif()
 
 # The same questions with git's search failing: every file is asked one at a time, and the
 # answers must be the ones git gave.
-execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${missingTree}" config grep.threads -1)
+execute_process(COMMAND ${scratchGit} -C "${missingTree}" config grep.threads -1)
 AskMissing(fallbackMissing fallbackLinkBytes fallbackMissingMode)
 # The TEXT search fails the same way and is answered the same way -- by reading -- where it used
 # to be refused outright: any stderr makes a search untrusted, a failure included.
 fastcached_tracked_files("${missingTree}" GLOBS "*" FILES_OUT unused MODE_OUT fallbackTextMode
     CONTAINING "ring" CONTAINING_OUT fallbackLinkText MISSING_OUT fallbackTextMissing)
-execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${missingTree}" config --unset grep.threads)
+execute_process(COMMAND ${scratchGit} -C "${missingTree}" config --unset grep.threads)
 Expect("missingGrepFails" "mode" "${fallbackMissingMode}" "git ls-files")
 Expect("missingGrepFails" "missing equals a working search's" "${fallbackMissing}" "${gitMissing}")
 Expect("missingGrepFails" "a byte equals a working search's" "${fallbackLinkBytes}" "${gitLinkBytes}")

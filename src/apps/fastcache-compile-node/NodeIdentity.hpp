@@ -69,9 +69,6 @@ struct NodeIdentity
 /// so the identity needs no discriminator that the state does not already force.
 inline constexpr std::string_view NodeIdentityFileName = StateFileName(StateFile::Identity);
 
-/// What a new id is written to first, beside `NodeIdentityFileName`, and renamed into place.
-inline constexpr std::string_view NodeIdentityReplacementSuffix = ".new";
-
 /// How many hex characters a minted identity carries.
 ///
 /// 128 bits. Long enough that no fleet collides by accident and short enough to read
@@ -276,15 +273,6 @@ static_assert(RowsInEnumeratorOrder(NodeIdentityFaultStages, [](NodeIdentityFaul
 /// @return `MintedNodeIdLength` lowercase hex characters, or why none could be drawn.
 [[nodiscard]] std::expected<std::string, SecureRandomError> MintNodeId(ISecureRandom& random);
 
-/// What a node holding an identity is, for what `--print-identity` tells its operator to type.
-///
-/// **PRIVATE: persisted and transmitted nowhere.**
-enum class IdentityRole : std::uint8_t
-{
-    Member, ///< Runs consensus: admitted with `--cluster-admit`, or by enrollment.
-    Worker, ///< Runs none: admitted with `--cluster-admit-worker` or `--enroll-from`.
-};
-
 /// What `--print-identity` prints (#178): one `name value` line per fact, the names the ones
 /// `fastcache-cli node` reports under.
 ///
@@ -296,14 +284,13 @@ enum class IdentityRole : std::uint8_t
 /// @param key Its public key, shown whole.
 /// @param dialAddress Where its peers dial it, when this configuration says; without one the
 ///        token cannot be written and is left out rather than guessed.
-/// @param role What the node IS (#178): a consensus MEMBER prints the `cluster-admit` token an
-///        operator types on a member, a WORKER the `cluster-admit-worker` token --
-///        the one line a worker's admission needs, spelled the way the flag parses it.
+///        A machine its peers do not dial -- a learner, which dials in -- is admitted through
+///        enrollment instead, where an operator compares the key printed here with the one
+///        `--enroll-list` shows.
 /// @return The lines, each ending in a newline.
 [[nodiscard]] std::string DescribeIdentity(std::string_view id,
                                            Ed25519PublicKey const& key,
-                                           std::optional<std::string> const& dialAddress,
-                                           IdentityRole role);
+                                           std::optional<std::string> const& dialAddress);
 
 /// Put a resolved identity into a configuration: the id and the key this node runs as. Its
 /// member entry is the formation's (`BootstrapMembersOf`), built from these and the address

@@ -185,6 +185,11 @@ void FormationController::Queue(Cluster::ProvenFleet const& fleet)
 
 void FormationController::Tick()
 {
+    // Confined to this machine, nothing is decided at all: every arm below asks another machine
+    // something, a seed, a fleet or a member, and none of them could reach this node back.
+    if (_self.reach == FleetReachability::ThisMachineAlone)
+        return;
+
     // A closed set whose arms are different work, the `EnrollRoleTable` precedent: only the two
     // modes that are still their own cluster decide anything on a beat.
     switch (Mode())
@@ -552,7 +557,7 @@ void FormationController::TickPending()
                     abandon();
                     break;
                 }
-                // A CHAIN bound, as `RunEnrollClient`'s: past it the next poll goes back to the fleet's
+                // A CHAIN bound, as `RunEnrollAdmin`'s: past it the next poll goes back to the fleet's
                 // own leader endpoint rather than following two stale leaders around each other.
                 if (_redirects >= MaxEnrollRedirects)
                 {

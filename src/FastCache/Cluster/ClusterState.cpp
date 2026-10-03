@@ -1385,9 +1385,8 @@ std::expected<void, ConsensusError> ValidateAgainst(ClusterState const& state, C
             // `KeyToRecord`, the answer `Apply` records, so the courtesy and the guarantee agree.
             if (!KeyToRecord(state, command).has_value())
                 return std::unexpected(InvalidConfiguration(
-                    std::format("{} would be admitted with no identity key; a principal is admitted by its key, so give "
-                                "--cluster-admit-worker={}@<key>",
-                                command.key,
+                    std::format("{} would be admitted with no identity key; a principal is admitted by its key, so "
+                                "the request must carry one",
                                 command.key)));
             return refuseKey();
 

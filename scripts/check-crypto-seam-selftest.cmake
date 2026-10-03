@@ -26,6 +26,10 @@
 
 cmake_minimum_required(VERSION 3.28)
 
+# `fastcached_scratch_git`: the fixture's own git runs with the inherited `GIT_DIR` and its
+# kin removed, or under an exported `GIT_DIR` its `git init` writes THAT repository.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 foreach(required IN ITEMS FASTCACHED_SOURCE_DIR FASTCACHED_SCRATCH_DIR)
     if(NOT DEFINED ${required})
         message(FATAL_ERROR "${required} must be set")
@@ -71,8 +75,9 @@ function(fastcached_stage_git tree)
     if(NOT GIT_EXECUTABLE)
         message(FATAL_ERROR "crypto-seam-selftest: INCONCLUSIVE -- no git to stage ${tree} with")
     endif()
+    fastcached_scratch_git("${GIT_EXECUTABLE}" scratchGit)
     foreach(step IN ITEMS "init;-q" "add;-A")
-        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${tree}" ${step} RESULT_VARIABLE status
+        execute_process(COMMAND ${scratchGit} -C "${tree}" ${step} RESULT_VARIABLE status
                         OUTPUT_QUIET ERROR_VARIABLE errors)
         if(NOT status EQUAL 0)
             message(FATAL_ERROR "crypto-seam-selftest: INCONCLUSIVE -- `git ${step}` in ${tree} failed: ${errors}")

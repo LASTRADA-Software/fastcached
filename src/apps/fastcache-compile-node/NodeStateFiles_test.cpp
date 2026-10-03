@@ -191,7 +191,7 @@ TEST_CASE("A foreign temporary of a state file, and a foreign entry no row names
         std::string_view expect; // What the refusal says about it.
     };
     for (auto const& [name, expect]: { Case { .name = "formation.tmp", .expect = "as a temporary of formation" },
-                                       Case { .name = "node-id.new", .expect = "as a temporary of node-id" },
+                                       Case { .name = "node-id.tmp", .expect = "as a temporary of node-id" },
                                        Case { .name = "raft-log.tmp", .expect = "as a temporary of raft-log" },
                                        Case { .name = "planted", .expect = "keeps no entry by that name" } })
     {
@@ -416,36 +416,6 @@ TEST_CASE("A history file another account owns is set aside where it is read, an
     CHECK(Logged(logger, "starts without"));
     CHECK_FALSE(std::ranges::contains(guard.Owners(), paths.received));
     CHECK(TextOf(paths.fleet) == "planted");
-}
-
-TEST_CASE("Enrollment refuses a consensus store another account wrote for that, never as this node's history",
-          "[enrollment][client][state]")
-{
-    // Enrollment reads the consensus history BEFORE it resolves the key, so the walk runs ahead of
-    // that read: a planted store holding a term would otherwise be refused as "this node took part
-    // in a cluster before" -- the wrong problem, with a remedy that deletes the evidence.
-    ScratchDirectory const scratch { "enroll-foreign-store" };
-    {
-        auto store = Consensus::FileRaftStorage::Open(scratch.Path());
-        REQUIRE(store.has_value());
-        REQUIRE(store
-                    ->SaveState(Consensus::PersistentState { .currentTerm = Consensus::Term { .value = 3 },
-                                                             .votedFor = std::string { "n-9" } })
-                    .has_value());
-    }
-    auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.clusterDir = scratch.Path();
-    cfg.enrollFrom = "10.0.0.1:6680";
-    auto guard = ScriptedNodeKeyGuard::OwnerOnly();
-    guard.OwnedByAnother(Consensus::RaftStateFileName);
-    ScriptedSecureRandom random { ScriptedSecureRandom::Ascending(Ed25519SeedBytes) };
-
-    auto const refused = RunEnrollClient(cfg, random, guard);
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().reason.contains("consensus term and vote"));
-    CHECK(refused.error().reason.contains("scripted-owner"));
-    CHECK_FALSE(refused.error().reason.contains("already holds consensus state"));
-    CHECK(random.FillCount() == 0);
 }
 
 TEST_CASE("Every file the node's writers leave in its state directory has a row, the key alone its owner's alone",
@@ -706,7 +676,7 @@ TEST_CASE("A formation record planted as a link to a file this account owns is r
 TEST_CASE("A state file an elevated operator writes stays readable by the service the directory grants",
           "[node][state][secret]")
 {
-    // `--enroll-from` is run elevated before the service ever starts, and writes as
+    // `--print-identity` may run elevated before the service ever starts, and writes as
     // `Administrators`; the install then grants the service's account the directory, inheritably
     // (`GrantPathAccess`). A file with a protected list of its own takes that grant neither before
     // nor after, and the service is refused its own roster with no remedy. So every state file
@@ -718,7 +688,7 @@ TEST_CASE("A state file an elevated operator writes stays readable by the servic
     FileTrustNodeKeyGuard guard;
     REQUIRE(ResolveNodeKey(dir, random, guard).has_value());
 
-    // Before the grant: the roster, as enrollment saves it.
+    // Before the grant: the roster, as an earlier run saves it.
     REQUIRE(Distributed::FileRosterStore { dir / Distributed::RosterFileName }
                 .Save(Cluster::PersistedRoster {
                     .certificate = Cluster::CertifiedRoster { .clusterId = "mine",
@@ -755,7 +725,7 @@ TEST_CASE("A state file the node cannot open names the command that hands it to 
     auto const file = std::filesystem::path { "C:/ProgramData/fastcache-node/cluster/roster" };
     auto const hint = StateFileUnreadableHint(file);
     CHECK(hint.contains(std::format(R"(icacls "{}" /setowner "NT SERVICE\<the service's name>")", file.string())));
-    CHECK(hint.contains("--enroll-from"));
+    CHECK(hint.contains("--print-identity"));
 }
 #else
 TEST_CASE("A state file the node cannot open names the chown that hands it to the service", "[node][state]")
@@ -861,7 +831,7 @@ TEST_CASE("Below the top level the walk accepts the archive's layout and nothing
 namespace
 {
 /// A POSIX-semantics rename that answers what it was scripted to, and moves nothing when it refuses.
-class ScriptedReplacingRename final: public Consensus::IReplacingRename
+class ScriptedReplacingRename final: public Platform::IReplacingRename
 {
   public:
     /// @param refusal What every rename answers; empty to rename as the platform does.
@@ -870,14 +840,14 @@ class ScriptedReplacingRename final: public Consensus::IReplacingRename
     {
     }
 
-    /// @copydoc Consensus::IReplacingRename::RenameReplacing
+    /// @copydoc Platform::IReplacingRename::RenameReplacing
     [[nodiscard]] std::error_code RenameReplacing(std::filesystem::path const& from,
                                                   std::filesystem::path const& to) const override
     {
         ++_asked;
         if (_refusal)
             return _refusal;
-        return Consensus::SystemReplacingRename {}.RenameReplacing(from, to);
+        return Platform::SystemReplacingRename {}.RenameReplacing(from, to);
     }
 
     /// @return How many renames were asked.
@@ -907,14 +877,14 @@ TEST_CASE("A replace whose POSIX rename is refused as unsupported still lands, a
 
     // Only Windows reads that answer as "no such rename here": `rename(2)` has the semantics, so a
     // POSIX build treats any refusal as the failure it is.
-    if (!Consensus::MeansNoPosixRename(refused))
+    if (!Platform::MeansNoPosixRename(refused))
     {
         CHECK_FALSE(route.has_value());
         CHECK(metrics.Read(IMetricsSink::Counter::StateFileReplacesFellBack) == 0);
         return;
     }
     REQUIRE(route.has_value());
-    CHECK(Testing::Unwrap(route) == Consensus::ReplaceRoute::Classic);
+    CHECK(Testing::Unwrap(route) == Platform::ReplaceRoute::Classic);
     CHECK(rename.Asked() > 0);
     CHECK(metrics.Read(IMetricsSink::Counter::StateFileReplacesFellBack) == 1);
     auto const said = logger.Snapshot();
@@ -934,9 +904,60 @@ TEST_CASE("A replace whose POSIX rename works is neither said nor counted", "[no
     auto const rename = ScriptedReplacingRename { std::error_code {} };
     auto const route = ReportReplaceRoute(scratch.Path(), rename, logger, metrics);
     REQUIRE(route.has_value());
-    CHECK(Testing::Unwrap(route) == Consensus::ReplaceRoute::PosixSemantics);
+    CHECK(Testing::Unwrap(route) == Platform::ReplaceRoute::PosixSemantics);
     CHECK(rename.Asked() > 0);
     CHECK(metrics.Read(IMetricsSink::Counter::StateFileReplacesFellBack) == 0);
     CHECK(logger.Snapshot().empty());
     CHECK_FALSE(std::filesystem::exists(scratch / Consensus::ReplaceProbeFileName));
+}
+
+TEST_CASE("What a crash during the replace probe leaves is no reason to refuse the next start, and the probe clears it",
+          "[node][state-files]")
+{
+    // A SIGKILL or a power loss inside the startup probe leaves the probe, or its temporary. Both are
+    // never read, so the judge passes them by NAME -- and the next probe, which every serving body
+    // runs, clears them.
+    {
+        ScratchDirectory const scratch { "replace-probe-leftover" };
+        for (auto const name: NodeStateProbeLeftovers())
+            WriteText(scratch.Path() / std::filesystem::path { std::string { name } }, "a crash left this");
+        auto guard = ScriptedNodeKeyGuard::OwnerOnly();
+        auto const walked = RefuseForeignStateFiles(scratch.Path(), guard);
+        INFO((walked.has_value() ? std::string {} : walked.error().message));
+        CHECK(walked.has_value());
+
+        CapturingLogger logger;
+        AtomicMetricsSink metrics;
+        auto const rename = ScriptedReplacingRename { std::error_code {} };
+        auto const route = ReportReplaceRoute(scratch.Path(), rename, logger, metrics);
+        REQUIRE(route.has_value());
+        for (auto const name: NodeStateProbeLeftovers())
+        {
+            INFO(name);
+            CHECK_FALSE(std::filesystem::exists(scratch.Path() / std::filesystem::path { std::string { name } }));
+        }
+    }
+    {
+        // By name and nothing wider: a file that merely starts like the probe is still nothing this build
+        // wrote.
+        ScratchDirectory const scratch { "replace-probe-lookalike" };
+        auto const lookalike = scratch.Path() / (std::string { Consensus::ReplaceProbeFileName } + ".old");
+        WriteText(lookalike, "planted");
+        auto guard = ScriptedNodeKeyGuard::OwnerOnly();
+        auto const walked = RefuseForeignStateFiles(scratch.Path(), guard);
+        REQUIRE_FALSE(walked.has_value());
+        CHECK(walked.error().fault == NodeKeyFault::UnknownEntry);
+        CHECK(walked.error().message.contains(lookalike.string()));
+    }
+    {
+        // And only as a regular file: a DIRECTORY of that name is no probe's leftover, and the probe could
+        // never replace it.
+        ScratchDirectory const scratch { "replace-probe-directory" };
+        std::filesystem::create_directories(scratch.Path()
+                                            / std::filesystem::path { std::string { Consensus::ReplaceProbeFileName } });
+        auto guard = ScriptedNodeKeyGuard::OwnerOnly();
+        auto const walked = RefuseForeignStateFiles(scratch.Path(), guard);
+        REQUIRE_FALSE(walked.has_value());
+        CHECK(walked.error().fault == NodeKeyFault::UnknownEntry);
+    }
 }

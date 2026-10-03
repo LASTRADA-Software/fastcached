@@ -178,7 +178,7 @@ std::expected<std::unique_ptr<NodeFrameSurface>, NodeRefusal> StartNodeSurfaceOr
     auto judged = JudgeBindFailure(
         RowFor(NodeSurface::Node),
         std::format("--listen-node: {}. this node opens exactly one 0xFC port, so without it there is nowhere for a "
-                    "dispatched compile to arrive -- and it would still register with --scheduler and advertise an "
+                    "dispatched compile to arrive -- and it would still register its worker and advertise an "
                     "address nothing answers, which every client meets as a failed connection and a silent local "
                     "compile. the usual cause is a fastcached holding that port on this machine: stop it, or give "
                     "--listen-node a port of its own. a node needs no daemon beside it -- it answers every verb the "

@@ -3288,6 +3288,33 @@ set_tests_properties("workflow-walk-sole-selftest" PROPERTIES
 )
 
 # ---------------------------------------------------------------------------
+# Every git WRITE a script or fixture runs goes through `scratch_git` (scripts/lib/git-scrub.sh)
+# or `fastcached_scratch_git` (scripts/lib/CheckCommon.cmake), which remove the inherited
+# `GIT_DIR` and the rest of scripts/lib/git-scrub-variables.txt from that one command. An
+# exported `GIT_DIR` around a ctest run once made every self-test's scratch `git init` write
+# `core.worktree` into the configuration all worktrees share. The header carries the pattern and
+# what it cannot see; the self-test replays that run against a SCRATCH repository, one bash and
+# one `cmake -P` self-test, and prints how many cases ran.
+add_test(
+    NAME "scratch-git"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-scratch-git.sh"
+)
+set_tests_properties("scratch-git" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 60
+)
+
+add_test(
+    NAME "scratch-git-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-scratch-git.sh" --self-test
+        --cmake "${CMAKE_COMMAND}" --git "${GIT_EXECUTABLE}"
+)
+set_tests_properties("scratch-git-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 180
+)
+
+# ---------------------------------------------------------------------------
 # Every fixture that starts `fastcache-compile-node` names `--cluster-dir` and turns off the
 # default fleet features it does not test (`--listen-raft=`, or `--discovery=` on a consensus
 # node). A node with no flags is a fleet member on shared default ports, keeping its identity in
@@ -6617,24 +6644,29 @@ endif()
 # Measured 2026-09-10 on this branch, WSL2/Ubuntu-24.04: 23 cases, 0.06 s wall, neither
 # skip arm taken. `TIMEOUT 60` is its neighbours' figure; the margin is enormous and
 # the alternative is inventing a number nobody can check.
-if(NOT WIN32)
-    add_test(
-        NAME "repair-worktree-pointers-selftest"
-        COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/repair-worktree-pointers.sh" --self-test
-    )
-    # `PASS_REGULAR_EXPRESSION` as well, for `tidy-sweep-selftest`'s reason: an EARLY
-    # STOP exits 0 having judged nothing (a planted `return 0` printed nothing and ctest
-    # said Passed, measured), and the script prints its pass line only once the count of
-    # checks matched `RepairSelfTestChecks` and none failed. The skip arms' lines end
-    # `-- SKIPPED: ...` and cannot match it, and SKIP_RETURN_CODE still decides a skip.
-    set_tests_properties("repair-worktree-pointers-selftest" PROPERTIES
-        FAIL_REGULAR_EXPRESSION "REPAIR SELF-TEST FAILED:"
-        PASS_REGULAR_EXPRESSION "REPAIR SELF-TEST PASSED"
-        LABELS "hygiene"
-        SKIP_RETURN_CODE 77
-        TIMEOUT 60
-    )
-endif()
+#
+# Registered on EVERY platform. It was `if(NOT WIN32)` while its fixture's positive
+# control knew only the POSIX spelling of an absolute pointer: Windows git writes
+# `gitdir: C:/...` even under Git Bash, so the self-test failed one case on every
+# Windows host and nothing registered it there to say so. The control now asks the
+# script's own `pointer_is_absolute`, and Windows is where the defect this script
+# repairs is CREATED, so it is the last platform to leave unchecked.
+add_test(
+    NAME "repair-worktree-pointers-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/repair-worktree-pointers.sh" --self-test
+)
+# `PASS_REGULAR_EXPRESSION` as well, for `tidy-sweep-selftest`'s reason: an EARLY
+# STOP exits 0 having judged nothing (a planted `return 0` printed nothing and ctest
+# said Passed, measured), and the script prints its pass line only once the count of
+# checks matched `RepairSelfTestChecks` and none failed. The skip arms' lines end
+# `-- SKIPPED: ...` and cannot match it, and SKIP_RETURN_CODE still decides a skip.
+set_tests_properties("repair-worktree-pointers-selftest" PROPERTIES
+    FAIL_REGULAR_EXPRESSION "REPAIR SELF-TEST FAILED:"
+    PASS_REGULAR_EXPRESSION "REPAIR SELF-TEST PASSED"
+    LABELS "hygiene"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 60
+)
 
 # ---------------------------------------------------------------------------
 # The consumer of `check-merge-queue-contexts.sh`'s `RequiredContexts` table:

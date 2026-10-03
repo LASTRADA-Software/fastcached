@@ -222,8 +222,9 @@ tls_args=()
 [[ -n "$tls_cert" ]] && tls_args=(--tls-cert "$tls_cert" --tls-key "$tls_key")
 [[ -n "$tls_self_signed" ]] && tls_args=(--tls-self-signed)
 
+# No --scheduler: a node that serves is refused one, and its worker registers with the
+# scheduler its own mode serves, on --listen-node.
 "$node" \
-    --scheduler "127.0.0.1:${sched_port}" \
     --toolchain "$toolchain" \
     --advertise "127.0.0.1:${sched_port}" \
     --listen-node "127.0.0.1:${sched_port}" \

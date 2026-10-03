@@ -3502,7 +3502,11 @@ _e2e_launcher_state_caller_damage() {
                         source = log_field("source")
                         for (i = 1; i <= n; i++) if (source != "" && t[i] != "" && index(source, t[i]) == 1) { hits++; break }
                     }
-                    END { print hits + 0, log_foreign + 0, log_malformed + 0 }')" || counted=""
+                    END { print hits + 0, log_foreign + 0, log_malformed + 0 }'
+            # BOTH stages: under `set +o pipefail` the status is awk's alone, and an awk a failed
+            # `tail` handed nothing prints `0 0 0` -- which reads as a clean log.
+            statuses=("${PIPESTATUS[@]}")
+            [ "${statuses[0]}" -eq 0 ] && [ "${statuses[1]}" -eq 0 ])" || counted=""
         # A count that did not come back is the instrument failing, never a clean log: it is its
         # own answer, and a damage line, since nothing then says what this run did to the log.
         case "$counted" in

@@ -733,13 +733,8 @@ class FormationHarness
             summary { controller, machine.identity },
             audience { machine.self.nodeEndpoint },
             session { verifier, Node::SessionKeys {}, machine.random, machine.harness._wall, machine.metrics },
-            sharedCache { cfg,
-                          machine.membership,
-                          machine.harness._clock,
-                          machine.metrics,
-                          machine.logger,
-                          nullptr,
-                          Node::ReconcileOn::Caller },
+            sharedCache { cfg,     machine.membership,       machine.harness._clock, machine.metrics, machine.logger,
+                          nullptr, Node::ReconcileOn::Caller },
             nextBeacon { machine.harness._clock.now() },
             nextTick { machine.harness._clock.now() }
         {
@@ -810,14 +805,14 @@ class FormationHarness
         /// The session component over a body that holds no roster: every ticket it is shown is
         /// refused, which is all a formation case needs of it.
         ExactAudience audience;
-        Distributed::SpentTickets spent;                                   ///< What its verifier spent.
+        Distributed::SpentTickets spent;                                         ///< What its verifier spent.
         Distributed::TicketVerifier const verifier { nullptr, audience, spent }; ///< Over no roster.
-        Node::SessionResponder session;                                    ///< Ticket minting and AUTH.
+        Node::SessionResponder session;                                          ///< Ticket minting and AUTH.
         /// The fleet's shared cache every node builds, dormant: nothing names this machine.
         Node::SharedCacheService sharedCache;
-        std::optional<Node::MergedResponder> merged;                      ///< What its node port answers with.
-        core::platform::SteadyTimePoint nextBeacon;                       ///< When it beacons next.
-        core::platform::SteadyTimePoint nextTick;                         ///< When its formation beats next.
+        std::optional<Node::MergedResponder> merged; ///< What its node port answers with.
+        core::platform::SteadyTimePoint nextBeacon;  ///< When it beacons next.
+        core::platform::SteadyTimePoint nextTick;    ///< When its formation beats next.
     };
 
     /// One machine: what outlives its bodies.
@@ -845,11 +840,6 @@ class FormationHarness
         {
             base.nodeId = nodeId;
             base.identityPublicKey = self.publicKey;
-            // Every worker names its scheduler today: the `--scheduler is required` row reads
-            // `cfg.schedulers`, never `SchedulersOf`, so a ZERO-CONFIG worker is refused at every start
-            // and every reform until Task 24 moves registration to `SchedulersOf`. Named here as an
-            // operator must name it now -- the machine's own node port, as a node that schedules does.
-            base.schedulers = { self.nodeEndpoint };
             base.hostNames =
                 Node::NodeHostNames { .fqdn = nodeId + ".corp.example", .dnsSuffix = "corp.example", .withheld = {} };
         }
@@ -894,7 +884,7 @@ class FormationHarness
         /// builds them, over a source slot nothing attaches -- so each answers that it has nothing to
         /// read. Built for their place on the surface, whose ceiling is their fold.
         LiveStatsSourceSlot liveSources;
-        SilentNodeStatus describe; ///< What `NodeStatus` answers: nothing this harness asserts.
+        SilentNodeStatus describe;       ///< What `NodeStatus` answers: nothing this harness asserts.
         FixedStanding const standing {}; ///< The standing it reports: no roster, nothing pending.
         Node::NodeStatusResponder nodeStatus { describe, liveSources, membership, standing, metrics };
         Node::LiveStatsResponder liveStats { liveSources, membership, AdminCredential {}, harness._loop, metrics };

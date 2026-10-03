@@ -1391,7 +1391,7 @@ class MergedResponder final: public IFrameResponder
         { .family = CompileCacheWire::VerbFamily::NodeProof,
           .refusal = { .code = CompileCacheWire::ErrorCode::NoCluster,
                        .rationale = "what a node running no consensus answers every proof aimed at it: it is no "
-                                    "scheduler, so a proof here is a --scheduler naming the wrong machine; counted, "
+                                    "scheduler, so a proof here is a node registering at the wrong machine; counted, "
                                     "one misdirected node would dominate the series that says whether an identity is "
                                     "WRONG somewhere" },
           .detail = "this node runs no consensus, so it holds no roster to prove an identity against and is no "
@@ -1437,9 +1437,9 @@ class MergedResponder final: public IFrameResponder
     /// without consensus implements these verbs perfectly well and has no cluster to
     /// let anybody into, so `UnimplementedVerb` -- which the client reads as
     /// `UnknownOpcode` -- told a joiner *the seed is running a build older than this
-    /// one*. The documented flow points `--enroll-from` at ANY member and most members
-    /// run no consensus, so the commonest operator mistake produced a confident wrong
-    /// diagnosis that sends somebody to upgrade a node that is already current.
+    /// one*. A joiner pointed at a node that runs no consensus is the commonest operator
+    /// mistake, and it produced a confident wrong diagnosis that sends somebody to upgrade
+    /// a node that is already current.
     ///
     /// `CompileCacheHandler`'s `RefusedVerbs` table already drew exactly this
     /// distinction for the daemon, with the argument written out beside it -- *"a joiner

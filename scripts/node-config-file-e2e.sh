@@ -56,11 +56,10 @@ FAILURES=0
 # both questions, so the cases that assert PARSING now supply the flag that startup
 # requires, leaving the file's own content the only thing under test.
 #
-# Any case here whose subject is the file rather than the policy needs this -- and,
-# since #178 PR 6, the state directory beside it: a node that names a scheduler and
-# runs no consensus proves an identity key kept there, and is refused at startup
-# without one. `--print-surfaces` opens nothing, so the directory is never created.
-SCHEDULER_FOR_STARTUP="--scheduler=scheduler.internal:6675"
+# A node given no flags at all starts -- it serves a fleet of its own and registers its
+# worker there -- so a case whose subject is the file needs nothing beside it but a state
+# directory of its own, kept out of the account's real one. `--print-surfaces` opens
+# nothing, so the directory is never created.
 # An array, so `check-node-fixture-starts` reads the --cluster-dir each start names.
 STATE_FOR_STARTUP=("--cluster-dir=$WORK/state")
 
@@ -132,7 +131,7 @@ expect_refusal() {
 #
 # The rule is a TYPED --discovery on a node that turned consensus off: it names the empty
 # --listen-raft= a fixture owes anyway, so the start could not have joined a fleet even past it.
-STOPS_AT_THE_RULES=(--listen-node=127.0.0.1:6674 --scheduler=127.0.0.1:6674 --listen-raft= --discovery=255.255.255.255:6681)
+STOPS_AT_THE_RULES=(--listen-node=127.0.0.1:6674 --listen-raft= --discovery=255.255.255.255:6681)
 expect_start_refusal() {
     name="$1"; want="$2"; needle="$3"; shift 3
     out="$("$NODE" "$@" "${STATE_FOR_STARTUP[@]}" "${STOPS_AT_THE_RULES[@]}" 2>&1)"
@@ -145,7 +144,6 @@ expect_start_refusal() {
 # the address it resolves to: a key that did nothing would leave the cache row
 # reading "not served", which is a different line rather than a missing one.
 cat >"$WORK/good.yaml" <<'YAML'
-scheduler: "cache.internal:6675"
 cluster_dir: "node-state"
 listen_node: "0.0.0.0:6699"
 YAML
@@ -161,7 +159,7 @@ expect_ok "the command line wins over the file" "0.0.0.0:6698" \
 # it is the first thing the map says. Before a first start has minted a record it is the
 # solitary one that start will mint -- and `--print-surfaces` writes nothing, so it stays
 # that way across calls.
-out="$("$NODE" "$SCHEDULER_FOR_STARTUP" "${STATE_FOR_STARTUP[@]}" --print-surfaces 2>&1)"
+out="$("$NODE" "${STATE_FOR_STARTUP[@]}" --print-surfaces 2>&1)"
 first="${out%%$'\n'*}"
 first="${first%$'\r'}"
 case "$first" in
@@ -187,7 +185,7 @@ expect_refusal "a named file that is absent is refused by name, and may be retri
     "--config=$WORK/definitely-not-here.yaml"
 
 # --- malformed ---------------------------------------------------------------
-printf 'scheduler: [1,\n' >"$WORK/malformed.yaml"
+printf 'listen_node: [1,\n' >"$WORK/malformed.yaml"
 expect_refusal "a malformed file is refused as a parse error" 2 "ParseError" \
     "--config=$WORK/malformed.yaml"
 
@@ -219,13 +217,22 @@ judge_refusal "a start whose command line does not parse is refused" 78 "--no-su
 printf 'schedular: "typo:6675"\n' >"$WORK/typo.yaml"
 expect_refusal "a key naming no setting is refused" 2 "UnknownKey" "--config=$WORK/typo.yaml"
 
+# --- a key for a node that does not serve ------------------------------------
+#
+# `scheduler:` names where a one-shot verb is sent. A node that serves finds its scheduler
+# from the fleet it joined, so a serving node's file naming one is refused by name rather
+# than registering anywhere it says.
+printf 'scheduler: "cache.internal:6675"\n' >"$WORK/aimed.yaml"
+expect_refusal "a serving node's file naming a scheduler is refused by name" 2 \
+    "--scheduler names where a one-shot verb is sent" "${STATE_FOR_STARTUP[@]}" "--config=$WORK/aimed.yaml"
+
 # --- unreadable --------------------------------------------------------------
 #
 # Skipped rather than asserted when running as root, which can read a 0000 file:
 # a case that cannot fail is worse than one that is absent, because it reports
 # success for a property nobody checked. `id -u` rather than $EUID, which bash
 # 3.2 has but `sh` does not guarantee.
-printf 'scheduler: "cache.internal:6675"\n' >"$WORK/locked.yaml"
+printf 'listen_node: "0.0.0.0:6699"\n' >"$WORK/locked.yaml"
 chmod 000 "$WORK/locked.yaml" 2>/dev/null
 if [ "$(id -u)" = "0" ]; then
     echo "skip: an unreadable file is refused (running as root, which can read it)"
@@ -254,7 +261,7 @@ chmod 644 "$WORK/locked.yaml" 2>/dev/null
 # `--discovery` rule. The accepted line's consensus address must reach past this machine, since
 # a typed `--discovery` that would beacon a loopback address is refused as well.
 printf '# the settings are on the command line\n' >"$WORK/lines.yaml"
-REGISTERED_LINE=(--listen-node=127.0.0.1:6674 --scheduler=127.0.0.1:6674 --advertise=127.0.0.1:6674 --discovery=255.255.255.255:6681)
+REGISTERED_LINE=(--listen-node=127.0.0.1:6674 --advertise=127.0.0.1:6674 --discovery=255.255.255.255:6681)
 expect_refusal "a typed --discovery without consensus is refused as a start refuses it" 2 \
     "--discovery needs --listen-raft" \
     "--config=$WORK/lines.yaml" "${STATE_FOR_STARTUP[@]}" "${REGISTERED_LINE[@]}" --listen-raft=
@@ -267,7 +274,7 @@ expect_ok "the same line with a consensus port is accepted" "36680" \
 # The shipped reference is exactly this shape, so a reader that treated an empty
 # document as a failure would refuse every fresh package install.
 printf '# nothing uncommented yet\n' >"$WORK/comments.yaml"
-expect_ok "a file of nothing but comments starts normally" "compile" "$SCHEDULER_FOR_STARTUP" \
+expect_ok "a file of nothing but comments starts normally" "compile" \
     "${STATE_FOR_STARTUP[@]}" "--config=$WORK/comments.yaml"
 
 # --- a file this worker FOUND, with no --config at all -----------------------
@@ -303,8 +310,7 @@ esac
 # machine with no configuration file at all must start on built-in defaults
 # rather than refuse. Only a path the operator NAMED is strict.
 rm -rf "$WORK/xdg/fastcache-compile-node"
-out="$(XDG_CONFIG_HOME="$WORK/xdg" HOME="$WORK" "$NODE" "$SCHEDULER_FOR_STARTUP" "${STATE_FOR_STARTUP[@]}" \
-    --print-surfaces 2>&1)"
+out="$(XDG_CONFIG_HOME="$WORK/xdg" HOME="$WORK" "$NODE" "${STATE_FOR_STARTUP[@]}" --print-surfaces 2>&1)"
 rc=$?
 if [ "$rc" -eq 0 ]; then
     echo "ok: no configuration file anywhere is not an error"
@@ -320,7 +326,7 @@ fi
 # check follows the file rather than a build layout.
 REFERENCE="$(dirname "$0")/../packaging/config/fastcache-compile-node.yaml"
 if [ -f "$REFERENCE" ]; then
-    expect_ok "the shipped reference configuration parses" "compile" "$SCHEDULER_FOR_STARTUP" \
+    expect_ok "the shipped reference configuration parses" "compile" \
         "${STATE_FOR_STARTUP[@]}" "--config=$REFERENCE"
 else
     case_failed "the shipped reference configuration parses" "not found at $REFERENCE"

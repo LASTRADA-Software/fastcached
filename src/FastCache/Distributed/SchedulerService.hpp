@@ -465,7 +465,7 @@ inline constexpr EnumTable<CompileCacheWire::IdentityRequirement, IdentityRequir
       .satisfiedBy = [](CallerContext const& caller) noexcept { return caller.provenNodeId.has_value(); },
       .refusal = CompileCacheWire::ErrorCode::NodeIdentityRequired,
       .remedy = "is sent only by a machine that proved its identity on this connection; prove it first, and have it "
-                "admitted with --enroll-from or --cluster-admit-worker" },
+                "admitted: it asks to enroll, and --enroll-approve admits it" },
     { .requirement = CompileCacheWire::IdentityRequirement::IdentifiedCaller,
       .satisfiedBy = [](CallerContext const& caller) noexcept { return caller.identified; },
       .refusal = CompileCacheWire::ErrorCode::IdentifiedCallerRequired,

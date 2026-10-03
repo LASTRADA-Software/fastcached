@@ -2,11 +2,13 @@
 #include "NodeConditions.hpp"
 #include "NodeFormation.hpp"
 #include "NodeReload.hpp"
+#include "WorkerLease.hpp"
 
 #include <FastCache/Config/YamlReader.hpp>
 #include <FastCache/Core/Logger.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <expected>
 #include <filesystem>
@@ -45,14 +47,6 @@ namespace Wire = FastCache::CompileCacheWire;
 namespace
 {
 
-/// A node registering with a scheduler on its own machine.
-///
-/// Loopback deliberately: a REMOTE scheduler plus an admission route -- which a worker's
-/// state directory always is -- is what the `--advertise` reachability rows are about,
-/// so a fixture that named one would have every reload below refused for a reason none
-/// of them is testing.
-constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
-
 /// A peer that is not this machine. `LoopbackMembership` answers `Member` for the whole
 /// of `127.0.0.0/8`, so a loopback caller could never show that a policy decides anything.
 constexpr std::string_view Stranger = "10.0.0.99";
@@ -77,16 +71,15 @@ constexpr std::string_view StateDirectory = "node-state";
 
 /// Write @p body to a worker's configuration file this case owns.
 ///
-/// The worker these cases are about runs NO consensus -- the kind a reload may not widen
-/// admission on without a `--voter-key` -- so the file says so: consensus is on by default,
-/// and an empty `listen_raft` is how a file turns it off.
+/// It names no `scheduler:`: a node that serves is refused one, and registers where its
+/// formation record says. And it leaves consensus on, as it is by default: a worker with its
+/// consensus port closed never registers anywhere and is refused at startup.
 /// @param dir Scratch directory.
-/// @param body The keys this case is about; the scheduler, state-directory and consensus lines are added.
+/// @param body The keys this case is about; the state-directory line is added.
 /// @return The path written.
 [[nodiscard]] std::filesystem::path WriteConfig(std::filesystem::path const& dir, std::string_view body)
 {
-    return WriteFile(
-        dir, std::format("scheduler: {}\ncluster_dir: {}\nlisten_raft: \"\"\n{}", SelfScheduler, StateDirectory, body));
+    return WriteFile(dir, std::format("cluster_dir: {}\n{}", StateDirectory, body));
 }
 
 /// Read @p path into a fresh configuration, exactly as the worker's reloader does.
@@ -109,9 +102,7 @@ constexpr std::string_view StateDirectory = "node-state";
 [[nodiscard]] NodeConfig RunningNode(bool open = false)
 {
     NodeConfig cfg;
-    cfg.schedulers = { std::string { SelfScheduler } };
     cfg.clusterDir = StateDirectory;
-    cfg.raftListen.clear(); // as `WriteConfig`'s file says
     cfg.fleetOpen = open;
     return cfg;
 }
@@ -143,9 +134,7 @@ TEST_CASE("A reload candidate is shaped by the formation, the names and the iden
     // most: a candidate shaped by no record runs no consensus and serves no scheduler, while the
     // running node does both.
     Testing::ScratchDirectory const scratch { "node-reload-shape" };
-    auto const path =
-        WriteFile(scratch.Path(),
-                  std::format("scheduler: {}\ncluster_dir: {}\n", SelfScheduler, (scratch / "state").generic_string()));
+    auto const path = WriteFile(scratch.Path(), std::format("cluster_dir: {}\n", (scratch / "state").generic_string()));
     auto const record = Cluster::FormationRecord { .mode = Cluster::NodeMode::Solitary,
                                                    .own = { .clusterId = "own-c", .createdAtUnixSeconds = 100 },
                                                    .joining = std::nullopt,
@@ -258,6 +247,85 @@ TEST_CASE("A reload declines when the formation record cannot be read or is gone
     CHECK(gone.error().context.contains("gone"));
 }
 
+TEST_CASE("A reload may not widen admission while the running worker verifies no lease", "[node][membership][reload][lease]")
+{
+    // Review I-2(b). A worker's lease check is chosen ONCE, at startup, and one that verifies
+    // nothing is safe only while no machine but this one reaches its compile verbs -- so a reload
+    // widening admission past it would open an unauthenticated compile port with every refusal
+    // counter reading zero. Keyed on what the running worker BUILT (`LeaseCheckInForce`), never on
+    // a flag shape, so a path no shape foresaw cannot reach it unguarded.
+    //
+    // Asserted on the REFUSAL, by its own words, and on the oracle together: "the reload was
+    // declined" and "nothing took effect" are two claims.
+    Testing::ScratchDirectory const scratch { "node-reload-unchecked-widen" };
+    auto const path = WriteConfig(scratch.Path(), "fleet_open: true\n");
+
+    auto const initial = RunningNode();
+    NodeMembership membership { initial, membershipLog };
+    // Bound ONCE, as a surface does at startup.
+    auto const& oracle = membership.Oracle();
+    std::ostringstream sink;
+    ConsoleLogger logger { sink, LogLevel::Info, LogTimestamps::No };
+
+    LeaseCheckInForce inForce;
+    inForce.Record(BuiltLeaseCheck::Unchecked);
+    NodeReloader reloader { initial, path, &Reparse, ReloadCheckWith(inForce) };
+    NodeConditions conditions;
+    ApplyReloadRequest(&reloader, membership, conditions, logger);
+
+    CHECK_FALSE(Admits(oracle, Stranger));
+    CHECK(sink.str().contains("may not widen admission with --fleet-open while this worker compiles WITHOUT verifying"));
+    CHECK_FALSE(reloader.Current()->fleetOpen);
+}
+
+TEST_CASE("A reload widens admission on a worker that verifies its leases, and on a node that built no worker",
+          "[node][membership][reload][lease]")
+{
+    // The control for the case above: the SAME save, refused only because of what was built. A
+    // worker checking every grant against its roster may admit whom it likes, and so may a node
+    // that built no lease check at all (`--slots=0`, which serves no compile verb).
+    auto const built = GENERATE(BuiltLeaseCheck::Signed, BuiltLeaseCheck::None);
+    INFO("built: " << static_cast<int>(built));
+    Testing::ScratchDirectory const scratch { "node-reload-checked-widen" };
+    auto const path = WriteConfig(scratch.Path(), "fleet_open: true\n");
+
+    auto const initial = RunningNode();
+    NodeMembership membership { initial, membershipLog };
+    auto const& oracle = membership.Oracle();
+    NullLogger logger;
+
+    LeaseCheckInForce inForce;
+    inForce.Record(built);
+    NodeReloader reloader { initial, path, &Reparse, ReloadCheckWith(inForce) };
+    NodeConditions conditions;
+    ApplyReloadRequest(&reloader, membership, conditions, logger);
+
+    CHECK(Admits(oracle, Stranger));
+}
+
+TEST_CASE("Narrowing is allowed on an unchecked worker, and a widening refusal names every setting first",
+          "[node][membership][reload][lease]")
+{
+    // Asked as a WIDENING rather than as a state: a worker already admitting a remote peer passed
+    // its own startup rules, and narrowing is the one edit that makes it safer.
+    LeaseCheckInForce inForce;
+    inForce.Record(BuiltLeaseCheck::Unchecked);
+    auto const check = ReloadCheckWith(inForce);
+    auto const admitting = RunningNode(/*open=*/true);
+    auto const narrowed = check(admitting, RunningNode());
+    INFO((narrowed.has_value() ? std::string {} : narrowed.error().context));
+    CHECK(narrowed.has_value());
+
+    // And LAST: a save that both widens and moves an unreloadable setting is told about the
+    // setting, rather than about the widening alone -- or the operator fixes one, saves, and only
+    // then learns the other was never going to apply.
+    auto moved = RunningNode(/*open=*/true);
+    moved.slots = 7;
+    auto const refused = check(RunningNode(), moved);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().context.contains("--slots"));
+}
+
 TEST_CASE("Dropping fleet_open closes the node again", "[node][membership][reload][revocation]")
 {
     // The narrowing direction: an open node admits every caller there is, so turning it
@@ -284,131 +352,6 @@ TEST_CASE("Dropping fleet_open closes the node again", "[node][membership][reloa
     // And this machine is still admitted, which is the rule that survives every
     // policy: a process on this host already has this host's compiler.
     CHECK(Admits(oracle, "127.0.0.1"));
-}
-
-TEST_CASE("A reload may not widen admission on a node that cannot check a lease", "[node][membership][reload][revocation]")
-{
-    // **The hole this ticket would otherwise open, which is #282 arriving through a
-    // new door.** A worker with no roster is legitimate for one shape of node: one no other
-    // machine can dial. `StartupPolicyRejection` decides that from the listen flags,
-    // which describe nothing under socket activation, and `MakeWorkerLeaseValidator`
-    // is the backstop for that -- and it runs once, at startup, against the
-    // configuration the process started with. Neither can see a reload that widens.
-    //
-    // Asserted on the REFUSAL and on the oracle together, because "the reload was
-    // declined" and "nothing took effect" are two claims and a reload is all-or-nothing
-    // only if both hold.
-    Testing::ScratchDirectory const scratch { "node-reload-keyless-widen" };
-    auto const path = WriteConfig(scratch.Path(), "fleet_open: true\n");
-
-    auto const initial = RunningNode();
-    REQUIRE(initial.voterKeys.empty()); // no roster root (#178)
-    NodeMembership membership { initial, membershipLog };
-    // Bound ONCE, as a surface does at startup.
-    auto const& oracle = membership.Oracle();
-
-    std::ostringstream sink;
-    ConsoleLogger logger { sink, LogLevel::Info, LogTimestamps::No };
-
-    NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
-    NodeConditions conditions;
-    ApplyReloadRequest(&reloader, membership, conditions, logger);
-
-    CHECK_FALSE(Admits(oracle, Stranger));
-    // **WHICH refusal, not that one happened.** The startup table's lease row and this
-    // guard both name `--voter-key` (#178), so matching that string alone passes
-    // for either -- and on a loopback-bound node the startup row does not fire, which is
-    // exactly the gap this rule exists to cover. `may not widen` is this rule's own
-    // words; the case below asserts the other side of the same distinction.
-    CHECK(sink.str().contains("may not widen"));
-    CHECK_FALSE(reloader.Current()->fleetOpen);
-}
-
-TEST_CASE("A node running no worker may widen admission without a key", "[node][membership][reload][revocation]")
-{
-    // The case above guards the lease check a WORKER chose at startup, and a node started
-    // with `--slots=0` chose none: it builds no validator and serves no compile verb, so
-    // admitting a remote peer opens no compile port (#206). Refusing it would turn away a
-    // keyless scheduling or caching machine for a reason about a worker it does not run.
-    //
-    // No `scheduler:` line, because a node running no worker registers nowhere.
-    Testing::ScratchDirectory const scratch { "node-reload-no-worker-widen" };
-    auto const path = WriteFile(scratch.Path(), "slots: 0\nfleet_open: true\n");
-
-    NodeConfig initial;
-    initial.slots = 0;
-    REQUIRE(initial.voterKeys.empty()); // no roster root (#178)
-    REQUIRE_FALSE(RunsWorker(initial));
-
-    auto const candidate = Reparse(path);
-    REQUIRE(candidate.has_value());
-    // The premise: the widening shape the case above refuses on a worker.
-    REQUIRE(AdmitsRemotePeers(*candidate, RosterPresence::Absent));
-    REQUIRE_FALSE(AdmitsRemotePeers(initial, RosterPresence::Absent));
-
-    auto const outcome = ValidateNodeReloadable(initial, *candidate);
-    INFO((outcome.has_value() ? std::string {} : outcome.error().context));
-    CHECK(outcome.has_value());
-}
-
-TEST_CASE("A widening refusal names every setting that may not change", "[node][membership][reload][revocation]")
-{
-    // **The ordering the guard depends on, asserted rather than assumed.**
-    //
-    // A reload names EVERY unreloadable setting that changed, because a refusal that
-    // reports one and stops sends the operator round the same loop per field. The
-    // widening guard is a second refusal reachable from the same save, so if it is asked
-    // first it answers instead of that whole list -- the operator fixes the widening,
-    // saves again, and only then learns that `--slots` was never going to apply either.
-    //
-    // Asserted on WHICH refusal, never on the fact of one: BOTH orderings refuse this
-    // save, so a case checking `has_value()` alone passes under the defect. That is not
-    // hypothetical here -- the first version of this case used a peer-list candidate
-    // and passed under both orderings, because `StartupPolicyRejection` refuses that one
-    // before either check runs. It was the neuter that said so, not the reading.
-    Testing::ScratchDirectory const scratch { "node-reload-widen-diagnosis" };
-    auto const path = WriteConfig(scratch.Path(), "slots: 7\nfleet_open: true\n");
-
-    auto const initial = RunningNode();
-    auto const candidate = Reparse(path);
-    REQUIRE(candidate.has_value());
-
-    // The premise, stated so a fixture that stopped exercising the guard says so rather
-    // than passing quietly: this save BOTH widens -- which needs the previous
-    // configuration to admit nobody remote, or the widening rule cannot fire at all and
-    // the case proves nothing -- and moves an unreloadable row.
-    REQUIRE_FALSE(AdmitsRemotePeers(initial, RosterPresence::Absent));
-    REQUIRE(AdmitsRemotePeers(*candidate, RosterPresence::Absent));
-    REQUIRE(candidate->slots != initial.slots);
-
-    auto const outcome = ValidateNodeReloadable(initial, *candidate);
-    REQUIRE_FALSE(outcome.has_value());
-    CHECK(outcome.error().context.contains("--slots"));
-}
-
-TEST_CASE("Narrowing is allowed on a keyless node, which is the direction that closes it",
-          "[node][membership][reload][revocation]")
-{
-    // The control for the case above, and the reason it asks about a WIDENING rather
-    // than about a state. A rosterless worker that already admits remote peers passed its
-    // own startup rules and is running today; refusing its reloads would refuse the
-    // one edit that makes it safer, which is a guard that punishes the remedy.
-    Testing::ScratchDirectory const scratch { "node-reload-keyless-narrow" };
-    auto const path = WriteConfig(scratch.Path(), "");
-
-    auto const initial = RunningNode(/*open=*/true);
-    NodeMembership membership { initial, membershipLog };
-    // Bound ONCE, as a surface does at startup.
-    auto const& oracle = membership.Oracle();
-    NullLogger logger;
-
-    REQUIRE(Admits(oracle, Stranger));
-
-    NodeReloader reloader { initial, path, &Reparse, &ValidateNodeReloadable };
-    NodeConditions conditions;
-    ApplyReloadRequest(&reloader, membership, conditions, logger);
-
-    CHECK_FALSE(Admits(oracle, Stranger));
 }
 
 TEST_CASE("A revocation is announced, and a reload that touched nothing is silent", "[node][membership][reload][revocation]")
@@ -483,62 +426,6 @@ TEST_CASE("A reload never revokes what the cluster agreed", "[node][membership][
     // The node closed, and the cluster's member survived it.
     CHECK_FALSE(Admits(oracle, Stranger));
     CHECK(Distributed::ExplainConnection(oracle, member).verdict == Distributed::Membership::Member);
-}
-
-TEST_CASE("A node that binds its own network-facing port is closed by the reload guard too",
-          "[node][membership][reload][revocation]")
-{
-    // **What decides how severe the widening hole is, pinned rather than reasoned.**
-    //
-    // The guard above was written as a backstop for a node whose configuration does not
-    // describe its own port -- socket activation, where the unit chose the address and
-    // `--listen-node` keeps whatever was typed. Until #178 PR 6 a node that binds its OWN
-    // network-facing port never reached it: `StartupPolicyRejection` is re-run on the candidate
-    // by `ValidateNodeReloadable`, and a startup row refused any worker other machines could
-    // reach with no roster to check against. That row went when every worker came to keep a
-    // state directory -- a node naming a scheduler must hold an identity -- because a directory
-    // may hold a roster no configuration can see, so the table cannot refuse it.
-    //
-    // So the guard is now what closes this for EVERY worker, and this case pins that: the
-    // widening is refused, and refused by the guard's own words. A change that let it through
-    // would open an unauthenticated compile port with every refusal counter reading zero.
-    //
-    // `--advertise` is named because otherwise the reachability rows answer first -- an
-    // admission route plus a wildcard advertise is what they are about, and the case
-    // would then pass for a reason that has nothing to do with keys.
-    Testing::ScratchDirectory const scratch { "node-reload-self-bound" };
-    auto const path = WriteConfig(scratch.Path(),
-                                  "listen_node: 0.0.0.0:6674\n"
-                                  "advertise: worker-01.internal:6674\n"
-                                  "fleet_open: true\n");
-
-    auto initial = RunningNode();
-    initial.nodeListen = "0.0.0.0:6674";
-    initial.advertise = "worker-01.internal:6674";
-    REQUIRE(initial.voterKeys.empty()); // no roster root the configuration can see (#178)
-
-    auto const candidate = Reparse(path);
-    REQUIRE(candidate.has_value());
-    // The premise: this really is the widening shape, on a port that really does face
-    // the network. Without both, the case would pass having exercised nothing.
-    REQUIRE(AdmitsRemotePeers(*candidate, RosterPresence::Absent));
-    REQUIRE_FALSE(AdmitsRemotePeers(initial, RosterPresence::Absent));
-    REQUIRE(candidate->nodeListen == "0.0.0.0:6674");
-    // And the startup table lets the candidate through, which is what leaves the guard as the
-    // only thing standing: it names a state directory, which might hold a roster.
-    REQUIRE_FALSE(StartupPolicyRejection(*candidate).has_value());
-
-    auto const outcome = ValidateNodeReloadable(initial, *candidate);
-    REQUIRE_FALSE(outcome.has_value());
-    CHECK(outcome.error().context.contains("may not widen"));
-
-    // The control: a worker that names the voters has a roster root the configuration CAN see,
-    // so the same widening is taken.
-    auto anchored = initial;
-    anchored.voterKeys = { Testing::TestKeyPair("scheduler").PublicKey() };
-    auto anchoredCandidate = *candidate;
-    anchoredCandidate.voterKeys = anchored.voterKeys;
-    CHECK(ValidateNodeReloadable(anchored, anchoredCandidate).has_value());
 }
 
 TEST_CASE("A reload that gives --advertise clears unqualified-host-name, and one that does not leaves it",

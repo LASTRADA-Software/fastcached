@@ -3,6 +3,7 @@
 #include "NodeIdentity.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Core/Ed25519.hpp>
 #include <FastCache/Core/ISecureRandom.hpp>
 
@@ -43,7 +44,6 @@ namespace
 [[nodiscard]] NodeConfig ClusteredNode(std::filesystem::path const& dir)
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.schedulers = { "127.0.0.1:6674" };
     cfg.raftListen = "6680";
     cfg.raftSelf = "10.0.0.7";
     cfg.clusterDir = dir;
@@ -257,7 +257,7 @@ TEST_CASE("A recorded identity that cannot be read is refused, never replaced", 
         CHECK(refused.error().fault == NodeIdentityFault::Unreadable);
         CHECK(StageOf(refused.error().fault) == StartStage::NodeIdentityIo);
         CHECK(held.Held());
-        CHECK_FALSE(std::filesystem::exists(std::filesystem::path { path }.concat(".new")));
+        CHECK_FALSE(std::filesystem::exists(std::filesystem::path { path }.concat(Consensus::ReplacementSuffix)));
     }
 
     // The control, and it is not decoration: without it "refuses a damaged record" and
@@ -432,7 +432,6 @@ TEST_CASE("A consensus node that names itself neither way is refused", "[node][i
     // name it would otherwise fall back to has resolved to nothing. Before it resolves the
     // address is awaited, not missing.
     auto neither = Testing::FirstStart(NodeConfig {});
-    neither.schedulers = { "127.0.0.1:6674" };
     // Where CLIENTS dial it is stated, so the only address left unnamed is the one this rule is
     // about: a consensus node admits other machines by key, and with no host name resolved an
     // unnamed advertise would be the wildcard, which its own row refuses first.
@@ -466,7 +465,6 @@ TEST_CASE("The startup row refuses exactly the consensus nodes whose dial addres
     };
 
     auto worker = Testing::FirstStart(NodeConfig {});
-    worker.schedulers = { "127.0.0.1:6674" };
     // Stated for `A consensus node that names itself neither way`'s reason: the client address is
     // not what this row asks about, and a consensus shape leaving it to a withheld name is refused
     // by the wildcard row first.
@@ -544,7 +542,6 @@ TEST_CASE("A --raft-self without a consensus port is refused", "[node][identity]
     // `--listen-raft` there is nothing to pair the host with -- and no consensus for
     // the pair to name a member of.
     auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.schedulers = { "127.0.0.1:6674" };
     cfg.raftSelf = "10.0.0.7";
     cfg.raftListen.clear();
 
@@ -562,7 +559,6 @@ TEST_CASE("An invocation that only asks a question mints nothing", "[node][ident
     // them is entitled to leave state behind.
     auto const clustered = [] {
         auto cfg = Testing::FirstStart(NodeConfig {});
-        cfg.schedulers = { "127.0.0.1:6674" };
         cfg.raftListen = "6680";
         cfg.raftSelf = "10.0.0.7";
         return cfg;
@@ -593,7 +589,6 @@ TEST_CASE("An invocation that only asks a question mints nothing", "[node][ident
     // And a node running no consensus keeps one too: every node holds an identity key now,
     // and the id travels with it -- a worker proves it on every connection to a scheduler.
     auto lone = Testing::FirstStart(NodeConfig {});
-    lone.schedulers = { "127.0.0.1:6674" };
     lone.raftListen.clear();
     CHECK(NodeIdentityNeed(lone) == IdentityNeed::Mint);
 }
@@ -703,7 +698,7 @@ TEST_CASE("What --print-identity prints is the line --cluster-admit reads back i
 
     SECTION("a consensus member prints its id, its key and its admission line")
     {
-        auto const text = DescribeIdentity("n1", key, std::optional<std::string> { "10.0.0.7:6680" }, IdentityRole::Member);
+        auto const text = DescribeIdentity("n1", key, std::optional<std::string> { "10.0.0.7:6680" });
         CHECK(text.contains(std::format("node-id n1\n")));
         CHECK(text.contains(std::format("public-key {}\n", FormatEd25519PublicKey(key))));
 
@@ -713,7 +708,7 @@ TEST_CASE("What --print-identity prints is the line --cluster-admit reads back i
         auto const argument = std::format("--cluster-admit={}", value.substr(0, value.find('\n')));
 
         auto parsed = Testing::FirstStart(NodeConfig {});
-        auto const argv = std::array { "--scheduler=10.0.0.1:6675", argument.c_str() };
+        auto const argv = std::array { argument.c_str() };
         REQUIRE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, parsed).has_value());
         CHECK(parsed.cluster.action == ClusterAction::Admit);
         CHECK(parsed.cluster.key == "n1");
@@ -721,44 +716,17 @@ TEST_CASE("What --print-identity prints is the line --cluster-admit reads back i
         CHECK(parsed.cluster.publicKey == std::optional { key });
     }
 
-    SECTION("a node its peers could not dial yet prints no admission line rather than a guessed one")
+    SECTION("a node its peers do not dial prints no admission line rather than a guessed one")
     {
-        auto const text = DescribeIdentity("n1", key, std::nullopt, IdentityRole::Member);
-        CHECK(text.contains("public-key "));
-        CHECK_FALSE(text.contains("cluster-admit"));
+        // A learner, which dials in: it is admitted through enrollment, where its key is compared
+        // with the one `--enroll-list` shows -- so it prints the key and nothing to type.
+        auto const text = DescribeIdentity("n1", key, std::nullopt);
+        CHECK(text == std::format("node-id n1\npublic-key {}\n", FormatEd25519PublicKey(key)));
     }
 
     SECTION("a node with no id yet has a key and nothing else to print")
     {
-        auto const text = DescribeIdentity("", key, std::nullopt, IdentityRole::Worker);
+        auto const text = DescribeIdentity("", key, std::nullopt);
         CHECK(text == std::format("public-key {}\n", FormatEd25519PublicKey(key)));
     }
-}
-
-TEST_CASE("What --print-identity prints for a worker is what --cluster-admit-worker reads back", "[node][identity][key]")
-{
-    // #178 PR 6: a worker that runs no consensus is admitted by the identity it proves, and an
-    // operator who does not open an enrollment window admits it by typing what it printed. So the
-    // line is asserted by PARSING it through the flag, the way the operator's command will be.
-    auto const key = Ed25519KeyPair::FromSeed(ScriptedSecureRandom::Ascending(Ed25519SeedBytes)).value().PublicKey();
-    auto const text = DescribeIdentity("w-7", key, std::nullopt, IdentityRole::Worker);
-    CHECK(text.contains("node-id w-7\n"));
-    // A worker is no consensus member, so it prints no line `--cluster-admit` would read.
-    CHECK_FALSE(text.contains("cluster-admit "));
-
-    auto const lineAt = text.find("cluster-admit-worker ");
-    REQUIRE(lineAt != std::string::npos);
-    auto const value = std::string_view { text }.substr(lineAt + std::string_view { "cluster-admit-worker " }.size());
-    auto const argument = std::format("--cluster-admit-worker={}", value.substr(0, value.find('\n')));
-
-    auto parsed = Testing::FirstStart(NodeConfig {});
-    auto const argv = std::array { "--scheduler=10.0.0.1:6675", argument.c_str() };
-    REQUIRE(ParseOptionsInto(NodeOptions(), std::span<char const* const> { argv }, parsed).has_value());
-    CHECK(parsed.cluster.action == ClusterAction::AdmitWorker);
-    CHECK(parsed.cluster.key == "w-7");
-    CHECK(parsed.cluster.publicKey == std::optional { key });
-
-    // A member prints the other line, never this one: the two routes admit different things.
-    CHECK_FALSE(DescribeIdentity("n1", key, std::optional<std::string> { "10.0.0.7:6680" }, IdentityRole::Member)
-                    .contains("cluster-admit-worker"));
 }

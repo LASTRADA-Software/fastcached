@@ -12,7 +12,6 @@
 # statement contains -- is REFUSED as stale: a permission kept past its subject excuses the
 # next start that happens to look like it.
 
-helper	scripts/dist-compile-e2e.sh	admit_worker	--print-identity over the state directory start_node hands it, which each call spells
 helper	scripts/node-scratch-isolation-e2e.ps1	Start-NodeIn	its body runs the argv each call spells as an @( ... ) block
 exempt	scripts/exit-codes-e2e.sh	"$NODE" --no-such-flag	refused while its command line is parsed, before any state directory is named or any port is opened
 exempt	scripts/node-config-file-e2e.sh	"$NODE" --no-such-flag	refused while its command line is parsed, before any state directory is named or any port is opened

@@ -104,6 +104,22 @@ struct BoundSocket
 /// @return The code a caller is told.
 [[nodiscard]] core::net::NetErrorCode SocketErrorCode(int osError) noexcept;
 
+/// Where a listening socket is bound: its address, as the socket reports it, and its port.
+struct BoundEndpoint
+{
+    std::string host;      ///< The bound address: `0.0.0.0` or `::` for the wildcard, else the one address.
+    std::uint16_t port {}; ///< The bound port.
+};
+
+/// Where a listening socket a supervisor handed over is bound. Socket activation names a descriptor
+/// NUMBER, never a handle, and only the socket knows where it listens: the unit chose the address
+/// as well as the port -- `ListenStream=6676` is the wildcard, `ListenStream=10.0.0.5:6676` one
+/// address -- so neither can be read off this process's configuration.
+/// @param descriptor The inherited descriptor. Windows has no socket activation, so there a
+///        number names no socket and the answer is always nothing.
+/// @return The address and port, or nothing when the socket cannot be asked or names no address.
+[[nodiscard]] std::optional<BoundEndpoint> BoundEndpointOfDescriptor(int descriptor);
+
 /// Close a socket this file handed out, ignoring the result.
 void CloseNativeSocket(core::platform::NativeHandle socket) noexcept;
 

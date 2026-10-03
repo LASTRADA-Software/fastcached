@@ -49,7 +49,8 @@ std::expected<std::optional<Cluster::PersistedRoster>, RosterLoadError> LoadPers
         return std::unexpected { RosterLoadError {
             .step = RosterLoadStep::Decode,
             .reason = std::format("{} holds the roster this machine adopted, and it is not one this build can use "
-                                  "({}); move it aside only if this machine should trust its --voter-key anchors again",
+                                  "({}); move it aside only if this machine should verify no grant until it runs "
+                                  "consensus again",
                                   path.string(),
                                   persisted.error().context) } };
     return std::optional { *std::move(persisted) };

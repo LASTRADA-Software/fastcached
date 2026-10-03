@@ -387,10 +387,10 @@ std::size_t DialAndAnnounce(SchedulerLink& link,
         if (client == nullptr)
         {
             // Named BEFORE `Lost()` moves the target, and the fallback named after it:
-            // with several `--scheduler` values the sentence has to say where this node
-            // went next, which "the configured endpoint" no longer identifies (#1310). How
-            // LOUDLY is `SchedulerReachability`'s: on the transition, then on a cadence,
-            // never per round.
+            // with several scheduler endpoints (`SchedulersOf`) the sentence has to say where
+            // this node went next, which "the configured endpoint" no longer identifies (#1310). How
+            // LOUDLY is `SchedulerReachability`'s: on the transition, then on a cadence, never per
+            // round.
             auto const unreachable = link.Target();
             auto const next = link.Lost();
             auto const said = reachability.Failed(SchedulerOutcome::Unreachable,
@@ -410,7 +410,7 @@ std::size_t DialAndAnnounce(SchedulerLink& link,
 
         // Proved before anything is said, and sealed from then on (#178). A connection the proof did
         // not seal is one no joining verb can be heard on, so it counts as an endpoint that did not
-        // answer: the next `--scheduler` is tried in this same round.
+        // answer: the next scheduler endpoint is tried in this same round.
         auto proved = ProveConnection(std::move(client), proof);
         if (!proved.has_value())
         {

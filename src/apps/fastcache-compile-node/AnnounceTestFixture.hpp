@@ -9,6 +9,7 @@
 #include "NodeAnnounce.hpp"
 #include "NodeConditions.hpp"
 #include "NodeConfig.hpp"
+#include "NodeFormation.hpp"
 #include "NodeProofClient.hpp"
 #include "SchedulerLink.hpp"
 #include "SchedulerReachability.hpp"
@@ -35,6 +36,7 @@
 
 #include <WorkerProtocol.hpp>
 #include <core/platform/Clock.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/ScriptedSocket.hpp>
 #include <tests/Unwrap.hpp>
 
@@ -134,7 +136,7 @@ struct AnnounceFixture
 
     AnnounceFixture()
     {
-        cfg.schedulers = { "scheduler.example:6676" };
+        cfg = Testing::LearnerRegisteringWith(std::move(cfg), { "scheduler.example:6676" });
         registrars.push_back(Registrar("gcc-14"));
     }
 
@@ -163,13 +165,13 @@ struct AnnounceFixture
     [[nodiscard]] std::vector<std::pair<std::uint8_t, std::vector<std::byte>>> AnnounceTo(std::vector<std::byte> replies)
     {
         FastCache::Testing::ScriptedSocket scheduler { std::move(replies) };
-        (void) AnnounceOnce(Round(), scheduler, cfg.schedulers.front());
+        (void) AnnounceOnce(Round(), scheduler, SchedulersOf(cfg, AsConfigured).front());
         return FramesIn(scheduler.Sent());
     }
 };
 
-/// The link a worker configured with @p schedulers holds.
-/// @param schedulers A non-empty `--scheduler` list.
+/// The link a worker registering with @p schedulers holds.
+/// @param schedulers A non-empty list, as `SchedulersOf` answers it.
 /// @return The link; the case fails when none could be built.
 [[nodiscard]] inline SchedulerLink LinkOver(std::vector<std::string> const& schedulers)
 {

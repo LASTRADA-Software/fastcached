@@ -586,10 +586,10 @@ inline constexpr std::array DeclineCauseTable {
     //
     // `NotPermitted` rather than `Withdrawn`, and the difference is what a launcher DOES:
     // withdrawn means retry somewhere else in a moment, and this does not clear without a
-    // person. The joiner that legitimately meets it is `--enroll-from`, which does not go
-    // through this table at all -- it reads the same code through `ReadEnrollReply`, where
-    // a full list is a WAIT rather than a refusal, because that client is the one thing in
-    // the tree with a reason to keep asking.
+    // person. The joiner that legitimately meets it is a node's formation controller, which
+    // does not go through this table at all -- it reads the same code through
+    // `ReadEnrollReply`, where a full list is a WAIT rather than a refusal, because that
+    // client is the one thing in the tree with a reason to keep asking.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::EnrollmentFull, .cause = DeclineCause::NotPermitted },
     // A fleet read, which no compile reaches: the same reasoning as the enrollment rows above.
     DeclineCauseRow { .code = CompileCacheWire::ErrorCode::UnknownFleetSelector, .cause = DeclineCause::NotPermitted },

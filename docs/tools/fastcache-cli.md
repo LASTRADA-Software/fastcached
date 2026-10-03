@@ -319,10 +319,9 @@ settles — so the symptom points at consensus rather than at the character that
 mistyped, and one address costs an afternoon.
 
 The same verbs are also spelled `fastcache-compile-node --cluster-status`,
-`--cluster-set`, `--cluster-forget`, `--cluster-admit` and `--cluster-admit-learner`. Prefer these: that path
-needs `--scheduler`, which is also a **startup** flag, so putting it in a unit file
-to run one admin command points that node at one scheduler forever — a registration
-replays its command line.
+`--cluster-set`, `--cluster-forget`, `--cluster-admit` and `--cluster-admit-learner`. Either works:
+the node's verbs ask this machine's own node unless `--scheduler` names another, and a node
+that serves is refused `--scheduler`, so it never ends up in a unit file.
 
 A modifier that means nothing for a verb is **refused**, not ignored:
 `set k v --raw` is a usage error rather than a store that silently prints
@@ -409,7 +408,7 @@ Beside them, what that worker is offering and whether anyone knows about it:
   still finishing and alarming an hour later.
 - **`last-registration-seconds-ago`** — when a scheduler last accepted one. **Absent
   means never**, and that is the whole reason it is not a number: a node whose
-  `--scheduler` has never answered and one that registered an hour ago are exactly the
+  scheduler has never answered and one that registered an hour ago are exactly the
   two states you are trying to separate. A round that accepts nothing does not reset
   it, so an unreachable scheduler shows a value that keeps growing rather than
   disappearing.
@@ -1021,7 +1020,8 @@ Stated so it is not rediscovered:
   - Listing, approving or rejecting the machines waiting to join are
     `fastcache-compile-node --enroll-list`, `--enroll-approve` and
     `--enroll-reject`.
-  - Joining a cluster is `--enroll-from`, run on the machine that is joining.
+  - Joining a fleet needs no verb: a machine asks by itself, given `--fleet-seed` where
+    no beacon reaches.
   - The ports a node's configuration would open are `--print-surfaces`.
 
   `fastcache-cli --help` says so in its NOTES, and `ctest -R cli-node-flags`

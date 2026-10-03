@@ -258,6 +258,10 @@ TEST_CASE("A lease taken from the configured leader is released back to it", "[n
     auto const& calls = fleet.Calls();
     REQUIRE(calls.size() == 3); // LEASE, COMPILE, RELEASE -- no redirect hop
     CHECK(calls.front().endpoint == SchedulerA);
+    // The compile goes to the worker the lease NAMES, never back to the scheduler that granted it:
+    // the e2e runs both on one node, so a client dialling the scheduler instead would pass there.
+    CHECK(calls[1].opRaw == Raw(Wire::Op::Compile));
+    CHECK(calls[1].endpoint == Worker);
     CHECK(calls.back().opRaw == Raw(Wire::Op::Release));
     CHECK(calls.back().endpoint == SchedulerA);
     CHECK_FALSE(fleet.IsInFlight(SchedulerA, Key));

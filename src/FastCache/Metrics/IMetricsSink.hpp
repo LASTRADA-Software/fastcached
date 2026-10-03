@@ -1420,16 +1420,6 @@ class IMetricsSink
         /// dissolve follows; the node stays in its own cluster. Only admissions whose signature
         /// held reach this check: an unsigned or forged one is `FormationAdmissionsUnverified`.
         FormationAdmissionsRefused,
-        /// Answers -- an admission, a refusal or a not-yet -- a pending node refused because their
-        /// signature did not bind them to the fleet it asked: none, one that does not verify over its
-        /// own request and the outcome stated, or a genuine one by a key it never proved for that
-        /// fleet. Each counts as no answer. A roster is public, so this -- not the roster's content --
-        /// is what stops an answer the fleet did not give.
-        FormationAdmissionsUnverified,
-        /// Serving bodies that found, at their start, that a state file in this node's directory is
-        /// replaced by the classic rename: the POSIX-semantics one was refused (`ProbeReplaceRoute`).
-        /// On Windows a reader holding a state file open then makes its replace fail.
-        StateFileReplacesFellBack,
 
         /// A machine ticket this node verified and spent: AUTH on that connection speaks for the
         /// machine it names.
@@ -1516,6 +1506,16 @@ class IMetricsSink
         /// of the service in the same process. This project's nodes send none that long, so a rise
         /// names a peer that does.
         DispatchNodeAnnouncementsFieldTooLong,
+        /// Answers -- an admission, a refusal or a not-yet -- a pending node refused because their
+        /// signature did not bind them to the fleet it asked: none, one that does not verify over its
+        /// own request and the outcome stated, or a genuine one by a key it never proved for that
+        /// fleet. Each counts as no answer. A roster is public, so this -- not the roster's content --
+        /// is what stops an answer the fleet did not give.
+        FormationAdmissionsUnverified,
+        /// Serving bodies that found, at their start, that a state file in this node's directory is
+        /// replaced by the classic rename: the POSIX-semantics one was refused (`ProbeReplaceRoute`).
+        /// On Windows a reader holding a state file open then makes its replace fail.
+        StateFileReplacesFellBack,
 
         Last,
     };

@@ -2,6 +2,7 @@
 #include "HostEventInbox.hpp"
 #include "NodeConfig.hpp"
 #include "NodeCredential.hpp"
+#include "NodeFormation.hpp"
 #include "NodeIoLoop.hpp"
 #include "PeerIdentity.hpp"
 #include "SchedulerReachability.hpp"
@@ -60,8 +61,8 @@ TEST_CASE("A node running no worker builds no worker tier, and a worker builds o
     // #206, #1387. The tier is the one place the question *does this node run a worker*
     // is answered, and on a node running none there is nothing: no pool thread, no
     // capacity sized to zero, no validator, no survey and no heartbeat to register with.
-    // A `--scheduler` is named on it deliberately -- the cluster and enrollment commands
-    // read it -- and it still builds nothing that could register.
+    // Its formation record names a scheduler deliberately, and it still builds nothing that
+    // could register.
     WorkerTierFixture fixture;
 
     fixture.cfg.slots = 0;
@@ -98,15 +99,20 @@ TEST_CASE("A node running no worker builds no worker tier, and a worker builds o
 
 TEST_CASE("A worker with no scheduler to register with is refused rather than started", "[node][worker-tier]")
 {
-    // The startup table refuses this configuration, and the tier refuses it again by
-    // name: a worker that started without a link would never register, which is the
-    // invisible-node failure. One fact, so the link and the worker cannot disagree.
+    // The tier refuses this by name: a worker that started without a link would never
+    // register, which is the invisible-node failure. Its formation record names nowhere --
+    // a learner that remembers no endpoint of its fleet -- so there is nowhere to register.
     WorkerTierFixture fixture;
-    fixture.cfg.schedulers.clear();
+    REQUIRE(fixture.cfg.formation.has_value());
+    if (fixture.cfg.formation.has_value())
+    {
+        fixture.cfg.formation->fleetSchedulers.clear();
+    }
+    REQUIRE(SchedulersOf(fixture.cfg, AsConfigured).empty());
 
     auto const refused = fixture.Start();
     REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().reason.contains("no --scheduler"));
+    CHECK(refused.error().reason.contains("nowhere to register"));
     CHECK(refused.error().cause == NodeRefusalCause::EarlierRule);
 }
 
@@ -266,6 +272,86 @@ TEST_CASE("A reloaded allowlist re-judges the refused-arguments row", "[node][wo
     report.OnJobRefused(Cc::JobError::RejectedArgumentNaming("-fno-such", Cc::Flavor::Gcc));
     AdoptAllowlist(jobs, report, logger, inForce, { "-fanalyzer" });
     CHECK(conditions.StateOf(NodeCondition::RefusedCompileArguments) == Wire::ConditionState::Raised);
+}
+
+TEST_CASE("A worker registers where its formation record says, never where --scheduler points",
+          "[node][worker-tier][formation][principal]")
+{
+    // A serving node is refused `--scheduler`, which aims one-shot verbs, so the tier's link
+    // is the formation record's answer (`SchedulersOf`). Asserted on what the tier BUILT, with a
+    // `--scheduler` value present that it must ignore: a tier reading the flag registers there.
+    WorkerTierFixture fixture;
+    fixture.cfg.schedulers = { "one-shot.example:6674" };
+
+    SECTION("a learner registers with its fleet")
+    {
+        auto const started = fixture.Start();
+        REQUIRE(started.has_value());
+        REQUIRE(started.value() != nullptr);
+        CHECK(started.value()->RegistersWith()
+              == std::vector<std::string> { std::string { WorkerTierTesting::FleetScheduler } });
+    }
+
+    SECTION("a node that serves a scheduler registers with its own")
+    {
+        REQUIRE(fixture.cfg.formation.has_value());
+        if (fixture.cfg.formation.has_value())
+        {
+            fixture.cfg.formation->mode = Cluster::NodeMode::Solitary;
+            fixture.cfg.formation->foundedHere = true;
+        }
+        fixture.cfg.raftListen = "127.0.0.1:6680";
+        REQUIRE(ServesScheduler(fixture.cfg));
+        auto const started = fixture.Start();
+        REQUIRE(started.has_value());
+        REQUIRE(started.value() != nullptr);
+        CHECK(started.value()->RegistersWith() == SchedulersOf(fixture.cfg, AsConfigured));
+        CHECK(started.value()->RegistersWith() == std::vector<std::string> { "127.0.0.1:6674" });
+    }
+}
+
+TEST_CASE("A worker serving its own scheduler registers at the port the node serves, a handed-over one included",
+          "[node][worker-tier][formation][activation]")
+{
+    // Under socket activation the supervisor chose the port and `--listen-node` describes
+    // nothing: the packaged unit listens on 6676 while the flag's default is 6674. The tier takes
+    // the handed-over port from `main` as a value and registers there, never at the default.
+    WorkerTierFixture fixture;
+    REQUIRE(fixture.cfg.formation.has_value());
+    if (fixture.cfg.formation.has_value())
+    {
+        fixture.cfg.formation->mode = Cluster::NodeMode::Solitary;
+        fixture.cfg.formation->foundedHere = true;
+    }
+    fixture.cfg.raftListen = "127.0.0.1:6680";
+    REQUIRE(ServesScheduler(fixture.cfg));
+
+    SECTION("a socket a supervisor handed over on every interface is where it registers, at loopback")
+    {
+        fixture.activatedNodeEndpoint = ActivatedEndpoint { .host = "0.0.0.0", .port = 6676 };
+        auto const started = fixture.Start();
+        REQUIRE(started.has_value());
+        REQUIRE(started.value() != nullptr);
+        CHECK(started.value()->RegistersWith() == std::vector<std::string> { "127.0.0.1:6676" });
+    }
+
+    SECTION("a socket a supervisor handed over on one address is where it registers, at that address")
+    {
+        fixture.activatedNodeEndpoint = ActivatedEndpoint { .host = "10.0.0.5", .port = 6676 };
+        auto const started = fixture.Start();
+        REQUIRE(started.has_value());
+        REQUIRE(started.value() != nullptr);
+        CHECK(started.value()->RegistersWith() == std::vector<std::string> { "10.0.0.5:6676" });
+    }
+
+    SECTION("a port the node binds itself is where it registers")
+    {
+        fixture.cfg.nodeListen = "127.0.0.1:6690";
+        auto const started = fixture.Start();
+        REQUIRE(started.has_value());
+        REQUIRE(started.value() != nullptr);
+        CHECK(started.value()->RegistersWith() == std::vector<std::string> { "127.0.0.1:6690" });
+    }
 }
 
 TEST_CASE("A worker answers whether its scratch root can be written into a mapping rule", "[node][worker-tier][conditions]")

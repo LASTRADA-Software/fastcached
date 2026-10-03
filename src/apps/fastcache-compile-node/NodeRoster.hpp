@@ -38,8 +38,8 @@
 /// - a CONSENSUS member reads the state it applied (`Distributed::StateLeaseRoster`), which
 ///   needs no certificate and never expires;
 /// - any other node holds the roster a strict majority of the voters it trusts endorsed
-///   (`Distributed::RosterTrust`), rooted in `--voter-key` or in the roster it kept in its state
-///   directory, and refreshed by NODE-ANNOUNCE's reply;
+///   (`Distributed::RosterTrust`), rooted in the roster it kept in its state directory, and
+///   refreshed by NODE-ANNOUNCE's reply;
 /// - a node no other machine can reach holds neither, and checks no grant -- the rule the
 ///   startup table and `CompileVerbsReachOtherMachines` hold it to.
 namespace FastCache::Node
@@ -96,9 +96,8 @@ class NodeRoster final: public IPresenceRoster, public IServerTrust
     ///
     /// Refuses a kept roster that cannot be used -- it may be the only thing standing between
     /// this worker and a voter the cluster has revoked since. And refuses a worker other
-    /// machines can reach that holds no
-    /// roster and names no `--voter-key`, which is where `RosterlessWorkerRefusal` is answered:
-    /// only the state directory knows whether it holds a roster.
+    /// machines can reach that runs no consensus and holds no roster, which is where
+    /// `RosterlessWorkerRefusal` is answered: only the state directory knows whether it holds one.
     /// @param cfg The parsed configuration.
     /// @param wallClock What "now" is when an offered roster is judged. Borrowed.
     /// @param metrics Where a refused roster is counted. Borrowed.

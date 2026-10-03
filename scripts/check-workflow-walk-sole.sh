@@ -56,6 +56,9 @@ if [ "${1:-}" = "--self-test" ]; then
     selfTestCases=0
     selfTestStatus=0
     me="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    # From beside THIS script, not the root the run was handed: that may be a staged tree.
+    # shellcheck source=scripts/lib/git-scrub.sh
+    . "${me%/*}/lib/git-scrub.sh"
     scratch="$(mktemp -d)" || { echo "cannot create a scratch directory" >&2; exit 2; }
     # shellcheck disable=SC2064  # expand $scratch now, not at trap time
     trap "rm -rf '$scratch'" EXIT
@@ -75,10 +78,10 @@ if [ "${1:-}" = "--self-test" ]; then
         cp "${me%/*}/lib/third-party-roots.sh" "$scratch/tree/scripts/lib/"
         cp "${me%/*}/lib/third-party-roots.txt" "$scratch/tree/scripts/lib/"
         : > "$scratch/tree/exemptions.txt"
-        git -C "$scratch/tree" init -q 2>/dev/null
+        scratch_git -C "$scratch/tree" init -q 2>/dev/null
     }
 
-    Track() { git -C "$scratch/tree" add -A -f >/dev/null 2>&1; }
+    Track() { scratch_git -C "$scratch/tree" add -A -f >/dev/null 2>&1; }
 
     # @param 1 what is being staged  @param 2 want-pass|want-fail|want-refuse
     Case() {

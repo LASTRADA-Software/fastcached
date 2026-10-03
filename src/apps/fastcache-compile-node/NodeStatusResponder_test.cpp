@@ -359,7 +359,9 @@ TEST_CASE("A node reports only the surfaces its configuration resolves", "[node]
 
     SECTION("and all three when all three are configured")
     {
-        Fixture const all { { .admin = true, .raft = true, .discovery = true }, clock };
+        // Consensus on the wildcard: a defaulted discovery stands down beside a consensus address
+        // that reaches only this machine, which a loopback one would be.
+        Fixture const all { { .admin = true, .raft = true, .discovery = true, .raftWildcard = true }, clock };
         auto const everything = all.status.Describe();
         CHECK(Unwrap(SurfaceOf(everything, Wire::WireSurface::Admin)).port == AdminPort);
         CHECK(Unwrap(SurfaceOf(everything, Wire::WireSurface::Raft)).port == RaftPort);
@@ -405,7 +407,8 @@ TEST_CASE("The reported admin scheme follows the TLS MATERIAL, not a boolean", "
         // Raft and discovery carry `tls = false` whatever the admin material says: this
         // is a per-surface column, and one TLS flag folded across the map would tell a
         // client to speak TLS to a UDP beacon.
-        Fixture const fixture { { .admin = true, .raft = true, .discovery = true, .tlsPair = true }, clock };
+        Fixture const fixture { { .admin = true, .raft = true, .discovery = true, .tlsPair = true, .raftWildcard = true },
+                                clock };
         auto const fields = fixture.status.Describe();
         CHECK(Unwrap(SurfaceOf(fields, Wire::WireSurface::Admin)).tls);
         CHECK_FALSE(Unwrap(SurfaceOf(fields, Wire::WireSurface::Raft)).tls);

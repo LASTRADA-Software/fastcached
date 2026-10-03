@@ -75,8 +75,9 @@ set(_table [=[
 <Custom Action="FastCachedDeleteLeftover"|/>|!~><
 <Custom Action="FastCachedDeleteLeftover"|/>|After="FastCacheNodeDeleteLeftover"
 
-<CustomAction Id="FastCacheNodeInstallService"|/>|--scheduler=[FASTCACHE_NODE_SCHEDULER] [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument]"
+<CustomAction Id="FastCacheNodeInstallService"|/>|--service-start=auto [FastCacheNodeAdvertiseArgument] [FastCacheFirewallAllowArgument] [FastCacheNodeDiscoveryReplyArgument] [FastCacheFleetSeedArgument]"
 <CustomAction Id="FastCacheNodeInstallService"|/>|!--discovery-reply-port=
+<CustomAction Id="FastCacheNodeInstallService"|/>|!--scheduler
 <CustomAction Id="FastCachedInstallService"|/>|!DiscoveryReply
 <Property Id="FASTCACHE_DISCOVERY_REPLY_PORT"|/>|Value="6682"
 <CustomAction Id="FastCachedInstallService"|/>|--service-start=[FASTCACHED_START_MODE] [FastCacheFirewallAllowArgument]"
@@ -84,8 +85,11 @@ set(_table [=[
 <CustomAction Id="FastCacheNodeInstallService"|/>|!--firewall-allow=
 <CustomAction Id="FastCacheNodeInstallService"|/>|!--cluster-dir
 <CustomAction Id="FastCacheNodeInstallService"|/>|!--advertise=
-<Custom Action="FastCacheNodeInstallService"|/>|FASTCACHE_NODE_SELECTED = "1" AND FASTCACHE_NODE_SCHEDULER"
+<CustomAction Id="FastCacheNodeInstallService"|/>|!--fleet-seed=
+<Custom Action="FastCacheNodeInstallService"|/>|Condition="FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCacheNodeInstallService"|/>|!FASTCACHE_NODE_SCHEDULER
 <Custom Action="FastCacheNodeInstallService"|/>|!FASTCACHE_NODE_ADVERTISE
+<Custom Action="FastCacheNodeInstallService"|/>|!FASTCACHE_FLEET_SEED
 <SetProperty Action="SetFastCacheNodeAdvertiseArgument"|/>|Id="FastCacheNodeAdvertiseArgument"
 <SetProperty Action="SetFastCacheNodeAdvertiseArgument"|/>|Value="--advertise=[FASTCACHE_NODE_ADVERTISE]"
 <SetProperty Action="SetFastCacheNodeAdvertiseArgument"|/>|Condition="FASTCACHE_NODE_ADVERTISE"
@@ -98,6 +102,57 @@ set(_table [=[
 <SetProperty Action="SetFastCacheNodeDiscoveryReplyArgument"|/>|Value="--discovery-reply-port=[FASTCACHE_DISCOVERY_REPLY_PORT]"
 <SetProperty Action="SetFastCacheNodeDiscoveryReplyArgument"|/>|Condition="FASTCACHE_DISCOVERY_REPLY_PORT"
 <SetProperty Action="SetFastCacheNodeDiscoveryReplyArgument"|/>|After="SetFastCacheFirewallAllowArgument"
+<SetProperty Action="SetFastCacheFleetSeedArgument"|/>|Id="FastCacheFleetSeedArgument"
+<SetProperty Action="SetFastCacheFleetSeedArgument"|/>|Value="--fleet-seed=[FASTCACHE_FLEET_SEED]"
+<SetProperty Action="SetFastCacheFleetSeedArgument"|/>|Condition="FASTCACHE_FLEET_SEED"
+<SetProperty Action="SetFastCacheFleetSeedArgument"|/>|After="SetFastCacheNodeDiscoveryReplyArgument"
+
+<Property Id="FASTCACHE_FIREWALL_ALLOW"|</Property>|Key="SOFTWARE\fastcached\Installer"
+<Property Id="FASTCACHE_FIREWALL_ALLOW"|</Property>|Name="FirewallAllow"
+<Property Id="FASTCACHE_FIREWALL_ALLOW"|</Property>|Root="HKLM"
+<Property Id="FASTCACHE_NODE_ADVERTISE"|</Property>|Key="SOFTWARE\fastcached\Installer"
+<Property Id="FASTCACHE_NODE_ADVERTISE"|</Property>|Name="NodeAdvertise"
+<Property Id="FASTCACHE_NODE_ADVERTISE"|</Property>|Root="HKLM"
+<Property Id="FASTCACHE_FLEET_SEED"|</Property>|Key="SOFTWARE\fastcached\Installer"
+<Property Id="FASTCACHE_FLEET_SEED"|</Property>|Name="FleetSeed"
+<Property Id="FASTCACHE_FLEET_SEED"|</Property>|Root="HKLM"
+<SetProperty Action="SaveTypedFastCacheFirewallAllow"|/>|Value="[FASTCACHE_FIREWALL_ALLOW]"
+<SetProperty Action="SaveTypedFastCacheFirewallAllow"|/>|Before="AppSearch" Sequence="both"
+<SetProperty Action="SaveTypedFastCacheFirewallAllow"|/>|Condition="FASTCACHE_FIREWALL_ALLOW"
+<SetProperty Action="RestoreTypedFastCacheFirewallAllow"|/>|Id="FASTCACHE_FIREWALL_ALLOW"
+<SetProperty Action="RestoreTypedFastCacheFirewallAllow"|/>|After="AppSearch" Sequence="both"
+<SetProperty Action="RestoreTypedFastCacheFirewallAllow"|/>|Condition="FastCacheFirewallAllowTyped"
+<SetProperty Action="SaveTypedFastCacheNodeAdvertise"|/>|Value="[FASTCACHE_NODE_ADVERTISE]"
+<SetProperty Action="SaveTypedFastCacheNodeAdvertise"|/>|Before="AppSearch" Sequence="both"
+<SetProperty Action="SaveTypedFastCacheNodeAdvertise"|/>|Condition="FASTCACHE_NODE_ADVERTISE"
+<SetProperty Action="RestoreTypedFastCacheNodeAdvertise"|/>|Id="FASTCACHE_NODE_ADVERTISE"
+<SetProperty Action="RestoreTypedFastCacheNodeAdvertise"|/>|After="AppSearch" Sequence="both"
+<SetProperty Action="RestoreTypedFastCacheNodeAdvertise"|/>|Condition="FastCacheNodeAdvertiseTyped"
+<SetProperty Action="SaveTypedFastCacheFleetSeed"|/>|Value="[FASTCACHE_FLEET_SEED]"
+<SetProperty Action="SaveTypedFastCacheFleetSeed"|/>|Before="AppSearch" Sequence="both"
+<SetProperty Action="SaveTypedFastCacheFleetSeed"|/>|Condition="FASTCACHE_FLEET_SEED"
+<SetProperty Action="RestoreTypedFastCacheFleetSeed"|/>|Id="FASTCACHE_FLEET_SEED"
+<SetProperty Action="RestoreTypedFastCacheFleetSeed"|/>|After="AppSearch" Sequence="both"
+<SetProperty Action="RestoreTypedFastCacheFleetSeed"|/>|Condition="FastCacheFleetSeedTyped"
+<Component Id="FastCacheRememberedProperties"|</Component>|Guid="87BB5EEE-8B9E-4401-9367-C86DB5061258"
+<Component Id="FastCacheRememberedProperties"|</Component>|Action="removeOnUninstall"
+<ComponentRef Id="FastCacheRememberedProperties"|/>|ComponentRef
+<CustomAction Id="FastCacheRememberFirewallAllow"|/>|reg.exe" add HKLM\SOFTWARE\fastcached\Installer /v FirewallAllow /t REG_SZ /d "[FASTCACHE_FIREWALL_ALLOW]" /f /reg:64"
+<CustomAction Id="FastCacheRememberFirewallAllow"|/>|Execute="deferred"
+<CustomAction Id="FastCacheRememberFirewallAllow"|/>|Impersonate="no"
+<CustomAction Id="FastCacheRememberFirewallAllow"|/>|Return="check"
+<CustomAction Id="FastCacheRememberNodeAdvertise"|/>|reg.exe" add HKLM\SOFTWARE\fastcached\Installer /v NodeAdvertise /t REG_SZ /d "[FASTCACHE_NODE_ADVERTISE]" /f /reg:64"
+<CustomAction Id="FastCacheRememberNodeAdvertise"|/>|Execute="deferred"
+<CustomAction Id="FastCacheRememberNodeAdvertise"|/>|Impersonate="no"
+<CustomAction Id="FastCacheRememberNodeAdvertise"|/>|Return="check"
+<CustomAction Id="FastCacheRememberFleetSeed"|/>|reg.exe" add HKLM\SOFTWARE\fastcached\Installer /v FleetSeed /t REG_SZ /d "[FASTCACHE_FLEET_SEED]" /f /reg:64"
+<CustomAction Id="FastCacheRememberFleetSeed"|/>|Execute="deferred"
+<CustomAction Id="FastCacheRememberFleetSeed"|/>|Impersonate="no"
+<CustomAction Id="FastCacheRememberFleetSeed"|/>|Return="check"
+<Custom Action="FastCacheRememberFirewallAllow"|/>|Condition="FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCacheRememberNodeAdvertise"|/>|Condition="FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCacheRememberFleetSeed"|/>|Condition="FASTCACHED_SELECTED = "1" OR FASTCACHE_NODE_SELECTED = "1""
+<Custom Action="FastCacheRememberFleetSeed"|/>|After="FastCacheRememberNodeAdvertise"
 
 <SetProperty Action="SetFastCacheOwnImagePathPrefix"|/>|Value=""[INSTALL_ROOT]"
 <SetProperty Action="SetFastCacheOwnImagePathPrefix"|/>|After="CostFinalize"

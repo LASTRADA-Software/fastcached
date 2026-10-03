@@ -25,6 +25,10 @@
 
 cmake_minimum_required(VERSION 3.20)
 
+# `fastcached_scratch_git`: the fixture's own git runs with the inherited `GIT_DIR` and its
+# kin removed, or under an exported `GIT_DIR` its `git init` writes THAT repository.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+
 if(NOT DEFINED FASTCACHED_SOURCE_DIR OR FASTCACHED_SOURCE_DIR STREQUAL "")
     message(FATAL_ERROR "FASTCACHED_SOURCE_DIR must be set")
 endif()
@@ -103,9 +107,10 @@ function(Case name expectFail phrase seam)
                 "case that silently ran the fallback instead would be the defect this file "
                 "exists to avoid")
         endif()
-        execute_process(COMMAND "${GIT_EXECUTABLE}" init -q "${tree}"
+        fastcached_scratch_git("${GIT_EXECUTABLE}" scratchGit)
+        execute_process(COMMAND ${scratchGit} init -q "${tree}"
                         OUTPUT_QUIET ERROR_QUIET)
-        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${tree}" add -A
+        execute_process(COMMAND ${scratchGit} -C "${tree}" add -A
                         OUTPUT_QUIET ERROR_QUIET)
     endif()
 

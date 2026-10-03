@@ -4,6 +4,7 @@
 #include "NodeStateFiles.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Consensus/DurableFile.hpp>
 #include <FastCache/Core/HostPort.hpp>
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Platform/FileTrust.hpp>
@@ -18,6 +19,7 @@
 #include <limits>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -119,28 +121,14 @@ namespace
     /// @return Nothing, or why it could not be written.
     [[nodiscard]] std::expected<void, std::string> WriteIdentityFile(std::filesystem::path const& path, std::string_view id)
     {
-        // Created exclusively, after a temporary a crash left is cleared, with the access its row
-        // gives it (`CreateStateFile`): the id is not a secret, and an install mints it elevated
-        // BEFORE the service's grant is made -- which a protected list would never take.
-        auto const temporary = std::filesystem::path { path }.concat(NodeIdentityReplacementSuffix);
-        {
-            auto stale = std::error_code {};
-            std::filesystem::remove(temporary, stale);
-            auto created = CreateStateFile(temporary, StateFile::Identity);
-            if (!created.has_value())
-                return std::unexpected { std::format("cannot write {}: {}", temporary.string(), created.error().message()) };
-            auto const stream = *std::move(created);
-            auto const line = std::format("{}\n", id);
-            if (std::fwrite(line.data(), 1, line.size(), stream.get()) != line.size() || std::fflush(stream.get()) != 0)
-                return std::unexpected { std::format("cannot write {}", temporary.string()) };
-        }
-
-        auto failure = std::error_code {};
-        std::filesystem::rename(temporary, path, failure);
-        if (failure)
-            return std::unexpected { std::format(
-                "cannot record the node identity in {}: {}", path.string(), failure.message()) };
-        return {};
+        // Through the node's one durable writer, with the access its row gives it (`CreateStateFile`):
+        // the id is not a secret, and an install mints it elevated BEFORE the service's grant is made --
+        // which a protected list would never take. Synced and its close checked, as every state file is.
+        auto const line = std::format("{}\n", id);
+        return Consensus::ReplaceFileAtomically(path, std::as_bytes(std::span { line }), StateFile::Identity)
+            .transform_error([&path](ConsensusError const& failure) {
+                return std::format("cannot record the node identity in {}: {}", path.string(), failure.context);
+            });
     }
 
     /// What a node says at startup about where its identity came from.
@@ -338,10 +326,7 @@ std::expected<NodeIdentity, NodeIdentityRefusal> ResolveNodeIdentity(std::filesy
                           .publicKey = std::nullopt };
 }
 
-std::string DescribeIdentity(std::string_view id,
-                             Ed25519PublicKey const& key,
-                             std::optional<std::string> const& dialAddress,
-                             IdentityRole role)
+std::string DescribeIdentity(std::string_view id, Ed25519PublicKey const& key, std::optional<std::string> const& dialAddress)
 {
     auto const spelled = FormatEd25519PublicKey(key);
     auto text = std::string {};
@@ -350,10 +335,8 @@ std::string DescribeIdentity(std::string_view id,
     text += std::format("public-key {}\n", spelled);
     if (id.empty())
         return text;
-    if (role == IdentityRole::Member && dialAddress.has_value())
+    if (dialAddress.has_value())
         text += std::format("cluster-admit {}={}@{}\n", id, *dialAddress, spelled);
-    if (role == IdentityRole::Worker)
-        text += std::format("cluster-admit-worker {}@{}\n", id, spelled);
     return text;
 }
 

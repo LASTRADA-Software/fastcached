@@ -158,7 +158,7 @@ std::string ReplacedNodeKeyDiagnosis(std::string_view id)
 {
     return std::format("this cluster records {} under another identity key: that machine's node-key was replaced while "
                        "the id it minted survived. Restore the node-key it was recorded with, or --cluster-forget={} on "
-                       "a member and admit the new key (--enroll-from=<seed> there, or "
+                       "a member and admit the new key (it asks to enroll and --enroll-approve admits it, or "
                        "--cluster-admit={}=<host>:<port>@<key> on a member, with what --print-identity prints)",
                        id,
                        id,
@@ -257,7 +257,8 @@ void NodeProofClient::NarrateHold(OwnRecord record, ILogger& logger) const
         logger.Logf(LogLevel::Warn,
                     "still not announcing to the fleet: after {} asks this node's own cluster has not recorded {}. "
                     "Either that cluster cannot elect a leader -- a majority of its voters must answer -- or this "
-                    "machine joined a cluster that never admitted it: --enroll-from=<seed> on this machine, or "
+                    "machine joined a cluster that never admitted it: it asks to enroll and --enroll-approve admits "
+                    "it, or "
                     "--cluster-admit=<id>=<host>:<port>@<key> on a member, with the id and key this machine's "
                     "--print-identity prints",
                     OwnRecordPatience,

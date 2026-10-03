@@ -4,6 +4,7 @@
 #include <FastCache/Core/Errors/ConsensusError.hpp>
 #include <FastCache/Core/Owner.hpp>
 #include <FastCache/Core/StateFiles.hpp>
+#include <FastCache/Platform/ReplacingRename.hpp>
 
 #include <cstddef>
 #include <cstdio>
@@ -52,6 +53,26 @@ using ReadStream = std::unique_ptr<std::FILE, int (*)(std::FILE*)>;
 /// @return The stream, or why it could not be opened.
 [[nodiscard]] std::expected<ReadStream, std::error_code> OpenForReading(std::filesystem::path const& path);
 
+/// Make the directory entries a rename just wrote in @p directory survive a power loss.
+///
+/// A file flushed to the platter and renamed into place is NOT yet durable: the rename changed the
+/// DIRECTORY, and until the directory is flushed too, a power loss can bring back the entry that
+/// named the old file -- for the Raft term and vote, a vote forgotten, and a node that votes twice
+/// in one term. So every replace syncs the parent directory after its rename.
+///
+/// POSIX: the directory opened read-only and `fsync`ed. Windows: `FlushFileBuffers` on a handle
+/// to the directory opened with `FILE_FLAG_BACKUP_SEMANTICS` and `FILE_WRITE_DATA` (for a
+/// directory, the add-file right a replace already needs). MEASURED (Windows 11 26200, an
+/// unelevated process, NTFS and ReFS): that call succeeds; the same call on a handle opened with
+/// read access only is refused with `ERROR_ACCESS_DENIED`. `MOVEFILE_WRITE_THROUGH` is not the
+/// answer here: it belongs to `MoveFileEx`, and the replace renames through
+/// `SetFileInformationByHandle` (`Platform::RenameIntoPlace`), which has no write-through flag.
+/// That the flush makes the entry durable is Microsoft's documented behaviour, not something a
+/// test here measured -- only a power cut could.
+/// @param directory The directory the rename wrote into.
+/// @return Nothing, or why the directory could not be opened or flushed.
+[[nodiscard]] std::error_code SyncDirectoryToDisk(std::filesystem::path const& directory);
+
 /// Flush a stream all the way to the platter.
 ///
 /// `fflush` alone only pushes the C library's buffer into the kernel, which a
@@ -81,77 +102,97 @@ using ReadStream = std::unique_ptr<std::FILE, int (*)(std::FILE*)>;
 /// file names its temporaries through this rather than through a literal of its own.
 inline constexpr std::string_view ReplacementSuffix = ".tmp";
 
-/// The rename a replace moves its temporary into place with: POSIX semantics first.
+/// One temporary a replace writes: its bytes, then flushed to the platter, then a CHECKED close.
 ///
-/// A seam so the answer a filesystem gives can be scripted: what makes a replace FALL BACK to the
-/// classic rename is a refusal no test volume produces on demand.
-class IReplacingRename
+/// Three steps rather than one write, because each fails for its own reason and each is a property
+/// of the replace: `Sync` is what survives a power loss (`FlushToDisk`), and `Close` is where a
+/// buffered write can first meet a full volume -- a write whose close was not asked is one nobody
+/// knows landed. A seam so each can be failed, and seen to be asked, without a failing disk.
+class IDurableSink
 {
   public:
-    IReplacingRename() = default;
-    IReplacingRename(IReplacingRename const&) = delete;
-    IReplacingRename(IReplacingRename&&) = delete;
-    IReplacingRename& operator=(IReplacingRename const&) = delete;
-    IReplacingRename& operator=(IReplacingRename&&) = delete;
-    virtual ~IReplacingRename() = default;
+    IDurableSink() = default;
+    IDurableSink(IDurableSink const&) = delete;
+    IDurableSink(IDurableSink&&) = delete;
+    IDurableSink& operator=(IDurableSink const&) = delete;
+    IDurableSink& operator=(IDurableSink&&) = delete;
+    virtual ~IDurableSink() = default;
 
-    /// Rename @p from over @p to with POSIX semantics: the name moves at once, and a reader holding
-    /// @p to open with delete sharing keeps reading the file it opened.
-    /// @param from The file to move.
-    /// @param to Where it goes; replaced when it exists.
-    /// @return Nothing, or the platform's own refusal, untranslated.
-    [[nodiscard]] virtual std::error_code RenameReplacing(std::filesystem::path const& from,
-                                                          std::filesystem::path const& to) const = 0;
+    /// Append @p bytes.
+    /// @param bytes What to write.
+    /// @return Nothing, or why they could not all be written.
+    [[nodiscard]] virtual std::error_code Write(std::span<std::byte const> bytes) = 0;
+
+    /// Flush what was written all the way to the platter.
+    /// @return Nothing, or why it could not be.
+    [[nodiscard]] virtual std::error_code Sync() = 0;
+
+    /// Close the file. Called once, before the file is renamed or removed.
+    /// @return Nothing, or why the close failed: what was written is not known to be stored.
+    [[nodiscard]] virtual std::error_code Close() = 0;
 };
 
-/// The platform's: `FileRenameInfoEx` with `FILE_RENAME_FLAG_POSIX_SEMANTICS` on Windows, and
-/// `rename(2)` everywhere else, which has those semantics already.
-class SystemReplacingRename final: public IReplacingRename
+/// How a replace creates its temporary -- with the access its state file's row gives it, which is the
+/// caller's choice (`StateFile`) rather than the writer's -- and makes the rename that follows durable.
+class IDurableFiles
 {
   public:
-    /// @copydoc IReplacingRename::RenameReplacing
-    [[nodiscard]] std::error_code RenameReplacing(std::filesystem::path const& from,
-                                                  std::filesystem::path const& to) const override;
+    IDurableFiles() = default;
+    IDurableFiles(IDurableFiles const&) = delete;
+    IDurableFiles(IDurableFiles&&) = delete;
+    IDurableFiles& operator=(IDurableFiles const&) = delete;
+    IDurableFiles& operator=(IDurableFiles&&) = delete;
+    virtual ~IDurableFiles() = default;
+
+    /// Create @p path exclusively, with the access @p which's row gives it.
+    /// @param path The temporary.
+    /// @param which Which state file it will become.
+    /// @return A sink over it, or why it could not be created.
+    [[nodiscard]] virtual std::expected<std::unique_ptr<IDurableSink>, std::error_code> Create(
+        std::filesystem::path const& path, StateFile which) = 0;
+
+    /// Flush @p directory, after a rename into it, so the new entry survives a power loss
+    /// (`SyncDirectoryToDisk`).
+    /// @param directory The directory the rename wrote into.
+    /// @return Nothing, or why it could not be flushed.
+    [[nodiscard]] virtual std::error_code SyncDirectory(std::filesystem::path const& directory) = 0;
 };
 
-/// Whether @p refusal is a filesystem saying it has no POSIX-semantics rename -- the information
-/// class or its flags not understood -- rather than anything about the files. Such a refusal is
-/// answered by the classic rename; every other is a failure of the replace.
-///
-/// `ERROR_INVALID_PARAMETER` is among them and it is BROAD: a path form the call will not take
-/// answers it on a filesystem that DOES have the rename. So a fallback is never silent -- see
-/// `ProbeReplaceRoute`.
-/// @param refusal What `IReplacingRename::RenameReplacing` answered.
-/// @return True when the classic rename is the answer.
-[[nodiscard]] bool MeansNoPosixRename(std::error_code refusal) noexcept;
-
-/// How a replace moved its file into place. **Private**: never transmitted or persisted.
-enum class ReplaceRoute : std::uint8_t
+/// This machine's: `CreateStateFile`, `fwrite`, `FlushToDisk`, a checked `fclose` and
+/// `SyncDirectoryToDisk`.
+class SystemDurableFiles final: public IDurableFiles
 {
-    PosixSemantics, ///< The rename a reader holding the file open does not refuse.
-    Classic,        ///< The fallback: a reader holding the file open on Windows refuses it.
+  public:
+    /// @copydoc IDurableFiles::Create
+    [[nodiscard]] std::expected<std::unique_ptr<IDurableSink>, std::error_code> Create(std::filesystem::path const& path,
+                                                                                       StateFile which) override;
+
+    /// @copydoc IDurableFiles::SyncDirectory
+    [[nodiscard]] std::error_code SyncDirectory(std::filesystem::path const& directory) override;
 };
 
-/// What a replace did, and why it fell back when it did.
-struct ReplacedBy
-{
-    ReplaceRoute route { ReplaceRoute::PosixSemantics }; ///< How the file moved into place.
-    std::error_code posixRefusal;                        ///< What refused the POSIX rename; empty unless `Classic`.
-};
-
-/// `ReplaceFileAtomically` through @p rename, saying which route it took.
+/// `ReplaceFileAtomically` through @p files and @p rename, saying which route it took.
 /// @param path What to replace.
 /// @param body The new contents.
 /// @param which Which state file it is, and so who may read it.
+/// @param files How the temporary is created, written, synced and closed.
 /// @param rename The POSIX-semantics rename tried first.
 /// @return How it was replaced, or why it could not be.
-[[nodiscard]] std::expected<ReplacedBy, ConsensusError> ReplaceFileWith(std::filesystem::path const& path,
-                                                                        std::span<std::byte const> body,
-                                                                        StateFile which,
-                                                                        IReplacingRename const& rename);
+[[nodiscard]] std::expected<Platform::ReplacedBy, ConsensusError> ReplaceFileWith(std::filesystem::path const& path,
+                                                                                  std::span<std::byte const> body,
+                                                                                  StateFile which,
+                                                                                  IDurableFiles& files,
+                                                                                  Platform::IReplacingRename const& rename);
 
 /// What `ProbeReplaceRoute` names the file it replaces in a directory.
 inline constexpr std::string_view ReplaceProbeFileName = ".replace-probe";
+
+/// The temporary a replace of `ReplaceProbeFileName` writes first (`ReplacementSuffix`).
+inline constexpr std::string_view ReplaceProbeTemporaryName = ".replace-probe.tmp";
+static_assert(ReplaceProbeTemporaryName.size() == ReplaceProbeFileName.size() + ReplacementSuffix.size()
+                  && ReplaceProbeTemporaryName.starts_with(ReplaceProbeFileName)
+                  && ReplaceProbeTemporaryName.ends_with(ReplacementSuffix),
+              "the probe's temporary is the probe's name with the writer's suffix");
 
 /// Replace a probe file in @p directory the way every state file there is replaced, and say which
 /// route it took -- so a node whose replaces FALL BACK says so once, at its start, rather than
@@ -159,20 +200,31 @@ inline constexpr std::string_view ReplaceProbeFileName = ".replace-probe";
 ///
 /// The same path form and directory every state file there uses, which is what decides the
 /// fallback: a filesystem without the rename, or a path form the rename will not take.
+///
+/// A crash inside the probe leaves `ReplaceProbeFileName` or `ReplaceProbeTemporaryName` behind.
+/// Neither is ever READ: the next probe clears a stale temporary before it writes (every replace
+/// does) and replaces, then removes, a stale probe -- so the state directory's judge names both
+/// rather than refusing the next start over a file nothing trusts.
 /// @param directory The state directory.
 /// @param rename The POSIX-semantics rename tried first.
 /// @return How a replace there moves its file, or why the probe could not be written.
-[[nodiscard]] std::expected<ReplacedBy, ConsensusError> ProbeReplaceRoute(std::filesystem::path const& directory,
-                                                                          IReplacingRename const& rename);
+[[nodiscard]] std::expected<Platform::ReplacedBy, ConsensusError> ProbeReplaceRoute(
+    std::filesystem::path const& directory, Platform::IReplacingRename const& rename);
 
 /// Replace `path` with `body`, indivisibly.
 ///
-/// Written beside the target and renamed over it: rename is the only single
-/// filesystem operation that replaces a file's contents in one step, so a
-/// crash leaves either the whole previous file or the whole new one. On Windows the rename has POSIX
-/// semantics, so a reader that holds the file open (`OpenForReading`) does not refuse it; a
-/// filesystem that has no such rename is renamed over the classic way (`MeansNoPosixRename`), which
-/// `ProbeReplaceRoute` makes visible. The new file is created with
+/// Written beside the target, flushed to the platter, closed with the close CHECKED, renamed over
+/// it, and the directory flushed: rename is the only single filesystem operation that replaces a
+/// file's contents in one step, so a crash leaves either the whole previous file or the whole new
+/// one, and the directory sync is what keeps a power loss from bringing back the previous one after
+/// the replace was reported (`SyncDirectoryToDisk`). A failed directory sync is a failed replace. On Windows the
+/// rename has POSIX semantics (`Platform::RenameIntoPlace`), so a reader that holds the file open
+/// (`OpenForReading`) does not refuse it; a filesystem that has no such rename is renamed over the
+/// classic way, which `ProbeReplaceRoute` makes visible.
+///
+/// **The node's ONE durable writer**: every file it keeps in its state directory and reads back as
+/// a unit is replaced through this -- the Raft state, log and snapshot, the roster, the formation
+/// record and the remembered endpoints, the node's id and the fleet histories. The new file is created with
 /// the access @p which's row of the state-file table gives it (`CreateStateFile`), so its mode is
 /// that row's whatever the umask says.
 /// @param path What to replace.

@@ -83,28 +83,11 @@ namespace
 /// reason.
 constexpr std::string_view SchedulerEndpoint = "scheduler.internal:6675";
 
-/// What a node that serves the fleet's scheduler names as its own scheduler: itself.
-///
-/// **Not `SchedulerEndpoint`, and the difference decides which rows fire.** A REMOTE
-/// scheduler plus a membership policy is what the three advertise rows are about -- such
-/// a node has told peers to dial it, so its `--advertise` has to be an address they can
-/// reach -- and handing a scheduler-node fixture a remote endpoint trips those rows
-/// instead of whatever it was written to test.
-///
-/// A scheduler registering with itself over loopback is the documented shape
-/// (`--scheduler=127.0.0.1:6675` on the node whose mode serves it), and it is what makes
-/// `SchedulerIsRemote` false.
-///
-/// Found by giving the scheduler fixtures a REMOTE endpoint and watching the dashboard
-/// and fleet-policy cases go red on the advertise rows -- so the two constants are not
-/// a tidiness preference, and picking the wrong one does not fail where you are looking.
-constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
-
 /// A node that runs NO consensus, and nothing else configured.
 ///
 /// Named, since consensus is on by default (`DefaultRaftListen`): the worker-policy cases below
-/// were written about a worker running none -- the only kind a `--voter-key` roots a roster for
-/// -- and an empty `--listen-raft=` is how an operator says so.
+/// were written about a worker running none, whose mode then serves no scheduler of its own --
+/// and an empty `--listen-raft=` is how an operator says so.
 [[nodiscard]] NodeConfig NoConsensus()
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
@@ -128,10 +111,48 @@ constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
         return std::string { TlsUnavailableRefusal };
 }
 
+/// Make @p cfg a worker that registers with @p endpoints, as its formation record says one does.
+///
+/// Where a worker registers is the record's answer (`SchedulersOf`), never a flag: `--scheduler`
+/// aims one-shot verbs, and a node that serves is refused it. So a case about a worker that
+/// registers with a scheduler elsewhere makes it what such a worker is -- a LEARNER of a fleet,
+/// which dials its leader and serves no scheduler of its own -- and writes the record's field. The
+/// registration is asserted, so a fixture that did not take is a red here rather than a case
+/// quietly about another node.
+/// @param cfg A configuration with a formation record applied.
+/// @param endpoints Where it registers, in the order tried.
+void RegistersWith(NodeConfig& cfg, std::vector<std::string> const& endpoints)
+{
+    REQUIRE(cfg.formation.has_value());
+    if (cfg.formation.has_value())
+    {
+        cfg.formation->mode = Cluster::NodeMode::Learner;
+        cfg.formation->fleetSchedulers = endpoints;
+    }
+    REQUIRE_FALSE(ServesScheduler(cfg));
+    REQUIRE(SchedulersOf(cfg, AsConfigured) == endpoints);
+}
+
+[[nodiscard]] NodeConfig Installable();
+
+/// @p cfg on a first start rather than in a fleet: SOLITARY, so its consensus switch is
+/// `--listen-raft` and its scheduler, when that is on, is its own.
+/// @param cfg A configuration with a formation record applied (`Installable`).
+/// @return The same configuration, solitary.
+[[nodiscard]] NodeConfig Solitary(NodeConfig cfg)
+{
+    REQUIRE(cfg.formation.has_value());
+    if (cfg.formation.has_value())
+    {
+        cfg.formation->mode = Cluster::NodeMode::Solitary;
+        cfg.formation->fleetSchedulers.clear();
+    }
+    return cfg;
+}
+
 [[nodiscard]] NodeConfig Installable()
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.schedulers = { "cache.internal:6675" };
     // BOTH halves, because since #290 stage 3 one without the other is not an
     // installable worker. `--advertise` alone leaves `--listen-node` on its loopback
     // default, so the node would tell peers to dial an address it never accepts on --
@@ -145,11 +166,10 @@ constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
     // default: a node that announces itself to a scheduler proves which machine it is on every
     // connection.
     cfg.clusterDir = "cluster";
-    // A worker that runs NO consensus, which is the shape every case built on this was written
-    // about -- named, since consensus is on by default and its own cases assert that. TYPED,
-    // so a registration replays `--listen-raft=` and the service runs as this describes.
-    cfg.raftListen.clear();
-    cfg.raftListenExplicit = true;
+    // Registering with a scheduler on another machine, as its formation record says: a learner of
+    // that fleet. Its consensus is left as the default, because a worker whose consensus port is
+    // closed never forms, registers nowhere, and is refused at startup.
+    RegistersWith(cfg, { "cache.internal:6675" });
 
     // The provenance bits for what this fixture TYPES (#713). Since emission follows
     // whether the operator said a thing rather than whether its value differs from a
@@ -165,15 +185,6 @@ constexpr std::string_view SelfScheduler = "127.0.0.1:6675";
     // authors ever seeing it.
     cfg.advertiseExplicit = true;
     return cfg;
-}
-
-/// A voter's identity key, as `--voter-key` names it (#178): what a worker that runs no
-/// consensus, and that another machine can reach, checks that machine's grants against until
-/// it holds a roster of its own.
-/// @return The key.
-[[nodiscard]] Ed25519PublicKey AVoterKey()
-{
-    return Testing::TestKeyPair("scheduler-01.internal").PublicKey();
 }
 
 /// Make @p cfg a consensus member of a cluster of one, which is what a scheduler is since #178
@@ -430,9 +441,6 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         // would demote the member again at every boot of this node, whoever had since
         // promoted it.
         "--cluster-admit-learner",
-        // Same rule (#178): a registration carrying it would re-admit a worker's key at every
-        // boot, so a worker forgotten since would be admitted again by this node's restart.
-        "--cluster-admit-worker",
         // The cordon, for the same rule with the consequence #1303 names: a registration
         // carrying one would re-cordon the worker at every boot -- a machine that silently
         // never comes back to the fleet.
@@ -451,24 +459,19 @@ TEST_CASE("NodeConfig: every flag that is worker state reaches the supervisor", 
         // The enrollment verbs, and the same rule the cluster ones above carry: each
         // asks the leader one question and exits, so a registration carrying one would
         // replay an operator's decision at every boot instead of serving.
-        //
-        // `--enroll-from` is excluded for the ordinary reason too: it is a one-shot join
-        // that ends the process, so a service that carried it would try to join a
-        // cluster it is already a member of instead of serving.
-        "--enroll-from",
         "--enroll-list",
         "--enroll-approve",
         "--enroll-reject",
         "--enroll-auto-approve",
         "--enroll-clear",
+        // Where those verbs are sent, and nothing else: a registration is of a node that
+        // SERVES, which is refused `--scheduler` -- it registers where its formation record
+        // says.
+        "--scheduler",
     });
 
     // A configuration in which no field holds its default, so every emitter fires.
     auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.schedulers = { "cache.internal:6675" };
-    // Beside consensus below, which a running node would refuse -- this case asserts nothing
-    // about coherence, only that every emitter fires.
-    cfg.voterKeys = { AVoterKey() };
     cfg.advertise = "worker-01.internal:6674";
     cfg.nodeListen = "0.0.0.0:6674";
     cfg.toolchains = { "/usr/bin/g++", "abc123=/usr/bin/clang++" };
@@ -613,40 +616,28 @@ TEST_CASE("NodeConfig: every toolchain is re-emitted", "[node][service]")
     }
 }
 
-TEST_CASE("NodeConfig: several --scheduler values are kept in order, and a registration carries every one",
-          "[node][service]")
+TEST_CASE("NodeConfig: several --scheduler values are kept in order, and no registration carries one",
+          "[node][service][formation]")
 {
-    // #1310. A registration replays its command line forever, so one that carried the
-    // FIRST of three schedulers is the single point of re-provisioning the list exists
-    // to remove -- and it would look right on every machine until that first one is
-    // retired. Asserted as the whole ordered list at each step: parsed, emitted, and
-    // re-read by this binary's own parser the way the service reads it at a start.
-    auto const parsed = ParseNodeArgv(
-        { "--scheduler=sched-a.internal:6675", "--scheduler=sched-b.internal:6675", "--scheduler=10.0.0.9:6675" });
+    // #1310's list survives for the one-shot verbs it aims, kept whole and in order: each is
+    // tried until one answers. A registration is of a node that SERVES, which registers where its
+    // formation record says -- so it carries none, and an install naming one is refused by name.
+    auto const parsed = ParseNodeArgv({ "--scheduler=sched-a.internal:6675",
+                                        "--scheduler=sched-b.internal:6675",
+                                        "--scheduler=10.0.0.9:6675",
+                                        "--cluster-status" });
     REQUIRE(parsed.has_value());
     auto const expected = std::vector<std::string> { "sched-a.internal:6675", "sched-b.internal:6675", "10.0.0.9:6675" };
     CHECK(parsed->schedulers == expected);
+    CHECK(AdminTargetsOf(*parsed) == expected);
 
-    auto cfg = Installable();
-    cfg.schedulers = parsed->schedulers;
-    auto const spec =
-        MakeNodeServiceSpec(std::filesystem::path { "fastcache-compile-node" }, cfg, Testing::InstallerPathProbe());
+    auto const spec = MakeNodeServiceSpec(
+        std::filesystem::path { "fastcache-compile-node" }, Installable(), Testing::InstallerPathProbe());
+    CHECK(std::ranges::none_of(spec.arguments, [](std::string const& a) { return a.starts_with("--scheduler"); }));
 
-    std::vector<std::string> emitted;
-    for (auto const& argument: spec.arguments)
-        if (argument.starts_with("--scheduler="))
-            emitted.push_back(argument);
-    CHECK(emitted
-          == std::vector<std::string> {
-              "--scheduler=sched-a.internal:6675", "--scheduler=sched-b.internal:6675", "--scheduler=10.0.0.9:6675" });
-
-    auto const reparsed = ReparseSpec(spec);
-    REQUIRE(reparsed.has_value());
-    CHECK(reparsed->schedulers == expected);
-
-    // And an install of that list is not refused for being a list: every rule that
-    // judges `--scheduler` judges each value.
-    CHECK_FALSE(NodeInstallRejection(cfg).has_value());
+    auto named = Installable();
+    named.schedulers = expected;
+    CHECK(NodeInstallRejection(named) == std::optional<std::string> { std::string { SchedulerOnAServingNodeRefusal } });
 }
 
 TEST_CASE("NodeConfig: a node that names a scheduler and no --cluster-dir is not refused for want of an identity",
@@ -660,16 +651,6 @@ TEST_CASE("NodeConfig: a node that names a scheduler and no --cluster-dir is not
     keyless.clusterDir.clear();
     CHECK_FALSE(StartupPolicyRejection(keyless).has_value());
     CHECK_FALSE(NodeInstallRejection(keyless).has_value());
-
-    // A voter's key is still no identity -- `--voter-key` says whom a node running NO consensus
-    // trusts -- and consensus is on by default now, so it is refused as a voter key on a
-    // consensus node until consensus is turned off.
-    auto anchored = keyless;
-    anchored.voterKeys = { AVoterKey() };
-    anchored.raftListen = std::string { DefaultRaftListen };
-    CHECK(Unwrap(StartupPolicyRejection(anchored)) == VoterKeyOnConsensusNodeRefusal);
-    anchored.raftListen.clear();
-    CHECK_FALSE(StartupPolicyRejection(anchored).has_value());
 }
 
 TEST_CASE("NodeConfig: --cluster-key-file is gone, and naming it is refused as a flag this node does not have",
@@ -678,7 +659,7 @@ TEST_CASE("NodeConfig: --cluster-key-file is gone, and naming it is refused as a
     // #178 retired the cluster's pre-shared key outright rather than leaving the flag accepted and
     // ignored: a key an operator still provisions and still believes protects the fleet, read by
     // nothing, is the silent no-op this table exists to refuse.
-    auto const parsed = ParseNodeArgv(std::vector<char const*> { "--scheduler=s:1", "--cluster-key-file=cluster.key" });
+    auto const parsed = ParseNodeArgv(std::vector<char const*> { "--cluster-key-file=cluster.key" });
     REQUIRE_FALSE(parsed.has_value());
     CHECK(parsed.error().code == ConfigErrorCode::UnknownKey);
     CHECK(parsed.error().field.contains("--cluster-key-file"));
@@ -705,7 +686,7 @@ TEST_CASE("NodeConfig: --fleet-member is gone, and naming it is refused as a fla
     auto const explained = ParseNodeCommandLine(std::span<char const* const> { typed }, productionCfg);
     REQUIRE_FALSE(explained.has_value());
     CHECK(explained.error().context.starts_with("--fleet-member was retired"));
-    CHECK(explained.error().context.contains("--enroll-from"));
+    CHECK(explained.error().context.contains("--enroll-approve"));
 
     // And no row answers to it from a file either; the file case is asserted below, beside
     // the other file refusals.
@@ -755,9 +736,10 @@ TEST_CASE("A node with no roster admits by key nobody, so only --fleet-open or i
     cfg.fleetOpen = true;
     CHECK(AdmitsRemotePeers(cfg, RosterPresence::Absent));
 
-    // Each clause that may give this node a roster is a key route on its own.
+    // Each clause that may give this node a roster is a key route on its own: a state directory
+    // may keep one an earlier run adopted.
     NodeConfig anchored;
-    anchored.voterKeys = { AVoterKey() };
+    anchored.clusterDir = "cluster";
     CHECK(AdmitsByKey(anchored));
     CHECK(AdmitsRemotePeers(anchored, RosterPresence::Unknown));
     // Consensus is one, on a solitary node too: it admits nobody else yet, but an approval makes
@@ -791,7 +773,7 @@ TEST_CASE("A network-facing worker with a roster reaches other machines through 
     // made every roster-holding worker look single-machine.
     NodeConfig cfg;
     cfg.nodeListen = "0.0.0.0:6674";
-    cfg.voterKeys = { AVoterKey() };
+    cfg.clusterDir = "cluster"; // a state directory may keep a roster
     CHECK(CompileVerbsReachOtherMachines(cfg, RosterPresence::Held));
     CHECK(CompileVerbsReachOtherMachines(cfg, RosterPresence::Unknown));
     CHECK_FALSE(CompileVerbsReachOtherMachines(cfg, RosterPresence::Absent));
@@ -806,7 +788,7 @@ TEST_CASE("A compile port bound by NAME faces the network, whatever the name beg
     // loopback while `IsLoopbackHost` matched a prefix, which switched the lease check OFF for a
     // port that could be facing the network: the fail-open direction. Every name now faces it.
     NodeConfig cfg;
-    cfg.voterKeys = { AVoterKey() };
+    cfg.clusterDir = "cluster"; // a state directory may keep a roster
     for (auto const* named: { "127.cache.example.com:6674", "localhost:6674", "worker-01.internal:6674" })
     {
         INFO(named);
@@ -827,11 +809,14 @@ TEST_CASE("The four advertise rows fire on a key route, with no membership flag 
     // The second fail-open guard. Before this, their gate was `--fleet-member || --fleet-open`,
     // and with the list gone a worker that tells ticket holders to dial themselves started
     // silently.
+    //
+    // A worker registers where its formation record says (`SchedulersOf`), never at `--scheduler`,
+    // which a serving node is refused -- so the worker registering with a scheduler on another
+    // machine is a LEARNER of that machine's fleet.
     auto keyed = [] {
         NodeConfig cfg;
-        cfg.schedulers = { "scheduler.internal:6675" };
         cfg.clusterDir = "cluster"; // a key route: a kept roster may admit ticket holders
-        return cfg;
+        return Testing::LearnerRegisteringWith(std::move(cfg), { "scheduler.internal:6675" });
     };
     auto wildcard = keyed();
     wildcard.advertise = "0.0.0.0:6676";
@@ -869,48 +854,36 @@ TEST_CASE("The four advertise rows fire on a key route, with no membership flag 
         CHECK(Unwrap(refusal).contains(row.phrase));
         CHECK(Unwrap(refusal).contains("by key, or by --fleet-open"));
 
-        // The control: the same shape with no route at all is not refused by THIS row.
+        // The control: the same shape with no route at all is not refused by THIS row. A learner
+        // always runs consensus, which is a route, and a voter's fleet is one, so the routeless shape
+        // is a record whose mode reaches no other machine, its consensus CLOSED (`--listen-raft=`):
+        // it serves no scheduler of its own, so it registers where the record remembers, and it
+        // keeps no state directory. No start reaches it -- a worker with consensus closed is refused
+        // later in the table -- which is what makes the route gate defence in depth, and why the
+        // refusal it gets is that later row's, whole.
         auto routeless = row.cfg;
         routeless.clusterDir.clear();
+        REQUIRE(routeless.formation.has_value());
+        auto solitary = Unwrap(routeless.formation);
+        solitary.mode = Cluster::NodeMode::Solitary;
+        routeless.formation = std::move(solitary);
+        routeless.raftListen.clear();
+        REQUIRE_FALSE(RunsConsensus(routeless));
+        REQUIRE(SchedulersOf(routeless, AsConfigured) == SchedulersOf(row.cfg, AsConfigured));
         auto const other = StartupPolicyRejection(routeless);
         INFO("routeless refusal: " << other.value_or("<none>"));
         CHECK_FALSE(other.value_or("").contains(row.phrase));
+        CHECK(other == std::optional { std::string { WorkerWithConsensusClosedRefusal } });
 
-        // And consensus alone is a route, so the node every zero-config start forms answers
-        // the same row with nothing else named.
-        auto const formed = Testing::FirstStart(routeless);
-        REQUIRE(RunsConsensus(formed));
-        auto const consensus = StartupPolicyRejection(formed);
+        // And consensus alone is a route, so the learner answers the same row with no state
+        // directory named.
+        auto consensusOnly = row.cfg;
+        consensusOnly.clusterDir.clear();
+        REQUIRE(RunsConsensus(consensusOnly));
+        auto const consensus = StartupPolicyRejection(consensusOnly);
         INFO("consensus refusal: " << consensus.value_or("<none>"));
         CHECK(consensus.value_or("").contains(row.phrase));
     }
-}
-
-TEST_CASE("A reload may not open a worker that checks no lease, whatever route it names", "[node][config][admission]")
-{
-    // A worker that could start: a state directory for its identity, and a bind and an
-    // advertise other machines can reach, so no startup row answers in the guard's place.
-    NodeConfig closed;
-    closed.schedulers = { "scheduler.internal:6675" };
-    closed.clusterDir = "cluster";
-    closed.nodeListen = "0.0.0.0:6674";
-    closed.advertise = "worker-01.internal:6674";
-    REQUIRE_FALSE(StartupPolicyRejection(closed).has_value());
-
-    // The rule asks the configuration with no roster in view, so the state directory -- which
-    // `Unknown` would read as a live key route on both sides -- must not silence it.
-    auto opened = closed;
-    opened.fleetOpen = true;
-    auto const refused = ValidateNodeReloadable(closed, opened);
-    REQUIRE_FALSE(refused.has_value());
-    CHECK(refused.error().context.contains("--fleet-open"));
-    CHECK(refused.error().context.contains("may not widen"));
-    CHECK_FALSE(refused.error().context.contains("--fleet-member"));
-
-    // And the narrowing direction is always allowed.
-    auto const narrowed = ValidateNodeReloadable(opened, closed);
-    INFO((narrowed.has_value() ? std::string {} : narrowed.error().context));
-    CHECK(narrowed.has_value());
 }
 
 TEST_CASE("NodeConfig: a later enrollment verb drops the earlier one's subject", "[node][config]")
@@ -923,8 +896,8 @@ TEST_CASE("NodeConfig: a later enrollment verb drops the earlier one's subject",
     // and the operator was answered *a control frame this build cannot read*: a
     // VERSION-MISMATCH sentence for a flag-combination mistake, which sends somebody
     // comparing builds across a fleet that is fine.
-    auto const overridden = ParseNodeArgv(
-        { "--scheduler=s:1", "--enroll-approve=n4@PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0", "--enroll-list" });
+    auto const overridden =
+        ParseNodeArgv({ "--enroll-approve=n4@PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0", "--enroll-list" });
     REQUIRE(overridden.has_value());
     CHECK(overridden->enroll.action == EnrollAction::List);
 
@@ -935,16 +908,15 @@ TEST_CASE("NodeConfig: a later enrollment verb drops the earlier one's subject",
 
     // The other order still carries its operand, or "clear it" would have been
     // implemented as "never set it" and every approval would name nobody.
-    auto const named = ParseNodeArgv(
-        { "--scheduler=s:1", "--enroll-list", "--enroll-approve=n4@PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0" });
+    auto const named = ParseNodeArgv({ "--enroll-list", "--enroll-approve=n4@PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0" });
     REQUIRE(named.has_value());
     CHECK(named->enroll.action == EnrollAction::Approve);
     CHECK(named->enroll.subject == "n4");
 
     // And a subject-taking verb replacing another keeps its OWN subject rather than the
     // first one's, which is the case a naive clear-on-entry would also pass.
-    auto const second = ParseNodeArgv(
-        { "--scheduler=s:1", "--enroll-approve=n4@PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0", "--enroll-reject=n9" });
+    auto const second =
+        ParseNodeArgv({ "--enroll-approve=n4@PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0", "--enroll-reject=n9" });
     REQUIRE(second.has_value());
     CHECK(second->enroll.action == EnrollAction::Reject);
     CHECK(second->enroll.subject == "n9");
@@ -955,12 +927,12 @@ TEST_CASE("NodeConfig: discovery is on unless the operator turns it off", "[node
     // On by default, because the whole point of #139 is that installing the package
     // is the setup. A worker that had to be told to look would be back to a
     // per-machine list somebody maintains.
-    auto const byDefault = ParseNodeArgv({ "--scheduler=s:1" });
+    auto const byDefault = ParseNodeArgv({});
     REQUIRE(byDefault.has_value());
     CHECK(byDefault->toolchainDiscovery);
     CHECK(byDefault->toolchains.empty());
 
-    auto const off = ParseNodeArgv({ "--scheduler=s:1", "--no-toolchain-discovery", "--toolchain=/usr/bin/cc" });
+    auto const off = ParseNodeArgv({ "--no-toolchain-discovery", "--toolchain=/usr/bin/cc" });
     REQUIRE(off.has_value());
     CHECK_FALSE(off->toolchainDiscovery);
 }
@@ -1017,7 +989,8 @@ TEST_CASE("NodeConfig: an install reports the rule that names the install", "[no
     // names the action the operator is taking. Ordering is the only thing the
     // composition decides, so it is the only thing worth pinning.
     auto broken = Installable();
-    broken.schedulers.clear();    // an install rule
+    broken.toolchains.clear(); // an install rule: nothing named, and discovery off
+    broken.toolchainDiscovery = false;
     broken.raftSelf = "10.0.0.7"; // and a startup rule: a host with no consensus port to pair it with
 
     REQUIRE(NodeServiceRejection(broken).has_value());
@@ -1025,7 +998,7 @@ TEST_CASE("NodeConfig: an install reports the rule that names the install", "[no
 
     auto const refusal = NodeInstallRejection(broken);
     REQUIRE(refusal.has_value());
-    CHECK(Unwrap(refusal).starts_with("--scheduler is required to install a service"));
+    CHECK(Unwrap(refusal).starts_with("--toolchain is required alongside --no-toolchain-discovery"));
 }
 
 TEST_CASE("NodeConfig: a second startup rule is refused at install too", "[node][service][policy]")
@@ -1064,10 +1037,6 @@ TEST_CASE("NodeConfig: a registration that could not work is refused", "[node][s
     // its job, which is the worst shape this system has: the operator is told it
     // was installed, and nothing at any later point says otherwise.
     CHECK(!NodeServiceRejection(Installable()).has_value());
-
-    auto noScheduler = Installable();
-    noScheduler.schedulers.clear();
-    CHECK(NodeServiceRejection(noScheduler).has_value());
 
     // No toolchain is NOT one of them any more, and that reversal is the point of
     // #139: registering a service before anybody knows what the machine holds is
@@ -1251,7 +1220,7 @@ TEST_CASE("NodeConfig: a --cluster-admit that names no member is refused where i
     {
         INFO("token: " << token);
         auto const flag = std::format("--cluster-admit={}", token);
-        auto const parsed = ParseNodeArgv({ "--scheduler=s:1", flag.c_str() });
+        auto const parsed = ParseNodeArgv({ flag.c_str() });
         REQUIRE_FALSE(parsed.has_value());
         CHECK(parsed.error().field == "--cluster-admit");
         // The offending token is named, which is the half a policy row could not do:
@@ -1268,7 +1237,7 @@ TEST_CASE("NodeConfig: a --cluster-admit that names no member is refused where i
     {
         INFO("token: " << token);
         auto const flag = std::format("--cluster-admit={}", token);
-        auto const parsed = ParseNodeArgv({ "--scheduler=s:1", flag.c_str() });
+        auto const parsed = ParseNodeArgv({ flag.c_str() });
         REQUIRE(parsed.has_value());
         CHECK(parsed->cluster.key == id);
         CHECK(parsed->cluster.value == endpoint);
@@ -1278,11 +1247,11 @@ TEST_CASE("NodeConfig: a --cluster-admit that names no member is refused where i
 TEST_CASE("NodeConfig: every flag carrying a key refuses a small-order or non-canonical one by name",
           "[node][config][identity][security]")
 {
-    // Five doors, one parser. The all-zero key is a perfectly formed 43 characters, and it is the
+    // Three doors, one parser. The all-zero key is a perfectly formed 43 characters, and it is the
     // key under which the all-zero signature verifies every message -- so a flag that admitted it
     // would hand an identity to whoever cares to claim it. p + 3 is a second spelling of a point.
     // Each is refused with the ROW's own spelling and the fault's own sentence; the control is a
-    // real key through the same five doors, so a refusal below is about the point and nothing else.
+    // real key through the same three doors, so a refusal below is about the point and nothing else.
     struct Door
     {
         std::string_view field;              ///< The row's own spelling, which the refusal names.
@@ -1297,12 +1266,6 @@ TEST_CASE("NodeConfig: every flag carrying a key refuses a small-order or non-ca
         Door { .field = "--cluster-admit-learner",
                .shape = "--cluster-admit-learner=n2=10.0.0.2:6680@{}",
                .companions = { "--scheduler=s:1" } },
-        Door { .field = "--cluster-admit-worker",
-               .shape = "--cluster-admit-worker=w1@{}",
-               .companions = { "--scheduler=s:1" } },
-        Door { .field = "--voter-key",
-               .shape = "--voter-key={}",
-               .companions = { "--scheduler=s:1", "--toolchain=/usr/bin/cc" } },
     };
     auto const argvOf = [](Door const& door, std::string const& keyText) {
         auto flag = std::vformat(door.shape, std::make_format_args(keyText));
@@ -1312,7 +1275,7 @@ TEST_CASE("NodeConfig: every flag carrying a key refuses a small-order or non-ca
     for (auto const& door: doors)
     {
         INFO("flag: " << door.field);
-        auto const control = FormatEd25519PublicKey(AVoterKey());
+        auto const control = FormatEd25519PublicKey(Testing::TestKeyPair("n2").PublicKey());
         auto [companions, flag] = argvOf(door, control);
         companions.push_back(flag.c_str());
         REQUIRE(ParseNodeArgv(companions).has_value());
@@ -1346,21 +1309,21 @@ TEST_CASE("NodeConfig: --cluster-admit carries a key after @, and one that is no
     {
         INFO("verb: " << verb);
         auto const flag = std::format("{}=n2=10.0.0.2:6680@{}", verb, keyText);
-        auto const keyed = ParseNodeArgv({ "--scheduler=s:1", flag.c_str() });
+        auto const keyed = ParseNodeArgv({ flag.c_str() });
         REQUIRE(keyed.has_value());
         CHECK(keyed->cluster.key == "n2");
         CHECK(keyed->cluster.value == "10.0.0.2:6680");
         CHECK(keyed->cluster.publicKey == std::optional { key });
 
         auto const plain = std::format("{}=n2=10.0.0.2:6680", verb);
-        auto const unkeyed = ParseNodeArgv({ "--scheduler=s:1", plain.c_str() });
+        auto const unkeyed = ParseNodeArgv({ plain.c_str() });
         REQUIRE(unkeyed.has_value());
         CHECK(unkeyed->cluster.value == "10.0.0.2:6680");
         CHECK_FALSE(unkeyed->cluster.publicKey.has_value());
 
         // Refused by the grammar's own sentence, stamped with the row's own spelling.
         auto const cut = std::format("{}=n2=10.0.0.2:6680@{}", verb, keyText.substr(1));
-        auto const refused = ParseNodeArgv({ "--scheduler=s:1", cut.c_str() });
+        auto const refused = ParseNodeArgv({ cut.c_str() });
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().field == std::string_view { verb });
         CHECK(refused.error().context.contains("names a key that is not one"));
@@ -1382,7 +1345,7 @@ TEST_CASE("NodeConfig: a consensus node that names no dial address is refused be
     // defaults a node naming no --raft-self is dialled at this machine's name, so "names
     // itself neither way" is a name that resolved empty. Before the name resolves the
     // address is awaited rather than missing, which is asserted in `NodeDefaults_test`.
-    auto nameless = Installable();
+    auto nameless = Solitary(Installable());
     nameless.nodeId = "n1";
     nameless.raftListen = "6680";
     nameless.clusterDir = std::filesystem::path { "/var/lib/fastcache-node" };
@@ -1458,7 +1421,7 @@ TEST_CASE("NodeConfig: a cluster configured without --listen-raft is refused bef
          }))
     {
         INFO("--listen-raft=" << listen);
-        auto cfg = Installable();
+        auto cfg = Solitary(Installable());
         cfg.nodeId = "n1";
         cfg.raftSelf = "10.0.0.1";
         cfg.raftListen = listen;
@@ -1472,7 +1435,7 @@ TEST_CASE("NodeConfig: a cluster configured without --listen-raft is refused bef
 
     // A bare port is enough, and binds the wildcard -- peers are on other machines
     // by definition.
-    auto bare = Installable();
+    auto bare = Solitary(Installable());
     bare.nodeId = "n1";
     bare.raftSelf = "10.0.0.1";
     bare.raftListen = "6680";
@@ -1480,8 +1443,8 @@ TEST_CASE("NodeConfig: a cluster configured without --listen-raft is refused bef
     CHECK_FALSE(StartupPolicyRejection(bare).has_value());
     CHECK_FALSE(NodeInstallRejection(bare).has_value());
 
-    // And a worker with no consensus at all is not asked for a port it has no use
-    // for, which is by far the common deployment.
+    // And a learner, which dials its leader and listens for nobody, is not asked for a port it
+    // has no use for.
     CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
 }
 
@@ -1506,7 +1469,8 @@ TEST_CASE("NodeConfig: the consensus switch is --listen-raft, not --node-id", "[
     SECTION("--node-id with no --listen-raft runs NO consensus")
     {
         // The case that fails if the predicate is left reading the id.
-        auto cfg = Installable();
+        auto cfg = Solitary(Installable());
+        cfg.raftListen.clear();
         cfg.nodeId = "n1";
         CHECK_FALSE(RunsConsensus(cfg));
     }
@@ -1515,20 +1479,29 @@ TEST_CASE("NodeConfig: the consensus switch is --listen-raft, not --node-id", "[
     {
         // The mirror, and the one the identity work needs: an id that is derived
         // rather than typed cannot be what turns the mode on.
-        auto cfg = Installable();
+        auto cfg = Solitary(Installable());
         cfg.raftListen = "6680";
         CHECK(RunsConsensus(cfg));
     }
 
-    SECTION("neither flag: the single-machine install still starts")
+    SECTION("neither flag: the single-machine install starts, and closing its consensus is refused by name")
     {
-        // The regression this ticket exists to make impossible. Asserted as a STARTUP
-        // verdict rather than only as the predicate, because the predicate being false
-        // is not the same fact as the node being allowed to run.
-        auto const cfg = Installable();
-        CHECK_FALSE(RunsConsensus(cfg));
+        // The regression #1022 made impossible, restated for the zero-config defaults: the
+        // single-machine install names neither flag, runs consensus on the default port and
+        // serves its own scheduler. Asserted as a STARTUP verdict rather than only as the
+        // predicate, because the predicate is not the same fact as the node being allowed to run.
+        auto cfg = Solitary(Installable());
+        cfg.raftListen = std::string { DefaultRaftListen };
+        CHECK(RunsConsensus(cfg));
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
         CHECK_FALSE(NodeInstallRejection(cfg).has_value());
+
+        // Closed, the same worker would register nowhere, and is refused for exactly that.
+        cfg.raftListen.clear();
+        CHECK_FALSE(RunsConsensus(cfg));
+        CHECK(StartupPolicyRejection(cfg)
+              == std::optional<std::string> { std::string { WorkerWithConsensusClosedRefusal } });
+        CHECK(NodeInstallRejection(cfg) == std::optional<std::string> { std::string { WorkerWithConsensusClosedRefusal } });
     }
 
     SECTION("the surface row and the predicate are one answer")
@@ -1540,7 +1513,7 @@ TEST_CASE("NodeConfig: the consensus switch is --listen-raft, not --node-id", "[
         //
         // Both values, because an identity between two expressions that are both
         // false is satisfied by a predicate that is always false.
-        auto cfg = Installable();
+        auto cfg = Solitary(Installable());
         cfg.raftListen = "6680";
         CHECK(RunsConsensus(cfg));
         CHECK(RunsConsensus(cfg) == !RowFor(NodeSurface::Raft).Resolve(cfg).empty());
@@ -1555,11 +1528,12 @@ TEST_CASE("NodeConfig: the consensus switch is --listen-raft, not --node-id", "[
         // the same rule. It now reads no consensus predicate at all: a key admits a
         // machine on a clustered node and on a lone one alike, since a lone worker's
         // state directory may keep a roster, so both lines name the key routes.
-        auto clustered = Installable();
+        auto clustered = Solitary(Installable());
         clustered.raftListen = "6680";
         CHECK(AdmissionSummary(clustered).contains("by key or ticket"));
 
-        auto lone = Installable();
+        auto lone = Solitary(Installable());
+        lone.raftListen.clear();
         lone.nodeId = "n1";
         CHECK(AdmissionSummary(lone) == AdmissionSummary(clustered));
     }
@@ -1572,7 +1546,6 @@ TEST_CASE("NodeConfig: the packaged socket-activated worker starts", "[node][pol
     // exactly as `.github/workflows/build.yml` writes it into the file the unit's
     // ExecStart names:
     //
-    //     scheduler: 127.0.0.1:6675
     //     advertise: 127.0.0.1:6676
     //     toolchain:
     //       - /usr/bin/g++
@@ -1588,7 +1561,6 @@ TEST_CASE("NodeConfig: the packaged socket-activated worker starts", "[node][pol
     // is why this case is written from the workflow's own bytes rather than from a
     // shape that seemed representative.
     auto packaged = Testing::FirstStart(NodeConfig {});
-    packaged.schedulers = { "127.0.0.1:6675" };
     packaged.clusterDir = "cluster";
     packaged.advertise = "127.0.0.1:6676";
     packaged.toolchains = { "/usr/bin/g++" };
@@ -1612,14 +1584,13 @@ TEST_CASE("NodeConfig: the packaged socket-activated worker starts", "[node][pol
 TEST_CASE("A defaulted wildcard bind under a loopback advertise is judged on a node that admits other machines now",
           "[node][policy][admission]")
 {
-    // The #770 shape -- a bind nobody typed, a loopback advertise, a loopback `--scheduler` -- on
+    // The #770 shape -- a bind nobody typed, a loopback advertise, a scheduler on loopback -- on
     // each kind of node. Solitary and closed it is the packaged single-machine install and starts;
     // on a node whose peers are ALREADY real, `--fleet-open` or a formation record whose mode
     // reaches beyond this machine, each of them would be leased `127.0.0.1`, so the row answers
     // whatever the bind's provenance.
     auto const packaged = [] {
         auto cfg = Testing::FirstStart(NodeConfig {});
-        cfg.schedulers = { "127.0.0.1:6675" };
         cfg.clusterDir = "cluster";
         cfg.advertise = "127.0.0.1:6676";
         cfg.toolchains = { "/usr/bin/g++" };
@@ -1630,7 +1601,12 @@ TEST_CASE("A defaulted wildcard bind under a loopback advertise is judged on a n
     auto const withMode = [&packaged](Cluster::NodeMode mode) {
         auto cfg = packaged();
         if (cfg.formation.has_value())
+        {
             cfg.formation->mode = mode;
+            // Where a mode serving no scheduler of its own registers (`SchedulersOf`): the
+            // fleet's, on loopback, as the packaged install's own is.
+            cfg.formation->fleetSchedulers = { "127.0.0.1:6675" };
+        }
         return cfg;
     };
 
@@ -1678,7 +1654,6 @@ TEST_CASE("NodeConfig: --advertise naming this machine at a port it does not ser
     // machine the fourth row answers a loopback advertise before this can.
     auto const worker = [] {
         auto cfg = Testing::FirstStart(NodeConfig {});
-        cfg.schedulers = { "127.0.0.1:6685" };
         cfg.clusterDir = "cluster";
         cfg.toolchains = { "/usr/bin/g++" };
         // On loopback by NAME: a bare port takes the wildcard since the zero-config defaults, and
@@ -1809,42 +1784,6 @@ TEST_CASE("NodeConfig: --advertise naming this machine at a port it does not ser
         // absence of this rule's, because "the other rule answered" is the claim.
         CHECK(Unwrap(refusal).contains("dial ITSELF"));
     }
-}
-
-TEST_CASE("NodeConfig: an empty --scheduler is refused at STARTUP and not only at install", "[node][policy]")
-{
-    // **The rule this ticket is about, asserted where it has to hold.** An empty
-    // `--scheduler` was refused by an inline `if` in `main()` and by row 1 of
-    // `NodeServiceRejection`. `main.cpp` is in no test target, so the copy that ran at
-    // startup was the one nothing could assert, and the two had already drifted on the
-    // sentence they say -- which is the observable half of a duplicate
-    // ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
-    auto headless = Installable();
-    headless.schedulers.clear();
-
-    // **The control FIRST, so one run shows the discrimination.** `NodeInstallRejection`
-    // composes `NodeServiceRejection`, which has always had this row -- so it refuses an
-    // empty `--scheduler` whether or not the startup table does. Asserting through it
-    // would pass under the exact bug this case exists to catch, which is why the ticket
-    // names it as the wrong target. Ordered ahead of the subject because a `REQUIRE`
-    // below aborts the case: read after the subject, this control would simply not run
-    // on the failing build and could not show what it is for.
-    CHECK(NodeInstallRejection(headless).has_value());
-
-    auto const refusal = StartupPolicyRejection(headless);
-    REQUIRE(refusal.has_value());
-    CHECK(Unwrap(refusal).contains("--scheduler"));
-
-    // **The message must be the STARTUP sentence, not the install-time one.** Both
-    // rules are about the same empty field and the install row says "to install a
-    // service" -- true when a registration is being written and false at every start,
-    // where the process is simply refusing to run. An operator told the wrong one goes
-    // looking for a service they never asked to install.
-    CHECK_FALSE(Unwrap(refusal).contains("to install a service"));
-
-    // And the ordinary configuration is untouched: a node that names its scheduler
-    // starts, so this is a refusal of the empty value and not of the flag.
-    CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
 }
 
 TEST_CASE("NodeConfig: a listen flag whose value is not an endpoint is refused before it is installed", "[node][policy]")
@@ -2020,7 +1959,9 @@ TEST_CASE("NodeConfig: consensus flags with no --listen-raft are refused rather 
     keyed.clusterDir = "cluster";
     CHECK_FALSE(StartupPolicyRejection(keyed).has_value());
 
-    auto selfed = Installable();
+    // On a node whose consensus is closed: a learner runs consensus by dialling its leader.
+    auto selfed = Solitary(Installable());
+    selfed.raftListen.clear();
     selfed.raftSelf = "10.0.0.1";
     CHECK(Unwrap(StartupPolicyRejection(selfed)).starts_with("--raft-self names the host"));
 
@@ -2181,8 +2122,8 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         for (auto const& row: refused)
         {
             INFO(row.what);
+            // Its own scheduler, on this machine's node port: a first start serves one.
             auto cfg = Testing::FirstStart(NodeConfig {});
-            cfg.schedulers = { "scheduler.internal:6675" };
             cfg.clusterDir = "cluster";
             cfg.advertise = row.advertise;
             cfg.fleetOpen = true;
@@ -2200,7 +2141,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // conditions sharing one phrase is the same defect the `reason` column above
         // catches, one row further along.
         auto wildcard = NoConsensus();
-        wildcard.schedulers = { "scheduler.internal:6675" };
+        RegistersWith(wildcard, { "scheduler.internal:6675" });
         wildcard.clusterDir = "cluster";
         wildcard.fleetOpen = true;
         wildcard.advertise = "0.0.0.0:6676";
@@ -2231,11 +2172,6 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         NodeConfig reachable = wildcard;
         reachable.advertise = "worker-01.internal:6674";
         reachable.nodeListen = "0.0.0.0:6674";
-        // And the voters' keys, because widening the bind is what makes the compile verbs
-        // face the network -- so the unrelated row that wants a roster root for remote
-        // peers fires too (#178). Naming them here keeps this assertion about the three
-        // reachability rows rather than about whichever rule happens to answer first.
-        reachable.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(reachable).has_value());
 
         // **The single-machine fleet: loopback bind, loopback advertise, peers
@@ -2246,7 +2182,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // `127.0.0.1` advertising `127.0.0.1`. The fixture comment that caught it was
         // right and is why the rule is about DISAGREEMENT rather than reachability.
         auto singleMachine = NoConsensus();
-        singleMachine.schedulers = { "127.0.0.1:6675" };
+        RegistersWith(singleMachine, { "127.0.0.1:6675" });
         singleMachine.clusterDir = "cluster";
         singleMachine.nodeListen = "127.0.0.1:6674";
         singleMachine.advertise = "127.0.0.1:6674";
@@ -2267,45 +2203,32 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // everything it advertises, so nothing is told to dial anywhere it cannot. This is what an operator gets by
         // installing the package and starting a node, and it is correct.
         auto alone = Testing::FirstStart(NodeConfig {});
-        alone.schedulers = { "127.0.0.1:6675" };
         alone.clusterDir = "cluster";
         CHECK_FALSE(StartupPolicyRejection(alone).has_value());
 
-        // A node sharing its CACHE tier with listed peers and REGISTERING NOWHERE.
-        // That surface is reached at `--listen-node`, so its advertise is never
+        // A node sharing its CACHE tier with listed peers and REGISTERING NOWHERE: its
+        // consensus is closed, so its mode serves no scheduler and its formation record
+        // names none. That surface is reached at `--listen-node`, so its advertise is never
         // sent to anybody and the wildcard costs it nothing -- which is why the three
-        // advertise rows are scoped to `!c.schedulers.empty()`.
-        //
-        // **But "registering nowhere" is not a node that starts**, and that is worth
-        // knowing rather than asserting past: `--scheduler` is required of every node,
-        // so the exemption those rows carry describes a configuration the binary
-        // refuses. This case could assert otherwise only because the scheduler rule
-        // lived in `main.cpp`, which no test target compiles
-        // ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
-        //
-        // So the property is asserted the way it is actually observable: such a config
-        // IS refused, and refused for the scheduler rather than for the advertise. The
-        // scope clause therefore still does what it says -- it just cannot decide
-        // anything at startup, which is recorded here rather than changed, being
-        // nobody's ticket yet.
+        // advertise rows are scoped to a worker that registers somewhere (`SchedulersOf`).
+        // Its worker tier refuses to start with nowhere to register, by name; the table
+        // does not answer for it.
         auto cacheOnly = NoConsensus();
         cacheOnly.fleetOpen = true;
-        cacheOnly.voterKeys = { AVoterKey() }; // it admits another machine (#282, #178)
+        REQUIRE(SchedulersOf(cacheOnly, AsConfigured).empty());
         auto const cacheOnlyRefusal = StartupPolicyRejection(cacheOnly);
-        REQUIRE(cacheOnlyRefusal.has_value());
-        CHECK(Unwrap(cacheOnlyRefusal).contains("--scheduler"));
-        CHECK_FALSE(Unwrap(cacheOnlyRefusal).contains("--advertise"));
+        INFO("refusal: " << cacheOnlyRefusal.value_or("<none>"));
+        CHECK_FALSE((cacheOnlyRefusal.has_value() && Unwrap(cacheOnlyRefusal).contains("--advertise")));
 
         // And the worker the getting-started page documents, which names both.
         auto worker = NoConsensus();
-        worker.schedulers = { "scheduler.internal:6675" };
+        RegistersWith(worker, { "scheduler.internal:6675" });
         worker.clusterDir = "cluster";
         // BOTH, as the getting-started page now says: --advertise alone leaves the
         // surface on loopback and the worker unreachable.
         worker.nodeListen = "0.0.0.0:6674";
         worker.advertise = "worker-01.internal:6674";
         worker.fleetOpen = true;
-        worker.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(worker).has_value());
     }
 
@@ -2317,7 +2240,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // shape at the default: a no-flag worker binds the wildcard and advertises this
         // machine's name, so it is not refused -- asserted first.
         auto noFlags = NoConsensus();
-        noFlags.schedulers = { "scheduler.internal:6675" };
+        RegistersWith(noFlags, { "scheduler.internal:6675" });
         noFlags.clusterDir = "cluster";
         noFlags.fleetOpen = true;
         CHECK_FALSE(StartupPolicyRejection(noFlags).has_value());
@@ -2330,7 +2253,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // fall back to it: the advertise and the bind agree, so the rule about their
         // disagreement is silent, and this one answers -- at a hand start and at install.
         auto bare = NoConsensus();
-        bare.schedulers = { "scheduler.internal:6675" };
+        RegistersWith(bare, { "scheduler.internal:6675" });
         bare.clusterDir = "cluster";
         bare.fleetOpen = true;
         bare.nodeListen = "127.0.0.1:6674";
@@ -2347,25 +2270,25 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // directory may keep a roster that admits ticket holders, and each of them would
         // be told to dial itself.
         auto keyed = NoConsensus();
-        keyed.schedulers = { "scheduler.internal:6675" };
+        RegistersWith(keyed, { "scheduler.internal:6675" });
         keyed.clusterDir = "cluster";
         keyed.nodeListen = "127.0.0.1:6674";
         auto const keyedRefusal = StartupPolicyRejection(keyed);
         REQUIRE(keyedRefusal.has_value());
         CHECK(Unwrap(keyedRefusal).contains("dial ITSELF"));
 
-        // #1310: ANY configured scheduler on another machine, not the first. The
+        // #1310: ANY scheduler it registers with on another machine, not the first. The
         // heartbeat falls back through all of them, so a loopback first entry says
         // nothing about where this node registers once that entry stops answering.
         NodeConfig laterRemote = bare;
-        laterRemote.schedulers = { "127.0.0.1:6675", "scheduler.internal:6675" };
+        RegistersWith(laterRemote, { "127.0.0.1:6675", "scheduler.internal:6675" });
         auto const laterRefusal = StartupPolicyRejection(laterRemote);
         REQUIRE(laterRefusal.has_value());
         CHECK(Unwrap(laterRefusal).contains("dial ITSELF"));
 
         // And a list that is all this machine is the single-machine fleet still.
         NodeConfig allLocal = bare;
-        allLocal.schedulers = { "127.0.0.1:6675", "localhost:6675" };
+        RegistersWith(allLocal, { "127.0.0.1:6675", "localhost:6675" });
         CHECK_FALSE(StartupPolicyRejection(allLocal).has_value());
 
         // And an explicit loopback `--advertise` is the same configuration spelled
@@ -2383,7 +2306,6 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         wide.nodeListen = std::string { DefaultNodeListen };
         wide.nodeListenExplicit = false;
         wide.advertise = "127.0.0.1:6674"; // a loopback advertise over a NETWORK bind
-        wide.voterKeys = { AVoterKey() };
         auto const wideRefusal = StartupPolicyRejection(wide);
         REQUIRE(wideRefusal.has_value());
         CHECK(Unwrap(wideRefusal) != Unwrap(refusal));
@@ -2395,7 +2317,7 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // decides this and not the bind: every address here is loopback and that is
         // correct. `dist-compile-e2e.sh` runs exactly this.
         NodeConfig singleMachine = bare;
-        singleMachine.schedulers = { "127.0.0.1:6675" };
+        RegistersWith(singleMachine, { "127.0.0.1:6675" });
         CHECK_FALSE(StartupPolicyRejection(singleMachine).has_value());
 
         // **And the same fleet written the way people actually write it.**
@@ -2406,105 +2328,61 @@ TEST_CASE("A scheduler that could not admit anybody is refused at startup", "[no
         // the rule steering somebody into a wider surface than they had.
         for (auto const* spelling: { "localhost:6675", "[::1]:6675", "127.0.0.5:6675" })
         {
-            INFO("--scheduler=" << spelling);
+            INFO("registers with " << spelling);
             NodeConfig sameBox = bare;
-            sameBox.schedulers = { spelling };
+            RegistersWith(sameBox, { spelling });
             CHECK_FALSE(StartupPolicyRejection(sameBox).has_value());
         }
-
-        // A `--scheduler` that is not `host:port` is still not THIS row's business, and
-        // since [#968](https://github.com/LASTRADA-Software/fastcached/issues/968) the
-        // shape row answers it first. The expectation moves from "not refused" to
-        // "refused by the OTHER rule", which is what this block's own comment argued
-        // for before such a rule existed: a bare port reaches `HostOfEndpoint` as a
-        // bare HOST, so it reads as "not loopback" and this row would have said where
-        // the scheduler is when the fault is the value's shape.
-        //
-        // Asserted on WHICH refusal, never on the mere fact of one -- a case checking
-        // only `has_value()` would pass whichever rule fired, which is the same green
-        // it gave before the row existed.
-        NodeConfig malformed = bare;
-        malformed.schedulers = { "6675" };
-        auto const shapeRefusal = StartupPolicyRejection(malformed);
-        REQUIRE(shapeRefusal.has_value());
-        CHECK(Unwrap(shapeRefusal).contains("--scheduler=6675"));
-        CHECK(Unwrap(shapeRefusal).contains("an address to dial"));
 
         // And the worker that answered the refusal: both flags named, so nothing
         // about it is loopback any more.
         NodeConfig fixed = bare;
         fixed.nodeListen = "0.0.0.0:6674";
         fixed.advertise = "worker-01.internal:6674";
-        fixed.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(fixed).has_value());
     }
 
     SECTION("the working shapes are accepted")
     {
         // Each can check a grant from another machine, which every shape admitting one
-        // needs (#282): a scheduler runs consensus and checks against its own state, and
-        // a worker names the voters whose roster it checks against (#178).
-        // Each also names `--scheduler`, which every node needs to start at all -- a
-        // scheduler included, and it names itself. These fixtures did not, so the
-        // shapes they called "accepted" were shapes the binary refuses; the rule was an
-        // inline `if` in `main.cpp` and no test could see it (#386).
+        // needs (#282): a scheduler runs consensus and checks against its own state.
+        // None names `--scheduler`: a node registers where its formation record says,
+        // and a scheduler with itself.
         auto keyed = Testing::FirstStart(NodeConfig {});
-        keyed.schedulers = { std::string { SelfScheduler } };
         RunConsensusAlone(keyed);
         CHECK_FALSE(StartupPolicyRejection(keyed).has_value());
 
         auto open = Testing::FirstStart(NodeConfig {});
-        open.schedulers = { std::string { SelfScheduler } };
         open.fleetOpen = true;
         RunConsensusAlone(open);
         CHECK_FALSE(StartupPolicyRejection(open).has_value());
 
-        // And the minimum startable worker -- a scheduler and nothing else -- is
-        // untouched by any of this. That is the claim this line always meant to make.
-        //
-        // **It used to be `StartupPolicyRejection(Testing::FirstStart(NodeConfig {}))`, asserted to be
-        // ACCEPTED, under a comment calling a worker with no scheduler "by far the
-        // common case".** The binary has never agreed: `main()` refused an empty
-        // `--scheduler` outright, and every documented command line names one,
-        // including the scheduler's own and the cache-tier node's. A default
-        // `NodeConfig` is not a deployment -- it is a struct -- and while the rule
-        // lived in a file no test target compiles, this suite could hold a belief
-        // about which nodes exist that production had been contradicting all along
-        // ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
+        // And the minimum startable worker -- a first start and nothing else -- is
+        // untouched by any of this. It names no `--scheduler`: its mode serves its own,
+        // and its worker registers there. #386's rule that every node name one went with
+        // the formation record, which is where a worker's registration comes from now.
         auto minimal = Testing::FirstStart(NodeConfig {});
-        minimal.schedulers = { std::string { SchedulerEndpoint } };
         minimal.clusterDir = "cluster";
         CHECK_FALSE(StartupPolicyRejection(minimal).has_value());
-
-        // And the section's real claim, now stated rather than implied: none of the
-        // rows above depends on `--scheduler`. A bare config is refused, and refused
-        // for the scheduler ALONE -- so a row here that started answering in its place
-        // would fail this rather than hide behind it.
-        auto const bare = StartupPolicyRejection(Testing::FirstStart(NodeConfig {}));
-        REQUIRE(bare.has_value());
-        CHECK(Unwrap(bare).contains("--scheduler"));
-        CHECK_FALSE(Unwrap(bare).contains("--fleet-open"));
-        CHECK_FALSE(Unwrap(bare).contains("--raft-self"));
+        CHECK_FALSE(StartupPolicyRejection(Testing::FirstStart(NodeConfig {})).has_value());
 
         // Including a worker that admits other machines by key, which is the whole of
         // #235: one `NodeMembership` serves the scheduler, the cache tier AND the compile
         // port, and the compile port is built unconditionally, so a worker that could
         // admit nobody refused every dispatched compile with `NotAMember`.
         auto keyedWorker = NoConsensus();
-        keyedWorker.schedulers = { "scheduler.internal:6675" };
+        RegistersWith(keyedWorker, { "scheduler.internal:6675" });
         keyedWorker.clusterDir = "cluster";
         keyedWorker.nodeListen = "0.0.0.0:6674";
         keyedWorker.advertise = "worker-01.internal:6674";
-        keyedWorker.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(keyedWorker).has_value());
 
         auto openWorker = NoConsensus();
-        openWorker.schedulers = { "scheduler.internal:6675" };
+        RegistersWith(openWorker, { "scheduler.internal:6675" });
         openWorker.clusterDir = "cluster";
         openWorker.nodeListen = "0.0.0.0:6674";
         openWorker.advertise = "worker-01.internal:6674";
         openWorker.fleetOpen = true;
-        openWorker.voterKeys = { AVoterKey() };
         CHECK_FALSE(StartupPolicyRejection(openWorker).has_value());
     }
 }
@@ -2517,7 +2395,6 @@ TEST_CASE("NodeConfig: a reserve of zero is re-emitted, because zero is an answe
     // that its operator told to hold nothing back would come up holding two cores
     // back on every start, with a command line that looks correct.
     auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.schedulers = { "cache.internal:6675" };
     cfg.clusterDir = "cluster";
     cfg.advertise = "worker-01.internal:6676";
     cfg.toolchains = { "/usr/bin/g++" };
@@ -2540,19 +2417,19 @@ TEST_CASE("NodeConfig: a reserve of zero is re-emitted, because zero is an answe
 TEST_CASE("NodeConfig: a node class is parsed by name and refused by name", "[node][cli]")
 {
     // Off `NodeClassTable`, so a class added there is accepted here without an edit.
-    auto const dedicated = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--node-class=dedicated" });
+    auto const dedicated = ParseNodeArgv({ "--toolchain=/usr/bin/cc", "--node-class=dedicated" });
     REQUIRE(dedicated.has_value());
     CHECK(dedicated->nodeClass == Distributed::NodeClass::Dedicated);
 
     // The default is the safe one rather than the common one.
-    auto const unstated = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc" });
+    auto const unstated = ParseNodeArgv({ "--toolchain=/usr/bin/cc" });
     REQUIRE(unstated.has_value());
     CHECK(unstated->nodeClass == Distributed::NodeClass::Workstation);
     CHECK_FALSE(unstated->reservedCores.has_value());
 
     // Refused rather than defaulted, and the message names what would have worked:
     // a rejection that cannot say that cannot be acted on.
-    auto const wrong = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--node-class=server" });
+    auto const wrong = ParseNodeArgv({ "--toolchain=/usr/bin/cc", "--node-class=server" });
     REQUIRE_FALSE(wrong.has_value());
     CHECK(wrong.error().context.contains("workstation"));
     CHECK(wrong.error().context.contains("dedicated"));
@@ -2565,12 +2442,12 @@ TEST_CASE("NodeConfig: a slot count of zero parses, and is a different answer fr
     // That answer is now the field's ABSENCE, so zero means what it says: a node running
     // no worker. Three values, and the pair that matters is the last two, since a build
     // folding them back together passes the other two.
-    auto const omitted = ParseNodeArgv({ "--scheduler=s:1" });
+    auto const omitted = ParseNodeArgv({});
     REQUIRE(omitted.has_value());
     CHECK_FALSE(omitted->slots.has_value());
     CHECK(RunsWorker(*omitted));
 
-    auto const four = ParseNodeArgv({ "--scheduler=s:1", "--slots=4" });
+    auto const four = ParseNodeArgv({ "--slots=4" });
     REQUIRE(four.has_value());
     CHECK(four->slots == std::optional<std::uint32_t> { 4 });
     CHECK(RunsWorker(*four));
@@ -2582,12 +2459,12 @@ TEST_CASE("NodeConfig: a slot count of zero parses, and is a different answer fr
 
     // A reserve of zero is the same shape one flag over, and it is still its own
     // instruction: drive this machine to its last core.
-    auto const reserve = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/cc", "--reserve-cores=0" });
+    auto const reserve = ParseNodeArgv({ "--toolchain=/usr/bin/cc", "--reserve-cores=0" });
     REQUIRE(reserve.has_value());
     CHECK(reserve->reservedCores == std::optional<std::uint32_t> { 0 });
 
     // What is not a number is still refused, and says what it was given.
-    auto const junk = ParseNodeArgv({ "--scheduler=s:1", "--slots=many" });
+    auto const junk = ParseNodeArgv({ "--slots=many" });
     REQUIRE_FALSE(junk.has_value());
     CHECK(junk.error().context.contains("many"));
 }
@@ -2602,9 +2479,11 @@ TEST_CASE("NodeConfig: the discovery reply port is pinned by name and needs disc
     // It names where its peers dial it with `--raft-self` -- discovery finds the OTHERS, and
     // this node's own address is the half only it knows. Without it the startup table can
     // refuse the whole command line before reaching anything this case is about.
-    auto const base =
-        std::vector<char const*> { "--scheduler=s:1",    "--toolchain=/usr/bin/cc", "--node-id=n1",
-                                   "--listen-raft=6680", "--raft-self=10.0.0.1",    "--discovery=255.255.255.255:6681" };
+    auto const base = std::vector<char const*> { "--toolchain=/usr/bin/cc",
+                                                 "--node-id=n1",
+                                                 "--listen-raft=6680",
+                                                 "--raft-self=10.0.0.1",
+                                                 "--discovery=255.255.255.255:6681" };
 
     auto const unset = ParseNodeArgv(base);
     REQUIRE(unset.has_value());
@@ -2857,14 +2736,10 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
     /// dashboard rule under test can fire.
     ///
     /// The node's mode says it RUNS a scheduler (a first start is solitary, and serves one
-    /// while it runs consensus); `--scheduler` says where it registers, and is required of
-    /// every node including one that schedules -- it names itself. This lambda once set only
-    /// the first, so the configurations it built could not have started, and nothing here
-    /// could tell while that rule lived as an inline `if` in `main.cpp`
-    /// ([#386](https://github.com/LASTRADA-Software/fastcached/issues/386)).
+    /// while it runs consensus), and its worker registers there: no `--scheduler`, which a
+    /// node that serves is refused.
     auto const servingNode = [] {
         auto cfg = Testing::FirstStart(NodeConfig {});
-        cfg.schedulers = { std::string { SelfScheduler } };
         cfg.fleetOpen = true;
         // A scheduler runs consensus (#178), which is also how a node that admits other
         // machines checks the grants they present (#282). Present here so that only the
@@ -3038,8 +2913,7 @@ TEST_CASE("A dashboard that could never show a fleet is refused at startup", "[n
 
 TEST_CASE("Naming the dashboard flags parses them", "[node][dashboard][cli]")
 {
-    auto const parsed = ParseNodeArgv({ "--scheduler=cache:6675",
-                                        "--toolchain=/usr/bin/g++",
+    auto const parsed = ParseNodeArgv({ "--toolchain=/usr/bin/g++",
                                         "--admin-listen=6677",
                                         "--dashboard",
                                         "--dashboard-token-file=/etc/fastcached/dashboard.token",
@@ -3053,14 +2927,13 @@ TEST_CASE("Naming the dashboard flags parses them", "[node][dashboard][cli]")
     CHECK_FALSE(parsed->tlsSelfSigned);
 
     // The other spelling of asking for TLS, which needs no material to name.
-    auto const generated =
-        ParseNodeArgv({ "--scheduler=cache:6675", "--toolchain=/usr/bin/g++", "--admin-listen=6677", "--tls-self-signed" });
+    auto const generated = ParseNodeArgv({ "--toolchain=/usr/bin/g++", "--admin-listen=6677", "--tls-self-signed" });
     REQUIRE(generated.has_value());
     CHECK(generated->tlsSelfSigned);
     CHECK(generated->tlsCertFile.empty());
 
     // Off unless asked for, like every other surface this program serves.
-    auto const bare = ParseNodeArgv({ "--scheduler=cache:6675", "--toolchain=/usr/bin/g++" });
+    auto const bare = ParseNodeArgv({ "--toolchain=/usr/bin/g++" });
     REQUIRE(bare.has_value());
     CHECK_FALSE(bare->dashboard);
     CHECK(bare->dashboardTokenFile.empty());
@@ -3154,7 +3027,7 @@ TEST_CASE("Typing the cache budget is what marks it explicit", "[node][config][c
     REQUIRE(typed.has_value());
     CHECK(typed->cacheMemoryExplicit);
 
-    auto const silent = ParseNodeArgv({ "--scheduler=s:1" });
+    auto const silent = ParseNodeArgv({});
     REQUIRE(silent.has_value());
     CHECK_FALSE(silent->cacheMemoryExplicit);
 }
@@ -3174,7 +3047,7 @@ TEST_CASE("Typing the cache port is what marks it explicit, even at its default 
     REQUIRE(off.has_value());
     CHECK(off->nodeListenExplicit);
 
-    auto const silent = ParseNodeArgv({ "--scheduler=s:1" });
+    auto const silent = ParseNodeArgv({});
     REQUIRE(silent.has_value());
     CHECK_FALSE(silent->nodeListenExplicit);
 }
@@ -3492,14 +3365,13 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // never had to see before. A rule that refused one of them would turn a working
     // install into a service that registers cleanly and refuses at every boot.
     //
-    // Asserted rather than reasoned about. The lease rule reads `voterKeys`,
-    // `nodeListen` and the admission fields and none of the cache ones, so by
+    // Asserted rather than reasoned about. The lease rule reads `nodeListen` and
+    // the admission fields and none of the cache ones, so by
     // inspection it cannot refuse these -- but "by inspection" is what this file
     // exists to replace, and the next rule added to either table gets this case for
     // free.
     auto cfg = Installable();
     cfg.fleetOpen = true;
-    cfg.voterKeys = { AVoterKey() }; // the lease rule's own requirement (#282, #178)
 
     // Both provenance-bearing flags typed at exactly their defaults, which is the
     // whole point of `explicitBit`: the value says nothing, the fact that it was
@@ -3511,8 +3383,7 @@ TEST_CASE("NodeConfig: the lease rule permits every flag provenance now emits", 
     // The default `--listen-node` is the WILDCARD, so `Installable()`'s routable advertise
     // and remote scheduler already agree with it: the ordinary fleet worker. `--fleet-open`
     // stays, which is what keeps this case about its own subject: `AdmitsRemotePeers` is
-    // what makes #282's lease rule apply at all, and the voters' keys above are that rule's
-    // requirement, satisfied.
+    // what makes #282's lease rule apply at all.
     cfg.cacheMemoryBytes = defaults.cacheMemoryBytes;
     cfg.cacheMemoryExplicit = true;
 
@@ -3583,8 +3454,8 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a roster to che
         // have (#463): `Installable()` registers with `cache.internal`, so as written
         // this was a loopback endpoint handed to a machine that could not dial it --
         // the fourth reachability row's exact subject, not the loopback fleet the
-        // harnesses run. `dist-compile-e2e.sh` names 127.0.0.1 here too.
-        loopbackBound.schedulers = { "127.0.0.1:6675" };
+        // harnesses run.
+        RegistersWith(loopbackBound, { "127.0.0.1:6675" });
         loopbackBound.fleetOpen = true;
         CHECK_FALSE(StartupPolicyRejection(loopbackBound).has_value());
 
@@ -3606,19 +3477,6 @@ TEST_CASE("NodeConfig: a worker that admits other machines needs a roster to che
         // has this host's compiler, so a lease check there escalates nobody.
         // Refusing it would break every developer's laptop to prevent nothing.
         CHECK_FALSE(StartupPolicyRejection(Installable()).has_value());
-    }
-
-    SECTION("the voters' keys root a directory that holds no roster yet")
-    {
-        auto cfg = Installable();
-        cfg.fleetOpen = true;
-        cfg.voterKeys = { AVoterKey() };
-        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
-
-        // And with no flag at all: the keys alone are a route, since a roster they root
-        // admits machines by proof and by ticket.
-        cfg.fleetOpen = false;
-        CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
     }
 
     SECTION("a state directory is asked at startup, where its answer is")
@@ -3680,7 +3538,6 @@ TEST_CASE("Every typed id is held to the one id bound, and refused by name past 
         { .flag = "--node-id", .prefix = "--node-id=", .suffix = "" },
         { .flag = "--cluster-admit", .prefix = "--cluster-admit=", .suffix = "=10.0.0.1:6680" },
         { .flag = "--cluster-admit-learner", .prefix = "--cluster-admit-learner=", .suffix = "=10.0.0.1:6680" },
-        { .flag = "--cluster-admit-worker", .prefix = "--cluster-admit-worker=", .suffix = "@" + key },
         { .flag = "--enroll-approve", .prefix = "--enroll-approve=", .suffix = "@" + key },
         { .flag = "--enroll-reject", .prefix = "--enroll-reject=", .suffix = "" },
     };
@@ -3717,7 +3574,6 @@ TEST_CASE("Every cluster verb names itself in a refusal by its own spelling, das
         Row { .flag = "--cluster-set", .refusedValue = "no-assignment", .says = "not <name>=<value>" },
         Row { .flag = "--cluster-admit", .refusedValue = "no-endpoint", .says = "not <id>=<host>:<port>" },
         Row { .flag = "--cluster-admit-learner", .refusedValue = "no-endpoint", .says = "not <id>=<host>:<port>" },
-        Row { .flag = "--cluster-admit-worker", .refusedValue = "no-key", .says = "is <id>@<key>" },
         Row { .flag = "--cluster-forget", .refusedValue = "", .says = "names no member" },
     };
     for (auto const& row: rows)
@@ -3851,7 +3707,7 @@ TEST_CASE("NodeConfig: a file's slots: 0 runs no worker, exactly as the flag doe
 
     // And a count on the command line still wins over the file's zero, which is the
     // precedence every other setting has.
-    auto const overridden = FromFileAndArgv({ Setting("slots", { "0" }) }, { "--scheduler=s:1", "--slots=8" });
+    auto const overridden = FromFileAndArgv({ Setting("slots", { "0" }) }, { "--slots=8" });
     REQUIRE(overridden.has_value());
     CHECK(overridden->slots == std::optional<std::uint32_t> { 8 });
     CHECK(RunsWorker(*overridden));
@@ -3859,11 +3715,11 @@ TEST_CASE("NodeConfig: a file's slots: 0 runs no worker, exactly as the flag doe
 
 TEST_CASE("NodeConfig: the command line wins over the file", "[node][config]")
 {
-    auto const merged = FromFileAndArgv({ Setting("scheduler", { "from-file:6675" }), Setting("slots", { "9" }) },
-                                        { "--scheduler=from-argv:6675" });
+    auto const merged = FromFileAndArgv({ Setting("advertise", { "from-file:6674" }), Setting("slots", { "9" }) },
+                                        { "--advertise=from-argv:6674" });
 
     REQUIRE(merged.has_value());
-    CHECK(merged->schedulers == std::vector<std::string> { "from-argv:6675" });
+    CHECK(merged->advertise == "from-argv:6674");
     // And a setting the command line did NOT name is still the file's: precedence
     // is per setting, not per source.
     CHECK(merged->slots == 9);
@@ -4064,17 +3920,9 @@ namespace
 /// configuration name the same one. Never read -- validation asks the configuration, not the disk.
 constexpr std::string_view RunnableStateDirectory = "node-state";
 
-/// The scheduler a node that could actually be running registers with: one on its own machine.
-///
-/// Loopback, because that state directory is a key route -- it may keep a roster that admits
-/// other machines -- and a worker that admits them while registering its loopback default with
-/// a scheduler ELSEWHERE is refused by the fourth advertise row, which no reload case here is
-/// about. The single-machine install names its scheduler this way.
-constexpr std::string_view RunnableScheduler = "127.0.0.1:6675";
-
 /// Write a configuration file for a node that could actually be running.
 ///
-/// `WriteNodeConfigFile` plus the `scheduler:` and `cluster_dir:` lines, so a fixture about reload MECHANICS
+/// `WriteNodeConfigFile` plus the `cluster_dir:` line, so a fixture about reload MECHANICS
 /// does not have to restate a startup precondition it is not testing. Named rather than
 /// folded into `WriteNodeConfigFile`, because several cases assert on a file's exact
 /// contents and a writer that silently added a key would break them for a reason none of
@@ -4084,16 +3932,15 @@ constexpr std::string_view RunnableScheduler = "127.0.0.1:6675";
 /// @return The path.
 [[nodiscard]] std::filesystem::path WriteRunnableNodeConfigFile(std::filesystem::path const& dir, std::string_view body)
 {
-    return WriteNodeConfigFile(
-        dir, std::format("scheduler: {}\ncluster_dir: {}\n{}", RunnableScheduler, RunnableStateDirectory, body));
+    return WriteNodeConfigFile(dir, std::format("cluster_dir: {}\n{}", RunnableStateDirectory, body));
 }
 
 /// The live configuration of a node that could actually be running.
-/// @return A config naming a scheduler and where its identity is kept, and nothing else.
+/// @return A config naming where its identity is kept, and nothing else: a first start serves
+///         its own scheduler, and its worker registers there.
 [[nodiscard]] NodeConfig RunningNode()
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.schedulers = { std::string { RunnableScheduler } };
     cfg.clusterDir = RunnableStateDirectory;
     return cfg;
 }
@@ -4230,9 +4077,9 @@ TEST_CASE("A worker's file naming a key twice is refused, where it used to keep 
     REQUIRE_FALSE(candidate.has_value());
     CHECK(candidate.error().code == ConfigErrorCode::ParseError);
     CHECK(candidate.error().field == "listen_node");
-    // Lines 1 and 2 are the runnable prefix -- the scheduler and the state directory.
-    CHECK(candidate.error().line == 4);
-    CHECK(candidate.error().context.contains("first at line 3"));
+    // Line 1 is the runnable prefix -- the state directory.
+    CHECK(candidate.error().line == 3);
+    CHECK(candidate.error().context.contains("first at line 2"));
 }
 
 TEST_CASE("A file that fails halfway is declined, never half-applied", "[node][config][reload]")
@@ -4835,14 +4682,18 @@ TEST_CASE("An operator who edits --listen-raft is answered by the right rule", "
 
     SECTION("turning consensus OFF is refused for stranding --raft-self, not for being immutable")
     {
-        auto const path = WriteRunnableNodeConfigFile(scratch.Path(), "listen_raft: 0.0.0.0:7000\nraft_self: 10.0.0.7\n");
+        // On a node running no worker: on one that runs a worker, closing consensus is refused
+        // first for leaving the worker nowhere to register (`WorkerWithConsensusClosedRefusal`),
+        // which is a true answer and not the one this section is about.
+        auto const path =
+            WriteRunnableNodeConfigFile(scratch.Path(), "slots: 0\nlisten_raft: 0.0.0.0:7000\nraft_self: 10.0.0.7\n");
 
         auto const previous = ReparseNodeConfig(path);
         REQUIRE(previous.has_value());
         REQUIRE(RunsConsensus(previous.value()));
 
         auto reloader = MakeNodeReloader(previous.value(), path);
-        (void) WriteRunnableNodeConfigFile(scratch.Path(), "raft_self: 10.0.0.7\nlisten_raft: \"\"\n");
+        (void) WriteRunnableNodeConfigFile(scratch.Path(), "slots: 0\nraft_self: 10.0.0.7\nlisten_raft: \"\"\n");
 
         auto const reloaded = reloader.Reload();
         REQUIRE_FALSE(reloaded.has_value());
@@ -4979,14 +4830,7 @@ TEST_CASE("The identity key is watched at the start and at every reload, and onl
 
     // Written here rather than through `WriteRunnableNodeConfigFile`, whose state directory is a
     // fixed name: this case's directory is the one it minted a key into.
-    //
-    // The scheduler is on THIS machine, and that is load-bearing rather than incidental: a worker
-    // holding a key admits other machines by it, so a REMOTE scheduler with the loopback advertise
-    // this configuration falls back to is a real misconfiguration the reload rules refuse -- and
-    // a refused reload is no key-watch outcome at all. The same-host shape is the single-machine
-    // fleet, which those rules leave alone.
-    auto const path = WriteNodeConfigFile(
-        scratch.Path(), std::format("scheduler: {}\ncluster_dir: {}\n", RunnableScheduler, stateDir.string()));
+    auto const path = WriteNodeConfigFile(scratch.Path(), std::format("cluster_dir: {}\n", stateDir.string()));
     REQUIRE(::chmod(path.c_str(), S_IRUSR | S_IWUSR) == 0);
 
     std::vector<std::string> said;
@@ -5181,9 +5025,8 @@ TEST_CASE("An --advertise that clients cannot dial is refused at startup", "[nod
         // answering here would not have been noticed (#1039).
         //
         // The single-machine shape first, where an empty value is simply the fallback
-        // to a loopback bind and nothing is refused at all.
-        auto cfg = Installable();
-        cfg.schedulers = { "127.0.0.1:6675" };
+        // to a loopback bind and nothing is refused at all: solitary, so its scheduler is its own.
+        auto cfg = Solitary(Installable());
         cfg.nodeListen = "127.0.0.1:6674";
         cfg.advertise = {};
         auto const refusal = StartupPolicyRejection(cfg);
@@ -5226,11 +5069,18 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
     // case's subject.
     auto const base = [] {
         auto cfg = NoConsensus();
-        cfg.schedulers = { std::string { SchedulerEndpoint } };
+        RegistersWith(cfg, { std::string { SchedulerEndpoint } });
         cfg.clusterDir = "cluster";
         cfg.toolchains = { "/usr/bin/g++" };
         cfg.nodeListen = "0.0.0.0:6674";
         cfg.advertise = "worker-01.internal:6674";
+        return cfg;
+    };
+    // `--scheduler` is judged where it is legal: on a one-shot verb, the one place it is read.
+    // On a node that serves it is refused whatever its shape, by a rule of its own.
+    auto const aimed = [&base] {
+        auto cfg = base();
+        cfg.cluster.action = ClusterAction::Status;
         return cfg;
     };
 
@@ -5244,7 +5094,7 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
         }));
         INFO(flag << "=" << value);
 
-        auto cfg = base();
+        auto cfg = flag == "--scheduler" ? aimed() : base();
         if (flag == "--scheduler")
             cfg.schedulers = { value };
         else
@@ -5265,7 +5115,7 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
         // right for a bind address an operator typed and wrong for text naming
         // somewhere else to ask -- a node told to dial `6675` would ask itself. The
         // same call `--discovery` and `--advertise` already make.
-        auto cfg = base();
+        auto cfg = aimed();
         cfg.schedulers = { "6675" };
         REQUIRE(StartupPolicyRejection(cfg).has_value());
     }
@@ -5280,14 +5130,14 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
         auto const bad = GENERATE(as<std::string> {}, "6675", "not an address", "");
         INFO("second --scheduler=" << bad);
 
-        auto cfg = base();
+        auto cfg = aimed();
         cfg.schedulers = { std::string { SchedulerEndpoint }, bad };
         auto const refusal = StartupPolicyRejection(cfg);
         REQUIRE(refusal.has_value());
         CHECK(Unwrap(refusal).contains(std::format("--scheduler={} is not an address to dial", bad)));
 
         // The control: two good values are two good values.
-        auto good = base();
+        auto good = aimed();
         good.schedulers = { std::string { SchedulerEndpoint }, "sched-b.internal:6675" };
         CHECK_FALSE(StartupPolicyRejection(good).has_value());
     }
@@ -5297,27 +5147,14 @@ TEST_CASE("NodeConfig: the addresses this node DIALS are judged for shape, each 
         // "Parses when GIVEN", never "must parse" -- the surface loop's own rule, and
         // the two questions belong to different rules on purpose. `--upstream` is
         // legitimately empty: a machine with no shared cache gets `NoUpstream`, which
-        // is honest rather than broken.
-        //
-        // `--scheduler` is REQUIRED, by a rule of its own further down, and that is
-        // why this section does not clear it. A shape row that also demanded presence
-        // would answer "is not an address to dial" for a flag nobody typed, which
-        // describes the wrong problem -- and it would make this case pass for a reason
-        // that has nothing to do with shape.
-        auto cfg = base();
+        // is honest rather than broken, and an empty `--scheduler` on a one-shot verb asks
+        // this machine's own node (`AdminTargetsOf`).
+        auto cfg = aimed();
         cfg.upstream.clear();
+        cfg.schedulers.clear();
         auto const refusal = StartupPolicyRejection(cfg);
         INFO("refusal: " << refusal.value_or("<none>"));
         CHECK_FALSE(refusal.has_value());
-
-        // And the required-ness IS asserted, so the two rules are seen to be separate
-        // rather than assumed to be: an empty `--scheduler` is refused, by the other
-        // rule and not by this one.
-        auto missing = cfg;
-        missing.schedulers.clear();
-        auto const required = StartupPolicyRejection(missing);
-        REQUIRE(required.has_value());
-        CHECK(Unwrap(required).contains("--scheduler is required"));
     }
 }
 
@@ -5501,7 +5338,6 @@ TEST_CASE("The allowlist row is reloadable, and LOCAL rather than advertised", "
     // the lists again: a reload that changes only this is accepted, and it does not
     // move what this worker advertises.
     auto previous = Testing::FirstStart(NodeConfig {});
-    previous.schedulers = { std::string { SchedulerEndpoint } };
     previous.clusterDir = "cluster";
     auto candidate = previous;
     candidate.extraAllowedArgs = { "-fno-plt" };
@@ -5534,7 +5370,6 @@ TEST_CASE("The advertise row is reloadable, and is the ADDRESS kind rather than 
     // than of the list again: a reload naming a new address is accepted, and it does not
     // drag the toolchain re-survey with it.
     auto previous = Testing::FirstStart(NodeConfig {});
-    previous.schedulers = { std::string { SchedulerEndpoint } };
     previous.clusterDir = "cluster";
     previous.nodeListen = "0.0.0.0:6674";
     previous.advertise = "worker-01.internal:6674";
@@ -5558,14 +5393,12 @@ TEST_CASE("A reload may not advertise what the startup rules refuse", "[node][co
     // asks, which is a property of `ValidateNodeReloadable` and would be equally true of
     // a build where it stopped asking.
     auto previous = NoConsensus();
-    previous.schedulers = { std::string { SchedulerEndpoint } };
+    RegistersWith(previous, { std::string { SchedulerEndpoint } });
     previous.clusterDir = "cluster";
     // Admitting other machines is what makes the advertised endpoint TRAVEL, and
     // therefore what scopes the wildcard rule: a node admitting nobody is reached at
-    // `--listen-node` and needs no advertise at all. `--fleet-open` states it outright,
-    // and the voters' keys root the roster that checks the grants those machines bring.
+    // `--listen-node` and needs no advertise at all. `--fleet-open` states it outright.
     previous.fleetOpen = true;
-    previous.voterKeys = { AVoterKey() };
     // And a listener peers could actually reach, because the table ALSO refuses an
     // advertise that names a dialable address while `--listen-node` binds loopback --
     // a rule this change does not relax and deliberately re-asks: a reload cannot
@@ -5672,11 +5505,9 @@ TEST_CASE("ObservabilityAnnouncement tells a fleet node it opens no admin surfac
     // default is deliberately NOT flipped -- and it is a pure function because
     // `main.cpp` is in no test target (#909).
 
-    // **Every case names `--scheduler`, and that is the point.** It is required of
-    // every startable node, one that only schedules included, so it is no evidence
-    // of a fleet -- a predicate reading it would fire on every node there is. Nor is a
-    // state directory, which every node naming a scheduler keeps, nor a wildcard node
-    // port, which every node binds by default.
+    // A first start registers with its own scheduler: no evidence of a fleet, so a predicate
+    // reading it would fire on every node there is. Nor is a state directory, which every
+    // node keeps, nor a wildcard node port, which every node binds by default.
     //
     // A "fleet node" is one another machine can reach AND a route admits: its node port
     // faces the network, and a key, `--fleet-open` or the fleet its formation record puts
@@ -5684,7 +5515,6 @@ TEST_CASE("ObservabilityAnnouncement tells a fleet node it opens no admin surfac
     // consensus holds a roster of this machine alone.
     auto const base = [] {
         auto cfg = Testing::FirstStart(NodeConfig {});
-        cfg.schedulers = { std::string { SchedulerEndpoint } };
         cfg.nodeListen = "0.0.0.0:6674";
         cfg.advertise = "worker-01.internal:6674";
         return cfg;
@@ -5697,8 +5527,8 @@ TEST_CASE("ObservabilityAnnouncement tells a fleet node it opens no admin surfac
         // wildcard default. It runs consensus, and its roster is this machine alone, so the
         // remark would be a false statement.
         auto single = Testing::FirstStart(NodeConfig {});
-        single.schedulers = { "127.0.0.1:6675" };
         REQUIRE(RunsConsensus(single));
+        INFO("refusal: " << StartupPolicyRejection(single).value_or("<none>"));
         REQUIRE_FALSE(StartupPolicyRejection(single).has_value());
         CHECK_FALSE(ObservabilityAnnouncement(single).has_value());
 
@@ -5726,10 +5556,14 @@ TEST_CASE("ObservabilityAnnouncement tells a fleet node it opens no admin surfac
     {
         // A state directory, which may keep a roster that admits machines by key, on a
         // port another machine can reach -- asked of a node running no consensus, whose
-        // roster is whatever that directory keeps.
+        // roster is whatever that directory keeps. Such a node runs no worker: one would have
+        // nowhere to register, and is refused by name (`WorkerConsensusClosed`), so this is
+        // the cache-only node that shape still starts as.
         auto cfg = base();
         cfg.raftListen.clear();
         cfg.clusterDir = "cluster";
+        cfg.slots = 0;
+        INFO("refusal: " << StartupPolicyRejection(cfg).value_or("<none>"));
         REQUIRE_FALSE(StartupPolicyRejection(cfg).has_value());
         auto const said = ObservabilityAnnouncement(cfg);
         REQUIRE(said.has_value());
@@ -5776,11 +5610,6 @@ TEST_CASE("ObservabilityAnnouncement tells a fleet node it opens no admin surfac
         if (pending.formation.has_value())
             pending.formation->mode = Cluster::NodeMode::Pending;
         CHECK(ObservabilityAnnouncement(pending).has_value());
-
-        auto anchored = base();
-        anchored.raftListen.clear();
-        anchored.voterKeys = { AVoterKey() };
-        CHECK(ObservabilityAnnouncement(anchored).has_value());
     }
 
     SECTION("the same node with an admin surface says nothing")
@@ -5884,7 +5713,7 @@ TEST_CASE("The compression settings parse, and each names its own flag", "[node]
     // `none` is the only codec guaranteed to exist: lz4 and zstd are behind
     // FASTCACHED_ENABLE_COMPRESSION, so a build without them must still parse the
     // flag rather than refuse a value the table documents.
-    auto const off = ParseNodeArgv({ "--scheduler=s:1", "--memory-compression=none", "--compression=none" });
+    auto const off = ParseNodeArgv({ "--memory-compression=none", "--compression=none" });
     REQUIRE(off.has_value());
     CHECK(off->memoryCompression == CompressionCodec::Identity);
     CHECK(off->compression == CompressionCodec::Identity);
@@ -5894,7 +5723,7 @@ TEST_CASE("The compression settings parse, and each names its own flag", "[node]
         if (!Compression::IsAvailable(codec))
             continue;
         auto const named = std::format("--memory-compression={}", Compression::NameOf(codec));
-        auto const parsed = ParseNodeArgv({ "--scheduler=s:1", named.c_str() });
+        auto const parsed = ParseNodeArgv({ named.c_str() });
         REQUIRE(parsed.has_value());
         CHECK(parsed->memoryCompression == codec);
     }
@@ -5903,7 +5732,7 @@ TEST_CASE("The compression settings parse, and each names its own flag", "[node]
     // MEMORY one: the parser is shared with `--compression`, and the daemon's
     // private copy of it hard-coded `compression` as the field, which sent an
     // operator to a flag they had not written.
-    auto const bad = ParseNodeArgv({ "--scheduler=s:1", "--memory-compression=brotli" });
+    auto const bad = ParseNodeArgv({ "--memory-compression=brotli" });
     REQUIRE_FALSE(bad.has_value());
     CHECK(bad.error().code == ConfigErrorCode::OutOfRange);
     CHECK(bad.error().field == "--memory-compression");
@@ -6003,7 +5832,7 @@ TEST_CASE("The compression level is range-checked at both ends", "[node][config]
 {
     for (auto const* good: { "--compression-level=1", "--compression-level=22" })
     {
-        auto const parsed = ParseNodeArgv({ "--scheduler=s:1", good });
+        auto const parsed = ParseNodeArgv({ good });
         INFO("flag: " << good);
         REQUIRE(parsed.has_value());
     }
@@ -6011,20 +5840,19 @@ TEST_CASE("The compression level is range-checked at both ends", "[node][config]
     // written as `== 0` alone accepts 23.
     for (auto const* bad: { "--compression-level=0", "--compression-level=23", "--memory-compression-level=0" })
     {
-        auto const parsed = ParseNodeArgv({ "--scheduler=s:1", bad });
+        auto const parsed = ParseNodeArgv({ bad });
         INFO("flag: " << bad);
         REQUIRE_FALSE(parsed.has_value());
         CHECK(parsed.error().code == ConfigErrorCode::OutOfRange);
     }
-    auto const level = ParseNodeArgv({ "--scheduler=s:1", "--memory-compression-level=9" });
+    auto const level = ParseNodeArgv({ "--memory-compression-level=9" });
     REQUIRE(level.has_value());
     CHECK(level->memoryCompressionLevel == 9);
 }
 
 TEST_CASE("The compression floors take byte suffixes", "[node][config][compression]")
 {
-    auto const parsed =
-        ParseNodeArgv({ "--scheduler=s:1", "--memory-compression-min-bytes=8k", "--compression-min-bytes=512" });
+    auto const parsed = ParseNodeArgv({ "--memory-compression-min-bytes=8k", "--compression-min-bytes=512" });
     REQUIRE(parsed.has_value());
     CHECK(parsed->memoryCompressionMinBytes == 8192);
     CHECK(parsed->compressionMinBytes == 512);
@@ -6032,7 +5860,7 @@ TEST_CASE("The compression floors take byte suffixes", "[node][config][compressi
     // A disk budget as a fraction of RAM is meaningless, and so is a compression
     // floor: no host total is passed to the parser, so `%` is refused rather than
     // silently resolved against this machine.
-    auto const percent = ParseNodeArgv({ "--scheduler=s:1", "--memory-compression-min-bytes=10%" });
+    auto const percent = ParseNodeArgv({ "--memory-compression-min-bytes=10%" });
     CHECK_FALSE(percent.has_value());
 }
 
@@ -6073,7 +5901,7 @@ TEST_CASE("A registration carries the codec by name, not by number", "[node][con
     if (!Compression::IsAvailable(CompressionCodec::Zstd))
         SKIP("this build has no zstd, so there is no non-default codec to pin");
 
-    auto parsed = ParseNodeArgv({ "--scheduler=s:1", "--toolchain=/usr/bin/g++", "--memory-compression=zstd" });
+    auto parsed = ParseNodeArgv({ "--toolchain=/usr/bin/g++", "--memory-compression=zstd" });
     REQUIRE(parsed.has_value());
 
     auto const spec = MakeNodeServiceSpec("/usr/bin/fastcache-compile-node", *parsed, Testing::InstallerPathProbe());
@@ -6121,9 +5949,6 @@ constexpr auto WorkerSettingSamples = std::to_array<WorkerSettingSample>({
     // provenance case below.
     { .flag = "--drain-timeout", .value = "45s" },
     { .flag = "--reserve-cores", .value = "2" },
-    // RFC 8037 A.1's public key: any well-formed key, since a node running no worker is
-    // refused it before anything asks whose it is.
-    { .flag = "--voter-key", .value = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo" },
 });
 
 /// @p flag spelled on a command line, with its sample value when it takes one.
@@ -6154,15 +5979,13 @@ TEST_CASE("NodeConfig: a node running no worker is refused every setting only a 
 
     // The two bases, each accepted on its own, so a refusal below is the flag's doing.
     // A node running no worker needs something else to run, and the default cache tier is
-    // that; the worker needs a scheduler, a state directory to keep the identity it proves to
-    // that scheduler (#178) and, for `--no-toolchain-discovery`, a toolchain. Its scheduler is
-    // on this machine, because that state directory is a key route and a worker admitting
-    // other machines while registering loopback with a scheduler elsewhere is refused.
+    // that; the worker needs its consensus open (so it has a scheduler to register with), a
+    // state directory to keep its identity in (#178) and, for `--no-toolchain-discovery`, a
+    // toolchain.
     auto const noWorkerBase = ParseNodeArgv({ "--slots=0" });
     REQUIRE(noWorkerBase.has_value());
     REQUIRE_FALSE(StartupPolicyRejection(*noWorkerBase).has_value());
-    auto const workerBase =
-        ParseNodeArgv({ "--scheduler=s:1", "--cluster-dir=cluster", "--toolchain=/usr/bin/g++", "--listen-raft=" });
+    auto const workerBase = ParseNodeArgv({ "--cluster-dir=cluster", "--toolchain=/usr/bin/g++" });
     REQUIRE(workerBase.has_value());
     REQUIRE_FALSE(StartupPolicyRejection(*workerBase).has_value());
 
@@ -6186,11 +6009,7 @@ TEST_CASE("NodeConfig: a node running no worker is refused every setting only a 
             CHECK(NodeInstallRejection(*noWorker) == refusal);
 
             // The control: the same flag on a worker is an ordinary setting.
-            auto const worker = ParseNodeArgv({ "--scheduler=s:1",
-                                                "--cluster-dir=cluster",
-                                                "--toolchain=/usr/bin/g++",
-                                                "--listen-raft=",
-                                                spelled.c_str() });
+            auto const worker = ParseNodeArgv({ "--cluster-dir=cluster", "--toolchain=/usr/bin/g++", spelled.c_str() });
             REQUIRE(worker.has_value());
             CHECK_FALSE(StartupPolicyRejection(*worker).has_value());
         }
@@ -6278,17 +6097,19 @@ TEST_CASE("NodeConfig: a file's no_toolchain_discovery: false names no worker se
     CHECK(Unwrap(refusal).starts_with("--no-toolchain-discovery configures the worker"));
 }
 
-TEST_CASE("NodeConfig: a node running no worker may name a scheduler", "[node][config][policy]")
+TEST_CASE("NodeConfig: a node running no worker starts and installs, and is refused --scheduler as any serving node is",
+          "[node][config][policy]")
 {
-    // #206. On a node running no worker `--scheduler` registers nothing: it is where the
-    // `--cluster-*` and `--enroll-*` commands run on this machine ask, and a machine-wide
-    // file carries it for them. So a scheduling machine naming its own scheduler starts
-    // and installs -- on a wildcard bind with a key route (it runs consensus), which is the
-    // shape the four advertise rows judge for a worker.
+    // #206. A scheduling machine running no worker starts and installs -- on a wildcard bind
+    // with a key route (it runs consensus), which is the shape the four advertise rows judge
+    // for a worker. `--scheduler` aims the one-shot verbs and nothing else, so beside a node
+    // that serves, worker or not, it is refused by name.
     auto schedulerOnly = SchedulerOnly();
-    schedulerOnly.schedulers = { std::string { SelfScheduler } };
     CHECK_FALSE(StartupPolicyRejection(schedulerOnly).has_value());
     CHECK_FALSE(NodeInstallRejection(schedulerOnly).has_value());
+    auto named = schedulerOnly;
+    named.schedulers = { "127.0.0.1:6674" };
+    CHECK(StartupPolicyRejection(named) == std::optional<std::string> { std::string { SchedulerOnAServingNodeRefusal } });
 
     // The control: the same configuration running a worker IS judged by those rows, which
     // is what keeps the case from passing because nothing looks at this shape at all.
@@ -6299,13 +6120,6 @@ TEST_CASE("NodeConfig: a node running no worker may name a scheduler", "[node][c
     auto const workerRefusal = StartupPolicyRejection(worker);
     REQUIRE(workerRefusal.has_value());
     CHECK(Unwrap(workerRefusal).contains("--advertise names no address they can dial"));
-
-    // And a worker with no scheduler is still refused, by the table's last row.
-    auto unregistered = Installable();
-    unregistered.schedulers.clear();
-    auto const refusal = StartupPolicyRejection(unregistered);
-    REQUIRE(refusal.has_value());
-    CHECK(Unwrap(refusal).starts_with("--scheduler is required"));
 }
 
 TEST_CASE("NodeConfig: a node running nothing at all is refused", "[node][config][policy]")
@@ -6326,15 +6140,18 @@ TEST_CASE("NodeConfig: a node running nothing at all is refused", "[node][config
 
 TEST_CASE("NodeConfig: the install rows that ask for a worker's settings skip a node running none", "[node][config][policy]")
 {
-    // No `--scheduler`, no `--advertise`, no toolchain -- the three install rows a worker
-    // must satisfy -- and the registration is accepted.
-    CHECK_FALSE(NodeInstallRejection(SchedulerOnly()).has_value());
+    // No toolchain and no discovery -- the install row a worker must satisfy -- and the
+    // registration of a node running none is accepted.
+    auto none = SchedulerOnly();
+    none.toolchainDiscovery = false;
+    CHECK_FALSE(NodeInstallRejection(none).has_value());
 
     auto worker = Installable();
-    worker.schedulers.clear();
+    worker.toolchains.clear();
+    worker.toolchainDiscovery = false;
     auto const workerRefusal = NodeInstallRejection(worker);
     REQUIRE(workerRefusal.has_value());
-    CHECK(Unwrap(workerRefusal).starts_with("--scheduler is required to install a service"));
+    CHECK(Unwrap(workerRefusal).starts_with("--toolchain is required alongside --no-toolchain-discovery"));
 }
 
 TEST_CASE("NodeConfig: a registration replays --slots=0, and omits a count nobody typed", "[node][service]")
@@ -6423,13 +6240,12 @@ TEST_CASE("A localhost --advertise is judged as loopback, whichever way the name
         auto worker = NoConsensus();
         worker.clusterDir = "cluster";
         worker.toolchains = { "/usr/bin/g++" };
-        worker.voterKeys = { AVoterKey() };
         worker.advertise = std::format("{}:6674", host);
         worker.advertiseExplicit = true;
 
         // Over a wildcard bind it tells every peer to dial itself: the reachable-bind row.
         auto reachable = worker;
-        reachable.schedulers = { "sched.corp.example:6675" };
+        RegistersWith(reachable, { "sched.corp.example:6675" });
         reachable.nodeListen = "0.0.0.0:6674";
         reachable.nodeListenExplicit = true;
         auto const refused = StartupPolicyRejection(reachable);
@@ -6439,7 +6255,7 @@ TEST_CASE("A localhost --advertise is judged as loopback, whichever way the name
         // Over a loopback bind it is the single-machine fleet, and no advertise row answers --
         // least of all the one about a ROUTABLE address past a loopback bind.
         auto single = worker;
-        single.schedulers = { "127.0.0.1:6675" };
+        RegistersWith(single, { "127.0.0.1:6675" });
         single.nodeListen = "127.0.0.1:6674";
         single.nodeListenExplicit = true;
         auto const accepted = StartupPolicyRejection(single);
@@ -6519,7 +6335,7 @@ TEST_CASE("Every flag this binary's help names is one it parses", "[node][cli][h
 {
     // A string is not a call site: a help line naming a flag the parser refuses sends an operator
     // after a spelling that does not exist, and no build and no other case notices -- the
-    // `--enroll-from` row named `--raft-peer` for a whole review. The rendered help, so a
+    // retired one-shot join's row named `--raft-peer` for a whole review. The rendered help, so a
     // `{token}` expansion is judged as printed, and the retired rows' steps, which are printed too.
     CHECK(Testing::FlagsNoNodeRowAccepts(HelpText(UsageColor::Plain)).empty());
     for (auto const& row: RetiredNodeFlags())
@@ -6540,13 +6356,13 @@ TEST_CASE("Every flag this binary's help names is one it parses", "[node][cli][h
 TEST_CASE("The auto-approve flag arms for a duration and off ends it, and zero or over a day is refused by name",
           "[node][config][enrollment][auto-approve]")
 {
-    auto const armed = ParseNodeArgv({ "--scheduler=s:1", "--enroll-auto-approve=15min" });
+    auto const armed = ParseNodeArgv({ "--enroll-auto-approve=15min" });
     REQUIRE(armed.has_value());
     CHECK(armed->enroll.action == EnrollAction::AutoApprove);
     CHECK(armed->enroll.duration == std::chrono::seconds { 900 });
     CHECK(armed->enroll.subject.empty());
 
-    auto const off = ParseNodeArgv({ "--scheduler=s:1", "--enroll-auto-approve=off" });
+    auto const off = ParseNodeArgv({ "--enroll-auto-approve=off" });
     REQUIRE(off.has_value());
     CHECK(off->enroll.action == EnrollAction::AutoApproveOff);
     CHECK(off->enroll.duration == std::chrono::seconds::zero());
@@ -6558,16 +6374,15 @@ TEST_CASE("The auto-approve flag arms for a duration and off ends it, and zero o
                                          std::pair { "--enroll-auto-approve=25h", AutoApproveRefusal::OverCeiling } })
     {
         INFO(typed);
-        auto const refused = ParseNodeArgv({ "--scheduler=s:1", typed });
+        auto const refused = ParseNodeArgv({ typed });
         REQUIRE_FALSE(refused.has_value());
         CHECK(refused.error().context == AutoApproveSentence(refusal));
     }
 
     // Exactly the ceiling is allowed, and a later verb drops the earlier one's operand.
-    CHECK(ParseNodeArgv({ "--scheduler=s:1", "--enroll-auto-approve=24h" }).has_value());
-    auto const replaced = ParseNodeArgv({ "--scheduler=s:1",
-                                          "--enroll-auto-approve=15min",
-                                          "--enroll-approve=n4@PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0" });
+    CHECK(ParseNodeArgv({ "--enroll-auto-approve=24h" }).has_value());
+    auto const replaced =
+        ParseNodeArgv({ "--enroll-auto-approve=15min", "--enroll-approve=n4@PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0" });
     REQUIRE(replaced.has_value());
     CHECK(replaced->enroll.action == EnrollAction::Approve);
     CHECK(replaced->enroll.subject == "n4");
@@ -6579,7 +6394,7 @@ TEST_CASE("A later enroll verb drops the duration an earlier auto-approve left",
          { "--enroll-list", "--enroll-approve=n4@PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0", "--enroll-reject=n4" })
     {
         INFO(later);
-        auto const parsed = ParseNodeArgv({ "--scheduler=s:1", "--enroll-auto-approve=15min", later });
+        auto const parsed = ParseNodeArgv({ "--enroll-auto-approve=15min", later });
         REQUIRE(parsed.has_value());
         CHECK(parsed->enroll.action != EnrollAction::AutoApprove);
         CHECK(parsed->enroll.duration == std::chrono::seconds::zero());
@@ -6588,8 +6403,8 @@ TEST_CASE("A later enroll verb drops the duration an earlier auto-approve left",
 
 TEST_CASE("The clear flag selects the clear verb and drops another verb's operands", "[node][config][enrollment]")
 {
-    auto const cleared = ParseNodeArgv(
-        { "--scheduler=s:1", "--enroll-approve=n4@PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0", "--enroll-clear" });
+    auto const cleared =
+        ParseNodeArgv({ "--enroll-approve=n4@PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0", "--enroll-clear" });
     REQUIRE(cleared.has_value());
     CHECK(cleared->enroll.action == EnrollAction::Clear);
     CHECK(cleared->enroll.subject.empty());
@@ -6601,31 +6416,31 @@ TEST_CASE("An approval names the key it admits, and one naming no key or half a 
     // The key is REQUIRED: an id names a row, and a row whose machine stopped asking is replaced
     // by the next machine to ask under the id. Split at the LAST `@`, since a key holds none.
     auto const whole = std::format("--enroll-approve=n4@{}", FormatEd25519PublicKey(Ed25519PublicKey { std::byte { 7 } }));
-    auto const approved = ParseNodeArgv({ "--scheduler=s:1", whole.c_str() });
+    auto const approved = ParseNodeArgv({ whole.c_str() });
     REQUIRE(approved.has_value());
     CHECK(approved->enroll.action == EnrollAction::Approve);
     CHECK(approved->enroll.subject == "n4");
     CHECK(approved->enroll.key == std::optional { Ed25519PublicKey { std::byte { 7 } } });
 
     auto const atInId = std::format("--enroll-approve=a@b@{}", FormatEd25519PublicKey(Ed25519PublicKey { std::byte { 7 } }));
-    auto const odd = ParseNodeArgv({ "--scheduler=s:1", atInId.c_str() });
+    auto const odd = ParseNodeArgv({ atInId.c_str() });
     REQUIRE(odd.has_value());
     CHECK(odd->enroll.subject == "a@b");
 
-    auto const bare = ParseNodeArgv({ "--scheduler=s:1", "--enroll-approve=n4" });
+    auto const bare = ParseNodeArgv({ "--enroll-approve=n4" });
     REQUIRE_FALSE(bare.has_value());
     CHECK(bare.error().context.contains("<id>@<key>"));
     CHECK(bare.error().context.contains("--enroll-list"));
 
-    auto const cut = ParseNodeArgv({ "--scheduler=s:1", "--enroll-approve=n4@AAAA" });
+    auto const cut = ParseNodeArgv({ "--enroll-approve=n4@AAAA" });
     REQUIRE_FALSE(cut.has_value());
     CHECK(cut.error().context == DescribePublicKeyFault(PublicKeyFault::WrongLength));
 
     auto const noId = std::format("--enroll-approve=@{}", FormatEd25519PublicKey(Ed25519PublicKey { std::byte { 7 } }));
-    REQUIRE_FALSE(ParseNodeArgv({ "--scheduler=s:1", noId.c_str() }).has_value());
+    REQUIRE_FALSE(ParseNodeArgv({ noId.c_str() }).has_value());
 
     // A later verb drops the key with the id: the action and its operands are one decision.
-    auto const listed = ParseNodeArgv({ "--scheduler=s:1", whole.c_str(), "--enroll-list" });
+    auto const listed = ParseNodeArgv({ whole.c_str(), "--enroll-list" });
     REQUIRE(listed.has_value());
     CHECK_FALSE(listed->enroll.key.has_value());
 }
@@ -6639,12 +6454,12 @@ TEST_CASE("The over-ceiling refusal names the ceiling the constant holds, in a s
     CHECK(AutoApproveSentence(AutoApproveRefusal::OverCeiling).contains(std::format("at most {};", spelled)));
 
     auto const atCeiling = std::format("--enroll-auto-approve={}", spelled);
-    auto const armed = ParseNodeArgv({ "--scheduler=s:1", atCeiling.c_str() });
+    auto const armed = ParseNodeArgv({ atCeiling.c_str() });
     REQUIRE(armed.has_value());
     CHECK(armed->enroll.duration == std::chrono::seconds { AutoApproveCeiling });
 
     auto const past = std::format("--enroll-auto-approve={}s", std::chrono::seconds { AutoApproveCeiling }.count() + 1);
-    auto const refused = ParseNodeArgv({ "--scheduler=s:1", past.c_str() });
+    auto const refused = ParseNodeArgv({ past.c_str() });
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().context == AutoApproveSentence(AutoApproveRefusal::OverCeiling));
 }
@@ -6692,5 +6507,197 @@ TEST_CASE("TLS material on a build that cannot serve it is refused by the startu
     SECTION("the control: no TLS material is never refused for the build")
     {
         CHECK_FALSE(StartupPolicyRejection(cfg).has_value());
+    }
+}
+
+TEST_CASE("The principal flags are unknown options", "[node][formation][principal]")
+{
+    // A machine joins ONE way, as a learner: no flag admits a principal, anchors a roster it does
+    // not apply, or asks a seed to let it in. Refused as any flag this build never had is --
+    // `UnknownKey`, the parser's code for an unknown option -- and named as typed.
+    for (auto const* const flag: { "--enroll-from=office:6674", "--voter-key=ab", "--cluster-admit-worker=n1@ab" })
+    {
+        INFO(flag);
+        auto const parsed = ParseNodeArgv({ flag });
+        REQUIRE_FALSE(parsed.has_value());
+        CHECK(parsed.error().code == ConfigErrorCode::UnknownKey);
+        CHECK(parsed.error().field == flag);
+        CHECK(parsed.error().context == "unrecognised argument");
+    }
+
+    // And as configuration-file keys, refused the way the table refuses every key no row names.
+    for (auto const* const key: { "enroll_from", "voter_key", "cluster_admit_worker" })
+    {
+        INFO(key);
+        auto const refused = FromFileAndArgv({ Setting(key, { "x" }) }, {});
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().code == ConfigErrorCode::UnknownKey);
+        CHECK(refused.error().field == key);
+    }
+}
+
+TEST_CASE("A serving node given --scheduler is refused by name and a one-shot verb is not", "[node][formation][principal]")
+{
+    auto const serving = Unwrap(ParseNodeArgv({ "--scheduler=office:6674" }));
+    auto const refusal = StartupPolicyRejection(serving);
+    REQUIRE(refusal.has_value());
+    CHECK(Unwrap(refusal) == SchedulerOnAServingNodeRefusal);
+    CHECK(Unwrap(refusal).contains("--fleet-seed"));
+
+    auto const oneShot = Unwrap(ParseNodeArgv({ "--scheduler=office:6674", "--enroll-list" }));
+    CHECK_FALSE(StartupPolicyRejection(oneShot).has_value());
+
+    // A cluster verb is aimed by it too, and a node running no worker serves all the same.
+    CHECK_FALSE(
+        StartupPolicyRejection(Unwrap(ParseNodeArgv({ "--scheduler=office:6674", "--cluster-status" }))).has_value());
+    auto const noWorker = Unwrap(ParseNodeArgv({ "--scheduler=office:6674", "--slots=0" }));
+    CHECK(StartupPolicyRejection(noWorker) == std::optional<std::string> { std::string { SchedulerOnAServingNodeRefusal } });
+}
+
+TEST_CASE("A one-shot verb with no --scheduler asks this machine's own node", "[node][formation][principal]")
+{
+    auto const cfg = Unwrap(ParseNodeArgv({ "--enroll-list" }));
+    CHECK(AdminTargetsOf(cfg) == std::vector<std::string> { std::string { DefaultAdminTarget } });
+}
+
+TEST_CASE("A node with no flags at all starts, and registers where its formation record says",
+          "[node][formation][principal]")
+{
+    // The go-live case: a zero-config worker was refused at startup for naming no `--scheduler`.
+    // It names none and needs none -- a first start is solitary, serves its own scheduler, and its
+    // worker registers with it on this machine's own node port.
+    auto const cfg = Unwrap(ParseNodeArgv({}));
+    auto const refusal = StartupPolicyRejection(cfg);
+    INFO("refusal: " << refusal.value_or("<none>"));
+    CHECK_FALSE(refusal.has_value());
+    CHECK(cfg.schedulers.empty());
+    REQUIRE(ServesScheduler(cfg));
+    CHECK(SchedulersOf(cfg, AsConfigured) == std::vector<std::string> { "127.0.0.1:6674" });
+
+    // And a learner registers with the fleet its record names, never with a flag.
+    auto learner = cfg;
+    REQUIRE(learner.formation.has_value());
+    if (learner.formation.has_value())
+    {
+        learner.formation->mode = Cluster::NodeMode::Learner;
+        learner.formation->fleetSchedulers = { "office:6674" };
+    }
+    CHECK_FALSE(ServesScheduler(learner));
+    CHECK(SchedulersOf(learner, AsConfigured) == std::vector<std::string> { "office:6674" });
+    CHECK_FALSE(StartupPolicyRejection(learner).has_value());
+}
+
+TEST_CASE("A node running a worker with its consensus port closed is refused, and a cache-only one is not",
+          "[node][formation][policy]")
+{
+    // A node whose consensus port is closed gets no formation runtime, so it never joins a fleet and
+    // serves no scheduler: its worker would register nowhere. The tier found that at start; the table
+    // says it before anything is installed or bound.
+    SECTION("a worker, at a first start and at an install, is refused by name")
+    {
+        auto const worker = Unwrap(ParseNodeArgv({ "--cluster-dir=cluster", "--listen-raft=" }));
+        REQUIRE(RunsWorker(worker));
+        REQUIRE_FALSE(ServesScheduler(worker));
+        CHECK(SchedulersOf(worker, AsConfigured).empty());
+        CHECK(StartupPolicyRejection(worker)
+              == std::optional<std::string> { std::string { WorkerWithConsensusClosedRefusal } });
+        CHECK(NodeInstallRejection(worker)
+              == std::optional<std::string> { std::string { WorkerWithConsensusClosedRefusal } });
+
+        // An install is judged before any formation record is applied, and still refused.
+        auto unshaped = worker;
+        unshaped.formation.reset();
+        CHECK(StartupPolicyRejection(unshaped)
+              == std::optional<std::string> { std::string { WorkerWithConsensusClosedRefusal } });
+    }
+    SECTION("the remedy it names, --slots=0, is a cache-only node that starts")
+    {
+        auto const cacheOnly = Unwrap(ParseNodeArgv({ "--cluster-dir=cluster", "--listen-raft=", "--slots=0" }));
+        REQUIRE_FALSE(RunsWorker(cacheOnly));
+        REQUIRE(ConfiguresCacheTier(cacheOnly));
+        auto const refusal = StartupPolicyRejection(cacheOnly);
+        INFO("refusal: " << refusal.value_or("<none>"));
+        CHECK_FALSE(refusal.has_value());
+    }
+    SECTION("and so is its other remedy, a worker whose consensus is open")
+    {
+        auto const open = Unwrap(ParseNodeArgv({ "--cluster-dir=cluster" }));
+        REQUIRE(RunsWorker(open));
+        auto const refusal = StartupPolicyRejection(open);
+        INFO("refusal: " << refusal.value_or("<none>"));
+        CHECK_FALSE(refusal.has_value());
+    }
+    SECTION("a learner dials its leader and listens for nobody, so a closed port is not this case")
+    {
+        auto learner = Unwrap(ParseNodeArgv({ "--cluster-dir=cluster", "--listen-raft=" }));
+        REQUIRE(learner.formation.has_value());
+        if (learner.formation.has_value())
+        {
+            learner.formation->mode = Cluster::NodeMode::Learner;
+            learner.formation->fleetSchedulers = { "office:6674" };
+        }
+        CHECK_FALSE(WorkerConsensusClosed(learner));
+        auto const refusal = StartupPolicyRejection(learner);
+        INFO("refusal: " << refusal.value_or("<none>"));
+        CHECK_FALSE(refusal.has_value());
+    }
+    SECTION("once a record is applied and the names resolve, it judges what the node RUNS, never the flag")
+    {
+        // The review's I-2 path: a PENDING node -- it asked a fleet to take it -- restarting on a name
+        // that reaches only this machine, with a worker. Asked as `!RunsConsensus`, after the names,
+        // so whatever closes consensus is refused here rather than started with an unchecked lease
+        // check. Since its consensus is confined to loopback rather than closed, it runs, and starts.
+        // It names `--advertise`, as the review's path does: without it the advertised name is
+        // withheld too, and a remote scheduler is refused for that first (`WorkerNameReachesOnlyThisMachine`).
+        auto pending = Unwrap(ParseNodeArgv({ "--cluster-dir=cluster", "--advertise=build-7.corp.example:6674" }));
+        REQUIRE(pending.formation.has_value());
+        if (pending.formation.has_value())
+        {
+            pending.formation->mode = Cluster::NodeMode::Pending;
+            pending.formation->fleetSchedulers = { "office.corp.example:6674" };
+        }
+        ApplyHostNames(pending, NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = "localhost" });
+        REQUIRE(RunsWorker(pending));
+        CHECK(RunsConsensus(pending));
+        CHECK(WorkerConsensusClosed(pending) == !RunsConsensus(pending));
+        auto const refusal = StartupPolicyRejection(pending);
+        INFO("refusal: " << refusal.value_or("<none>"));
+        CHECK_FALSE(refusal.has_value());
+
+        // Its consensus closed by the flag, the same record is refused by name.
+        auto closed = Unwrap(ParseNodeArgv({ "--cluster-dir=cluster", "--listen-raft=" }));
+        REQUIRE(closed.formation.has_value());
+        if (closed.formation.has_value())
+            closed.formation->mode = Cluster::NodeMode::Pending;
+        ApplyHostNames(closed, NodeHostNames { .fqdn = {}, .dnsSuffix = {}, .withheld = "localhost" });
+        REQUIRE_FALSE(RunsConsensus(closed));
+        CHECK(StartupPolicyRejection(closed)
+              == std::optional<std::string> { std::string { WorkerWithConsensusClosedRefusal } });
+    }
+}
+
+TEST_CASE("Each one-shot verb family is named by one predicate that routing and --scheduler both read",
+          "[node][config][one-shot]")
+{
+    // Review M-1: `main` routed the two families by spelling each action's enum inline, and
+    // `AimsAtScheduler` spelled the same two halves again. One predicate now, so a family routed
+    // and not aimed -- which would refuse its own --scheduler -- cannot be written.
+    struct Row
+    {
+        std::vector<char const*> argv;
+        std::optional<OneShotVerb> family;
+    };
+    auto const rows = std::to_array<Row>({
+        { .argv = { "--cluster-status" }, .family = OneShotVerb::Cluster },
+        { .argv = { "--enroll-list" }, .family = OneShotVerb::Enroll },
+        { .argv = { "--cordon" }, .family = std::nullopt },
+        { .argv = {}, .family = std::nullopt },
+    });
+    for (auto const& row: rows)
+    {
+        auto const cfg = Unwrap(ParseNodeArgv(row.argv));
+        for (auto const verb: Enumerators<OneShotVerb>())
+            CHECK(IsOneShotVerb(cfg, verb) == (row.family == verb));
+        CHECK(AimsAtScheduler(cfg) == row.family.has_value());
     }
 }

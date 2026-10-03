@@ -1233,6 +1233,16 @@ and it is recorded here because the question will be asked again.
   and `persistLog` are: it is a durability write that has to be ordered against
   the messages, and only the driver can order it. Consequences that are each
   load-bearing:
+  - **Durable means the DIRECTORY too.** Every file a node keeps in its state directory is
+    replaced through ONE writer, `Consensus::ReplaceFileWith`: write, flush to the platter, a
+    CHECKED close, rename, and then the parent directory flushed (`SyncDirectoryToDisk`). The
+    rename changed the directory, so a replace reported before that flush is one a power loss
+    can take back -- the old entry returns, and for the Raft state that is a forgotten vote and
+    a node that votes twice in one term. POSIX `fsync`s the directory; Windows flushes a handle
+    to it opened with `FILE_FLAG_BACKUP_SEMANTICS` and `FILE_WRITE_DATA`, measured to succeed on
+    NTFS and ReFS where read access alone is refused. A failed directory sync is a failed
+    replace, reported and never taken as durable; the identity key, created once rather than
+    replaced, flushes its directory the same way.
   - **The write order is snapshot-then-trim, and the crash window it leaves is
     the reason that order is right.** A crash between them leaves a durable
     snapshot beside a log that still holds the entries it covers, which
@@ -2083,7 +2093,7 @@ right, because the wire now trusts it.
     never a mode (`CreateStateFile`). The protected owner-only list, POSIX 0600, is the KEY's
     alone. Every other state file -- temporaries included -- is created exclusively with the
     JUDGED directory's list on Windows, since a list of its own locks out the service account the
-    directory grants when an elevated operator (`--enroll-from`, an install) wrote it; and on
+    directory grants when an elevated operator (`--print-identity`, an install) wrote it; and on
     POSIX with EXACTLY 0644, set on the descriptor after the create. **Never the umask's**: the
     create's 0666 less a umask of 000 left formation, the Raft store and the id world-writable,
     and the next start adopted them -- measured. 0644 rather than 0600 because a verb run as

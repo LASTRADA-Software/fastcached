@@ -359,11 +359,9 @@ TEST_CASE("A rosterless node that runs no consensus admits no other machine, by 
     // caller here without also moving `AdmitsRemotePeers`, the unchecked port would reopen
     // silently: this case is what goes red first.
     NodeConfig cfg;
-    cfg.schedulers = { "127.0.0.1:6675" };
     cfg.clusterDir = "cluster";
     cfg.nodeListen = "0.0.0.0:6674";
     REQUIRE_FALSE(RunsConsensus(cfg));
-    REQUIRE(cfg.voterKeys.empty());
     // The premise the call sites act on.
     REQUIRE_FALSE(AdmitsRemotePeers(cfg, RosterPresence::Absent));
 

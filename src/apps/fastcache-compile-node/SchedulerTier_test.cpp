@@ -99,7 +99,6 @@ Distributed::CallerContext const Insider { .membership = Distributed::Membership
 [[nodiscard]] NodeConfig ClusteredNode()
 {
     auto cfg = Testing::FirstStart(NodeConfig {});
-    cfg.schedulers = { "127.0.0.1:6675" };
     cfg.nodeId = "n1";
     cfg.raftListen = "127.0.0.1:6680";
     return cfg;
@@ -164,7 +163,6 @@ TEST_CASE("A node whose consensus is closed serves no scheduler, whatever its mo
     // WHAT DISTINGUISHES: the same node with consensus open serves one, so the fold is about
     // consensus and not about the mode.
     auto lone = Testing::FirstStart(NodeConfig {});
-    lone.schedulers = { "127.0.0.1:6675" };
     lone.raftListen.clear();
     lone.raftListenExplicit = true;
     REQUIRE_FALSE(RunsConsensus(lone));

@@ -1137,7 +1137,10 @@ void ReplayStreams(std::string_view out, std::string_view err)
 
     // Beside the object rather than in the system temp directory: the build already
     // writes here, so it is writable and on the same filesystem, and a rename or a
-    // copy cannot cross a device.
+    // copy cannot cross a device. A plain copy rather than `WriteFileAtomically`: the
+    // aside is scratch nobody reads while it is written, its error is checked, and a
+    // failure is Inconclusive without touching the build's object, so the one-writer
+    // rule does not reach it.
     auto const aside = std::filesystem::path { *served }.concat(".fastcache-verify");
 
     std::error_code ec;

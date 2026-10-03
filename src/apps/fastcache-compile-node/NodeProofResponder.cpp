@@ -242,7 +242,8 @@ std::string NodeProofResponder::UnknownKeyReason(ProvenIdentity const& proven) c
                            "its own, so it mints its own id and key",
                            proven.id);
     if (!ownId)
-        return std::format("this cluster holds no such key for {}: admit it with --enroll-from or --cluster-admit-worker",
+        return std::format("this cluster holds no such key for {}: it joins by asking to enroll (--fleet-seed names a "
+                           "fleet no beacon reaches), and --enroll-approve admits it",
                            proven.id);
     // This node's own id and key, recorded under ANOTHER key: its node-key was replaced while its
     // id survived, which waiting will not fix -- the diagnosis this node's prover gives itself. Only

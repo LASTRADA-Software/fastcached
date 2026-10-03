@@ -152,9 +152,10 @@ namespace
         [](ResolvedHostNames const& resolved) {
             return std::format(
                 "this machine names itself '{}', and '{}' reaches only this machine: every peer told to dial it would "
-                "reach ITSELF. So it is offered to no peer -- nothing is advertised to a scheduler, and consensus "
-                "and discovery stand down unless --raft-self names this node -- and the node serves this machine "
-                "alone. Set --advertise and --raft-self to an address or a name other machines resolve, or give "
+                "reach ITSELF. So it is offered to no peer -- nothing is advertised to a scheduler elsewhere, and "
+                "unless --raft-self names this node its consensus is confined to loopback, a fleet of its own that "
+                "can neither form nor join one -- and the node serves this machine alone. Set --advertise and --raft-self "
+                "to an address or a name other machines resolve, or give "
                 "this machine a real host name",
                 resolved.declined.empty() ? resolved.names.withheld : resolved.declined,
                 resolved.names.withheld);
@@ -373,8 +374,9 @@ std::optional<std::string> NameReachesOnlyThisMachineInUse(NodeConfig const& cfg
         consequences.emplace_back(SchedulerIsRemote(cfg)
                                       ? "nothing is advertised to a scheduler in place of --advertise"
                                       : "its worker is advertised at loopback, to this machine's own scheduler");
-    if (ConsensusNameWithheld(cfg) && !RunsConsensus(cfg))
-        consequences.emplace_back("consensus and discovery stand down in place of --raft-self");
+    if (ConsensusConfinedToThisMachine(cfg))
+        consequences.emplace_back("it runs as a fleet of its own on loopback and can neither form nor join a fleet "
+                                  "-- fix this machine's DNS, or give --raft-self and --advertise");
     if (consequences.empty())
         return std::nullopt;
 

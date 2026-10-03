@@ -3,6 +3,7 @@
 #include "EndpointDialerTestUtils.hpp"
 #include "NodeAnnounce.hpp"
 #include "NodeCredential.hpp"
+#include "NodeFormation.hpp"
 #include "NodePresenceTier.hpp"
 #include "NodeProofClient.hpp"
 #include "RemoteUpstream.hpp"
@@ -40,6 +41,7 @@
 #include <core/net/IConnector.hpp>
 #include <core/platform/Clock.hpp>
 #include <tests/LocalityFakes.hpp>
+#include <tests/NodeFormationFakes.hpp>
 #include <tests/NodeProofFakes.hpp>
 #include <tests/ScratchPath.hpp>
 #include <tests/ScriptedSocket.hpp>
@@ -495,8 +497,7 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
     // The secret is configured in every section and the round is the production one, so a
     // round that read `cfg.requirePass` again -- or an exchange that presented anything --
     // shows up in the bytes.
-    NodeConfig cfg;
-    cfg.schedulers = { "scheduler.example:6676" };
+    auto cfg = Testing::LearnerRegisteringWith(NodeConfig {}, { "scheduler.example:6676" });
     cfg.requirePass = FirstSecret;
 
     AtomicMetricsSink metrics;
@@ -536,7 +537,7 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
     SECTION("a registration")
     {
         Testing::ScriptedSocket scheduler { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today") };
-        (void) AnnounceOnce(roundProvedBy(nullptr), scheduler, cfg.schedulers.front());
+        (void) AnnounceOnce(roundProvedBy(nullptr), scheduler, SchedulersOf(cfg, AsConfigured).front());
         CheckBare(scheduler.Sent(), Wire::Op::Register);
     }
 
@@ -545,7 +546,7 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
         // A node running no consensus serves no proof: the round stops at the challenge, which
         // is the first thing any connection to a scheduler carries.
         Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NoCluster, "no consensus here") } };
-        auto link = Testing::Unwrap(SchedulerLink::For(cfg.schedulers));
+        auto link = Testing::Unwrap(SchedulerLink::For(SchedulersOf(cfg, AsConfigured)));
         CHECK(AnnounceRound(roundProvedBy(&prover), link, dialer) == 0);
         CheckBare(dialer.SentOn(0), Wire::Op::NodeChallenge);
     }
@@ -553,7 +554,7 @@ TEST_CASE("No round a node sends a scheduler presents the password whatever is c
     SECTION("a presence announcement")
     {
         Testing::ScriptedDialer dialer { { Wire::EncodeErrorReply(Wire::ErrorCode::NotAMember, "not today") } };
-        auto link = Testing::Unwrap(SchedulerLink::For(cfg.schedulers));
+        auto link = Testing::Unwrap(SchedulerLink::For(SchedulersOf(cfg, AsConfigured)));
         Wire::CapacityFields const machine {};
         Wire::LoadFields const load {};
         CHECK_FALSE(AnnouncePresence(PresenceMessage { .endpoint = "10.0.0.2:6677",
@@ -582,18 +583,12 @@ TEST_CASE("The production source answers from the LIVE snapshot, not the startup
     // fail at the `CHECK` -- and those are two different repairs in two different
     // files, which is why they are separate assertions rather than one.
     Testing::ScratchDirectory const scratch { "node-credential-rotation" };
-    // A state directory in both, because a node naming a scheduler must keep an identity (#178)
+    // A state directory in both, because a node that registers must keep an identity (#178)
     // and `cluster_dir` is not reloadable: a file and a live configuration disagreeing about it
     // would make this reload refuse for a reason that has nothing to do with the credential.
-    //
-    // The scheduler is on this machine: that state directory is a key route, and a worker admitting
-    // other machines while registering loopback with a scheduler elsewhere is refused -- which is a
-    // reload refusal about the advertise, not the credential.
-    auto const path = WriteConfig(
-        scratch.Path(), std::format("scheduler: 127.0.0.1:6676\ncluster_dir: node-state\nrequirepass: {}\n", SecondSecret));
+    auto const path = WriteConfig(scratch.Path(), std::format("cluster_dir: node-state\nrequirepass: {}\n", SecondSecret));
 
     NodeConfig initial;
-    initial.schedulers = { "127.0.0.1:6676" };
     initial.clusterDir = "node-state";
     initial.requirePass = std::string { FirstSecret };
 
@@ -725,9 +720,12 @@ struct CredentialHolderRow
 /// A source is `--requirepass`, and the one service that checks a password is the cache behind
 /// `--upstream`. A leg presenting it anywhere else hands the secret, in the clear and ahead of any
 /// seal, to an endpoint that checks nothing -- the enroll channel did, once a beat, to whatever
-/// machine a beacon named. A file absent from this list is refused by name, so a new holder is a
-/// new ROW with a reason rather than a forgotten argument; and a row whose file names no source
-/// any more is refused as stale, so a `Retiring` row leaves with the leg it describes.
+/// machine a beacon named. An operator's one-shot verb asks what to present PER ENDPOINT
+/// (`Cc::ICredentialFor`), which shows each one this machine's node's ticket and keeps the password
+/// for `--upstream` alone; a file holding that seam is a holder too. A file absent from this list
+/// is refused by name, so a new holder is a new ROW with a reason rather than a forgotten argument;
+/// and a row whose file names no source any more is refused as stale, so a `Retiring` row leaves
+/// with the leg it describes.
 constexpr auto CredentialHolders = std::array {
     CredentialHolderRow { .file = "NodeCredential.hpp",
                           .kind = HolderKind::Seam,
@@ -753,22 +751,20 @@ constexpr auto CredentialHolders = std::array {
                           .why = "builds that per-endpoint seam from the configuration the verb was invoked with" },
     CredentialHolderRow { .file = "ClusterAdminCli.hpp",
                           .kind = HolderKind::Retiring,
-                          .why = "an operator's cluster verb, to the --scheduler the operator typed" },
+                          .why = "an operator's cluster verb, asking per endpoint what each is shown" },
     CredentialHolderRow { .file = "ClusterAdminCli.cpp",
                           .kind = HolderKind::Retiring,
-                          .why = "an operator's cluster verb, to the --scheduler the operator typed" },
+                          .why = "an operator's cluster verb, asking per endpoint what each is shown" },
     CredentialHolderRow {
         .file = "EnrollClient.hpp",
         .kind = HolderKind::Retiring,
-        .why = "--enroll-from and its admin verbs: every pre-auth Enroll poll presents it to the seed the operator "
-               "typed AND to each endpoint an unsigned NotLeader redirect names; integration's polls "
-               "present none" },
+        .why = "the operator's enrollment verbs, asking per endpoint -- the one dialled AND each one an unsigned "
+               "NotLeader redirect names -- what each is shown; a joiner's polls present none" },
     CredentialHolderRow {
         .file = "EnrollClient.cpp",
         .kind = HolderKind::Retiring,
-        .why = "--enroll-from and its admin verbs: every pre-auth Enroll poll presents it to the seed the operator "
-               "typed AND to each endpoint an unsigned NotLeader redirect names; integration's polls "
-               "present none" },
+        .why = "the operator's enrollment verbs, asking per endpoint -- the one dialled AND each one an unsigned "
+               "NotLeader redirect names -- what each is shown; a joiner's polls present none" },
 };
 
 /// What marks a file as holding a credential: a source, or a credential VALUE.
@@ -899,8 +895,8 @@ TEST_CASE("Only the files the holder list names hold a credential source", "[nod
         return source.name == "NodeCredential.hpp" && NamesCredentialSource(source.code);
     }));
 
-    INFO("holding a credential source with no CredentialHolders row -- a credential is presented to the "
-         "cache behind --upstream and to nothing else: "
+    INFO("holding a credential source with no CredentialHolders row -- a credential is presented where a row "
+         "says why, and nowhere else: "
          << Joined(unlisted));
     CHECK(unlisted.empty());
     INFO("CredentialHolders rows whose file names no credential source any more -- delete them: " << Joined(stale));

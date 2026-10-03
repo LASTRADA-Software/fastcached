@@ -3,6 +3,13 @@
 # The acceptance criterion from the ticket, as a test: two nodes, same toolchain,
 # concurrent compiles of DIFFERENT translation units, each getting its own object.
 #
+# Each node is SOLITARY -- a fleet of its own, whose scheduler leases its own worker --
+# and each client dispatches to its own node. The property needs no fleet: it is about
+# two worker PROCESSES on one host claiming scratch roots under one TEMP, and that is
+# why this stays a real-process script rather than an in-process case. Exclusive
+# claiming is decided by the operating system between processes (a lock file beside
+# the root), and no arrangement inside one process reaches that.
+#
 # Why an end-to-end fixture and not only the unit tests beside `ScratchClaim.cpp`:
 # those prove the claim mechanism, this proves the WIRING -- that the node actually
 # claims a root before it compiles anything. The defect was never in the mechanism;
@@ -608,48 +615,6 @@ function Wait-ForLogLine([string]$log, [string]$pattern, [int]$seconds, [string]
     return $false
 }
 
-# Admit a worker to the cluster its scheduler leads, under the identity it will prove there
-# (#178 PR 6), and wait until the leader has APPLIED the admission. Its twins are
-# `dist-compile-e2e.ps1`'s and `dist-compile-e2e.sh`'s `admit_worker`, and the reasoning is the same: a worker that dials
-# in before the entry is applied is refused `node-key-unknown` and registers a heartbeat
-# interval late, and a scheduler that has just started answers `not-leader` until it leads
-# its cluster of one. What an operator runs, in the order an operator runs it: the worker's
-# `--print-identity` mints the identity into its state directory and prints the
-# `--cluster-admit-worker` line, and the start then reads the same files back.
-#
-# Bounded by a Stopwatch, which is monotonic, rather than by counting the sleeps it asked for.
-function Admit-Worker([string]$stateDir, [string]$scheduler, [string]$what) {
-    # A worker runs no consensus -- named, since consensus is on by default -- so the
-    # identity printed is a worker's, with the `--cluster-admit-worker` line.
-    $identity = @(& $Node --print-identity "--cluster-dir=$stateDir" "--listen-raft=")
-    if ($LASTEXITCODE -ne 0) { throw "--print-identity could not mint an identity for the $what in $stateDir (exit $LASTEXITCODE)" }
-    $tokenLine = $identity | Where-Object { $_ -like 'cluster-admit-worker *' } | Select-Object -First 1
-    $keyLine = $identity | Where-Object { $_ -like 'public-key *' } | Select-Object -First 1
-    if (-not $tokenLine -or -not $keyLine) {
-        throw "--print-identity printed no cluster-admit-worker line and key for the ${what}: $($identity -join ' | ')"
-    }
-    $token = $tokenLine.Substring('cluster-admit-worker '.Length)
-    $key = $keyLine.Substring('public-key '.Length)
-
-    $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    $recorded = $false
-    $last = ""
-    while ($clock.Elapsed.TotalSeconds -lt 30) {
-        if (-not $recorded) {
-            $last = (@(& $Node "--scheduler=$scheduler" "--cluster-admit-worker=$token") -join ' | ')
-            $recorded = ($LASTEXITCODE -eq 0)
-        }
-        if ($recorded) {
-            $status = (@(& $Node "--scheduler=$scheduler" --cluster-status) -join "`n")
-            if ($LASTEXITCODE -eq 0 -and $status.Contains("key=$key")) { return }
-            $last = $status
-        }
-        Start-Sleep -Milliseconds 200
-    }
-    throw ("the scheduler at $scheduler did not admit the $what within " +
-           "$([int]$clock.Elapsed.TotalSeconds) s (recorded: $recorded): $last")
-}
-
 function ConvertTo-QuotedArgs([string[]]$arguments) {
     # -ArgumentList joins an array with spaces into ONE command line, so an element
     # CONTAINING a space arrives at the child as two. `cl.exe` lives under
@@ -1244,14 +1209,12 @@ $clientBody = {
 function Invoke-Phase([string]$label, [bool]$separateTempForB) {
     Write-Host "--- $label"
 
-    # One port per node: since #290 stage 3 the compile verbs arrive on
-    # --listen-node beside the cache and scheduler verbs, so the scheduler's own
-    # worker half answers on $schedPort and the separate $schedWork is gone.
-    $cachePort = New-E2EPort; $schedPort = New-E2EPort
-    $workerA   = New-E2EPort; $workerB   = New-E2EPort; $adminPort = New-E2EPort
-    # The scheduler's consensus port (#178): a scheduler is a cluster of one, bound to
-    # loopback where nothing dials it.
-    $schedRaft = New-E2EPort
+    # Per node: its 0xFC port (the scheduler and compile verbs both answer there), its
+    # admin port, and its consensus port (#178) -- each node is a cluster of one, bound
+    # to loopback where nothing dials it.
+    $cachePort = New-E2EPort
+    $workerA   = New-E2EPort; $adminA = New-E2EPort; $raftA = New-E2EPort
+    $workerB   = New-E2EPort; $adminB = New-E2EPort; $raftB = New-E2EPort
 
     $phaseDir = Join-Path $scratch $label
     $proj = Join-Path $phaseDir "proj"
@@ -1342,22 +1305,9 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
             }
         }
 
-        # The scheduler runs no worker (`--slots=0`, #206), so every lease has to land on
-        # worker A or worker B -- and it names no --scheduler, having nothing to register.
-        # It runs consensus, a cluster of one (#178), keeping the identity key it signs
-        # leases with in a state directory of its own; the loopback workers check nothing.
-        $schedProc = Start-NodeIn "sched" @(
-            "--listen-node=127.0.0.1:$schedPort", "--fleet-open",
-            "--listen-raft=127.0.0.1:$schedRaft", "--raft-self=127.0.0.1",
-            "--cluster-dir=$(Join-Path $phaseDir 'sched.state')", "--discovery=",
-            "--advertise=127.0.0.1:$schedPort",
-            "--slots=0",
-            "--admin-listen=127.0.0.1:$adminPort") $null
-        $procs += $schedProc
-
-        # ONE slot each, so the second lease cannot land on the machine already busy
-        # -- which is what puts a compile on both processes at the same time.
-        # Each worker is started and waited for BEFORE the next one, and that is a
+        # ONE slot each, and each client dispatches to its OWN node -- which is what puts
+        # a compile on both processes at the same time, each in a scratch root it claimed.
+        # Each node is started and waited for BEFORE the next one, and that is a
         # deliberate reduction in what this fixture asks of the machine. A bare
         # `--toolchain` makes a node compute a fingerprint by walking the compiler's
         # whole include tree, which is seconds when warm and much longer cold; two of
@@ -1407,70 +1357,63 @@ function Invoke-Phase([string]$label, [bool]$separateTempForB) {
         # So it is the other possibility: one walker now costs more than the ceiling on
         # that runner. What the ceiling is set from, and why it is no longer the thing
         # that catches a wedge, is at `$SurveySeconds` near the top of this file.
-        # The scheduler runs no worker, so it has no survey to wait for: it is waited
-        # for as SERVING, and its ready line must say so. The survey bounds are unused.
-        Wait-ForNodeUp "sched" $schedProc $false 180 0 0
-
-        # Each worker proves its OWN identity to the scheduler (#178 PR 6), so it keeps a
-        # state directory and is admitted there before it starts: the scheduler refuses
-        # registering and heartbeating from a machine that proved nothing, loopback included.
+        #
+        # Each node is a cluster of one with a worker of its own: consensus on its own
+        # loopback port, no discovery beacon on the port every fixture shares, and its own
+        # state directory. Its worker registers with the scheduler in the same process.
         $workerAState = Join-Path $phaseDir "workerA.state"
-        Admit-Worker $workerAState "127.0.0.1:$schedPort" "workerA"
         $workerAProc = Start-NodeIn "workerA" @(
-            "--scheduler=127.0.0.1:$schedPort", "--cluster-dir=$workerAState", "--listen-raft=", "--listen-node=127.0.0.1:$workerA",
-            "--advertise=127.0.0.1:$workerA",
+            "--listen-node=127.0.0.1:$workerA", "--advertise=127.0.0.1:$workerA",
+            "--listen-raft=127.0.0.1:$raftA", "--raft-self=127.0.0.1",
+            "--cluster-dir=$workerAState", "--discovery=",
+            "--admin-listen=127.0.0.1:$adminA",
             "--toolchain=$Compiler", "--slots=1") $null
         $procs += $workerAProc
         Wait-ForNodeUp "workerA" $workerAProc $true 120 $SurveySeconds $SurveyIdleSeconds
 
         $bTemp = if ($separateTempForB) { Join-Path $phaseDir "tempB" } else { $null }
         $workerBState = Join-Path $phaseDir "workerB.state"
-        Admit-Worker $workerBState "127.0.0.1:$schedPort" "workerB"
         $workerBProc = Start-NodeIn "workerB" @(
-            "--scheduler=127.0.0.1:$schedPort", "--cluster-dir=$workerBState", "--listen-raft=", "--listen-node=127.0.0.1:$workerB",
-            "--advertise=127.0.0.1:$workerB",
+            "--listen-node=127.0.0.1:$workerB", "--advertise=127.0.0.1:$workerB",
+            "--listen-raft=127.0.0.1:$raftB", "--raft-self=127.0.0.1",
+            "--cluster-dir=$workerBState", "--discovery=",
+            "--admin-listen=127.0.0.1:$adminB",
             "--toolchain=$Compiler", "--slots=1") $bTemp
         $procs += $workerBProc
         Wait-ForNodeUp "workerB" $workerBProc $true 120 $SurveySeconds $SurveyIdleSeconds
 
-        # Asked of the SCHEDULER, bounded, and it says what it waited for. A worker
-        # logging "compile node ready" says that worker is serving -- its own surface
-        # is accepting and its heartbeat thread is running -- and NOT that the
-        # scheduler has heard from it. The heartbeat having STARTED is not a round
-        # having ARRIVED, so dispatching on that races the first heartbeat and is
-        # refused NoWorker.
+        # Asked of each node's SCHEDULER, bounded, and it says what it waited for. A worker
+        # logging "compile node ready" says that worker is serving -- its own surface is
+        # accepting and its heartbeat thread is running -- and NOT that its scheduler has
+        # heard from it. The heartbeat having STARTED is not a round having ARRIVED, so
+        # dispatching on that races the first heartbeat and is refused NoWorker.
         #
-        # The toolchain walk is NOT in this wait. #428 moved a 600 s budget here on
-        # the reasoning that the walk had moved with it, which was half right: the
-        # walk did move past the bind, but each node is waited for individually above
-        # and is surveyed before the next one starts, so by the time control reaches
-        # this line both workers' identities exist. What remains is the first heartbeat,
-        # which is a round trip. A budget sized for the walk would hide a scheduler
-        # that never hears a registration behind ten minutes of nothing.
+        # The toolchain walk is NOT in this wait: each node is waited for individually
+        # above and is surveyed before the next one starts, so what remains is the first
+        # heartbeat, which is a round trip. ONE registration per node: its own worker.
         $registrationBudget = 120
-        $deadline = (Get-Date).AddSeconds($registrationBudget); $regs = 0
-        # TWO registrations: the scheduler runs no worker, so it registers nothing.
-        while ((Get-Date) -lt $deadline -and $regs -lt 2) {
-            Start-Sleep -Milliseconds 700
-            try {
-                $text = (Invoke-WebRequest -Uri "http://127.0.0.1:$adminPort/metrics" -TimeoutSec 5).Content
-                foreach ($line in ($text -split "`n")) {
-                    if ($line -match '^fastcached_dispatch_worker_registrations_total\s+([0-9]+)') { $regs = [int]$Matches[1] }
-                }
-            } catch { }
-        }
-        if ($regs -lt 2) {
-            Write-Host "waited ${registrationBudget}s for two worker registrations at the scheduler; saw $regs (the scheduler was serving and both workers had finished their toolchain surveys, so this covers the first heartbeat only)"
-            foreach ($n in @("sched", "workerA", "workerB")) {
-                Write-Host "--- $n"; Get-Content (Join-Path $phaseDir "$n.err.log") -Tail 20 -ErrorAction SilentlyContinue
+        foreach ($n in @(@{ name = "workerA"; admin = $adminA }, @{ name = "workerB"; admin = $adminB })) {
+            $deadline = (Get-Date).AddSeconds($registrationBudget); $regs = 0
+            while ((Get-Date) -lt $deadline -and $regs -lt 1) {
+                Start-Sleep -Milliseconds 700
+                try {
+                    $text = (Invoke-WebRequest -Uri "http://127.0.0.1:$($n.admin)/metrics" -TimeoutSec 5).Content
+                    foreach ($line in ($text -split "`n")) {
+                        if ($line -match '^fastcached_dispatch_worker_registrations_total\s+([0-9]+)') { $regs = [int]$Matches[1] }
+                    }
+                } catch { }
             }
-            throw "the workers did not register"
+            if ($regs -lt 1) {
+                Write-Host "waited ${registrationBudget}s for $($n.name)'s own worker to register with its scheduler; saw $regs (the node was serving and had finished its toolchain survey, so this covers the first heartbeat only)"
+                Write-Host "--- $($n.name)"; Get-Content (Join-Path $phaseDir "$($n.name).err.log") -Tail 20 -ErrorAction SilentlyContinue
+                throw "$($n.name)'s worker did not register"
+            }
         }
 
         $objA = Join-Path $proj "build\a.obj"; $objB = Join-Path $proj "build\b.obj"
         $jobs = @(
-            Start-Job -ScriptBlock $clientBody -ArgumentList $Launcher,$Compiler,$proj,$objA,$srcA,"127.0.0.1:$schedPort",$cachePort,"A",$launcherStateModule,$launcherState
-            Start-Job -ScriptBlock $clientBody -ArgumentList $Launcher,$Compiler,$proj,$objB,$srcB,"127.0.0.1:$schedPort",$cachePort,"B",$launcherStateModule,$launcherState
+            Start-Job -ScriptBlock $clientBody -ArgumentList $Launcher,$Compiler,$proj,$objA,$srcA,"127.0.0.1:$workerA",$cachePort,"A",$launcherStateModule,$launcherState
+            Start-Job -ScriptBlock $clientBody -ArgumentList $Launcher,$Compiler,$proj,$objB,$srcB,"127.0.0.1:$workerB",$cachePort,"B",$launcherStateModule,$launcherState
         )
         $results = $jobs | Wait-Job -Timeout 300 | Receive-Job
         $jobs | Remove-Job -Force -ErrorAction SilentlyContinue

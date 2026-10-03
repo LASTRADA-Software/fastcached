@@ -50,6 +50,8 @@ set -euo pipefail
 # are not this project's to keep parseable by bash 3.2, and ctest runs none of them.
 # shellcheck source=lib/third-party-roots.sh
 . "$(dirname "$0")/lib/third-party-roots.sh"
+# shellcheck source=lib/git-scrub.sh
+. "$(dirname "$0")/lib/git-scrub.sh"
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 selfTest=0
@@ -310,7 +312,7 @@ RunSelfTest() {
         printf '%s\n' '#!/usr/bin/env bash' 'echo hello' > "$tree/scripts/fine.sh"
         printf '%s\n' '#!/usr/bin/env bash' 'if [ 1 -eq 1 ]; then' > "$tree/vendor/upstream/broken.sh"
         if [ "$mode" = git ]; then
-            ( cd "$tree" && git init -q . && git add -A ) >/dev/null 2>&1 \
+            ( cd "$tree" && scratch_git init -q . && scratch_git add -A ) >/dev/null 2>&1 \
                 || Bad "case 8: git could not stage the planted tree, so the git mode was not exercised"
         fi
         out=$(FASTCACHED_PARSE_ALLOW_MODERN_BASH=1 bash "$0" --root "$tree" 2>&1) && rc=0 || rc=$?
@@ -354,7 +356,7 @@ RunSelfTest() {
     PlantRoots "$tmp/missing"
     printf '%s\n' '#!/usr/bin/env bash' 'echo hello' > "$tmp/missing/scripts/fine.sh"
     printf '%s\n' '#!/usr/bin/env bash' 'echo also fine' > "$tmp/missing/scripts/gone.sh"
-    ( cd "$tmp/missing" && git init -q . && git add -A ) >/dev/null 2>&1 \
+    ( cd "$tmp/missing" && scratch_git init -q . && scratch_git add -A ) >/dev/null 2>&1 \
         || Bad "case 10: git could not stage the tree, so the index-names-it case was not built"
     rm -f "$tmp/missing/scripts/gone.sh"
     out=$(FASTCACHED_PARSE_ALLOW_MODERN_BASH=1 bash "$0" --root "$tmp/missing" 2>&1) && rc=0 || rc=$?

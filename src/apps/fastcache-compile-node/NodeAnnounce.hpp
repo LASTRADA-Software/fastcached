@@ -366,7 +366,7 @@ inline void RetireAllRegistrations(std::vector<Cc::WorkerRegistrar> rebuilt,
 ///
 /// Short, and separate from the exchange's I/O bound: ten seconds is a reasonable
 /// ceiling on an exchange and a very long time to wait for a TCP handshake. It is
-/// also what a retired first `--scheduler` costs every round that starts there, which
+/// also what a retired first scheduler endpoint costs every round that starts there, which
 /// is why a round's walk starts at the endpoint that last accepted (`SchedulerLink`).
 inline constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
 
@@ -378,7 +378,7 @@ inline constexpr std::chrono::milliseconds HeartbeatConnectTimeout { 1'000 };
 inline constexpr std::chrono::milliseconds HeartbeatIoTimeout { 10'000 };
 
 /// Announce this machine once, following `NotLeader` to wherever it points and falling
-/// back through the configured `--scheduler` list when an endpoint cannot be reached.
+/// back through the scheduler endpoints (`SchedulersOf`) when one cannot be reached.
 ///
 /// Out of `main.cpp` for #1310, whose acceptance is a FALLBACK: a first scheduler that
 /// does not answer and a second that does, asserted by which one took the request.
@@ -504,7 +504,7 @@ struct ReportableAddresses
 /// One announcement, on a connection somebody else dialled.
 ///
 /// **The seam that lets a node with NO WORKER reach the fleet.** Everything about *which*
-/// scheduler to talk to -- the `--scheduler` list walked at most once per round, a `NotLeader`
+/// scheduler to talk to -- the `SchedulersOf` list walked at most once per round, a `NotLeader`
 /// followed to the endpoint it names, a remembered leader that stops answering falling back in
 /// the SAME round, the bound that stops two nodes naming each other forever -- lives in
 /// `DialAndAnnounce` below and must live in exactly one place. A second loop with its own copy
@@ -548,7 +548,7 @@ struct AnnounceProof
 /// **The proof is part of reaching a scheduler, not of what is said**, so both announcements
 /// prove through the same lines (#178): a connection the proof did not seal is one on which no
 /// joining verb can be heard, and it is treated exactly as an endpoint that did not answer --
-/// the next `--scheduler` is tried in the same round.
+/// the next scheduler endpoint is tried in the same round.
 /// @param link Which endpoint to try, and what an answer teaches it.
 /// @param reachability How loudly an endpoint that does not answer, or refuses the proof, is said:
 ///        on the transition, then on a cadence, never per round. One per process, shared by every loop.

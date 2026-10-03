@@ -290,7 +290,7 @@ readable and silently ignored. Every rule below has already been one of them.
   wildcard and `--advertise` defaulting to loopback are that pair.
 
   What stayed out needs stating carefully, because the easy reason is the wrong one.
-  `--advertise`, `--scheduler`, `--upstream` and `--enroll-from` are addresses on
+  `--advertise`, `--scheduler` and `--upstream` are addresses on
   the same command line, and it is tempting to say they are excluded
   because they fail at `bind()` or `connect()` -- but that is about **reachability**,
   and their *grammar* is every bit as much a pure function of the command line as a
@@ -397,7 +397,7 @@ readable and silently ignored. Every rule below has already been one of them.
   - **WHO READS an exit decides it, and a one-shot command is not a start.** A START is read by
     a supervisor: 1 or 78 by the arm, as above. A ONE-SHOT command -- `--print-surfaces`,
     `--print-identity`, `--install-service`, `--uninstall-service`, `--migrate-storage`,
-    `--migrate-cache`, `--seed-config`, `--cluster-*`, `--enroll-*`, `--enroll-from`, `--cordon`
+    `--migrate-cache`, `--seed-config`, `--cluster-*`, `--enroll-*`, `--cordon`
     -- is read by an operator or a script, and ends as a `CommandEnding` by what that reader
     should do next: **2 (`Declined`) is a DECISION -- the same command gets the same
     answer, so do not retry; 1 (`Failed`) is TRANSIENT -- a retry may get past it.** A decision:
@@ -661,22 +661,29 @@ readable and silently ignored. Every rule below has already been one of them.
     and is left alone. That path removes neither the service's firewall group nor its event
     source -- an accepted residual: the rules name a program that is no longer installed, so
     they admit nothing, and a reinstall that registers the service replaces the group. For
-    fastcached every reinstall does; for the node only one that passes
-    `FASTCACHE_NODE_SCHEDULER`, since without it nothing is registered and the inert group stays.
+    fastcached and for the node every reinstall does.
   - Deselecting a feature outside an upgrade (`REMOVE=CM_C_Node`, Settings > Apps > Modify, an
     uninstall) removes its service through its own binary, firewall rules included.
 - **The MSI's service table decides every start mode**, and is applied on every transaction that
   leaves a feature installed -- a first install, a repair, a feature change and an upgrade. With
   the node installed, the node is registered `auto` and started, and fastcached `manual` and
   stopped through `net stop`, which waits (both would answer on 6674); with fastcached alone it
-  is `auto` and started unless `FASTCACHED_START_SERVICE=0`. The node is re-registered only when
-  `FASTCACHE_NODE_SCHEDULER` is given, and started whether or not it was, since an upgrade keeps a
-  registration its `ServiceControl` row stopped. `FASTCACHE_NODE_ADVERTISE` is OPTIONAL and reaches
+  is `auto` and started unless `FASTCACHED_START_SERVICE=0`. The node is re-registered on EVERY
+  such transaction and needs no property -- a node that serves is refused `--scheduler`, and a
+  registration kept as found would replay the one an earlier package wrote and fail at every
+  start -- so the OPTIONAL properties are REMEMBERED (the WiX remember-property pattern: saved
+  before `AppSearch`, read back from `HKLM\SOFTWARE\fastcached\Installer`, restored, written
+  again by a deferred `FastCacheRemember*` action on every transaction that registers; a root-feature
+  component only OWNS the key, since a feature change reinstalls no component). Three of them:
+  `FASTCACHE_FIREWALL_ALLOW`, `FASTCACHE_NODE_ADVERTISE` and `FASTCACHE_FLEET_SEED`, each a row of
+  `check-wix-service-table` and of the remember case. Not remembering them failed OPEN: a repair that left out
+  `FASTCACHE_FIREWALL_ALLOW` opened the rules to any address. The `[msi]` remember case runs the
+  fragment's own rows across install, repair, upgrade and repair. `FASTCACHE_NODE_ADVERTISE` is OPTIONAL and reaches
   the command line only through the derived `FastCacheNodeAdvertiseArgument`, so an absent one is
   no `--advertise` at all -- never an empty one -- and the node advertises its own name; the MSI
   names no `--cluster-dir` either, since a registered value outranks the file's `cluster_dir`.
   `DocumentedCommandLines_test`'s `[msi]` case reads the `ExeCommand` out of the fragment and
-  round-trips both shapes. The
+  round-trips every shape, the no-property one first. The
   inputs are `FASTCACHE_NODE_SELECTED` / `FASTCACHED_SELECTED`, derived once from the feature
   states after `MigrateFeatureStates`, so no condition restates the feature-state expression.
   NOT after `CostFinalize`: on a major upgrade `MigrateFeatureStates` runs later and carries the
@@ -1036,8 +1043,9 @@ readable and silently ignored. Every rule below has already been one of them.
     when its formation mode changes (`RunNodeBodies`), and PUBLISHES the reformed
     configuration into the reloader as the one in force. Shaped from the start's `cfg`,
     which no reload changes, it reverted every accepted reload at the next yield,
-    approval, forget or dissolve: a `--fleet-member` entry the operator removed was
-    admitted again, a rotated `--requirepass` went back to the old secret, and nothing
+    approval, forget or dissolve: an admission the operator removed (`--fleet-member`, since
+    retired; `--fleet-open` today) was admitted again, a rotated `--requirepass` went back to
+    the old secret, and nothing
     logged either. Removal is the direction that fails OPEN, so this is the dangerous
     reading of the rule above, one level later. Every body is adopted from
     `INodeConfigSource::Current()` — `LiveNodeConfig`, the reloader's snapshot, or the

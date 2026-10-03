@@ -101,52 +101,51 @@ struct EnrollRoleRow
     CompileCacheWire::EnrollRole role; ///< The wire role.
     std::string_view name;             ///< Its one spelling in a list and in a sentence.
 
-    /// Whether a request in this role states an endpoint. Neither live role does: a learner
-    /// dials the leader rather than being dialled, and a principal has no address anybody
-    /// dials.
+    /// Whether a request in this role states an endpoint. A learner does not: it dials the
+    /// leader rather than being dialled.
     bool statesEndpoint;
 
-    /// The principal role an approval records, or absent for a learner, which `ClusterAdmit`
-    /// records as a member instead.
-    std::optional<Cluster::PrincipalRole> principal;
-
-    /// The seat `ClusterAdmit` records a MEMBER role in, or absent for a principal. A learner's
-    /// is `Learner`: it dials in, so it is admitted with no consensus endpoint, and it holds no
-    /// vote until an operator promotes it.
-    std::optional<Cluster::MemberSeat> seat;
+    /// The seat `ClusterAdmit` records the joiner in. A learner's is `Learner`: it dials in, so it
+    /// is admitted with no consensus endpoint, and it holds no vote until an operator promotes it.
+    Cluster::MemberSeat seat;
 };
 
-/// One row per role this build implements.
+/// One row per role a joiner may ask for: a machine joins ONE way, as a learner.
 ///
 /// A plain array rather than an `EnumTable`, for `KnownEnrollmentDecisions`' reason: a WIRE enum
-/// carries no `Last`. Completeness is asserted against `KnownEnrollRoles` instead.
+/// carries no `Last`. Every row names a role the wire knows; a role the wire still decodes and no
+/// row names is one this build refuses at the door (`ServesEnrollRole`).
 inline constexpr std::array EnrollRoleTable {
     EnrollRoleRow { .role = CompileCacheWire::EnrollRole::Learner,
                     .name = "learner",
                     .statesEndpoint = false,
-                    .principal = std::nullopt,
                     .seat = Cluster::MemberSeat::Learner },
-    EnrollRoleRow { .role = CompileCacheWire::EnrollRole::Worker,
-                    .name = "worker",
-                    .statesEndpoint = false,
-                    .principal = Cluster::PrincipalRole::Worker,
-                    .seat = std::nullopt },
 };
 
-/// Whether every role this build knows has exactly one row.
-/// @return True when `EnrollRoleTable` is complete and has no duplicate.
-[[nodiscard]] consteval bool EveryEnrollRoleHasARow() noexcept
+/// Whether every row names a role the wire knows, and no role has two rows.
+/// @return True when `EnrollRoleTable` is well formed.
+[[nodiscard]] consteval bool EveryEnrollRoleRowIsKnownAndUnique() noexcept
 {
-    return std::ranges::all_of(CompileCacheWire::KnownEnrollRoles, [](CompileCacheWire::EnrollRole role) {
-        return std::ranges::count(EnrollRoleTable, role, &EnrollRoleRow::role) == 1;
+    return std::ranges::all_of(EnrollRoleTable, [](EnrollRoleRow const& row) {
+        return std::ranges::count(CompileCacheWire::KnownEnrollRoles, row.role) == 1
+               && std::ranges::count(EnrollRoleTable, row.role, &EnrollRoleRow::role) == 1;
     });
 }
 
-static_assert(EveryEnrollRoleHasARow(), "every enrollment role needs one EnrollRoleTable row");
+static_assert(EveryEnrollRoleRowIsKnownAndUnique(), "every EnrollRoleTable row names one role the wire knows, once");
+
+/// Whether a joiner may ask to be @p role: a row names it.
+/// @param role A role the decoder accepted.
+/// @return True when this build admits a joiner in that role.
+[[nodiscard]] constexpr bool ServesEnrollRole(CompileCacheWire::EnrollRole role) noexcept
+{
+    return std::ranges::count(EnrollRoleTable, role, &EnrollRoleRow::role) == 1;
+}
 
 /// The row for @p role.
-/// @param role A role the decoder accepted.
-/// @return Its row; the first row for a value no row names, which the assertion above makes unreachable.
+/// @param role A role `ServesEnrollRole` accepted.
+/// @return Its row; the first row for a value no row names, which the enrollment door refuses before
+///         anything asks.
 [[nodiscard]] constexpr EnrollRoleRow const& EnrollRoleRowFor(CompileCacheWire::EnrollRole role) noexcept
 {
     for (auto const& row: EnrollRoleTable)
@@ -155,12 +154,11 @@ static_assert(EveryEnrollRoleHasARow(), "every enrollment role needs one EnrollR
     return EnrollRoleTable.front();
 }
 
-/// Whether @p roster records @p nodeId holding @p key in @p role -- as a member for a member, and
-/// as a principal in the role's principal role for anything else.
+/// Whether @p roster records @p nodeId holding @p key as a member, in @p role.
 ///
 /// What the leader asks of its own roster before it answers `Approved`, and what the joiner asks
 /// of the roster it is handed before it believes it was admitted: one question, so the two ends
-/// cannot come to mean different things by "admitted". A principal is not a member.
+/// cannot come to mean different things by "admitted".
 /// @param roster The roster.
 /// @param nodeId The joiner's id.
 /// @param key The key it asked under.

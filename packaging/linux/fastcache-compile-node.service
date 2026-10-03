@@ -25,11 +25,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 
-# The scheduler address and the advertised endpoint are SITE-SPECIFIC and have no
-# defensible default, so they come from a file an operator writes rather than
-# from this unit. A worker nothing knows about serves nobody, so starting without
-# them is a configuration error and the binary refuses -- loudly, at start, which
-# is the right time to find out.
+# What is SITE-SPECIFIC -- an advertised address other machines must dial in place
+# of this machine's name, a fleet seed across a VPN, the membership policy -- comes
+# from a file an operator writes rather than from this unit. None of it is required:
+# a node with no configuration forms a fleet of its own and registers its worker
+# where its formation record says, never at a scheduler address anybody typed (a
+# node that serves is refused `--scheduler`, which aims the one-shot verbs alone).
 #
 # That file is now the node's own YAML configuration rather than a shell fragment
 # of command-line arguments (#291). One file, one grammar, one precedence rule:
@@ -138,8 +139,8 @@ WorkingDirectory=/run/fastcache-node
 #
 # It is where the node keeps WHO IT IS -- its identity key and its id (#178) -- and
 # every worker needs one: a worker proves that key on every connection to its
-# scheduler, and a node that names a scheduler with no state directory is refused at
-# startup. The runtime directory above cannot be it, because systemd removes that at
+# scheduler, and every node keeps its formation record there too. The runtime
+# directory above cannot be it, because systemd removes that at
 # every stop and a worker that mints a new identity on every restart is a machine the
 # cluster has to admit again each time. Under ProtectSystem=strict nothing else is
 # writable, so without this line the setting the configuration asks for could not
@@ -178,9 +179,9 @@ CapabilityBoundingSet=
 ProtectSystem=strict
 
 # AF_UNIX and AF_NETLINK are not for listening. glibc's getaddrinfo needs both
-# to resolve a non-numeric scheduler address (NSS reaches systemd-resolved over
-# AF_UNIX and enumerates interfaces over AF_NETLINK), and `--scheduler
-# build-cache.internal:6675` is the spelling an operator will reach for.
+# to resolve a non-numeric address -- this machine's own name at startup, a
+# `fleet_seed:` such as `build-cache.internal` -- since NSS reaches systemd-resolved
+# over AF_UNIX and enumerates interfaces over AF_NETLINK.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 # @system-service covers fork and exec, which this unit cannot do without.

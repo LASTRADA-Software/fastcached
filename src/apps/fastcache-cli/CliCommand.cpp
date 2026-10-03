@@ -382,8 +382,8 @@ namespace
         // there reddens here instead of leaving this paragraph pointing at nothing.
         "Some operator actions are fastcache-compile-node flags, not commands here.\n"
         "Enrollment: --enroll-list, --enroll-approve and --enroll-reject ask the\n"
-        "cluster at --scheduler; --enroll-from runs on the machine that is joining,\n"
-        "since it writes that machine's identity and the key it is handed.\n"
+        "cluster at --scheduler, or this machine's own node without one; a machine\n"
+        "that is joining asks by itself, given --fleet-seed where no beacon reaches.\n"
         "--print-surfaces lists the ports a node's configuration would open, and\n"
         "dials nothing. The cluster-* commands above send the requests its\n"
         "--cluster-status, --cluster-set, --cluster-admit, --cluster-admit-learner and\n"
