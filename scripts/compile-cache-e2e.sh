@@ -85,20 +85,18 @@ command -v "$compiler" >/dev/null 2>&1 || { echo "compiler not found: '$compiler
 
 workdir="$(mktemp -d)"
 server_pid=""
-# The authentication section starts a second daemon on its own port. It is reaped
-# there on the happy path, but the trap has to know about it too: a `fail` in
-# between exits the script, and a daemon left holding a port makes the NEXT run
-# of this test fail at startup for a reason that has nothing to do with the run
-# that actually broke.
 auth_pid=""
+# Every background job this shell started -- both daemons, and the launcher the
+# large-object case backgrounds -- is reaped on every path out, BOUNDED:
+# `reap_background_jobs` escalates to SIGKILL and names a job that outlives even
+# that rather than waiting on it. The `kill; wait` pair this replaced waited
+# unboundedly, and a local gate hung in it for 80 minutes on a daemon the kernel
+# could not finish killing. A daemon left holding a port also makes the NEXT run
+# fail at startup for a reason that has nothing to do with the run that broke.
 cleanup() {
-    for pid in "$server_pid" "$auth_pid"; do
-        if [[ -n "$pid" ]]; then
-            kill "$pid" >/dev/null 2>&1 || true
-            wait "$pid" 2>/dev/null || true
-        fi
-    done
+    reap_background_jobs
     rm -rf "$workdir"
+    e2e_exit_if_reap_left_survivors
 }
 trap cleanup EXIT
 
@@ -1242,8 +1240,11 @@ kill -0 "$auth_pid" 2>/dev/null || {
     [[ -f "${authdir}/build/ok.o" ]] || fail "no object reproduced on the authenticated hit"
 ) || exit 1
 
-kill "$auth_pid" >/dev/null 2>&1 || true
-wait "$auth_pid" 2>/dev/null || true
+# Stopped and REQUIRED to go, within `dist-compile-e2e.sh`'s `daemon_stop_seconds`
+# and for its reason: `fastcached` has nothing to drain, so it stops as soon as its
+# loop is woken. A bare `kill; wait` here was unbounded.
+stop_and_require_exit "$auth_pid" "the authenticating daemon" 5
+auth_pid=""
 echo "   a credential is required, refusals never break the build, and the right one still HITs"
 
 # --- statistics -------------------------------------------------------------

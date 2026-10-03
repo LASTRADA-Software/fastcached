@@ -3412,6 +3412,23 @@ makes it anyway and says so there.
   already fails: CMake's co-compile step returns clang-tidy's status and builds no
   object, measured against the same stub.
 
+  **A tool that parses is not a tool that reports on HEADERS.** A header finding is
+  kept only when `HeaderFilterRegex` takes the header's path *as clang spells it on
+  that host*, and clang joins an include directory to a header name with the host's
+  separator: a cl or clang-cl database reports `D:\...\src\tests\X.hpp`, or
+  `D:\...\src\FastCache/Core/X.hpp` where `-I...\src` meets a `/` include. The
+  pattern wrote every separator as `/`, so the `clang-tidy-windows` leg discarded
+  every first-party header finding as non-user code and reported clean -- measured
+  with the pinned 22.1.8, native, over both Windows databases, by a planted `g_`
+  global in `src/tests/WindowsErrorPopups.hpp` that exited 0 before and 1 after.
+  The unit canary could not see it: the unit parsed. So the gate's coverage count
+  asks every header in the three spellings clang produces, generated on every host,
+  and `tidy-sweep.sh`'s `HeaderCanary` plants a finding in a sibling-included and an
+  `-I`-included header and stops unless the analyser reports both. On Windows by
+  hand, pass nothing: the repository's pattern is the one to test. Run from INSIDE the
+  build directory of a database that scans modules, since its `@*.modmap` response
+  files are relative.
+
   "Refuses a verdict it did not earn" is four separate refusals, and each one closes
   a path that ends in `CLEAN` over nothing: the plan's exit status is *observed*
   (`mapfile < <(plan)` throws it away, and every way a compile database can fail to
@@ -6514,6 +6531,54 @@ and nothing would say so.
   adopting a narrower set: a difference that is invisible today and silent on the day it matters
   is worse than one that shows up as a count.
 
+## `git grep` exits 0 over a file it cannot read; stderr is the only signal
+
+<!-- agent-tripwire: untriaged: #1567 the git-grep-cannot-read rule has no AGENT.md bullet; one is proposed for the integration consolidation -->
+
+**`git grep` exits 0 over a tracked file it cannot open**, leaves it out of `-l` and `-L`
+both, and says so on stderr alone: `error: failed to stat 'X': Permission denied`.
+Measured with git 2.53 on ext4 under `chmod 000` as a non-root user and git 2.51.2 on
+Windows under a deny-read access list — the same status, the same line. It also skips a
+tracked file DELETED from the work tree without a word, stderr included, and never searches
+a symlink. Each of those is a file left out of an answer, and **a file left out of an
+answer is a file PASSED**: the reviewer's plant, `::htonl(` in a `chmod 000`
+`src/FastCache/Core/Endian.hpp`, made the byte-order check exit 0 through the seam when the
+per-file read it replaced had refused.
+
+So `fastcached_tracked_files` (`scripts/lib/CheckCommon.cmake`) owes an ACCOUNT of every file
+a question names — judged, reported missing, or refused by name — and the rules follow:
+
+- **Any stderr makes a search untrusted**, a status of 0 included, and the question is then
+  answered by reading every file. A benign line some git prints costs time and never a
+  verdict — that direction fails CLOSED on purpose.
+- **Unreadable is not missing.** A file that is there and cannot be read is refused whenever
+  contents were asked for (`cannot judge a file it cannot read`) and is never MISSING_OUT's —
+  a presence-only question answers "present", which is true. Deleted, or a link to nothing,
+  is MISSING_OUT's answer when the caller asked, and refused otherwise.
+- **The directory tells the two apart, not the file.** `EXISTS` is `access(R_OK)` on POSIX
+  and calls a `chmod 000` file absent; `file(TIMESTAMP)` is empty for both; a literal
+  `file(GLOB)` reads names out of the directory, so it lists an unreadable file and a
+  dangling link and not a deleted file. A link is followed to the END of its chain (a cycle
+  is nothing).
+- **A walk refuses a directory it cannot list**: `file(GLOB_RECURSE)` skips one silently, so
+  every file under it would go unfound. On POSIX the directory is still listed as an entry
+  and `EXISTS` calls it absent.
+- **Prove a plant bit with the primitive under test.** `cmake -E cat` exits 0 with no output
+  over a file a Windows access list denies, so it reads as "readable"; the self-test asks a
+  child `file(READ)` instead.
+
+The same defect in a shell script is the same rule: `check-tidy-sweep-database.sh` kept
+`2>/dev/null` on its `git grep`, and its walk's `grep -r` exit 2 vanished into a pipeline;
+both now refuse on any stderr. Census pattern for the next one: `git( -C [^ ]+)? grep` over
+`scripts/*.sh` and `scripts/*.cmake`. Enforced by `ctest -R tracked-files-selftest`, whose
+unreadable rows run on Windows (access list) and on POSIX legs as non-root.
+
+**Blind spot, and its direction.** On Windows neither `EXISTS` nor `IS_READABLE` sees an
+access list and a glob has no error channel, so a deny-list DIRECTORY in a walk is still
+skipped — **OPEN**. A deny-list FILE is caught in git mode by git's stderr naming it, and in
+a walk by CMake's own failing `file(READ)`. The walk is the no-index case; CI's Windows legs
+run in git mode.
+
 ## The enumerators of an enum are a view, and a hand-spelled walk is refused
 
 <!-- agent-tripwire: An enum's ENUMERATORS are `Enumerators<Enum>()` / `Enumerators(from)`, never `views::iota` to `EnumeratorCount<Enum>` -->
@@ -6685,6 +6750,65 @@ and clang-cl. clang-cl links through `lld-link`, which never links incrementally
 `/INCREMENTAL:NO` silently (LLD 22.1.3, checked with `/debug`, alone and beside `/INCREMENTAL`).
 A GNU-style driver on Windows spells no such switch and is left alone.
 
+## clang-tidy's header filter is matched against the path a header was OPENED by, in every spelling
+
+<!-- agent-tripwire: untriaged: #1567 the separator-agnostic header filter has no AGENT.md bullet; one is proposed for the integration consolidation -->
+
+`HeaderFilterRegex` in `.clang-tidy` is matched against the path the preprocessor
+OPENED a header by, and that path is spelled by the build, not by the repository. The
+MSVC compile database spells its include directories with backslashes, so
+`#include <tests/ScratchPath.hpp>` opens `D:\...\src/tests/ScratchPath.hpp` — a
+backslashed include directory and a slashed `#include` name. **So every separator in
+the filter is `[/\\]`**, and the filter names this repository's own roots and no
+dependency location.
+
+**Spelled with `/` alone, the filter matched no header on a Windows run and the run
+still read clean.** Measured with clang-tidy 22.1.8 on Windows over
+`ConsensusTier_test.cpp`, a naming violation planted in a header under `src/tests/` and
+force-included through the backslashed include directory: 0 reports under the `/`-only
+filter — all 20,891 warnings suppressed as non-user code — and 2 under `[/\\]`. The
+same shape held on three more units. Nothing looked wrong, because the main file's
+findings still came through.
+
+**Two dimensions, each of which has already shipped a defect**, so a verdict is taken
+in both: WHERE a checkout lives (#1040 — a pattern anchored on a directory name matched
+CI's `.../fastcached/` and no lane worktree) and HOW its separators are spelled (the
+above). The guard that existed read **363/363 under both the broken and the fixed
+filter**, because it matched POSIX paths only — a guard that could not fail on the
+defect in front of it.
+
+- **One predicate, one table of spellings**: `scripts/lib/header-filter.sh` —
+  `header_filter_match` (coverage: a header counts only if it is taken in EVERY
+  spelling), `header_filter_reach` (a leak: a dependency or third-party header taken
+  in ANY spelling is one, since a filter taking catch2 only when backslashed drowns a
+  Windows sweep and no other), and `HeaderFilterSpellings` (`posix`, `windows`,
+  `msvc`).
+- **Two callers of it, for two reasons.** `ctest -R tidy-header-filter` asks at this
+  checkout's real root on EVERY platform, Windows included, where `local-gate.sh` does
+  not run; `local-gate.sh`'s coverage check asks the same predicate as the tidy
+  sweep's PRECONDITION, with the vendored/first-party split and its untracked-root
+  refusal. Neither may grow a private copy of the match.
+- **What must stay OUT is derived, not listed**: `header_filter_dependency_paths` lays every
+  `CPMAddPackage(NAME ...)` the tree declares out in both layouts (`_deps/<name>-src/`,
+  `.cache/CPM/<name>/<hash>/`) and both header shapes (`src/<name>/`, `include/<name>/`),
+  and a tree declaring none is refused — zero is a parser that found nothing. Tracked
+  third-party headers come from `scripts/lib/third-party-roots.txt`.
+- **A miss names its cause**: a header taken in one spelling and not another is
+  reported with `(<spelling> spelling)`, and the gate then says *separator*, never
+  *where this checkout lives* — the #1040 sentence would send the reader to the wrong
+  fix. A header missed in every spelling carries no suffix.
+- **The remedy is either separator, never a second copy of the pattern.** Two copies
+  — one `/`, one `\` — still miss MSVC's mix, and the self-tests pin exactly that.
+
+**Blind spot, and its direction.** Both callers model `llvm::Regex` with `grep -E`
+(POSIX ERE, where a backslash inside a bracket is literal, as it is in clang-tidy) and
+model *how a build opens a header* with three spellings. No registered check asks
+clang-tidy itself; the agreement above was checked by hand. A construct the two
+engines read differently, or a build that opens headers by a fourth spelling (a `\\?\`
+long-path prefix, an 8.3 short name), fails **OPEN**: the check says covered while
+clang-tidy discards. That is the reason to keep the filter to classes, alternation and
+`.*`, and to add a spelling row when a build is found opening headers another way.
+
 ## Open work
 
 <!-- agent-tripwire: none: deferred work, tracked as GitHub issues; AGENT.md tripwires rules, not residuals -->
@@ -6705,7 +6829,10 @@ A GNU-style driver on Windows spells no such switch and is left alone.
   corrected in the places you REMEMBER writing it is not corrected fires in no session
   that does not open this file. Marked `untriaged:` and not `none:`, because `none`
   would claim the section needs no tripwire, and `ctest -R rulebook-tripwires` prints
-  the count against this issue on every run.
+  the count against this issue on every run. `## clang-tidy's header filter is matched
+  against the path a header was OPENED by, in every spelling` and `` ## `git grep` exits 0
+  over a file it cannot read; stderr is the only signal `` are in the same state until the
+  integration consolidation adds their proposed bullets.
 
 - **[#829](https://github.com/LASTRADA-Software/fastcached/issues/829)** — six
   contexts are still `Undecided` in `check-merge-queue-contexts.sh`'s binding table

@@ -4473,7 +4473,7 @@ struct LeaseView
     std::span<std::byte const> key;
     CodecList acceptedCodecs;
     std::vector<std::span<std::byte const>> excluded; ///< Borrowed from the payload, newest first.
-    std::span<std::byte const> toolchainLabel; ///< Empty when the client did not say.
+    std::span<std::byte const> toolchainLabel;        ///< Empty when the client did not say.
 };
 
 /// A client handing a worker one translation unit.

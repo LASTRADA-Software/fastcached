@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "NodeConfig.hpp"
 #include "NodeFirewall.hpp"
+#include "NodeKey.hpp"
 #include "NodeSurfaces.hpp"
 
+#include <FastCache/Cluster/FormationRecord.hpp>
 #include <FastCache/Platform/Firewall.hpp>
 #include <FastCache/Platform/ServiceControl.hpp>
 
@@ -11,13 +13,16 @@
 #include <algorithm>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include <tests/FirewallFakes.hpp>
+#include <tests/HostNamingFakes.hpp>
 #include <tests/NodeFormationFakes.hpp>
+#include <tests/ScratchPath.hpp>
 #include <tests/Unwrap.hpp>
 
 using namespace FastCache;
@@ -453,4 +458,82 @@ TEST_CASE("An install whose formation record was held is judged on the configura
     CHECK(result.message.contains("refusing the install"));
     CHECK(result.message.contains(LoopbackAdvertise));
     CHECK(firewall.rules.empty());
+}
+
+TEST_CASE("An install reads the formation record in exactly the directory its registration secured",
+          "[node][firewall][install]")
+{
+    // A `cluster_dir:` in the configuration FILE reaches the merged configuration and never the
+    // registration, which carries only what was typed. The handover secures the registration's
+    // directory (`RegisteredStateDirectory`), so that is the one directory the install may read:
+    // a record in the file's directory sits where other accounts may still write, which is the
+    // read the registration-first order exists to prevent. Here the file's directory holds a record
+    // nobody can read, so an install that read it would refuse.
+    Testing::ScratchDirectory const scratch { "install-state-dir" };
+    // On Windows the machine-wide base is the probe's `ProgramData`, so the registration's
+    // directory lands inside the scratch directory; on POSIX it is a fixed path.
+    Testing::ScriptedConfigPathProbe const probe { { { "ProgramData", (scratch / "programdata").string() } },
+                                                   Testing::ScriptedConfigPathProbe::Privilege::Privileged };
+    NodeConfig registration;
+    registration.schedulers = { "build-cache.internal:6675" };
+    REQUIRE(registration.clusterDir.empty());
+    auto const secured = RegisteredStateDirectory(registration, probe);
+    REQUIRE(secured.has_value());
+    auto const securedInScratch = Testing::Unwrap(secured).string().starts_with(scratch.Path().string());
+    if (!securedInScratch && std::filesystem::exists(Testing::Unwrap(secured)))
+        SKIP("this host keeps a machine-wide node state directory at " << Testing::Unwrap(secured).string()
+                                                                       << ", which the case cannot stand in for");
+
+    auto merged = registration;
+    merged.clusterDir = scratch / "from-file";
+    auto const recordIn = [](std::filesystem::path const& directory) {
+        return (directory / std::string { Cluster::FormationRecordFileName }).string();
+    };
+    scratch.Write(std::format("from-file/{}", Cluster::FormationRecordFileName), "not a formation record");
+
+    auto const install = [&](Testing::RecordingFirewall& firewall, std::vector<ServiceSpec>& registered) {
+        return InstallNodeService(
+            merged,
+            registration,
+            probe,
+            Program,
+            [&registered](ServiceSpec const& spec) {
+                registered.push_back(spec);
+                return ServiceControlResult { .outcome = ServiceControlOutcome::Done, .message = "installed" };
+            },
+            &firewall);
+    };
+
+    Testing::RecordingFirewall firewall;
+    std::vector<ServiceSpec> registered;
+    auto const result = install(firewall, registered);
+    INFO(result.message);
+    CHECK(result.ExitCode() == 0);
+    CHECK_FALSE(result.message.contains(recordIn(merged.clusterDir)));
+    REQUIRE(registered.size() == 1);
+    // The directory the handover secures is the one the install read.
+    CHECK(std::ranges::contains(registered.front().ownedPaths,
+                                OwnedPath { .path = Testing::Unwrap(secured),
+                                            .privacy = PathPrivacy::Private,
+                                            .credentialFiles = { std::filesystem::path { NodeKeyFileName } } }));
+    auto const opened = firewall.NamesInGroup(FirewallGroupFor(registration.serviceName));
+    REQUIRE(opened.has_value());
+    CHECK(std::ranges::contains(Testing::Unwrap(opened), std::string { "FastCacheCompileNode raft tcp/6680" }));
+
+    // The other direction, where the case can write into the registration's directory: a record
+    // there that cannot be read refuses the install, naming that record and not the file's.
+    if (securedInScratch)
+    {
+        auto const relative =
+            Testing::Unwrap(secured).lexically_relative(scratch.Path()) / std::string { Cluster::FormationRecordFileName };
+        scratch.Write(relative.generic_string(), "not a formation record either");
+        Testing::RecordingFirewall refusedFirewall;
+        std::vector<ServiceSpec> refusedRegistered;
+        auto const refused = install(refusedFirewall, refusedRegistered);
+        INFO(refused.message);
+        CHECK(refused.ExitCode() == 1);
+        CHECK(refused.message.contains(recordIn(Testing::Unwrap(secured))));
+        CHECK_FALSE(refused.message.contains(recordIn(merged.clusterDir)));
+        CHECK(refusedFirewall.rules.empty());
+    }
 }

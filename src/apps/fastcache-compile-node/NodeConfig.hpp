@@ -1065,6 +1065,19 @@ inline constexpr std::string_view RetiredNodeFlagsGuide =
                                               NodeConfig const& cfg,
                                               IConfigPathProbe const& probe);
 
+/// The state directory a service registration of @p registration owns and secures.
+///
+/// The `--cluster-dir` the registration names, else the machine-wide default. ONE derivation
+/// for both halves of an install: `MakeNodeServiceSpec` hands this directory over and secures it,
+/// and the install reads the formation record from this directory and no other
+/// (`InstallNodeService`). Two derivations disagreed: the reader took the MERGED configuration's
+/// directory, so a `cluster_dir:` in the file had the install read a directory nothing secured.
+/// @param registration The command-line configuration a registration is built from.
+/// @param probe Where the machine-wide default is resolved.
+/// @return The directory, or none where no machine-wide default resolves.
+[[nodiscard]] std::optional<std::filesystem::path> RegisteredStateDirectory(NodeConfig const& registration,
+                                                                            IConfigPathProbe const& probe);
+
 /// Why @p cfg must not be registered as a service, if it must not.
 ///
 /// Install-time rules that are the WORKER's rather than the platform's, checked
@@ -1621,12 +1634,14 @@ enum class RosterPresence : std::uint8_t
 ///
 /// A key admits only against a roster, and three things in a configuration may give this node
 /// one: consensus, whose roster is the state it applies; `--voter-key`, the anchors a roster is
-/// adopted against; and `--cluster-dir`, a state directory that may hold a roster an earlier run
-/// adopted. It answers "may", never "does": a directory that turns out empty is `NodeRoster::Build`'s
-/// finding, and until that runs the fail-closed reading is that a key route is live.
+/// adopted against; and the state directory, which may hold a roster an earlier run adopted --
+/// the one `ChosenStateDirectory` names, typed or the default the start resolved, since that is
+/// where `NodeRoster::Build` reads a kept roster back. It answers "may", never "does": a
+/// directory that turns out empty is `NodeRoster::Build`'s finding, and until that runs the
+/// fail-closed reading is that a key route is live.
 /// @param cfg The parsed configuration.
 /// @return Whether any clause of the configuration may give this node a roster.
-[[nodiscard]] bool AdmitsByKey(NodeConfig const& cfg) noexcept;
+[[nodiscard]] bool AdmitsByKey(NodeConfig const& cfg);
 
 /// Whether this node runs a compile worker: surveys its toolchains, claims a scratch
 /// root, serves the compile verbs and registers with a scheduler.

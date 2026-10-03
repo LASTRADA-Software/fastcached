@@ -137,6 +137,11 @@
 # running -- and a status that distinguished it would be read as an error.
 set -uo pipefail
 
+# The one `/proc/<pid>/stat` reader, shared with local-gate.sh's lock-holder walk.
+# shellcheck source=lib/proc-stat.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/proc-stat.sh" \
+    || { echo "reap: cannot read scripts/lib/proc-stat.sh, so no ancestry can be walked; REFUSING" >&2; exit 1; }
+
 # ---------------------------------------------------------------------------
 # The decision
 # ---------------------------------------------------------------------------
@@ -234,8 +239,10 @@ gate_candidates() {
             pid="${entry#/proc/}"
             # NUL-separated; `tr` makes it greppable. A cmdline that cannot be read
             # is another process's, and skipping it is correct rather than lossy --
-            # this helper only ever kills what it can attribute.
-            args="$(tr '\0' ' ' < "${entry}/cmdline" 2>/dev/null)" || continue
+            # this helper only ever kills what it can attribute. `2>` BEFORE `<`:
+            # redirections apply left to right, so a process that exited since the
+            # glob printed "No such file or directory" past a `2>` written after.
+            args="$(tr '\0' ' ' 2>/dev/null < "${entry}/cmdline")" || continue
             case "$args" in
                 *"$ReapGateMarker"*) printf '%s\n' "$pid" ;;
             esac
@@ -256,8 +263,19 @@ gate_candidates() {
 }
 
 # One process's parent, or nothing.
+#
+# `/proc` FIRST, `ps -o` only where there is none. Git Bash's `ps` is not POSIX: it
+# takes `[-aefls] [-u UID] [-p PID]` and nothing else, so `ps -o ppid=` there is a
+# usage error that prints nothing -- and an empty parent ended the ancestry walk at
+# `$$`, leaving the reaper's own CALLER unprotected. Measured: the self-test's
+# wrapper case killed the wrapper that invoked the reaper on 20 of 20 Git Bash runs.
 gate_ppid_of() {
     local pid="$1" out=""
+    if [ -d /proc ]; then
+        proc_stat_ppid "$pid" || return 1
+        printf '%s\n' "$proc_stat_reply"
+        return 0
+    fi
     out="$(ps -o ppid= -p "$pid" 2>/dev/null)" || return 1
     out="${out// /}"
     [ -n "$out" ] || return 1
@@ -269,16 +287,37 @@ gate_ppid_of() {
 # Bounded rather than looped to a root condition: a pid whose parent chain is
 # circular or unreadable would otherwise hang the reaper, and a hang here is worse
 # than an over-broad spare list.
+#
+# Returns 1 when the walk STOPPED SHORT -- a parent it could not read, or the bound
+# -- rather than reaching pid 1 or a parent of 0. A short list is not an over-broad
+# one: every ancestor it failed to name is unprotected, and one of them is the
+# caller. That is exactly how Git Bash's `ps` made the reaper kill its invoker, so
+# the reaper refuses on this status instead of reaping with half a spare list.
+#
+# On Cygwin and MSYS2 a parent of `1` is NOT init: it is how the runtime spells "my
+# parent is not one of my processes" -- a native Windows process, whose own parent
+# this runtime cannot name. So there it is a walk that stopped short, never a root,
+# told apart by `/proc/<pid>/winpid`, which only those runtimes write. Reading it as
+# the root let a native INTERMEDIARY hide the caller: local-gate -> powershell.exe ->
+# bash reap-my-gate.sh walked "completely" to 1 and listed its own wrapper as a
+# victim (review I1, measured with `--dry-run`). The cost is that the reaper refuses
+# on every Git Bash chain, which starts at a native process, and that is the
+# direction to fail in: a refusal there is an inconvenience, the kill was the caller.
 gate_protected_pids() {
     local pid="$$" depth=0 parent
     while [ "$depth" -lt 64 ]; do
         printf '%s\n' "$pid"
-        [ "$pid" != "1" ] || break
-        parent="$(gate_ppid_of "$pid")" || break
-        [ -n "$parent" ] && [ "$parent" != "0" ] || break
+        [ "$pid" != "1" ] || return 0
+        parent="$(gate_ppid_of "$pid")" || return 1
+        [ -n "$parent" ] || return 1
+        [ "$parent" != "0" ] || return 0
+        if [ "$parent" = "1" ] && [ -e "/proc/${pid}/winpid" ]; then
+            return 1
+        fi
         pid="$parent"
         depth=$(( depth + 1 ))
     done
+    return 1
 }
 
 # Every descendant of the given pids, from ONE snapshot of the process table.
@@ -292,19 +331,22 @@ gate_protected_pids() {
 # that flag is GNU-only and this script runs on macOS, where it is a usage error
 # that prints nothing -- which reads exactly like a process with no children.
 #
+# The fields are SPLIT, never cut at the first space: `ps -Ao pid=,ppid=` right-aligns
+# both columns (`      7       2` on procps), and trimming ONE leading space left the
+# pid empty, so every row of a real table was skipped and no gate ever had a child.
+# Measured on WSL at the base of this change: a live child of the walking shell, over
+# a real `ps` table, came back as nothing. The staged tables had no padding.
+#
 # @param 1 newline-separated root pids
-# @param 2 the process table, as `pid ppid` lines (injected so the self-test can
-#          stage a tree without forking one)
+# @param 2 the process table, as `pid ppid` lines, padded or not (injected so the
+#          self-test can stage a tree without forking one)
 gate_descendants_of() {
     local roots="$1" table="$2"
-    local depth=0 next found line entry pid parent
+    local depth=0 next found line pid parent
     found=""
     while [ "$depth" -lt 32 ] && [ -n "$roots" ]; do
         next=""
-        while IFS= read -r entry || [ -n "$entry" ]; do
-            entry="${entry# }"
-            pid="${entry%% *}"
-            parent="${entry##* }"
+        while read -r pid parent _ || [ -n "$pid" ]; do
             [ -n "$pid" ] && [ -n "$parent" ] || continue
             while IFS= read -r line || [ -n "$line" ]; do
                 [ -n "$line" ] || continue
@@ -320,8 +362,22 @@ gate_descendants_of() {
     printf '%s' "$found"
 }
 
-# The process table this run reads, as `pid ppid` lines.
+# The process table this run reads, as `pid ppid` lines -- from `/proc` where there
+# is one, for the reason `gate_ppid_of` gives: Git Bash's `ps -Ao` is a usage error,
+# and an empty table reads exactly like a gate with no children, so a reaped gate's
+# `ctest` would be orphaned rather than signalled.
 gate_process_table() {
+    local entry pid parent
+    if [ -d /proc ]; then
+        for entry in /proc/[0-9]*; do
+            pid="${entry#/proc/}"
+            # Read through the reply variable, never `$(...)`: this runs once per process on
+            # the machine, and a command substitution is a fork each time.
+            proc_stat_ppid "$pid" || continue
+            printf '%s %s\n' "$pid" "$proc_stat_reply"
+        done
+        return 0
+    fi
     ps -Ao pid=,ppid= 2>/dev/null || true
 }
 
@@ -343,7 +399,22 @@ reap_my_gate() {
     local root="$1" mode="${2:-}"
     local protected candidates table pid cwd verdict
     local killed="" spared=0 unknown=0
-    protected="$(gate_protected_pids)"
+    if ! protected="$(gate_protected_pids)"; then
+        echo "reap: this reaper's own ancestry could not be read to its root (it stopped at $(printf '%s\n' "$protected" | tail -n 1):"
+        echo "reap:   a parent it could not read, or -- on Cygwin/MSYS -- a native process, whose own parent"
+        echo "reap:   that runtime cannot name), so the processes a kill would take from under it are not known."
+        echo "reap:   REFUSING to signal anything."
+        # The NEXT STEP, not only the refusal: under Git Bash every chain starts at a native
+        # process, so this refusal is certain there -- and the gate runs under WSL, where the
+        # ancestry is walkable. Relative to the worktree, so no path needs translating: MSYS
+        # rewrites a `/mnt/...` argument handed to a Windows program, and the reaper's default
+        # root is the repository it sits in.
+        if [ -e "/proc/$$/winpid" ]; then
+            echo "reap: the gate runs under WSL; run this reaper there, from the worktree:"
+            echo "reap:   cd '${root}' && wsl.exe -e bash scripts/reap-my-gate.sh${mode:+ --${mode}}"
+        fi
+        return 1
+    fi
     candidates="$(gate_candidates)"
     table="$(gate_process_table)"
 
@@ -474,6 +545,29 @@ reap_self_test() {
                    reap_verdict '' /w/mine no; } | sort -u | grep -c . )"
     _reap_expect "the decision has four distinct answers" "4" "$distinct"
 
+    # --- an ancestry that cannot be read to its root -------------------------
+    #
+    # Staged by making the parent lookup answer nothing, in a subshell so the real
+    # one is untouched: the walk must say it stopped short, and the reaper must then
+    # refuse without signalling -- not reap with a spare list naming only itself.
+    # `if`, never `case`, inside `$( )`: bash 3.2 reads a case pattern's `)` as the
+    # substitution's end (#1224).
+    _reap_expect "an ancestry that stops short says so" \
+        "1" "$( ( gate_ppid_of() { return 1; }; gate_protected_pids >/dev/null; echo $? ) )"
+    _reap_expect "and the reaper then refuses rather than reaping" \
+        "1 refused" "$( ( gate_ppid_of() { return 1; }
+                         out="$(reap_my_gate /nonexistent-root 2>&1)"; status=$?
+                         if [[ "$out" == *REFUSING* ]]; then echo "$status refused"; else echo "$status [$out]"; fi ) )"
+    # The walk from THIS shell: complete to the root, except on Cygwin/MSYS, where every
+    # chain starts at a native process and so says it stopped short. The wanted answer is
+    # derived from the runtime, and the real-process half below does not run where the
+    # chain cannot be walked -- it would only watch the reaper refuse.
+    local wantWalk=0 walkable=yes
+    if [ -e "/proc/$$/winpid" ]; then wantWalk=1; fi
+    _reap_expect "a walk from this shell is complete, or on Cygwin/MSYS says it is not" \
+        "$wantWalk" "$( ( gate_protected_pids >/dev/null; echo $? ) )"
+    ( gate_protected_pids >/dev/null ) || walkable=no
+
     # --- the ancestry walk, over a staged process table ------------------
     local table="100 1
 200 100
@@ -484,6 +578,26 @@ reap_self_test() {
         "200 300" "$(printf '%s' "$(gate_descendants_of '100' "$table")" | tr '\n' ' ' | sed 's/ $//')"
     _reap_expect "an unrelated tree is not" \
         "" "$(printf '%s' "$(gate_descendants_of '999' "$table")" | tr '\n' ' ' | sed 's/ $//')"
+    # The shape `ps -Ao pid=,ppid=` really prints, right-aligned. The rows above have
+    # no padding, which is why they passed while every real table was skipped.
+    local padded="    100      1
+    200    100
+    300    200"
+    _reap_expect "a right-aligned table, as ps prints it, is walked too" \
+        "200 300" "$(printf '%s' "$(gate_descendants_of '100' "$padded")" | tr '\n' ' ' | sed 's/ $//')"
+
+    # --- the process table and the parent lookup, against THIS process -------
+    #
+    # Asked of the running shell, whose parent the shell itself knows (`$PPID`), so
+    # the answer is checked against a second source rather than against itself. A
+    # lookup that answers nothing -- Git Bash's `ps -o` -- ends the ancestry walk at
+    # `$$` and leaves the caller killable, and it did.
+    _reap_expect "this shell's parent is read" "$PPID" "$(gate_ppid_of "$$")"
+    local selfRow="no" rowPid rowParent
+    while read -r rowPid rowParent _ || [ -n "$rowPid" ]; do
+        [ "$rowPid" = "$$" ] && [ "$rowParent" = "$PPID" ] && selfRow="yes"
+    done <<< "$(gate_process_table)"
+    _reap_expect "and the process table holds this shell under its parent" "yes" "$selfRow"
 
     # --- and against real processes --------------------------------------
     #
@@ -522,10 +636,16 @@ reap_self_test() {
     # `/private/var` for a `/var` path, say) genuinely cannot attribute here, and
     # saying so is more use than a match that would not have held.
     _reap_attribution_detail=""
+    # Every staged process sleeps this long BEFORE its `cd` and `exec`, which WIDENS
+    # the window between the fork and the state the reaper reads. On purpose: left at
+    # its natural width that window is milliseconds, so a wait on the wrong condition
+    # (`kill -0`, a single ask) failed about 1 run in 10 -- and a neuter of it stayed
+    # green over 10 runs. Widened, the wrong wait fails every time.
+    local stageDelay=0.5
     _reap_can_attribute_cwd() {
         local dir probePid seen waited=0
         dir="$(mktemp -d)"
-        ( cd "$dir" && exec sleep 30 ) >/dev/null 2>&1 &
+        ( sleep "$stageDelay"; cd "$dir" && exec sleep 30 ) >/dev/null 2>&1 &
         probePid=$!
         while [ "$waited" -lt 50 ]; do
             kill -0 "$probePid" 2>/dev/null && break
@@ -537,19 +657,45 @@ reap_self_test() {
             rm -rf "$dir"
             return 1
         fi
-        seen="$(gate_cwd_of "$probePid" 2>/dev/null || true)"
+        # A pid that EXISTS is not yet a process standing in `$dir`: between the fork
+        # and the `exec`, MSYS2 answers no cwd at all, so asking once read a working
+        # platform as one that cannot attribute -- 2 of 20 Git Bash runs skipped the
+        # whole real-process half this way, and the gate's self-test then passed over
+        # the wrapper defect those runs would have shown. So the answer is waited for,
+        # bounded, and the skip reports what was seen when the bound ran out.
+        seen=""
+        waited=0
+        while [ "$waited" -lt 50 ]; do
+            seen="$(gate_cwd_of "$probePid" 2>/dev/null || true)"
+            [ "$seen" = "$dir" ] && break
+            sleep 0.1
+            waited=$(( waited + 1 ))
+        done
         kill -KILL "$probePid" 2>/dev/null || true
         wait "$probePid" 2>/dev/null || true
         if [ "$seen" = "$dir" ]; then
             rm -rf "$dir"
             return 0
         fi
-        _reap_attribution_detail="gate_cwd_of answered '${seen:-<nothing>}' for a process staged in '${dir}'"
+        _reap_attribution_detail="gate_cwd_of answered '${seen:-<nothing>}' for a process staged in '${dir}', after 5 s of asking"
         rm -rf "$dir"
         return 1
     }
 
-    if ! _reap_can_attribute_cwd; then
+    # A decoy is STAGED when the reaper would see it as one: a candidate by argv
+    # and attributable by cwd.
+    _reap_staged() {
+        local pid="$1" dir="$2" candidate found="no"
+        [ "$(gate_cwd_of "$pid" 2>/dev/null || true)" = "$dir" ] || return 1
+        while IFS= read -r candidate || [ -n "$candidate" ]; do
+            [ "$candidate" = "$pid" ] && found="yes"
+        done <<< "$(gate_candidates)"
+        [ "$found" = "yes" ]
+    }
+
+    if [ "$walkable" = "no" ]; then
+        skipped="this host's ancestry is not walkable to its root (on Cygwin/MSYS every chain starts at a native process), so the reaper refuses here and there is no reap to watch"
+    elif ! _reap_can_attribute_cwd; then
         skipped="cannot attribute another process's working directory here -- ${_reap_attribution_detail}"
     else
         local scratch outside inside decoy pidOut pidIn reaper_self
@@ -562,15 +708,31 @@ reap_self_test() {
         printf '#!/usr/bin/env bash\nsleep 30\n' > "$decoy"
         chmod +x "$decoy"
 
-        ( cd "${scratch}/other" && exec bash "$decoy" ) >/dev/null 2>&1 &
+        ( sleep "$stageDelay"; cd "${scratch}/other" && exec bash "$decoy" ) >/dev/null 2>&1 &
         pidOut=$!
-        ( cd "${scratch}/mine" && exec bash "$decoy" ) >/dev/null 2>&1 &
+        ( sleep "$stageDelay"; cd "${scratch}/mine" && exec bash "$decoy" ) >/dev/null 2>&1 &
         pidIn=$!
         # Both must be up before the reaper looks, or a decoy that has not execed
-        # yet carries no marker and the case passes for the wrong reason.
+        # yet carries no marker and the case passes for the wrong reason. "Up" is
+        # what the REAPER would see -- the marker in its argv and its cwd readable --
+        # never `kill -0`, which is true from the fork onward, before either holds.
         local waited=0
         while [ "$waited" -lt 50 ]; do
-            if kill -0 "$pidOut" 2>/dev/null && kill -0 "$pidIn" 2>/dev/null; then break; fi
+            if _reap_staged "$pidOut" "${scratch}/other" && _reap_staged "$pidIn" "${scratch}/mine"; then break; fi
+            sleep 0.1
+            waited=$(( waited + 1 ))
+        done
+        _reap_expect "both decoys are staged as the reaper sees them before it runs" \
+            "yes" "$(_reap_staged "$pidOut" "${scratch}/other" && _reap_staged "$pidIn" "${scratch}/mine" && echo yes || echo no)"
+        # The in-root decoy's own CHILD, its `sleep`, whose cwd is no evidence -- the
+        # gate's cmake, ninja and ctest are in its position, and are reached only by
+        # ANCESTRY. Staged before the reap, so "gone" afterwards is about the reap.
+        local childIn=""
+        waited=0
+        while [ "$waited" -lt 50 ]; do
+            childIn="$(gate_descendants_of "$pidIn" "$(gate_process_table)")"
+            childIn="${childIn%%$'\n'*}"
+            [ -n "$childIn" ] && break
             sleep 0.1
             waited=$(( waited + 1 ))
         done
@@ -584,6 +746,14 @@ reap_self_test() {
             "alive" "$(kill -0 "$pidOut" 2>/dev/null && echo alive || echo gone)"
         _reap_expect "the decoy in THIS worktree is gone, by pid" \
             "gone" "$(kill -0 "$pidIn" 2>/dev/null && echo alive || echo gone)"
+        if [ -n "$childIn" ]; then
+            _reap_expect "and its child, reached by ancestry, is gone too" \
+                "gone" "$(kill -0 "$childIn" 2>/dev/null && echo alive || echo gone)"
+            kill -KILL "$childIn" 2>/dev/null || true
+        else
+            _reap_expect "and its child, reached by ancestry, is gone too" \
+                "gone" "never staged: no child of ${pidIn} in the process table after 5 s"
+        fi
 
 
         # --- THE ASKING PROCESS IS IN THE CANDIDATE SET ----------------------
@@ -610,8 +780,19 @@ reap_self_test() {
         chmod +x "$wrapper"
 
         local victim wrapperPid
-        ( cd "${scratch}/mine" && exec bash "$decoy" ) >/dev/null 2>&1 &
+        ( sleep "$stageDelay"; cd "${scratch}/mine" && exec bash "$decoy" ) >/dev/null 2>&1 &
         victim=$!
+        # Staged BEFORE the wrapper starts, since the wrapper reaps at once: a victim
+        # still between fork and exec carries no marker, survives, and reads as a
+        # reaper that failed to kill.
+        waited=0
+        while [ "$waited" -lt 50 ]; do
+            _reap_staged "$victim" "${scratch}/mine" && break
+            sleep 0.1
+            waited=$(( waited + 1 ))
+        done
+        _reap_expect "the in-root victim is staged as the reaper sees it before the wrapper runs" \
+            "yes" "$(_reap_staged "$victim" "${scratch}/mine" && echo yes || echo no)"
         ( cd "${scratch}/mine" && exec bash "$wrapper" ) >/dev/null 2>&1 &
         wrapperPid=$!
 
@@ -638,8 +819,67 @@ reap_self_test() {
         rm -rf "$scratch"
     fi
 
+    # --- a NATIVE intermediary between the caller and the reaper (review I1) ----
+    #
+    # The shape that hid the caller: a wrapper carrying the marker, standing in the
+    # root, starts the reaper THROUGH cmd.exe. The reaper's MSYS parent is then `1`,
+    # and a walk that read that as init listed the wrapper -- its real caller -- as a
+    # victim. It must REFUSE instead and name nothing. `--dry-run`, so the case
+    # signals nothing whichever way it goes. Only where the runtime has native
+    # processes; elsewhere it is said to be not applicable, never skipped silently.
+    if [ -e "/proc/$$/winpid" ]; then
+        if command -v cmd.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+            local nroot nwrap nout nwrapPid nwaited=0 nreaper nbash nbatch
+            nroot="$(mktemp -d)"
+            mkdir -p "${nroot}/mine"
+            nreaper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+            nbash="$(cygpath -w "$BASH")"
+            nout="${nroot}/reaper.out"
+            # A batch file, so cmd.exe is handed ONE quoted path: its `/c` strips the outer
+            # quotes of a longer quoted line, and the reaper's arguments are then its own.
+            nbatch="${nroot}/run.cmd"
+            printf '@"%s" "%s" --dry-run "%s" > "%s" 2>&1\r\n' \
+                "$nbash" "$nreaper" "${nroot}/mine" "$(cygpath -w "$nout")" > "$nbatch"
+            nwrap="${nroot}/${ReapGateMarker}"
+            printf '#!/usr/bin/env bash\nMSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*" cmd.exe /c "%s"\nsleep 30\n' \
+                "$(cygpath -w "$nbatch")" > "$nwrap"
+            ( cd "${nroot}/mine" && exec bash "$nwrap" ) >/dev/null 2>&1 &
+            nwrapPid=$!
+            # Waits for the reaper's LAST line, whichever verdict it reached.
+            while [ "$nwaited" -lt 150 ]; do
+                grep -q 'REFUSING to signal anything\|would signal\|no gate of this lane\|signalled' "$nout" 2>/dev/null && break
+                sleep 0.1
+                nwaited=$(( nwaited + 1 ))
+            done
+            local nverdict
+            nverdict="$(cat "$nout" 2>/dev/null)"
+            if [[ "$nverdict" == *"REFUSING to signal anything"* && "$nverdict" != *"would signal"* ]]; then
+                if [[ "$nverdict" == *"wsl.exe -e bash scripts/reap-my-gate.sh --dry-run"* ]]; then
+                    nverdict="refused"
+                else
+                    nverdict="refused, but named no next step: ${nverdict}"
+                fi
+            fi
+            _reap_expect "a reaper started through a native process (cmd.exe) refuses, lists nobody, and names the WSL run" \
+                "refused" "$nverdict"
+            kill -KILL "$nwrapPid" 2>/dev/null || true
+            wait "$nwrapPid" 2>/dev/null || true
+            rm -rf "$nroot"
+        else
+            skipped="${skipped:+${skipped}; }the native-intermediary case (no cmd.exe or cygpath here)"
+        fi
+    else
+        echo "reap-my-gate --self-test: the native-intermediary case is not applicable (no Cygwin/MSYS runtime)"
+    fi
+
     echo "reap-my-gate --self-test: ${ran} checks ran, ${failed} failed${skipped:+ -- SKIPPED: $skipped}"
-    [ "$failed" -eq 0 ]
+    # 77 for a run that SKIPPED the real-process half, never 0 -- the repairer's rule
+    # (#1231). Returning 0 there scored a run that never staged a process as Passed,
+    # the SUCCEED-standing-in-for-a-skip shape, and the half it skips is the one that
+    # found the Git Bash defect. A failure already recorded outranks the skip.
+    [ "$failed" -eq 0 ] || return 1
+    [ -z "$skipped" ] || return 77
+    return 0
 }
 
 # ---------------------------------------------------------------------------

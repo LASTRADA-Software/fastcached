@@ -2364,6 +2364,13 @@ Distributed::NodeCapacity NodeCapacityOf(NodeConfig const& cfg,
                                        .cache = cache };
 }
 
+std::optional<std::filesystem::path> RegisteredStateDirectory(NodeConfig const& registration, IConfigPathProbe const& probe)
+{
+    if (!registration.clusterDir.empty())
+        return registration.clusterDir;
+    return MachineWideNodeClusterDirectory(probe);
+}
+
 ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig const& cfg, IConfigPathProbe const& probe)
 {
     std::vector<std::string> argv;
@@ -2578,11 +2585,8 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // unprivileged compile account.
     //
     // And whether each keeps what it inherits. The cache holds objects the fleet already
-    // shares; the state directory holds the identity key this machine proves itself with,
-    // which the SERVICE mints at its first start -- so it is Private, and gets a list of its
-    // own rather than an entry added to `%ProgramData%`'s `BUILTIN\Users` read.
-    // A Private directory names the credential files inside it whose exposure is a
-    // re-mint rather than a reset: the identity key this node keeps in `--cluster-dir`.
+    // shares, so it is Shared. The state directory -- named or defaulted -- is not a row here
+    // but the block below, since which directory it is has one derivation the install reads by.
     struct OwnedDirectory
     {
         std::filesystem::path NodeConfig::* member;
@@ -2591,9 +2595,6 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     };
     auto OwnedDirectories = std::to_array<OwnedDirectory>({
         OwnedDirectory { .member = &NodeConfig::cacheDir, .privacy = PathPrivacy::Shared, .credentialFiles = {} },
-        OwnedDirectory { .member = &NodeConfig::clusterDir,
-                         .privacy = PathPrivacy::Private,
-                         .credentialFiles = { std::filesystem::path { NodeKeyFileName } } },
     });
     std::vector<OwnedPath> owned;
     for (auto& row: OwnedDirectories)
@@ -2604,7 +2605,8 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // **A service keeps the MACHINE's identity, in a directory the install OWNS -- on every
     // platform.** A registration naming no `--cluster-dir` owns the machine-wide directory, so the
     // install creates it and secludes it for the service's account: `Private`, exactly as a named
-    // `--cluster-dir` is above, because it is the same directory holding the same key. That
+    // `--cluster-dir` is, because it is the same directory holding the same key -- the identity
+    // key, named as a credential file whose exposure is a re-mint rather than a reset. That
     // REPLACES `%ProgramData%`'s inherited read for every local user with a protected list of its
     // own (`SecureDirectoryForService`), and a list that does not take refuses the install. The
     // KEY FILE keeps its own guarantee beside it -- created owner-only whatever the directory
@@ -2618,16 +2620,19 @@ ServiceSpec MakeNodeServiceSpec(std::filesystem::path const& exePath, NodeConfig
     // outranks the configuration file for the life of the registration, and an operator who
     // later sets `cluster_dir:` in the file would be silently overridden. Windows has no such
     // row: its service token is privileged and takes the machine-wide default by itself.
+    //
+    // Which directory that is -- the named one, else the machine-wide default -- is
+    // `RegisteredStateDirectory`'s answer, the one the install also reads the formation record
+    // from, so what is secured and what is read cannot be two derivations.
     std::vector<std::pair<std::string, std::string>> accountEnvironment;
-    if (cfg.clusterDir.empty())
-        if (auto const machineWide = MachineWideNodeClusterDirectory(probe); machineWide.has_value())
-        {
-            owned.push_back(OwnedPath { .path = *machineWide,
-                                        .privacy = PathPrivacy::Private,
-                                        .credentialFiles = { std::filesystem::path { NodeKeyFileName } } });
-            if (ServiceManagerHandsOverStateDirectory())
-                accountEnvironment.emplace_back(std::string { ServiceStateDirectoryVariable }, machineWide->string());
-        }
+    if (auto const state = RegisteredStateDirectory(cfg, probe); state.has_value())
+    {
+        owned.push_back(OwnedPath { .path = *state,
+                                    .privacy = PathPrivacy::Private,
+                                    .credentialFiles = { std::filesystem::path { NodeKeyFileName } } });
+        if (cfg.clusterDir.empty() && ServiceManagerHandsOverStateDirectory())
+            accountEnvironment.emplace_back(std::string { ServiceStateDirectoryVariable }, state->string());
+    }
 
     return ServiceSpec { .serviceName = cfg.serviceName,
                          .exePath = exePath,
@@ -2753,9 +2758,11 @@ bool RunsConsensus(NodeConfig const& cfg) noexcept
     return !RowFor(NodeSurface::Raft).Resolve(cfg).empty();
 }
 
-bool AdmitsByKey(NodeConfig const& cfg) noexcept
+bool AdmitsByKey(NodeConfig const& cfg)
 {
-    return RunsConsensus(cfg) || !cfg.voterKeys.empty() || !cfg.clusterDir.empty();
+    // The state directory this node KEEPS, never the typed flag alone: `NodeRoster::Build` reads a
+    // kept roster through `ChosenStateDirectory`, so a defaulted directory may hold one too.
+    return RunsConsensus(cfg) || !cfg.voterKeys.empty() || ChosenStateDirectory(cfg).has_value();
 }
 
 std::string RaftSelfEndpoint(NodeConfig const& cfg)

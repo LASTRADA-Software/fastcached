@@ -61,6 +61,7 @@
 #include <functional>
 #include <future>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -618,7 +619,8 @@ TEST_CASE("Destroying the frame endpoint stops it, with nothing to remember", "[
     });
 
     REQUIRE(stopped.wait_for(15s) == std::future_status::ready);
-    REQUIRE(stopped.get());
+    auto const stoppedCleanly = stopped.get();
+    REQUIRE(stoppedCleanly);
 
     // And the port is free again, which is only true if the listener was really closed
     // rather than leaked with its thread still parked on it.
@@ -1461,8 +1463,14 @@ TEST_CASE("A held answer does not stop another client being served", "[node][fra
     // timeout naming nothing.
     REQUIRE(first.wait_for(15s) == std::future_status::ready);
     REQUIRE(second.wait_for(15s) == std::future_status::ready);
-    CHECK_FALSE(ReplyFrom(first).empty());
-    CHECK_FALSE(ReplyFrom(second).empty());
+    // Both collected before either is judged: `ReplyFrom` REQUIREs, so a first helper that could not connect ended
+    // the case before the second was reported at all.
+    auto const firstOutcome = first.get();
+    auto const secondOutcome = second.get();
+    CHECK(firstOutcome.has_value());  // the first helper could not connect
+    CHECK(secondOutcome.has_value()); // the second helper could not connect
+    CHECK_FALSE(Unwrap(firstOutcome).empty());
+    CHECK_FALSE(Unwrap(secondOutcome).empty());
 }
 
 TEST_CASE("Two requests on one connection are both answered", "[node][frame]")
@@ -1797,7 +1805,8 @@ TEST_CASE("A self-accounting surface stops holding the endpoint's budget while i
 
     responder.Release();
     REQUIRE(client.wait_for(15s) == std::future_status::ready);
-    CHECK_FALSE(ReplyFrom(client).empty());
+    auto const reply = ReplyFrom(client);
+    CHECK_FALSE(reply.empty());
 }
 
 TEST_CASE("A surface that does not account for itself keeps the endpoint's budget", "[node][frame]")
@@ -1839,7 +1848,8 @@ TEST_CASE("A surface that does not account for itself keeps the endpoint's budge
 
     responder.Release();
     REQUIRE(client.wait_for(15s) == std::future_status::ready);
-    CHECK_FALSE(ReplyFrom(client).empty());
+    auto const reply = ReplyFrom(client);
+    CHECK_FALSE(reply.empty());
 }
 
 TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing its listener", "[node][frame]")
@@ -1896,8 +1906,14 @@ TEST_CASE("A long self-accounting answer does not refuse the small verbs sharing
     REQUIRE(small.wait_for(15s) == std::future_status::ready);
     // Collected here, on the case's thread: a helper that failed to connect used to throw
     // inside a future nobody read, so these two were never reported at all.
-    CHECK_FALSE(ReplyFrom(firstBig).empty());
-    CHECK_FALSE(ReplyFrom(secondBig).empty());
+    // Both collected before either is judged, which is what "these two" above needs: `ReplyFrom` REQUIREs, so the
+    // first helper failing to connect ended the case before the second was reported at all.
+    auto const firstBigOutcome = firstBig.get();
+    auto const secondBigOutcome = secondBig.get();
+    CHECK(firstBigOutcome.has_value());  // the first helper could not connect
+    CHECK(secondBigOutcome.has_value()); // the second helper could not connect
+    CHECK_FALSE(Unwrap(firstBigOutcome).empty());
+    CHECK_FALSE(Unwrap(secondBigOutcome).empty());
 
     // And it was SERVED, not refused: reaching the responder and being answered are
     // two facts, and only the pair rules out a busy signal encoded further along.
@@ -2744,20 +2760,32 @@ TEST_CASE("A pulsed answer is preceded by pulses and ends with the reply", "[nod
     REQUIRE(client.SendOnly(Fetch("a-key-whose-answer-is-held-while-the-pulse-runs")));
     REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
 
-    // Several intervals, so what is asserted is a CADENCE rather than one frame that
-    // could have been an accident of scheduling.
-    std::this_thread::sleep_for(Interval * 8);
+    // **Released once the client has READ pulses, never after a wall-clock hold.** A hold
+    // counts this thread's time and the pulse counts the REACTOR's turns, and under load the
+    // two part company: a reactor that gets no CPU from before the first pulse is due until
+    // after the release finds the answer ready as well, and sending the reply rather than a
+    // pulse in front of it is right -- which a timed hold read as a missing pulse, once in a
+    // whole-binary run at 100% CPU. Reading them first makes the release come AFTER the
+    // pulses, so no schedule can leave fewer on the wire. Several, so what is asserted is a
+    // CADENCE rather than one frame that could have been an accident of scheduling.
+    //
+    // A build that never pulses cannot hang here: the hold gives up at its bound and answers
+    // `Miss`, the reads after it see EOF, and `Release()` names the hold that ran out.
+    constexpr std::size_t PulsesBeforeRelease = 3;
+    std::vector<std::byte> stream;
+    for ([[maybe_unused]] auto const pulse: std::views::iota(std::size_t { 0 }, PulsesBeforeRelease))
+        std::ranges::copy(client.ReadReply(), std::back_inserter(stream));
     responder.Release();
 
-    auto const stream = client.ReadRest();
+    std::ranges::copy(client.ReadRest(), std::back_inserter(stream));
     REQUIRE_FALSE(stream.empty());
     auto const statuses = StatusSequence(stream);
     INFO("frames: " << statuses.size());
 
-    // At least one pulse AND the reply, or the two claims below say nothing: with one
+    // The pulses read above AND the reply, or the two claims below say nothing: with one
     // frame the last IS the reply and the run before it is empty, so a build that never
     // pulsed would pass an ordering test about pulses.
-    REQUIRE(statuses.size() >= 2);
+    REQUIRE(statuses.size() >= PulsesBeforeRelease + 1);
     CHECK(statuses.back() == Wire::Status::Miss);
     CHECK(std::ranges::all_of(std::span { statuses }.first(statuses.size() - 1),
                               [](Wire::Status status) { return status == Wire::Status::Progress; }));
@@ -2794,8 +2822,11 @@ TEST_CASE("A surface that asks for no pulse writes exactly one frame", "[node][f
     REQUIRE(client.SendOnly(Fetch("a-key-whose-answer-is-held-and-never-pulsed")));
     REQUIRE(WaitFor([&responder] { return responder.Entered() == 1; })); // waited for: the answer to begin
 
-    // The same wall-clock hold the case above uses, so the difference between them is
-    // the cadence and not the timing.
+    // Eight of the case above's intervals, through which a pulsing surface writes several
+    // frames. A wall-clock hold rather than an event, because what is asserted is an
+    // ABSENCE and there is nothing to wait on; and unlike the case above it cannot go red
+    // under load, since a starved reactor only writes FEWER frames -- it gets weaker, which
+    // is the direction the case above no longer depends on.
     std::this_thread::sleep_for(160ms);
     responder.Release();
 

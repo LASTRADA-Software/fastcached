@@ -79,10 +79,12 @@ node_pid=""
 # a loopback-only policy closes the port on its own, and this fixture has the first and
 # deliberately not the second.
 
+# Bounded, where the `kill; wait` it replaced was not: `reap_background_jobs`
+# escalates to SIGKILL and names a node that outlives even that.
 cleanup() {
-    [[ -n "$node_pid" ]] && kill "$node_pid" 2>/dev/null
-    [[ -n "$node_pid" ]] && wait "$node_pid" 2>/dev/null
+    reap_background_jobs
     rm -rf "$workdir"
+    e2e_exit_if_reap_left_survivors
 }
 trap cleanup EXIT
 

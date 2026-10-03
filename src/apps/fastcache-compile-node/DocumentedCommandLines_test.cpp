@@ -803,6 +803,11 @@ TEST_CASE("The MSI's node registration installs with and without an advertised e
         // And the registration comes back up as what was installed.
         auto const reparsed = ParsedFirstStart(spec.arguments);
         REQUIRE(reparsed.has_value());
+        // Judged as the START judges it, not only as the install did: what the service runs is the
+        // registration, and a rule only the startup table carries would refuse it at every boot.
+        auto const startRefusal = StartupPolicyRejection(Testing::Unwrap(reparsed));
+        INFO(startRefusal.value_or(std::string {}));
+        CHECK_FALSE(startRefusal.has_value());
         CHECK(Testing::Unwrap(reparsed).schedulers == std::vector<std::string> { "build-cache.internal:6675" });
         CHECK(Testing::Unwrap(reparsed).advertiseExplicit == !shape.advertised.empty());
         // The pinned reply port is worker state: the registration replays it at every start.

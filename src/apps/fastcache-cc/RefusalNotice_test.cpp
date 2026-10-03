@@ -34,8 +34,8 @@ TEST_CASE("RefusalNotice: a refusal about the daemon is persistent, one about th
 TEST_CASE("RefusalNotice: a thousand units produce one line, not a thousand", "[launcher]")
 {
     // `ScratchDirectory`, never a bare `UniqueScratchPath`: the stamps are written at a FIXED
-    // epoch and a bare path is never cleared, so a leftover from an earlier run whose pid
-    // Windows handed out again reads as "announced a second ago" (#1355).
+    // epoch, and a bare path is neither created nor removed afterward, so a directory this
+    // case's own writes populate would otherwise outlive it (#1355).
     auto const scratch = FastCache::Testing::ScratchDirectory { "refusal-throttle" };
     auto const& dir = scratch.Path();
 
@@ -58,8 +58,8 @@ TEST_CASE("RefusalNotice: a thousand units produce one line, not a thousand", "[
 TEST_CASE("RefusalNotice: two daemons and two causes throttle separately", "[launcher]")
 {
     // `ScratchDirectory`, never a bare `UniqueScratchPath`: the stamps are written at a FIXED
-    // epoch and a bare path is never cleared, so a leftover from an earlier run whose pid
-    // Windows handed out again reads as "announced a second ago" (#1355).
+    // epoch, and a bare path is neither created nor removed afterward, so a directory this
+    // case's own writes populate would otherwise outlive it (#1355).
     auto const scratch = FastCache::Testing::ScratchDirectory { "refusal-keys" };
     auto const& dir = scratch.Path();
 

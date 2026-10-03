@@ -4871,14 +4871,31 @@ else()
         # broken -- and one was taken: `dist-compile E2E PASSED` against
         # `out/build/clangcl-release`, 2026-09-11. It is simply not the evidence
         # the change rests on.
+        #
+        # The client is how the fixture reads the scheduler's own record of a worker
+        # whose lease came back `withdrawn` -- one of the two readings a SKIP on a
+        # host saturated by other work requires. Optional, and guarded rather than
+        # required: without it that reading is absent, and absent confirms nothing,
+        # so a withdrawal stays a failure rather than the test disappearing.
+        set(_fc_dist_e2e_cli)
+        if(TARGET fastcache-cli)
+            set(_fc_dist_e2e_cli -Cli "$<TARGET_FILE:fastcache-cli>")
+        endif()
         add_test(
             NAME "dist-compile-e2e"
             COMMAND pwsh -NoProfile -File "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.ps1"
                 -Fastcached "$<TARGET_FILE:fastcached>"
                 -Node "$<TARGET_FILE:fastcache-compile-node>"
                 -Launcher "$<TARGET_FILE:fastcache-cc>"
+                ${_fc_dist_e2e_cli}
         )
     else()
+        # The client reads the scheduler's record of a worker whose lease came back
+        # `withdrawn`, for the reason the Windows registration above gives.
+        set(_fc_dist_e2e_cli)
+        if(TARGET fastcache-cli)
+            set(_fc_dist_e2e_cli --cli "$<TARGET_FILE:fastcache-cli>")
+        endif()
         add_test(
             NAME "dist-compile-e2e"
             COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/dist-compile-e2e.sh"
@@ -4886,6 +4903,7 @@ else()
                 --node "$<TARGET_FILE:fastcache-compile-node>"
                 --launcher "$<TARGET_FILE:fastcache-cc>"
                 --compiler "${CMAKE_CXX_COMPILER}"
+                ${_fc_dist_e2e_cli}
                 --case suite
         )
     endif()
@@ -5971,6 +5989,36 @@ set_tests_properties("wall-clock-borrow-selftest" PROPERTIES
     TIMEOUT 180
 )
 
+# clang-tidy's HeaderFilterRegex takes every tracked first-party header in each spelling a
+# supported build opens it by -- POSIX, all-backslash, and MSVC's backslash include directory
+# with a slash include -- and no spelling of a dependency path. Registered on EVERY platform
+# and needing no build: the question is about Windows, and a check that ran only where the
+# answer was already right would report nothing where it is asked.
+#
+# Before this, `.clang-tidy` spelled every separator `/`, and a Windows tidy run discarded
+# every header finding while reporting clean. The self-test plants that filter (red, naming
+# both backslash spellings) and the widening a separator fix tempts, `[/\\]src[/\\].*` (red,
+# naming catch2), beside the configured one (green) -- and it reads the configured one, so it
+# goes red too when `.clang-tidy` regresses. Its predicate and spellings are
+# `scripts/lib/header-filter.sh`, which `local-gate.sh`'s coverage check shares: this asks at
+# the real root on every platform, the gate asks the same thing before its tidy sweep.
+add_test(
+    NAME "tidy-header-filter"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-header-filter.sh"
+)
+set_tests_properties("tidy-header-filter" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+add_test(
+    NAME "tidy-header-filter-selftest"
+    COMMAND ${FASTCACHED_BASH} "${CMAKE_SOURCE_DIR}/scripts/run-check.sh" "${CMAKE_SOURCE_DIR}/scripts/check-tidy-header-filter.sh" --self-test
+)
+set_tests_properties("tidy-header-filter-selftest" PROPERTIES
+    LABELS "hygiene"
+    TIMEOUT 120
+)
+
 # The macOS package fixture's failure-path diagnostic, driven against a SYNTHESISED
 # log tree (#1055).
 #
@@ -6338,25 +6386,33 @@ set_tests_properties("credential-containers-selftest" PROPERTIES
 # status is taken from. It cannot fire on a healthy run -- the tally line says `failed`
 # in lower case and carries no colon.
 #
-# `if(NOT WIN32)` for the reason `local-gate-selftest` carries it, and here the guard
-# is LOAD-BEARING rather than conventional -- measured, not assumed. Under Git Bash
-# this self-test fails: `ps -Ao pid=,ppid=`, which `gate_ppid_of` walks, is answered
-# by MSYS2's `ps` with `unknown option -- A`. The ancestry walk therefore returns
-# nothing, the caller is not protected, and the one case that matters goes red:
-# `and the WRAPPER that invoked it -- a candidate by cwd -- survives: expected
-# 'alive', got 'gone'`. That is the script's own macOS warning arriving one platform
-# over -- *a usage error that prints nothing reads exactly like a process with no
-# ancestors* -- and its consequence is that the reaper would kill its own invoker.
-# So this is not merely untested on Windows: do not hand `reap-my-gate.sh` to a
-# Windows lane until that is fixed.
+# `if(NOT WIN32)` for the reason `local-gate-selftest` carries it: the script is POSIX.
+# It USED to be load-bearing as well. Under Git Bash, `gate_ppid_of` asked
+# `ps -o ppid=`, which MSYS2's `ps` answers with a usage error and no parent, so the
+# ancestry walk stopped at `$$`, the caller was not protected, and the reaper killed its
+# own invoker -- `and the WRAPPER that invoked it -- a candidate by cwd -- survives:
+# expected 'alive', got 'gone'`, on 20 of 20 Git Bash runs. The ancestry and the process
+# table are now read from `/proc/<pid>/stat`, which MSYS2 writes as Linux does; the
+# self-test asks the parent lookup against `$PPID` so the next such platform fails a row
+# of its own. Git Bash is exercised through `local-gate.sh --self-test`, which drives
+# this self-test and runs there -- and there the reaper now REFUSES by design: on
+# Cygwin/MSYS a parent of 1 is a native process, so no chain is walkable to its root,
+# the real-process half is SKIPPED (exit 77) and only the native-intermediary refusal
+# and the staged rows run.
 #
-# Measured 2026-09-10 on this branch, WSL2/Ubuntu-24.04, 14 cases and no case skipped.
-# A range rather than a number, because the two readings differ by the load and a
-# single figure would silently claim whichever condition the reader assumes: **2.69 s**
-# on a quiet box, **6.87 s** with two other lanes' full gates running. `TIMEOUT 60` is
-# the figure its two neighbours carry rather than a new one, so the margin is ~9x at
-# the worst reading taken here. It is a wall-clock reading and this host steps
-# CLOCK_REALTIME, so treat it as an order of magnitude, not a budget.
+# Measured 2026-09-29, three runs each, as a table of conditions rather than a number:
+#
+#   host                          checks  outcome        duration     clock
+#   WSL2/Ubuntu-24.04, nice -n 10     23  passed         5.56-5.63 s  /proc/uptime (monotonic)
+#   Git Bash (MSYS2), Windows 11       17  skipped (77)   1.14-1.25 s  date +%N (wall)
+#   Git Bash, BEFORE the I1 refusal   23  passed         9.8 s        the reviewer's, wall
+#
+# Most of the WSL figure is the fixture's own 0.5 s stage delay (three staged
+# processes) and the reaper's 2 s TERM grace. The 2026-09-10 figures (14 cases, 2.69 s
+# quiet, 6.87 s under two other lanes' gates) predate the staging waits and are
+# superseded. `TIMEOUT 60` is the figure its two neighbours carry rather than a new one,
+# a margin of ~10x over the slowest reading here; a wall reading on this host can step,
+# so treat the Git Bash rows as an order of magnitude, not a budget.
 if(NOT WIN32)
     add_test(
         NAME "reap-my-gate-selftest"
@@ -6365,6 +6421,7 @@ if(NOT WIN32)
     set_tests_properties("reap-my-gate-selftest" PROPERTIES
         FAIL_REGULAR_EXPRESSION "REAP SELF-TEST FAILED:"
         LABELS "hygiene"
+        SKIP_RETURN_CODE 77
         TIMEOUT 60
     )
 endif()
@@ -6891,7 +6948,7 @@ set_tests_properties("required-context-table" PROPERTIES
     TIMEOUT 60
 )
 
-# Fifteen cases, both directions for every rule. The ACCEPTING arms are not decoration:
+# Sixteen cases, both directions for every rule. The ACCEPTING arms are not decoration:
 # a guard that refuses every tree passes every negative case, and one stood here for two
 # days (#1031). Case 13 is the accepting arm of the data-REGION mechanism, which is the
 # one part of this check that can reduce its own coverage.
@@ -7774,11 +7831,11 @@ if(TARGET FastCacheTest)
         # the assertion that could not have failed while this ticket was open: 69
         # cases ran, and 69 is non-zero.
         #
-        # 217 = 153 (CompileCacheWire) + 25 (RaftWire) + 17 (ClusterState)
+        # 221 = 156 (CompileCacheWire) + 25 (RaftWire) + 17 (ClusterState)
         #     + 18 (DiscoveryWire) + 1 (RaftTypes) + 1 (SchedulerService)
-        #     + 1 (MachineTicket) + 1 (MachineStanding).
+        #     + 1 (MachineTicket) + 1 (MachineStanding) + 1 (RosterCertificate).
         # The first four files are wholly wire subject and are the scan's table; the
-        # last four carry wire cases among others, which is why the scan cannot cover
+        # last five carry wire cases among others, which is why the scan cannot cover
         # them and why this number is the only thing that watches them.
         #
         # `[(]` rather than `\(`: CMake reads `\(` in a quoted argument as an escape
@@ -7791,7 +7848,7 @@ if(TARGET FastCacheTest)
         # anything matches nothing. No `SKIP_RETURN_CODE` here -- Catch2's exit code
         # is its failed-assertion count clamped at 255 (#1152), and the pattern has
         # already replaced the status.
-        PASS_REGULAR_EXPRESSION "All tests passed [(][0-9]+ assertions in 217 test cases[)]"
+        PASS_REGULAR_EXPRESSION "All tests passed [(][0-9]+ assertions in 221 test cases[)]"
         LABELS "hygiene"
         TIMEOUT 300
     )

@@ -94,8 +94,9 @@
 # command line, re-pointing is an edit and a restart rather than a
 # re-registration.
 #
-# A node that names a scheduler and runs no consensus also needs cluster_dir:
-# its identity key is what the scheduler admits it by.
+# A node that names a scheduler and runs no consensus still keeps an identity
+# key, which is what the scheduler admits it by -- in its state directory,
+# which needs no cluster_dir: the default below serves.
 #scheduler:
 #  - <host:port>
 #  - <host:port>
@@ -105,7 +106,8 @@
 # roster a strict majority of these endorse, and from then on only the roster
 # it holds -- so a key here never outvotes the cluster's own revocation.
 # Required of a worker other machines can reach and that keeps no roster in
-# cluster_dir: without it no lease it is handed could be checked.
+# its state directory (cluster_dir, or the default one): without it no lease
+# it is handed could be checked.
 #voter_key:
 #  - <public-key>
 #  - <public-key>

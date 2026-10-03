@@ -170,6 +170,8 @@ fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
     PATHSPECS "src/*.cpp" "src/*.hpp"
     GLOBS "src/*.cpp" "src/*.hpp"
     FILTER "\\.(cpp|hpp)$"
+    CONTAINING "TEST_CASE" "SCENARIO" CONTAINING_OUT testSourcesHolding
+    MISSING_OUT testSourcesMissing
     FILES_OUT testSources MODE_OUT fileSetMode)
 
 # Take the next line of `sourceRest` into `line`, advancing `sourceRest` and `lineNo`.
@@ -183,9 +185,23 @@ fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
 # One copy because there were two: the walk below and the wrapped-name lookahead both
 # split on a newline, and the second was the first with `set(line ...)` replaced by an
 # append.
+#
+# `sourceRest` is a WINDOW onto the file, not the rest of it: `sourceText` holds the file
+# and `sourceTaken` how much of it the window has been given. Every `"${...}"` is a COPY in
+# CMake, so taking a line by re-copying the whole remaining file twice made this walk
+# quadratic in the file's size -- and the test files it walks are the largest in the tree.
+# The window is refilled only when it holds no whole line, so each line costs about its
+# window. The lines, their order and their numbers are what they were.
+set(FastCachedLineWindow 4096)
 macro(TakeLine)
     math(EXPR lineNo "${lineNo} + 1")
     string(FIND "${sourceRest}" "\n" sourceNewline)
+    while(sourceNewline EQUAL -1 AND sourceTaken LESS sourceLength)
+        string(SUBSTRING "${sourceText}" ${sourceTaken} ${FastCachedLineWindow} sourceMore)
+        string(APPEND sourceRest "${sourceMore}")
+        math(EXPR sourceTaken "${sourceTaken} + ${FastCachedLineWindow}")
+        string(FIND "${sourceRest}" "\n" sourceNewline)
+    endwhile()
     if(sourceNewline EQUAL -1)
         set(line "${sourceRest}")
         set(sourceRest "")
@@ -193,6 +209,47 @@ macro(TakeLine)
         string(SUBSTRING "${sourceRest}" 0 ${sourceNewline} line)
         math(EXPR sourceNewline "${sourceNewline} + 1")
         string(SUBSTRING "${sourceRest}" ${sourceNewline} -1 sourceRest)
+    endif()
+endmacro()
+
+# Skip every WHOLE line before the next one naming a case family, counting them into
+# `lineNo`. Every macro this check reads -- a case macro, or an unknown member of the
+# family -- is named on a line carrying `TEST_CASE` or `SCENARIO`, and a line that carries
+# neither is one the walk would take and drop; the lookahead that reads lines AFTER a macro
+# starts from a family line, so skipping never shortens it.
+#
+# Measured before it was written: the window above alone moved nothing (8.4 s against
+# 8.7 s on Windows). The cost was never the copying but CMake running some nine commands
+# on each of ~140k lines, and on a busy host that is what took this check to 118 s against
+# its 120 s budget. This makes the walk cost the family lines and their neighbours.
+macro(SkipToCandidate)
+    string(FIND "${sourceRest}" "\n" skipNewline)
+    while(skipNewline EQUAL -1 AND sourceTaken LESS sourceLength)
+        string(SUBSTRING "${sourceText}" ${sourceTaken} ${FastCachedLineWindow} sourceMore)
+        string(APPEND sourceRest "${sourceMore}")
+        math(EXPR sourceTaken "${sourceTaken} + ${FastCachedLineWindow}")
+        string(FIND "${sourceRest}" "\n" skipNewline)
+    endwhile()
+    string(FIND "${sourceRest}" "TEST_CASE" skipAt)
+    string(FIND "${sourceRest}" "SCENARIO" skipAtScenario)
+    if(skipAt EQUAL -1 OR (NOT skipAtScenario EQUAL -1 AND skipAtScenario LESS skipAt))
+        set(skipAt "${skipAtScenario}")
+    endif()
+    if(skipAt EQUAL -1)
+        # No family word in the window: every whole line in it goes. A word split across
+        # the window's end sits in the partial line kept after the last newline.
+        string(FIND "${sourceRest}" "\n" skipLast REVERSE)
+    else()
+        string(SUBSTRING "${sourceRest}" 0 ${skipAt} skipHead)
+        string(FIND "${skipHead}" "\n" skipLast REVERSE)
+    endif()
+    if(NOT skipLast EQUAL -1)
+        string(SUBSTRING "${sourceRest}" 0 ${skipLast} skipped)
+        string(REGEX MATCHALL "\n" skippedNewlines "${skipped}")
+        list(LENGTH skippedNewlines skippedCount)
+        math(EXPR lineNo "${lineNo} + ${skippedCount} + 1")
+        math(EXPR skipLast "${skipLast} + 1")
+        string(SUBSTRING "${sourceRest}" ${skipLast} -1 sourceRest)
     endif()
 endmacro()
 
@@ -237,12 +294,18 @@ foreach(source IN LISTS testSources)
     # read". A file that is not there and a case whose name is unreachable are fixed
     # in different places, and folding them would be this batch's own subject landing
     # on this batch's own work.
-    if(NOT EXISTS "${FASTCACHED_SOURCE_DIR}/${source}")
+    # Asked of the file set once rather than of the filesystem per file: see MISSING_OUT.
+    if("${source}" IN_LIST testSourcesMissing)
         list(APPEND missingFiles "  ${source}")
         continue()
     endif()
-    file(READ "${FASTCACHED_SOURCE_DIR}/${source}" sourceRest)
-    string(REPLACE "\r\n" "\n" sourceRest "${sourceRest}")
+    # The whole-file prefilter below, answered by the file set: a file naming neither
+    # family is not read at all.
+    if(NOT "${source}" IN_LIST testSourcesHolding)
+        continue()
+    endif()
+    file(READ "${FASTCACHED_SOURCE_DIR}/${source}" sourceText)
+    string(REPLACE "\r\n" "\n" sourceText "${sourceText}")
     # The pre-filter that pays for the widened file set. A strict SUPERSET of what
     # the walk below can find -- no line anchor, and it sees mentions in comments and
     # strings too -- so it fails toward doing the walk. `scannedCount` is what it
@@ -258,9 +321,9 @@ foreach(source IN LISTS testSources)
     # The predicate is identical because the pattern holds no metacharacter -- which
     # is why the family pattern itself stays, for the per-line test further down where
     # it is a real regex.
-    string(FIND "${sourceRest}" "TEST_CASE" familyAt)
+    string(FIND "${sourceText}" "TEST_CASE" familyAt)
     if(familyAt EQUAL -1)
-        string(FIND "${sourceRest}" "SCENARIO" familyAt)
+        string(FIND "${sourceText}" "SCENARIO" familyAt)
     endif()
     if(familyAt EQUAL -1)
         continue()
@@ -269,7 +332,14 @@ foreach(source IN LISTS testSources)
     # Counted for every line, including the ones skipped below, so a reported
     # site is the line an editor jumps to rather than an index into the matches.
     set(lineNo 0)
-    while(NOT sourceRest STREQUAL "")
+    string(LENGTH "${sourceText}" sourceLength)
+    set(sourceRest "")
+    set(sourceTaken 0)
+    while(NOT sourceRest STREQUAL "" OR sourceTaken LESS sourceLength)
+        SkipToCandidate()
+        if(sourceRest STREQUAL "" AND NOT sourceTaken LESS sourceLength)
+            break()
+        endif()
         TakeLine()
 
         # What the REGEX argument used to do, now that the reader cannot.
@@ -309,7 +379,7 @@ foreach(source IN LISTS testSources)
         # `lineNo` were incremented on adjacent lines and could never diverge.
         math(EXPR lookaheadLimit "${lineNo} + ${FastCachedCaseNameLookahead}")
         while(NOT invocation MATCHES "\"([^\"]*)\""
-              AND NOT sourceRest STREQUAL ""
+              AND (NOT sourceRest STREQUAL "" OR sourceTaken LESS sourceLength)
               AND lineNo LESS lookaheadLimit)
             TakeLine()
             string(APPEND invocation "\n${line}")

@@ -54,14 +54,15 @@ WORK="$(mktemp -d)"
 # Reaps the daemons BEFORE removing the work tree. Every `fail` between those two
 # points -- including the one a wait raises on expiry -- exits without reaching the
 # kill, which would leave a daemon running and then delete its directory underneath it.
-_CLI_E2E_PIDS=""
+#
+# Every background job of this shell, reaped by `reap_background_jobs` -- BOUNDED: it
+# escalates to SIGKILL and names a job that outlives even that instead of waiting on
+# it. The per-pid ledger and `kill; wait` this replaced were unbounded, and that shape
+# hung a local gate for 80 minutes on a daemon the kernel could not finish killing.
 _cli_e2e_cleanup() {
-    local pid
-    for pid in $_CLI_E2E_PIDS; do
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-    done
+    reap_background_jobs
     rm -rf "$WORK"
+    e2e_exit_if_reap_left_survivors
 }
 trap _cli_e2e_cleanup EXIT
 
@@ -89,8 +90,6 @@ start_daemon() {
     "$FASTCACHED" --config "$EMPTY_CONFIG" --port="$port" \
         --metrics --metrics-port="$metricsPort" "$@" > "$log" 2>&1 &
     local pid=$!
-    # Tracked before anything can fail, so the EXIT trap reaps it on every path.
-    _CLI_E2E_PIDS="$_CLI_E2E_PIDS $pid"
     wait_for_port 127.0.0.1 "$port" "$pid" "fastcached" "$log"
 }
 
@@ -580,7 +579,6 @@ else
             --cluster-dir="$WORK/node-state" \
             --slots=0 > "$nodeLog" 2>&1 &
     nodePid=$!
-    _CLI_E2E_PIDS="$_CLI_E2E_PIDS $nodePid"
     wait_for_port 127.0.0.1 "$nodePort" "$nodePid" "fastcache-compile-node" "$nodeLog"
 
     # `run_cli` dials `$port`, which is the daemon's. The node is a different address,

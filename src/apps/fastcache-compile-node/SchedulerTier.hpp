@@ -49,6 +49,9 @@ struct SchedulerConditionInputs
     Distributed::SchedulerService const& service; ///< The fleet as this scheduler sees it.
     std::string_view ownVersion;                  ///< This build, as `VersionString` spells it.
     std::string_view ownEndpoint;                 ///< Where this node answers; its name in the version spread.
+    /// How long this scheduler has led without a break -- one term, never interrupted; none when it
+    /// does not lead.
+    std::optional<core::platform::SteadyDuration> leadingFor;
 };
 
 /// Answer every `ConditionScope::Scheduler` row.
@@ -56,9 +59,20 @@ struct SchedulerConditionInputs
 /// **A fleet-wide row is the LEADER's.** On the leader each is raised or cleared; on any other
 /// scheduler each is `not-evaluated`, naming the leader when one is known -- never `clear`, which from
 /// a node that cannot see the fleet would be a confident wrong signal.
+///
+/// **And a leader may say `clear` only once it has WATCHED what the row is about.** What each row
+/// reads -- the leases refused no-worker, the machines that announced -- reaches the leader alone, and
+/// nothing another leader saw carries over a failover. So a leader that has led for less than the
+/// row's observation span reports `not-evaluated` rather than `clear` (`undecided` must not read as
+/// `clear`), while anything it does see is raised at once: a refusal observed is a fact whatever
+/// came before it.
 /// @param conditions Where the answers go.
 /// @param inputs What they are read from.
 void EvaluateSchedulerConditions(NodeConditions& conditions, SchedulerConditionInputs const& inputs);
+
+/// The longest span a leader must have led before every fleet-wide row may read `clear`.
+/// @return The longest row's observation span.
+[[nodiscard]] core::platform::SteadyDuration LongestFleetObservation() noexcept;
 
 /// The node's scheduler surface: service, protocol, membership, responder and
 /// listener, owned as one thing.
@@ -205,7 +219,8 @@ class SchedulerTier
     }
 
     /// Answer this scheduler's fleet-wide condition rows now. Thread-safe: the consensus thread (via
-    /// `SetRole`), the watch and a case may all call it.
+    /// `SetRole`), the watch and a case may all call it, and every evaluation is ordered against every
+    /// role change (`_roleMutex`).
     void EvaluateConditions();
 
   private:
@@ -223,6 +238,9 @@ class SchedulerTier
     /// Start the thread that re-asks the fleet-wide rows every @p interval. Called by `Start` once the
     /// tier is fully built, never from the constructor.
     void WatchConditions(std::chrono::milliseconds interval);
+
+    /// `EvaluateConditions` with `_roleMutex` already held.
+    void EvaluateConditionsLocked();
 
     // Declaration order IS construction order, and each is referenced by the one
     // below it.
@@ -245,6 +263,22 @@ class SchedulerTier
 
     /// Where the fleet-wide rows are answered. Borrowed; outlives this tier.
     NodeConditions& _conditions;
+
+    /// What `_leadingSince` is read from: the clock the service expires its registry by. Borrowed.
+    core::platform::IClock& _clock;
+
+    /// **A role change and every evaluation are ONE ordered decision.** Without it the watch could
+    /// read `Leader`, the consensus thread demote this node and answer `not-evaluated`, and the watch
+    /// then write its stale raise or clear over that for up to an interval. Held across the role
+    /// change AND the evaluation that follows it, and across every other evaluation, so a pass either
+    /// finishes before a role change (which then answers again) or starts after it.
+    std::mutex _roleMutex;
+    /// When this scheduler's current, unbroken leadership began; none while it does not lead.
+    /// Guarded by `_roleMutex`.
+    std::optional<core::platform::SteadyTimePoint> _leadingSince;
+    /// The term `_leadingSince` belongs to: leading again in another term is a new leadership, since
+    /// another node may have led in between. Guarded by `_roleMutex`.
+    std::uint64_t _leadingEpoch { 0 };
 
     /// Where this node answers, as its start resolved it -- its name in the version spread. A snapshot:
     /// after an `--advertise` reload the leader may be listed once more under its own build, which

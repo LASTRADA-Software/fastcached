@@ -15,6 +15,14 @@
 # grep for "error:" reads exactly like success. That mistake has already sent a
 # branch to CI twice with findings a local sweep had reported clean.
 #
+# **And that its HEADER findings reach the report.** A finding in a header is kept
+# only when `.clang-tidy`'s HeaderFilterRegex takes the header's path as clang spells
+# it on this host; the rest is discarded as non-user code in the same silence. A
+# `/`-only pattern did exactly that on Windows, where the path carries backslashes,
+# and the `clang-tidy-windows` leg reported clean without keeping a single header
+# finding. So a second canary plants a finding in two headers and refuses to go on
+# unless the analyser reports both.
+#
 # **What it sweeps is the diff plus everything the diff can break.** A changed
 # header is not a translation unit, so tidying only the changed `.cpp` files would
 # let an edit to `Logger.hpp` land a finding in fifty files nobody checked. The
@@ -88,8 +96,8 @@
 #                `MERGE_GROUP_BASE_SHA`). This is how the workflow invokes it, so
 #                that the event -> (scope, base) mapping lives in one place a
 #                reader can see whole rather than in three CI expressions.
-#   --self-test  check the scope computation against a synthetic tree, and the
-#                canary's verdict against staged probe records, then exit. Needs
+#   --self-test  check the scope computation against a synthetic tree, and both
+#                canaries' verdicts against staged probe records, then exit. Needs
 #                no compile database and no clang-tidy -- which is the whole
 #                point of the second one: until #257 the canary's decision could
 #                only be exercised by a machine already running a full sweep with
@@ -1121,7 +1129,74 @@ TidyUnitVerdict() {
 # that stopped early -- a helper that `return`ed, a block skipped by a failed
 # precondition, a row deleted by mistake -- would otherwise print PASSED over fewer
 # judgements than it claims. Change it in the same edit that adds or removes a row.
-SelfTestCases=93
+SelfTestCases=104
+
+# The HEADER canary's decision: was a finding planted in each named header REPORTED?
+#
+# `Canary` proves the analyser parses a unit, which says nothing about headers: a
+# finding in a header is reported only when `.clang-tidy`'s HeaderFilterRegex takes the
+# header's path AS CLANG SPELLS IT, and everything else is discarded as non-user code
+# with nothing to show for it but a `Suppressed N warnings` line. On Windows that path
+# carries a backslash wherever clang joined an include directory to a header name, and
+# a `/`-only pattern discarded every first-party header finding there while the
+# `clang-tidy-windows` leg reported clean. `local-gate.sh` asks the same question of a
+# MODEL of the regex engine on every host; this asks the analyser itself, on the host
+# the sweep runs on, before any verdict is believed.
+#
+# The failing arms are four because the remedies are: `filtered` is the header filter
+# refusing a path (clang-tidy SAID it suppressed something), `unreported` is a finding
+# that never happened at all -- no line, no suppression, so the check that should fire
+# is off or the header was never read -- `config-unread` is clang-tidy refusing the
+# `--config-file` it was handed, and the unit-level arms are `CanaryVerdict`'s, asked
+# first, since a probe that did not parse says nothing about any of them.
+#
+# `config-unread` has its own arm because it is how a path that did not survive the
+# trip to the analyser looks -- on the Windows leg, an MSYS conversion that went wrong
+# -- and it exits 1 with no finding and no suppression, which `unreported` would send
+# looking for a disabled check.
+#
+# A header is matched by its BASENAME at the end of a path spelled with EITHER
+# separator, since the line naming it on Windows is `C:\...\src\tests\X.hpp:3:12:`, AND
+# by the PLANTED check's tag. Any finding at the header is not enough: a compile error
+# in a header is reported whatever HeaderFilterRegex says -- measured, the `/`-only
+# pattern reports `[clang-diagnostic-error]` from a header it filters -- so counting it
+# would pass the canary over the very filter it exists to test.
+#
+# @param 1 The probe's exit status.
+# @param 2 Everything the probe printed, stdout and stderr together.
+# @param 3.. The basename of each header a finding was planted in.
+# @return Prints `ok`, `filtered <header>`, `unreported <header>`, `config-unread
+#         <output>`, or a `CanaryVerdict` failure word.
+HeaderCanaryVerdict() {
+    local rc="$1" output="$2" unit header
+    shift 2
+    unit="$(CanaryVerdict "$rc" "$output")"
+    if [[ "$unit" != ok ]]; then
+        echo "$unit"
+        return
+    fi
+    case "$output" in
+        *"can't read config-file"*)
+            echo "config-unread ${output}"
+            return ;;
+    esac
+    for header in "$@"; do
+        # A herestring rather than a pipe: `producer | grep -q` is a false negative
+        # under pipefail, and on the success path.
+        # The name's `.` stays a wildcard, which costs nothing for names this fixed.
+        # The tag is `[readability-identifier-naming]`, or with `,-warnings-as-errors`
+        # appended where `.clang-tidy` makes it an error, so it ends at `]` or `,`.
+        if grep -Eq "(^|[/\\\\])${header}:[0-9]+:[0-9]+: (warning|error): .*\\[readability-identifier-naming[],]" <<< "$output"; then
+            continue
+        fi
+        case "$output" in
+            *"in non-user code"*) echo "filtered ${header}" ;;
+            *)                    echo "unreported ${header}" ;;
+        esac
+        return
+    done
+    echo ok
+}
 
 SelfTest() {
     local status=0 cases=0
@@ -1638,6 +1713,63 @@ STUB
            "src/unknown-warning-option/x.cpp:1:1: warning: bad [readability-foo]" \
            "$(FindingLines "src/unknown-warning-option/x.cpp:1:1: warning: bad [readability-foo]")"
 
+    # The HEADER canary's verdict, accepting first. The lines are the ones the pinned
+    # clang-tidy printed natively over a Windows database: the sibling header spelled
+    # with backslashes throughout, the `-I` one joined to a `/` include -- so a verdict
+    # that only recognised `/` would refuse the very run that proves the filter works.
+    local hdrSib="TidyHeaderCanarySibling.hpp" hdrInc="TidyHeaderCanaryIncluded.hpp"
+    local winSib="C:\\Temp\\tmp.x\\header-canary\\src\\tests\\${hdrSib}:4:12: error: invalid case style for global variable ${SQ}g_siblingCanary${SQ} [readability-identifier-naming,-warnings-as-errors]"
+    local winInc="C:/Temp/tmp.x/header-canary/src\\FastCache/${hdrInc}:4:12: error: invalid case style for global variable ${SQ}g_includedCanary${SQ} [readability-identifier-naming,-warnings-as-errors]"
+    local posixSib="/tmp/tmp.x/header-canary/src/tests/${hdrSib}:4:12: warning: invalid case style for global variable ${SQ}g_siblingCanary${SQ} [readability-identifier-naming]"
+    local posixInc="/tmp/tmp.x/header-canary/src/FastCache/${hdrInc}:4:12: warning: invalid case style for global variable ${SQ}g_includedCanary${SQ} [readability-identifier-naming]"
+    local suppressed="Suppressed 2 warnings (2 in non-user code)."
+    Expect "both header findings reported with Windows spellings pass the header canary" \
+           "ok" "$(HeaderCanaryVerdict 1 "2 warnings generated.
+${winInc}
+${winSib}
+2 warnings treated as errors" "$hdrSib" "$hdrInc")"
+    Expect "both header findings reported with POSIX spellings pass the header canary" \
+           "ok" "$(HeaderCanaryVerdict 1 "${posixSib}
+${posixInc}" "$hdrSib" "$hdrInc")"
+    # The blind filter, verbatim from the `/`-only pattern's run: exit 0, a suppression
+    # line, no finding. This is the state the Windows leg sat in, reporting clean.
+    Expect "findings the header filter suppressed are refused as filtered" \
+           "filtered ${hdrSib}" "$(HeaderCanaryVerdict 0 "2 warnings generated.
+${suppressed}" "$hdrSib" "$hdrInc")"
+    # Half a fix -- `\\` after the root only -- takes the sibling and refuses the mixed
+    # spelling, and the verdict names WHICH header, so the remedy points at the shape.
+    Expect "a filter taking only one spelling is refused, naming the other header" \
+           "filtered ${hdrInc}" "$(HeaderCanaryVerdict 1 "${winSib}
+Suppressed 1 warnings (1 in non-user code)." "$hdrSib" "$hdrInc")"
+    Expect "no finding and no suppression is unreported, never filtered" \
+           "unreported ${hdrSib}" "$(HeaderCanaryVerdict 0 "" "$hdrSib" "$hdrInc")"
+    # A finding in the UNIT is not a finding in the header: the anchor is the basename
+    # at the end of a path, so `TidyHeaderCanary.cpp` cannot stand in for either.
+    Expect "a finding in the unit alone does not pass the header canary" \
+           "unreported ${hdrSib}" \
+           "$(HeaderCanaryVerdict 1 "C:\\Temp\\src\\tests\\TidyHeaderCanary.cpp:1:1: error: x [y]" "$hdrSib" "$hdrInc")"
+    # A compile error in a header is reported whatever the header filter says, so it
+    # must not stand in for the planted finding -- measured, the `/`-only pattern reports
+    # this line from a header it filters. Neither is another check's finding.
+    Expect "a header COMPILE ERROR alone does not count as the planted finding" \
+           "unreported ${hdrSib}" \
+           "$(HeaderCanaryVerdict 1 "C:\\Temp\\src\\tests\\${hdrSib}:2:1: error: unknown type name ${SQ}not_a_type${SQ} [clang-diagnostic-error]
+${winInc}" "$hdrSib" "$hdrInc")"
+    Expect "another check's finding at the header does not count either" \
+           "unreported ${hdrInc}" \
+           "$(HeaderCanaryVerdict 1 "${winSib}
+C:/Temp/src\\FastCache/${hdrInc}:4:1: error: variable is non-const [cppcoreguidelines-avoid-non-const-global-variables,-warnings-as-errors]" "$hdrSib" "$hdrInc")"
+    # The configuration never read is its own outcome, not `unreported`: it is what a
+    # path the analyser could not open looks like, and it exits 1 with nothing else said.
+    Expect "an unreadable --config-file is config-unread, never unreported" \
+           "config-unread Error: can${SQ}t read config-file ${SQ}D:/no/such/.clang-tidy${SQ}: no such file or directory" \
+           "$(HeaderCanaryVerdict 1 "Error: can${SQ}t read config-file ${SQ}D:/no/such/.clang-tidy${SQ}: no such file or directory" "$hdrSib" "$hdrInc")"
+    Expect "a header canary probe that could not execute says so first" \
+           "not-executed exit 127" "$(HeaderCanaryVerdict 127 "" "$hdrSib" "$hdrInc")"
+    Expect "a header canary probe that could not parse says so first" \
+           "not-parsing fatal error: ${SQ}stddef.h${SQ} file not found" \
+           "$(HeaderCanaryVerdict 0 "fatal error: ${SQ}stddef.h${SQ} file not found" "$hdrSib" "$hdrInc")"
+
     # The third-party roots (#1370), planted: a scratch repository whose roots file names
     # `vendor`, holding one first-party source and one vendored one. The sweep's file set
     # must keep the first and decline the second BY NAME -- a roots reader that silently
@@ -1913,6 +2045,55 @@ Canary() {
     esac
 }
 
+# A canary for HEADERS, against the analyser itself. Two first-party-shaped headers,
+# each holding a naming violation, reached the two ways clang builds a header path:
+# `TidyHeaderCanarySibling.hpp` by a quote include beside the unit (on Windows,
+# `...\src\tests\TidyHeaderCanarySibling.hpp`) and `TidyHeaderCanaryIncluded.hpp` through
+# `-I<root>/src` and `<FastCache/...>` (on Windows, `...\src\FastCache/...`, the mixed
+# spelling). Both must be REPORTED under this tree's own `.clang-tidy`, or the sweep
+# stops: a clean verdict from a run that discards every header finding is a claim about
+# no header at all. Measured with the pinned clang-tidy, natively on Windows from Git
+# Bash, which is how the `clang-tidy-windows` job calls it, and with no compile database,
+# since this unit brings its own flags: under the `/`-only pattern both findings are
+# suppressed and this refuses; under `[/\\]` both are reported. On Linux it passes under
+# either pattern, because clang spells the paths with `/` there; the backslash half is
+# checked on the Windows leg alone, and on Linux by `local-gate.sh`'s model of the regex.
+#
+# In the scratch tree rather than in `src/`: nothing is written into the checkout, and
+# `--config-file` names the configuration so the one under test is this tree's whether
+# or not the scratch directory sits under it. No compile database either -- the unit
+# includes nothing else, and the header filter is a question about PATHS.
+HeaderCanary() {
+    local canary="${scratch}/header-canary" probe probe_rc verdict
+    mkdir -p "${canary}/src/tests" "${canary}/src/FastCache" \
+        || fatal "cannot create the header canary's scratch tree"
+    printf '#pragma once\nnamespace FastCache::TidyHeaderCanary\n{\ninline int g_siblingCanary = 0;\n}\n' \
+        > "${canary}/src/tests/TidyHeaderCanarySibling.hpp"
+    printf '#pragma once\nnamespace FastCache::TidyHeaderCanary\n{\ninline int g_includedCanary = 0;\n}\n' \
+        > "${canary}/src/FastCache/TidyHeaderCanaryIncluded.hpp"
+    printf '#include "TidyHeaderCanarySibling.hpp"\n#include <FastCache/TidyHeaderCanaryIncluded.hpp>\n' \
+        > "${canary}/src/tests/TidyHeaderCanary.cpp"
+    # Colour off: `.clang-tidy` turns it on, and an escape sequence between a path and
+    # `error:` is a finding the verdict cannot see -- measured, it refused a run that
+    # had reported both headers.
+    probe="$("$TIDY" "--config-file=${repo_root}/.clang-tidy" --use-color=false \
+        "${canary}/src/tests/TidyHeaderCanary.cpp" -- -std=c++23 "-I${canary}/src" 2>&1)"
+    probe_rc=$?
+    verdict="$(HeaderCanaryVerdict "$probe_rc" "$probe" TidyHeaderCanarySibling.hpp TidyHeaderCanaryIncluded.hpp)"
+    case "$verdict" in
+        ok) ;;
+        filtered*) fatal "the header filter in ${repo_root}/.clang-tidy (HeaderFilterRegex) discarded a finding planted in ${verdict#filtered } as non-user code, so every first-party header finding in this sweep would be discarded the same way and a clean verdict would describe no header. clang spells a header's path with THIS host's separator wherever it joined an include directory to a header name, so a pattern that writes a separator as / is blind on Windows: write every separator as [/\\\\]. What $TIDY printed:
+${probe}" ;;
+        unreported*) fatal "$TIDY reported nothing about a naming violation planted in ${verdict#unreported } -- no finding and no suppressed warning -- so it is not reading headers the way this sweep assumes: the check that should fire (readability-identifier-naming's GlobalVariableCase) may be off in ${repo_root}/.clang-tidy, or the header was never included, or the configuration file was not read (check the path clang-tidy received). This is not the header filter, which would have said it suppressed something. What $TIDY printed:
+${probe}" ;;
+        config-unread*) fatal "$TIDY could not read the configuration it was handed as --config-file=${repo_root}/.clang-tidy, so the header canary tested no header filter at all. Check the path clang-tidy received: on the Windows leg this is what an MSYS path conversion that went wrong looks like, and the path in the message below is the one the analyser actually tried. What $TIDY printed:
+${verdict#config-unread }" ;;
+        not-executed*) fatal "$TIDY could not be executed for the header canary (${verdict#not-executed })" ;;
+        not-parsing*) fatal "$TIDY is not parsing the header canary: ${verdict#not-parsing }" ;;
+        *) fatal "HeaderCanaryVerdict returned an unrecognised verdict [${verdict}]; that is a bug in this script, not a problem with $TIDY" ;;
+    esac
+}
+
 # A compile database is not a tree that PARSES. clang-tidy reads each unit the way the
 # compiler would, so a header the build generates has to exist -- and the clang-tidy job
 # configures without building. libunicode, which core-cpp's terminal UI links, writes its
@@ -2081,6 +2262,7 @@ fi
 echo "TIDY SWEEP: ${#plan[@]} translation unit(s), ${TIDY}, ${JOBS} at a time"
 EnsureGeneratedSources
 Canary
+HeaderCanary
 
 # One translation unit, into numbered files so the report below is in a stable
 # order however the pool interleaves. A refusal to EXECUTE is recorded apart from

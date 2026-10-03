@@ -226,11 +226,11 @@ EOF
 server_pid=""
 cleanup() {
     sccache --stop-server >/dev/null 2>&1 || true
-    if [[ -n "$server_pid" ]]; then
-        kill "$server_pid" >/dev/null 2>&1 || true
-        wait "$server_pid" 2>/dev/null || true
-    fi
+    # Bounded, where the `kill; wait` it replaced was not: `reap_background_jobs`
+    # escalates to SIGKILL and names a daemon that outlives even that.
+    reap_background_jobs
     rm -rf "$workdir"
+    e2e_exit_if_reap_left_survivors
 }
 trap cleanup EXIT
 

@@ -38,7 +38,20 @@ endif()
 set(Pattern "#[ \t]*pragma[ \t]+(GCC[ \t]+target|clang[ \t]+attribute.*target)")
 set(Prefilter "pragma[^\n]*(GCC[^\n]*target|clang[^\n]*attribute[^\n]*target)")
 
-file(GLOB_RECURSE sourceFiles LIST_DIRECTORIES false "${FASTCACHED_SOURCE_DIR}/src/*")
+# Through `fastcached_tracked_files`, this tree's one answer to HOW a check finds its files,
+# rather than a traversal of `src/` of its own: on DrvFs -- where every local gate tree takes
+# its sources from -- the traversal and a read of every file cost this check seconds against
+# a third of a second natively. CONTAINING asks git once which files hold `target`: every line
+# the pattern can match contains it, and `pragma` would not do -- every header says `#pragma
+# once`. Only those are read, and the prefilter below still runs on them, so `walked` counts
+# what it always counted.
+fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
+    PATHSPECS "src/"
+    GLOBS "src/*"
+    CONTAINING "target" CONTAINING_OUT sourcesHolding
+    FILES_OUT sourceFiles MODE_OUT sourcesMode)
+list(TRANSFORM sourceFiles PREPEND "${FASTCACHED_SOURCE_DIR}/")
+list(TRANSFORM sourcesHolding PREPEND "${FASTCACHED_SOURCE_DIR}/")
 set(problems "")
 set(scanned 0)
 set(walked 0)
@@ -48,6 +61,9 @@ foreach(path IN LISTS sourceFiles)
         continue()
     endif()
     math(EXPR scanned "${scanned} + 1")
+    if(NOT "${path}" IN_LIST sourcesHolding)
+        continue()
+    endif()
     file(READ "${path}" content)
     if(NOT content MATCHES "${Prefilter}")
         continue()

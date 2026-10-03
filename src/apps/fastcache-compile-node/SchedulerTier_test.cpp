@@ -16,6 +16,8 @@
 #include <FastCache/Core/Utf8.hpp>
 #include <FastCache/Core/Version.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
+#include <FastCache/Distributed/UnservedToolchains.hpp>
+#include <FastCache/Distributed/WorkerRegistry.hpp>
 #include <FastCache/Metrics/IMetricsSink.hpp>
 #include <FastCache/Protocol/CompileCacheWire.hpp>
 
@@ -207,8 +209,8 @@ TEST_CASE("A scheduler answers its fleet-wide rows as it starts, and only a lead
     // A fleet-wide row reads the LEADER's registry -- what clients asked it for, what every machine
     // announced to it -- and a follower's copy holds none of that. So anything but the leader says
     // `not-evaluated`, never `clear`: clear from a node that cannot see the fleet is a confident
-    // wrong signal. WHAT DISTINGUISHES: the same rows read `clear` once this node leads, and go back
-    // to `not-evaluated`, naming the new leader, when it is demoted.
+    // wrong signal. WHAT DISTINGUISHES: the same rows read `clear` once this node has led long enough
+    // to have watched them, and go back to `not-evaluated`, naming the new leader, when it is demoted.
     TierFixture fix;
     auto const cfg = ClusteredNode();
     NodeMembership membership { cfg, membershipLog };
@@ -235,6 +237,8 @@ TEST_CASE("A scheduler answers its fleet-wide rows as it starts, and only a lead
     }
 
     (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
+    fix.clock.advance(LongestFleetObservation());
+    (*tier)->EvaluateConditions();
     for (auto const condition: fleetRows)
     {
         INFO("condition " << RowFor(condition).id);
@@ -261,6 +265,8 @@ TEST_CASE("A leading scheduler names the toolchain nobody serves, and clears it 
         cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.identity, fix.conditions, NoWatch);
     REQUIRE(tier.has_value());
     (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
+    // Led long enough to have watched the row, so "nothing unserved" may read `clear` below.
+    fix.clock.advance(LongestFleetObservation());
     auto& service = (*tier)->ServiceForSurfaces();
 
     auto const ask =
@@ -337,7 +343,8 @@ TEST_CASE("The condition watch re-asks the fleet-wide rows without being told", 
                                      std::chrono::milliseconds { 10 });
     REQUIRE(tier.has_value());
     (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
-    REQUIRE(fix.conditions.StateOf(NodeCondition::UnservedToolchain) == Wire::ConditionState::Clear);
+    // A leader that has not yet watched the row's span says so; a refusal it sees is raised anyway.
+    REQUIRE(fix.conditions.StateOf(NodeCondition::UnservedToolchain) == Wire::ConditionState::NotEvaluated);
 
     REQUIRE((*tier)
                 ->ServiceForSurfaces()
@@ -366,6 +373,8 @@ TEST_CASE("A leading scheduler raises mixed-node-versions for two builds of one 
         cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.identity, fix.conditions, NoWatch);
     REQUIRE(tier.has_value());
     (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
+    fix.clock.advance(LongestFleetObservation());
+    (*tier)->EvaluateConditions();
     // Alone, the leader is one build: checked and benign.
     REQUIRE(fix.conditions.StateOf(NodeCondition::MixedNodeVersions) == Wire::ConditionState::Clear);
 
@@ -439,4 +448,91 @@ TEST_CASE("mixed-node-versions counts a machine that named no version apart, and
     auto const raised = SentRow(fix.conditions, NodeCondition::MixedNodeVersions);
     CHECK(raised.state == "raised");
     CHECK(raised.detail.contains("(1 more machine(s) did not say)"));
+}
+
+TEST_CASE("A new leader reads each fleet-wide row not-evaluated, never clear, until it has watched its span",
+          "[node][scheduler][conditions]")
+{
+    // What the rows read reaches the leader alone, and nothing another leader saw survives a failover:
+    // a leader elected a second ago that answered `clear` would vouch for fifteen minutes of refusals
+    // it never received. So it says `not-evaluated` -- undecided must not read as clear -- and each row
+    // turns `clear` once THIS leadership has lasted that row's span, the shorter row first.
+    TierFixture fix;
+    auto const cfg = ClusteredNode();
+    NodeMembership membership { cfg, membershipLog };
+    auto tier = SchedulerTier::Start(
+        cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.identity, fix.conditions, NoWatch);
+    REQUIRE(tier.has_value());
+
+    (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
+    for (auto const condition: { NodeCondition::UnservedToolchain, NodeCondition::MixedNodeVersions })
+    {
+        INFO("condition " << RowFor(condition).id);
+        auto const row = SentRow(fix.conditions, condition);
+        CHECK(row.state == "not-evaluated");
+        CHECK(row.detail.contains("has led for less than"));
+    }
+
+    fix.clock.advance(Distributed::WorkerRegistry::DefaultHeartbeatTimeout);
+    (*tier)->EvaluateConditions();
+    CHECK(fix.conditions.StateOf(NodeCondition::MixedNodeVersions) == Wire::ConditionState::Clear);
+    CHECK(fix.conditions.StateOf(NodeCondition::UnservedToolchain) == Wire::ConditionState::NotEvaluated);
+    CHECK(SentRow(fix.conditions, NodeCondition::UnservedToolchain).detail.contains("fifteen minutes"));
+
+    fix.clock.advance(Distributed::UnservedToolchains::Window - Distributed::WorkerRegistry::DefaultHeartbeatTimeout);
+    (*tier)->EvaluateConditions();
+    CHECK(fix.conditions.StateOf(NodeCondition::UnservedToolchain) == Wire::ConditionState::Clear);
+}
+
+TEST_CASE("A leader elected again in a later term watches its span afresh, while the same term keeps it",
+          "[node][scheduler][conditions]")
+{
+    // Between two of this node's terms another node may have led, and the refusals of that term went
+    // to it. So leadership in a NEW term starts the span over, even with no demotion seen in between,
+    // while the consensus tier repeating the SAME term is one unbroken leadership.
+    TierFixture fix;
+    auto const cfg = ClusteredNode();
+    NodeMembership membership { cfg, membershipLog };
+    auto tier = SchedulerTier::Start(
+        cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.identity, fix.conditions, NoWatch);
+    REQUIRE(tier.has_value());
+
+    (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
+    fix.clock.advance(LongestFleetObservation());
+    (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
+    CHECK(fix.conditions.StateOf(NodeCondition::UnservedToolchain) == Wire::ConditionState::Clear);
+
+    SECTION("demoted, then elected again")
+    {
+        (*tier)->SetRole(Distributed::SchedulerRole::Follower, "10.0.0.5:6674", 8);
+        (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 9);
+    }
+    SECTION("leading in a later term with no demotion seen")
+    {
+        (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 9);
+    }
+    CHECK(fix.conditions.StateOf(NodeCondition::UnservedToolchain) == Wire::ConditionState::NotEvaluated);
+    CHECK(fix.conditions.StateOf(NodeCondition::MixedNodeVersions) == Wire::ConditionState::NotEvaluated);
+}
+
+TEST_CASE("A new leader raises a refusal it sees at once, before it has watched the whole span",
+          "[node][scheduler][conditions]")
+{
+    // The span guards `clear` only. A no-worker refusal this leader received is a fact whatever came
+    // before it, so waiting fifteen minutes to say so would hide the one thing it knows.
+    TierFixture fix;
+    auto const cfg = ClusteredNode();
+    NodeMembership membership { cfg, membershipLog };
+    auto tier = SchedulerTier::Start(
+        cfg, membership.Oracle(), fix.clock, fix.wallClock, fix.metrics, fix.logger, fix.identity, fix.conditions, NoWatch);
+    REQUIRE(tier.has_value());
+    (*tier)->SetRole(Distributed::SchedulerRole::Leader, {}, 7);
+
+    REQUIRE((*tier)
+                ->ServiceForSurfaces()
+                .Lease(Insider, Wire::LeaseRequest { .fingerprint = "fp-cl", .key = "k1", .acceptedCodecs = {} })
+                .error
+            == Wire::ErrorCode::NoWorker);
+    (*tier)->EvaluateConditions();
+    CHECK(fix.conditions.StateOf(NodeCondition::UnservedToolchain) == Wire::ConditionState::Raised);
 }

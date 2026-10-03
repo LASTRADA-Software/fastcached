@@ -99,6 +99,7 @@ set(totalAssignments 0)
 
 # --- collect every production source under the scan roots --------------------
 set(scanFiles "")
+set(scanHolding "")
 foreach(root IN LISTS vslangScanRoots)
     set(resolvedRoot "${FASTCACHED_SOURCE_DIR}/${root}")
     if(NOT IS_DIRECTORY "${resolvedRoot}")
@@ -108,9 +109,23 @@ foreach(root IN LISTS vslangScanRoots)
     # ONE traversal, then filtered -- two patterns walk the tree twice, which is
     # what `check-glob-traversals` refuses (#502) and what caught this scan on its
     # first run.
-    file(GLOB_RECURSE rootFiles LIST_DIRECTORIES false "${resolvedRoot}/*")
-    list(FILTER rootFiles INCLUDE REGEX "[.](cpp|hpp)$")
+    #
+    # Through `fastcached_tracked_files`, this tree's one answer to HOW a check finds its files,
+    # rather than a traversal of its own: on DrvFs -- where every local gate tree takes its
+    # sources from -- walking the tree and reading every file it found cost seconds a single
+    # `git grep` spends in under half of one, and several lanes gating at once took this check
+    # past its budget. CONTAINING names the literal every match must contain, so a file without
+    # it is not read at all; the count printed is still over the whole set.
+    fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
+        PATHSPECS "${root}/"
+        GLOBS "${root}/*"
+        FILTER "^${root}/.*[.](cpp|hpp)$"
+        CONTAINING "VSLANG" CONTAINING_OUT rootHolding
+        FILES_OUT rootFiles MODE_OUT rootMode)
+    list(TRANSFORM rootFiles PREPEND "${FASTCACHED_SOURCE_DIR}/")
+    list(TRANSFORM rootHolding PREPEND "${FASTCACHED_SOURCE_DIR}/")
     list(APPEND scanFiles ${rootFiles})
+    list(APPEND scanHolding ${rootHolding})
 endforeach()
 
 # --- count assignments per file ----------------------------------------------
@@ -141,6 +156,9 @@ foreach(sourceFile IN LISTS scanFiles)
     # corpus that DID have a two-match file, and there one `]` took its count from 15
     # to 14 while it still passed. Same shape, different corpus, opposite verdict --
     # which is why exposure is judged per (reader, file, surviving lines).
+    if(NOT "${sourceFile}" IN_LIST scanHolding)
+        continue()
+    endif()
     file(READ "${sourceFile}" _vslangText)
     fastcached_split_lines_tokenised("${_vslangText}" matchedLines)
     list(FILTER matchedLines INCLUDE REGEX "${vslangAssignmentPattern}")

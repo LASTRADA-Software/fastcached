@@ -1822,6 +1822,55 @@ _e2e_counter_wait() {
 }
 
 
+# How long a SIGKILLed process is given to be gone before it is reported rather
+# than waited on.
+#
+# SIGKILL cannot be caught, and that is not the same as prompt: the kernel finishes
+# a kill only when the process leaves the system call it is in, and one stuck in
+# uninterruptible I/O never does. Observed, not argued: on a WSL VM whose 9p client
+# sat in a kernel soft lockup, a `fastcached` that never became ready was still alive
+# a second after SIGTERM and again a second after SIGKILL, and was only a zombie
+# minutes later -- and a local gate's `wait` on such a daemon hung for 80 minutes.
+# So nothing here `wait`s on a killed process until `kill -0` says it has gone; one
+# that outlives this grace is NAMED instead, because a `wait` on it is a hang and a
+# hang reports nothing.
+_e2e_kill_grace_seconds=5
+
+# The command line a process was started with, for a message that names it.
+#
+# Read BEFORE it is signalled: once it has exited there is nothing left to read, and
+# the one message that needs this is about a process nobody could identify later.
+# @param 1 pid
+# Prints the command, or `(command unknown)` where `ps` will not say.
+_e2e_command_of() {
+    local args=""
+    args="$(ps -o args= -p "$1" 2>/dev/null || true)"
+    printf '%s\n' "${args:-(command unknown)}"
+}
+
+# Poll until every listed process has gone, or the seconds run out.
+#
+# Counted in `sleep` ticks for `reap_background_jobs`'s reason: it runs inside a
+# firing EXIT trap, where backgrounding the deadline's subshell is the one thing
+# this file has already been bitten by, and nothing asserts on this duration -- it
+# only decides when to stop waiting and start reporting.
+# @param 1 space-separated pids
+# @param 2 seconds
+# @return 0 once none is alive, 1 when one still is at the end
+_e2e_gone_within() {
+    local pids="$1" ticks=$(( $2 * 5 )) tick=0 pid="" alive=""
+    while :; do
+        alive=""
+        for pid in $pids; do
+            if kill -0 "$pid" 2>/dev/null; then alive="yes"; break; fi
+        done
+        [ -n "$alive" ] || return 0
+        [ "$tick" -lt "$ticks" ] || return 1
+        sleep 0.2
+        tick=$(( tick + 1 ))
+    done
+}
+
 # Stop a process and require it to actually exit, within a bound.
 #
 # `kill` then a bare `wait` is the obvious spelling and it HANGS when the signal
@@ -1835,12 +1884,16 @@ _e2e_counter_wait() {
 # asks. `wait` can only answer for a child of THIS shell; for anything else it answers
 # 127, which is recorded like any other status.
 #
+# And the escalation is bounded too, for `_e2e_kill_grace_seconds`' reason: a
+# process that survives SIGKILL is named with its pid and command and NOT waited on.
+#
 # @param 1 pid
 # @param 2 what it is, for the message
 # @param 3 seconds to allow
 stop_and_require_exit() {
-    local pid="$1" what="$2" seconds="$3"
+    local pid="$1" what="$2" seconds="$3" cmdline=""
     E2eStopStatus=""
+    cmdline="$(_e2e_command_of "$pid")"
     kill "$pid" >/dev/null 2>&1 || true
     # Bounded by a DURATION for the reason `wait_until` is: this bound is an
     # assertion about how promptly a process stops, so a loop that silently ran
@@ -1869,8 +1922,10 @@ stop_and_require_exit() {
     done
     _e2e_deadline_disarm "$dpid" "$dmark"
     kill -9 "$pid" >/dev/null 2>&1 || true
+    _e2e_gone_within "$pid" "$_e2e_kill_grace_seconds" \
+        || fail "${what} (pid ${pid}: ${cmdline}) was still running ${elapsed}s (measured) after being asked to stop, against a ${seconds}s bound, and was still there ${_e2e_kill_grace_seconds}s after SIGKILL -- not waited on, since a wait on a process the kernel cannot finish killing never returns"
     wait "$pid" 2>/dev/null || true
-    fail "${what} was still running ${elapsed}s (measured) after being asked to stop, against a ${seconds}s bound"
+    fail "${what} (pid ${pid}: ${cmdline}) was still running ${elapsed}s (measured) after being asked to stop, against a ${seconds}s bound"
 }
 
 # Stop a process as `stop_and_require_exit` does, and require it to have ENDED CLEANLY:
@@ -2936,33 +2991,40 @@ run_bounded() {
 # bash 3.2: `jobs -pr` in the caller's shell (a function does not fork), and a
 # plain `for` over word splitting -- no `mapfile`, no arrays, no `wait -n`.
 #
+# ## Nor may it wait on what SIGKILL did not end
+#
+# SIGKILL is uncatchable, not instantaneous: `_e2e_kill_grace_seconds` has the case
+# where it never completes. A killed job is waited on only once `kill -0` says it has
+# gone; one still there after the grace is a SURVIVOR, named on stderr with its pid
+# and command, counted in `E2eReapSurvivors`, and left unwaited. This still never
+# fails the run -- the count is what a caller that must not report success over a
+# survivor reads, which is `e2e_exit_if_reap_left_survivors`.
+#
 # @param 1 seconds of grace before escalating to SIGKILL; default 5
-# @return always 0; sets `E2eReapKilled` to how many needed the KILL
+# @return always 0; sets `E2eReapKilled` to how many needed the KILL and
+#         `E2eReapSurvivors` to how many outlived it
 E2eReapKilled=0
+E2eReapSurvivors=0
 reap_background_jobs() {
-    local seconds="${1:-5}" ticks=0 tick=0 leftover="" alive=""
+    local seconds="${1:-5}" leftover="" killed="" commands=""
     E2eReapKilled=0
+    E2eReapSurvivors=0
     # Snapshotted BEFORE anything is signalled, and before the poll below can add
     # a job of its own: what is reaped is what was running when cleanup started.
     local doomed=""
     doomed="$(jobs -pr)"
     [ -n "$doomed" ] || return 0
 
+    # The commands too, and before the signal for the reason `_e2e_command_of` gives.
+    for leftover in $doomed; do
+        commands="${commands}${leftover} $(_e2e_command_of "$leftover")"$'\n'
+    done
+
     for leftover in $doomed; do
         kill "$leftover" >/dev/null 2>&1 || true
     done
 
-    ticks=$(( seconds * 5 ))
-    tick=0
-    while [ "$tick" -lt "$ticks" ]; do
-        alive=""
-        for leftover in $doomed; do
-            if kill -0 "$leftover" 2>/dev/null; then alive="yes"; break; fi
-        done
-        [ -n "$alive" ] || break
-        sleep 0.2
-        tick=$(( tick + 1 ))
-    done
+    _e2e_gone_within "$doomed" "$seconds" || true
 
     # The tally is the KILL's own status and not a line beside it. That is the
     # `ClaimReadSlot` idiom -- a guard folded INTO the operation is self-enforcing,
@@ -2974,12 +3036,37 @@ reap_background_jobs() {
     # that cannot tell that from a SIGKILL is a count of nothing.
     for leftover in $doomed; do
         if kill -0 "$leftover" 2>/dev/null; then
-            kill -9 "$leftover" >/dev/null 2>&1 && E2eReapKilled=$(( E2eReapKilled + 1 ))
+            kill -9 "$leftover" >/dev/null 2>&1 && {
+                E2eReapKilled=$(( E2eReapKilled + 1 ))
+                killed="${killed} ${leftover}"
+            }
         fi
-        # AFTER the escalation, never before: SIGKILL is uncatchable, so this is
-        # prompt. A `wait` reached before it is unbounded against exactly the
-        # TERM-ignoring child these suites stage on purpose.
+    done
+    [ -z "$killed" ] || _e2e_gone_within "$killed" "$_e2e_kill_grace_seconds" || true
+
+    for leftover in $doomed; do
+        # AFTER the escalation, never before: a `wait` reached before it is
+        # unbounded against exactly the TERM-ignoring child these suites stage on
+        # purpose. And only on a job that has GONE: one SIGKILL did not end is named
+        # instead, since waiting on it is the hang this section exists to prevent.
+        if kill -0 "$leftover" 2>/dev/null; then
+            E2eReapSurvivors=$(( E2eReapSurvivors + 1 ))
+            echo "${_e2e_label:-e2e}: pid ${leftover} was still running ${_e2e_kill_grace_seconds}s after SIGKILL and was NOT waited on: $(printf '%s' "$commands" | awk -v p="$leftover" '$1 == p { sub(/^[^ ]+ /, ""); print; exit }')" >&2
+            continue
+        fi
         wait "$leftover" 2>/dev/null || true
     done
     return 0
+}
+
+# Do not let a job that outlived SIGKILL pass for a clean exit.
+#
+# `reap_background_jobs` never fails, because it runs on the failing paths too; this
+# is the one decision it leaves to the caller, made once here rather than in each
+# fixture's trap. A survivor turns the run's status into 1 -- a green run leaving an
+# unkillable daemon behind is not green -- and a run that was already failing or
+# skipping keeps a non-zero status either way. Call it LAST in the trap, after the
+# reap and anything else the cleanup does, since it may `exit`.
+e2e_exit_if_reap_left_survivors() {
+    [ "$E2eReapSurvivors" -eq 0 ] || exit 1
 }

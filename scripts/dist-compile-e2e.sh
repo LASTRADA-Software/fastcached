@@ -67,6 +67,7 @@
 # Usage:
 #   dist-compile-e2e.sh --fastcached <path> --node <path> --launcher <path>
 #                       [--compiler <cxx>] [--case suite|self-test]
+#                       [--cli <fastcache-cli>]
 #
 # Exit codes: 0 = all assertions held; 1 = a failure; 77 = a runtime prerequisite
 # was missing (skip).
@@ -76,6 +77,10 @@ fastcached=""
 node=""
 launcher=""
 compiler="${CXX:-c++}"
+# Optional: how the scheduler's record of a withdrawn worker is read. Without it a
+# withdrawal still fails, and cannot say which limit took the slots; see
+# `fail_if_withdrawn`.
+cli=""
 
 # Which body of assertions to run: `suite` is the twelve cases above, and `self-test`
 # drives the pure verdict decisions below with no binary built.
@@ -87,6 +92,7 @@ while [[ $# -gt 0 ]]; do
         --node)       node="$2";       shift 2 ;;
         --launcher)   launcher="$2";   shift 2 ;;
         --compiler)   compiler="$2";   shift 2 ;;
+        --cli)        cli="$2";        shift 2 ;;
         --case)       mode="$2";       shift 2 ;;
         --self-test)  mode="self-test"; shift ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -164,7 +170,37 @@ source_name_of() {
     dwarf_attr_of "$1" "AT_name"
 }
 
-# Drive every decision above over staged text. No process, no port, no compiler.
+# --- a worker that withdrew its slots -------------------------------------------
+#
+# The worker every dispatching case uses is offered one slot above this host's core
+# count (see `worker_slots`), so CPU used outside this fleet cannot withdraw it: a
+# `rejected (withdrawn)` is a FAILURE, never a skip, and the useful thing to say is
+# WHICH limit took the slots -- memory and scratch still can, and should, on a starved
+# host. Load-driven withdrawal itself is the product's behaviour and is covered where
+# it lives: `NodePolicy_test.cpp`'s `SlotCeilingsFor` cases, and the `Withdrawn`
+# refusal in `SchedulerProtocol_test.cpp` and `WorkerRegistry_test.cpp`.
+
+# Whether a launcher's output is the scheduler refusing a lease because every matching
+# worker withdrew. Pure, so the self-test drives it without a process.
+# @param 1 the launcher's output for a compile that was not dispatched
+is_withdrawn_refusal() {
+    [[ "$1" == *"not dispatched (rejected (withdrawn)"* ]]
+}
+
+# The scheduler's `limited-by` for one worker, out of `fleet workers` as TSV. The
+# columns are found by their header, not by position.
+# @param 1 what `fastcache-cli --format=tsv fleet workers` printed
+# @param 2 the worker's advertised endpoint
+# @param 3 the toolchain the lease asked for
+# Prints the `limited-by` text, or nothing when no such worker is in the record.
+worker_limit_from_tsv() {
+    awk -F'\t' -v ep="$2" -v fp="$3" '
+        NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+        ("endpoint" in col) && ("toolchain" in col) && ("limited-by" in col) &&
+            $col["endpoint"] == ep && $col["toolchain"] == fp { print $col["limited-by"]; exit }
+    ' <<< "$1"
+}
+
 _selftest_cases=0
 _selftest_failures=0
 
@@ -244,6 +280,25 @@ run_self_test() {
     # An attribute the dump does not carry is EMPTY rather than the next line's value.
     _check "$(_is "$(dwarf_attr_of "$llvm_dump" "AT_ranges")" "")" "a missing attribute reads empty"
 
+    # ---- is_withdrawn_refusal ---------------------------------------------
+    local withdrawn="fastcache-cc: not dispatched (rejected (withdrawn): every matching worker has withdrawn its capacity); compiling locally"
+    local no_worker="fastcache-cc: not dispatched (rejected (no-worker): no worker serves this toolchain); compiling locally"
+    _check "$(is_withdrawn_refusal "$withdrawn" && echo y || echo n)" "a withdrawn refusal is recognised"
+    _check "$(is_withdrawn_refusal "$no_worker" && echo n || echo y)" "a different refusal is not a withdrawal"
+    _check "$(is_withdrawn_refusal "" && echo n || echo y)" "nor is a compile that said nothing"
+
+    # The scheduler's record as `fastcache-cli --format=tsv fleet workers` prints it,
+    # captured from a real run with a second row added, so the reader is asked WHICH
+    # worker it is looking at rather than whether a `limited-by` exists.
+    local fleet_tsv
+    fleet_tsv="$(printf '%s\t' id toolchain compiler endpoint slots in-flight available limited-by heartbeat-age registered-age; printf 'last-picked-age\n')"
+    fleet_tsv+=$'\n'"$(printf 'w1\t3f5d2a3eca09d20f79b8bf9217019b87\tcl 19.51.36252\t127.0.0.1:25271\t32\t0\t0\texternal-cpu\t2078\t2078\t')"
+    fleet_tsv+=$'\n'"$(printf 'w2\t3f5d2a3eca09d20f79b8bf9217019b87\tcl 19.51.36252\t127.0.0.1:25999\t4\t0\t4\tregistered\t10\t10\t')"
+    _check "$(_is "$(worker_limit_from_tsv "$fleet_tsv" 127.0.0.1:25271 3f5d2a3eca09d20f79b8bf9217019b87)" external-cpu)" "the worker's own row is read"
+    _check "$(_is "$(worker_limit_from_tsv "$fleet_tsv" 127.0.0.1:25999 3f5d2a3eca09d20f79b8bf9217019b87)" registered)" "and not its neighbour's"
+    _check "$(_is "$(worker_limit_from_tsv "$fleet_tsv" 127.0.0.1:25271 9e5d3aaa03c5f0c2564bda4c6c68f021)" "")" "another toolchain at that endpoint is not this worker"
+    _check "$(_is "$(worker_limit_from_tsv "not a table" 127.0.0.1:25271 3f5d2a3eca09d20f79b8bf9217019b87)" "")" "an unreadable record is absent, not a limit"
+
     # A self-test states how many cases it RAN: a run that stopped early must not look
     # like one that judged something, and a scan that matched nothing must not read as
     # a clean tree.
@@ -322,6 +377,9 @@ cleanup() {
     # were left running until now.
     reap_background_jobs 5
     rm -rf "$workdir"
+    # A job that outlived SIGKILL was named on stderr; it must not pass for a
+    # clean exit either.
+    e2e_exit_if_reap_left_survivors
 }
 
 # The shared helpers: `fail`, `free_port`, `wait_for_port`, `wait_for_log`,
@@ -783,24 +841,65 @@ run_launcher() {
 # counter that never moved used to end the run only because `set -e` happened to
 # notice a command substitution's status.
 
-# Slots enough that background CPU cannot withdraw all of them.
+# ONE slot above the node's own core count, so no amount of CPU used outside this fleet can
+# withdraw the worker these cases dispatch to.
 #
-# `AvailableSlots` reduces a worker's ceiling by the cores its machine is busy
-# with OUTSIDE this fleet -- `cpuBusyPermille * logicalCores / 1000`, less this
-# fleet's own in-flight jobs -- so a worker offering two slots on a many-core
-# machine withdraws both as soon as a few percent of that machine is doing
-# something else. This fixture IS that something else: it runs local reference
-# compiles on the same box, and on CI the rest of the suite runs beside it. The
-# dispatch then comes back `rejected (withdrawn)` and the case fails as "the
-# compile was not dispatched to a worker", which reads as a fault in dispatch and
-# is a fault in the fixture's sizing.
+# `SlotCeilingsFor` charges other work only past the headroom the slots leave, and with the
+# slots above the cores there is no headroom: every external core is charged. There are at
+# most `logicalCores` of them, so the ceiling never falls below `slots - logicalCores`, which
+# is one. With the slots AT the core count it fell to zero on any host with no idle core,
+# and a host running other builds beside this suite is exactly that: the worker withdrew
+# `external-cpu`, and case 12 -- whose subject is an unreachable CACHE -- ended as a skip or a
+# failure about a withdrawal it was never about. A case that asserts nothing whenever the
+# host is busy is not tested where it is most often run.
 #
-# Offering the whole machine puts the ceiling at cores-minus-external, which
-# reaches zero only when the host really is saturated -- and is what a node
-# dedicating this machine to the fleet would advertise anyway. The `--slots=1`
-# workers elsewhere in this file are deliberate and stay: their cases are ABOUT
-# a worker having exactly one.
-worker_slots="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)"
+# Oversubscribing is a supported configuration rather than a trick: `OfferableSlots` takes an
+# operator's `--slots` untouched, precisely so a machine can be offered more jobs than it
+# has cores. The other two ceilings are not covered and should not be: a host with under
+# 1 GiB of memory or 128 MiB of scratch left is starved, not busy, and still withdraws.
+#
+# Counted the way the node counts, `sysconf(_SC_NPROCESSORS_ONLN)`, which is what `getconf`
+# asks. `nproc` honours this process's affinity mask and so can only be LOWER -- under
+# `taskset` or a container's cpuset it would put the floor below one slot again. No count at
+# all is a refusal, since the floor cannot then be established.
+#
+# The `--slots=1` workers elsewhere in this file are deliberate and stay: their cases are
+# ABOUT a worker having exactly one.
+host_cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+[[ "$host_cores" =~ ^[1-9][0-9]*$ ]] \
+    || fail "could not read this host's online core count (getconf _NPROCESSORS_ONLN said '${host_cores}'), so the worker cannot be sized above it"
+worker_slots="$((host_cores + 1))"
+
+# Called where a dispatch the case needed did not happen. A withdrawal FAILS, naming
+# the limit the scheduler's record gives -- the worker is sized so CPU used outside this
+# fleet cannot cause one (`worker_slots`), so whatever did is the finding. Anything else
+# returns, and the caller's own failure stands.
+# @param 1 the launcher's log for that compile
+# @param 2 the scheduler endpoint
+# @param 3 the worker's advertised endpoint
+# @param 4 the toolchain fingerprint
+fail_if_withdrawn() {
+    local text limit=""
+    text="$(cat "$1")"
+    is_withdrawn_refusal "$text" || return 0
+    # Bounded, because this runs on a path that is already failing and an unbounded
+    # ask here turns a named refusal into a hang. The client's own ceilings are 5 s to
+    # connect and 10 s per read and write, so the bound is their sum; an expiry is
+    # SAID, naming what was waited for, and reads as an absent record. stderr is left
+    # out of the capture, which is the table `worker_limit_from_tsv` parses.
+    if [[ -n "$cli" && -x "$cli" ]]; then
+        local records="" asked=0 cli_read_seconds=15
+        records="$(run_bounded "$cli_read_seconds" bash -c 'exec "$0" "$@" 2>/dev/null' \
+            "$cli" "--addr=$2" --format=tsv fleet workers)" || asked=$?
+        if [[ "$(e2e_bound_outcome)" == "$E2eBoundOutcomeExceeded" ]]; then
+            echo "the scheduler's record was not read: fastcache-cli fleet workers against $2 did not answer within ${cli_read_seconds}s" >&2
+        elif [[ "$asked" -eq 0 ]]; then
+            limit="$(worker_limit_from_tsv "$records" "$3" "$4")"
+        fi
+    fi
+    printf '%s\n' "$text" >&2
+    fail "the worker withdrew its slots (the scheduler's record says it is limited by '${limit:-unreadable}'), which it is sized never to do for CPU used outside this fleet -- see worker_slots"
+}
 
 # --- start the cache ---------------------------------------------------------
 # One listener now, and only the cache. `fastcached` used to carry the scheduler
@@ -952,6 +1051,7 @@ run_launcher "${workdir}/case1.log" -std=c++17 -O1 -c "${proj}/one.cpp" -o "${pr
 
 grep -q "DISPATCHED to " "${workdir}/case1.log" \
     || {
+        fail_if_withdrawn "${workdir}/case1.log" "127.0.0.1:${dispatch_port}" "127.0.0.1:${worker_port}" "$fingerprint"
         cat "${workdir}/case1.log" >&2
         # The worker's side as well. A refusal reaches the client as one line
         # naming a wire error code; WHY it happened is only visible on the worker.
@@ -1186,7 +1286,12 @@ EOF
 "$compiler" -O1 -c "${proj}/seven.c" -o "${proj}/build/seven-ref.o"     || fail "the case 7 reference compile failed"
 
 run_launcher "${workdir}/case7.log" -O1 -c "${proj}/seven.c" -o "${proj}/build/seven.o"     || { cat "${workdir}/case7.log" >&2; fail "the .c compile failed"; }
-grep -q "DISPATCHED to " "${workdir}/case7.log"     || { cat "${workdir}/case7.log" >&2; fail "the .c compile was not dispatched"; }
+grep -q "DISPATCHED to " "${workdir}/case7.log" \
+    || {
+        fail_if_withdrawn "${workdir}/case7.log" "127.0.0.1:${dispatch_port}" "127.0.0.1:${worker_port}" "$fingerprint"
+        cat "${workdir}/case7.log" >&2
+        fail "the .c compile was not dispatched"
+    }
 cmp -s "${proj}/build/seven-ref.o" "${proj}/build/seven.o"     || {
         # C compiled as C++ differs in far more than a byte: this source has
         # external linkage, so the symbol names themselves are mangled.
@@ -1494,6 +1599,7 @@ fi
 
 grep -q "DISPATCHED to " "${workdir}/case12.log" \
     || {
+        fail_if_withdrawn "${workdir}/case12.log" "127.0.0.1:${dispatch_port}" "127.0.0.1:${worker_port}" "$fingerprint"
         cat "${workdir}/case12.log" >&2
         echo "--- worker log ---" >&2
         cat "${workdir}/worker.log" >&2
@@ -1609,6 +1715,7 @@ case13_at() {
 
     grep -q "DISPATCHED to " "${workdir}/case13-${label}.log" \
         || {
+            fail_if_withdrawn "${workdir}/case13-${label}.log" "127.0.0.1:${dispatch_port}" "127.0.0.1:${worker_port}" "$fingerprint"
             cat "${workdir}/case13-${label}.log" >&2 || true
             echo "--- worker log ---" >&2
             cat "${workdir}/worker.log" >&2 || true
@@ -1881,6 +1988,7 @@ else
 
         grep -q "DISPATCHED to " "${workdir}/case14.log" \
             || {
+                fail_if_withdrawn "${workdir}/case14.log" "127.0.0.1:${dispatch_port}" "127.0.0.1:${worker_port}" "$fingerprint"
                 cat "${workdir}/case14.log" >&2 || true
                 fail "case 14 was not dispatched, so it says nothing about a dispatched object"
             }

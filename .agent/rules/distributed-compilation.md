@@ -2656,6 +2656,25 @@ ceiling rather than one of zero; and a tie names the earlier limit in enumerator
 order, which is application order -- left unstated it would depend on how the
 comparison happened to be written and change under somebody tidying it.
 
+**The CPU ceiling charges only the external cores beyond the HEADROOM the slots leave
+(`cores - slots`, floored at zero), never all of them and never a cap at the idle
+cores.** Slots are the share of a machine the fleet may have; charging every external
+core against that share charges all of somebody's work against it. It did: `--slots=4`
+on a 32-core machine was fully withdrawn by four busy cores with 28 idle, and a
+workstation's reserve was spent twice, once deriving the slots and again the moment
+its owner used the cores it holds back. The first repair, `min(slots, idle)`, broke
+the other end: `OfferableSlots` takes an operator's count untouched, so `--slots=64`
+on 16 cores offered 16 on an idle machine, named `external-cpu`. With the slots at the
+core count -- the default on a dedicated node, and every fixture that asked for "the
+whole machine" -- all three formulas agree, which is why no test noticed either. What
+a fixture can never run under is a host with no idle core: that is a machine the fleet correctly
+refuses, so both `dist-compile-e2e` fixtures SKIP on it -- and only when the
+scheduler's `limited-by` and their own CPU reading of the host BOTH say so, since
+the scheduler's answer alone is the product vouching for itself -- and the host
+reading is taken NET of the fixture's own processes, because a spinning daemon or
+scheduler saturates the host by itself and is exactly the regression a raw reading
+would skip.
+
 **A heartbeat age is a duration on a report, never a `TimePoint` on `WorkerInfo`.**
 `WorkerInfo` is what `Pick` returns and what a lease is built from, and an age
 frozen inside a lease stops meaning anything the moment it is stored. Worse,

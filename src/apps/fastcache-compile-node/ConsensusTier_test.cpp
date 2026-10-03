@@ -35,7 +35,6 @@
 #include <expected>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -416,6 +415,100 @@ TEST_CASE("A consensus tier refuses to start without an identity key", "[node][c
     CHECK(tier.error() == ConsensusNeedsIdentityKeyRefusal);
 }
 
+TEST_CASE("A listener handed to consensus is served only on the configured address, and closed when refused",
+          "[node][consensus]")
+{
+    // The cases above choose their peer port by binding port 0 and hand the tier that socket,
+    // so the port is never free between choosing and serving it. What the tier owes such a
+    // caller is checked here: a socket on any ADDRESS but the configured one -- another port, or
+    // the right port on another host -- is refused by name, since every peer dials the configured
+    // address and serving another would be a node nobody can reach that reports itself up; and a
+    // refused socket is closed, not leaked.
+    NullLogger logger;
+    AtomicMetricsSink metrics;
+
+    auto held = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(held);
+    REQUIRE(held->IsBound());
+    auto const heldPort = held->boundPort();
+
+    // The port the configuration names, which is NOT the held one. Nothing binds it here: the
+    // refusal comes before the tier binds anything.
+    auto const namedPort = [] {
+        auto probe = BlockingListener::Bind("127.0.0.1", 0);
+        REQUIRE(probe);
+        REQUIRE(probe->IsBound());
+        return probe->boundPort();
+    }();
+    REQUIRE(namedPort != heldPort);
+
+    Testing::ScratchDirectory const scratch { "consensus-handed-listener" };
+    // A first start: a cluster of one, founded here, whose formation record is the member list
+    // the retired --raft-peer used to spell.
+    auto cfg = Testing::FirstStart(NodeConfig {});
+    cfg.nodeId = "n1";
+    cfg.raftListen = std::format("127.0.0.1:{}", namedPort);
+    cfg.raftSelf = "127.0.0.1";
+    cfg.clusterDir = scratch / "state";
+
+    auto const start = [&](std::unique_ptr<BlockingListener> listener) {
+        return ConsensusTier::Start(
+            cfg,
+            {},
+            Testing::TestKeyPair("n1"),
+            [](Distributed::SchedulerRole, std::string_view, std::uint64_t) {},
+            [](Cluster::ClusterState const&) {},
+            core::platform::defaultSystemWallClock(),
+            {},
+            metrics,
+            logger,
+            nullptr,
+            std::move(listener));
+    };
+
+    SECTION("a socket on another port is refused, naming both addresses, and closed")
+    {
+        auto const started = start(std::move(held));
+        REQUIRE_FALSE(started.has_value());
+        CHECK(started.error().contains(std::format("bound to 127.0.0.1:{}", heldPort)));
+        CHECK(started.error().contains(std::format("names 127.0.0.1:{}", namedPort)));
+        // Closed: the port it held can be claimed again, which a still-open listener forbids.
+        auto const rebound = BlockingListener::Bind("127.0.0.1", heldPort);
+        REQUIRE(rebound);
+        CHECK(rebound->IsBound());
+    }
+
+    SECTION("a listener that never bound is refused, with its own reason")
+    {
+        // Bound to the held port while it is held, which an exclusive claim refuses.
+        auto unbound = BlockingListener::Bind("127.0.0.1", heldPort);
+        REQUIRE(unbound);
+        REQUIRE_FALSE(unbound->IsBound());
+        auto const started = start(std::move(unbound));
+        REQUIRE_FALSE(started.has_value());
+        CHECK(started.error().contains("the listener handed to consensus is not bound"));
+    }
+
+    SECTION("the right port on another host is refused, naming both addresses")
+    {
+        // The configuration names every interface; the socket answers loopback alone. Same port,
+        // so only the HOST comparison can refuse it.
+        cfg.raftListen = std::format("0.0.0.0:{}", heldPort);
+        auto const started = start(std::move(held));
+        REQUIRE_FALSE(started.has_value());
+        CHECK(started.error().contains(std::format("bound to 127.0.0.1:{}", heldPort)));
+        CHECK(started.error().contains(std::format("names 0.0.0.0:{}", heldPort)));
+    }
+
+    SECTION("a configured host NAME is refused rather than matched by its spelling")
+    {
+        cfg.raftListen = std::format("localhost:{}", heldPort);
+        auto const started = start(std::move(held));
+        REQUIRE_FALSE(started.has_value());
+        CHECK(started.error().contains("names its host by name"));
+    }
+}
+
 TEST_CASE("What a node reports about its own quorum is one read of the driver", "[node][consensus][observability]")
 {
     // #435. `ConsensusTier::Status()` is `ConsensusStatusFrom` over a single
@@ -507,18 +600,16 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
     AtomicMetricsSink metrics;
 
     // Port 0 is refused by the member grammar, so bind an ephemeral one the ordinary way.
-    auto probe = BlockingListener::Bind("127.0.0.1", 0);
-    REQUIRE(probe);
-    REQUIRE(probe->IsBound());
-    auto const port = probe->boundPort();
-    probe.reset();
+    // Held, never released: the tier is handed this socket, so the port is not free for anything
+    // else on the host between choosing it and serving it.
+    auto held = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(held);
+    REQUIRE(held->IsBound());
+    auto const port = held->boundPort();
 
     Testing::ScratchDirectory const scratchDirectory { "consensus-forget-only-voter" };
+    scratchDirectory.Write("cluster.key", std::string(32, 'k'));
     auto const& scratch = scratchDirectory.Path();
-    {
-        auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
-        key << std::string(32, 'k');
-    }
 
     auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.nodeId = "n1";
@@ -542,7 +633,9 @@ TEST_CASE("A running one-voter tier refuses to forget its only voter, and nothin
         core::platform::defaultSystemWallClock(),
         {},
         metrics,
-        logger);
+        logger,
+        nullptr,
+        std::move(held));
     REQUIRE(started.has_value());
     auto const& tier = *started;
 
@@ -883,18 +976,16 @@ TEST_CASE("A lone voter endorses the roster it applied, under its own key, and r
     NullLogger logger;
     AtomicMetricsSink metrics;
 
-    auto probe = BlockingListener::Bind("127.0.0.1", 0);
-    REQUIRE(probe);
-    REQUIRE(probe->IsBound());
-    auto const port = probe->boundPort();
-    probe.reset();
+    // Held, never released: the tier is handed this socket, so the port is not free for anything
+    // else on the host between choosing it and serving it.
+    auto held = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(held);
+    REQUIRE(held->IsBound());
+    auto const port = held->boundPort();
 
     Testing::ScratchDirectory const scratchDirectory { "consensus-endorse" };
+    scratchDirectory.Write("cluster.key", std::string(32, 'k'));
     auto const& scratch = scratchDirectory.Path();
-    {
-        auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
-        key << std::string(32, 'k');
-    }
 
     auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.nodeId = "n1";
@@ -922,7 +1013,9 @@ TEST_CASE("A lone voter endorses the roster it applied, under its own key, and r
             seen->endorsements.push_back(endorsement);
         },
         metrics,
-        logger);
+        logger,
+        nullptr,
+        std::move(held));
     REQUIRE(started.has_value());
     auto const& tier = *started;
 
@@ -1058,22 +1151,20 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
     NullLogger logger;
     AtomicMetricsSink metrics;
 
-    auto probe = BlockingListener::Bind("127.0.0.1", 0);
-    REQUIRE(probe);
-    REQUIRE(probe->IsBound());
-    auto const port = probe->boundPort();
-    probe.reset();
+    // Held, never released: the tier is handed this socket, so the port is not free for anything
+    // else on the host between choosing it and serving it.
+    auto held = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(held);
+    REQUIRE(held->IsBound());
+    auto const port = held->boundPort();
 
     // Cleared first and removed after, which a bare `UniqueScratchPath` is not: its name is the
     // pid and a counter, Windows reuses pids freely, and a directory an earlier run left behind
     // under the same name holds a log `PlantConsensusState` cannot write over -- every section
     // then failed at its `SaveLog`, in two runs of four on a host holding 2,933 such directories.
     Testing::ScratchDirectory const scratchDirectory { "consensus-unreadable-state" };
+    scratchDirectory.Write("cluster.key", std::string(32, 'k'));
     auto const& scratch = scratchDirectory.Path();
-    {
-        auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
-        key << std::string(32, 'k');
-    }
 
     auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.nodeId = "n1";
@@ -1102,7 +1193,9 @@ TEST_CASE("A node whose own consensus state this build cannot read refuses to st
             core::platform::defaultSystemWallClock(),
             {},
             metrics,
-            logger);
+            logger,
+            nullptr,
+            std::move(held));
     };
 
     SECTION("control: state this build wrote starts, with the snapshot restored and the entry above it applied")
@@ -1385,17 +1478,19 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
     AtomicMetricsSink metrics;
     NodeConditions conditions;
 
-    auto const self = FreeLoopbackPort();
+    // The tier's own port is held and handed over, so it is never free between choosing it and
+    // serving it.
+    auto held = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(held);
+    REQUIRE(held->IsBound());
+    auto const self = held->boundPort();
     // Nobody answers here. The tier dials its leader and fails, which is ordinary for a
     // follower that has not reached its leader yet; the leader reaches IT, below.
     auto const leaderPort = FreeLoopbackPort();
 
     Testing::ScratchDirectory const scratchDirectory { "consensus-unreadable-install" };
+    scratchDirectory.Write("cluster.key", std::string(32, 'k'));
     auto const& scratch = scratchDirectory.Path();
-    {
-        auto key = std::ofstream { scratch / "cluster.key", std::ios::binary };
-        key << std::string(32, 'k');
-    }
 
     auto cfg = Testing::FirstStart(NodeConfig {});
     cfg.nodeId = "n2";
@@ -1429,7 +1524,8 @@ TEST_CASE("A running tier offered a snapshot it cannot read raises unreadable-le
         {},
         metrics,
         logger,
-        &conditions);
+        &conditions,
+        std::move(held));
     REQUIRE(started.has_value());
     auto const& tier = *started;
     REQUIRE(conditions.StateOf(NodeCondition::UnreadableLeaderSnapshot) == CompileCacheWire::ConditionState::Clear);

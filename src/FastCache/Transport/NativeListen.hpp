@@ -6,8 +6,10 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include <core/net/IListener.hpp>
 #include <core/net/NetError.hpp>
@@ -79,6 +81,17 @@ struct BoundSocket
 /// @return The port @p socket is bound to, or 0 when it cannot be asked.
 [[nodiscard]] std::uint16_t BoundPortOf(core::platform::NativeHandle socket) noexcept;
 
+/// @return The address @p socket is bound to as the KERNEL reports it -- "127.0.0.1", "::1",
+///         "0.0.0.0" -- in `CanonicalAddressLiteral`'s spelling, or empty when it cannot be asked.
+[[nodiscard]] std::string BoundAddressOf(core::platform::NativeHandle socket);
+
+/// The canonical spelling of an IPv4 or IPv6 address literal -- the one `BoundAddressOf` reports,
+/// so `::0001` and `::1` compare equal. Pure: nothing is looked up, so a host NAME is not a
+/// literal and answers nothing.
+/// @param text The text, unbracketed.
+/// @return The canonical literal, or nothing when @p text is not an address literal.
+[[nodiscard]] std::optional<std::string> CanonicalAddressLiteral(std::string_view text);
+
 /// Close a socket this file handed out, ignoring the result.
 void CloseNativeSocket(core::platform::NativeHandle socket) noexcept;
 
@@ -121,6 +134,21 @@ struct AcceptedSocket
 /// @return The listener, or why the descriptor could not be served.
 [[nodiscard]] std::expected<std::unique_ptr<core::net::IListener>, std::string> AdoptInheritedListener(
     core::net::EventLoop& loop, int descriptor);
+
+/// A listener over a socket this process bound and set listening itself, driven by @p loop.
+///
+/// For a caller that must hold a port from the moment it is chosen until the moment it is
+/// served: binding port 0, reading the port and closing the socket so a loop can bind it again
+/// leaves the port free in between, and on a host running other processes it is an ephemeral
+/// port something else may take. Handing the bound socket over closes that gap.
+///
+/// **@p handle is this call's on every path**, as `AdoptInheritedListener`'s descriptor is: the
+/// listener closes it, and a handle `core::net::adoptListener` refuses is closed here.
+/// @param loop The loop the listener belongs to.
+/// @param handle A bound, listening socket; owned from here on.
+/// @return The listener, or why the socket could not be served.
+[[nodiscard]] std::expected<std::unique_ptr<core::net::IListener>, std::string> AdoptBoundListener(
+    core::net::EventLoop& loop, core::platform::NativeHandle handle);
 
 /// A TCP listener a thread BLOCKS on: `accept()` completes before it returns.
 ///
@@ -167,6 +195,10 @@ class BlockingListener final: public core::net::IListener
 
     [[nodiscard]] std::uint16_t boundPort() const noexcept override;
 
+    /// @return The address this listener is bound to, as the kernel reports it; empty when it is
+    ///         not bound. See `BoundAddressOf`.
+    [[nodiscard]] std::string BoundAddress() const;
+
     /// @param acceptPoll How long one accept waits before answering `Timeout`; zero waits for ever.
     /// @param ioTimeout The send and receive timeout every accepted socket gets; zero for none.
     void SetTimeouts(std::chrono::milliseconds acceptPoll, std::chrono::milliseconds ioTimeout) noexcept;
@@ -181,6 +213,14 @@ class BlockingListener final: public core::net::IListener
     [[nodiscard]] std::string_view BindError() const noexcept
     {
         return _bindError;
+    }
+
+    /// Hand the listening socket out and own it no longer -- to `AdoptBoundListener`, so a
+    /// loop serves the port this bound without it ever being released in between.
+    /// @return The socket, or `InvalidHandle` when none is bound; the caller owns it.
+    [[nodiscard]] core::platform::NativeHandle Release() noexcept
+    {
+        return std::exchange(_handle, core::platform::InvalidHandle);
     }
 
   private:

@@ -392,6 +392,15 @@ enum class DrainAction : std::uint8_t
     Last, ///< Not an action; `EnumTable`'s length.
 };
 
+/// How often a stop says what it is still waiting for.
+///
+/// A stop that says nothing for the whole timeout is indistinguishable from one
+/// that has hung, which is the reading this whole change exists to prevent -- so
+/// the interval is short enough that an operator watching `systemctl stop` sees
+/// the count fall rather than a pause. Declared here rather than beside `Drain` so a
+/// case can pin it: one releasing its slot on the report alone accepts any cadence.
+inline constexpr std::chrono::seconds DrainReportInterval { 2 };
+
 /// Decide what a stop does next.
 ///
 /// `Finished` outranks everything, including an expired bound: a stop that has

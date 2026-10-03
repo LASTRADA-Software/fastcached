@@ -1113,6 +1113,14 @@ The log lines stay.
   that left. `EveryFleetRowHasAnEvaluator` makes a `Scheduler`-scope row with no evaluator a BUILD
   failure. The LEASE's toolchain label is display only, like a worker's, and reaches the row through
   `ListDetail`, which escapes it: a label is never a reason to refuse a lease.
+- **And the leader says `clear` only once it has WATCHED.** What those rows read reaches the leader
+  alone and nothing another leader saw survives a failover, so a leadership younger than a row's
+  span (`FleetConditionRow::observation`: `UnservedToolchains::Window`, the heartbeat timeout)
+  answers `not-evaluated` -- undecided must not read as clear -- while a refusal it does see is
+  raised at once. Leading in a new TERM is a new leadership even with no demotion seen, since another
+  node may have led in between. The role change and every evaluation are ONE ordered decision
+  (`SchedulerTier::_roleMutex`): without it a watch pass that read `Leader` could write its stale
+  raise or clear over a demotion's `not-evaluated`, for up to an interval.
 
 ## Open work
 

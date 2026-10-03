@@ -67,10 +67,8 @@ namespace
         if (ntdll == nullptr)
             return {};
 
-        // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast) -- GetProcAddress
-        // returns FARPROC and there is no other way to call through it.
-        auto* const entry =
-            reinterpret_cast<RtlGetVersionFn>(reinterpret_cast<void*>(::GetProcAddress(ntdll, "RtlGetVersion")));
+        // GetProcAddress returns FARPROC, and a cast is the only way to call through it.
+        auto* const entry = reinterpret_cast<RtlGetVersionFn>(::GetProcAddress(ntdll, "RtlGetVersion"));
         if (entry == nullptr)
             return {};
 

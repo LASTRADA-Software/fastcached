@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -19,6 +20,44 @@
 
 namespace FastCache::Testing
 {
+
+namespace Detail
+{
+    /// Remove whatever an earlier process left at @p path, or throw naming it and the error.
+    ///
+    /// **The one place a leftover is cleared, and the one argument for why that is safe.** The name
+    /// carries THIS process's pid, and an operating system hands a pid to a new process only once
+    /// the one that held it is gone -- so what sits there is this process's own earlier leftover,
+    /// or a dead process's whose pid was reused. It is never a live peer's, whose pid differs, which
+    /// is exactly what a bare counter did reach.
+    ///
+    /// **A leftover that cannot be cleared is a refusal, never a reuse.** Handed back with a dead
+    /// process's files still in it, it is the flake this header exists for, silently: four
+    /// consensus-tier cases once read a stale Raft log out of one and failed about one run in two.
+    /// Thrown rather than returned because every caller is a fixture, and Catch2 reports the throw
+    /// as a failure of the case that constructed it, which is where it belongs.
+    /// @param path What to clear.
+    inline void RemoveLeftover(std::filesystem::path const& path)
+    {
+        auto error = std::error_code {};
+        std::filesystem::remove_all(path, error);
+        if (error)
+            throw std::runtime_error { std::format(
+                "scratch: cannot clear {} before using it ({}); refusing to reuse what an earlier run left there",
+                path.string(),
+                error.message()) };
+    }
+
+    /// Create @p path, parents and all, or throw naming it and the error.
+    /// @param path The directory to create.
+    inline void CreateScratch(std::filesystem::path const& path)
+    {
+        auto error = std::error_code {};
+        std::filesystem::create_directories(path, error);
+        if (error)
+            throw std::runtime_error { std::format("scratch: cannot create {}: {}", path.string(), error.message()) };
+    }
+} // namespace Detail
 
 /// A scratch directory name no other test process can collide with.
 ///
@@ -47,46 +86,47 @@ namespace FastCache::Testing
 ///
 /// @param prefix Short, human-recognisable tag so a leaked directory can be
 ///        traced back to the test that made it.
-/// @return An absolute path under the system temp directory. NOT created.
-[[nodiscard]] inline std::filesystem::path UniqueScratchPath(std::string_view prefix)
+/// @param parent Directory the name is placed under. Defaults to the system
+///        temp directory; a caller that reparents the name elsewhere passes
+///        its own, so the clear below reaches the path it actually uses
+///        rather than the default one it discarded.
+/// @return A path under `parent`, absolute exactly when `parent` is, guaranteed
+///         not to exist at return time. Nothing is created there.
+/// @throws std::runtime_error if a leftover exists at that name and this cannot remove it
+///         (`Detail::RemoveLeftover`).
+[[nodiscard]] inline std::filesystem::path UniqueScratchPath(
+    std::string_view prefix, std::filesystem::path const& parent = std::filesystem::temp_directory_path())
 {
     // Process id AND a counter. The pid separates concurrent test processes; the
-    // counter separates several scratch directories within one case. Either alone
-    // is insufficient, which is exactly how the original bug survived review.
-    static int counter = 0;
+    // counter separates several scratch directories within one process, and is
+    // atomic because a case may draw names from more than one thread.
+    static std::atomic<unsigned long> counter { 0 };
 #if defined(_WIN32)
     auto const pid = static_cast<unsigned long>(::GetCurrentProcessId());
 #else
     auto const pid = static_cast<unsigned long>(::getpid());
 #endif
-    return std::filesystem::temp_directory_path() / std::format("{}-{}-{}", prefix, pid, ++counter);
+    auto path = parent / std::format("{}-{}-{}", prefix, pid, ++counter);
+
+    // Folded in here rather than left to each caller: a raw call site that creates a
+    // directory at this name and never removes it leaked several hundred
+    // `consensus-unreadable-state-*` directories into %TEMP%, each holding a
+    // snapshot-trimmed Raft log. When Windows later reused that dead process's pid, a
+    // fresh test process computed the SAME name, reopened that log as its own, and
+    // failed a `SaveLog` gap check the log's real history never provoked.
+    Detail::RemoveLeftover(path);
+    return path;
 }
 
 /// Empty @p path and create it afresh, or throw naming the path and the error.
 ///
-/// **A directory that cannot be cleared is a refusal, never a reuse.** The name a
-/// `ScratchDirectory` takes is this process's pid and a counter, so what this can reach is
-/// this process's own earlier leftovers or a dead process's whose pid was reused -- and a
-/// leftover that SURVIVES the clear is exactly that inheritance: four consensus-tier cases
-/// once read a stale Raft log out of one and failed about one run in two. The clear used to
-/// discard `remove_all`'s error, so a directory holding a file somebody still had open was
-/// handed back with its contents as if it were fresh.
-///
-/// Throws, rather than returning a code, because every caller is a fixture: Catch2 reports the
-/// throw as a failure of the case that constructed it, which is where it belongs.
+/// The clear is `Detail::RemoveLeftover`'s, so a directory that cannot be cleared is refused
+/// here exactly as `UniqueScratchPath` refuses a name it cannot clear.
 /// @param path The directory to empty and create.
 inline void ClearScratch(std::filesystem::path const& path)
 {
-    auto error = std::error_code {};
-    std::filesystem::remove_all(path, error);
-    if (error)
-        throw std::runtime_error { std::format(
-            "scratch: cannot clear {} before using it ({}); refusing to reuse what an earlier run left there",
-            path.string(),
-            error.message()) };
-    std::filesystem::create_directories(path, error);
-    if (error)
-        throw std::runtime_error { std::format("scratch: cannot create {}: {}", path.string(), error.message()) };
+    Detail::RemoveLeftover(path);
+    Detail::CreateScratch(path);
 }
 
 /// Remove @p path, and say so on @p diagnostics when it cannot be removed.
@@ -94,7 +134,7 @@ inline void ClearScratch(std::filesystem::path const& path)
 /// A WARNING rather than a throw, because its caller is a destructor: one that throws while a
 /// failed assertion is already unwinding ends the process and loses the report of the failure
 /// that caused it. The warning is enough because the next construction under the same name is
-/// what guards the reuse -- `ClearScratch` refuses a directory it cannot clear -- so a leftover
+/// what guards the reuse -- `UniqueScratchPath` refuses a name it cannot clear -- so a leftover
 /// costs disk space and a line of output, never a test reading another run's files.
 /// @param path The directory to remove.
 /// @param diagnostics Where a failure is reported.
@@ -127,16 +167,13 @@ class ScratchDirectory
   public:
     /// Create a directory under the system temp location.
     /// @param prefix Human-recognisable tag; see `UniqueScratchPath`.
-    /// @throws std::runtime_error When the directory cannot be cleared or created (`ClearScratch`).
+    /// @throws std::runtime_error When a leftover at the name cannot be cleared
+    ///         (`UniqueScratchPath`), or the directory cannot be created.
     explicit ScratchDirectory(std::string_view prefix):
         _path { UniqueScratchPath(prefix) }
     {
-        // Clearing first is safe ONLY because the name carries this process's
-        // pid: what it can reach is this process's own earlier leftovers, or a
-        // dead process whose pid was reused. It can never reach a live peer's
-        // directory -- which is precisely what it did do while the name was a
-        // bare counter, turning a name collision into deleted data.
-        ClearScratch(_path);
+        // Created only: `UniqueScratchPath` has already cleared the name, or refused it.
+        Detail::CreateScratch(_path);
     }
 
     ScratchDirectory(ScratchDirectory const&) = delete;

@@ -4406,15 +4406,17 @@ TEST_CASE("A LEASE carries the client's unreachable workers, and none is an empt
     auto const noneView = DecodeLeasePayload(std::span<std::byte const> { none }.subspan(RequestHeaderSize));
     REQUIRE(noneView.has_value());
     CHECK(Unwrap(noneView).excluded.empty());
-    CHECK(OpFieldCount(Op::Lease) == 4);
+    CHECK(OpFieldCount(Op::Lease) == 5);
 }
 
 TEST_CASE("A LEASE naming too many, an empty or an over-long exclusion is refused", "[wire][lease][exclusion]")
 {
     auto const leaseWith = [](std::vector<std::span<std::byte const>> const& entries) {
         auto const list = WireFields::Encode(WireFields::FieldList { entries });
-        auto const fields =
-            std::vector<std::span<std::byte const>> { AsBytes("f"), AsBytes("k"), {}, std::span<std::byte const> { list } };
+        // The label after the list, empty: a LEASE carries both, and the arity is exact.
+        auto const fields = std::vector<std::span<std::byte const>> {
+            AsBytes("f"), AsBytes("k"), {}, std::span<std::byte const> { list }, {}
+        };
         return WireFields::Encode(WireFields::FieldList { fields });
     };
 
@@ -4444,6 +4446,27 @@ TEST_CASE("A LEASE naming too many, an empty or an over-long exclusion is refuse
     REQUIRE(Unwrap(view).excluded.size() == MaxLeaseExclusions);
     CHECK(AsStringView(Unwrap(view).excluded.front()) == "w0:1");
     CHECK(AsStringView(Unwrap(view).excluded.back()) == std::format("w{}:1", MaxLeaseExclusions - 1));
+}
+
+TEST_CASE("A LEASE carries its exclusions and its toolchain label together", "[wire][lease][exclusion]")
+{
+    // Two lanes each gave LEASE a fourth field -- the exclusion list and the label -- and the
+    // integration carries both. Each lane's own case leaves the other's field EMPTY, so a decoder
+    // that read the label out of the exclusions' slot, or the other way round, would pass both.
+    // This one sets every field at once, with values neither field could mistake for the other.
+    std::array<std::string_view, 2> const excluded { "laptop.corp:6676", "10.0.0.9:6676" };
+    constexpr std::string_view Label = "cl 19.44.35207";
+    auto const frame = EncodeLease(LeaseRequest {
+        .fingerprint = "fp", .key = "objkey", .acceptedCodecs = { 1 }, .excluded = excluded, .toolchainLabel = Label });
+    auto const decoded = DecodeLeasePayload(std::span<std::byte const> { frame }.subspan(RequestHeaderSize));
+    REQUIRE(decoded.has_value());
+    CHECK(AsStringView(Unwrap(decoded).fingerprint) == "fp");
+    CHECK(AsStringView(Unwrap(decoded).key) == "objkey");
+    CHECK(Unwrap(decoded).acceptedCodecs == CodecList { 1 });
+    REQUIRE(Unwrap(decoded).excluded.size() == 2);
+    CHECK(AsStringView(Unwrap(decoded).excluded[0]) == "laptop.corp:6676");
+    CHECK(AsStringView(Unwrap(decoded).excluded[1]) == "10.0.0.9:6676");
+    CHECK(AsStringView(Unwrap(decoded).toolchainLabel) == Label);
 }
 
 TEST_CASE("A LEASE carries the client's toolchain label", "[wire][lease]")
@@ -4537,7 +4560,8 @@ TEST_CASE("The longest NODE-ANNOUNCE is exactly the budget its constants add up 
     CHECK(Unwrap(decoded).capacity.interfaceAddresses.size() == MaxInterfaceAddresses);
     CHECK(Unwrap(decoded).load.history.size() == MaxHistoryBucketsPerHeartbeat);
     REQUIRE(Unwrap(decoded).load.conditions.has_value());
-    CHECK(Unwrap(decoded).load.conditions->size() == MaxNodeConditions);
-    CHECK(Unwrap(decoded).load.conditions->back().remedy.size() == MaxConditionRemedyBytes);
+    auto const& conditions = Unwrap(Unwrap(decoded).load.conditions);
+    REQUIRE(conditions.size() == MaxNodeConditions);
+    CHECK(conditions.back().remedy.size() == MaxConditionRemedyBytes);
     CHECK(Unwrap(decoded).endorsement.size() == MaxRosterEndorsementBytes);
 }

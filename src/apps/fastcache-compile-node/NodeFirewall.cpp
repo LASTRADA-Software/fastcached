@@ -95,20 +95,20 @@ std::vector<FirewallRule> NodeFirewallRules(NodeConfig const& cfg, std::filesyst
     return rules;
 }
 
-StateDirectoryFormationReader::StateDirectoryFormationReader(NodeConfig const& cfg):
-    _cfg { cfg }
+StateDirectoryFormationReader::StateDirectoryFormationReader(std::optional<std::filesystem::path> directory):
+    _directory { std::move(directory) }
 {
 }
 
 std::expected<KeptFormation, std::string> StateDirectoryFormationReader::Read() const
 {
-    auto const directory = ChosenStateDirectory(_cfg);
-    if (!directory.has_value())
+    if (!_directory.has_value())
         return std::unexpected { std::string { "this node has no state directory to keep its formation record in" } };
-    Cluster::FileFormationStore const store { directory->path };
-    Cluster::FleetEndpointsFile endpoints { directory->path };
+    auto const& directory = *_directory;
+    Cluster::FileFormationStore const store { directory };
+    Cluster::FleetEndpointsFile endpoints { directory };
     return ReadKeptFormation(store, endpoints).transform_error([&directory](std::string const& error) {
-        return error + StateFileUnreadableHint(directory->path / Cluster::FormationRecordFileName);
+        return error + StateFileUnreadableHint(directory / Cluster::FormationRecordFileName);
     });
 }
 
@@ -149,6 +149,19 @@ ServiceControlResult InstallWithServiceFirewall(std::function<ServiceControlResu
     if (auto const rejection = NodeInstallRejection(*shaped))
         return refused(*rejection);
     return WithRegistrationFirewall(std::move(registered), firewall, serviceName, NodeFirewallRules(*shaped, program));
+}
+
+ServiceControlResult InstallNodeService(NodeConfig const& merged,
+                                        NodeConfig const& registration,
+                                        IConfigPathProbe const& probe,
+                                        std::filesystem::path const& program,
+                                        std::function<ServiceControlResult(ServiceSpec const&)> const& install,
+                                        IFirewall* firewall)
+{
+    auto const spec = MakeNodeServiceSpec(program, registration, probe);
+    StateDirectoryFormationReader const formation { RegisteredStateDirectory(registration, probe) };
+    return InstallWithServiceFirewall(
+        [&install, &spec] { return install(spec); }, merged, spec.exePath, spec.serviceName, formation, firewall);
 }
 
 } // namespace FastCache::Node

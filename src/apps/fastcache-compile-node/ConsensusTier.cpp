@@ -359,7 +359,8 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
     EndorsementObserver onEndorsement,
     IMetricsSink& metrics,
     ILogger& logger,
-    NodeConditions* conditions)
+    NodeConditions* conditions,
+    std::unique_ptr<BlockingListener> boundListener)
 {
     // The members the FORMATION starts consensus with (`BootstrapMembersOf`): this node alone
     // where it runs its own cluster, the fleet's roster where it joined one -- never both. No
@@ -458,7 +459,8 @@ std::expected<std::unique_ptr<ConsensusTier>, std::string> ConsensusTier::Start(
                                                                      logger,
                                                                      conditions } };
 
-    if (auto started = tier->Launch(cfg, members, bootstrap, endpoint.host, endpoint.port); !started.has_value())
+    if (auto started = tier->Launch(cfg, members, bootstrap, endpoint.host, endpoint.port, std::move(boundListener));
+        !started.has_value())
         return std::unexpected { started.error() };
 
     logger.Logf(LogLevel::Info,
@@ -475,35 +477,75 @@ std::expected<void, std::string> ConsensusTier::Launch(NodeConfig const& cfg,
                                                        std::vector<Cluster::MemberSpec> const& dialable,
                                                        std::vector<Cluster::MemberSpec> const& bootstrap,
                                                        std::string_view bindAddress,
-                                                       std::uint16_t bindPort)
+                                                       std::uint16_t bindPort,
+                                                       std::unique_ptr<BlockingListener> boundListener)
 {
-    // Bound against THIS node's reactor, which is what makes `co_await Accept()`
-    // and every read inside `RaftPeerServer` actually suspend. A blocking listener
-    // would serve the first peer that connects and never accept another.
-    auto listened = core::net::listen(_reactor, core::net::ListenOptions { .host = bindAddress, .port = bindPort });
-
-    // The failure is the `expected`'s, and carries its own diagnostic.
-    if (!listened.has_value())
+    // A socket the caller already bound is served as it is, and only if it is the ADDRESS the
+    // configuration names -- host and port both: every peer dials `--raft-peer`'s address for
+    // this node, so a listener on another port, or on another interface of the right port, is
+    // a node nobody can reach that reports itself up. Adopted onto THIS node's reactor, for the
+    // reason the bind below is.
+    if (boundListener != nullptr)
     {
-        // Through the row (#352), which carries why this is fatal. Not restated
-        // here: a paraphrase beside a pointer is two copies that can disagree.
-        auto judged = JudgeBindFailure(
-            RowFor(NodeSurface::Raft),
-            std::format("cannot bind {}: {}", FormatHostPort(bindAddress, bindPort), listened.error().toString()),
-            _logger);
-        if (!judged.has_value())
-            return std::unexpected { std::move(judged).error() };
-
-        // Refused rather than tolerated (#352). This is the earliest point in `Launch`,
-        // so returning success here hands `Start` a tier whose `_transport`, `_driver`,
-        // `_sink` and `_peerServer` were never built -- it would log "consensus on ..."
-        // against a listener that never bound, and the first `Propose` would dereference
-        // a null `_driver`. Carrying a tolerated verdict here is not a branch, it is the
-        // rest of this function.
-        return std::unexpected { BindToleranceUnsupported(
-            RowFor(NodeSurface::Raft), "the tier's driver, transport and peer server are built below this point") };
+        if (!boundListener->IsBound())
+            return std::unexpected { std::format("the listener handed to consensus is not bound: {}",
+                                                 boundListener->BindError()) };
+        // The host is compared as the KERNEL reports it, against the configured host's canonical
+        // literal. A configured NAME would need a lookup this path does not make, so it is refused
+        // rather than matched by spelling; an empty host is the wildcard, which either family's
+        // unspecified address answers.
+        auto const heldHost = boundListener->BoundAddress();
+        auto const heldPort = boundListener->boundPort();
+        auto const configuredHost = CanonicalAddressLiteral(bindAddress);
+        if (!bindAddress.empty() && !configuredHost.has_value())
+            return std::unexpected { std::format(
+                "the listener handed to consensus cannot be matched to {}: the configuration names its host by name, "
+                "and a handed listener is matched against an address literal only",
+                FormatHostPort(bindAddress, bindPort)) };
+        auto const hostMatches =
+            bindAddress.empty() ? (heldHost == "0.0.0.0" || heldHost == "::") : heldHost == *configuredHost;
+        if (!hostMatches || heldPort != bindPort)
+            return std::unexpected { std::format(
+                "the listener handed to consensus is bound to {}, and the configuration names {}",
+                FormatHostPort(heldHost, heldPort),
+                FormatHostPort(bindAddress, bindPort)) };
+        auto adopted = AdoptBoundListener(_reactor, boundListener->Release());
+        if (!adopted.has_value())
+            return std::unexpected { std::format("cannot serve the listener handed to consensus on {}: {}",
+                                                 FormatHostPort(bindAddress, bindPort),
+                                                 adopted.error()) };
+        _listener = std::move(*adopted);
     }
-    _listener = std::move(*listened);
+    else
+    {
+        // Bound against THIS node's reactor, which is what makes `co_await Accept()`
+        // and every read inside `RaftPeerServer` actually suspend. A blocking listener
+        // would serve the first peer that connects and never accept another.
+        auto listened = core::net::listen(_reactor, core::net::ListenOptions { .host = bindAddress, .port = bindPort });
+
+        // The failure is the `expected`'s, and carries its own diagnostic.
+        if (!listened.has_value())
+        {
+            // Through the row (#352), which carries why this is fatal. Not restated
+            // here: a paraphrase beside a pointer is two copies that can disagree.
+            auto judged = JudgeBindFailure(
+                RowFor(NodeSurface::Raft),
+                std::format("cannot bind {}: {}", FormatHostPort(bindAddress, bindPort), listened.error().toString()),
+                _logger);
+            if (!judged.has_value())
+                return std::unexpected { std::move(judged).error() };
+
+            // Refused rather than tolerated (#352). This is the earliest point in `Launch`,
+            // so returning success here hands `Start` a tier whose `_transport`, `_driver`,
+            // `_sink` and `_peerServer` were never built -- it would log "consensus on ..."
+            // against a listener that never bound, and the first `Propose` would dereference
+            // a null `_driver`. Carrying a tolerated verdict here is not a branch, it is the
+            // rest of this function.
+            return std::unexpected { BindToleranceUnsupported(
+                RowFor(NodeSurface::Raft), "the tier's driver, transport and peer server are built below this point") };
+        }
+        _listener = std::move(*listened);
+    }
 
     // Two lists out of two, and the split is the whole of how a node joins. Who
     // this node DIALS is everything its operator named; who consensus COUNTS is

@@ -3,7 +3,6 @@
 #include "Dispatch.hpp"
 
 #include <FastCache/Core/HostPort.hpp>
-
 #include <FastCache/Core/Utf8.hpp>
 
 #include <algorithm>
@@ -414,11 +413,12 @@ namespace
         {
             // Rebuilt per attempt: `Exchange` takes the frame by value and moves it,
             // so the second ask cannot reuse the first one's bytes.
-            auto frame = Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = request.fingerprint,
-                                                                .key = request.objectKey,
-                                                                .acceptedCodecs = accepted,
-                                                                .excluded = excluded,
-                                                                .toolchainLabel = SendableToolchainLabel(request.toolchainLabel) });
+            auto frame =
+                Wire::EncodeLease(Wire::LeaseRequest { .fingerprint = request.fingerprint,
+                                                       .key = request.objectKey,
+                                                       .acceptedCodecs = accepted,
+                                                       .excluded = excluded,
+                                                       .toolchainLabel = SendableToolchainLabel(request.toolchainLabel) });
             attempt.outcome = exchange.Exchange(attempt.scheduler, std::move(frame), credential, budget);
 
             auto redirect = RedirectTarget(attempt.outcome);

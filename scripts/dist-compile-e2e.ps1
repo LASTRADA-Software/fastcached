@@ -62,6 +62,10 @@ param(
     [string]$Fastcached = "$PSScriptRoot/../out/build/clangcl-debug/target/fastcached.exe",
     [string]$Node       = "$PSScriptRoot/../out/build/clangcl-debug/target/fastcache-compile-node.exe",
     [string]$Launcher   = "$PSScriptRoot/../out/build/clangcl-debug/target/fastcache-cc.exe",
+    # Asked for the scheduler's own record of a worker when a dispatch comes back
+    # withdrawn; see `Assert-NotWithdrawn`. Without it a withdrawal still fails, and
+    # cannot say which limit took the slots.
+    [string]$Cli        = "",
     # Zero allocates a free block per run, which is the default; a non-zero value
     # pins one, which is what somebody reproducing a failure wants. See
     # `Get-FreePortBlock` for why the fixed default had to go.
@@ -133,6 +137,12 @@ $NoLocalCache = "--cache-memory=0"
 # Not a LOG name problem: with every kill made late, the same removal met the
 # isolation scheduler's `raft-log` first, and a state directory has no per-driver
 # name to give it. Waiting longer only moves that line; sharing nothing removes it.
+#
+# Nor is it only this run's processes: Defender opens a file to scan it when its last
+# writer closes it, and a delete meeting that handle fails with a sharing violation.
+# Measured: `iso-scheduler.log` refused its delete with the Restart Manager naming
+# `WinDefend` as the only holder, and the run failed as "The process cannot access the
+# file" with every case green.
 $scratchBase = Join-Path (Split-Path (Split-Path $Launcher -Parent) -Parent) "dist-e2e"
 
 # How many consecutive ports the run needs, counted from `$BasePort`.
@@ -258,13 +268,30 @@ function Start-Background([string]$path, [string[]]$arguments, [string]$errorLog
 # its cases run from `-SelfTest` below.
 Import-Module (Join-Path $PSScriptRoot "lib/E2EProcesses.psm1") -Force
 
+# How long the killed processes are given, together, to be gone.
+#
+# A stall bound rather than an estimate: a kill is not instant, and on a
+# saturated host it was measured taking 2.2 s with one busy thread per core and
+# over 5 s with three -- where the 5 s this used to allow ran out, silently, and
+# the run carried on beside a process still holding its port and its log. One
+# that is not gone in a minute is wedged, and is reported as such.
+$KillWaitMilliseconds = 60000
+
 function Stop-Spawned {
     # Every spawned process, on every exit path. One left holding a port makes the
     # NEXT run fail at startup for a reason unrelated to what actually broke -- so
     # one that outlives the bound is NAMED, rather than returned from in silence.
-    $survivors = @(Stop-E2EProcesses $script:procs $script:spawnedCommandLines)
-    foreach ($line in $survivors) { Write-Host "teardown: $line" }
+    #
+    # Returns one line per process NOT gone within `$KillWaitMilliseconds`, and the
+    # caller prints them at once and decides what they mean. Between drivers they are
+    # FATAL when `-BasePort` is pinned, since every driver then shares one port block and
+    # the next pass would start beside them; with the default, each driver has a port
+    # block and a directory of its own, so they are counted and fail the exit status in
+    # the `finally`. In the `finally` they are lines, since an exception there would
+    # replace the real diagnostic with one about tearing down.
+    $survivors = @(Stop-E2EProcesses $script:procs $script:spawnedCommandLines -BoundMilliseconds $KillWaitMilliseconds)
     $script:procs = @()
+    return $survivors
 }
 
 # Read a file another process is still writing to.
@@ -828,6 +855,75 @@ function New-SyntheticCoff([string]$path, [object[]]$sections, [uint32]$stamp = 
     [System.IO.File]::WriteAllBytes($path, $all.ToArray())
 }
 
+# ---- a worker that withdrew its slots --------------------------------------
+#
+# The worker every dispatching case uses is offered one slot above this host's
+# core count (see `$workerSlots`), so CPU used outside this fleet cannot withdraw
+# it: a `rejected (withdrawn)` is a FAILURE, never a skip, and the useful thing to
+# say is WHICH limit took the slots -- memory and scratch still can, and should, on
+# a starved host. Load-driven withdrawal itself is the product's behaviour and is
+# covered where it lives: `NodePolicy_test.cpp`'s `SlotCeilingsFor` cases, and the
+# `Withdrawn` refusal in `SchedulerProtocol_test.cpp` and `WorkerRegistry_test.cpp`.
+
+# Whether a launcher's output is the scheduler refusing a lease because every
+# matching worker withdrew. Pure, so the self-test drives it without a process.
+# @param stderr The launcher's stderr for a compile that was not dispatched.
+# @return True for a withdrawal.
+function Test-WithdrawnRefusal([string]$stderr) {
+    return $stderr -match "not dispatched \(rejected \(withdrawn\)"
+}
+
+# The scheduler's `limited-by` for one worker, out of `fleet workers` as JSON.
+# @param json        What `fastcache-cli --format=json fleet workers` printed.
+# @param endpoint    The worker's advertised endpoint.
+# @param fingerprint The toolchain the lease asked for.
+# @return The `limited-by` text, or $null when no such worker is in the record.
+function Get-WorkerLimit([string]$json, [string]$endpoint, [string]$fingerprint) {
+    try { $rows = @($json | ConvertFrom-Json) } catch { return $null }
+    foreach ($row in $rows) {
+        if ($row.endpoint -eq $endpoint -and $row.toolchain -eq $fingerprint) { return $row.'limited-by' }
+    }
+    return $null
+}
+
+# Read the scheduler's record of one worker, or $null when it cannot be read.
+#
+# Bounded, because it is asked on a path that is already failing and an unbounded
+# ask there turns a named refusal into a hang: the client's own ceilings are 5 s to
+# connect and 10 s per read and write, so `$CliReadSeconds` is their sum. An expiry
+# is SAID, naming what was waited for, and reads as an absent record.
+$CliReadSeconds = 15
+function Read-WorkerLimit([string]$scheduler, [string]$endpoint, [string]$fingerprint) {
+    if (-not $Cli -or -not (Test-Path $Cli)) { return $null }
+    $out = Join-Path ([IO.Path]::GetTempPath()) ("dist-e2e-fleet-" + [Guid]::NewGuid().ToString("N") + ".json")
+    $asked = Start-Process -FilePath $Cli -PassThru -NoNewWindow `
+        -ArgumentList (ConvertTo-QuotedArgs @("--addr=$scheduler", "--format=json", "fleet", "workers")) `
+        -RedirectStandardOutput $out -RedirectStandardError "$out.err"
+    try {
+        if (-not $asked.WaitForExit($CliReadSeconds * 1000)) {
+            try { $asked.Kill() } catch { $null = $_ }
+            Write-Host "the scheduler's record was not read: fastcache-cli fleet workers against $scheduler did not answer within $CliReadSeconds s"
+            return $null
+        }
+        if ($asked.ExitCode -ne 0) { return $null }
+        return Get-WorkerLimit (Get-Content -Raw -LiteralPath $out) $endpoint $fingerprint
+    } finally {
+        Remove-Item -LiteralPath $out, "$out.err" -ErrorAction SilentlyContinue
+    }
+}
+
+# Called where a dispatch the case needed did not happen. A withdrawal THROWS,
+# naming the limit the scheduler's record gives -- the worker is sized so CPU used
+# outside this fleet cannot cause one (`$workerSlots`), so whatever did is the
+# finding. Anything else returns, and the caller's own failure stands.
+function Assert-NotWithdrawn($result, [string]$scheduler, [string]$workerEndpoint, [string]$fingerprint) {
+    if (-not (Test-WithdrawnRefusal $result.stderr)) { return }
+    $limit = Read-WorkerLimit $scheduler $workerEndpoint $fingerprint
+    $limitText = if ($null -eq $limit) { "unreadable" } else { $limit }
+    Write-Host $result.stderr
+    throw "the worker withdrew its slots (the scheduler's record says it is limited by '$limitText'), which it is sized never to do for CPU used outside this fleet -- see `$workerSlots"
+}
+
 function Invoke-SelfTest {
     $failures = 0
     function Assert-That([bool]$condition, [string]$what) {
@@ -921,6 +1017,24 @@ function Invoke-SelfTest {
         Assert-That ($sections[0].Name -eq ".text`$mn" -and $sections[1].Name -eq ".debug`$S") "in file order, by name"
         Assert-That ($sections[0].Size -eq $code.Length) "with their sizes"
 
+        # ---- Test-WithdrawnRefusal ---------------------------------------
+        $withdrawn = "fastcache-cc: not dispatched (rejected (withdrawn): every matching worker has withdrawn its capacity); compiling locally"
+        $noWorker  = "fastcache-cc: not dispatched (rejected (no-worker): no worker serves this toolchain); compiling locally"
+        Assert-That (Test-WithdrawnRefusal $withdrawn) "a withdrawn refusal is recognised"
+        Assert-That (-not (Test-WithdrawnRefusal $noWorker)) "a different refusal is not a withdrawal"
+        Assert-That (-not (Test-WithdrawnRefusal "")) "nor is a compile that said nothing"
+
+        # The scheduler's record as `fastcache-cli --format=json fleet workers`
+        # prints it -- captured from a real run, with a second row added -- so
+        # the reader is asked which worker it is looking at, not just whether a
+        # `limited-by` exists.
+        $fleet = '[{"id":"w1","toolchain":"3f5d2a3eca09d20f79b8bf9217019b87","compiler":"cl 19.51.36252","endpoint":"127.0.0.1:25271","slots":"32","in-flight":"0","available":"0","limited-by":"external-cpu","heartbeat-age":"2078","registered-age":"2078","last-picked-age":null},' +
+                 '{"id":"w2","toolchain":"3f5d2a3eca09d20f79b8bf9217019b87","compiler":"cl 19.51.36252","endpoint":"127.0.0.1:25999","slots":"4","in-flight":"0","available":"4","limited-by":"registered","heartbeat-age":"10","registered-age":"10","last-picked-age":null}]'
+        Assert-That ((Get-WorkerLimit $fleet "127.0.0.1:25271" "3f5d2a3eca09d20f79b8bf9217019b87") -eq "external-cpu") "the worker's own row is read"
+        Assert-That ((Get-WorkerLimit $fleet "127.0.0.1:25999" "3f5d2a3eca09d20f79b8bf9217019b87") -eq "registered") "and not its neighbour's"
+        Assert-That ($null -eq (Get-WorkerLimit $fleet "127.0.0.1:25271" "9e5d3aaa03c5f0c2564bda4c6c68f021")) "another toolchain at that endpoint is not this worker"
+        Assert-That ($null -eq (Get-WorkerLimit "not json" "127.0.0.1:25271" "3f5d2a3eca09d20f79b8bf9217019b87")) "an unreadable record is absent, not a limit"
+
         # ---- the readiness waits (#1213) --------------------------------
         #
         # Driven here rather than through the fixture, for the reason
@@ -998,10 +1112,10 @@ function Invoke-SelfTest {
     # down in a comment anywhere: it moves whenever a case is added, and a
     # restated total is a second thing to be wrong.
     if ($script:selfTestFailures -ne 0) {
-        Write-Host "dist-compile-e2e self-test FAILED ($script:selfTestFailures of $script:selfTestCases case(s): object comparison, the readiness waits, the teardown report and scratch roots)"
+        Write-Host "dist-compile-e2e self-test FAILED ($script:selfTestFailures of $script:selfTestCases case(s): object comparison, the withdrawal refusal, the readiness waits, the teardown report and scratch roots)"
         return 1
     }
-    Write-Host "dist-compile-e2e self-test PASSED ($script:selfTestCases case(s): object comparison, the readiness waits, the teardown report and scratch roots)"
+    Write-Host "dist-compile-e2e self-test PASSED ($script:selfTestCases case(s): object comparison, the withdrawal refusal, the readiness waits, the teardown report and scratch roots)"
     return 0
 }
 
@@ -1033,6 +1147,8 @@ $Drivers = @(
 )
 
 $runRoot = $null
+# Every process a teardown between drivers could not end, for the verdict in `finally`.
+$script:killSurvivors = @()
 try {
     # Old roots first, reported and never fatal; then this run's own: see `$scratchBase`.
     foreach ($line in @(Clear-E2EStaleRoots -Base $scratchBase)) { Write-Host "stale scratch: $line" }
@@ -1133,24 +1249,38 @@ try {
         $fingerprint = (& $Launcher --print-toolchain-fingerprint $ccPath) | Select-Object -First 1
         if (-not $fingerprint) { throw "the launcher reported no toolchain fingerprint for $cc" }
 
-        # Slots enough that background CPU cannot withdraw all of them.
+        # ONE slot above the node's own core count, so no amount of CPU used outside
+        # this fleet can withdraw the worker these cases dispatch to.
         #
-        # `AvailableSlots` reduces a worker's ceiling by the cores its machine is
-        # busy with OUTSIDE this fleet -- `cpuBusyPermille * logicalCores / 1000`,
-        # less this fleet's own in-flight jobs -- so a worker offering two slots on
-        # a many-core machine withdraws both as soon as a few percent of that
-        # machine is doing something else. This fixture IS that something else: it
-        # runs local reference compiles on the same box, and on CI the rest of the
-        # suite runs beside it. The dispatch then comes back `rejected (withdrawn)`
-        # and the case fails as "the compile was not dispatched to a worker", which
-        # reads as a fault in dispatch and is a fault in the fixture's sizing.
+        # `SlotCeilingsFor` charges other work only past the headroom the slots leave,
+        # and with the slots above the cores there is no headroom: every external core
+        # is charged. There are at most `logicalCores` of them, so the ceiling never
+        # falls below `slots - logicalCores`, which is one. With the slots AT the core
+        # count it fell to zero on any host with no idle core, and a host running other
+        # builds beside this suite is exactly that: the worker withdrew `external-cpu`,
+        # and case 5 -- whose subject is an unreachable CACHE -- ended as a skip or a
+        # failure about a withdrawal it was never about.
         #
-        # Offering the whole machine puts the ceiling at cores-minus-external,
-        # which reaches zero only when the host really is saturated -- and is what
-        # a node dedicating this machine to the fleet would advertise anyway. The
-        # `--slots=1` workers elsewhere in this file are deliberate and stay: their
-        # cases are ABOUT a worker having exactly one.
-        $workerSlots = [Environment]::ProcessorCount
+        # Oversubscribing is a supported configuration rather than a trick:
+        # `OfferableSlots` takes an operator's `--slots` untouched, precisely so a
+        # machine can be offered more jobs than it has cores. The other two ceilings
+        # are not covered and should not be: a host with under 1 GiB of memory or
+        # 128 MiB of scratch left is starved, not busy, and still withdraws.
+        #
+        # Counted so it cannot fall SHORT of the node's count, which is
+        # `GetSystemInfo`'s processor count. `[Environment]::ProcessorCount` honours
+        # this process's affinity mask and so can only be lower; the CIM figure is the
+        # whole machine and can only be higher, which is the safe direction. The larger
+        # of the two is used.
+        #
+        # The `--slots=1` workers elsewhere in this file are deliberate and stay:
+        # their cases are ABOUT a worker having exactly one.
+        $hostCores = [Environment]::ProcessorCount
+        $machine = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+        if ($machine -and $machine.NumberOfLogicalProcessors -gt $hostCores) {
+            $hostCores = [int]$machine.NumberOfLogicalProcessors
+        }
+        $workerSlots = $hostCores + 1
 
         $workerLog = Join-Path $scratch "worker.log"
         $workerState = Join-Path $scratch "worker.state"
@@ -1196,6 +1326,7 @@ try {
         $r = Invoke-Dispatching $cc $root $obj "127.0.0.1:$dispatchPort" $cachePort
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the dispatched compile failed" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
+            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$workerPort" $fingerprint
             Write-Host $r.stderr
             # The WORKER's log too, not just the client's. A refusal reaches the
             # client as one line naming a wire error code, and the reason it
@@ -1328,6 +1459,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $r = Invoke-Dispatching $cc $croot $cobj "127.0.0.1:$dispatchPort" $cachePort "u.c"
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the dispatched C compile failed" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
+            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$workerPort" $fingerprint
             Write-Host $r.stderr
             Write-Host "--- worker log ---"
             Write-Host (Read-LiveText $workerLog)
@@ -1440,6 +1572,7 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         $r = Invoke-Dispatching $cc $deadRoot $deadObj "127.0.0.1:$dispatchPort" $deadCachePort
         if ($r.code -ne 0) { Write-Host $r.stderr; throw "the build did not survive an unreachable cache" }
         if ($r.stderr -notmatch "DISPATCHED to ") {
+            Assert-NotWithdrawn $r "127.0.0.1:$dispatchPort" "127.0.0.1:$workerPort" $fingerprint
             Write-Host $r.stderr
             Write-Host "--- worker log ---"
             Write-Host (Read-LiveText $workerLog)
@@ -1488,7 +1621,18 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
         # accepted cost of cross-checkout sharing on this platform.
         Write-Host "== no case 13 here: neither COFF driver has a path-map switch (see #203, #506)"
 
-        Stop-Spawned
+        # Named WHEN FOUND, so the line precedes whatever the next driver reports. Fatal
+        # here only with `-BasePort` pinned: every driver then shares one port block, and
+        # the next pass would start beside a process still holding it. With the default
+        # the next pass has a directory and a port block of its own (see `$scratchBase`),
+        # so a survivor holds nothing it will reach for; it is still not a clean run, so
+        # it is counted and the `finally` fails the exit status.
+        $found = @(Stop-Spawned)
+        foreach ($line in $found) { Write-Host "teardown after ${cc}: $line" }
+        $script:killSurvivors += $found
+        if ($found.Count -gt 0 -and $PinnedBasePort -ne 0) {
+            throw "$($found.Count) process(es) outlived the teardown after $cc, and -BasePort pins every driver to one port block"
+        }
     }
 
     if (-not $ranAnyCompiler) {
@@ -1501,9 +1645,17 @@ int Entry(void) { return Helper((int) sizeof(size_t)); }
     Write-Host "dist-compile E2E FAILED: $_"
     $exit = 1
 } finally {
-    Stop-Spawned
+    # Those found between drivers were printed when found; only this teardown's are new.
+    $final = @(Stop-Spawned)
+    foreach ($line in $final) { Write-Host "teardown: $line" }
+    $survivors = @($script:killSurvivors) + $final
     # Released LAST, once nothing this run started should still be writing under it.
     if ($null -ne $runRoot) { $runRoot.Claim.Dispose() }
+    # And not a clean exit. A run that is already failing keeps its failure, which is
+    # the diagnostic that matters; a pass -- or a SKIP, whose `exit` is unwinding
+    # through here -- leaving a process it could not kill is not one, so the `exit`
+    # here overrides it.
+    if ($survivors.Count -gt 0 -and $exit -ne 1) { exit 1 }
 }
 
 exit $exit

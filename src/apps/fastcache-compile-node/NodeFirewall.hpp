@@ -63,8 +63,13 @@ class IKeptFormationReader
     [[nodiscard]] virtual std::expected<KeptFormation, std::string> Read() const = 0;
 };
 
-/// The production reader: the record and the remembered endpoints in the directory the start
-/// resolves (`ChosenStateDirectory`), read through `ReadKeptFormation` as the start reads them.
+/// The production reader: the record and the remembered endpoints in the directory it is GIVEN,
+/// read through `ReadKeptFormation` as the start reads them.
+///
+/// Given rather than derived from a configuration, because the only directory an install may read
+/// is the one its handover secured: `InstallNodeService` passes `RegisteredStateDirectory`, the
+/// derivation `MakeNodeServiceSpec` hands over. Derived from the MERGED configuration instead, a
+/// `cluster_dir:` in the file made the install read a directory nothing had secured.
 ///
 /// **Without the start's owner judgement (`JudgeStateDirectory`), and that is the point rather
 /// than a shortcut.** Who may own an entry is judged from the account ASKING: the start runs as
@@ -78,14 +83,14 @@ class IKeptFormationReader
 class StateDirectoryFormationReader final: public IKeptFormationReader
 {
   public:
-    /// @param cfg The configuration whose state directory is read; must outlive the reader.
-    explicit StateDirectoryFormationReader(NodeConfig const& cfg);
+    /// @param directory The state directory to read; none when the registration resolved none.
+    explicit StateDirectoryFormationReader(std::optional<std::filesystem::path> directory);
 
     /// @copydoc IKeptFormationReader::Read
     [[nodiscard]] std::expected<KeptFormation, std::string> Read() const override;
 
   private:
-    NodeConfig const& _cfg;
+    std::optional<std::filesystem::path> _directory;
 };
 
 /// The configuration the SERVICE starts with: @p cfg shaped by the record @p formation reads now.
@@ -141,5 +146,29 @@ class StateDirectoryFormationReader final: public IKeptFormationReader
                                                               std::string_view serviceName,
                                                               IKeptFormationReader const& formation,
                                                               IFirewall* firewall);
+
+/// `--install-service` as `main` runs it: the registration, and the formation read from the ONE
+/// state directory that registration secured.
+///
+/// The spec and the reader are built here from one derivation, `RegisteredStateDirectory` of
+/// @p registration, so the directory the handover owns and the directory the install reads cannot
+/// diverge. @p merged decides only what the service is judged by and which rules it opens. A
+/// `cluster_dir:` in a configuration FILE is not on the registered command line, so the handover
+/// never secured it, and reading a record there would trust a directory other accounts may write
+/// in -- the very read the registration-first order exists to prevent. The start, as the service,
+/// judges whatever directory it resolves before acting on anything in it.
+/// @param merged The merged configuration the install was given.
+/// @param registration The command-line configuration the registration replays (`cliOnly`).
+/// @param probe Answers where the machine-wide state directory lives.
+/// @param program The executable registered and admitted.
+/// @param install Registers a spec (`InstallService` at the configured scope).
+/// @param firewall The machine's firewall, or null where none is managed.
+/// @return As `InstallWithServiceFirewall`.
+[[nodiscard]] ServiceControlResult InstallNodeService(NodeConfig const& merged,
+                                                      NodeConfig const& registration,
+                                                      IConfigPathProbe const& probe,
+                                                      std::filesystem::path const& program,
+                                                      std::function<ServiceControlResult(ServiceSpec const&)> const& install,
+                                                      IFirewall* firewall);
 
 } // namespace FastCache::Node

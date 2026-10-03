@@ -160,6 +160,24 @@ function(CaseExact name entering line expected)
     set(failedNames "${failedNames}" PARENT_SCOPE)
 endfunction()
 
+## A whole file through `fastcached_strip_comments`, compared exactly. The multi-line function
+## copies a run of comment-free lines in one step and answers a comment-only line inline, so
+## what it returns has to be pinned as TEXT -- CRs, indentation and newlines included -- or a
+## run that kept its CRs would pass every single-line case above.
+## @param name The case name.
+## @param content The file content.
+## @param expected The required result.
+function(CaseContent name content expected)
+    fastcached_strip_comments("${content}" code)
+    string(COMPARE EQUAL "${code}" "${expected}" held)
+    string(REPLACE "\r" "<CR>" shownCode "${code}")
+    string(REPLACE "\r" "<CR>" shownExpected "${expected}")
+    Expect("${name}" "exact file text" "${held}" "expected [${shownExpected}] got [${shownCode}]")
+    set(caseCount "${caseCount}" PARENT_SCOPE)
+    set(failureCount "${failureCount}" PARENT_SCOPE)
+    set(failedNames "${failedNames}" PARENT_SCOPE)
+endfunction()
+
 ## Every case, in one place, so the shipped library and each neuter are asked the same thing.
 function(RunEveryCase)
     # -- Lines with nothing to strip, and the ordinary comment shapes.
@@ -235,6 +253,26 @@ function(RunEveryCase)
     # A raw string's first line has an unterminated literal by construction. 10 here.
     Case(NAME "rawStringFirstLine" LINE "constexpr std::string_view Css = R\"CSS("
          SURVIVES "R\"CSS(")
+
+    # -- Whole files through `fastcached_strip_comments`, which copies comment-free runs in one
+    #    step and answers a comment-only line inline. Each expected text is what the one-line-
+    #    at-a-time walk it replaced returned for the same content.
+    string(ASCII 13 CR)
+    CaseContent("fileRunThenComments"
+        "int a;\nint b;\n// note\n    /// doc\nint c; // tail\nint d;\n"
+        "int a;\nint b;\n\n    \nint c; \nint d;\n")
+    CaseContent("fileCrlfRun"
+        "int a;${CR}\nint b;${CR}\n// x${CR}\nint c;${CR}"
+        "int a;\nint b;\n\nint c;")
+    CaseContent("fileBlockAcrossLines"
+        "a();\n/* one\n   two */ b();\nc();\n"
+        "a();\n\n  b();\nc();\n")
+    CaseContent("fileLiteralAfterRun"
+        "x();\nauto u = \"http://h\"; y();\nz();\n"
+        "x();\nauto u = \"http://h\"; y();\nz();\n")
+    CaseContent("fileIndentedCommentCrlf"
+        "  q();\n    // c${CR}\nz();"
+        "  q();\n    \nz();")
 
     set(caseCount "${caseCount}" PARENT_SCOPE)
     set(failureCount "${failureCount}" PARENT_SCOPE)
@@ -397,6 +435,27 @@ else()
         "if(NOT inBlockComment AND NOT line MATCHES \"/[/*]\")"
         "if(NOT inBlockComment)"
         "lineComment")
+
+    # (7) A comment-free run copied in one step keeps its CRs -- the per-line walk removed one
+    #     from the end of every line, so the run must turn each CRLF into LF.
+    Neuter("runKeepsItsCRs"
+        "                string(REPLACE \"\\r\\n\" \"\\n\" run \"\${run}\")\n"
+        ""
+        "fileCrlfRun")
+
+    # (8) A comment-only line answered inline must keep its indentation, as the per-line walk
+    #     did: it strips the comment, not the line.
+    Neuter("commentLineLosesIndent"
+        "                string(APPEND code \"\${CMAKE_MATCH_1}\")\n"
+        ""
+        "fileRunThenComments")
+
+    # (9) The run must stop at the start of the line carrying the introducer. Running it to the
+    #     end of the file copies comments as code.
+    Neuter("runSwallowsTheIntroducerLine"
+        "string(FIND \"\${runHead}\" \"\\n\" runEnd REVERSE)"
+        "string(LENGTH \"\${rest}\" runEnd)\n            math(EXPR runEnd \"\${runEnd} - 1\")"
+        "fileRunThenComments")
 
     # -----------------------------------------------------------------------
     # The counts are printed whatever the verdict: a self-test that stopped early must not look

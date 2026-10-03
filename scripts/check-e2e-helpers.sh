@@ -1752,6 +1752,75 @@ run_case() {
             || echo "BUG: expected exactly one SIGKILL escalation, got ${killed} -- a dead KILL arm and a lucky grace read alike"
         ;;
 
+    # A job SIGKILL does not end is NAMED and never waited on. No real process can
+    # outlive SIGKILL on demand -- the case that needs this is a kernel stuck in
+    # uninterruptible I/O -- so `kill` is shadowed to lie about ONE pid: TERM and
+    # KILL "succeed" and `kill -0` keeps saying it is alive. `wait` is shadowed to
+    # RECORD what it was asked about, because a reaper that waited on the survivor
+    # is the hang itself, and a real `wait` on a live `sleep 30` would only show
+    # that as a slow pass. The real job is ended by hand once the shadows are gone.
+    reap-names-a-survivor-of-sigkill)
+        sleep 30 &
+        stuck=$!
+        sleep 0.2
+        waited=""
+        kill() {
+            case "$*" in
+                "$stuck"|"-0 $stuck"|"-9 $stuck") return 0 ;;
+            esac
+            command kill "$@"
+        }
+        wait() { waited="${waited} $*"; builtin wait "$@"; }
+        _e2e_kill_grace_seconds=1
+        reap_background_jobs 1 2> "${scratch}/reap.err"
+        unset -f kill wait
+        echo "reap outcome: escalated=${E2eReapKilled}, survivors=${E2eReapSurvivors}"
+        case "$waited" in *"$stuck"*) echo "BUG: the survivor was waited on (${waited})" ;; esac
+        if grep -q "pid ${stuck} was still running 1s after SIGKILL and was NOT waited on: sleep 30" "${scratch}/reap.err"; then
+            echo "the survivor was named with its pid and command"
+        else
+            cat "${scratch}/reap.err"
+            echo "BUG: the survivor was not named with its pid and command"
+        fi
+        command kill -9 "$stuck" 2>/dev/null || true
+        builtin wait "$stuck" 2>/dev/null || true
+        ;;
+
+    # The one decision `reap_background_jobs` leaves to a fixture's trap: a survivor
+    # must end the run non-zero, and none must leave it alone. Both directions, since
+    # a helper that always exited would pass the first half by itself.
+    exit-if-reap-left-survivors)
+        E2eReapSurvivors=0
+        ( e2e_exit_if_reap_left_survivors; echo "with no survivor the trap carried on" )
+        E2eReapSurvivors=1
+        ( e2e_exit_if_reap_left_survivors; echo "BUG: a survivor did not end the shell" )             || echo "a survivor ended the shell with status $?"
+        ;;
+
+    # `stop_and_require_exit`'s escalation, bounded the same way, and its refusal
+    # naming the pid. A pid nothing owns, with `kill` lying that it is alive and
+    # that every signal landed, so there is no real process for the case to leave
+    # behind and `ps` has no command to report.
+    stop-names-a-survivor-of-sigkill)
+        ghost=2147483000
+        kill() {
+            case "$*" in
+                "$ghost"|"-0 $ghost"|"-9 $ghost") return 0 ;;
+            esac
+            command kill "$@"
+        }
+        # The survivor alone: the deadline's own helper process is waited on
+        # legitimately when it is disarmed.
+        wait() {
+            case " $* " in
+                *" $ghost "*) echo "BUG: the survivor was waited on" ;;
+                *) builtin wait "$@" ;;
+            esac
+        }
+        _e2e_kill_grace_seconds=1
+        stop_and_require_exit "$ghost" "the staged survivor" 1
+        echo "BUG: stop_and_require_exit returned for a process that never went"
+        ;;
+
     # --- the real-socket cases ----------------------------------------------
     #
     # `wait_for_port` and `http_get` against a listener that really binds, really
@@ -3076,6 +3145,9 @@ cases=(
     "bounded-fast-path-bites|0|the staged flat-pause defect asked for|!BUG:"
     "bounded-outlasts-a-trapped-term|0|a TERM-ignoring child exited 124"
     "reap-takes-what-nothing-recorded|0|escalated=1, still alive: none|!BUG:"
+    "reap-names-a-survivor-of-sigkill|0|reap outcome: escalated=1, survivors=1|the survivor was named with its pid and command|!BUG:"
+    "exit-if-reap-left-survivors|0|with no survivor the trap carried on|a survivor ended the shell with status 1|!BUG:"
+    "stop-names-a-survivor-of-sigkill|1|the staged survivor (pid 2147483000: (command unknown)) was still running|was still there 1s after SIGKILL -- not waited on|!BUG:"
     "ancestry-bound-fires|0|at the default bound a real child is a descendant|the ancestry bound gave up rather than walking on|!BUG:"
 )
 

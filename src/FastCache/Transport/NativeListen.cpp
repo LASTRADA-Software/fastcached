@@ -159,16 +159,6 @@ namespace
         apply(SO_SNDTIMEO, send);
     }
 
-#if !defined(_WIN32)
-    /// Make @p socket non-blocking, which `core::net::adoptListener` asks of a listener it adopts.
-    /// POSIX only, because socket activation, its one caller, is.
-    void SetNonBlocking(SocketValue socket) noexcept
-    {
-        auto const flags = ::fcntl(socket, F_GETFL, 0);
-        if (flags >= 0)
-            std::ignore = ::fcntl(socket, F_SETFL, flags | O_NONBLOCK);
-    }
-#endif
 } // namespace
 
 void CloseNativeSocket(core::platform::NativeHandle socket) noexcept
@@ -236,7 +226,9 @@ std::expected<BoundSocket, std::string> BindAndListen(core::net::IAddressResolve
             lastError = std::format("socket() failed: {}", LastSocketError());
             continue;
         }
-        auto const owned = ToHandle(sock);
+        // Its own type, not `auto`: a pointer on Windows and an int on POSIX, so neither `auto`
+        // (qualified-auto wants `auto*` on Windows) nor `auto*` (no pointer on POSIX) is right on both.
+        core::platform::NativeHandle const owned = ToHandle(sock);
         ApplyHotSocketOptions(owned);
 
         // Fatal to this candidate: the option carries a security property, and a daemon that
@@ -283,6 +275,54 @@ std::uint16_t BoundPortOf(core::platform::NativeHandle socket) noexcept
     return core::net::detail::portOfSockaddr(&address, static_cast<std::uint32_t>(length));
 }
 
+namespace
+{
+    /// An address's bytes as `inet_ntop` spells them: the ONE spelling both `BoundAddressOf` and
+    /// `CanonicalAddressLiteral` produce, so the kernel's answer and a configured literal compare.
+    /// @param family `AF_INET` or `AF_INET6`. @param bytes The `in_addr` or `in6_addr`.
+    /// @return The text, or empty when it does not convert.
+    std::string FormatAddressBytes(int family, void const* bytes)
+    {
+        std::array<char, INET6_ADDRSTRLEN> text {};
+        if (::inet_ntop(family, bytes, text.data(), text.size()) == nullptr)
+            return {};
+        return std::string { text.data() };
+    }
+} // namespace
+
+std::string BoundAddressOf(core::platform::NativeHandle socket)
+{
+    if (socket == core::platform::InvalidHandle)
+        return {};
+    sockaddr_storage address {};
+    auto length = static_cast<AddrLen>(sizeof(address));
+    if (::getsockname(ToSocket(socket), reinterpret_cast<sockaddr*>(&address), &length) != 0)
+        return {};
+    switch (address.ss_family)
+    {
+        case AF_INET:
+            return FormatAddressBytes(AF_INET, &reinterpret_cast<sockaddr_in const*>(&address)->sin_addr);
+        case AF_INET6:
+            return FormatAddressBytes(AF_INET6, &reinterpret_cast<sockaddr_in6 const*>(&address)->sin6_addr);
+        default:
+            return {};
+    }
+}
+
+std::optional<std::string> CanonicalAddressLiteral(std::string_view text)
+{
+    // `inet_pton` needs a NUL-terminated string, and is the platform's own definition of a
+    // literal -- no character inspection here to disagree with it.
+    auto const terminated = std::string { text };
+    in_addr v4 {};
+    if (::inet_pton(AF_INET, terminated.c_str(), &v4) == 1)
+        return FormatAddressBytes(AF_INET, &v4);
+    in6_addr v6 {};
+    if (::inet_pton(AF_INET6, terminated.c_str(), &v6) == 1)
+        return FormatAddressBytes(AF_INET6, &v6);
+    return std::nullopt;
+}
+
 std::expected<std::unique_ptr<core::net::IListener>, std::string> AdoptInheritedListener(core::net::EventLoop& loop,
                                                                                          int descriptor)
 {
@@ -296,8 +336,19 @@ std::expected<std::unique_ptr<core::net::IListener>, std::string> AdoptInherited
     if (descriptor < 0)
         // Refused before anything touches it, and nothing to close.
         return std::unexpected(std::string { "adopt: not a descriptor" });
-    auto const handle = ToHandle(static_cast<SocketValue>(descriptor));
-    SetNonBlocking(ToSocket(handle));
+    return AdoptBoundListener(loop, ToHandle(static_cast<SocketValue>(descriptor)));
+#endif
+}
+
+std::expected<std::unique_ptr<core::net::IListener>, std::string> AdoptBoundListener(core::net::EventLoop& loop,
+                                                                                     core::platform::NativeHandle handle)
+{
+    if (handle == core::platform::InvalidHandle)
+        // Refused before anything touches it, and nothing to close.
+        return std::unexpected(std::string { "adopt: not a socket" });
+    // Made non-blocking and close-on-exec by core-cpp itself (`PosixListener::adopt`), which is
+    // where the reactor's requirement lives; a second `fcntl` here was measured to change nothing
+    // -- removed, every [adopt] and [consensus] case stayed green on Linux.
     auto adopted = core::net::adoptListener(loop, handle);
     if (!adopted.has_value())
     {
@@ -305,7 +356,6 @@ std::expected<std::unique_ptr<core::net::IListener>, std::string> AdoptInherited
         return std::unexpected(adopted.error().toString());
     }
     return std::move(adopted).value();
-#endif
 }
 
 std::expected<AcceptedSocket, core::net::NetError> AcceptRaw(core::platform::NativeHandle listening)
@@ -316,7 +366,8 @@ std::expected<AcceptedSocket, core::net::NetError> AcceptRaw(core::platform::Nat
     if (accepted == InvalidSocketValue)
         return std::unexpected(SystemError("accept"));
 
-    auto const handle = ToHandle(accepted);
+    // Its own type, for the reason `owned` in `BindAndListen` has one.
+    core::platform::NativeHandle const handle = ToHandle(accepted);
     ApplyHotSocketOptions(handle);
     return AcceptedSocket {
         .handle = handle,
@@ -361,6 +412,11 @@ void BlockingListener::close() noexcept
 std::uint16_t BlockingListener::boundPort() const noexcept
 {
     return BoundPortOf(_handle);
+}
+
+std::string BlockingListener::BoundAddress() const
+{
+    return BoundAddressOf(_handle);
 }
 
 void BlockingListener::SetTimeouts(std::chrono::milliseconds acceptPoll, std::chrono::milliseconds ioTimeout) noexcept

@@ -191,9 +191,19 @@ endfunction()
 
 fastcached_globs_to_regex("${FastCachedCounterSourceGlobs}" sourceRegex)
 
-file(GLOB_RECURSE treeAll LIST_DIRECTORIES false "${sourceRoot}/*")
-set(sources ${treeAll})
-list(FILTER sources INCLUDE REGEX "${sourceRegex}")
+# Through `fastcached_tracked_files`, this tree's one answer to HOW a check finds its files,
+# rather than a traversal of its own: on DrvFs -- where every local gate tree takes its
+# sources from -- walking the tree and reading every file it found cost seconds a single
+# `git grep` spends in under half of one, and several lanes gating at once took this check
+# past its budget. CONTAINING names the literal every match must contain, so a file without
+# it is not read at all; the count printed is still over the whole set.
+fastcached_tracked_files("${sourceRoot}"
+    GLOBS "*"
+    FILTER "${sourceRegex}"
+    CONTAINING "${FastCachedCounterPrefilter}" CONTAINING_OUT sourcesHolding
+    FILES_OUT sources MODE_OUT sourcesMode)
+list(TRANSFORM sources PREPEND "${sourceRoot}/")
+list(TRANSFORM sourcesHolding PREPEND "${sourceRoot}/")
 
 # `list(LENGTH)`, never `if(sources STREQUAL "")`: copying an empty glob result leaves
 # `sources` UNDEFINED, and `if()` then compares the literal name. Measured in
@@ -218,7 +228,11 @@ foreach(source IN LISTS sources)
     file(RELATIVE_PATH relativeSource "${sourceRoot}" "${source}")
 
     # Whole-file prefilter: almost no file names a counter, and splitting every file
-    # into lines costs a default-set check seconds (#492).
+    # into lines costs a default-set check seconds (#492). Now answered by the file set:
+    # a file without the prefilter's literal is not read at all.
+    if(NOT "${source}" IN_LIST sourcesHolding)
+        continue()
+    endif()
     file(READ "${source}" content)
     string(FIND "${content}" "${FastCachedCounterPrefilter}" prefilterAt)
     if(prefilterAt EQUAL -1)

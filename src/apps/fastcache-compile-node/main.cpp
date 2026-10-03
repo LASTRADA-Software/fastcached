@@ -1729,24 +1729,26 @@ struct EarlyVerbRow
     // service, and nothing changes. What the registration does carry is the `--config`
     // path, so the service reads the current file at every start rather than a snapshot
     // of it.
-    auto const spec = MakeNodeServiceSpec(CurrentExecutablePath(), context.cliOnly, context.pathProbe);
+    //
     // The firewall follows the registration: opened for what the SERVICE will open at its next
     // start -- the merged configuration shaped by the formation record read AFTER the registration
-    // secured the state directory (`InstallWithServiceFirewall`) -- and closed on removal once the
-    // delete succeeded or found no registration, never after a refused one
-    // (`WithRemovalFirewall`), since a rule outliving its service admits nothing but misleads
-    // whoever reads the list.
+    // secured the state directory, and read from exactly the directory it secured
+    // (`InstallNodeService`) -- and closed on removal once the delete succeeded or found no
+    // registration, never after a refused one (`WithRemovalFirewall`), since a rule outliving its
+    // service admits nothing but misleads whoever reads the list.
     auto const firewall = MakeSystemFirewall();
-    Node::StateDirectoryFormationReader const formation { context.cfg };
-    auto const result =
-        context.cfg.installService
-            ? Node::InstallWithServiceFirewall([&] { return InstallService(spec, context.cfg.serviceScope); },
-                                               context.cfg,
-                                               spec.exePath,
-                                               spec.serviceName,
-                                               formation,
-                                               firewall.get())
-            : WithRemovalFirewall(UninstallService(spec, context.cfg.serviceScope), firewall.get(), spec.serviceName);
+    auto const result = [&] {
+        if (context.cfg.installService)
+            return Node::InstallNodeService(
+                context.cfg,
+                context.cliOnly,
+                context.pathProbe,
+                CurrentExecutablePath(),
+                [&](ServiceSpec const& spec) { return InstallService(spec, context.cfg.serviceScope); },
+                firewall.get());
+        auto const spec = MakeNodeServiceSpec(CurrentExecutablePath(), context.cliOnly, context.pathProbe);
+        return WithRemovalFirewall(UninstallService(spec, context.cfg.serviceScope), firewall.get(), spec.serviceName);
+    }();
     if (result.ExitCode() == 0)
         std::cout << "fastcache-compile-node: " << result.message << '\n';
     else

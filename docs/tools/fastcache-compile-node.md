@@ -3053,11 +3053,19 @@ translation unit.
 The class reserve is static — two cores held back permanently. What happens when
 the machine's owner starts using six more of them is the other half, and it rides
 on the heartbeat: every 20 seconds a worker reports its host CPU, its available
-memory and the free space where it compiles, and the scheduler subtracts what
-that leaves from the slots it may be given.
+memory and the free space where it compiles, and the scheduler caps the slots it
+may be given at what those leave.
 
-Three things about it are worth knowing:
+Four things about it are worth knowing:
 
+- **Somebody else's CPU costs a slot only once it reaches past the headroom the
+  slots leave.** The slots are the share of the machine the fleet may have, so the
+  cores it was never offered absorb other work first: `--slots=4` on a 32-core
+  machine keeps all four while its owner uses anything up to 28 cores, and a
+  workstation's two-core reserve absorbs the first two cores its owner uses rather
+  than being spent a second time. Oversubscription is kept too: `--slots=64` on 16
+  cores has no headroom, so it offers all 64 while the machine is idle and gives up
+  one slot for each core somebody else is using.
 - **The fleet's own jobs are subtracted first.** Without that, giving a machine
   work raises its CPU, which withdraws the capacity that let it take the work,
   which frees the CPU — a fleet that oscillates for reasons nobody can see from
@@ -3167,8 +3175,8 @@ Every row says two things before anything else:
 | `shared-cache-unavailable` | live | alert | the fleet's `shared-cache` setting names this machine and its shared tier will not open, so every other node's builds miss and compile locally; the detail says why | fix what the detail names — usually another process holding `<state-dir>/shared-cache`, or a full disk — and it opens at the next change the cluster applies or within 30 seconds; or name another machine with `--cluster-set shared-cache=<id>` |
 | `shared-cache-unproven` | live | warning | the fleet's `shared-cache` setting names another machine and this node's builds are not reaching it, so they compile locally; the detail says why — a machine at the announced address that proved another key (nothing was sent to it), the named machine refusing this node's key, one that did not answer, or a setting naming a machine this cluster cannot reach by key | check `--cluster-status` and the named machine's own `--node-status`; it clears by itself at the next operation that proves the named machine's key, and at the apply that stops the setting naming another machine or names a different one (not tried until an operation tries it); a setting naming a machine this cluster cannot reach by key raises it at the apply, before any build asks, and it clears at the apply that resolves it (not tried until an operation tries it); an operation still running when an apply moved the setting says nothing about the machine it had dialled |
 | `scheduler-unreachable` | live | warning | a `--scheduler` endpoint (or a leader it named) has not answered a dial; the detail names each, and one nobody has dialled for ten minutes is dropped from it | check the VPN or network between this machine and the schedulers named; the node keeps serving this machine meanwhile and rejoins by itself |
-| `unserved-toolchain` | live | warning | clients asked the leader for a toolchain no live worker serves, so those compiles ran on the clients' own machines; the detail names each by driver and version as the client reported it (`cl 19.44.35207`), with how many leases were refused. Decided by the leader; any other scheduler answers `not-evaluated` | put that compiler version on a worker, or move the clients to one the fleet serves; clears once a worker serves it, or after fifteen minutes with nobody asking |
-| `mixed-node-versions` | live | warning | the leader sees more than one build serving one wire — nothing refuses that, so nothing else says so; the detail names each build and the machines on it. Decided by the leader; any other scheduler answers `not-evaluated` | upgrade every node to one build ([Upgrading a fleet](../operations/upgrading-a-fleet.md)); clears once the odd machine is upgraded or has been gone ninety seconds |
+| `unserved-toolchain` | live | warning | clients asked the leader for a toolchain no live worker serves, so those compiles ran on the clients' own machines; the detail names each by driver and version as the client reported it (`cl 19.44.35207`), with how many leases were refused. Decided by the leader; any other scheduler answers `not-evaluated`, and so does a leader that has led for less than fifteen minutes, since nothing another leader saw carries over | put that compiler version on a worker, or move the clients to one the fleet serves; clears once a worker serves it, or after fifteen minutes with nobody asking |
+| `mixed-node-versions` | live | warning | the leader sees more than one build serving one wire — nothing refuses that, so nothing else says so; the detail names each build and the machines on it. Decided by the leader; any other scheduler answers `not-evaluated`, and so does a leader that has led for less than ninety seconds, before every machine has announced to it | upgrade every node to one build ([Upgrading a fleet](../operations/upgrading-a-fleet.md)); clears once the odd machine is upgraded or has been gone ninety seconds |
 
 The remedy each row carries is longer than this column, and it is the node's text: an older
 client or leader prints a newer node's row exactly as that node wrote it, rather than looking

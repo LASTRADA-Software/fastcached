@@ -37,6 +37,16 @@
 # therefore includes it, and that is stated rather than silently absorbed: a baseline of
 # one is the difference between "the filter works" and "the filter matched my file".
 #
+# ## Every case runs in BOTH file-set modes
+#
+# The check asks `fastcached_tracked_files` which files hold a forbidden byte, and the two modes
+# answer it by different mechanisms: git mode with one `git grep -a -P`, the walk by reading
+# every file as hex. A staged tree is not a git repository, so without a second pass every case
+# here would exercise the walk while CI's checkout takes git -- the shape that has already
+# shipped a guard that passed. So each case is staged twice, once as a plain directory and once
+# as a repository with the tree added to its index, and the mode is asserted wherever the check
+# prints it: in every accepting verdict and in the empty-scan refusal.
+#
 # ## Read from the OUTPUT, never from the exit code
 #
 # `message(WARNING)` exits 0 on every CMake while printing `CMake Warning`, so an exit
@@ -52,6 +62,15 @@ if(NOT DEFINED FASTCACHED_SCRATCH_DIR)
     message(FATAL_ERROR "FASTCACHED_SCRATCH_DIR must be set")
 endif()
 
+if(NOT GIT_EXECUTABLE)
+    find_package(Git QUIET)
+endif()
+if(NOT GIT_EXECUTABLE)
+    message(FATAL_ERROR
+        "git is needed: half of these cases run in git mode, and a run that silently exercised "
+        "only the walk would be the defect this file's second pass exists to catch.")
+endif()
+
 set(check "${FASTCACHED_SOURCE_DIR}/scripts/check-control-bytes.cmake")
 if(NOT EXISTS "${check}")
     message(FATAL_ERROR "the check under test is missing: ${check}")
@@ -64,6 +83,7 @@ string(ASCII 7 BEL)
 string(ASCII 27 ESC)
 string(ASCII 13 CR)
 string(ASCII 9 TAB)
+string(ASCII 26 SUB)
 
 set(ran 0)
 set(failures "")
@@ -83,13 +103,21 @@ endfunction()
 # refusal would then pass for a reason that has nothing to do with control bytes.
 #
 # @param name The case name, which names the directory.
-# @param files `path=content` pairs joined by `|`, or `-` for no staged file.
+# @param files `path=content` pairs joined by `|`, or `-` for no staged file. A content of
+#        `@tar:<member>` stages a TAR ARCHIVE holding one file with `<member>` in it: its
+#        header is padded with NULs, which is the only way this fixture can plant one --
+#        CMake cannot spell a NUL, and `string(ASCII 0)` is an error. A content of `@gone`
+#        stages a file that is added to the index and then deleted, in the git pass.
 # @param extensions A replacement extension allow-list for a STAGED copy of the check,
 #        or `-` to run the shipped one.
 # @param outFlat Set to the combined output, flattened onto one line.
 # @param outStaged Set to TRUE when the run used a staged copy of the check.
+#
+# `treeMode`, read from the caller, is `walk` for a plain directory or `git` for a repository
+# with every staged file added to its index.
 function(StageAndRun name files extensions outFlat outStaged)
-    set(tree "${FASTCACHED_SCRATCH_DIR}/case-${name}")
+    set(tree "${FASTCACHED_SCRATCH_DIR}/case-${treeMode}-${name}")
+    set(gone "")
     file(REMOVE_RECURSE "${tree}")
     file(MAKE_DIRECTORY "${tree}/scripts/lib")
     WriteBytes("${tree}/scripts/lib/third-party-roots.txt" "# planted\nvendor/upstream")
@@ -104,7 +132,19 @@ function(StageAndRun name files extensions outFlat outStaged)
             string(SUBSTRING "${entry}" 0 ${at} relative)
             math(EXPR at "${at} + 1")
             string(SUBSTRING "${entry}" ${at} -1 body)
-            WriteBytes("${tree}/${relative}" "${body}")
+            if(body STREQUAL "@gone")
+                WriteBytes("${tree}/${relative}" "added, then deleted")
+                list(APPEND gone "${tree}/${relative}")
+            elseif(body MATCHES "^@tar:(.*)$")
+                set(member "${FASTCACHED_SCRATCH_DIR}/member-${name}")
+                WriteBytes("${member}" "${CMAKE_MATCH_1}")
+                get_filename_component(parent "${tree}/${relative}" DIRECTORY)
+                file(MAKE_DIRECTORY "${parent}")
+                file(ARCHIVE_CREATE OUTPUT "${tree}/${relative}" PATHS "${member}" FORMAT gnutar)
+                file(REMOVE "${member}")
+            else()
+                WriteBytes("${tree}/${relative}" "${body}")
+            endif()
         endforeach()
     endif()
 
@@ -134,6 +174,20 @@ function(StageAndRun name files extensions outFlat outStaged)
              "message(STATUS \"control-bytes: STAGED-CHECK\")\n"
              "${afterTable}")
         set(runCheck "${tree}/scripts/staged-check.cmake")
+    endif()
+
+    if(treeMode STREQUAL "git")
+        execute_process(COMMAND "${GIT_EXECUTABLE}" init -q "${tree}" OUTPUT_QUIET ERROR_QUIET)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${tree}" add -A
+                        RESULT_VARIABLE addStatus OUTPUT_QUIET ERROR_VARIABLE addError)
+        if(NOT addStatus EQUAL 0)
+            message(FATAL_ERROR
+                "case `${name}`: the staged tree could not be added to its index (${addError}), "
+                "so this case would run the walk while claiming git")
+        endif()
+    endif()
+    if(NOT gone STREQUAL "")
+        file(REMOVE ${gone})
     endif()
 
     # `ENCODING NONE` because this fixture's whole subject is BYTES: without it the
@@ -170,11 +224,22 @@ function(ExpectVerdict name flat expect phrase scanned)
         set(verdict "accept")
     endif()
 
+    # Captured on its own: a second MATCHES in one condition clears CMAKE_MATCH_1 before it
+    # is read, and the comparison then passes on an empty string.
+    set(took "")
+    if(flat MATCHES "file set from ([a-z -]+)")
+        set(took "${CMAKE_MATCH_1}")
+    endif()
+
     set(problem "")
     if(NOT verdict STREQUAL expect)
         set(problem "expected ${expect}, got ${verdict}")
     elseif(NOT flat MATCHES "${phrase}")
         set(problem "${verdict} was right but the words were not: expected `${phrase}`")
+    elseif(NOT took STREQUAL "" AND NOT took MATCHES "^${modeWords}")
+        set(problem "the check took `${took}` where this pass staged ${treeMode}")
+    elseif(verdict STREQUAL "accept" AND NOT flat MATCHES "file set from")
+        set(problem "an accepting run did not say which file set it read")
     elseif(NOT scanned STREQUAL "-")
         # The half a verdict cannot carry. A reader that stopped reading files produces
         # a perfectly clean accept, which is this check's own thesis applied to itself.
@@ -194,6 +259,14 @@ function(ExpectVerdict name flat expect phrase scanned)
         set(failures "${failures}" PARENT_SCOPE)
     endif()
 endfunction()
+
+foreach(treeMode IN ITEMS walk git)
+if(treeMode STREQUAL "git")
+    set(modeWords "git ls-files")
+else()
+    set(modeWords "directory walk")
+endif()
+message(STATUS "--- ${treeMode}")
 
 # ---------------------------------------------------------------------------
 # Case 1 -- the ACCEPTING direction, with its count. Two staged files plus the roots
@@ -226,8 +299,8 @@ ExpectVerdict("case 5: an ESC is refused" "${flat}" "refuse" "docs/note\\.md" "-
 # different one: line endings rather than an eaten escape. A refusal that said "an
 # escape got eaten" would send every reader of it to the wrong fix.
 #
-# It is also the case that cannot be reached through the text read on this host, so it
-# is the one proving the hex arm exists at all.
+# And the byte a text read loses: CMake's `file(READ)` drops the CR of a CRLF on Windows and
+# on Linux, which is why this check never looks for a byte in text.
 StageAndRun("cr" "src/Alpha.cpp=int alpha()|scripts/dos.sh=#!/usr/bin/env bash${CR}\necho hi${CR}" "-" flat staged)
 ExpectVerdict("case 6: a CR is refused and named as a line-ending problem" "${flat}"
     "refuse" "CR \\(0x0d\\) -- this tree is LF-only" "-")
@@ -270,6 +343,37 @@ endif()
 StageAndRun("mixed" "src/Alpha.cpp=int alpha() ${BEL}|scripts/fine.sh=echo hi" "-" flat staged)
 ExpectVerdict("case 10: a clean file beside a dirty one does not hide it" "${flat}"
     "refuse" "src/Alpha\\.cpp" "-")
+
+# Case 12 -- a NUL. This check missed every one until it was measured: it looked for bytes in
+# a text read, whose string HOLDS a NUL while the regex engine stops AT one, so the class never
+# saw it. A tar archive is the file here, because its header is the only way this
+# fixture can plant a NUL; its member text is plain, so the NUL is the only forbidden byte.
+StageAndRun("nul" "src/Alpha.cpp=int alpha()|docs/blob.txt=@tar:plain text" "-" flat staged)
+ExpectVerdict("case 12: a NUL is refused and named" "${flat}"
+    "refuse" "docs/blob\\.txt: .*NUL \\(0x00\\)" "-")
+
+# Case 13 -- and a byte BEHIND a NUL. The regex engine stops at the first NUL, so a BEL in
+# the archived member sat where no pattern could reach it; the byte pass names both.
+StageAndRun("behindnul" "src/Alpha.cpp=int alpha()|docs/blob.txt=@tar:ring ${BEL} bell" "-" flat staged)
+ExpectVerdict("case 13: a BEL behind a NUL is refused and named" "${flat}"
+    "refuse" "control byte 0x07" "-")
+
+# Case 14 -- a 0x1A, which ENDS a text-mode read on Windows: a check that looked in text would
+# see nothing after it. Both bytes are named, the one after the 0x1A included.
+StageAndRun("sub" "src/Alpha.cpp=int alpha()|scripts/sub.sh=echo a${SUB}b ${BEL}" "-" flat staged)
+ExpectVerdict("case 14: a 0x1A is refused, and what follows it is read" "${flat}"
+    "refuse" "control byte 0x1a.*control byte 0x07|control byte 0x07.*control byte 0x1a" "-")
+
+# Case 15 -- a file the index names and the tree does not have is refused BY NAME, never
+# counted as scanned: the file set's answer is the only thing that knows it is gone, since
+# nothing here asks the filesystem per file. The git pass only -- a walk finds what is there.
+if(treeMode STREQUAL "git")
+    StageAndRun("gone" "src/Alpha.cpp=int alpha()|docs/gone.md=@gone" "-" flat staged)
+    ExpectVerdict("case 15: a file the index names and the tree lacks is refused by name" "${flat}"
+        "refuse" "docs/gone\\.md: named by the file set \\(git ls-files\\) and not present here" "-")
+endif()
+
+endforeach()
 
 # ---------------------------------------------------------------------------
 # The shared premise, asserted rather than assumed: `string(ASCII 7 ...)` really does

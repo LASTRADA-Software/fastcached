@@ -87,10 +87,12 @@ activator="$(command -v systemd-socket-activate 2>/dev/null || true)"
 workdir="$(mktemp -d)"
 activator_pid=""
 
+# Bounded, where the `kill; wait` it replaced was not: `reap_background_jobs`
+# escalates to SIGKILL and names a process that outlives even that.
 cleanup() {
-    [[ -n "$activator_pid" ]] && kill "$activator_pid" 2>/dev/null
-    [[ -n "$activator_pid" ]] && wait "$activator_pid" 2>/dev/null
+    reap_background_jobs
     rm -rf "$workdir"
+    e2e_exit_if_reap_left_survivors
 }
 trap cleanup EXIT
 

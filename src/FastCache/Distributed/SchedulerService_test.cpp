@@ -2671,6 +2671,38 @@ TEST_CASE("A capacity refusal is not an unserved toolchain", "[distributed][sche
     CHECK(unserved.front().refusals == 1);
 }
 
+TEST_CASE("A lease that excluded every serving worker is not an unserved toolchain",
+          "[distributed][scheduler][conditions][exclusion]")
+{
+    // `Excluded` answers with `NoWorker`'s CODE, and is the one pick refusal that does: the fleet
+    // serves the toolchain, and this client could not reach the machines that do. Naming it
+    // `unserved-toolchain` would send an operator to install a compiler they already have, so the
+    // pick table's row says it is not one -- asserted here, because the code alone cannot say it.
+    Leading fleet;
+    REQUIRE(fleet.service.Register(Insider, OneSlot("gcc-14", "laptop.corp:7100")).status == Wire::Status::Ok);
+    std::array<std::string_view, 1> const excluded { "laptop.corp:7100" };
+    REQUIRE(fleet.service
+                .Lease(Insider,
+                       Wire::LeaseRequest { .fingerprint = "gcc-14",
+                                            .key = "key-1",
+                                            .acceptedCodecs = {},
+                                            .excluded = excluded,
+                                            .toolchainLabel = "g++ 14.2.0" })
+                .error
+            == Wire::ErrorCode::NoWorker);
+
+    // Past the worker's heartbeat bound and inside the window, for the capacity case's reason: the
+    // list is filtered at READ against the live workers, so a recorded refusal hides for exactly
+    // as long as the excluded worker stays up.
+    static_assert(WorkerRegistry::DefaultHeartbeatTimeout + 1s < UnservedToolchains::Window);
+    fleet.clock.advance(WorkerRegistry::DefaultHeartbeatTimeout + 1s);
+    CHECK(fleet.service.UnservedToolchainsNow().empty());
+
+    // The control: a real no-worker refusal at the same fleet IS recorded.
+    REQUIRE(fleet.service.Lease(Insider, Ask("gcc-14", "key-2")).error == Wire::ErrorCode::NoWorker);
+    CHECK(fleet.service.UnservedToolchainsNow().size() == 1);
+}
+
 TEST_CASE("A lease naming its toolchain in bytes that are not text is refused, and never recorded",
           "[distributed][scheduler][conditions]")
 {

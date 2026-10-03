@@ -8,8 +8,11 @@
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <format>
 #include <future>
 #include <memory>
+#include <optional>
+#include <ranges>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -25,6 +28,7 @@
 #include <core/net/Sockets.hpp>
 #include <core/platform/Types.hpp>
 #include <core/platform/WinsockInit.hpp>
+#include <tests/Unwrap.hpp>
 
 #if defined(_WIN32)
     #include <winsock2.h>
@@ -41,6 +45,7 @@
 #endif
 
 using namespace std::chrono_literals;
+using FastCache::Testing::Unwrap;
 
 namespace
 {
@@ -266,9 +271,70 @@ TEST_CASE("BoundPortOf reports the port the kernel chose, not the one asked for"
     CHECK(listener->boundPort() == port);
 }
 
+TEST_CASE("A released listening socket is served by a loop on the port it held, never freed in between",
+          "[net][listener][adopt]")
+{
+    auto held = FastCache::BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(held != nullptr);
+    if (!held->IsBound())
+        SKIP("cannot bind loopback here");
+    auto const port = held->boundPort();
+
+    // Its own type, not `auto`: a pointer on Windows and an int on POSIX.
+    core::platform::NativeHandle const handle = held->Release();
+    REQUIRE(handle != core::platform::InvalidHandle);
+    CHECK_FALSE(held->IsBound());
+    // Released means the destructor no longer owns it: were it closed here, the adoption below
+    // would be refused, and the port free for anyone.
+    held.reset();
+
+    core::net::PlatformLoop loop;
+    auto adopted = FastCache::AdoptBoundListener(loop, handle);
+    REQUIRE(adopted.has_value());
+    CHECK((*adopted)->boundPort() == port);
+
+    // Still claimed, by the adopted listener: an exclusive bind of the same port is refused.
+    auto const second = FastCache::BlockingListener::Bind("127.0.0.1", port);
+    REQUIRE(second != nullptr);
+    CHECK_FALSE(second->IsBound());
+}
+
+TEST_CASE("AdoptBoundListener refuses no socket at all, before touching anything", "[net][listener][adopt]")
+{
+    core::net::PlatformLoop loop;
+    auto const adopted = FastCache::AdoptBoundListener(loop, core::platform::InvalidHandle);
+    REQUIRE_FALSE(adopted.has_value());
+    CHECK(adopted.error() == "adopt: not a socket");
+}
+
 TEST_CASE("BoundPortOf reports 0 for a handle that is not bound", "[net][listener]")
 {
     CHECK(FastCache::BoundPortOf(core::platform::InvalidHandle) == 0);
+}
+
+TEST_CASE("BoundAddressOf reports the host the kernel bound, in the canonical literal spelling", "[net][listener]")
+{
+    auto listener = FastCache::BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(listener != nullptr);
+    if (!listener->IsBound())
+        SKIP("cannot bind loopback here");
+    CHECK(listener->BoundAddress() == "127.0.0.1");
+    CHECK(FastCache::BoundAddressOf(core::platform::InvalidHandle).empty());
+}
+
+TEST_CASE("CanonicalAddressLiteral spells one address one way, and a name as nothing", "[net][listener]")
+{
+    // The spelling `BoundAddressOf` reports, so a configured literal compares with the kernel's
+    // answer however it was written.
+    CHECK(FastCache::CanonicalAddressLiteral("127.0.0.1") == "127.0.0.1");
+    CHECK(FastCache::CanonicalAddressLiteral("::0001") == "::1");
+    CHECK(FastCache::CanonicalAddressLiteral("0:0:0:0:0:0:0:1") == "::1");
+    CHECK(FastCache::CanonicalAddressLiteral("0.0.0.0") == "0.0.0.0");
+    // Pure: a name is not looked up, so it is not a literal -- and neither is a bracketed one,
+    // since the contract is unbracketed text.
+    CHECK_FALSE(FastCache::CanonicalAddressLiteral("localhost").has_value());
+    CHECK_FALSE(FastCache::CanonicalAddressLiteral("[::1]").has_value());
+    CHECK_FALSE(FastCache::CanonicalAddressLiteral("").has_value());
 }
 
 TEST_CASE("An armed listener's accept wakes on its own poll, with nobody connecting", "[net][socket][listener]")
@@ -307,13 +373,13 @@ TEST_CASE("A socket this process owns is not handed to the children it spawns", 
 
 #if defined(_WIN32)
     auto const raw = ::socket(AF_INET, SOCK_STREAM, 0);
-    REQUIRE(raw != INVALID_SOCKET);
-    auto const native = reinterpret_cast<core::platform::NativeHandle>(raw);
+    REQUIRE(std::cmp_not_equal(raw, INVALID_SOCKET));
+    auto* const native = reinterpret_cast<core::platform::NativeHandle>(raw);
 
     // The default is asserted too: a Windows socket IS inheritable unless something says
     // otherwise.
     DWORD before = 0;
-    auto const handle = reinterpret_cast<HANDLE>(raw);
+    auto* const handle = reinterpret_cast<HANDLE>(raw);
     REQUIRE(::GetHandleInformation(handle, &before) != 0);
     CHECK((before & HANDLE_FLAG_INHERIT) != 0);
 
@@ -337,6 +403,68 @@ TEST_CASE("A socket this process owns is not handed to the children it spawns", 
 
     FastCache::CloseNativeSocket(native);
 }
+
+namespace
+{
+
+/// The pause `CloseUnderParkedAccept` is given on the first attempt, doubled on every attempt after it.
+constexpr auto FirstParkPause = 50ms;
+
+/// How many attempts may try to catch an accept parked: pauses of 50 ms up to 1.6 s, 3.15 s at most.
+constexpr auto ParkAttempts = 6;
+
+/// Start a thread in `AcceptRaw` on @p listening, close @p listening under it, and report what the accept said.
+///
+/// The thread says when it is about to make the call and the close comes @p pause after THAT, so a thread slow
+/// to start costs nothing. What no signal can say is that it is INSIDE the syscall -- a blocking `::accept` has
+/// no entry this process can observe, so a hook in `AcceptRaw` could only say "about to call" as well, which is
+/// why none is added there. The caller judges each attempt by the answer instead.
+///
+/// The thread's state is shared rather than borrowed: an accept that never returns is detached, and a detached
+/// thread that did return later must not write into a frame that has gone.
+/// @param listening A bound, listening socket; closed by this call.
+/// @param pause How long after the thread says it is about to call to close the socket.
+/// @return What `AcceptRaw` returned, or nullopt when it was still parked 10 s after the close.
+[[nodiscard]] std::optional<core::net::NetError> CloseUnderParkedAccept(core::platform::NativeHandle listening,
+                                                                        std::chrono::milliseconds pause)
+{
+    struct Shared
+    {
+        std::promise<void> calling;
+        std::promise<core::net::NetError> outcome;
+    };
+    auto const shared = std::make_shared<Shared>();
+    auto aboutToCall = shared->calling.get_future();
+    auto answered = shared->outcome.get_future();
+    std::thread acceptor { [listening, shared] {
+        shared->calling.set_value();
+        auto accepted = FastCache::AcceptRaw(listening);
+        if (accepted.has_value())
+        {
+            FastCache::CloseNativeSocket(accepted->handle);
+            shared->outcome.set_value(core::net::makeNetError(core::net::NetErrorCode::Ok, 0, "accept SUCCEEDED"));
+            return;
+        }
+        shared->outcome.set_value(std::move(accepted).error());
+    } };
+
+    // Bounded like every wait here; a thread that has not started by then makes this attempt read `BadHandle`,
+    // which the caller treats as proving nothing.
+    (void) aboutToCall.wait_for(10s);
+    std::this_thread::sleep_for(pause);
+    FastCache::CloseNativeSocket(listening);
+
+    if (answered.wait_for(10s) != std::future_status::ready)
+    {
+        // Detach rather than join: the thread is in a syscall nothing remaining can end.
+        acceptor.detach();
+        return std::nullopt;
+    }
+    acceptor.join();
+    return answered.get();
+}
+
+} // namespace
 
 TEST_CASE("closing a listening socket unblocks a parked AcceptRaw, and says which", "[net][socket][listener]")
 {
@@ -367,45 +495,46 @@ TEST_CASE("closing a listening socket unblocks a parked AcceptRaw, and says whic
 
     SECTION("a parked accept is cancelled, not merely failed")
     {
-        auto const listening = bound->handle;
-
-        // Nothing ever dials this port, so the accept genuinely parks.
-        std::promise<core::net::NetError> outcome;
-        auto answered = outcome.get_future();
-        std::thread acceptor { [listening, &outcome] {
-            auto accepted = FastCache::AcceptRaw(listening);
-            if (accepted.has_value())
-            {
-                FastCache::CloseNativeSocket(accepted->handle);
-                outcome.set_value(core::net::makeNetError(core::net::NetErrorCode::Ok, 0, "accept SUCCEEDED"));
-                return;
-            }
-            outcome.set_value(std::move(accepted).error());
-        } };
-
-        // Long enough that the acceptor is inside the syscall. If it were not, the close would
-        // land first and the code below would read `BadHandle` -- which is why the assertion is on
-        // WHICH error: a too-short pause fails this case instead of passing it quietly.
-        std::this_thread::sleep_for(250ms);
-        FastCache::CloseNativeSocket(listening);
-
-        if (answered.wait_for(10s) != std::future_status::ready)
+        // **Proved by the ANSWER, never by a pause.** This slept 250 ms and closed, trusting the pause to have put
+        // the acceptor inside the syscall; an acceptor the scheduler had not yet run read `BadHandle`, and the case
+        // went red with nothing wrong. The answer is the proof the pause could only hope for: `Cancelled` is a close
+        // that found the accept PARKED, `BadHandle` one that landed before it. So a `BadHandle` attempt proved
+        // nothing and is repeated on a fresh listener with twice the pause, `ParkAttempts` times at most -- and every
+        // attempt reading `BadHandle` is still RED at the bound, which is what a close that stopped cancelling a
+        // parked accept would read too, so the repetition cannot hide that regression. Any other answer ends the
+        // attempts and is judged at once. Nothing ever dials these ports, so an accept that is reached parks.
+        core::platform::NativeHandle listening = bound->handle;
+        std::string attempts;
+        std::optional<core::net::NetError> decisive;
+        for (auto const attempt: std::views::iota(0, ParkAttempts))
         {
-            // Detach rather than join: the thread is in a syscall nothing remaining can end.
-            acceptor.detach();
-            FAIL("AcceptRaw was still parked 10s after its listening socket was closed, so the mechanism "
-                 "RunMultiReactorWindows' stopAll depends on does not hold on this platform (#1238)");
+            if (attempt > 0)
+            {
+                auto again = FastCache::BindAndListen(core::net::defaultAddressResolver(), "127.0.0.1", 0, /*backlog*/ 4);
+                REQUIRE(again.has_value());
+                listening = again->handle;
+            }
+            auto const answer = CloseUnderParkedAccept(listening, FirstParkPause * (1 << attempt));
+            if (!answer.has_value())
+                FAIL("AcceptRaw was still parked 10s after its listening socket was closed, so the mechanism "
+                     "RunMultiReactorWindows' stopAll depends on does not hold on this platform (#1238)");
+            auto const& error = Unwrap(answer);
+            attempts += std::format("{}{}", attempts.empty() ? "" : "; ", error.toString());
+            if (error.code != core::net::NetErrorCode::BadHandle)
+            {
+                decisive = error;
+                break;
+            }
         }
-        acceptor.join();
 
-        auto const err = answered.get();
-        INFO("AcceptRaw returned " << err.toString());
-        CHECK(err.code == core::net::NetErrorCode::Cancelled);
+        INFO("AcceptRaw returned, attempt by attempt: " << attempts);
+        REQUIRE(decisive.has_value()); // every attempt's close landed before the accept parked
+        CHECK(Unwrap(decisive).code == core::net::NetErrorCode::Cancelled);
     }
 
     SECTION("an accept CALLED after the close reports the other code")
     {
-        auto const listening = bound->handle;
+        core::platform::NativeHandle const listening = bound->handle;
         FastCache::CloseNativeSocket(listening);
 
         auto const accepted = FastCache::AcceptRaw(listening);

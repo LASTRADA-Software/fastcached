@@ -173,14 +173,22 @@ endforeach()
 #
 # Every C++ file under `src/`, headers included, because #447 put refusal rows in a
 # header and the old scan could not see them.
-# ONE traversal, filtered afterwards. Two patterns meant two traversals of `src/`, and
-# on DrvFs one costs 2.09 s (#502). No glob-to-regex helper here because the extensions
-# are stated once, right here, so the regex IS the source of truth rather than a second
-# statement of it.
-file(GLOB_RECURSE sources RELATIVE "${FASTCACHED_SOURCE_DIR}"
-     "${FASTCACHED_SOURCE_DIR}/src/*")
-list(FILTER sources INCLUDE REGEX "\\.(cpp|hpp)$")
-list(SORT sources)
+# Through `fastcached_tracked_files`, this tree's one answer to HOW a check finds its files,
+# rather than a traversal of `src/` of its own: on DrvFs -- where every local gate tree takes
+# its sources from -- the traversal alone cost seconds (#502). The extensions are stated once,
+# right here, as the FILTER.
+#
+# The needles are the three the whole-file prefilter below has always used, asked of git in
+# ONE search: `sourcesHolding` is the files containing any of them, and only those are READ.
+# That is the prefilter moved, not a second one -- see the paragraph beside it for why it
+# cannot hide a match.
+include("${CMAKE_CURRENT_LIST_DIR}/lib/CheckCommon.cmake")
+fastcached_tracked_files("${FASTCACHED_SOURCE_DIR}"
+    PATHSPECS "src/"
+    GLOBS "src/*"
+    FILTER "^src/.*\\.(cpp|hpp)$"
+    CONTAINING "EncodeErrorReply" "RefuseUntriaged" ".issue" CONTAINING_OUT sourcesHolding
+    FILES_OUT sources MODE_OUT sourcesMode)
 
 if(NOT sources)
     message("")
@@ -233,6 +241,11 @@ foreach(relative IN LISTS sources)
         set(allowed TRUE)
     endif()
 
+    # The whole-file prefilter, answered by the file set: a file holding none of the three
+    # needles is not read at all.
+    if(NOT "${relative}" IN_LIST sourcesHolding)
+        continue()
+    endif()
     file(READ "${FASTCACHED_SOURCE_DIR}/${relative}" content)
 
     # Nothing below can fire in a file containing none of these three substrings, and

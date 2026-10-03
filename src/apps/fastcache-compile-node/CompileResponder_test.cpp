@@ -752,12 +752,13 @@ class IdleListener final: public core::net::IListener
 /// the case's own thread.
 /// @param port Where the endpoint listens.
 /// @param frame The request.
-/// @param progressSeen Where to count the progress pulses that preceded the answer; may be null.
+/// @param progressSeen Where to count the progress pulses that preceded the answer, as each one
+///        is READ -- so a case can wait on the count while the compile is still held; may be null.
 /// @return The reply -- empty when the peer closed without answering -- or nullopt when the
 ///         dial itself failed.
 [[nodiscard]] std::optional<std::vector<std::byte>> TryExchange(std::uint16_t port,
                                                                 std::vector<std::byte> frame,
-                                                                std::size_t* progressSeen = nullptr)
+                                                                std::atomic<std::size_t>* progressSeen = nullptr)
 {
     core::net::BlockingConnector connector;
     auto socket = core::async::syncRun(
@@ -765,10 +766,9 @@ class IdleListener final: public core::net::IListener
     if (!socket.has_value())
         return std::nullopt;
 
-    std::size_t pulses = 0;
     auto reply = core::async::syncRun([](core::net::ISocket* peer,
                                          std::vector<std::byte> request,
-                                         std::size_t* seen) -> core::async::Task<std::vector<std::byte>> {
+                                         std::atomic<std::size_t>* seen) -> core::async::Task<std::vector<std::byte>> {
         auto const written = co_await peer->write(std::span<std::byte const> { request });
         if (!written.has_value())
             co_return std::vector<std::byte> {};
@@ -801,16 +801,14 @@ class IdleListener final: public core::net::IListener
                 co_return received;
 
             if (seen != nullptr)
-                ++*seen;
+                seen->fetch_add(1, std::memory_order_acq_rel);
             // Drained by the DECLARED length, exactly as a real reader does, so anything
             // a later version puts in this payload cannot desynchronise the stream.
             received.erase(received.begin(), received.begin() + static_cast<std::ptrdiff_t>(want));
         }
-    }((*socket).get(), std::move(frame), &pulses));
+    }((*socket).get(), std::move(frame), progressSeen));
 
     (*socket)->close();
-    if (progressSeen != nullptr)
-        *progressSeen = pulses;
     return reply;
 }
 
@@ -821,7 +819,7 @@ class IdleListener final: public core::net::IListener
 /// @return The reply, or empty when the peer closed without answering.
 [[nodiscard]] std::vector<std::byte> Exchange(std::uint16_t port,
                                               std::vector<std::byte> frame,
-                                              std::size_t* progressSeen = nullptr)
+                                              std::atomic<std::size_t>* progressSeen = nullptr)
 {
     auto const reply = TryExchange(port, std::move(frame), progressSeen);
     REQUIRE(reply.has_value());
@@ -840,51 +838,6 @@ class IdleListener final: public core::net::IListener
     auto const reply = pending.get();
     REQUIRE(reply.has_value());
     return Unwrap(reply);
-}
-
-/// Send @p frame and read the whole reply stream, right up to the peer's EOF.
-///
-/// **The half `Exchange` cannot answer.** That helper stops at the first terminal
-/// status, which is what every case asserting about the ANSWER wants -- and it is
-/// therefore blind to a frame that arrives AFTER the answer, which is exactly what a
-/// missing `SettlePulse` produces. Reading to EOF is what makes the ordering
-/// observable.
-///
-/// The write side is shut before reading, so the node sees the request is complete and
-/// this side is not the reason the connection stays open. The node closes after the
-/// reply, which is what ends the read loop.
-///
-/// Asserts nothing, for `TryExchange`'s reason: its one caller runs it on a helper thread.
-/// @param port The loopback port to dial.
-/// @param frame A complete request.
-/// @return Every byte the node wrote, in order, or nullopt when the dial itself failed.
-[[nodiscard]] std::optional<std::vector<std::byte>> TryExchangeUntilEof(std::uint16_t port, std::vector<std::byte> frame)
-{
-    core::net::BlockingConnector connector;
-    auto socket = core::async::syncRun(
-        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
-    if (!socket.has_value())
-        return std::nullopt;
-
-    auto stream = core::async::syncRun(
-        [](core::net::ISocket* peer, std::vector<std::byte> request) -> core::async::Task<std::vector<std::byte>> {
-            auto const written = co_await peer->write(std::span<std::byte const> { request });
-            if (!written.has_value())
-                co_return std::vector<std::byte> {};
-
-            std::vector<std::byte> received;
-            while (true)
-            {
-                std::array<std::byte, 4096> chunk {};
-                auto const read = co_await peer->read(std::span<std::byte> { chunk });
-                if (!read.has_value() || *read == 0)
-                    co_return received;
-                received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
-            }
-        }((*socket).get(), std::move(frame)));
-
-    (*socket)->close();
-    return stream;
 }
 
 /// The status of every whole frame in @p stream, in order.
@@ -910,6 +863,60 @@ class IdleListener final: public core::net::IListener
         stream = stream.subspan(whole);
     }
     return statuses;
+}
+
+/// Send @p frame and read the whole reply stream, right up to the peer's EOF.
+///
+/// **The half `Exchange` cannot answer.** That helper stops at the first terminal
+/// status, which is what every case asserting about the ANSWER wants -- and it is
+/// therefore blind to a frame that arrives AFTER the answer, which is exactly what a
+/// missing `SettlePulse` produces. Reading to EOF is what makes the ordering
+/// observable.
+///
+/// The write side is shut before reading, so the node sees the request is complete and
+/// this side is not the reason the connection stays open. The node closes after the
+/// reply, which is what ends the read loop.
+///
+/// Asserts nothing, for `TryExchange`'s reason: its one caller runs it on a helper thread.
+/// @param port The loopback port to dial.
+/// @param frame A complete request.
+/// @param progressSeen Where to count the whole progress pulses received so far, updated as
+///        bytes ARRIVE -- so a case can wait on the count while the compile is still held;
+///        may be null.
+/// @return Every byte the node wrote, in order, or nullopt when the dial itself failed.
+[[nodiscard]] std::optional<std::vector<std::byte>> TryExchangeUntilEof(std::uint16_t port,
+                                                                        std::vector<std::byte> frame,
+                                                                        std::atomic<std::size_t>* progressSeen = nullptr)
+{
+    core::net::BlockingConnector connector;
+    auto socket = core::async::syncRun(
+        connector.connect("127.0.0.1", port, core::net::DialOptions { .connectTimeout = std::chrono::seconds { 5 } }));
+    if (!socket.has_value())
+        return std::nullopt;
+
+    auto stream = core::async::syncRun([](core::net::ISocket* peer,
+                                          std::vector<std::byte> request,
+                                          std::atomic<std::size_t>* seen) -> core::async::Task<std::vector<std::byte>> {
+        auto const written = co_await peer->write(std::span<std::byte const> { request });
+        if (!written.has_value())
+            co_return std::vector<std::byte> {};
+
+        std::vector<std::byte> received;
+        while (true)
+        {
+            std::array<std::byte, 4096> chunk {};
+            auto const read = co_await peer->read(std::span<std::byte> { chunk });
+            if (!read.has_value() || *read == 0)
+                co_return received;
+            received.insert(received.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(*read));
+            if (seen != nullptr)
+                seen->store(static_cast<std::size_t>(std::ranges::count(StatusSequence(received), Wire::Status::Progress)),
+                            std::memory_order_release);
+        }
+    }((*socket).get(), std::move(frame), progressSeen));
+
+    (*socket)->close();
+    return stream;
 }
 
 /// A config naming @p port for the node surface.
@@ -957,6 +964,34 @@ class IdleListener final: public core::net::IListener
     // reimplemented. A file arguing that in one helper while hand-rolling the next is
     // how the third copy gets written.
     return DrainWithin([&capacity] { return capacity.InFlight() != 0; },
+                       DrainBound { .ceiling = bound, .poll = std::chrono::milliseconds { 5 } })
+           == DrainResult::Drained;
+}
+
+/// How long a held compile waits for its pulses before it is released anyway: half the production cadence.
+///
+/// **The bound is what pins the RATE.** Released on pulses that were read, a case no longer races the cadence --
+/// but a bound long enough to be safe for any cadence accepts every cadence, and a build that dropped the interval
+/// its case configured and pulsed at `DefaultProgressInterval` passed 7 and 8 runs in 10 (review of `d3bbc085`,
+/// I1). At half the default it cannot: its first pulse is 5 s away. A build pulsing at the configured 20-40 ms needs
+/// its two pulses sixty times over before this bound is at risk -- over 2.4 s of a reactor the host did not run.
+constexpr auto PulseRateBound = std::chrono::duration_cast<std::chrono::milliseconds>(Wire::DefaultProgressInterval / 2);
+
+/// Wait until the client has READ @p many progress pulses, for at most @p bound.
+///
+/// **What a held compile is released on, never a wall-clock hold.** A hold counts the case's
+/// thread and the pulse counts the node REACTOR's turns, and under load the two part company:
+/// a reactor that gets no CPU from before a pulse is due until after the release finds the
+/// answer ready as well, and sending it rather than a pulse in front of it is right -- which a
+/// timed hold reads as a missing pulse. Released after this, the pulses are on the wire
+/// before the answer can be, whatever the schedule.
+/// @param seen The count `TryExchange` or `TryExchangeUntilEof` keeps as it reads.
+/// @param many How many to wait for.
+/// @param bound How long to allow.
+/// @return Whether that many were read inside @p bound.
+[[nodiscard]] bool PulsedWithin(std::atomic<std::size_t> const& seen, std::size_t many, std::chrono::milliseconds bound)
+{
+    return DrainWithin([&seen, many] { return seen.load(std::memory_order_acquire) < many; },
                        DrainBound { .ceiling = bound, .poll = std::chrono::milliseconds { 5 } })
            == DrainResult::Drained;
 }
@@ -1274,15 +1309,18 @@ TEST_CASE("A held compile pulses at its client, and the object still arrives beh
     REQUIRE(endpoint.has_value());
     io.Start();
 
-    std::size_t pulses = 0;
+    std::atomic<std::size_t> pulses { 0 };
     auto pending = std::async(std::launch::async, [port, &pulses] { return TryExchange(port, CompileFrame(), &pulses); });
     REQUIRE(worker.runner.WaitForStarted(1));
 
-    // Long enough for several intervals, so the assertion below is about a CADENCE and
-    // not about one frame that might have been a coincidence of scheduling. Derived from
-    // the interval this case configured rather than written as a number, so it cannot
-    // stop covering it if that moves.
-    std::this_thread::sleep_for(Interval * 6);
+    // Released once the client has READ several pulses, so the assertion below is about a
+    // CADENCE and not about one frame that might have been a coincidence of scheduling --
+    // and never after a wall-clock hold, which is what this case did until a starved reactor
+    // was shown to write one pulse and then the answer: see `PulsedWithin`. Released whatever
+    // the wait found and BEFORE anything is asserted, so a build that never pulses fails the
+    // checks below instead of holding the compile to its runner's bound.
+    constexpr std::size_t PulsesBeforeRelease = 2;
+    auto const pulsed = PulsedWithin(pulses, PulsesBeforeRelease, PulseRateBound);
     worker.runner.Release();
 
     auto const reply = ReplyFrom(pending);
@@ -1293,8 +1331,9 @@ TEST_CASE("A held compile pulses at its client, and the object still arrives beh
     // stopped would produce, and a client measuring SILENCE would abandon that worker
     // exactly as it abandons a mute one -- so one pulse is indistinguishable from none
     // for the purpose this exists to serve.
-    INFO("pulses observed: " << pulses);
-    CHECK(pulses >= 2);
+    INFO("pulses observed: " << pulses.load());
+    CHECK(pulsed);
+    CHECK(pulses.load() >= PulsesBeforeRelease);
 
     // And the answer really is the answer: a compile that ran, with the object the
     // client asked for behind however many pulses preceded it.
@@ -1323,7 +1362,7 @@ TEST_CASE("A compile that finishes inside one interval pulses nothing", "[node][
     REQUIRE(endpoint.has_value());
     io.Start();
 
-    std::size_t pulses = 0;
+    std::atomic<std::size_t> pulses { 0 };
     auto pending = std::async(std::launch::async, [port, &pulses] { return TryExchange(port, CompileFrame(), &pulses); });
     REQUIRE(worker.runner.WaitForStarted(1));
     worker.runner.Release();
@@ -1331,7 +1370,7 @@ TEST_CASE("A compile that finishes inside one interval pulses nothing", "[node][
     auto const reply = ReplyFrom(pending);
     REQUIRE_FALSE(reply.empty());
     CHECK(StatusOf(reply) == Wire::Status::Ok);
-    CHECK(pulses == 0);
+    CHECK(pulses.load() == 0);
 
     CHECK(DrainedWithin(worker.capacity, std::chrono::seconds { 5 }));
     worker.capacity.Drain();
@@ -1361,21 +1400,27 @@ TEST_CASE("The pulse stops before the reply, so the answer is the last thing on 
     REQUIRE(endpoint.has_value());
     io.Start();
 
-    auto pending = std::async(std::launch::async, [port] { return TryExchangeUntilEof(port, CompileFrame()); });
+    std::atomic<std::size_t> pulses { 0 };
+    auto pending =
+        std::async(std::launch::async, [port, &pulses] { return TryExchangeUntilEof(port, CompileFrame(), &pulses); });
     REQUIRE(worker.runner.WaitForStarted(1));
-    std::this_thread::sleep_for(Interval * 6);
+    // Released on pulses the client has READ, never after a wall-clock hold -- see
+    // `PulsedWithin` -- and before anything is asserted, for the case above's reason.
+    constexpr std::size_t PulsesBeforeRelease = 2;
+    auto const pulsed = PulsedWithin(pulses, PulsesBeforeRelease, PulseRateBound);
     worker.runner.Release();
 
     auto const stream = ReplyFrom(pending);
     auto const statuses = StatusSequence(stream);
     INFO("statuses: " << statuses.size());
 
-    // At least one pulse AND the answer, or the two claims below are vacuous: with a
+    // The pulses read above AND the answer, or the two claims below are vacuous: with a
     // single frame `statuses.back()` is the answer and the `all_of` runs over nothing,
     // so a build that pulses not at all would pass an ordering test about pulses. That
     // is the empty-range trap this project keeps a rule about, and it was observed here
     // -- a counterfactual that stopped the pulse left this case green.
-    REQUIRE(statuses.size() >= 2);
+    CHECK(pulsed);
+    REQUIRE(statuses.size() >= PulsesBeforeRelease + 1);
 
     // Every frame but the last is a pulse, and the last is the answer. Stated as two
     // claims about the SEQUENCE rather than as a count, because the count is timing and

@@ -933,12 +933,11 @@ it is — routing it through `Unwrap` does not even compile.
 **A per-process counter is not unique, because every `TEST_CASE` is a process.**
 `catch_discover_tests` registers each case as its own ctest test, so a fixture that
 names a scratch directory from a `static` counter hands the same path to every
-concurrent case -- and the constructors of these fixtures all begin with
-`remove_all`, which turns a name collision into **deleted data**: the second case
-wipes the files the first is still reading. `tests/ScratchPath.hpp` is the one
-definition now (`UniqueScratchPath`, pid + counter, and the RAII
-`ScratchDirectory` over it), and four things about how it got there are worth
-keeping:
+concurrent case -- and a name that gets cleared before it is used turns a collision
+into **deleted data**: the second case wipes the files the first is still reading.
+`tests/ScratchPath.hpp` is the one definition now -- `UniqueScratchPath` (pid +
+counter, cleared before it is handed out) and the RAII `ScratchDirectory` over it --
+and what got it there is worth keeping:
 
 - **It has been written SIX times.** The first fix was private to
   `Stats_test.cpp`; three later files reintroduced it; the fifth,
@@ -973,10 +972,22 @@ keeping:
   not reach it re-derived it. A helper is shared only if it sits where everything
   that needs it can include from; `src` is on all three test targets' paths, which
   is why this and `tests/Unwrap.hpp` live together.
-- **The constructor's `remove_all` is safe only because the name carries the
-  pid.** What it can then reach is this process's own leftovers or a dead
-  process's -- never a live peer's. Removing something you did not create is the
-  step that made a collision destructive rather than merely confusing.
+- **`UniqueScratchPath` clears its own name before returning it**, safe only
+  because the name carries the pid: what it can then reach is this process's own
+  leftover or a dead process's -- never a live peer's. Removing something you did
+  not create is the step that makes a collision destructive rather than merely
+  confusing.
+  - **The guarantee stops at the name it returned, and it fails SILENTLY there.**
+    A sibling built by appending a suffix to that name, or a name reparented
+    under a different directory, is a DIFFERENT path this clearing never
+    reaches -- no error, no exception, just a leftover a caller who assumed the
+    guarantee extended there will never see coming. Such a caller passes its
+    own parent through `UniqueScratchPath`'s parent parameter, or clears what
+    it builds itself.
+  - **A caller that CREATES a directory at the returned name must use
+    `ScratchDirectory`**, whose destructor removes it again. A raw
+    `create_directories` call with no matching removal is a LEAK, and a leak is
+    what turns pid reuse into a live process inheriting a dead one's state.
 - **A caller-supplied name becomes a child of a unique parent, not the whole
   name.** `ScratchTree`/`ScopedTree` take names like `"cache-hit"` and one that is
   itself a nested path, and those names are what a reader recognises; they hang

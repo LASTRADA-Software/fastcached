@@ -14,6 +14,7 @@
 #include <stop_token>
 #include <string_view>
 #include <thread>
+#include <tuple>
 
 using namespace FastCache;
 using namespace FastCache::Node;
@@ -45,6 +46,13 @@ constexpr std::string_view AbandonReport = "giving up after";
 /// obvious needle is a substring of BOTH reports and separates neither. A needle that the
 /// opposite outcome also produces is not a needle.
 constexpr std::string_view WaitingReport = "compile(s) to finish before stopping";
+
+/// How long the drain case waits for the first report before it frees the slot anyway: seven quarters of
+/// `DrainReportInterval`. Scaled in MILLISECONDS -- `DrainReportInterval` is whole seconds, and `seconds { 2 } * 7 / 4`
+/// is 3 s, which is the bound this replaced; the assertion is what says the scaling happened.
+constexpr auto DrainReportAwaitedAtMost = std::chrono::milliseconds { DrainReportInterval } * 7 / 4;
+static_assert(DrainReportAwaitedAtMost == std::chrono::milliseconds { 3500 },
+              "the drain case's margins below are stated against a 3.5 s bound");
 
 /// How many records in @p logger carry @p phrase.
 /// @param logger The capture.
@@ -412,15 +420,36 @@ TEST_CASE("A drain still inside its bound says what it is waiting for and abando
     // (2 s), so a section that observes one cannot be quicker than that; the bound is long
     // enough that the release, not the ceiling, is what ends the drain.
     constexpr auto LongBound = std::chrono::seconds { 30 };
-    constexpr auto HoldPast = std::chrono::milliseconds { 2200 };
     CapturingLogger logger;
     RecordingAbandonment abandonment;
     CompileCapacity capacity { 4, WorkerMaxRequestBytes, LongBound, logger, abandonment };
 
     REQUIRE(capacity.TryTakeSlot() == SlotAdmission::Taken);
     capacity.BeginShutdown();
-    auto releaser = std::jthread { [&capacity, HoldPast] {
-        std::this_thread::sleep_for(HoldPast);
+    // **Released once the report is in the log, never after a wall-clock hold.** This held
+    // for 2200 ms against a 2 s cadence, and a drain that gets no CPU from the deadline until
+    // past such a release wakes to find the slot free as well -- `NextDrainAction` answers
+    // `Finished` before `Report`, rightly -- and says nothing. Released on the report, it is
+    // in the log before the slot can be free, whatever the schedule. Released whatever the
+    // wait found, so a drain that never reports fails the check below rather than holding
+    // the slot to `LongBound`; nothing is asserted on this thread.
+    //
+    // **And the cadence is pinned, which releasing on the report alone gave up** (review of
+    // `e8687ce1`, M3): the releaser waits for the report no longer than seven quarters of a
+    // report interval, so a drain reporting at twice `DrainReportInterval` has its slot freed
+    // first, finishes without a word, and the check below reads that. The value is pinned
+    // beside it, since the bound derived from it would otherwise move with it.
+    //
+    // Margins (`DrainReportAwaitedAtMost`): a correct drain may go unscheduled for up to 1.5 s
+    // after its 2 s wake and still report inside the 3.5 s bound -- at 3 s, 1.2 s went red 10/10
+    // in review -- while a drain reporting at 4 s misses it by 0.5 s. Widening trades the second
+    // margin for the first.
+    static_assert(DrainReportInterval == std::chrono::seconds { 2 },
+                  "the stop an operator watches reports every 2 s; this case and its bound are written against that");
+    auto releaser = std::jthread { [&capacity, &logger] {
+        std::ignore =
+            DrainWithin([&logger] { return Reports(logger, WaitingReport) == 0; },
+                        DrainBound { .ceiling = DrainReportAwaitedAtMost, .poll = std::chrono::milliseconds { 5 } });
         capacity.ReleaseSlot();
     } };
 

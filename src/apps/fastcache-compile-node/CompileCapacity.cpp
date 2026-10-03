@@ -11,17 +11,6 @@
 namespace FastCache::Node
 {
 
-namespace
-{
-    /// How often a stop says what it is still waiting for.
-    ///
-    /// A stop that says nothing for the whole timeout is indistinguishable from one
-    /// that has hung, which is the reading this whole change exists to prevent -- so
-    /// the interval is short enough that an operator watching `systemctl stop` sees
-    /// the count fall rather than a pause.
-    constexpr std::chrono::seconds DrainReportInterval { 2 };
-} // namespace
-
 bool CompileCapacity::TakeBytes(std::size_t want) noexcept
 {
     // Compare-and-swap against the budget rather than "add, then check and undo":

@@ -32,6 +32,11 @@ namespace
         NodeCondition condition; ///< The row this answers.
         /// The detail to raise it with, or nothing when the leader finds it benign.
         std::optional<std::string> (*raisedDetail)(SchedulerConditionInputs const& inputs);
+        /// How long a leader must have led before "nothing raised" may read `clear`: the span over
+        /// which what this row reads reaches the leader, none of which survives a failover.
+        core::platform::SteadyDuration observation;
+        /// That span in words, for the `not-evaluated` detail a leader gives until it has watched it.
+        std::string_view observationWords;
     };
 
     /// What an operator calls @p toolchain: the client's label, else its fingerprint, marked.
@@ -90,9 +95,20 @@ namespace
 
     /// Every `ConditionScope::Scheduler` row, with its question. A row joins HERE and in
     /// `NodeConditionTable` together; `EveryFleetRowHasAnEvaluator` holds that at compile time.
+    ///
+    /// The observation spans: a toolchain counts as unserved for `UnservedToolchains::Window` after the
+    /// last refusal, so a leader has seen every refusal that could still raise the row only once it
+    /// has led that long; and every live machine announces to the leader within the heartbeat
+    /// timeout, after which a single build in its registry is a fact rather than an absence of reports.
     constexpr std::array FleetConditionTable {
-        FleetConditionRow { .condition = NodeCondition::UnservedToolchain, .raisedDetail = &UnservedToolchainDetail },
-        FleetConditionRow { .condition = NodeCondition::MixedNodeVersions, .raisedDetail = &MixedNodeVersionsDetail },
+        FleetConditionRow { .condition = NodeCondition::UnservedToolchain,
+                            .raisedDetail = &UnservedToolchainDetail,
+                            .observation = Distributed::UnservedToolchains::Window,
+                            .observationWords = "fifteen minutes" },
+        FleetConditionRow { .condition = NodeCondition::MixedNodeVersions,
+                            .raisedDetail = &MixedNodeVersionsDetail,
+                            .observation = Distributed::WorkerRegistry::DefaultHeartbeatTimeout,
+                            .observationWords = "ninety seconds" },
     };
 
     /// Whether every `Scheduler`-scope row has exactly one evaluator here, and nothing else does.
@@ -113,15 +129,15 @@ namespace
                   "have one -- a row nothing evaluates reads `undecided` forever");
 
     static_assert(Distributed::UnservedToolchains::Window == std::chrono::minutes { 15 },
-                  "the unserved-toolchain remedy tells the operator fifteen minutes");
+                  "the unserved-toolchain remedy and its observationWords tell the operator fifteen minutes");
 
     static_assert(Distributed::WorkerRegistry::DefaultHeartbeatTimeout == std::chrono::seconds { 90 },
-                  "the mixed-node-versions remedy tells the operator ninety seconds");
+                  "the mixed-node-versions remedy and its observationWords tell the operator ninety seconds");
 } // namespace
 
 void EvaluateSchedulerConditions(NodeConditions& conditions, SchedulerConditionInputs const& inputs)
 {
-    if (inputs.service.Role() != Distributed::SchedulerRole::Leader)
+    if (inputs.service.Role() != Distributed::SchedulerRole::Leader || !inputs.leadingFor.has_value())
     {
         auto const leader = inputs.service.LeaderEndpoint();
         auto const reason =
@@ -137,9 +153,19 @@ void EvaluateSchedulerConditions(NodeConditions& conditions, SchedulerConditionI
         auto const detail = row.raisedDetail(inputs);
         if (detail.has_value())
             conditions.Raise(row.condition, *detail);
+        else if (*inputs.leadingFor < row.observation)
+            conditions.NotEvaluated(row.condition,
+                                    std::format("this scheduler has led for less than {}, the span this row must watch "
+                                                "before it may read clear; nothing another leader saw carries over",
+                                                row.observationWords));
         else
             conditions.Clear(row.condition);
     }
+}
+
+core::platform::SteadyDuration LongestFleetObservation() noexcept
+{
+    return std::ranges::max(FleetConditionTable | std::views::transform(&FleetConditionRow::observation));
 }
 
 SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
@@ -162,6 +188,7 @@ SchedulerTier::SchedulerTier(Distributed::IMembershipOracle const& membership,
     // cache with no scheduler at all.
     _responder { _protocol, membership, metrics },
     _conditions { conditions },
+    _clock { clock },
     _ownEndpoint { std::move(ownEndpoint) }
 {
     // No standalone leadership any more (#178). Every scheduler runs consensus -- a lone one
@@ -218,17 +245,38 @@ std::expected<std::unique_ptr<SchedulerTier>, std::string> SchedulerTier::Start(
 
 void SchedulerTier::SetRole(Distributed::SchedulerRole role, std::string_view leaderEndpoint, std::uint64_t epoch)
 {
+    // The role change and the evaluation answering it are one decision under `_roleMutex`, so no
+    // watch pass that read the OLD role can write after them (see `_roleMutex`).
+    std::scoped_lock const lock { _roleMutex };
     _service.SetRole(role, leaderEndpoint, epoch);
-    // A role change moves every fleet-wide row at once -- a new leader starts vouching, a demoted
+    if (role != Distributed::SchedulerRole::Leader)
+        _leadingSince.reset();
+    else if (!_leadingSince.has_value() || epoch != _leadingEpoch)
+    {
+        // A new leadership: either this node did not lead, or it leads in another term, and some
+        // other node may have led -- and seen what the rows read -- in between.
+        _leadingSince = _clock.now();
+        _leadingEpoch = epoch;
+    }
+    // A role change moves every fleet-wide row at once -- a new leader starts watching, a demoted
     // one stops -- so it is answered now rather than up to an interval later.
-    EvaluateConditions();
+    EvaluateConditionsLocked();
 }
 
 void SchedulerTier::EvaluateConditions()
 {
+    std::scoped_lock const lock { _roleMutex };
+    EvaluateConditionsLocked();
+}
+
+void SchedulerTier::EvaluateConditionsLocked()
+{
+    auto const leadingFor = _leadingSince.transform(
+        [this](core::platform::SteadyTimePoint since) { return core::platform::SteadyDuration { _clock.now() - since }; });
     EvaluateSchedulerConditions(
         _conditions,
-        SchedulerConditionInputs { .service = _service, .ownVersion = VersionString, .ownEndpoint = _ownEndpoint });
+        SchedulerConditionInputs {
+            .service = _service, .ownVersion = VersionString, .ownEndpoint = _ownEndpoint, .leadingFor = leadingFor });
 }
 
 void SchedulerTier::WatchConditions(std::chrono::milliseconds interval)

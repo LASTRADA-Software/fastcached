@@ -339,7 +339,11 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
     // started the way `main` starts it and with the registry, because it answers
     // `unreadable-leader-snapshot` as its driver starts.
     FastCache::Testing::ScratchDirectory consensusState { "conditions-consensus" };
-    auto const raftPort = FreePort();
+    // Held and handed to the tier, so the peer port is not free between choosing and serving it.
+    auto raftHeld = BlockingListener::Bind("127.0.0.1", 0);
+    REQUIRE(raftHeld);
+    REQUIRE(raftHeld->IsBound());
+    auto const raftPort = raftHeld->boundPort();
     auto clusteredNode = Testing::FirstStart(NodeConfig {});
     clusteredNode.nodeId = "n1";
     clusteredNode.raftListen = std::format("127.0.0.1:{}", raftPort);
@@ -355,7 +359,8 @@ TEST_CASE("Every condition row is evaluated on a fully configured node", "[node]
         {},
         metrics,
         logger,
-        &conditions);
+        &conditions,
+        std::move(raftHeld));
     REQUIRE(consensus.has_value());
 
     // Discovery, started beside consensus the way `main` starts it: it answers

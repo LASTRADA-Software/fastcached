@@ -28,6 +28,7 @@
 #include <FastCache/Core/Logger.hpp>
 #include <FastCache/Distributed/IClusterAdmin.hpp>
 #include <FastCache/Distributed/SchedulerService.hpp>
+#include <FastCache/Transport/NativeListen.hpp>
 
 #include <core/net/PlatformLoop.hpp>
 #include <core/platform/Clock.hpp>
@@ -409,6 +410,12 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     /// @param logger Where progress and refusals are reported.
     /// @param conditions Where this tier answers its node conditions; null when nobody
     ///        reads them. Must outlive the tier.
+    /// @param boundListener A socket already bound to the peer port the configuration names and
+    ///        listening, served as it is instead of binding that port again; null binds it, which
+    ///        is what a node does. For a caller that chose the port by binding it: releasing the
+    ///        socket so the tier can bind the same number leaves an ephemeral port free for
+    ///        anything else on the host to take in between. Owned from here on, on every path --
+    ///        a start refused before the listener is served closes it.
     /// @return The running tier, or the fatal reason.
     [[nodiscard]] static std::expected<std::unique_ptr<ConsensusTier>, std::string> Start(
         NodeConfig const& cfg,
@@ -420,7 +427,8 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
         EndorsementObserver onEndorsement,
         IMetricsSink& metrics,
         ILogger& logger,
-        NodeConditions* conditions = nullptr);
+        NodeConditions* conditions = nullptr,
+        std::unique_ptr<BlockingListener> boundListener = nullptr);
 
     ConsensusTier(ConsensusTier const&) = delete;
     ConsensusTier& operator=(ConsensusTier const&) = delete;
@@ -550,12 +558,14 @@ class ConsensusTier final: public Distributed::IClusterAdmin, public IConsensusS
     ///        waiting to be admitted.
     /// @param bindAddress Where the peer port binds.
     /// @param bindPort The peer port.
+    /// @param boundListener The peer port already bound, or null to bind it; see `Start`.
     /// @return Nothing on success, or the fatal reason.
     [[nodiscard]] std::expected<void, std::string> Launch(NodeConfig const& cfg,
                                                           std::vector<Cluster::MemberSpec> const& dialable,
                                                           std::vector<Cluster::MemberSpec> const& bootstrap,
                                                           std::string_view bindAddress,
-                                                          std::uint16_t bindPort);
+                                                          std::uint16_t bindPort,
+                                                          std::unique_ptr<BlockingListener> boundListener);
 
     /// Translate a consensus role into the scheduler's, and pass it on.
     ///

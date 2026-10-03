@@ -244,6 +244,27 @@ TEST_CASE("The state directory is named with why it is that one, and asking befo
     CHECK(RenderSurfaces(cfg).contains(DescribeNodeStateDirectory(cfg)));
 }
 
+TEST_CASE("A state directory the start resolved is a key route though nobody typed --cluster-dir",
+          "[node][formation][defaults]")
+{
+    // The worker 3d040a99b was about: no consensus, no --voter-key, no --cluster-dir -- and an
+    // enrollment that saved its roster into the DEFAULT state directory, which `NodeRoster::Build`
+    // reads back through `ChosenStateDirectory`. Asked before that read, the fail-closed answer
+    // has to count that directory as one that may hold a roster, exactly as a typed one does.
+    auto cfg = Testing::FirstStart(Unwrap(Parse({ "--listen-raft=" })));
+    REQUIRE_FALSE(RunsConsensus(cfg));
+    REQUIRE(cfg.voterKeys.empty());
+    REQUIRE(cfg.clusterDir.empty());
+
+    // The control: nothing resolved, so nothing could hold a roster yet.
+    CHECK_FALSE(AdmitsByKey(cfg));
+
+    ApplyNodeStateDirectory(cfg, ScriptedConfigPathProbe { EveryBase(), Privilege::Unprivileged });
+    REQUIRE(ChosenStateDirectory(cfg).has_value());
+    REQUIRE(Unwrap(ChosenStateDirectory(cfg)).origin != StateDirectoryOrigin::Named);
+    CHECK(AdmitsByKey(cfg));
+}
+
 TEST_CASE("Only an invocation that writes into the state directory is refused for having none",
           "[node][formation][defaults]")
 {
